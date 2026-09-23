@@ -212,6 +212,7 @@ JAVA_TESTS = \
 
 MAIN_SRC = src/main/java
 TEST_SRC = src/test/java
+GENERATED_SRC = src/generated/java
 OUTPUT = target
 MAIN_CLASSES = $(OUTPUT)/classes
 TEST_CLASSES = $(OUTPUT)/test-classes
@@ -285,7 +286,7 @@ JAVAC_MAJOR_VERSION := $(word 3,$(subst ., ,$(JAVAC_VERSION)))
 endif
 
 # Test whether the version we see meets our minimum
-MIN_JAVAC_MAJOR_VERSION := 8
+MIN_JAVAC_MAJOR_VERSION := 25
 JAVAC_VERSION_GE_MIN := $(shell [ $(JAVAC_MAJOR_VERSION) -ge $(MIN_JAVAC_MAJOR_VERSION) ] > /dev/null 2>&1 && echo true)
 
 # Set the default JAVA_ARGS to "" for DEBUG_LEVEL=0
@@ -301,7 +302,8 @@ include $(ROCKSDB_PLUGIN_MKS)
 # Add paths to Java sources in plugins
 ROCKSDB_PLUGIN_JAVA_ROOTS = $(foreach plugin, $(ROCKSDB_PLUGINS), $(PLUGIN_PATH)/$(plugin)/java)
 PLUGIN_SOURCES = $(foreach root, $(ROCKSDB_PLUGIN_JAVA_ROOTS), $(foreach pkg, org/rocksdb/util org/rocksdb, $(root)/$(MAIN_SRC)/$(pkg)/*.java))
-CORE_SOURCES = $(foreach pkg, org/rocksdb/util org/rocksdb, $(MAIN_SRC)/$(pkg)/*.java)
+CORE_SOURCES = $(foreach pkg, org/rocksdb/util org/rocksdb org/rocksdb/ffm, $(MAIN_SRC)/$(pkg)/*.java)
+GENERATED_SOURCES = $(GENERATED_SRC)/org/rocksdb/ffm/*.java
 SOURCES = $(wildcard $(CORE_SOURCES) $(PLUGIN_SOURCES))
 PLUGIN_TEST_SOURCES = $(foreach root, $(ROCKSDB_PLUGIN_JAVA_ROOTS), $(foreach pkg, org/rocksdb/test org/rocksdb/util org/rocksdb, $(root)/$(TEST_SRC)/$(pkg)/*.java))
 CORE_TEST_SOURCES = $(foreach pkg, org/rocksdb/test org/rocksdb/util org/rocksdb, $(TEST_SRC)/$(pkg)/*.java)
@@ -335,21 +337,27 @@ endif
 clean: clean-not-downloaded clean-downloaded
 
 clean-not-downloaded:
-	$(AM_V_at)rm -rf $(NATIVE_INCLUDE) $(OUTPUT) $(BENCHMARK_OUTPUT) $(SAMPLES_OUTPUT)
+	$(AM_V_at)rm -rf $(NATIVE_INCLUDE) $(OUTPUT) $(BENCHMARK_OUTPUT) $(SAMPLES_OUTPUT) ./$(GENERATED_SRC)
+	$(AM_V_at)rm -f ./ffm_generated.java
 
 clean-downloaded:
 	$(AM_V_at)rm -rf $(JAVA_TEST_LIBDIR)
 
+java-jextract:
+	$(AM_V_GEN)jextract --include-dir ../include/rocksdb --output ./$(GENERATED_SRC) --target-package org.rocksdb.ffm --library rocksdb ../include/rocksdb/c.h
+	# List the jextract files in a parameter file for javac, working around the fact that
+	# names may contain '$'-symbol, then shell substitutes non-existent shell variables in command line parameters
+	$(AM_V_at)@find ./$(GENERATED_SRC) -name \*.java -print > ./ffm_generated.java
 
 javadocs: java
 	$(AM_V_GEN)mkdir -p $(JAVADOC)
-	$(AM_V_at)$(JAVADOC_CMD) -d $(JAVADOC) -sourcepath $(MAIN_SRC) -subpackages org
+	$(AM_V_at)$(JAVADOC_CMD) -d $(JAVADOC) -sourcepath $(MAIN_SRC) -sourcepath $(GENERATED_SRC) -subpackages org
 
 javalib: java java_test javadocs
 
-java: java-version
+java: java-version java-jextract
 	$(AM_V_GEN)mkdir -p $(MAIN_CLASSES)
-	$(AM_V_at) $(JAVAC_CMD) $(JAVAC_ARGS) -h $(NATIVE_INCLUDE) -d $(MAIN_CLASSES) $(SOURCES)
+	$(AM_V_at) $(JAVAC_CMD) $(JAVAC_ARGS) -h $(NATIVE_INCLUDE) -d $(MAIN_CLASSES) $(SOURCES) @ffm_generated.java
 	$(AM_V_at)@cp ../HISTORY.md ./HISTORY-CPP.md
 	$(AM_V_at)@rm -f ./HISTORY-CPP.md
 
@@ -361,6 +369,13 @@ sample: java
 	$(JAVA_CMD) $(JAVA_ARGS) -Djava.library.path=target -cp $(MAIN_CLASSES):$(SAMPLES_MAIN_CLASSES) RocksDBSample /tmp/rocksdbjni
 	$(AM_V_at)@rm -rf /tmp/rocksdbjni
 	$(AM_V_at)@rm -rf /tmp/rocksdbjni_not_found
+
+ffm_sample: java
+	$(AM_V_GEN)mkdir -p $(SAMPLES_MAIN_CLASSES)
+	$(AM_V_at)$(JAVAC_CMD) $(JAVAC_ARGS) -cp $(MAIN_CLASSES) -d $(SAMPLES_MAIN_CLASSES) $(SAMPLES_MAIN_SRC)/RocksFFMSample.java
+	$(AM_V_at)@rm -rf /tmp/rocksdbjni
+	$(JAVA_CMD) $(JAVA_ARGS) --enable-native-access=ALL-UNNAMED -DROCKS_JAVA_DEBUG_NLL=true -Djava.library.path=target -cp $(MAIN_CLASSES):$(SAMPLES_MAIN_CLASSES) RocksFFMSample /tmp/rocksdbjni
+	$(AM_V_at)@rm -rf /tmp/rocksdbjni
 
 column_family_sample: java
 	$(AM_V_GEN)mkdir -p $(SAMPLES_MAIN_CLASSES)

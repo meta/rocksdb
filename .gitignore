@@ -114,3 +114,5 @@ tools/__pycache__/
 # Keep documentation trackable even if broader ignores match names like "*_test".
 !docs/
 !docs/**
+/java/src/generated
+/java/ffm_generated.java
