@@ -338,7 +338,7 @@ clean: clean-not-downloaded clean-downloaded
 
 clean-not-downloaded:
 	$(AM_V_at)rm -rf $(NATIVE_INCLUDE) $(OUTPUT) $(BENCHMARK_OUTPUT) $(SAMPLES_OUTPUT) ./$(GENERATED_SRC)
-	$(AM_V_at)rm -f ./ffm_generated.java
+	$(AM_V_at)rm -f ./ffm_generated_java
 
 clean-downloaded:
 	$(AM_V_at)rm -rf $(JAVA_TEST_LIBDIR)
@@ -347,7 +347,7 @@ java-jextract:
 	$(AM_V_GEN)jextract --include-dir ../include/rocksdb --output ./$(GENERATED_SRC) --target-package org.rocksdb.ffm --library rocksdb ../include/rocksdb/c.h
 	# List the jextract files in a parameter file for javac, working around the fact that
 	# names may contain '$'-symbol, then shell substitutes non-existent shell variables in command line parameters
-	$(AM_V_at)@find ./$(GENERATED_SRC) -name \*.java -print > ./ffm_generated.java
+	$(AM_V_at)@find ./$(GENERATED_SRC) -name \*.java -print > ./ffm_generated_java
 
 javadocs: java
 	$(AM_V_GEN)mkdir -p $(JAVADOC)
@@ -357,7 +357,7 @@ javalib: java java_test javadocs
 
 java: java-version java-jextract
 	$(AM_V_GEN)mkdir -p $(MAIN_CLASSES)
-	$(AM_V_at) $(JAVAC_CMD) $(JAVAC_ARGS) -h $(NATIVE_INCLUDE) -d $(MAIN_CLASSES) $(SOURCES) @ffm_generated.java
+	$(AM_V_at) $(JAVAC_CMD) $(JAVAC_ARGS) -h $(NATIVE_INCLUDE) -d $(MAIN_CLASSES) $(SOURCES) @ffm_generated_java
 	$(AM_V_at)@cp ../HISTORY.md ./HISTORY-CPP.md
 	$(AM_V_at)@rm -f ./HISTORY-CPP.md
 

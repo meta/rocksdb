@@ -115,4 +115,4 @@ tools/__pycache__/
 !docs/
 !docs/**
 /java/src/generated
-/java/ffm_generated.java
+/java/ffm_generated_java
