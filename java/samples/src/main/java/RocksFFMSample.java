@@ -8,6 +8,7 @@ import org.rocksdb.ffm.RocksFFM;
 public class RocksFFMSample {
 
     public static void main(final String[] args) {
-        RocksFFM.justDoIt();;
+        RocksFFM.justDoIt();
+        System.err.println("Didn't die!");
     }
 }

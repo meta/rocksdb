@@ -17,7 +17,6 @@ public class RocksFFM {
 
     static {
         RocksDB.loadLibrary();
-        System.err.println("Map library name is " + System.mapLibraryName("rocksdb"));
     }
 
     public static void justDoIt() {

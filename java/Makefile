@@ -344,7 +344,9 @@ clean-downloaded:
 	$(AM_V_at)rm -rf $(JAVA_TEST_LIBDIR)
 
 java-jextract:
-	$(AM_V_GEN)jextract --include-dir ../include/rocksdb --output ./$(GENERATED_SRC) --target-package org.rocksdb.ffm --library rocksdb ../include/rocksdb/c.h
+	# No `--library rocksdb` is passed to `jextract`, because we use the library packed in the jar
+	# via our own special `RocksDB.loadLibrary()`
+	$(AM_V_GEN)jextract --include-dir ../include/rocksdb --output ./$(GENERATED_SRC) --target-package org.rocksdb.ffm ../include/rocksdb/c.h
 	# List the jextract files in a parameter file for javac, working around the fact that
 	# names may contain '$'-symbol, then shell substitutes non-existent shell variables in command line parameters
 	$(AM_V_at)@find ./$(GENERATED_SRC) -name \*.java -print > ./ffm_generated_java
