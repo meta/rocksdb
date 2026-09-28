@@ -375,9 +375,9 @@ sample: java
 ffm_sample: java
 	$(AM_V_GEN)mkdir -p $(SAMPLES_MAIN_CLASSES)
 	$(AM_V_at)$(JAVAC_CMD) $(JAVAC_ARGS) -cp $(MAIN_CLASSES) -d $(SAMPLES_MAIN_CLASSES) $(SAMPLES_MAIN_SRC)/RocksFFMSample.java
-	$(AM_V_at)@rm -rf /tmp/rocksdbjni
-	$(JAVA_CMD) $(JAVA_ARGS) --enable-native-access=ALL-UNNAMED -DROCKS_JAVA_DEBUG_NLL=true -Djava.library.path=target -cp $(MAIN_CLASSES):$(SAMPLES_MAIN_CLASSES) RocksFFMSample /tmp/rocksdbjni
-	$(AM_V_at)@rm -rf /tmp/rocksdbjni
+	$(AM_V_at)@rm -rf /tmp/rocksdbffm
+	$(JAVA_CMD) $(JAVA_ARGS) --enable-native-access=ALL-UNNAMED -DROCKS_JAVA_DEBUG_NLL=true -Djava.library.path=target -cp $(MAIN_CLASSES):$(SAMPLES_MAIN_CLASSES) RocksFFMSample /tmp/rocksdbffm
+	$(AM_V_at)@rm -rf /tmp/rocksdbffm
 
 column_family_sample: java
 	$(AM_V_GEN)mkdir -p $(SAMPLES_MAIN_CLASSES)

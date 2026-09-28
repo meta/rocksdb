@@ -5,32 +5,33 @@
 
 package org.rocksdb.ffm;
 
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
-
-import org.rocksdb.RocksDB;
-
 import static org.rocksdb.ffm.c_h.*;
 import static org.rocksdb.ffm.c_h_2.*;
 
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import org.rocksdb.RocksDB;
+
 public class RocksFFM {
+  static {
+    RocksDB.loadLibrary();
+  }
 
-    static {
-        RocksDB.loadLibrary();
+  public static void open() {
+    c_h_2.rocksdb_open(MemorySegment options, MemorySegment name, MemorySegment errptr)
+  }
+
+  public static void wibble() {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment db = arena.allocate(64, 1);
+      MemorySegment options = arena.allocate(64, 1);
+      MemorySegment column_family = arena.allocate(64, 1);
+      long num_keys = 0;
+      MemorySegment keys = arena.allocate(64, 1);
+      byte sorted_input = 1;
+
+      MemorySegment multiGet = c_h_2.rocksdb_batched_multi_get_pinned_cf(
+          db, options, column_family, num_keys, keys, sorted_input);
     }
-
-    public static void justDoIt() {
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment db = arena.allocate(64, 1);
-            MemorySegment options = arena.allocate(64, 1);
-            MemorySegment column_family = arena.allocate(64, 1);
-            long num_keys = 0;
-            MemorySegment keys = arena.allocate(64, 1);
-            byte sorted_input = 1;
-            
-            MemorySegment multiGet = c_h_2.rocksdb_batched_multi_get_pinned_cf(
-                db, options, column_family, num_keys, keys, sorted_input);
-        }
-
-    }
+  }
 }
