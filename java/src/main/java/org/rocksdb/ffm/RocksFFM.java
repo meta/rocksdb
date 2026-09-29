@@ -18,7 +18,7 @@ public class RocksFFM {
   }
 
   public static void open() {
-    c_h_2.rocksdb_open(MemorySegment options, MemorySegment name, MemorySegment errptr)
+    // c_h_2.rocksdb_open(MemorySegment options, MemorySegment name, MemorySegment errptr);
   }
 
   public static void wibble() {

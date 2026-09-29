@@ -15,7 +15,8 @@ public class RocksFFMSample {
       System.exit(-1);
     }
 
-    createDB(args[0]);
+    final RocksFFMSample sample = new RocksFFMSample();
+    sample.createDB(args[0]);
     // createCF(args[0]);
 
     //RocksFFM.wibble();
@@ -24,14 +25,16 @@ public class RocksFFMSample {
 
   private void createDB(String db_path) {
     try (final RocksDB db = RocksDB.open(db_path)) {
-      db.put("key1", "value1");
-      db.put("key2", "value2");
-      db.put("key3", "somethingElseEntirely");
+      db.put("key1".getBytes(), "value1".getBytes());
+      db.put("key2".getBytes(), "value2".getBytes());
+      db.put("key3".getBytes(), "somethingElseEntirely".getBytes());
+    } catch (RocksDBException e) {
+      throw new RuntimeException(e);
     }
   }
 
   private void createCF(String db_path) {
-    System.out.println("%s\n", NAME);
+    System.out.printf("%s\n", NAME);
     try (final Options options = new Options().setCreateIfMissing(true);
         final RocksDB db = RocksDB.open(options, db_path)) {
       assert (db != null);
@@ -41,6 +44,8 @@ public class RocksFFMSample {
                new ColumnFamilyDescriptor("new_cf".getBytes(), new ColumnFamilyOptions()))) {
         assert (columnFamilyHandle != null);
       }
+    } catch (RocksDBException e) {
+      throw new RuntimeException(e);
     }
   }
 }
