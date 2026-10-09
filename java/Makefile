@@ -212,7 +212,7 @@ JAVA_TESTS = \
 
 MAIN_SRC = src/main/java
 TEST_SRC = src/test/java
-GENERATED_SRC = src/generated/java
+GENERATED_SRC = target/generated-sources/ffmapi
 OUTPUT = target
 MAIN_CLASSES = $(OUTPUT)/classes
 TEST_CLASSES = $(OUTPUT)/test-classes
