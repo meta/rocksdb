@@ -5,15 +5,13 @@
 
 package org.rocksdb.ffm;
 
-import static org.rocksdb.ffm.rocksdb_c_api.*;
-import static org.rocksdb.ffm.rocksdb_c_api_2.*;
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
 import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
 
 public class RocksFFM {
   static {
@@ -30,35 +28,61 @@ public class RocksFFM {
 
   private static final MemorySegment NULL = MemorySegment.ofAddress(0L);
 
-  public static RocksFFM open(Arena dbArena, String dbPath) {
+  public static RocksFFM open(Arena dbArena, String dbPath) throws RocksDBException {
     // TODO (AP) -- Options lifecycle may not be safely confined to a confined arena ?
     // See RocksDB rules on options structs
     MemorySegment options = rocksdb_c_api_2.rocksdb_options_create();
-    MemorySegment pathName = dbArena.allocateFrom(dbPath, StandardCharsets.UTF_8);
+    MemorySegment pathName = dbArena.allocateFrom(dbPath, UTF_8);
     MemorySegment errptr = dbArena.allocateFrom(ValueLayout.ADDRESS, NULL);
     MemorySegment db = rocksdb_c_api_2.rocksdb_open(options, pathName, errptr);
 
-    return new RocksFFM(dbArena, db);
+    MemorySegment err = errptr.get(ValueLayout.ADDRESS, 0L);
+    if (err.address() == NULL.address()) {
+      return new RocksFFM(dbArena, db);
+    } else {
+      err = err.reinterpret(Long.MAX_VALUE);
+      String message = err.getString(0, UTF_8);
+      throw new RocksDBException("rocksdb_open() " + message);
+    }
   }
 
-  public MemorySegment get(String key) {
+  public MemorySegment get(String key) throws RocksDBException {
     MemorySegment read_options = rocksdb_c_api.rocksdb_readoptions_create();
-    MemorySegment keySegment = dbArena.allocateFrom(key, StandardCharsets.UTF_8);
+    MemorySegment keySegment = dbArena.allocateFrom(key, UTF_8);
     long keySize = keySegment.byteSize() - 1; // 0-terminated
     MemorySegment vallenSegment = dbArena.allocateFrom(ValueLayout.JAVA_LONG, 0L);
     MemorySegment errptr = dbArena.allocateFrom(ValueLayout.ADDRESS, NULL);
-    System.err.printf("Reading key %s of %d bytes from DB\n", key, keySegment.byteSize());
     MemorySegment value =
         rocksdb_c_api_2.rocksdb_get(db, read_options, keySegment, keySize, vallenSegment, errptr);
     MemorySegment err = errptr.get(ValueLayout.ADDRESS, 0L);
     if (err.address() == NULL.address()) {
       // success
+      if (value.address() == NULL.address()) {
+        // Status is NOT_FOUND
+        return null;
+      }
       long vallen = vallenSegment.get(ValueLayout.JAVA_LONG, 0);
       return value.asSlice(0L, vallen);
     } else {
-      byte statusCode = err.get(ValueLayout.JAVA_BYTE, 0L);
-      throw new RuntimeException("rocksdb_get(() status %d" + statusCode);
+      err = err.reinterpret(Long.MAX_VALUE);
+      String message = err.getString(0, UTF_8);
+      throw new RocksDBException("rocksdb_get() " + message);
     }
+  }
+
+  /**
+   * Extract a string from a segment
+   * `MemorySegment.getString(offset, charset)` doesn't work for us, as it expects a C-style
+   * null-terminated string
+   *
+   * @param segment to interpret as a String
+   * @return the Java string contained in `segment`
+   */
+  public static String stringFromSegment(MemorySegment segment) {
+    int byteSize = (int) segment.byteSize();
+    byte[] bytes = new byte[byteSize];
+    MemorySegment.copy(segment, ValueLayout.JAVA_BYTE, 0, bytes, 0, byteSize);
+    return new String(bytes, UTF_8);
   }
 
   // TODO (AP) - multiGet is ***INTERESTING***

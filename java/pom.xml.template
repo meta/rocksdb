@@ -59,8 +59,8 @@
     </mailingLists>
 
     <properties>
-        <project.build.source>1.8</project.build.source>
-        <project.build.target>1.8</project.build.target>
+        <project.build.source>25</project.build.source>
+        <project.build.target>25</project.build.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
