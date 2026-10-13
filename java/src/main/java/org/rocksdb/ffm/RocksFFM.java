@@ -46,6 +46,13 @@ public class RocksFFM {
     }
   }
 
+  /**
+   * Fetch the value for a supplied key
+   * @param key to look up
+   * @return a {@link java.lang.foreign.MemorySegment} containing the retrieved value, or {@code
+   *     null} if no value exists for the key
+   * @throws RocksDBException if an error occurs
+   */
   public MemorySegment get(String key) throws RocksDBException {
     MemorySegment read_options = rocksdb_c_api.rocksdb_readoptions_create();
     MemorySegment keySegment = dbArena.allocateFrom(key, UTF_8);
