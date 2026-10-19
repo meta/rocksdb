@@ -3,6 +3,7 @@
 ## Resources
 
 - [Adam's Presentation](https://evolvedbinary.slides.com/adamretter/rocksjava-present-and-future)
+- [Adam's Presentation](https://evolvedbinary.slides.com/adamretter/rocksjava-past-present-and-future#18)
 - [JNI Spec](https://docs.oracle.com/en/java/javase/17/docs/specs/jni/functions.html)
 - [Prototype Blog Post](https://rocksdb.org/blog/2024/02/20/foreign-function-interface.html)
 - [Prototype PR](https://github.com/facebook/rocksdb/pull/11095)
@@ -204,3 +205,24 @@ This is slightly incidental, and more about hygiene, and not creating reams of u
 
 We would like to keep the Java API in sync with the `C` API at zero effort. This demands automation.
 
+## Plans
+
+### Alternative Approaches
+* How does `jpassport` compare to `jextract` as a basis for an API ?
+* Is there a possibility of rolling our own ?
+  * Post-processing via JavaParser or [Spoon](https://tomassetti.me/analyze-generate-and-transform-java-code/)
+
+#### JPassport
+* JPassport appears to have been very minimally tested on MacOS
+  * Lots of crashes when I try to do what it says to do
+  * But perhaps that is only that I have been using it in a non-typical way ?
+    * Trying `PassportFactory.link()` now
+  * `PassportFactory.link()` may be the canonical way to approach it.
+    * Generates FFM method calls to implement a Java interface.
+    * We would need to specify each interface / method that we want to use, manually.
+
+### Platform Stability
+* Is the RocksDB Java API stable across important platforms ?
+  * `i386` vs `x86-64`
+  * 32-bit vs 64-bit ARM
+  * ARM vs Intel
