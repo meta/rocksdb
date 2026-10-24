@@ -395,16 +395,41 @@ inline void DeleteIOUring(void* p) {
   delete iu;
 }
 
-inline struct io_uring* CreateIOUring() {
+// Creates a new io_uring instance for the calling thread.
+//
+// On failure, returns nullptr and, if err_out is non-null, sets *err_out to
+// the positive errno value returned by io_uring_queue_init.  Callers can use
+// this to distinguish resource-exhaustion failures (ENOMEM — memlock limit
+// hit) from "not supported by kernel" failures (ENOSYS/EPERM).
+//
+// Common failure reasons:
+//   ENOMEM  — the process has exhausted its locked-memory quota
+//             (RLIMIT_MEMLOCK).  Raise the limit or reduce the number of
+//             concurrent io_uring rings.
+//   ENOSYS  — the kernel does not support io_uring.
+//   EPERM   — the process lacks the required capability.
+inline struct io_uring* CreateIOUring(int* err_out = nullptr) {
   struct io_uring* new_io_uring = new struct io_uring;
   unsigned int flags = 0;
   flags |= IORING_SETUP_SINGLE_ISSUER;
   flags |= IORING_SETUP_DEFER_TASKRUN;
   int ret = io_uring_queue_init(kIoUringDepth, new_io_uring, flags);
   if (ret) {
-    fprintf(stdout, "CreateIOUring failed: %s (errno=%d), thread=%lu\n",
-            errnoStr(-ret).c_str(), -ret,
-            static_cast<unsigned long>(pthread_self()));
+    int err = -ret;  // liburing returns negative errno
+    if (err_out) {
+      *err_out = err;
+    }
+    if (err == ENOMEM) {
+      fprintf(stderr,
+              "CreateIOUring failed: %s (errno=%d) — memlock limit may be too"
+              " low; consider raising RLIMIT_MEMLOCK. thread=%lu\n",
+              errnoStr(err).c_str(), err,
+              static_cast<unsigned long>(pthread_self()));
+    } else {
+      fprintf(stderr, "CreateIOUring failed: %s (errno=%d), thread=%lu\n",
+              errnoStr(err).c_str(), err,
+              static_cast<unsigned long>(pthread_self()));
+    }
     delete new_io_uring;
     new_io_uring = nullptr;
   } else {
