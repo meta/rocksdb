@@ -1254,6 +1254,12 @@ Status DBImpl::CloseHelper() {
   if (immutable_db_options_.sst_file_manager && !own_sfm_) {
     mutex_.Unlock();
     UntrackDataFiles();
+    if (sfm_reserved_disk_buffer_ > 0) {
+      auto sfm = static_cast<SstFileManagerImpl*>(
+          immutable_db_options_.sst_file_manager.get());
+      sfm->ReleaseDiskBuffer(sfm_reserved_disk_buffer_);
+      sfm_reserved_disk_buffer_ = 0;
+    }
     mutex_.Lock();
   }
 

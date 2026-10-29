@@ -2999,6 +2999,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     // WAL write failures and resultant forced flushes
     sfm->ReserveDiskBuffer(max_write_buffer_size,
                            impl->immutable_db_options_.db_paths[0].path);
+    impl->sfm_reserved_disk_buffer_ = max_write_buffer_size;
   }
 
   if (s.ok() &&

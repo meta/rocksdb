@@ -4095,6 +4095,10 @@ class DBImpl : public DB
   // Flag to indicate whether sst_file_manager object was allocated in
   // DB::Open() or passed to us
   bool own_sfm_;
+  // Disk buffer this instance reserved in the SstFileManager at open. It is
+  // given back on close, so that an SstFileManager shared across instances or
+  // reopens holds one buffer per open DB rather than one per DB::Open().
+  uint64_t sfm_reserved_disk_buffer_ = 0;
 
   // Flag to check whether Close() has been called on this DB
   bool closed_ = false;

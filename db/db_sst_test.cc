@@ -23,6 +23,10 @@ class DBSSTTest : public DBTestBase {
  public:
   DBSSTTest(const std::string& test_name = "db_sst_test")
       : DBTestBase(test_name, /*env_do_fsync=*/true) {}
+
+  static uint64_t ReservedDiskBuffer(SstFileManagerImpl* sfm) {
+    return sfm->SstFileManagerImpl::GetReservedDiskBuffer();
+  }
 };
 
 // A class which remembers the name of each flushed file.
@@ -1400,6 +1404,44 @@ TEST_F(DBSSTTest, DBWithMaxSpaceAllowedWithBlobFiles) {
   TEST_SYNC_POINT("DBSSTTest::DBWithMaxSpaceAllowedWithBlobFiles:1");
   ASSERT_TRUE(delete_blob_file);
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+}
+
+// Each DB::Open() with an SstFileManager reserves one write buffer of disk
+// headroom for recovery from out of space errors. A manager shared across
+// reopens or DB instances has to hold one buffer per open DB, not one per open
+// ever made, or it eventually refuses to clear a NoSpace error however much
+// space is free.
+TEST_F(DBSSTTest, ReservedDiskBufferGivenBackOnClose) {
+  std::shared_ptr<SstFileManager> sst_file_manager(NewSstFileManager(env_));
+  auto sfm = static_cast<SstFileManagerImpl*>(sst_file_manager.get());
+
+  Options options = CurrentOptions();
+  options.sst_file_manager = sst_file_manager;
+  options.write_buffer_size = 1 << 20;
+  DestroyAndReopen(options);
+  ASSERT_EQ(ReservedDiskBuffer(sfm), options.write_buffer_size);
+  for (int i = 0; i < 3; ++i) {
+    Reopen(options);
+    ASSERT_EQ(ReservedDiskBuffer(sfm), options.write_buffer_size);
+  }
+
+  // A second DB on the same manager holds its own buffer, and closing either
+  // one gives back only what that one reserved.
+  Options other_options = options;
+  other_options.write_buffer_size = 2 << 20;
+  const std::string other_name = dbname_ + "_other";
+  ASSERT_OK(DestroyDB(other_name, other_options));
+  std::unique_ptr<DB> other;
+  ASSERT_OK(DB::Open(other_options, other_name, &other));
+  ASSERT_EQ(ReservedDiskBuffer(sfm),
+            options.write_buffer_size + other_options.write_buffer_size);
+
+  Close();
+  ASSERT_EQ(ReservedDiskBuffer(sfm), other_options.write_buffer_size);
+  ASSERT_OK(other->Close());
+  other.reset();
+  ASSERT_EQ(ReservedDiskBuffer(sfm), 0);
+  ASSERT_OK(DestroyDB(other_name, other_options));
 }
 
 TEST_F(DBSSTTest, CancellingCompactionsWorks) {
