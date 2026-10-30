@@ -2993,13 +2993,14 @@ class NonBatchedOpsStressTest : public StressTest {
     fprintf(stderr,
             "Iterator config: allow_unprepared_value=%d, "
             "auto_refresh_iterator_with_snapshot=%d, has_snapshot=%d, "
-            "use_multi_cf_iterator=%d, using_udi=%d, use_trie_index=%d\n",
+            "use_multi_cf_iterator=%d, use_trie_index=%d, index_mode=%d, "
+            "read_index=%d\n",
             static_cast<int>(ro.allow_unprepared_value),
             static_cast<int>(ro.auto_refresh_iterator_with_snapshot),
             static_cast<int>(ro.snapshot != nullptr),
             static_cast<int>(FLAGS_use_multi_cf_iterator),
-            static_cast<int>(ro.table_index_factory != nullptr),
-            static_cast<int>(FLAGS_use_trie_index));
+            static_cast<int>(FLAGS_use_trie_index), FLAGS_index_mode,
+            static_cast<int>(ro.read_index));
     fprintf(stderr, "Iterator value: %s\n",
             iter->value().ToString(true).c_str());
 
@@ -3055,28 +3056,30 @@ class NonBatchedOpsStressTest : public StressTest {
     };
 
     ReadOptions standard_ro = ro;
-    standard_ro.table_index_factory = nullptr;
+    standard_ro.read_index = ReadOptions::ReadIndex::kBuiltin;
+    ReadOptions trie_ro = ro;
+    trie_ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
     dump_debug_iter("Debug standard direct", standard_ro,
                     /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/false);
-    dump_debug_iter("Debug trie direct", ro, /*use_multi_cf_iter=*/false,
+    dump_debug_iter("Debug trie direct", trie_ro, /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/false);
     dump_debug_iter("Debug standard direct", standard_ro,
                     /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/true);
-    dump_debug_iter("Debug trie direct", ro, /*use_multi_cf_iter=*/false,
+    dump_debug_iter("Debug trie direct", trie_ro, /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/true);
     if (FLAGS_use_multi_cf_iterator) {
       dump_debug_iter("Debug standard coalescing", standard_ro,
                       /*use_multi_cf_iter=*/true,
                       /*replay_from_mid=*/false);
-      dump_debug_iter("Debug trie coalescing", ro,
+      dump_debug_iter("Debug trie coalescing", trie_ro,
                       /*use_multi_cf_iter=*/true,
                       /*replay_from_mid=*/false);
       dump_debug_iter("Debug standard coalescing", standard_ro,
                       /*use_multi_cf_iter=*/true,
                       /*replay_from_mid=*/true);
-      dump_debug_iter("Debug trie coalescing", ro,
+      dump_debug_iter("Debug trie coalescing", trie_ro,
                       /*use_multi_cf_iter=*/true,
                       /*replay_from_mid=*/true);
     }
