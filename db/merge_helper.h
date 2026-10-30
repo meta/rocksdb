@@ -36,7 +36,8 @@ class MergeHelper {
  public:
   MergeHelper(Env* env, const Comparator* user_comparator,
               const MergeOperator* user_merge_operator,
-              const CompactionFilter* compaction_filter, Logger* logger,
+              const CompactionFilter* compaction_filter,
+              CompactionFilter::MergeOrder merge_order, Logger* logger,
               bool assert_valid_internal_key, SequenceNumber latest_snapshot,
               const SnapshotChecker* snapshot_checker = nullptr, int level = 0,
               Statistics* stats = nullptr,
@@ -208,6 +209,15 @@ class MergeHelper {
   //                So keys().back() was the first key seen by iterator.
   // TODO: Re-style this comment to be like the first one
   const std::deque<std::string>& keys() const { return keys_; }
+
+  enum class Outcome { kUncombined, kFull, kPartial };
+  Outcome outcome() const { return outcome_; }
+  bool aggregate_eligible() const { return aggregate_eligible_; }
+  bool history_exhausted() const { return history_exhausted_; }
+  CompactionFilter::MergeOrder merge_order() const { return merge_order_; }
+  bool OperandEligible(SequenceNumber seq) const {
+    return seq > latest_snapshot_;
+  }
   const std::vector<Slice>& values() const {
     return merge_context_.GetOperands();
   }
@@ -234,6 +244,10 @@ class MergeHelper {
   const Comparator* user_comparator_;
   const MergeOperator* user_merge_operator_;
   const CompactionFilter* compaction_filter_;
+  const CompactionFilter::MergeOrder merge_order_;
+  Outcome outcome_ = Outcome::kUncombined;
+  bool aggregate_eligible_ = true;
+  bool history_exhausted_ = false;
   const std::atomic<bool>* shutting_down_;
   Logger* logger_;
   bool assert_valid_internal_key_;  // enforce no internal key corruption?
@@ -304,6 +318,10 @@ class MergeOutputIterator {
   void SeekToFirst();
   // Advances to the next record in the output.
   void Next();
+  void Invalidate() {
+    it_keys_ = merge_helper_->keys().rend();
+    it_values_ = merge_helper_->values().rend();
+  }
 
   Slice key() { return Slice(*it_keys_); }
   Slice value() { return Slice(*it_values_); }

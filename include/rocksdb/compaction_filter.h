@@ -125,6 +125,42 @@ class WideColumnBlobResolver {
 // including data loss, unreported corruption, deadlocks, and more.
 class CompactionFilter : public Customizable {
  public:
+  enum class MergeOrder {
+    kFilterBeforeMerge,
+    kMergeBeforeFilter,
+  };
+
+  // A stable, concurrent configuration query, called without the DB mutex.
+  // It must be bounded, non-reentrant, and must not perform I/O or wait.
+  // kMergeBeforeFilter offers eligible full results as values/entities and
+  // partial results or uncombined operands as kMergeOperand through FilterV4.
+  // All retained operands must be newer than the latest snapshot for an
+  // aggregate callback. Consumed bases receive no separate callback.
+  // Partial merge can decline; filtering must also handle uncombined operands.
+  // Operand replacements must remain valid for the configured merge operator.
+  //
+  // In this order, every value/entity kPurge acts like kRemove, including
+  // input values, earlier full results, and key-only blob filtering. It creates
+  // an ordinary Delete, which can retain more tombstones than SingleDelete.
+  // Do not use SingleDelete history or future SingleDeletes on affected keys,
+  // including after switching back to the legacy order. Operand kPurge and
+  // kChangeWideColumnEntity fail with NotSupported in this order.
+  //
+  // This order supports local and compatible remote rewriting compactions.
+  // Services must advertise support and workers must validate and acknowledge
+  // the requested order. Missing support or an order decline falls back
+  // locally; actual compaction errors remain errors. SnapshotChecker, user
+  // timestamps, and the old stacked BlobDB filter are not supported. Integrated
+  // BlobDB is supported. No callbacks are added to trivial moves or whole-file
+  // FIFO deletion. Previously aggregated SST records have no retained
+  // source/count metadata; application filtering must account for different
+  // operand groupings. Wrappers must forward or validate the wrapped
+  // filter/factory declaration. New virtuals change the ABI: rebuild
+  // applications and custom subclasses.
+  virtual MergeOrder GetMergeOrder() const {
+    return MergeOrder::kFilterBeforeMerge;
+  }
+
   // Value type of the key-value passed to the compaction filter's
   // FilterV2/V3/V4 methods.
   enum ValueType {
@@ -263,8 +299,10 @@ class CompactionFilter : public Customizable {
   // The application can inspect the existing value of the key and make decision
   // based on it.
   //
-  // Key-Values that are results of merge operation during table file creation
-  // are not passed into this function. Currently, when you have a mix of Put()s
+  // With the default merge order, key-values that are results of merge
+  // operations during table file creation are not passed into this function.
+  // kMergeBeforeFilter offers eligible full results through FilterV4, which
+  // can delegate here. With the default order and a mix of Put()s
   // and Merge()s on a same key, we only guarantee to process the merge operands
   // through the `CompactionFilter`s. Put()s might be processed, or might not.
   //
@@ -480,6 +518,16 @@ class CompactionFilter : public Customizable {
 // including data loss, unreported corruption, deadlocks, and more.
 class CompactionFilterFactory : public Customizable {
  public:
+  // Declares routing expectations before a filter is created. Every non-null
+  // returned filter must agree; disagreement fails with InvalidArgument.
+  // This query has the stability/concurrency requirements of the filter getter.
+  // With kMergeBeforeFilter, ShouldFilterTableFileCreation must be stable for
+  // each reason and return false for every non-compaction reason. Open and CF
+  // creation reject unsupported selections; runtime guards validate instances.
+  virtual CompactionFilter::MergeOrder GetMergeOrder() const {
+    return CompactionFilter::MergeOrder::kFilterBeforeMerge;
+  }
+
   ~CompactionFilterFactory() override = default;
   static const char* Type() { return "CompactionFilterFactory"; }
   static Status CreateFromString(

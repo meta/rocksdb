@@ -19,6 +19,7 @@
 #include "file/filename.h"
 #include "options/cf_options.h"
 #include "port/port.h"
+#include "test_util/merge_filter_test_util.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/string_util.h"
@@ -286,10 +287,18 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
       snapshot_checker_.reset(
           new TestSnapshotChecker(last_committed_sequence, snapshot_map_));
     }
-    merge_helper_.reset(
-        new MergeHelper(Env::Default(), cmp_, merge_op, filter, nullptr, false,
-                        0 /*latest_snapshot*/, snapshot_checker_.get(),
-                        0 /*level*/, nullptr /*statistics*/, &shutting_down_));
+    CompactionFilter::MergeOrder merge_order =
+        filter ? filter->GetMergeOrder()
+               : CompactionFilter::MergeOrder::kFilterBeforeMerge;
+    SequenceNumber latest_merge_snapshot =
+        merge_order == CompactionFilter::MergeOrder::kMergeBeforeFilter &&
+                !snapshots_.empty()
+            ? snapshots_.back()
+            : 0;
+    merge_helper_.reset(new MergeHelper(
+        Env::Default(), cmp_, merge_op, filter, merge_order, nullptr, false,
+        latest_merge_snapshot, snapshot_checker_.get(), 0 /*level*/,
+        nullptr /*statistics*/, &shutting_down_));
 
     if (c_iter_) {
       // Since iter_ is still used in ~CompactionIterator(), we call
@@ -299,8 +308,8 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
     iter_.reset(new LoggingForwardVectorIterator(ks, vs));
     iter_->SeekToFirst();
     c_iter_.reset(new CompactionIterator(
-        iter_.get(), cmp_, merge_helper_.get(), last_sequence, &snapshots_,
-        snapshots_.empty() ? kMaxSequenceNumber : snapshots_.at(0),
+        iter_.get(), cmp_, merge_helper_.get(), merge_order, last_sequence,
+        &snapshots_, snapshots_.empty() ? kMaxSequenceNumber : snapshots_.at(0),
         earliest_write_conflict_snapshot, kMaxSequenceNumber,
         snapshot_checker_.get(), Env::Default(),
         false /* report_detailed_time */, range_del_agg_.get(),
@@ -342,7 +351,8 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
     c_iter_->SeekToFirst();
     for (size_t i = 0; i < expected_keys.size(); i++) {
       std::string info = "i = " + std::to_string(i);
-      ASSERT_TRUE(c_iter_->Valid()) << info;
+      ASSERT_TRUE(c_iter_->Valid())
+          << info << " " << c_iter_->status().ToString();
       ASSERT_OK(c_iter_->status()) << info;
       ASSERT_EQ(expected_keys[i], c_iter_->key().ToString()) << info;
       ASSERT_EQ(expected_values[i], c_iter_->value().ToString()) << info;
@@ -371,6 +381,475 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
   const std::atomic<bool> kManualCompactionCanceledFalse_{false};
   FakeCompaction* compaction_proxy_;
 };
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterFullOrder) {
+  if (GetParam()) {
+    return;
+  }
+  test::MergeFilterTrace trace;
+  test::RecordingMergeOperator merge(&trace);
+  test::RecordingMergeFilter filter(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  RunTest({test::KeyStr("a", 5, kTypeMerge), test::KeyStr("a", 4, kTypeMerge),
+           test::KeyStr("a", 3, kTypeValue), test::KeyStr("b", 2, kTypeValue)},
+          {"C", "B", "A", "next"},
+          {test::KeyStr("a", 5, kTypeValue), test::KeyStr("b", 2, kTypeValue)},
+          {"ABC", "next"}, kMaxSequenceNumber, &merge, &filter);
+  ASSERT_EQ(
+      (std::vector<std::string>{"full:a:ABC", "value:a:ABC", "value:b:next"}),
+      trace.Events());
+  ASSERT_EQ(MergeHelper::Outcome::kFull, merge_helper_->outcome());
+  ASSERT_TRUE(merge_helper_->aggregate_eligible());
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterPartialAndDecline) {
+  if (GetParam()) {
+    return;
+  }
+  for (bool partial_success : {true, false}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeOperator merge(&trace);
+    merge.partial_success = partial_success;
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    filter.operand_decision = CompactionFilter::Decision::kChangeValue;
+    filter.replacement = "replacement";
+    const std::vector<std::string> inputs{test::KeyStr("a", 5, kTypeMerge),
+                                          test::KeyStr("a", 4, kTypeMerge)};
+    RunTest(inputs, {"B", "A"},
+            partial_success ? std::vector<std::string>{inputs[0]} : inputs,
+            partial_success
+                ? std::vector<std::string>{"replacement"}
+                : std::vector<std::string>{"replacement", "replacement"},
+            kMaxSequenceNumber, &merge, &filter);
+    ASSERT_EQ(partial_success ? MergeHelper::Outcome::kPartial
+                              : MergeHelper::Outcome::kUncombined,
+              merge_helper_->outcome());
+    ASSERT_EQ(partial_success
+                  ? (std::vector<std::string>{"partial:a:AB", "operand:a:AB"})
+                  : (std::vector<std::string>{"partial:a:AB", "operand:a:B",
+                                              "operand:a:A"}),
+              trace.Events());
+  }
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterSingleOperand) {
+  if (GetParam()) {
+    return;
+  }
+  for (bool allow_single : {false, true}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeOperator merge(&trace);
+    merge.allow_single = allow_single;
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    RunTest({test::KeyStr("a", 5, kTypeMerge)}, {"A"},
+            {test::KeyStr("a", 5, kTypeMerge)}, {"A"}, kMaxSequenceNumber,
+            &merge, &filter);
+    ASSERT_EQ(allow_single
+                  ? (std::vector<std::string>{"partial:a:A", "operand:a:A"})
+                  : (std::vector<std::string>{"operand:a:A"}),
+              trace.Events());
+  }
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterFullRemovalCursor) {
+  if (GetParam()) {
+    return;
+  }
+  for (bool bottommost : {false, true}) {
+    for (bool snapshot : {false, true}) {
+      for (CompactionFilter::Decision decision :
+           {CompactionFilter::Decision::kRemove,
+            CompactionFilter::Decision::kPurge}) {
+        ClearSnapshots();
+        if (snapshot) {
+          AddSnapshot(1);
+        }
+        test::MergeFilterTrace trace;
+        test::RecordingMergeOperator merge(&trace);
+        test::RecordingMergeFilter filter(
+            CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+        filter.action_key = "a";
+        filter.value_decision = decision;
+        InitIterators(
+            {test::KeyStr("a", 3, kTypeMerge), test::KeyStr("a", 2, kTypeValue),
+             test::KeyStr("a", 1, kTypeValue),
+             test::KeyStr("b", 4, kTypeValue)},
+            {"M", "base", "old", "next"}, {}, {}, 4, kMaxSequenceNumber, &merge,
+            &filter, bottommost);
+        c_iter_->SeekToFirst();
+        if (!bottommost || snapshot) {
+          ASSERT_TRUE(c_iter_->Valid());
+          ASSERT_EQ(kTypeDeletion, c_iter_->ikey().type);
+          ASSERT_EQ(3, c_iter_->ikey().sequence);
+          c_iter_->Next();
+        }
+        if (snapshot) {
+          ASSERT_TRUE(c_iter_->Valid());
+          ASSERT_EQ("old", c_iter_->value());
+          ASSERT_EQ(kTypeValue, c_iter_->ikey().type);
+          c_iter_->Next();
+        }
+        ASSERT_TRUE(c_iter_->Valid());
+        ASSERT_EQ("b", c_iter_->ikey().user_key);
+        ASSERT_EQ("next", c_iter_->value());
+        c_iter_->Next();
+        ASSERT_OK(c_iter_->status());
+        ASSERT_FALSE(c_iter_->Valid());
+        ASSERT_EQ(1, c_iter_->iter_stats().num_record_drop_user);
+        ASSERT_EQ(decision == CompactionFilter::Decision::kPurge ? 1 : 0,
+                  c_iter_->iter_stats().num_purge_normalized);
+        ASSERT_EQ((std::vector<std::string>{"full:a:baseM", "value:a:baseM",
+                                            "value:b:next"}),
+                  trace.Events());
+      }
+    }
+  }
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterPartialRemovalPreservesBase) {
+  if (GetParam()) {
+    return;
+  }
+  AddSnapshot(2);
+  for (bool partial_success : {true, false}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeOperator merge(&trace);
+    merge.partial_success = partial_success;
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    filter.operand_decision = CompactionFilter::Decision::kRemove;
+    RunTest({test::KeyStr("a", 4, kTypeMerge), test::KeyStr("a", 3, kTypeMerge),
+             test::KeyStr("a", 2, kTypeValue)},
+            {"B", "A", "base"}, {test::KeyStr("a", 2, kTypeValue)}, {"base"},
+            kMaxSequenceNumber, &merge, &filter);
+    ASSERT_EQ(partial_success ? 1 : 2,
+              c_iter_->iter_stats().num_record_drop_user);
+    ASSERT_EQ(partial_success
+                  ? (std::vector<std::string>{"partial:a:AB", "operand:a:AB",
+                                              "value:a:base"})
+                  : (std::vector<std::string>{"partial:a:AB", "operand:a:B",
+                                              "operand:a:A", "value:a:base"}),
+              trace.Events());
+  }
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterInvalidOperandDecision) {
+  if (GetParam()) {
+    return;
+  }
+  for (CompactionFilter::Decision decision :
+       {CompactionFilter::Decision::kPurge,
+        CompactionFilter::Decision::kChangeWideColumnEntity,
+        CompactionFilter::Decision::kUndetermined,
+        CompactionFilter::Decision::kChangeBlobIndex,
+        CompactionFilter::Decision::kIOError}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeOperator merge(&trace);
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    filter.operand_decision = decision;
+    InitIterators({test::KeyStr("a", 5, kTypeMerge)}, {"A"}, {}, {}, 5,
+                  kMaxSequenceNumber, &merge, &filter);
+    c_iter_->SeekToFirst();
+    ASSERT_TRUE(c_iter_->status().IsNotSupported());
+    ASSERT_FALSE(c_iter_->Valid());
+    ASSERT_EQ(0, c_iter_->iter_stats().num_record_drop_user);
+    ASSERT_EQ((std::vector<std::string>{"operand:a:A"}), trace.Events());
+  }
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterSingleDeleteAndCancellation) {
+  if (GetParam()) {
+    return;
+  }
+  test::MergeFilterTrace trace;
+  test::RecordingMergeOperator merge(&trace);
+  test::RecordingMergeFilter filter(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  RunTest({test::KeyStr("a", 5, kTypeSingleDeletion),
+           test::KeyStr("a", 4, kTypeValue)},
+          {"", "A"}, {}, {}, kMaxSequenceNumber, &merge, &filter);
+  ASSERT_TRUE(trace.Events().empty());
+  for (ValueType type : {kTypeMerge, kTypeDeletion}) {
+    InitIterators(
+        {test::KeyStr("a", 5, kTypeSingleDeletion), test::KeyStr("a", 4, type)},
+        {"", "A"}, {}, {}, 5, kMaxSequenceNumber, &merge, &filter);
+    c_iter_->SeekToFirst();
+    if (type == kTypeDeletion) {
+      ASSERT_TRUE(c_iter_->status().IsCorruption());
+    } else {
+      // Preserve the existing mismatch accounting; this is not valid history.
+      ASSERT_OK(c_iter_->status());
+      ASSERT_EQ(1, c_iter_->iter_stats().num_single_del_mismatch);
+    }
+    ASSERT_FALSE(c_iter_->Valid());
+  }
+  merge.partial_success = false;
+  InitIterators(
+      {test::KeyStr("a", 5, kTypeMerge), test::KeyStr("a", 4, kTypeMerge)},
+      {"B", "A"}, {}, {}, 5, kMaxSequenceNumber, &merge, &filter);
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->Valid());
+  shutting_down_.store(true);
+  c_iter_->Next();
+  ASSERT_TRUE(c_iter_->status().IsShutdownInProgress());
+  ASSERT_FALSE(c_iter_->Valid());
+  ASSERT_EQ((std::vector<std::string>{"partial:a:AB", "operand:a:B"}),
+            trace.Events());
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterStackedFilterRejected) {
+  class StackedFilter : public test::RecordingMergeFilter {
+   public:
+    explicit StackedFilter(test::MergeFilterTrace* trace)
+        : RecordingMergeFilter(MergeOrder::kMergeBeforeFilter, trace) {}
+    bool IsStackedBlobDbInternalCompactionFilter() const override {
+      return true;
+    }
+  };
+  test::MergeFilterTrace trace;
+  StackedFilter filter(&trace);
+  test::RecordingMergeOperator merge(&trace);
+  InitIterators({test::KeyStr("a", 5, kTypeMerge)}, {"A"}, {}, {}, 5,
+                kMaxSequenceNumber, &merge, &filter);
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->status().IsNotSupported());
+  ASSERT_FALSE(c_iter_->Valid());
+  ASSERT_TRUE(trace.Events().empty());
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterDeletionAndExhaustedHistory) {
+  if (GetParam()) {
+    return;
+  }
+  for (bool deletion_base : {false, true}) {
+    for (bool remove : {false, true}) {
+      test::MergeFilterTrace trace;
+      test::RecordingMergeOperator merge(&trace);
+      test::RecordingMergeFilter filter(
+          CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+      filter.action_key = "a";
+      filter.value_decision = remove ? CompactionFilter::Decision::kPurge
+                                     : CompactionFilter::Decision::kKeep;
+      std::vector<std::string> keys{test::KeyStr("a", 5, kTypeMerge)};
+      std::vector<std::string> values{"A"};
+      if (deletion_base) {
+        keys.push_back(test::KeyStr("a", 4, kTypeDeletion));
+        values.push_back("");
+      }
+      keys.push_back(test::KeyStr("b", 3, kTypeValue));
+      values.push_back("next");
+      InitIterators(keys, values, {}, {}, 5, kMaxSequenceNumber, &merge,
+                    &filter,
+                    /*bottommost_level=*/true);
+      c_iter_->SeekToFirst();
+      ASSERT_EQ(!deletion_base, merge_helper_->history_exhausted());
+      if (!remove) {
+        ASSERT_TRUE(c_iter_->Valid());
+        ASSERT_EQ("A", c_iter_->value());
+        ASSERT_EQ(kTypeValue, c_iter_->ikey().type);
+        ASSERT_EQ(0, c_iter_->ikey().sequence);
+        c_iter_->Next();
+      }
+      ASSERT_TRUE(c_iter_->Valid());
+      ASSERT_EQ("b", c_iter_->ikey().user_key);
+      c_iter_->Next();
+      ASSERT_OK(c_iter_->status());
+      ASSERT_FALSE(c_iter_->Valid());
+      ASSERT_EQ(remove ? 1 : 0, c_iter_->iter_stats().num_record_drop_user);
+      ASSERT_EQ(
+          (std::vector<std::string>{"full:a:A", "value:a:A", "value:b:next"}),
+          trace.Events());
+    }
+  }
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterSequenceZero) {
+  if (GetParam()) {
+    return;
+  }
+  for (bool full : {false, true}) {
+    for (bool partial_success : {false, true}) {
+      for (bool all_zero : {false, true}) {
+        test::MergeFilterTrace trace;
+        test::RecordingMergeOperator merge(&trace);
+        merge.partial_success = partial_success;
+        test::RecordingMergeFilter filter(
+            CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+        std::vector<std::string> keys{
+            test::KeyStr("a", all_zero ? 0 : 5, kTypeMerge),
+            test::KeyStr("a", 0, kTypeMerge)};
+        std::vector<std::string> values{"B", "A"};
+        if (full) {
+          keys.push_back(test::KeyStr("a", 0, kTypeValue));
+          values.push_back("base");
+        }
+        InitIterators(keys, values, {}, {}, 5, kMaxSequenceNumber, &merge,
+                      &filter);
+        c_iter_->SeekToFirst();
+        std::vector<std::string> output_keys;
+        std::vector<std::string> output_values;
+        while (c_iter_->Valid()) {
+          output_keys.push_back(c_iter_->key().ToString());
+          output_values.push_back(c_iter_->value().ToString());
+          c_iter_->Next();
+        }
+        ASSERT_OK(c_iter_->status());
+        ASSERT_FALSE(merge_helper_->aggregate_eligible());
+        std::vector<std::string> expected{full ? "full:a:baseAB"
+                                               : "partial:a:AB"};
+        if (!full && !partial_success && !all_zero) {
+          expected.push_back("operand:a:B");
+        }
+        ASSERT_EQ(expected, trace.Events());
+        if (full) {
+          ASSERT_EQ(1, output_keys.size());
+          trace.Clear();
+          RunTest(output_keys, output_values, output_keys, output_values,
+                  kMaxSequenceNumber, &merge, &filter);
+          ASSERT_EQ((std::vector<std::string>{"value:a:baseAB"}),
+                    trace.Events());
+        } else if (partial_success) {
+          ASSERT_EQ(test::KeyStr("a", all_zero ? 0 : 5, kTypeMerge),
+                    output_keys[0]);
+        }
+      }
+    }
+  }
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterProtectedAggregate) {
+  if (GetParam()) {
+    return;
+  }
+  AddSnapshot(6);
+  test::MergeFilterTrace trace;
+  test::RecordingMergeOperator merge(&trace);
+  test::RecordingMergeFilter filter(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  filter.operand_decision = CompactionFilter::Decision::kRemove;
+  RunTest({test::KeyStr("a", 5, kTypeMerge), test::KeyStr("a", 4, kTypeMerge)},
+          {"B", "A"}, {test::KeyStr("a", 5, kTypeMerge)}, {"AB"},
+          kMaxSequenceNumber, &merge, &filter);
+  ASSERT_FALSE(merge_helper_->aggregate_eligible());
+  ASSERT_EQ((std::vector<std::string>{"partial:a:AB"}), trace.Events());
+  // A stored partial operand can become eligible in a later, explicit pass.
+  ClearSnapshots();
+  trace.Clear();
+  RunTest({test::KeyStr("a", 5, kTypeMerge)}, {"AB"}, {}, {},
+          kMaxSequenceNumber, &merge, &filter);
+  ASSERT_EQ((std::vector<std::string>{"operand:a:AB"}), trace.Events());
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterRangeAndSkips) {
+  if (GetParam()) {
+    return;
+  }
+  test::MergeFilterTrace trace;
+  test::RecordingMergeOperator merge(&trace);
+  test::RecordingMergeFilter filter(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  InitIterators(
+      {test::KeyStr("a", 5, kTypeMerge), test::KeyStr("a", 3, kTypeMerge),
+       test::KeyStr("b", 2, kTypeValue)},
+      {"new", "covered", "next"}, {test::KeyStr("a", 4, kTypeRangeDeletion)},
+      {"b"}, 5, kMaxSequenceNumber, &merge, &filter);
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ("new", c_iter_->value());
+  c_iter_->Next();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ("b", c_iter_->ikey().user_key);
+  c_iter_->Next();
+  ASSERT_OK(c_iter_->status());
+  ASSERT_EQ((std::vector<std::string>{"operand:a:new", "value:b:next"}),
+            trace.Events());
+  for (bool valid_skip : {false, true}) {
+    trace.Clear();
+    merge.partial_success = false;
+    filter.action_key = "a";
+    filter.operand_decision = CompactionFilter::Decision::kRemoveAndSkipUntil;
+    filter.skip_target = valid_skip ? "b+" : "a";
+    const std::vector<std::string> keys{
+        test::KeyStr("a", 5, kTypeMerge), test::KeyStr("a", 4, kTypeMerge),
+        test::KeyStr("b", 3, kTypeValue), test::KeyStr("c", 2, kTypeValue)};
+    RunTest(keys, {"B", "A", "skipped", "next"},
+            valid_skip ? std::vector<std::string>{keys[3]} : keys,
+            valid_skip ? std::vector<std::string>{"next"}
+                       : std::vector<std::string>{"B", "A", "skipped", "next"},
+            kMaxSequenceNumber, &merge, &filter);
+    ASSERT_EQ(valid_skip ? (std::vector<std::string>{
+                               "partial:a:AB", "operand:a:B", "value:c:next"})
+                         : (std::vector<std::string>{
+                               "partial:a:AB", "operand:a:B", "operand:a:A",
+                               "value:b:skipped", "value:c:next"}),
+              trace.Events());
+    ASSERT_EQ(valid_skip ? 1 : 0, c_iter_->iter_stats().num_record_drop_user);
+  }
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterFullReplacementAndFailure) {
+  if (GetParam()) {
+    return;
+  }
+  for (CompactionFilter::Decision decision :
+       {CompactionFilter::Decision::kChangeValue,
+        CompactionFilter::Decision::kChangeWideColumnEntity}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeOperator merge(&trace);
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    filter.value_decision = decision;
+    filter.replacement = "changed";
+    filter.replacement_columns = {{"extra", "payload"}, {"", "changed"}};
+    std::string expected = "changed";
+    ValueType type = kTypeValue;
+    if (decision == CompactionFilter::Decision::kChangeWideColumnEntity) {
+      type = kTypeWideColumnEntity;
+      expected.clear();
+      ASSERT_OK(WideColumnSerialization::Serialize(
+          {{"", "changed"}, {"extra", "payload"}}, expected));
+    }
+    RunTest(
+        {test::KeyStr("a", 5, kTypeMerge), test::KeyStr("a", 4, kTypeValue)},
+        {"B", "A"}, {test::KeyStr("a", 5, type)}, {expected},
+        kMaxSequenceNumber, &merge, &filter);
+    ASSERT_EQ((std::vector<std::string>{"full:a:AB", "value:a:AB"}),
+              trace.Events());
+  }
+  test::MergeFilterTrace trace;
+  test::RecordingMergeOperator merge(&trace);
+  merge.fail_full = true;
+  merge.failure_scope = MergeOperator::OpFailureScope::kMustMerge;
+  test::RecordingMergeFilter filter(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  filter.operand_decision = CompactionFilter::Decision::kChangeValue;
+  filter.replacement = "changed";
+  RunTest({test::KeyStr("a", 5, kTypeMerge), test::KeyStr("a", 4, kTypeValue)},
+          {"B", "A"},
+          {test::KeyStr("a", 5, kTypeMerge), test::KeyStr("a", 4, kTypeValue)},
+          {"changed", "A"}, kMaxSequenceNumber, &merge, &filter);
+  ASSERT_EQ((std::vector<std::string>{"full:a:AB", "operand:a:B", "value:a:A"}),
+            trace.Events());
+}
+
+TEST_P(CompactionIteratorTest, MergeBeforeFilterSnapshotCheckerRejected) {
+  if (!GetParam()) {
+    return;
+  }
+  test::MergeFilterTrace trace;
+  test::RecordingMergeOperator merge(&trace);
+  test::RecordingMergeFilter filter(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  InitIterators({test::KeyStr("a", 5, kTypeMerge)}, {"A"}, {}, {}, 5,
+                kMaxSequenceNumber, &merge, &filter);
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->status().IsNotSupported());
+  ASSERT_FALSE(c_iter_->Valid());
+  ASSERT_TRUE(trace.Events().empty());
+}
 
 // It is possible that the output of the compaction iterator is empty even if
 // the input is not.
@@ -1428,6 +1907,30 @@ class CompactionIteratorWithAllowIngestBehindTest
 // When allow_ingest_behind is set, compaction iterator is not targeting
 // the bottommost level since there is no guarantee there won't be further
 // data ingested under the compaction output in future.
+TEST_P(CompactionIteratorWithAllowIngestBehindTest,
+       MergeBeforeFilterRetainsDelete) {
+  if (GetParam()) {
+    return;
+  }
+  test::MergeFilterTrace trace;
+  test::RecordingMergeOperator merge(&trace);
+  test::RecordingMergeFilter filter(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  filter.action_key = "a";
+  filter.value_decision = CompactionFilter::Decision::kPurge;
+  RunTest(
+      {test::KeyStr("a", 4, kTypeMerge), test::KeyStr("a", 3, kTypeValue),
+       test::KeyStr("b", 2, kTypeValue)},
+      {"B", "A", "next"},
+      {test::KeyStr("a", 4, kTypeDeletion), test::KeyStr("b", 2, kTypeValue)},
+      {"", "next"}, kMaxSequenceNumber, &merge, &filter,
+      /*bottommost_level=*/true, kMaxSequenceNumber,
+      /*key_not_exists_beyond_output_level=*/true);
+  ASSERT_EQ(
+      (std::vector<std::string>{"full:a:AB", "value:a:AB", "value:b:next"}),
+      trace.Events());
+}
+
 TEST_P(CompactionIteratorWithAllowIngestBehindTest, NoConvertToPutAtBottom) {
   std::shared_ptr<MergeOperator> merge_op =
       MergeOperators::CreateStringAppendOperator();
@@ -1462,6 +1965,19 @@ class CompactionIteratorTsGcTest : public CompactionIteratorTest {
   CompactionIteratorTsGcTest()
       : CompactionIteratorTest(test::BytewiseComparatorWithU64TsWrapper()) {}
 };
+
+TEST_P(CompactionIteratorTsGcTest, MergeBeforeFilterTimestampRejected) {
+  test::MergeFilterTrace trace;
+  test::RecordingMergeOperator merge(&trace);
+  test::RecordingMergeFilter filter(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  InitIterators({test::KeyStr(10002, "a", 5, kTypeMerge)}, {"A"}, {}, {}, 5,
+                kMaxSequenceNumber, &merge, &filter);
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->status().IsNotSupported());
+  ASSERT_FALSE(c_iter_->Valid());
+  ASSERT_TRUE(trace.Events().empty());
+}
 
 TEST_P(CompactionIteratorTsGcTest, NoKeyEligibleForGC) {
   constexpr char user_key[][2] = {{'a', '\0'}, {'b', '\0'}};
@@ -1934,16 +2450,18 @@ class WideColumnEntityBlobExtractionTest : public testing::Test {
     std::atomic<bool> shutting_down{false};
     const std::atomic<bool> manual_compaction_canceled{false};
 
-    MergeHelper merge_helper(Env::Default(), cmp, nullptr /*merge_op*/,
-                             nullptr /*filter*/, nullptr /*db_options*/, false,
-                             0 /*latest_snapshot*/,
-                             nullptr /*snapshot_checker*/, 0 /*level*/,
-                             nullptr /*statistics*/, &shutting_down);
+    MergeHelper merge_helper(
+        Env::Default(), cmp, nullptr /*merge_op*/, nullptr /*filter*/,
+        CompactionFilter::MergeOrder::kFilterBeforeMerge,
+        nullptr /*db_options*/, false, 0 /*latest_snapshot*/,
+        nullptr /*snapshot_checker*/, 0 /*level*/, nullptr /*statistics*/,
+        &shutting_down);
 
     iter->SeekToFirst();
     CompactionIterator c_iter(
-        iter.get(), cmp, &merge_helper, kMaxSequenceNumber, &snapshots,
-        kMaxSequenceNumber /*earliest_snapshot*/,
+        iter.get(), cmp, &merge_helper,
+        CompactionFilter::MergeOrder::kFilterBeforeMerge, kMaxSequenceNumber,
+        &snapshots, kMaxSequenceNumber /*earliest_snapshot*/,
         kMaxSequenceNumber /*earliest_write_conflict_snapshot*/,
         kMaxSequenceNumber /*job_snapshot*/, nullptr /*snapshot_checker*/,
         Env::Default(), false /*report_detailed_time*/, range_del_agg.get(),
@@ -2377,11 +2895,12 @@ class WideColumnEntityBlobGCTest : public testing::Test {
     std::atomic<bool> shutting_down{false};
     const std::atomic<bool> manual_compaction_canceled{false};
 
-    MergeHelper merge_helper(Env::Default(), cmp, nullptr /*merge_op*/,
-                             nullptr /*filter*/, nullptr /*db_options*/, false,
-                             0 /*latest_snapshot*/,
-                             nullptr /*snapshot_checker*/, 0 /*level*/,
-                             nullptr /*statistics*/, &shutting_down);
+    MergeHelper merge_helper(
+        Env::Default(), cmp, nullptr /*merge_op*/, nullptr /*filter*/,
+        CompactionFilter::MergeOrder::kFilterBeforeMerge,
+        nullptr /*db_options*/, false, 0 /*latest_snapshot*/,
+        nullptr /*snapshot_checker*/, 0 /*level*/, nullptr /*statistics*/,
+        &shutting_down);
 
     // Create compaction proxy. Note: blob GC is disabled since we don't have
     // a real Version object. These tests verify that entities with blob indices
@@ -2391,8 +2910,9 @@ class WideColumnEntityBlobGCTest : public testing::Test {
     iter->SeekToFirst();
 
     CompactionIterator c_iter(
-        iter.get(), cmp, &merge_helper, kMaxSequenceNumber, &snapshots,
-        kMaxSequenceNumber /*earliest_snapshot*/,
+        iter.get(), cmp, &merge_helper,
+        CompactionFilter::MergeOrder::kFilterBeforeMerge, kMaxSequenceNumber,
+        &snapshots, kMaxSequenceNumber /*earliest_snapshot*/,
         kMaxSequenceNumber /*earliest_write_conflict_snapshot*/,
         kMaxSequenceNumber /*job_snapshot*/, nullptr /*snapshot_checker*/,
         Env::Default(), false /*report_detailed_time*/, range_del_agg.get(),
@@ -2817,8 +3337,10 @@ TEST_F(WideColumnEntityBlobGCTest,
   std::atomic<bool> shutting_down{false};
   const std::atomic<bool> manual_compaction_canceled{false};
 
-  MergeHelper merge_helper(Env::Default(), cmp, nullptr, nullptr, nullptr,
-                           false, 0, nullptr, 0, nullptr, &shutting_down);
+  MergeHelper merge_helper(Env::Default(), cmp, nullptr, nullptr,
+                           CompactionFilter::MergeOrder::kFilterBeforeMerge,
+                           nullptr, false, 0, nullptr, 0, nullptr,
+                           &shutting_down);
 
   auto fake_compaction = std::make_unique<FakeCompactionWithBlobGC>();
 
@@ -2830,11 +3352,12 @@ TEST_F(WideColumnEntityBlobGCTest,
   iter->SeekToFirst();
 
   CompactionIterator c_iter(
-      iter.get(), cmp, &merge_helper, kMaxSequenceNumber, &snapshots,
-      kMaxSequenceNumber, kMaxSequenceNumber, kMaxSequenceNumber, nullptr,
-      Env::Default(), false, range_del_agg.get(), nullptr /*blob_file_builder*/,
-      true, true, manual_compaction_canceled, std::move(fake_compaction), false,
-      &keep_filter, &shutting_down);
+      iter.get(), cmp, &merge_helper,
+      CompactionFilter::MergeOrder::kFilterBeforeMerge, kMaxSequenceNumber,
+      &snapshots, kMaxSequenceNumber, kMaxSequenceNumber, kMaxSequenceNumber,
+      nullptr, Env::Default(), false, range_del_agg.get(),
+      nullptr /*blob_file_builder*/, true, true, manual_compaction_canceled,
+      std::move(fake_compaction), false, &keep_filter, &shutting_down);
 
   c_iter.SeekToFirst();
   ASSERT_TRUE(c_iter.Valid());

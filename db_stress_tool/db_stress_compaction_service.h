@@ -28,6 +28,7 @@ class DbStressCompactionService : public CompactionService {
   static const char* kClassName() { return "DbStressCompactionService"; }
 
   const char* Name() const override { return kClassName(); }
+  bool SupportsMergeBeforeFilter() const override { return true; }
 
   static constexpr uint64_t kWaitIntervalInMicros = 10 * 1000;  // 10ms
   static constexpr const char* kTempOutputDirectoryPrefix = "tmp_output_";
@@ -66,6 +67,8 @@ class DbStressCompactionService : public CompactionService {
         CompactionServiceResult::Read(serialized, &result).ok()) {
       DestroyDir(Env::Default(), result.output_path).PermitUncheckedError();
     }
+    // The primary handles the result status; this callback only owns cleanup.
+    result.status.PermitUncheckedError();
     shared_->RemoveRemoteCompactionResult(scheduled_job_id);
   }
 

@@ -684,6 +684,10 @@ enum Tickers : uint32_t {
   // metadata, files, or capabilities failed validation before installation.
   REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT,
 
+  // New-order kPurge decisions converted to ordinary removals. Counts local
+  // processing attempts and accepted remote results, not installed records.
+  COMPACTION_FILTER_PURGE_NORMALIZED,
+
   TICKER_ENUM_MAX
 };
 

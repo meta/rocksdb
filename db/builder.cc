@@ -162,6 +162,13 @@ Status BuildTable(
       context.reason = tboptions.reason;
       compaction_filter =
           ioptions.compaction_filter_factory->CreateCompactionFilter(context);
+      CompactionFilter::MergeOrder order;
+      s = GetCompactionFilterMergeOrder(
+          compaction_filter.get(), ioptions.compaction_filter_factory.get(),
+          tboptions.reason, &order);
+      if (!s.ok()) {
+        return s;
+      }
       if (compaction_filter != nullptr &&
           !compaction_filter->IgnoreSnapshots()) {
         s.PermitUncheckedError();
@@ -217,7 +224,8 @@ Status BuildTable(
     auto ucmp = tboptions.internal_comparator.user_comparator();
     MergeHelper merge(
         env, ucmp, ioptions.merge_operator.get(), compaction_filter.get(),
-        ioptions.logger, true /* internal key corruption is not ok */,
+        CompactionFilter::MergeOrder::kFilterBeforeMerge, ioptions.logger,
+        true /* internal key corruption is not ok */,
         snapshots.empty() ? 0 : snapshots.back(), snapshot_checker);
 
     std::unique_ptr<BlobFileBuilder> blob_file_builder(
@@ -237,7 +245,8 @@ Status BuildTable(
 
     const std::atomic<bool> kManualCompactionCanceledFalse{false};
     CompactionIterator c_iter(
-        input, ucmp, &merge, kMaxSequenceNumber, &snapshots, earliest_snapshot,
+        input, ucmp, &merge, CompactionFilter::MergeOrder::kFilterBeforeMerge,
+        kMaxSequenceNumber, &snapshots, earliest_snapshot,
         earliest_write_conflict_snapshot, job_snapshot, snapshot_checker, env,
         ShouldReportDetailedTime(env, ioptions.stats), range_del_agg.get(),
         blob_file_builder.get(), ioptions.allow_data_in_errors,

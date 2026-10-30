@@ -494,6 +494,9 @@ struct CompactionServiceJobInfo {
   // the output level of the compaction.
   int output_level;
 
+  // The scheduled request requires merge-before-filter worker support.
+  bool merge_before_filter = false;
+
   CompactionServiceJobInfo() {}
   CompactionServiceJobInfo(std::string db_name_, std::string db_id_,
                            std::string db_session_id_, uint32_t cf_id_,
@@ -538,6 +541,15 @@ class CompactionService : public Customizable {
 
   // Returns the name of this compaction service.
   const char* Name() const override = 0;
+
+  // Declares support for transporting merge-before-filter requests and their
+  // capability acknowledgments. Called without the DB mutex; must be bounded,
+  // thread-safe, non-reentrant, and perform no I/O or waits. Old workers ignore
+  // the request field and return no applied-order acknowledgment; RocksDB then
+  // falls back to local compaction before importing output. Services can also
+  // decline incompatible workers with kUseLocal before execution.
+  // The default routes new-order jobs locally.
+  virtual bool SupportsMergeBeforeFilter() const { return false; }
 
   // Schedule compaction to be processed remotely.
   virtual CompactionServiceScheduleResponse Schedule(

@@ -8,7 +8,11 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "db/db_test_util.h"
+#include "options/options_helper.h"
 #include "port/stack_trace.h"
+#include "test_util/merge_filter_test_util.h"
+#include "util/defer.h"
+#include "utilities/fault_injection_env.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -23,6 +27,16 @@ class DBTestCompactionFilter : public DBTestBase {
  public:
   DBTestCompactionFilter()
       : DBTestBase("db_compaction_filter_test", /*env_do_fsync=*/true) {}
+
+  Status CompactAllMergeFilterFiles() {
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    std::vector<std::string> names;
+    for (const auto& file : files) {
+      names.push_back(file.relative_filename);
+    }
+    return db_->CompactFiles(CompactionOptions(), names, 1);
+  }
 };
 
 // Param variant of DBTestBase::ChangeCompactOptions
@@ -1045,6 +1059,479 @@ TEST_F(DBTestCompactionFilter, DropKeyWithSingleDelete) {
     CompactRangeOptions cro;
     cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
     ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  }
+}
+
+TEST_F(DBTestCompactionFilter, MergeBeforeFilterModeDeclarations) {
+  using Order = CompactionFilter::MergeOrder;
+  test::MergeFilterTrace trace;
+  test::RecordingMergeFilter legacy(Order::kFilterBeforeMerge, &trace);
+  test::RecordingMergeFilter post(Order::kMergeBeforeFilter, &trace);
+  test::RecordingMergeFilter invalid(static_cast<Order>(99), &trace);
+  test::RecordingMergeFilterFactory legacy_factory(Order::kFilterBeforeMerge,
+                                                   &trace);
+  test::RecordingMergeFilterFactory post_factory(Order::kMergeBeforeFilter,
+                                                 &trace);
+  test::RecordingMergeFilterFactory invalid_factory(static_cast<Order>(99),
+                                                    &trace);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(Order::kFilterBeforeMerge, legacy.GetMergeOrder());
+    ASSERT_EQ(Order::kMergeBeforeFilter, post.GetMergeOrder());
+    ASSERT_EQ(Order::kMergeBeforeFilter, post_factory.GetMergeOrder());
+  }
+  Order order;
+  ASSERT_OK(GetCompactionFilterMergeOrder(
+      nullptr, nullptr, TableFileCreationReason::kCompaction, &order));
+  ASSERT_EQ(Order::kFilterBeforeMerge, order);
+  ASSERT_OK(GetCompactionFilterMergeOrder(
+      &post, &post_factory, TableFileCreationReason::kCompaction, &order));
+  ASSERT_EQ(Order::kMergeBeforeFilter, order);
+  ASSERT_TRUE(
+      GetCompactionFilterMergeOrder(
+          &legacy, &post_factory, TableFileCreationReason::kCompaction, &order)
+          .IsInvalidArgument());
+  ASSERT_TRUE(
+      GetCompactionFilterMergeOrder(
+          &post, &legacy_factory, TableFileCreationReason::kCompaction, &order)
+          .IsInvalidArgument());
+  ASSERT_TRUE(
+      GetCompactionFilterMergeOrder(
+          &invalid, nullptr, TableFileCreationReason::kCompaction, &order)
+          .IsInvalidArgument());
+  ASSERT_TRUE(GetCompactionFilterMergeOrder(
+                  nullptr, &invalid_factory,
+                  TableFileCreationReason::kCompaction, &order)
+                  .IsInvalidArgument());
+  for (TableFileCreationReason reason :
+       {TableFileCreationReason::kFlush, TableFileCreationReason::kRecovery,
+        TableFileCreationReason::kMisc,
+        TableFileCreationReason::kSstFileWriter}) {
+    ASSERT_OK(GetCompactionFilterMergeOrder(&legacy, &legacy_factory, reason,
+                                            &order));
+    ASSERT_TRUE(
+        GetCompactionFilterMergeOrder(&post, &post_factory, reason, &order)
+            .IsInvalidArgument());
+  }
+}
+
+TEST_F(DBTestCompactionFilter, MergeBeforeFilterNullFactory) {
+  test::MergeFilterTrace trace;
+  auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  factory->return_null = true;
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.compaction_filter_factory = factory;
+  Reopen(options);
+  ASSERT_OK(Put("a", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(CompactAllMergeFilterFiles());
+  ASSERT_EQ("value", Get("a"));
+  ASSERT_EQ(1, factory->creations.load());
+  ASSERT_TRUE(trace.Events().empty());
+  Close();
+}
+
+TEST_F(DBTestCompactionFilter, MergeBeforeFilterSharedCreationRuntimeGuard) {
+  for (bool recovery : {false, true}) {
+    test::MergeFilterTrace trace;
+    auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+        CompactionFilter::MergeOrder::kFilterBeforeMerge, &trace);
+    factory->filter_other_reason = true;
+    factory->other_reason = recovery ? TableFileCreationReason::kRecovery
+                                     : TableFileCreationReason::kFlush;
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.compaction_filter_factory = factory;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("a", "durable"));
+    factory->instance_order = CompactionFilter::MergeOrder::kMergeBeforeFilter;
+    ASSERT_OK(ValidateCompactionFilterOptions(options));
+    if (recovery) {
+      Close();
+      ASSERT_TRUE(TryReopen(options).IsInvalidArgument());
+    } else {
+      ASSERT_TRUE(Flush().IsInvalidArgument());
+      ASSERT_EQ(0, NumTableFilesAtLevel(0));
+      ASSERT_EQ("durable", Get("a"));
+      Close();
+    }
+    ASSERT_EQ(1, factory->creations.load());
+    ASSERT_TRUE(trace.Events().empty());
+    factory->instance_order = CompactionFilter::MergeOrder::kFilterBeforeMerge;
+    Reopen(options);
+    ASSERT_EQ("durable", Get("a"));
+    Close();
+  }
+}
+
+TEST_F(DBTestCompactionFilter, MergeBeforeFilterRepairRuntimeGuard) {
+  test::MergeFilterTrace trace;
+  auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+      CompactionFilter::MergeOrder::kFilterBeforeMerge, &trace);
+  factory->filter_other_reason = true;
+  factory->other_reason = TableFileCreationReason::kRecovery;
+  factory->instance_order = CompactionFilter::MergeOrder::kMergeBeforeFilter;
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("sst", "preserved"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("wal", "not-installed"));
+  Close();
+  options.compaction_filter_factory = factory;
+  ASSERT_OK(ValidateCompactionFilterOptions(options));
+  // Repair retains its best-effort policy: a failed WAL conversion is logged
+  // and archived, while existing SST files are still recovered.
+  ASSERT_OK(RepairDB(dbname_, options));
+  ASSERT_EQ(1, factory->creations.load());
+  // The filter was created but never saw a key, and the WAL data is absent.
+  ASSERT_TRUE(trace.Events().empty());
+  options.compaction_filter_factory.reset();
+  Reopen(options);
+  ASSERT_EQ("preserved", Get("sst"));
+  ASSERT_EQ("NOT_FOUND", Get("wal"));
+  ASSERT_EQ(1, TotalTableFiles());
+  Close();
+}
+
+TEST_F(DBTestCompactionFilter, MergeBeforeFilterRepeatedPurgeAndRollback) {
+  test::MergeFilterTrace trace;
+  test::RecordingMergeFilter post(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  test::RecordingMergeFilter legacy(
+      CompactionFilter::MergeOrder::kFilterBeforeMerge, &trace);
+  auto merge = std::make_shared<test::RecordingMergeOperator>(&trace);
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.merge_operator = merge;
+  options.compaction_filter = &post;
+  Reopen(options);
+  ASSERT_OK(Put("a", "A"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Merge("a", "B"));
+  ASSERT_OK(Flush());
+  trace.Clear();
+  ASSERT_OK(CompactAllMergeFilterFiles());
+  ASSERT_EQ((std::vector<std::string>{"full:a:AB", "value:a:AB"}),
+            trace.Events());
+  ASSERT_EQ("AB", Get("a"));
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_OK(Merge("a", "C"));
+  ASSERT_OK(Flush());
+  trace.Clear();
+  ASSERT_OK(CompactAllMergeFilterFiles());
+  ASSERT_EQ((std::vector<std::string>{"operand:a:C", "value:a:AB"}),
+            trace.Events());
+  ASSERT_EQ("AB", Get("a", snapshot));
+  db_->ReleaseSnapshot(snapshot);
+  trace.Clear();
+  ASSERT_OK(CompactAllMergeFilterFiles());
+  ASSERT_EQ((std::vector<std::string>{"full:a:ABC", "value:a:ABC"}),
+            trace.Events());
+  trace.Clear();
+  post.value_decision = CompactionFilter::Decision::kPurge;
+  ASSERT_OK(CompactAllMergeFilterFiles());
+  ASSERT_EQ("NOT_FOUND", Get("a"));
+  ASSERT_EQ((std::vector<std::string>{"value:a:ABC"}), trace.Events());
+  // Startup selection changes ordering, retaining ordinary removal for history.
+  Close();
+  legacy.value_decision = CompactionFilter::Decision::kRemove;
+  options.compaction_filter = &legacy;
+  Reopen(options);
+  ASSERT_EQ("NOT_FOUND", Get("a"));
+  ASSERT_OK(Put("a", "new"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(CompactAllMergeFilterFiles());
+  ASSERT_EQ("NOT_FOUND", Get("a"));
+  Close();
+}
+
+TEST_F(DBTestCompactionFilter,
+       MergeBeforeFilterRemovalOutsideInputsAndExactSkip) {
+  for (bool skip : {false, true}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    filter.action_key = "a";
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.compaction_filter = &filter;
+    options.merge_operator =
+        std::make_shared<test::RecordingMergeOperator>(&trace);
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("a", "older"));
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(options.num_levels - 1);
+    const Snapshot* snapshot = db_->GetSnapshot();
+    ASSERT_OK(Put("a", "base"));
+    ASSERT_OK(Put("b", "middle"));
+    ASSERT_OK(Put("c", "next"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Merge("a", "operand"));
+    ASSERT_OK(Flush());
+    filter.value_decision =
+        skip ? CompactionFilter::Decision::kRemoveAndSkipUntil
+             : CompactionFilter::Decision::kPurge;
+    filter.skip_target = "c";
+    trace.Clear();
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    std::vector<std::string> inputs;
+    for (const auto& file : files) {
+      if (file.level == 0) {
+        inputs.push_back(file.relative_filename);
+      }
+    }
+    ASSERT_EQ(2, inputs.size());
+    ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, 1));
+    ASSERT_EQ(skip ? "older" : "NOT_FOUND", Get("a"));
+    ASSERT_EQ("older", Get("a", snapshot));
+    ASSERT_EQ(skip ? "NOT_FOUND" : "middle", Get("b"));
+    ASSERT_EQ("next", Get("c"));
+    ASSERT_EQ(
+        skip ? (std::vector<std::string>{"full:a:baseoperand",
+                                         "value:a:baseoperand", "value:c:next"})
+             : (std::vector<std::string>{"full:a:baseoperand",
+                                         "value:a:baseoperand",
+                                         "value:b:middle", "value:c:next"}),
+        trace.Events());
+    db_->ReleaseSnapshot(snapshot);
+    if (!skip) {
+      CompactRangeOptions compact;
+      compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+      ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+      ASSERT_EQ("NOT_FOUND", Get("a"));
+    }
+    Close();
+    Reopen(options);
+    ASSERT_EQ(skip ? "older" : "NOT_FOUND", Get("a"));
+    Close();
+  }
+}
+
+TEST_F(DBTestCompactionFilter, MergeBeforeFilterWideEntityAndBlobBase) {
+  for (bool blobs : {false, true}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    auto merge = std::make_shared<test::RecordingMergeOperator>(&trace);
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.compaction_filter = &filter;
+    options.merge_operator = merge;
+    options.enable_blob_files = blobs;
+    options.min_blob_size = 0;
+    DestroyAndReopen(options);
+    ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "a",
+                             {{"", "A"}, {"extra", "payload"}}));
+    ASSERT_OK(Put("b", "base"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Merge("a", "B"));
+    ASSERT_OK(Merge("b", "operand"));
+    ASSERT_OK(Flush());
+    trace.Clear();
+    ASSERT_OK(CompactAllMergeFilterFiles());
+    ASSERT_EQ(
+        (std::vector<std::string>{"full:a:AB", "entity:a:AB",
+                                  "full:b:baseoperand", "value:b:baseoperand"}),
+        trace.Events());
+    PinnableWideColumns columns;
+    ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(), "a",
+                             &columns));
+    ASSERT_EQ((WideColumns{{"", "AB"}, {"extra", "payload"}}),
+              columns.columns());
+    ASSERT_EQ("baseoperand", Get("b"));
+    filter.value_decision = CompactionFilter::Decision::kPurge;
+    filter.blob_decision = CompactionFilter::Decision::kPurge;
+    trace.Clear();
+    ASSERT_OK(CompactAllMergeFilterFiles());
+    ASSERT_EQ("NOT_FOUND", Get("a"));
+    ASSERT_EQ("NOT_FOUND", Get("b"));
+    if (blobs) {
+      ASSERT_GT(filter.blob_key_calls.load(), 0);
+    }
+    Close();
+    Reopen(options);
+    ASSERT_EQ("NOT_FOUND", Get("a"));
+    ASSERT_EQ("NOT_FOUND", Get("b"));
+    Close();
+  }
+}
+
+TEST_F(DBTestCompactionFilter, MergeBeforeFilterBlobReadFailures) {
+  class ResolvingFilter : public test::RecordingMergeFilter {
+   public:
+    explicit ResolvingFilter(test::MergeFilterTrace* trace)
+        : RecordingMergeFilter(MergeOrder::kMergeBeforeFilter, trace) {}
+
+    Decision FilterV4(
+        int level, const Slice& key, ValueType type, const Slice* value,
+        const WideColumns* columns, std::string* new_value,
+        std::vector<std::pair<std::string, std::string>>* new_columns,
+        std::string* skip_until,
+        WideColumnBlobResolver* resolver) const override {
+      if (resolver != nullptr) {
+        Slice resolved;
+        Status s = resolver->ResolveColumn(0, &resolved);
+        if (!s.ok()) {
+          resolve_failed.store(true);
+          return Decision::kKeep;
+        }
+      }
+      return RecordingMergeFilter::FilterV4(level, key, type, value, columns,
+                                            new_value, new_columns, skip_until,
+                                            resolver);
+    }
+
+    mutable std::atomic<bool> resolve_failed{false};
+  };
+
+  for (int history : {0, 1, 2}) {
+    FaultInjectionTestEnv fault_env(env_);
+    test::MergeFilterTrace trace;
+    ResolvingFilter filter(&trace);
+    Defer cleanup([&]() {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      fault_env.SetFilesystemActive(true);
+      Close();
+    });
+    Options options = CurrentOptions();
+    options.env = &fault_env;
+    options.disable_auto_compactions = true;
+    options.compaction_filter = &filter;
+    options.merge_operator =
+        std::make_shared<test::RecordingMergeOperator>(&trace);
+    options.enable_blob_files = true;
+    options.min_blob_size = 0;
+    options.blob_compaction_readahead_size = 0;
+    DestroyAndReopen(options);
+    if (history == 0) {
+      ASSERT_OK(Put("a", "base"));
+    } else {
+      ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "a",
+                               {{"", "base"}, {"extra", "payload"}}));
+    }
+    ASSERT_OK(Flush());
+    if (history != 2) {
+      ASSERT_OK(Merge("a", "operand"));
+      ASSERT_OK(Flush());
+    }
+    trace.Clear();
+    std::vector<LiveFileMetaData> before;
+    db_->GetLiveFilesMetaData(&before);
+    SyncPoint::GetInstance()->SetCallBack(
+        "BlobFileReader::GetBlob:ReadFromFile", [&](void*) {
+          fault_env.SetFilesystemActive(false, Status::IOError("blob read"));
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    Status s = CompactAllMergeFilterFiles();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    fault_env.SetFilesystemActive(true);
+    ASSERT_TRUE(s.IsIOError()) << s.ToString();
+    ASSERT_TRUE(trace.Events().empty());
+    ASSERT_EQ(history == 2, filter.resolve_failed.load());
+    std::vector<LiveFileMetaData> after;
+    db_->GetLiveFilesMetaData(&after);
+    ASSERT_EQ(before.size(), after.size());
+    for (size_t i = 0; i < before.size(); ++i) {
+      ASSERT_EQ(before[i].file_number, after[i].file_number);
+    }
+    ASSERT_EQ(history == 2 ? "base" : "baseoperand", Get("a"));
+    Close();
+    Reopen(options);
+    ASSERT_EQ(history == 2 ? "base" : "baseoperand", Get("a"));
+  }
+}
+
+TEST_F(DBTestCompactionFilter, MergeBeforeFilterEarlyFactoryValidation) {
+  for (TableFileCreationReason reason :
+       {TableFileCreationReason::kFlush, TableFileCreationReason::kRecovery,
+        TableFileCreationReason::kMisc,
+        TableFileCreationReason::kSstFileWriter}) {
+    test::MergeFilterTrace trace;
+    auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    factory->filter_other_reason = true;
+    factory->other_reason = reason;
+    test::RecordingMergeFilter direct(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    Options invalid = CurrentOptions();
+    invalid.compaction_filter_factory = factory;
+    invalid.compaction_filter = &direct;
+    ASSERT_TRUE(ValidateCompactionFilterOptions(invalid).IsInvalidArgument());
+    ColumnFamilyHandle* handle = nullptr;
+    ASSERT_TRUE(db_->CreateColumnFamily(invalid, "rejected", &handle)
+                    .IsInvalidArgument());
+    ASSERT_EQ(nullptr, handle);
+    ASSERT_EQ(0, factory->creations.load());
+    std::vector<ColumnFamilyHandle*> handles;
+    Status batch = db_->CreateColumnFamilies(
+        {ColumnFamilyDescriptor("accepted", CurrentOptions()),
+         ColumnFamilyDescriptor("rejected", invalid)},
+        &handles);
+    ASSERT_TRUE(batch.IsInvalidArgument());
+    ASSERT_EQ(1, handles.size());
+    ASSERT_EQ("accepted", handles[0]->GetName());
+    ASSERT_OK(db_->DropColumnFamily(handles[0]));
+    ASSERT_OK(db_->DestroyColumnFamilyHandle(handles[0]));
+    Close();
+    ASSERT_TRUE(TryReopen(invalid).IsInvalidArgument());
+    ASSERT_EQ(0, factory->creations.load());
+    ASSERT_TRUE(trace.Events().empty());
+    Reopen(CurrentOptions());
+  }
+}
+
+TEST_F(DBTestCompactionFilter, MergeBeforeFilterRuntimeDeclarationAndErrors) {
+  for (bool paranoid : {false, true}) {
+    test::MergeFilterTrace trace;
+    auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.paranoid_checks = paranoid;
+    options.merge_operator =
+        std::make_shared<test::RecordingMergeOperator>(&trace);
+    options.compaction_filter_factory = factory;
+    DestroyAndReopen(options);
+    ASSERT_OK(Merge("a", "A"));
+    ASSERT_OK(Flush());
+    trace.Clear();
+    factory->instance_order = CompactionFilter::MergeOrder::kFilterBeforeMerge;
+    CompactRangeOptions compact;
+    compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    compact.change_level = true;
+    compact.target_level = options.num_levels - 1;
+    ASSERT_TRUE(
+        db_->CompactRange(compact, nullptr, nullptr).IsInvalidArgument());
+    ASSERT_EQ(1, factory->creations.load());
+    ASSERT_TRUE(trace.Events().empty());
+    ASSERT_EQ("A", Get("a"));
+    Close();
+    factory->instance_order = CompactionFilter::MergeOrder::kMergeBeforeFilter;
+    Reopen(options);
+    ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+    factory->operand_decision = CompactionFilter::Decision::kPurge;
+    // Keep the base in a lower level outside this compaction's inputs.
+    ASSERT_OK(Merge("a", "B"));
+    ASSERT_OK(Flush());
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    ASSERT_FALSE(files.empty());
+    const LiveFileMetaData* newest = &files.front();
+    for (const auto& file : files) {
+      if (file.file_number > newest->file_number) {
+        newest = &file;
+      }
+    }
+    Status invalid =
+        db_->CompactFiles(CompactionOptions(), {newest->relative_filename}, 1);
+    ASSERT_TRUE(invalid.IsNotSupported()) << invalid.ToString();
+    ASSERT_EQ("AB", Get("a"));
+    Close();
   }
 }
 

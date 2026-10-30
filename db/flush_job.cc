@@ -35,6 +35,7 @@
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics_impl.h"
 #include "monitoring/thread_status_util.h"
+#include "options/options_helper.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -493,11 +494,20 @@ Status FlushJob::MemPurge() {
       ctx.reason = TableFileCreationReason::kFlush;
       compaction_filter =
           ioptions.compaction_filter_factory->CreateCompactionFilter(ctx);
-      if (compaction_filter != nullptr &&
+      CompactionFilter::MergeOrder order;
+      s = GetCompactionFilterMergeOrder(
+          compaction_filter.get(), ioptions.compaction_filter_factory.get(),
+          TableFileCreationReason::kFlush, &order);
+      if (s.ok() && compaction_filter != nullptr &&
           !compaction_filter->IgnoreSnapshots()) {
         s = Status::NotSupported(
             "CompactionFilter::IgnoreSnapshots() = false is not supported "
             "anymore.");
+      }
+      if (!s.ok()) {
+        // Destroy the application filter before restoring the caller's lock.
+        compaction_filter.reset();
+        db_mutex_->Lock();
         return s;
       }
     }
@@ -515,6 +525,7 @@ Status FlushJob::MemPurge() {
     assert(env);
     MergeHelper merge(env, (cfd_->internal_comparator()).user_comparator(),
                       (ioptions.merge_operator).get(), compaction_filter.get(),
+                      CompactionFilter::MergeOrder::kFilterBeforeMerge,
                       ioptions.logger,
                       true /* internal key corruption is not ok */,
                       job_context_->GetLatestSnapshotSequence(),
@@ -523,7 +534,8 @@ Status FlushJob::MemPurge() {
     const std::atomic<bool> kManualCompactionCanceledFalse{false};
     CompactionIterator c_iter(
         iter.get(), (cfd_->internal_comparator()).user_comparator(), &merge,
-        kMaxSequenceNumber, &job_context_->snapshot_seqs, earliest_snapshot_,
+        CompactionFilter::MergeOrder::kFilterBeforeMerge, kMaxSequenceNumber,
+        &job_context_->snapshot_seqs, earliest_snapshot_,
         job_context_->earliest_write_conflict_snapshot,
         job_context_->GetJobSnapshotSequence(), job_context_->snapshot_checker,
         env, ShouldReportDetailedTime(env, ioptions.stats), range_del_agg.get(),

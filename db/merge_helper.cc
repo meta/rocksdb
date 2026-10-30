@@ -31,6 +31,7 @@ namespace ROCKSDB_NAMESPACE {
 MergeHelper::MergeHelper(Env* env, const Comparator* user_comparator,
                          const MergeOperator* user_merge_operator,
                          const CompactionFilter* compaction_filter,
+                         CompactionFilter::MergeOrder merge_order,
                          Logger* logger, bool assert_valid_internal_key,
                          SequenceNumber latest_snapshot,
                          const SnapshotChecker* snapshot_checker, int level,
@@ -41,6 +42,7 @@ MergeHelper::MergeHelper(Env* env, const Comparator* user_comparator,
       user_comparator_(user_comparator),
       user_merge_operator_(user_merge_operator),
       compaction_filter_(compaction_filter),
+      merge_order_(merge_order),
       shutting_down_(shutting_down),
       logger_(logger),
       assert_valid_internal_key_(assert_valid_internal_key),
@@ -292,6 +294,9 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
   keys_.clear();
   merge_context_.Clear();
   has_compaction_filter_skip_until_ = false;
+  outcome_ = Outcome::kUncombined;
+  aggregate_eligible_ = true;
+  history_exhausted_ = false;
   assert(user_merge_operator_);
   assert(user_comparator_);
   const size_t ts_sz = user_comparator_->timestamp_size();
@@ -488,6 +493,7 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
       // We store the result in keys_.back() and operands_.back()
       // if nothing went wrong (i.e.: no operand corruption on disk)
       if (s.ok()) {
+        outcome_ = Outcome::kFull;
         // The original key encountered
         original_key = std::move(keys_.back());
 
@@ -528,7 +534,8 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
       // it out, no matter what compaction filter says
       // 2) it's not filtered by a compaction filter
       CompactionFilter::Decision filter =
-          ikey.sequence <= latest_snapshot_
+          merge_order_ == CompactionFilter::MergeOrder::kMergeBeforeFilter ||
+                  ikey.sequence <= latest_snapshot_
               ? CompactionFilter::Decision::kKeep
               : FilterMerge(orig_ikey.user_key, value_slice);
       // FIXME: should also check for kRemove here
@@ -540,6 +547,7 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
       }
       if (filter == CompactionFilter::Decision::kKeep ||
           filter == CompactionFilter::Decision::kChangeValue) {
+        aggregate_eligible_ &= OperandEligible(ikey.sequence);
         if (original_key_is_iter) {
           // this is just an optimization that saves us one memcpy
           keys_.emplace_front(original_key);
@@ -615,6 +623,7 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
       (hit_the_next_user_key || !iter->Valid()) && at_bottom &&
       (ts_sz == 0 || cmp_with_full_history_ts_low < 0);
   if (surely_seen_the_beginning) {
+    history_exhausted_ = true;
     // do a final merge with nullptr as the existing value and say
     // bye to the merge type (it's now converted to a Put)
     assert(kTypeMerge == orig_ikey.type);
@@ -630,6 +639,7 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
                        &merge_result,
                        /* result_operand */ nullptr, &merge_result_type);
     if (s.ok()) {
+      outcome_ = Outcome::kFull;
       // The original key encountered
       // We are certain that keys_ is not empty here (see assertions couple of
       // lines before).
@@ -677,6 +687,7 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
           s = Status::Corruption("PartialMerge result exceeds 4GB limit");
           return s;
         }
+        outcome_ = Outcome::kPartial;
         merge_context_.Clear();
         merge_context_.PushOperand(merge_result);
         keys_.erase(keys_.begin(), keys_.end() - 1);

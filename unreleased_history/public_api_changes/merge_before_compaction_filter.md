@@ -1,0 +1,1 @@
+Added opt-in merge-before-filter ordering through C++ FilterV4, with compatible compaction service support and purge statistics. The default order is unchanged. Rebuild applications, plugins, and service implementations for the new API/ABI; SingleDelete and unsupported-configuration restrictions are documented in the API.

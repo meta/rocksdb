@@ -5002,8 +5002,11 @@ Status DBImpl::CreateColumnFamiliesImpl(
           "Column family name cannot be the empty string");
       break;
     }
-    preparation_status =
-        ColumnFamilyData::ValidateOptions(db_options, column_family.options);
+    preparation_status = ValidateCompactionFilterOptions(column_family.options);
+    if (preparation_status.ok()) {
+      preparation_status =
+          ColumnFamilyData::ValidateOptions(db_options, column_family.options);
+    }
     if (preparation_status.ok()) {
       for (const auto& cf_path : column_family.options.cf_paths) {
         preparation_status = env_->CreateDirIfMissing(cf_path.path);
@@ -5078,7 +5081,10 @@ Status DBImpl::CreateColumnFamilyWithPreparedOptions(
     }
   }
 
-  Status s;
+  Status s = ValidateCompactionFilterOptions(sanitized_cf_options);
+  if (!s.ok()) {
+    return s;
+  }
   SuperVersionContext sv_context(/* create_superversion */ true);
   {
     InstrumentedMutexLock l(&mutex_);

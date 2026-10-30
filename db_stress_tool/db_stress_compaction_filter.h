@@ -25,12 +25,18 @@ namespace ROCKSDB_NAMESPACE {
 class DbStressCompactionFilter : public CompactionFilter {
  public:
   DbStressCompactionFilter(SharedState* state, int cf_id)
-      : state_(state), cf_id_(cf_id) {}
+      : state_(state),
+        cf_id_(cf_id),
+        merge_order_(FLAGS_merge_before_compaction_filter
+                         ? MergeOrder::kMergeBeforeFilter
+                         : MergeOrder::kFilterBeforeMerge) {}
+
+  MergeOrder GetMergeOrder() const override { return merge_order_; }
 
   Decision FilterV2(int /*level*/, const Slice& key, ValueType /*value_type*/,
                     const Slice& /*existing_value*/, std::string* /*new_value*/,
                     std::string* /*skip_until*/) const override {
-    if (state_ == nullptr) {
+    if (merge_order_ == MergeOrder::kMergeBeforeFilter || state_ == nullptr) {
       return Decision::kKeep;
     }
     if (key.empty() || ('0' <= key[0] && key[0] <= '9')) {
@@ -70,11 +76,20 @@ class DbStressCompactionFilter : public CompactionFilter {
  private:
   SharedState* const state_;
   const int cf_id_;
+  const MergeOrder merge_order_;
 };
 
 class DbStressCompactionFilterFactory : public CompactionFilterFactory {
  public:
-  DbStressCompactionFilterFactory() : state_(nullptr) {}
+  DbStressCompactionFilterFactory()
+      : state_(nullptr),
+        merge_order_(FLAGS_merge_before_compaction_filter
+                         ? CompactionFilter::MergeOrder::kMergeBeforeFilter
+                         : CompactionFilter::MergeOrder::kFilterBeforeMerge) {}
+
+  CompactionFilter::MergeOrder GetMergeOrder() const override {
+    return merge_order_;
+  }
 
   void SetSharedState(SharedState* state) {
     MutexLock state_mutex_guard(&state_mutex_);
@@ -95,6 +110,7 @@ class DbStressCompactionFilterFactory : public CompactionFilterFactory {
  private:
   port::Mutex state_mutex_;
   SharedState* state_;
+  const CompactionFilter::MergeOrder merge_order_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -690,7 +690,16 @@ int db_stress_tool(int argc, char** argv) {
           "true.");
     }
   }
-  if ((FLAGS_enable_compaction_filter || FLAGS_inplace_update_support) &&
+  if (FLAGS_merge_before_compaction_filter &&
+      (!FLAGS_enable_compaction_filter || FLAGS_use_txn ||
+       FLAGS_user_timestamp_size != 0)) {
+    return ReturnValidationError(
+        "merge_before_compaction_filter requires enable_compaction_filter, "
+        "no transactions, and no user-defined timestamps");
+  }
+  if (((FLAGS_enable_compaction_filter &&
+        !FLAGS_merge_before_compaction_filter) ||
+       FLAGS_inplace_update_support) &&
       (FLAGS_acquire_snapshot_one_in > 0 || FLAGS_compact_range_one_in > 0 ||
        FLAGS_iterpercent > 0 || FLAGS_prefixpercent > 0 ||
        FLAGS_test_batches_snapshots || FLAGS_test_cf_consistency ||

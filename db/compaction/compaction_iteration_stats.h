@@ -14,9 +14,10 @@ namespace ROCKSDB_NAMESPACE {
 struct CompactionIterationStats {
   // Compaction statistics
 
-  // Doesn't include records skipped because of
-  // CompactionFilter::Decision::kRemoveAndSkipUntil.
+  // The default merge order excludes kRemoveAndSkipUntil. Merge-before-filter
+  // counts its current output once, but does not count the skipped range.
   int64_t num_record_drop_user = 0;
+  uint64_t num_purge_normalized = 0;
 
   int64_t num_record_drop_hidden = 0;
   int64_t num_record_drop_obsolete = 0;

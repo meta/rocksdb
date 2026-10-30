@@ -2697,7 +2697,14 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   const WriteOptions write_options(Env::IOActivity::kDBOpen);
   const ReadOptions read_options(Env::IOActivity::kDBOpen);
 
-  Status s = ValidateOptionsByTable(db_options, column_families);
+  Status s;
+  for (const ColumnFamilyDescriptor& cf : column_families) {
+    s = ValidateCompactionFilterOptions(cf.options);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  s = ValidateOptionsByTable(db_options, column_families);
   if (!s.ok()) {
     return s;
   }

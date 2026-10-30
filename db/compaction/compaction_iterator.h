@@ -258,8 +258,8 @@ class CompactionIterator {
   //     `NumInputEntryScanned()`.
   CompactionIterator(
       InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
-      SequenceNumber last_sequence, std::vector<SequenceNumber>* snapshots,
-      SequenceNumber earliest_snapshot,
+      CompactionFilter::MergeOrder merge_order, SequenceNumber last_sequence,
+      std::vector<SequenceNumber>* snapshots, SequenceNumber earliest_snapshot,
       SequenceNumber earliest_write_conflict_snapshot,
       SequenceNumber job_snapshot, const SnapshotChecker* snapshot_checker,
       Env* env, bool report_detailed_time,
@@ -280,8 +280,8 @@ class CompactionIterator {
   // Constructor with custom CompactionProxy, used for tests.
   CompactionIterator(
       InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
-      SequenceNumber last_sequence, std::vector<SequenceNumber>* snapshots,
-      SequenceNumber earliest_snapshot,
+      CompactionFilter::MergeOrder merge_order, SequenceNumber last_sequence,
+      std::vector<SequenceNumber>* snapshots, SequenceNumber earliest_snapshot,
       SequenceNumber earliest_write_conflict_snapshot,
       SequenceNumber job_snapshot, const SnapshotChecker* snapshot_checker,
       Env* env, bool report_detailed_time,
@@ -448,7 +448,11 @@ class CompactionIterator {
 
   // Invoke compaction filter if needed.
   // Return true on success, false on failures (e.g.: kIOError).
-  bool InvokeFilterIfNeeded(bool* need_skip, Slice* skip_until);
+  bool InvokeFilterIfNeeded(bool* need_skip, Slice* skip_until,
+                            bool merge_output);
+  bool SelectMergeOutput(uint8_t valid_context);
+  bool ProcessDeletion(SequenceNumber prev_snapshot,
+                       bool input_already_advanced);
 
   // Given a sequence number, return the sequence number of the
   // earliest snapshot that this sequence number is visible in.
@@ -509,6 +513,7 @@ class CompactionIterator {
   BlobFileBuilder* blob_file_builder_;
   std::unique_ptr<CompactionProxy> compaction_;
   const CompactionFilter* compaction_filter_;
+  const CompactionFilter::MergeOrder merge_order_;
   const bool filter_supports_v4_;
   const std::atomic<bool>* shutting_down_;
   const std::atomic<bool>& manual_compaction_canceled_;

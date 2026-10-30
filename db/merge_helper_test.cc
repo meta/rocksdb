@@ -11,6 +11,7 @@
 
 #include "db/dbformat.h"
 #include "rocksdb/comparator.h"
+#include "test_util/merge_filter_test_util.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/coding.h"
@@ -29,9 +30,13 @@ class MergeHelperTest : public testing::Test {
              SequenceNumber latest_snapshot = 0) {
     iter_.reset(new VectorIterator(ks_, vs_, &icmp_));
     iter_->SeekToFirst();
-    merge_helper_.reset(new MergeHelper(env_, icmp_.user_comparator(),
-                                        merge_op_.get(), filter_.get(), nullptr,
-                                        false, latest_snapshot));
+    CompactionFilter* filter =
+        order_filter_ ? order_filter_.get() : filter_.get();
+    merge_helper_.reset(new MergeHelper(
+        env_, icmp_.user_comparator(), merge_op_.get(), filter,
+        filter ? filter->GetMergeOrder()
+               : CompactionFilter::MergeOrder::kFilterBeforeMerge,
+        nullptr, false, latest_snapshot));
     return merge_helper_->MergeUntil(
         iter_.get(), nullptr /* range_del_agg */, stop_before, at_bottom,
         false /* allow_data_in_errors */, nullptr /* blob_fetcher */,
@@ -58,7 +63,58 @@ class MergeHelperTest : public testing::Test {
   std::vector<std::string> ks_;
   std::vector<std::string> vs_;
   std::unique_ptr<test::FilterNumber> filter_;
+  std::unique_ptr<CompactionFilter> order_filter_;
 };
+
+TEST_F(MergeHelperTest, MergeBeforeFilterOutcomeAndReset) {
+  test::MergeFilterTrace trace;
+  merge_op_ = std::make_shared<test::RecordingMergeOperator>(&trace);
+  order_filter_.reset(new test::RecordingMergeFilter(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace));
+  AddKeyVal("a", 6, kTypeMerge, "C");
+  AddKeyVal("a", 5, kTypeMerge, "B");
+  AddKeyVal("a", 4, kTypeValue, "A");
+  AddKeyVal("b", 3, kTypeMerge, "B");
+  AddKeyVal("b", 0, kTypeMerge, "A");
+  ASSERT_OK(Run(0, false));
+  ASSERT_EQ(MergeHelper::Outcome::kFull, merge_helper_->outcome());
+  ASSERT_TRUE(merge_helper_->aggregate_eligible());
+  ASSERT_FALSE(merge_helper_->history_exhausted());
+  ASSERT_EQ((std::vector<std::string>{"full:a:ABC"}), trace.Events());
+  ASSERT_TRUE(merge_helper_
+                  ->MergeUntil(iter_.get(), nullptr, 0, false, false, nullptr,
+                               nullptr, nullptr, nullptr)
+                  .IsMergeInProgress());
+  ASSERT_EQ(MergeHelper::Outcome::kPartial, merge_helper_->outcome());
+  ASSERT_FALSE(merge_helper_->aggregate_eligible());
+  ASSERT_FALSE(merge_helper_->history_exhausted());
+  ASSERT_EQ("AB", merge_helper_->values()[0]);
+  ASSERT_EQ((std::vector<std::string>{"full:a:ABC", "partial:b:AB"}),
+            trace.Events());
+}
+
+TEST_F(MergeHelperTest, MergeBeforeFilterHistoryAndFailure) {
+  for (bool fail_full : {false, true}) {
+    test::MergeFilterTrace trace;
+    auto merge = std::make_shared<test::RecordingMergeOperator>(&trace);
+    merge->fail_full = fail_full;
+    merge->failure_scope = MergeOperator::OpFailureScope::kMustMerge;
+    merge_op_ = merge;
+    order_filter_.reset(new test::RecordingMergeFilter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace));
+    ks_.clear();
+    vs_.clear();
+    AddKeyVal("a", 0, kTypeMerge, "A");
+    Status s = Run(0, true);
+    ASSERT_TRUE(fail_full ? s.IsMergeInProgress() : s.ok());
+    ASSERT_EQ(fail_full ? MergeHelper::Outcome::kUncombined
+                        : MergeHelper::Outcome::kFull,
+              merge_helper_->outcome());
+    ASSERT_FALSE(merge_helper_->aggregate_eligible());
+    ASSERT_TRUE(merge_helper_->history_exhausted());
+    ASSERT_EQ((std::vector<std::string>{"full:a:A"}), trace.Events());
+  }
+}
 
 // If MergeHelper encounters a new key on the last level, we know that
 // the key has no more history and it can merge keys.

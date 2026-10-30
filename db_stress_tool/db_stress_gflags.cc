@@ -1423,6 +1423,11 @@ DEFINE_bool(enable_compaction_filter, false,
             "If true, configures a compaction filter that returns a kRemove "
             "decision for deleted keys.");
 
+DEFINE_bool(merge_before_compaction_filter, false,
+            "Use a keep-only compaction filter declaring merge-before-filter "
+            "order. Requires enable_compaction_filter; does not alter the "
+            "expected-state oracle.");
+
 DEFINE_bool(paranoid_file_checks, true,
             "After writing every SST file, reopen it and read all the keys "
             "and validate checksums");

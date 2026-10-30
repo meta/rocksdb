@@ -1466,8 +1466,48 @@ void CompactionJob::NotifyOnSubcompactionCompleted(
 
 bool CompactionJob::ShouldUseLocalCompaction(SubcompactionState* sub_compact) {
   if (db_options_.compaction_service) {
+    const ImmutableCFOptions& options =
+        sub_compact->compaction->column_family_data()->ioptions();
+    const CompactionFilterFactory* factory = nullptr;
+    if (options.compaction_filter == nullptr &&
+        options.compaction_filter_factory &&
+        options.compaction_filter_factory->ShouldFilterTableFileCreation(
+            TableFileCreationReason::kCompaction)) {
+      factory = options.compaction_filter_factory.get();
+    }
+    CompactionFilter::MergeOrder order;
+    Status s = GetCompactionFilterMergeOrder(
+        options.compaction_filter, factory,
+        TableFileCreationReason::kCompaction, &order);
+    if (!s.ok()) {
+      sub_compact->status = s;
+      return false;
+    }
+    if (order == CompactionFilter::MergeOrder::kMergeBeforeFilter) {
+      if (job_context_->snapshot_checker != nullptr ||
+          sub_compact->compaction->column_family_data()
+                  ->user_comparator()
+                  ->timestamp_size() != 0 ||
+          (options.compaction_filter &&
+           options.compaction_filter
+               ->IsStackedBlobDbInternalCompactionFilter())) {
+        sub_compact->status = Status::NotSupported(
+            "Merge-before-filter does not support SnapshotChecker, timestamps, "
+            "or stacked BlobDB");
+        return false;
+      }
+      if (!db_options_.compaction_service->SupportsMergeBeforeFilter()) {
+        ROCKS_LOG_INFO(db_options_.info_log,
+                       "Merge-before-filter uses local execution: compaction "
+                       "service does not advertise support");
+        TEST_SYNC_POINT(
+            "CompactionJob::ShouldUseLocalCompaction:MergeBeforeFilterLocal");
+        sub_compact->compaction_job_stats.is_remote_compaction = false;
+        return true;
+      }
+    }
     CompactionServiceJobStatus comp_status =
-        ProcessKeyValueCompactionWithCompactionService(sub_compact);
+        ProcessKeyValueCompactionWithCompactionService(sub_compact, order);
     if (comp_status != CompactionServiceJobStatus::kUseLocal) {
       return false;
     }
@@ -1499,7 +1539,8 @@ Status CompactionJob::SetupAndValidateCompactionFilter(
     SubcompactionState* sub_compact,
     const CompactionFilter* configured_compaction_filter,
     const CompactionFilter*& compaction_filter,
-    std::unique_ptr<CompactionFilter>& compaction_filter_from_factory) {
+    std::unique_ptr<CompactionFilter>& compaction_filter_from_factory,
+    CompactionFilter::MergeOrder& merge_order) {
   compaction_filter = configured_compaction_filter;
 
   if (compaction_filter == nullptr) {
@@ -1508,13 +1549,40 @@ Status CompactionJob::SetupAndValidateCompactionFilter(
     compaction_filter = compaction_filter_from_factory.get();
   }
 
+  const CompactionFilterFactory* factory =
+      configured_compaction_filter == nullptr
+          ? sub_compact->compaction->column_family_data()
+                ->ioptions()
+                .compaction_filter_factory.get()
+          : nullptr;
+  Status s = GetCompactionFilterMergeOrder(compaction_filter, factory,
+                                           TableFileCreationReason::kCompaction,
+                                           &merge_order);
+  if (!s.ok()) {
+    return s;
+  }
+  if (compaction_filter == nullptr) {
+    merge_order = CompactionFilter::MergeOrder::kFilterBeforeMerge;
+  }
+  if (compaction_filter &&
+      merge_order == CompactionFilter::MergeOrder::kMergeBeforeFilter &&
+      (job_context_->snapshot_checker != nullptr ||
+       sub_compact->compaction->column_family_data()
+               ->user_comparator()
+               ->timestamp_size() != 0 ||
+       compaction_filter->IsStackedBlobDbInternalCompactionFilter())) {
+    return Status::NotSupported(
+        "Merge-before-filter does not support SnapshotChecker, timestamps, "
+        "or stacked BlobDB");
+  }
+
   if (compaction_filter != nullptr && !compaction_filter->IgnoreSnapshots()) {
     return Status::NotSupported(
         "CompactionFilter::IgnoreSnapshots() = false is not supported "
         "anymore.");
   }
 
-  return Status::OK();
+  return ValidateCompactionFilterMergeOrder(merge_order);
 }
 
 void CompactionJob::InitializeReadOptionsAndBoundaries(
@@ -1676,9 +1744,9 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
   assert(job_context_);
 
   return std::make_unique<CompactionIterator>(
-      input, cfd->user_comparator(), &merge, versions_->LastSequence(),
-      &(job_context_->snapshot_seqs), earliest_snapshot_,
-      job_context_->earliest_write_conflict_snapshot,
+      input, cfd->user_comparator(), &merge, merge.merge_order(),
+      versions_->LastSequence(), &(job_context_->snapshot_seqs),
+      earliest_snapshot_, job_context_->earliest_write_conflict_snapshot,
       job_context_->GetJobSnapshotSequence(), job_context_->snapshot_checker,
       env_, ShouldReportDetailedTime(env_, stats_), sub_compact->RangeDelAgg(),
       blob_file_builder.get(), db_options_.allow_data_in_errors,
@@ -1854,6 +1922,11 @@ void CompactionJob::FinalizeSubcompactionJobStats(
     uint64_t start_cpu_micros, uint64_t prev_cpu_micros,
     const CompactionIOStatsSnapshot& io_stats) {
   const CompactionIterationStats& c_iter_stats = c_iter->iter_stats();
+  sub_compact->num_purge_normalized = c_iter_stats.num_purge_normalized;
+  if (!IsRemoteCompaction()) {
+    RecordTick(stats_, COMPACTION_FILTER_PURGE_NORMALIZED,
+               sub_compact->num_purge_normalized);
+  }
 
   assert(!sub_compact->compaction->DoesInputReferenceBlobFiles() ||
          c_iter->HasNumInputEntryScanned());
@@ -1991,9 +2064,10 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
   const CompactionFilter* compaction_filter;
   std::unique_ptr<CompactionFilter> compaction_filter_from_factory = nullptr;
+  CompactionFilter::MergeOrder merge_order;
   Status filter_status = SetupAndValidateCompactionFilter(
       sub_compact, cfd->ioptions().compaction_filter, compaction_filter,
-      compaction_filter_from_factory);
+      compaction_filter_from_factory, merge_order);
   if (!filter_status.ok()) {
     sub_compact->status = filter_status;
     return;
@@ -2024,7 +2098,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
 
   MergeHelper merge(
       env_, cfd->user_comparator(), cfd->ioptions().merge_operator.get(),
-      compaction_filter, db_options_.info_log.get(),
+      compaction_filter, merge_order, db_options_.info_log.get(),
       false /* internal key corruption is expected */,
       job_context_->GetLatestSnapshotSequence(), job_context_->snapshot_checker,
       compact_->compaction->level(), db_options_.stats);

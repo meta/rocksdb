@@ -68,6 +68,7 @@ class SubcompactionState {
 
   // compaction job stats for this sub-compaction
   CompactionJobStats compaction_job_stats;
+  uint64_t num_purge_normalized = 0;
 
   // sub-compaction job id, which is used to identify different sub-compaction
   // within the same compaction job.

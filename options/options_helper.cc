@@ -30,6 +30,64 @@
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+Status GetCompactionFilterMergeOrder(const CompactionFilter* filter,
+                                     const CompactionFilterFactory* factory,
+                                     TableFileCreationReason reason,
+                                     CompactionFilter::MergeOrder* order) {
+  using Order = CompactionFilter::MergeOrder;
+  const Order filter_order =
+      filter ? filter->GetMergeOrder() : Order::kFilterBeforeMerge;
+  const Order factory_order =
+      factory ? factory->GetMergeOrder() : Order::kFilterBeforeMerge;
+  if ((filter_order != Order::kFilterBeforeMerge &&
+       filter_order != Order::kMergeBeforeFilter) ||
+      (factory_order != Order::kFilterBeforeMerge &&
+       factory_order != Order::kMergeBeforeFilter)) {
+    return Status::InvalidArgument("Invalid compaction filter merge order");
+  }
+  if (factory && filter && filter_order != factory_order) {
+    return Status::InvalidArgument(
+        "Compaction filter/factory merge order mismatch");
+  }
+  *order = factory ? factory_order : filter_order;
+  if (reason != TableFileCreationReason::kCompaction &&
+      *order == Order::kMergeBeforeFilter) {
+    return Status::InvalidArgument(
+        "Merge-before-filter is supported only during compaction");
+  }
+  return Status::OK();
+}
+
+Status ValidateCompactionFilterOptions(const ColumnFamilyOptions& cf_opts) {
+  using Order = CompactionFilter::MergeOrder;
+  Order order;
+  Status s = GetCompactionFilterMergeOrder(cf_opts.compaction_filter, nullptr,
+                                           TableFileCreationReason::kCompaction,
+                                           &order);
+  if (!s.ok()) {
+    return s;
+  }
+  const CompactionFilterFactory* factory =
+      cf_opts.compaction_filter_factory.get();
+  s = GetCompactionFilterMergeOrder(
+      nullptr, factory, TableFileCreationReason::kCompaction, &order);
+  if (!s.ok()) {
+    return s;
+  }
+  if (factory && order == Order::kMergeBeforeFilter) {
+    for (TableFileCreationReason reason :
+         {TableFileCreationReason::kFlush, TableFileCreationReason::kRecovery,
+          TableFileCreationReason::kMisc,
+          TableFileCreationReason::kSstFileWriter}) {
+      if (factory->ShouldFilterTableFileCreation(reason)) {
+        return Status::InvalidArgument(
+            "Merge-before-filter factory selects non-compaction creation");
+      }
+    }
+  }
+  return Status::OK();
+}
+
 ConfigOptions::ConfigOptions() : registry(ObjectRegistry::NewInstance()) {
   env = Env::Default();
 }

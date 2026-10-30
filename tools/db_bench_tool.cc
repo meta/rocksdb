@@ -964,6 +964,12 @@ DEFINE_bool(read_cache_direct_read, true,
 
 DEFINE_bool(use_keep_filter, false, "Whether to use a noop compaction filter");
 
+DEFINE_bool(merge_before_compaction_filter, false,
+            "Use merge-before-filter order for merge_filter_benchmark.");
+DEFINE_string(merge_filter_benchmark, "",
+              "Compaction filter for merge benchmarks: v2_keep, v4_keep, or "
+              "remove_operands (removes about 90% of operand keys).");
+
 static bool ValidateCacheNumshardbits(const char* flagname, int32_t value) {
   if (value >= 20) {
     fprintf(stderr, "Invalid value for --%s: %d, must be < 20\n", flagname,
@@ -4175,6 +4181,72 @@ class Benchmark {
     const char* Name() const override { return "KeepFilter"; }
   };
 
+  class MergeBenchmarkFilter : public CompactionFilter {
+   public:
+    MergeBenchmarkFilter(MergeOrder order, bool remove_operands)
+        : order_(order), remove_operands_(remove_operands) {}
+
+    MergeOrder GetMergeOrder() const override { return order_; }
+    const char* Name() const override { return "MergeBenchmarkFilterV2"; }
+
+    Decision FilterV2(int /*level*/, const Slice& key, ValueType type,
+                      const Slice& /*value*/, std::string* /*new_value*/,
+                      std::string* /*skip_until*/) const override {
+      return remove_operands_ && type == ValueType::kMergeOperand &&
+                     XXH64(key.data(), key.size(), 301) % 10 != 0
+                 ? Decision::kRemove
+                 : Decision::kKeep;
+    }
+
+   private:
+    const MergeOrder order_;
+    const bool remove_operands_;
+  };
+
+  class MergeBenchmarkFilterV4 : public MergeBenchmarkFilter {
+   public:
+    explicit MergeBenchmarkFilterV4(MergeOrder order)
+        : MergeBenchmarkFilter(order, false) {}
+
+    const char* Name() const override { return "MergeBenchmarkFilterV4"; }
+    bool SupportsFilterV4() const override { return true; }
+
+    Decision FilterV4(
+        int /*level*/, const Slice& /*key*/, ValueType /*type*/,
+        const Slice* /*value*/, const WideColumns* /*columns*/,
+        std::string* /*new_value*/,
+        std::vector<std::pair<std::string, std::string>>* /*new_columns*/,
+        std::string* /*skip_until*/,
+        WideColumnBlobResolver* /*resolver*/) const override {
+      return Decision::kKeep;
+    }
+  };
+
+  class MergeBenchmarkFilterFactory : public CompactionFilterFactory {
+   public:
+    MergeBenchmarkFilterFactory(CompactionFilter::MergeOrder order,
+                                const std::string& style)
+        : order_(order), style_(style) {}
+
+    CompactionFilter::MergeOrder GetMergeOrder() const override {
+      return order_;
+    }
+    const char* Name() const override { return "MergeBenchmarkFilterFactory"; }
+
+    std::unique_ptr<CompactionFilter> CreateCompactionFilter(
+        const CompactionFilter::Context& /*context*/) override {
+      if (style_ == "v4_keep") {
+        return std::make_unique<MergeBenchmarkFilterV4>(order_);
+      }
+      return std::make_unique<MergeBenchmarkFilter>(
+          order_, style_ == "remove_operands");
+    }
+
+   private:
+    const CompactionFilter::MergeOrder order_;
+    const std::string style_;
+  };
+
   static std::shared_ptr<MemoryAllocator> GetCacheAllocator() {
     std::shared_ptr<MemoryAllocator> allocator;
 
@@ -6502,6 +6574,34 @@ class Benchmark {
         options.file_checksum_gen_factory.reset(
             new FileChecksumGenCrc32cFactory());
       }
+    }
+
+    if (!FLAGS_merge_filter_benchmark.empty()) {
+      if (FLAGS_merge_filter_benchmark != "v2_keep" &&
+          FLAGS_merge_filter_benchmark != "v4_keep" &&
+          FLAGS_merge_filter_benchmark != "remove_operands") {
+        fprintf(stderr, "Invalid merge_filter_benchmark\n");
+        db_bench_exit(1);
+      }
+      if (options.compaction_filter ||
+          (options.compaction_filter_factory &&
+           !options.compaction_filter_factory->IsInstanceOf(
+               "MergeBenchmarkFilterFactory"))) {
+        fprintf(stderr,
+                "merge_filter_benchmark requires no configured filter\n");
+        db_bench_exit(1);
+      }
+      const CompactionFilter::MergeOrder order =
+          FLAGS_merge_before_compaction_filter
+              ? CompactionFilter::MergeOrder::kMergeBeforeFilter
+              : CompactionFilter::MergeOrder::kFilterBeforeMerge;
+      options.compaction_filter_factory =
+          std::make_shared<MergeBenchmarkFilterFactory>(
+              order, FLAGS_merge_filter_benchmark);
+      fprintf(stdout, "Merge benchmark filter=%s order=%s\n",
+              FLAGS_merge_filter_benchmark.c_str(),
+              FLAGS_merge_before_compaction_filter ? "merge-before-filter"
+                                                   : "legacy");
     }
 
     if (FLAGS_num_multi_db <= 1) {
