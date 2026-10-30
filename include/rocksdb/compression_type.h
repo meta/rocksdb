@@ -249,10 +249,12 @@ struct CompressionOptions {
   // recommended for lightweight compression algorithms such as Snappy, LZ4, and
   // obviously kNoCompression because there is unlikely to be a throughput gain.
   //
-  // This option is valid only when BlockBasedTable is used and is disabled
-  // (sanitized to 1) with any of these:
-  // * User-defined index (UserDefinedIndexFactory)
-  // * partition_filters == true && decouple_partitioned_filters == false
+  // This option is valid only when BlockBasedTable is used, and is sanitized
+  // to 1 when partition_filters == true && decouple_partitioned_filters ==
+  // false. With a user_defined_index_factory, an SST is compressed in parallel
+  // only if every index builder supports it (see
+  // IndexFactoryBuilder::SupportsParallelAddEntry()); otherwise it is
+  // compressed single-threaded and a warning is logged.
   //
   // When parallel compression is enabled, SST size file sizes might be
   // more inflated compared to the target size, because more data of unknown
