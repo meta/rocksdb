@@ -880,6 +880,14 @@ Status BlockBasedTable::Open(
       rep->index_has_first_key,
       FormatVersionUsesValueDeltaEscape(rep->footer.format_version()),
       rep->data_block_restart_interval, rep->index_block_restart_interval);
+  // Blocks written by RocksDB 11.10 through 11.13 with
+  // ReverseBytewiseComparator can need full-key seeks (see
+  // BlockCreateContext::check_common_prefix).
+  if (rep->internal_comparator.user_comparator() ==
+      ReverseBytewiseComparator()) {
+    rep->create_context.check_common_prefix = true;
+    rep->create_context.index_key_includes_seq = rep->index_key_includes_seq;
+  }
 
   // Check expected unique id if provided
   if (expected_unique_id != kNullUniqueId64x2) {

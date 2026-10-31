@@ -46,6 +46,7 @@
 #include "rocksdb/comparator.h"
 #include "table/block_based/block_util.h"
 #include "table/block_based/data_block_footer.h"
+#include "test_util/sync_point.h"
 #include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -338,12 +339,13 @@ inline void BlockBuilder::AddWithLastKeyImpl(
   // keys in the block. The prefix is removed from restart-point keys later, in
   // RewriteRestartKeysStrippingPrefix() at Finish(). To keep this nearly free
   // in the common (stable-prefix) case, we exploit `shared` (bytes shared with
-  // the previous key): a non-restart key that shares >= prefix_len bytes with
-  // its predecessor still starts with the whole running prefix (keys are
-  // sorted), so the prefix can only shrink when shared < prefix_len, in which
-  // case the new prefix length is exactly `shared`. Restart entries have shared
-  // forced to 0, so they are rechecked with a real comparison (cheap:
-  // 1/restart_interval).
+  // the previous key): a non-restart key shares exactly its first `shared`
+  // bytes with its predecessor, so the new prefix length is
+  // min(prefix_len, shared, user key size). `shared` counts internal key
+  // bytes, so it can extend past a user key into its footer when the
+  // comparator orders a user key after longer user keys that extend it (e.g.
+  // ReverseBytewiseComparator). Restart entries have shared forced to 0, so
+  // they are rechecked with a real comparison (cheap: 1/restart_interval).
   if (use_common_prefix_) {
     // The reader treats every shared==0 entry as a stripped restart key and
     // prepends the block's common prefix. skip_delta_encoding would create a
@@ -364,8 +366,15 @@ inline void BlockBuilder::AddWithLastKeyImpl(
       if (common < first_key_prefix_.size()) {
         first_key_prefix_.resize(common);
       }
-    } else if (shared < first_key_prefix_.size()) {
-      first_key_prefix_.resize(shared);
+    } else {
+      size_t uk_size = is_user_key_ ? key_to_persist.size()
+                                    : ExtractUserKey(key_to_persist).size();
+      TEST_SYNC_POINT_CALLBACK(
+          "BlockBuilder::AddWithLastKeyImpl:CommonPrefixUserKeySize", &uk_size);
+      const size_t limit = std::min<size_t>(shared, uk_size);
+      if (limit < first_key_prefix_.size()) {
+        first_key_prefix_.resize(limit);
+      }
     }
   }
 

@@ -7,6 +7,7 @@
 #include "rocksdb/convenience.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/sst_file_writer.h"
+#include "util/defer.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -14,6 +15,463 @@ class DBEtc3Test : public DBTestBase {
  public:
   DBEtc3Test() : DBTestBase("db_etc3_test", /*env_do_fsync=*/true) {}
 };
+
+namespace {
+// The configuration in which RocksDB 11.10 through 11.13 could write a common
+// prefix extending past a user key: format_version=8 (with the default
+// optimize_key_common_prefix) and ReverseBytewiseComparator, which orders a
+// user key after longer user keys that extend it.
+Options PreviouslyBuggyCommonPrefixOptions(
+    Options options, BlockBasedTableOptions table_options) {
+  options.comparator = ReverseBytewiseComparator();
+  options.disable_auto_compactions = true;
+  table_options.format_version = 8;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  return options;
+}
+
+// Makes BlockBuilder compute the common prefix as RocksDB 11.10 through 11.13
+// did, which could extend it past a user key.
+void SimulateOldCommonPrefixWriter() {
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlockBuilder::AddWithLastKeyImpl:CommonPrefixUserKeySize",
+      [](void* arg) {
+        *static_cast<size_t*>(arg) = std::numeric_limits<size_t>::max();
+      });
+}
+
+void StopSimulatingOldCommonPrefixWriter() {
+  SyncPoint::GetInstance()->ClearCallBack(
+      "BlockBuilder::AddWithLastKeyImpl:CommonPrefixUserKeySize");
+}
+
+// Data and index blocks found on load to have a last user key shorter than
+// their common prefix.
+struct ShortLastUserKeyBlockCounts {
+  std::atomic<int> data{0};
+  std::atomic<int> index{0};
+};
+
+void CountShortLastUserKeyBlocks(ShortLastUserKeyBlockCounts* counts) {
+  SyncPoint::GetInstance()->SetCallBack(
+      "Block::InitializeDataBlockCommonPrefixCheck:LastUserKeyShorter",
+      [counts](void*) { counts->data.fetch_add(1); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Block::InitializeIndexBlockCommonPrefixCheck:LastUserKeyShorter",
+      [counts](void*) { counts->index.fetch_add(1); });
+}
+
+const std::string kPutLonger(
+    "ab\x01"
+    "c",
+    4);
+}  // namespace
+
+TEST_F(DBEtc3Test, CommonKeyPrefixWithShorterKeyAfterLongerKey) {
+  DestroyAndReopen(PreviouslyBuggyCommonPrefixOptions(
+      CurrentOptions(), BlockBasedTableOptions()));
+  ShortLastUserKeyBlockCounts counts;
+  CountShortLastUserKeyBlocks(&counts);
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put("xy", "old"));
+  ASSERT_OK(Flush());
+  const std::string del_long(
+      "xy\x00"
+      "c",
+      4);
+  ASSERT_OK(Put(del_long, "long"));
+  ASSERT_OK(Delete("xy"));
+  ASSERT_OK(Flush());
+  EXPECT_EQ("long", Get(del_long));
+  EXPECT_EQ("NOT_FOUND", Get("xy"));
+
+  ASSERT_OK(Put(kPutLonger, "long"));
+  ASSERT_OK(Put("ab", "short"));
+  ASSERT_OK(Flush());
+  EXPECT_EQ("long", Get(kPutLonger));
+  EXPECT_EQ("short", Get("ab"));
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->Seek("ab");
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ("ab", iter->key().ToString());
+  ASSERT_OK(iter->status());
+
+  EXPECT_EQ(0, counts.data.load());
+  EXPECT_EQ(0, counts.index.load());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBEtc3Test, CommonKeyPrefixReadsBlocksWithShorterKey) {
+  Options options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.max_subcompactions = 2;
+  options.target_file_size_base = 1024;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 1000;
+  table_options.block_size_deviation = 0;
+  DestroyAndReopen(PreviouslyBuggyCommonPrefixOptions(options, table_options));
+  ShortLastUserKeyBlockCounts counts;
+  CountShortLastUserKeyBlocks(&counts);
+  SimulateOldCommonPrefixWriter();
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Data block [kPutLonger, "ab"] with common prefix "ab\x01".
+  const std::string big(2000, 'v');
+  ASSERT_OK(Put("c", big));
+  ASSERT_OK(Put(kPutLonger, "x"));
+  ASSERT_OK(Put("ab", big));
+  ASSERT_OK(Put("aa", big));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("b", "y"));
+  ASSERT_OK(Flush());
+  StopSimulatingOldCommonPrefixWriter();
+
+  auto verify = [&]() {
+    EXPECT_EQ(big, Get("ab"));
+    EXPECT_EQ("x", Get(kPutLonger));
+    EXPECT_EQ(std::vector<std::string>({big, "x"}),
+              MultiGet({"ab", kPutLonger}));
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    // "ab\x01" equals the common prefix, so it can be compared by suffix.
+    for (const Slice& target :
+         {Slice("ab"), Slice("ab\x00", 3), Slice("ab\x01", 3)}) {
+      iter->Seek(target);
+      ASSERT_TRUE(iter->Valid());
+      EXPECT_EQ("ab", iter->key().ToString());
+    }
+    iter->SeekForPrev("ab");
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ("ab", iter->key().ToString());
+    iter->SeekForPrev(Slice("ab\x01", 3));
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(kPutLonger, iter->key().ToString());
+    ASSERT_OK(iter->status());
+  };
+  verify();
+  EXPECT_GT(counts.data.load(), 0);
+
+  // With subcompactions, a compaction starts by seeking to a key.
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  verify();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBEtc3Test, CommonKeyPrefixIteratesBlocksWithShorterKey) {
+  // Iteration seeks internally after skipping many versions of a key
+  // (max_sequential_skip_in_iterations) and when reversing.
+  Options options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(
+      PreviouslyBuggyCommonPrefixOptions(options, BlockBasedTableOptions()));
+  ShortLastUserKeyBlockCounts counts;
+  CountShortLastUserKeyBlocks(&counts);
+  SimulateOldCommonPrefixWriter();
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Put("aa", "va"));
+  ASSERT_OK(Flush());
+  // Data block [kPutLonger, "ab"] with common prefix "ab\x01".
+  ASSERT_OK(Put(kPutLonger, "vl"));
+  ASSERT_OK(Put("ab", "v0"));
+  ASSERT_OK(Flush());
+  StopSimulatingOldCommonPrefixWriter();
+  const Snapshot* snap = db_->GetSnapshot();
+  for (int i = 1; i <= 10; ++i) {
+    ASSERT_OK(Put("ab", "v" + std::to_string(i)));
+    ASSERT_OK(Flush());
+  }
+
+  auto scan = [&](const Snapshot* s, bool forward) {
+    ReadOptions ro;
+    ro.snapshot = s;
+    std::unique_ptr<Iterator> it(db_->NewIterator(ro));
+    std::string out;
+    for (forward ? it->SeekToFirst() : it->SeekToLast(); it->Valid();
+         forward ? it->Next() : it->Prev()) {
+      out +=
+          it->key().ToString(/*hex=*/true) + "=" + it->value().ToString() + " ";
+    }
+    EXPECT_OK(it->status());
+    return out;
+  };
+  // Hex keys: "c", kPutLonger, "ab", "aa".
+  EXPECT_EQ("63=vc 61620163=vl 6162=v10 6161=va ", scan(nullptr, true));
+  EXPECT_EQ("63=vc 61620163=vl 6162=v0 6161=va ", scan(snap, true));
+  EXPECT_EQ("6161=va 6162=v10 61620163=vl 63=vc ", scan(nullptr, false));
+  EXPECT_EQ("6161=va 6162=v0 61620163=vl 63=vc ", scan(snap, false));
+  EXPECT_GT(TestGetTickerCount(options, NUMBER_OF_RESEEKS_IN_ITERATION), 0);
+  EXPECT_GT(counts.data.load(), 0);
+  db_->ReleaseSnapshot(snap);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBEtc3Test, CommonKeyPrefixIndexBlockWithShorterKey) {
+  // One key per data block. Two versions of "ab" in adjacent data blocks make
+  // the index keys internal keys, so the old writer can store a common prefix
+  // in the index block (with more than one key per restart interval) that
+  // extends past a user key.
+  Options options = CurrentOptions();
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 1;
+  table_options.index_block_restart_interval = 16;
+  DestroyAndReopen(PreviouslyBuggyCommonPrefixOptions(options, table_options));
+  ShortLastUserKeyBlockCounts counts;
+  CountShortLastUserKeyBlocks(&counts);
+  SimulateOldCommonPrefixWriter();
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put(kPutLonger, "x"));
+  ASSERT_OK(Put("ab", "v1"));
+  const Snapshot* snap = db_->GetSnapshot();
+  ASSERT_OK(Put("ab", "v2"));
+  ASSERT_OK(Flush());
+  StopSimulatingOldCommonPrefixWriter();
+
+  auto verify = [&]() {
+    EXPECT_EQ("v2", Get("ab"));
+    EXPECT_EQ("v1", Get("ab", snap));
+    EXPECT_EQ("x", Get(kPutLonger));
+    EXPECT_EQ(std::vector<std::string>({"v2", "x"}),
+              MultiGet({"ab", kPutLonger}));
+    for (const Snapshot* s : {static_cast<const Snapshot*>(nullptr), snap}) {
+      ReadOptions ro;
+      ro.snapshot = s;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      for (const Slice& target : {Slice("ab"), Slice("ab\x01", 3)}) {
+        iter->Seek(target);
+        ASSERT_TRUE(iter->Valid());
+        EXPECT_EQ("ab", iter->key().ToString());
+        EXPECT_EQ(s ? "v1" : "v2", iter->value().ToString());
+      }
+      iter->SeekForPrev(Slice("ab\x01", 3));
+      ASSERT_TRUE(iter->Valid());
+      EXPECT_EQ(kPutLonger, iter->key().ToString());
+      ASSERT_OK(iter->status());
+    }
+  };
+  verify();
+  EXPECT_GT(counts.index.load(), 0);
+  EXPECT_EQ(0, counts.data.load());
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  verify();
+  db_->ReleaseSnapshot(snap);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBEtc3Test, CommonKeyPrefixRandomizedReverse) {
+  // Random keys, often prefixes of each other, from both the old and the
+  // current writer, checked against a model.
+  struct RevLess {
+    bool operator()(const std::string& a, const std::string& b) const {
+      return Slice(a).compare(Slice(b)) > 0;
+    }
+  };
+  const uint32_t base_seed = static_cast<uint32_t>(env_->NowMicros());
+  ShortLastUserKeyBlockCounts counts;
+  for (int round = 0; round < 60; ++round) {
+    const uint32_t seed = base_seed + round;
+    SCOPED_TRACE("seed=" + std::to_string(seed));
+    Random rnd(seed);
+    const bool old_writer = rnd.OneIn(2);
+    Options options = CurrentOptions();
+    options.compression = kNoCompression;
+    options.max_subcompactions = 1 + rnd.Uniform(3);
+    const uint8_t kProtectionBytes[] = {0, 1, 2, 4, 8};
+    options.block_protection_bytes_per_key = kProtectionBytes[rnd.Uniform(5)];
+    BlockBasedTableOptions table_options;
+    // Small blocks make it more likely that the old writer's prefix extends
+    // past a user key: all keys of the block must extend that user key.
+    table_options.block_size = 64 + rnd.Uniform(rnd.OneIn(2) ? 64 : 512);
+    table_options.block_size_deviation = 0;
+    const int kRestartIntervals[] = {1, 2, 4, 16};
+    table_options.block_restart_interval = kRestartIntervals[rnd.Uniform(4)];
+    table_options.index_block_restart_interval =
+        kRestartIntervals[rnd.Uniform(4)];
+    table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+    // Small index partitions make it more likely that the old writer's prefix
+    // extends past a user key in index blocks.
+    switch (rnd.Uniform(4)) {
+      case 0:
+        break;
+      case 1:
+        table_options.index_type =
+            BlockBasedTableOptions::kBinarySearchWithFirstKey;
+        break;
+      default:
+        table_options.index_type = BlockBasedTableOptions::kTwoLevelIndexSearch;
+        table_options.metadata_block_size = 64 + rnd.Uniform(64);
+        table_options.partition_filters = true;
+        table_options.decouple_partitioned_filters = rnd.OneIn(2);
+        break;
+    }
+    table_options.cache_index_and_filter_blocks = rnd.OneIn(2);
+    // Warming the cache while building a table does not check blocks (only
+    // blocks from the old writer need it), so only with the current writer.
+    if (!old_writer && rnd.OneIn(2)) {
+      table_options.prepopulate_block_cache =
+          rnd.OneIn(2)
+              ? BlockBasedTableOptions::PrepopulateBlockCache::kFlushOnly
+              : BlockBasedTableOptions::PrepopulateBlockCache::
+                    kFlushAndCompaction;
+    }
+    table_options.separate_key_value_in_data_block = rnd.OneIn(3);
+    if (rnd.OneIn(3)) {
+      table_options.data_block_index_type =
+          BlockBasedTableOptions::kDataBlockBinaryAndHash;
+    }
+    const Options db_options =
+        PreviouslyBuggyCommonPrefixOptions(options, table_options);
+    DestroyAndReopen(db_options);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    CountShortLastUserKeyBlocks(&counts);
+    if (old_writer) {
+      SimulateOldCommonPrefixWriter();
+    }
+    SyncPoint::GetInstance()->EnableProcessing();
+    const int flagged_before = counts.data.load() + counts.index.load();
+
+    auto rand_key = [&](bool allow_no_prefix) {
+      static const char kAlphabet[] = {'\x00', '\x01', '\x02', 'a', 'b'};
+      std::string k;
+      if (!allow_no_prefix || !rnd.OneIn(4)) {
+        k = "pp";
+      }
+      const int len = static_cast<int>(rnd.Uniform(6));
+      for (int i = 0; i < len; ++i) {
+        k.push_back(kAlphabet[rnd.Uniform(5)]);
+      }
+      return k;
+    };
+    std::map<std::string, std::string, RevLess> model;
+    std::vector<std::string> keys;
+    // Snapshots keep older versions, which can make index keys internal keys.
+    std::vector<const Snapshot*> snapshots;
+    Defer release_snapshots([&]() {
+      for (const Snapshot* s : snapshots) {
+        db_->ReleaseSnapshot(s);
+      }
+    });
+    const int num_files = 1 + static_cast<int>(rnd.Uniform(3));
+    for (int f = 0; f < num_files; ++f) {
+      const int n = 20 + static_cast<int>(rnd.Uniform(300));
+      for (int i = 0; i < n; ++i) {
+        std::string k = rand_key(/*allow_no_prefix=*/false);
+        keys.push_back(k);
+        if (rnd.OneIn(5)) {
+          ASSERT_OK(Delete(k));
+          model.erase(k);
+        } else {
+          std::string v = "v" + std::to_string(rnd.Next());
+          ASSERT_OK(Put(k, v));
+          model[k] = v;
+        }
+        if (rnd.OneIn(20)) {
+          snapshots.push_back(db_->GetSnapshot());
+        }
+      }
+      ASSERT_OK(Flush());
+    }
+    // Sometimes also ingest a file whose keys overlap the DB, so it is
+    // assigned a global sequence number (applied to block keys when seeking).
+    if (rnd.OneIn(2)) {
+      std::map<std::string, std::string, RevLess> file_kvs;
+      const int n = 10 + static_cast<int>(rnd.Uniform(100));
+      for (int i = 0; i < n; ++i) {
+        file_kvs[rand_key(/*allow_no_prefix=*/false)] =
+            "i" + std::to_string(rnd.Next());
+      }
+      const std::string file = dbname_ + "/ingest.sst";
+      SstFileWriter writer(EnvOptions(), db_options);
+      ASSERT_OK(writer.Open(file));
+      for (const auto& kv : file_kvs) {
+        ASSERT_OK(writer.Put(kv.first, kv.second));
+        keys.push_back(kv.first);
+        model[kv.first] = kv.second;
+      }
+      ASSERT_OK(writer.Finish());
+      IngestExternalFileOptions ifo;
+      ifo.allow_global_seqno = true;
+      ASSERT_OK(db_->IngestExternalFile({file}, ifo));
+    }
+
+    auto verify = [&]() {
+      for (const auto& k : keys) {
+        auto it = model.find(k);
+        const std::string expected =
+            it == model.end() ? "NOT_FOUND" : it->second;
+        ASSERT_EQ(expected, Get(k)) << "key=" << Slice(k).ToString(true);
+      }
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+      auto mit = model.begin();
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++mit) {
+        ASSERT_TRUE(mit != model.end());
+        ASSERT_EQ(Slice(mit->first).ToString(true), iter->key().ToString(true));
+      }
+      ASSERT_OK(iter->status());
+      ASSERT_TRUE(mit == model.end());
+      auto rit = model.rbegin();
+      for (iter->SeekToLast(); iter->Valid(); iter->Prev(), ++rit) {
+        ASSERT_TRUE(rit != model.rend());
+        ASSERT_EQ(Slice(rit->first).ToString(true), iter->key().ToString(true));
+      }
+      ASSERT_OK(iter->status());
+      ASSERT_TRUE(rit == model.rend());
+      for (int p = 0; p < 400; ++p) {
+        const std::string target = rand_key(/*allow_no_prefix=*/true);
+        SCOPED_TRACE("target=" + Slice(target).ToString(true));
+        iter->Seek(target);
+        auto lb = model.lower_bound(target);
+        if (lb == model.end()) {
+          ASSERT_FALSE(iter->Valid());
+        } else {
+          ASSERT_TRUE(iter->Valid());
+          ASSERT_EQ(Slice(lb->first).ToString(true),
+                    iter->key().ToString(true));
+        }
+        ASSERT_OK(iter->status());
+        iter->SeekForPrev(target);
+        auto ub = model.upper_bound(target);
+        if (ub == model.begin()) {
+          ASSERT_FALSE(iter->Valid());
+        } else {
+          --ub;
+          ASSERT_TRUE(iter->Valid());
+          ASSERT_EQ(Slice(ub->first).ToString(true),
+                    iter->key().ToString(true));
+        }
+        ASSERT_OK(iter->status());
+      }
+    };
+    verify();
+    if (HasFatalFailure()) {
+      return;
+    }
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    verify();
+    if (HasFatalFailure()) {
+      return;
+    }
+    if (!old_writer) {
+      // Blocks from the current writer never need the check to flag them.
+      ASSERT_EQ(flagged_before, counts.data.load() + counts.index.load());
+    }
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  // Some blocks from the old writer needed the full-key search.
+  EXPECT_GT(counts.data.load() + counts.index.load(), 0);
+}
 
 TEST_F(DBEtc3Test, ManifestRollOver) {
   do {
