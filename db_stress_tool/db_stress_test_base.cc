@@ -1567,6 +1567,15 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
       opts.secondary_cache = std::move(secondary_cache);
       block_cache = NewLRUCache(opts);
     }
+  } else if (cache_type == "fifo_cache" && !tiered) {
+    FIFOCacheOptions opts;
+    opts.capacity = cache_size;
+    opts.num_shard_bits = num_shard_bits;
+    opts.metadata_charge_policy =
+        static_cast<CacheMetadataChargePolicy>(FLAGS_metadata_charge_policy);
+    opts.hash_seed = BitwiseAnd(FLAGS_seed, INT32_MAX);
+    opts.secondary_cache = std::move(secondary_cache);
+    block_cache = opts.MakeSharedCache();
   } else {
     fprintf(stderr, "Cache type not supported.");
     exit(1);
