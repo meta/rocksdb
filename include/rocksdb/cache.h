@@ -476,6 +476,64 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
   std::shared_ptr<Cache> MakeSharedCache() const;
 };
 
+// EXPERIMENTAL: the API is subject to change.
+// FIFOCache - A cache using plain FIFO eviction to stay at or below a set
+// capacity. The cache is sharded to 2^num_shard_bits shards, by hash of the
+// key. The total capacity is divided and evenly assigned to each shard, and
+// each shard has its own FIFO queue for evictions: the oldest unpinned entry is
+// evicted first, with no frequency or recency tracking. Lookups take no lock;
+// inserts, erases and eviction take a per-shard mutex. Pinned entries are never
+// evicted; eviction sets long-pinned entries aside instead of rescanning them,
+// and a fully-pinned shard evicts nothing. Under kFullChargeCacheMetadata (the
+// default) the slot table also counts against capacity: 64 bytes per slot the
+// table has grown to, 256 bytes per shard at construction, growing with the
+// entries, and shrinking back once the shard is emptied (by EraseUnRefEntries,
+// or by a capacity cut that evicts every entry). A shard needs well over that
+// much capacity to hold any entry. Each shard reserves address space for
+// max(2048, shard capacity / 64) slots of 64 bytes up front, using max_capacity
+// instead of capacity when it is larger, and touches it as the table grows. On
+// Linux the reservation does not count against the commit limit unless
+// vm.overcommit_memory=2; on Windows it is committed up front. If it cannot be
+// reserved, construction aborts, as for HyperClockCache. The table cannot grow
+// past its reservation, which holds about one entry per 107 bytes of reserved
+// capacity: once SetCapacity raises capacity beyond that (about 38x for 4 KiB
+// entries, with the default max_capacity), new keys are also evicted by
+// occupancy.
+//
+// This is an opt-in implementation reached only by constructing it directly
+// (see MakeSharedCache); no option string or tool selects it and it is not
+// the default block cache.
+struct FIFOCacheOptions : public ShardedCacheOptions {
+  // Whether to use adaptive mutexes for cache shards. Note that adaptive
+  // mutexes need to be supported by the platform in order for this to have any
+  // effect. The default value is true if RocksDB is compiled with
+  // -DROCKSDB_DEFAULT_TO_ADAPTIVE_MUTEX, false otherwise.
+  bool use_adaptive_mutex = kDefaultToAdaptiveMutex;
+
+  // Capacity the slot table is reserved for, when larger than capacity (see
+  // above). Set it to the largest capacity SetCapacity may raise this cache
+  // to; 0 (the default) reserves for capacity. On Linux a larger
+  // reservation costs only address space until the table grows into it; on
+  // Windows it is committed up front.
+  size_t max_capacity = 0;
+
+  FIFOCacheOptions() {}
+  // Every argument is required, so a positional call written for another
+  // cache's options does not compile.
+  FIFOCacheOptions(size_t _capacity, int _num_shard_bits,
+                   bool _strict_capacity_limit,
+                   std::shared_ptr<MemoryAllocator> _memory_allocator,
+                   bool _use_adaptive_mutex,
+                   CacheMetadataChargePolicy _metadata_charge_policy)
+      : ShardedCacheOptions(_capacity, _num_shard_bits, _strict_capacity_limit,
+                            std::move(_memory_allocator),
+                            _metadata_charge_policy),
+        use_adaptive_mutex(_use_adaptive_mutex) {}
+
+  // Construct an instance of FIFOCache using these options
+  std::shared_ptr<Cache> MakeSharedCache() const;
+};
+
 // DEPRECATED - The old Clock Cache implementation had an unresolved bug and
 // has been removed. The new HyperClockCache requires an additional
 // configuration parameter that is not provided by this API. This function
