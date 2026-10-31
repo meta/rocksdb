@@ -3310,7 +3310,8 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
   // If file deletion is disabled, don't recycle logs since it'll result in
   // the file getting renamed
   if (creating_new_log && immutable_db_options_.recycle_log_file_num &&
-      !wal_recycle_files_.empty() && IsFileDeletionsEnabled()) {
+      !wal_recycle_files_.empty() && IsFileDeletionsEnabled() &&
+      !IsWalInLogs(wal_recycle_files_.front())) {
     recycle_log_number = wal_recycle_files_.front();
   }
   uint64_t new_log_number = cur_wal_number_;

@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <algorithm>
+#include <future>
 
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
@@ -1262,6 +1263,8 @@ TEST_F(DBWALTest, FullPurgePreservesLogPendingReuse) {
     // flush finishes.
     ASSERT_OK(Put("foo", "bar"));
     ASSERT_OK(Flush());
+    // The first log can be recycled only after the flush closes its writer.
+    ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
 
     // The second flush can recycle the first log. Sync points enforce the
     // full purge happens after choosing the log to recycle and before it is
@@ -1283,6 +1286,81 @@ TEST_F(DBWALTest, FullPurgePreservesLogPendingReuse) {
     ASSERT_OK(Put("foo", "bar"));
     ASSERT_OK(Flush());
     thread.join();
+  }
+}
+
+TEST_F(DBWALTest, RecycledWalKeepsSyncedWritesWhenOldWriterCloses) {
+  // The flush pauses either before it removes WAL A from logs_, or after it
+  // removed A but before it frees the writers it released.
+  for (const char* pause_point : {"FindObsoleteFiles::PostMutexUnlock",
+                                  "DBImpl::BackgroundCallFlush:FilesFound"}) {
+    for (bool background_close : {false, true}) {
+      for (bool sync_old_wal_before_flush : {false, true}) {
+        SCOPED_TRACE(std::string("pause_point=") + pause_point +
+                     " background_close_inactive_wals=" +
+                     std::to_string(background_close) +
+                     " sync_old_wal_before_flush=" +
+                     std::to_string(sync_old_wal_before_flush));
+        Options options = CurrentOptions();
+        options.recycle_log_file_num = 1;
+        options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+        options.max_background_flushes = 1;
+        options.background_close_inactive_wals = background_close;
+        DestroyAndReopen(options);
+        ASSERT_OK(Put("a", "small"));
+
+        // The flush of WAL A's memtable waits until A may have been synced as
+        // an inactive WAL. It then puts A on the recycle list and pauses at
+        // pause_point.
+        std::atomic<bool> flush_started{false};
+        std::promise<void> old_wal_synced;
+        std::shared_future<void> old_wal_synced_future =
+            old_wal_synced.get_future().share();
+        std::atomic<bool> paused{false};
+        std::promise<void> reached;
+        std::promise<void> resume;
+        std::shared_future<void> resume_future = resume.get_future().share();
+        SyncPoint::GetInstance()->SetCallBack(
+            "DBImpl::BackgroundCallFlush:start", [&](void*) {
+              if (!flush_started.exchange(true)) {
+                old_wal_synced_future.wait();
+              }
+            });
+        SyncPoint::GetInstance()->SetCallBack(pause_point, [&](void*) {
+          if (!paused.exchange(true)) {
+            reached.set_value();
+            resume_future.wait();
+          }
+        });
+        SyncPoint::GetInstance()->EnableProcessing();
+        FlushOptions no_wait;
+        no_wait.wait = false;
+        ASSERT_OK(db_->Flush(no_wait));
+        WriteOptions sync_write;
+        sync_write.sync = true;
+        if (sync_old_wal_before_flush) {
+          ASSERT_OK(db_->Put(sync_write, "c", "small"));
+        }
+        old_wal_synced.set_value();
+        reached.get_future().wait();
+
+        // The next memtable switch reuses A as WAL C, and a synced write lands
+        // in C past A's old size.
+        ASSERT_OK(Put("b", "small"));
+        ASSERT_OK(db_->Flush(no_wait));
+        const std::string big_value(64 * 1024, 'v');
+        ASSERT_OK(db_->Put(sync_write, "big", big_value));
+
+        resume.set_value();
+        ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+        ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+        SyncPoint::GetInstance()->DisableProcessing();
+        SyncPoint::GetInstance()->ClearAllCallBacks();
+
+        Reopen(options);
+        EXPECT_EQ(big_value, Get("big"));
+      }
+    }
   }
 }
 
@@ -1938,6 +2016,8 @@ TEST_F(DBWALTest, TrackAndVerifyWALsRecycleWAL) {
   ASSERT_OK(Put("key_ignore1", "wal_to_recycle"));
   ASSERT_OK(Put("key_ignore2", "wal_to_recycle"));
   ASSERT_OK(Flush());
+  // The second WAL can be recycled only after the flush closes its writer.
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
 
   // Stop background flush to avoid deleting any WAL
   options.env->SetBackgroundThreads(1, Env::HIGH);

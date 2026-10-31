@@ -121,6 +121,16 @@ uint64_t DBImpl::MinLogNumberToKeep() {
 
 uint64_t DBImpl::MinLogNumberToRecycle() { return min_wal_number_to_recycle_; }
 
+bool DBImpl::IsWalInLogs(uint64_t wal_number) {
+  InstrumentedMutexLock wal_lock(&wal_write_mutex_);
+  for (const auto& wal : logs_) {
+    if (wal.number == wal_number) {
+      return true;
+    }
+  }
+  return false;
+}
+
 uint64_t DBImpl::MinObsoleteSstNumberToKeep() {
   mutex_.AssertHeld();
   if (!pending_outputs_.empty()) {
@@ -443,7 +453,10 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
       // If it's already closed, then it's been fully synced. If
       // !background_close_inactive_wals then we need to Close it before
       // removing from logs_ but not blocking while holding wal_write_mutex_.
-      if (!immutable_db_options_.background_close_inactive_wals &&
+      // A WAL that may be recycled must also be closed before it leaves
+      // logs_, because it can be reused as soon as it is gone from there.
+      if ((!immutable_db_options_.background_close_inactive_wals ||
+           immutable_db_options_.recycle_log_file_num > 0) &&
           log.writer->file()) {
         // We are taking ownership of and pinning the front entry, so we can
         // expect it to be the same after releasing and re-acquiring the lock

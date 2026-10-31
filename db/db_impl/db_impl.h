@@ -1108,6 +1108,12 @@ class DBImpl : public DB
 
   uint64_t MinLogNumberToRecycle();
 
+  // Whether the WAL is still in logs_, i.e. its writer may still be open. Such
+  // a WAL must not be recycled yet: closing the old writer truncates the file
+  // to its old size.
+  // REQUIRES: wal_write_mutex_ not held
+  bool IsWalInLogs(uint64_t wal_number);
+
   // Returns the lower bound file number for SSTs that won't be deleted, even if
   // they're obsolete. This lower bound is used internally to prevent newly
   // created flush/compaction output files from being deleted before they're
