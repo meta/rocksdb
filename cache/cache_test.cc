@@ -431,12 +431,6 @@ TEST_P(CacheTest, EntriesArePinned) {
 }
 
 TEST_P(CacheTest, EvictionPolicy) {
-  if (GetParam() == kFIFO) {
-    ROCKSDB_GTEST_BYPASS(
-        "Plain FIFOCache ignores lookups by design; frequency-based "
-        "retention arrives with the probation queue.");
-    return;
-  }
   Insert(100, 101);
   Insert(200, 201);
   // Frequently used entry must be kept around
@@ -449,6 +443,12 @@ TEST_P(CacheTest, EvictionPolicy) {
 }
 
 TEST_P(CacheTest, ExternalRefPinsEntries) {
+  if (GetParam() == kFIFO) {
+    ROCKSDB_GTEST_BYPASS(
+        "FIFOCache promotes an entry hit twice to resident, where insertions "
+        "of keys never looked up do not evict it.");
+    return;
+  }
   Insert(100, 101);
   Cache::Handle* h = cache_->Lookup(EncodeKey(100));
   ASSERT_TRUE(cache_->Ref(h));
