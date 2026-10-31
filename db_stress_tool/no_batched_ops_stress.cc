@@ -2998,7 +2998,7 @@ class NonBatchedOpsStressTest : public StressTest {
             static_cast<int>(ro.auto_refresh_iterator_with_snapshot),
             static_cast<int>(ro.snapshot != nullptr),
             static_cast<int>(FLAGS_use_multi_cf_iterator),
-            static_cast<int>(ro.table_index_factory != nullptr),
+            static_cast<int>(ro.read_index != ReadOptions::ReadIndex::kDefault),
             static_cast<int>(FLAGS_use_trie_index));
     fprintf(stderr, "Iterator value: %s\n",
             iter->value().ToString(true).c_str());
@@ -3055,7 +3055,7 @@ class NonBatchedOpsStressTest : public StressTest {
     };
 
     ReadOptions standard_ro = ro;
-    standard_ro.table_index_factory = nullptr;
+    standard_ro.read_index = ReadOptions::ReadIndex::kBuiltin;
     dump_debug_iter("Debug standard direct", standard_ro,
                     /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/false);

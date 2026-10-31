@@ -493,6 +493,16 @@ class Bitvector {
   // Build select hint arrays from the rank LUT. Called after BuildRankLUT().
   void BuildSelectHints();
 
+  // Calls fn(ones, k, sample) for every select hint: sample is the rank LUT
+  // index of the interval holding the (k * kOnesPerSelectHint)-th one bit
+  // (ones) or zero bit (!ones). Requires a correct rank LUT.
+  template <typename Fn>
+  void ForEachSelectHint(Fn fn) const;
+
+  // Checks that the rank LUT, num_ones_ and select hints read by
+  // InitFromData() match the bits, and that no bit past num_bits_ is set.
+  Status ValidateDerivedData() const;
+
   // Re-compute pointers into owned_data_ after a move operation.
   // Re-seats pointers into owned_data_ buffer.
   // Layout: [words][rank_lut][select1_hints][select0_hints]

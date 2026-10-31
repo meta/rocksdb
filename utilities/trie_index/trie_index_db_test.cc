@@ -17,6 +17,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "port/port.h"
@@ -169,19 +170,25 @@ class ParallelCompressionStartCounter {
   std::atomic<int> started_{0};
 };
 
-// Parameterized on IndexMode: kStandardDefault, kCustomDefault, and
-// kCustomOnly. All tests run in all three modes to ensure full coverage.
+// Parameterized on IndexMode (kStandardDefault, kCustomDefault, and
+// kCustomOnly) and on the trie format version written. All tests run in every
+// combination to ensure full coverage.
 class TrieIndexDBTest
-    : public testing::TestWithParam<BlockBasedTableOptions::IndexMode> {
+    : public testing::TestWithParam<
+          std::tuple<BlockBasedTableOptions::IndexMode, uint32_t>> {
  protected:
   bool IsPrimaryMode() const {
-    return GetParam() == BlockBasedTableOptions::IndexMode::kCustomDefault ||
-           GetParam() == BlockBasedTableOptions::IndexMode::kCustomOnly;
+    return GetIndexMode() ==
+               BlockBasedTableOptions::IndexMode::kCustomDefault ||
+           GetIndexMode() == BlockBasedTableOptions::IndexMode::kCustomOnly;
   }
-  BlockBasedTableOptions::IndexMode GetIndexMode() const { return GetParam(); }
+  BlockBasedTableOptions::IndexMode GetIndexMode() const {
+    return std::get<0>(GetParam());
+  }
+  uint32_t GetFormatVersion() const { return std::get<1>(GetParam()); }
 
   void SetUp() override {
-    trie_factory_ = std::make_shared<TrieIndexFactory>();
+    trie_factory_ = std::make_shared<TrieIndexFactory>(GetFormatVersion());
     dbname_ = test::PerThreadDBPath("trie_index_db_test");
     ASSERT_OK(DestroyDB(dbname_, Options()));
   }
@@ -3799,6 +3806,82 @@ TEST_P(TrieIndexDBTest, ReopenWithoutTrieUDI) {
 
 // Mixed SSTs: some written with UDI, some without. Both should be readable
 // through both index paths.
+TEST_P(TrieIndexDBTest, EmptyUserKey) {
+  ASSERT_OK(OpenDB(/*block_size=*/256));
+  // The empty key's value fills a data block, so that block's separator is
+  // the empty key.
+  ASSERT_OK(db_->Put(WriteOptions(), "", std::string(1000, 'E')));
+  std::vector<std::string> expected_keys = {""};
+  for (char c = 'b'; c <= 'f'; c++) {
+    expected_keys.emplace_back(1, c);
+    ASSERT_OK(
+        db_->Put(WriteOptions(), expected_keys.back(), std::string(300, c)));
+  }
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes("", std::string(1000, 'E')));
+  ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes("d", std::string(300, 'd')));
+  ASSERT_NO_FATAL_FAILURE(VerifyScanBothIndexes(expected_keys));
+}
+
+TEST_P(TrieIndexDBTest, OnlyEmptyUserKey) {
+  ASSERT_OK(OpenDB());
+  ASSERT_OK(db_->Put(WriteOptions(), "", "v"));
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes("", "v"));
+  ASSERT_NO_FATAL_FAILURE(VerifyScanBothIndexes({""}));
+}
+
+// SSTs of both trie format versions are read by a factory writing either.
+TEST_P(TrieIndexDBTest, MixedFormatVersions) {
+  options_.disable_auto_compactions = true;
+  const uint32_t other_version = GetFormatVersion() == 1 ? 2 : 1;
+  std::vector<std::string> expected_keys;
+  // The two SSTs interleave so that every Seek and Next consults both.
+  for (uint32_t version : {GetFormatVersion(), other_version}) {
+    trie_factory_ = std::make_shared<TrieIndexFactory>(version);
+    ASSERT_OK(OpenDB(/*block_size=*/128));
+    for (int i = version == GetFormatVersion() ? 0 : 1; i < 400; i += 2) {
+      char key[16];
+      snprintf(key, sizeof(key), "key_%04d", i);
+      ASSERT_OK(db_->Put(WriteOptions(), key, "v" + std::to_string(version)));
+    }
+    ASSERT_OK(db_->Flush(FlushOptions()));
+    ASSERT_OK(db_->Close());
+    db_.reset();
+  }
+  for (int i = 0; i < 400; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "key_%04d", i);
+    expected_keys.emplace_back(key);
+  }
+
+  for (uint32_t version : {GetFormatVersion(), other_version}) {
+    SCOPED_TRACE("reader writes format " + std::to_string(version));
+    trie_factory_ = std::make_shared<TrieIndexFactory>(version);
+    ASSERT_OK(OpenDB(/*block_size=*/128));
+    ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes(
+        "key_0100", "v" + std::to_string(GetFormatVersion())));
+    ASSERT_NO_FATAL_FAILURE(
+        VerifyGetBothIndexes("key_0101", "v" + std::to_string(other_version)));
+    ASSERT_NO_FATAL_FAILURE(VerifyScanBothIndexes(expected_keys));
+    // Rewrites both SSTs in the format this factory writes.
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    ASSERT_NO_FATAL_FAILURE(VerifyScanBothIndexes(expected_keys));
+    ASSERT_OK(db_->Close());
+    db_.reset();
+  }
+}
+
+TEST_P(TrieIndexDBTest, OpenRejectsNonBytewiseComparator) {
+  options_.comparator = ReverseBytewiseComparator();
+  ASSERT_EQ(OpenDB().code(), Status::Code::kNotSupported);
+}
+
+TEST_P(TrieIndexDBTest, OpenRejectsUnknownFormatVersion) {
+  trie_factory_ = std::make_shared<TrieIndexFactory>(3);
+  ASSERT_EQ(OpenDB().code(), Status::Code::kInvalidArgument);
+}
+
 TEST_P(TrieIndexDBTest, MixedSSTsWithAndWithoutUDI) {
   // This test mixes SSTs with and without UDI by reopening without UDI.
   // In primary mode, SSTs can still be read without UDI (the standard
@@ -4672,7 +4755,11 @@ TEST_P(TrieIndexDBTest, RollbackFromPrimaryToSecondary) {
 // must not brick those files: both kCustomDefault and kStandardDefault keep
 // serving default reads by routing to the trie. Only an explicit kBuiltin
 // request fails, because there is no standard index to honor it with.
-TEST_F(TrieIndexDBTest, CustomOnlySSTsSurviveLoweredIndexMode) {
+TEST_P(TrieIndexDBTest, CustomOnlySSTsSurviveLoweredIndexMode) {
+  if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kStandardDefault) {
+    ROCKSDB_GTEST_SKIP("Sets its own index modes");
+    return;
+  }
   ASSERT_OK(OpenDBImpl(/*block_size=*/128,
                        BlockBasedTableOptions::IndexMode::kCustomOnly));
   WriteSequentialKeys(0, 30);
@@ -5200,7 +5287,11 @@ TEST_P(TrieIndexDBTest, ParallelCompressionWithTrieIndex) {
 // kBinarySearch case; this test covers kHashSearch. kTwoLevelIndexSearch
 // is excluded because partition_filters constraints force
 // parallel_threads = 1.
-TEST_F(TrieIndexDBTest, ParallelCompressionWithHashStandardIndexAndTrieUdi) {
+TEST_P(TrieIndexDBTest, ParallelCompressionWithHashStandardIndexAndTrieUdi) {
+  if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kStandardDefault) {
+    ROCKSDB_GTEST_SKIP("Sets its own index modes");
+    return;
+  }
   if (!Zlib_Supported()) {
     ROCKSDB_GTEST_SKIP("Zlib not linked into this build");
     return;
@@ -5248,15 +5339,26 @@ TEST_F(TrieIndexDBTest, ParallelCompressionWithHashStandardIndexAndTrieUdi) {
   }
 }
 
+// Format 1 is only supported on little-endian hosts.
+std::vector<uint32_t> SupportedFormatVersions() {
+  if (port::kLittleEndian) {
+    return {1, 2};
+  }
+  return {2};
+}
+
 // Run all parameterized tests in all three custom UDI modes:
 // - kStandardDefault: UDI is secondary, reads require read_index
 // - kCustomDefault: UDI is primary, all reads use the trie by default
 // - kCustomOnly: UDI is primary, standard-index reads fail loudly
+// and with both trie format versions.
 INSTANTIATE_TEST_CASE_P(
     AllIndexModes, TrieIndexDBTest,
-    ::testing::Values(BlockBasedTableOptions::IndexMode::kStandardDefault,
-                      BlockBasedTableOptions::IndexMode::kCustomDefault,
-                      BlockBasedTableOptions::IndexMode::kCustomOnly));
+    ::testing::Combine(
+        ::testing::Values(BlockBasedTableOptions::IndexMode::kStandardDefault,
+                          BlockBasedTableOptions::IndexMode::kCustomDefault,
+                          BlockBasedTableOptions::IndexMode::kCustomOnly),
+        ::testing::ValuesIn(SupportedFormatVersions())));
 
 }  // namespace trie_index
 }  // namespace ROCKSDB_NAMESPACE

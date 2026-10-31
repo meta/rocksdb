@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,6 +24,7 @@
 #include "options/options_helper.h"
 #include "port/port.h"
 #include "rocksdb/comparator.h"
+#include "rocksdb/convenience.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/sst_file_reader.h"
@@ -41,6 +43,7 @@
 #include "utilities/trie_index/bitvector.h"
 #include "utilities/trie_index/louds_trie.h"
 #include "utilities/trie_index/trie_index_factory.h"
+#include "utilities/trie_index/trie_v2.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace trie_index {
@@ -1153,6 +1156,21 @@ static void VerifyTrieIteration(const std::vector<std::string>& keys) {
   ASSERT_FALSE(iter.Seek(Slice(past_all)));
   ASSERT_FALSE(iter.Valid());
 
+  // Test 3b: SeekToFirst, and SeekToLast then Prev through all keys.
+  ASSERT_TRUE(iter.SeekToFirst());
+  ASSERT_EQ(iter.Key().ToString(), keys[0]);
+  ASSERT_EQ(iter.Value().offset, 0u);
+  ASSERT_TRUE(iter.SeekToLast());
+  for (size_t i = keys.size(); i-- > 0;) {
+    ASSERT_TRUE(iter.Valid()) << "Invalid at i=" << i;
+    ASSERT_EQ(iter.Key().ToString(), keys[i])
+        << "Key mismatch during reverse iteration at i=" << i;
+    ASSERT_EQ(iter.Value().offset, i * 100)
+        << "Handle mismatch during reverse iteration at i=" << i;
+    ASSERT_EQ(iter.Prev(), i > 0);
+  }
+  ASSERT_FALSE(iter.Valid());
+
   // Test 4: Seek before all keys.
   std::string before_all(1, keys[0][0] - 1);
   if (keys[0][0] > 0) {
@@ -1175,6 +1193,17 @@ TEST_F(LoudsTrieTest, TrieTopologyVariants) {
 
   // Minimal multi-key trie.
   ASSERT_NO_FATAL_FAILURE(run("TwoKeys", {"aa", "ab"}));
+
+  // The empty key alone, under a sparse root, and under a dense root.
+  ASSERT_NO_FATAL_FAILURE(run("EmptyKeyOnly", {""}));
+  ASSERT_NO_FATAL_FAILURE(run("EmptyKeySparseRoot", {"", "a", "ab", "b"}));
+  {
+    std::vector<std::string> keys = {""};
+    for (int b = 0; b < 256; b++) {
+      keys.emplace_back(1, static_cast<char>(b));
+    }
+    ASSERT_NO_FATAL_FAILURE(run("EmptyKeyDenseRoot", std::move(keys)));
+  }
 
   // All keys share a long prefix, differ only in last byte.
   {
@@ -1379,6 +1408,9 @@ TEST_F(LoudsTrieTest, RandomizedStress) {
     keys.reserve(num_keys);
     for (int i = 0; i < num_keys; i++) {
       keys.push_back(rnd.RandomString(1 + rnd.Uniform(max_key_len)));
+    }
+    if (rnd.OneIn(3)) {
+      keys.emplace_back();
     }
     std::sort(keys.begin(), keys.end());
     keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
@@ -2026,6 +2058,36 @@ TEST_F(LoudsTrieTest, ApproximateAuxMemoryUsage) {
   // (child position lookup tables are allocated).
   size_t aux_mem = bt.trie.ApproximateAuxMemoryUsage();
   ASSERT_GT(aux_mem, 0u);
+
+  // Unaligned data is copied, and the copy is charged too.
+  const Slice data = bt.builder.GetSerializedData();
+  std::string unaligned(1, '\0');
+  unaligned.append(data.data(), data.size());
+  LoudsTrie unaligned_trie;
+  ASSERT_OK(
+      unaligned_trie.InitFromData(Slice(unaligned.data() + 1, data.size())));
+  ASSERT_GE(unaligned_trie.ApproximateAuxMemoryUsage(), aux_mem + data.size());
+}
+
+TEST_F(LoudsTrieTest, InitFromDataUnknownFlagsOrReserved) {
+  LoudsTrieBuilder builder;
+  builder.SetHasSeqnoEncoding(true);
+  builder.AddKeyWithSeqno("a", {0, 50}, 0, 1);
+  builder.AddKeyWithSeqno("b", {100, 50}, 0, 1);
+  builder.Finish();
+  const std::string data = builder.GetSerializedData().ToString();
+  LoudsTrie trie;
+  ASSERT_OK(trie.InitFromData(data));
+
+  // The flags word is at offset 48 and the reserved word at offset 52.
+  for (size_t pos : {48, 49, 51, 52, 55}) {
+    SCOPED_TRACE(pos);
+    std::string patched = data;
+    patched[pos] ^= pos == 48 ? 2 : 1;
+    LoudsTrie patched_trie;
+    ASSERT_EQ(patched_trie.InitFromData(patched).code(),
+              Status::Code::kCorruption);
+  }
 }
 
 TEST_F(LoudsTrieTest, InitFromDataUnsupportedVersion) {
@@ -2358,9 +2420,12 @@ TEST_F(LoudsTrieTest, ChainSeekEndAtLeaf) {
 // TrieIndexFactory integration tests
 // ============================================================================
 
-class TrieIndexFactoryTest : public testing::Test {
+// Parameterized by the format version the factory writes.
+class TrieIndexFactoryTest : public testing::TestWithParam<uint32_t> {
  protected:
-  void SetUp() override { factory_ = std::make_shared<TrieIndexFactory>(); }
+  void SetUp() override {
+    factory_ = std::make_shared<TrieIndexFactory>(GetParam());
+  }
 
   // ---- Table-driven test helpers ----
 
@@ -2479,7 +2544,7 @@ class TrieIndexFactoryTest : public testing::Test {
   std::shared_ptr<TrieIndexFactory> factory_;
 };
 
-TEST_F(TrieIndexFactoryTest, EstimatedSizeBoundsSerializedTrie) {
+TEST_P(TrieIndexFactoryTest, EstimatedSizeBoundsSerializedTrie) {
   struct KeySet {
     const char* name;
     std::vector<std::string> keys;
@@ -2521,7 +2586,8 @@ TEST_F(TrieIndexFactoryTest, EstimatedSizeBoundsSerializedTrie) {
   }
 }
 
-TEST_F(TrieIndexFactoryTest, BlockHandleEncodingLimit) {
+// Format 1 rejects handles past 32 bits; format 2 stores them.
+TEST_P(TrieIndexFactoryTest, BlockHandleEncodingLimit) {
   constexpr uint64_t kLimit = UINT32_MAX;
   for (bool parallel : {false, true}) {
     for (bool large_offset : {false, true}) {
@@ -2535,6 +2601,7 @@ TEST_F(TrieIndexFactoryTest, BlockHandleEncodingLimit) {
         }
         // Identical separators exercise both primary and overflow handles.
         const Slice key("same");
+        std::vector<IndexFactoryBuilder::BlockHandle> handles;
         for (size_t i = 0; i < 2; ++i) {
           IndexFactoryBuilder::BlockHandle handle{kLimit, kLimit};
           if (i == invalid_entry) {
@@ -2544,6 +2611,7 @@ TEST_F(TrieIndexFactoryTest, BlockHandleEncodingLimit) {
               ++handle.size;
             }
           }
+          handles.push_back(handle);
           std::string scratch;
           const Slice* next = i == 0 ? &key : nullptr;
           const auto context = EntryCtx(200 - i * 100, 100);
@@ -2557,8 +2625,8 @@ TEST_F(TrieIndexFactoryTest, BlockHandleEncodingLimit) {
         }
         Slice contents;
         Status s = builder->Finish(&contents);
-        if (invalid_entry < 2) {
-          EXPECT_TRUE(s.IsNotSupported()) << s.ToString();
+        if (invalid_entry < 2 && GetParam() == 1) {
+          EXPECT_EQ(s.code(), Status::Code::kNotSupported) << s.ToString();
           EXPECT_TRUE(contents.empty());
         } else {
           ASSERT_OK(s);
@@ -2568,18 +2636,18 @@ TEST_F(TrieIndexFactoryTest, BlockHandleEncodingLimit) {
           auto iter = reader->NewIterator(ReadOptions());
           IterateResult result;
           ASSERT_OK(iter->SeekToFirstAndGetResult(&result));
-          EXPECT_EQ(iter->value().offset, kLimit);
-          EXPECT_EQ(iter->value().size, kLimit);
+          EXPECT_EQ(iter->value().offset, handles[0].offset);
+          EXPECT_EQ(iter->value().size, handles[0].size);
           ASSERT_OK(iter->NextAndGetResult(&result));
-          EXPECT_EQ(iter->value().offset, kLimit);
-          EXPECT_EQ(iter->value().size, kLimit);
+          EXPECT_EQ(iter->value().offset, handles[1].offset);
+          EXPECT_EQ(iter->value().size, handles[1].size);
         }
       }
     }
   }
 }
 
-TEST_F(TrieIndexFactoryTest, BasicBuildAndRead) {
+TEST_P(TrieIndexFactoryTest, BasicBuildAndRead) {
   // Build a trie index using the factory interface.
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
@@ -2627,11 +2695,34 @@ TEST_F(TrieIndexFactoryTest, BasicBuildAndRead) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kInbound);
 }
 
-TEST_F(TrieIndexFactoryTest, FactoryName) {
+TEST_P(TrieIndexFactoryTest, EmptySeparator) {
+  // The first block holds only the empty key.
+  auto ctx = BuildTrieAndGetIterator({{"", "b", 0, 95, 10, 9},
+                                      {"b", "c", 100, 95, 9, 8},
+                                      {"c", "", 200, 95, 8, 0}});
+  ASSERT_NO_FATAL_FAILURE(
+      AssertFullForwardScan(ctx.iter.get(), Slice(""), {0, 100, 200}));
+  ASSERT_NO_FATAL_FAILURE(
+      AssertSeekOffset(ctx.iter.get(), "", kMaxSequenceNumber, 0));
+  ASSERT_NO_FATAL_FAILURE(
+      AssertSeekOffset(ctx.iter.get(), "a", kMaxSequenceNumber, 100));
+  ASSERT_NO_FATAL_FAILURE(
+      AssertSeekOffset(ctx.iter.get(), "b", kMaxSequenceNumber, 100));
+  IterateResult result;
+  ASSERT_OK(ctx.iter->SeekToLastAndGetResult(&result));
+  ASSERT_EQ(ctx.iter->value().offset, 200u);
+  ASSERT_OK(ctx.iter->PrevAndGetResult(&result));
+  ASSERT_OK(ctx.iter->PrevAndGetResult(&result));
+  ASSERT_EQ(result.bound_check_result, IterBoundCheck::kInbound);
+  ASSERT_EQ(result.key, "");
+  ASSERT_EQ(ctx.iter->value().offset, 0u);
+}
+
+TEST_P(TrieIndexFactoryTest, FactoryName) {
   ASSERT_STREQ(factory_->Name(), "trie_index");
 }
 
-TEST_F(TrieIndexFactoryTest, EmptyIndex) {
+TEST_P(TrieIndexFactoryTest, EmptyIndex) {
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
@@ -2644,7 +2735,7 @@ TEST_F(TrieIndexFactoryTest, EmptyIndex) {
   // Empty index should produce empty or minimal contents.
 }
 
-TEST_F(TrieIndexFactoryTest, DoubleFinish) {
+TEST_P(TrieIndexFactoryTest, DoubleFinish) {
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
@@ -2660,7 +2751,7 @@ TEST_F(TrieIndexFactoryTest, DoubleFinish) {
   ASSERT_TRUE(s.IsInvalidArgument());
 }
 
-TEST_F(TrieIndexFactoryTest, IteratorBoundsChecking) {
+TEST_P(TrieIndexFactoryTest, IteratorBoundsChecking) {
   // Test the bounds checking in the UDI iterator.
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
@@ -2723,7 +2814,7 @@ TEST_F(TrieIndexFactoryTest, IteratorBoundsChecking) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kInbound);
 }
 
-TEST_F(TrieIndexFactoryTest, IteratorNoBounds) {
+TEST_P(TrieIndexFactoryTest, IteratorNoBounds) {
   // Without Prepare(), bounds checking should always return kInbound.
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
@@ -2752,7 +2843,7 @@ TEST_F(TrieIndexFactoryTest, IteratorNoBounds) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kInbound);
 }
 
-TEST_F(TrieIndexFactoryTest, UpperBoundDoesNotDropValidBlocks) {
+TEST_P(TrieIndexFactoryTest, UpperBoundDoesNotDropValidBlocks) {
   // Validates that CheckBounds uses the previous separator (not the current
   // one) as the reference key. The trie stores separator keys (upper
   // bounds on block contents), NOT first-in-block keys. CheckBounds must
@@ -2823,7 +2914,7 @@ TEST_F(TrieIndexFactoryTest, UpperBoundDoesNotDropValidBlocks) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kOutOfBound);
 }
 
-TEST_F(TrieIndexFactoryTest, PrevAfterPrepareDoesNotUseForwardUpperBound) {
+TEST_P(TrieIndexFactoryTest, PrevAfterPrepareDoesNotUseForwardUpperBound) {
   auto ctx = BuildTrieAndGetIterator({
       {"az", "b", 0, 500, 0, 0},
       {"bz", "d", 1000, 500, 0, 0},
@@ -2850,7 +2941,7 @@ TEST_F(TrieIndexFactoryTest, PrevAfterPrepareDoesNotUseForwardUpperBound) {
   ASSERT_EQ(ctx.iter->value().offset, 0u);
 }
 
-TEST_F(TrieIndexFactoryTest, MultiScanBoundsAdvanceCorrectly) {
+TEST_P(TrieIndexFactoryTest, MultiScanBoundsAdvanceCorrectly) {
   // Validates that current_scan_idx_ advances correctly when
   // the seek target is past the current scan's limit. Otherwise all
   // bounds checks evaluate against scan 0's limit.
@@ -2938,7 +3029,7 @@ TEST_F(TrieIndexFactoryTest, MultiScanBoundsAdvanceCorrectly) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kOutOfBound);
 }
 
-TEST_F(TrieIndexFactoryTest, RejectsNonBytewiseComparator) {
+TEST_P(TrieIndexFactoryTest, RejectsNonBytewiseComparator) {
   // The trie index requires bytewise ordering because it traverses keys
   // byte-by-byte. Non-bytewise comparators should be rejected.
   IndexFactoryOptions option;
@@ -2963,7 +3054,7 @@ TEST_F(TrieIndexFactoryTest, RejectsNonBytewiseComparator) {
   ASSERT_NE(builder, nullptr);
 }
 
-TEST_F(TrieIndexFactoryTest, ApproximateMemoryUsageReportsOnlyAuxData) {
+TEST_P(TrieIndexFactoryTest, ApproximateMemoryUsageReportsOnlyAuxData) {
   // The reader reports its auxiliary heap allocations. The serialized block
   // is accounted separately by the table reader or block cache.
   IndexFactoryOptions option;
@@ -3005,7 +3096,7 @@ TEST_F(TrieIndexFactoryTest, ApproximateMemoryUsageReportsOnlyAuxData) {
   ASSERT_LT(mem_usage, serialized_size);
 }
 
-TEST_F(TrieIndexFactoryTest, EmptyTrieIterator) {
+TEST_P(TrieIndexFactoryTest, EmptyTrieIterator) {
   // Seek on an iterator built from an empty index.
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
@@ -3033,7 +3124,7 @@ TEST_F(TrieIndexFactoryTest, EmptyTrieIterator) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
-TEST_F(TrieIndexFactoryTest, PrepareWithZeroScans) {
+TEST_P(TrieIndexFactoryTest, PrepareWithZeroScans) {
   // Prepare with 0 scan ranges, then seek -- should behave as no bounds.
   auto ctx = BuildTrieAndGetIterator({
       {"az", "c", 0, 500, 0, 0},
@@ -3050,7 +3141,7 @@ TEST_F(TrieIndexFactoryTest, PrepareWithZeroScans) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kInbound);
 }
 
-TEST_F(TrieIndexFactoryTest, RePrepareResetsScanState) {
+TEST_P(TrieIndexFactoryTest, RePrepareResetsScanState) {
   // Call Prepare twice -- second Prepare should reset scan state.
   auto ctx = BuildTrieAndGetIterator({
       {"az", "c", 0, 500, 0, 0},
@@ -3077,7 +3168,7 @@ TEST_F(TrieIndexFactoryTest, RePrepareResetsScanState) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kInbound);
 }
 
-TEST_F(TrieIndexFactoryTest, ScanWithNoLimit) {
+TEST_P(TrieIndexFactoryTest, ScanWithNoLimit) {
   // Prepare with a scan range that has no upper limit.
   auto ctx = BuildTrieAndGetIterator({
       {"az", "c", 0, 500, 0, 0},
@@ -3107,7 +3198,7 @@ TEST_F(TrieIndexFactoryTest, ScanWithNoLimit) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
-TEST_F(TrieIndexFactoryTest, NewReaderWithCorruptedData) {
+TEST_P(TrieIndexFactoryTest, NewReaderWithCorruptedData) {
   // Attempt to create a reader from corrupted data.
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
@@ -3119,7 +3210,112 @@ TEST_F(TrieIndexFactoryTest, NewReaderWithCorruptedData) {
   ASSERT_TRUE(s.IsCorruption()) << s.ToString();
 }
 
-TEST_F(TrieIndexFactoryTest, OnKeyAddedNoOp) {
+// An index block that passes its checksum can still be malformed, e.g. when
+// written by a buggy writer. The reader must reject it or read it without
+// undefined behavior; run under ASAN/UBSAN to catch out-of-bounds reads.
+TEST_P(TrieIndexFactoryTest, MalformedIndexIsRejectedOrReadable) {
+  const uint32_t seed = static_cast<uint32_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+
+  // Long shared prefixes give format 1 path-compression chains, and a user
+  // key spanning three blocks gives it seqno overflow runs.
+  std::vector<std::string> keys = {""};
+  for (int i = 0; i < 30; i++) {
+    char suffix[8];
+    snprintf(suffix, sizeof(suffix), "%04d", i * 3);
+    keys.push_back("tenant/0001/objects/" + std::string(suffix) +
+                   std::string(rnd.Uniform(12), 'x'));
+  }
+  std::vector<TestBlock> blocks;
+  for (size_t i = 0; i < keys.size(); i++) {
+    const uint64_t offset = blocks.size() * 100;
+    if (i == keys.size() / 2) {
+      blocks.push_back({keys[i], keys[i], offset, 95, 30, 29});
+      blocks.push_back({keys[i], keys[i], offset + 100, 95, 20, 19});
+      blocks.push_back({keys[i], keys[i + 1], offset + 200, 95, 10, 9});
+    } else {
+      blocks.push_back(
+          {keys[i], i + 1 < keys.size() ? keys[i + 1] : "", offset, 95, 10, 9});
+    }
+  }
+  TrieTestContext ctx = BuildTrieAndGetIterator(blocks);
+  const std::string data = ctx.index_contents.ToString();
+
+  auto exercise = [&](const std::string& mutated) {
+    Slice contents(mutated);
+    std::unique_ptr<IndexFactoryReader> reader;
+    if (!factory_->NewReader(IndexFactoryOptions(), contents, reader).ok()) {
+      return;
+    }
+    std::unique_ptr<IndexFactoryIterator> iter =
+        reader->NewIterator(ReadOptions());
+    const size_t limit = 2 * blocks.size() + 10;
+    IterateResult result;
+    Status s = iter->SeekToFirstAndGetResult(&result);
+    for (size_t i = 0;
+         s.ok() && result.bound_check_result == IterBoundCheck::kInbound &&
+         i < limit;
+         i++) {
+      iter->value();
+      s = iter->NextAndGetResult(&result);
+    }
+    s = iter->SeekToLastAndGetResult(&result);
+    for (size_t i = 0;
+         s.ok() && result.bound_check_result == IterBoundCheck::kInbound &&
+         i < limit;
+         i++) {
+      s = iter->PrevAndGetResult(&result);
+    }
+    for (const std::string& key : keys) {
+      for (SequenceNumber seq : {kMaxSequenceNumber, SequenceNumber{15}}) {
+        s = iter->SeekAndGetResult(key, &result, SeekCtx(seq));
+        if (s.ok() && result.bound_check_result == IterBoundCheck::kInbound) {
+          iter->value();
+          s = iter->NextAndGetResult(&result);
+        }
+      }
+    }
+    s.PermitUncheckedError();
+  };
+
+  // Counts and offsets are 32- or 64-bit fields: plant values that overflow
+  // size arithmetic, and pairs of 32-bit counts whose sum wraps to zero.
+  for (size_t pos = 0; pos + 4 <= data.size(); pos += 4) {
+    for (uint32_t v : {0x7fffffffu, 0x80000001u, 0xffffffffu}) {
+      std::string mutated = data;
+      EncodeFixed32(&mutated[pos], v);
+      exercise(mutated);
+    }
+    if (pos + 8 <= data.size()) {
+      std::string mutated = data;
+      EncodeFixed32(&mutated[pos], 0x80000001u);
+      EncodeFixed32(&mutated[pos + 4], 0x80000001u);
+      exercise(mutated);
+      for (uint64_t v : {uint64_t{1} << 32, uint64_t{0x8000000000000002},
+                         uint64_t{0xffffffffffffffff}}) {
+        mutated = data;
+        EncodeFixed64(&mutated[pos], v);
+        exercise(mutated);
+      }
+    }
+  }
+  for (size_t len = 0; len < data.size(); len++) {
+    exercise(data.substr(0, len));
+  }
+  for (int i = 0; i < 2000; i++) {
+    std::string mutated = data;
+    const int flips = 1 + rnd.Uniform(3);
+    for (int f = 0; f < flips; f++) {
+      mutated[rnd.Uniform(static_cast<int>(mutated.size()))] ^=
+          static_cast<char>(1 + rnd.Uniform(255));
+    }
+    exercise(mutated);
+  }
+}
+
+TEST_P(TrieIndexFactoryTest, OnKeyAddedNoOp) {
   // Verify that OnKeyAdded() is a no-op for the trie builder regardless of
   // the ValueType. The trie only uses separator keys from AddIndexEntry().
   IndexFactoryOptions option;
@@ -3151,7 +3347,7 @@ TEST_F(TrieIndexFactoryTest, OnKeyAddedNoOp) {
   ASSERT_GT(index_contents.size(), 0u);
 }
 
-TEST_F(TrieIndexFactoryTest, NullComparator) {
+TEST_P(TrieIndexFactoryTest, NullComparator) {
   // NewBuilder and NewReader with nullptr comparator should default to
   // BytewiseComparator. This tests that the null-comparator guard in both
   // NewBuilder and NewReader prevents null-pointer dereferences.
@@ -3202,7 +3398,7 @@ TEST_F(TrieIndexFactoryTest, NullComparator) {
   EXPECT_EQ(iter->value().offset, 100u);
 }
 
-TEST_F(TrieIndexFactoryTest, SeekSucceedsButTargetPastLimit) {
+TEST_P(TrieIndexFactoryTest, SeekSucceedsButTargetPastLimit) {
   // Set up bounds with a limit, then seek to a target that is >= the limit.
   // CheckBounds should return kOutOfBound even though the trie Seek succeeds.
   auto ctx = BuildTrieAndGetIterator({
@@ -3236,7 +3432,7 @@ TEST_F(TrieIndexFactoryTest, SeekSucceedsButTargetPastLimit) {
 // so the trie can distinguish the two blocks.
 // ============================================================================
 
-TEST_F(TrieIndexFactoryTest, SameUserKeyBoundaryTriggersSeqnoEncoding) {
+TEST_P(TrieIndexFactoryTest, SameUserKeyBoundaryTriggersSeqnoEncoding) {
   // When the same user key spans two adjacent data blocks (e.g.,
   // "foo"|seq=100 ends Block 0, "foo"|seq=50 starts Block 1), the
   // builder must detect this and switch to seqno-encoded separators.
@@ -3290,7 +3486,7 @@ TEST_F(TrieIndexFactoryTest, SameUserKeyBoundaryTriggersSeqnoEncoding) {
       AssertFullForwardScan(ctx.iter.get(), Slice("foo"), {0, 1000, 2000}));
 }
 
-TEST_F(TrieIndexFactoryTest, DistinctUserKeysSeekWithMaxSeqno) {
+TEST_P(TrieIndexFactoryTest, DistinctUserKeysSeekWithMaxSeqno) {
   // Seqno encoding is always active. Verify that seeking with
   // kMaxSequenceNumber correctly finds each block.
   auto ctx = BuildTrieAndGetIterator({
@@ -3308,7 +3504,7 @@ TEST_F(TrieIndexFactoryTest, DistinctUserKeysSeekWithMaxSeqno) {
                                            kMaxSequenceNumber, 2000));
 }
 
-TEST_F(TrieIndexFactoryTest, MultipleSameUserKeyBoundaries) {
+TEST_P(TrieIndexFactoryTest, MultipleSameUserKeyBoundaries) {
   // Multiple same-user-key boundaries in one SST: the same user key appears
   // across 3 consecutive blocks with decreasing seqnos.
   // Block 0: "key"|seq=300
@@ -3362,7 +3558,7 @@ TEST_F(TrieIndexFactoryTest, MultipleSameUserKeyBoundaries) {
                                                 {0, 1000, 2000, 3000}));
 }
 
-TEST_F(TrieIndexFactoryTest, SameUserKeyWithZeroSeqnos) {
+TEST_P(TrieIndexFactoryTest, SameUserKeyWithZeroSeqnos) {
   // During bottommost compaction, RocksDB zeroes sequence numbers for keys
   // that no longer need version discrimination. When the same user key spans
   // multiple data blocks and all versions have seqno=0, the overflow entries
@@ -3402,7 +3598,7 @@ TEST_F(TrieIndexFactoryTest, SameUserKeyWithZeroSeqnos) {
   ASSERT_EQ(ctx.iter->value().offset, 3000u);
 }
 
-TEST_F(TrieIndexFactoryTest, SameUserKeyLastBlockZeroSeqno) {
+TEST_P(TrieIndexFactoryTest, SameUserKeyLastBlockZeroSeqno) {
   // Same user key spans blocks including the last block in the SST, with
   // all seqnos zeroed (bottommost compaction). The last block's AddIndexEntry
   // call has first_key_in_next_block=nullptr and first_key_tag=0.
@@ -3426,7 +3622,7 @@ TEST_F(TrieIndexFactoryTest, SameUserKeyLastBlockZeroSeqno) {
   ASSERT_NE(result.bound_check_result, IterBoundCheck::kInbound);
 }
 
-TEST_F(TrieIndexFactoryTest, SeqnoEncodingRoundTripSerialization) {
+TEST_P(TrieIndexFactoryTest, SeqnoEncodingRoundTripSerialization) {
   // Verify that the seqno encoding flag survives serialization/deserialization.
   // Build a trie with a same-user-key boundary (triggers seqno encoding),
   // serialize it, deserialize it, and verify the flag is set and seeks work.
@@ -3442,7 +3638,7 @@ TEST_F(TrieIndexFactoryTest, SeqnoEncodingRoundTripSerialization) {
   ASSERT_NO_FATAL_FAILURE(AssertSeekOffset(ctx.iter.get(), Slice("x"), 5, 500));
 }
 
-TEST_F(TrieIndexFactoryTest, SeqnoEncodingWithBoundsChecking) {
+TEST_P(TrieIndexFactoryTest, SeqnoEncodingWithBoundsChecking) {
   // Verify that bounds checking still works correctly when seqno encoding
   // is active. The bounds comparison should use user keys only (not the
   // seqno-encoded internal representation).
@@ -3494,7 +3690,7 @@ TEST_F(TrieIndexFactoryTest, SeqnoEncodingWithBoundsChecking) {
 //   - Re-seeking after being positioned in an overflow run
 // ============================================================================
 
-TEST_F(TrieIndexFactoryTest, LargeOverflowRun) {
+TEST_P(TrieIndexFactoryTest, LargeOverflowRun) {
   // 12 blocks all with user key "key", seqnos descending from 1200 to 100.
   // The last "key" block transitions to "zzz", so
   // FindShortestSeparator("key", "zzz") = "l". The trie has:
@@ -3590,7 +3786,7 @@ TEST_F(TrieIndexFactoryTest, LargeOverflowRun) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
-TEST_F(TrieIndexFactoryTest, MixedSameKeyRuns) {
+TEST_P(TrieIndexFactoryTest, MixedSameKeyRuns) {
   // Two different user keys each with multi-block runs, plus distinct blocks.
   //
   // The trie structure (after FindShortestSeparator shortening):
@@ -3728,7 +3924,7 @@ TEST_F(TrieIndexFactoryTest, MixedSameKeyRuns) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
-TEST_F(TrieIndexFactoryTest, AdjacentSameKeyRuns) {
+TEST_P(TrieIndexFactoryTest, AdjacentSameKeyRuns) {
   // Two adjacent same-user-key runs. The trick is that the last block of
   // the first run has a different-key boundary, creating a non-run trie leaf
   // between the two runs. To get true adjacency we make ALL "aaa" blocks
@@ -3776,7 +3972,7 @@ TEST_F(TrieIndexFactoryTest, AdjacentSameKeyRuns) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
-TEST_F(TrieIndexFactoryTest, SeqnoEncodingResultKeyIsUserKey) {
+TEST_P(TrieIndexFactoryTest, SeqnoEncodingResultKeyIsUserKey) {
   // Verify that result.key from SeekAndGetResult is the trie separator key
   // (no encoded seqno suffix). For same-key boundary leaves, the separator
   // IS the original user key. For different-key boundaries, the separator
@@ -3808,7 +4004,7 @@ TEST_F(TrieIndexFactoryTest, SeqnoEncodingResultKeyIsUserKey) {
   ASSERT_LT(result.key.ToString(), "zoo");
 }
 
-TEST_F(TrieIndexFactoryTest, SeekNonExistentKeyWithSeqnoEncoding) {
+TEST_P(TrieIndexFactoryTest, SeekNonExistentKeyWithSeqnoEncoding) {
   // Seeking for keys not in the trie when seqno encoding is active.
   //
   // Trie: "mmm"(run=1, seq=100) -> "n" -> "zzz"
@@ -3833,7 +4029,7 @@ TEST_F(TrieIndexFactoryTest, SeekNonExistentKeyWithSeqnoEncoding) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
-TEST_F(TrieIndexFactoryTest, SeqnoEncodingPastEndAndNextPastEnd) {
+TEST_P(TrieIndexFactoryTest, SeqnoEncodingPastEndAndNextPastEnd) {
   // Verify seeking past all keys and Next() past the last block with seqno
   // encoding active.
   //
@@ -3862,7 +4058,7 @@ TEST_F(TrieIndexFactoryTest, SeqnoEncodingPastEndAndNextPastEnd) {
   ASSERT_NO_FATAL_FAILURE(AssertFullForwardScan(iter, Slice("key"), {0, 500}));
 }
 
-TEST_F(TrieIndexFactoryTest, SeqnoEncodingOutOfBoundWithOverflow) {
+TEST_P(TrieIndexFactoryTest, SeqnoEncodingOutOfBoundWithOverflow) {
   // Verify that bounds checking works correctly with seqno encoding and
   // overflow blocks.
   //
@@ -3930,9 +4126,13 @@ TEST_F(TrieIndexFactoryTest, SeqnoEncodingOutOfBoundWithOverflow) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kOutOfBound);
 }
 
-TEST_F(TrieIndexFactoryTest, SeqnoEncodingConsistentSize) {
+TEST_P(TrieIndexFactoryTest, SeqnoEncodingConsistentSize) {
   // Verify that tries built with different seqno contexts produce the
   // same serialized size (seqno encoding is always on).
+  if (GetParam() != 1) {
+    ROCKSDB_GTEST_SKIP("Format 2 stores only nonzero tags");
+    return;
+  }
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
@@ -3989,7 +4189,7 @@ TEST_F(TrieIndexFactoryTest, SeqnoEncodingConsistentSize) {
   ASSERT_EQ(size_no_seq, size_with_seq);
 }
 
-TEST_F(TrieIndexFactoryTest, SeekWithMaxSeqOnSameKeyBlocks) {
+TEST_P(TrieIndexFactoryTest, SeekWithMaxSeqOnSameKeyBlocks) {
   // kMaxSequenceNumber should always land on Block 0 of a same-key run.
   //
   // Trie: "key"(run=3, seqnos 400,300,200) -> "l"
@@ -4003,7 +4203,7 @@ TEST_F(TrieIndexFactoryTest, SeekWithMaxSeqOnSameKeyBlocks) {
       AssertSeekOffset(ctx.iter.get(), Slice("key"), kMaxSequenceNumber, 0u));
 }
 
-TEST_F(TrieIndexFactoryTest, SeekWithZeroSeqOnSameKeyBlocks) {
+TEST_P(TrieIndexFactoryTest, SeekWithZeroSeqOnSameKeyBlocks) {
   // seq=0 is below all overflow seqnos -> advance past the entire run.
   //
   // Trie: "key"(run=2, seqnos 300,200) -> "l" -> "zzz"
@@ -4018,7 +4218,7 @@ TEST_F(TrieIndexFactoryTest, SeekWithZeroSeqOnSameKeyBlocks) {
       AssertSeekOffset(ctx.iter.get(), Slice("key"), 0, 2000u));
 }
 
-TEST_F(TrieIndexFactoryTest, ZeroSeqMustNotSkipLeafForSmallerUserKey) {
+TEST_P(TrieIndexFactoryTest, ZeroSeqMustNotSkipLeafForSmallerUserKey) {
   // Validates correctness of DBIter's forward-scan reseek path.
   //
   // Block 0 ends with user key "m" and block 1 starts with the same user key,
@@ -4040,7 +4240,7 @@ TEST_F(TrieIndexFactoryTest, ZeroSeqMustNotSkipLeafForSmallerUserKey) {
   ASSERT_NO_FATAL_FAILURE(AssertSeekOffset(ctx.iter.get(), Slice("l"), 0, 0u));
 }
 
-TEST_F(TrieIndexFactoryTest, NextTransitionOverflowToOverflow) {
+TEST_P(TrieIndexFactoryTest, NextTransitionOverflowToOverflow) {
   // Test Next() transitioning from one overflow run to the next trie leaf
   // that also has an overflow run.
   //
@@ -4143,7 +4343,7 @@ TEST_F(TrieIndexFactoryTest, NextTransitionOverflowToOverflow) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
-TEST_F(TrieIndexFactoryTest, SingleBlockWithSeqnoActive) {
+TEST_P(TrieIndexFactoryTest, SingleBlockWithSeqnoActive) {
   // Both blocks have the same user key "x". Without successor shortening
   // for the last block, both separators are "x", forming a 2-block run:
   //   "x"(run=2, seqnos 10,5)
@@ -4169,7 +4369,7 @@ TEST_F(TrieIndexFactoryTest, SingleBlockWithSeqnoActive) {
   }
 }
 
-TEST_F(TrieIndexFactoryTest, TagDistinguishesSameSeqDifferentType) {
+TEST_P(TrieIndexFactoryTest, TagDistinguishesSameSeqDifferentType) {
   // the trie must use the full tag (seq << 8 |
   // type) for block selection, not just the sequence number. Without this,
   // when two blocks share the same user key and same seqno but differ in
@@ -4225,7 +4425,7 @@ TEST_F(TrieIndexFactoryTest, TagDistinguishesSameSeqDifferentType) {
   ASSERT_EQ(iter->value().offset, 500u);
 }
 
-TEST_F(TrieIndexFactoryTest, SeqnoEncodingReSeekAfterOverflow) {
+TEST_P(TrieIndexFactoryTest, SeqnoEncodingReSeekAfterOverflow) {
   // Verify that re-seeking after being positioned in an overflow run
   // correctly resets the overflow state.
   //
@@ -4252,7 +4452,7 @@ TEST_F(TrieIndexFactoryTest, SeqnoEncodingReSeekAfterOverflow) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
-TEST_F(TrieIndexFactoryTest, AllFfLastKeyWithSameKeyBoundary) {
+TEST_P(TrieIndexFactoryTest, AllFfLastKeyWithSameKeyBoundary) {
   // Validates that an all-0xFF last key with same-user-key boundary preceding
   // it. The last block uses "\xff\xff" as its separator (no shortening), which
   // matches the previous entry's separator. AddIndexEntry detects the collision
@@ -4278,7 +4478,7 @@ TEST_F(TrieIndexFactoryTest, AllFfLastKeyWithSameKeyBoundary) {
   ASSERT_NO_FATAL_FAILURE(AssertFullForwardScan(iter, Slice(ff), {0, 500}));
 }
 
-TEST_F(TrieIndexFactoryTest, AllFfLastKeyWithoutPrecedingSameKey) {
+TEST_P(TrieIndexFactoryTest, AllFfLastKeyWithoutPrecedingSameKey) {
   // Complementary test: all-0xFF last key but NO same-user-key boundary.
   // No seqno encoding is triggered.
   std::string ff("\xff\xff", 2);
@@ -4290,7 +4490,7 @@ TEST_F(TrieIndexFactoryTest, AllFfLastKeyWithoutPrecedingSameKey) {
       AssertFullForwardScan(ctx.iter.get(), Slice("aaa"), {0, 500}));
 }
 
-TEST_F(TrieIndexFactoryTest, SeqnoEncodingRandomized) {
+TEST_P(TrieIndexFactoryTest, SeqnoEncodingRandomized) {
   // Randomized test: generate random block layouts with a mix of same-user-key
   // and distinct-key boundaries, build a trie, then verify:
   //   1. Full forward scan visits all blocks in offset order
@@ -4406,10 +4606,11 @@ TEST_F(TrieIndexFactoryTest, SeqnoEncodingRandomized) {
 // End-to-end SST integration tests
 // ============================================================================
 
-class TrieIndexSSTTest : public testing::Test {
+// Parameterized by the format version the factory writes.
+class TrieIndexSSTTest : public testing::TestWithParam<uint32_t> {
  protected:
   void SetUp() override {
-    trie_factory_ = std::make_shared<TrieIndexFactory>();
+    trie_factory_ = std::make_shared<TrieIndexFactory>(GetParam());
     sst_path_ = test::PerThreadDBPath("trie_index_sst_test.sst");
   }
 
@@ -4460,7 +4661,7 @@ class TrieIndexSSTTest : public testing::Test {
   std::string sst_path_;
 };
 
-TEST_F(TrieIndexSSTTest, WriteAndReadWithTrieUDI) {
+TEST_P(TrieIndexSSTTest, WriteAndReadWithTrieUDI) {
   // Write SST with trie UDI.
   auto kvs = GenerateKVs(100);
   ASSERT_OK(WriteSST(kvs));
@@ -4520,7 +4721,7 @@ TEST_F(TrieIndexSSTTest, WriteAndReadWithTrieUDI) {
   }
 }
 
-TEST_F(TrieIndexSSTTest, SeekWithTrieUDI) {
+TEST_P(TrieIndexSSTTest, SeekWithTrieUDI) {
   auto kvs = GenerateKVs(100);
   ASSERT_OK(WriteSST(kvs));
 
@@ -4561,7 +4762,7 @@ TEST_F(TrieIndexSSTTest, SeekWithTrieUDI) {
   ASSERT_EQ(iter->key().ToString(), kvs[0].first);
 }
 
-TEST_F(TrieIndexSSTTest, SeekWithUpperBound) {
+TEST_P(TrieIndexSSTTest, SeekWithUpperBound) {
   auto kvs = GenerateKVs(100);
   ASSERT_OK(WriteSST(kvs));
 
@@ -4593,7 +4794,7 @@ TEST_F(TrieIndexSSTTest, SeekWithUpperBound) {
   ASSERT_EQ(count, 25);
 }
 
-TEST_F(TrieIndexSSTTest, SmallSST) {
+TEST_P(TrieIndexSSTTest, SmallSST) {
   // Edge case: SST with very few keys (just one data block).
   auto kvs = GenerateKVs(3);
   ASSERT_OK(WriteSST(kvs));
@@ -4627,7 +4828,7 @@ TEST_F(TrieIndexSSTTest, SmallSST) {
 // UDI wrapper forwards OnKeyAdded() to the internal ShortenedIndexBuilder
 // for all value types, ensuring current_block_first_internal_key_ is always
 // populated before the buffered-block replay in MaybeEnterUnbuffered().
-TEST_F(TrieIndexSSTTest, MixedKeyTypesWithCompressionDict) {
+TEST_P(TrieIndexSSTTest, MixedKeyTypesWithCompressionDict) {
   const auto& dict_compressions = GetSupportedDictCompressions();
   if (dict_compressions.empty()) {
     ROCKSDB_GTEST_SKIP("No dictionary-capable compression available");
@@ -4944,7 +5145,7 @@ TEST_F(TrieSeekBenchmark, TrieVsRealIndexBlockIter) {
 // Mixed key type tests -- verifies UDI works with Delete, Merge, etc.
 // ============================================================================
 
-TEST_F(TrieIndexSSTTest, MixedKeyTypesWithTrieUDI) {
+TEST_P(TrieIndexSSTTest, MixedKeyTypesWithTrieUDI) {
   // Write an SST containing Puts, Deletes, and Merges using the trie UDI.
   // This validates that the UDI builder wrapper correctly handles all
   // operation types, and the resulting SST is readable via both the native
@@ -5055,7 +5256,7 @@ TEST_F(TrieIndexSSTTest, MixedKeyTypesWithTrieUDI) {
   }
 }
 
-TEST_F(TrieIndexSSTTest, LargeMixedKeyTypesWithTrieUDI) {
+TEST_P(TrieIndexSSTTest, LargeMixedKeyTypesWithTrieUDI) {
   // Larger test with many keys of different types to exercise multiple data
   // blocks and verify the trie index handles block boundaries correctly.
   Options options;
@@ -5188,7 +5389,7 @@ TEST_F(TrieIndexSSTTest, LargeMixedKeyTypesWithTrieUDI) {
   }
 }
 
-TEST_F(TrieIndexFactoryTest, WrapperNextAndGetResultReturnsInternalKey) {
+TEST_P(TrieIndexFactoryTest, WrapperNextAndGetResultReturnsInternalKey) {
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
@@ -5296,7 +5497,7 @@ TEST_F(TrieIndexFactoryTest, WrapperNextAndGetResultReturnsInternalKey) {
 //
 //   Without fix: Seek("b") at low seqno gets "ab"'s overflow data (wrong
 //   offset and seqno), while Seek("ab") at low seqno gets "b"'s overflow.
-TEST_F(TrieIndexFactoryTest, OverflowBfsReordering) {
+TEST_P(TrieIndexFactoryTest, OverflowBfsReordering) {
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
@@ -5477,7 +5678,7 @@ TEST_F(TrieIndexFactoryTest, OverflowBfsReordering) {
   EXPECT_EQ(iter->value().offset, 500u) << "Seek(b,50): expected c (500)";
 }
 
-TEST_F(TrieIndexFactoryTest, SeekToLastPrefixKeyOnlyTrie) {
+TEST_P(TrieIndexFactoryTest, SeekToLastPrefixKeyOnlyTrie) {
   // DescendToRightmostLeaf skips prefix keys (they are the smallest leaf at
   // a node). This test verifies that SeekToLast correctly lands on the
   // rightmost regular leaf ("ab"), and Prev correctly visits the prefix key
@@ -5509,7 +5710,7 @@ TEST_F(TrieIndexFactoryTest, SeekToLastPrefixKeyOnlyTrie) {
   ASSERT_NE(result.bound_check_result, IterBoundCheck::kInbound);
 }
 
-TEST_F(TrieIndexFactoryTest, SeekToLastAndPrevWithPrefixKeys) {
+TEST_P(TrieIndexFactoryTest, SeekToLastAndPrevWithPrefixKeys) {
   // Verifies SeekToLast and Prev correctly handle prefix keys in a trie
   // with multiple levels. Separators "a", "ab", "abc", "b" create prefix
   // keys at the "a" and "ab" nodes.
@@ -5548,7 +5749,7 @@ TEST_F(TrieIndexFactoryTest, SeekToLastAndPrevWithPrefixKeys) {
   ASSERT_EQ(rev_keys, expected_rev);
 }
 
-TEST_F(TrieIndexFactoryTest, LastBlockSeekWithRealSeqno) {
+TEST_P(TrieIndexFactoryTest, LastBlockSeekWithRealSeqno) {
   // Verifies that seeking with a real seqno (not kMaxSequenceNumber) on the
   // last block's separator correctly finds the block. The last block stores
   // the real tag of the last key, so a seek with any seqno <= that tag
@@ -5584,7 +5785,7 @@ TEST_F(TrieIndexFactoryTest, LastBlockSeekWithRealSeqno) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
-TEST_F(TrieIndexFactoryTest, IntermediateNonBoundarySeparatorNoAdvance) {
+TEST_P(TrieIndexFactoryTest, IntermediateNonBoundarySeparatorNoAdvance) {
   // Verifies that seeking with any seqno on an intermediate non-boundary
   // separator does NOT advance past it. Intermediate non-boundary separators
   // store tag=0 (sentinel), making target_tag < 0 always false -> stays.
@@ -5614,7 +5815,7 @@ TEST_F(TrieIndexFactoryTest, IntermediateNonBoundarySeparatorNoAdvance) {
       AssertSeekOffset(ctx.iter.get(), Slice("cherry"), 1, 1000));
 }
 
-TEST_F(TrieIndexFactoryTest, NonBoundarySeparatorSeekWhenShorteningFails) {
+TEST_P(TrieIndexFactoryTest, NonBoundarySeparatorSeekWhenShorteningFails) {
   // Reproducer for GitHub issue #14561: when FindShortestSeparator cannot
   // shorten the separator (e.g., "acc" -> "acd" stays "acc"), the trie lands
   // on separator "acc" with tag=0 (non-boundary sentinel). The post-seek
@@ -5654,7 +5855,7 @@ TEST_F(TrieIndexFactoryTest, NonBoundarySeparatorSeekWhenShorteningFails) {
   AssertFullForwardScan(ctx.iter.get(), Slice("aaa"), {0, 1000, 2000});
 }
 
-TEST_F(TrieIndexFactoryTest, PrevWithinOverflowRun) {
+TEST_P(TrieIndexFactoryTest, PrevWithinOverflowRun) {
   // Exercises PrevAndGetResult when positioned mid-overflow: the fast path
   // that decrements overflow_run_index_ without calling iter_.Prev().
   auto ctx = BuildTrieAndGetIterator({
@@ -5688,7 +5889,7 @@ TEST_F(TrieIndexFactoryTest, PrevWithinOverflowRun) {
   ASSERT_NE(result.bound_check_result, IterBoundCheck::kInbound);
 }
 
-TEST_F(TrieIndexFactoryTest, SeekToLastWithOverflowRun) {
+TEST_P(TrieIndexFactoryTest, SeekToLastWithOverflowRun) {
   // SeekToLast on a trie where the last leaf has block_count > 1 should
   // position at the last overflow block.
   auto ctx = BuildTrieAndGetIterator({
@@ -5729,7 +5930,7 @@ TEST_F(TrieIndexFactoryTest, SeekToLastWithOverflowRun) {
   ASSERT_NE(result.bound_check_result, IterBoundCheck::kInbound);
 }
 
-TEST_F(TrieIndexFactoryTest, PrevLandsOnLeafWithOverflow) {
+TEST_P(TrieIndexFactoryTest, PrevLandsOnLeafWithOverflow) {
   // Prev from a standalone leaf should land on a previous leaf that has an
   // overflow run, positioning at the last block in that run.
   auto ctx = BuildTrieAndGetIterator({
@@ -5769,7 +5970,7 @@ TEST_F(TrieIndexFactoryTest, PrevLandsOnLeafWithOverflow) {
   ASSERT_NE(result.bound_check_result, IterBoundCheck::kInbound);
 }
 
-TEST_F(TrieIndexFactoryTest, SeekToFirstOnEmptyTrie) {
+TEST_P(TrieIndexFactoryTest, SeekToFirstOnEmptyTrie) {
   // SeekToFirstAndGetResult on an empty trie should return kUnknown.
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
@@ -5787,7 +5988,7 @@ TEST_F(TrieIndexFactoryTest, SeekToFirstOnEmptyTrie) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
-TEST_F(TrieIndexFactoryTest, SeekToLastOnEmptyTrie) {
+TEST_P(TrieIndexFactoryTest, SeekToLastOnEmptyTrie) {
   // SeekToLastAndGetResult on an empty trie should return kUnknown.
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
@@ -5805,7 +6006,7 @@ TEST_F(TrieIndexFactoryTest, SeekToLastOnEmptyTrie) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
-TEST_F(TrieIndexFactoryTest, OverflowExhaustionThenForwardScanThroughOverflow) {
+TEST_P(TrieIndexFactoryTest, OverflowExhaustionThenForwardScanThroughOverflow) {
   // When SeekAndGetResult exhausts an overflow run and advances to the next
   // trie leaf, verify that subsequent Next() calls correctly traverse through
   // any later overflow runs.
@@ -5845,7 +6046,7 @@ TEST_F(TrieIndexFactoryTest, OverflowExhaustionThenForwardScanThroughOverflow) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
-TEST_F(TrieIndexFactoryTest, AllScansExhaustedThenSeek) {
+TEST_P(TrieIndexFactoryTest, AllScansExhaustedThenSeek) {
   // After all scan ranges are exhausted (current_scan_idx_ >= size), any
   // subsequent seek should return kOutOfBound.
   auto ctx = BuildTrieAndGetIterator({
@@ -5883,7 +6084,7 @@ TEST_F(TrieIndexFactoryTest, AllScansExhaustedThenSeek) {
 // Parallel compression protocol tests
 // ============================================================================
 
-TEST_F(TrieIndexFactoryTest, SupportsParallelAddEntry) {
+TEST_P(TrieIndexFactoryTest, SupportsParallelAddEntry) {
   // The trie builder must opt into the parallel protocol so the table
   // builder routes EmitBlockForParallel through PrepareAddEntry /
   // FinishAddEntry instead of forcing a serial fallback.
@@ -5897,7 +6098,7 @@ TEST_F(TrieIndexFactoryTest, SupportsParallelAddEntry) {
   EXPECT_NE(prep, nullptr);
 }
 
-TEST_F(TrieIndexFactoryTest, ParallelMatchesSerialOutput) {
+TEST_P(TrieIndexFactoryTest, ParallelMatchesSerialOutput) {
   // Drive identical inputs through AddIndexEntry (serial) and through
   // CreatePreparedAddEntry / PrepareAddEntry / FinishAddEntry (parallel).
   // The two paths must produce byte-identical serialized index blocks
@@ -5999,7 +6200,7 @@ TEST_F(TrieIndexFactoryTest, ParallelMatchesSerialOutput) {
   EXPECT_EQ(iter->value().offset, 420u);
 }
 
-TEST_F(TrieIndexFactoryTest, ParallelPipelineOverlapsPrepareAndFinish) {
+TEST_P(TrieIndexFactoryTest, ParallelPipelineOverlapsPrepareAndFinish) {
   // ParallelMatchesSerialOutput drives Prepare and Finish from one thread.
   // The real table builder calls PrepareAddEntry on the emit thread while
   // the BG writer thread is still finishing earlier blocks, which is the
@@ -6137,9 +6338,9 @@ TEST_F(TrieIndexFactoryTest, ParallelPipelineOverlapsPrepareAndFinish) {
   }
 }
 
-TEST_F(TrieIndexFactoryTest, ParallelEstimatedSizeStaysMonotonic) {
-  // EstimatedSize() uses state updated by emit-thread PrepareAddEntry calls,
-  // disjoint from state committed by FinishAddEntry on the BG worker.
+TEST_P(TrieIndexFactoryTest, ParallelEstimatedSizeStaysMonotonic) {
+  // EstimatedSize() runs on the emit thread while FinishAddEntry commits
+  // entries on the BG worker, and never decreases.
   IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
   std::unique_ptr<IndexFactoryBuilder> builder;
@@ -6166,13 +6367,14 @@ TEST_F(TrieIndexFactoryTest, ParallelEstimatedSizeStaysMonotonic) {
     std::string scratch;
     builder->FinishAddEntry(h, p.get(), &scratch,
                             /*skip_delta_encoding=*/false);
-    EXPECT_EQ(builder->EstimatedSize(), prepared_size)
-        << "BG-thread FinishAddEntry must not mutate estimation state";
-    last_size = prepared_size;
+    const uint64_t finished_size = builder->EstimatedSize();
+    EXPECT_GE(finished_size, prepared_size)
+        << "EstimatedSize should not shrink after FinishAddEntry";
+    last_size = finished_size;
   }
 }
 
-TEST_F(TrieIndexFactoryTest, ParallelFinishWithoutPrepareFailsBuild) {
+TEST_P(TrieIndexFactoryTest, ParallelFinishWithoutPrepareFailsBuild) {
   // FinishAddEntry() on an entry that PrepareAddEntry() did not fill, or on
   // one that was already finished, has no separator to commit for its data
   // block. Skipping the block would leave its keys unreachable through the
@@ -6215,6 +6417,650 @@ TEST_F(TrieIndexFactoryTest, ParallelFinishWithoutPrepareFailsBuild) {
     ASSERT_EQ(s.code(), Status::Code::kInvalidArgument) << s.ToString();
   }
 }
+
+// ============================================================================
+// Trie format version 2
+// ============================================================================
+
+class TrieV2Test : public testing::Test {
+ protected:
+  struct Block {
+    std::string separator;
+    TrieBlockHandle handle;
+    uint64_t tag;
+  };
+
+  // Tag of a Seek target that lands on the first block of its key.
+  const uint64_t kSeekTag =
+      PackSequenceAndType(kMaxSequenceNumber, kValueTypeForSeek);
+
+  // Serializes blocks with the given bucket size, failing the test on error.
+  static std::string Build(const std::vector<Block>& blocks,
+                           uint32_t bucket_size) {
+    TrieV2Builder builder(bucket_size);
+    for (const Block& b : blocks) {
+      builder.AddBlock(b.separator, b.handle, b.tag);
+    }
+    std::string data;
+    Status s = builder.Finish(&data);
+    EXPECT_OK(s);
+    return data;
+  }
+
+  // One block per separator, laid out back to back with random sizes and a
+  // 5-byte gap between blocks.
+  static std::vector<Block> ContiguousBlocks(
+      const std::vector<std::string>& separators, Random* rnd) {
+    std::vector<Block> blocks;
+    uint64_t offset = rnd->Uniform(1000);
+    for (const std::string& sep : separators) {
+      const uint64_t size = 100 + rnd->Uniform(4000);
+      blocks.push_back({sep, {offset, size}, 0});
+      offset += size + 5;
+    }
+    return blocks;
+  }
+
+  // Sorted distinct non-empty keys from one of several shapes: a tiny
+  // alphabet (deep shared prefixes, keys that prefix other keys), full-range
+  // bytes (wide fanout), and either of those behind a long common prefix.
+  static std::vector<std::string> RandomKeys(Random* rnd, size_t n) {
+    const uint32_t shape = rnd->Uniform(4);
+    const std::string common = shape >= 2 ? rnd->RandomString(30) : "";
+    std::set<std::string> keys;
+    while (keys.size() < n) {
+      std::string k = common;
+      const size_t len = 1 + rnd->Uniform(shape % 2 == 0 ? 12 : 3);
+      for (size_t i = 0; i < len; i++) {
+        k.push_back(shape % 2 == 0
+                        ? static_cast<char>("ab\0\xff"[rnd->Uniform(4)])
+                        : static_cast<char>(rnd->Uniform(256)));
+      }
+      keys.insert(k);
+    }
+    return {keys.begin(), keys.end()};
+  }
+
+  // Seek targets around each separator plus random strings.
+  static std::vector<std::string> SeekTargets(
+      const std::vector<std::string>& separators, Random* rnd) {
+    std::vector<std::string> targets = {""};
+    for (const std::string& sep : separators) {
+      targets.push_back(sep);
+      targets.push_back(sep + std::string(1, '\0'));
+      targets.push_back(sep + "a");
+      targets.push_back(
+          sep.substr(0, rnd->Uniform(static_cast<int>(sep.size()) + 1)));
+      if (!sep.empty()) {
+        std::string bumped = sep;
+        bumped.back() =
+            static_cast<char>(bumped.back() + (rnd->OneIn(2) ? 1 : -1));
+        targets.push_back(bumped);
+      }
+    }
+    for (int i = 0; i < 100; i++) {
+      targets.push_back(rnd->RandomBinaryString(rnd->Uniform(40)));
+    }
+    return targets;
+  }
+
+  // Index of the first block at or after (target, tag) in internal key
+  // order, or blocks.size().
+  static size_t ExpectedSeek(const std::vector<Block>& blocks,
+                             const std::string& target, uint64_t tag) {
+    for (size_t i = 0; i < blocks.size(); i++) {
+      const int cmp = Slice(blocks[i].separator).compare(target);
+      if (cmp > 0 ||
+          (cmp == 0 && (blocks[i].tag == 0 || tag >= blocks[i].tag))) {
+        return i;
+      }
+    }
+    return blocks.size();
+  }
+
+  static void ExpectAt(const TrieV2Iterator& it,
+                       const std::vector<Block>& blocks, size_t i) {
+    if (i == blocks.size()) {
+      ASSERT_FALSE(it.Valid());
+      return;
+    }
+    ASSERT_TRUE(it.Valid());
+    ASSERT_EQ(it.key(), blocks[i].separator);
+    ASSERT_EQ(it.value().offset, blocks[i].handle.offset);
+    ASSERT_EQ(it.value().size, blocks[i].handle.size);
+  }
+
+  // Seek tags for user-key-only lookups and for an old snapshot.
+  static std::vector<uint64_t> BasicSeekTags() {
+    return {PackSequenceAndType(kMaxSequenceNumber, kValueTypeForSeek),
+            PackSequenceAndType(1, kValueTypeForSeek)};
+  }
+
+  // Checks a forward scan and Seek to every (target, tag) against the
+  // blocks.
+  static void Verify(const std::vector<Block>& blocks, uint32_t bucket_size,
+                     const std::vector<std::string>& targets,
+                     const std::vector<uint64_t>& tags) {
+    SCOPED_TRACE("bucket_size=" + std::to_string(bucket_size));
+    std::string data = Build(blocks, bucket_size);
+    TrieV2Index index;
+    ASSERT_OK(index.Init(data));
+    ASSERT_EQ(index.NumBlocks(), blocks.size());
+    TrieV2Iterator it(&index);
+    ASSERT_OK(it.SeekToFirst());
+    for (size_t i = 0; i <= blocks.size(); i++) {
+      ASSERT_NO_FATAL_FAILURE(ExpectAt(it, blocks, i));
+      ASSERT_OK(it.Next());
+    }
+    ASSERT_OK(it.SeekToLast());
+    for (size_t i = blocks.size(); i-- > 0;) {
+      ASSERT_NO_FATAL_FAILURE(ExpectAt(it, blocks, i));
+      ASSERT_OK(it.Prev());
+    }
+    ASSERT_FALSE(it.Valid());
+    for (const std::string& target : targets) {
+      for (uint64_t tag : tags) {
+        SCOPED_TRACE(Slice(target).ToString(true) + " tag " +
+                     std::to_string(tag));
+        ASSERT_OK(it.Seek(target, tag));
+        const size_t expected = ExpectedSeek(blocks, target, tag);
+        ASSERT_NO_FATAL_FAILURE(ExpectAt(it, blocks, expected));
+        if (expected == blocks.size()) {
+          continue;
+        }
+        // Step back and forth from the Seek position.
+        ASSERT_OK(it.Prev());
+        if (expected == 0) {
+          ASSERT_FALSE(it.Valid());
+          continue;
+        }
+        ASSERT_NO_FATAL_FAILURE(ExpectAt(it, blocks, expected - 1));
+        ASSERT_OK(it.Next());
+        ASSERT_NO_FATAL_FAILURE(ExpectAt(it, blocks, expected));
+      }
+    }
+  }
+};
+
+TEST_F(TrieV2Test, EmptySeparator) {
+  const uint32_t seed = static_cast<uint32_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+  std::vector<std::vector<std::string>> cases = {
+      {""},
+      {"", std::string(1, '\0')},
+      {"", "a"},
+      {"", "a", "ab", "b"},
+  };
+  for (int i = 0; i < 10; i++) {
+    std::vector<std::string> keys = RandomKeys(&rnd, 1 + rnd.Uniform(100));
+    keys.insert(keys.begin(), "");
+    cases.push_back(keys);
+  }
+  for (const auto& keys : cases) {
+    std::vector<Block> blocks = ContiguousBlocks(keys, &rnd);
+    std::vector<std::string> targets = SeekTargets(keys, &rnd);
+    for (uint32_t bucket_size : {1u, 2u, 8u}) {
+      ASSERT_NO_FATAL_FAILURE(
+          Verify(blocks, bucket_size, targets, BasicSeekTags()));
+    }
+  }
+}
+
+// One user key spanning several blocks repeats its separator; each block of
+// the run carries the tag of its last key, newest first.
+TEST_F(TrieV2Test, SameKeyRunsAndTags) {
+  const uint32_t seed = static_cast<uint32_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+  for (int round = 0; round < 30; round++) {
+    std::vector<std::string> keys = RandomKeys(&rnd, 1 + rnd.Uniform(300));
+    std::vector<std::string> separators;
+    std::vector<uint64_t> block_tags;
+    for (const std::string& key : keys) {
+      const uint32_t run = rnd.OneIn(3) ? 2 + rnd.Uniform(4) : 1;
+      SequenceNumber seq = 1000 + rnd.Uniform(1000);
+      for (uint32_t j = 0; j < run; j++) {
+        separators.push_back(key);
+        uint64_t tag = 0;
+        if (run > 1 ? (j + 1 < run || rnd.OneIn(2)) : rnd.OneIn(8)) {
+          tag = PackSequenceAndType(seq, kTypeValue);
+        }
+        block_tags.push_back(tag);
+        seq -= 1 + rnd.Uniform(100);
+      }
+    }
+    std::vector<Block> blocks = ContiguousBlocks(separators, &rnd);
+    std::vector<uint64_t> tags = BasicSeekTags();
+    tags.push_back(0);
+    for (size_t i = 0; i < blocks.size(); i++) {
+      blocks[i].tag = block_tags[i];
+      if (block_tags[i] != 0) {
+        tags.push_back(block_tags[i]);
+        tags.push_back(block_tags[i] - 1);
+        tags.push_back(block_tags[i] + 1);
+      }
+    }
+    // Keep the cross product of targets and tags small.
+    std::vector<std::string> targets = keys;
+    targets.push_back("");
+    std::sort(tags.begin(), tags.end());
+    tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
+    if (tags.size() > 60) {
+      tags.resize(60);
+    }
+    for (uint32_t bucket_size : {1u, 3u, 8u}) {
+      ASSERT_NO_FATAL_FAILURE(Verify(blocks, bucket_size, targets, tags));
+    }
+  }
+}
+
+TEST_F(TrieV2Test, LargeHandlesAndIrregularGaps) {
+  const uint32_t seed = static_cast<uint32_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+  std::vector<std::string> keys = RandomKeys(&rnd, 500);
+  std::vector<std::string> targets = SeekTargets(keys, &rnd);
+
+  // Offsets past 4 GiB with a uniform gap between blocks.
+  std::vector<Block> far = ContiguousBlocks(keys, &rnd);
+  for (Block& b : far) {
+    b.handle.offset += uint64_t{5} << 40;
+  }
+  // Gaps of varying size, as with block alignment padding.
+  std::vector<Block> padded = ContiguousBlocks(keys, &rnd);
+  uint64_t offset = 0;
+  for (Block& b : padded) {
+    b.handle.offset = offset;
+    offset += b.handle.size + rnd.Uniform(4096);
+  }
+  // Blocks larger than 4 GiB.
+  std::vector<Block> huge = ContiguousBlocks(keys, &rnd);
+  offset = 0;
+  for (Block& b : huge) {
+    b.handle.offset = offset;
+    b.handle.size = (uint64_t{1} << 33) + rnd.Uniform(1 << 20);
+    offset += b.handle.size + 5;
+  }
+  for (const auto* blocks : {&far, &padded, &huge}) {
+    ASSERT_NO_FATAL_FAILURE(Verify(*blocks, 8, targets, BasicSeekTags()));
+  }
+}
+
+// Column residuals are limited to 56 bits, far beyond any real SST.
+TEST_F(TrieV2Test, ColumnRangeLimit) {
+  TrieV2Builder builder(8);
+  builder.AddBlock("a", {0, 1}, 0);
+  builder.AddBlock("b", {1, 1}, 0);
+  builder.AddBlock("c", {uint64_t{1} << 60, 1}, 0);
+  std::string data;
+  ASSERT_EQ(builder.Finish(&data).code(), Status::Code::kNotSupported);
+}
+
+TEST_F(TrieV2Test, NoBlocks) {
+  std::string data = Build({}, 8);
+  TrieV2Index index;
+  ASSERT_OK(index.Init(data));
+  ASSERT_EQ(index.NumBlocks(), 0u);
+  TrieV2Iterator it(&index);
+  ASSERT_OK(it.SeekToFirst());
+  ASSERT_FALSE(it.Valid());
+  ASSERT_OK(it.SeekToLast());
+  ASSERT_FALSE(it.Valid());
+  ASSERT_OK(it.Seek("a", kSeekTag));
+  ASSERT_FALSE(it.Valid());
+}
+
+TEST_F(TrieV2Test, SeparatorsOutOfOrder) {
+  TrieV2Builder builder(8);
+  builder.AddBlock("b", {0, 10}, 0);
+  builder.AddBlock("a", {15, 10}, 0);
+  std::string data;
+  ASSERT_EQ(builder.Finish(&data).code(), Status::Code::kInvalidArgument);
+}
+
+// The serialized bytes of a small index, written out by hand from the format
+// description in trie_v2.h. Changing them breaks existing SST files.
+TEST_F(TrieV2Test, GoldenBytes) {
+  std::string data = Build({{"ab", {0, 10}, 0}, {"ac", {15, 20}, 257}}, 8);
+  std::string expected;
+  ASSERT_TRUE(
+      Slice(
+          // magic, version, flags, bucket_size
+          "45495254"
+          "02000000"
+          "00000000"
+          "08000000"
+          // num_blocks, num_keys
+          "0200000000000000"
+          "0200000000000000"
+          // prefix_len, max_key_len, id_width, trie_root
+          "01000000"
+          "02000000"
+          "01000000"
+          "00000000"
+          // size_gap
+          "0500000000000000"
+          // trie, bucket table, bucket data, offset table, size table (none),
+          // run table, tag table, end
+          "7900000000000000"
+          "7D00000000000000"
+          "A500000000000000"
+          "A700000000000000"
+          "0000000000000000"
+          "D100000000000000"
+          "D900000000000000"
+          "F100000000000000"
+          // shared prefix "a"
+          "61"
+          // trie: terminal leaf, 1-byte pointers, path "b", bucket 0
+          "04"
+          "01"
+          "62"
+          "00"
+          // bucket table: 2 values, width 0, base 0, slope 2, padding
+          "0200000000000000"
+          "00000000"
+          "00000000"
+          "0000000000000000"
+          "0200000000000000"
+          "0000000000000000"
+          // bucket data: "ac" after "ab" drops 1 byte and adds "c"
+          "11"
+          "63"
+          // offset table: offsets 0, 15 and 40 (35 plus the 5-byte gap) as
+          // -5 + 20 * i + residuals 5, 0, 5 in 3 bits each, then padding
+          "0300000000000000"
+          "03000000"
+          "00000000"
+          "FBFFFFFFFFFFFFFF"
+          "1400000000000000"
+          "4501"
+          "0000000000000000"
+          // run table: empty
+          "0000000000000000"
+          // tag table: block 1 has tag 257
+          "0100000000000000"
+          "0100000000000000"
+          "0101000000000000"
+          // padding
+          "00000000000000000000000000000000")
+          .DecodeHex(&expected));
+  ASSERT_EQ(Slice(data).ToString(true), Slice(expected).ToString(true));
+}
+
+// Malformed indexes must be rejected by Init() or iterate without crashing.
+// Run under ASAN to catch out-of-bounds reads.
+TEST_F(TrieV2Test, MalformedData) {
+  const uint32_t seed = static_cast<uint32_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+
+  auto exercise = [&](const std::string& data) {
+    TrieV2Index index;
+    if (!index.Init(data).ok()) {
+      return;
+    }
+    TrieV2Iterator it(&index);
+    const uint64_t limit = 2 * index.NumBlocks() + 10;
+    Status s = it.SeekToFirst();
+    for (uint64_t i = 0; s.ok() && it.Valid() && i < limit; i++) {
+      it.value();
+      s = it.Next();
+    }
+    s = it.SeekToLast();
+    for (uint64_t i = 0; s.ok() && it.Valid() && i < limit; i++) {
+      s = it.Prev();
+    }
+    for (int i = 0; i < 20; i++) {
+      s = it.Seek(rnd.RandomBinaryString(rnd.Uniform(12)), kSeekTag);
+      if (s.ok() && it.Valid()) {
+        s = it.Prev();
+      }
+    }
+    s.PermitUncheckedError();
+  };
+
+  for (int round = 0; round < 20; round++) {
+    std::vector<std::string> separators = RandomKeys(&rnd, 1 + rnd.Uniform(60));
+    if (rnd.OneIn(2)) {
+      separators.insert(
+          separators.begin() + rnd.Uniform(static_cast<int>(separators.size())),
+          separators[0]);
+      std::sort(separators.begin(), separators.end());
+    }
+    std::vector<Block> blocks = ContiguousBlocks(separators, &rnd);
+    blocks.back().tag = 1 << 8;
+    const std::string data = Build(blocks, 1 + rnd.Uniform(8));
+
+    for (size_t len = 0; len < data.size(); len++) {
+      TrieV2Index index;
+      ASSERT_NOK(index.Init(Slice(data.data(), len)));
+    }
+    for (size_t pos = 0; pos < kTrieV2HeaderSize; pos++) {
+      for (char v : {'\0', '\xff', static_cast<char>(data[pos] ^ 1)}) {
+        std::string mutated = data;
+        mutated[pos] = v;
+        exercise(mutated);
+      }
+    }
+    for (int i = 0; i < 300; i++) {
+      std::string mutated = data;
+      const int flips = 1 + rnd.Uniform(3);
+      for (int f = 0; f < flips; f++) {
+        mutated[rnd.Uniform(static_cast<int>(mutated.size()))] ^=
+            static_cast<char>(1 + rnd.Uniform(255));
+      }
+      exercise(mutated);
+    }
+  }
+}
+
+TEST_F(TrieV2Test, RandomizedSeekAndScan) {
+  const uint32_t seed = static_cast<uint32_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+  for (int round = 0; round < 40; round++) {
+    const size_t n = 1 + rnd.Uniform(round < 20 ? 40 : 1500);
+    std::vector<std::string> keys = RandomKeys(&rnd, n);
+    std::vector<Block> blocks = ContiguousBlocks(keys, &rnd);
+    std::vector<std::string> targets = SeekTargets(keys, &rnd);
+    for (uint32_t bucket_size : {1u, 2u, 3u, 8u, 64u}) {
+      ASSERT_NO_FATAL_FAILURE(
+          Verify(blocks, bucket_size, targets, BasicSeekTags()));
+    }
+  }
+}
+
+TEST_F(TrieV2Test, SingleBlock) {
+  std::string data = Build({{"apple", {0, 4000}, 0}}, 8);
+  TrieV2Index index;
+  ASSERT_OK(index.Init(data));
+  ASSERT_EQ(index.NumBlocks(), 1u);
+  TrieV2Iterator it(&index);
+
+  for (const char* target : {"", "aardvark", "apple"}) {
+    SCOPED_TRACE(target);
+    ASSERT_OK(it.Seek(target, kSeekTag));
+    ASSERT_TRUE(it.Valid());
+    ASSERT_EQ(it.key(), "apple");
+    ASSERT_EQ(it.value().offset, 0u);
+    ASSERT_EQ(it.value().size, 4000u);
+  }
+  for (const char* target : {"apples", "b"}) {
+    SCOPED_TRACE(target);
+    ASSERT_OK(it.Seek(target, kSeekTag));
+    ASSERT_FALSE(it.Valid());
+  }
+}
+
+// Builds an index over blocks ending in "a", "b" and "c" with factory.
+std::string BuildThreeBlockIndex(const IndexFactory& factory) {
+  std::unique_ptr<IndexFactoryBuilder> builder;
+  EXPECT_OK(factory.NewBuilder(IndexFactoryOptions(), builder));
+  if (builder == nullptr) {
+    return "";
+  }
+  const std::vector<std::string> keys = {"a", "b", "c"};
+  for (size_t i = 0; i < keys.size(); i++) {
+    Slice next;
+    if (i + 1 < keys.size()) {
+      next = keys[i + 1];
+    }
+    std::string scratch;
+    builder->AddIndexEntry(keys[i], i + 1 < keys.size() ? &next : nullptr,
+                           {i * 100, 95}, &scratch, EntryCtx(10, 10));
+  }
+  Slice contents;
+  EXPECT_OK(builder->Finish(&contents));
+  return contents.ToString();
+}
+
+TEST(TrieIndexFormatVersionTest, SelectsWrittenFormat) {
+  struct Case {
+    const char* table_options;
+    uint32_t written_version;
+  };
+  for (const Case& c : std::vector<Case>{
+           {"user_defined_index_factory=trie_index", 1},
+           {"user_defined_index_factory={id=trie_index;format_version=1}", 1},
+           {"user_defined_index_factory={id=trie_index;format_version=2}", 2},
+       }) {
+    SCOPED_TRACE(c.table_options);
+    BlockBasedTableOptions table_options;
+    ConfigOptions config_options;
+    ASSERT_OK(GetBlockBasedTableOptionsFromString(
+        config_options, BlockBasedTableOptions(), c.table_options,
+        &table_options));
+    ASSERT_NE(table_options.user_defined_index_factory, nullptr);
+    std::string data =
+        BuildThreeBlockIndex(*table_options.user_defined_index_factory);
+    ASSERT_GE(data.size(), 8u);
+    ASSERT_EQ(DecodeFixed32(data.data() + 4), c.written_version);
+
+    // Every factory reads every format, whatever it writes.
+    for (uint32_t reader_version : {1u, 2u}) {
+      SCOPED_TRACE(reader_version);
+      TrieIndexFactory reader_factory(reader_version);
+      Slice contents(data);
+      std::unique_ptr<IndexFactoryReader> reader;
+      ASSERT_OK(
+          reader_factory.NewReader(IndexFactoryOptions(), contents, reader));
+      auto iter = reader->NewIterator(ReadOptions());
+      IterateResult result;
+      ASSERT_OK(iter->SeekAndGetResult("b", &result, SeekCtx(5)));
+      ASSERT_EQ(result.bound_check_result, IterBoundCheck::kInbound);
+      ASSERT_EQ(result.key, "b");
+      ASSERT_EQ(iter->value().offset, 100u);
+      ASSERT_EQ(iter->value().size, 95u);
+    }
+  }
+}
+
+TEST(TrieIndexFormatVersionTest, RejectsUnknownFormatVersion) {
+  for (uint32_t version : {1u, 2u}) {
+    SCOPED_TRACE(version);
+    TrieIndexFactory factory(version);
+    ASSERT_EQ(
+        factory.ValidateOptions(DBOptions(), ColumnFamilyOptions()).code(),
+        version == 1 && !port::kLittleEndian ? Status::Code::kNotSupported
+                                             : Status::Code::kOk);
+  }
+  for (uint32_t version : {0u, 3u}) {
+    SCOPED_TRACE(version);
+    TrieIndexFactory factory(version);
+    std::unique_ptr<IndexFactoryBuilder> builder;
+    ASSERT_EQ(factory.NewBuilder(IndexFactoryOptions(), builder).code(),
+              Status::Code::kInvalidArgument);
+    ASSERT_EQ(
+        factory.ValidateOptions(DBOptions(), ColumnFamilyOptions()).code(),
+        Status::Code::kInvalidArgument);
+  }
+}
+
+// RocksDB versions that predate format 2 parse every trie index as format 1,
+// and must reject format 2 instead of misreading it.
+TEST(TrieIndexFormatVersionTest, FormatOneReaderRejectsFormatTwo) {
+  const std::string data = BuildThreeBlockIndex(TrieIndexFactory(2));
+  LoudsTrie trie;
+  Status s = trie.InitFromData(data);
+  ASSERT_EQ(s.code(), Status::Code::kCorruption);
+  ASSERT_NE(s.ToString().find("unsupported format version"), std::string::npos)
+      << s.ToString();
+}
+
+// A format 1 index written by RocksDB 11.14 for blocks ending in "apple"@90,
+// "apricot"@80, "apricot"@70 and "banana"@7. SST files holding such indexes
+// must stay readable.
+TEST(TrieIndexFormatVersionTest, ReadsFormatOneGoldenIndex) {
+  std::string data;
+  ASSERT_TRUE(
+      Slice("4549525401000000040000000000000000000000070000000000000000000000"
+            "0000000000000000010000000000000001000000000000000000000000000000"
+            "0000000000000000000000000000000000000000000000000000000000000000"
+            "0000000000000000000000000000000000000000000000000000000000000000"
+            "0E000000000000006162706171726E6961636E6F617400000E00000000000000"
+            "0B00000000000000EF0F00000000000000000000000000000000000000000000"
+            "00000000000000000E000000000000000C00000000000000DD3F000000000000"
+            "0000000000000000000000000000000000000000000000000C00000000000000"
+            "0100000000000000040000000000000000000000000000000000000000000000"
+            "00000000000000000B0000000000000002000000030000000400000006000000"
+            "0700000008000000090000000A0000000B0000000C0000000D00000000000000"
+            "0300000004000000060000000700000008000000090000000A0000000B000000"
+            "0C0000000D0000000E000000000000000000000000000000AE1F000000000000"
+            "EF2E0000A50F00003C0F0000A00F0000D0070000041000000000000000000000"
+            "0000000000000000000000000000000001070000000000000150000000000000"
+            "01000000010000000100000001000000")
+          .DecodeHex(&data));
+  const std::vector<std::pair<uint64_t, uint64_t>> handles = {
+      {0, 4000}, {4005, 4100}, {8110, 3900}, {12015, 2000}};
+  for (uint32_t reader_version : {1u, 2u}) {
+    SCOPED_TRACE(reader_version);
+    TrieIndexFactory factory(reader_version);
+    Slice contents(data);
+    std::unique_ptr<IndexFactoryReader> reader;
+    ASSERT_OK(factory.NewReader(IndexFactoryOptions(), contents, reader));
+    auto iter = reader->NewIterator(ReadOptions());
+    IterateResult result;
+    ASSERT_OK(iter->SeekToFirstAndGetResult(&result));
+    for (size_t i = 0; i < handles.size(); i++) {
+      ASSERT_EQ(result.bound_check_result, IterBoundCheck::kInbound);
+      ASSERT_EQ(iter->value().offset, handles[i].first);
+      ASSERT_EQ(iter->value().size, handles[i].second);
+      ASSERT_OK(iter->NextAndGetResult(&result));
+    }
+    ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
+
+    ASSERT_OK(iter->SeekAndGetResult("apple", &result, SeekCtx(95)));
+    ASSERT_EQ(iter->value().offset, 0u);
+    ASSERT_OK(iter->SeekAndGetResult("apricot", &result, SeekCtx(85)));
+    ASSERT_EQ(iter->value().offset, 4005u);
+    ASSERT_OK(iter->SeekAndGetResult("apricot", &result, SeekCtx(75)));
+    ASSERT_EQ(iter->value().offset, 8110u);
+    ASSERT_OK(iter->SeekAndGetResult("banana", &result, SeekCtx(8)));
+    ASSERT_EQ(iter->value().offset, 12015u);
+    ASSERT_OK(iter->SeekAndGetResult("banana", &result, SeekCtx(6)));
+    ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
+  }
+}
+
+// Format 1 is only supported on little-endian hosts.
+std::vector<uint32_t> SupportedFormatVersions() {
+  if (port::kLittleEndian) {
+    return {1, 2};
+  }
+  return {2};
+}
+
+INSTANTIATE_TEST_CASE_P(FormatVersions, TrieIndexFactoryTest,
+                        ::testing::ValuesIn(SupportedFormatVersions()));
+INSTANTIATE_TEST_CASE_P(FormatVersions, TrieIndexSSTTest,
+                        ::testing::ValuesIn(SupportedFormatVersions()));
 
 }  // namespace trie_index
 }  // namespace ROCKSDB_NAMESPACE

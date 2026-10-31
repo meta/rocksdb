@@ -1,0 +1,1 @@
+`DB::Open` now rejects the trie index factory with a non-bytewise comparator, an unknown `format_version`, or format 1 on big-endian platforms, instead of failing at flush time or writing non-portable indexes.

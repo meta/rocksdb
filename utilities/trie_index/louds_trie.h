@@ -55,6 +55,7 @@
 #include "rocksdb/status.h"
 #include "util/autovector.h"
 #include "utilities/trie_index/bitvector.h"
+#include "utilities/trie_index/trie_block_handle.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace trie_index {
@@ -63,16 +64,6 @@ namespace trie_index {
 // Forward declarations
 // ============================================================================
 class LoudsTrie;
-
-// ============================================================================
-// BlockHandle: offset and size of a data block in the SST file.
-// Matches IndexFactoryBuilder::BlockHandle but defined locally to avoid
-// header dependencies in the core trie implementation.
-// ============================================================================
-struct TrieBlockHandle {
-  uint64_t offset = 0;
-  uint64_t size = 0;
-};
 
 // ============================================================================
 // LoudsTrieBuilder: Constructs a LOUDS-encoded trie from sorted keys.
@@ -274,12 +265,16 @@ class LoudsTrie {
   // avoiding any per-level overhead when chains are absent.
   bool HasChains() const { return !s_chain_lens_.empty(); }
 
-  // Approximate heap memory used by auxiliary data structures (child position
-  // lookup tables). Does not include the serialized data itself (which is
+  // Approximate heap memory used by auxiliary data structures: lookup tables
+  // built from the serialized data, and its aligned copy when the data is
+  // unaligned. Does not include the serialized data itself (which is
   // typically owned by the block cache).
   size_t ApproximateAuxMemoryUsage() const {
-    return (s_child_start_pos_.capacity() + s_child_end_pos_.capacity()) *
-           sizeof(uint32_t);
+    return (s_child_start_pos_.capacity() + s_child_end_pos_.capacity() +
+            s_chain_suffix_offsets_.capacity() +
+            s_chain_end_child_idx_.capacity() + overflow_base_.capacity()) *
+               sizeof(uint32_t) +
+           s_chain_lens_.capacity() * sizeof(uint16_t) + aligned_copy_.size();
   }
 
   // Allow the iterator to access internal bitvectors directly for
@@ -287,6 +282,10 @@ class LoudsTrie {
   friend class LoudsTrieIterator;
 
  private:
+  // Checks the parsed bitvectors, child position tables and chains against
+  // each other and the header. Called by InitFromData().
+  Status ValidateStructure() const;
+
   // Number of keys (leaves).
   uint64_t num_keys_;
 

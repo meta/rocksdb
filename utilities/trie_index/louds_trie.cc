@@ -148,6 +148,12 @@ void LoudsTrieBuilder::Finish() {
   // Determine cutoff level.
   cutoff_level_ = ComputeCutoffLevel();
   cutoff_level_ = std::min(cutoff_level_, max_depth_ + 1);
+  if (max_depth_ == 0) {
+    // The only key is empty, so the root has no labels. A sparse node needs
+    // at least one label, but a dense node can be an empty bitmap with its
+    // prefix key bit set.
+    cutoff_level_ = 1;
+  }
 
   // =========================================================================
   // Build per-level trie data directly from sorted keys (streaming approach).
@@ -277,6 +283,13 @@ void LoudsTrieBuilder::Finish() {
       }
     }
 
+    // The empty key, which can only be the first key, is the root's prefix
+    // key.
+    if (K == 0) {
+      levels[0].is_prefix.back() = true;
+      levels[0].prefix_handle.back() = static_cast<int64_t>(ki);
+    }
+
     // Step 2: Add labels for levels lcp..K-1.
     //
     // At level lcp: add a label to the existing (last) node.
@@ -394,8 +407,9 @@ void LoudsTrieBuilder::Finish() {
       }
 
       // Skip pure leaf nodes (no labels) -- they are accounted for by
-      // has_child=0 in their parent. They don't produce LOUDS entries.
-      if (label_start == label_end) {
+      // has_child=0 in their parent. They don't produce LOUDS entries. The
+      // root has no parent, so it is always encoded.
+      if (label_start == label_end && level > 0) {
         if (ld.is_prefix[ni]) {
           // Prefix key node with no children at THIS level (but it was
           // already counted above). This can happen for nodes created by
@@ -1085,10 +1099,20 @@ Status LoudsTrie::InitFromData(const Slice& data) {
   memcpy(&flags, p, 4);
   p += 4;
   remaining -= 4;
+  // Writers have only ever set kFlagSeqnoEncoding. Another flag would mean
+  // data this reader cannot interpret.
+  if ((flags & ~kFlagSeqnoEncoding) != 0) {
+    return Status::Corruption("Trie index: unknown header flags");
+  }
   has_seqno_encoding_ = (flags & kFlagSeqnoEncoding) != 0;
-  // Skip 4-byte reserved padding.
+  // 4-byte reserved padding, always written as zero.
+  uint32_t reserved;
+  memcpy(&reserved, p, 4);
   p += 4;
   remaining -= 4;
+  if (reserved != 0) {
+    return Status::Corruption("Trie index: nonzero reserved header field");
+  }
 
   // Dense bitvectors.
   size_t consumed;
@@ -1269,6 +1293,10 @@ Status LoudsTrie::InitFromData(const Slice& data) {
     memcpy(&num_chains, p, 8);
     p += 8;
     remaining -= 8;
+    // Each chain starts below a distinct sparse internal label.
+    if (num_chains > num_internal) {
+      return Status::Corruption("Trie index: more chains than internal labels");
+    }
 
     if (num_chains > 0) {
       // Read chain bitmap.
@@ -1352,6 +1380,11 @@ Status LoudsTrie::InitFromData(const Slice& data) {
         }
       }
     }
+  }
+
+  s = ValidateStructure();
+  if (!s.ok()) {
+    return s;
   }
 
   // Block handles: packed uint32_t arrays for offsets and sizes.
@@ -1483,15 +1516,20 @@ Status LoudsTrie::InitFromData(const Slice& data) {
     // Compute overflow_base_ prefix sum for O(1) access to overflow arrays.
     // overflow_base_[i] = sum of (block_count-1) for leaves [0, i).
     overflow_base_.resize(num_keys_);
-    uint32_t running_sum = 0;
+    // 64-bit so that large counts cannot wrap around to the declared total.
+    uint64_t running_sum = 0;
     for (uint64_t i = 0; i < num_keys_; i++) {
       if (leaf_block_counts_[i] == 0) {
         return Status::Corruption(
             "Trie index: leaf block count is zero for leaf " +
             std::to_string(i));
       }
-      overflow_base_[i] = running_sum;
+      overflow_base_[i] = static_cast<uint32_t>(running_sum);
       running_sum += leaf_block_counts_[i] - 1;
+      if (running_sum > num_overflow_blocks_) {
+        return Status::Corruption(
+            "Trie index: overflow count mismatch with leaf block counts");
+      }
     }
     // Verify the prefix sum matches the declared overflow count.
     if (running_sum != num_overflow_blocks_) {
@@ -1502,6 +1540,144 @@ Status LoudsTrie::InitFromData(const Slice& data) {
     return Status::OK();
   }
 
+  return Status::OK();
+}
+
+Status LoudsTrie::ValidateStructure() const {
+  // Every count the iterator relies on is checked against the others, so
+  // that malformed data cannot lead it out of bounds. Dense and sparse nodes
+  // are numbered together in BFS order, dense first, and the k-th internal
+  // label overall (counting from 1) leads to node k.
+  const uint64_t dense_labels = d_has_child_.NumBits();
+  const uint64_t dense_internal = d_has_child_.NumOnes();
+  const uint64_t sparse_internal = s_has_child_.NumOnes();
+  const uint64_t sparse_nodes = s_louds_.NumOnes();
+  auto corrupt = [](const char* what) {
+    return Status::Corruption("Trie index: ", what);
+  };
+  if (dense_node_count_ == 0 &&
+      (d_labels_.NumBits() != 0 || dense_labels != 0 ||
+       d_is_prefix_key_.NumBits() != 0)) {
+    return corrupt("dense bitvectors without dense nodes");
+  }
+  if (s_labels_size_ == 0 &&
+      (s_has_child_.NumBits() != 0 || s_louds_.NumBits() != 0)) {
+    return corrupt("sparse bitvectors without sparse labels");
+  }
+  if (s_is_prefix_key_.NumBits() != sparse_nodes) {
+    return corrupt("s_is_prefix_key size inconsistent with sparse nodes");
+  }
+  if (num_keys_ == 0) {
+    if (dense_node_count_ != 0 || s_labels_size_ != 0 ||
+        !s_child_start_pos_.empty() || !s_chain_lens_.empty()) {
+      return corrupt("nodes in a trie without keys");
+    }
+    return Status::OK();
+  }
+  if ((cutoff_level_ > 0) != (dense_node_count_ > 0)) {
+    return corrupt("cutoff level inconsistent with dense node count");
+  }
+  if (s_labels_size_ > 0 && !s_louds_.GetBit(0)) {
+    return corrupt("first sparse label does not start a node");
+  }
+  if (dense_internal + 1 != dense_node_count_ + dense_child_count_ ||
+      sparse_nodes != dense_child_count_ + sparse_internal) {
+    return corrupt("node counts inconsistent with internal labels");
+  }
+  const uint64_t dense_leaves =
+      dense_labels - dense_internal + d_is_prefix_key_.NumOnes();
+  if (dense_leaf_count_ != dense_leaves || dense_leaves + s_labels_size_ -
+                                                   sparse_internal +
+                                                   s_is_prefix_key_.NumOnes() !=
+                                               num_keys_) {
+    return corrupt("leaf counts inconsistent with num_keys");
+  }
+
+  // The child position tables hold the label range of every sparse node
+  // below a sparse label.
+  if (s_child_start_pos_.size() != sparse_internal) {
+    return corrupt("child position table size inconsistent with labels");
+  }
+  uint64_t start = 0;
+  for (uint64_t node = 0; node < sparse_nodes; node++) {
+    const uint64_t end = s_louds_.NextSetBit(start + 1);
+    if (node >= dense_child_count_) {
+      const uint64_t k = node - dense_child_count_;
+      if (s_child_start_pos_[k] != start || s_child_end_pos_[k] != end) {
+        return corrupt("child position table inconsistent with s_louds");
+      }
+    }
+    start = end;
+  }
+
+  // Walk the BFS levels: the children of level l are the nodes after it, as
+  // many as level l has internal labels. This rules out cycles and bounds
+  // the depth, and so the key length, by max_depth_.
+  const uint64_t total_nodes = dense_node_count_ + sparse_nodes;
+  auto internal_before = [&](uint64_t node) {
+    if (node < dense_node_count_) {
+      return d_has_child_.Rank1(d_labels_.Rank1(node * 256));
+    }
+    const uint64_t sparse_node = node - dense_node_count_;
+    const uint64_t pos = sparse_node < sparse_nodes
+                             ? s_louds_.FindNthOneBit(sparse_node)
+                             : s_labels_size_;
+    return dense_internal + s_has_child_.Rank1(pos);
+  };
+  uint64_t level_end = 1;
+  uint32_t depth = 0;
+  while (level_end < total_nodes) {
+    const uint64_t next_level_end = 1 + internal_before(level_end);
+    if (next_level_end <= level_end) {
+      return corrupt("node without a parent");
+    }
+    if (++depth > max_depth_) {
+      return corrupt("trie deeper than max_depth");
+    }
+    level_end = next_level_end;
+  }
+
+  // Each chain must match the fanout-1 path the builder derived it from.
+  const uint64_t num_chains = s_chain_lens_.size();
+  if (num_chains > 0 && (s_chain_bitmap_.NumBits() != sparse_internal ||
+                         s_chain_bitmap_.NumOnes() != num_chains)) {
+    return corrupt("chain bitmap inconsistent with chains");
+  }
+  auto is_prefix_key = [&](uint64_t pos) {
+    return s_is_prefix_key_.GetBit(s_louds_.Rank1(pos + 1) - 1);
+  };
+  uint64_t k = 0;
+  for (uint64_t c = 0; c < num_chains; c++, k++) {
+    k = s_chain_bitmap_.NextSetBit(k);
+    const uint32_t len = s_chain_lens_[c];
+    const uint8_t* suffix = s_chain_suffix_data_ + s_chain_suffix_offsets_[c];
+    uint64_t pos = s_child_start_pos_[k];
+    if (s_child_end_pos_[k] - pos != 1 || !s_has_child_.GetBit(pos) ||
+        is_prefix_key(pos) || len == 0 || suffix[0] != s_labels_data_[pos]) {
+      return corrupt("chain start inconsistent with trie");
+    }
+    uint32_t matched = 1;
+    uint32_t end_child_idx = UINT32_MAX;
+    while (true) {
+      const uint64_t child_idx = s_has_child_.Rank1(pos + 1) - 1;
+      const uint64_t next = s_child_start_pos_[child_idx];
+      if (s_child_end_pos_[child_idx] - next != 1 || is_prefix_key(next)) {
+        end_child_idx = static_cast<uint32_t>(child_idx);
+        break;
+      }
+      if (matched == len || suffix[matched] != s_labels_data_[next]) {
+        return corrupt("chain suffix inconsistent with trie");
+      }
+      matched++;
+      pos = next;
+      if (!s_has_child_.GetBit(pos)) {
+        break;
+      }
+    }
+    if (matched != len || end_child_idx != s_chain_end_child_idx_[c]) {
+      return corrupt("chain end inconsistent with trie");
+    }
+  }
   return Status::OK();
 }
 
@@ -2595,7 +2771,14 @@ bool LoudsTrieIterator::DescendToRightmostLeaf(bool in_dense,
       }
       uint64_t last = trie_->d_labels_.PrevSetBit(node_end);
       if (last >= trie_->d_labels_.NumBits() || last < base) {
-        // Empty node -- shouldn't happen in a valid trie, but guard anyway.
+        // Only a root whose sole key is the empty key has no labels.
+        if (node_num < trie_->d_is_prefix_key_.NumBits() &&
+            trie_->d_is_prefix_key_.GetBit(node_num)) {
+          is_at_prefix_key_ = true;
+          leaf_index_ = DensePrefixKeyLeafIndex(node_num);
+          valid_ = true;
+          return true;
+        }
         valid_ = false;
         return false;
       }

@@ -658,11 +658,15 @@ struct BlockBasedTableOptions {
   //
   // Rollback:
   //   From kCustomDefault: switch to kStandardDefault or kStandardOnly.
-  //     The standard index is fully populated, so SSTs are immediately
-  //     readable. kStandardOnly silently ignores any factory pointer that
-  //     remains set in the config.
+  //     The standard index is fully populated, so no rewrite is needed.
+  //     kStandardOnly silently ignores any factory pointer that remains set
+  //     in the config.
   //   From kCustomOnly: switch to kCustomDefault and compact to rewrite
   //     all SSTs with both indexes before downgrading further.
+  //   An SST's index routing is fixed when its table reader is opened. A
+  //   change made through SetOptions() applies to SSTs opened afterwards;
+  //   SSTs already open keep their routing until they are reopened, e.g. by
+  //   reopening the DB.
   //
   // Backup/restore and other Options-serialization reopen paths:
   //   user_defined_index_factory (shared_ptr) does not survive Options

@@ -251,6 +251,16 @@ early_argument_parsing_before_main()
 # base liveness profile cannot accidentally turn fault injection back on.
 
 
+# use_trie_index and index_mode must be the same across invocations so that all
+# SSTs in a DB are opened with matching table options, so they are drawn once
+# here. The custom index modes require the trie factory.
+_USE_TRIE_INDEX = random.choice([0] * 15 + [1])
+# 0=kStandardOnly, 1=kStandardDefault, 2=kCustomDefault, 3=kCustomOnly,
+# 4=kStandardRequired. Without a factory, the default kStandardDefault builds
+# only the standard index.
+_INDEX_MODE = random.choice([0, 1, 2, 2, 3, 3, 4]) if _USE_TRIE_INDEX == 1 else 1
+
+
 default_params = {
     "acquire_snapshot_one_in": lambda: random.choice([100, 10000]),
     "backup_max_size": 100 * 1024 * 1024,
@@ -420,13 +430,16 @@ default_params = {
     "uncache_aggressiveness": lambda: int(math.pow(10, 4.0 * random.random()) - 1.0),
     "use_full_merge_v1": lambda: random.randint(0, 1),
     "use_merge": lambda: random.randint(0, 1),
-    # use_trie_index must be the same across invocations so that all SSTs
-    # in a DB are opened with matching table options.
-    "use_trie_index": random.choice([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
-    # use_udi_as_primary_index must be the same across invocations (like
-    # use_trie_index) so that SSTs written in primary mode can be read on
-    # reopen.
-    "use_udi_as_primary_index": random.choice([0, 0, 0, 1]),
+    # Drawn above, together with index_mode.
+    "use_trie_index": _USE_TRIE_INDEX,
+    "index_mode": _INDEX_MODE,
+    # Format of trie indexes in new SSTs. Readers handle every format, so this
+    # changes between invocations and DBs mix SSTs of both formats.
+    "trie_index_format_version": lambda: random.choice([1, 2]),
+    # ReadOptions::read_index: -1=auto (db_stress selects kPreferCustom when the
+    # trie is the secondary index), 0=kDefault, 1=kBuiltin, 2=kPreferCustom.
+    # finalize_and_sanitize() drops selectors the index mode cannot serve.
+    "read_index": lambda: random.choice([-1, -1, 0, 1, 2]),
     # use_put_entity_one_in has to be the same across invocations for verification to work, hence no lambda
     "use_put_entity_one_in": random.choice([0] * 7 + [1, 5, 10]),
     "use_attribute_group": lambda: random.randint(0, 1),
@@ -1628,25 +1641,27 @@ def finalize_and_sanitize(src_params):
         # Trie UDI uses zero-copy pointers into block data, which is
         # incompatible with mmap_read.
         dest_params["mmap_read"] = 0
-        if dest_params.get("use_udi_as_primary_index") == 1:
-            # Primary UDI mode: the standard index is still fully populated,
-            # but partitioned index (kTwoLevelIndexSearch) and partitioned
-            # filters are not compatible with the UDI wrapper layout.
+        index_mode = dest_params.get("index_mode")
+        if index_mode in (2, 3):
+            # kCustomDefault/kCustomOnly reject partitioned index
+            # (kTwoLevelIndexSearch) and partitioned filters.
             dest_params["index_type"] = random.choice([0, 0, 3])
             dest_params["partition_filters"] = 0
-            # Backup/restore serializes Options to strings, losing the
-            # user_defined_index_factory (shared_ptr). The restored DB
-            # opens without UDI support and cannot route reads through
-            # the trie in primary mode.
+            # db_stress rebuilds the restored DB's options from strings that
+            # do not carry the user_defined_index_factory, so the restored DB
+            # cannot read through the trie, and cannot open kCustomOnly SSTs.
             dest_params["backup_one_in"] = 0
-            # Secondary DB opens SSTs with default Options (not a copy of
-            # the primary's), losing the UDI factory. Without the factory,
-            # reads cannot be routed through the trie.
+            # The secondary instance gets the trie through the column family
+            # options, but it has not been crash tested with the trie as the
+            # default read index.
             dest_params["test_secondary"] = 0
-    else:
-        # use_udi_as_primary_index requires use_trie_index
-        dest_params["use_udi_as_primary_index"] = 0
-
+        if index_mode == 3:
+            # kCustomOnly requires format_version >= 6.
+            dest_params["format_version"] = max(6, dest_params["format_version"])
+            # kCustomOnly SSTs have only a stub standard index, so db_stress
+            # rejects kBuiltin reads.
+            if dest_params.get("read_index") == 1:
+                dest_params["read_index"] = -1
     # Multi-key operations are not currently compatible with transactions or
     # timestamp.
     if (
@@ -2161,6 +2176,15 @@ def finalize_and_sanitize(src_params):
         dest_params["readahead_size"] = 4096
         dest_params["cache_size"] = 65536
         dest_params["use_write_buffer_manager"] = 0
+
+    # Some sanitizers, such as user timestamps, can disable trie after the
+    # UDI-specific rules above have run. Keep the final mode and per-read
+    # selection valid without a custom factory.
+    if dest_params.get("use_trie_index") != 1:
+        if dest_params.get("index_mode", 1) in (2, 3, 4):
+            dest_params["index_mode"] = 1
+        if dest_params.get("read_index", -1) > 0:
+            dest_params["read_index"] = -1
 
     # `db_stress` rejects either verification knob when `skip_verifydb` is set.
     # Must stay last: sanitization above can turn a verification knob back on

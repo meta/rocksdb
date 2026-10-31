@@ -88,6 +88,32 @@ void Bitvector::EncodeTo(std::string* output) const {
   write_u32_array(select0_hints_, num_select0_hints_);
 }
 
+template <typename Fn>
+void Bitvector::ForEachSelectHint(Fn fn) const {
+  uint64_t sample_idx = 0;
+  for (uint64_t k = 0; k < num_select1_hints_; k++) {
+    uint64_t target = k * kOnesPerSelectHint;
+    // Advance sample_idx until rank_lut_[sample_idx+1] > target.
+    while (sample_idx + 1 < num_rank_samples_ &&
+           rank_lut_[sample_idx + 1] <= target) {
+      sample_idx++;
+    }
+    fn(true, k, static_cast<uint32_t>(sample_idx));
+  }
+
+  // Select0 hints analogously use zero counts.
+  sample_idx = 0;
+  for (uint64_t k = 0; k < num_select0_hints_; k++) {
+    uint64_t target = k * kOnesPerSelectHint;
+    while (sample_idx + 1 < num_rank_samples_ &&
+           ((sample_idx + 1) * kBitsPerRankSample -
+            rank_lut_[sample_idx + 1]) <= target) {
+      sample_idx++;
+    }
+    fn(false, k, static_cast<uint32_t>(sample_idx));
+  }
+}
+
 Status Bitvector::InitFromData(const char* data, size_t data_size,
                                size_t* bytes_consumed) {
   const char* start = data;
@@ -192,8 +218,43 @@ Status Bitvector::InitFromData(const char* data, size_t data_size,
     }
   }
 
+  s = ValidateDerivedData();
+  if (!s.ok()) {
+    return s;
+  }
+
   *bytes_consumed = static_cast<size_t>(data - start);
 
+  return Status::OK();
+}
+
+Status Bitvector::ValidateDerivedData() const {
+  if (num_bits_ % 64 != 0 &&
+      (words_[num_words_ - 1] >> (num_bits_ % 64)) != 0) {
+    return Status::Corruption("Bitvector: bits set past num_bits");
+  }
+  uint64_t cumulative = 0;
+  for (uint64_t s = 0; s < num_rank_samples_; s++) {
+    if (rank_lut_[s] != cumulative) {
+      return Status::Corruption("Bitvector: rank LUT inconsistent with bits");
+    }
+    const uint64_t word_start = s * kWordsPerRankSample;
+    const uint64_t word_end =
+        std::min(word_start + kWordsPerRankSample, num_words_);
+    for (uint64_t w = word_start; w < word_end; w++) {
+      cumulative += Popcount(words_[w]);
+    }
+  }
+  if (cumulative != num_ones_) {
+    return Status::Corruption("Bitvector: num_ones inconsistent with bits");
+  }
+  bool hints_match = true;
+  ForEachSelectHint([&](bool ones, uint64_t k, uint32_t sample) {
+    hints_match &= (ones ? select1_hints_ : select0_hints_)[k] == sample;
+  });
+  if (!hints_match) {
+    return Status::Corruption("Bitvector: select hints inconsistent with bits");
+  }
   return Status::OK();
 }
 
@@ -263,37 +324,9 @@ void Bitvector::BuildRankLUT() {
 }
 
 void Bitvector::BuildSelectHints() {
-  // Build select1 hints: for each k, select1_hints_[k] is the rank LUT
-  // index of the sample interval containing the (k * kOnesPerSelectHint)-th
-  // 1-bit.
-  if (num_select1_hints_ > 0) {
-    uint32_t* hints = const_cast<uint32_t*>(select1_hints_);
-    uint64_t sample_idx = 0;
-    for (uint64_t k = 0; k < num_select1_hints_; k++) {
-      uint64_t target = k * kOnesPerSelectHint;
-      // Advance sample_idx until rank_lut_[sample_idx+1] > target.
-      while (sample_idx + 1 < num_rank_samples_ &&
-             rank_lut_[sample_idx + 1] <= target) {
-        sample_idx++;
-      }
-      hints[k] = static_cast<uint32_t>(sample_idx);
-    }
-  }
-
-  // Build select0 hints analogously using zero counts.
-  if (num_select0_hints_ > 0) {
-    uint32_t* hints = const_cast<uint32_t*>(select0_hints_);
-    uint64_t sample_idx = 0;
-    for (uint64_t k = 0; k < num_select0_hints_; k++) {
-      uint64_t target = k * kOnesPerSelectHint;
-      while (sample_idx + 1 < num_rank_samples_ &&
-             ((sample_idx + 1) * kBitsPerRankSample -
-              rank_lut_[sample_idx + 1]) <= target) {
-        sample_idx++;
-      }
-      hints[k] = static_cast<uint32_t>(sample_idx);
-    }
-  }
+  ForEachSelectHint([this](bool ones, uint64_t k, uint32_t sample) {
+    const_cast<uint32_t*>(ones ? select1_hints_ : select0_hints_)[k] = sample;
+  });
 }
 
 // FindNthOneBit is now inline in bitvector.h for hot-path performance.

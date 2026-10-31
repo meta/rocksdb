@@ -10,17 +10,28 @@
 //  Trie-based User Defined Index (UDI) for RocksDB's block-based tables.
 //
 //  This provides a TrieIndexFactory that implements the IndexFactory
-//  interface, building a Fast Succinct Trie (FST) index from the separator keys
-//  generated during SST file construction. Based on the SuRF paper results, the
-//  trie is expected to achieve significant space reduction compared to the
-//  standard index while providing comparable Seek() performance.
+//  interface, building a trie index from the separator keys generated during
+//  SST file construction.
+//
+//  Two serialized formats exist. Readers accept both; the factory's
+//  format_version option picks the one new SST files are written with:
+//  - 1 (default): a LOUDS-encoded Fast Succinct Trie. Data-block offsets and
+//    sizes are 32-bit integers. Only supported on little-endian hosts.
+//  - 2: a byte trie over buckets of front-coded separators, with 64-bit block
+//    handles (see trie_v2.h). Smaller and faster than format 1, especially
+//    for keys with long shared prefixes. RocksDB versions that predate it
+//    fail to open SST files written with it while this factory is
+//    configured.
 //
 //  Usage:
+//    // TrieIndexFactory(2) writes format 2.
 //    auto trie_factory = std::make_shared<TrieIndexFactory>();
 //    BlockBasedTableOptions table_options;
 //    table_options.user_defined_index_factory = trie_factory;
 //    table_options.index_mode =
-//    BlockBasedTableOptions::IndexMode::kStandardDefault;
+//        BlockBasedTableOptions::IndexMode::kStandardDefault;
+//  or in an options string:
+//    user_defined_index_factory={id=trie_index;format_version=2}
 //
 //  In kStandardDefault mode, reads use the standard index by default.
 //  Set ReadOptions::read_index to kPreferCustom to use the trie:
@@ -30,12 +41,12 @@
 //
 //  In kCustomDefault/kCustomOnly mode, all reads use the trie automatically.
 //
-//  The trie format stores data-block offsets and sizes as 32-bit integers.
-//  If either exceeds UINT32_MAX, SST construction fails with NotSupported in
+//  Format 1 stores data-block offsets and sizes as 32-bit integers. If
+//  either exceeds UINT32_MAX, SST construction fails with NotSupported in
 //  every mode that builds the trie, including kStandardDefault. File-size
 //  targets do not guarantee this limit: L0 outputs and SstFileWriter
-//  outputs are not split at the target size. Bound those outputs explicitly
-//  or use kStandardOnly to stop building the trie.
+//  outputs are not split at the target size. Bound those outputs explicitly,
+//  use format 2, or use kStandardOnly to stop building the trie.
 
 #pragma once
 
@@ -47,7 +58,9 @@
 #include "rocksdb/comparator.h"
 #include "rocksdb/index_factory.h"
 #include "rocksdb/types.h"
+#include "util/atomic.h"
 #include "utilities/trie_index/louds_trie.h"
+#include "utilities/trie_index/trie_v2.h"
 
 namespace ROCKSDB_NAMESPACE {
 class ObjectLibrary;
@@ -58,8 +71,35 @@ namespace trie_index {
 int RegisterBuiltinTrieIndexFactory(ObjectLibrary& library,
                                     const std::string& arg);
 
+// Scan bounds from IndexFactoryIterator::Prepare(), shared by the iterators
+// of both formats.
+class TrieScanBounds {
+ public:
+  void Prepare(const ScanOptions scan_opts[], size_t num_opts);
+
+  // Moves past the scans whose limit is at or before a Seek target.
+  void SkipScansBefore(const Slice& target, const Comparator* comparator);
+
+  // Whether Check() can return anything but kInbound.
+  bool Active() const { return prepared_ && !scan_opts_.empty(); }
+
+  // Checks whether the current block may hold keys in the current scan.
+  // reference_key is the key to compare against the limit: for Seek this is
+  // the seek target, for Next this is the previous separator key. Separators
+  // are upper bounds on block contents, not first-in-block keys, so the
+  // current separator cannot be compared against the limit directly -- see
+  // the UDI API contract in user_defined_index.h.
+  IterBoundCheck Check(const Slice& reference_key,
+                       const Comparator* comparator) const;
+
+ private:
+  std::vector<ScanOptions> scan_opts_;
+  size_t current_scan_idx_ = 0;
+  bool prepared_ = false;
+};
+
 // ============================================================================
-// TrieIndexBuilder: Implements IndexFactoryBuilder using LoudsTrieBuilder.
+// TrieIndexBuilder: Implements IndexFactoryBuilder.
 //
 // During SST file construction, RocksDB calls:
 //   1. OnKeyAdded() for each key-value pair.
@@ -67,11 +107,12 @@ int RegisterBuiltinTrieIndexFactory(ObjectLibrary& library,
 //   3. Finish() to serialize the index.
 //
 // The trie builder collects the separator keys from AddIndexEntry() and
-// builds a LOUDS-encoded trie during Finish().
+// builds the trie in the requested format during Finish().
 // ============================================================================
 class TrieIndexBuilder final : public IndexFactoryBuilder {
  public:
-  explicit TrieIndexBuilder(const Comparator* comparator);
+  // format_version is the serialized format to write, 1 or 2.
+  TrieIndexBuilder(const Comparator* comparator, uint32_t format_version);
   ~TrieIndexBuilder() override = default;
 
   // Called at each data block boundary. We compute a short separator
@@ -92,9 +133,9 @@ class TrieIndexBuilder final : public IndexFactoryBuilder {
   void OnKeyAdded(const Slice& key, ValueType type,
                   const Slice& value) override;
 
-  // Finalize the trie and return the serialized index data. Returns
-  // NotSupported if any data-block offset or size exceeds UINT32_MAX;
-  // the serialized trie encodes these fields as 32-bit integers.
+  // Finalize the trie and return the serialized index data. In format 1,
+  // returns NotSupported if any data-block offset or size exceeds UINT32_MAX;
+  // that format encodes these fields as 32-bit integers.
   Status Finish(Slice* index_contents) override;
 
   // Returns an estimate of the current serialized index size. The estimate is
@@ -121,8 +162,14 @@ class TrieIndexBuilder final : public IndexFactoryBuilder {
                       bool skip_delta_encoding) override;
 
  private:
+  // Builds the format 2 index from buffered_entries_.
+  Status FinishV2(Slice* index_contents);
+
   const Comparator* comparator_;
+  const uint32_t format_version_;
   LoudsTrieBuilder trie_builder_;
+  // Serialized format 2 index.
+  std::string v2_data_;
   bool finished_;
   bool has_unsupported_handle_ = false;
   // Set when FinishAddEntry receives an entry with nothing prepared in it, so
@@ -148,9 +195,31 @@ class TrieIndexBuilder final : public IndexFactoryBuilder {
   uint64_t estimated_trie_edges_ = 0;
   uint64_t estimated_num_entries_ = 0;
   std::string previous_prepared_separator_;
+  // Format 2 only: bytes of every separator front coded against the previous
+  // one, the longest separator, separators equal to the previous one, and
+  // entries that may carry a nonzero tag.
+  uint64_t estimated_v2_bucket_bytes_ = 0;
+  uint64_t estimated_v2_max_key_len_ = 0;
+  uint64_t estimated_v2_duplicates_ = 0;
+  uint64_t estimated_v2_tagged_ = 0;
   // Returns the shared prefix length for reusing emit-owned separator bytes.
+  // may_have_tag is whether the entry may get a nonzero tag.
   size_t UpdateSizeEstimate(const Slice& separator,
-                            const Slice& previous_separator);
+                            const Slice& previous_separator, bool may_have_tag);
+
+  // Format 2 only: statistics of the block handles added so far. Written by
+  // the thread that adds handles (the BG writer during parallel builds) and
+  // read by EstimatedSize() on the emit thread. They bound the widths of the
+  // offset and size columns.
+  RelaxedAtomic<uint64_t> max_block_step_{0};
+  RelaxedAtomic<uint64_t> max_block_size_{0};
+  RelaxedAtomic<bool> irregular_block_gaps_{false};
+  // Owned by the thread that adds handles.
+  TrieBlockHandle previous_handle_;
+  uint64_t block_gap_ = 0;
+  // Records the next block's handle in the statistics above.
+  void TrackHandle(const TrieBlockHandle& handle);
+  uint64_t EstimatedV2Size() const;
 
   // Staged data for the parallel AddIndexEntry protocol. Populated by
   // PrepareAddEntry on the emit thread, consumed by FinishAddEntry on
@@ -222,13 +291,9 @@ class TrieIndexIterator final : public IndexFactoryIterator {
   IndexFactoryBuilder::BlockHandle value() override;
 
  private:
-  // Check if the current block is within the active scan bounds.
-  // reference_key is the key to compare against the limit: for Seek this
-  // is the seek target, for Next this is the previous separator key.
-  // The trie stores separator keys (upper bounds on block contents), not
-  // first-in-block keys, so we cannot compare the current separator against
-  // the limit directly -- see the UDI API contract in user_defined_index.h.
-  IterBoundCheck CheckBounds(const Slice& reference_key) const;
+  IterBoundCheck CheckBounds(const Slice& reference_key) const {
+    return bounds_.Check(reference_key, comparator_);
+  }
 
   const Comparator* comparator_;
   LoudsTrieIterator iter_;
@@ -241,10 +306,7 @@ class TrieIndexIterator final : public IndexFactoryIterator {
   // preceding Seek or Next which sets current_key_scratch_ (copied here).
   std::string prev_key_scratch_;
 
-  // Active scan options (from Prepare()).
-  std::vector<ScanOptions> scan_opts_;
-  size_t current_scan_idx_;
-  bool prepared_;
+  TrieScanBounds bounds_;
 
   // True if the trie was built with a seqno side-table. When true:
   //   - SeekAndGetResult seeks with user key only, then does post-seek
@@ -298,7 +360,58 @@ class TrieIndexIterator final : public IndexFactoryIterator {
 };
 
 // ============================================================================
-// TrieIndexReader: Implements IndexFactoryReader.
+// TrieV2IndexIterator: Implements IndexFactoryIterator over a format 2 index.
+// ============================================================================
+class TrieV2IndexIterator final : public IndexFactoryIterator {
+ public:
+  TrieV2IndexIterator(const TrieV2Index* index, const Comparator* comparator);
+
+  void Prepare(const ScanOptions scan_opts[], size_t num_opts) override;
+  Status SeekAndGetResult(const Slice& target, IterateResult* result,
+                          const SeekContext& context) override;
+  Status NextAndGetResult(IterateResult* result) override;
+  Status SeekToFirstAndGetResult(IterateResult* result) override;
+  Status SeekToLastAndGetResult(IterateResult* result) override;
+  Status PrevAndGetResult(IterateResult* result) override;
+  IndexFactoryBuilder::BlockHandle value() override;
+
+ private:
+  // Fills *result from the iterator position after a call that returned s.
+  // bounds is the bound check result to report when positioned.
+  Status SetResult(const Status& s, IterBoundCheck bounds,
+                   IterateResult* result) const;
+
+  const Comparator* comparator_;
+  TrieV2Iterator iter_;
+  TrieScanBounds bounds_;
+  // The separator before a Next, used as the reference key for its bound
+  // check.
+  std::string prev_key_;
+};
+
+// ============================================================================
+// TrieV2IndexReader: Implements IndexFactoryReader over a format 2 index.
+// ============================================================================
+class TrieV2IndexReader : public IndexFactoryReader {
+ public:
+  explicit TrieV2IndexReader(const Comparator* comparator);
+
+  // The data must remain valid for the lifetime of this reader.
+  Status InitFromSlice(const Slice& data);
+
+  std::unique_ptr<IndexFactoryIterator> NewIterator(
+      const ReadOptions& read_options) override;
+
+  // The index is used in place, so only this object is charged.
+  size_t ApproximateMemoryUsage() const override;
+
+ private:
+  const Comparator* comparator_;
+  TrieV2Index index_;
+};
+
+// ============================================================================
+// TrieIndexReader: Implements IndexFactoryReader over a format 1 index.
 //
 // Owns (or references) the deserialized LoudsTrie and creates iterators
 // for read operations.
@@ -327,13 +440,18 @@ class TrieIndexReader : public IndexFactoryReader {
 // ============================================================================
 // TrieIndexFactory: Implements IndexFactory.
 //
-// Factory for creating TrieIndexBuilder (during SST file writes) and
-// TrieIndexReader (during SST file reads). Registered as a Customizable
-// with name "trie_index".
+// Factory for creating TrieIndexBuilder (during SST file writes) and the
+// reader matching each index's format (during SST file reads). Registered as
+// a Customizable with name "trie_index".
 // ============================================================================
 class TrieIndexFactory : public IndexFactory {
  public:
-  TrieIndexFactory() = default;
+  // Writes format version 1.
+  TrieIndexFactory();
+  // Writes the given format version, 1 or 2. Other values fail
+  // ValidateOptions() and NewBuilder() with InvalidArgument. On big-endian
+  // hosts, format 1 fails them with NotSupported.
+  explicit TrieIndexFactory(uint32_t format_version);
   ~TrieIndexFactory() override = default;
 
   static const char* kClassName() { return "trie_index"; }
@@ -345,8 +463,19 @@ class TrieIndexFactory : public IndexFactory {
       const IndexFactoryOptions& option,
       std::unique_ptr<IndexFactoryBuilder>& builder) const override;
 
+  // Reads either format version, whatever this factory writes.
   Status NewReader(const IndexFactoryOptions& option, Slice& index_block,
                    std::unique_ptr<IndexFactoryReader>& reader) const override;
+
+  // Rejects an unknown format version and a comparator other than
+  // BytewiseComparator.
+  Status ValidateOptions(const DBOptions& db_opts,
+                         const ColumnFamilyOptions& cf_opts) const override;
+
+ private:
+  Status ValidateFormatVersion() const;
+
+  uint32_t format_version_;
 };
 
 }  // namespace trie_index

@@ -369,6 +369,16 @@ class DBCrashTestTest(unittest.TestCase):
             self.assertEqual(0, choose_tracking())
             self.assertEqual(1, choose_tracking())
 
+    def test_trie_index_format_version_is_randomized_per_invocation(self):
+        # Readers handle every format, so DBs may mix SSTs of both formats.
+        db_crashtest = self.load_db_crashtest()
+        choose_version = db_crashtest.default_params["trie_index_format_version"]
+
+        with mock.patch.object(db_crashtest.random, "choice", side_effect=min):
+            self.assertEqual(1, choose_version())
+        with mock.patch.object(db_crashtest.random, "choice", side_effect=max):
+            self.assertEqual(2, choose_version())
+
     def test_cf_lifecycle_profile_and_schedule(self):
         db_crashtest = self.load_db_crashtest()
         params = db_crashtest.gen_cmd_params(
@@ -1204,6 +1214,117 @@ class DBCrashTestTest(unittest.TestCase):
                 self.assertEqual(
                     0, finalized["ingest_external_file_atomic_replace_one_in"]
                 )
+
+    def test_finalize_trie_index_mode_rules(self):
+        db_crashtest = self.load_db_crashtest()
+        for index_mode in range(5):
+            with self.subTest(index_mode=index_mode):
+                params = self.build_params(
+                    db_crashtest.default_params,
+                    {
+                        "use_trie_index": 1,
+                        "index_mode": index_mode,
+                        "mmap_read": 1,
+                        "index_type": 2,
+                        "partition_filters": 1,
+                        "backup_one_in": 1000,
+                        "test_secondary": 1,
+                        "remote_compaction_worker_threads": 0,
+                        "format_version": 2,
+                    },
+                )
+
+                finalized = db_crashtest.finalize_and_sanitize(params)
+
+                self.assertEqual(index_mode, finalized["index_mode"])
+                self.assertEqual(0, finalized["mmap_read"])
+                if index_mode in (2, 3):
+                    self.assertIn(finalized["index_type"], [0, 3])
+                    self.assertEqual(0, finalized["partition_filters"])
+                    self.assertEqual(0, finalized["backup_one_in"])
+                    self.assertEqual(0, finalized["test_secondary"])
+                else:
+                    self.assertEqual(2, finalized["index_type"])
+                    self.assertEqual(1, finalized["partition_filters"])
+                    self.assertEqual(1000, finalized["backup_one_in"])
+                    self.assertEqual(1, finalized["test_secondary"])
+                if index_mode == 3:
+                    self.assertGreaterEqual(finalized["format_version"], 6)
+
+    def test_finalize_keeps_remote_compaction_in_trie_index_modes(self):
+        db_crashtest = self.load_db_crashtest()
+        for index_mode in range(5):
+            with self.subTest(index_mode=index_mode):
+                params = self.build_params(
+                    db_crashtest.default_params,
+                    {
+                        "use_trie_index": 1,
+                        "index_mode": index_mode,
+                        "backup_one_in": 0,
+                        "test_secondary": 0,
+                        "remote_compaction_worker_threads": 8,
+                        "enable_blob_direct_write": 0,
+                        "use_txn": 0,
+                    },
+                )
+
+                finalized = db_crashtest.finalize_and_sanitize(params)
+
+                self.assertEqual(8, finalized["remote_compaction_worker_threads"])
+
+    def test_finalize_read_index_rules(self):
+        db_crashtest = self.load_db_crashtest()
+        # (use_trie_index, index_mode, read_index, expected read_index)
+        cases = [
+            (1, 2, 1, 1),  # kBuiltin is valid with kCustomDefault
+            (1, 3, 1, -1),  # kCustomOnly has only a stub standard index
+            (1, 3, 2, 2),
+            (0, 1, 1, -1),  # selectors need the trie factory
+            (0, 1, 2, -1),
+            (0, 1, 0, 0),
+        ]
+        for use_trie_index, index_mode, read_index, expected in cases:
+            with self.subTest(
+                use_trie_index=use_trie_index,
+                index_mode=index_mode,
+                read_index=read_index,
+            ):
+                params = self.build_params(
+                    db_crashtest.default_params,
+                    {
+                        "use_trie_index": use_trie_index,
+                        "index_mode": index_mode,
+                        "read_index": read_index,
+                    },
+                )
+
+                finalized = db_crashtest.finalize_and_sanitize(params)
+
+                self.assertEqual(expected, finalized["read_index"])
+
+    def test_finalize_resets_custom_index_mode_without_trie(self):
+        db_crashtest = self.load_db_crashtest()
+        for index_mode in (2, 3, 4):
+            for overrides in (
+                {"use_trie_index": 0},
+                # Timestamps disable the trie after the trie rules run.
+                {
+                    "use_trie_index": 1,
+                    "user_timestamp_size": 8,
+                    "persist_user_defined_timestamps": 1,
+                },
+            ):
+                with self.subTest(index_mode=index_mode, **overrides):
+                    params = self.build_params(
+                        db_crashtest.default_params,
+                        dict(overrides, index_mode=index_mode, read_index=2),
+                    )
+
+                    finalized = db_crashtest.finalize_and_sanitize(params)
+
+                    self.assertEqual(0, finalized["use_trie_index"])
+                    self.assertEqual(1, finalized["index_mode"])
+                    self.assertEqual(-1, finalized["read_index"])
 
     def test_sanitize_known_stderr_suppresses_only_known_sigterm_lines(self):
         db_crashtest = self.load_db_crashtest()

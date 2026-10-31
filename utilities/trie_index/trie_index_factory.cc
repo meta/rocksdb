@@ -10,13 +10,29 @@
 #include <cstring>
 
 #include "db/dbformat.h"
+#include "port/port.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/utilities/object_registry.h"
+#include "rocksdb/utilities/options_type.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
+#include "util/math.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace trie_index {
+
+namespace {
+// Separators per bucket in format 2. Larger buckets make the index smaller
+// and Seek slower; 8 was the best tradeoff on the key sets measured. The
+// value is stored in each index, so it can change without a format change.
+constexpr uint32_t kTrieV2BucketSize = 8;
+
+std::unordered_map<std::string, OptionTypeInfo> trie_index_factory_type_info = {
+    {"format_version",
+     {0, OptionType::kUInt32T, OptionVerificationType::kNormal,
+      OptionTypeFlags::kNone}},
+};
+}  // namespace
 
 int RegisterBuiltinTrieIndexFactory(ObjectLibrary& library,
                                     const std::string& /*arg*/) {
@@ -35,8 +51,11 @@ int RegisterBuiltinTrieIndexFactory(ObjectLibrary& library,
 // TrieIndexBuilder
 // ============================================================================
 
-TrieIndexBuilder::TrieIndexBuilder(const Comparator* comparator)
-    : comparator_(comparator), finished_(false) {}
+TrieIndexBuilder::TrieIndexBuilder(const Comparator* comparator,
+                                   uint32_t format_version)
+    : comparator_(comparator),
+      format_version_(format_version),
+      finished_(false) {}
 
 Slice TrieIndexBuilder::AddIndexEntry(const Slice& last_key_in_current_block,
                                       const Slice* first_key_in_next_block,
@@ -141,10 +160,11 @@ Slice TrieIndexBuilder::AddIndexEntry(const Slice& last_key_in_current_block,
   entry.handle = handle;
   has_unsupported_handle_ |=
       handle.offset > UINT32_MAX || handle.size > UINT32_MAX;
+  TrackHandle(handle);
   const Slice previous_separator =
       buffered_entries_.empty() ? Slice()
                                 : Slice(buffered_entries_.back().separator_key);
-  UpdateSizeEstimate(entry.separator_key, previous_separator);
+  UpdateSizeEstimate(entry.separator_key, previous_separator, entry.tag != 0);
   buffered_entries_.push_back(std::move(entry));
 
   return separator;
@@ -161,14 +181,17 @@ Status TrieIndexBuilder::Finish(Slice* index_contents) {
     return Status::InvalidArgument("TrieIndexBuilder::Finish called twice");
   }
   finished_ = true;
-  if (has_unsupported_handle_) {
-    return Status::NotSupported(
-        "Trie index block offset or size exceeds the 32-bit encoding limit");
-  }
   if (has_unprepared_entry_) {
     return Status::InvalidArgument(
         "TrieIndexBuilder::FinishAddEntry called without a matching "
         "PrepareAddEntry");
+  }
+  if (format_version_ == kTrieV2FormatVersion) {
+    return FinishV2(index_contents);
+  }
+  if (has_unsupported_handle_) {
+    return Status::NotSupported(
+        "Trie index block offset or size exceeds the 32-bit encoding limit");
   }
 
   // Every staged entry needs the seqno side-table so the post-seek
@@ -242,11 +265,30 @@ Status TrieIndexBuilder::Finish(Slice* index_contents) {
   return Status::OK();
 }
 
+Status TrieIndexBuilder::FinishV2(Slice* index_contents) {
+  // The tags have the meaning TrieV2Builder::AddBlock() expects: 0 for a
+  // block found by user key alone, otherwise the tag of the block's last key.
+  TrieV2Builder builder(kTrieV2BucketSize);
+  for (const BufferedEntry& entry : buffered_entries_) {
+    builder.AddBlock(entry.separator_key, entry.handle, entry.tag);
+  }
+  buffered_entries_.clear();
+  buffered_entries_.shrink_to_fit();
+  Status s = builder.Finish(&v2_data_);
+  if (s.ok()) {
+    *index_contents = v2_data_;
+  }
+  return s;
+}
+
 // ============================================================================
 // TrieIndexIterator
 // ============================================================================
 
 uint64_t TrieIndexBuilder::EstimatedSize() const {
+  if (format_version_ == kTrieV2FormatVersion) {
+    return finished_ ? v2_data_.size() : EstimatedV2Size();
+  }
   if (finished_) {
     return trie_builder_.GetSerializedData().size();
   }
@@ -258,11 +300,85 @@ uint64_t TrieIndexBuilder::EstimatedSize() const {
 }
 
 size_t TrieIndexBuilder::UpdateSizeEstimate(const Slice& separator,
-                                            const Slice& previous_separator) {
+                                            const Slice& previous_separator,
+                                            bool may_have_tag) {
   const size_t shared_prefix = previous_separator.difference_offset(separator);
-  estimated_trie_edges_ += separator.size() - shared_prefix;
+  const size_t drop = previous_separator.size() - shared_prefix;
+  const size_t add = separator.size() - shared_prefix;
+  estimated_trie_edges_ += add;
+  if (format_version_ == kTrieV2FormatVersion) {
+    // Matches the entry encoding in trie_v2.h. The first separator and the
+    // bucket heads are charged too, which only overestimates.
+    estimated_v2_bucket_bytes_ +=
+        add + (drop < 15 && add < 15
+                   ? 1
+                   : 1 + VarintLength(drop) + VarintLength(add));
+    estimated_v2_max_key_len_ =
+        std::max<uint64_t>(estimated_v2_max_key_len_, separator.size());
+    if (estimated_num_entries_ > 0 && drop == 0 && add == 0) {
+      ++estimated_v2_duplicates_;
+      may_have_tag = true;
+    }
+    if (may_have_tag) {
+      ++estimated_v2_tagged_;
+    }
+  }
   ++estimated_num_entries_;
   return shared_prefix;
+}
+
+void TrieIndexBuilder::TrackHandle(const TrieBlockHandle& handle) {
+  if (format_version_ != kTrieV2FormatVersion) {
+    return;
+  }
+  max_block_size_.StoreRelaxed(
+      std::max(max_block_size_.LoadRelaxed(), handle.size));
+  if (!buffered_entries_.empty()) {
+    const uint64_t step = handle.offset - previous_handle_.offset;
+    max_block_step_.StoreRelaxed(std::max(max_block_step_.LoadRelaxed(), step));
+    // Mirrors the derived-size rule in TrieV2Builder::Finish(). Wrapping
+    // arithmetic only matters for blocks that already make sizes explicit.
+    const uint64_t previous_end =
+        previous_handle_.offset + previous_handle_.size;
+    const uint64_t gap = handle.offset - previous_end;
+    if (handle.offset < previous_end ||
+        previous_end < previous_handle_.offset ||
+        (buffered_entries_.size() > 1 && gap != block_gap_)) {
+      irregular_block_gaps_.StoreRelaxed(true);
+    }
+    block_gap_ = gap;
+  }
+  previous_handle_ = handle;
+}
+
+uint64_t TrieIndexBuilder::EstimatedV2Size() const {
+  // Upper bound on every section of the format described in trie_v2.h.
+  auto column = [](uint64_t count, uint64_t max_range) {
+    // The residuals of a group never exceed the range of its values.
+    const uint64_t width = max_range == 0 ? 0 : FloorLog2(max_range) + 1;
+    return 16 + 16 * ((count + 63) / 64) + (count * width + 7) / 8 + 8;
+  };
+  const uint64_t n = estimated_num_entries_;
+  const uint64_t num_buckets = (n + kTrieV2BucketSize - 1) / kTrieV2BucketSize;
+  // Path and label bytes never exceed the front-coded suffix bytes. A trie
+  // with b terminal nodes has fewer than 2b nodes, each costing at most 17
+  // bytes besides its path: header, path length, bucket id, child count,
+  // the pointer to it, and its share of a bitmap.
+  const uint64_t trie = estimated_trie_edges_ + 17 * 2 * num_buckets;
+  // Offsets and sizes come in block order, so a group of 64 offsets spans at
+  // most 64 steps (the last one to the sentinel), and a size column value is
+  // at most the largest size.
+  const uint64_t max_step = max_block_step_.LoadRelaxed();
+  const uint64_t max_size = max_block_size_.LoadRelaxed();
+  uint64_t size =
+      kTrieV2HeaderSize + estimated_v2_max_key_len_ + trie +
+      column(num_buckets + 1, estimated_v2_bucket_bytes_) +
+      estimated_v2_bucket_bytes_ + column(n + 1, 64 * (max_step + max_size)) +
+      8 + 16 * estimated_v2_duplicates_ + 8 + 16 * estimated_v2_tagged_ + 16;
+  if (irregular_block_gaps_.LoadRelaxed()) {
+    size += column(n, max_size);
+  }
+  return size;
 }
 
 // ---------------------------------------------------------------------------
@@ -301,8 +417,11 @@ void TrieIndexBuilder::PrepareAddEntry(const Slice& last_key_in_current_block,
   }
 
   p->valid = true;
+  // A separator equal to the previous one gets a tag in FinishAddEntry, which
+  // UpdateSizeEstimate detects.
   const size_t shared_prefix =
-      UpdateSizeEstimate(p->separator_key, previous_prepared_separator_);
+      UpdateSizeEstimate(p->separator_key, previous_prepared_separator_,
+                         p->same_user_key_initial || !p->has_next_block);
   // The writer can move the prepared key as soon as this callback returns.
   // Keep one emit-owned copy, reusing the prefix bytes already stored here.
   previous_prepared_separator_.replace(shared_prefix, std::string::npos,
@@ -363,6 +482,7 @@ void TrieIndexBuilder::FinishAddEntry(const BlockHandle& block_handle,
   be.handle.size = block_handle.size;
   has_unsupported_handle_ |=
       be.handle.offset > UINT32_MAX || be.handle.size > UINT32_MAX;
+  TrackHandle(be.handle);
 
   buffered_entries_.push_back(std::move(be));
 
@@ -377,8 +497,6 @@ TrieIndexIterator::TrieIndexIterator(const LoudsTrie* trie,
     : comparator_(comparator),
       iter_(trie),
       trie_(trie),
-      current_scan_idx_(0),
-      prepared_(false),
       has_seqno_encoding_(has_seqno_encoding),
       overflow_run_index_(0),
       overflow_run_size_(1),
@@ -386,13 +504,7 @@ TrieIndexIterator::TrieIndexIterator(const LoudsTrie* trie,
 
 void TrieIndexIterator::Prepare(const ScanOptions scan_opts[],
                                 size_t num_opts) {
-  scan_opts_.clear();
-  scan_opts_.reserve(num_opts);
-  for (size_t i = 0; i < num_opts; i++) {
-    scan_opts_.push_back(scan_opts[i]);
-  }
-  current_scan_idx_ = 0;
-  prepared_ = true;
+  bounds_.Prepare(scan_opts, num_opts);
 }
 
 Status TrieIndexIterator::SeekToFirstAndGetResult(IterateResult* result) {
@@ -460,20 +572,7 @@ Status TrieIndexIterator::SeekAndGetResult(const Slice& target,
                                            const SeekContext& context) {
   uint64_t target_packed = context.target_tag;
 
-  // Advance current_scan_idx_ past any scans whose limit <= target.
-  // This handles the multi-scan case where the caller seeks into a later
-  // scan range after the previous scan returned kOutOfBound.
-  if (prepared_) {
-    while (current_scan_idx_ < scan_opts_.size()) {
-      const auto& opts = scan_opts_[current_scan_idx_];
-      if (opts.range.limit.has_value() &&
-          comparator_->Compare(target, opts.range.limit.value()) >= 0) {
-        current_scan_idx_++;
-      } else {
-        break;
-      }
-    }
-  }
+  bounds_.SkipScansBefore(target, comparator_);
 
   ResetOverflowState();
 
@@ -625,24 +724,44 @@ IndexFactoryBuilder::BlockHandle TrieIndexIterator::value() {
   return IndexFactoryBuilder::BlockHandle{handle.offset, handle.size};
 }
 
-IterBoundCheck TrieIndexIterator::CheckBounds(
-    const Slice& reference_key) const {
-  if (!prepared_ || scan_opts_.empty()) {
-    // No bounds to check -- always in-bound.
+// ============================================================================
+// TrieScanBounds
+// ============================================================================
+
+void TrieScanBounds::Prepare(const ScanOptions scan_opts[], size_t num_opts) {
+  scan_opts_.assign(scan_opts, scan_opts + num_opts);
+  current_scan_idx_ = 0;
+  prepared_ = true;
+}
+
+void TrieScanBounds::SkipScansBefore(const Slice& target,
+                                     const Comparator* comparator) {
+  // This handles the multi-scan case where the caller seeks into a later
+  // scan range after the previous scan returned kOutOfBound.
+  if (!prepared_) {
+    return;
+  }
+  while (current_scan_idx_ < scan_opts_.size()) {
+    const auto& opts = scan_opts_[current_scan_idx_];
+    if (opts.range.limit.has_value() &&
+        comparator->Compare(target, opts.range.limit.value()) >= 0) {
+      current_scan_idx_++;
+    } else {
+      break;
+    }
+  }
+}
+
+IterBoundCheck TrieScanBounds::Check(const Slice& reference_key,
+                                     const Comparator* comparator) const {
+  if (!Active()) {
     return IterBoundCheck::kInbound;
   }
-
   if (current_scan_idx_ >= scan_opts_.size()) {
     return IterBoundCheck::kOutOfBound;
   }
-
   const auto& opts = scan_opts_[current_scan_idx_];
 
-  // Check upper bound (limit) against the reference key, NOT the current
-  // separator. The trie stores separator keys (upper bounds on block
-  // contents), so comparing the separator against the limit would
-  // prematurely reject blocks that contain keys < limit.
-  //
   // For Seek: reference_key = seek target. If target < limit, the found
   //   block may contain keys within bounds.
   // For Next: reference_key = previous separator. If prev_sep < limit,
@@ -650,14 +769,99 @@ IterBoundCheck TrieIndexIterator::CheckBounds(
   //
   // This is conservative: it may return kInbound for a block that is fully
   // out of bounds. The data-level iterator handles per-key filtering.
-  if (opts.range.limit.has_value()) {
-    const Slice& limit = opts.range.limit.value();
-    if (comparator_->Compare(reference_key, limit) >= 0) {
-      return IterBoundCheck::kOutOfBound;
-    }
+  if (opts.range.limit.has_value() &&
+      comparator->Compare(reference_key, opts.range.limit.value()) >= 0) {
+    return IterBoundCheck::kOutOfBound;
   }
-
   return IterBoundCheck::kInbound;
+}
+
+// ============================================================================
+// TrieV2IndexIterator
+// ============================================================================
+
+TrieV2IndexIterator::TrieV2IndexIterator(const TrieV2Index* index,
+                                         const Comparator* comparator)
+    : comparator_(comparator), iter_(index) {}
+
+void TrieV2IndexIterator::Prepare(const ScanOptions scan_opts[],
+                                  size_t num_opts) {
+  bounds_.Prepare(scan_opts, num_opts);
+}
+
+Status TrieV2IndexIterator::SetResult(const Status& s, IterBoundCheck bounds,
+                                      IterateResult* result) const {
+  if (s.ok() && iter_.Valid()) {
+    result->key = iter_.key();
+    result->bound_check_result = bounds;
+  } else {
+    // Running off the end of this SST says nothing about the upper bound:
+    // the next SST on the level may still hold in-bound keys, and
+    // kOutOfBound would make LevelIterator stop scanning the level.
+    result->key = Slice();
+    result->bound_check_result = IterBoundCheck::kUnknown;
+  }
+  return s;
+}
+
+Status TrieV2IndexIterator::SeekAndGetResult(const Slice& target,
+                                             IterateResult* result,
+                                             const SeekContext& context) {
+  bounds_.SkipScansBefore(target, comparator_);
+  Status s = iter_.Seek(target, context.target_tag);
+  return SetResult(s, bounds_.Check(target, comparator_), result);
+}
+
+Status TrieV2IndexIterator::NextAndGetResult(IterateResult* result) {
+  const bool check_bounds = bounds_.Active();
+  if (check_bounds) {
+    const Slice key = iter_.key();
+    prev_key_.assign(key.data(), key.size());
+  }
+  Status s = iter_.Next();
+  return SetResult(s,
+                   check_bounds ? bounds_.Check(prev_key_, comparator_)
+                                : IterBoundCheck::kInbound,
+                   result);
+}
+
+Status TrieV2IndexIterator::SeekToFirstAndGetResult(IterateResult* result) {
+  return SetResult(iter_.SeekToFirst(), IterBoundCheck::kInbound, result);
+}
+
+Status TrieV2IndexIterator::SeekToLastAndGetResult(IterateResult* result) {
+  return SetResult(iter_.SeekToLast(), IterBoundCheck::kInbound, result);
+}
+
+Status TrieV2IndexIterator::PrevAndGetResult(IterateResult* result) {
+  // Upper-bound checks are based on forward movement. While moving backward,
+  // DBIter's lower-bound handling decides when to stop.
+  return SetResult(iter_.Prev(), IterBoundCheck::kInbound, result);
+}
+
+IndexFactoryBuilder::BlockHandle TrieV2IndexIterator::value() {
+  const TrieBlockHandle handle = iter_.value();
+  return IndexFactoryBuilder::BlockHandle{handle.offset, handle.size};
+}
+
+// ============================================================================
+// TrieV2IndexReader
+// ============================================================================
+
+TrieV2IndexReader::TrieV2IndexReader(const Comparator* comparator)
+    : comparator_(comparator) {}
+
+Status TrieV2IndexReader::InitFromSlice(const Slice& data) {
+  return index_.Init(data);
+}
+
+std::unique_ptr<IndexFactoryIterator> TrieV2IndexReader::NewIterator(
+    const ReadOptions& /*read_options*/) {
+  return std::make_unique<TrieV2IndexIterator>(&index_, comparator_);
+}
+
+size_t TrieV2IndexReader::ApproximateMemoryUsage() const {
+  return sizeof(*this);
 }
 
 // ============================================================================
@@ -687,6 +891,56 @@ size_t TrieIndexReader::ApproximateMemoryUsage() const {
 // TrieIndexFactory
 // ============================================================================
 
+TrieIndexFactory::TrieIndexFactory() : TrieIndexFactory(1) {}
+
+TrieIndexFactory::TrieIndexFactory(uint32_t format_version)
+    : format_version_(format_version) {
+  RegisterOptions("TrieIndexFactoryOptions", &format_version_,
+                  &trie_index_factory_type_info);
+}
+
+namespace {
+// Format 1 stores arrays in host byte order and reads them in place, with a
+// little-endian header, so only little-endian hosts can read it.
+Status CheckFormatOneSupported() {
+  if (!port::kLittleEndian) {
+    return Status::NotSupported(
+        "Trie index format 1 requires a little-endian host; use "
+        "format_version=2");
+  }
+  return Status::OK();
+}
+}  // namespace
+
+Status TrieIndexFactory::ValidateFormatVersion() const {
+  if (format_version_ == 1) {
+    return CheckFormatOneSupported();
+  }
+  if (format_version_ != kTrieV2FormatVersion) {
+    return Status::InvalidArgument(
+        "TrieIndexFactory format_version must be 1 or 2; got " +
+        std::to_string(format_version_));
+  }
+  return Status::OK();
+}
+
+Status TrieIndexFactory::ValidateOptions(
+    const DBOptions& db_opts, const ColumnFamilyOptions& cf_opts) const {
+  Status s = ValidateFormatVersion();
+  if (!s.ok()) {
+    return s;
+  }
+  // NewBuilder() and NewReader() reject other comparators too; failing here
+  // stops DB::Open instead of every flush and compaction.
+  if (cf_opts.comparator != nullptr &&
+      cf_opts.comparator != BytewiseComparator()) {
+    return Status::NotSupported(
+        "TrieIndexFactory requires BytewiseComparator; got: ",
+        cf_opts.comparator->Name());
+  }
+  return IndexFactory::ValidateOptions(db_opts, cf_opts);
+}
+
 Status TrieIndexFactory::NewBuilder(
     const IndexFactoryOptions& option,
     std::unique_ptr<IndexFactoryBuilder>& builder) const {
@@ -704,9 +958,13 @@ Status TrieIndexFactory::NewBuilder(
   // Default to BytewiseComparator when null. The trie requires a bytewise
   // comparator for separator key ordering; null would cause a dereference
   // crash in AddIndexEntry when comparing keys.
+  Status s = ValidateFormatVersion();
+  if (!s.ok()) {
+    return s;
+  }
   const Comparator* cmp =
       option.comparator ? option.comparator : BytewiseComparator();
-  builder = std::make_unique<TrieIndexBuilder>(cmp);
+  builder = std::make_unique<TrieIndexBuilder>(cmp, format_version_);
   return Status::OK();
 }
 
@@ -719,8 +977,25 @@ Status TrieIndexFactory::NewReader(
     return Status::NotSupported(
         "TrieIndexFactory requires BytewiseComparator; got: ", cmp->Name());
   }
+  // Both formats start with the magic and a 32-bit version. Format 1 reports
+  // its own errors for anything that is not format 2, including truncation.
+  if (index_block.size() >= 8 &&
+      DecodeFixed32(index_block.data() + 4) == kTrieV2FormatVersion) {
+    std::unique_ptr<TrieV2IndexReader> v2_reader =
+        std::make_unique<TrieV2IndexReader>(cmp);
+    Status s = v2_reader->InitFromSlice(index_block);
+    if (!s.ok()) {
+      return s;
+    }
+    reader = std::move(v2_reader);
+    return Status::OK();
+  }
+  Status s = CheckFormatOneSupported();
+  if (!s.ok()) {
+    return s;
+  }
   auto trie_reader = std::make_unique<TrieIndexReader>(cmp);
-  Status s = trie_reader->InitFromSlice(index_block);
+  s = trie_reader->InitFromSlice(index_block);
   if (!s.ok()) {
     return s;
   }

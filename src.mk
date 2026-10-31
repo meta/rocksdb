@@ -352,6 +352,7 @@ LIB_SOURCES =                                                   \
   utilities/trie_index/bitvector.cc                              \
   utilities/trie_index/louds_trie.cc                             \
   utilities/trie_index/trie_index_factory.cc                     \
+  utilities/trie_index/trie_v2.cc                                \
   utilities/types_util.cc                                       \
   utilities/wal_filter.cc                                       \
   utilities/write_batch_with_index/write_batch_with_index.cc    \

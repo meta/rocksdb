@@ -381,6 +381,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "utilities/trie_index/bitvector.cc",
         "utilities/trie_index/louds_trie.cc",
         "utilities/trie_index/trie_index_factory.cc",
+        "utilities/trie_index/trie_v2.cc",
         "utilities/ttl/db_ttl_impl.cc",
         "utilities/types_util.cc",
         "utilities/wal_filter.cc",
