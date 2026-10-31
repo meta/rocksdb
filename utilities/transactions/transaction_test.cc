@@ -275,6 +275,60 @@ TEST_P(TransactionTest, SuccessTest) {
   delete txn;
 }
 
+TEST_P(TransactionTest, SingleDeleteBatchLocking) {
+  ColumnFamilyHandle* cf1 = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(ColumnFamilyOptions(), "cf1", &cf1));
+  ColumnFamilyHandle* cf0 = db->DefaultColumnFamily();
+
+  WriteOptions write_options;
+  ReadOptions read_options;
+  std::string value;
+
+  ASSERT_OK(db->Put(write_options, cf0, "k0", "val0"));
+  ASSERT_OK(db->Put(write_options, cf1, "k1", "val1"));
+
+  Transaction* txn = db->BeginTransaction(write_options);
+  ASSERT_TRUE(txn);
+
+  ASSERT_OK(txn->GetForUpdate(read_options, cf0, "k0", &value));
+  ASSERT_EQ("val0", value);
+
+  // A batched SingleDelete on the key locked by txn should time out / fail
+  {
+    WriteBatch batch;
+    ASSERT_OK(batch.SingleDelete(cf0, "k0"));
+    Status s = db->Write(write_options, &batch);
+    ASSERT_TRUE(s.IsTimedOut() || s.IsBusy()) << s.ToString();
+  }
+
+  // The key must not have been deleted
+  ASSERT_OK(db->Get(read_options, cf0, "k0", &value));
+  ASSERT_EQ("val0", value);
+
+  ASSERT_OK(txn->Rollback());
+  delete txn;
+
+  // After rollback, batched SingleDelete on default CF succeeds
+  {
+    WriteBatch batch;
+    ASSERT_OK(batch.SingleDelete(cf0, "k0"));
+    ASSERT_OK(db->Write(write_options, &batch));
+    Status s = db->Get(read_options, cf0, "k0", &value);
+    ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+  }
+
+  // Batched SingleDelete on non-default CF also succeeds
+  {
+    WriteBatch batch;
+    ASSERT_OK(batch.SingleDelete(cf1, "k1"));
+    ASSERT_OK(db->Write(write_options, &batch));
+    Status s = db->Get(read_options, cf1, "k1", &value);
+    ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+  }
+
+  delete cf1;
+}
+
 TEST_P(TransactionTest, DirectWriteCommitPath) {
   if (options.two_write_queues || options.unordered_write) {
     ROCKSDB_GTEST_BYPASS(
