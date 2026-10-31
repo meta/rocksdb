@@ -500,7 +500,11 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
 // past its reservation, which holds about one entry per 107 bytes of reserved
 // capacity: once SetCapacity raises capacity beyond that (about 38x for 4 KiB
 // entries, with the default max_capacity), new keys are also evicted by
-// occupancy.
+// occupancy. Each shard also keeps one cache line per thread that has used it
+// (allocated 64 threads at a time, for up to 8192 threads), which is not
+// charged against capacity. A thread that finds all 8192 in use (exited
+// threads' lines are reused) takes the shard mutex instead whenever it pins
+// or unpins an entry still in probation.
 //
 // This is an opt-in implementation reached only by constructing it directly
 // (see MakeSharedCache); no option string or tool selects it and it is not

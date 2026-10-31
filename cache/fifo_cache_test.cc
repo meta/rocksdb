@@ -6,6 +6,9 @@
 #include "cache/fifo_cache.h"
 
 #include <atomic>
+#ifndef OS_WIN
+#include <pthread.h>
+#endif
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -26,6 +29,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/random.h"
+#include "util/thread_local.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -125,47 +129,54 @@ class FIFOCacheTest : public testing::Test {
   }
 
   // Drives resident second-chance laps around "k" and returns the number of
-  // resident evictions before "k" itself is evicted. "k" travels the public
-  // path throughout (pressure promotion, saturating lookups); only the cold
-  // filler entries use TEST_PromoteToResident, and only for placement (their
-  // frequency is 0 either way). Resident holds exactly 10 entries whenever
-  // pressure is applied, so k is visited once per 9 evictions: counter n
-  // means exactly 9n evictions before k. Rounds are capped so a broken
-  // termination bound fails instead of hanging.
+  // resident evictions before "k" itself is evicted. Everything travels the
+  // public path: fillers reach resident through pressure promotion (hit
+  // twice, then an over-budget probation sweep promotes them while a cold
+  // sacrificial covers the eviction). Resident holds exactly 10 entries
+  // whenever round pressure is applied, so k is visited once per 9
+  // evictions: counter n means exactly 9n evictions before k. Capacity is
+  // 11 so a refill (filler plus sacrificial) stages without pressure,
+  // while each round still draws from resident first with a single
+  // trigger in probation at (not over) the budget of 1. Rounds are capped
+  // so a broken termination bound fails instead of hanging.
   int CountEvictionsBeforeK(int hits) {
-    NewCache(/*capacity*/ 10);
+    NewCache(/*capacity*/ 11);
     EXPECT_OK(Insert("k"));
     HitNTimes("k", 2);
     for (int i = 0; i < 9; i++) {
-      EXPECT_OK(Insert("f" + std::to_string(i)));
-    }
-    // Promotes k (resetting its counter) and evicts f0.
-    EXPECT_OK(Insert("p"));
-    HitNTimes("k", hits);
-    for (int i = 1; i < 9; i++) {
-      Erase("f" + std::to_string(i));
-    }
-    Erase("p");
-    int evicted = 0;
-    int tag = 0;
-    // Refill resident to 10 (k plus 9 cold) without pressure.
-    for (int i = 0; i < 9; i++) {
-      std::string y = "y" + std::to_string(tag++);
+      std::string y = "y" + std::to_string(i);
       EXPECT_OK(Insert(y));
-      cache_->TEST_PromoteToResident(y);
+      HitNTimes(y, 2);
     }
+    EXPECT_OK(Insert("s"));
+    // Promotes k and y0..y8, evicts s: resident holds k plus 9 cold.
+    EXPECT_OK(Insert("t"));
+    Erase("t");
+    HitNTimes("k", hits);
+    int evicted = 0;
+    int tag = 9;
     for (int round = 0; round < 40; round++) {
+      // Two triggers: the first lands without pressure, the second applies
+      // it with probation at (not over) budget, so resident goes first.
       std::string l = "l" + std::to_string(round);
       EXPECT_OK(Insert(l));
+      std::string m = "m" + std::to_string(round);
+      EXPECT_OK(Insert(m));
       if (!ContainsForTest("k")) {
         break;
       }
       Erase(l);
+      Erase(m);
       evicted++;
-      // Restore resident to 10 without pressure.
+      // Restore resident to 10 without disturbing it: the sweep promotes
+      // the filler and spends the sacrificial.
       std::string y = "y" + std::to_string(tag++);
       EXPECT_OK(Insert(y));
-      cache_->TEST_PromoteToResident(y);
+      HitNTimes(y, 2);
+      EXPECT_OK(Insert("s" + std::to_string(round)));
+      std::string t = "t" + std::to_string(round);
+      EXPECT_OK(Insert(t));
+      Erase(t);
     }
     EXPECT_FALSE(ContainsForTest("k"));
     return evicted;
@@ -1645,6 +1656,652 @@ TEST_F(FIFOCacheTest, UseAdaptiveMutexReachesShard) {
   }
 }
 
+// R1/R2: exceeding the probation budget under total capacity evicts
+// nothing; the cold head waits first in line and goes on first pressure
+// while a later twice-hit entry survives.
+TEST_F(FIFOCacheTest, ProbationOverBudgetEvictsProbationHead) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_EQ(12, cache_->TEST_GetProbationBudget());
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  HitNTimes("b", 2);
+  for (int i = 0; i < 11; i++) {
+    EXPECT_OK(Insert("c" + std::to_string(i)));
+  }
+  // Probation holds 13, over the budget of 12, but total 13 is under
+  // capacity: nothing evicted.
+  EXPECT_EQ(13, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(13, cache_->GetUsage());
+  EXPECT_TRUE(ContainsForTest("a"));
+  ValidateFIFOList({"a", "b", "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7",
+                    "c8", "c9", "c10"});
+  for (int i = 0; i < 87; i++) {
+    EXPECT_OK(Insert("d" + std::to_string(i)));
+  }
+  EXPECT_EQ(100, cache_->GetUsage());
+  EXPECT_OK(Insert("e"));
+  EXPECT_FALSE(ContainsForTest("a"));
+  EXPECT_TRUE(ContainsForTest("b"));
+  EXPECT_TRUE(ContainsForTest("e"));
+  EXPECT_EQ(100, cache_->GetUsage());
+}
+
+// R2: with probation under budget, pressure draws from resident first.
+// Fails on the unbounded base, which always drains probation first.
+TEST_F(FIFOCacheTest, ProbationUnderBudgetDrawsFromResident) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("r"));
+  HitNTimes("r", 2);
+  for (int i = 0; i < 87; i++) {
+    std::string y = "y" + std::to_string(i);
+    EXPECT_OK(Insert(y));
+    HitNTimes(y, 2);
+  }
+  EXPECT_OK(Insert("s"));
+  for (int i = 0; i < 11; i++) {
+    EXPECT_OK(Insert("p" + std::to_string(i)));
+  }
+  // Total is 100; the sweep promotes r and y0..y86 and evicts s.
+  EXPECT_EQ(100, cache_->GetUsage());
+  EXPECT_OK(Insert("t"));
+  EXPECT_TRUE(ContainsForTest("r"));
+  EXPECT_FALSE(ContainsForTest("s"));
+  // Probation holds p0..p10 plus t: 12, at (not over) the budget.
+  EXPECT_EQ(12, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(100, cache_->GetUsage());
+  EXPECT_OK(Insert("x"));
+  EXPECT_FALSE(ContainsForTest("r"));
+  EXPECT_TRUE(ContainsForTest("p0"));
+  EXPECT_TRUE(ContainsForTest("x"));
+}
+
+// The queue choice reads the current probation charge, before the incoming
+// entry is accounted: probation exactly at budget draws from resident even
+// when the incoming entry would push it over.
+TEST_F(FIFOCacheTest, ProbationBudgetBoundaryUsesCurrentUsage) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("big", /*charge*/ 88));
+  HitNTimes("big", 2);
+  for (int i = 0; i < 12; i++) {
+    EXPECT_OK(Insert("p" + std::to_string(i)));
+  }
+  EXPECT_EQ(100, cache_->GetUsage());
+  // Promotes big, evicts p0.
+  EXPECT_OK(Insert("t"));
+  EXPECT_TRUE(ContainsForTest("big"));
+  EXPECT_FALSE(ContainsForTest("p0"));
+  // Probation holds p1..p11 plus t: 12, exactly at budget.
+  EXPECT_EQ(12, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(100, cache_->GetUsage());
+  // Incoming charge 5 would push probation to 17 if counted; the choice
+  // ignores it and draws from resident.
+  EXPECT_OK(Insert("x", /*charge*/ 5));
+  EXPECT_FALSE(ContainsForTest("big"));
+  EXPECT_TRUE(ContainsForTest("p1"));
+  EXPECT_TRUE(ContainsForTest("x"));
+}
+
+// Long-lived pins in probation (cache reservations, pinned index/filter
+// blocks) do not count toward the budget: with 13 pins over a budget of 12
+// the resident clock still runs, so a stale resident entry is evicted
+// rather than the next unpinned probation entry.
+TEST_F(FIFOCacheTest, PinnedProbationEntriesDoNotHoldBudget) {
+  NewCache(/*capacity*/ 100);
+  std::vector<FIFOHandle*> pins;
+  for (int i = 0; i < 13; i++) {
+    FIFOHandle* h = nullptr;
+    ASSERT_OK(Insert("pin" + std::to_string(i), /*charge*/ 1, &h));
+    pins.push_back(h);
+  }
+  for (int i = 0; i < 80; i++) {
+    std::string hot = "h" + std::to_string(i);
+    EXPECT_OK(Insert(hot));
+    HitNTimes(hot, 2);
+  }
+  for (int i = 0; i < 7; i++) {
+    EXPECT_OK(Insert("c" + std::to_string(i)));
+  }
+  EXPECT_EQ(100, cache_->GetUsage());
+  // Unpinned probation is 87, over budget: promotes h0..h79, evicts c0.
+  EXPECT_OK(Insert("x0"));
+  EXPECT_FALSE(ContainsForTest("c0"));
+  // Probation holds c1..c6, x0 and the 13 pins: 20 linked, 7 unpinned.
+  EXPECT_EQ(20, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(7, cache_->TEST_GetProbationUnpinnedUsage());
+  EXPECT_EQ(12, cache_->TEST_GetProbationBudget());
+  // Unpinned probation is within budget, so resident pays: h0 is at freq 0
+  // after promotion and is evicted; c1 survives.
+  EXPECT_OK(Insert("x1"));
+  EXPECT_FALSE(ContainsForTest("h0"));
+  EXPECT_TRUE(ContainsForTest("c1"));
+  EXPECT_TRUE(ContainsForTest("x1"));
+  for (FIFOHandle* h : pins) {
+    EXPECT_FALSE(cache_->Release(h, true, false));
+  }
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+}
+
+// R5: promotion moves charge out of probation only; usage and pinned usage
+// are unchanged. A pinned bystander keeps pinned usage nonzero across it.
+TEST_F(FIFOCacheTest, PromotionPreservesUsageAndPinnedUsage) {
+  NewCache(/*capacity*/ 30);
+  FIFOHandle* pinned = nullptr;
+  EXPECT_OK(Insert("pin", /*charge*/ 4, &pinned));
+  ASSERT_NE(nullptr, pinned);
+  EXPECT_OK(Insert("k", /*charge*/ 10));
+  HitNTimes("k", 2);
+  EXPECT_OK(Insert("a", /*charge*/ 9));
+  EXPECT_OK(Insert("b", /*charge*/ 7));
+  EXPECT_EQ(30, cache_->GetUsage());
+  EXPECT_EQ(4, cache_->GetPinnedUsage());
+  EXPECT_EQ(30, cache_->TEST_GetProbationUsage());
+  // Promotes k and evicts a: usage drops by a's charge only; pinned usage
+  // holds; probation drops by k's and a's charges and gains d's.
+  EXPECT_OK(Insert("d", /*charge*/ 5));
+  EXPECT_TRUE(ContainsForTest("k"));
+  EXPECT_FALSE(ContainsForTest("a"));
+  EXPECT_EQ(26, cache_->GetUsage());
+  EXPECT_EQ(4, cache_->GetPinnedUsage());
+  EXPECT_EQ(16, cache_->TEST_GetProbationUsage());
+  EXPECT_FALSE(cache_->Release(pinned, true, false));
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+}
+
+// R1: the probation charge tracks inserts, evictions, promotions, erases
+// and overwrites by charge, not entry count.
+TEST_F(FIFOCacheTest, ProbationUsageAccounting) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_EQ(0, cache_->TEST_GetProbationUsage());
+  EXPECT_OK(Insert("a", /*charge*/ 5));
+  EXPECT_OK(Insert("b", /*charge*/ 7));
+  EXPECT_EQ(12, cache_->TEST_GetProbationUsage());
+  HitNTimes("a", 2);
+  // Fill to capacity without pressure, then promote a and evict b.
+  for (int i = 0; i < 88; i++) {
+    EXPECT_OK(Insert("f" + std::to_string(i)));
+  }
+  EXPECT_EQ(100, cache_->GetUsage());
+  EXPECT_EQ(100, cache_->TEST_GetProbationUsage());
+  EXPECT_OK(Insert("t"));
+  EXPECT_TRUE(ContainsForTest("a"));
+  EXPECT_FALSE(ContainsForTest("b"));
+  // a promoted (5 left probation), b evicted (7 left), t entered (1).
+  EXPECT_EQ(89, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(94, cache_->GetUsage());
+  // Erasing from resident leaves probation alone; erasing from probation
+  // drops it.
+  Erase("a");
+  EXPECT_EQ(89, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(89, cache_->GetUsage());
+  Erase("f0");
+  EXPECT_EQ(88, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(88, cache_->GetUsage());
+  // Overwriting a probation entry swaps its charge.
+  Status s = Insert("f1", /*charge*/ 3);
+  EXPECT_TRUE(s.IsOkOverwritten());
+  EXPECT_EQ(90, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(90, cache_->GetUsage());
+}
+
+// R3: the budget tracks capacity up and down; shrinking below the
+// probation charge makes the shrink draw probation first.
+TEST_F(FIFOCacheTest, SetCapacityRetracksProbationBudget) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_EQ(12, cache_->TEST_GetProbationBudget());
+  cache_->SetCapacity(200);
+  EXPECT_EQ(24, cache_->TEST_GetProbationBudget());
+  cache_->SetCapacity(50);
+  EXPECT_EQ(6, cache_->TEST_GetProbationBudget());
+  EXPECT_OK(Insert("r"));
+  HitNTimes("r", 2);
+  for (int i = 0; i < 49; i++) {
+    EXPECT_OK(Insert("f" + std::to_string(i)));
+  }
+  EXPECT_EQ(50, cache_->GetUsage());
+  // Promotes r, evicts f0.
+  EXPECT_OK(Insert("t"));
+  EXPECT_TRUE(ContainsForTest("r"));
+  EXPECT_FALSE(ContainsForTest("f0"));
+  EXPECT_EQ(49, cache_->TEST_GetProbationUsage());
+  cache_->SetCapacity(10);
+  EXPECT_EQ(1, cache_->TEST_GetProbationBudget());
+  // Shrink draws probation first (over budget): oldest probation entries
+  // go, resident r stays.
+  EXPECT_TRUE(ContainsForTest("r"));
+  EXPECT_EQ(10, cache_->GetUsage());
+  cache_->SetCapacity(100);
+  EXPECT_EQ(12, cache_->TEST_GetProbationBudget());
+  EXPECT_EQ(10, cache_->GetUsage());
+}
+
+// R3: a shrink re-derives the budget before evicting. Probation at 10 is
+// under the old budget of 12 but over the new budget of 6, so the shrink
+// draws probation first.
+TEST_F(FIFOCacheTest, SetCapacityShrinkUsesFreshBudget) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("big", /*charge*/ 90));
+  HitNTimes("big", 2);
+  for (int i = 0; i < 10; i++) {
+    EXPECT_OK(Insert("p" + std::to_string(i)));
+  }
+  EXPECT_EQ(100, cache_->GetUsage());
+  // Promotes big, evicts p0.
+  EXPECT_OK(Insert("t"));
+  EXPECT_TRUE(ContainsForTest("big"));
+  EXPECT_FALSE(ContainsForTest("p0"));
+  // Probation holds p1..p9 plus t: 10.
+  EXPECT_EQ(10, cache_->TEST_GetProbationUsage());
+  cache_->SetCapacity(50);
+  // Fresh budget is 6: probation first, so p1 goes. A stale budget of 12
+  // would draw resident first and leave p1 alone.
+  EXPECT_FALSE(ContainsForTest("p1"));
+}
+
+// SetCapacity folds every thread's pin counts before choosing which queue
+// evicts first, so pins another thread's lock-free hits took since the last
+// fold are counted.
+TEST_F(FIFOCacheTest, SetCapacityFoldsOtherThreadsPins) {
+  NewCache(/*capacity*/ 100);
+  ASSERT_OK(Insert("big", /*charge*/ 80));
+  HitNTimes("big", 2);
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_OK(Insert("p" + std::to_string(i)));
+  }
+  // Promotes big and evicts p0. Probation holds p1..p19 and t: 20, against
+  // a budget of 12.
+  ASSERT_OK(Insert("t"));
+  ASSERT_FALSE(InProbationForTest("big"));
+
+  // Another thread pins p1..p15 with lock-free hits, which only its own
+  // ReaderSlot records until the shard folds it.
+  std::promise<void> pinned;
+  std::promise<void> release;
+  port::Thread pinner([&] {
+    std::vector<FIFOHandle*> handles;
+    for (int i = 1; i <= 15; ++i) {
+      handles.push_back(Lookup("p" + std::to_string(i)));
+    }
+    pinned.set_value();
+    release.get_future().wait();
+    for (FIFOHandle* h : handles) {
+      EXPECT_FALSE(cache_->Release(h, true, false));
+    }
+  });
+  pinned.get_future().wait();
+
+  // Unpinned probation is 5, under budget, so resident (big) pays. Without
+  // the pins it would look like 20 and probation would pay first, evicting
+  // p16..p19 and t.
+  cache_->SetCapacity(90);
+  EXPECT_FALSE(ContainsForTest("big"));
+  EXPECT_TRUE(ContainsForTest("p16"));
+  EXPECT_TRUE(ContainsForTest("t"));
+  release.set_value();
+  pinner.join();
+}
+
+// A thread that releases pins another thread's lock-free hits took since
+// the last fold reads its own share live, below zero, against others'
+// shares from the fold. That must count as nothing pinned, not everything:
+// probation (20, all unpinned, against a budget of 12) still pays, and the
+// hot resident entry stays.
+TEST_F(FIFOCacheTest, CrossThreadReleaseKeepsProbationPaying) {
+  NewCache(/*capacity*/ 100);
+  ASSERT_OK(Insert("big", /*charge*/ 80));
+  HitNTimes("big", 2);
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_OK(Insert("p" + std::to_string(i)));
+  }
+  // Promotes big and evicts p0. Probation holds p1..p19 and t.
+  ASSERT_OK(Insert("t"));
+  ASSERT_FALSE(InProbationForTest("big"));
+  std::vector<FIFOHandle*> handles;
+  port::Thread pinner([&] {
+    for (int i = 1; i <= 15; ++i) {
+      handles.push_back(Lookup("p" + std::to_string(i)));
+    }
+  });
+  pinner.join();
+  // Released here, before the shard folds the pinner's ReaderSlot.
+  for (FIFOHandle* h : handles) {
+    ASSERT_NE(nullptr, h);
+    EXPECT_FALSE(cache_->Release(h, true, false));
+  }
+  ASSERT_OK(Insert("x"));
+  EXPECT_TRUE(ContainsForTest("big"));
+  EXPECT_FALSE(ContainsForTest("p1"));
+}
+
+// The periodic fold reads the ReaderSlots outside mutex_, then applies its
+// reading under the lock: another thread's lock-free pins reach
+// folded_slot_sum_ through inserts alone, without SetCapacity or a test
+// getter folding.
+TEST_F(FIFOCacheTest, DeferredFoldReachesFoldedSum) {
+  NewCache(/*capacity*/ 1000);
+  for (int i = 1; i <= 15; ++i) {
+    ASSERT_OK(Insert("p" + std::to_string(i)));
+  }
+  std::promise<void> pinned;
+  std::promise<void> release;
+  port::Thread pinner([&] {
+    std::vector<FIFOHandle*> handles;
+    for (int i = 1; i <= 15; ++i) {
+      handles.push_back(Lookup("p" + std::to_string(i)));
+    }
+    pinned.set_value();
+    release.get_future().wait();
+    for (FIFOHandle* h : handles) {
+      EXPECT_FALSE(cache_->Release(h, true, false));
+    }
+  });
+  pinned.get_future().wait();
+  EXPECT_EQ(0, cache_->TEST_GetFoldedSlotSum());
+  // Enough locked calls for a fold to be read and then applied.
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_OK(Insert("x" + std::to_string(i)));
+  }
+  EXPECT_EQ(15, cache_->TEST_GetFoldedSlotSum());
+  release.set_value();
+  pinner.join();
+}
+
+#ifndef NDEBUG
+// The periodic fold reads every ReaderSlot line, a walk that grows with the
+// process's threads, so it must not hold mutex_. A probe thread takes the
+// shard lock while the walk runs: it waits only if the walk holds it.
+TEST_F(FIFOCacheTest, PeriodicFoldRunsOutsideShardLock) {
+  NewCache(/*capacity*/ 1000);
+  // The first insert allocates this thread's ReaderSlot chunk.
+  ASSERT_OK(Insert("p"));
+  FIFOHandle* h = Lookup("p");
+  ASSERT_NE(nullptr, h);
+  std::atomic<int> folds{0};
+  std::atomic<int> held{0};
+  std::vector<port::Thread> probes;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FIFOCacheShard::FoldReaderSlots", [&](void*) {
+        folds.fetch_add(1);
+        if (held.load() > 0) {
+          return;
+        }
+        auto acquired = std::make_shared<std::atomic<bool>>(false);
+        probes.emplace_back([this, acquired] {
+          DMutexLock l(cache_->TEST_GetMutex());
+          acquired->store(true);
+        });
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!acquired->load() &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::yield();
+        }
+        if (!acquired->load()) {
+          held.fetch_add(1);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_OK(Insert("k" + std::to_string(i)));
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  for (port::Thread& probe : probes) {
+    probe.join();
+  }
+  EXPECT_FALSE(cache_->Release(h, true, false));
+  EXPECT_GE(folds.load(), 1);
+  EXPECT_EQ(0, held.load());
+}
+#endif  // !NDEBUG
+
+// R4: the budget is exact on small capacities, never overflows, and rounds
+// to zero (probation-first) on tiny shards.
+TEST_F(FIFOCacheTest, ProbationBudgetArithmetic) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_EQ(12, cache_->TEST_GetProbationBudget());
+  NewCache(/*capacity*/ 99);
+  EXPECT_EQ(11, cache_->TEST_GetProbationBudget());
+  NewCache(/*capacity*/ 8);
+  EXPECT_EQ(0, cache_->TEST_GetProbationBudget());
+  // SIZE_MAX = 100q + 15, so floor(12%) is 12q + 1. Raised by SetCapacity,
+  // which reserves nothing, so the test does not map a table for SIZE_MAX
+  // (Windows commits the whole reservation).
+  NewCache(/*capacity*/ 100);
+  cache_->SetCapacity(SIZE_MAX);
+  size_t q = SIZE_MAX / 100;
+  EXPECT_EQ(12 * q + 1, cache_->TEST_GetProbationBudget());
+  // capacity * 12 / 100 would wrap here; the split form does not.
+  EXPECT_GT(cache_->TEST_GetProbationBudget(), SIZE_MAX / 10);
+}
+
+// A shard bounded by its slot table rather than by charge holds far less
+// charge than capacity_. Its budget follows the charge it holds, so the
+// one-time keys that fill it are paid for by probation and a hot set that
+// fits stays resident. A budget of 12% of capacity_ would never be reached,
+// send every eviction to resident first and drain the hot set.
+TEST_F(FIFOCacheTest, OccupancyBoundShardKeepsHotSet) {
+  // 1 MiB reserves 16384 homes, so the table stops at 9830 entries; at
+  // charge 1 they hold under 1% of capacity.
+  NewCache(/*capacity*/ 1 << 20);
+  constexpr int kHot = 2000;
+  for (int i = 0; i < kHot; i++) {
+    const std::string key = "h" + std::to_string(i);
+    EXPECT_OK(Insert(key));
+    HitNTimes(key, 2);
+  }
+  int hot_misses = 0;
+  for (int i = 0; i < 40000; i++) {
+    EXPECT_OK(Insert("c" + std::to_string(i)));
+    const std::string hot = "h" + std::to_string(i % kHot);
+    if (!LookupBool(hot)) {
+      ++hot_misses;
+      EXPECT_OK(Insert(hot));
+    }
+  }
+  EXPECT_EQ(9830, cache_->GetOccupancyCount());
+  EXPECT_LT(cache_->GetUsage(), (size_t{1} << 20) / 100);
+  EXPECT_EQ(0, hot_misses);
+}
+
+// An entry larger than the whole probation budget waits in probation like
+// any other and is promoted or evicted on its turn; the bound never
+// splits, refuses, or spins on it.
+TEST_F(FIFOCacheTest, SingleEntryExceedsProbationBudget) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("big", /*charge*/ 20));
+  EXPECT_EQ(20, cache_->TEST_GetProbationUsage());
+  for (int i = 0; i < 80; i++) {
+    EXPECT_OK(Insert("f" + std::to_string(i)));
+  }
+  EXPECT_EQ(100, cache_->GetUsage());
+  EXPECT_OK(Insert("t"));
+  // Probation over budget, head cold: big goes.
+  EXPECT_FALSE(ContainsForTest("big"));
+  EXPECT_TRUE(ContainsForTest("t"));
+  EXPECT_EQ(81, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(81, cache_->GetUsage());
+
+  // Twice-hit instead: the same oversized entry promotes to resident.
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("big", /*charge*/ 20));
+  HitNTimes("big", 2);
+  for (int i = 0; i < 80; i++) {
+    EXPECT_OK(Insert("f" + std::to_string(i)));
+  }
+  EXPECT_OK(Insert("t"));
+  EXPECT_TRUE(ContainsForTest("big"));
+  EXPECT_FALSE(ContainsForTest("f0"));
+  EXPECT_EQ(80, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(100, cache_->GetUsage());
+}
+
+// A fully pinned shard with probation over budget terminates and evicts
+// nothing; a pinned probation still falls back to resident when resident
+// has evictable entries.
+TEST_F(FIFOCacheTest, FullyPinnedProbationOverBudgetTerminates) {
+  NewCache(/*capacity*/ 100);
+  for (int i = 0; i < 100; i++) {
+    EXPECT_OK(Insert("p" + std::to_string(i)));
+  }
+  EXPECT_EQ(100, cache_->TEST_GetProbationUsage());
+  std::vector<FIFOHandle*> pinned;
+  for (int i = 0; i < 100; i++) {
+    FIFOHandle* h = Lookup("p" + std::to_string(i));
+    ASSERT_NE(nullptr, h);
+    pinned.push_back(h);
+  }
+  // Probation over budget and fully pinned, resident empty: terminates,
+  // evicts nothing, drops the insert.
+  EXPECT_OK(Insert("x"));
+  EXPECT_FALSE(ContainsForTest("x"));
+  EXPECT_EQ(100, cache_->GetUsage());
+  for (FIFOHandle* h : pinned) {
+    EXPECT_FALSE(cache_->Release(h, true, false));
+  }
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+
+  // Pinned probation over budget with an evictable resident entry: the
+  // probation sweep skips, resident covers.
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("r"));
+  HitNTimes("r", 2);
+  for (int i = 0; i < 99; i++) {
+    EXPECT_OK(Insert("p" + std::to_string(i)));
+  }
+  EXPECT_EQ(100, cache_->GetUsage());
+  EXPECT_OK(Insert("t"));
+  // Promotes r, evicts p0.
+  EXPECT_TRUE(ContainsForTest("r"));
+  EXPECT_FALSE(ContainsForTest("p0"));
+  std::vector<FIFOHandle*> pinned2;
+  for (int i = 1; i < 99; i++) {
+    FIFOHandle* h = Lookup("p" + std::to_string(i));
+    ASSERT_NE(nullptr, h);
+    pinned2.push_back(h);
+  }
+  FIFOHandle* ht = Lookup("t");
+  ASSERT_NE(nullptr, ht);
+  pinned2.push_back(ht);
+  // Probation (99) over budget and fully pinned; resident r unpinned.
+  EXPECT_EQ(99, cache_->TEST_GetProbationUsage());
+  EXPECT_OK(Insert("x"));
+  EXPECT_FALSE(ContainsForTest("r"));
+  EXPECT_TRUE(ContainsForTest("p1"));
+  for (FIFOHandle* h : pinned2) {
+    cache_->Release(h, true, false);
+  }
+}
+
+TEST_F(FIFOCacheTest, ProbationFallbackPromotionRetriesResident) {
+  for (bool strict : {true, false}) {
+    SCOPED_TRACE("strict=" + std::to_string(strict));
+    NewCache(/*capacity*/ 100, strict);
+    EXPECT_OK(Insert("r", /*charge*/ 89));
+    HitNTimes("r", 2);
+    EXPECT_OK(Insert("s", /*charge*/ 11));
+    // Promotes r, evicts s.
+    EXPECT_OK(Insert("t"));
+    Erase("t");
+    FIFOHandle* hr = Lookup("r");
+    ASSERT_NE(nullptr, hr);
+    EXPECT_OK(Insert("p", /*charge*/ 10));
+    HitNTimes("p", 2);
+    ASSERT_FALSE(InProbationForTest("r"));
+    ASSERT_EQ(10, cache_->TEST_GetProbationUsage());
+    ASSERT_EQ(99, cache_->GetUsage());
+
+    // Probation stays within its budget of 12, so resident is tried first
+    // and frees nothing; the probation fallback only promotes p, so the
+    // resident pass must run again to evict it.
+    FIFOHandle* hx = nullptr;
+    EXPECT_OK(Insert("x", /*charge*/ 2, &hx));
+    EXPECT_NE(nullptr, hx);
+    EXPECT_LE(cache_->GetUsage(), 100);
+    EXPECT_FALSE(ContainsForTest("p"));
+    if (hx != nullptr) {
+      cache_->Release(hx, true, false);
+    }
+    cache_->Release(hr, true, false);
+  }
+}
+
+// A probation fallback that promotes entries but frees too little runs the
+// resident pass again: the promoted entry, unpinned at freq 0, makes room.
+TEST_F(FIFOCacheTest, ResidentRetriedAfterProbationPromotes) {
+  NewCache(/*capacity*/ 86, /*strict_capacity_limit*/ true);
+  EXPECT_OK(Insert("r", 80));
+  HitNTimes("r", 2);
+  EXPECT_OK(Insert("s", 6));
+  // Promotes r and evicts s.
+  EXPECT_OK(Insert("t", 1));
+  Erase("t");
+  FIFOHandle* hr = Lookup("r");
+  ASSERT_NE(nullptr, hr);
+  EXPECT_OK(Insert("p", 5));
+  HitNTimes("p", 2);
+  EXPECT_OK(Insert("c", 1));
+  // Probation (6) is within budget (10), so resident goes first and frees
+  // nothing (r is pinned). Probation promotes p and evicts c, freeing 1 of
+  // the 2 needed; resident then evicts p.
+  FIFOHandle* hx = nullptr;
+  EXPECT_OK(Insert("x", 2, &hx));
+  ASSERT_NE(nullptr, hx);
+  EXPECT_FALSE(ContainsForTest("p"));
+  EXPECT_LE(cache_->GetUsage(), 86);
+  EXPECT_FALSE(cache_->Release(hx, true, false));
+  EXPECT_FALSE(cache_->Release(hr, true, false));
+}
+
+// With every entry pinned eviction returns at once; releasing one entry,
+// in either queue, must make it evictable again.
+TEST_F(FIFOCacheTest, ReleasedEntryEvictableInFullyPinnedShard) {
+  NewCache(/*capacity*/ 10);
+  std::vector<FIFOHandle*> pinned;
+  for (int i = 0; i < 10; ++i) {
+    FIFOHandle* h = nullptr;
+    EXPECT_OK(Insert("p" + std::to_string(i), /*charge*/ 1, &h));
+    pinned.push_back(h);
+  }
+  EXPECT_OK(Insert("x"));
+  EXPECT_FALSE(ContainsForTest("x"));
+  EXPECT_FALSE(cache_->Release(pinned[3], true, false));
+  EXPECT_OK(Insert("y"));
+  EXPECT_TRUE(ContainsForTest("y"));
+  EXPECT_FALSE(ContainsForTest("p3"));
+  for (int i = 0; i < 10; ++i) {
+    if (i != 3) {
+      cache_->Release(pinned[i], true, false);
+    }
+  }
+
+  NewCache(/*capacity*/ 10);
+  for (int i = 0; i < 9; ++i) {
+    EXPECT_OK(Insert("r" + std::to_string(i)));
+    HitNTimes("r" + std::to_string(i), 2);
+  }
+  EXPECT_OK(Insert("s"));
+  // Promotes r0..r8, evicts s.
+  EXPECT_OK(Insert("t"));
+  Erase("t");
+  pinned.clear();
+  for (int i = 0; i < 9; ++i) {
+    FIFOHandle* h = Lookup("r" + std::to_string(i));
+    ASSERT_NE(nullptr, h);
+    ASSERT_FALSE(InProbationForTest("r" + std::to_string(i)));
+    pinned.push_back(h);
+  }
+  EXPECT_FALSE(cache_->Release(pinned[4], true, false));
+  EXPECT_OK(Insert("y", /*charge*/ 2));
+  EXPECT_TRUE(ContainsForTest("y"));
+  EXPECT_FALSE(ContainsForTest("r4"));
+  for (int i = 0; i < 9; ++i) {
+    if (i != 4) {
+      cache_->Release(pinned[i], true, false);
+    }
+  }
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+}
+
 // C2: a configured secondary cache wraps the primary instead of failing.
 TEST_F(FIFOCacheTest, SecondaryCacheWrapped) {
   FIFOCacheOptions opts(/*capacity*/ 10, /*num_shard_bits*/ 0,
@@ -1732,7 +2389,7 @@ void HitLoop(FIFOCacheTest* t, int rounds) {
 
 // Q1: Lookup (hit or miss), Ref and a Release that does not erase never take
 // the shard lock: another thread completes them while this one holds it,
-// including registering its thread's reader.
+// including registering its reader slot.
 TEST_F(FIFOCacheTest, HitsNeverTakeShardLock) {
   PopulateBothQueues(this);
   std::atomic<bool> done{false};
@@ -1756,8 +2413,8 @@ TEST_F(FIFOCacheTest, HitsNeverTakeShardLock) {
   EXPECT_TRUE(completed);
 }
 
-// Q2: hits write no byte of the shard object: only the entries and the
-// thread's reader change.
+// Q2: once the thread's reader slot exists, hits write no byte of the shard
+// object: only the entries and the slot change.
 TEST_F(FIFOCacheTest, HitsWriteNoShardState) {
   PopulateBothQueues(this);
   HitLoop(this, 1);
@@ -1767,6 +2424,89 @@ TEST_F(FIFOCacheTest, HitsWriteNoShardState) {
   const std::string after(reinterpret_cast<const char*>(cache_),
                           sizeof(FIFOCacheShard));
   EXPECT_TRUE(before == after);
+}
+
+// Q3: after a multi-threaded run of lock-free and locked ref changes, pinned
+// usage and unpinned probation charge match a walk of the queues, both while
+// some handles are still held and after all are released.
+TEST_F(FIFOCacheTest, ConcurrentRefChangesKeepCountersExact) {
+  NewCache(/*capacity*/ 300);
+  constexpr int kThreads = 6;
+  std::vector<std::vector<FIFOHandle*>> held(kThreads);
+  std::vector<port::Thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([this, t, &held] {
+      Random rnd(1000 + t);
+      std::vector<FIFOHandle*>& mine = held[t];
+      for (int i = 0; i < 20000; ++i) {
+        const std::string key = "k" + std::to_string(rnd.Uniform(120));
+        const uint32_t op = rnd.Uniform(10);
+        if (op < 6) {
+          FIFOHandle* h = Lookup(key);
+          if (h != nullptr) {
+            mine.push_back(h);
+          }
+        } else if (op < 8) {
+          FIFOHandle* h = nullptr;
+          EXPECT_OK(
+              Insert(key, 1 + rnd.Uniform(4), rnd.OneIn(2) ? &h : nullptr));
+          if (h != nullptr) {
+            mine.push_back(h);
+          }
+        } else if (op == 8) {
+          Erase(key);
+        } else if (!mine.empty()) {
+          const size_t idx = rnd.Uniform(static_cast<int>(mine.size()));
+          cache_->Release(mine[idx], true, rnd.OneIn(8));
+          mine[idx] = mine.back();
+          mine.pop_back();
+        }
+        if (mine.size() > 6) {
+          cache_->Release(mine.front(), true, false);
+          mine.erase(mine.begin());
+        }
+      }
+    });
+  }
+  for (port::Thread& thread : threads) {
+    thread.join();
+  }
+
+  auto check = [&] {
+    std::set<FIFOHandle*> distinct;
+    for (const auto& mine : held) {
+      distinct.insert(mine.begin(), mine.end());
+    }
+    size_t pinned = 0;
+    for (FIFOHandle* h : distinct) {
+      pinned += h->total_charge;
+    }
+    size_t probation = 0;
+    size_t probation_unpinned = 0;
+    FIFOHandle* fifo;
+    cache_->TEST_GetFIFOList(&fifo);
+    for (FIFOHandle* h = cache_->TEST_Next(fifo); h != fifo;
+         h = cache_->TEST_Next(h)) {
+      probation += h->total_charge;
+      if (!h->HasRefs()) {
+        probation_unpinned += h->total_charge;
+      }
+    }
+    EXPECT_EQ(pinned, cache_->GetPinnedUsage());
+    EXPECT_EQ(probation, cache_->TEST_GetProbationUsage());
+    EXPECT_EQ(probation_unpinned, cache_->TEST_GetProbationUnpinnedUsage());
+  };
+  check();
+  // Released from a thread that did not take most of these refs.
+  for (auto& mine : held) {
+    for (FIFOHandle* h : mine) {
+      cache_->Release(h, true, false);
+    }
+    mine.clear();
+  }
+  check();
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
 }
 
 #ifndef NDEBUG
@@ -1835,6 +2575,57 @@ TEST_F(FIFOCacheTest, ReclaimWaitsForInFlightLookup) {
   EXPECT_TRUE(LookupBool("k"));
 }
 
+// Q3 attribution: a lock-free 0 <-> 1 ref change is credited to the queue in
+// its own CAS snapshot, even when the lock holder moves the entry before
+// the credit lands: a Release that unpins a probation entry promoted
+// before it credits, and a Lookup that pins a probation entry erased
+// before it credits.
+TEST_F(FIFOCacheTest, RefChangesCreditTheirSnapshotQueue) {
+  auto expect_counters_match_walk = [&] {
+    size_t probation_unpinned = 0;
+    FIFOHandle* fifo;
+    cache_->TEST_GetFIFOList(&fifo);
+    for (FIFOHandle* h = cache_->TEST_Next(fifo); h != fifo;
+         h = cache_->TEST_Next(h)) {
+      if (!h->HasRefs()) {
+        probation_unpinned += h->total_charge;
+      }
+    }
+    EXPECT_EQ(probation_unpinned, cache_->TEST_GetProbationUnpinnedUsage());
+  };
+  // Release vs promotion. Capacity 10, budget 1: p is hit twice and pinned;
+  // c0..c8 fill the shard.
+  NewCache(/*capacity*/ 10);
+  ASSERT_OK(Insert("p"));
+  HitNTimes("p", 2);
+  FIFOHandle* p = Lookup("p");
+  ASSERT_NE(nullptr, p);
+  InsertN("c", 9);
+  RunWhileParked(
+      "FIFOCacheShard::Release:AfterUnref",
+      [&] { EXPECT_FALSE(cache_->Release(p, true, false)); },
+      [&] {
+        // p is unpinned now, so this insert's probation pass promotes it.
+        ASSERT_OK(Insert("x"));
+        ASSERT_FALSE(InProbationForTest("p"));
+        ASSERT_TRUE(ContainsForTest("p"));
+      });
+  expect_counters_match_walk();
+
+  // Lookup vs Erase: q is in probation with unpinned company.
+  NewCache(/*capacity*/ 10);
+  ASSERT_OK(Insert("q"));
+  ASSERT_OK(Insert("r"));
+  FIFOHandle* q = nullptr;
+  RunWhileParked(
+      "FIFOCacheShard::Lookup:AfterRef", [&] { q = Lookup("q"); },
+      [&] { Erase("q"); });
+  ASSERT_NE(nullptr, q);
+  expect_counters_match_walk();
+  EXPECT_TRUE(cache_->Release(q, true, false));
+  expect_counters_match_walk();
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+}
 #endif  // !NDEBUG
 
 // Q4: many threads mix Lookup, Release (some erasing), Insert with and
@@ -2500,12 +3291,14 @@ TEST_F(FIFOCacheTest, AsideEntriesReturnOnceUnpinned) {
     }
     return keys;
   }());
+  EXPECT_EQ(200, cache_->TEST_GetProbationUsage());
   EXPECT_EQ(200, cache_->GetPinnedUsage());
 
   // Aside entries are found, and erased while pinned.
   EXPECT_TRUE(LookupBool("p150"));
   Erase("p160");
   EXPECT_FALSE(LookupBool("p160"));
+  EXPECT_EQ(199, cache_->TEST_GetProbationUsage());
   EXPECT_EQ(200, cache_->GetPinnedUsage());
   EXPECT_TRUE(cache_->Release(pinned[160], true, false));
 
@@ -2528,12 +3321,15 @@ TEST_F(FIFOCacheTest, AsideEntriesReturnOnceUnpinned) {
   EXPECT_FALSE(ContainsForTest("p151"));
   EXPECT_EQ(197, cache_->GetOccupancyCount());
   EXPECT_EQ(197, cache_->GetPinnedUsage());
+  EXPECT_EQ(197, cache_->TEST_GetProbationUsage());
   for (int i = 0; i < 200; ++i) {
     if (i != 150 && i != 151 && i != 160) {
       EXPECT_FALSE(cache_->Release(pinned[i], true, false));
     }
   }
   EXPECT_EQ(0, cache_->GetPinnedUsage());
+  EXPECT_EQ(197, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(197, cache_->TEST_GetProbationUnpinnedUsage());
 }
 
 // Entries set aside while pinned stay within eviction's reach once
@@ -3027,6 +3823,61 @@ TEST_F(FIFOCacheTest, ModestPinCountSetsNothingAside) {
   }
   EXPECT_EQ(0, cache_->GetPinnedUsage());
 }
+
+#ifndef OS_WIN
+namespace {
+struct ExitWork {
+  FIFOCacheShard* cache;
+  FIFOHandle* pinned_at_exit;
+  std::string lookup_key;
+};
+
+// Releases the handle its thread pinned, then pins and releases another
+// probation entry. Runs as a pthread key destructor, after the thread's C++
+// thread_local destructors and after ThreadLocalPtr's own exit handler.
+void RefChangesAtExit(void* arg) {
+  auto* work = static_cast<ExitWork*>(arg);
+  if (work->pinned_at_exit != nullptr) {
+    work->cache->Release(work->pinned_at_exit, true, false);
+  }
+  const std::string& key = work->lookup_key;
+  FIFOHandle* h =
+      work->cache->Lookup(key, FIFOCacheShard::ComputeHash(key, 0), nullptr,
+                          nullptr, Cache::Priority::LOW, nullptr);
+  if (h != nullptr) {
+    work->cache->Release(h, true, false);
+  }
+}
+}  // namespace
+
+// Lookups and Releases of probation entries from a thread that is exiting
+// must not touch per-thread state the thread no longer owns, and must keep
+// pinned and unpinned-probation charge exact.
+TEST_F(FIFOCacheTest, RefChangesAtThreadExitStayExact) {
+  NewCache(/*capacity*/ 100);
+  ASSERT_OK(Insert("a"));
+  ASSERT_OK(Insert("b"));
+  // Another component's thread-local state, set up before the key below, as
+  // in a process where RocksDB's ThreadLocalPtr exit handler runs first.
+  ThreadLocalPtr other_component;
+  pthread_key_t key;
+  ASSERT_EQ(0, pthread_key_create(&key, &RefChangesAtExit));
+
+  ExitWork used_before{cache_, nullptr, "b"};
+  std::thread first([&] {
+    other_component.Reset(&used_before);
+    // Pins a probation entry, released only at exit.
+    used_before.pinned_at_exit = Lookup("a");
+    ASSERT_NE(nullptr, used_before.pinned_at_exit);
+    pthread_setspecific(key, &used_before);
+  });
+  first.join();
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+  EXPECT_EQ(cache_->TEST_GetProbationUsage(),
+            cache_->TEST_GetProbationUnpinnedUsage());
+  ASSERT_EQ(0, pthread_key_delete(key));
+}
+#endif  // OS_WIN
 
 #ifndef NDEBUG
 // The reader scan runs once per ReaderWorkInterval() calls, which grows with

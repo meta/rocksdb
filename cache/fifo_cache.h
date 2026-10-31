@@ -297,11 +297,22 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   Slice KeyOf(const FIFOHandle* h, UniqueId64x2* buf) const;
 
  public:  // other function definitions
-  // Test-only: moves a probation entry to the resident tail without the
-  // promotion-threshold check, so tests can build exact resident layouts
-  // that pressure-driven promotion cannot assemble without disturbing the
-  // entry under test. The entry must be unpinned.
-  void TEST_PromoteToResident(const Slice& key);
+  // Test-only: charge currently held in the probation queue. Not threadsafe
+  // beyond the shard lock taken inside.
+  size_t TEST_GetProbationUsage() const;
+
+  // Test-only: charge of probation entries with no external reference, the
+  // quantity the budget is compared with. Not threadsafe beyond the shard
+  // lock taken inside.
+  size_t TEST_GetProbationUnpinnedUsage();
+
+  // Test-only: other threads' pinned probation charge as of the last fold
+  // applied, without folding. Takes the shard lock.
+  size_t TEST_GetFoldedSlotSum() const;
+
+  // Test-only: current probation budget derived from capacity. Not
+  // threadsafe beyond the shard lock taken inside.
+  size_t TEST_GetProbationBudget() const;
 
   // Probation list only; resident entries are not visible here. Walk it
   // with TEST_Next.
@@ -383,6 +394,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   FIFOHandle* AllocateSlot(size_t home);
   // Under mutex_: whether inserting one more entry would grow the table.
   bool WouldGrowOnNewInsert() const;
+  // Under mutex_: whether the table is as large as it gets and full to its
+  // load factor, so a new key also evicts one entry by occupancy.
+  bool AtOccupancyLimit() const;
   // Under mutex_: once no entry is in the table, returns it to its initial
   // homes (and their charge), or to the fewest that still cover every slot
   // in use. Heap keys of reclaimed slots go to heap_keys, as in Reclaim.
@@ -416,12 +430,14 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
                                    size_t total_charge);
   static void FreeStandalone(FIFOHandle* h);
 
-  // Unlinks e from its queue or the aside list.
+  // Unlinks e from its queue or the aside list. in_probation says whether
+  // to remove e's charge from probation_usage_, since the caller may
+  // already have cleared kInProbation when claiming e.
   void FIFO_Remove(FIFOHandle* e, bool in_probation);
   // Links e at the tail of queue. Appending to probation requires
   // kInProbation already set; neither function touches state.
   void FIFO_Append(FIFOHandle* queue, FIFOHandle* e);
-  // FIFO_Append, also for the aside list.
+  // FIFO_Append without the probation charge, also for the aside list.
   void LinkAtTail(FIFOHandle* queue, FIFOHandle* e);
   // Moves a linked entry to the tail of queue (probation, resident or
   // aside) without changing any charge: an entry set aside stays charged
@@ -435,6 +451,26 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   void ReturnAllUnpinnedAside();
   // Moves a linked, pinned entry to the aside tail.
   void SetAside(FIFOHandle* e);
+  // Unpinned probation charge, the quantity the budget is compared with:
+  // probation_usage_ minus the charge pinned in probation, which is
+  // probation_pinned_usage_ plus the ReaderSlots' shares. Other threads'
+  // shares come from the last fold applied, the caller's own share is read
+  // live. So it is exact after a fold, and for ref changes made by the
+  // calling thread; another thread's lock-free ref changes reach it within
+  // ReaderWorkInterval() locked operations. A stale value only reorders
+  // which queue pays for an eviction.
+  size_t ProbationUnpinnedUsage();
+  // Adds each ReaderSlot's probation_pinned change since the last fold to
+  // folded_slot_sum_. The values folded are kept in folded_slot_values_, so the
+  // owners' lines are only read. Needs mutex_; for the cold paths only
+  // (SetCapacity, test getters). The periodic fold is FoldReaderSlots.
+  void FoldSlots();
+  // The periodic fold MaybeReclaim handed to the caller: reads every
+  // ReaderSlot into fold_values_ and fold_sum_ without mutex_ (the walk
+  // grows with the threads in the process, so, like ScanReaders, it is kept
+  // out of the lock), then takes mutex_ only to swap them into
+  // folded_slot_values_ and folded_slot_sum_.
+  void FoldReaderSlots();
   // Release of the last ref when it must erase or free: takes mutex_.
   bool ReleaseLocked(FIFOHandle* e, bool erase_if_last_ref);
   // Erase or overwrite: clears both bits of e in one step, unlinks it from
@@ -469,14 +505,41 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   // entries aside.
   static constexpr size_t kPinnedRotationsPerPass = 64;
   static constexpr int kAsideChecksPerEviction = 2;
+  // The probation budget, 12% of the charge the shard can hold (see
+  // ProbationBudget). It only chooses which queue evicts (see EvictFromQueues):
+  // eviction never takes probation below it, so probation shrinks toward it
+  // only as entries are promoted, and on a warm shard whose hot set is already
+  // resident it can stay well above it. Shard-internal: not an option. On
+  // shards small enough that the share rounds to zero the budget is zero, so
+  // any non-empty probation is over budget and eviction keeps the old
+  // probation-first order.
+  // Why 12%: S3-FIFO (SOSP '23) sizes its small queue at 10% of the cache.
+  // Compared with cache_bench (2026-10, the full S3-FIFO policy), 12% missed
+  // less when the cache already hit above 0.9, and 10% slightly less under
+  // cache pressure; the two differed by at most 0.003 in hit ratio. 12% is
+  // kept for now.
+  static constexpr size_t kProbationPercent = 12;
+
+  // Probation budget: floor(base * 12 / 100) computed as
+  // base/100*12 + (base%100)*12/100, which is exact without overflowing on
+  // large capacities. base is capacity_, except at the occupancy limit,
+  // where the table rather than capacity_ bounds what the shard holds: there
+  // it is the charge in the table, if smaller. A budget of 12% of capacity_
+  // would then never be reached and would send every eviction to resident
+  // first, draining the hot set. Evaluated at each use, so SetCapacity can
+  // never leave a stale bound behind.
+  size_t ProbationBudget() const;
+
   // Free some space until enough to hold (usage_ + charge) is freed or no
-  // unpinned entry remains. Probation drains first: one pass over its head,
-  // promoting freq >= kPromoteThreshold to the resident tail (reset to 0)
-  // and evicting below it; pinned entries move to the probation tail.
-  // Resident follows with second-chance: head with freq > 0 is decremented
-  // and moved to the tail, head at 0 is evicted, pinned heads rotate
-  // undecayed. Promotion touches only links: usage_ is unchanged by a move
-  // between queues.
+  // unpinned entry remains. Total capacity decides whether to evict; the
+  // probation budget only selects the queue. When probation is over budget
+  // (or resident is empty) the probation pass runs first, otherwise the
+  // resident pass runs first; the other queue is tried if need remains, so
+  // a pinned preferred queue falls back instead of stranding evictable
+  // entries. The choice reads the current probation charge, before the
+  // incoming entry is accounted. An entry that alone exceeds the whole
+  // budget is treated like any other: it waits in probation and is
+  // promoted or evicted on its turn under pressure.
   // The probation pass consumes its head each step, so it ends after at
   // most the initial number of entries; the resident scan is bounded by
   // kMaxResidentIdlePasses per eviction. An all-pinned shard terminates
@@ -535,6 +598,40 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   // this shard with an epoch at or before the slot's retirement, so no
   // Lookup can still be reading it. Values are not deferred: deleters and
   // eviction callbacks run as soon as an entry leaves the cache.
+  //
+  // ReaderSlot: per (ThreadReader, shard), the net charge the reader's
+  // threads pinned in probation through lock-free 0 <-> 1 ref changes,
+  // modulo 2^64 (a thread may unpin what another pinned). Only the reader's
+  // current owner writes it, and only on a probation ref change. A reader
+  // outlives its thread and passes to a later one together with its slots,
+  // so no slot is ever read through freed thread-local state.
+  struct ALIGN_AS(CACHE_LINE_SIZE) ReaderSlot {
+    std::atomic<size_t> probation_pinned{0};
+    // The owning reader's index, the slot's position in folded_slot_values_.
+    uint32_t index = 0;
+
+    void AddProbationPinned(size_t delta) {
+      probation_pinned.store(
+          probation_pinned.load(std::memory_order_relaxed) + delta,
+          std::memory_order_relaxed);
+    }
+  };
+  // Slots for readers [0, kReaderSlotChunks * kReaderSlotsPerChunk). A
+  // reader past that, or an exiting thread, gets no slot and credits its
+  // probation ref changes under mutex_ instead.
+  static constexpr size_t kReaderSlotsPerChunk = 64;
+  static constexpr size_t kReaderSlotChunks = 128;
+  // The calling thread's slot, allocating its chunk without mutex_ on first
+  // use; nullptr when the thread has none (see above). Release and Insert
+  // also give a thread its reader here: a thread whose first FIFOCache call
+  // is such a Release or Insert from a pthread key destructor keeps that
+  // reader, and its slot index, for the life of the process (see
+  // OwnThreadReader), so churn of such threads pushes later threads past
+  // the slots.
+  ReaderSlot* MySlot();
+  // Credits a lock-free probation ref change of the calling thread: to its
+  // ReaderSlot, or to probation_pinned_usage_ under mutex_ if it has none.
+  void CreditProbationPin(size_t delta);
   // Queues retired slots chained through next, values already released,
   // for Reclaim. Safe without mutex_.
   void Retire(FIFOHandle* first, FIFOHandle* last);
@@ -546,14 +643,24 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
     // Slot index of the first retired slot, chained through next.
     uint32_t first;
   };
+  // Reader work MaybeReclaim hands to its caller, to run once it has
+  // released mutex_.
+  struct ReaderWork {
+    // Scan the readers' announcements (ScanReaders).
+    bool scan = false;
+    // Read the ReaderSlots for the periodic fold (FoldReaderSlots).
+    bool fold = false;
+  };
   // Every kReclaimInterval calls, stamps queued slots and applies the last
   // reader scan; once per ReaderWorkInterval() calls it also asks for a new
-  // scan. Returns whether the caller must scan the readers
-  // (ScanReaders) once it has released mutex_: the scan's cost grows with
-  // the threads in the process, so it is kept out of the lock. Needs
-  // mutex_. Heap keys of reclaimed slots are added to heap_keys, for the
-  // caller to free after releasing mutex_.
-  bool MaybeReclaim(std::vector<FIFOHandle::HeapKey*>* heap_keys);
+  // scan and a new fold. Returns the reader work the caller must
+  // run once it has released mutex_: both walks grow with the threads in the
+  // process, so they are kept out of the lock. Needs mutex_. Heap keys of
+  // reclaimed slots are added to heap_keys, for the caller to free after
+  // releasing mutex_.
+  ReaderWork MaybeReclaim(std::vector<FIFOHandle::HeapKey*>* heap_keys);
+  // Runs the reader work MaybeReclaim returned. Without mutex_.
+  void RunReaderWork(const ReaderWork& work);
   // Stamps queued slots, scans the readers and frees every batch it can,
   // all under mutex_, for the rare callers that need the slots now.
   void Reclaim(std::vector<FIFOHandle::HeapKey*>* heap_keys);
@@ -605,8 +712,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
 
   // Layout. Lookup and a Release that neither erases nor frees run without
   // mutex_ and write only the slot
-  // (state, freq) and the caller's ThreadReader. What they read sits on
-  // lines that no hit and no insert writes:
+  // (state, freq), the caller's ThreadReader and, on a probation ref change,
+  // the caller's ReaderSlot. What they read sits on lines that no hit and
+  // no insert writes:
   // 1. Read on every hit, written only by SetCapacity,
   //    SetStrictCapacityLimit, a table growth step, an epoch advance (which
   //    Reclaim makes only when it finds a Lookup in flight) and a change of
@@ -652,6 +760,33 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   // any that is occupied.
   std::vector<uint32_t> free_slots_;
 
+  // Memory size for entries currently linked in probation. Maintained by
+  // FIFO_Append/FIFO_Remove on every queue move; promotion moves charge
+  // out of this counter while usage_ stays unchanged.
+  size_t probation_usage_;
+
+  // The part of the charge pinned in probation that changed under mutex_
+  // (inserts with a handle, erasing a pinned entry, locked Release);
+  // lock-free ref changes go to the ReaderSlots. Modulo 2^64. The probation
+  // budget is compared with unpinned probation charge, not probation_usage_:
+  // pinned entries can be neither evicted nor promoted, so long-lived pins
+  // (cache reservations, pinned index and filter blocks) must not hold
+  // probation over budget and stop the resident clock.
+  size_t probation_pinned_usage_;
+  // Sum of the ReaderSlots' probation_pinned as of the last FoldSlots.
+  // Modulo 2^64.
+  size_t folded_slot_sum_;
+  // Each ReaderSlot's probation_pinned at the last fold, by reader index.
+  std::vector<size_t> folded_slot_values_;
+  // A periodic fold was handed to a caller and is not applied yet. Under
+  // mutex_.
+  bool fold_in_flight_;
+  // The periodic fold's reading: written only by the caller it was handed
+  // to (fold_in_flight_ makes that caller the only one), without mutex_,
+  // then swapped in by that caller under mutex_.
+  size_t fold_sum_;
+  std::vector<size_t> fold_values_;
+
   // Charge of referenced entries outside the queues: detached by Erase or
   // overwrite while pinned, or standalone.
   LockedSize detached_pinned_usage_;
@@ -662,11 +797,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   // just before the hand, and the hand moves past an entry that leaves, so
   // the order is the FIFO-reinsertion order. The resident dummy head when
   // resident is empty.
-  // New entries enter probation. Eviction drains probation first: a head
-  // with enough frequency is promoted to resident, any other is evicted,
-  // and resident is evicted only when probation cannot free enough.
-  // Probation has no size bound, so a burst of promotions can leave it
-  // holding only the newest entries.
+  // New entries enter probation; probation victims with enough frequency
+  // are promoted to resident. The 12% budget (kProbationPercent) decides
+  // which of the two queues evicts, not how much each holds.
   // Together they contain all in-cache items, pinned and unpinned.
   FIFOHandle* resident_hand_;
 
@@ -710,6 +843,12 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   // is due. Under mutex_.
   size_t reader_ticks_;
   bool scan_due_;
+
+  // ReaderSlot chunks, allocated on first use without mutex_ and freed with
+  // the shard. Read on probation ref changes, written only when a chunk is
+  // installed, so kept off the lines a hit reads.
+  ALIGN_AS(CACHE_LINE_SIZE)
+  std::array<std::atomic<ReaderSlot*>, kReaderSlotChunks> reader_slot_chunks_{};
 };
 
 class FIFOCache
