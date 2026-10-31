@@ -25,8 +25,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache/lru_cache.h"
 #include "port/port.h"
 #include "rocksdb/cache.h"
+#include "rocksdb/convenience.h"
+#include "rocksdb/table.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/random.h"
@@ -2943,6 +2946,279 @@ TEST_F(FIFOCacheTest, AlternatingTinyAndHugeNoStarvation) {
   }
   EXPECT_EQ(kRounds - 1, tiny_hits);
   EXPECT_EQ(kRounds - 1, huge_hits);
+}
+
+// Every exposed scalar option survives serialize -> parse, both into
+// FIFOCacheOptions and through Cache::CreateFromString into the cache.
+TEST_F(FIFOCacheTest, CreateFromStringRoundTripsScalarOptions) {
+  ConfigOptions config_options;
+  FIFOCacheOptions a(/*capacity*/ 12345, /*num_shard_bits*/ 3,
+                     /*strict_capacity_limit*/ true, nullptr,
+                     !kDefaultToAdaptiveMutex, kDontChargeCacheMetadata);
+  a.hash_seed = 42;
+  a.max_capacity = 54321;
+  FIFOCacheOptions b(/*capacity*/ size_t{1} << 30, /*num_shard_bits*/ 0,
+                     /*strict_capacity_limit*/ false, nullptr,
+                     kDefaultToAdaptiveMutex, kFullChargeCacheMetadata);
+  b.hash_seed = ShardedCacheOptions::kQuasiRandomHashSeed;
+  for (const FIFOCacheOptions& opts : {a, b}) {
+    std::string str;
+    ASSERT_OK(OptionTypeInfo::SerializeType(
+        config_options, FIFOCacheOptionsTypeInfo(), &opts, &str));
+    EXPECT_EQ(std::string::npos, str.find("memory_allocator"));
+    EXPECT_EQ(std::string::npos, str.find("secondary_cache"));
+
+    FIFOCacheOptions parsed;
+    ASSERT_OK(OptionTypeInfo::ParseStruct(config_options, "fifo_cache",
+                                          &FIFOCacheOptionsTypeInfo(),
+                                          "fifo_cache", str, &parsed));
+    EXPECT_EQ(opts.capacity, parsed.capacity);
+    EXPECT_EQ(opts.num_shard_bits, parsed.num_shard_bits);
+    EXPECT_EQ(opts.strict_capacity_limit, parsed.strict_capacity_limit);
+    EXPECT_EQ(opts.metadata_charge_policy, parsed.metadata_charge_policy);
+    EXPECT_EQ(opts.hash_seed, parsed.hash_seed);
+    EXPECT_EQ(opts.use_adaptive_mutex, parsed.use_adaptive_mutex);
+    EXPECT_EQ(opts.max_capacity, parsed.max_capacity);
+
+    std::shared_ptr<Cache> cache;
+    ASSERT_OK(
+        Cache::CreateFromString(config_options, "fifo_cache://" + str, &cache));
+    auto* fifo = dynamic_cast<FIFOCache*>(cache.get());
+    ASSERT_NE(nullptr, fifo);
+    EXPECT_EQ(opts.capacity, fifo->GetCapacity());
+    EXPECT_EQ(opts.num_shard_bits, fifo->GetNumShardBits());
+    EXPECT_EQ(opts.strict_capacity_limit, fifo->HasStrictCapacityLimit());
+    if (opts.hash_seed >= 0) {
+      EXPECT_EQ(static_cast<uint32_t>(opts.hash_seed), fifo->GetHashSeed());
+    }
+    ASSERT_OK(cache->Insert("k", nullptr, &kNoopCacheItemHelper, 1));
+    EXPECT_EQ(opts.metadata_charge_policy == kDontChargeCacheMetadata,
+              cache->GetUsage() == 1);
+  }
+}
+
+// Spaces inside the braces are trimmed as in the LRU form, so a fifo_cache://
+// value written that way builds a FIFOCache instead of falling through to the
+// object registry, which returns OK and leaves the caller's cache unchanged.
+TEST_F(FIFOCacheTest, CreateFromStringTrimsSpacesInsideBraces) {
+  ConfigOptions config_options;
+  for (const char* value :
+       {"{ fifo_cache://capacity=1M}", "{fifo_cache://capacity=1M }",
+        "{  fifo_cache://capacity=1M; num_shard_bits=2 }",
+        " fifo_cache://capacity=1M", " {fifo_cache://capacity=1M} "}) {
+    std::shared_ptr<Cache> cache;
+    ASSERT_OK(Cache::CreateFromString(config_options, value, &cache)) << value;
+    ASSERT_NE(nullptr, cache) << value;
+    EXPECT_STREQ("FIFOCache", cache->Name()) << value;
+    EXPECT_EQ(size_t{1} << 20, cache->GetCapacity()) << value;
+  }
+}
+
+// Invalid configuration fails with InvalidArgument naming the field, and
+// leaves the output untouched.
+TEST_F(FIFOCacheTest, CreateFromStringRejectsInvalidOptions) {
+  ConfigOptions config_options;
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"fifo_cache://", "capacity"},
+      {"fifo_cache://num_shard_bits=2", "capacity"},
+      {"fifo_cache://capacity=0", "capacity"},
+      {"fifo_cache://capacity=1M;num_shard_bits=20", "num_shard_bits"},
+      {"fifo_cache://capacity=1M;num_shard_bits=25", "num_shard_bits"},
+      {"fifo_cache://capacity=abc", "capacity"},
+      {"fifo_cache://capacity=1M;num_shard_bits=x", "num_shard_bits"},
+      {"fifo_cache://capacity=1M;strict_capacity_limit=maybe",
+       "strict_capacity_limit"},
+      {"fifo_cache://capacity=1M;metadata_charge_policy=kSometimes",
+       "metadata_charge_policy"},
+      {"fifo_cache://capacity=1M;hash_seed=seed", "hash_seed"},
+      {"fifo_cache://capacity=1M;use_adaptive_mutex=2", "use_adaptive_mutex"},
+      {"fifo_cache://capacity=1M;max_capacity=abc", "max_capacity"},
+      {"fifo_cache://capacity=1M;high_pri_pool_ratio=0.5",
+       "high_pri_pool_ratio"},
+      {"fifo_cache://capacity=1M;probation_ratio=0.2", "probation_ratio"},
+      {"fifo_cache://capacity=1M;memory_allocator=jemalloc",
+       "memory_allocator"},
+      {"fifo_cache://capacity=1M;"
+       "secondary_cache=compressed_secondary_cache://capacity=1M",
+       "secondary_cache"},
+  };
+  for (const auto& [value, field] : cases) {
+    std::shared_ptr<Cache> sentinel = NewLRUCache(1);
+    std::shared_ptr<Cache> cache = sentinel;
+    Status s = Cache::CreateFromString(config_options, value, &cache);
+    EXPECT_TRUE(s.IsInvalidArgument()) << value << " -> " << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find(field))
+        << value << " -> " << s.ToString();
+    EXPECT_EQ(sentinel, cache) << value;
+  }
+}
+
+// A capacity whose slot tables could not all be reserved fails with
+// InvalidArgument instead of aborting in the shard constructor. Each of
+// these would reserve 128 GiB per shard over 1024 or more shards, past the
+// x86-64 user address space.
+TEST_F(FIFOCacheTest, CreateFromStringRejectsUnreservableCapacity) {
+  ConfigOptions config_options;
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"fifo_cache://capacity=1M;max_capacity=-1;num_shard_bits=10",
+       "max_capacity"},
+      {"fifo_cache://capacity=1M;max_capacity=18446744073709551615;"
+       "num_shard_bits=19",
+       "max_capacity"},
+      {"fifo_cache://capacity=1125899906842624;num_shard_bits=10", "capacity"},
+  };
+  for (const auto& [value, field] : cases) {
+    std::shared_ptr<Cache> sentinel = NewLRUCache(1);
+    std::shared_ptr<Cache> cache = sentinel;
+    Status s = Cache::CreateFromString(config_options, value, &cache);
+    EXPECT_TRUE(s.IsInvalidArgument()) << value << " -> " << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find("fifo_cache." + field))
+        << value << " -> " << s.ToString();
+    EXPECT_EQ(sentinel, cache) << value;
+  }
+}
+
+// A block_cache= string builds the selected FIFOCache, not a fallback:
+// 05's incoming-charge queue choice and charge-plus-slot ghost bound hold.
+TEST_F(FIFOCacheTest, CreateFromStringPreservesSelectedBehavior) {
+  auto make = [](size_t capacity) {
+    BlockBasedTableOptions table_opts;
+    EXPECT_OK(GetBlockBasedTableOptionsFromString(
+        ConfigOptions(), BlockBasedTableOptions(),
+        "block_cache={fifo_cache://capacity=" + std::to_string(capacity) +
+            ";num_shard_bits=0;metadata_charge_policy=kDontChargeCacheMetadata"
+            "}",
+        &table_opts));
+    EXPECT_STREQ("FIFOCache", table_opts.block_cache->Name());
+    EXPECT_NE(nullptr, dynamic_cast<FIFOCache*>(table_opts.block_cache.get()));
+    return table_opts.block_cache;
+  };
+  auto shard = [](const std::shared_ptr<Cache>& cache) -> FIFOCacheShard& {
+    return static_cast<FIFOCache*>(cache.get())->GetShard(kNullUniqueId64x2);
+  };
+  auto insert = [](const std::shared_ptr<Cache>& cache, const std::string& key,
+                   size_t charge = 1) {
+    ASSERT_OK(cache->Insert(key, nullptr, &kNoopCacheItemHelper, charge));
+  };
+  auto hit2 = [](const std::shared_ptr<Cache>& cache, const std::string& key) {
+    for (int i = 0; i < 2; i++) {
+      Cache::Handle* h = cache->Lookup(key);
+      ASSERT_NE(nullptr, h);
+      cache->Release(h);
+    }
+  };
+  auto contains = [](const std::shared_ptr<Cache>& cache,
+                     const std::string& key) {
+    bool found = false;
+    cache->ApplyToAllEntries(
+        [&](const Slice& k, Cache::ObjectPtr, size_t,
+            const Cache::CacheItemHelper*) { found |= k.ToString() == key; },
+        {});
+    return found;
+  };
+  auto in_probation = [&](const std::shared_ptr<Cache>& cache,
+                          const std::string& key) {
+    FIFOHandle* fifo;
+    shard(cache).TEST_GetFIFOList(&fifo);
+    for (FIFOHandle* h = shard(cache).TEST_Next(fifo); h != fifo;
+         h = shard(cache).TEST_Next(h)) {
+      if (h->key().ToString() == key) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Probation at budget, incoming charge 5: probation pays. Ignoring the
+  // incoming charge (pre-05) would draw from resident and evict big.
+  std::shared_ptr<Cache> cache = make(100);
+  insert(cache, "big", 88);
+  hit2(cache, "big");
+  for (int i = 0; i < 12; i++) {
+    insert(cache, "p" + std::to_string(i));
+  }
+  insert(cache, "t");
+  EXPECT_EQ(12, shard(cache).TEST_GetProbationUsage());
+  EXPECT_EQ(100, cache->GetUsage());
+  insert(cache, "x", 5);
+  EXPECT_TRUE(contains(cache, "big"));
+  EXPECT_FALSE(contains(cache, "p5"));
+  EXPECT_TRUE(contains(cache, "p6"));
+  EXPECT_TRUE(contains(cache, "x"));
+  EXPECT_EQ(12, shard(cache).TEST_GetProbationUsage());
+
+  // Large victims behind many small residents: the charge bound keeps 10
+  // ghosts where a count-only (881 slot) bound would keep all 49.
+  cache = make(1000);
+  for (int i = 0; i < 880; i++) {
+    std::string r = "r" + std::to_string(i);
+    insert(cache, r);
+    hit2(cache, r);
+  }
+  for (int i = 0; i < 50; i++) {
+    insert(cache, "L" + std::to_string(i), 100);
+  }
+  EXPECT_EQ(881, cache->GetOccupancyCount());
+  EXPECT_EQ(10, shard(cache).TEST_GetGhostSize());
+  insert(cache, "L0", 100);
+  EXPECT_TRUE(in_probation(cache, "L0"));
+  insert(cache, "L45", 100);
+  EXPECT_TRUE(contains(cache, "L45"));
+  EXPECT_FALSE(in_probation(cache, "L45"));
+}
+
+// Strings that worked before never reach the fifo_cache:// branch: each
+// builds the same LRUCache as the direct factory, and other URIs still go
+// to the object registry.
+TEST_F(FIFOCacheTest, CreateFromStringLeavesExistingStringsUnchanged) {
+  ConfigOptions config_options;
+  LRUCacheOptions full(/*capacity*/ 1 << 20, /*num_shard_bits*/ 4,
+                       /*strict_capacity_limit*/ true,
+                       /*high_pri_pool_ratio*/ 0.25);
+  full.low_pri_pool_ratio = 0.125;
+  const std::string full_str =
+      "capacity=1M;num_shard_bits=4;strict_capacity_limit=true;"
+      "high_pri_pool_ratio=0.25;low_pri_pool_ratio=0.125";
+  const std::vector<std::pair<std::string, std::shared_ptr<Cache>>> cases = {
+      {"1M", NewLRUCache(1 << 20)},
+      {"capacity=2M", NewLRUCache(2 << 20)},
+      {full_str, full.MakeSharedCache()},
+      {"{" + full_str + "}", full.MakeSharedCache()},
+  };
+  for (const auto& [value, expected] : cases) {
+    std::shared_ptr<Cache> direct;
+    ASSERT_OK(Cache::CreateFromString(config_options, value, &direct));
+    BlockBasedTableOptions table_opts;
+    ASSERT_OK(GetBlockBasedTableOptionsFromString(
+        config_options, BlockBasedTableOptions(),
+        "block_cache=" +
+            (value.find(';') == std::string::npos || value[0] == '{'
+                 ? value
+                 : "{" + value + "}"),
+        &table_opts));
+    for (const std::shared_ptr<Cache>& actual :
+         {direct, table_opts.block_cache}) {
+      auto* lru = dynamic_cast<LRUCache*>(actual.get());
+      auto* want = static_cast<LRUCache*>(expected.get());
+      ASSERT_NE(nullptr, lru) << value;
+      EXPECT_STREQ("LRUCache", lru->Name());
+      EXPECT_EQ(want->GetCapacity(), lru->GetCapacity()) << value;
+      EXPECT_EQ(want->GetNumShardBits(), lru->GetNumShardBits()) << value;
+      EXPECT_EQ(want->HasStrictCapacityLimit(), lru->HasStrictCapacityLimit());
+      EXPECT_EQ(want->GetHashSeed(), lru->GetHashSeed()) << value;
+      EXPECT_EQ(want->GetHighPriPoolRatio(), lru->GetHighPriPoolRatio());
+      EXPECT_EQ(want->GetShard(0).GetLowPriPoolRatio(),
+                lru->GetShard(0).GetLowPriPoolRatio());
+    }
+  }
+
+  for (const char* uri : {"foo://bar", "my_fifo_cache://capacity=1"}) {
+    std::shared_ptr<Cache> sentinel = NewLRUCache(1);
+    std::shared_ptr<Cache> cache = sentinel;
+    Status s = Cache::CreateFromString(config_options, uri, &cache);
+    EXPECT_FALSE(s.IsInvalidArgument()) << s.ToString();
+    EXPECT_EQ(sentinel, cache);
+  }
 }
 
 // Values that detect use after free and double free: the deleter marks the

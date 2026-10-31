@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -23,6 +24,7 @@
 #include "port/likely.h"
 #include "port/mmap.h"
 #include "port/port.h"
+#include "rocksdb/utilities/options_type.h"
 #include "table/unique_id_impl.h"
 #include "util/autovector.h"
 #include "util/distributed_mutex.h"
@@ -458,6 +460,13 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   DMutex& TEST_GetMutex() const { return mutex_; }
 
   void AppendPrintableOptions(std::string& /*str*/) const;
+
+  // Address space a shard with this capacity and max_capacity reserves for
+  // its slot table at construction.
+  static size_t ReservationBytes(size_t capacity, size_t max_capacity) {
+    return sizeof(FIFOHandle) *
+           (kFirstSlot + MaxLengthFor(std::max(capacity, max_capacity)) + 1);
+  }
 
  private:
   friend class FIFOCache;
@@ -1074,5 +1083,14 @@ class FIFOCache
 using FIFOCache = fifo_cache::FIFOCache;
 using FIFOHandle = fifo_cache::FIFOHandle;
 using FIFOCacheShard = fifo_cache::FIFOCacheShard;
+
+// The fifo_cache:// option fields. Built on first use, so it is ready even
+// when called during another translation unit's static initialization.
+const std::unordered_map<std::string, OptionTypeInfo>&
+FIFOCacheOptionsTypeInfo();
+
+// Address space FIFOCacheOptions::MakeSharedCache reserves for the slot
+// tables of all shards. Requires num_shard_bits < 20.
+uint64_t FIFOCacheReservationBytes(const FIFOCacheOptions& opts);
 
 }  // namespace ROCKSDB_NAMESPACE
