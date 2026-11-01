@@ -198,6 +198,10 @@ class VersionEditHandler : public VersionEditHandlerBase {
     return Status::OK();
   }
 
+  // Durable loss-marker recovery is integrated by the later recovery layer.
+  // Until then, missing targets use existing point-in-time fallback.
+  bool CanMarkMissingBlobRelocationFiles() const { return false; }
+
   // Rebuilds the startup ownership index from opened Versions plus raw claims
   // retained for column families omitted by a read-only open.
   Status RebuildPhysicalFileOwnershipIndex();
@@ -237,6 +241,8 @@ class VersionEditHandler : public VersionEditHandlerBase {
 
   void ResetUnopenedPhysicalFileOwnership() {
     unopened_physical_file_owners_.clear();
+    replay_relocation_file_owners_.clear();
+    replay_relocation_files_by_cf_.clear();
   }
 
   void CheckIterationResult(const log::Reader& reader, Status* s) override;
@@ -283,6 +289,12 @@ class VersionEditHandler : public VersionEditHandlerBase {
   // recovery intentionally does not instantiate omitted column families.
   std::unordered_map<uint32_t, UnopenedPhysicalFileKinds>
       unopened_physical_file_owners_;
+  // Live-only replay ownership also covers opened CFs whose candidate
+  // Versions have not been installed yet. It catches a foreign deletion
+  // without retaining durable deleted-ID tombstones after reopen/snapshot.
+  std::map<uint64_t, uint32_t> replay_relocation_file_owners_;
+  std::unordered_map<uint32_t, std::set<uint64_t>>
+      replay_relocation_files_by_cf_;
   VersionEditParams version_edit_params_;
   bool no_error_if_files_missing_;
   std::shared_ptr<IOTracer> io_tracer_;

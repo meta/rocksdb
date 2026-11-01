@@ -2277,6 +2277,24 @@ TEST_F(VersionSetTest, AddLiveBlobFiles) {
   first_version->Unref();
 }
 
+TEST_F(VersionSetTest, DetachLastVersionReferenceForUnlockedDestruction) {
+  NewDB();
+
+  ColumnFamilyData* const cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(cfd, nullptr);
+  Version* const old_version = cfd->current();
+  ASSERT_NE(old_version, nullptr);
+
+  mutex_.Lock();
+  old_version->Ref();
+  versions_->TEST_CreateAndAppendVersion(cfd);
+  const bool detached = old_version->UnrefAndTryDetach();
+  mutex_.Unlock();
+
+  ASSERT_TRUE(detached);
+  old_version->DeleteDetached();
+}
+
 TEST_F(VersionSetTest, ObsoleteBlobFile) {
   // Initialize the database and add a blob file that is entirely garbage
   // and thus can immediately be marked obsolete.
@@ -3645,9 +3663,6 @@ TEST_F(VersionSetAtomicGroupTest,
   ASSERT_NE(second_cfd, nullptr);
   Version* const version_before_collision = second_cfd->current();
   ASSERT_NE(version_before_collision, nullptr);
-  ASSERT_FALSE(
-      version_before_collision->storage_info()->IsBlobRelocationFileRetired(
-          kTableFileNumber));
 
   edits_.clear();
   edits_.emplace_back();
@@ -3666,9 +3681,6 @@ TEST_F(VersionSetAtomicGroupTest,
 
   ASSERT_TRUE(status.IsCorruption()) << status.ToString();
   ASSERT_EQ(second_cfd->current(), version_before_collision);
-  ASSERT_FALSE(
-      second_cfd->current()->storage_info()->IsBlobRelocationFileRetired(
-          kTableFileNumber));
 }
 
 TEST_F(VersionSetAtomicGroupTest,
@@ -4582,8 +4594,9 @@ TEST_F(VersionSetAtomicGroupTest,
   ColumnFamilyData* first_cfd =
       reactive_versions_->GetColumnFamilySet()->GetColumnFamily(1);
   ASSERT_NE(first_cfd, nullptr);
-  ASSERT_TRUE(first_cfd->current()->storage_info()->IsBlobRelocationFileRetired(
-      kBlobFileNumber));
+  ASSERT_EQ(first_cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+                kBlobFileNumber),
+            nullptr);
 }
 
 TEST_F(VersionSetAtomicGroupTest,
@@ -4688,7 +4701,7 @@ TEST_F(VersionSetAtomicGroupTest,
 }
 
 TEST_F(VersionSetAtomicGroupTest,
-       ReactiveManifestSwitchRejectsOwnerVersionDivergence) {
+       ReactiveManifestSwitchDoesNotRetainDeletedOwnershipClaim) {
   constexpr uint64_t kTableFileNumber = 100;
   std::vector<FileMetaData> file_metas;
   CreateDummyTableFiles({SstInfo(kTableFileNumber, kColumnFamilyName1, "key",
@@ -4774,7 +4787,10 @@ TEST_F(VersionSetAtomicGroupTest,
       &reactive_mu, &manifest_reader, manifest_reader_status.get(),
       &cfds_changed, /*files_to_delete=*/nullptr);
   reactive_mu.Unlock();
-  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  // The complete snapshot omits the dropped primary CF and the deletion of
+  // the nonexistent relocation file. The retained secondary CF still owns its
+  // old table; no live file in the new snapshot conflicts with that ownership.
+  ASSERT_OK(status);
   ASSERT_GT(unlocked_candidate_deletions, 0U);
 
   ColumnFamilyData* reactive_first_cfd =
@@ -4787,9 +4803,10 @@ TEST_F(VersionSetAtomicGroupTest,
                   ->storage_info()
                   ->GetFileLocation(kTableFileNumber)
                   .IsValid());
-  ASSERT_FALSE(reactive_second_cfd->current()
-                   ->storage_info()
-                   ->IsBlobRelocationFileRetired(kTableFileNumber));
+  ASSERT_EQ(reactive_second_cfd->current()
+                ->storage_info()
+                ->GetBlobRelocationFileMetaData(kTableFileNumber),
+            nullptr);
 
   primary_mu.Lock();
   primary_first_cfd->UnrefAndTryDelete();

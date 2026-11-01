@@ -33,6 +33,7 @@
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/builder.h"
 #include "db/coalescing_iterator.h"
 #include "db/compaction/compaction_job.h"
@@ -770,7 +771,9 @@ void DBImpl::WaitForBackgroundWork() {
   while (remote_compaction_pool_jobs_ || CompactionsScheduled() ||
          bg_flush_scheduled_ || bg_wbm_flush_scheduled_ ||
          bg_pressure_callback_in_progress_ ||
-         bg_async_file_open_state_ == AsyncFileOpenState::kScheduled) {
+         bg_async_file_open_state_ == AsyncFileOpenState::kScheduled ||
+         bg_blob_reference_census_state_ ==
+             BlobReferenceCensusJobState::kScheduled) {
     bg_cv_.Wait();
   }
 }
@@ -786,6 +789,44 @@ void DBImpl::WaitForAsyncFileOpen() {
     bg_cv_.Wait();
   }
 }
+
+#ifndef NDEBUG
+void DBImpl::TEST_WaitForBlobReferenceCensus() {
+  // Bring deferred-but-actionable slices back onto the LOW queue. Waiting
+  // only for the scheduled task can otherwise stop before its catch-up slice.
+  RetryBlobReferenceCensus();
+  InstrumentedMutexLock lock(&mutex_);
+  // A test can request a candidate refresh without a Version installation
+  // (for example, by releasing an unfinished-publication reservation).
+  // Drive that queued work before waiting; production uses its retry timer.
+  for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+    ScheduleBlobReferenceCensus(cfd);
+  }
+  for (;;) {
+    while (bg_blob_reference_census_state_ ==
+               BlobReferenceCensusJobState::kScheduled &&
+           !shutting_down_.load(std::memory_order_acquire)) {
+      bg_cv_.Wait();
+    }
+    bool deferred_catch_up = false;
+    for (ColumnFamilyData* cfd = blob_reference_census_retry_head_;
+         cfd != nullptr; cfd = cfd->next_blob_reference_census_) {
+      // Failed/pressure-limited builds are intentionally allowed to remain
+      // unavailable. Only finish actionable, non-failed catch-up slices.
+      deferred_catch_up |= !cfd->IsDropped() &&
+                           cfd->blob_reference_census_failures_ == 0 &&
+                           cfd->blob_reference_census()->NeedsWorkerRun(
+                               cfd->current()->GetVersionNumber());
+    }
+    if (!deferred_catch_up || shutting_down_.load(std::memory_order_acquire)) {
+      break;
+    }
+    mutex_.Unlock();
+    RetryBlobReferenceCensus();
+    mutex_.Lock();
+  }
+}
+#endif  // NDEBUG
 
 void DBImpl::NotifyOnDBShutdownBegin() {
   mutex_.AssertHeld();
@@ -854,10 +895,21 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
   shutting_down_.store(true, std::memory_order_release);
   bg_cv_.SignalAll();
   env_->UnSchedule(&bg_async_file_open_state_, Env::Priority::HIGH);
+  env_->UnSchedule(&bg_blob_reference_census_state_, Env::Priority::LOW);
   if (!wait) {
     return;
   }
   WaitForBackgroundWork();
+  // A census worker may have registered its lazy task after the first cancel.
+  // WaitForBackgroundWork also waits for its unlocked pin/log destruction.
+  mutex_.Unlock();
+  periodic_task_scheduler_.Unregister(PeriodicTaskType::kBlobReferenceCensus)
+      .PermitUncheckedError();
+  mutex_.Lock();
+  if (blob_reference_census_queue_head_ != nullptr ||
+      blob_reference_census_retry_head_ != nullptr) {
+    UnscheduleBlobReferenceCensus(this);
+  }
 }
 
 Status DBImpl::MaybeReleaseTimestampedSnapshotsAndCheck() {
@@ -1127,6 +1179,8 @@ Status DBImpl::CloseHelper() {
          bg_flush_scheduled_ || bg_wbm_flush_scheduled_ ||
          bg_purge_scheduled_ || bg_pressure_callback_in_progress_ ||
          bg_async_file_open_state_ == AsyncFileOpenState::kScheduled ||
+         bg_blob_reference_census_state_ ==
+             BlobReferenceCensusJobState::kScheduled ||
          async_wal_precreate_state_ == AsyncWALPrecreateState::kScheduled ||
          pending_purge_obsolete_files_ ||
          error_handler_.IsRecoveryInProgress()) {
@@ -1134,7 +1188,28 @@ Status DBImpl::CloseHelper() {
     bg_cv_.Wait();
   }
 
+  // Reverse census state can be proportional to the live SST set.  // A worker
+  // may have registered its lazy retry task after the initial
+  // CancelPeriodicTaskScheduler call. No worker remains after the wait above.
   mutex_.Unlock();
+  periodic_task_scheduler_.Unregister(PeriodicTaskType::kBlobReferenceCensus)
+      .PermitUncheckedError();
+  mutex_.Lock();
+  if (blob_reference_census_queue_head_ != nullptr ||
+      blob_reference_census_retry_head_ != nullptr) {
+    UnscheduleBlobReferenceCensus(this);
+  }
+  std::vector<BlobReferenceCensusGarbage> census_garbage;
+  const size_t column_family_count =
+      versions_->GetColumnFamilySet()->NumberOfColumnFamilies();
+  mutex_.Unlock();
+  census_garbage.reserve(column_family_count);
+  mutex_.Lock();
+  for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+    census_garbage.emplace_back(cfd->CancelBlobReferenceCensus());
+  }
+  mutex_.Unlock();
+  std::vector<BlobReferenceCensusGarbage>().swap(census_garbage);
   ReleaseRemoteCompactionPool();
   mutex_.Lock();
 

@@ -34,6 +34,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class Slice;
 class BlobSource;
+struct BlobReferenceSstSummary;
 
 struct BlobRelocationFileMetadata {
   uint32_t directory_digest = 0;
@@ -368,6 +369,14 @@ class TableBuilder {
 
   // Returns table properties
   virtual TableProperties GetTableProperties() const = 0;
+
+  // Available only after successful Finish() when exact metadata was enabled.
+  // Passing this immutable handle to FileMetaData avoids reopening a newly
+  // built output at the MANIFEST queue head.
+  virtual std::shared_ptr<const BlobReferenceSstSummary>
+  GetBlobReferenceSstSummary() const {
+    return nullptr;
+  }
 
   // Return file checksum
   virtual std::string GetFileChecksum() const = 0;

@@ -2308,6 +2308,70 @@ std::shared_ptr<const TableProperties> BlockBasedTable::GetTableProperties()
   return rep_->table_properties;
 }
 
+Status BlockBasedTable::ReadBlobReferenceGroups(
+    const Slice& expected_descriptor,
+    std::vector<BlobReferenceGroup>* groups) const {
+  if (groups == nullptr) {
+    return Status::InvalidArgument("Null blob reference group output");
+  }
+  groups->clear();
+
+  const auto properties = GetTableProperties();
+  if (properties == nullptr) {
+    return Status::Corruption("Missing table properties");
+  }
+  const auto property = properties->user_collected_properties.find(
+      kBlobReferenceDescriptorPropertyName);
+  if (property == properties->user_collected_properties.end()) {
+    return Status::Corruption("Missing required blob reference descriptor");
+  }
+  if (Slice(property->second) != expected_descriptor) {
+    return Status::Corruption("Blob reference descriptor mismatch");
+  }
+
+  BlobReferenceMetadataDescriptor descriptor;
+  Status status = BlobReferenceMetadataDescriptor::DecodeFrom(
+      expected_descriptor, &descriptor);
+  if (!status.ok()) {
+    return status;
+  }
+
+  ReadOptions read_options;
+  read_options.fill_cache = false;
+  read_options.verify_checksums = true;
+  const auto read_block = [&](const BlockHandle& handle,
+                              BlockContents* contents) -> Status {
+    IOStatus io_status =
+        BlockFetcher(rep_->file.get(), nullptr /* prefetch_buffer */,
+                     rep_->footer, read_options, handle, contents,
+                     rep_->ioptions, false /* do_uncompress */,
+                     false /* maybe_compressed */, BlockType::kUserDefinedIndex,
+                     nullptr /* decompressor */, rep_->persistent_cache_options)
+            .ReadBlockContents();
+    return io_status;
+  };
+
+  BlockContents index_contents;
+  status = read_block(descriptor.index_handle, &index_contents);
+  if (!status.ok()) {
+    return status;
+  }
+  std::vector<BlobReferenceBlockIndexEntry> block_index;
+  status =
+      DecodeBlobReferenceIndex(index_contents.data, descriptor, &block_index);
+  if (!status.ok()) {
+    return status;
+  }
+
+  BlockContents directory_contents;
+  status = read_block(descriptor.directory_handle, &directory_contents);
+  if (!status.ok()) {
+    return status;
+  }
+  return DecodeBlobReferenceDirectory(directory_contents.data, descriptor,
+                                      block_index.size(), groups);
+}
+
 const SeqnoToTimeMapping& BlockBasedTable::GetSeqnoToTimeMapping() const {
   return rep_->seqno_to_time_mapping;
 }
