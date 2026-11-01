@@ -196,6 +196,7 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckOneFile) {
   ASSERT_EQ(
       blob_file_addition.GetTotalBlobBytes(),
       number_of_blobs * (BlobLogRecord::kHeaderSize + key_size + value_size));
+  ASSERT_FALSE(blob_file_addition.IsIdentityRoot());
 
   // Verify the contents of the new blob file as well as the blob references
   VerifyBlobFile(blob_file_number, blob_file_path, column_family_id,
@@ -229,6 +230,9 @@ TEST_F(BlobFileBuilderTest, StableIdentityIndex) {
   std::string encoded;
   ASSERT_OK(builder.Add("key", value, &encoded));
   ASSERT_OK(builder.Finish());
+
+  ASSERT_EQ(blob_file_additions.size(), 1U);
+  ASSERT_TRUE(blob_file_additions.front().IsIdentityRoot());
 
   BlobIndex blob_index;
   ASSERT_OK(blob_index.DecodeFrom(encoded));

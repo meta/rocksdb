@@ -34,6 +34,7 @@
 #include "cache/cache_helpers.h"
 #include "db/blob/blob_file_meta.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_relocation_manifest.h"
 #include "db/column_family.h"
 #include "db/compaction/compaction.h"
 #include "db/compaction/compaction_picker.h"
@@ -61,6 +62,7 @@
 #include "util/autovector.h"
 #include "util/coro_utils.h"
 #include "util/hash_containers.h"
+#include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -69,6 +71,7 @@ class Writer;
 }
 
 class BlobIndex;
+struct BlobFileOpenInfo;
 class Compaction;
 class LogBuffer;
 class LookupKey;
@@ -492,6 +495,65 @@ class VersionStorageInfo {
     return std::shared_ptr<BlobFileMetaData>();
   }
 
+  using BlobRelocationFiles =
+      std::vector<std::shared_ptr<BlobRelocationFileMetaData>>;
+  using BlobRelocationRoutes = std::vector<BlobRelocationRoute>;
+  using RetiredBlobRelocationFiles = std::vector<uint64_t>;
+  using RetiredBlobRelocationRoutes = std::vector<BlobRelocationRouteSource>;
+
+  void ReserveBlobRelocationFiles(size_t size) {
+    blob_relocation_files_.reserve(size);
+  }
+  void ReserveBlobRelocationRoutes(size_t size) {
+    blob_relocation_routes_.reserve(size);
+  }
+  void ReserveRetiredBlobRelocationFiles(size_t size) {
+    retired_blob_relocation_files_.reserve(size);
+  }
+  void ReserveRetiredBlobRelocationRoutes(size_t size) {
+    retired_blob_relocation_routes_.reserve(size);
+  }
+  void AddBlobRelocationFile(
+      std::shared_ptr<BlobRelocationFileMetaData> metadata);
+  void AddBlobRelocationRoute(BlobRelocationRoute route);
+  void AddRetiredBlobRelocationFile(uint64_t file_number);
+  void AddRetiredBlobRelocationRoute(BlobRelocationRouteSource source);
+
+  const BlobRelocationFiles& GetBlobRelocationFiles() const {
+    return blob_relocation_files_;
+  }
+  const BlobRelocationRoutes& GetBlobRelocationRoutes() const {
+    return blob_relocation_routes_;
+  }
+  const RetiredBlobRelocationFiles& GetRetiredBlobRelocationFiles() const {
+    return retired_blob_relocation_files_;
+  }
+  const RetiredBlobRelocationRoutes& GetRetiredBlobRelocationRoutes() const {
+    return retired_blob_relocation_routes_;
+  }
+
+  std::shared_ptr<BlobRelocationFileMetaData> GetBlobRelocationFileMetaData(
+      uint64_t file_number) const;
+  const BlobRelocationRoute* GetBlobRelocationRoute(
+      const BlobRelocationRouteSource& source) const;
+  bool IsBlobRelocationFileRetired(uint64_t file_number) const;
+  bool IsBlobRelocationRouteRetired(
+      const BlobRelocationRouteSource& source) const;
+  size_t GetBlobRelocationRouteTargetCount(uint64_t physical_file_number) const;
+  size_t GetBlobRelocationRouteTargetOriginCount(
+      uint64_t physical_file_number, uint64_t origin_file_number) const;
+
+  void SetBlobIndirectionFormatVersion(uint32_t format_version) {
+    blob_indirection_format_version_ = format_version;
+  }
+  uint32_t GetBlobIndirectionFormatVersion() const {
+    return blob_indirection_format_version_;
+  }
+  bool HasBlobIndirectionFormat() const {
+    return blob_indirection_format_version_ != 0;
+  }
+  Status ValidateBlobRelocationState() const;
+
   // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
   struct BlobStats {
     uint64_t total_file_size = 0;
@@ -768,6 +830,18 @@ class VersionStorageInfo {
 
   // Vector of blob files in version sorted by blob file number.
   BlobFiles blob_files_;
+
+  // Physical relocation files and pair routes are separate immutable Version
+  // state. Both vectors are sorted, making read routing allocation-free and
+  // preserving old snapshots by ordinary Version ownership.
+  BlobRelocationFiles blob_relocation_files_;
+  BlobRelocationRoutes blob_relocation_routes_;
+  RetiredBlobRelocationFiles retired_blob_relocation_files_;
+  RetiredBlobRelocationRoutes retired_blob_relocation_routes_;
+  std::map<uint64_t, size_t> blob_relocation_route_target_counts_;
+  std::map<std::pair<uint64_t, uint64_t>, size_t>
+      blob_relocation_route_target_origin_counts_;
+  uint32_t blob_indirection_format_version_ = 0;
 
   // Level that L0 data should be compacted to. All levels < base_level_ should
   // be empty. -1 if it is not level-compaction so it's not applicable.
@@ -1208,6 +1282,12 @@ class Version {
       int level, bool allow_unprepared_value);
 
  private:
+  Status ResolveBlobPhysicalFile(const BlobIndex& blob_index,
+                                 BlobFileOpenInfo* physical_file,
+                                 uint64_t* physical_file_size,
+                                 bool* is_relocation_file,
+                                 uint32_t* relocation_directory_digest) const;
+
   Env* env_;
   SystemClock* clock_;
 
@@ -1821,7 +1901,17 @@ class VersionSet {
   void GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata);
 
   void AddObsoleteBlobFile(uint64_t blob_file_number, std::string path) {
+    MutexLock lock(&obsolete_files_mutex_);
     obsolete_blob_files_.emplace_back(blob_file_number, std::move(path));
+  }
+
+  void AddObsoleteFile(
+      FileMetaData* metadata, const std::string& path,
+      int uncache_aggressiveness,
+      std::shared_ptr<CacheReservationManager> file_metadata_cache_res_mgr) {
+    MutexLock lock(&obsolete_files_mutex_);
+    obsolete_files_.emplace_back(metadata, path, uncache_aggressiveness,
+                                 std::move(file_metadata_cache_res_mgr));
   }
 
   void GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
@@ -1919,6 +2009,12 @@ class VersionSet {
   size_t TEST_GetManifestPreallocationSize() {
     return manifest_preallocation_size_;
   }
+  bool TEST_IsPhysicalFileOwnedBy(uint64_t file_number,
+                                  uint32_t column_family_id) const {
+    const auto owner = physical_file_owners_.find(file_number);
+    return owner != physical_file_owners_.end() &&
+           owner->second.column_family_id == column_family_id;
+  }
 
   // Appends a kColumnFamilyDrop record for each id in cf_ids to the MANIFEST
   // file at manifest_path, whose valid content length is manifest_size bytes.
@@ -1938,6 +2034,7 @@ class VersionSet {
   friend class Version;
   friend class VersionEditHandler;
   friend class VersionEditHandlerPointInTime;
+  friend class ManifestTailer;
   friend class DumpManifestHandler;
   friend class DBImpl;
   friend class DBImplReadOnly;
@@ -1981,7 +2078,8 @@ class VersionSet {
       const std::unordered_map<uint32_t, MutableCFState>& curr_state,
       const VersionEdit& wal_additions,
       const OptionsFileManifestState& options_file_manifest_state,
-      log::Writer* log, IOStatus& io_s);
+      uint32_t blob_indirection_format_version, log::Writer* log,
+      IOStatus& io_s);
 
   // Reopen the existing MANIFEST file for append at the end of Recover()
   // when reuse_manifest_on_open is set, so the next LogAndApply appends
@@ -2028,6 +2126,34 @@ class VersionSet {
   // holding DB mutex if outside of DB startup.
   void TuneMaxManifestFileSize();
 
+  enum class PhysicalFileOwnerKind : uint8_t {
+    kTable,
+    kBlob,
+    kBlobRelocation,
+  };
+
+  struct PhysicalFileOwner {
+    uint32_t column_family_id;
+    PhysicalFileOwnerKind kind;
+  };
+
+  struct PhysicalFileOwnershipDelta {
+    PhysicalFileOwner owner;
+    bool present;
+  };
+
+  using PhysicalFileOwnershipDeltas =
+      std::unordered_map<uint64_t, PhysicalFileOwnershipDelta>;
+  using PhysicalFileOwnershipIndex = std::map<uint64_t, PhysicalFileOwner>;
+
+  // With a non-null DB mutex, the caller must have released it. The method
+  // briefly reacquires it to pin and revalidate one CFD/current Version at a
+  // time, and returns with it released. A null mutex is for single-threaded
+  // recovery.
+  Status BuildPhysicalFileOwnershipIndex(
+      const autovector<Version*>& candidate_versions,
+      InstrumentedMutex* db_mutex, PhysicalFileOwnershipIndex* index) const;
+
   // Protected by DB mutex.
   WalSet wals_;
 
@@ -2051,6 +2177,16 @@ class VersionSet {
   uint64_t options_file_size_;
   bool has_committed_options_file_number_;
   uint64_t pending_manifest_file_number_;
+  // DB-global, monotonic compatibility fence. Unlike per-CF format state,
+  // this survives dropping the last activated CF and every MANIFEST rotation.
+  uint32_t blob_indirection_format_version_ = 0;
+  // Current physical file ownership, plus durable relocation tombstones.
+  // Recovery rebuilds this once from the installed Versions. Live MANIFEST
+  // commits maintain it incrementally. The ordered index avoids a hash-table
+  // rehash proportional to all owned files while holding the DB mutex; each
+  // live update performs only a bounded number of tree operations per edited
+  // file.
+  PhysicalFileOwnershipIndex physical_file_owners_;
   // The last seq visible to reads. It normally indicates the last sequence in
   // the memtable but when using two write queues it could also indicate the
   // last sequence in the WAL visible to reads.
@@ -2133,6 +2269,10 @@ class VersionSet {
 
   // Obsolete files, or during DB shutdown any files not referenced by what's
   // left of the in-memory LSM state.
+  // Candidate Versions and builders can release their final physical metadata
+  // references outside the DB mutex. Keep obsolete publication independently
+  // serialized so their large teardown does not have to run under that mutex.
+  mutable port::Mutex obsolete_files_mutex_;
   std::vector<ObsoleteFileInfo> obsolete_files_;
   std::vector<ObsoleteBlobFileInfo> obsolete_blob_files_;
   std::vector<std::string> obsolete_manifests_;
@@ -2185,6 +2325,24 @@ class VersionSet {
   Status LogAndApplyHelper(ColumnFamilyData* cfd, VersionBuilder* b,
                            VersionEdit* edit, SequenceNumber* max_last_sequence,
                            InstrumentedMutex* mu);
+  Status ValidateAndTrackPhysicalFileOwnership(
+      const VersionEdit& edit, uint32_t active_format_version,
+      PhysicalFileOwnershipDeltas& deltas, bool validate_current_owners,
+      bool* deferred_conflict) const;
+  void MarkRemovedBlobFileOwners(const autovector<VersionEdit*>& edits,
+                                 const autovector<Version*>& versions,
+                                 PhysicalFileOwnershipDeltas& deltas) const;
+  void PrepareColumnFamilyDropOwnershipIndex(
+      uint32_t column_family_id, PhysicalFileOwnershipIndex* index) const;
+  static void RemoveColumnFamilyPhysicalFileOwners(
+      uint32_t column_family_id, PhysicalFileOwnershipIndex* index);
+  static void MarkColumnFamilyDroppedOwnershipDeltas(
+      uint32_t column_family_id, PhysicalFileOwnershipDeltas& deltas);
+  void ApplyPhysicalFileOwnershipDeltas(
+      const PhysicalFileOwnershipDeltas& deltas);
+  static void ApplyPhysicalFileOwnershipDeltasToIndex(
+      const PhysicalFileOwnershipDeltas& deltas,
+      PhysicalFileOwnershipIndex* index);
 
   const bool unchanging_;
   bool closed_;
@@ -2262,7 +2420,8 @@ class ReactiveVersionSet : public VersionSet {
 
   Status MaybeSwitchManifest(
       log::Reader::Reporter* reporter,
-      std::unique_ptr<log::FragmentBufferedReader>* manifest_reader);
+      std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+      InstrumentedMutex* db_mutex);
 
  private:
   std::unique_ptr<ManifestTailer> manifest_tailer_;
@@ -2274,6 +2433,9 @@ class ReactiveVersionSet : public VersionSet {
   // Defers initial SecondaryDB SST validation and opening until after
   // OpenAsSecondary returns. Catch-up remains synchronous.
   const bool defer_sst_file_opening_;
+  // Prevents another catch-up from entering while this one temporarily
+  // releases the DB mutex for decode, file verification, or Version building.
+  bool manifest_tail_in_progress_ = false;
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options_;
   using VersionSet::LogAndApply;

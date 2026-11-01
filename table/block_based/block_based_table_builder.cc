@@ -4283,12 +4283,16 @@ Status BlockBasedTableBuilder::Finish() {
     if (directory_status.ok()) {
       std::string encoded_directory;
       directory.EncodeTo(&encoded_directory);
-      r->props.user_collected_properties[kBlobRelocationDirectoryPropertyName] =
-          std::move(encoded_directory);
       r->blob_relocation_file_metadata = BlobRelocationFileMetadata{
           directory.directory_digest(),
           static_cast<uint64_t>(directory.origins().size()),
-          directory.total_entries(), directory.total_record_bytes()};
+          directory.total_entries(), directory.total_record_bytes(),
+          encoded_directory};
+      // Finish() keeps the Rep alive until this method returns;
+      // NULLSAFECLANG cannot carry that ownership invariant through `r`.
+      // @lint-ignore NULLSAFECLANG nullable-dereference
+      r->props.user_collected_properties[kBlobRelocationDirectoryPropertyName] =
+          std::move(encoded_directory);
     } else {
       r->SetStatus(std::move(directory_status));
     }

@@ -2181,6 +2181,14 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
     // Get the latest mutable cf options while the mutex is still locked
     const MutableCFOptions mutable_cf_options_copy =
         cfd->GetLatestMutableCFOptions();
+    // WAL recovery can be the first writer of feature identity BlobIndexes.
+    // Fence its edit before releasing the mutex, so successful SST/blob
+    // additions never depend on a later ordinary flush for format activation.
+    if (mutable_cf_options_copy.enable_blob_indirection ||
+        cfd->current()->storage_info()->HasBlobIndirectionFormat()) {
+      edit->SetBlobIndirectionFormatVersion(
+          kBlobIndirectionManifestFormatVersion);
+    }
     bool paranoid_file_checks =
         cfd->GetLatestMutableCFOptions().paranoid_file_checks;
 

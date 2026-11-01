@@ -383,9 +383,9 @@ Status BlobFileBuilder::CloseBlobFile() {
   }
 
   assert(blob_file_additions_);
-  blob_file_additions_->emplace_back(blob_file_number, blob_count_, blob_bytes_,
-                                     std::move(checksum_method),
-                                     std::move(checksum_value));
+  blob_file_additions_->emplace_back(
+      blob_file_number, blob_count_, blob_bytes_, std::move(checksum_method),
+      std::move(checksum_value), enable_blob_indirection_);
 
   assert(immutable_options_);
   ROCKS_LOG_INFO(immutable_options_->logger,
