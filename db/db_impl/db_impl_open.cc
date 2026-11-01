@@ -1092,9 +1092,12 @@ Status DBImpl::LogAndApplyForRecovery(RecoveryContext& recovery_ctx) {
     recovery_ctx.UpdateVersionEdits(default_cfd, edit);
   }
 
-  Status s = versions_->LogAndApply(recovery_ctx.cfds_, read_options,
-                                    write_options, recovery_ctx.edit_lists_,
-                                    &mutex_, directories_.GetDbDir());
+  Status s = versions_->LogAndApply(
+      recovery_ctx.cfds_, read_options, write_options, recovery_ctx.edit_lists_,
+      VersionSet::LogAndApplyColumnFamilyMode::kMayRepeatColumnFamilies,
+      /*new_mutable_cf_options=*/nullptr,
+      /*compaction_phase_anchor_time=*/std::nullopt, &mutex_,
+      directories_.GetDbDir());
   if (s.ok()) {
     versions_->force_new_manifest_on_open_ = false;
   }

@@ -1928,8 +1928,7 @@ class VersionBuilder::Rep : public MutableScalars {
     return true;
   }
 
-  // Save the current state in *vstorage.
-  Status SaveTo(VersionStorageInfo* vstorage) const {
+  Status SaveTableFilesTo(VersionStorageInfo* vstorage) const {
     assert(!track_found_and_missing_files_ || valid_version_available_);
     Status s;
 
@@ -1947,13 +1946,27 @@ class VersionBuilder::Rep : public MutableScalars {
     }
 
     SaveSSTFilesTo(vstorage);
+    SaveCompactCursorsTo(vstorage);
+
+    return Status::OK();
+  }
+
+  Status FinalizeBlobFilesTo(VersionStorageInfo* vstorage) const {
+    assert(!track_found_and_missing_files_ || valid_version_available_);
 
     SaveBlobFilesTo(vstorage);
 
-    SaveCompactCursorsTo(vstorage);
+    return CheckConsistency(vstorage);
+  }
 
-    s = CheckConsistency(vstorage);
-    return s;
+  // Save the current state in *vstorage.
+  Status SaveTo(VersionStorageInfo* vstorage) const {
+    Status s = SaveTableFilesTo(vstorage);
+    if (!s.ok()) {
+      return s;
+    }
+
+    return FinalizeBlobFilesTo(vstorage);
   }
 
   Status LoadTableHandlers(InternalStats* internal_stats, int max_threads,
@@ -2052,6 +2065,14 @@ Status VersionBuilder::Apply(const VersionEdit* edit) {
 
 Status VersionBuilder::SaveTo(VersionStorageInfo* vstorage) const {
   return rep_->SaveTo(vstorage);
+}
+
+Status VersionBuilder::SaveTableFilesTo(VersionStorageInfo* vstorage) const {
+  return rep_->SaveTableFilesTo(vstorage);
+}
+
+Status VersionBuilder::FinalizeBlobFilesTo(VersionStorageInfo* vstorage) const {
+  return rep_->FinalizeBlobFilesTo(vstorage);
 }
 
 Status VersionBuilder::LoadTableHandlers(

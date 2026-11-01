@@ -245,6 +245,10 @@ ForwardIterator::ForwardIterator(DBImpl* db, const ReadOptions& read_options,
       is_prev_set_(false),
       is_prev_inclusive_(false),
       pinned_iters_mgr_(nullptr) {
+  // A SuperVersion alone does not keep a dropped CFD linked in the list used
+  // by AddLiveFiles(). Match ordinary iterators' direct CFD lifetime pin before
+  // any child can lazily open an SST/blob after the CF handle is destroyed.
+  cfd_->Ref();
   if (sv_) {
     RebuildIterators(false);
   }
@@ -259,7 +263,12 @@ ForwardIterator::ForwardIterator(DBImpl* db, const ReadOptions& read_options,
   immutable_status_.PermitUncheckedError();
 }
 
-ForwardIterator::~ForwardIterator() { Cleanup(true); }
+ForwardIterator::~ForwardIterator() {
+  Cleanup(true);
+  // Release only after the SuperVersion; deferred SV cleanups own their own
+  // direct CFD pin until their visited key/value slices are unpinned.
+  db_->ReleaseColumnFamilyDataPin(cfd_);
+}
 
 void ForwardIterator::SVCleanup(DBImpl* db, SuperVersion* sv,
                                 bool background_purge_on_iterator_cleanup) {
@@ -290,6 +299,7 @@ namespace {
 struct SVCleanupParams {
   DBImpl* db;
   SuperVersion* sv;
+  ColumnFamilyData* cfd;
   bool background_purge_on_iterator_cleanup;
 };
 }  // anonymous namespace
@@ -299,6 +309,7 @@ void ForwardIterator::DeferredSVCleanup(void* arg) {
   auto d = static_cast<SVCleanupParams*>(arg);
   ForwardIterator::SVCleanup(d->db, d->sv,
                              d->background_purge_on_iterator_cleanup);
+  d->db->ReleaseColumnFamilyDataPin(d->cfd);
   delete d;
 }
 
@@ -314,7 +325,8 @@ void ForwardIterator::SVCleanup() {
     // are alive until pinned_iters_mgr_->ReleasePinnedData() is called.
     // The slices may point into some memtables owned by sv_, so we need to keep
     // sv_ referenced until pinned_iters_mgr_ unpins everything.
-    auto p = new SVCleanupParams{db_, sv_, background_purge};
+    auto p = new SVCleanupParams{db_, sv_, cfd_, background_purge};
+    cfd_->Ref();
     pinned_iters_mgr_->PinPtr(p, &ForwardIterator::DeferredSVCleanup);
   } else {
     SVCleanup(db_, sv_, background_purge);

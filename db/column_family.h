@@ -371,6 +371,14 @@ class ColumnFamilyData {
   // Validate CF options against DB options
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
+  // Parses and validates a replacement without publishing it. The caller
+  // keeps the DB mutex held so the latest-options base remains stable.
+  Status PrepareMutableCFOptions(
+      const DBOptions& db_options,
+      const std::unordered_map<std::string, std::string>& options_map,
+      MutableCFOptions* mutable_cf_options) const;
+  // Publishes a previously prepared replacement. REQUIRES: DB mutex held.
+  void InstallMutableCFOptions(const MutableCFOptions& mutable_cf_options);
   // REQUIRES: DB mutex held
   Status SetOptions(
       const DBOptions& db_options,
