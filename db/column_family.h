@@ -400,9 +400,6 @@ class ColumnFamilyData {
   // Validate CF options against DB options
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
-  // Test-only, not public API. Until the Blob GC stack is complete,
-  // ValidateOptions rejects enable_blob_indirection unless a test allows it.
-  static void TEST_SetAllowBlobIndirection(bool allow);
   // Validates writer-only constraints that depend on the recovered sticky
   // format fence. REQUIRES: DB mutex held after MANIFEST recovery.
   Status ValidateBlobIndirectionOptionsAfterRecovery() const;

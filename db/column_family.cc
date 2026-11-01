@@ -61,26 +61,7 @@ ColumnFamilyHandleImpl::~ColumnFamilyHandleImpl() {
     for (auto& listener : cfd_->ioptions().listeners) {
       listener->OnColumnFamilyHandleDeletionStarted(this);
     }
-    // Job id == 0 means that this is not our background process, but rather
-    // user thread
-    // Need to hold some shared pointers owned by the initial_cf_options
-    // before final cleaning up finishes.
-    ColumnFamilyOptions initial_cf_options_copy = cfd_->initial_cf_options();
-    JobContext job_context(0);
-    mutex_->Lock();
-    bool dropped = cfd_->IsDropped();
-    if (cfd_->UnrefAndTryDelete()) {
-      if (dropped) {
-        db_->FindObsoleteFiles(&job_context, false, true);
-      }
-    }
-    mutex_->Unlock();
-    if (job_context.HaveSomethingToDelete()) {
-      bool defer_purge =
-          db_->immutable_db_options().avoid_unnecessary_blocking_io;
-      db_->PurgeObsoleteFiles(job_context, defer_purge);
-    }
-    job_context.Clean();
+    db_->ReleaseColumnFamilyHandle(cfd_);
   }
 }
 
@@ -760,20 +741,23 @@ BlobReferenceCensusGarbage ColumnFamilyData::CancelBlobReferenceCensus() {
   return blob_reference_census_->Cancel();
 }
 
-// DB mutex held
+// The DB mutex is held unless DetachFromColumnFamilySet() already performed
+// the mutex-protected unlink for an unlocked final teardown.
 ColumnFamilyData::~ColumnFamilyData() {
   assert(refs_.load(std::memory_order_relaxed) == 0);
-  // remove from linked list
-  auto prev = prev_;
-  auto next = next_;
-  prev->next_ = next;
-  next->prev_ = prev;
+  if (!detached_from_column_family_set_) {
+    // remove from linked list
+    auto prev = prev_;
+    auto next = next_;
+    prev->next_ = next;
+    next->prev_ = prev;
 
-  if (!dropped_ && column_family_set_ != nullptr) {
-    // If it's dropped, it's already removed from column family set
-    // If column_family_set_ == nullptr, this is dummy CFD and not in
-    // ColumnFamilySet
-    column_family_set_->RemoveColumnFamily(this);
+    if (!dropped_ && column_family_set_ != nullptr) {
+      // If it's dropped, it's already removed from column family set
+      // If column_family_set_ == nullptr, this is dummy CFD and not in
+      // ColumnFamilySet
+      column_family_set_->RemoveColumnFamily(this);
+    }
   }
 
   if (current_ != nullptr) {
@@ -848,6 +832,66 @@ bool ColumnFamilyData::UnrefAndTryDelete() {
     }
   }
   return false;
+}
+
+void ColumnFamilyData::DetachFromColumnFamilySet() {
+  assert(!detached_from_column_family_set_);
+  ColumnFamilyData* const prev = prev_;
+  ColumnFamilyData* const next = next_;
+  prev->next_ = next;
+  next->prev_ = prev;
+  next_ = this;
+  prev_ = this;
+  if (!dropped_ && column_family_set_ != nullptr) {
+    column_family_set_->RemoveColumnFamily(this);
+  }
+  detached_from_column_family_set_ = true;
+}
+
+bool ColumnFamilyData::UnrefAndTryDetach(
+    SuperVersion** pending_super_version,
+    std::unique_ptr<ThreadLocalPtr>* detached_local_super_versions) {
+  assert(pending_super_version != nullptr);
+  assert(detached_local_super_versions != nullptr);
+  assert(*detached_local_super_versions == nullptr);
+  *pending_super_version = nullptr;
+  const int old_refs = refs_.fetch_sub(1);
+  assert(old_refs > 0);
+
+  if (old_refs == 1) {
+    assert(super_version_ == nullptr);
+    DetachFromColumnFamilySet();
+    return true;
+  }
+
+  if (old_refs == 2 && super_version_ != nullptr) {
+    // The installed SuperVersion owns the only remaining CFD reference. Drain
+    // its thread-local references before dropping the installed reference, as
+    // their cleanup callback cannot delete a SuperVersion.
+    DetachFromColumnFamilySet();
+    *pending_super_version = super_version_;
+    super_version_ = nullptr;
+    *detached_local_super_versions = std::move(local_sv_);
+  }
+  return false;
+}
+
+bool ColumnFamilyData::FinishSuperVersionDetach(
+    SuperVersion* pending_super_version) {
+  assert(pending_super_version != nullptr);
+  assert(super_version_ == nullptr);
+  assert(local_sv_ == nullptr);
+  if (!pending_super_version->Unref()) {
+    return false;
+  }
+  assert(pending_super_version->cfd == this);
+  return true;
+}
+
+void ColumnFamilyData::DeleteDetached() {
+  assert(detached_from_column_family_set_);
+  assert(refs_.load(std::memory_order_relaxed) == 0);
+  delete this;
 }
 
 void ColumnFamilyData::SetDropped() {
@@ -1564,23 +1608,8 @@ Status CheckBlobIndirectionCompactionStyle(CompactionStyle style,
   return Status::OK();
 }
 
-namespace {
-std::atomic<bool> allow_blob_indirection_for_test{false};
-}  // namespace
-
-void ColumnFamilyData::TEST_SetAllowBlobIndirection(bool allow) {
-  allow_blob_indirection_for_test.store(allow, std::memory_order_relaxed);
-}
-
 Status ColumnFamilyData::ValidateOptions(
     const DBOptions& db_options, const ColumnFamilyOptions& cf_options) {
-  // Later revisions of this stack complete the feature. Until then, data
-  // written with it may not stay readable or safely activated.
-  if (cf_options.enable_blob_indirection &&
-      !allow_blob_indirection_for_test.load(std::memory_order_relaxed)) {
-    return Status::NotSupported(
-        "enable_blob_indirection is not supported in this revision");
-  }
   Status s = CheckBlobIndirectionCompactionStyle(
       cf_options.compaction_style, cf_options.enable_blob_indirection);
   if (!s.ok()) {

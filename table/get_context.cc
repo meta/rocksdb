@@ -431,6 +431,21 @@ bool GetContext::SaveValue(const ParsedInternalKey& parsed_key,
 
     auto type = parsed_key.type;
     Slice unpacked_value = value;
+    if ((type == kTypeBlobIndex || type == kTypeWideColumnEntity) &&
+        blob_fetcher_ != nullptr && blob_fetcher_->HasBlobValueLoss()) {
+      bool lost = false;
+      const Status status = blob_fetcher_->IsBlobValueLost(type, value, &lost);
+      if (!status.ok()) {
+        state_ = kCorrupt;
+        *read_status = status;
+        return false;
+      }
+      if (lost) {
+        // Reuse ordinary deletion/merge handling without exposing an older
+        // version of this key. No stable cache or lazy column is consulted.
+        type = kTypeDeletion;
+      }
+    }
     // Key matches. Process it
     if ((type == kTypeValue || type == kTypeValuePreferredSeqno ||
          type == kTypeMerge || type == kTypeBlobIndex ||

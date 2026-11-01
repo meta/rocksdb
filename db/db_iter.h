@@ -753,5 +753,10 @@ class DBIter final : public Iterator {
 
   IterKey range_tomb_first_key_;
   IterKey range_tomb_end_key_;
+  // ParseKey() turned the current entry into a deletion because its blob
+  // value is an accepted loss. Lost keys never join a tombstone run.
+  bool current_entry_lost_ = false;
+  // FindValueForCurrentKey*() found a visible deletion that is a lost key.
+  bool current_key_deleted_by_loss_ = false;
 };
 }  // namespace ROCKSDB_NAMESPACE

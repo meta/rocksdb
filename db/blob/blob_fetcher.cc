@@ -44,6 +44,21 @@ Status VersionBlobFetcherBase::FetchBlob(const Slice& user_key,
       prefetch_buffer, blob_value, bytes_read);
 }
 
+Status VersionBlobFetcherBase::IsBlobValueLost(ValueType type,
+                                               const Slice& value,
+                                               bool* lost) const {
+  if (version_ != nullptr) {
+    return version_->IsBlobValueLost(type, value, lost);
+  }
+  *lost = false;
+  return Status::OK();
+}
+
+bool VersionBlobFetcherBase::HasBlobValueLoss() const {
+  return version_ != nullptr &&
+         version_->storage_info()->HasMissingBlobRelocationFiles();
+}
+
 Status VersionBlobFetcherBase::FetchBlobRange(
     const Slice& user_key, const BlobIndex& blob_index, uint64_t range_offset,
     size_t range_length, BlobVerifyPolicy verify_policy,

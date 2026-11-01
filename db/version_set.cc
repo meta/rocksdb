@@ -2929,12 +2929,53 @@ Status Version::ResolveBlobPhysicalFile(
   if (relocation->GetDirectory().Find(source.origin_file_number) == nullptr) {
     return Status::Corruption("Relocation file does not contain blob origin");
   }
+  if (relocation->IsMarkedMissing()) {
+    return Status::NotFound("Blob relocation target is marked lost");
+  }
   *physical_file = BlobFileOpenInfo{
       selected_file_number, relocation->GetChecksumValue(),
       relocation->GetChecksumMethod(), relocation->GetTailSize()};
   *physical_file_size = relocation->GetFileSize();
   *is_relocation_file = true;
   *relocation_directory_digest = relocation->GetDirectoryDigest();
+  return Status::OK();
+}
+
+bool VersionStorageInfo::IsBlobReferenceLost(const BlobIndex& index) const {
+  if (!index.IsIndirect() || !HasMissingBlobRelocationFiles()) {
+    return false;
+  }
+  const BlobRelocationRouteSource source{index.generation_file_number(),
+                                         index.origin_file_number()};
+  const BlobRelocationRoute* const route = GetBlobRelocationRoute(source);
+  const std::shared_ptr<BlobRelocationFileMetaData> file =
+      GetBlobRelocationFileMetaData(route != nullptr
+                                        ? route->GetPhysicalFileNumber()
+                                        : source.generation_file_number);
+  return file != nullptr && file->IsMarkedMissing();
+}
+
+Status Version::IsBlobValueLost(ValueType type, const Slice& value,
+                                bool* lost) const {
+  assert(lost != nullptr);
+  *lost = false;
+  if (!storage_info_.HasMissingBlobRelocationFiles()) {
+    return Status::OK();
+  }
+  if (type == kTypeBlobIndex) {
+    BlobIndex index;
+    const Status status = index.DecodeFrom(value);
+    if (!status.ok()) {
+      return status;
+    }
+    *lost = storage_info_.IsBlobReferenceLost(index);
+  } else if (type == kTypeWideColumnEntity) {
+    return WideColumnSerialization::ForEachBlobIndex(
+        value, [this, lost](const BlobIndex& index) {
+          *lost |= storage_info_.IsBlobReferenceLost(index);
+          return Status::OK();
+        });
+  }
   return Status::OK();
 }
 
@@ -4399,6 +4440,108 @@ void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
                                     /*enable_blob_indirection=*/false);
 }
 
+void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
+    double blob_garbage_collection_age_cutoff,
+    double blob_garbage_collection_force_threshold,
+    bool enable_blob_garbage_collection, bool enable_blob_indirection) {
+  files_marked_for_forced_blob_gc_.clear();
+  if (!(enable_blob_garbage_collection &&
+        blob_garbage_collection_age_cutoff > 0.0 &&
+        blob_garbage_collection_force_threshold < 1.0)) {
+    return;
+  }
+
+  if (blob_files_.empty()) {
+    return;
+  }
+  // Compaction preserves stable identity references while this policy is on;
+  // rewriting their linked SSTs cannot advance legacy prefix GC. Let the
+  // independent ratio heap collect them instead of repeatedly marking work
+  // that leaves the oldest identity root unchanged.
+  if (enable_blob_indirection && blob_files_.front()->IsIdentityRoot()) {
+    return;
+  }
+
+  // Number of blob files eligible for GC based on age
+  const size_t cutoff_count = static_cast<size_t>(
+      blob_garbage_collection_age_cutoff * blob_files_.size());
+  if (!cutoff_count) {
+    return;
+  }
+
+  // Compute the sum of total and garbage bytes over the batch of blob files
+  // currently eligible for garbage collection based on
+  // blob_garbage_collection_age_cutoff, and if the garbage ratio exceeds
+  // blob_garbage_collection_force_threshold, schedule compaction for the
+  // SST files that reference the oldest batch of blob files. Here is a toy
+  // example. Let's assume we have three SSTs 1, 2, and 3, and four blob files
+  // 10, 11, 12, and 13, which correspond to the range that is eligible for GC
+  // and satisfy the garbage ratio threshold. Also, let's say SSTs 1 and 2 both
+  // rely on blob file 10 and potentially some higher-numbered ones, while SST 3
+  // relies on blob file 12 and potentially some higher-numbered ones. Then, the
+  // SST to oldest blob file mapping is as follows:
+  //
+  // SST file number               Oldest blob file number
+  // 1                             10
+  // 2                             10
+  // 3                             12
+  //
+  // This is what the same thing looks like from the blob files' POV. (Note that
+  // the linked SSTs simply denote the inverse mapping of the above.)
+  //
+  // Blob file number              Linked SST set
+  // 10                            {1, 2}
+  // 11                            {}
+  // 12                            {3}
+  // 13                            {}
+  //
+  // Then, the oldest batch of blob files consists of blob files 10 and 11,
+  // and we can get rid of them by forcing the compaction of SSTs 1 and 2.
+  const auto& oldest_meta = blob_files_.front();
+  assert(oldest_meta);
+
+  const auto& linked_ssts = oldest_meta->GetLinkedSsts();
+  assert(!linked_ssts.empty());
+
+  size_t count = 1;
+  uint64_t sum_total_blob_bytes = oldest_meta->GetTotalBlobBytes();
+  uint64_t sum_garbage_blob_bytes = oldest_meta->GetGarbageBlobBytes();
+
+  assert(cutoff_count <= blob_files_.size());
+
+  for (; count < cutoff_count; ++count) {
+    const auto& meta = blob_files_[count];
+    assert(meta);
+
+    sum_total_blob_bytes += meta->GetTotalBlobBytes();
+    sum_garbage_blob_bytes += meta->GetGarbageBlobBytes();
+  }
+
+  if (sum_garbage_blob_bytes <
+      blob_garbage_collection_force_threshold * sum_total_blob_bytes) {
+    return;
+  }
+
+  for (uint64_t sst_file_number : linked_ssts) {
+    const FileLocation location = GetFileLocation(sst_file_number);
+    assert(location.IsValid());
+
+    const int level = location.GetLevel();
+    assert(level >= 0);
+
+    const size_t pos = location.GetPosition();
+
+    FileMetaData* const sst_meta = files_[level][pos];
+    assert(sst_meta);
+
+    if (sst_meta->being_compacted) {
+      continue;
+    }
+
+    files_marked_for_forced_blob_gc_.emplace_back(level, sst_meta);
+  }
+}
+
 void VersionStorageInfo::ComputeFilesMarkedForReadTriggeredCompaction(
     double threshold, CompactionStyle compaction_style) {
   read_triggered_compaction_files_.clear();
@@ -4515,6 +4658,14 @@ void VersionStorageInfo::AddBlobRelocationRoute(BlobRelocationRoute route) {
   MutableBlobRelocationState().SetRoute(std::move(route));
 }
 
+void VersionStorageInfo::DeleteBlobRelocationFile(uint64_t file_number) {
+  MutableBlobRelocationState().DeleteFile(file_number);
+}
+
+void VersionStorageInfo::DeleteBlobRelocationRoute(
+    const BlobRelocationRouteSource& source) {
+  MutableBlobRelocationState().DeleteRoute(source);
+}
 std::shared_ptr<BlobRelocationFileMetaData>
 VersionStorageInfo::GetBlobRelocationFileMetaData(uint64_t file_number) const {
   return BlobRelocationStateForRead().FindFile(file_number);
@@ -4532,6 +4683,11 @@ size_t VersionStorageInfo::GetBlobRelocationRouteTargetCount(
   return sources != nullptr ? sources->size() : 0;
 }
 
+const std::vector<BlobRelocationRouteSource>*
+VersionStorageInfo::GetBlobRelocationRouteSourcesForTarget(
+    uint64_t physical_file_number) const {
+  return BlobRelocationStateForRead().SourcesForTarget(physical_file_number);
+}
 size_t VersionStorageInfo::GetBlobRelocationRouteTargetOriginCount(
     uint64_t physical_file_number, uint64_t origin_file_number) const {
   return BlobRelocationStateForRead().TargetOriginCount(physical_file_number,
@@ -4617,6 +4773,91 @@ VersionStorageInfo::GetBlobFileMetaDataLB(uint64_t blob_file_number) const {
         assert(lhs);
         return lhs->GetBlobFileNumber() < rhs;
       });
+}
+
+void VersionStorageInfo::SetBlobGcCandidates(
+    const std::array<uint64_t, kBlobGcMaxSelectedFiles>& files) {
+  blob_files_for_standalone_gc_ = files;
+  blob_files_for_standalone_gc_count_ = 0;
+  for (uint64_t file_number : files) {
+    if (file_number == kInvalidBlobFileNumber) {
+      break;
+    }
+    ++blob_files_for_standalone_gc_count_;
+  }
+}
+
+void VersionStorageInfo::SuppressBlobFileForStandaloneGC(
+    uint64_t physical_file_number) {
+  for (size_t i = 0; i < empty_blob_files_for_standalone_gc_.size(); ++i) {
+    if (empty_blob_files_for_standalone_gc_[i] == physical_file_number) {
+      std::move(empty_blob_files_for_standalone_gc_.begin() + i + 1,
+                empty_blob_files_for_standalone_gc_.end(),
+                empty_blob_files_for_standalone_gc_.begin() + i);
+      empty_blob_files_for_standalone_gc_.back() = 0;
+      break;
+    }
+  }
+  for (size_t i = 0; i < blob_files_for_standalone_gc_count_; ++i) {
+    if (blob_files_for_standalone_gc_[i] == physical_file_number) {
+      for (size_t next = i + 1; next < blob_files_for_standalone_gc_count_;
+           ++next) {
+        blob_files_for_standalone_gc_[next - 1] =
+            blob_files_for_standalone_gc_[next];
+      }
+      blob_files_for_standalone_gc_[--blob_files_for_standalone_gc_count_] = 0;
+      return;
+    }
+  }
+}
+
+void VersionStorageInfo::DeferBlobFilesForStandaloneGC(
+    const std::vector<uint64_t>& physical_file_numbers) {
+  for (uint64_t file_number : physical_file_numbers) {
+    for (size_t i = 0; i < blob_files_for_standalone_gc_count_; ++i) {
+      if (blob_files_for_standalone_gc_[i] != file_number) {
+        continue;
+      }
+      for (size_t next = i + 1; next < blob_files_for_standalone_gc_count_;
+           ++next) {
+        blob_files_for_standalone_gc_[next - 1] =
+            blob_files_for_standalone_gc_[next];
+      }
+      blob_files_for_standalone_gc_[blob_files_for_standalone_gc_count_ - 1] =
+          file_number;
+      break;
+    }
+  }
+}
+
+uint64_t VersionStorageInfo::BlobPhysicalFileForStandaloneGC() const {
+  return blob_files_for_standalone_gc_count_ != 0
+             ? blob_files_for_standalone_gc_[0]
+             : kInvalidBlobFileNumber;
+}
+
+void VersionStorageInfo::GetBlobPhysicalFilesForStandaloneGC(
+    size_t max_files, std::vector<uint64_t>* physical_file_numbers) const {
+  assert(physical_file_numbers != nullptr);
+  physical_file_numbers->clear();
+  const size_t count = std::min(max_files, blob_files_for_standalone_gc_count_);
+  for (size_t i = 0; i < count; ++i) {
+    physical_file_numbers->push_back(blob_files_for_standalone_gc_[i]);
+  }
+}
+
+void VersionStorageInfo::GetEmptyBlobGcCandidates(
+    size_t max_files, std::vector<uint64_t>* files) const {
+  assert(files != nullptr);
+  files->clear();
+  for (size_t i = 0;
+       i < std::min(max_files, empty_blob_files_for_standalone_gc_.size());
+       ++i) {
+    if (empty_blob_files_for_standalone_gc_[i] == kInvalidBlobFileNumber) {
+      break;
+    }
+    files->push_back(empty_blob_files_for_standalone_gc_[i]);
+  }
 }
 
 void VersionStorageInfo::SetFinalized() {
@@ -5768,6 +6009,13 @@ Env::WriteLifeTimeHint VersionStorageInfo::CalculateSSTWriteHint(
 
 void Version::AddLiveFiles(std::vector<uint64_t>* live_table_files,
                            std::vector<uint64_t>* live_blob_files) const {
+  AddLiveFiles(live_table_files, live_blob_files,
+               /*skip_marked_missing=*/false);
+}
+
+void Version::AddLiveFiles(std::vector<uint64_t>* live_table_files,
+                           std::vector<uint64_t>* live_blob_files,
+                           bool skip_marked_missing) const {
   assert(live_table_files);
   assert(live_blob_files);
 
@@ -5789,6 +6037,9 @@ void Version::AddLiveFiles(std::vector<uint64_t>* live_table_files,
   for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
        storage_info_.GetBlobRelocationFiles()) {
     assert(metadata != nullptr);
+    if (skip_marked_missing && metadata->IsMarkedMissing()) {
+      continue;
+    }
     live_blob_files->emplace_back(metadata->GetFileNumber());
   }
 }
@@ -5900,6 +6151,7 @@ struct VersionSet::ManifestWriter {
   bool precondition_may_join_batch;
   bool starts_caller;
   bool has_predating_blob_reference_output;
+  bool activates_blob_indirection = false;
   bool caller_has_predating_blob_reference_output;
   bool caller_activates_blob_indirection;
   int max_file_opening_threads;
@@ -5913,7 +6165,7 @@ struct VersionSet::ManifestWriter {
       bool _has_predating_blob_reference_output,
       const MutableCFOptions* _new_mutable_cf_options,
       std::optional<uint64_t> _compaction_phase_anchor_time,
-      int _max_file_opening_threads = 1)
+      int _max_file_opening_threads)
       : done(false),
         cv(mu),
         cfd(_cfd),
@@ -6028,6 +6280,7 @@ VersionSet::VersionSet(
       manifest_last_valid_record_end_(0),
       manifest_last_valid_record_end_file_number_(0),
       force_new_manifest_on_open_(false),
+      repair_manifest_staging_(false),
       last_compacted_manifest_file_size_(0),
       file_options_(storage_options),
       block_cache_tracer_(block_cache_tracer),
@@ -6265,6 +6518,7 @@ void VersionSet::Reset() {
   manifest_last_valid_record_end_ = 0;
   manifest_last_valid_record_end_file_number_ = 0;
   force_new_manifest_on_open_ = false;
+  repair_manifest_staging_ = false;
   last_compacted_manifest_file_size_ = 0;
   TuneMaxManifestFileSize();
   {
@@ -6779,17 +7033,34 @@ Status VersionSet::ProcessManifestWrites(
         }
       } else {
         if (last_writer->has_predating_blob_reference_output &&
-            writer_cfd->current()->storage_info()->HasBlobIndirectionFormat()) {
+            (writer_cfd->current()
+                 ->storage_info()
+                 ->HasBlobIndirectionFormat() ||
+             last_writer->activates_blob_indirection)) {
           const uint64_t base_version_number =
               writer_cfd->current()->GetVersionNumber();
+          const bool base_has_format =
+              writer_cfd->current()->storage_info()->HasBlobIndirectionFormat();
           db_mutex.Unlock();
           // The queue head prevents another MANIFEST install while the
           // potentially output-proportional classification runs unlocked.
+          // One caller can contain both preactivation and activation edits
+          // (parallel flushes completing in reverse order). Classify only its
+          // predating outputs without splitting the atomic install group.
           // @lint-ignore NULLSAFECLANG nullable-dereference
           TEST_SYNC_POINT_CALLBACK(
               "VersionSet::ProcessManifestWrites:"
               "MarkPredatingBlobReferenceOutputsUnlocked",
               &db_mutex);
+          if (last_writer->activates_blob_indirection) {
+            // An earlier edit must validate against this caller's final fence,
+            // not an unfenced intermediate builder state. Repeat the same
+            // monotonic fence in its first record; do not reorder or split
+            // flush/atomic-group edits. Replay sees a valid classified prefix
+            // (or, for an atomic group, only the complete group).
+            last_writer->edit_list.front()->SetBlobIndirectionFormatVersion(
+                kBlobIndirectionManifestFormatVersion);
+          }
           for (VersionEdit* edit : last_writer->edit_list) {
             edit->MarkBlobReferenceOutputsPredatingIndirectionLegacy();
           }
@@ -6799,9 +7070,9 @@ Status VersionSet::ProcessManifestWrites(
               writer_cfd->IsDropped() ||
               writer_cfd->current()->GetVersionNumber() !=
                   base_version_number ||
-              !writer_cfd->current()
-                   ->storage_info()
-                   ->HasBlobIndirectionFormat()) {
+              writer_cfd->current()
+                      ->storage_info()
+                      ->HasBlobIndirectionFormat() != base_has_format) {
             const Status ownership_changed = Status::Corruption(
                 "MANIFEST queue or blob indirection fence changed while "
                 "classifying preactivation outputs");
@@ -7078,6 +7349,7 @@ Status VersionSet::ProcessManifestWrites(
   }
 #endif  // NDEBUG
 
+  Status s;
   uint64_t prev_manifest_file_size = manifest_file_size_;
   assert(pending_manifest_file_number_ == 0);
   bool has_foreground_operation = false;
@@ -7104,8 +7376,14 @@ Status VersionSet::ProcessManifestWrites(
     // don't keep in case of overflow
     enforced_limit = std::max(enforced_limit, new_limit);
   }
-  if (!skip_manifest_write &&
-      (!descriptor_log_ || prev_manifest_file_size >= enforced_limit)) {
+  if (repair_manifest_staging_) {
+    if (descriptor_log_ == nullptr || new_descriptor_log) {
+      s = Status::Corruption("Repair has no valid staged MANIFEST writer");
+    }
+    new_descriptor_log = false;
+    pending_manifest_file_number_ = manifest_file_number_;
+  } else if (!skip_manifest_write &&
+             (!descriptor_log_ || prev_manifest_file_size >= enforced_limit)) {
     TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:BeforeNewManifest");
     new_descriptor_log = true;
   } else {
@@ -7142,7 +7420,6 @@ Status VersionSet::ProcessManifestWrites(
   }
 
   uint64_t new_manifest_file_size = 0;
-  Status s;
   // Finalization fails before any MANIFEST record is written.
   bool blob_finalization_failed = false;
   IOStatus io_s;
@@ -7242,9 +7519,6 @@ Status VersionSet::ProcessManifestWrites(
         }
       }
     }
-    if (s.ok()) {
-      s = prepare_census_installs();
-    }
 #ifndef NDEBUG
     if (activates_blob_indirection) {
       TEST_SYNC_POINT(
@@ -7270,6 +7544,11 @@ Status VersionSet::ProcessManifestWrites(
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
         versions[i]->PrepareAppend(read_options, update_stats);
       }
+      // PrepareAppend derives the installed coarse identity frontier during
+      // its existing file-location walk. Capture it only afterwards so the
+      // asynchronous heap and the installed Version use the same pinning
+      // epoch. All delta allocation and preparation remains outside DB mutex.
+      s = prepare_census_installs();
     }
     db_mutex.Lock();
   } else {
@@ -7287,7 +7566,8 @@ Status VersionSet::ProcessManifestWrites(
     // infer through the test-only macro expansion.
     // @lint-ignore NULLSAFECLANG nullable-dereference
     TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:BeforeBlobFinalization");
-    if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
+    if (s.ok() &&
+        !first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
         assert(!builder_guards.empty() &&
                builder_guards.size() == versions.size());
@@ -7300,10 +7580,6 @@ Status VersionSet::ProcessManifestWrites(
           break;
         }
       }
-    }
-    if (s.ok() &&
-        !first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
-      s = prepare_census_installs();
     }
 #ifndef NDEBUG
     if (activates_blob_indirection) {
@@ -7384,6 +7660,10 @@ Status VersionSet::ProcessManifestWrites(
         for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
           versions[i]->PrepareAppend(read_options, update_stats);
         }
+        // The coarse identity frontier is derived by PrepareAppend. Preparing
+        // the delta earlier would publish a stale frontier and allow a pinned
+        // L0 identity root into the standalone-GC candidate heap.
+        s = prepare_census_installs();
       }
 
       // Write new records to MANIFEST log
@@ -7391,7 +7671,7 @@ Status VersionSet::ProcessManifestWrites(
       size_t idx = 0;
 #endif
       assert(batch_edits.size() == batch_edits_ts_sz.size());
-      for (size_t bidx = 0; bidx < batch_edits.size(); bidx++) {
+      for (size_t bidx = 0; s.ok() && bidx < batch_edits.size(); bidx++) {
         auto& e = batch_edits[bidx];
         files_to_quarantine_if_commit_fail.push_back(
             e->GetFilesToQuarantineIfCommitFail());
@@ -7876,6 +8156,7 @@ Status VersionSet::LogAndApplyImpl(
     const auto wcb =
         manifest_wcbs.empty() ? [](const Status&) {} : manifest_wcbs[i];
     bool writer_has_predating_blob_reference_output = false;
+    bool writer_activates_blob_indirection = false;
     for (const VersionEdit* edit : edit_lists[i]) {
       writer_has_predating_blob_reference_output |=
           edit->HasBlobReferenceOutputPredatingIndirection();
@@ -7885,11 +8166,12 @@ Status VersionSet::LogAndApplyImpl(
                ->current()
                ->storage_info()
                ->HasBlobIndirectionFormat()) {
-        caller_activates_blob_indirection = true;
+        writer_activates_blob_indirection = true;
       }
     }
     caller_has_predating_blob_reference_output |=
         writer_has_predating_blob_reference_output;
+    caller_activates_blob_indirection |= writer_activates_blob_indirection;
     writers.emplace_back(
         mu, column_family_datas[i], edit_lists[i], wcb,
         /*requires_precondition=*/i == 0 && !!pre_cb,
@@ -7900,6 +8182,8 @@ Status VersionSet::LogAndApplyImpl(
         new_mutable_cf_options == nullptr ? nullptr
                                           : (*new_mutable_cf_options)[i],
         compaction_phase_anchor_time, max_file_opening_threads);
+    writers.back().activates_blob_indirection =
+        writer_activates_blob_indirection;
   }
   assert(!writers.empty());
   ManifestWriter& first_writer = writers.front();
@@ -7996,6 +8280,7 @@ Status VersionSet::ValidateAndTrackPhysicalFileOwnership(
        edit.GetDbBlobIndirectionFormatVersion() != 0) ||
       !edit.GetBlobRelocationFileAdditions().empty() ||
       !edit.GetBlobRelocationFileDeletions().empty() ||
+      !edit.GetBlobRelocationFileLosses().empty() ||
       !edit.GetBlobRelocationRoutes().empty() ||
       !edit.GetBlobRelocationRouteDeletions().empty() ||
       !edit.GetBlobFileRetirements().empty();
@@ -8082,6 +8367,12 @@ Status VersionSet::ValidateAndTrackPhysicalFileOwnership(
       return status;
     }
   }
+  for (uint64_t file_number : edit.GetBlobRelocationFileLosses()) {
+    Status status = record(file_number, relocation_owner, true);
+    if (!status.ok()) {
+      return status;
+    }
+  }
   for (const auto& new_file : edit.GetNewFiles()) {
     Status status = record(new_file.second.fd.GetNumber(), table_owner, true);
     if (!status.ok()) {
@@ -8119,6 +8410,18 @@ void VersionSet::MarkRemovedBlobFileOwners(
       continue;
     }
     final_storage.emplace(version_cfd->GetID(), version->storage_info());
+    const PhysicalFileOwner owner{version_cfd->GetID(),
+                                  PhysicalFileOwnerKind::kBlob};
+    for (uint64_t file_number : version->storage_info()->RemovedBlobFiles()) {
+      const auto result = deltas.emplace(
+          file_number, PhysicalFileOwnershipDelta{owner, /*present=*/false});
+      if (!result.second &&
+          result.first->second.owner.column_family_id ==
+              owner.column_family_id &&
+          result.first->second.owner.kind == owner.kind) {
+        result.first->second.present = false;
+      }
+    }
   }
 
   for (const VersionEdit* edit : edits) {
@@ -8470,14 +8773,19 @@ Status VersionSet::GetManifestAppendBoundary(uint64_t* manifest_size) const {
 
 Status VersionSet::ReopenManifestForAppend(const std::string& manifest_path) {
   assert(db_options_->reuse_manifest_on_open);
+  return ReopenManifestForAppendImpl(manifest_path,
+                                     /*allow_fresh_manifest_fallback=*/true);
+}
+
+Status VersionSet::ReopenManifestForAppendImpl(
+    const std::string& manifest_path, bool allow_fresh_manifest_fallback) {
   assert(manifest_recovery_last_valid_record_end_ > 0);
   assert(manifest_last_valid_record_end_file_number_ == manifest_file_number_);
 
-  // Disabled under best_efforts_recovery: that mode rebuilds the
-  // MANIFEST + CURRENT from scratch via the side-effect of
-  // LogAndApplyForRecovery emitting an edit. Reusing the (possibly
-  // stale) prior MANIFEST contradicts the salvage contract.
-  if (db_options_->best_efforts_recovery) {
+  // Normal best-efforts recovery rebuilds MANIFEST + CURRENT from scratch.
+  // Repair passes false after creating and recovering a known-fresh staged
+  // MANIFEST, so it can safely append without enabling stale-MANIFEST reuse.
+  if (db_options_->best_efforts_recovery && allow_fresh_manifest_fallback) {
     return Status::OK();
   }
 
@@ -8495,6 +8803,11 @@ Status VersionSet::ReopenManifestForAppend(const std::string& manifest_path) {
                                      /*dbg=*/nullptr);
   if (!stat_s.ok() ||
       physical_size != manifest_recovery_last_valid_record_end_) {
+    if (!allow_fresh_manifest_fallback) {
+      return stat_s.ok() ? Status::Corruption(
+                               "Repair MANIFEST size changed before append")
+                         : stat_s;
+    }
     ROCKS_LOG_WARN(db_options_->info_log,
                    "reuse_manifest_on_open: physical size %" PRIu64
                    " != last valid record end %" PRIu64
@@ -8508,6 +8821,10 @@ Status VersionSet::ReopenManifestForAppend(const std::string& manifest_path) {
   // file (alignment + tail-pad). POSIX's OptimizeForManifestWrite forces
   // it off, but custom FileSystems may not.
   if (opt_file_opts.use_direct_writes) {
+    if (!allow_fresh_manifest_fallback) {
+      return Status::NotSupported(
+          "Direct writes cannot append the staged repair MANIFEST");
+    }
     ROCKS_LOG_WARN(db_options_->info_log,
                    "reuse_manifest_on_open: direct writes enabled; "
                    "creating fresh MANIFEST during open");
@@ -8519,6 +8836,9 @@ Status VersionSet::ReopenManifestForAppend(const std::string& manifest_path) {
   IOStatus io_s = fs_->ReopenWritableFile(manifest_path, opt_file_opts,
                                           &manifest_file, /*dbg=*/nullptr);
   if (!io_s.ok()) {
+    if (!allow_fresh_manifest_fallback) {
+      return io_s;
+    }
     ROCKS_LOG_WARN(db_options_->info_log,
                    "Failed to reopen MANIFEST for append: %s",
                    io_s.ToString().c_str());
@@ -8529,6 +8849,10 @@ Status VersionSet::ReopenManifestForAppend(const std::string& manifest_path) {
   const uint64_t reopened_size =
       manifest_file->GetFileSize(opt_file_opts.io_options, /*dbg=*/nullptr);
   if (reopened_size != manifest_recovery_last_valid_record_end_) {
+    if (!allow_fresh_manifest_fallback) {
+      return Status::Corruption(
+          "Repair MANIFEST reopened at an unexpected size");
+    }
     ROCKS_LOG_WARN(db_options_->info_log,
                    "reuse_manifest_on_open: reopened handle size %" PRIu64
                    " != last valid record end %" PRIu64
@@ -8910,6 +9234,45 @@ Status VersionSet::TryRecover(
     const std::vector<ColumnFamilyDescriptor>& column_families, bool read_only,
     const std::vector<std::string>& files_in_dbname, std::string* db_id,
     bool* has_missing_table_file) {
+  RepairCatalog repair_catalog;
+  bool guarded = false;
+  Status repair_guard =
+      ReadRepairCatalog(db_options_->env, dbname_, &repair_catalog, &guarded);
+  if (guarded) {
+    if (!repair_guard.ok()) {
+      return repair_guard;
+    }
+    bool committed = false;
+    Status resolved = ResolveRepairCatalog(
+        db_options_->env, dbname_, repair_catalog, true, false, &committed);
+    if (!resolved.ok()) {
+      return resolved;
+    }
+    // Repair first stages privately, then renames its complete MANIFEST, and
+    // commits it by updating CURRENT last. A post-rename error may leave an
+    // unpublished higher MANIFEST. With the durable guard, only CURRENT can
+    // distinguish it from an ambiguous error after a successful publication.
+    // A missing or unreadable CURRENT is not permission to guess or create DB.
+    std::string manifest_path;
+    Status status =
+        GetCurrentManifestPath(dbname_, fs_.get(), /*is_retry=*/false,
+                               &manifest_path, &manifest_file_number_);
+    if (!status.ok()) {
+      return status;
+    }
+    TEST_SYNC_POINT_CALLBACK("VersionSet::TryRecover:GuardedManifest",
+                             &manifest_path);
+    return TryRecoverFromOneManifest(manifest_path, column_families, read_only,
+                                     db_id, has_missing_table_file);
+  }
+  if (!repair_guard.ok()) {
+    Status checked =
+        CheckRepairCatalogForOpen(db_options_->env, dbname_, true,
+                                  db_options_->db_paths, column_families);
+    if (!checked.ok()) {
+      return checked;
+    }
+  }
   ManifestPicker manifest_picker(dbname_, files_in_dbname);
   if (!manifest_picker.Valid()) {
     return Status::Corruption("Cannot locate MANIFEST file in " + dbname_);
@@ -8978,6 +9341,72 @@ Status VersionSet::TryRecoverFromOneManifest(
     RecoverEpochNumbers();
   }
   return s;
+}
+
+Status VersionSet::RecoverForRepair(
+    const std::string& manifest_path, uint64_t manifest_file_number,
+    const std::vector<ColumnFamilyDescriptor>& column_families) {
+  if (manifest_file_number == 0 ||
+      manifest_file_number == std::numeric_limits<uint64_t>::max()) {
+    return Status::Corruption("Invalid staged repair MANIFEST number");
+  }
+  // Keep this fresh writer open throughout repair. ReopenWritableFile and
+  // append-boundary support are optional FileSystem capabilities; repair does
+  // not need either. The caller supplies a non-MANIFEST temporary path, so an
+  // incomplete candidate can never be selected by best-efforts recovery.
+  const FileOptions options = GetFileOptionsForManifestWrite();
+  std::unique_ptr<FSWritableFile> file;
+  Status status = NewWritableFile(fs_.get(), manifest_path, &file, options);
+  if (!status.ok()) {
+    return status;
+  }
+  std::unique_ptr<log::Writer> writer = CreateManifestWriter(
+      std::move(file), manifest_path, options, manifest_preallocation_size_);
+  VersionEdit initial;
+  initial.SetLogNumber(0);
+  initial.SetNextFile(manifest_file_number + 1);
+  initial.SetLastSequence(0);
+  std::string record;
+  if (!initial.EncodeTo(&record)) {
+    return Status::Corruption("Cannot encode initial repair MANIFEST");
+  }
+  const WriteOptions write_options(Env::IOActivity::kDBOpen);
+  status = writer->AddRecord(write_options, record);
+  if (status.ok()) {
+    status = SyncManifest(db_options_, write_options, writer->file());
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  manifest_file_number_ = manifest_file_number;
+  bool has_missing_table_file = false;
+  status = TryRecoverFromOneManifest(
+      manifest_path, column_families, /*read_only=*/false,
+      /*db_id=*/nullptr, &has_missing_table_file);
+  if (status.ok() && has_missing_table_file) {
+    status = Status::Corruption(
+        "Initial repair MANIFEST unexpectedly references missing files");
+  }
+  if (status.ok()) {
+    descriptor_log_ = std::move(writer);
+    repair_manifest_staging_ = true;
+  }
+  return status;
+}
+
+Status VersionSet::SyncAndCloseRepairManifest() {
+  if (!repair_manifest_staging_ || descriptor_log_ == nullptr) {
+    return Status::Corruption("Repair has no complete staged MANIFEST");
+  }
+  const WriteOptions write_options(Env::IOActivity::kDBOpen);
+  Status status =
+      SyncManifest(db_options_, write_options, descriptor_log_->file());
+  if (status.ok()) {
+    // Close the log, not just its file: log::Writer's destructor otherwise
+    // tries to flush the already-closed destination.
+    status = descriptor_log_->Close(write_options);
+  }
+  return status;
 }
 
 void VersionSet::RecoverEpochNumbers() {
@@ -9460,6 +9889,9 @@ Status VersionSet::GetLiveFilesChecksumInfo(FileChecksumList* checksum_list) {
     for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
          vstorage->GetBlobRelocationFiles()) {
       assert(metadata != nullptr);
+      if (metadata->IsMarkedMissing()) {
+        continue;
+      }
       std::string checksum_value = metadata->GetChecksumValue();
       std::string checksum_method = metadata->GetChecksumMethod();
       if (checksum_method.empty()) {
@@ -9683,7 +10115,9 @@ Status VersionSet::WriteCurrentStateToManifest(
           FileMetaData& snapshot_file = edit.GetMutableNewFiles().back().second;
           snapshot_file.blob_reference_legacy_metadata =
               vstorage->HasBlobIndirectionFormat() &&
-              f->blob_reference_descriptor.empty();
+              f->blob_reference_descriptor.empty() &&
+              f->oldest_coarse_identity_blob_file_number ==
+                  kInvalidBlobFileNumber;
         }
       }
 
@@ -10652,222 +11086,6 @@ uint64_t ReactiveVersionSet::TEST_read_edits_in_atomic_group() const {
 std::vector<VersionEdit>& ReactiveVersionSet::replay_buffer() {
   assert(manifest_tailer_);
   return manifest_tailer_->GetReadBuffer().replay_buffer();
-}
-
-bool VersionStorageInfo::IsBlobReferenceLost(const BlobIndex& index) const {
-  if (!index.IsIndirect() || !HasMissingBlobRelocationFiles()) {
-    return false;
-  }
-  const BlobRelocationRouteSource source{index.generation_file_number(),
-                                         index.origin_file_number()};
-  const BlobRelocationRoute* const route = GetBlobRelocationRoute(source);
-  const std::shared_ptr<BlobRelocationFileMetaData> file =
-      GetBlobRelocationFileMetaData(route != nullptr
-                                        ? route->GetPhysicalFileNumber()
-                                        : source.generation_file_number);
-  return file != nullptr && file->IsMarkedMissing();
-}
-
-void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
-    double blob_garbage_collection_age_cutoff,
-    double blob_garbage_collection_force_threshold,
-    bool enable_blob_garbage_collection, bool enable_blob_indirection) {
-  files_marked_for_forced_blob_gc_.clear();
-  if (!(enable_blob_garbage_collection &&
-        blob_garbage_collection_age_cutoff > 0.0 &&
-        blob_garbage_collection_force_threshold < 1.0)) {
-    return;
-  }
-
-  if (blob_files_.empty()) {
-    return;
-  }
-  // Compaction preserves stable identity references while this policy is on;
-  // rewriting their linked SSTs cannot advance legacy prefix GC. Let the
-  // independent ratio heap collect them instead of repeatedly marking work
-  // that leaves the oldest identity root unchanged.
-  if (enable_blob_indirection && blob_files_.front()->IsIdentityRoot()) {
-    return;
-  }
-
-  // Number of blob files eligible for GC based on age
-  const size_t cutoff_count = static_cast<size_t>(
-      blob_garbage_collection_age_cutoff * blob_files_.size());
-  if (!cutoff_count) {
-    return;
-  }
-
-  // Compute the sum of total and garbage bytes over the batch of blob files
-  // currently eligible for garbage collection based on
-  // blob_garbage_collection_age_cutoff, and if the garbage ratio exceeds
-  // blob_garbage_collection_force_threshold, schedule compaction for the
-  // SST files that reference the oldest batch of blob files. Here is a toy
-  // example. Let's assume we have three SSTs 1, 2, and 3, and four blob files
-  // 10, 11, 12, and 13, which correspond to the range that is eligible for GC
-  // and satisfy the garbage ratio threshold. Also, let's say SSTs 1 and 2 both
-  // rely on blob file 10 and potentially some higher-numbered ones, while SST 3
-  // relies on blob file 12 and potentially some higher-numbered ones. Then, the
-  // SST to oldest blob file mapping is as follows:
-  //
-  // SST file number               Oldest blob file number
-  // 1                             10
-  // 2                             10
-  // 3                             12
-  //
-  // This is what the same thing looks like from the blob files' POV. (Note that
-  // the linked SSTs simply denote the inverse mapping of the above.)
-  //
-  // Blob file number              Linked SST set
-  // 10                            {1, 2}
-  // 11                            {}
-  // 12                            {3}
-  // 13                            {}
-  //
-  // Then, the oldest batch of blob files consists of blob files 10 and 11,
-  // and we can get rid of them by forcing the compaction of SSTs 1 and 2.
-  const auto& oldest_meta = blob_files_.front();
-  assert(oldest_meta);
-
-  const auto& linked_ssts = oldest_meta->GetLinkedSsts();
-  assert(!linked_ssts.empty());
-
-  size_t count = 1;
-  uint64_t sum_total_blob_bytes = oldest_meta->GetTotalBlobBytes();
-  uint64_t sum_garbage_blob_bytes = oldest_meta->GetGarbageBlobBytes();
-
-  assert(cutoff_count <= blob_files_.size());
-
-  for (; count < cutoff_count; ++count) {
-    const auto& meta = blob_files_[count];
-    assert(meta);
-
-    sum_total_blob_bytes += meta->GetTotalBlobBytes();
-    sum_garbage_blob_bytes += meta->GetGarbageBlobBytes();
-  }
-
-  if (sum_garbage_blob_bytes <
-      blob_garbage_collection_force_threshold * sum_total_blob_bytes) {
-    return;
-  }
-
-  for (uint64_t sst_file_number : linked_ssts) {
-    const FileLocation location = GetFileLocation(sst_file_number);
-    assert(location.IsValid());
-
-    const int level = location.GetLevel();
-    assert(level >= 0);
-
-    const size_t pos = location.GetPosition();
-
-    FileMetaData* const sst_meta = files_[level][pos];
-    assert(sst_meta);
-
-    if (sst_meta->being_compacted) {
-      continue;
-    }
-
-    files_marked_for_forced_blob_gc_.emplace_back(level, sst_meta);
-  }
-}
-
-void VersionStorageInfo::DeleteBlobRelocationFile(uint64_t file_number) {
-  MutableBlobRelocationState().DeleteFile(file_number);
-}
-
-void VersionStorageInfo::DeleteBlobRelocationRoute(
-    const BlobRelocationRouteSource& source) {
-  MutableBlobRelocationState().DeleteRoute(source);
-}
-
-void VersionStorageInfo::SetBlobGcCandidates(
-    const std::array<uint64_t, kBlobGcMaxSelectedFiles>& files) {
-  blob_files_for_standalone_gc_ = files;
-  blob_files_for_standalone_gc_count_ = 0;
-  for (uint64_t file_number : files) {
-    if (file_number == kInvalidBlobFileNumber) {
-      break;
-    }
-    ++blob_files_for_standalone_gc_count_;
-  }
-}
-
-void VersionStorageInfo::SuppressBlobFileForStandaloneGC(
-    uint64_t physical_file_number) {
-  for (size_t i = 0; i < empty_blob_files_for_standalone_gc_.size(); ++i) {
-    if (empty_blob_files_for_standalone_gc_[i] == physical_file_number) {
-      std::move(empty_blob_files_for_standalone_gc_.begin() + i + 1,
-                empty_blob_files_for_standalone_gc_.end(),
-                empty_blob_files_for_standalone_gc_.begin() + i);
-      empty_blob_files_for_standalone_gc_.back() = 0;
-      break;
-    }
-  }
-  for (size_t i = 0; i < blob_files_for_standalone_gc_count_; ++i) {
-    if (blob_files_for_standalone_gc_[i] == physical_file_number) {
-      for (size_t next = i + 1; next < blob_files_for_standalone_gc_count_;
-           ++next) {
-        blob_files_for_standalone_gc_[next - 1] =
-            blob_files_for_standalone_gc_[next];
-      }
-      blob_files_for_standalone_gc_[--blob_files_for_standalone_gc_count_] = 0;
-      return;
-    }
-  }
-}
-
-void VersionStorageInfo::DeferBlobFilesForStandaloneGC(
-    const std::vector<uint64_t>& physical_file_numbers) {
-  for (uint64_t file_number : physical_file_numbers) {
-    for (size_t i = 0; i < blob_files_for_standalone_gc_count_; ++i) {
-      if (blob_files_for_standalone_gc_[i] != file_number) {
-        continue;
-      }
-      for (size_t next = i + 1; next < blob_files_for_standalone_gc_count_;
-           ++next) {
-        blob_files_for_standalone_gc_[next - 1] =
-            blob_files_for_standalone_gc_[next];
-      }
-      blob_files_for_standalone_gc_[blob_files_for_standalone_gc_count_ - 1] =
-          file_number;
-      break;
-    }
-  }
-}
-
-uint64_t VersionStorageInfo::BlobPhysicalFileForStandaloneGC() const {
-  return blob_files_for_standalone_gc_count_ != 0
-             ? blob_files_for_standalone_gc_[0]
-             : kInvalidBlobFileNumber;
-}
-
-void VersionStorageInfo::GetBlobPhysicalFilesForStandaloneGC(
-    size_t max_files, std::vector<uint64_t>* physical_file_numbers) const {
-  assert(physical_file_numbers != nullptr);
-  physical_file_numbers->clear();
-  const size_t count = std::min(max_files, blob_files_for_standalone_gc_count_);
-  for (size_t i = 0; i < count; ++i) {
-    physical_file_numbers->push_back(blob_files_for_standalone_gc_[i]);
-  }
-}
-
-void VersionStorageInfo::GetEmptyBlobGcCandidates(
-    size_t max_files, std::vector<uint64_t>* files) const {
-  assert(files != nullptr);
-  files->clear();
-  for (size_t i = 0;
-       i < std::min(max_files, empty_blob_files_for_standalone_gc_.size());
-       ++i) {
-    if (empty_blob_files_for_standalone_gc_[i] == kInvalidBlobFileNumber) {
-      break;
-    }
-    files->push_back(empty_blob_files_for_standalone_gc_[i]);
-  }
-}
-
-const std::vector<BlobRelocationRouteSource>*
-VersionStorageInfo::GetBlobRelocationRouteSourcesForTarget(
-    uint64_t physical_file_number) const {
-  return BlobRelocationStateForRead().SourcesForTarget(physical_file_number);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

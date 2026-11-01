@@ -1265,6 +1265,11 @@ Status DBImplSecondary::OpenAsSecondaryImpl(
   }
 
   DBOptions tmp_opts(db_options);
+  Status catalog_status = CheckRepairCatalogForOpen(
+      tmp_opts.env, dbname, true, tmp_opts.db_paths, column_families);
+  if (!catalog_status.ok()) {
+    return catalog_status;
+  }
   Status s;
   if (nullptr == tmp_opts.info_log) {
     s = CreateLoggerFromOptions(secondary_path, tmp_opts, &tmp_opts.info_log);

@@ -45,8 +45,13 @@ struct TableCacheOpenOptions {
   // the pinned reader or shared TableCache entry.
   bool open_ephemeral_table_reader = false;
 
-  // Avoid inserting open-time metadata blocks into the shared block cache.
+  // Avoid shared block and persistent caches for metadata reads.
   bool avoid_shared_metadata_cache = false;
+
+  // Offline repair only: disable shared block/persistent caches for every
+  // read, not just opening metadata. Compaction's ephemeral readers retain
+  // their data cache even when avoid_shared_metadata_cache is true.
+  bool isolate_repair_caches = false;
 
   // Disable loading/accessing filter blocks for this open/iterator.
   bool skip_filters = false;
@@ -100,9 +105,9 @@ class TableCache {
   // underlying the returned iterator, or nullptr if no Table object underlies
   // the returned iterator.  The returned "*table_reader_ptr" object is owned
   // by the cache and should not be deleted, and is valid for as long as the
-  // returned iterator is live. `table_reader_ptr` must be nullptr when
-  // `open_options.open_ephemeral_table_reader` is set because that reader is
-  // owned by iterator cleanup rather than by the cache.
+  // returned iterator is live. An ephemeral reader is owned by iterator
+  // cleanup, so any returned pointer remains valid only while the iterator is
+  // live.
   // If !options.ignore_range_deletions, and range_del_iter is non-nullptr,
   // then range_del_iter is set to a TruncatedRangeDelIterator for range
   // tombstones in the SST file corresponding to the specified file number. The
@@ -264,6 +269,15 @@ class TableCache {
                             const MutableCFOptions& mutable_cf_options,
                             bool no_io = false);
 
+  Status GetTableProperties(const FileOptions& toptions,
+                            const ReadOptions& read_options,
+                            const InternalKeyComparator& internal_comparator,
+                            const FileMetaData& file_meta,
+                            std::shared_ptr<const TableProperties>* properties,
+                            const MutableCFOptions& mutable_cf_options,
+                            bool no_io,
+                            const TableCacheOpenOptions& open_options);
+
   // Opens an ephemeral reader and reads only the exact external-blob group
   // metadata. The open avoids inserting metadata into the shared block cache.
   Status ReadBlobReferenceGroups(
@@ -287,6 +301,7 @@ class TableCache {
       const TableReader& reader, const FileMetaData& file_meta,
       const MutableCFOptions& mutable_cf_options,
       std::shared_ptr<const BlobReferenceSstSummary>* summary);
+
   // Opens an ephemeral reader and appends the data blocks for one exact group
   // without inserting table metadata into the shared block cache.
   Status ReadBlobReferences(const ReadOptions& read_options,
@@ -304,6 +319,13 @@ class TableCache {
       const InternalKeyComparator& internal_comparator,
       const FileMetaData& file_meta,
       const MutableCFOptions& mutable_cf_options);
+
+  Status ReadAllBlobReferences(const ReadOptions& read_options,
+                               const FileOptions& file_options,
+                               const InternalKeyComparator& internal_comparator,
+                               const FileMetaData& file_meta,
+                               const MutableCFOptions& mutable_cf_options,
+                               std::vector<BlobReference>* references);
 
   Status ApproximateKeyAnchors(const ReadOptions& ro,
                                const InternalKeyComparator& internal_comparator,
@@ -377,12 +399,12 @@ class TableCache {
                         HistogramImpl* file_read_hist,
                         std::unique_ptr<TableReader>* table_reader,
                         const MutableCFOptions& mutable_cf_options,
-                        bool skip_filters = false, int level = -1,
-                        bool prefetch_index_and_filter_in_cache = true,
-                        size_t max_file_size_for_l0_meta_pin = 0,
-                        Temperature file_temperature = Temperature::kUnknown,
-                        std::string* file_open_metadata = nullptr,
-                        bool avoid_shared_metadata_cache = false);
+                        bool skip_filters, int level,
+                        bool prefetch_index_and_filter_in_cache,
+                        size_t max_file_size_for_l0_meta_pin,
+                        Temperature file_temperature,
+                        std::string* file_open_metadata,
+                        const TableCacheOpenOptions& open_options);
 
   // Update the max_covering_tombstone_seq in the GetContext for each key based
   // on the range deletions in the table

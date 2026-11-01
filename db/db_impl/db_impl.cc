@@ -1188,8 +1188,9 @@ Status DBImpl::CloseHelper() {
     bg_cv_.Wait();
   }
 
-  // Reverse census state can be proportional to the live SST set.  // A worker
-  // may have registered its lazy retry task after the initial
+  // Reverse census state can be proportional to the live SST set. Detach it
+  // while serialized, then release its maps and queued summaries unlocked.
+  // A worker may have registered its lazy retry task after the initial
   // CancelPeriodicTaskScheduler call. No worker remains after the wait above.
   mutex_.Unlock();
   periodic_task_scheduler_.Unregister(PeriodicTaskType::kBlobReferenceCensus)
@@ -1619,7 +1620,6 @@ Status DBImpl::StartPeriodicTaskScheduler() {
       PeriodicTaskType::kTriggerCompaction,
       periodic_task_functions_.at(PeriodicTaskType::kTriggerCompaction),
       ComputeTriggerCompactionPeriod(), /*run_immediately=*/false);
-
   return s;
 }
 
@@ -6608,9 +6608,69 @@ void DBImpl::CleanupSuperVersion(SuperVersion* sv) {
   RecordTick(stats_, NUMBER_SUPERVERSION_RELEASES);
 }
 
+bool DBImpl::ReleaseColumnFamilyDataReference(ColumnFamilyData* cfd,
+                                              bool* dropped) {
+  assert(cfd != nullptr);
+  SuperVersion* pending_super_version = nullptr;
+  std::unique_ptr<ThreadLocalPtr> detached_local_super_versions;
+  bool detached = false;
+  {
+    InstrumentedMutexLock lock(&mutex_);
+    if (dropped != nullptr) {
+      *dropped = cfd->IsDropped();
+    }
+    detached = cfd->UnrefAndTryDetach(&pending_super_version,
+                                      &detached_local_super_versions);
+  }
+  // ThreadLocalPtr destruction can visit every thread that cached this CF's
+  // SuperVersion. The installed SuperVersion reference remains pinned across
+  // this unlocked drain, so its callback cannot become the final unref.
+  if (detached_local_super_versions != nullptr) {
+    TEST_SYNC_POINT(
+        "DBImpl::ReleaseColumnFamilyDataPin:BeforeThreadLocalDrain");
+  }
+  detached_local_super_versions.reset();
+  if (pending_super_version != nullptr) {
+    InstrumentedMutexLock lock(&mutex_);
+    detached = cfd->FinishSuperVersionDetach(pending_super_version);
+  }
+  if (!detached) {
+    return false;
+  }
+
+  TEST_SYNC_POINT("DBImpl::ReleaseColumnFamilyDataPin:BeforeCleanup");
+  // Keep option-owned shared objects alive until CFD teardown completes.
+  ColumnFamilyOptions initial_cf_options_copy = cfd->initial_cf_options();
+  if (pending_super_version != nullptr) {
+    pending_super_version->Cleanup();
+    delete pending_super_version;
+  } else {
+    cfd->DeleteDetached();
+  }
+  return true;
+}
+
 void DBImpl::ReleaseColumnFamilyDataPin(ColumnFamilyData* cfd) {
-  InstrumentedMutexLock lock(&mutex_);
-  cfd->UnrefAndTryDelete();
+  ReleaseColumnFamilyDataReference(cfd, /*dropped=*/nullptr);
+}
+
+void DBImpl::ReleaseColumnFamilyHandle(ColumnFamilyData* cfd) {
+  bool dropped = false;
+  if (!ReleaseColumnFamilyDataReference(cfd, &dropped) || !dropped) {
+    return;
+  }
+
+  JobContext job_context(/*job_id=*/0);
+  {
+    InstrumentedMutexLock lock(&mutex_);
+    FindObsoleteFiles(&job_context, /*force=*/false,
+                      /*no_full_scan=*/true);
+  }
+  if (job_context.HaveSomethingToDelete()) {
+    PurgeObsoleteFiles(job_context,
+                       immutable_db_options_.avoid_unnecessary_blocking_io);
+  }
+  job_context.Clean();
 }
 
 void DBImpl::ReturnAndCleanupSuperVersion(ColumnFamilyData* cfd,
@@ -7127,6 +7187,7 @@ void DBImpl::GetAllColumnFamilyMetaData(
     pinned_versions.push_back({cfd, version});
   }
   mutex_.Unlock();
+  TEST_SYNC_POINT("DBImpl::GetAllColumnFamilyMetaData:AfterPin");
 
   for (size_t index = 0; index < pinned_versions.size(); ++index) {
     pinned_versions[index].version->AppendBlobRelocationFileMetaData(
@@ -7143,10 +7204,7 @@ void DBImpl::GetAllColumnFamilyMetaData(
     if (detached_version != nullptr) {
       detached_version->DeleteDetached();
     }
-    {
-      InstrumentedMutexLock l(&mutex_);
-      pinned.cfd->UnrefAndTryDelete();
-    }
+    ReleaseColumnFamilyDataPin(pinned.cfd);
   }
 }
 
@@ -7309,6 +7367,32 @@ Status DestroyDB(const std::string& dbname, const Options& options,
         ->GetChildren(dbname, io_opts, &filenames,
                       /*IODebugContext*=*/nullptr)
         .PermitUncheckedError();
+
+    if (std::find(filenames.begin(), filenames.end(), "REPAIR-IN-PROGRESS") !=
+        filenames.end()) {
+      RepairCatalog catalog;
+      bool recognized = false;
+      Status catalog_status =
+          ReadRepairCatalog(env, dbname, &catalog, &recognized);
+      const bool catalog_valid = catalog_status.ok();
+      if (recognized) {
+        // Explicit owner destruction, unlike generic obsolete-file purge,
+        // can remove a catalog with a verified ownership header even when
+        // its later records are incomplete. Do not delete an unrelated file
+        // or an unsupported guard whose ownership cannot be established.
+        if (catalog.header.number != 0 && !catalog.header.identity.empty()) {
+          result = env->DeleteFile(RepairInProgressFileName(dbname));
+        } else {
+          result = catalog_valid
+                       ? Status::Corruption("Repair catalog lacks ownership")
+                       : catalog_status;
+        }
+        if (!result.ok()) {
+          env->UnlockFile(lock).PermitUncheckedError();
+          return result;
+        }
+      }
+    }
 
     uint64_t number;
     FileType type;

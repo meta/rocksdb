@@ -14,7 +14,6 @@
 #include <utility>
 #include <vector>
 
-#include "cache/cache_reservation_manager.h"
 #include "db/arena_wrapped_db_iter.h"
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_index.h"
@@ -189,6 +188,53 @@ TEST(BlobIndexTest, IdentityBlobNormalizesGenerationToOrigin) {
   EXPECT_EQ(blob_index.origin_file_number(), 77);
 }
 
+TEST(BlobIndexTest, DualChecksumEncodingAndFlattening) {
+  const std::string payload = "stored-value";
+  for (CompressionType compression : {kNoCompression, kZSTD}) {
+    SCOPED_TRACE(static_cast<int>(compression));
+    const uint32_t logical = crc32c::Value(payload.data(), payload.size());
+    const uint32_t stored =
+        BlobIndex::ComputeStoredChecksum(payload, compression);
+    std::string encoded;
+    BlobIndex::EncodeIdentityBlob(&encoded, 100, 42, payload.size(),
+                                  compression, logical, stored);
+    BlobIndex index;
+    ASSERT_OK(index.DecodeFrom(encoded));
+    ASSERT_OK(index.Validate());
+    ASSERT_EQ(index.stable_checksum_version(),
+              BlobIndex::kStableChecksumVersion2);
+    ASSERT_EQ(index.stable_checksum(), logical);
+    ASSERT_EQ(index.stored_checksum(), stored);
+    ASSERT_OK(index.VerifyStoredChecksum(payload));
+    ASSERT_TRUE(index.VerifyStoredChecksum(std::string(payload.size(), 'x'))
+                    .IsCorruption());
+    // Uncompressed v2 adds no checksum bytes compared with v1. The compressed
+    // encoding stores the extra CRC explicitly.
+    std::string v1;
+    BlobIndex::EncodeIdentityBlob(&v1, 100, 42, payload.size(), compression,
+                                  logical);
+    ASSERT_EQ(encoded.size(),
+              v1.size() + (compression == kNoCompression ? 0 : 4));
+    ASSERT_OK(index.SetGenerationFileNumber(200));
+    std::string flattened;
+    index.EncodeTo(&flattened);
+    BlobIndex decoded;
+    ASSERT_OK(decoded.DecodeFrom(flattened));
+    ASSERT_EQ(decoded.generation_file_number(), 200U);
+    ASSERT_EQ(decoded.stored_checksum(), stored);
+    BlobReference reference;
+    bool included = false;
+    ASSERT_OK(BlobReference::FromBlobIndex(decoded, &reference, &included));
+    ASSERT_TRUE(included);
+    ASSERT_EQ(reference.stored_checksum, stored);
+    for (size_t length = 0; length < encoded.size(); ++length) {
+      BlobIndex truncated;
+      ASSERT_TRUE(
+          truncated.DecodeFrom(Slice(encoded.data(), length)).IsCorruption());
+    }
+  }
+}
+
 TEST(BlobIndexTest, IndirectBlobIndexRejectsMalformedEncoding) {
   std::string encoded;
   BlobIndex::EncodeIdentityBlob(&encoded, /*origin_file_number=*/77,
@@ -256,6 +302,9 @@ TEST(BlobReferenceMetadataTest, CompleteEmptyRoundTrip) {
   ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(encoded_descriptor,
                                                         &decoded_descriptor));
   EXPECT_TRUE(decoded_descriptor.IsCompleteEmpty());
+  EXPECT_TRUE(decoded_descriptor.HasRepairMetadata());
+  EXPECT_EQ(decoded_descriptor.column_family_id, 0U);
+  EXPECT_EQ(decoded_descriptor.sst_file_number, 1U);
 
   // Persisted count limits are independent of the ABI size of the decoded
   // group struct. In particular, this count exceeds the old x86-64
@@ -494,6 +543,11 @@ TEST(BlobReferenceMetadataTest, SplitsLargeGroupIntoBoundedDataBlocks) {
     ASSERT_OK(collector.Add(DecodeBlobIndexForTest(encoded)));
   }
 
+  const uint64_t estimated_size = collector.EstimatedEncodedSize();
+  EXPECT_EQ(estimated_size, 4096U + 45U * kReferenceCount + 211U);
+  // A single large group must not be charged as one directory/data block per
+  // value, which used to cut normal SST outputs far below their target size.
+  EXPECT_LT(estimated_size, 224U * kReferenceCount / 2);
   std::vector<std::string> data_blocks;
   uint64_t next_offset = 1000;
   ASSERT_OK(
@@ -507,6 +561,9 @@ TEST(BlobReferenceMetadataTest, SplitsLargeGroupIntoBoundedDataBlocks) {
   EXPECT_EQ(collector.descriptor().reference_count, kReferenceCount);
   EXPECT_EQ(collector.descriptor().group_count, 1);
   EXPECT_EQ(collector.descriptor().stored_value_bytes, kReferenceCount * 80);
+  EXPECT_GE(estimated_size, next_offset - 1000 +
+                                collector.index_block().size() +
+                                collector.directory_block().size() + 10);
 
   BlobReferenceMetadataDescriptor descriptor = collector.descriptor();
   descriptor.index_handle =
@@ -534,6 +591,41 @@ TEST(BlobReferenceMetadataTest, SplitsLargeGroupIntoBoundedDataBlocks) {
   EXPECT_EQ(references.front().original_value_offset, 1000);
   EXPECT_EQ(references.back().original_value_offset,
             1000 + (kReferenceCount - 1) * 100);
+}
+
+TEST(BlobReferenceMetadataTest, EstimateCoversDistinctWideEncodedGroups) {
+  constexpr size_t kBlockTrailerBytes = 5;
+  const std::shared_ptr<Cache> cache = NewLRUCache(16 * 1024 * 1024);
+  const std::shared_ptr<CacheReservationManager> reservation =
+      std::make_shared<CacheReservationManagerImpl<
+          CacheEntryRole::kBlobReferenceMetadataBuildingBuffer>>(cache);
+  BlobReferenceMetadataCollector collector(reservation);
+  constexpr uint64_t kReferences = 200;
+  for (uint64_t i = 0; i < kReferences; ++i) {
+    std::string encoded;
+    BlobIndex::EncodeIndirectBlob(&encoded, (1ULL << 60) + 1, (1ULL << 59) + i,
+                                  (1ULL << 63) + i, 1ULL << 40, kZSTD,
+                                  BlobIndex::kStableChecksumVersion2, 123, 456);
+    ASSERT_OK(collector.Add(DecodeBlobIndexForTest(encoded)));
+  }
+  const uint64_t estimated = collector.EstimatedEncodedSize();
+  EXPECT_EQ(estimated, 4096U + kReferences * (45U + 211U));
+  EXPECT_GT(cache->GetPinnedUsage(), 0U);
+  uint64_t written = 0;
+  ASSERT_OK(collector.Finish(
+      [&written](const Slice& block, BlockHandle* handle) -> Status {
+        *handle = BlockHandle((1ULL << 60) + written, block.size());
+        written += block.size() + kBlockTrailerBytes;
+        return Status::OK();
+      }));
+  EXPECT_GE(estimated, written + collector.index_block().size() +
+                           collector.directory_block().size() +
+                           2 * kBlockTrailerBytes);
+  EXPECT_EQ(collector.descriptor().group_count, kReferences);
+  ASSERT_OK(collector.ReleaseWorkingMemory());
+  // Empty strings can retain their inline (object-owned) SSO capacity.
+  EXPECT_LE(collector.TEST_ReservedMemory(), 3 * std::string().capacity());
+  EXPECT_EQ(cache->GetPinnedUsage(), 0U);
 }
 
 TEST(BlobReferenceMetadataTest, ConflictingStableIdentityFailsClosed) {
@@ -651,6 +743,40 @@ TEST(BlobReferenceMetadataTest, RejectsCorruptDescriptorAndBlocks) {
   std::vector<BlobReferenceBlockIndexEntry> block_index;
   EXPECT_TRUE(DecodeBlobReferenceIndex(corrupt_index, descriptor, &block_index)
                   .IsCorruption());
+}
+
+TEST(BlobReferenceMetadataTest, RejectsImpossibleIndexReferenceDensity) {
+  constexpr uint32_t kIndexBlockMagic = 0x42475249U;
+  constexpr uint64_t kImpossibleReferenceCount = 16ULL * 1024 * 1024;
+  constexpr uint64_t kDataBlockSize = 32;
+
+  std::string index_block(12, '\0');
+  SetFixed32ForTest(&index_block, 0, kIndexBlockMagic);
+  SetFixed32ForTest(&index_block, 4,
+                    BlobReferenceMetadataDescriptor::kFormatVersion);
+  PutVarint64(&index_block, 1);
+  PutVarint64(&index_block, kImpossibleReferenceCount);
+  PutVarint64(&index_block, 1);
+  PutFixed32(&index_block, 0);
+  PutVarint64(&index_block, 1000);
+  PutVarint64(&index_block, kDataBlockSize);
+  PutVarint64(&index_block, 0);
+  PutVarint64(&index_block, kImpossibleReferenceCount);
+  PutFixed32(&index_block, 0);
+  SetFixed32ForTest(
+      &index_block, 8,
+      crc32c::Value(index_block.data() + 12, index_block.size() - 12));
+
+  BlobReferenceMetadataDescriptor descriptor;
+  descriptor.index_handle = BlockHandle(2000, index_block.size());
+  descriptor.reference_count = kImpossibleReferenceCount;
+  descriptor.stored_value_bytes = 1;
+  descriptor.index_digest =
+      crc32c::Value(index_block.data(), index_block.size());
+  std::vector<BlobReferenceBlockIndexEntry> block_index;
+  EXPECT_TRUE(DecodeBlobReferenceIndex(index_block, descriptor, &block_index)
+                  .IsCorruption());
+  EXPECT_TRUE(block_index.empty());
 }
 
 namespace {
@@ -906,28 +1032,6 @@ TEST(BlobGcCandidateHeapTest, RanksUpdatesAndRetiresPhysicalFiles) {
   ASSERT_FALSE(heap.IsIdentityRoot(20));
 }
 
-TEST(BlobReferenceCensusTest, RetirementSkipsLeasedPrefixWithoutStarvation) {
-  BlobReferenceCensus census;
-  auto forward = std::make_shared<BlobRelocationState>();
-  auto dependencies = std::make_shared<BlobRelocationPublicationDependencies>();
-  for (uint64_t generation = 1; generation <= 65; ++generation) {
-    forward->SetRoute(BlobRelocationRoute(generation, 100, 200));
-    if (generation <= 64) {
-      dependencies->sources.push_back({generation, 100});
-    }
-  }
-  const uint64_t token = census.BeginBuild();
-  ASSERT_OK(census.ResetWorkerState(token, 7, forward, nullptr));
-  BlobRelocationPublicationReservation lease;
-  lease.dependencies = dependencies;
-  ASSERT_OK(census.RegisterPublication(&lease));
-  const BlobReferenceCensus::RetirementSelection selected =
-      census.SelectWorkerRetirementSources(token);
-  ASSERT_EQ(selected[0].generation_file_number, 65U);
-  ASSERT_EQ(selected[0].origin_file_number, 100U);
-  ASSERT_EQ(selected[1].generation_file_number, 0U);
-  census.UnregisterPublication(&lease);
-}
 TEST(BlobReferenceCensusTest, MetadataIntentFencesLatePublication) {
   BlobReferenceCensus census;
   BlobRelocationPublicationSnapshot snapshot;
@@ -963,6 +1067,29 @@ TEST(BlobReferenceCensusTest, AmbiguousMetadataIntentRequiresRecovery) {
   auto garbage = census.Cancel();
   census.ResolveMetadataCommitAmbiguity();
   ASSERT_TRUE(census.WaitForMetadataCommit().IsColumnFamilyDropped());
+}
+
+TEST(BlobReferenceCensusTest, RetirementSkipsLeasedPrefixWithoutStarvation) {
+  BlobReferenceCensus census;
+  auto forward = std::make_shared<BlobRelocationState>();
+  auto dependencies = std::make_shared<BlobRelocationPublicationDependencies>();
+  for (uint64_t generation = 1; generation <= 65; ++generation) {
+    forward->SetRoute(BlobRelocationRoute(generation, 100, 200));
+    if (generation <= 64) {
+      dependencies->sources.push_back({generation, 100});
+    }
+  }
+  const uint64_t token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(token, 7, forward, nullptr));
+  BlobRelocationPublicationReservation lease;
+  lease.dependencies = dependencies;
+  ASSERT_OK(census.RegisterPublication(&lease));
+  const BlobReferenceCensus::RetirementSelection selected =
+      census.SelectWorkerRetirementSources(token);
+  ASSERT_EQ(selected[0].generation_file_number, 65U);
+  ASSERT_EQ(selected[0].origin_file_number, 100U);
+  ASSERT_EQ(selected[1].generation_file_number, 0U);
+  census.UnregisterPublication(&lease);
 }
 
 TEST(BlobGcCandidateHeapTest, ExactPortableRatioOrdering) {
@@ -1611,28 +1738,6 @@ class DBBlobIndexTest : public DBTestBase {
 // Note: the following test case pertains to the StackableDB-based BlobDB
 // implementation. We should be able to write kTypeBlobIndex to memtables and
 // SST files.
-TEST_F(DBBlobIndexTest, PrefixGateRejectsBlobIndirection) {
-  Options options = CurrentOptions();
-  options.enable_blob_files = true;
-  DestroyAndReopen(options);
-  ColumnFamilyData::TEST_SetAllowBlobIndirection(false);
-  struct RestoreGate {
-    ~RestoreGate() { ColumnFamilyData::TEST_SetAllowBlobIndirection(true); }
-  } restore_gate;
-
-  ASSERT_TRUE(dbfull()
-                  ->SetOptions({{"enable_blob_indirection", "true"}})
-                  .IsNotSupported());
-  Options gated = options;
-  gated.enable_blob_indirection = true;
-  ColumnFamilyHandle* handle = nullptr;
-  ASSERT_TRUE(
-      db_->CreateColumnFamily(gated, "gated", &handle).IsNotSupported());
-  ASSERT_EQ(handle, nullptr);
-  Close();
-  ASSERT_TRUE(TryReopen(gated).IsNotSupported());
-}
-
 TEST_F(DBBlobIndexTest, SstFileWriterOutputStaysLegacy) {
   Options options = CurrentOptions();
   options.enable_blob_files = true;
@@ -1689,6 +1794,12 @@ TEST_F(DBBlobIndexTest, FlushRecordsExactReferenceMetadata) {
   const std::string value(100, 'v');
   ASSERT_OK(Put(1, key, value));
   ASSERT_OK(Flush(1));
+  // Flush writes only the classification; an L1 output carries the exact
+  // descriptor and reference blocks.
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, handles_[1], nullptr, nullptr));
 
   TablePropertiesCollection properties;
   ASSERT_OK(db_->GetPropertiesOfAllTables(handles_[1], &properties));

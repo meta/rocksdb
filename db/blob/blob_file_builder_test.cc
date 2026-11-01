@@ -235,6 +235,18 @@ TEST_F(BlobFileBuilderTest, StableIdentityIndex) {
   ASSERT_EQ(blob_file_additions.size(), 1U);
   ASSERT_TRUE(blob_file_additions.front().IsIdentityRoot());
 
+  std::unique_ptr<RandomAccessFileReader> file_reader;
+  ASSERT_OK(RandomAccessFileReader::Create(
+      mock_env_->GetFileSystem(), blob_file_paths.front(), file_options_,
+      &file_reader, /*dbg=*/nullptr));
+  BlobLogSequentialReader log_reader(std::move(file_reader), clock_,
+                                     /*statistics=*/nullptr);
+  BlobLogHeader header;
+  ASSERT_OK(log_reader.ReadHeader(&header));
+  EXPECT_TRUE(header.has_repair_metadata);
+  EXPECT_TRUE(header.is_identity_root);
+  EXPECT_EQ(header.repair_file_number, 2U);
+
   BlobIndex blob_index;
   ASSERT_OK(blob_index.DecodeFrom(encoded));
   ASSERT_TRUE(blob_index.IsIndirect());

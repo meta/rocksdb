@@ -59,7 +59,8 @@ Status DBImpl::GetLiveFiles(std::vector<std::string>& ret,
     if (cfd->IsDropped()) {
       continue;
     }
-    cfd->current()->AddLiveFiles(&live_table_files, &live_blob_files);
+    cfd->current()->AddLiveFiles(&live_table_files, &live_blob_files,
+                                 /*skip_marked_missing=*/true);
   }
 
   ret.clear();
@@ -472,10 +473,7 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
       if (detached_version != nullptr) {
         detached_version->DeleteDetached();
       }
-      {
-        InstrumentedMutexLock lock(&mutex_);
-        pinned.cfd->UnrefAndTryDelete();
-      }
+      ReleaseColumnFamilyDataPin(pinned.cfd);
     }
     pinned_versions.clear();
   };
@@ -553,6 +551,9 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     const auto& relocation_files = vsi.GetBlobRelocationFiles();
     for (const auto& meta : relocation_files) {
       assert(meta != nullptr);
+      if (meta->IsMarkedMissing()) {
+        continue;
+      }
       AddBlobFile(meta->GetFileNumber(), meta->GetFileSize(),
                   meta->GetChecksumMethod(), meta->GetChecksumValue());
     }

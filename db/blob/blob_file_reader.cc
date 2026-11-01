@@ -233,12 +233,8 @@ Status BlobFileReader::CreateRelocationFileForRepair(
     uint8_t block_protection_bytes_per_key,
     const std::shared_ptr<IOTracer>& io_tracer,
     std::unique_ptr<BlobFileReader>* blob_file_reader) {
-  // Repair cache isolation is not implemented by the reader options until D11.
-  BlockBasedTableOptions table_options(source_table_options);
-  table_options.no_block_cache = true;
-  table_options.block_cache.reset();
-  table_options.persistent_cache.reset();
-  BlockBasedTableFactory factory(MakeBlobRelocationTableOptions(table_options));
+  BlockBasedTableFactory factory(
+      MakeBlobRelocationTableOptions(source_table_options));
   return CreateRelocationFileImpl(
       immutable_options, read_options, file_options, blob_file_read_hist,
       /*column_family_id=*/0, blob_file_number, expected_file_size,

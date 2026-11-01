@@ -210,9 +210,29 @@ bool DBIter::ParseKey(ParsedInternalKey* ikey) {
     valid_ = false;
     ROCKS_LOG_ERROR(logger_, "In DBIter: %s", status_.getState());
     return false;
-  } else {
-    return true;
   }
+  current_entry_lost_ = false;
+  if ((ikey->type == kTypeBlobIndex || ikey->type == kTypeWideColumnEntity) &&
+      blob_state_->reader.blob_fetcher().HasBlobValueLoss()) {
+    if (!PrepareValueInternal()) {
+      return false;
+    }
+    bool lost = false;
+    s = blob_state_->reader.blob_fetcher().IsBlobValueLost(
+        ikey->type, iter_.value(), &lost);
+    if (!s.ok()) {
+      status_ = s;
+      valid_ = false;
+      return false;
+    }
+    if (lost) {
+      // Every forward, reverse and merge traversal must see the same point
+      // deletion boundary, even when value materialization is deferred.
+      ikey->type = kTypeDeletion;
+      current_entry_lost_ = true;
+    }
+  }
+  return true;
 }
 
 void DBIter::Next() {
@@ -599,10 +619,16 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
               // Skip if outside seek prefix -- the top-of-loop check
               // flushed any pending run, but we must also avoid starting
               // a new run outside the prefix.
-              if (min_tombstones_for_range_conversion_ > 0 &&
-                  PrefixCheck(user_key_without_ts)) {
-                TrackContiguousTombstone(ikey_.user_key,
-                                         /*always_update_first_key=*/false);
+              if (min_tombstones_for_range_conversion_ > 0) {
+                if (current_entry_lost_) {
+                  // A lost blob value is a virtual deletion that keeps its
+                  // Put identity. Like a live key, it ends a run and never
+                  // becomes part of a real range tombstone.
+                  FlushPendingTombstoneRun(ikey_.user_key);
+                } else if (PrefixCheck(user_key_without_ts)) {
+                  TrackContiguousTombstone(ikey_.user_key,
+                                           /*always_update_first_key=*/false);
+                }
               }
             }
             break;
@@ -1082,7 +1108,15 @@ void DBIter::PrevInternal() {
     // would use a stale value.
     if (min_tombstones_for_range_conversion_ > 0 &&
         range_tomb_end_key_.Size() > 0 && timestamp_lb_ == nullptr) {
-      if (!valid_ && found_visible && PrefixCheck(saved_key_without_ts)) {
+      if (!valid_ && found_visible && current_key_deleted_by_loss_) {
+        // A lost blob value ends the run like a live key. A later run below
+        // it must end at this key, so it never covers the lost key.
+        FlushPendingTombstoneRun(range_tomb_end_key_.GetUserKey(),
+                                 /*check_prefix_match=*/true);
+        range_tomb_end_key_.SetUserKey(saved_key_.GetUserKey(),
+                                       true /* copy */);
+      } else if (!valid_ && found_visible &&
+                 PrefixCheck(saved_key_without_ts)) {
         // Key was deleted and is within the seek prefix -- track it.
         TrackContiguousTombstone(saved_key_.GetUserKey(),
                                  /*always_update_first_key=*/true);
@@ -1144,6 +1178,8 @@ bool DBIter::FindValueForCurrentKey(bool& found_visible) {
   // kTypeBlobIndex, kTypeWideColumnEntity or kTypeValuePreferredSeqno)
   ValueType last_not_merge_type = kTypeDeletion;
   ValueType last_key_entry_type = kTypeDeletion;
+  bool last_key_entry_lost = false;
+  current_key_deleted_by_loss_ = false;
 
   // If false, it indicates that we have not seen any valid entry, even though
   // last_key_entry_type is initialized to kTypeDeletion.
@@ -1218,6 +1254,7 @@ bool DBIter::FindValueForCurrentKey(bool& found_visible) {
     ikey_ = ikey;
     valid_entry_seen = true;
     last_key_entry_type = ikey.type;
+    last_key_entry_lost = current_entry_lost_;
     switch (last_key_entry_type) {
       case kTypeValue:
       case kTypeValuePreferredSeqno:
@@ -1307,6 +1344,7 @@ bool DBIter::FindValueForCurrentKey(bool& found_visible) {
     case kTypeDeletion:
     case kTypeDeletionWithTimestamp:
     case kTypeSingleDeletion:
+      current_key_deleted_by_loss_ = last_key_entry_lost;
       if (timestamp_lb_ == nullptr) {
         valid_ = false;
       } else {
@@ -1443,6 +1481,7 @@ bool DBIter::FindValueForCurrentKeyUsingSeek() {
 
   if (ikey.type == kTypeDeletion || ikey.type == kTypeSingleDeletion ||
       kTypeDeletionWithTimestamp == ikey.type) {
+    current_key_deleted_by_loss_ = current_entry_lost_;
     if (timestamp_lb_ == nullptr) {
       valid_ = false;
     } else {

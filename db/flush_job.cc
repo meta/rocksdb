@@ -211,6 +211,9 @@ void FlushJob::PickMemTable() {
   // will no longer be picked up for recovery.
   edit_->SetLogNumber(max_next_log_number);
   edit_->SetColumnFamily(cfd_->GetID());
+  if (mutable_cf_options_.enable_blob_indirection) {
+    cfd_->imm()->BeginBlobIndirectionActivation(m);
+  }
 
   // path 0 for level 0 file.
   meta_.fd = FileDescriptor(versions_->NewFileNumber(), 0, 0);
@@ -1057,13 +1060,20 @@ Status FlushJob::WriteLevel0Table() {
               ? preclude_last_level_min_seqno_
               : std::min(earliest_snapshot_, preclude_last_level_min_seqno_),
           dbname_ /*db_name*/);
-      tboptions.collect_blob_reference_metadata =
+      tboptions.track_blob_reference_classification =
           mutable_cf_options_.enable_blob_indirection ||
           // FlushJob pins a non-null base Version for its lifetime.
           // @lint-ignore NULLSAFECLANG nullable-dereference
           base_->storage_info()->HasBlobIndirectionFormat();
+      // Flush sees ordinary memtable values, not route-dependent BlobIndexes.
+      // It needs only a scalar identity frontier, so it remains single-output.
+      tboptions.collect_blob_reference_metadata = false;
       TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:TableBuilderOptions",
                                &tboptions);
+      tboptions.blob_route_snapshot_fingerprint_high =
+          base_->storage_info()->GetBlobRelocationStateFingerprintHigh();
+      tboptions.blob_route_snapshot_fingerprint_low =
+          base_->storage_info()->GetBlobRelocationStateFingerprintLow();
       s = BuildTable(
           dbname_, versions_, db_options_, tboptions, file_options_,
           cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,

@@ -1220,6 +1220,10 @@ class Version {
                  FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
                  uint64_t* bytes_read) const;
 
+  // True means this entry is a same-sequence point deletion. Check the entire
+  // entity, including unrequested columns, before any lazy/cache resolution.
+  Status IsBlobValueLost(ValueType type, const Slice& value, bool* lost) const;
+
   // Retrieves a byte sub-range [range_offset, range_offset + range_length) of
   // an *uncompressed*, separate-file blob's value into *value, reading only
   // those bytes on a cache miss (see BlobSource::GetBlobRange). The blob file
@@ -1294,6 +1298,12 @@ class Version {
   // *live_blob_files.
   void AddLiveFiles(std::vector<uint64_t>* live_table_files,
                     std::vector<uint64_t>* live_blob_files) const;
+
+  // Copy enumeration omits durable loss targets, whose metadata must remain
+  // live for reads/purge protection but has no physical bytes to back up.
+  void AddLiveFiles(std::vector<uint64_t>* live_table_files,
+                    std::vector<uint64_t>* live_blob_files,
+                    bool skip_marked_missing) const;
 
   // Remove live files that are in the delete candidate lists.
   void RemoveLiveFiles(
@@ -1689,6 +1699,13 @@ class VersionSet {
                  bool read_only = false, std::string* db_id = nullptr,
                  bool no_error_if_files_missing = false, bool is_retry = false,
                  Status* log_status = nullptr);
+
+  // Creates/replays a fresh candidate at a non-MANIFEST temporary path and
+  // retains its writer until RepairDB validates and publishes the full image.
+  Status RecoverForRepair(
+      const std::string& manifest_path, uint64_t manifest_file_number,
+      const std::vector<ColumnFamilyDescriptor>& column_families);
+  Status SyncAndCloseRepairManifest();
 
   // Do a best-efforts recovery (Options.best_efforts_recovery=true) from all
   // available MANIFEST files. Similar to `Recover` with these differences:
@@ -2222,6 +2239,8 @@ class VersionSet {
   // (descriptor_log_ stays null, next LogAndApply creates a fresh
   // MANIFEST as before) if ReopenWritableFile fails.
   Status ReopenManifestForAppend(const std::string& manifest_path);
+  Status ReopenManifestForAppendImpl(const std::string& manifest_path,
+                                     bool allow_fresh_manifest_fallback);
 
   // FileOptions for MANIFEST writes -- applies the FS's
   // OptimizeForManifestWrite tuning, then re-applies the user-configured
@@ -2385,6 +2404,11 @@ class VersionSet {
   // MANIFEST before returning so normal writable operation never appends to
   // the old tail.
   bool force_new_manifest_on_open_;
+
+  // A repair MANIFEST is private until RepairDB finishes validation and
+  // publishes CURRENT. It must keep appending to the staged descriptor rather
+  // than rotating through the normal SetCurrentFile path.
+  bool repair_manifest_staging_;
 
   // Size of the populated manifest file last time it was re-written from
   // scratch.

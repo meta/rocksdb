@@ -379,18 +379,25 @@ Status DBImpl::NewDB(std::vector<std::string>* new_filenames) {
       s = SyncManifest(&immutable_db_options_, write_options, log.file());
     }
   }
+  if (!s.ok()) {
+    // Publication has not begun, so this new file cannot be authoritative.
+    fs_->DeleteFile(manifest, IOOptions(), nullptr).PermitUncheckedError();
+    return s;
+  }
   if (s.ok()) {
     // Make "CURRENT" file that points to the new manifest file.
     s = SetCurrentFile(write_options, fs_.get(), dbname_, 1,
                        immutable_db_options_.metadata_write_temperature,
                        directories_.GetDbDir());
-    if (new_filenames) {
-      new_filenames->emplace_back(
-          manifest.substr(manifest.find_last_of("/\\") + 1));
-    }
-  } else {
-    fs_->DeleteFile(manifest, IOOptions(), nullptr).PermitUncheckedError();
   }
+  if (s.ok() && new_filenames != nullptr) {
+    new_filenames->emplace_back(
+        manifest.substr(manifest.find_last_of("/\\") + 1));
+  }
+  // SetCurrentFile can report an error after a successful remote rename.
+  // Retain the valid MANIFEST even on error so either possible CURRENT image
+  // remains readable; recovery, not a failed client response, decides
+  // ownership.
   return s;
 }
 
@@ -455,6 +462,15 @@ Status DBImpl::Recover(
   bool& is_new_db = recovery_ctx ? recovery_ctx->is_new_db_ : tmp_is_new_db;
   assert(db_lock_ == nullptr);
   std::vector<std::string> files_in_dbname;
+  if (read_only) {
+    mutex_.Unlock();
+    Status catalog_status = CheckRepairCatalogForOpen(
+        env_, dbname_, true, immutable_db_options_.db_paths, column_families);
+    mutex_.Lock();
+    if (!catalog_status.ok()) {
+      return catalog_status;
+    }
+  }
   if (!read_only) {
     Status s = directories_.SetDirectories(fs_.get(), dbname_,
                                            immutable_db_options_.wal_dir,
@@ -464,6 +480,13 @@ Status DBImpl::Recover(
     }
 
     s = env_->LockFile(LockFileName(dbname_), &db_lock_);
+    if (!s.ok()) {
+      return s;
+    }
+    mutex_.Unlock();
+    s = CheckRepairCatalogForOpen(
+        env_, dbname_, false, immutable_db_options_.db_paths, column_families);
+    mutex_.Lock();
     if (!s.ok()) {
       return s;
     }
@@ -502,6 +525,8 @@ Status DBImpl::Recover(
       }
     }
     if (s.IsNotFound()) {
+      // Recognized feature catalogs were resolved under DB LOCK before this
+      // discovery. An unrelated basename does not change legacy creation.
       if (immutable_db_options_.create_if_missing) {
         s = NewDB(&files_in_dbname);
         is_new_db = true;
@@ -607,6 +632,35 @@ Status DBImpl::Recover(
   }
   if (!s.ok()) {
     return s;
+  }
+  if (!immutable_db_options_.best_efforts_recovery) {
+    // Startup has not exposed any CF or started its background jobs. Do
+    // physical existence checks outside DB mutex, after complete replay so
+    // intentionally retired historical additions are not checked.
+    mutex_.Unlock();
+    for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+      if (cfd->IsDropped()) {
+        continue;
+      }
+      for (const std::shared_ptr<BlobRelocationFileMetaData>& file :
+           cfd->current()->storage_info()->GetBlobRelocationFiles()) {
+        if (file->IsMarkedMissing()) {
+          continue;
+        }
+        s = env_->FileExists(BlobFileName(cfd->ioptions().cf_paths.front().path,
+                                          file->GetFileNumber()));
+        if (!s.ok()) {
+          break;
+        }
+      }
+      if (!s.ok()) {
+        break;
+      }
+    }
+    mutex_.Lock();
+    if (!s.ok()) {
+      return s;
+    }
   }
   if (!read_only) {
     for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
@@ -2249,11 +2303,12 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           kMaxSequenceNumber, dbname_ /* db_name */);
       Version* version = cfd->current();
       version->Ref();
-      tboptions.collect_blob_reference_metadata =
+      tboptions.track_blob_reference_classification =
           mutable_cf_options_copy.enable_blob_indirection ||
           // A live ColumnFamilyData always has a current Version.
           // @lint-ignore NULLSAFECLANG nullable-dereference
           version->storage_info()->HasBlobIndirectionFormat();
+      tboptions.collect_blob_reference_metadata = false;
       TableProperties temp_table_proerties;
       s = BuildTable(
           dbname_, versions_.get(), immutable_db_options_, tboptions,

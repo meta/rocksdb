@@ -7854,6 +7854,96 @@ TEST_F(DBBasicTest, FileChecksumInFileOptions) {
   Close();
 }
 
+TEST_F(DBBasicTest, MetadataPinReleasesDroppedColumnFamilyOutsideMutex) {
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  DestroyAndReopen(options);
+
+  ColumnFamilyHandle* handle = nullptr;
+  ASSERT_OK(db_->CreateColumnFamily(options, "drop-me", &handle));
+  ASSERT_NE(handle, nullptr);
+  ASSERT_OK(db_->Put(WriteOptions(), handle, "key", "value"));
+  ASSERT_OK(db_->Flush(FlushOptions(), handle));
+  ColumnFamilyData* const cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(handle)->cfd();
+  const std::vector<FileMetaData*>& l0_files =
+      cfd->current()->storage_info()->LevelFiles(0);
+  ASSERT_EQ(l0_files.size(), 1U);
+  const std::string dropped_sst_path =
+      TableFileName(cfd->ioptions().cf_paths, l0_files.front()->fd.GetNumber(),
+                    l0_files.front()->fd.GetPathId());
+
+  Status drop_status;
+  Status destroy_status;
+  bool thread_local_drain_observed = false;
+  bool cleanup_observed = false;
+  bool aggregate_property_observed = false;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "DBImpl::GetAllColumnFamilyMetaData:AfterPin", [&](void*) {
+        drop_status = db_->DropColumnFamily(handle);
+        destroy_status = db_->DestroyColumnFamilyHandle(handle);
+        handle = nullptr;
+      });
+  sync_point->SetCallBack(
+      "DBImpl::ReleaseColumnFamilyDataPin:BeforeThreadLocalDrain", [&](void*) {
+        dbfull()->TEST_LockMutex();
+        dbfull()->TEST_UnlockMutex();
+        uint64_t table_reader_memory = 0;
+        aggregate_property_observed = db_->GetAggregatedIntProperty(
+            DB::Properties::kEstimateTableReadersMem, &table_reader_memory);
+        thread_local_drain_observed = true;
+      });
+  sync_point->SetCallBack("DBImpl::ReleaseColumnFamilyDataPin:BeforeCleanup",
+                          [&](void*) {
+                            // Acquiring the same mutex here proves that
+                            // potentially large final CFD teardown is entered
+                            // only after the release transition unlocks.
+                            dbfull()->TEST_LockMutex();
+                            dbfull()->TEST_UnlockMutex();
+                            cleanup_observed = true;
+                          });
+  sync_point->EnableProcessing();
+  auto cleanup_sync_point = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  std::vector<ColumnFamilyMetaData> metadata;
+  db_->GetAllColumnFamilyMetaData(&metadata);
+  ASSERT_OK(drop_status);
+  ASSERT_OK(destroy_status);
+  EXPECT_TRUE(thread_local_drain_observed);
+  EXPECT_TRUE(aggregate_property_observed);
+  EXPECT_TRUE(cleanup_observed);
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_OK(dbfull()->TEST_WaitForPurge());
+  EXPECT_TRUE(env_->FileExists(dropped_sst_path).IsNotFound());
+}
+
+TEST_F(DBBasicTest, ExternalHandleReleasePurgesDroppedColumnFamily) {
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  DestroyAndReopen(options);
+
+  ColumnFamilyHandle* handle = nullptr;
+  ASSERT_OK(db_->CreateColumnFamily(options, "drop-me", &handle));
+  ASSERT_OK(db_->Put(WriteOptions(), handle, "key", "value"));
+  ASSERT_OK(db_->Flush(FlushOptions(), handle));
+  ColumnFamilyData* const cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(handle)->cfd();
+  const std::vector<FileMetaData*>& l0_files =
+      cfd->current()->storage_info()->LevelFiles(0);
+  ASSERT_EQ(l0_files.size(), 1U);
+  const std::string dropped_sst_path =
+      TableFileName(cfd->ioptions().cf_paths, l0_files.front()->fd.GetNumber(),
+                    l0_files.front()->fd.GetPathId());
+
+  ASSERT_OK(db_->DropColumnFamily(handle));
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(handle));
+  EXPECT_TRUE(env_->FileExists(dropped_sst_path).IsNotFound());
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

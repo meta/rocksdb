@@ -893,6 +893,7 @@ BlobReferenceCensus::SelectWorkerRetirementSources(uint64_t token) {
   }
   return result;
 }
+
 bool BlobReferenceCensus::NeedsWorkerRun(uint64_t version_number) const {
   std::lock_guard<std::mutex> lock(mutex_);
   return !build_waiting_for_install_ &&

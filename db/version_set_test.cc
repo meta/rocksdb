@@ -3797,6 +3797,10 @@ TEST_F(VersionSetAtomicGroupTest,
   ASSERT_NE(second_cfd, nullptr);
   Version* const version_before_collision = second_cfd->current();
   ASSERT_NE(version_before_collision, nullptr);
+  ASSERT_EQ(
+      version_before_collision->storage_info()->GetBlobRelocationFileMetaData(
+          kTableFileNumber),
+      nullptr);
 
   edits_.clear();
   edits_.emplace_back();
@@ -3815,6 +3819,10 @@ TEST_F(VersionSetAtomicGroupTest,
 
   ASSERT_TRUE(status.IsCorruption()) << status.ToString();
   ASSERT_EQ(second_cfd->current(), version_before_collision);
+  ASSERT_EQ(
+      second_cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+          kTableFileNumber),
+      nullptr);
 }
 
 TEST_F(VersionSetAtomicGroupTest,

@@ -40,6 +40,7 @@
 #include "util/coding.h"
 #include "util/compression.h"
 #include "util/crc32c.h"
+#include "util/defer.h"
 #include "utilities/fault_injection_env.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -213,6 +214,12 @@ void WriteRelocationFile(const ImmutableOptions& immutable_options,
 
 TEST(BlobRelocationDirectoryTest, ValidatesOrderingAndChecksums) {
   BlobRelocationDirectoryBuilder builder;
+  ASSERT_OK(builder.AddServedRouteSource(/*origin_file_number=*/10,
+                                         /*generation_file_number=*/10));
+  ASSERT_OK(builder.AddServedRouteSource(/*origin_file_number=*/10,
+                                         /*generation_file_number=*/15));
+  ASSERT_OK(builder.AddServedRouteSource(/*origin_file_number=*/20,
+                                         /*generation_file_number=*/20));
   ASSERT_OK(builder.Add(/*origin_file_number=*/10,
                         /*original_value_offset=*/2,
                         /*relocated_value_offset=*/100,
@@ -229,6 +236,7 @@ TEST(BlobRelocationDirectoryTest, ValidatesOrderingAndChecksums) {
   ASSERT_OK(builder.Finish(&directory));
   ASSERT_EQ(directory.origins().size(), 2U);
   ASSERT_EQ(directory.total_entries(), 3U);
+  ASSERT_TRUE(directory.HasRepairMetadata());
   ASSERT_EQ(directory.total_record_bytes(),
             12U + 3U * kSimpleGen2BlobTrailerSize);
   ASSERT_NE(directory.Find(10), nullptr);
@@ -245,6 +253,10 @@ TEST(BlobRelocationDirectoryTest, ValidatesOrderingAndChecksums) {
   BlobRelocationDirectory decoded;
   ASSERT_OK(BlobRelocationDirectory::DecodeFrom(encoded, &decoded));
   ASSERT_EQ(decoded.directory_digest(), directory.directory_digest());
+  ASSERT_EQ(decoded.Find(10)->served_generation_file_numbers,
+            (std::vector<uint64_t>{10, 15}));
+  ASSERT_EQ(decoded.Find(20)->served_generation_file_numbers,
+            (std::vector<uint64_t>{20}));
 
   // Two distinct offsets cannot fit in the single-point inclusive range.
   std::string impossible_cardinality = encoded;
@@ -672,6 +684,25 @@ TEST_F(BlobFileReaderTest, RelocationFileMultiOriginCompressedRoundTrip) {
   EXPECT_TRUE(stored_payloads[2].empty());
   EXPECT_EQ(stored_bytes_read, first_value.size() + compressed_second.size() +
                                    2 * kSimpleGen2BlobTrailerSize);
+
+  stored_requests[2].stable_checksum ^= 1;
+  for (std::string& payload : stored_payloads) {
+    payload.clear();
+  }
+  stored_requests[1].stored_payload = nullptr;
+  stored_bytes_read = 0;
+  reader->MultiGetStoredBlobsFromRelocationFile(
+      read_options, stored_requests.size(), stored_requests.data(),
+      /*max_stored_value_size=*/1 << 20,
+      /*max_logical_value_size=*/1 << 20, &stored_bytes_read);
+  ASSERT_OK(stored_statuses[0]);
+  ASSERT_OK(stored_statuses[1]);
+  ASSERT_OK(stored_statuses[2]);
+  EXPECT_EQ(stored_payloads[0], first_value);
+  EXPECT_TRUE(stored_payloads[1].empty());
+  EXPECT_EQ(stored_payloads[2], third_value);
+  EXPECT_EQ(stored_bytes_read, metadata.record_bytes);
+  stored_requests[1].stored_payload = &stored_payloads[1];
 
   PinnableSlice value;
   uint64_t bytes_read = 0;
@@ -1186,6 +1217,16 @@ TEST_F(BlobFileReaderTest, CreateReaderAndGetBlob) {
       total_size += blob_sizes[i];
     }
     ASSERT_EQ(bytes_read, total_size);
+
+    bytes_read = 0;
+    ASSERT_OK(reader->GetStoredBlobForRelocation(
+        read_options, blob_offsets[0], blob_sizes[0], kNoCompression,
+        BlobIndex::kStableChecksumVersion1,
+        crc32c::Value(blob_strs[0].data(), blob_strs[0].size()),
+        /*max_stored_value_size=*/1 << 20,
+        /*max_logical_value_size=*/1 << 20,
+        /*stored_payload=*/nullptr, &bytes_read));
+    EXPECT_EQ(bytes_read, blob_sizes[0]);
   }
 
   read_options.verify_checksums = true;
@@ -1463,6 +1504,24 @@ TEST_F(BlobFileReaderTest,
   for (std::string& payload : stored_payloads) {
     payload.clear();
   }
+  requests[1].stored_payload = nullptr;
+  bytes_read = 0;
+  reader->MultiGetStoredBlobsForRelocation(
+      read_options, requests.size(), requests.data(),
+      /*max_stored_value_size=*/1 << 20,
+      /*max_logical_value_size=*/1 << 20, &bytes_read);
+  for (const Status& status : statuses) {
+    ASSERT_OK(status);
+  }
+  EXPECT_FALSE(stored_payloads[0].empty());
+  EXPECT_TRUE(stored_payloads[1].empty());
+  EXPECT_FALSE(stored_payloads[2].empty());
+  EXPECT_EQ(bytes_read, blob_sizes[0] + blob_sizes[1] + blob_sizes[2]);
+
+  requests[1].stored_payload = &stored_payloads[1];
+  for (std::string& payload : stored_payloads) {
+    payload.clear();
+  }
   bytes_read = 0;
   reader->MultiGetStoredBlobsForRelocation(
       read_options, requests.size(), requests.data(),
@@ -1473,6 +1532,126 @@ TEST_F(BlobFileReaderTest,
     EXPECT_TRUE(stored_payloads[i].empty());
   }
   EXPECT_EQ(bytes_read, 0U);
+}
+
+TEST_F(BlobFileReaderTest, DualChecksumRelocationDoesNotDecompress) {
+  if (!CompressionTypeSupported(kZSTD)) {
+    ROCKSDB_GTEST_SKIP("ZSTD is required for this test");
+    return;
+  }
+  Options options;
+  options.env = mock_env_.get();
+  options.enable_blob_files = true;
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(), "DualChecksumRelocation"), 0);
+  const ImmutableOptions immutable_options(options);
+  const std::string key = "key";
+  const std::string logical(4096, 'x');
+  GrowableBuffer compressed;
+  std::unique_ptr<Compressor> compressor =
+      GetBuiltinV2CompressionManager()->GetCompressor({}, kZSTD);
+  ASSERT_OK(LegacyForceBuiltinCompression(*compressor, nullptr, logical,
+                                          &compressed));
+  uint64_t offset = 0;
+  uint64_t size = 0;
+  const ExpirationRange expiration_range;
+  WriteBlobFile(immutable_options, 0, false, expiration_range, expiration_range,
+                1, key, logical, kZSTD, &offset, &size);
+  std::unique_ptr<BlobFileReader> reader;
+  ASSERT_OK(BlobFileReader::Create(immutable_options, ReadOptions(),
+                                   FileOptions(), 0, nullptr, 1, nullptr,
+                                   &reader));
+  const uint32_t logical_crc = crc32c::Value(logical.data(), logical.size());
+  const uint32_t stored_crc =
+      BlobIndex::ComputeStoredChecksum(compressed, kZSTD);
+  size_t decompressions = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlobFileReader::UncompressBlobIfNeeded:TamperWithResult",
+      [&](void*) { ++decompressions; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  std::string stored;
+  ASSERT_OK(reader->GetStoredBlobForRelocation(
+      ReadOptions(), offset, size, kZSTD, BlobIndex::kStableChecksumVersion2,
+      logical_crc, stored_crc, size, /*max_logical_value_size=*/1, &stored,
+      nullptr));
+  ASSERT_EQ(Slice(stored), Slice(compressed));
+  ASSERT_EQ(decompressions, 0U);
+  std::string encoded;
+  BlobIndex::EncodeIdentityBlob(&encoded, 1, offset, size, kZSTD, logical_crc,
+                                stored_crc);
+  BlobIndex index;
+  ASSERT_OK(index.DecodeFrom(encoded));
+  std::string streamed;
+  ASSERT_OK(reader->StreamStoredBlobForRelocation(
+      ReadOptions(), index, [&](const Slice& chunk) {
+        EXPECT_LE(chunk.size(), kBlobRelocationStreamChunkSize);
+        streamed.append(chunk.data(), chunk.size());
+        return Status::OK();
+      }));
+  ASSERT_EQ(streamed, stored);
+  ASSERT_EQ(decompressions, 0U);
+  ASSERT_TRUE(reader
+                  ->GetStoredBlobForRelocation(
+                      ReadOptions(), offset, size, kZSTD,
+                      BlobIndex::kStableChecksumVersion2, logical_crc,
+                      stored_crc ^ 1, size, 1, &stored, nullptr)
+                  .IsCorruption());
+  ASSERT_EQ(decompressions, 0U);
+}
+
+TEST(BlobStoredStreamTest, ChecksLengthAndPreservesSourceFailures) {
+  const std::string payload = "stored payload";
+  const uint32_t checksum =
+      BlobIndex::ComputeStoredChecksum(payload, kNoCompression);
+  for (int mode = 0; mode < 4; ++mode) {
+    SCOPED_TRACE(mode);
+    std::unique_ptr<test::StringSink> sink =
+        std::make_unique<test::StringSink>();
+    test::StringSink* const sink_ptr = sink.get();
+    WritableFileWriter writer(std::move(sink), "stream", FileOptions());
+    const Status result = WriteSimpleGen2BlobRecordStream(
+        &writer, WriteOptions(), kCRC32c, /*base_context_checksum=*/123,
+        /*record_offset=*/0, payload.size(), kNoCompression, checksum,
+        [&](const BlobChunkConsumer& consume) {
+          if (mode == 0) {
+            return consume(payload);
+          }
+          if (mode == 1) {
+            return consume(Slice(payload.data(), payload.size() - 1));
+          }
+          if (mode == 2) {
+            Status status = consume(payload + "extra");
+            EXPECT_TRUE(status.IsCorruption());
+            // A buggy source cannot swallow a failed consumer and publish.
+            return Status::OK();
+          }
+          Status status = consume(payload);
+          return status.ok() ? Status::IOError("injected source I/O") : status;
+        });
+    if (mode == 0) {
+      ASSERT_OK(result);
+    } else if (mode == 3) {
+      ASSERT_TRUE(result.IsIOError());
+    } else {
+      ASSERT_TRUE(result.IsCorruption());
+    }
+    ASSERT_OK(writer.Flush(IOOptions()));
+    ASSERT_EQ(sink_ptr->contents().size(),
+              mode == 0 ? payload.size() + kSimpleGen2BlobTrailerSize
+                        : (mode == 1 ? payload.size() - 1
+                                     : (mode == 2 ? 0 : payload.size())));
+    if (mode == 0) {
+      const Slice trailer(sink_ptr->contents().data() + payload.size(),
+                          kSimpleGen2BlobTrailerSize);
+      ASSERT_EQ(DecodeFixed32(trailer.data() + 1),
+                crc32c::Mask(checksum) + ChecksumModifierForContext(123, 0));
+    }
+    ASSERT_OK(writer.Close(IOOptions(), nullptr));
+  }
 }
 
 // Verifies Create() prefers the file size reported by the opened handle over a

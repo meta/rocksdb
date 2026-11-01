@@ -198,9 +198,11 @@ class VersionEditHandler : public VersionEditHandlerBase {
     return Status::OK();
   }
 
-  // Durable loss-marker recovery is integrated by the later recovery layer.
-  // Until then, missing targets use existing point-in-time fallback.
-  bool CanMarkMissingBlobRelocationFiles() const { return false; }
+  // Only explicit writable best-efforts recovery may infer new durable loss.
+  // Secondary/follower absence can be transient and must never become a delete.
+  bool CanMarkMissingBlobRelocationFiles() const {
+    return allow_incomplete_valid_version_ && !read_only_;
+  }
 
   // Rebuilds the startup ownership index from opened Versions plus raw claims
   // retained for column families omitted by a read-only open.
