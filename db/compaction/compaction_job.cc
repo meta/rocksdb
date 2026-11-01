@@ -2156,6 +2156,7 @@ void CompactionJob::ProcessLocalKeyValueCompaction(
     input_iter->SeekToFirst();
   } else if (!status.ok()) {
     sub_compact->status = status;
+    NotifyOnSubcompactionCompleted(sub_compact);
     return;
   }
 

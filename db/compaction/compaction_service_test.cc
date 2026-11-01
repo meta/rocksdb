@@ -7724,6 +7724,123 @@ TEST_F(CompactionServiceTest, RemoteEventListener) {
   }
 }
 
+namespace {
+// Runs each remote compaction in two attempts. The first attempt stops after
+// it saves progress. The second attempt resumes after the saved output files
+// are deleted, so the resume fails and the primary compacts locally.
+class FailedResumeCompactionService : public MyTestCompactionService {
+ public:
+  using MyTestCompactionService::MyTestCompactionService;
+
+  CompactionServiceJobStatus Wait(const std::string& scheduled_job_id,
+                                  std::string* result) override {
+    std::string compaction_input;
+    {
+      InstrumentedMutexLock l(&mutex_);
+      auto it = jobs_.find(scheduled_job_id);
+      if (it == jobs_.end()) {
+        return CompactionServiceJobStatus::kFailure;
+      }
+      compaction_input = it->second;
+      jobs_.erase(it);
+    }
+
+    CompactionServiceOptionsOverride options_override = GetOptionsOverride();
+    std::atomic<bool> canceled{false};
+    OpenAndCompactOptions open_options;
+    open_options.allow_resumption = true;
+    open_options.canceled = &canceled;
+
+    // Put each key in its own output file, and stop at the first saved
+    // progress.
+    SyncPoint::GetInstance()->SetCallBack(
+        "CompactionOutputs::ShouldStopBefore::manual_decision", [](void* p) {
+          *static_cast<std::pair<bool*, const Slice>*>(p)->first = true;
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "CompactionJob::PersistSubcompactionProgress:Complete",
+        [&](void*) { canceled.store(true); });
+    SyncPoint::GetInstance()->EnableProcessing();
+    std::string first_result;
+    Status s =
+        DB::OpenAndCompact(open_options, db_path_, scheduled_job_id,
+                           compaction_input, &first_result, options_override);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    EXPECT_TRUE(s.IsManualCompactionPaused()) << s.ToString();
+
+    Env* env = options_override.env;
+    const std::string output_dir = GetOutputPath(scheduled_job_id);
+    std::vector<std::string> children;
+    EXPECT_OK(env->GetChildren(output_dir, &children));
+    for (const auto& child : children) {
+      uint64_t number = 0;
+      FileType type;
+      if (ParseFileName(child, &number, &type) && type == kTableFile) {
+        EXPECT_OK(env->DeleteFile(MakeTableFileName(output_dir, number)));
+      }
+    }
+
+    canceled.store(false);
+    s = DB::OpenAndCompact(open_options, db_path_, scheduled_job_id,
+                           compaction_input, result, options_override);
+    EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+};
+}  // namespace
+
+TEST_F(CompactionServiceTest, FailedResumeReportsSubcompactionCompleted) {
+  class SubcompactionEventCounter : public EventListener {
+   public:
+    const char* Name() const override { return "SubcompactionEventCounter"; }
+
+    void OnSubcompactionBegin(const SubcompactionJobInfo& /*info*/) override {
+      ++begin_count;
+    }
+    void OnSubcompactionCompleted(const SubcompactionJobInfo& info) override {
+      ++completed_count;
+      if (info.status.IsCorruption()) {
+        ++corruption_count;
+      }
+    }
+
+    std::atomic<int> begin_count{0};
+    std::atomic<int> completed_count{0};
+    std::atomic<int> corruption_count{0};
+  };
+
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.env = env_;
+  auto listener = std::make_shared<SubcompactionEventCounter>();
+  std::shared_ptr<Statistics> statistics = CreateDBStatistics();
+  auto cs = std::make_shared<FailedResumeCompactionService>(
+      dbname_, options, statistics,
+      std::vector<std::shared_ptr<EventListener>>{listener},
+      std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>{});
+  options.compaction_service = cs;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 2; ++i) {
+    for (int key = 0; key < 4; ++key) {
+      ASSERT_OK(Put(Key(key), "value" + std::to_string(i)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  // Each attempt that began a subcompaction also reported its completion, and
+  // the failed resume reported its status.
+  ASSERT_GT(listener->begin_count, 0);
+  ASSERT_EQ(listener->completed_count, listener->begin_count);
+  ASSERT_GT(listener->corruption_count, 0);
+  for (int key = 0; key < 4; ++key) {
+    ASSERT_EQ(Get(Key(key)), "value1");
+  }
+}
+
 TEST_F(CompactionServiceTest, TablePropertiesCollector) {
   const static std::string kUserPropertyName = "TestCount";
 
