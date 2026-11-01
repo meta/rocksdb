@@ -22,6 +22,7 @@ from block_cache_pysim import (
     OPTCache,
     OPTCacheEntry,
     run,
+    S3FIFOCache,
     ThompsonSamplingCache,
     TraceCache,
     TraceRecord,
@@ -404,6 +405,7 @@ def test_end_to_end():
         "gdsize",
         "pyccbt",
         "pycctbbt",
+        "s3fifo",
     ]:
         cache = create_cache(cache_type, cache_size, downsample_size)
         run(trace_file_path, cache_type, cache, 0, -1, "all")
@@ -678,9 +680,237 @@ def test_trace_cache():
     print("Test trace cache: Success")
 
 
+def test_s3fifo_cache():
+    print("Test S3-FIFO cache")
+    test_cache(
+        S3FIFOCache(3, enable_cache_row_key=0),
+        [3, 7, 4, [2, 3, 4], []],
+        custom_hashtable=False,
+    )
+
+    hot = TraceRecord(0, 1, 1, 1, 0, "", 0, 0, 1, 0, 1, 1, 5, 1, 1, 0, 0, 0, 0, 0, 0, 0)
+    cold = TraceRecord(1, 2, 1, 1, 0, "", 0, 0, 1, 0, 1, 1, 5, 1, 1, 0, 0, 0, 0, 0, 0, 0)
+    scan = TraceRecord(2, 3, 1, 1, 0, "", 0, 0, 1, 0, 1, 1, 5, 1, 1, 0, 0, 0, 0, 0, 0, 0)
+    reread = TraceRecord(3, 2, 1, 1, 0, "", 0, 0, 1, 0, 1, 1, 5, 1, 1, 0, 0, 0, 0, 0, 0, 0)
+
+    cache = S3FIFOCache(2, enable_cache_row_key=0)
+    # One miss plus two hits: the hot block reaches move_to_main_threshold.
+    cache.access(hot)
+    cache.access(hot)
+    cache.access(hot)
+    cache.access(cold)
+    cache.access(scan)
+    assert "b1" in cache.table
+    cache.access(reread)
+    assert "b2" in cache.table
+    print("Test S3-FIFO cache: Success")
+
+
+def s3fifo_record(block_id):
+    return TraceRecord(
+        block_id, block_id, 1, 1, 0, "", 0, 0, 1, 0, 1, 1, 5, 1, 1, 0, 0, 0, 0, 0, 0, 0
+    )
+
+
+def test_s3fifo_promotes_at_threshold():
+    print("Test S3-FIFO small-queue promotion")
+    cache = S3FIFOCache(2, enable_cache_row_key=0)
+    for _ in range(3):  # b1: one miss, two hits (num_hits == 2)
+        cache.access(s3fifo_record(1))
+    for _ in range(2):  # b2: one miss, one hit (num_hits == 1)
+        cache.access(s3fifo_record(2))
+    cache.access(s3fifo_record(3))  # full: evicts from the small queue
+    # Hits >= move_to_main_threshold (2): moved to main, counter reset.
+    assert "b1" in cache.main and "b1" not in cache.small
+    assert cache.table["b1"].num_hits == 0
+    # Below the threshold: evicted from small and remembered in ghost.
+    assert "b2" not in cache.table and "b2" in cache.ghost
+    assert cache.used_size == 2
+    print("Test S3-FIFO small-queue promotion: Success")
+
+
+def test_s3fifo_main_clock_eviction():
+    print("Test S3-FIFO main-queue CLOCK eviction")
+    cache = S3FIFOCache(4, enable_cache_row_key=0)
+    for block in (1, 2, 3):  # two hits each: all promote on the next eviction
+        for _ in range(3):
+            cache.access(s3fifo_record(block))
+    cache.access(s3fifo_record(4))
+    cache.access(s3fifo_record(5))  # promotes b1, b2, b3; evicts b4 to ghost
+    assert list(cache.main) == ["b3", "b2", "b1"]  # newest first
+    cache.access(s3fifo_record(1))  # b1 in main: num_hits == 1
+    for _ in range(3):  # b5: two hits, so the small pass only promotes it
+        cache.access(s3fifo_record(5))
+    cache.access(s3fifo_record(6))  # small frees nothing: main must evict
+    # Main head b1 had num_hits 1: decremented to 0 and rotated to the tail.
+    # Next head b2 had num_hits 0: evicted.
+    assert "b2" not in cache.table
+    assert cache.table["b1"].num_hits == 0
+    assert list(cache.main) == ["b1", "b5", "b3"]  # newest first
+    assert cache.used_size == 4
+    print("Test S3-FIFO main-queue CLOCK eviction: Success")
+
+
+def s3fifo_sized_record(block_id, block_size):
+    return TraceRecord(
+        block_id, block_id, 1, block_size, 0, "", 0, 0, 1, 0, 1, 1, 5, 1, 1, 0, 0,
+        0, 0, 0, 0, 0
+    )
+
+
+def test_s3fifo_ghost_bounded():
+    print("Test S3-FIFO ghost bound")
+    cache = S3FIFOCache(4, enable_cache_row_key=0)
+    for block in range(1, 13):  # one-hit blocks: b1..b8 become victims
+        cache.access(s3fifo_record(block))
+    # At most as many keys as cached entries, and at most cache_size bytes.
+    assert len(cache.ghost) <= len(cache.table)
+    assert cache.ghost_used_size <= cache.cache_size
+    assert "b8" in cache.ghost and "b1" not in cache.ghost
+    cache.access(s3fifo_record(1))  # forgotten: back to small, not main
+    assert "b1" in cache.small and "b1" not in cache.main
+    print("Test S3-FIFO ghost bound: Success")
+
+
+def test_s3fifo_ghost_stale_slots():
+    print("Test S3-FIFO ghost stale slots")
+    cache = S3FIFOCache(4, enable_cache_row_key=0)
+    # 1..7 evict 1, 2, 3 to the ghost; re-reading 3 and 4 readmits them to
+    # main and leaves their slots stale; 8 evicts more victims.
+    for block in (1, 2, 3, 4, 5, 6, 7, 3, 4, 8):
+        cache.access(s3fifo_record(block))
+    # Stale slots for 3 and 4 still count toward the bound of 4 slots, so
+    # the live keys 1 and 2 were dropped, as in C++.
+    assert "b3" not in cache.ghost and "b4" not in cache.ghost
+    assert "b1" not in cache.ghost and "b2" not in cache.ghost
+    assert len(cache.ghost_ring) <= len(cache.table)
+    assert cache.ghost_used_size == sum(size for _, size, _ in cache.ghost_ring)
+    cache.access(s3fifo_record(2))  # no longer remembered: small, not main
+    assert "b2" in cache.small and "b2" not in cache.main
+    print("Test S3-FIFO ghost stale slots: Success")
+
+
+def test_s3fifo_ghost_size_bound():
+    print("Test S3-FIFO ghost size bound")
+    cache = S3FIFOCache(100, enable_cache_row_key=0)
+    for block in range(100, 110):  # ten 2-byte entries, two hits each
+        for _ in range(3):
+            cache.access(s3fifo_sized_record(block, 2))
+    for block in range(1, 7):  # one-hit 35-byte blocks
+        cache.access(s3fifo_sized_record(block, 35))
+    # The ring has slots to spare, so the size bound alone trimmed b1..b3.
+    assert len(cache.ghost_ring) < len(cache.table)
+    assert "b1" not in cache.ghost and "b4" in cache.ghost
+    print("Test S3-FIFO ghost size bound: Success")
+
+
+def test_s3fifo_ghost_count_bound():
+    print("Test S3-FIFO ghost count bound")
+    cache = S3FIFOCache(100, enable_cache_row_key=0)
+    for _ in range(3):  # one 80-byte entry, two hits
+        cache.access(s3fifo_sized_record(100, 80))
+    for block in range(1, 11):  # one-hit 5-byte blocks
+        cache.access(s3fifo_sized_record(block, 5))
+    # Bytes to spare, so the count bound alone trimmed b1: N slots for N
+    # entries, recorded while the victim is still in the table.
+    assert cache.ghost_used_size < cache.cache_size
+    assert len(cache.ghost_ring) == len(cache.table) == 5
+    assert "b1" not in cache.ghost and "b2" in cache.ghost
+    print("Test S3-FIFO ghost count bound: Success")
+
+
+def test_s3fifo_counter_saturates():
+    print("Test S3-FIFO frequency counter saturation")
+    cache = S3FIFOCache(4, enable_cache_row_key=0)
+    for block in (1, 2, 3, 4):
+        cache.access(s3fifo_record(block))
+    for _ in range(10):
+        cache.access(s3fifo_record(1))
+    assert cache.table["b1"].num_hits == cache.max_freq == 3
+    print("Test S3-FIFO frequency counter saturation: Success")
+
+
+def test_s3fifo_main_first_and_readmit_budget():
+    print("Test S3-FIFO main-first eviction and readmission budget")
+    cache = S3FIFOCache(1000, enable_cache_row_key=0)  # small budget 120
+    for block in range(10, 19):  # m: 9 x 100, two hits each
+        for _ in range(3):
+            cache.access(s3fifo_sized_record(block, 100))
+    cache.access(s3fifo_sized_record(1, 30))  # g: cold
+    # x needs 30: the small pass promotes every m and evicts g to the ghost.
+    cache.access(s3fifo_sized_record(2, 100))
+    assert "b1" in cache.ghost and cache.ghost_sizes["b1"] == 30
+    assert cache.small_used_size == 100 and cache.used_size == 1000
+    # Re-inserting g lands in main, so small stays within budget (100 <= 120)
+    # and main pays: its oldest entry (counter reset on promotion) goes.
+    cache.access(s3fifo_sized_record(1, 30))
+    assert "b1" in cache.main
+    assert "b2" in cache.table
+    assert "b10" not in cache.table
+    assert cache.used_size == 930
+    print("Test S3-FIFO main-first eviction and readmission budget: Success")
+
+
+def test_s3fifo_ghost_recheck_after_eviction():
+    print("Test S3-FIFO ghost re-check after eviction")
+    cache = S3FIFOCache(5, enable_cache_row_key=0)
+    cache.access(s3fifo_sized_record(4, 5))
+    cache.access(s3fifo_sized_record(3, 3))  # evicts b4 to the ghost
+    assert "b4" in cache.ghost
+    # b4 is remembered when its re-read starts evicting, but recording the
+    # victim b3 pushes the ghost past its bounds and drops b4's own slot. As
+    # in C++, where GhostTake then fails, b4 enters small, not main.
+    cache.access(s3fifo_sized_record(4, 5))
+    assert "b3" in cache.ghost and "b4" not in cache.ghost
+    assert "b4" in cache.small and "b4" not in cache.main
+    print("Test S3-FIFO ghost re-check after eviction: Success")
+
+
+def s3fifo_small_at(incoming_size):
+    """A 1000-byte cache (small budget 120) with 800 bytes in main, a cold
+    100-byte b2 in small, and b3 of incoming_size inserted into it."""
+    cache = S3FIFOCache(1000, enable_cache_row_key=0)
+    for block in range(10, 19):  # 9 x 100, two hits each
+        for _ in range(3):
+            cache.access(s3fifo_sized_record(block, 100))
+    cache.access(s3fifo_sized_record(1, 100))  # cold
+    cache.access(s3fifo_sized_record(2, 100))  # promotes every m, evicts b1
+    assert cache.small_used_size == 100 and cache.used_size == 1000
+    cache.access(s3fifo_sized_record(3, incoming_size))
+    return cache
+
+
+def test_s3fifo_small_budget_boundary():
+    print("Test S3-FIFO small budget boundary")
+    # 100 + 20 = 120 is within the 12% budget: main pays (its oldest, b10).
+    cache = s3fifo_small_at(20)
+    assert "b10" not in cache.table and "b2" in cache.small
+    # 100 + 21 = 121 is over it: small pays (b2).
+    cache = s3fifo_small_at(21)
+    assert "b2" not in cache.table and "b10" in cache.main
+    print("Test S3-FIFO small budget boundary: Success")
+
+
+def test_s3fifo_mix():
+    for cache_type in ["s3fifo", "s3fifo_hybrid", "s3fifo_hybridn"]:
+        test_mix(create_cache(cache_type, cache_size=100, downsample_size=1))
+
+
 if __name__ == "__main__":
     test_hash_table()
     test_trace_cache()
+    test_s3fifo_cache()
+    test_s3fifo_promotes_at_threshold()
+    test_s3fifo_main_clock_eviction()
+    test_s3fifo_ghost_bounded()
+    test_s3fifo_ghost_stale_slots()
+    test_s3fifo_ghost_size_bound()
+    test_s3fifo_ghost_count_bound()
+    test_s3fifo_counter_saturates()
+    test_s3fifo_main_first_and_readmit_budget()
+    test_s3fifo_ghost_recheck_after_eviction()
+    test_s3fifo_small_budget_boundary()
+    test_s3fifo_mix()
     test_opt_cache()
     test_lru_cache(
         ThompsonSamplingCache(
@@ -711,6 +941,7 @@ if __name__ == "__main__":
         "ts",
         "opt",
         "arc",
+        "s3fifo",
         "pylfu",
         "pymru",
         "trace",
