@@ -1288,10 +1288,17 @@ void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
 }
 
 bool ColumnFamilyData::NeedsCompaction() const {
+  Version* const current = current_;
+  // Exact empty-file cleanup is not an LSM compaction and copies no values.
+  // The policy knobs disable relocation, not this storage-lifecycle work.
+  if (current != nullptr && blob_reference_census_ != nullptr &&
+      blob_reference_census_->IsReady(current->GetVersionNumber()) &&
+      current->storage_info()->HasEmptyBlobGcCandidate()) {
+    return true;
+  }
   if (mutable_cf_options_.disable_auto_compactions) {
     return false;
   }
-  Version* const current = current_;
   if (current == nullptr) {
     return false;
   }
@@ -1788,6 +1795,34 @@ Status ColumnFamilyData::ValidateOptions(
   return s;
 }
 
+Status ColumnFamilyData::ValidateBlobIndirectionOptionsAfterRecovery() const {
+  Status s = CheckBlobIndirectionCompactionStyle(
+      ioptions_.compaction_style,
+      GetLatestMutableCFOptions().enable_blob_indirection ||
+          HasPendingBlobIndirectionOutput() ||
+          (current_ != nullptr &&
+           current_->storage_info()->HasBlobIndirectionFormat()));
+  if (!s.ok()) {
+    return s;
+  }
+  if (current_ == nullptr ||
+      !current_->storage_info()->HasBlobIndirectionFormat()) {
+    return Status::OK();
+  }
+  if (ioptions_.enable_blob_direct_write) {
+    return Status::NotSupported(
+        "Blob direct write cannot open a column family with blob indirection "
+        "state");
+  }
+
+  if (GetBlockBasedTableWriterOptions(
+          initial_cf_options_.table_factory.get()) == nullptr) {
+    return Status::NotSupported(
+        "Blob indirection state requires a Block-Based Table writer");
+  }
+  return Status::OK();
+}
+
 Status ColumnFamilyData::PrepareMutableCFOptions(
     const DBOptions& db_opts,
     const std::unordered_map<std::string, std::string>& options_map,
@@ -1808,6 +1843,24 @@ Status ColumnFamilyData::PrepareMutableCFOptions(
     // FIXME: we should call SanitizeOptions() too or consolidate it with
     // ValidateOptions().
     s = ValidateOptions(db_opts, cf_opts);
+  }
+  if (s.ok() && ((current_ != nullptr &&
+                  current_->storage_info()->HasBlobIndirectionFormat()) ||
+                 HasPendingBlobIndirectionOutput())) {
+    s = CheckBlobIndirectionCompactionStyle(cf_opts.compaction_style, true);
+  }
+  if (s.ok() &&
+      ((current_ != nullptr &&
+        current_->storage_info()->HasBlobIndirectionFormat()) ||
+       HasPendingBlobIndirectionOutput()) &&
+      GetBlockBasedTableWriterOptions(cf_opts.table_factory.get()) == nullptr) {
+    // Turning off creation does not cancel an older enabled output job, which
+    // may still publish the first fence. Its intent is checked in O(1) here.
+    // Turning off the GC policy does not remove the persistent format fence.
+    // Future compactions must still be able to preserve exact references and
+    // read/retire existing relocation files.
+    s = Status::NotSupported(
+        "Blob indirection state requires a Block-Based Table writer");
   }
   if (s.ok()) {
     *mutable_cf_options = MutableCFOptions(cf_opts);

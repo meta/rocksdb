@@ -553,6 +553,10 @@ class ReadOnlyMemTable {
   // These are used to manage memtable flushes to storage
   bool flush_in_progress_{false};  // started the flush
   bool flush_completed_{false};    // finished the flush
+  // DB-mutex-protected intent, retained through out-of-order flush completion
+  // until publication or rollback. The first memtable of an enabled flush
+  // owns one MemTableList activation count.
+  bool pending_blob_indirection_activation_ = false;
   uint64_t file_number_{0};
 
   // The updates to be applied to the transaction log when this

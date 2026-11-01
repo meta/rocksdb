@@ -1456,6 +1456,16 @@ class VersionSetTestBase {
     mutex_.Unlock();
   }
 
+  void UseBlockBasedWriterForBlobIndirection(ColumnFamilyData* cfd) {
+    // These metadata/ownership tests use MockTable readers. Format activation
+    // nevertheless requires a real capable write factory, just as production.
+    MutableCFOptions mutable_options(cfd->GetLatestMutableCFOptions());
+    mutable_options.table_factory.reset(NewBlockBasedTableFactory());
+    mutex_.Lock();
+    cfd->InstallMutableCFOptions(mutable_options);
+    mutex_.Unlock();
+  }
+
   ColumnFamilyData* CreateColumnFamily(const std::string& cf_name,
                                        const ColumnFamilyOptions& cf_options) {
     VersionEdit new_cf;
@@ -1598,6 +1608,82 @@ TEST_F(VersionSetTest, UnlockedApplyRevalidatesPrecondition) {
   ASSERT_EQ(cfd->current()->GetVersionNumber(), original_version_number);
 }
 
+TEST_F(VersionSetTest, PreconditionedWriterIsManifestBatchBarrier) {
+  NewDB();
+  ColumnFamilyData* const cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(cfd, nullptr);
+  const uint64_t original_version_number = cfd->current()->GetVersionNumber();
+
+  std::promise<void> apply_unlocked;
+  std::future<void> apply_unlocked_future = apply_unlocked.get_future();
+  std::promise<void> release_apply;
+  std::future<void> release_apply_future = release_apply.get_future();
+  std::promise<void> follower_queued;
+  std::future<void> follower_queued_future = follower_queued.get_future();
+  std::atomic<bool> signal_follower_queue{false};
+  std::atomic<bool> follower_signaled{false};
+  std::atomic<size_t> same_cf_group_count{0};
+  std::atomic<size_t> new_version_count{0};
+
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+  sync_point->SetCallBack("VersionSet::LogAndApplyHelper:ApplyUnlocked",
+                          [&](void*) {
+                            apply_unlocked.set_value();
+                            release_apply_future.wait();
+                          });
+  sync_point->SetCallBack(
+      "VersionSet::LogAndApply:BeforeWriterWaiting", [&](void*) {
+        if (signal_follower_queue.load(std::memory_order_relaxed) &&
+            !follower_signaled.exchange(true, std::memory_order_relaxed)) {
+          follower_queued.set_value();
+        }
+      });
+  sync_point->SetCallBack("VersionSet::ProcessManifestWrites:SameColumnFamily",
+                          [&](void*) { same_cf_group_count.fetch_add(1); });
+  sync_point->SetCallBack("VersionSet::ProcessManifestWrites:NewVersion",
+                          [&](void*) { new_version_count.fetch_add(1); });
+  sync_point->EnableProcessing();
+
+  Status leader_status;
+  VersionEdit leader_edit;
+  leader_edit.SetDBId("preconditioned_leader");
+  port::Thread leader([&] {
+    mutex_.Lock();
+    leader_status = versions_->LogAndApply(
+        cfd, read_options_, write_options_, &leader_edit, &mutex_,
+        /*dir_contains_current_file=*/nullptr,
+        /*new_descriptor_log=*/false,
+        /*column_family_options=*/nullptr,
+        /*manifest_wcb=*/{}, [] { return Status::OK(); });
+    mutex_.Unlock();
+  });
+  ASSERT_EQ(apply_unlocked_future.wait_for(std::chrono::seconds(30)),
+            std::future_status::ready);
+
+  signal_follower_queue.store(true, std::memory_order_relaxed);
+  Status follower_status;
+  VersionEdit follower_edit;
+  follower_edit.SetDBId("follower");
+  port::Thread follower(
+      [&] { follower_status = LogAndApplyToDefaultCF(follower_edit); });
+  ASSERT_EQ(follower_queued_future.wait_for(std::chrono::seconds(30)),
+            std::future_status::ready);
+
+  release_apply.set_value();
+  leader.join();
+  follower.join();
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+
+  ASSERT_OK(leader_status);
+  ASSERT_OK(follower_status);
+  ASSERT_EQ(same_cf_group_count.load(), 0U);
+  ASSERT_EQ(new_version_count.load(), 2U);
+  ASSERT_GT(cfd->current()->GetVersionNumber(), original_version_number);
+}
+
 TEST_F(VersionSetTest, BlobFinalizationDoesNotHoldDBMutex) {
   NewDB();
 
@@ -1722,6 +1808,8 @@ TEST_F(VersionSetTest, AtomicFormatActivationRejectsEarlierFileConflict) {
   ASSERT_NE(first_cfd, nullptr);
   ASSERT_NE(second_cfd, nullptr);
 
+  UseBlockBasedWriterForBlobIndirection(second_cfd);
+
   VersionEdit first_addition;
   first_addition.SetColumnFamily(first_cfd->GetID());
   first_addition.AddFile(/*level=*/0, file_metas.front());
@@ -1774,6 +1862,8 @@ TEST_F(VersionSetTest, SeparateFormatActivationRejectsInstalledFileConflict) {
       versions_->GetColumnFamilySet()->GetColumnFamily(2);
   ASSERT_NE(first_cfd, nullptr);
   ASSERT_NE(second_cfd, nullptr);
+
+  UseBlockBasedWriterForBlobIndirection(second_cfd);
 
   for (ColumnFamilyData* cfd : {first_cfd, second_cfd}) {
     VersionEdit addition;
@@ -1867,6 +1957,7 @@ TEST_F(VersionSetTest, ColumnFamilyDropReleasesPhysicalFileOwnership) {
   ASSERT_OK(status);
 
   VersionEdit reserve_relocation_identity;
+  UseBlockBasedWriterForBlobIndirection(second_cfd);
   reserve_relocation_identity.SetColumnFamily(second_cfd->GetID());
   reserve_relocation_identity.SetBlobIndirectionFormatVersion(
       kBlobIndirectionManifestFormatVersion);
@@ -4790,6 +4881,7 @@ TEST_F(VersionSetAtomicGroupTest,
   ASSERT_OK(status);
 
   VersionEdit reservation;
+  UseBlockBasedWriterForBlobIndirection(primary_second_cfd);
   reservation.SetColumnFamily(/*column_family_id=*/2);
   reservation.SetBlobIndirectionFormatVersion(
       kBlobIndirectionManifestFormatVersion);
