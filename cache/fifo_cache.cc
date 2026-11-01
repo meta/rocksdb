@@ -3,6 +3,37 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+// FIFOCache implements S3-FIFO, from "FIFO Queues are All You Need for Cache
+// Eviction" (SOSP '23): https://jasony.me/publication/sosp23-s3fifo.pdf
+//
+// Each shard has three FIFO queues:
+//   P (probation): where new entries start.
+//   R (resident): entries that showed reuse.
+//   P and R share the shard's capacity. A 12% budget (by charge) for P picks
+//   which queue evicts first; P settles near it, but it is not a partition.
+//   G (ghost): key hashes of entries evicted from P. No values.
+//
+// How it works:
+//   - A hit bumps a per-entry counter (max 3). It never moves the entry.
+//   - Eviction runs when the shard is over capacity, or when its slot table
+//     is full (one entry per new key). P goes first when it is over its
+//     budget.
+//   - At P's head: counter >= 2 moves to R with the counter reset. Otherwise
+//     the entry is evicted and its key is recorded in G.
+//   - At R's head: counter > 0 is decremented and moved to R's tail. Counter
+//     0 is evicted.
+//   - Inserting a key found in G skips P and goes straight to R.
+//   - Pinned entries are never evicted. A queue pass that meets many of them
+//     sets the rest aside until they are unpinned.
+//
+// Expectation: entries read once, and scans, leave through P without
+// touching R, so hot entries survive. This should mean fewer misses than LRU
+// on skewed and scan-heavy workloads. Hits stay cheap: Lookup and most
+// Releases take no lock (a counter bump and a refcount CAS on the entry's
+// slot); inserts, erases, eviction and a Release that erases or frees the
+// entry take a per-shard mutex. So the shard count only spreads inserts;
+// FIFOCacheOptions in include/rocksdb/cache.h says how to choose it.
+
 #include "cache/fifo_cache.h"
 
 #include <algorithm>

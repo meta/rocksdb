@@ -514,6 +514,14 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
 // finds all 8192 in use (exited threads' lines are reused) takes the shard
 // mutex instead whenever it pins or unpins an entry still in probation.
 //
+// Choosing num_shard_bits: hits take no lock, so more shards only spread
+// inserts (misses) over more locks, while fewer, larger shards share space
+// more evenly. In db_bench and cache_bench runs, the default (up to 64
+// shards) was best or tied from 256 MiB up; fewer shards were faster only
+// for a cache much smaller than its hot set, and very small shards were
+// slower. So keep the default unless the cache is much smaller than its hot
+// set.
+//
 // This is an opt-in implementation and not the default block cache. Besides
 // MakeSharedCache, Cache::CreateFromString accepts
 // "fifo_cache://capacity=<n>;..." with the scalar fields below (e.g.

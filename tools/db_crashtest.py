@@ -411,6 +411,8 @@ default_params = {
             "fixed_hyper_clock_cache",
             "auto_hyper_clock_cache",
             "auto_hyper_clock_cache",
+            # No tiered_ variant: TieredCacheOptions has no FIFO primary type.
+            "fifo_cache",
             "tiered_lru_cache",
             "tiered_fixed_hyper_clock_cache",
             "tiered_auto_hyper_clock_cache",
