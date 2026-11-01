@@ -7,12 +7,15 @@
 
 #include <cinttypes>
 
+#include "db/blob/blob_constants.h"
 #include "rocksdb/compression_type.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "util/autovector.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+class BlobIndex;
 
 // Non-owning metadata needed when opening a blob file for reading. The
 // checksum slices must remain valid while this object is in use. A file without
@@ -22,6 +25,9 @@ struct BlobFileOpenInfo {
   uint64_t file_number = 0;
   Slice file_checksum;
   Slice file_checksum_func_name;
+  // Exact metadata tail for a relocation table. Ordinary blob-log readers do
+  // not use this field; offline repair discovery has a separate open API.
+  uint64_t relocation_tail_size = 0;
 };
 
 // A read Blob request structure for use in BlobSource::MultiGetBlob and
@@ -46,6 +52,9 @@ struct BlobReadRequest {
 
   // Status of read
   Status* status = nullptr;
+  // Present only on the indirect read path. Verified before decompression;
+  // ordinary physical blob reads retain their existing checksum contract.
+  const BlobIndex* stable_blob_index = nullptr;
 
   BlobReadRequest(const Slice& _user_key, uint64_t _offset, size_t _len,
                   CompressionType _compression, PinnableSlice* _result,
@@ -112,5 +121,28 @@ struct BlobRangeReadRequest {
 using BlobFileRangeReadRequests =
     std::tuple<BlobFileOpenInfo, uint64_t /* file_size */,
                autovector<BlobRangeReadRequest>>;
+
+// One stable-identity lookup within an already selected relocation file.
+// The BlobIndex supplies origin, original offset, stored size, and compression;
+// stable checksum validation is owned by BlobSource after materialization.
+struct RelocationBlobReadRequest {
+  const BlobIndex* blob_index = nullptr;
+  uint64_t range_offset = 0;
+  size_t range_length = kWholeBlobLength;
+  PinnableSlice* result = nullptr;
+  Status* status = nullptr;
+};
+
+// One feature BlobIndex read after the caller has resolved all requests in the
+// batch to the same physical file. BlobSource owns stable-cache probing,
+// logical checksum validation, and normal-versus-relocation physical batching.
+struct IndirectBlobReadRequest {
+  Slice user_key;
+  const BlobIndex* blob_index = nullptr;
+  uint64_t range_offset = 0;
+  size_t range_length = kWholeBlobLength;
+  PinnableSlice* result = nullptr;
+  Status* status = nullptr;
+};
 
 }  // namespace ROCKSDB_NAMESPACE

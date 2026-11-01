@@ -297,6 +297,32 @@ class CompactionPickerTest : public CompactionPickerTestBase {
   }
 };
 
+TEST_F(CompactionPickerTest, ExactL0ClosureUsesEpochNotFileNumber) {
+  NewVersionStorage(3, kCompactionStyleLevel);
+  Add(0, 1, "a", "b");
+  Add(0, 100, "c", "d");
+  Add(0, 2, "e", "f");
+  files_[0]->epoch_number = 20;
+  files_[1]->epoch_number = 10;
+  files_[2]->epoch_number = 10;
+  // This unit tests membership closure, not descriptor decoding.
+  files_[2]->blob_reference_descriptor = "exact";
+  vstorage_->SetBlobIndirectionFormatVersion(1);
+  std::vector<FileMetaData*> selected{files_[2].get()};
+  ASSERT_TRUE(vstorage_->ExpandExactL0Inputs(&selected));
+  ASSERT_EQ(selected.size(), 2U);
+  ASSERT_EQ(selected[0]->fd.GetNumber(), 100U);
+  ASSERT_EQ(selected[1]->fd.GetNumber(), 2U);
+  files_[1]->being_compacted = true;
+  selected = {files_[2].get()};
+  ASSERT_FALSE(vstorage_->ExpandExactL0Inputs(&selected));
+  ASSERT_EQ(selected.size(), 1U);
+  files_[1]->being_compacted = false;
+  vstorage_->SetBlobIndirectionFormatVersion(0);
+  ASSERT_TRUE(vstorage_->ExpandExactL0Inputs(&selected));
+  ASSERT_EQ(selected.size(), 1U);
+}
+
 class CompactionPickerU64TsTest : public CompactionPickerTestBase {
  public:
   explicit CompactionPickerU64TsTest()

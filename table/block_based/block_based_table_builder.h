@@ -68,12 +68,30 @@ class BlockBasedTableBuilder : public TableBuilder {
   // REQUIRES: Finish(), Abandon() have not been called
   void Add(const Slice& key, const Slice& value) override;
 
-  // Keeps block-based builders behind the retry-capable TableBuilder contract
-  // even though the current format accepts every row. Future format-specific
-  // boundary policies can then ask callers to cut the file without changing
-  // compaction's Add() assumptions.
+  // Preflights the per-SST exact-reference budget without consuming the row.
+  // Compaction can cut and retry the same scalar or wide-column entry; an
+  // individually oversized entity fails before any of its references are added.
   TableBuilderAddResult TryAdd(const Slice& key, const Slice& value,
                                TableBuilderAddContext* context) override;
+
+  Status StartBlobRelocationFile() override;
+
+  Status AddBlobRelocationRouteSource(uint64_t origin_file_number,
+                                      uint64_t generation_file_number) override;
+
+  Status AddBlobRelocation(uint64_t origin_file_number,
+                           uint64_t original_value_offset,
+                           const Slice& stored_payload,
+                           CompressionType compression) override;
+
+  Status GetBlobRelocationFileMetadata(
+      BlobRelocationFileMetadata* metadata) const override;
+  Status AddBlobRelocation(uint64_t origin_file_number,
+                           uint64_t original_value_offset,
+                           uint64_t stored_value_size,
+                           CompressionType compression,
+                           uint32_t stored_checksum,
+                           const VerifiedBlobStoredSource& source) override;
 
   // Return non-ok iff some error has been detected.
   Status status() const override;
@@ -121,6 +139,9 @@ class BlockBasedTableBuilder : public TableBuilder {
 
   // Get table properties
   TableProperties GetTableProperties() const override;
+
+  std::shared_ptr<const BlobReferenceSstSummary> GetBlobReferenceSstSummary()
+      const override;
 
   // Get file checksum
   std::string GetFileChecksum() const override;
@@ -194,6 +215,7 @@ class BlockBasedTableBuilder : public TableBuilder {
   void WritePropertiesBlock(MetaIndexBuilder* meta_index_builder);
   void WriteCompressionDictBlock(MetaIndexBuilder* meta_index_builder);
   void WriteRangeDelBlock(MetaIndexBuilder* meta_index_builder);
+  void WriteBlobReferenceMetadata(MetaIndexBuilder* meta_index_builder);
   void WriteFooter(BlockHandle& metaindex_block_handle,
                    BlockHandle& index_block_handle);
 
@@ -216,11 +238,13 @@ class BlockBasedTableBuilder : public TableBuilder {
   // original value should be used as-is).
   Status BuildEmbeddedWideColumnEntity(const Slice& value, bool* rewritten);
 
-  // Appends one uncompressed same-file blob record for `payload` at the current
-  // table offset, advances the offset, lazily allocates and updates the
-  // embedded-blob state (counters), and encodes a same-file BlobIndex into
-  // rep_->embedded_blob_state->blob_index_buf.
-  Status WriteEmbeddedBlobRecord(const Slice& payload);
+  // Appends one same-file blob record for the already-stored representation in
+  // `payload`, advances the table offset, updates the embedded-blob counters,
+  // and encodes a same-file BlobIndex. When non-null, `record_offset` receives
+  // the payload's physical offset.
+  Status WriteEmbeddedBlobRecord(const Slice& payload,
+                                 CompressionType compression,
+                                 uint64_t* record_offset);
 
   struct Rep;
   class BlockBasedTablePropertiesCollectorFactory;

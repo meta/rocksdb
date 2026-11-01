@@ -961,7 +961,20 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     assert(compaction_outputs);
     compaction_outputs->AddOutput(std::move(meta), cfd->internal_comparator(),
                                   false, true, file.paranoid_hash);
-    compaction_outputs->UpdateTableProperties(file.table_properties);
+    s = compaction_outputs->UpdateTableProperties(file.table_properties);
+    if (!s.ok()) {
+      fs_->DeleteFile(tgt_file, IOOptions(), /*dbg=*/nullptr)
+          .PermitUncheckedError();
+      cleanup_installed_sst_files();
+      const Status cleanup_status = cleanup_installed_blob_files();
+      if (!cleanup_status.ok()) {
+        s = cleanup_status;
+      }
+      sub_compact->status = s;
+      db_options_.compaction_service->OnInstallation(
+          response.scheduled_job_id, CompactionServiceJobStatus::kFailure);
+      return CompactionServiceJobStatus::kFailure;
+    }
     installed_sst_files.push_back(tgt_file);
   }
 

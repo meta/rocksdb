@@ -5,17 +5,22 @@
 
 #include "db/blob/blob_source.h"
 
+#include <array>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "cache/charged_cache.h"
 #include "cache/compressed_secondary_cache.h"
 #include "db/blob/blob_contents.h"
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_reader.h"
+#include "db/blob/blob_gen2_format.h"
+#include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_writer.h"
 #include "db/db_test_util.h"
@@ -23,7 +28,11 @@
 #include "file/read_write_util.h"
 #include "options/cf_options.h"
 #include "rocksdb/options.h"
+#include "test_util/sync_point.h"
+#include "util/coding.h"
 #include "util/compression.h"
+#include "util/crc32c.h"
+#include "util/math.h"
 #include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -137,6 +146,460 @@ class BlobSourceTest : public DBTestBase {
   std::string db_session_id_;
 };
 
+TEST(StableBlobCacheKeyTest, SeparatesFinalKeysIncludingZeroWordSwap) {
+  const std::string db_id = "stable-cache-domain-test";
+  constexpr uint64_t file_number = 100;
+  UniqueId64x2 initial_id;
+  ASSERT_OK(GetSstInternalUniqueId(db_id, EncodeSessionId(0, 1), file_number,
+                                   &initial_id, true));
+  // H does not depend on session_lower. Choose real encoded sessions that
+  // force A=0 for a physical file, and then for the rejected fixed-bit domain.
+  for (uint64_t domain : {uint64_t{0}, uint64_t{1} << 63}) {
+    const uint64_t lower =
+        DownwardInvolution(ReverseBits(initial_id[1] ^ domain));
+    ASSERT_NE(lower, 0U);
+    const std::string session = EncodeSessionId(0, lower);
+    UniqueId64x2 forced_id;
+    ASSERT_OK(GetSstInternalUniqueId(db_id, session, file_number | domain,
+                                     &forced_id, true));
+    ASSERT_EQ(DownwardInvolution(forced_id[0]) ^ ReverseBits(forced_id[1]), 0U);
+    for (uint64_t origin :
+         {file_number, file_number + 1, uint64_t{0x3fffffffffffffff}}) {
+      const CacheKey stable = GetStableBlobCacheKey(db_id, session, origin, 42);
+      ASSERT_EQ(stable.AsSlice().size(), 16U);
+      ASSERT_FALSE(stable.IsEmpty());
+      const CacheKey other_offset =
+          GetStableBlobCacheKey(db_id, session, origin, 43);
+      EXPECT_NE(stable.AsSlice(), other_offset.AsSlice());
+      const CacheKey other_origin = GetStableBlobCacheKey(
+          db_id, session, origin == file_number ? file_number + 1 : file_number,
+          42);
+      EXPECT_NE(stable.AsSlice(), other_origin.AsSlice());
+      for (uint64_t physical :
+           {file_number, file_number + 1, uint64_t{0x3fffffffffffffff}}) {
+        const OffsetableCacheKey base(db_id, session, physical);
+        const CacheKey physical_key = base.WithOffset(42);
+        // First-word separation is stronger than testing a few offsets: no
+        // offset (including the SST right shift) can change that word.
+        EXPECT_NE(Slice(stable.AsSlice().data(), 8),
+                  Slice(physical_key.AsSlice().data(), 8));
+      }
+    }
+    const std::shared_ptr<Cache> cache = NewLRUCache(1024);
+    const CacheKey reservation =
+        CacheKey::CreateUniqueForCacheLifetime(cache.get());
+    const CacheKey stable =
+        GetStableBlobCacheKey(db_id, session, file_number, 0);
+    EXPECT_NE(Slice(stable.AsSlice().data(), 8),
+              Slice(reservation.AsSlice().data(), 8));
+  }
+}
+
+TEST(StableBlobContentsTest, ValidatesSerializedFingerprint) {
+  const std::string value = "stable-value";
+  const uint32_t checksum = crc32c::Value(value.data(), value.size());
+  std::unique_ptr<StableBlobContents> contents;
+  ASSERT_OK(StableBlobContents::Create(value, value.size(), kNoCompression,
+                                       BlobIndex::kStableChecksumVersion1,
+                                       checksum,
+                                       /*allocator=*/nullptr, &contents));
+  ASSERT_EQ(contents->data(), value);
+
+  std::string serialized = contents->ContentSlice().ToString();
+  serialized.back() ^= 1;
+  StableBlobContents corrupted(
+      AllocateAndCopyBlock(serialized, /*allocator=*/nullptr),
+      serialized.size());
+  EXPECT_TRUE(corrupted.validation_status().IsCorruption());
+
+  std::string unsupported = contents->ContentSlice().ToString();
+  unsupported[32] = static_cast<char>(kFirstCustomCompression);
+  EncodeFixed32(unsupported.data() + 36, crc32c::Value(unsupported.data(), 36));
+  StableBlobContents unsupported_contents(
+      AllocateAndCopyBlock(unsupported, /*allocator=*/nullptr),
+      unsupported.size());
+  EXPECT_TRUE(unsupported_contents.validation_status().IsCorruption());
+
+  std::unique_ptr<StableBlobContents> invalid;
+  EXPECT_TRUE(
+      StableBlobContents::Create(value, value.size() + 1, kNoCompression,
+                                 BlobIndex::kStableChecksumVersion1, checksum,
+                                 /*allocator=*/nullptr, &invalid)
+          .IsInvalidArgument());
+  EXPECT_TRUE(
+      StableBlobContents::Create(value, value.size(), kFirstCustomCompression,
+                                 BlobIndex::kStableChecksumVersion1, checksum,
+                                 /*allocator=*/nullptr, &invalid)
+          .IsInvalidArgument());
+
+  EXPECT_TRUE(StableBlobContents::Create(value, value.size(), kNoCompression,
+                                         BlobIndex::kStableChecksumVersion1,
+                                         checksum ^ 1,
+                                         /*allocator=*/nullptr, &invalid)
+                  .IsCorruption());
+  ASSERT_OK(StableBlobContents::CreateWithVerifiedValue(
+      value, value.size(), kNoCompression, BlobIndex::kStableChecksumVersion1,
+      checksum, /*stored_checksum=*/0, /*allocator=*/nullptr, &invalid));
+  serialized = invalid->ContentSlice().ToString();
+  serialized.back() ^= 1;
+  std::unique_ptr<StableBlobContents> promoted;
+  size_t charge = 0;
+  // Promotion must not inherit the primary-only trust boundary.
+  StableBlobContentsCreator::Create(&promoted, &charge, serialized,
+                                    kNoCompression, /*allocator=*/nullptr);
+  EXPECT_TRUE(promoted->validation_status().IsCorruption());
+}
+
+class StableBlobCacheTest : public BlobSourceTest,
+                            public testing::WithParamInterface<bool> {};
+
+INSTANTIATE_TEST_CASE_P(CacheImplementations, StableBlobCacheTest,
+                        testing::Bool());
+
+TEST_P(StableBlobCacheTest, IndirectBlobUsesStableLogicalCacheKey) {
+  options_.statistics = CreateDBStatistics();
+  options_.blob_cache = GetParam()
+                            ? HyperClockCacheOptions(1 << 20).MakeSharedCache()
+                            : NewLRUCache(1 << 20);
+  options_.cf_paths.emplace_back(
+      test::PerThreadDBPath(env_, "BlobSourceTest_StableLogicalCache"), 0);
+  DestroyAndReopen(options_);
+  const ImmutableOptions immutable_options(options_);
+  const MutableCFOptions mutable_cf_options(options_);
+
+  constexpr uint32_t column_family_id = 1;
+  constexpr uint64_t origin_file_number = 10;
+  constexpr bool has_ttl = false;
+  constexpr ExpirationRange expiration_range;
+  const std::string user_key = "key";
+  const std::string logical_value = "stable-logical-value";
+  std::vector<Slice> keys{user_key};
+  std::vector<Slice> blobs{logical_value};
+  std::vector<uint64_t> offsets(1);
+  std::vector<uint64_t> sizes(1);
+  WriteBlobFile(immutable_options, column_family_id, has_ttl, expiration_range,
+                expiration_range, origin_file_number, keys, blobs,
+                kNoCompression, offsets, sizes);
+  const uint64_t file_size = BlobLogHeader::kSize + BlobLogRecord::kHeaderSize +
+                             user_key.size() + logical_value.size() +
+                             BlobLogFooter::kSize;
+
+  std::shared_ptr<Cache> file_cache = NewLRUCache(1024);
+  FileOptions file_options;
+  BlobFileCache blob_file_cache(
+      file_cache.get(), &immutable_options, &file_options, column_family_id,
+      /*blob_file_read_hist=*/nullptr, /*io_tracer=*/nullptr,
+      /*relocation_file_table_options=*/nullptr);
+  BlobSource blob_source(immutable_options, mutable_cf_options, db_id_,
+                         db_session_id_, &blob_file_cache);
+
+  const uint32_t stable_checksum =
+      crc32c::Value(logical_value.data(), logical_value.size());
+  const auto make_index = [&](uint64_t generation, uint32_t checksum) {
+    std::string encoded;
+    BlobIndex::EncodeIndirectBlob(&encoded, generation, origin_file_number,
+                                  offsets[0], sizes[0], kNoCompression,
+                                  BlobIndex::kStableChecksumVersion1, checksum);
+    BlobIndex index;
+    EXPECT_OK(index.DecodeFrom(encoded));
+    return index;
+  };
+  const BlobIndex identity_index =
+      make_index(origin_file_number, stable_checksum);
+
+  ReadOptions read_options;
+  read_options.verify_checksums = true;
+  read_options.io_activity = Env::IOActivity::kLazyResolve;
+  PinnableSlice value;
+  uint64_t bytes_read = 0;
+  const BlobIndex wrong_disk_checksum =
+      make_index(origin_file_number, stable_checksum ^ 1);
+  read_options.fill_cache = false;
+  EXPECT_TRUE(blob_source
+                  .GetIndirectBlob(
+                      read_options, user_key, wrong_disk_checksum,
+                      OpenInfoWithoutChecksum(origin_file_number), file_size,
+                      /*is_relocation_file=*/false,
+                      /*relocation_directory_digest=*/0,
+                      /*relocation_compression_manager=*/nullptr,
+                      /*block_protection_bytes_per_key=*/0,
+                      /*range_offset=*/0, kWholeBlobLength,
+                      /*prefetch_buffer=*/nullptr, &value, &bytes_read)
+                  .IsCorruption());
+  EXPECT_TRUE(value.empty());
+
+  const uint64_t lazy_before_batch =
+      options_.statistics->getTickerCount(BLOB_DB_LAZY_READ_COUNT);
+  const uint64_t lazy_bytes_before_batch =
+      options_.statistics->getTickerCount(BLOB_DB_LAZY_READ_BYTES);
+
+  std::array<PinnableSlice, 2> duplicate_values;
+  std::array<Status, 2> duplicate_statuses;
+  std::array<IndirectBlobReadRequest, 2> duplicate_requests;
+  for (size_t i = 0; i < duplicate_requests.size(); ++i) {
+    duplicate_requests[i].user_key = user_key;
+    duplicate_requests[i].blob_index = &identity_index;
+    duplicate_requests[i].result = &duplicate_values[i];
+    duplicate_requests[i].status = &duplicate_statuses[i];
+  }
+  std::atomic<size_t> duplicate_multiread_calls{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlobFileReader::MultiGetBlob:Requests", [&](void* arg) {
+        const std::vector<FSReadRequest>* const read_requests =
+            static_cast<std::vector<FSReadRequest>*>(arg);
+        ++duplicate_multiread_calls;
+        for (size_t i = 1; i < read_requests->size(); ++i) {
+          EXPECT_LE(
+              (*read_requests)[i - 1].offset + (*read_requests)[i - 1].len,
+              (*read_requests)[i].offset);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  blob_source.MultiGetIndirectBlobFromOneFile(
+      read_options, OpenInfoWithoutChecksum(origin_file_number), file_size,
+      /*is_relocation_file=*/false, /*relocation_directory_digest=*/0,
+      /*relocation_compression_manager=*/nullptr,
+      /*block_protection_bytes_per_key=*/0, duplicate_requests.size(),
+      duplicate_requests.data(), &bytes_read);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(duplicate_statuses[0]);
+  ASSERT_OK(duplicate_statuses[1]);
+  EXPECT_EQ(duplicate_values[0], logical_value);
+  EXPECT_EQ(duplicate_values[1], logical_value);
+  EXPECT_EQ(duplicate_multiread_calls.load(), 2U);
+  EXPECT_EQ(options_.statistics->getTickerCount(BLOB_DB_LAZY_READ_COUNT),
+            lazy_before_batch + 2);
+  EXPECT_EQ(options_.statistics->getTickerCount(BLOB_DB_LAZY_READ_BYTES),
+            lazy_bytes_before_batch + bytes_read);
+
+  std::array<PinnableSlice, 2> overlapping_values;
+  std::array<Status, 2> overlapping_statuses;
+  std::array<IndirectBlobReadRequest, 2> overlapping_requests;
+  for (size_t i = 0; i < overlapping_requests.size(); ++i) {
+    overlapping_requests[i].user_key = user_key;
+    overlapping_requests[i].blob_index = &identity_index;
+    overlapping_requests[i].range_offset = i * 3;
+    overlapping_requests[i].range_length = 5;
+    overlapping_requests[i].result = &overlapping_values[i];
+    overlapping_requests[i].status = &overlapping_statuses[i];
+  }
+  std::atomic<size_t> overlapping_multiread_calls{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlobFileReader::MultiGetBlobRange:Requests", [&](void* arg) {
+        const std::vector<FSReadRequest>* const read_requests =
+            static_cast<std::vector<FSReadRequest>*>(arg);
+        ++overlapping_multiread_calls;
+        for (size_t i = 1; i < read_requests->size(); ++i) {
+          EXPECT_LE(
+              (*read_requests)[i - 1].offset + (*read_requests)[i - 1].len,
+              (*read_requests)[i].offset);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  blob_source.MultiGetIndirectBlobFromOneFile(
+      read_options, OpenInfoWithoutChecksum(origin_file_number), file_size,
+      /*is_relocation_file=*/false, /*relocation_directory_digest=*/0,
+      /*relocation_compression_manager=*/nullptr,
+      /*block_protection_bytes_per_key=*/0, overlapping_requests.size(),
+      overlapping_requests.data(), &bytes_read);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(overlapping_statuses[0]);
+  ASSERT_OK(overlapping_statuses[1]);
+  EXPECT_EQ(overlapping_values[0], Slice(logical_value.data(), 5));
+  EXPECT_EQ(overlapping_values[1], Slice(logical_value.data() + 3, 5));
+  EXPECT_EQ(overlapping_multiread_calls.load(), 2U);
+  EXPECT_EQ(options_.statistics->getTickerCount(BLOB_DB_LAZY_READ_COUNT),
+            lazy_before_batch + 4);
+  EXPECT_EQ(
+      options_.statistics->getTickerCount(BLOB_DB_LAZY_PARTIAL_READ_COUNT), 2U);
+  EXPECT_EQ(
+      options_.statistics->getTickerCount(BLOB_DB_LAZY_PARTIAL_BYTES_SAVED),
+      2 * (logical_value.size() - 5));
+
+  read_options.fill_cache = true;
+  ASSERT_OK(blob_source.GetIndirectBlob(
+      read_options, user_key, identity_index,
+      OpenInfoWithoutChecksum(origin_file_number), file_size,
+      /*is_relocation_file=*/false, /*relocation_directory_digest=*/0,
+      /*relocation_compression_manager=*/nullptr,
+      /*block_protection_bytes_per_key=*/0, /*range_offset=*/0,
+      kWholeBlobLength, /*prefetch_buffer=*/nullptr, &value, &bytes_read));
+  EXPECT_EQ(value, logical_value);
+  EXPECT_GT(bytes_read, 0U);
+  EXPECT_EQ(options_.statistics->getTickerCount(BLOB_DB_LAZY_READ_COUNT),
+            lazy_before_batch + 5);
+
+  // Generation and physical placement do not participate in the stable key.
+  const BlobIndex flattened_index =
+      make_index(/*generation=*/999, stable_checksum);
+  value.Reset();
+  read_options.read_tier = kBlockCacheTier;
+  ASSERT_OK(blob_source.GetIndirectBlob(
+      read_options, user_key, flattened_index,
+      OpenInfoWithoutChecksum(/*file_number=*/777), file_size,
+      /*is_relocation_file=*/true, /*relocation_directory_digest=*/123,
+      /*relocation_compression_manager=*/nullptr,
+      /*block_protection_bytes_per_key=*/0, /*range_offset=*/2,
+      /*range_length=*/6, /*prefetch_buffer=*/nullptr, &value, &bytes_read));
+  EXPECT_EQ(value, Slice(logical_value.data() + 2, 6));
+  EXPECT_EQ(bytes_read, 0U);
+  EXPECT_EQ(options_.statistics->getTickerCount(BLOB_DB_LAZY_READ_COUNT),
+            lazy_before_batch + 5);
+
+  BlobFileCache other_cf_file_cache(file_cache.get(), &immutable_options,
+                                    &file_options, column_family_id + 1,
+                                    /*blob_file_read_hist=*/nullptr,
+                                    /*io_tracer=*/nullptr,
+                                    /*relocation_file_table_options=*/nullptr);
+  BlobSource other_cf_source(immutable_options, mutable_cf_options, db_id_,
+                             db_session_id_, &other_cf_file_cache);
+  value.Reset();
+  // File numbers are DB-global. This artificial source shares the same origin
+  // identity, so it must hit the same entry; real Version routing enforces CF
+  // ownership before BlobSource is called.
+  ASSERT_OK(other_cf_source.GetIndirectBlob(
+      read_options, user_key, identity_index,
+      OpenInfoWithoutChecksum(/*file_number=*/778), file_size,
+      /*is_relocation_file=*/false,
+      /*relocation_directory_digest=*/0,
+      /*relocation_compression_manager=*/nullptr,
+      /*block_protection_bytes_per_key=*/0,
+      /*range_offset=*/0, kWholeBlobLength,
+      /*prefetch_buffer=*/nullptr, &value, &bytes_read));
+  EXPECT_EQ(value, logical_value);
+  EXPECT_EQ(bytes_read, 0U);
+
+  const BlobIndex conflicting_index =
+      make_index(/*generation=*/999, stable_checksum ^ 1);
+  value.Reset();
+  EXPECT_TRUE(blob_source
+                  .GetIndirectBlob(
+                      read_options, user_key, conflicting_index,
+                      OpenInfoWithoutChecksum(origin_file_number), file_size,
+                      /*is_relocation_file=*/false,
+                      /*relocation_directory_digest=*/0,
+                      /*relocation_compression_manager=*/nullptr,
+                      /*block_protection_bytes_per_key=*/0,
+                      /*range_offset=*/0, kWholeBlobLength,
+                      /*prefetch_buffer=*/nullptr, &value, &bytes_read)
+                  .IsCorruption());
+  EXPECT_TRUE(value.empty());
+
+  // A conflicting lookup must not evict or replace the valid incumbent.
+  value.Reset();
+  ASSERT_OK(blob_source.GetIndirectBlob(
+      read_options, user_key, identity_index,
+      OpenInfoWithoutChecksum(/*file_number=*/779), file_size,
+      /*is_relocation_file=*/true, /*relocation_directory_digest=*/456,
+      /*relocation_compression_manager=*/nullptr,
+      /*block_protection_bytes_per_key=*/0, /*range_offset=*/0,
+      kWholeBlobLength, /*prefetch_buffer=*/nullptr, &value, &bytes_read));
+  EXPECT_EQ(value, logical_value);
+  EXPECT_EQ(bytes_read, 0U);
+
+  std::string oversized_encoding;
+  BlobIndex::EncodeIndirectBlob(
+      &oversized_encoding, origin_file_number + 1, origin_file_number + 1,
+      offsets[0], kMaxSimpleGen2BlobPayloadSize + 1, kNoCompression,
+      BlobIndex::kStableChecksumVersion1, stable_checksum);
+  BlobIndex oversized_index;
+  ASSERT_OK(oversized_index.DecodeFrom(oversized_encoding));
+
+  std::string unsupported_encoding;
+  BlobIndex::EncodeIndirectBlob(
+      &unsupported_encoding, origin_file_number + 2, origin_file_number + 2,
+      offsets[0], sizes[0], kFirstCustomCompression,
+      BlobIndex::kStableChecksumVersion1, stable_checksum);
+  BlobIndex unsupported_index;
+  ASSERT_OK(unsupported_index.DecodeFrom(unsupported_encoding));
+
+  const auto verify_rejected_before_cache_or_io = [&](const BlobIndex& index,
+                                                      bool is_relocation_file) {
+    value.Reset();
+    EXPECT_TRUE(
+        blob_source
+            .GetIndirectBlob(read_options, user_key, index,
+                             OpenInfoWithoutChecksum(origin_file_number),
+                             file_size, is_relocation_file,
+                             /*relocation_directory_digest=*/0,
+                             /*relocation_compression_manager=*/nullptr,
+                             /*block_protection_bytes_per_key=*/0,
+                             /*range_offset=*/0, kWholeBlobLength,
+                             /*prefetch_buffer=*/nullptr, &value, &bytes_read)
+            .IsCorruption());
+    EXPECT_TRUE(value.empty());
+
+    Status multi_status;
+    IndirectBlobReadRequest request;
+    request.user_key = user_key;
+    request.blob_index = &index;
+    request.result = &value;
+    request.status = &multi_status;
+    blob_source.MultiGetIndirectBlobFromOneFile(
+        read_options, OpenInfoWithoutChecksum(origin_file_number), file_size,
+        is_relocation_file, /*relocation_directory_digest=*/0,
+        /*relocation_compression_manager=*/nullptr,
+        /*block_protection_bytes_per_key=*/0, /*num_requests=*/1, &request,
+        &bytes_read);
+    EXPECT_TRUE(multi_status.IsCorruption());
+    EXPECT_TRUE(value.empty());
+  };
+  verify_rejected_before_cache_or_io(oversized_index,
+                                     /*is_relocation_file=*/true);
+  verify_rejected_before_cache_or_io(unsupported_index,
+                                     /*is_relocation_file=*/false);
+
+  value.Reset();
+  EXPECT_TRUE(blob_source
+                  .GetIndirectBlob(
+                      read_options, user_key, oversized_index,
+                      OpenInfoWithoutChecksum(origin_file_number), file_size,
+                      /*is_relocation_file=*/false,
+                      /*relocation_directory_digest=*/0,
+                      /*relocation_compression_manager=*/nullptr,
+                      /*block_protection_bytes_per_key=*/0,
+                      /*range_offset=*/0, kWholeBlobLength,
+                      /*prefetch_buffer=*/nullptr, &value, &bytes_read)
+                  .IsIncomplete());
+  Status oversized_normal_status;
+  IndirectBlobReadRequest oversized_normal_request;
+  oversized_normal_request.user_key = user_key;
+  oversized_normal_request.blob_index = &oversized_index;
+  oversized_normal_request.result = &value;
+  oversized_normal_request.status = &oversized_normal_status;
+  blob_source.MultiGetIndirectBlobFromOneFile(
+      read_options, OpenInfoWithoutChecksum(origin_file_number), file_size,
+      /*is_relocation_file=*/false, /*relocation_directory_digest=*/0,
+      /*relocation_compression_manager=*/nullptr,
+      /*block_protection_bytes_per_key=*/0, /*num_requests=*/1,
+      &oversized_normal_request, &bytes_read);
+  EXPECT_TRUE(oversized_normal_status.IsIncomplete());
+  EXPECT_TRUE(value.empty());
+
+  std::string uncached_encoding;
+  BlobIndex::EncodeIndirectBlob(
+      &uncached_encoding, origin_file_number, origin_file_number,
+      offsets[0] + 1, sizes[0], kNoCompression,
+      BlobIndex::kStableChecksumVersion1, stable_checksum);
+  BlobIndex uncached_offset_index;
+  ASSERT_OK(uncached_offset_index.DecodeFrom(uncached_encoding));
+  value.Reset();
+  EXPECT_TRUE(blob_source
+                  .GetIndirectBlob(
+                      read_options, user_key, uncached_offset_index,
+                      OpenInfoWithoutChecksum(origin_file_number), file_size,
+                      /*is_relocation_file=*/false,
+                      /*relocation_directory_digest=*/0,
+                      /*relocation_compression_manager=*/nullptr,
+                      /*block_protection_bytes_per_key=*/0,
+                      /*range_offset=*/0, kWholeBlobLength,
+                      /*prefetch_buffer=*/nullptr, &value, &bytes_read)
+                  .IsIncomplete());
+  EXPECT_TRUE(value.empty());
+}
+
 TEST_F(BlobSourceTest, GetBlobsFromCache) {
   options_.cf_paths.emplace_back(
       test::PerThreadDBPath(env_, "BlobSourceTest_GetBlobsFromCache"), 0);
@@ -192,7 +655,8 @@ TEST_F(BlobSourceTest, GetBlobsFromCache) {
   std::unique_ptr<BlobFileCache> blob_file_cache =
       std::make_unique<BlobFileCache>(
           backing_cache.get(), &immutable_options, &file_options,
-          column_family_id, blob_file_read_hist, nullptr /*IOTracer*/);
+          column_family_id, blob_file_read_hist, nullptr /*IOTracer*/,
+          nullptr /*relocation_file_table_options*/);
 
   BlobSource blob_source(immutable_options, mutable_cf_options, db_id_,
                          db_session_id_, blob_file_cache.get());
@@ -506,7 +970,8 @@ TEST_F(BlobSourceTest, GetCompressedBlobs) {
   std::unique_ptr<BlobFileCache> blob_file_cache =
       std::make_unique<BlobFileCache>(
           backing_cache.get(), &immutable_options, &file_options,
-          column_family_id, nullptr /*HistogramImpl*/, nullptr /*IOTracer*/);
+          column_family_id, nullptr /*HistogramImpl*/, nullptr /*IOTracer*/,
+          nullptr /*relocation_file_table_options*/);
 
   BlobSource blob_source(immutable_options, mutable_cf_options, db_id_,
                          db_session_id_, blob_file_cache.get());
@@ -653,7 +1118,8 @@ TEST_F(BlobSourceTest, MultiGetBlobsFromMultiFiles) {
   std::unique_ptr<BlobFileCache> blob_file_cache =
       std::make_unique<BlobFileCache>(
           backing_cache.get(), &immutable_options, &file_options,
-          column_family_id, blob_file_read_hist, nullptr /*IOTracer*/);
+          column_family_id, blob_file_read_hist, nullptr /*IOTracer*/,
+          nullptr /*relocation_file_table_options*/);
 
   BlobSource blob_source(immutable_options, mutable_cf_options, db_id_,
                          db_session_id_, blob_file_cache.get());
@@ -843,7 +1309,8 @@ TEST_F(BlobSourceTest, MultiGetBlobsFromCache) {
   std::unique_ptr<BlobFileCache> blob_file_cache =
       std::make_unique<BlobFileCache>(
           backing_cache.get(), &immutable_options, &file_options,
-          column_family_id, blob_file_read_hist, nullptr /*IOTracer*/);
+          column_family_id, blob_file_read_hist, nullptr /*IOTracer*/,
+          nullptr /*relocation_file_table_options*/);
 
   BlobSource blob_source(immutable_options, mutable_cf_options, db_id_,
                          db_session_id_, blob_file_cache.get());
@@ -1104,7 +1571,8 @@ TEST_F(BlobSourceTest, GetBlobPreservesCorruptionDetailsWhenRefreshOpenFails) {
   std::unique_ptr<BlobFileCache> blob_file_cache =
       std::make_unique<BlobFileCache>(
           backing_cache.get(), &immutable_options, &file_options,
-          column_family_id, nullptr /*HistogramImpl*/, nullptr /*IOTracer*/);
+          column_family_id, nullptr /*HistogramImpl*/, nullptr /*IOTracer*/,
+          nullptr /*relocation_file_table_options*/);
 
   BlobSource blob_source(immutable_options, mutable_cf_options, db_id_,
                          db_session_id_, blob_file_cache.get());
@@ -1179,7 +1647,8 @@ TEST_F(BlobSourceTest,
   std::unique_ptr<BlobFileCache> blob_file_cache =
       std::make_unique<BlobFileCache>(
           backing_cache.get(), &immutable_options, &file_options,
-          column_family_id, nullptr /*HistogramImpl*/, nullptr /*IOTracer*/);
+          column_family_id, nullptr /*HistogramImpl*/, nullptr /*IOTracer*/,
+          nullptr /*relocation_file_table_options*/);
 
   BlobSource blob_source(immutable_options, mutable_cf_options, db_id_,
                          db_session_id_, blob_file_cache.get());
@@ -1311,7 +1780,8 @@ TEST_F(BlobSecondaryCacheTest, GetBlobsFromSecondaryCache) {
 
   std::unique_ptr<BlobFileCache> blob_file_cache(new BlobFileCache(
       backing_cache.get(), &immutable_options, &file_options, column_family_id,
-      blob_file_read_hist, nullptr /*IOTracer*/));
+      blob_file_read_hist, nullptr /*IOTracer*/,
+      /*relocation_file_table_options=*/nullptr));
 
   BlobSource blob_source(immutable_options, mutable_cf_options, db_id_,
                          db_session_id_, blob_file_cache.get());
@@ -1604,7 +2074,8 @@ TEST_F(BlobSourceCacheReservationTest, SimpleCacheReservation) {
   std::unique_ptr<BlobFileCache> blob_file_cache =
       std::make_unique<BlobFileCache>(
           backing_cache.get(), &immutable_options, &file_options,
-          kColumnFamilyId, blob_file_read_hist, nullptr /*IOTracer*/);
+          kColumnFamilyId, blob_file_read_hist, nullptr /*IOTracer*/,
+          nullptr /*relocation_file_table_options*/);
 
   BlobSource blob_source(immutable_options, mutable_cf_options, db_id_,
                          db_session_id_, blob_file_cache.get());
@@ -1726,7 +2197,8 @@ TEST_F(BlobSourceCacheReservationTest, IncreaseCacheReservation) {
   std::unique_ptr<BlobFileCache> blob_file_cache =
       std::make_unique<BlobFileCache>(
           backing_cache.get(), &immutable_options, &file_options,
-          kColumnFamilyId, blob_file_read_hist, nullptr /*IOTracer*/);
+          kColumnFamilyId, blob_file_read_hist, nullptr /*IOTracer*/,
+          nullptr /*relocation_file_table_options*/);
 
   BlobSource blob_source(immutable_options, mutable_cf_options, db_id_,
                          db_session_id_, blob_file_cache.get());

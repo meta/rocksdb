@@ -330,6 +330,8 @@ class UniversalCompactionBuilder {
   Compaction* PickCompactionWithSortedRunRange(
       size_t start_index, size_t end_index, CompactionReason compaction_reason);
 
+  bool ExpandExactL0RunRange(size_t* start_index, size_t* end_index) const;
+
   // Try to pick periodic compaction. The caller should only call it
   // if there is at least one file marked for periodic compaction.
   // null will be returned if no such a compaction can be formed
@@ -1029,7 +1031,12 @@ Compaction* UniversalCompactionBuilder::PickCompactionToReduceSortedRuns(
   if (!done || candidate_count <= 1) {
     return nullptr;
   }
-  size_t first_index_after = start_index + candidate_count;
+  size_t end_index = start_index + candidate_count - 1;
+  if (!ExpandExactL0RunRange(&start_index, &end_index)) {
+    return nullptr;
+  }
+  candidate_count = static_cast<unsigned int>(end_index - start_index + 1);
+  size_t first_index_after = end_index + 1;
   // Compression is enabled if files compacted earlier already reached
   // size ratio of compression.
   bool enable_compression = true;
@@ -1556,9 +1563,36 @@ Compaction* UniversalCompactionBuilder::PickCompactionToOldest(
                                           compaction_reason);
 }
 
+bool UniversalCompactionBuilder::ExpandExactL0RunRange(
+    size_t* start_index, size_t* end_index) const {
+  if (sorted_runs_[*start_index].level != 0) {
+    return true;
+  }
+  std::vector<FileMetaData*> inputs;
+  for (size_t index = *start_index;
+       index <= *end_index && sorted_runs_[index].level == 0; ++index) {
+    inputs.push_back(sorted_runs_[index].file);
+  }
+  if (!vstorage_->ExpandExactL0Inputs(&inputs)) {
+    return false;
+  }
+  if (!inputs.empty()) {
+    *start_index = std::min(
+        *start_index, vstorage_->GetFileLocation(inputs.front()->fd.GetNumber())
+                          .GetPosition());
+    *end_index = std::max(
+        *end_index, vstorage_->GetFileLocation(inputs.back()->fd.GetNumber())
+                        .GetPosition());
+  }
+  return true;
+}
+
 Compaction* UniversalCompactionBuilder::PickCompactionWithSortedRunRange(
     size_t start_index, size_t end_index, CompactionReason compaction_reason) {
   assert(start_index < sorted_runs_.size());
+  if (!ExpandExactL0RunRange(&start_index, &end_index)) {
+    return nullptr;
+  }
 
   // Estimate total file size
   uint64_t estimated_total_size = 0;

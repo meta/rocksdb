@@ -22,6 +22,7 @@ enum BlobFileAddition::CustomFieldTags : uint32_t {
   kEndMarker,
 
   // Add forward compatible fields here
+  kIdentityRoot,
 
   /////////////////////////////////////////////////////////////////////
 
@@ -41,6 +42,13 @@ void BlobFileAddition::EncodeTo(std::string* output) const {
   // CustomFieldTags above) followed by a length prefixed slice. Unknown custom
   // fields will be ignored during decoding unless they're in the forward
   // incompatible range.
+
+  if (is_identity_root_) {
+    PutVarint32(output, kIdentityRoot);
+    std::string encoded;
+    PutVarint32(&encoded, 1);
+    PutLengthPrefixedSlice(output, encoded);
+  }
 
   TEST_SYNC_POINT_CALLBACK("BlobFileAddition::EncodeTo::CustomFields", output);
 
@@ -73,7 +81,9 @@ Status BlobFileAddition::DecodeFrom(Slice* input) {
     return Status::Corruption(class_name, "Error decoding checksum value");
   }
   checksum_value_ = checksum_value.ToString();
+  is_identity_root_ = false;
 
+  bool has_identity_root = false;
   while (true) {
     uint32_t custom_field_tag = 0;
     if (!GetVarint32(input, &custom_field_tag)) {
@@ -93,6 +103,16 @@ Status BlobFileAddition::DecodeFrom(Slice* input) {
     if (!GetLengthPrefixedSlice(input, &custom_field_value)) {
       return Status::Corruption(class_name,
                                 "Error decoding custom field value");
+    }
+    if (custom_field_tag == kIdentityRoot) {
+      uint32_t value = 0;
+      if (has_identity_root || !GetVarint32(&custom_field_value, &value) ||
+          !custom_field_value.empty() || value != 1) {
+        return Status::Corruption(class_name,
+                                  "Error decoding identity-root field");
+      }
+      has_identity_root = true;
+      is_identity_root_ = true;
     }
   }
 
@@ -122,7 +142,8 @@ bool operator==(const BlobFileAddition& lhs, const BlobFileAddition& rhs) {
          lhs.GetTotalBlobCount() == rhs.GetTotalBlobCount() &&
          lhs.GetTotalBlobBytes() == rhs.GetTotalBlobBytes() &&
          lhs.GetChecksumMethod() == rhs.GetChecksumMethod() &&
-         lhs.GetChecksumValue() == rhs.GetChecksumValue();
+         lhs.GetChecksumValue() == rhs.GetChecksumValue() &&
+         lhs.IsIdentityRoot() == rhs.IsIdentityRoot();
 }
 
 bool operator!=(const BlobFileAddition& lhs, const BlobFileAddition& rhs) {
@@ -136,7 +157,8 @@ std::ostream& operator<<(std::ostream& os,
      << " total_blob_bytes: " << blob_file_addition.GetTotalBlobBytes()
      << " checksum_method: " << blob_file_addition.GetChecksumMethod()
      << " checksum_value: "
-     << Slice(blob_file_addition.GetChecksumValue()).ToString(/* hex */ true);
+     << Slice(blob_file_addition.GetChecksumValue()).ToString(/* hex */ true)
+     << " identity_root: " << blob_file_addition.IsIdentityRoot();
 
   return os;
 }
@@ -148,7 +170,8 @@ JSONWriter& operator<<(JSONWriter& jw,
      << "TotalBlobBytes" << blob_file_addition.GetTotalBlobBytes()
      << "ChecksumMethod" << blob_file_addition.GetChecksumMethod()
      << "ChecksumValue"
-     << Slice(blob_file_addition.GetChecksumValue()).ToString(/* hex */ true);
+     << Slice(blob_file_addition.GetChecksumValue()).ToString(/* hex */ true)
+     << "IdentityRoot" << blob_file_addition.IsIdentityRoot();
 
   return jw;
 }

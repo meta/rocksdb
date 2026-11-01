@@ -90,6 +90,8 @@ Status DBImplFollower::Recover(
 //   1. Cleanup obsolete files afterward
 //   2. Add some error notifications and statistics
 Status DBImplFollower::TryCatchUpWithLeader() {
+  TEST_SYNC_POINT("DBImplFollower::TryCatchUpWithLeader:BeforeCatchUpLock");
+  std::lock_guard<std::mutex> catch_up_lock(catch_up_mutex_);
   assert(versions_.get() != nullptr);
   assert(manifest_reader_.get() != nullptr);
   Status s;

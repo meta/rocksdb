@@ -531,6 +531,7 @@ Status FlushJob::MemPurge() {
         ioptions.enforce_single_del_contracts,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse,
         false /* must_count_input_entries */,
+        false /* allow_blob_index_flattening */,
         /*compaction=*/nullptr, compaction_filter.get(),
         /*shutting_down=*/nullptr, ioptions.info_log, full_history_ts_low);
 
@@ -1056,6 +1057,8 @@ Status FlushJob::WriteLevel0Table() {
               ? preclude_last_level_min_seqno_
               : std::min(earliest_snapshot_, preclude_last_level_min_seqno_),
           dbname_ /*db_name*/);
+      TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:TableBuilderOptions",
+                               &tboptions);
       s = BuildTable(
           dbname_, versions_, db_options_, tboptions, file_options_,
           cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
@@ -1154,6 +1157,13 @@ Status FlushJob::WriteLevel0Table() {
       // Add file to L0
       TEST_SYNC_POINT_CALLBACK("FileMetaData::FileMetaData", &meta_);
       edit_->AddFile(0 /* level */, meta_);
+      if (mutable_cf_options_.enable_blob_indirection) {
+        // PickMemTable() establishes edit_ before a nonempty flush can reach
+        // this point; NULLSAFECLANG cannot carry that invariant through Run().
+        // @lint-ignore NULLSAFECLANG nullable-dereference
+        edit_->SetBlobIndirectionFormatVersion(
+            kBlobIndirectionManifestFormatVersion);
+      }
     }
 
     edit_->SetBlobFileAdditions(std::move(blob_file_additions));

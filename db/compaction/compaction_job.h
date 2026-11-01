@@ -12,6 +12,8 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -20,6 +22,7 @@
 
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_completion_callback.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/column_family.h"
 #include "db/compaction/compaction_iterator.h"
 #include "db/compaction/compaction_outputs.h"
@@ -343,6 +346,11 @@ class CompactionJob {
   void AggregateSubcompactionOutputAndJobStats();
   Status VerifyCompactionRecordCounts(bool stats_built_from_input_table_prop,
                                       uint64_t num_input_range_del);
+  Status PrepareBlobRelocationPublicationReservation();
+  Status PrepareBlobRelocationOutputDependencies();
+  Status ReserveBlobRelocationDependencyMemory(size_t additional_bytes);
+  Status PrepareUnpublishedBlobCompactionOutputs();
+  Status ValidateBlobRelocationOutputDependencies(const Version& current) const;
   void FinalizeCompactionRun(const Status& status,
                              bool stats_built_from_input_table_prop,
                              uint64_t num_input_range_del);
@@ -547,6 +555,20 @@ class CompactionJob {
   // write times.
   SequenceNumber preserve_seqno_after_ = kMaxSequenceNumber;
 
+  std::shared_ptr<BlobRelocationPublicationReservation>
+      blob_publication_reservation_;
+  struct BlobOutputDependency {
+    std::shared_ptr<SharedBlobFileMetaData> normal;
+    std::shared_ptr<BlobRelocationFileMetaData> relocation;
+    std::vector<BlobRelocationRouteSource> sources;
+  };
+  std::map<uint64_t, BlobOutputDependency> blob_output_dependencies_;
+  std::shared_ptr<CacheReservationManager> blob_dependency_reservation_manager_;
+  size_t blob_dependency_reserved_bytes_ = 0;
+  std::vector<JobContext::UnpublishedCompactionOutput>
+      blob_unpublished_outputs_;
+  bool blob_dependency_rejected_ = false;
+
   // Minimal sequence number to preclude the data from the last level. If the
   // key has bigger (newer) sequence number than this, it will be precluded from
   // the last level (output to proximal level).
@@ -594,6 +616,10 @@ class CompactionJob {
   // True if this job builds output files as a remote (offloaded)
   // CompactionService worker. Overridden by CompactionServiceCompactionJob.
   virtual bool IsRemoteCompaction() const { return false; }
+  virtual bool AllowBlobIndexFlattening() const {
+    return !IsRemoteCompaction();
+  }
+  virtual bool AllowBlobFileCreation() const { return true; }
   // The rate limiter priority (io_priority) is determined dynamically here.
   // The Compaction Read and Write priorities are the same for different
   // scenarios, such as write stalled.
@@ -614,7 +640,7 @@ class CompactionJob {
       const FileMetaData* file_meta, const ReadOptions& read_options,
       std::shared_ptr<const TableProperties>* tp);
 
-  void RestoreCompactionOutputs(
+  Status RestoreCompactionOutputs(
       const ColumnFamilyData* cfd,
       const std::vector<std::shared_ptr<const TableProperties>>&
           output_files_table_properties,

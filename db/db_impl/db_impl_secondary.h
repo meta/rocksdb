@@ -346,6 +346,10 @@ class DBImplSecondary : public DBImpl {
                           JobContext* job_context);
 
   std::unique_ptr<log::FragmentBufferedReader> manifest_reader_;
+  // Acquire before mutex_ and retain across unlocked MANIFEST preparation.
+  // Secondary calls and follower refresh share this serialization, so a
+  // concurrent caller waits and then catches up instead of returning TryAgain.
+  std::mutex catch_up_mutex_;
   std::unique_ptr<log::Reader::Reporter> manifest_reporter_;
   std::unique_ptr<Status> manifest_reader_status_;
 

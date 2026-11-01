@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "db/blob/blob_gen2_format.h"
 #include "db/dbformat.h"
 #include "db/seqno_to_time_mapping.h"
 #include "db/table_properties_collector.h"
@@ -34,6 +35,16 @@ namespace ROCKSDB_NAMESPACE {
 
 class Slice;
 class BlobSource;
+struct BlobReferenceSstSummary;
+
+struct BlobRelocationFileMetadata {
+  uint32_t directory_digest = 0;
+  uint64_t origin_count = 0;
+  uint64_t entry_count = 0;
+  uint64_t record_bytes = 0;
+  std::string encoded_directory;
+  uint64_t tail_size = 0;
+};
 
 struct TableReaderOptions {
   // @param skip_filters Disables loading/accessing the filter block
@@ -113,9 +124,12 @@ struct TableReaderOptions {
   // Whether the key in the table contains user-defined timestamps.
   bool user_defined_timestamps_persisted;
 
-  // Open-time metadata reads should not insert index/filter/dictionary blocks
-  // into the shared block cache.
+  // Metadata reads should avoid shared block and persistent caches.
   bool avoid_shared_metadata_cache;
+
+  // Repair needs an isolated reader for all blocks. Ephemeral compaction
+  // readers only bypass shared metadata at open and must retain data caches.
+  bool isolate_repair_caches = false;
 
   // Column family that owns this table. Empty outside DB-owned table opens.
   std::string column_family_name;
@@ -171,6 +185,7 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
         db_name(_db_name),
         is_remote_compaction(_is_remote_compaction),
         cur_file_num(_cur_file_num),
+        collect_blob_reference_metadata(_moptions.enable_blob_indirection),
         embedded_blob_options(_embedded_blob_options) {}
 
   const ImmutableOptions& ioptions;
@@ -196,6 +211,19 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
   // END for FilterBuildingContext
 
   const uint64_t cur_file_num;
+  // Creation policy alone is insufficient after the sticky format fence is
+  // active: disabling relocation GC must not make a new SST lose the exact
+  // metadata needed to read and eventually retire existing routes. DB-owned
+  // builders set this from their pinned Version as well as the mutable option.
+  bool collect_blob_reference_metadata;
+  // DB-owned coarse L0 and legacy outputs still persist their cheap
+  // classification, without allocating an exact per-reference collector.
+  bool track_blob_reference_classification = false;
+  // Immutable route-state hint captured with this output. Repair does not use
+  // it as commitment evidence, but it lets diagnostics distinguish files
+  // built from different one-hop route snapshots.
+  uint64_t blob_route_snapshot_fingerprint_high = 0;
+  uint64_t blob_route_snapshot_fingerprint_low = 0;
   // Non-null only for table builders that should write eligible large values as
   // same-file ("embedded") blob records. Currently only honored by
   // BlockBasedTableBuilder.
@@ -219,6 +247,7 @@ enum class TableBuilderNewTableReason : uint8_t {
   kSchemaVersionIncompatible,
   kUnsupportedEntryType,
   kBuilderPolicy,
+  kBlobReferenceLimit,
 };
 
 inline const char* TableBuilderNewTableReasonToString(
@@ -236,6 +265,8 @@ inline const char* TableBuilderNewTableReasonToString(
       return "UnsupportedEntryType";
     case TableBuilderNewTableReason::kBuilderPolicy:
       return "BuilderPolicy";
+    case TableBuilderNewTableReason::kBlobReferenceLimit:
+      return "BlobReferenceLimit";
   }
   assert(false);
   return "Invalid";
@@ -281,6 +312,58 @@ class TableBuilder {
     context->new_table_reason = TableBuilderNewTableReason::kNone;
     Add(key, value);
     return TableBuilderAddResult::kAdded;
+  }
+
+  // Starts a block-based relocation file. Implementations that do not support
+  // raw embedded blob records return NotSupported.
+  virtual Status StartBlobRelocationFile() {
+    return Status::NotSupported("Blob relocation files are not supported");
+  }
+
+  // Registers one transitive RouteSourceID that an origin partition can
+  // serve. Relocation files persist this set for feature-aware RepairDB.
+  virtual Status AddBlobRelocationRouteSource(uint64_t origin_file_number,
+                                              uint64_t generation_file_number) {
+    (void)origin_file_number;
+    (void)generation_file_number;
+    return Status::NotSupported("Blob relocation files are not supported");
+  }
+
+  // Adds one stored blob payload under its stable identity. The payload is
+  // already compressed according to `compression` and is written verbatim.
+  virtual Status AddBlobRelocation(uint64_t origin_file_number,
+                                   uint64_t original_value_offset,
+                                   const Slice& stored_payload,
+                                   CompressionType compression) {
+    (void)origin_file_number;
+    (void)original_value_offset;
+    (void)stored_payload;
+    (void)compression;
+    return Status::NotSupported("Blob relocation files are not supported");
+  }
+
+  // Streaming counterpart. The source verifies exact checksum-v2 stored
+  // bytes; a failure requires abandoning the complete unpublished output.
+  virtual Status AddBlobRelocation(uint64_t origin_file_number,
+                                   uint64_t original_value_offset,
+                                   uint64_t stored_value_size,
+                                   CompressionType compression,
+                                   uint32_t stored_checksum,
+                                   const VerifiedBlobStoredSource& source) {
+    (void)origin_file_number;
+    (void)original_value_offset;
+    (void)stored_value_size;
+    (void)compression;
+    (void)stored_checksum;
+    (void)source;
+    return Status::NotSupported("Blob relocation streaming is not supported");
+  }
+
+  // Returns immutable directory metadata after Finish() succeeds.
+  virtual Status GetBlobRelocationFileMetadata(
+      BlobRelocationFileMetadata* metadata) const {
+    (void)metadata;
+    return Status::NotSupported("Blob relocation files are not supported");
   }
 
   // Return non-ok iff some error has been detected.
@@ -333,6 +416,14 @@ class TableBuilder {
 
   // Returns table properties
   virtual TableProperties GetTableProperties() const = 0;
+
+  // Available only after successful Finish() when exact metadata was enabled.
+  // Passing this immutable handle to FileMetaData avoids reopening a newly
+  // built output at the MANIFEST queue head.
+  virtual std::shared_ptr<const BlobReferenceSstSummary>
+  GetBlobReferenceSstSummary() const {
+    return nullptr;
+  }
 
   // Return file checksum
   virtual std::string GetFileChecksum() const = 0;
