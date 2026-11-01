@@ -476,7 +476,8 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
   std::shared_ptr<Cache> MakeSharedCache() const;
 };
 
-// EXPERIMENTAL: the API is subject to change.
+// EXPERIMENTAL: the API and the fifo_cache:// option string are subject to
+// change.
 // FIFOCache - A cache using segmented FIFO eviction to stay at or below a
 // set capacity. The cache is sharded to 2^num_shard_bits shards, by hash of
 // the key. The total capacity is divided and evenly assigned to each shard,
@@ -513,9 +514,13 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
 // finds all 8192 in use (exited threads' lines are reused) takes the shard
 // mutex instead whenever it pins or unpins an entry still in probation.
 //
-// This is an opt-in implementation reached only by constructing it directly
-// (see MakeSharedCache); no option string or tool selects it and it is not
-// the default block cache.
+// This is an opt-in implementation and not the default block cache. Besides
+// MakeSharedCache, Cache::CreateFromString accepts
+// "fifo_cache://capacity=<n>;..." with the scalar fields below (e.g.
+// block_cache={fifo_cache://capacity=1G;num_shard_bits=6}); memory_allocator
+// and secondary_cache can only be set in C++. A string whose shards would
+// together reserve more than 32 TiB of address space is rejected with
+// InvalidArgument rather than aborting.
 struct FIFOCacheOptions : public ShardedCacheOptions {
   // Whether to use adaptive mutexes for cache shards. Note that adaptive
   // mutexes need to be supported by the platform in order for this to have any
