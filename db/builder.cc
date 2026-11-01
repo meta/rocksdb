@@ -270,6 +270,7 @@ Status BuildTable(
                   tboptions.db_session_id, job_id, tboptions.column_family_id,
                   tboptions.column_family_name, write_hint, io_tracer,
                   blob_callback, blob_creation_reason,
+                  mutable_cf_options.enable_blob_indirection,
                   ioptions.cf_paths.front().path, &blob_file_paths,
                   blob_file_additions)
             : nullptr);
@@ -283,6 +284,7 @@ Status BuildTable(
         ioptions.enforce_single_del_contracts,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse,
         true /* must_count_input_entries */,
+        false /* allow_blob_index_flattening */,
         /*compaction=*/nullptr, compaction_filter.get(),
         /*shutting_down=*/nullptr, db_options.info_log, full_history_ts_low,
         std::nullopt, version, tboptions.read_options.io_activity);

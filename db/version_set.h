@@ -1379,12 +1379,23 @@ class Version {
 
   const MutableCFOptions& GetMutableCFOptions() { return mutable_cf_options_; }
 
+  // Checks source ownership with the same rules as an indirect read, without
+  // opening the blob file. Used before accepting imported remote exact metadata
+  // and when revalidating moved local compaction targets.
+  Status ValidateBlobReferenceSource(
+      const BlobRelocationRouteSource& source) const;
+
   InternalIterator* TEST_GetLevelIterator(
       const ReadOptions& read_options, MergeIteratorBuilder* merge_iter_builder,
       int level, bool allow_unprepared_value);
 
  private:
   Status ResolveBlobPhysicalFile(const BlobIndex& blob_index,
+                                 BlobFileOpenInfo* physical_file,
+                                 uint64_t* physical_file_size,
+                                 bool* is_relocation_file,
+                                 uint32_t* relocation_directory_digest) const;
+  Status ResolveBlobPhysicalFile(const BlobRelocationRouteSource& source,
                                  BlobFileOpenInfo* physical_file,
                                  uint64_t* physical_file_size,
                                  bool* is_relocation_file,

@@ -165,6 +165,8 @@ class CompactionIterator {
 
     virtual bool enable_blob_garbage_collection() const = 0;
 
+    virtual bool enable_blob_indirection() const = 0;
+
     virtual double blob_garbage_collection_age_cutoff() const = 0;
 
     virtual uint64_t blob_compaction_readahead_size() const = 0;
@@ -214,6 +216,12 @@ class CompactionIterator {
 
     bool enable_blob_garbage_collection() const override {
       return compaction_->enable_blob_garbage_collection();
+    }
+
+    bool enable_blob_indirection() const override {
+      // RealCompaction's constructor rejects a null Compaction.
+      // @lint-ignore NULLSAFECLANG nullable-dereference
+      return compaction_->mutable_cf_options().enable_blob_indirection;
     }
 
     double blob_garbage_collection_age_cutoff() const override {
@@ -267,7 +275,8 @@ class CompactionIterator {
       BlobFileBuilder* blob_file_builder, bool allow_data_in_errors,
       bool enforce_single_del_contracts,
       const std::atomic<bool>& manual_compaction_canceled,
-      bool must_count_input_entries, const Compaction* compaction = nullptr,
+      bool must_count_input_entries, bool allow_blob_index_flattening,
+      const Compaction* compaction = nullptr,
       const CompactionFilter* compaction_filter = nullptr,
       const std::atomic<bool>* shutting_down = nullptr,
       const std::shared_ptr<Logger> info_log = nullptr,
@@ -290,7 +299,7 @@ class CompactionIterator {
       bool enforce_single_del_contracts,
       const std::atomic<bool>& manual_compaction_canceled,
       std::unique_ptr<CompactionProxy> compaction,
-      bool must_count_input_entries,
+      bool must_count_input_entries, bool allow_blob_index_flattening,
       const CompactionFilter* compaction_filter = nullptr,
       const std::atomic<bool>* shutting_down = nullptr,
       const std::shared_ptr<Logger> info_log = nullptr,
@@ -313,6 +322,11 @@ class CompactionIterator {
 
   static uint64_t ComputeBlobGarbageCollectionCutoffFileNumber(
       const CompactionProxy* compaction);
+  // A negotiated SST-only worker must decline rather than change local blob
+  // placement. The primary reruns the whole attempt locally on TryAgain.
+  void SetSstOnlyBlobOutputPolicy(uint64_t min_blob_size) {
+    sst_only_min_blob_size_ = min_blob_size;
+  }
 
   // Seek to the beginning of the compaction iterator output.
   //
@@ -398,6 +412,8 @@ class CompactionIterator {
                                        : is_range_del_;
   }
 
+  bool HasFlattenedBlobIndex() const { return has_flattened_blob_index_; }
+
  private:
   friend class CompactionJob;
   friend class CompactionOutputs;
@@ -435,6 +451,7 @@ class CompactionIterator {
   // blob file (i.e. if it passed the value size check). Returns true if the
   // value got extracted to a blob file, false otherwise.
   bool ExtractLargeValueIfNeededImpl();
+  bool DeclineSstOnlyBlobOutput(const Slice& value);
 
   // Extracts large values as described above, and updates the internal key's
   // type to kTypeBlobIndex if the value got extracted. Should only be called
@@ -456,6 +473,15 @@ class CompactionIterator {
   // Note: the stacked BlobDB implementation's compaction filter based GC
   // algorithm is also called from here.
   void GarbageCollectBlobIfNeeded();
+
+  // Rewrites only the generation field of an indirect BlobIndex when the
+  // pinned input Version resolves its pair to a different physical relocation
+  // file. Blob payload bytes are never read.
+  bool FlattenBlobIndexIfNeeded(BlobIndex* blob_index);
+  void FlattenBlobIfNeeded();
+  void FlattenEntityBlobIndexesIfNeeded();
+  bool FlattenBlobIndexesIfNeeded(
+      std::vector<std::pair<size_t, BlobIndex>>* blob_columns);
 
   // Garbage collects blob references within wide column entities. For entities
   // that contain blob column references, this method checks if any of the
@@ -551,6 +577,7 @@ class CompactionIterator {
   const bool report_detailed_time_;
   CompactionRangeDelAggregator* range_del_agg_;
   BlobFileBuilder* blob_file_builder_;
+  std::optional<uint64_t> sst_only_min_blob_size_;
   std::unique_ptr<CompactionProxy> compaction_;
   const CompactionFilter* compaction_filter_;
   const bool filter_supports_v4_;
@@ -656,6 +683,11 @@ class CompactionIterator {
   std::unique_ptr<PrefetchBufferCollection> prefetch_buffers_;
 
   std::string blob_index_;
+  const bool allow_blob_index_flattening_;
+  // Computed once, outside the DB mutex, rather than scanning input SSTs for
+  // every value. Coarse L0 output uses compaction-coupled, age-based blob GC.
+  const bool coarse_blob_output_;
+  bool has_flattened_blob_index_ = false;
   PinnableSlice blob_value_;
   std::string compaction_filter_value_;
   InternalKey compaction_filter_skip_until_;
@@ -686,6 +718,10 @@ class CompactionIterator {
   // input record and whenever the filter rewrites the entity value.
   bool entity_deserialized_{false};
   bool output_prepared_{false};
+  // Loss is a virtual deletion, not a physical Delete operation. Retained
+  // records keep their Put-like type/reference for SingleDelete and conflict
+  // checks; only ordinary safe visibility/elision rules may discard them.
+  bool lost_blob_value_{false};
   // "level_ptrs" holds indices that remember which file of an associated
   // level we were last checking during the last call to compaction->
   // KeyNotExistsBeyondOutputLevel(). This allows future calls to the function

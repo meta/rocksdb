@@ -531,6 +531,7 @@ Status FlushJob::MemPurge() {
         ioptions.enforce_single_del_contracts,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse,
         false /* must_count_input_entries */,
+        false /* allow_blob_index_flattening */,
         /*compaction=*/nullptr, compaction_filter.get(),
         /*shutting_down=*/nullptr, ioptions.info_log, full_history_ts_low);
 

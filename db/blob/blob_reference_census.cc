@@ -583,6 +583,11 @@ size_t BlobReferenceCensus::WorkerState::MemoryUsage(
   add(membership_count, kMembershipBytes);
   add(additional_memberships, kMembershipBytes);
   add(files.size(), kFileBytes);
+  // At most one zero-membership candidate per installed forward route. The
+  // forward-state bound precharges insertions during the net delta transition.
+  add(std::max(retirement_sources.size(),
+               forward_state != nullptr ? forward_state->routes().size() : 0),
+      sizeof(BlobRelocationRouteSource) + 4 * sizeof(void*));
   // Map entries, geometric heap pointer capacity, and a worst-case timed
   // suppression node. Candidate updates happen only in this worker.
   add(1, candidates.MemoryUsage(additional_candidates));
@@ -628,6 +633,7 @@ Status BlobReferenceCensus::WorkerState::AddFile(
       return Status::Corruption("Invalid census route group");
     }
     WorkerRoute& route = routes[source];
+    retirement_sources.erase(source);
     if (route.sst_files.empty()) {
       route.physical_file_number = ResolvePhysical(source);
     }
@@ -696,6 +702,10 @@ Status BlobReferenceCensus::WorkerState::RemoveFile(uint64_t file_number) {
       return status;
     }
     if (route->second.sst_files.empty()) {
+      if (forward_state != nullptr &&
+          forward_state->FindRoute(source) != nullptr) {
+        retirement_sources.insert(source);
+      }
       routes.erase(route);
     }
   }
@@ -751,6 +761,10 @@ Status BlobReferenceCensus::ResetWorkerState(
     status = next->Reserve(0, next->forward_state->files().size());
     if (!status.ok()) {
       return status;
+    }
+    for (const BlobRelocationRoute& route : next->forward_state->routes()) {
+      next->retirement_sources.insert(
+          {route.GetGenerationFileNumber(), route.GetOriginFileNumber()});
     }
     for (const std::shared_ptr<BlobRelocationFileMetaData>& file :
          next->forward_state->files()) {
@@ -847,6 +861,38 @@ BlobGcCandidateHeap::Selection BlobReferenceCensus::SelectWorkerEmptyCandidates(
              : BlobGcCandidateHeap::Selection{};
 }
 
+BlobReferenceCensus::RetirementSelection
+BlobReferenceCensus::SelectWorkerRetirementSources(uint64_t token) {
+  BlobRelocationPublicationSnapshot publications;
+  Status snapshot_status = SnapshotPublications(&publications);
+  if (!snapshot_status.ok()) {
+    return {};
+  }
+  std::shared_ptr<WorkerState> worker = std::atomic_load(&worker_state_);
+  std::lock_guard<std::mutex> lock(worker_mutex_);
+  RetirementSelection result{};
+  if (worker == nullptr || worker->token != token ||
+      worker->retirement_sources.empty()) {
+    return result;
+  }
+  std::set<BlobRelocationRouteSource>::const_iterator iterator =
+      worker->retirement_sources.upper_bound(worker->retirement_cursor);
+  size_t output = 0;
+  for (size_t visited = 0;
+       output < result.size() && visited < worker->retirement_sources.size();
+       ++visited) {
+    if (iterator == worker->retirement_sources.end()) {
+      iterator = worker->retirement_sources.begin();
+    }
+    const BlobRelocationRouteSource source = *iterator++;
+    worker->retirement_cursor = source;
+    if (!publications.Contains(source) &&
+        !worker->candidates.IsCoarseIdentityPinned(source)) {
+      result[output++] = source;
+    }
+  }
+  return result;
+}
 bool BlobReferenceCensus::NeedsWorkerRun(uint64_t version_number) const {
   std::lock_guard<std::mutex> lock(mutex_);
   return !build_waiting_for_install_ &&
@@ -967,8 +1013,15 @@ Status BlobReferenceCensus::ApplyWorkerDelta(
     }
     additional_memberships += file->groups.size();
   }
+  if (delta.changed_routes.size() >
+      std::numeric_limits<size_t>::max() - additional_memberships) {
+    return Status::MemoryLimit("Census route delta reservation overflow");
+  }
+  // Changed routes can add zero-membership nodes before forward_state changes.
+  // Membership-node bounds are conservative enough to precharge those nodes.
   Status status =
-      worker->Reserve(additional_memberships, delta.physical_files.size());
+      worker->Reserve(additional_memberships + delta.changed_routes.size(),
+                      delta.physical_files.size());
   if (!status.ok()) {
     return status;
   }
@@ -1003,6 +1056,12 @@ Status BlobReferenceCensus::ApplyWorkerDelta(
     const std::map<BlobRelocationRouteSource, WorkerRoute>::iterator route =
         worker->routes.find(source);
     if (route == worker->routes.end()) {
+      if (worker->forward_state != nullptr &&
+          worker->forward_state->FindRoute(source) != nullptr) {
+        worker->retirement_sources.insert(source);
+      } else {
+        worker->retirement_sources.erase(source);
+      }
       continue;
     }
     const uint64_t target = worker->ResolvePhysical(source);

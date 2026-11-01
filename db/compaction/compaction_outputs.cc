@@ -539,7 +539,9 @@ Status CompactionOutputs::AddToOutput(
         compaction->immutable_options().allow_data_in_errors;
     const std::string key_for_diagnostics =
         allow_data_in_errors ? key.ToString(/* hex */ true) : "hidden";
-    if (compaction->output_level() == 0) {
+    if (compaction->output_level() == 0 &&
+        add_context.new_table_reason !=
+            TableBuilderNewTableReason::kBlobReferenceLimit) {
       const std::string detail =
           "cf: " + cfd->GetName() + ", file_number: " +
           std::to_string(current_output().meta.fd.GetNumber()) +
@@ -606,8 +608,15 @@ Status CompactionOutputs::AddToOutput(
     smallest_preferred_seqno_ =
         std::min(smallest_preferred_seqno_, preferred_seqno);
   }
-  s = current_output().meta.UpdateBoundaries(key, value, ikey.sequence,
-                                             ikey.type);
+  const Version* const input_version = compaction_->input_version();
+  if (input_version != nullptr &&
+      input_version->storage_info()->HasBlobIndirectionFormat()) {
+    s = current_output().meta.UpdateBoundaries(
+        key, value, ikey.sequence, ikey.type, *input_version->storage_info());
+  } else {
+    s = current_output().meta.UpdateBoundaries(key, value, ikey.sequence,
+                                               ikey.type);
+  }
 
   return s;
 }

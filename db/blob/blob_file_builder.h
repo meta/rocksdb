@@ -47,8 +47,8 @@ class BlobFileBuilder {
       const std::string& column_family_name, Env::WriteLifeTimeHint write_hint,
       const std::shared_ptr<IOTracer>& io_tracer,
       BlobFileCompletionCallback* blob_callback,
-      BlobFileCreationReason creation_reason, std::string blob_output_path,
-      std::vector<std::string>* output_file_paths,
+      BlobFileCreationReason creation_reason, bool write_repair_metadata,
+      std::string blob_output_path, std::vector<std::string>* output_file_paths,
       std::vector<BlobFileAddition>* blob_file_additions);
 
   BlobFileBuilder(
@@ -61,8 +61,8 @@ class BlobFileBuilder {
       const std::string& column_family_name, Env::WriteLifeTimeHint write_hint,
       const std::shared_ptr<IOTracer>& io_tracer,
       BlobFileCompletionCallback* blob_callback,
-      BlobFileCreationReason creation_reason, std::string blob_output_path,
-      std::vector<std::string>* output_file_paths,
+      BlobFileCreationReason creation_reason, bool write_repair_metadata,
+      std::string blob_output_path, std::vector<std::string>* output_file_paths,
       std::vector<BlobFileAddition>* blob_file_additions);
 
   BlobFileBuilder(const BlobFileBuilder&) = delete;
@@ -105,6 +105,7 @@ class BlobFileBuilder {
   mutable Compressor::ManagedWorkingArea blob_compressor_wa_;
   PrepopulateBlobCache prepopulate_blob_cache_;
   bool enable_blob_indirection_;
+  bool write_repair_metadata_;
   const FileOptions* file_options_;
   const WriteOptions* write_options_;
   const std::string db_id_;

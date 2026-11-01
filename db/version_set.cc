@@ -2831,16 +2831,34 @@ Status Version::ResolveBlobPhysicalFile(
     const BlobIndex& blob_index, BlobFileOpenInfo* physical_file,
     uint64_t* physical_file_size, bool* is_relocation_file,
     uint32_t* relocation_directory_digest) const {
+  if (!blob_index.IsIndirect()) {
+    return Status::InvalidArgument("BlobIndex does not have a stable identity");
+  }
+  return ResolveBlobPhysicalFile(
+      {blob_index.generation_file_number(), blob_index.origin_file_number()},
+      physical_file, physical_file_size, is_relocation_file,
+      relocation_directory_digest);
+}
+
+Status Version::ValidateBlobReferenceSource(
+    const BlobRelocationRouteSource& source) const {
+  BlobFileOpenInfo physical_file;
+  uint64_t physical_file_size = 0;
+  bool is_relocation_file = false;
+  uint32_t relocation_directory_digest = 0;
+  return ResolveBlobPhysicalFile(source, &physical_file, &physical_file_size,
+                                 &is_relocation_file,
+                                 &relocation_directory_digest);
+}
+
+Status Version::ResolveBlobPhysicalFile(
+    const BlobRelocationRouteSource& source, BlobFileOpenInfo* physical_file,
+    uint64_t* physical_file_size, bool* is_relocation_file,
+    uint32_t* relocation_directory_digest) const {
   assert(physical_file != nullptr);
   assert(physical_file_size != nullptr);
   assert(is_relocation_file != nullptr);
   assert(relocation_directory_digest != nullptr);
-  if (!blob_index.IsIndirect()) {
-    return Status::InvalidArgument("BlobIndex does not have a stable identity");
-  }
-
-  const BlobRelocationRouteSource source{blob_index.generation_file_number(),
-                                         blob_index.origin_file_number()};
   const BlobRelocationRoute* route =
       storage_info_.GetBlobRelocationRoute(source);
   const uint64_t selected_file_number = route == nullptr

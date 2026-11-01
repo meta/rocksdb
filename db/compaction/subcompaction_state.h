@@ -66,6 +66,10 @@ class SubcompactionState {
   // sub-compaction begin.
   bool notify_on_subcompaction_completion = false;
 
+  // True when local output contains a BlobIndex generation rewritten against
+  // the compaction's pinned input Version.
+  bool has_flattened_blob_index = false;
+
   // compaction job stats for this sub-compaction
   CompactionJobStats compaction_job_stats;
 
@@ -159,6 +163,7 @@ class SubcompactionState {
         io_status(std::move(state.io_status)),
         notify_on_subcompaction_completion(
             state.notify_on_subcompaction_completion),
+        has_flattened_blob_index(state.has_flattened_blob_index),
         compaction_job_stats(std::move(state.compaction_job_stats)),
         sub_job_id(state.sub_job_id),
         compaction_outputs_(std::move(state.compaction_outputs_)),
@@ -173,12 +178,19 @@ class SubcompactionState {
 
   ~SubcompactionState() = default;
 
-  // Add all the new files from this compaction to version_edit
-  void AddOutputsEdit(VersionEdit* out_edit) const {
-    for (const auto& file : proximal_level_outputs_.outputs_) {
+  // Add all the new files from this compaction to version_edit. Transient
+  // provenance is folded into this required output-transfer pass so install
+  // does not scan every output a second time while holding the DB mutex.
+  void AddOutputsEdit(VersionEdit* out_edit,
+                      bool output_predates_blob_indirection) {
+    for (auto& file : proximal_level_outputs_.outputs_) {
+      file.meta.blob_reference_output_predates_indirection |=
+          output_predates_blob_indirection;
       out_edit->AddFile(compaction->GetProximalLevel(), file.meta);
     }
-    for (const auto& file : compaction_outputs_.outputs_) {
+    for (auto& file : compaction_outputs_.outputs_) {
+      file.meta.blob_reference_output_predates_indirection |=
+          output_predates_blob_indirection;
       out_edit->AddFile(compaction->output_level(), file.meta);
     }
   }
