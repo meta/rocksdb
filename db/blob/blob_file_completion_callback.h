@@ -38,14 +38,12 @@ class BlobFileCompletionCallback {
                                                 job_id, creation_reason);
   }
 
-  Status OnBlobFileCompleted(const std::string& file_name,
-                             const std::string& column_family_name, int job_id,
-                             uint64_t file_number,
-                             BlobFileCreationReason creation_reason,
-                             const Status& report_status,
-                             const std::string& checksum_value,
-                             const std::string& checksum_method,
-                             uint64_t blob_count, uint64_t blob_bytes) {
+  Status OnBlobFileCompleted(
+      const std::string& file_name, const std::string& column_family_name,
+      int job_id, uint64_t file_number, BlobFileCreationReason creation_reason,
+      const Status& report_status, const std::string& checksum_value,
+      const std::string& checksum_method, uint64_t blob_count,
+      uint64_t blob_bytes, bool set_bg_error_on_space_limit) {
     Status s;
 
     auto sfm = static_cast<SstFileManagerImpl*>(sst_file_manager_);
@@ -56,8 +54,11 @@ class BlobFileCompletionCallback {
         s = Status::SpaceLimit("Max allowed space was reached");
         TEST_SYNC_POINT(
             "BlobFileCompletionCallback::CallBack::MaxAllowedSpaceReached");
-        InstrumentedMutexLock l(mutex_);
-        error_handler_->SetBGError(s, BackgroundErrorReason::kFlush);
+        if (set_bg_error_on_space_limit) {
+          // This callback historically reports space limits as flush errors.
+          InstrumentedMutexLock l(mutex_);
+          error_handler_->SetBGError(s, BackgroundErrorReason::kFlush);
+        }
       }
     }
 

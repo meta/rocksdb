@@ -22,9 +22,9 @@ set of blob files while using Universal Compaction for the key and metadata
 part of the LSM.
 
 The reduced-scope v1 implementation landed in
-[pull request #14535](https://github.com/facebook/rocksdb/pull/14535), and
+[pull request #14535](https://github.com/meta/rocksdb/pull/14535), and
 custom partition selection was added in
-[pull request #14565](https://github.com/facebook/rocksdb/pull/14565).
+[pull request #14565](https://github.com/meta/rocksdb/pull/14565).
 
 ## Background
 

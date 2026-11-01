@@ -105,17 +105,12 @@ class VersionBuilder {
   std::unique_ptr<Rep> rep_;
 };
 
-// A wrapper of version builder which references the current version in
-// constructor and unref it in the destructor.
-// Both of the constructor and destructor need to be called inside DB Mutex.
+// A VersionBuilder wrapper that keeps the supplied base Version referenced.
+// Both construction and destruction require the DB mutex.
 class BaseReferencedVersionBuilder {
  public:
-  explicit BaseReferencedVersionBuilder(
-      ColumnFamilyData* cfd, VersionEditHandler* version_edit_handler = nullptr,
-      bool track_found_and_missing_files = false,
-      bool allow_incomplete_valid_version = false);
   BaseReferencedVersionBuilder(
-      ColumnFamilyData* cfd, Version* v,
+      ColumnFamilyData* cfd, Version* base_version,
       VersionEditHandler* version_edit_handler = nullptr,
       bool track_found_and_missing_files = false,
       bool allow_incomplete_valid_version = false);

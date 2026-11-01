@@ -13,7 +13,7 @@ background. Most applications with long-lived data (many hours or
 longer) will likely benefit from adopting a Ribbon+Bloom hybrid filter
 policy. Here we explain why and how.
 
-[Ribbon filter on RocksDB wiki](https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter#ribbon-filter)
+[Ribbon filter on RocksDB wiki](https://github.com/meta/rocksdb/wiki/RocksDB-Bloom-Filter#ribbon-filter)
 
 [Ribbon filter paper](https://arxiv.org/abs/2103.02515)
 

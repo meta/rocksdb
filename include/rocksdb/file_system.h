@@ -1006,7 +1006,7 @@ struct FSReadRequest {
   // WARNING: Do NOT assume that fs_scratch points to the start of the actual
   // char* data returned by the read. As the type signature suggests, fs_scratch
   // is a pointer to any arbitrary data type. Use result.data() to get a valid
-  // start to the real data. See https://github.com/facebook/rocksdb/pull/13189
+  // start to the real data. See https://github.com/meta/rocksdb/pull/13189
   // for more context.
   FSAllocationPtr fs_scratch;
 };

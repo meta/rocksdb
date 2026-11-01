@@ -65,7 +65,7 @@ class SliceTransform : public Customizable {
   // prefix size of 4.
   //
   // Wiki documentation here:
-  // https://github.com/facebook/rocksdb/wiki/Prefix-Seek
+  // https://github.com/meta/rocksdb/wiki/Prefix-Seek
   //
   virtual bool InDomain(const Slice& key) const = 0;
 

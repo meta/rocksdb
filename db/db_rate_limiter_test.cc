@@ -9,6 +9,7 @@
 #include <string>
 
 #include "db/db_test_util.h"
+#include "env/composite_env_wrapper.h"
 #include "port/stack_trace.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -27,8 +28,11 @@ class DBRateLimiterOnReadTest
         use_block_cache_(std::get<1>(GetParam())),
         use_readahead_(std::get<2>(GetParam())) {}
 
-  void Init() {
+  void Init(Env* env = nullptr) {
     options_ = GetOptions();
+    if (env != nullptr) {
+      options_.env = env;
+    }
     Reopen(options_);
     for (int i = 0; i < kNumFiles; ++i) {
       for (int j = 0; j < kNumKeysPerFile; ++j) {
@@ -50,6 +54,23 @@ class DBRateLimiterOnReadTest
     read_options.rate_limiter_priority = Env::IO_USER;
     read_options.readahead_size = use_readahead_ ? kReadaheadBytes : 0;
     return read_options;
+  }
+
+  void MultiGetAllKeys(const ReadOptions& read_options) {
+    const int kNumKeys = kNumFiles * kNumKeysPerFile;
+    std::vector<std::string> key_bufs;
+    key_bufs.reserve(kNumKeys);
+    for (int i = 0; i < kNumKeys; ++i) {
+      key_bufs.emplace_back(Key(i));
+    }
+    std::vector<Slice> keys(key_bufs.begin(), key_bufs.end());
+    std::vector<Status> statuses(kNumKeys);
+    std::vector<PinnableSlice> values(kNumKeys);
+    db_->MultiGet(read_options, dbfull()->DefaultColumnFamily(), kNumKeys,
+                  keys.data(), values.data(), statuses.data());
+    for (const Status& s : statuses) {
+      ASSERT_OK(s);
+    }
   }
 
   Options GetOptions() {
@@ -163,6 +184,190 @@ TEST_P(DBRateLimiterOnReadTest, NewMultiGet) {
   }
   expected += kNumKeys;
   ASSERT_EQ(expected, options_.rate_limiter->GetTotalRequests(Env::IO_USER));
+}
+
+TEST_P(DBRateLimiterOnReadTest, AsyncIOMultiGet) {
+  if (use_direct_io_ && !IsDirectIOSupported()) {
+    return;
+  }
+  Init();
+
+  ReadOptions read_options = GetReadOptions();
+  read_options.fill_cache = false;
+  MultiGetAllKeys(read_options);
+  const int64_t sync_requests =
+      options_.rate_limiter->GetTotalRequests(Env::IO_USER);
+  const int64_t sync_bytes =
+      options_.rate_limiter->GetTotalBytesThrough(Env::IO_USER);
+  ASSERT_EQ(kNumFiles * kNumKeysPerFile, sync_requests);
+
+  int read_async_calls = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "RandomAccessFileReader::ReadAsync:InjectStatus",
+      [&](void* /*arg*/) { ++read_async_calls; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  read_options.async_io = true;
+  MultiGetAllKeys(read_options);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+#if USE_COROUTINES
+  ASSERT_GT(read_async_calls, 0);
+#endif  // USE_COROUTINES
+  ASSERT_EQ(2 * sync_requests,
+            options_.rate_limiter->GetTotalRequests(Env::IO_USER));
+  ASSERT_EQ(2 * sync_bytes,
+            options_.rate_limiter->GetTotalBytesThrough(Env::IO_USER));
+}
+
+TEST_P(DBRateLimiterOnReadTest, AsyncIOMultiGetAdjacentDirectIOBlocks) {
+  if (!use_direct_io_ || !IsDirectIOSupported()) {
+    return;
+  }
+  Options options = GetOptions();
+  BlockBasedTableOptions table_options = GetTableOptions();
+  table_options.block_size = 1000;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  Reopen(options);
+  constexpr int kFiles = 4;
+  constexpr int kKeysPerFile = 200;
+  Random rnd(301);
+  std::vector<std::string> values;
+  values.reserve(kFiles * kKeysPerFile);
+  for (int f = 0; f < kFiles; ++f) {
+    for (int k = 0; k < kKeysPerFile; ++k) {
+      values.push_back(rnd.RandomString(300 + (k % 7) * 37));
+      ASSERT_OK(Put(Key(f * kKeysPerFile + k), values.back()));
+    }
+    ASSERT_OK(Flush());
+  }
+  MoveFilesToLevel(1);
+
+  // One batch of consecutive keys from every file, so each file reads several
+  // adjacent blocks, most of them starting mid-page.
+  constexpr int kPickedPerFile = 8;
+  std::vector<int> picked;
+  std::vector<std::string> key_bufs;
+  picked.reserve(kFiles * kPickedPerFile);
+  key_bufs.reserve(kFiles * kPickedPerFile);
+  for (int f = 0; f < kFiles; ++f) {
+    for (int j = 0; j < kPickedPerFile; ++j) {
+      picked.push_back(f * kKeysPerFile + 3 + j);
+      key_bufs.push_back(Key(picked.back()));
+    }
+  }
+  std::vector<Slice> keys(key_bufs.begin(), key_bufs.end());
+  auto multi_get = [&](bool async_io) {
+    std::vector<PinnableSlice> results(keys.size());
+    std::vector<Status> statuses(keys.size());
+    ReadOptions read_options = GetReadOptions();
+    read_options.fill_cache = false;
+    read_options.async_io = async_io;
+    db_->MultiGet(read_options, dbfull()->DefaultColumnFamily(), keys.size(),
+                  keys.data(), results.data(), statuses.data());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      ASSERT_OK(statuses[i]);
+      ASSERT_EQ(values[picked[i]], results[i].ToString());
+    }
+  };
+
+  RateLimiter* const rate_limiter = options.rate_limiter.get();
+  const int64_t requests_before = rate_limiter->GetTotalRequests(Env::IO_USER);
+  const int64_t bytes_before = rate_limiter->GetTotalBytesThrough(Env::IO_USER);
+  ASSERT_NO_FATAL_FAILURE(multi_get(/*async_io=*/false));
+  const int64_t sync_requests =
+      rate_limiter->GetTotalRequests(Env::IO_USER) - requests_before;
+  const int64_t sync_bytes =
+      rate_limiter->GetTotalBytesThrough(Env::IO_USER) - bytes_before;
+
+  int read_async_calls = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "RandomAccessFileReader::ReadAsync:InjectStatus",
+      [&](void* /*arg*/) { ++read_async_calls; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_NO_FATAL_FAILURE(multi_get(/*async_io=*/true));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  const int64_t async_requests = rate_limiter->GetTotalRequests(Env::IO_USER) -
+                                 requests_before - sync_requests;
+  const int64_t async_bytes = rate_limiter->GetTotalBytesThrough(Env::IO_USER) -
+                              bytes_before - sync_bytes;
+
+#if USE_COROUTINES
+  // MultiRead() merges the adjacent aligned requests of a file into one read.
+  // The async_io path reads and charges each block on its own, re-reading the
+  // aligned pages that adjacent blocks share.
+  ASSERT_GT(read_async_calls, 0);
+  ASSERT_GT(async_requests, sync_requests);
+  ASSERT_GT(async_bytes, sync_bytes);
+#else
+  ASSERT_EQ(async_requests, sync_requests);
+  ASSERT_EQ(async_bytes, sync_bytes);
+#endif  // USE_COROUTINES
+}
+
+// A file system can reject ReadAsync even though it advertises kAsyncIO, e.g.
+// when io_uring fails to initialize. MultiGet then reads synchronously, and
+// each read must still be charged exactly once.
+class ReadAsyncNotSupportedFS : public FileSystemWrapper {
+ public:
+  explicit ReadAsyncNotSupportedFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+
+  static const char* kClassName() { return "ReadAsyncNotSupportedFS"; }
+  const char* Name() const override { return kClassName(); }
+
+  IOStatus NewRandomAccessFile(const std::string& fname,
+                               const FileOptions& opts,
+                               std::unique_ptr<FSRandomAccessFile>* result,
+                               IODebugContext* dbg) override {
+    IOStatus s = target()->NewRandomAccessFile(fname, opts, result, dbg);
+    if (s.ok()) {
+      *result = std::make_unique<File>(std::move(*result));
+    }
+    return s;
+  }
+
+ private:
+  class File : public FSRandomAccessFileOwnerWrapper {
+   public:
+    using FSRandomAccessFileOwnerWrapper::FSRandomAccessFileOwnerWrapper;
+    IOStatus ReadAsync(FSReadRequest& /*req*/, const IOOptions& /*opts*/,
+                       std::function<void(FSReadRequest&, void*)> /*cb*/,
+                       void* /*cb_arg*/, void** /*io_handle*/,
+                       IOHandleDeleter* /*del_fn*/,
+                       IODebugContext* /*dbg*/) override {
+      return IOStatus::NotSupported("ReadAsync");
+    }
+  };
+};
+
+TEST_P(DBRateLimiterOnReadTest, AsyncIOMultiGetSyncFallback) {
+  if (use_direct_io_ && !IsDirectIOSupported()) {
+    return;
+  }
+  auto fs = std::make_shared<ReadAsyncNotSupportedFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, fs));
+  Init(env.get());
+
+  int fallbacks = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "AsyncFileReader::MultiReadAsyncImpl:SyncFallback",
+      [&](void* /*arg*/) { ++fallbacks; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ReadOptions read_options = GetReadOptions();
+  read_options.async_io = true;
+  MultiGetAllKeys(read_options);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  const int64_t requests =
+      options_.rate_limiter->GetTotalRequests(Env::IO_USER);
+  Close();
+
+#if USE_COROUTINES
+  ASSERT_GT(fallbacks, 0);
+#endif  // USE_COROUTINES
+  ASSERT_EQ(kNumFiles * kNumKeysPerFile, requests);
 }
 
 TEST_P(DBRateLimiterOnReadTest, OldMultiGet) {

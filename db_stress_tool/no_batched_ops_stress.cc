@@ -17,6 +17,7 @@
 #include <cinttypes>
 #include <deque>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
@@ -29,6 +30,10 @@
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
+
+constexpr int kCfLifecycleOptionsFault = 1;
+constexpr int kCfLifecycleManifestFault = 2;
+constexpr int kExpectedCfLifecycleFaultExitCode = 86;
 
 // Finds a run of overwriteable keys strictly inside `file`'s key span, stopping
 // at `desired_width` keys. Runs shorter than two keys are not worth replacing
@@ -700,20 +705,82 @@ class NonBatchedOpsStressTest : public StressTest {
         }
         thread->shared->LockColumnFamily(cf);
         Status s = db_->DropColumnFamily(column_families_[cf]);
-        delete column_families_[cf];
         if (!s.ok()) {
           fprintf(stderr, "dropping column family error: %s\n",
                   s.ToString().c_str());
           thread->shared->SafeTerminate();
         }
+        delete column_families_[cf];
+        if (FLAGS_test_cf_lifecycle) {
+          column_families_[cf] = nullptr;
+          thread->shared->ClearColumnFamily(cf);
+        }
+
+        if (FLAGS_cf_lifecycle_fault_target != 0) {
+          assert(FLAGS_test_cf_lifecycle);
+          assert(db_fault_injection_fs_);
+          std::set<FileType> excluded = {
+              kWalFile,        kDBLockFile,   kTableFile,
+              kDescriptorFile, kCurrentFile,  kTempFile,
+              kInfoLogFile,    kMetaDatabase, kIdentityFile,
+              kOptionsFile,    kBlobFile,     kCompactionProgressFile,
+          };
+          if (FLAGS_cf_lifecycle_fault_target == kCfLifecycleOptionsFault) {
+            excluded.erase(kTempFile);
+            excluded.erase(kOptionsFile);
+          } else if (FLAGS_cf_lifecycle_fault_target ==
+                     kCfLifecycleManifestFault) {
+            excluded.erase(kDescriptorFile);
+          } else {
+            assert(false);
+          }
+          db_fault_injection_fs_->SetFileTypesExcludedFromFaultInjection(
+              excluded);
+          db_fault_injection_fs_->SetThreadLocalErrorContext(
+              FaultInjectionIOType::kWrite, thread->shared->GetSeed(), 1,
+              false /* retryable */, false /* has_data_loss */);
+          db_fault_injection_fs_->EnableThreadLocalErrorInjection(
+              FaultInjectionIOType::kWrite);
+        }
+
+        ColumnFamilyHandle* replacement = nullptr;
         s = db_->CreateColumnFamily(ColumnFamilyOptions(options_), new_name,
-                                    &column_families_[cf]);
-        column_family_names_[cf] = new_name;
-        thread->shared->ClearColumnFamily(cf);
+                                    &replacement);
+        if (FLAGS_cf_lifecycle_fault_target != 0) {
+          const int injected_errors =
+              db_fault_injection_fs_->GetAndResetInjectedThreadLocalErrorCount(
+                  FaultInjectionIOType::kWrite);
+          if (!s.ok() && injected_errors > 0 &&
+              FaultInjectionTestFS::IsInjectedError(s)) {
+            const char* target =
+                FLAGS_cf_lifecycle_fault_target == kCfLifecycleOptionsFault
+                    ? "options"
+                    : "manifest";
+            fprintf(stdout, "EXPECTED_CF_LIFECYCLE_FAULT target=%s\n", target);
+            fflush(stdout);
+            port::ImmediateExit(kExpectedCfLifecycleFaultExitCode);
+          }
+          fprintf(stderr,
+                  "targeted CF lifecycle fault was not observed: target=%d "
+                  "status=%s injected_errors=%d\n",
+                  FLAGS_cf_lifecycle_fault_target, s.ToString().c_str(),
+                  injected_errors);
+          fflush(stderr);
+          port::ImmediateExit(1);
+        }
         if (!s.ok()) {
           fprintf(stderr, "creating column family error: %s\n",
                   s.ToString().c_str());
           thread->shared->SafeTerminate();
+        }
+        column_families_[cf] = replacement;
+        column_family_names_[cf] = new_name;
+        if (!FLAGS_test_cf_lifecycle) {
+          thread->shared->ClearColumnFamily(cf);
+        }
+        if (FLAGS_test_cf_lifecycle) {
+          fprintf(stdout, "CF_LIFECYCLE_SUCCESS\n");
+          fflush(stdout);
         }
         thread->shared->UnlockColumnFamily(cf);
       }

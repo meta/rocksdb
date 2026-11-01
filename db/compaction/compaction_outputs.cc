@@ -395,8 +395,7 @@ void CompactionOutputs::PrepareNewOutputForFirstKey(
 }
 
 Status CompactionOutputs::AddToOutput(
-    const CompactionIterator& c_iter,
-    const CompactionFileOpenFunc& open_file_func,
+    CompactionIterator& c_iter, const CompactionFileOpenFunc& open_file_func,
     const CompactionFileCloseFunc& close_file_func,
     const ParsedInternalKey& prev_iter_output_internal_key) {
   Status s;
@@ -407,25 +406,33 @@ Status CompactionOutputs::AddToOutput(
     // 2. range tombstone may be dropped at bottommost level.
     return s;
   }
-  const Slice& key = c_iter.key();
   if (ShouldStopBefore(c_iter) && HasBuilder()) {
+    const Slice next_table_min_key = c_iter.key();
     s = close_file_func(c_iter.InputStatus(), prev_iter_output_internal_key,
-                        key, &c_iter, *this);
+                        next_table_min_key, &c_iter,
+                        /*post_prepare_retry=*/false, *this);
     if (!s.ok()) {
       return s;
     }
     // reset grandparent information
     grandparent_boundary_switched_num_ = 0;
     grandparent_overlapped_bytes_ =
-        GetCurrentKeyGrandparentOverlappedBytes(key);
+        GetCurrentKeyGrandparentOverlappedBytes(next_table_min_key);
     if (UNLIKELY(is_range_del)) {
       // lower bound for this new output file, this is needed as the lower bound
       // does not come from the smallest point key in this case.
-      range_tombstone_lower_bound_.DecodeFrom(key);
+      range_tombstone_lower_bound_.DecodeFrom(next_table_min_key);
     } else {
       range_tombstone_lower_bound_.Clear();
     }
   }
+
+  c_iter.PrepareOutputIfNeeded();
+  if (!c_iter.status().ok() || !c_iter.Valid()) {
+    s = c_iter.status();
+    return s;
+  }
+  const Slice& key = c_iter.key();
 
   // Open output file if necessary
   if (!HasBuilder()) {
@@ -457,7 +464,7 @@ Status CompactionOutputs::AddToOutput(
     }
 
     TableBuilderAddContext add_context;
-    TableBuilderAddResult add_result =
+    const TableBuilderAddResult add_result =
         builder_->TryAdd(key, value, &add_context);
 
     if (add_result == TableBuilderAddResult::kError) {
@@ -479,6 +486,10 @@ Status CompactionOutputs::AddToOutput(
     if (!s.ok()) {
       return s;
     }
+    const char* const new_table_reason =
+        add_context.new_table_reason == TableBuilderNewTableReason::kNone
+            ? "Unspecified"
+            : TableBuilderNewTableReasonToString(add_context.new_table_reason);
     const Compaction* compaction = compaction_;
     if (compaction == nullptr) {
       return Status::Corruption("Compaction output is missing compaction");
@@ -495,9 +506,8 @@ Status CompactionOutputs::AddToOutput(
     if (compaction->output_level() == 0) {
       const std::string detail =
           "cf: " + cfd->GetName() + ", file_number: " +
-          std::to_string(current_output().meta.fd.GetNumber()) + ", reason: " +
-          TableBuilderNewTableReasonToString(add_context.new_table_reason) +
-          ", key: " + key_for_diagnostics;
+          std::to_string(current_output().meta.fd.GetNumber()) +
+          ", reason: " + new_table_reason + ", key: " + key_for_diagnostics;
       return Status::Corruption(
           "TableBuilder requested a new table while producing level 0 output",
           detail);
@@ -505,9 +515,8 @@ Status CompactionOutputs::AddToOutput(
     if (retried_after_new_table || builder_->IsEmpty()) {
       const std::string detail =
           "cf: " + cfd->GetName() + ", file_number: " +
-          std::to_string(current_output().meta.fd.GetNumber()) + ", reason: " +
-          TableBuilderNewTableReasonToString(add_context.new_table_reason) +
-          ", key: " + key_for_diagnostics;
+          std::to_string(current_output().meta.fd.GetNumber()) +
+          ", reason: " + new_table_reason + ", key: " + key_for_diagnostics;
       return Status::Corruption(
           "TableBuilder requested a new table without accepting any rows",
           detail);
@@ -518,11 +527,10 @@ Status CompactionOutputs::AddToOutput(
         "[%s] Compaction output table builder requested a new table before "
         "key %s for file #%" PRIu64 ". reason: %s",
         cfd->GetName().c_str(), key_for_diagnostics.c_str(),
-        current_output().meta.fd.GetNumber(),
-        TableBuilderNewTableReasonToString(add_context.new_table_reason));
+        current_output().meta.fd.GetNumber(), new_table_reason);
 
     s = close_file_func(c_iter.InputStatus(), prev_iter_output_internal_key,
-                        key, &c_iter, *this);
+                        key, &c_iter, /*post_prepare_retry=*/true, *this);
     if (!s.ok()) {
       return s;
     }

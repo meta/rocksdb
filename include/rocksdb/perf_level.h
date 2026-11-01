@@ -56,4 +56,19 @@ void SetPerfLevel(PerfLevel level);
 // get current perf stats level for current thread
 PerfLevel GetPerfLevel();
 
+// EXPERIMENTAL
+// Per thread. When enabled, the next DB::GetAsync(), DB::MultiGetAsync(),
+// CoroDB::CoGet() or CoroDB::CoMultiGet() started on this thread adds the CPU
+// time it spends running between suspensions to
+// PerfContext::get_cpu_nanos, even when the perf level is below
+// kEnableTimeAndCPUTimeExceptForMutex. It reads the thread CPU clock twice per
+// running slice and enables no other timers. It has no effect while the perf
+// level is kDisable. Like the perf level, starting the read captures this
+// setting and resets it to disabled on the calling thread. A read served
+// synchronously on the calling thread, because the DB has no coroutine support
+// or read executor, does not record it.
+void SetAsyncReadCPUTimeEnabled(bool enabled);
+
+bool GetAsyncReadCPUTimeEnabled();
+
 }  // namespace ROCKSDB_NAMESPACE

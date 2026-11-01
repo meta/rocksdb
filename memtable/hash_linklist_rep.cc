@@ -75,8 +75,6 @@ struct Node {
     next_.store(x, std::memory_order_release);
   }
   // No-barrier variants that can be safely used in a few locations.
-  Node* NoBarrier_Next() { return next_.load(std::memory_order_relaxed); }
-
   void NoBarrier_SetNext(Node* x) { next_.store(x, std::memory_order_relaxed); }
 
   // Needed for placement new below which is fine
@@ -249,18 +247,7 @@ class HashLinkListRep : public MemTableRep {
     return (n != nullptr) && (compare_(n->key, key) < 0);
   }
 
-  bool KeyIsAfterOrAtNode(const Slice& internal_key, const Node* n) const {
-    // nullptr n is considered infinite
-    return (n != nullptr) && (compare_(n->key, internal_key) <= 0);
-  }
-
-  bool KeyIsAfterOrAtNode(const Key& key, const Node* n) const {
-    // nullptr n is considered infinite
-    return (n != nullptr) && (compare_(n->key, key) <= 0);
-  }
-
   Node* FindGreaterOrEqualInBucket(Node* head, const Slice& key) const;
-  Node* FindLessOrEqualInBucket(Node* head, const Slice& key) const;
 
   class FullListIterator : public MemTableRep::Iterator {
    public:
@@ -478,28 +465,6 @@ class HashLinkListRep : public MemTableRep {
     // the underlying memtable
     const HashLinkListRep& memtable_rep_;
     std::unique_ptr<MemtableSkipList::Iterator> skip_list_iter_;
-  };
-
-  class EmptyIterator : public MemTableRep::Iterator {
-    // This is used when there wasn't a bucket. It is cheaper than
-    // instantiating an empty bucket over which to iterate.
-   public:
-    EmptyIterator() = default;
-    bool Valid() const override { return false; }
-    const char* key() const override {
-      assert(false);
-      return nullptr;
-    }
-    void Next() override {}
-    void Prev() override {}
-    void Seek(const Slice& /*user_key*/,
-              const char* /*memtable_key*/) override {}
-    void SeekForPrev(const Slice& /*user_key*/,
-                     const char* /*memtable_key*/) override {}
-    void SeekToFirst() override {}
-    void SeekToLast() override {}
-
-   private:
   };
 };
 

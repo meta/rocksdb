@@ -428,6 +428,48 @@ TEST_P(CompactionIteratorTest, SimpleRangeDeletion) {
   ASSERT_FALSE(c_iter_->Valid());
 }
 
+TEST_P(CompactionIteratorTest, TracksConsumedEarlierEntriesUntilNextUserKey) {
+  AddSnapshot(4);
+  InitIterators(
+      {test::KeyStr("a", 6, kTypeValue), test::KeyStr("a", 5, kTypeValue),
+       test::KeyStr("a", 3, kTypeValue), test::KeyStr("b", 2, kTypeValue)},
+      {"a6", "a5", "a3", "b2"}, {}, {}, 6);
+
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(test::KeyStr("a", 6, kTypeValue), c_iter_->key().ToString());
+  EXPECT_FALSE(c_iter_->HasConsumedEarlierEntriesOfCurrentKey());
+
+  c_iter_->Next();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(test::KeyStr("a", 3, kTypeValue), c_iter_->key().ToString());
+  EXPECT_TRUE(c_iter_->HasConsumedEarlierEntriesOfCurrentKey());
+
+  c_iter_->Next();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(test::KeyStr("b", 2, kTypeValue), c_iter_->key().ToString());
+  EXPECT_FALSE(c_iter_->HasConsumedEarlierEntriesOfCurrentKey());
+}
+
+TEST_P(CompactionIteratorTest, TracksRangeDeletedEarlierEntry) {
+  AddSnapshot(10);
+  InitIterators({test::KeyStr("morning", 15, kTypeValue),
+                 test::KeyStr("morning", 5, kTypeValue),
+                 test::KeyStr("night", 40, kTypeValue)},
+                {"morning15", "morning5", "night40"},
+                {test::KeyStr("ma", 28, kTypeRangeDeletion)}, {"mz"}, 40);
+
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(test::KeyStr("morning", 5, kTypeValue), c_iter_->key().ToString());
+  EXPECT_TRUE(c_iter_->HasConsumedEarlierEntriesOfCurrentKey());
+
+  c_iter_->Next();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(test::KeyStr("night", 40, kTypeValue), c_iter_->key().ToString());
+  EXPECT_FALSE(c_iter_->HasConsumedEarlierEntriesOfCurrentKey());
+}
+
 TEST_P(CompactionIteratorTest, RangeDeletionWithSnapshots) {
   AddSnapshot(10);
   std::vector<std::string> ks1;
@@ -832,6 +874,40 @@ TEST_P(CompactionIteratorTest, ConvertToPutAtBottom) {
           true /*bottomost_level*/);
 }
 
+TEST_P(CompactionIteratorTest, TracksConsumedMergeThroughBaseValue) {
+  class MustMergeOperator : public MergeOperator {
+   public:
+    bool FullMergeV2(const MergeOperationInput& /*merge_in*/,
+                     MergeOperationOutput* merge_out) const override {
+      merge_out->op_failure_scope = OpFailureScope::kMustMerge;
+      return false;
+    }
+
+    const char* Name() const override { return "MustMergeOperator"; }
+  } merge_operator;
+
+  InitIterators(
+      {test::KeyStr("a", 3, kTypeMerge), test::KeyStr("a", 2, kTypeValue),
+       test::KeyStr("b", 1, kTypeValue)},
+      {"a3", "a2", "b1"}, {}, {}, kMaxSequenceNumber,
+      /*last_committed_sequence=*/kMaxSequenceNumber, &merge_operator);
+
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(test::KeyStr("a", 3, kTypeMerge), c_iter_->key().ToString());
+  EXPECT_TRUE(c_iter_->HasConsumedEarlierEntriesOfCurrentKey());
+
+  c_iter_->Next();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(test::KeyStr("a", 2, kTypeValue), c_iter_->key().ToString());
+  EXPECT_TRUE(c_iter_->HasConsumedEarlierEntriesOfCurrentKey());
+
+  c_iter_->Next();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(test::KeyStr("b", 1, kTypeValue), c_iter_->key().ToString());
+  EXPECT_FALSE(c_iter_->HasConsumedEarlierEntriesOfCurrentKey());
+}
+
 TEST_P(CompactionIteratorTest, ZeroSeqOfKeyAndSnapshot) {
   AddSnapshot(0);
   const std::vector<std::string> input_keys = {
@@ -1067,6 +1143,35 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
           {"", ""}, 2 /*last_committed_seq*/, nullptr /*merge_operator*/,
           nullptr /*compaction_filter*/, false /*bottommost_level*/,
           2 /*earliest_write_conflict_snapshot*/);
+}
+
+TEST_F(CompactionIteratorWithSnapshotCheckerTest,
+       TracksConsumedSingleDeleteForClearedPut) {
+  AddSnapshot(2, 0);
+  InitIterators(
+      {test::KeyStr("a", 2, kTypeSingleDeletion),
+       test::KeyStr("a", 1, kTypeValue), test::KeyStr("b", 1, kTypeValue)},
+      {"", "a1", "b1"}, {}, {}, kMaxSequenceNumber,
+      /*last_committed_sequence=*/2, /*merge_op=*/nullptr,
+      /*filter=*/nullptr, /*bottommost_level=*/false,
+      /*earliest_write_conflict_snapshot=*/2);
+
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(test::KeyStr("a", 2, kTypeSingleDeletion),
+            c_iter_->key().ToString());
+  EXPECT_TRUE(c_iter_->HasConsumedEarlierEntriesOfCurrentKey());
+
+  c_iter_->Next();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(test::KeyStr("a", 1, kTypeValue), c_iter_->key().ToString());
+  EXPECT_FALSE(c_iter_->IsCurrentKeyAlreadyScanned());
+  EXPECT_TRUE(c_iter_->HasConsumedEarlierEntriesOfCurrentKey());
+
+  c_iter_->Next();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(test::KeyStr("b", 1, kTypeValue), c_iter_->key().ToString());
+  EXPECT_FALSE(c_iter_->HasConsumedEarlierEntriesOfCurrentKey());
 }
 
 // Same as above but with a blob index. In addition to the value getting
@@ -1812,7 +1917,8 @@ class WideColumnEntityBlobExtractionTest : public testing::Test {
         "" /*db_session_id*/, job_id, column_family_id, column_family_name,
         write_hint, nullptr /*IOTracer*/,
         nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
-        &blob_file_paths_, &blob_file_additions_);
+        immutable_options.cf_paths.front().path, &blob_file_paths_,
+        &blob_file_additions_);
 
     // Set up the input iterator
     const Comparator* cmp = BytewiseComparator();
@@ -2252,7 +2358,8 @@ class WideColumnEntityBlobGCTest : public testing::Test {
           "" /*db_session_id*/, job_id, column_family_id, column_family_name,
           write_hint, nullptr /*IOTracer*/,
           nullptr /*BlobFileCompletionCallback*/,
-          BlobFileCreationReason::kCompaction, &blob_file_paths_,
+          BlobFileCreationReason::kCompaction,
+          immutable_options.cf_paths.front().path, &blob_file_paths_,
           &blob_file_additions_);
     }
 

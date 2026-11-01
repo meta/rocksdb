@@ -142,7 +142,7 @@ class BlockCacheTraceWriterImpl : public BlockCacheTraceWriter {
 };
 
 // Write a trace record in human readable format, see
-// https://github.com/facebook/rocksdb/wiki/Block-cache-analysis-and-simulation-tools#trace-format
+// https://github.com/meta/rocksdb/wiki/Block-cache-analysis-and-simulation-tools#trace-format
 // for details.
 class BlockCacheHumanReadableTraceWriter {
  public:
@@ -181,7 +181,7 @@ class BlockCacheTraceReader {
 };
 
 // Read a trace record in human readable format, see
-// https://github.com/facebook/rocksdb/wiki/Block-cache-analysis-and-simulation-tools#trace-format
+// https://github.com/meta/rocksdb/wiki/Block-cache-analysis-and-simulation-tools#trace-format
 // for detailed.
 class BlockCacheHumanReadableTraceReader : public BlockCacheTraceReader {
  public:

@@ -12,6 +12,7 @@
 
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
+#include "db/job_context.h"
 #include "file/filename.h"
 #include "options/options_helper.h"
 #include "port/port.h"
@@ -357,6 +358,21 @@ class ExternalSSTFileTest
     return sst_file_writer.Finish();
   }
 
+  Status GenerateAndPrepareExternalFile(
+      const Options& options,
+      std::vector<std::pair<std::string, std::string>> data,
+      std::unique_ptr<FileIngestionHandle>* handle) {
+    std::string external_file;
+    Status s =
+        GenerateExternalFileOnly(options, std::move(data), &external_file);
+    if (!s.ok()) {
+      return s;
+    }
+    return db_->PrepareFileIngestion(db_->DefaultColumnFamily(),
+                                     {external_file},
+                                     IngestExternalFileOptions(), handle);
+  }
+
  protected:
   int last_file_id_ = 0;
   bool two_phase_ingest_ = false;
@@ -427,6 +443,225 @@ TEST_F(ExternalSSTFileTest, PrepareThenCommit) {
   ASSERT_EQ("v1", Get("k1"));
   ASSERT_EQ("v2", Get("k2"));
   ASSERT_EQ("v3", Get("k3"));
+}
+
+TEST_F(ExternalSSTFileTest, PreparedIngestionDoesNotKeepUnrelatedSsts) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.avoid_unnecessary_blocking_io = false;
+  options.delete_obsolete_files_period_micros = 0;
+  for (bool commit : {false, true}) {
+    SCOPED_TRACE(commit);
+    DestroyAndReopen(options);
+
+    std::unique_ptr<FileIngestionHandle> handle;
+    ASSERT_OK(
+        GenerateAndPrepareExternalFile(options, {{"z", "prepared"}}, &handle));
+    std::vector<std::string> staged_files;
+    GetSstFiles(env_, dbname_, &staged_files);
+    ASSERT_EQ(1, staged_files.size());
+    const std::string staged_file = dbname_ + "/" + staged_files[0];
+
+    ASSERT_OK(Put("a", "old"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("a", "new"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr, nullptr,
+                                          true /* disallow_trivial_move */));
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    dbfull()->TEST_DeleteObsoleteFiles();
+
+    ASSERT_EQ(1, CountLiveFiles());
+    EXPECT_EQ(2, GetSstFileCount(dbname_));
+    ASSERT_OK(env_->FileExists(staged_file));
+    ASSERT_EQ("NOT_FOUND", Get("z"));
+    ASSERT_EQ("new", Get("a"));
+
+    if (commit) {
+      ASSERT_OK(db_->CommitFileIngestionHandle(std::move(handle)));
+      CompactRangeOptions compact_options;
+      compact_options.bottommost_level_compaction =
+          BottommostLevelCompaction::kForce;
+      ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+      ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    } else {
+      ASSERT_OK(handle->Abort());
+    }
+    dbfull()->TEST_DeleteObsoleteFiles();
+    EXPECT_TRUE(env_->FileExists(staged_file).IsNotFound());
+    ASSERT_EQ(commit ? "prepared" : "NOT_FOUND", Get("z"));
+    ASSERT_EQ(CountLiveFiles(), GetSstFileCount(dbname_));
+  }
+}
+
+TEST_F(ExternalSSTFileTest,
+       PreparedIngestionGroupedCommitDoesNotKeepObsoleteSsts) {
+  Options options = CurrentOptions();
+  options.num_levels = 2;
+  options.disable_auto_compactions = true;
+  options.avoid_unnecessary_blocking_io = false;
+  options.delete_obsolete_files_period_micros = 0;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(GenerateAndAddExternalFile(options, {{"k", "old"}}));
+  ASSERT_EQ(1, NumTableFilesAtLevel(1));
+  std::vector<std::string> old_files;
+  GetSstFiles(env_, dbname_, &old_files);
+  ASSERT_EQ(1, old_files.size());
+  std::unique_ptr<FileIngestionHandle> handle;
+  ASSERT_OK(GenerateAndPrepareExternalFile(options, {{"k", "new"}}, &handle));
+  std::vector<std::string> prepared_files;
+  GetSstFiles(env_, dbname_, &prepared_files);
+  ASSERT_EQ(2, prepared_files.size());
+  const std::string staged_file =
+      dbname_ + "/" +
+      (prepared_files[0] == old_files[0] ? prepared_files[1]
+                                         : prepared_files[0]);
+
+  SyncPoint* sync = SyncPoint::GetInstance();
+  bool first_writer = true;
+  sync->LoadDependency(
+      {{"GroupedIngestion:LeaderPaused", "GroupedIngestion:StartCommit"},
+       {"GroupedIngestion:Enqueued", "GroupedIngestion:ResumeLeader"},
+       {"GroupedIngestion:Installed", "GroupedIngestion:Compact"},
+       {"GroupedIngestion:Compacted", "GroupedIngestion:ResumeIngestion"}});
+  sync->SetCallBack("VersionSet::LogAndApply:WakeUpAndNotDone", [&](void* arg) {
+    if (first_writer) {
+      first_writer = false;
+      auto* mutex = static_cast<InstrumentedMutex*>(arg);
+      mutex->Unlock();
+      TEST_SYNC_POINT("GroupedIngestion:LeaderPaused");
+      TEST_SYNC_POINT("GroupedIngestion:ResumeLeader");
+      mutex->Lock();
+    }
+  });
+  sync->SetCallBack("VersionSet::LogAndApply:WakeUpAndDone", [&](void* arg) {
+    auto* mutex = static_cast<InstrumentedMutex*>(arg);
+    mutex->Unlock();
+    TEST_SYNC_POINT("GroupedIngestion:Installed");
+    TEST_SYNC_POINT("GroupedIngestion:ResumeIngestion");
+    mutex->Lock();
+  });
+  sync->EnableProcessing();
+
+  Status writer_status;
+  auto* cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(db_->DefaultColumnFamily())
+          ->cfd();
+  port::Thread writer_thread([&] {
+    VersionEdit edit;
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    writer_status = dbfull()->GetVersionSet()->LogAndApply(
+        cfd, ReadOptions(), WriteOptions(), &edit, dbfull()->mutex(), nullptr);
+  });
+  TEST_SYNC_POINT("GroupedIngestion:StartCommit");
+  sync->SetCallBack("VersionSet::LogAndApply:BeforeWriterWaiting", [&](void*) {
+    TEST_SYNC_POINT("GroupedIngestion:Enqueued");
+  });
+  Status ingestion_status;
+  port::Thread ingestion_thread([&] {
+    ingestion_status = db_->CommitFileIngestionHandle(std::move(handle));
+  });
+  TEST_SYNC_POINT("GroupedIngestion:Compact");
+  Status compaction_status = dbfull()->TEST_CompactRange(
+      0, nullptr, nullptr, nullptr, true /* disallow_trivial_move */);
+  dbfull()->TEST_DeleteObsoleteFiles();
+  TEST_SYNC_POINT("GroupedIngestion:Compacted");
+  ingestion_thread.join();
+  writer_thread.join();
+  sync->DisableProcessing();
+  sync->ClearAllCallBacks();
+  sync->LoadDependency({});
+
+  ASSERT_OK(writer_status);
+  ASSERT_OK(ingestion_status);
+  ASSERT_OK(compaction_status);
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  dbfull()->TEST_DeleteObsoleteFiles();
+  EXPECT_TRUE(env_->FileExists(staged_file).IsNotFound());
+  ASSERT_EQ("new", Get("k"));
+  ASSERT_EQ(1, CountLiveFiles());
+  ASSERT_EQ(1, GetSstFileCount(dbname_));
+}
+
+TEST_F(ExternalSSTFileTest, PreparedIngestionsSurvivePurgeAcrossCommit) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.avoid_unnecessary_blocking_io = false;
+  DestroyAndReopen(options);
+
+  std::unique_ptr<FileIngestionHandle> first_handle;
+  std::unique_ptr<FileIngestionHandle> second_handle;
+  ASSERT_OK(
+      GenerateAndPrepareExternalFile(options, {{"b", "first"}}, &first_handle));
+  ASSERT_OK(GenerateAndPrepareExternalFile(options, {{"z", "second"}},
+                                           &second_handle));
+
+  JobContext purge_snapshot(0);
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    dbfull()->FindObsoleteFiles(&purge_snapshot, true);
+  }
+  Status status = db_->CommitFileIngestionHandle(std::move(first_handle));
+  dbfull()->PurgeObsoleteFiles(purge_snapshot);
+  purge_snapshot.Clean();
+
+  ASSERT_OK(status);
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_EQ("first", Get("b"));
+  ASSERT_EQ("NOT_FOUND", Get("z"));
+  ASSERT_EQ(2, GetSstFileCount(dbname_));
+  ASSERT_EQ(1, CountLiveFiles());
+
+  second_handle.reset();
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_EQ(CountLiveFiles(), GetSstFileCount(dbname_));
+}
+
+TEST_F(ExternalSSTFileTest, PreparedIngestionProtectsGeneratedTombstone) {
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleUniversal;
+  options.disable_auto_compactions = true;
+  options.avoid_unnecessary_blocking_io = false;
+  options.wal_dir = alternative_wal_dir_;
+  options.db_paths.emplace_back(alternative_wal_dir_, 1024 * 1024);
+  DestroyAndReopen(options);
+
+  ASSERT_OK(GenerateAndAddExternalFile(
+      options, {{"a", "old-a"}, {"b", "old-b"}, {"f", "old-f"}}));
+  std::string replacement_file;
+  ASSERT_OK(
+      GenerateExternalFileOnly(options, {{"c", "new-c"}}, &replacement_file));
+  IngestExternalFileArg arg;
+  arg.column_family = db_->DefaultColumnFamily();
+  arg.external_files = {replacement_file};
+  arg.options.snapshot_consistency = false;
+  arg.atomic_replace_range = {{"b", "e"}};
+  std::unique_ptr<FileIngestionHandle> handle;
+  SyncPoint* sync = SyncPoint::GetInstance();
+  bool purged_during_prepare = false;
+  sync->SetCallBack("ExternalSstFileIngestionJob::BeforeSyncDir", [&](void*) {
+    dbfull()->TEST_DeleteObsoleteFiles();
+    purged_during_prepare = true;
+  });
+  sync->EnableProcessing();
+  Status status = db_->PrepareFileIngestion({arg}, &handle);
+  sync->DisableProcessing();
+  sync->ClearAllCallBacks();
+  ASSERT_OK(status);
+  ASSERT_TRUE(purged_during_prepare);
+
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_EQ(1, CountLiveFiles());
+  ASSERT_EQ(3, GetSstFileCount(alternative_wal_dir_));
+  ASSERT_EQ("old-b", Get("b"));
+  ASSERT_EQ("NOT_FOUND", Get("c"));
+
+  ASSERT_OK(db_->CommitFileIngestionHandle(std::move(handle)));
+  ASSERT_EQ("old-a", Get("a"));
+  ASSERT_EQ("NOT_FOUND", Get("b"));
+  ASSERT_EQ("new-c", Get("c"));
+  ASSERT_EQ("old-f", Get("f"));
 }
 
 TEST_F(ExternalSSTFileTest,

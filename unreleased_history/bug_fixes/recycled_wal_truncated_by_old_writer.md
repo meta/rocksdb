@@ -1,0 +1,1 @@
+Fixed a race with `recycle_log_file_num > 0` where an obsolete WAL could be reused for a new WAL while its old writer was still open. Closing the old writer then truncated the reused file to the old WAL's size, so writes in the new WAL past that point, including acknowledged `sync` writes, were lost on the next reopen.

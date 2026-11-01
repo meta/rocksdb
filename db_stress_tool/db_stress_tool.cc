@@ -121,6 +121,63 @@ int ValidateFileScopedWalWriteFaultFlags() {
   return 0;
 }
 
+int ValidateCfLifecycleFlags() {
+  if (FLAGS_cf_lifecycle_fault_target < 0 ||
+      FLAGS_cf_lifecycle_fault_target > 2) {
+    return ReturnValidationError(
+        "--cf_lifecycle_fault_target must be 0, 1, or 2");
+  }
+  if (!FLAGS_test_cf_lifecycle) {
+    if (FLAGS_cf_lifecycle_fault_target != 0) {
+      return ReturnValidationError(
+          "--cf_lifecycle_fault_target requires --test_cf_lifecycle");
+    }
+    return 0;
+  }
+  if (FLAGS_column_families != 2 || FLAGS_num_dbs != 1 || FLAGS_threads != 1 ||
+      FLAGS_read_only || FLAGS_test_batches_snapshots ||
+      FLAGS_test_cf_consistency || FLAGS_test_multi_ops_txns || FLAGS_use_txn ||
+      FLAGS_use_optimistic_txn || FLAGS_best_efforts_recovery ||
+      FLAGS_ttl != -1 || FLAGS_use_blob_db || FLAGS_enable_blob_files ||
+      FLAGS_enable_blob_direct_write ||
+      FLAGS_allow_setting_blob_options_dynamically || FLAGS_test_secondary ||
+      FLAGS_remote_compaction_worker_threads != 0 ||
+      FLAGS_verify_before_write || !FLAGS_skip_verifydb ||
+      !FLAGS_verify_cpu_corruption_dir.empty() ||
+      FLAGS_open_read_only_one_in > 0 || FLAGS_reopen != 0 ||
+      FLAGS_reuse_manifest_on_open || !FLAGS_options_file.empty() ||
+      !FLAGS_expected_values_dir.empty() || !FLAGS_env_uri.empty() ||
+      !FLAGS_fs_uri.empty()) {
+    return ReturnValidationError(
+        "--test_cf_lifecycle requires exactly two column families, one worker "
+        "thread, one local read-write plain DB, reopen=0, MANIFEST reuse "
+        "disabled, and no remote compaction, "
+        "batch/CF-consistency/multi-op transaction, best-efforts recovery, "
+        "TTL, BlobDB or dynamic blob options, persistent/fresh-state "
+        "verification, secondary/read-only opens, or options-file mode");
+  }
+  if (FLAGS_cf_lifecycle_fault_target != 0 &&
+      (!FLAGS_track_options_file_number_in_manifest ||
+       FLAGS_clear_column_family_one_in <= 0)) {
+    return ReturnValidationError(
+        "targeted CF lifecycle faults require tracked OPTIONS and "
+        "--clear_column_family_one_in > 0");
+  }
+  if (FLAGS_sync_fault_injection || FLAGS_read_fault_one_in > 0 ||
+      FLAGS_write_fault_one_in > 0 || FLAGS_metadata_read_fault_one_in > 0 ||
+      FLAGS_metadata_write_fault_one_in > 0 ||
+      FLAGS_open_read_fault_one_in > 0 || FLAGS_open_write_fault_one_in > 0 ||
+      FLAGS_open_metadata_read_fault_one_in > 0 ||
+      FLAGS_open_metadata_write_fault_one_in > 0 ||
+      FLAGS_secondary_cache_fault_one_in > 0 ||
+      FLAGS_file_scope_wal_write_faults) {
+    return ReturnValidationError(
+        "--test_cf_lifecycle requires unrelated fault injection to be "
+        "disabled");
+  }
+  return 0;
+}
+
 int DestroyAllDbs() {
   bool all_ok = true;
   const int num_dbs = FLAGS_num_dbs;
@@ -246,6 +303,12 @@ int db_stress_tool(int argc, char** argv) {
   }
   {
     int rc = ValidateFileScopedWalWriteFaultFlags();
+    if (rc != 0) {
+      return rc;
+    }
+  }
+  {
+    int rc = ValidateCfLifecycleFlags();
     if (rc != 0) {
       return rc;
     }

@@ -256,9 +256,6 @@ class TestFs : public FileSystemWrapper {
     limit_written_files_--;
     IOStatus s = FileSystemWrapper::NewWritableFile(f, file_opts, r, dbg);
     if (s.ok()) {
-      if ((*r)->use_direct_io()) {
-        ++num_direct_writers_;
-      }
       ++num_writers_;
     }
     return s;
@@ -421,7 +418,6 @@ class TestFs : public FileSystemWrapper {
     num_seq_readers_ = 0;
     num_direct_seq_readers_ = 0;
     num_writers_ = 0;
-    num_direct_writers_ = 0;
   }
 
   int num_rand_readers() { return num_rand_readers_; }
@@ -429,8 +425,6 @@ class TestFs : public FileSystemWrapper {
   int num_seq_readers() { return num_seq_readers_; }
   int num_direct_seq_readers() { return num_direct_seq_readers_; }
   int num_writers() { return num_writers_; }
-  // FIXME(?): unused
-  int num_direct_writers() { return num_direct_writers_; }
 
  private:
   port::Mutex mutex_;
@@ -454,7 +448,6 @@ class TestFs : public FileSystemWrapper {
   std::atomic<int> num_seq_readers_{};
   std::atomic<int> num_direct_seq_readers_{};
   std::atomic<int> num_writers_{};
-  std::atomic<int> num_direct_writers_{};
 };  // TestFs
 
 class FileManager : public EnvWrapper {
@@ -3631,7 +3624,7 @@ TEST_F(BackupEngineTest, ChangeManifestDuringBackupCreation) {
   AssertBackupConsistency(0, 0, 100);
 }
 
-// see https://github.com/facebook/rocksdb/issues/921
+// see https://github.com/meta/rocksdb/issues/921
 TEST_F(BackupEngineTest, Issue921Test) {
   BackupEngine* backup_engine;
   engine_options_->share_table_files = false;

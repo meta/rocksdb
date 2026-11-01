@@ -3955,7 +3955,7 @@ class FSBufferPrefetchTest
             // the read data. We can have the FSAllocationPtr point to a
             // wrapper around the result buffer in our test implementation so
             // that we can catch whenever we incorrectly make this assumption.
-            // See https://github.com/facebook/rocksdb/pull/13189 for more
+            // See https://github.com/meta/rocksdb/pull/13189 for more
             // context.
             char* internalData = new char[req.len];
             req.status = Read(req.offset, req.len, options, &req.result,

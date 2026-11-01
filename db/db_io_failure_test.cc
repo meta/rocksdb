@@ -99,7 +99,7 @@ class CorruptionFS : public FileSystemWrapper {
         for (size_t i = 0; i < num_reqs; ++i) {
           FSReadRequest& req = reqs[i];
           if (fs_.fs_buffer_) {
-            // See https://github.com/facebook/rocksdb/pull/13195 for why we
+            // See https://github.com/meta/rocksdb/pull/13195 for why we
             // want to set up our test implementation for FSAllocationPtr this
             // way.
             char* internalData = new char[req.len];
@@ -224,8 +224,6 @@ class CorruptionFS : public FileSystemWrapper {
   }
 
   bool VerifyRetry() { return corrupt_len_ > 0 && corrupt_fname_.empty(); }
-
-  int read_count() { return read_count_; }
 
   int corruption_trigger() { return corruption_trigger_; }
 

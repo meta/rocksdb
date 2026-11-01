@@ -20,7 +20,6 @@
 #include "db/db_test_util.h"
 #include "env/unique_id_gen.h"
 #include "port/stack_trace.h"
-#include "rocksdb/persistent_cache.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/table.h"
 #include "rocksdb/table_properties.h"
@@ -240,53 +239,6 @@ TEST_F(DBBlockCacheTest, TestWithoutCompressedBlockCache) {
 #ifdef SNAPPY
 
 namespace {
-class PersistentCacheFromCache : public PersistentCache {
- public:
-  PersistentCacheFromCache(std::shared_ptr<Cache> cache, bool read_only)
-      : cache_(cache), read_only_(read_only) {}
-
-  Status Insert(const Slice& key, const char* data,
-                const size_t size) override {
-    if (read_only_) {
-      return Status::NotSupported();
-    }
-    std::unique_ptr<char[]> copy{new char[size]};
-    std::copy_n(data, size, copy.get());
-    Status s = cache_.Insert(key, copy.get(), size);
-    if (s.ok()) {
-      copy.release();
-    }
-    return s;
-  }
-
-  Status Lookup(const Slice& key, std::unique_ptr<char[]>* data,
-                size_t* size) override {
-    auto handle = cache_.Lookup(key);
-    if (handle) {
-      char* ptr = cache_.Value(handle);
-      *size = cache_.get()->GetCharge(handle);
-      data->reset(new char[*size]);
-      std::copy_n(ptr, *size, data->get());
-      cache_.Release(handle);
-      return Status::OK();
-    } else {
-      return Status::NotFound();
-    }
-  }
-
-  bool IsCompressed() override { return false; }
-
-  StatsType Stats() override { return StatsType(); }
-
-  std::string GetPrintableOptions() const override { return ""; }
-
-  uint64_t NewId() override { return cache_.get()->NewId(); }
-
- private:
-  BasicTypedSharedCacheInterface<char[], CacheEntryRole::kMisc> cache_;
-  bool read_only_;
-};
-
 class ReadOnlyCacheWrapper : public CacheWrapper {
  public:
   using CacheWrapper::CacheWrapper;

@@ -60,6 +60,31 @@ DEFAULT_LIVENESS_NO_PROGRESS_TIMEOUT_SEC = 300
 REMOTE_DB_LIVENESS_TIMEOUT_MULTIPLIER = 2
 _FAULT_INJECTION_LOG_DIR_NAME = "fault_injection_logs"
 _STRESS_DIAGNOSTICS_DIR_NAME = "rocksdb_crashtest_diagnostics"
+_EXPECTED_CF_LIFECYCLE_FAULT_EXIT_CODE = 86
+_CF_LIFECYCLE_FAULT_MARKERS = {
+    1: "EXPECTED_CF_LIFECYCLE_FAULT target=options",
+    2: "EXPECTED_CF_LIFECYCLE_FAULT target=manifest",
+}
+_CF_LIFECYCLE_SUCCESS_MARKER = "CF_LIFECYCLE_SUCCESS"
+_CF_LIFECYCLE_MIN_COVERAGE = {"options": 1, "manifest": 1, "success": 2}
+# fault target, tracking enabled, clear-CF frequency. A faulted run is always
+# followed by a run that validates recovery before performing more topology
+# changes. The disabled run covers enabled -> disabled recovery, while the last
+# run covers enabled recovery and successful repeated lifecycle operations.
+_CF_LIFECYCLE_SCHEDULE = (
+    (1, 1, 1),
+    (0, 0, 0),
+    (2, 1, 1),
+    (0, 1, 100),
+)
+_CF_LIFECYCLE_AUTHORITATIVE_FLAGS = (
+    "cf_lifecycle_fault_target",
+    "track_options_file_number_in_manifest",
+    "clear_column_family_one_in",
+    "destroy_db_initially",
+    "max_key",
+    "log2_keys_per_lock",
+)
 _MAX_STRESS_DIAGNOSTIC_PROCESS_GROUPS = 8
 _STRESS_DIAGNOSTIC_FILE_RE = re.compile(
     r"^[A-Za-z0-9_.-]*\.pid_([0-9]+)\.thread_[0-9]+(?:"
@@ -627,6 +652,7 @@ default_params = {
     "remote_compaction_worker_threads": lambda: random.choice([0, 8]),
     "allow_resumption_one_in": lambda: random.choice([0, 1, 2, 20]),
     "remote_compaction_failure_fall_back_to_local": lambda: random.choice([0, 1]),
+    "use_separate_remote_compaction_pool": lambda: random.choice([0, 1]),
     "auto_refresh_iterator_with_snapshot": lambda: random.choice([0, 1]),
     "memtable_op_scan_flush_trigger": lambda: random.choice([0, 10, 100, 1000]),
     "memtable_avg_op_scan_flush_trigger": lambda: random.choice([0, 2, 20, 200]),
@@ -905,7 +931,7 @@ whitebox_default_params = {
 # enough for long liveness runs. The C++ abort/resume path is additionally
 # gated on completed compaction progress and backs off when write stall pressure
 # is already visible.
-liveness_fault_injection_params = {
+no_fault_injection_params = {
     "error_recovery_with_no_fault_injection": 0,
     "exclude_wal_from_write_fault_injection": 0,
     "file_scope_wal_write_faults": 0,
@@ -929,7 +955,7 @@ liveness_default_params = {
     "ops_per_thread": 100000000,
     "progress_reports": 1,
 }
-liveness_default_params.update(liveness_fault_injection_params)
+liveness_default_params.update(no_fault_injection_params)
 
 
 def liveness_default_timeout_sec():
@@ -1045,6 +1071,101 @@ cf_consistency_params = {
     "verify_iterator_with_expected_state_one_in": 0,
     "memtablerep": random.choice(["skip_list"] * 9 + ["vector"]),
 }
+
+cf_lifecycle_params = {
+    "test_cf_lifecycle": 1,
+    "cf_lifecycle_fault_target": 0,
+    "column_families": 2,
+    "threads": 1,
+    "clear_column_family_one_in": 100,
+    "track_options_file_number_in_manifest": 1,
+    # FaultInjectionTestFS cannot wrap an existing MANIFEST reopened from a
+    # prior process. Create a fresh MANIFEST at open so its subsequent CF edit
+    # always crosses the targeted write-fault wrapper.
+    "reuse_manifest_on_open": 0,
+    # This profile deliberately does not use a persistent expected-values
+    # directory because clear_column_family_one_in is incompatible with it.
+    # Restrict the workload to writes and disable data verification so a
+    # restart does not compare the retained DB contents against a fresh
+    # in-memory expected state. The lifecycle consistency oracle still runs
+    # before every writable open, including verification_only runs.
+    "readpercent": 0,
+    "prefixpercent": 0,
+    "writepercent": 100,
+    "delpercent": 0,
+    "delrangepercent": 0,
+    "iterpercent": 0,
+    "customopspercent": 0,
+    "nooverwritepercent": 0,
+    "skip_verifydb": 1,
+    "verify_db_one_in": 0,
+    "continuous_verification_interval": 0,
+    "verify_iterator_with_expected_state_one_in": 0,
+    "acquire_snapshot_one_in": 0,
+    "key_may_exist_one_in": 0,
+    "use_multiget": 0,
+    "use_get_entity": 0,
+    "use_multi_get_entity": 0,
+    "use_attribute_group": 0,
+    "use_multi_cf_iterator": 0,
+    "use_multiscan": 0,
+    "use_async_db_api": 0,
+    "use_merge": 0,
+    "use_put_entity_one_in": 0,
+    "use_timed_put_one_in": 0,
+    "use_write_buffer_manager": 0,
+    "wbm_flush_policy": 0,
+    # Keep the profile focused on foreground writes and CF metadata changes.
+    # Random maintenance APIs can outlive the blackbox SIGTERM grace period
+    # and obscure the restart result with shutdown-only failures.
+    "ingest_external_file_one_in": 0,
+    "set_options_one_in": 0,
+    "compact_files_one_in": 0,
+    "compact_range_one_in": 0,
+    "flush_one_in": 0,
+    "mark_for_compaction_one_file_in": 0,
+    "pause_background_one_in": 0,
+    "disable_file_deletions_one_in": 0,
+    "disable_manual_compaction_one_in": 0,
+    "reset_stats_one_in": 0,
+    "get_property_one_in": 0,
+    "get_properties_of_all_tables_one_in": 0,
+    "get_live_files_apis_one_in": 0,
+    "get_all_column_family_metadata_one_in": 0,
+    "verify_checksum_one_in": 0,
+    "verify_file_checksums_one_in": 0,
+    "verify_manifest_content_on_close": 0,
+    "long_running_snapshots": 0,
+    "periodic_compaction_seconds": 0,
+    "compaction_ttl": 0,
+    "preserve_internal_time_seconds": 0,
+    "remote_compaction_worker_threads": 0,
+    "manual_wal_flush_one_in": 0,
+    "sync_wal_one_in": 0,
+    "lock_wal_one_in": 0,
+    "disable_wal": 0,
+    "reopen": 0,
+    "read_only": 0,
+    "test_batches_snapshots": 0,
+    "test_cf_consistency": 0,
+    "test_multi_ops_txns": 0,
+    "use_txn": 0,
+    "use_optimistic_txn": 0,
+    "ttl": -1,
+    "use_blob_db": 0,
+    "enable_blob_files": 0,
+    "enable_blob_direct_write": 0,
+    "test_secondary": 0,
+    "open_read_only_one_in": 0,
+    "backup_one_in": 0,
+    "checkpoint_one_in": 0,
+    "parallel_checkpoint_one_in": 0,
+    "subset_cf_checkpoint_one_in": 0,
+    "abort_and_resume_compactions_one_in": 0,
+    "abort_and_resume_cf_compactions_one_in": 0,
+    "num_dbs": 1,
+}
+cf_lifecycle_params.update(no_fault_injection_params)
 
 # For pessimistic transaction db
 txn_params = {
@@ -1255,7 +1376,7 @@ multiops_txn_params = {
     # values will be sanitized to 65536 during db open. SetOptions currently
     # does not sanitize options, but very small write_buffer_size may cause
     # assertion failure in
-    # https://github.com/facebook/rocksdb/blob/7.0.fb/db/memtable.cc#L117.
+    # https://github.com/meta/rocksdb/blob/7.0.fb/db/memtable.cc#L117.
     "write_buffer_size": 65536,
     # flush more frequently to generate more files, thus trigger more
     # compactions.
@@ -1471,10 +1592,6 @@ def finalize_and_sanitize(src_params):
 
     # Remote Compaction Incompatible Tests and Features
     if dest_params.get("remote_compaction_worker_threads", 0) > 0:
-        # TODO Fix races when both Remote Compaction + BlobDB enabled
-        dest_params["enable_blob_files"] = 0
-        dest_params["enable_blob_garbage_collection"] = 0
-        dest_params["allow_setting_blob_options_dynamically"] = 0
         # Disable Incompatible Ones
         dest_params["inplace_update_support"] = 0
         dest_params["checkpoint_one_in"] = 0
@@ -1505,14 +1622,12 @@ def finalize_and_sanitize(src_params):
         dest_params["open_read_fault_one_in"] = 0
         dest_params["sync_fault_injection"] = 0
 
-    # UDI now supports all operation types and all iteration directions.
-    # Only parallel compression and mmap_read remain incompatible.
+    # UDI is compatible with all operation types and iteration directions
+    # except mmap_read.
     if dest_params.get("use_trie_index") == 1:
         # Trie UDI uses zero-copy pointers into block data, which is
         # incompatible with mmap_read.
         dest_params["mmap_read"] = 0
-        # Parallel compression is incompatible with UDI
-        dest_params["compression_parallel_threads"] = 1
         if dest_params.get("use_udi_as_primary_index") == 1:
             # Primary UDI mode: the standard index is still fully populated,
             # but partitioned index (kTwoLevelIndexSearch) and partitioned
@@ -2020,6 +2135,18 @@ def finalize_and_sanitize(src_params):
         dest_params["clear_column_family_one_in"] = 0
         dest_params["test_multi_ops_txns"] = 0
 
+    if dest_params.get("test_cf_lifecycle", 0):
+        # LockColumnFamily() can acquire many expected-state key locks at once.
+        # Bound that lock set so TSAN's deadlock detector can observe the CF
+        # lifecycle path without exceeding its implementation-specific lock
+        # limit. DB operations remain concurrent; this only coarsens the stress
+        # harness's expected-state locking.
+        max_key = max(1, dest_params["max_key"])
+        log2_keys_per_lock = 0
+        while max_key >> log2_keys_per_lock > 16:
+            log2_keys_per_lock += 1
+        dest_params["log2_keys_per_lock"] = log2_keys_per_lock
+
     # Occasionally shrink block, readahead and cache together so the
     # SeekToFirst()-after-Seek() iterator coverage can trim readahead across a
     # block boundary. Runs last so the tiered-cache split above sees the
@@ -2063,6 +2190,8 @@ def gen_cmd_params(args, unknown_params=None):
             params.update(whitebox_simple_default_params)
     if args.cf_consistency:
         params.update(cf_consistency_params)
+    if args.cf_lifecycle:
+        params.update(cf_lifecycle_params)
     if args.txn:
         params.update(txn_params)
     if args.optimistic_txn:
@@ -2085,6 +2214,7 @@ def gen_cmd_params(args, unknown_params=None):
         and not args.test_tiered_storage
         and not args.test_full_external_table
         and args.test_type != "liveness"
+        and not args.cf_lifecycle
         and params.get("test_secondary", 0) == 0
         and random.choice([0] * 9 + [1]) == 1
     ):
@@ -2118,6 +2248,7 @@ def gen_cmd_params(args, unknown_params=None):
         "disable_wal",
         "manual_wal_flush_one_in",
         "test_cf_consistency",
+        "test_cf_lifecycle",
         "use_txn",
         "test_multi_ops_txns",
         "test_batches_snapshots",
@@ -2161,6 +2292,7 @@ def gen_cmd_params(args, unknown_params=None):
         and not has_unparsed_file_scope_args
         and args.test_type != "liveness"
         and not args.cf_consistency
+        and not args.cf_lifecycle
         and not args.txn
         and not args.optimistic_txn
         and not args.test_best_efforts_recovery
@@ -2174,7 +2306,7 @@ def gen_cmd_params(args, unknown_params=None):
         params["file_scope_wal_write_faults"] = 1
     if args.test_type == "liveness":
         apply_liveness_remote_defaults(params, args)
-        params.update(liveness_fault_injection_params)
+        params.update(no_fault_injection_params)
 
     # DB paths must not change between the crash and recovery processes.
     wbm_flush_policy = params["wbm_flush_policy"]
@@ -2208,6 +2340,14 @@ def gen_cmd(params, unknown_params):
         else:
             for i in range(num_dbs):
                 os.makedirs(os.path.join(ev_val, "db_" + str(i)), exist_ok=True)
+    unknown_params = list(unknown_params)
+    lifecycle_mode_arg = (
+        f"--test_cf_lifecycle={finalzied_params.get('test_cf_lifecycle', 0)}"
+    )
+    if "--" in unknown_params:
+        unknown_params.insert(unknown_params.index("--"), lifecycle_mode_arg)
+    else:
+        unknown_params.append(lifecycle_mode_arg)
     cmd = (
         [stress_cmd]
         + [
@@ -2221,6 +2361,7 @@ def gen_cmd(params, unknown_params):
                 "interval",
                 "random_kill_odd",
                 "cf_consistency",
+                "cf_lifecycle",
                 "txn",
                 "optimistic_txn",
                 "test_best_efforts_recovery",
@@ -2237,6 +2378,11 @@ def gen_cmd(params, unknown_params):
         ]
         + unknown_params
     )
+    if finalzied_params.get("test_cf_lifecycle"):
+        cmd.extend(
+            f"--{name}={finalzied_params[name]}"
+            for name in _CF_LIFECYCLE_AUTHORITATIVE_FLAGS
+        )
     return cmd, finalzied_params
 
 
@@ -2737,18 +2883,56 @@ def liveness_main(args, unknown_args):
     cleanup_after_success(cmd_params["db"], num_dbs)
 
 
+def cf_lifecycle_iteration_overrides(iteration):
+    fault_target, tracking, clear_one_in = _CF_LIFECYCLE_SCHEDULE[
+        iteration % len(_CF_LIFECYCLE_SCHEDULE)
+    ]
+    return {
+        "cf_lifecycle_fault_target": fault_target,
+        "track_options_file_number_in_manifest": tracking,
+        "clear_column_family_one_in": clear_one_in,
+    }
+
+
+def expected_cf_lifecycle_fault_observed(params, hit_timeout, retcode, stdout):
+    marker = _CF_LIFECYCLE_FAULT_MARKERS.get(
+        params.get("cf_lifecycle_fault_target", 0)
+    )
+    return (
+        marker is not None
+        and not hit_timeout
+        and retcode == _EXPECTED_CF_LIFECYCLE_FAULT_EXIT_CODE
+        and marker in stdout.splitlines()
+    )
+
+
+def count_cf_lifecycle_successes(stdout):
+    return sum(line == _CF_LIFECYCLE_SUCCESS_MARKER for line in stdout.splitlines())
+
+
+def missing_cf_lifecycle_coverage(coverage):
+    return [
+        name
+        for name, minimum in _CF_LIFECYCLE_MIN_COVERAGE.items()
+        if coverage.get(name, 0) < minimum
+    ]
+
+
+def cf_lifecycle_final_verification_failed(args, hit_timeout, retcode):
+    return args.cf_lifecycle and (hit_timeout or retcode != 0)
+
+
 # This script runs and kills db_stress multiple times. It checks consistency
 # in case of unsafe crashes in RocksDB.
 def blackbox_crash_main(args, unknown_args):
     cmd_params = gen_cmd_params(args, unknown_args)
     db_parent_dir = get_db_parent_dir("blackbox")
-    ev_parent_dir = get_ev_parent_dir()
     num_dbs = cmd_params.get("num_dbs", 1)
 
     if not cmd_params.get("db"):
         cmd_params["db"] = db_parent_dir
-    if not cmd_params.get("expected_values_dir"):
-        cmd_params["expected_values_dir"] = ev_parent_dir
+    if not args.cf_lifecycle and not cmd_params.get("expected_values_dir"):
+        cmd_params["expected_values_dir"] = get_ev_parent_dir()
     set_default_stress_diagnostics_dir(cmd_params)
 
     exit_time = time.time() + cmd_params["duration"]
@@ -2763,9 +2947,20 @@ def blackbox_crash_main(args, unknown_args):
         + "\n"
     )
 
+    cf_lifecycle_iteration = 0
+    cf_lifecycle_coverage = {"options": 0, "manifest": 0, "success": 0}
+
     while time.time() < exit_time:
         apply_random_seed_per_iteration()
-        cmd, finalized_params = gen_cmd(dict(list(cmd_params.items())), unknown_args)
+        additional_opts = {}
+        if args.cf_lifecycle:
+            additional_opts = cf_lifecycle_iteration_overrides(
+                cf_lifecycle_iteration
+            )
+        cmd, finalized_params = gen_cmd(
+            dict(list(cmd_params.items()) + list(additional_opts.items())),
+            unknown_args,
+        )
 
         hit_timeout, retcode, outs, errs, pid = execute_cmd(cmd, cmd_params["interval"])
 
@@ -2773,6 +2968,25 @@ def blackbox_crash_main(args, unknown_args):
         # Reset destroy_db_initially after each run (it may have been set by
         # command line for first run only)
         cmd_params["destroy_db_initially"] = 0
+
+        fault_target = finalized_params.get("cf_lifecycle_fault_target", 0)
+        if args.cf_lifecycle and fault_target != 0:
+            print_run_output_and_exit_on_error(
+                args, finalized_params, outs, errs, hit_timeout
+            )
+            if not expected_cf_lifecycle_fault_observed(
+                finalized_params, hit_timeout, retcode, outs
+            ):
+                print(
+                    "TEST FAILED. Targeted CF lifecycle fault was not "
+                    "observed as expected\n"
+                )
+                sys.exit(2)
+            target_name = "options" if fault_target == 1 else "manifest"
+            cf_lifecycle_coverage[target_name] += 1
+            cf_lifecycle_iteration += 1
+            time.sleep(1)
+            continue
 
         if not hit_timeout:
             print("Exit Before Killing")
@@ -2785,15 +2999,37 @@ def blackbox_crash_main(args, unknown_args):
             args, finalized_params, outs, errs, hit_timeout
         )
 
-        time.sleep(1)  # time to stabilize before the next run
+        if args.cf_lifecycle:
+            cf_lifecycle_coverage["success"] += count_cf_lifecycle_successes(outs)
+        cf_lifecycle_iteration += 1
 
         time.sleep(1)  # time to stabilize before the next run
 
-    # We should run the test one more time with VerifyOnly setup and no-timeout
-    # Only do this if the tests are not failed for total-duration
+    if args.cf_lifecycle:
+        missing_coverage = missing_cf_lifecycle_coverage(cf_lifecycle_coverage)
+        if missing_coverage:
+            print(
+                "TEST FAILED. Missing CF lifecycle coverage: "
+                + ", ".join(missing_coverage)
+                + "\n"
+            )
+            sys.exit(2)
+        print("CF lifecycle coverage: %s\n" % cf_lifecycle_coverage)
+
+    # Run one final verification process. Lifecycle mode requires it to finish
+    # before the wrapper timeout; ordinary profiles keep legacy timeout handling.
     print("Running final time for verification")
     cmd_params.update({"verification_only": 1})
     cmd_params.update({"skip_verifydb": 0})
+    if args.cf_lifecycle:
+        cmd_params.update(
+            {
+                "cf_lifecycle_fault_target": 0,
+                "track_options_file_number_in_manifest": 1,
+                "clear_column_family_one_in": 0,
+                "skip_verifydb": 1,
+            }
+        )
 
     cmd, finalized_params = gen_cmd(dict(list(cmd_params.items())), unknown_args)
     hit_timeout, retcode, outs, errs, pid = execute_cmd(
@@ -2803,7 +3039,15 @@ def blackbox_crash_main(args, unknown_args):
     print_fault_injection_log(pid)
 
     # For the final run
-    print_run_output_and_exit_on_error(args, finalized_params, outs, errs)
+    print_run_output_and_exit_on_error(
+        args, finalized_params, outs, errs, hit_timeout
+    )
+    if cf_lifecycle_final_verification_failed(args, hit_timeout, retcode):
+        print(
+            "TEST FAILED. Final verification did not complete successfully: "
+            "hit_timeout=%s retcode=%d\n" % (hit_timeout, retcode)
+        )
+        sys.exit(2)
 
     # we need to clean up after ourselves -- only do this on test success
     cleanup_after_success(cmd_params["db"], num_dbs)
@@ -2905,7 +3149,7 @@ def whitebox_crash_main(args, unknown_args):
                 "compaction_style": 2,
             }
             # TODO: test transition from non-FIFO to FIFO with num_levels > 1.
-            # See https://github.com/facebook/rocksdb/pull/10348
+            # See https://github.com/meta/rocksdb/pull/10348
             # For now, tiered storage FIFO (file_temperature_age_thresholds)
             # requires num_levels == 1 and non-tiered operates that way.
             if args.test_tiered_storage:
@@ -3006,6 +3250,7 @@ def main():
     parser.add_argument("test_type", choices=["blackbox", "whitebox", "liveness"])
     parser.add_argument("--simple", action="store_true")
     parser.add_argument("--cf_consistency", action="store_true")
+    parser.add_argument("--cf_lifecycle", action="store_true")
     parser.add_argument("--txn", action="store_true")
     parser.add_argument("--optimistic_txn", action="store_true")
     parser.add_argument("--test_best_efforts_recovery", action="store_true")
@@ -3038,6 +3283,7 @@ def main():
         + list(multiops_txn_params.items())
         + list(best_efforts_recovery_params.items())
         + list(cf_consistency_params.items())
+        + list(cf_lifecycle_params.items())
         + list(tiered_params.items())
         + list(full_external_table_params.items())
         + list(txn_params.items())
@@ -3049,6 +3295,20 @@ def main():
     # unknown_args are passed directly to db_stress
 
     args, unknown_args = parser.parse_known_args(remain_args)
+    if (
+        args.test_cf_lifecycle is not None
+        or args.cf_lifecycle_fault_target is not None
+    ):
+        parser.error(
+            "--test_cf_lifecycle and --cf_lifecycle_fault_target are managed "
+            "by --cf_lifecycle"
+        )
+    if args.cf_lifecycle and args.test_type != "blackbox":
+        parser.error("--cf_lifecycle currently requires blackbox mode")
+    if args.cf_lifecycle and args.cf_consistency:
+        parser.error("--cf_lifecycle cannot be combined with --cf_consistency")
+    if args.cf_lifecycle and "--" in unknown_args:
+        parser.error("--cf_lifecycle does not support the -- argument terminator")
     multiplier = args.cache_and_write_buffer_size_multiplier
     if multiplier is not None and (not math.isfinite(multiplier) or multiplier <= 0):
         parser.error(

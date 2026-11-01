@@ -1,0 +1,1 @@
+With `ReadOptions::async_io`, `MultiGet` now reads data blocks of direct-IO files with asynchronous reads (`FSRandomAccessFile::ReadAsync`) instead of a synchronous `MultiRead`. Each block read is aligned separately rather than merged with adjacent reads. The bytes read are still charged to `DBOptions::rate_limiter` at `ReadOptions::rate_limiter_priority`.

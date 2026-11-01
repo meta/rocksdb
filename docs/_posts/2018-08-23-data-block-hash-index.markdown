@@ -88,7 +88,7 @@ As we use `uint8_t` to store binary seek index, i.e. restart interval index, the
 
 Data block hash index only supports point lookup. We do not support range lookup. Range lookup request will fall back to BinarySeek.
 
-RocksDB supports many types of records, such as `Put`, `Delete`, `Merge`, etc (visit [here](https://github.com/facebook/rocksdb/wiki/rocksdb-basics) for more information). Currently we only support `Put` and `Delete`, but not `Merge`. Internally we have a limited set of supported record types:
+RocksDB supports many types of records, such as `Put`, `Delete`, `Merge`, etc (visit [here](https://github.com/meta/rocksdb/wiki/rocksdb-basics) for more information). Currently we only support `Put` and `Delete`, but not `Merge`. Internally we have a limited set of supported record types:
 
 
 ```

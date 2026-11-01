@@ -1,0 +1,1 @@
+Added experimental `DB::GetEntityWithMetadata()` and `DB::MultiGetEntityWithMetadata()`, the wide-column entity counterparts of `DB::GetWithMetadata()` and `DB::MultiGetWithMetadata()` with opt-in explicit-snapshot newer-version detection. Requesting key timestamps returns `NotSupported`.

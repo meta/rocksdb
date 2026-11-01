@@ -1971,13 +1971,10 @@ TEST_F(DBPropertiesTest, MinObsoleteSstNumberToKeep) {
 
     void SetDB(DB* db) { db_ = db; }
 
-    int GetNumCompactions() { return num_compactions_; }
-
     // True if we've verified the property for at least one output file
     bool Validated() { return validated_; }
 
    private:
-    int num_compactions_ = 0;
     bool validated_ = false;
     DB* db_ = nullptr;
   };

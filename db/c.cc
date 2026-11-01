@@ -4952,6 +4952,11 @@ int rocksdb_compactionjobinfo_job_id(const rocksdb_compactionjobinfo_t* info) {
   return info->rep.job_id;
 }
 
+unsigned char rocksdb_compactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_compactionjobinfo_t* info) {
+  return info->rep.use_separate_remote_compaction_pool;
+}
+
 int rocksdb_compactionjobinfo_num_l0_files(
     const rocksdb_compactionjobinfo_t* info) {
   return info->rep.num_l0_files;
@@ -5013,6 +5018,11 @@ uint64_t rocksdb_subcompactionjobinfo_thread_id(
 int rocksdb_subcompactionjobinfo_job_id(
     const rocksdb_subcompactionjobinfo_t* info) {
   return info->rep.job_id;
+}
+
+unsigned char rocksdb_subcompactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_subcompactionjobinfo_t* info) {
+  return info->rep.use_separate_remote_compaction_pool;
 }
 
 int rocksdb_subcompactionjobinfo_subcompaction_job_id(
@@ -10258,6 +10268,16 @@ const char* rocksdb_options_get_db_host_id(rocksdb_options_t* opt,
   return opt->rep.db_host_id.data();
 }
 
+void rocksdb_options_set_use_separate_remote_compaction_pool(
+    rocksdb_options_t* opt, unsigned char v) {
+  opt->rep.use_separate_remote_compaction_pool = v;
+}
+
+unsigned char rocksdb_options_get_use_separate_remote_compaction_pool(
+    rocksdb_options_t* opt) {
+  return opt->rep.use_separate_remote_compaction_pool;
+}
+
 void rocksdb_options_set_remote_compaction_manifest_floor(
     rocksdb_options_t* opt, unsigned char v) {
   opt->rep.remote_compaction_manifest_floor = v;
@@ -13475,6 +13495,74 @@ void rocksdb_transactiondb_multi_get_cf(
       }
     }
   }
+}
+
+void rocksdb_transactiondb_batched_multi_get_cf(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const char* const* keys_list, const size_t* keys_list_sizes,
+    rocksdb_pinnableslice_t** values, char** errs, const bool sorted_input) {
+  Slice* key_slices = new Slice[num_keys];
+  PinnableSlice* value_slices = new PinnableSlice[num_keys];
+  Status* statuses = new Status[num_keys];
+  for (size_t i = 0; i < num_keys; ++i) {
+    key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
+  }
+
+  txn_db->rep->MultiGet(options->rep, column_family->rep, num_keys, key_slices,
+                        value_slices, statuses, sorted_input);
+
+  for (size_t i = 0; i < num_keys; ++i) {
+    if (statuses[i].ok()) {
+      values[i] = new (rocksdb_pinnableslice_t);
+      values[i]->rep = std::move(value_slices[i]);
+      errs[i] = nullptr;
+    } else {
+      values[i] = nullptr;
+      if (!statuses[i].IsNotFound()) {
+        errs[i] = strdup(statuses[i].ToString().c_str());
+      } else {
+        errs[i] = nullptr;
+      }
+    }
+  }
+
+  delete[] key_slices;
+  delete[] value_slices;
+  delete[] statuses;
+}
+
+void rocksdb_transactiondb_batched_multi_get_cf_slice(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const rocksdb_slice_t* keys_list, rocksdb_pinnableslice_t** values,
+    char** errs, const bool sorted_input) {
+  PinnableSlice* value_slices = new PinnableSlice[num_keys];
+  Status* statuses = new Status[num_keys];
+
+  // Cast rocksdb_slice_t* to Slice* - they have identical memory layout
+  const Slice* key_slices = reinterpret_cast<const Slice*>(keys_list);
+
+  txn_db->rep->MultiGet(options->rep, column_family->rep, num_keys, key_slices,
+                        value_slices, statuses, sorted_input);
+
+  for (size_t i = 0; i < num_keys; ++i) {
+    if (statuses[i].ok()) {
+      values[i] = new (rocksdb_pinnableslice_t);
+      values[i]->rep = std::move(value_slices[i]);
+      errs[i] = nullptr;
+    } else {
+      values[i] = nullptr;
+      if (!statuses[i].IsNotFound()) {
+        errs[i] = strdup(statuses[i].ToString().c_str());
+      } else {
+        errs[i] = nullptr;
+      }
+    }
+  }
+
+  delete[] value_slices;
+  delete[] statuses;
 }
 
 void rocksdb_transaction_set_commit_timestamp(rocksdb_transaction_t* txn,

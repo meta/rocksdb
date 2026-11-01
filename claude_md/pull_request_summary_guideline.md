@@ -87,15 +87,15 @@ to scan.
 
 ## Reference Pull Request Summaries
 
-- [PR #15216](https://github.com/facebook/rocksdb/pull/15216) is a strong
+- [PR #15216](https://github.com/meta/rocksdb/pull/15216) is a strong
   focused bug-fix example. It traces stale iterator state to readahead behavior
   and dropped keys, identifies the exact prerequisites and unaffected mmap
   case, gives before/after measurements, and explains how the regression test
   fails when the fix is reverted.
-- [PR #15218](https://github.com/facebook/rocksdb/pull/15218) is a concise
+- [PR #15218](https://github.com/meta/rocksdb/pull/15218) is a concise
   example of explicit `Why`, `Previous behavior`, `New behavior`,
   `Implementation`, and `Safety boundaries and unsupported cases` sections.
-- Peter Dillinger's [PR #15231](https://github.com/facebook/rocksdb/pull/15231)
+- Peter Dillinger's [PR #15231](https://github.com/meta/rocksdb/pull/15231)
   is a strong recent multi-part example. Its `Fix`/`Add`/`Change` bullets
   separate the behaviors, its compatibility sentence explains how old files
   read back, and its test plan maps each new persisted property to concrete

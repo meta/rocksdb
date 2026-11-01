@@ -113,6 +113,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockFetcher::ReadBlock)(bool retry) {
       break;
 
     case BlockType::kIndex:
+    case BlockType::kUserDefinedIndex:
       PERF_COUNTER_ADD(index_block_read_count, 1);
       break;
 

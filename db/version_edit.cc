@@ -1467,6 +1467,30 @@ void SubcompactionProgress::EncodeTo(std::string* dst) const {
     proximal_output_level_progress.EncodeTo(&level_progress_data);
     PutLengthPrefixedSlice(dst, level_progress_data);
   }
+
+  if (has_blob_compaction_progress) {
+    PutVarint32(dst, SubcompactionProgressCustomTag::kBlobCompactionProgress);
+    std::string blob_progress_data;
+    PutVarint64(&blob_progress_data, next_blob_file_number);
+
+    const size_t first_addition = GetLastPersistedBlobFileAdditionsCount();
+    assert(first_addition <= blob_file_additions.size());
+    PutVarint64(&blob_progress_data,
+                blob_file_additions.size() - first_addition);
+    for (size_t i = first_addition; i < blob_file_additions.size(); ++i) {
+      std::string encoded_addition;
+      blob_file_additions[i].EncodeTo(&encoded_addition);
+      PutLengthPrefixedSlice(&blob_progress_data, encoded_addition);
+    }
+
+    PutVarint64(&blob_progress_data, blob_file_garbages.size());
+    for (const auto& garbage : blob_file_garbages) {
+      std::string encoded_garbage;
+      garbage.EncodeTo(&encoded_garbage);
+      PutLengthPrefixedSlice(&blob_progress_data, encoded_garbage);
+    }
+    PutLengthPrefixedSlice(dst, blob_progress_data);
+  }
   PutVarint32(dst,
               SubcompactionProgressCustomTag::kSubcompactionProgressTerminate);
 }
@@ -1520,6 +1544,63 @@ Status SubcompactionProgress::DecodeFrom(Slice* input) {
         break;
       }
 
+      case SubcompactionProgressCustomTag::kBlobCompactionProgress: {
+        has_blob_compaction_progress = true;
+        if (!GetVarint64(&field, &next_blob_file_number)) {
+          return Status::Corruption("SubcompactionProgress",
+                                    "invalid next blob file number");
+        }
+
+        uint64_t num_additions = 0;
+        if (!GetVarint64(&field, &num_additions) ||
+            num_additions > field.size()) {
+          return Status::Corruption("SubcompactionProgress",
+                                    "invalid blob file addition count");
+        }
+        blob_file_additions.reserve(static_cast<size_t>(num_additions));
+        for (uint64_t i = 0; i < num_additions; ++i) {
+          Slice encoded_addition;
+          if (!GetLengthPrefixedSlice(&field, &encoded_addition)) {
+            return Status::Corruption("SubcompactionProgress",
+                                      "invalid blob file addition");
+          }
+          BlobFileAddition addition;
+          Status s = addition.DecodeFrom(&encoded_addition);
+          if (!s.ok() || !encoded_addition.empty()) {
+            return Status::Corruption("SubcompactionProgress",
+                                      "invalid blob file addition metadata");
+          }
+          blob_file_additions.emplace_back(std::move(addition));
+        }
+
+        uint64_t num_garbages = 0;
+        if (!GetVarint64(&field, &num_garbages) ||
+            num_garbages > field.size()) {
+          return Status::Corruption("SubcompactionProgress",
+                                    "invalid blob file garbage count");
+        }
+        blob_file_garbages.reserve(static_cast<size_t>(num_garbages));
+        for (uint64_t i = 0; i < num_garbages; ++i) {
+          Slice encoded_garbage;
+          if (!GetLengthPrefixedSlice(&field, &encoded_garbage)) {
+            return Status::Corruption("SubcompactionProgress",
+                                      "invalid blob file garbage");
+          }
+          BlobFileGarbage garbage;
+          Status s = garbage.DecodeFrom(&encoded_garbage);
+          if (!s.ok() || !encoded_garbage.empty()) {
+            return Status::Corruption("SubcompactionProgress",
+                                      "invalid blob file garbage metadata");
+          }
+          blob_file_garbages.emplace_back(std::move(garbage));
+        }
+        if (!field.empty()) {
+          return Status::Corruption("SubcompactionProgress",
+                                    "trailing blob compaction progress data");
+        }
+        break;
+      }
+
       default:
         if ((custom_tag & SubcompactionProgressCustomTag::
                               kSubcompactionProgressCustomTagSafeIgnoreMask) !=
@@ -1564,6 +1645,18 @@ void SubcompactionProgressBuilder::MergeDeltaProgress(
   MaybeMergeDeltaProgressPerLevel(
       accumulated_subcompaction_progress_.proximal_output_level_progress,
       delta_progress.proximal_output_level_progress);
+
+  if (delta_progress.has_blob_compaction_progress) {
+    accumulated_subcompaction_progress_.has_blob_compaction_progress = true;
+    accumulated_subcompaction_progress_.next_blob_file_number =
+        delta_progress.next_blob_file_number;
+    accumulated_subcompaction_progress_.blob_file_additions.insert(
+        accumulated_subcompaction_progress_.blob_file_additions.end(),
+        delta_progress.blob_file_additions.begin(),
+        delta_progress.blob_file_additions.end());
+    accumulated_subcompaction_progress_.blob_file_garbages =
+        delta_progress.blob_file_garbages;
+  }
 }
 
 void SubcompactionProgressBuilder::MaybeMergeDeltaProgressPerLevel(

@@ -38,6 +38,19 @@ class DBImplReadOnly : public DBImpl {
                             MultiGetOutputMetadata* output_metadata,
                             const bool sorted_input = false) override;
 
+  using DBImpl::MultiGetEntityWithMetadata;
+  void MultiGetEntityWithMetadata(const ReadOptions& options, size_t num_keys,
+                                  ColumnFamilyHandle* const* column_families,
+                                  const Slice* keys,
+                                  PinnableWideColumns* results,
+                                  Status* statuses,
+                                  MultiGetOutputMetadata* output_metadata,
+                                  bool sorted_input = false) override;
+  void MultiGetEntityWithMetadata(
+      const ReadOptions& options, size_t num_keys, const Slice* keys,
+      PinnableAttributeGroups* results,
+      MultiGetOutputMetadata* output_metadata) override;
+
   using DBImpl::NewIterator;
   Iterator* NewIterator(const ReadOptions& _read_options,
                         ColumnFamilyHandle* column_family) override;

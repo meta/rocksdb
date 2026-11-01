@@ -238,12 +238,6 @@ class PosixEnv : public CompositeEnv {
     PosixEnv& deflt;
   };
 
-  void SetFD_CLOEXEC(int fd, const EnvOptions* options) {
-    if ((options == nullptr || options->set_fd_cloexec) && fd > 0) {
-      fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-    }
-  }
-
 #ifndef ROCKSDB_NO_DYNAMIC_EXTENSION
   // Loads the named library into the result.
   // If the input name is empty, the current executable is loaded

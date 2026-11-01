@@ -1213,7 +1213,7 @@ Slice LegacyBloomBitsBuilder::Finish(std::unique_ptr<const char[]>* buf) {
 
       if (est_fp_rate >= 1.50 * vs_fp_rate) {
         // For more details, see
-        // https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter
+        // https://github.com/meta/rocksdb/wiki/RocksDB-Bloom-Filter
         ROCKS_LOG_WARN(
             info_log_,
             "Using legacy SST/BBT Bloom filter with excessive key count "
@@ -1549,7 +1549,7 @@ FilterBitsBuilder* BloomLikeFilterPolicy::GetLegacyBloomBuilderWithContext(
       adjective = "Significant";
     }
     // For more details, see
-    // https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter
+    // https://github.com/meta/rocksdb/wiki/RocksDB-Bloom-Filter
     ROCKS_LOG_WARN(context.info_log,
                    "Using legacy Bloom filter with high (%d) bits/key. "
                    "%s filter space and/or accuracy improvement is available "

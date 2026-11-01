@@ -1474,68 +1474,81 @@ TEST_P(BasicSecondaryCacheTest, CreateFailTest) {
 }
 
 TEST_P(BasicSecondaryCacheTest, FullCapacityTest) {
-  for (bool strict_capacity_limit : {false, true}) {
-    std::shared_ptr<TestSecondaryCache> secondary_cache =
-        std::make_shared<TestSecondaryCache>(2048, true);
-    std::shared_ptr<Cache> cache =
-        NewCache(1024 /* capacity */, 0 /* num_shard_bits */,
-                 strict_capacity_limit, secondary_cache);
-    CacheKey k1 = CacheKey::CreateUniqueForCacheLifetime(cache.get());
-    CacheKey k2 = CacheKey::CreateUniqueForCacheLifetime(cache.get());
+  const size_t kValueSize = 700;
+  estimated_value_size_ = kValueSize;
+  for (CacheMetadataChargePolicy charge_policy :
+       {kDontChargeCacheMetadata, kFullChargeCacheMetadata}) {
+    SCOPED_TRACE(charge_policy);
+    for (bool strict_capacity_limit : {false, true}) {
+      SCOPED_TRACE(strict_capacity_limit);
+      std::shared_ptr<TestSecondaryCache> secondary_cache =
+          std::make_shared<TestSecondaryCache>(2048, true);
+      std::shared_ptr<Cache> cache =
+          NewCache(1024, [&](ShardedCacheOptions& opts) {
+            opts.num_shard_bits = 0;
+            opts.strict_capacity_limit = strict_capacity_limit;
+            opts.metadata_charge_policy = charge_policy;
+            opts.secondary_cache = secondary_cache;
+          });
+      CacheKey k1 = CacheKey::CreateUniqueForCacheLifetime(cache.get());
+      CacheKey k2 = CacheKey::CreateUniqueForCacheLifetime(cache.get());
 
-    Random rnd(301);
-    std::string str1 = rnd.RandomString(1020);
-    TestItem* item1 = new TestItem(str1.data(), str1.length());
-    ASSERT_OK(cache->Insert(k1.AsSlice(), item1, GetHelper(), str1.length()));
-    std::string str2 = rnd.RandomString(1020);
-    TestItem* item2 = new TestItem(str2.data(), str2.length());
-    // k1 should be demoted to NVM
-    ASSERT_OK(cache->Insert(k2.AsSlice(), item2, GetHelper(), str2.length()));
+      Random rnd(301);
+      std::string str1 = rnd.RandomString(kValueSize);
+      TestItem* item1 = new TestItem(str1.data(), str1.length());
+      ASSERT_OK(cache->Insert(k1.AsSlice(), item1, GetHelper(), str1.length()));
+      std::string str2 = rnd.RandomString(kValueSize);
+      TestItem* item2 = new TestItem(str2.data(), str2.length());
+      // k1 should be demoted to NVM
+      ASSERT_OK(cache->Insert(k2.AsSlice(), item2, GetHelper(), str2.length()));
 
-    Cache::Handle* handle2;
-    handle2 = cache->Lookup(k2.AsSlice(), GetHelper(),
-                            /*context*/ this, Cache::Priority::LOW);
-    ASSERT_NE(handle2, nullptr);
-    // k1 lookup fails without secondary cache support
-    Cache::Handle* handle1;
-    handle1 = cache->Lookup(
-        k1.AsSlice(),
-        GetHelper(CacheEntryRole::kDataBlock, /*secondary_compatible=*/false),
-        /*context*/ this, Cache::Priority::LOW);
-    ASSERT_EQ(handle1, nullptr);
-
-    // k1 promotion can fail with strict_capacity_limit=true, but Lookup still
-    // succeeds using a standalone handle
-    handle1 = cache->Lookup(k1.AsSlice(), GetHelper(),
-                            /*context*/ this, Cache::Priority::LOW);
-    ASSERT_NE(handle1, nullptr);
-
-    ASSERT_EQ(secondary_cache->num_inserts(), 1u);
-    ASSERT_EQ(secondary_cache->num_lookups(), 1u);
-
-    // Releasing k2's handle first, k2 is evicted from primary iff k1 promotion
-    // was charged to the cache (except HCC doesn't erase in Release() over
-    // capacity)
-    // FIXME: Insert to secondary from Release disabled
-    cache->Release(handle2);
-    cache->Release(handle1);
-    handle2 = cache->Lookup(
-        k2.AsSlice(),
-        GetHelper(CacheEntryRole::kDataBlock, /*secondary_compatible=*/false),
-        /*context*/ this, Cache::Priority::LOW);
-    if (strict_capacity_limit || IsHyperClock()) {
+      Cache::Handle* handle2;
+      handle2 = cache->Lookup(k2.AsSlice(), GetHelper(),
+                              /*context*/ this, Cache::Priority::LOW);
       ASSERT_NE(handle2, nullptr);
-      cache->Release(handle2);
-      ASSERT_EQ(secondary_cache->num_inserts(), 1u);
-    } else {
-      ASSERT_EQ(handle2, nullptr);
-      // FIXME: Insert to secondary from Release disabled
-      // ASSERT_EQ(secondary_cache->num_inserts(), 2u);
-      ASSERT_EQ(secondary_cache->num_inserts(), 1u);
-    }
+      // k1 lookup fails without secondary cache support
+      Cache::Handle* handle1;
+      handle1 = cache->Lookup(
+          k1.AsSlice(),
+          GetHelper(CacheEntryRole::kDataBlock, /*secondary_compatible=*/false),
+          /*context*/ this, Cache::Priority::LOW);
+      ASSERT_EQ(handle1, nullptr);
 
-    cache.reset();
-    secondary_cache.reset();
+      // k1 promotion can fail with strict_capacity_limit=true, but Lookup still
+      // succeeds using a standalone handle
+      handle1 = cache->Lookup(k1.AsSlice(), GetHelper(),
+                              /*context*/ this, Cache::Priority::LOW);
+      ASSERT_NE(handle1, nullptr);
+      ASSERT_EQ(strict_capacity_limit ? 0 : str1.size(),
+                cache->GetUsage(handle1));
+
+      ASSERT_EQ(secondary_cache->num_inserts(), 1u);
+      ASSERT_EQ(secondary_cache->num_lookups(), 1u);
+
+      // Releasing k2's handle first, k2 is evicted from primary iff k1
+      // promotion was charged to the cache (except HCC doesn't erase in
+      // Release() over capacity)
+      // FIXME: Insert to secondary from Release disabled
+      cache->Release(handle2);
+      cache->Release(handle1);
+      handle2 = cache->Lookup(
+          k2.AsSlice(),
+          GetHelper(CacheEntryRole::kDataBlock, /*secondary_compatible=*/false),
+          /*context*/ this, Cache::Priority::LOW);
+      if (strict_capacity_limit || IsHyperClock()) {
+        ASSERT_NE(handle2, nullptr);
+        cache->Release(handle2);
+        ASSERT_EQ(secondary_cache->num_inserts(), 1u);
+      } else {
+        ASSERT_EQ(handle2, nullptr);
+        // FIXME: Insert to secondary from Release disabled
+        // ASSERT_EQ(secondary_cache->num_inserts(), 2u);
+        ASSERT_EQ(secondary_cache->num_inserts(), 1u);
+      }
+
+      cache.reset();
+      secondary_cache.reset();
+    }
   }
 }
 

@@ -468,7 +468,6 @@ class ColumnFamilyTestBase : public testing::Test {
       }
     }
     return ret;
-    return 0;
   }
 
   void AssertCountLiveLogFiles(int value) {

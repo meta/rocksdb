@@ -210,13 +210,8 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImpl::GetImpl)
     }
   }
 
-  if (get_impl_options.get_merge_operands_options != nullptr) {
-    for (int i = 0; i < get_impl_options.get_merge_operands_options
-                            ->expected_max_number_of_operands;
-         ++i) {
-      get_impl_options.merge_operands[i].Reset();
-    }
-  }
+  MergeContext merge_context;
+  PrepareGetMergeOperands(get_impl_options, &merge_context);
 
   // Acquire SuperVersion (or, for a batched lazy read, use the shared one the
   // batch already referenced -- see GetImplOptions::lazy_columns_shared_sv).
@@ -330,10 +325,6 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImpl::GetImpl)
   TEST_SYNC_POINT("DBImpl::GetImpl:3");
   TEST_SYNC_POINT("DBImpl::GetImpl:4");
 
-  // Prepare to store a list of merge operations if merge occurs.
-  MergeContext merge_context;
-  merge_context.get_merge_operands_options =
-      get_impl_options.get_merge_operands_options;
   SequenceNumber max_covering_tombstone_seq = 0;
 
   Status s;
@@ -477,68 +468,12 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImpl::GetImpl)
           size = get_impl_options.columns->payload_size();
         }
       } else {
-        // Return all merge operands for get_impl_options.key
-        *get_impl_options.number_of_operands =
-            static_cast<int>(merge_context.GetNumOperands());
-        // OK status is returned, some merge operand is found.
-        assert(*get_impl_options.number_of_operands > 0);
-        if (*get_impl_options.number_of_operands >
-            get_impl_options.get_merge_operands_options
-                ->expected_max_number_of_operands) {
-          s = Status::Incomplete(
-              Status::SubCode::KMergeOperandsInsufficientCapacity);
-        } else {
-          // Each operand depends on one of the following resources: `sv`,
-          // `pinned_iters_mgr`, or `merge_context`. It would be crazy expensive
-          // to reference `sv` for each operand relying on it because `sv` is
-          // (un)ref'd in all threads using the DB. Furthermore, we do not track
-          // on which resource each operand depends.
-          //
-          // To solve this, we bundle the resources in a `GetMergeOperandsState`
-          // and manage them with a `SharedCleanablePtr` shared among the
-          // `PinnableSlice`s we return. This bundle includes one `sv` reference
-          // and ownership of the `merge_context` and `pinned_iters_mgr`
-          // objects.
-          bool ref_sv = ShouldReferenceSuperVersion(merge_context);
-          if (ref_sv) {
-            assert(!merge_context.GetOperands().empty());
-            SharedCleanablePtr shared_cleanable;
-            GetMergeOperandsState* state = new GetMergeOperandsState(
-                std::move(merge_context), std::move(pinned_iters_mgr));
-
-            sv->Ref();
-
-            state->sv_handle = new SuperVersionHandle(
-                this, &mutex_, sv,
-                immutable_db_options_.avoid_unnecessary_blocking_io);
-
-            shared_cleanable.Allocate();
-            shared_cleanable->RegisterCleanup(CleanupGetMergeOperandsState,
-                                              state /* arg1 */,
-                                              nullptr /* arg2 */);
-            for (size_t i = 0; i < state->merge_context.GetOperands().size();
-                 ++i) {
-              const Slice& sl = state->merge_context.GetOperands()[i];
-              size += sl.size();
-
-              get_impl_options.merge_operands->PinSlice(
-                  sl, nullptr /* cleanable */);
-              if (i == state->merge_context.GetOperands().size() - 1) {
-                shared_cleanable.MoveAsCleanupTo(
-                    get_impl_options.merge_operands);
-              } else {
-                shared_cleanable.RegisterCopyWith(
-                    get_impl_options.merge_operands);
-              }
-              get_impl_options.merge_operands++;
-            }
-          } else {
-            for (const Slice& sl : merge_context.GetOperands()) {
-              size += sl.size();
-              get_impl_options.merge_operands->PinSelf(sl);
-              get_impl_options.merge_operands++;
-            }
-          }
+        // Keep an OK subcode set above, such as
+        // OkMergeOperandThresholdExceeded, unless finalization fails.
+        Status finalize_status = FinalizeGetMergeOperands(
+            get_impl_options, sv, &merge_context, &pinned_iters_mgr, &size);
+        if (!finalize_status.ok()) {
+          s = std::move(finalize_status);
         }
       }
       RecordTick(stats_, BYTES_READ, size);

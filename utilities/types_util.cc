@@ -6,6 +6,9 @@
 
 #include "rocksdb/utilities/types_util.h"
 
+#include <cassert>
+#include <cstring>
+
 #include "db/dbformat.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -145,14 +148,41 @@ Status EncodeEntry(const ParsedEntryInfo& entry, std::string* internal_key) {
   if (!status.ok()) {
     return status;
   }
-
-  internal_key->reserve(entry.user_key.size() + entry.timestamp.size() +
-                        kNumInternalBytes);
+  internal_key->reserve(GetEncodedEntrySize(entry));
   internal_key->assign(entry.user_key.data(), entry.user_key.size());
   if (!entry.timestamp.empty()) {
     internal_key->append(entry.timestamp.data(), entry.timestamp.size());
   }
   PutFixed64(internal_key, packed);
+  return Status::OK();
+}
+
+Status EncodeEntry(const ParsedEntryInfo& entry, char* internal_key) {
+  uint64_t packed = 0;
+  Status status = PackSequenceAndType(entry.sequence, entry.type, &packed);
+  if (!status.ok()) {
+    return status;
+  }
+#ifndef NDEBUG
+  const uintptr_t buffer_begin = reinterpret_cast<uintptr_t>(internal_key);
+  const uintptr_t buffer_end = buffer_begin + GetEncodedEntrySize(entry);
+  for (const Slice& slice : {entry.user_key, entry.timestamp}) {
+    const uintptr_t slice_begin = reinterpret_cast<uintptr_t>(slice.data());
+    assert((slice.empty() || slice_begin >= buffer_end ||
+            slice_begin + slice.size() <= buffer_begin) &&
+           "Input slices must not overlap the written region");
+  }
+#endif
+  char* dst = internal_key;
+  if (!entry.user_key.empty()) {
+    memcpy(dst, entry.user_key.data(), entry.user_key.size());
+  }
+  dst += entry.user_key.size();
+  if (!entry.timestamp.empty()) {
+    memcpy(dst, entry.timestamp.data(), entry.timestamp.size());
+  }
+  dst += entry.timestamp.size();
+  EncodeFixed64(dst, packed);
   return Status::OK();
 }
 

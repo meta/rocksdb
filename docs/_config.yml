@@ -29,7 +29,7 @@ url: "http://rocksdb.org"
 #https://github.com/blog/2277-what-s-new-in-github-pages-with-jekyll-3-3
 
 # The GitHub repo for your project
-ghrepo: "facebook/rocksdb"
+ghrepo: "meta/rocksdb"
 
 # Use these color settings to determine your colour scheme for the site.
 color:

@@ -677,6 +677,13 @@ enum Tickers : uint32_t {
   // logical value size minus the bytes actually read.
   BLOB_DB_LAZY_PARTIAL_BYTES_SAVED,
 
+  // Number of distinct blob files advertised by remote compaction jobs that
+  // dispatched at least one subcompaction.
+  REMOTE_COMPACT_INPUT_BLOB_FILE_COUNT,
+  // Number of remote compaction results declined by the primary because blob
+  // metadata, files, or capabilities failed validation before installation.
+  REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT,
+
   TICKER_ENUM_MAX
 };
 

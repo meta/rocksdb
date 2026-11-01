@@ -195,6 +195,49 @@ TEST_F(DBClipTest, TestClipRange) {
   }
 }
 
+TEST_F(DBClipTest, SingleEmptyUserKey) {
+  struct TestCase {
+    const Comparator* comparator;
+    const char* begin_key;
+    const char* end_key;
+    bool keep_empty_key;
+  };
+  const TestCase cases[] = {
+      {BytewiseComparator(), "b", "d", false},
+      {BytewiseComparator(), "", "z", true},
+      {ReverseBytewiseComparator(), "d", "", false},
+  };
+  for (const TestCase& test_case : cases) {
+    for (int level : {0, 1}) {
+      SCOPED_TRACE(test_case.comparator->Name());
+      SCOPED_TRACE(test_case.begin_key);
+      SCOPED_TRACE(level);
+      Options options = CurrentOptions();
+      options.comparator = test_case.comparator;
+      options.disable_auto_compactions = true;
+      DestroyAndReopen(options);
+
+      ASSERT_OK(db_->ClipColumnFamily(db_->DefaultColumnFamily(),
+                                      test_case.begin_key, test_case.end_key));
+      ASSERT_EQ("NOT_FOUND", Get(""));
+      ASSERT_OK(Put("", "empty-key-value"));
+      ASSERT_OK(Flush());
+      if (level != 0) {
+        MoveFilesToLevel(level);
+      }
+      ASSERT_EQ(1, NumTableFilesAtLevel(level));
+
+      ASSERT_OK(db_->ClipColumnFamily(db_->DefaultColumnFamily(),
+                                      test_case.begin_key, test_case.end_key));
+      const std::string expected =
+          test_case.keep_empty_key ? "empty-key-value" : "NOT_FOUND";
+      ASSERT_EQ(expected, Get(""));
+      Reopen(options);
+      ASSERT_EQ(expected, Get(""));
+    }
+  }
+}
+
 TEST_F(DBClipTest, KeepFileEndingAtBeginKey) {
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;

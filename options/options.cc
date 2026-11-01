@@ -554,7 +554,7 @@ Options* Options::OptimizeForSmallDb() {
 }
 
 Options* Options::DisableExtraChecks() {
-  // See https://github.com/facebook/rocksdb/issues/9354
+  // See https://github.com/meta/rocksdb/issues/9354
   force_consistency_checks = false;
   // Considered but no clear performance impact seen:
   // * paranoid_checks

@@ -8,6 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <atomic>
+#include <chrono>
+#include <limits>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -591,8 +593,6 @@ class FlushedFileCollector : public EventListener {
     }
     return result;
   }
-
-  void ClearFlushedFiles() { flushed_files_.clear(); }
 
  private:
   std::vector<std::string> flushed_files_;
@@ -5992,6 +5992,8 @@ TEST_F(DBCompactionTest, PeriodicCompactionPhaseTriggerTime) {
   const uint64_t kSeed = 0x9e3779b97f4a7c15ULL;
   const uint64_t target = FastRange64(kSeed, kN);
   ASSERT_LT(target, kN);
+  // Preferred-phase target for kSeed with a given periodic_compaction_seconds.
+  const auto target_for = [&](uint64_t n) { return FastRange64(kSeed, n); };
 
   // recovery_percent == 0 => classic behavior: trigger at file_mod + N.
   {
@@ -6064,25 +6066,212 @@ TEST_F(DBCompactionTest, PeriodicCompactionPhaseTriggerTime) {
     ASSERT_LT(trig, 200 + grid);     // within N/4 of the anchor
   }
 
-  // Past due against the recovery target but not yet at the deadline => spread
-  // across [anchor, deadline] using the phase; never later than the deadline.
+  // Natural deadline shortly after the anchor (0 < r = natural - anchor):
+  // the pull toward the phase is scaled down to offset * min(q, k * r / n)
+  // with k = 1/2, so the file triggers after the anchor and no earlier than
+  // with the steady-state pull. Once r >= q * n / k, the steady-state pull
+  // (offset * q) applies unchanged.
   {
     const uint64_t n = 100;
-    const uint64_t small_target = FastRange64(kSeed, n);
-    const uint64_t fm = small_target + 50 + 3 * n;  // phase offset == 50
+    const uint64_t fm = 3 * n + (target_for(n) + 50) % n;
+    ASSERT_EQ((fm % n + n - target_for(n)) % n, uint64_t{50});  // offset
     const uint64_t natural = fm + n;
-    const uint64_t anchor =
-        natural - 25;  // recovery target (natural-50) < anchor
-    Params p;
-    p.seed_hash = kSeed;
-    p.recovery_percent = 100;
-    p.anchor_time = anchor;
-    ASSERT_EQ((fm % n + n - small_target) % n, uint64_t{50});
-    const uint64_t expected = anchor + FastRange64(kSeed, natural - anchor);
-    const uint64_t trig = PeriodicCompactionPhaser::TriggerTime(fm, n, p);
-    ASSERT_EQ(trig, expected);
-    ASSERT_GE(trig, anchor);
-    ASSERT_LT(trig, natural);
+    struct Case {
+      int rp;
+      uint64_t r;
+      uint64_t pull;
+    };
+    for (const Case& c : {
+             Case{100, 25, 6},    // 50 * 0.5 * 25/100 = 6.25
+             Case{100, 150, 37},  // 50 * 0.5 * 150/100 = 37.5 (steady: 50)
+             Case{100, 200, 50},  // r == q * n / k: steady-state 50 * 1.0
+             Case{67, 100, 25},   // 50 * 0.5 * 100/100 = 25 (steady: 33)
+             Case{67, 134, 33},   // r == q * n / k: steady-state 50 * 0.67
+             Case{50, 1, 0},      // 50 * 0.5 * 1/100 = 0.25
+             Case{50, 99, 24},    // 50 * 0.5 * 99/100 = 24.75
+             Case{50, 100, 25},   // r == q * n / k: steady-state 50 * 0.5
+             Case{33, 25, 6},     // 50 * 0.5 * 25/100 = 6.25
+             Case{33, 60, 15},    // 50 * 0.5 * 60/100 = 15 (steady: 16)
+             Case{33, 66, 16},    // r == q * n / k: steady-state 50 * 0.33
+             Case{33, 70, 16},    // steady-state
+             Case{10, 19, 4},     // 50 * 0.5 * 19/100 = 4.75
+             Case{10, 20, 5},     // r == q * n / k: steady-state 50 * 0.1
+         }) {
+      Params p;
+      p.seed_hash = kSeed;
+      p.recovery_percent = c.rp;
+      p.anchor_time = natural - c.r;
+      const uint64_t trig = PeriodicCompactionPhaser::TriggerTime(fm, n, p);
+      ASSERT_EQ(trig, natural - c.pull) << "rp=" << c.rp << " r=" << c.r;
+      ASSERT_GT(trig, p.anchor_time);
+    }
+  }
+
+  // Long periodic_compaction_seconds. Up to kMaxPhasedPeriod the pull is
+  // computed exactly, without overflow, including the largest intermediate
+  // product (inputs chosen so the exact result is easy to derive by hand).
+  // Beyond it, phasing is not applied (pull 0: the classic deadline).
+  {
+    const uint64_t kMaxPhased = PeriodicCompactionPhaser::kMaxPhasedPeriod;
+    struct Case {
+      uint64_t n;
+      uint64_t offset;
+      uint64_t r;
+      int rp;
+      uint64_t pull;
+    };
+    for (const Case& c : {
+             // 30 days: 1296000 * 0.5 * 1/4
+             Case{30 * 86400, 15 * 86400, 30 * 86400 / 4, 33, 162000},
+             // Largest product: (n - 1) * (2n - 1) / (2n), rounded down
+             Case{kMaxPhased, kMaxPhased - 1, 2 * kMaxPhased - 1, 100,
+                  kMaxPhased - 2},
+             // Steady state at kMaxPhased: (n - 1) * 0.33, rounded down
+             Case{kMaxPhased, kMaxPhased - 1, kMaxPhased - 1, 33,
+                  (kMaxPhased - 1) * 33 / 100},
+             // Beyond kMaxPhasedPeriod: classic deadline
+             Case{kMaxPhased + 1, kMaxPhased / 2, kMaxPhased / 4, 33, 0},
+             Case{uint64_t{1} << 40, uint64_t{1} << 39, uint64_t{1} << 38, 100,
+                  0},
+             Case{std::numeric_limits<uint64_t>::max() / 8, 12345, 678, 50, 0},
+         }) {
+      const uint64_t fm = 3 * c.n + (target_for(c.n) + c.offset) % c.n;
+      ASSERT_EQ((fm % c.n + c.n - target_for(c.n)) % c.n, c.offset);
+      Params p;
+      p.seed_hash = kSeed;
+      p.recovery_percent = c.rp;
+      p.anchor_time = fm + c.n - c.r;
+      ASSERT_EQ(PeriodicCompactionPhaser::TriggerTime(fm, c.n, p),
+                fm + c.n - c.pull)
+          << "n=" << c.n;
+    }
+  }
+}
+
+TEST_F(DBCompactionTest, PeriodicCompactionPhaseTriggerTimeRandomized) {
+  // Randomized properties of PeriodicCompactionPhaser::TriggerTime, in
+  // particular around the anchor (when phasing took effect).
+  using Params = PeriodicCompactionPhaseParams;
+  const uint32_t seed = static_cast<uint32_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+
+  // Bounds sweep over (n, recovery_percent, phase, file time, anchor),
+  // including n at and beyond kMaxPhasedPeriod.
+  {
+    const uint64_t kMaxPhased = PeriodicCompactionPhaser::kMaxPhasedPeriod;
+    const uint64_t kNs[] = {1,
+                            2,
+                            3,
+                            4,
+                            7,
+                            100,
+                            86400,
+                            30 * 86400,
+                            kMaxPhased,
+                            kMaxPhased + 1,
+                            uint64_t{1} << 40,
+                            std::numeric_limits<uint64_t>::max() / 16};
+    const int kRps[] = {1, 10, 25, 33, 50, 67, 99, 100};
+    for (int i = 0; i < 100000; ++i) {
+      const uint64_t n = kNs[rnd.Uniform(std::size(kNs))];
+      const int rp = kRps[rnd.Uniform(std::size(kRps))];
+      Params p;
+      p.seed_hash = rnd.Next();
+      p.recovery_percent = rp;
+      p.anchor_time = rnd.Uniform(6 * n);
+      const uint64_t fm = rnd.Uniform(4 * n);
+      const uint64_t natural = fm + n;
+      const uint64_t trig = PeriodicCompactionPhaser::TriggerTime(fm, n, p);
+      if (n > kMaxPhased) {
+        ASSERT_EQ(trig, natural) << "n=" << n << " rp=" << rp;
+        continue;
+      }
+      const uint64_t offset = (fm % n + n - FastRange64(p.seed_hash, n)) % n;
+      const uint64_t steady_trigger = natural - offset * rp / 100;
+      if (natural > p.anchor_time) {
+        // Never before the anchor, never after the natural deadline, never
+        // earlier than with the steady-state pull.
+        ASSERT_GT(trig, p.anchor_time) << "n=" << n << " rp=" << rp;
+        ASSERT_LE(trig, natural) << "n=" << n << " rp=" << rp;
+        ASSERT_GE(trig, steady_trigger) << "n=" << n << " rp=" << rp;
+        if (fm >= p.anchor_time + (rp <= 50 ? 0 : n)) {
+          // Written at or after the anchor (at least a period after it for
+          // rp > 50): exactly the steady-state pull.
+          ASSERT_EQ(trig, steady_trigger) << "n=" << n << " rp=" << rp;
+        }
+      } else {
+        // Already past due at the anchor: within a quarter period after it.
+        ASSERT_GE(trig, p.anchor_time) << "n=" << n << " rp=" << rp;
+        ASSERT_LT(trig - p.anchor_time, std::max(n / 4, uint64_t{1}))
+            << "n=" << n << " rp=" << rp;
+      }
+    }
+  }
+
+  // Bounded trigger density after the anchor. Many files (random phases)
+  // share one anchor and have file ages spread uniformly over a period at the
+  // anchor, so their natural deadlines are uniform over the period after it.
+  // Without phasing, each 1% of that period would get 1% of the triggers. The
+  // scaled pull should give about 1.39x throughout (k = 1/2) for any
+  // recovery_percent, so no 1% bin may exceed 1.6x. (Choosing each trigger
+  // uniformly between the anchor and the natural deadline gave ~3.8x in the
+  // first 1%.)
+  {
+    const uint64_t n = 1000000;
+    const uint64_t anchor = 10 * n + 12345;
+    const int kFiles = 200000;
+    for (int rp : {10, 33, 50, 67, 100}) {
+      std::vector<int> bins(100);
+      for (int i = 0; i < kFiles; ++i) {
+        Params p;
+        p.seed_hash = rnd.Next();
+        p.recovery_percent = rp;
+        p.anchor_time = anchor;
+        // Natural deadline in (anchor, anchor + n]
+        const uint64_t fm = anchor - n + 1 + rnd.Uniform(n);
+        const uint64_t trig = PeriodicCompactionPhaser::TriggerTime(fm, n, p);
+        ASSERT_GT(trig, anchor);
+        ASSERT_LE(trig, fm + n);
+        bins[(trig - anchor - 1) * 100 / n]++;
+      }
+      for (size_t b = 0; b < bins.size(); ++b) {
+        ASSERT_LE(bins[b], kFiles / 100 * 16 / 10) << "rp=" << rp << " b=" << b;
+      }
+    }
+  }
+
+  // A herd: many DBs (random phases) share one natural deadline 0.62 * n after
+  // the anchor, as with a lockstep fleet when phasing is enabled. Triggers
+  // must stay spread over most of [natural - q * n, natural] (about 0.31 * n
+  // here), with no clump: no bin of width n/1000 may hold more than 1% of the
+  // herd (versus ~0.32% expected).
+  {
+    const uint64_t n = 1000000;
+    const uint64_t anchor = 10 * n;
+    const uint64_t natural = anchor + n * 62 / 100;
+    const uint64_t fm = natural - n;
+    const int kHerd = 100000;
+    for (int rp : {33, 50, 100}) {
+      std::vector<int> bins(1000);
+      uint64_t earliest = natural;
+      for (int i = 0; i < kHerd; ++i) {
+        Params p;
+        p.seed_hash = rnd.Next();
+        p.recovery_percent = rp;
+        p.anchor_time = anchor;
+        const uint64_t trig = PeriodicCompactionPhaser::TriggerTime(fm, n, p);
+        ASSERT_GT(trig, anchor);
+        ASSERT_LE(trig, natural);
+        earliest = std::min(earliest, trig);
+        bins[(trig - anchor) * 1000 / n]++;
+      }
+      ASSERT_GE(natural - earliest, n * 30 / 100) << "rp=" << rp;
+      for (size_t b = 0; b < bins.size(); ++b) {
+        ASSERT_LE(bins[b], kHerd / 100) << "rp=" << rp << " b=" << b;
+      }
+    }
   }
 }
 
@@ -6735,6 +6924,119 @@ TEST_F(DBCompactionTest, CompactRangeShutdownWhileDelayed) {
     }
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   }
+}
+
+TEST_F(DBCompactionTest, CompactRangeAtomicFlushOtherColumnFamilyDropped) {
+  Options options = CurrentOptions();
+  options.atomic_flush = true;
+  options.level0_stop_writes_trigger = 2;
+  options.level0_slowdown_writes_trigger = 2;
+  options.level0_file_num_compaction_trigger = -1;
+  for (bool drop_target : {false, true}) {
+    SCOPED_TRACE(drop_target);
+    DestroyAndReopen(options);
+    CreateAndReopenWithCF({"target", "obsolete"}, options);
+    test::SleepingBackgroundTask sleeping_task;
+    env_->SetBackgroundThreads(1, Env::LOW);
+    env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &sleeping_task,
+                   Env::LOW);
+    sleeping_task.WaitUntilSleeping();
+    ASSERT_OK(Put(2, "old", "value"));
+    ASSERT_OK(Flush(2));
+    ASSERT_OK(Put(2, "pending", "value"));
+    ASSERT_OK(Put(1, "key", "value"));
+
+    SyncPoint::GetInstance()->LoadDependency(
+        {{"DBImpl::WaitUntilFlushWouldNotStallWrites:StallWait",
+          "DBCompactionTest::AtomicFlushOtherColumnFamilyDropped:Drop"}});
+    SyncPoint::GetInstance()->EnableProcessing();
+    Status status;
+    port::Thread compact([&] {
+      status = db_->CompactRange(CompactRangeOptions(), handles_[1], nullptr,
+                                 nullptr);
+    });
+    TEST_SYNC_POINT(
+        "DBCompactionTest::AtomicFlushOtherColumnFamilyDropped:Drop");
+    if (drop_target) {
+      ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+    }
+    ASSERT_OK(db_->DropColumnFamily(handles_[2]));
+    sleeping_task.WakeUp();
+    compact.join();
+    if (drop_target) {
+      ASSERT_EQ(Status::kColumnFamilyDropped, status.code());
+    } else {
+      ASSERT_OK(status);
+      ASSERT_EQ("value", Get(1, "key"));
+      ASSERT_GT(TotalTableFiles(1), 0);
+      ASSERT_EQ(0, NumTableFilesAtLevel(0, 1));
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+  }
+}
+
+TEST_F(DBCompactionTest, CompactRangeAtomicFlushSelectedColumnFamilyDropped) {
+  // The target has nothing to flush, so the atomic flush selects only the
+  // other column family, which is dropped while the flush is pending.
+  Options options = CurrentOptions();
+  options.atomic_flush = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"target", "obsolete"}, options);
+  ASSERT_OK(Put(2, "key", "value"));
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::AtomicFlushMemTables:BeforeWaitForBgFlush",
+        "DBCompactionTest::AtomicFlushSelectedColumnFamilyDropped:Drop"},
+       {"DBCompactionTest::AtomicFlushSelectedColumnFamilyDropped:Dropped",
+        "DBImpl::BackgroundCallFlush:start"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  CompactRangeOptions cro;
+  cro.allow_write_stall = true;
+  Status status;
+  port::Thread compact(
+      [&] { status = db_->CompactRange(cro, handles_[1], nullptr, nullptr); });
+  TEST_SYNC_POINT(
+      "DBCompactionTest::AtomicFlushSelectedColumnFamilyDropped:Drop");
+  ASSERT_OK(db_->DropColumnFamily(handles_[2]));
+  TEST_SYNC_POINT(
+      "DBCompactionTest::AtomicFlushSelectedColumnFamilyDropped:Dropped");
+  compact.join();
+  ASSERT_OK(status);
+  SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBCompactionTest, WaitForCompactAtomicFlushOtherColumnFamilyDropped) {
+  // The flush waits for a write stall on another column family that is
+  // dropped during the wait. The live column family must still be flushed.
+  Options options = CurrentOptions();
+  options.atomic_flush = true;
+  options.level0_stop_writes_trigger = 2;
+  options.level0_slowdown_writes_trigger = 2;
+  options.level0_file_num_compaction_trigger = -1;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"live", "obsolete"}, options);
+  ASSERT_OK(Put(2, "old", "value"));
+  ASSERT_OK(Flush(2));
+  ASSERT_OK(Put(2, "pending", "value"));
+  ASSERT_OK(Put(1, "key", "value"));
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::WaitUntilFlushWouldNotStallWrites:StallWait",
+        "DBCompactionTest::WaitForCompactOtherColumnFamilyDropped:Drop"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status;
+  port::Thread wait([&] {
+    WaitForCompactOptions wait_for_compact_options;
+    wait_for_compact_options.flush = true;
+    status = db_->WaitForCompact(wait_for_compact_options);
+  });
+  TEST_SYNC_POINT(
+      "DBCompactionTest::WaitForCompactOtherColumnFamilyDropped:Drop");
+  ASSERT_OK(db_->DropColumnFamily(handles_[2]));
+  wait.join();
+  ASSERT_OK(status);
+  ASSERT_EQ(1, NumTableFilesAtLevel(0, 1));
+  SyncPoint::GetInstance()->DisableProcessing();
 }
 
 TEST_F(DBCompactionTest, CompactRangeSkipFlushAfterDelay) {
@@ -12590,7 +12892,7 @@ TEST_F(DBCompactionTest, VerifyOutputRecordCountPlainTable) {
 
 TEST_F(DBCompactionTest, ErrorWhenReadFileHead) {
   // This is to test a bug that is fixed in
-  // https://github.com/facebook/rocksdb/pull/11782.
+  // https://github.com/meta/rocksdb/pull/11782.
   //
   // Ingest error when reading from a file with offset = 0,
   // See if compaction handles it correctly.

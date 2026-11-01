@@ -893,7 +893,7 @@ function run_lsm {
   fi
   start_stats $log_file_name.stats
   # waitforcompaction can hang with universal (compaction_style=1)
-  # see bug https://github.com/facebook/rocksdb/issues/9275
+  # see bug https://github.com/meta/rocksdb/issues/9275
   eval $cmd
   stop_stats $log_file_name.stats
   # Don't summarize, the log doesn't have the output needed for it

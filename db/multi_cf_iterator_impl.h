@@ -214,7 +214,7 @@ class MultiCfIteratorImpl {
     // It is possible for one or more child iters are at invalid keys due to
     // manual prefix iteration. For such cases, we consider the result of the
     // multi-cf-iter is also undefined.
-    // https://github.com/facebook/rocksdb/wiki/Prefix-Seek#manual-prefix-iterating
+    // https://github.com/meta/rocksdb/wiki/Prefix-Seek#manual-prefix-iterating
     // for details about manual prefix iteration
     if (heap.empty()) {
       return;

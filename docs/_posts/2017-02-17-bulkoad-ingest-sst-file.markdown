@@ -41,7 +41,7 @@ s = db_->IngestExternalFile({"/home/usr/file1.sst"}, IngestExternalFileOptions()
 assert(s.ok());
 ```
 
-You can find more details about how to generate SST files and ingesting them into RocksDB in this [wiki page](https://github.com/facebook/rocksdb/wiki/Creating-and-Ingesting-SST-files)
+You can find more details about how to generate SST files and ingesting them into RocksDB in this [wiki page](https://github.com/meta/rocksdb/wiki/Creating-and-Ingesting-SST-files)
 
 ## Use cases
 There are multiple use cases where bulkloading could be useful, for example

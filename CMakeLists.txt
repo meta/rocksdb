@@ -1020,6 +1020,7 @@ set(SOURCES
         util/dynamic_bloom.cc
         util/hash.cc
         util/io_dispatcher_imp.cc
+        util/io_prefetch_scheduler.cc
         util/murmurhash.cc
         util/random.cc
         util/rate_limiter.cc
@@ -1050,6 +1051,7 @@ set(SOURCES
         utilities/cassandra/merge_operator.cc
         utilities/checkpoint/checkpoint_impl.cc
         utilities/compaction_filters.cc
+        utilities/db_split_merge.cc
         utilities/sorted_run_builder/sorted_run_builder.cc
         utilities/compaction_filters/remove_emptyvalue_compactionfilter.cc
         utilities/counted_fs.cc
@@ -1506,6 +1508,7 @@ if(WITH_TESTS)
         db/db_compaction_test.cc
         db/db_compaction_abort_test.cc
         db/db_clip_test.cc
+        utilities/db_split_merge_test.cc
         db/db_dynamic_level_test.cc
         db/db_encryption_test.cc
         db/db_etc2_test.cc

@@ -8,8 +8,12 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #pragma once
 
+#include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <string>
 
 #include "rocksdb/env.h"
 #include "rocksdb/threadpool.h"
@@ -88,6 +92,9 @@ class ThreadPoolImpl : public ThreadPool {
   // Set the thread priority.
   void SetThreadPriority(Env::Priority priority);
 
+  // Set before starting any threads. Empty names use the pool priority.
+  void SetThreadName(const std::string& name);
+
   // Reserve a specific number of threads, prevent them from running other
   // functions The number of reserved threads could be fewer than the desired
   // one
@@ -115,6 +122,38 @@ class ThreadPoolImpl : public ThreadPool {
   //
   // We can also combine these two approaches
   std::unique_ptr<Impl> impl_;
+};
+
+class RemoteCompactionThreadPool {
+ public:
+  static std::shared_ptr<RemoteCompactionThreadPool> GetShared(
+      bool create_if_missing = true);
+
+  RemoteCompactionThreadPool();
+  ~RemoteCompactionThreadPool();
+  RemoteCompactionThreadPool(const RemoteCompactionThreadPool&) = delete;
+  RemoteCompactionThreadPool& operator=(const RemoteCompactionThreadPool&) =
+      delete;
+  RemoteCompactionThreadPool(RemoteCompactionThreadPool&&) = delete;
+  RemoteCompactionThreadPool& operator=(RemoteCompactionThreadPool&&) = delete;
+
+  // Each accepted job must call CompleteJob before releasing its DB's pool
+  // reference. DB shutdown waits for that DB's jobs before releasing it.
+  void SubmitJob(std::function<void()> work, const void* client, int baseline);
+  void CompleteJob();
+  void Shrink(const void* client, int baseline);
+  void RemoveClient(const void* client);
+  int GetBackgroundThreads();
+
+ private:
+  int Baseline() const;
+  static uint64_t NowNanos();
+
+  std::mutex mutex_;
+  ThreadPoolImpl pool_;
+  std::map<const void*, int> client_baselines_;
+  int jobs_ = 0;
+  uint64_t last_activity_nanos_ = 0;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

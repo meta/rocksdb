@@ -78,7 +78,7 @@ static void FilterBuild(benchmark::State& state) {
   auto rnd = Random32(12345);
   uint32_t filter_num = rnd.Next();
   // run the test
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     std::unique_ptr<FilterBitsBuilder> builder(tester->GetBuilder());
     for (uint32_t i = 0; i < kEntryNum; i++) {
       builder->AddKey(km.Get(filter_num, i));
@@ -109,7 +109,7 @@ static void FilterQueryPositive(benchmark::State& state) {
 
   // run test
   uint32_t i = 0;
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     i++;
     i = i % kEntryNum;
     reader->MayMatch(km.Get(filter_num, i));
@@ -138,7 +138,7 @@ static void FilterQueryNegative(benchmark::State& state) {
   // run test
   uint32_t i = 0;
   double fp_cnt = 0;
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     i++;
     auto result = reader->MayMatch(km.Get(filter_num + 1, i));
     if (result) {

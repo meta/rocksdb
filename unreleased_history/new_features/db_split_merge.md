@@ -1,0 +1,1 @@
+Added `SplitDB()`, `DeleteSplitRanges()`, and `MergeDB()` in `rocksdb/utilities/db_split_merge.h`, plus a `db_split_merge` command-line tool, for moving selected column-family key ranges into a new DB and copying ranges into existing column families.

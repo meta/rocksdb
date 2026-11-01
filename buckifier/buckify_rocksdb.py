@@ -188,22 +188,22 @@ def generate_buck(repo_path, deps_map):
         # always add range_tree, it's only excluded on ppc64, which we don't use internally
         src_mk["RANGE_TREE_SOURCES"] + src_mk["TOOL_LIB_SOURCES"],
         deps=[
-            "//folly:executor",
-            "//folly/container:f14_hash",
-            "//folly/coro:baton",
-            "//folly/coro:blocking_wait",
-            "//folly/coro:collect",
-            "//folly/coro:coroutine",
-            "//folly/coro:nothrow",
-            "//folly/coro:task",
-            "//folly/executors:io_executor",
-            "//folly/executors:io_thread_pool_executor",
-            "//folly/executors/thread_factory:named_thread_factory",
-            "//folly/io/async:async_base",
-            "//folly/io/async:event_base_manager",
-            "//folly/io/async:io_uring_backend",
-            "//folly/io/async:request_context",
-            "//folly/synchronization:distributed_mutex",
+            "fbsource//xplat/folly:executor",
+            "fbsource//xplat/folly/container:f14_hash",
+            "fbsource//xplat/folly/coro:baton",
+            "fbsource//xplat/folly/coro:blocking_wait",
+            "fbsource//xplat/folly/coro:collect",
+            "fbsource//xplat/folly/coro:coroutine",
+            "fbsource//xplat/folly/coro:nothrow",
+            "fbsource//xplat/folly/coro:task",
+            "fbsource//xplat/folly/executors:io_executor",
+            "fbsource//xplat/folly/executors:io_thread_pool_executor",
+            "fbsource//xplat/folly/executors/thread_factory:named_thread_factory",
+            "fbsource//xplat/folly/io/async:async_base",
+            "fbsource//xplat/folly/io/async:event_base_manager",
+            "fbsource//xplat/folly/io/async:io_uring_backend",
+            "fbsource//xplat/folly/io/async:request_context",
+            "fbsource//xplat/folly/synchronization:distributed_mutex",
         ],
         headers=LiteralValue("glob([\"**/*.h\"])")
     )
@@ -298,6 +298,9 @@ def generate_buck(repo_path, deps_map):
     # ldb binary
     BUCK.add_binary(
         "ldb", ["tools/ldb.cc"], [":rocksdb_tools_lib"]
+    )
+    BUCK.add_binary(
+        "db_split_merge", ["tools/db_split_merge.cc"], [":rocksdb_lib"]
     )
     # db_stress binary
     BUCK.add_binary(

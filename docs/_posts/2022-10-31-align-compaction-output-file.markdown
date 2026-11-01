@@ -9,7 +9,7 @@ category: blog
 By cutting the compaction output file earlier and allowing larger than targeted_file_size to align the compaction output files to the next level files, it can **reduce WA (Write Amplification) by more than 10%**. The feature is **enabled by default** after the user upgrades RocksDB to version `7.8.0+`.
 
 ## Background
-RocksDB level compaction picks one file from the source level and compacts to the next level, which is a typical partial merge compaction algorithm. Compared to the full merge compaction strategy for example [universal compaction](https://github.com/facebook/rocksdb/wiki/Universal-Compaction), it has the benefits of smaller compaction size, better parallelism, etc. But it also has a larger write amplification (typically 20-30 times user data). One of the problems is wasted compaction at the beginning and ending:
+RocksDB level compaction picks one file from the source level and compacts to the next level, which is a typical partial merge compaction algorithm. Compared to the full merge compaction strategy for example [universal compaction](https://github.com/meta/rocksdb/wiki/Universal-Compaction), it has the benefits of smaller compaction size, better parallelism, etc. But it also has a larger write amplification (typically 20-30 times user data). One of the problems is wasted compaction at the beginning and ending:
 
 ![](/static/images/align-compaction-output/file_cut_normal.png)
 {: style="display: block; margin-left: auto; margin-right: auto; width: 80%"}
@@ -26,9 +26,9 @@ Internally, RocksDB tries to cut the file so its size is close to the `target_fi
 ```
 current_size > ((5 * min(bounderies_num, 8) + 50) / 100) * target_file_size
 ```
-([details](https://github.com/facebook/rocksdb/blob/23fa5b7789d6acd0c211d6bdd41448bbf1513bb6/db/compaction/compaction_outputs.cc#L270-L290))
+([details](https://github.com/meta/rocksdb/blob/23fa5b7789d6acd0c211d6bdd41448bbf1513bb6/db/compaction/compaction_outputs.cc#L270-L290))
 
-The file size is also capped at `2x target_file_size`: [details](https://github.com/facebook/rocksdb/blob/f726d29a8268ae4e2ffeec09172383cff2ab4db9/db/compaction/compaction.cc#L273-L277).
+The file size is also capped at `2x target_file_size`: [details](https://github.com/meta/rocksdb/blob/f726d29a8268ae4e2ffeec09172383cff2ab4db9/db/compaction/compaction.cc#L273-L277).
 Another benefit of cutting the file earlier is having more trivial move compaction, which is moving the file from a high level to a low level without compacting anything. Based on a compaction simulator test, the trivial move data is increased by 30% (but still less than 1% compaction data is trivial move):
 
 ![](/static/images/align-compaction-output/file_cut_trival_move.png)
@@ -54,7 +54,7 @@ options.level_compaction_dynamic_file_size = false;
 
 ## Other Options and Benchmark
 We also tested a few other options, starting with a fixed threshold: 75% of the target_file_size and 50%. Then with a dynamic threshold that is explained, but still limiting file size smaller than the target_file_size.
-1. Baseline (main branch before [PR#10655](https://github.com/facebook/rocksdb/pull/10655));
+1. Baseline (main branch before [PR#10655](https://github.com/meta/rocksdb/pull/10655));
 2. Fixed Threshold `75%`: after 75% of target file size, cut the file whenever it aligns with a low level file boundary;
 3. Fixed Threshold `50%`: reduce the threshold to 50% of target file size;
 4. Dynamic Threshold `(5*bounderies_num + 50)` percent of target file size and maxed at 90%;

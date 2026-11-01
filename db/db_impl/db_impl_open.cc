@@ -118,7 +118,7 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
     // - kPointInTimeRecovery and kAbsoluteConsistency are incompatible with
     //   recycle log file feature temporarily due to a bug found introducing a
     //   hole in the recovered data
-    //   (https://github.com/facebook/rocksdb/pull/7252#issuecomment-673766236).
+    //   (https://github.com/meta/rocksdb/pull/7252#issuecomment-673766236).
     //   Besides this bug, we believe the features are fundamentally compatible.
     result.recycle_log_file_num = 0;
   }

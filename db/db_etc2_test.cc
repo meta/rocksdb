@@ -28,6 +28,7 @@
 #include "rocksdb/utilities/replayer.h"
 #include "rocksdb/wal_filter.h"
 #include "test_util/testutil.h"
+#include "trace_replay/trace_replay.h"
 #include "util/defer.h"
 #include "util/mutexlock.h"
 #include "util/random.h"
@@ -5151,6 +5152,96 @@ TEST_F(DBTest2, TraceRecordsReadWriteOptions) {
       ASSERT_OK(DestroyDB(dbname2, options2));
     }
   }
+}
+
+// A newer RocksDB may add query record fields under payload bits this one
+// does not know. They are encoded after the known fields, which still decode.
+TEST_F(DBTest2, TraceDecoderIgnoresUnknownRecordFields) {
+  const std::string trace_filename = dbname_ + "/rocksdb.trace";
+  std::unique_ptr<TraceWriter> trace_writer;
+  ASSERT_OK(
+      NewFileTraceWriter(env_, EnvOptions(), trace_filename, &trace_writer));
+  TraceOptions trace_options;
+  trace_options.include_read_write_options = true;
+  ASSERT_OK(db_->StartTrace(trace_options, std::move(trace_writer)));
+  WriteOptions write_options;
+  write_options.disableWAL = true;
+  ASSERT_OK(db_->Put(write_options, "a", "1"));
+  ReadOptions read_options;
+  read_options.fill_cache = false;
+  std::string value;
+  ASSERT_OK(db_->Get(read_options, "a", &value));
+  std::vector<std::string> values;
+  for (const Status& s : db_->MultiGet(read_options, {Slice("a")}, &values)) {
+    ASSERT_OK(s);
+  }
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+    iter->Seek("a");
+    ASSERT_OK(iter->status());
+  }
+  ASSERT_OK(db_->EndTrace());
+
+  std::unique_ptr<TraceReader> trace_reader;
+  ASSERT_OK(
+      NewFileTraceReader(env_, EnvOptions(), trace_filename, &trace_reader));
+  int decoded = 0;
+  std::string encoded;
+  while (trace_reader->Read(&encoded).ok()) {
+    Trace trace;
+    ASSERT_OK(TracerHelper::DecodeTrace(encoded, &trace));
+    if (trace.type != kTraceWrite && trace.type != kTraceGet &&
+        trace.type != kTraceMultiGet && trace.type != kTraceIteratorSeek) {
+      continue;
+    }
+    Trace extended = trace;
+    EncodeFixed64(&extended.payload[0],
+                  DecodeFixed64(trace.payload.data()) | (uint64_t{1} << 40));
+    extended.payload.append("a field from a newer version");
+    std::unique_ptr<TraceRecord> expected;
+    std::unique_ptr<TraceRecord> actual;
+    ASSERT_OK(TracerHelper::DecodeTraceRecord(&trace, kTraceFileMinorVersion,
+                                              &expected));
+    ASSERT_OK(TracerHelper::DecodeTraceRecord(&extended, kTraceFileMinorVersion,
+                                              &actual));
+    ASSERT_EQ(expected->GetTraceType(), actual->GetTraceType());
+    switch (trace.type) {
+      case kTraceWrite: {
+        auto* e = static_cast<WriteQueryTraceRecord*>(expected.get());
+        auto* a = static_cast<WriteQueryTraceRecord*>(actual.get());
+        ASSERT_EQ(e->GetWriteBatchRep(), a->GetWriteBatchRep());
+        ASSERT_NE(a->GetWriteOptions(), nullptr);
+        ASSERT_TRUE(a->GetWriteOptions()->disableWAL);
+        break;
+      }
+      case kTraceGet: {
+        auto* e = static_cast<GetQueryTraceRecord*>(expected.get());
+        auto* a = static_cast<GetQueryTraceRecord*>(actual.get());
+        ASSERT_EQ(e->GetKey(), a->GetKey());
+        ASSERT_NE(a->GetReadOptions(), nullptr);
+        ASSERT_FALSE(a->GetReadOptions()->fill_cache);
+        break;
+      }
+      case kTraceMultiGet: {
+        auto* e = static_cast<MultiGetQueryTraceRecord*>(expected.get());
+        auto* a = static_cast<MultiGetQueryTraceRecord*>(actual.get());
+        ASSERT_EQ(e->GetKeys(), a->GetKeys());
+        ASSERT_NE(a->GetReadOptions(), nullptr);
+        ASSERT_FALSE(a->GetReadOptions()->fill_cache);
+        break;
+      }
+      default: {
+        auto* e = static_cast<IteratorSeekQueryTraceRecord*>(expected.get());
+        auto* a = static_cast<IteratorSeekQueryTraceRecord*>(actual.get());
+        ASSERT_EQ(e->GetKey(), a->GetKey());
+        ASSERT_NE(a->GetReadOptions(), nullptr);
+        ASSERT_FALSE(a->GetReadOptions()->fill_cache);
+        break;
+      }
+    }
+    ++decoded;
+  }
+  ASSERT_EQ(decoded, 4);
 }
 
 // A call that the live DB served without I/O (here from the memtable) needs

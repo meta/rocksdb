@@ -40,15 +40,16 @@ BlobFileBuilder::BlobFileBuilder(
     const std::string& column_family_name, Env::WriteLifeTimeHint write_hint,
     const std::shared_ptr<IOTracer>& io_tracer,
     BlobFileCompletionCallback* blob_callback,
-    BlobFileCreationReason creation_reason,
+    BlobFileCreationReason creation_reason, std::string blob_output_path,
     std::vector<std::string>* output_file_paths,
     std::vector<BlobFileAddition>* blob_file_additions)
     : BlobFileBuilder([versions]() { return versions->NewFileNumber(); }, fs,
                       immutable_options, mutable_cf_options, file_options,
-                      write_options, db_id, db_session_id, job_id,
-                      column_family_id, column_family_name, write_hint,
+                      write_options, std::move(db_id), std::move(db_session_id),
+                      job_id, column_family_id, column_family_name, write_hint,
                       io_tracer, blob_callback, creation_reason,
-                      output_file_paths, blob_file_additions) {}
+                      std::move(blob_output_path), output_file_paths,
+                      blob_file_additions) {}
 
 BlobFileBuilder::BlobFileBuilder(
     std::function<uint64_t()> file_number_generator, FileSystem* fs,
@@ -59,7 +60,7 @@ BlobFileBuilder::BlobFileBuilder(
     const std::string& column_family_name, Env::WriteLifeTimeHint write_hint,
     const std::shared_ptr<IOTracer>& io_tracer,
     BlobFileCompletionCallback* blob_callback,
-    BlobFileCreationReason creation_reason,
+    BlobFileCreationReason creation_reason, std::string blob_output_path,
     std::vector<std::string>* output_file_paths,
     std::vector<BlobFileAddition>* blob_file_additions)
     : file_number_generator_(std::move(file_number_generator)),
@@ -90,6 +91,7 @@ BlobFileBuilder::BlobFileBuilder(
       io_tracer_(io_tracer),
       blob_callback_(blob_callback),
       creation_reason_(creation_reason),
+      blob_output_path_(std::move(blob_output_path)),
       output_file_paths_(output_file_paths),
       blob_file_additions_(blob_file_additions),
       blob_count_(0),
@@ -102,16 +104,14 @@ BlobFileBuilder::BlobFileBuilder(
   assert(output_file_paths_);
   assert(output_file_paths_->empty());
   assert(blob_file_additions_);
-  assert(blob_file_additions_->empty());
+  // Resumable compactions restore finalized additions before creating a new
+  // builder. Any newly generated blob files are appended to that state.
 }
 
 BlobFileBuilder::~BlobFileBuilder() = default;
 
 std::string BlobFileBuilder::GetBlobFilePath(uint64_t blob_file_number) const {
-  assert(immutable_options_);
-  assert(!immutable_options_->cf_paths.empty());
-  return BlobFileName(immutable_options_->cf_paths.front().path,
-                      blob_file_number);
+  return BlobFileName(blob_output_path_, blob_file_number);
 }
 
 Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
@@ -194,6 +194,9 @@ Status BlobFileBuilder::OpenBlobFileIfNeeded() {
 
   assert(file_number_generator_);
   const uint64_t blob_file_number = file_number_generator_();
+  if (blob_file_number == kInvalidBlobFileNumber) {
+    return Status::Incomplete("Blob file number range exhausted");
+  }
 
   std::string blob_file_path = GetBlobFilePath(blob_file_number);
 
@@ -353,7 +356,7 @@ Status BlobFileBuilder::CloseBlobFile() {
     s = blob_callback_->OnBlobFileCompleted(
         GetBlobFilePath(blob_file_number), column_family_name_, job_id_,
         blob_file_number, creation_reason_, s, checksum_value, checksum_method,
-        blob_count_, blob_bytes_);
+        blob_count_, blob_bytes_, /*set_bg_error_on_space_limit=*/true);
   }
 
   assert(blob_file_additions_);
@@ -400,7 +403,7 @@ void BlobFileBuilder::Abandon(const Status& s) {
         ->OnBlobFileCompleted(GetBlobFilePath(blob_file_number),
                               column_family_name_, job_id_, blob_file_number,
                               creation_reason_, s, "", "", blob_count_,
-                              blob_bytes_)
+                              blob_bytes_, /*set_bg_error_on_space_limit=*/true)
         .PermitUncheckedError();
   }
 

@@ -1,11 +1,11 @@
-name: facebook/rocksdb/nightly-candidate
+name: meta/rocksdb/nightly-candidate
 on: workflow_dispatch
 permissions: {}
 jobs:
   # These jobs would be in nightly but are failing or otherwise broken for
   # some reason.
   build-linux-arm-test-full:
-    if: ${{ github.repository_owner == 'facebook' }}
+    if: ${{ github.repository_owner == 'meta' }}
     runs-on:
       labels: arm64large
     container:
@@ -16,4 +16,3 @@ jobs:
     - uses: "./.github/actions/pre-steps"
     - uses: "./.github/actions/install-gflags"
     - run: make V=1 J=4 -j4 check
-    - uses: "./.github/actions/post-steps"

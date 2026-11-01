@@ -2084,30 +2084,18 @@ std::vector<std::string> VersionBuilder::GetAndClearIntermediateFiles() {
 void VersionBuilder::ClearFoundFiles() { return rep_->ClearFoundFiles(); }
 
 BaseReferencedVersionBuilder::BaseReferencedVersionBuilder(
-    ColumnFamilyData* cfd, VersionEditHandler* version_edit_handler,
+    ColumnFamilyData* cfd, Version* base_version,
+    VersionEditHandler* version_edit_handler,
     bool track_found_and_missing_files, bool allow_incomplete_valid_version)
     : version_builder_(new VersionBuilder(
-          cfd->current()->version_set()->file_options(), &cfd->ioptions(),
-          cfd->table_cache(), cfd->current()->storage_info(),
-          cfd->current()->version_set(),
+          base_version->version_set()->file_options(), &cfd->ioptions(),
+          cfd->table_cache(), base_version->storage_info(),
+          base_version->version_set(),
           cfd->GetFileMetadataCacheReservationManager(), cfd,
           version_edit_handler, track_found_and_missing_files,
           allow_incomplete_valid_version)),
-      version_(cfd->current()) {
+      version_(base_version) {
   version_->Ref();
-}
-
-BaseReferencedVersionBuilder::BaseReferencedVersionBuilder(
-    ColumnFamilyData* cfd, Version* v, VersionEditHandler* version_edit_handler,
-    bool track_found_and_missing_files, bool allow_incomplete_valid_version)
-    : version_builder_(new VersionBuilder(
-          cfd->current()->version_set()->file_options(), &cfd->ioptions(),
-          cfd->table_cache(), v->storage_info(), v->version_set(),
-          cfd->GetFileMetadataCacheReservationManager(), cfd,
-          version_edit_handler, track_found_and_missing_files,
-          allow_incomplete_valid_version)),
-      version_(v) {
-  assert(version_ != cfd->current());
 }
 
 BaseReferencedVersionBuilder::~BaseReferencedVersionBuilder() {

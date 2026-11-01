@@ -12,12 +12,16 @@
 #include "port/stack_trace.h"
 #include "rocksdb/db.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/perf_context.h"
+#include "rocksdb/perf_level.h"
 #include "table/block_based/binary_search_index_reader.h"
 #include "table/block_based/block_based_table_builder.h"
 #include "table/block_based/block_based_table_factory.h"
 #include "table/block_based/block_based_table_reader.h"
+#include "table/block_based/block_cache.h"
 #include "table/format.h"
 #include "test_util/testharness.h"
+#include "util/defer.h"
 #include "utilities/memory_allocators.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -101,31 +105,36 @@ class BlockFetcherTest : public testing::Test {
                        CountedMemoryAllocator* heap_buf_allocator,
                        CountedMemoryAllocator* compressed_buf_allocator,
                        MemcpyStats* memcpy_stats, BlockContents* index_block,
-                       std::string* result) {
+                       std::string* result,
+                       BlockType block_type = BlockType::kIndex) {
     FileOptions fopt(options_);
     std::unique_ptr<RandomAccessFileReader> file;
     NewFileReader(table_name, fopt, &file);
 
-    // Get handle of the index block.
+    BlockHandle index_handle;
+    FindIndexBlockHandle(file.get(), &index_handle);
+
+    CompressionType compression_type;
+    FetchBlock(file.get(), index_handle, block_type, false /* compressed */,
+               false /* do_uncompress */, heap_buf_allocator,
+               compressed_buf_allocator, index_block, memcpy_stats,
+               &compression_type);
+    ASSERT_EQ(compression_type, CompressionType::kNoCompression);
+    result->assign(index_block->data.ToString());
+  }
+
+  void FindIndexBlockHandle(RandomAccessFileReader* file,
+                            BlockHandle* index_handle) {
     Footer footer;
     uint64_t file_size = 0;
-    ReadFooter(file.get(), &footer, &file_size);
+    ReadFooter(file, &footer, &file_size);
 
     // Index handle comes from metaindex for format_version >= 6
     ASSERT_TRUE(footer.index_handle().IsNull());
 
-    BlockHandle index_handle;
-    ASSERT_OK(FindMetaBlockInFile(
-        file.get(), file_size, kBlockBasedTableMagicNumber,
-        ImmutableOptions(options_), {}, kIndexBlockName, &index_handle));
-
-    CompressionType compression_type;
-    FetchBlock(file.get(), index_handle, BlockType::kIndex,
-               false /* compressed */, false /* do_uncompress */,
-               heap_buf_allocator, compressed_buf_allocator, index_block,
-               memcpy_stats, &compression_type);
-    ASSERT_EQ(compression_type, CompressionType::kNoCompression);
-    result->assign(index_block->data.ToString());
+    ASSERT_OK(FindMetaBlockInFile(file, file_size, kBlockBasedTableMagicNumber,
+                                  ImmutableOptions(options_), {},
+                                  kIndexBlockName, index_handle));
   }
 
   // Fetches the first data block in both direct IO and non-direct IO mode.
@@ -230,6 +239,39 @@ class BlockFetcherTest : public testing::Test {
     }
   }
 
+  void VerifyUserDefinedIndexReadCountsAsIndexBlock(
+      const std::string& table_name) {
+    CountedMemoryAllocator allocator;
+    MemcpyStats memcpy_stats{};
+    BlockContents index_block;
+    SetMode(Mode::kBufferedRead);
+
+    FileOptions fopt(options_);
+    std::unique_ptr<RandomAccessFileReader> file;
+    NewFileReader(table_name, fopt, &file);
+    BlockHandle index_handle;
+    FindIndexBlockHandle(file.get(), &index_handle);
+
+    SetPerfLevel(PerfLevel::kEnableCount);
+    Defer reset_perf_level([] { SetPerfLevel(PerfLevel::kDisable); });
+    get_perf_context()->Reset();
+
+    CompressionType compression_type;
+    FetchBlock(file.get(), index_handle, BlockType::kUserDefinedIndex,
+               false /* compressed */, false /* do_uncompress */, &allocator,
+               &allocator, &index_block, &memcpy_stats, &compression_type);
+    ASSERT_EQ(compression_type, CompressionType::kNoCompression);
+
+    ASSERT_EQ(get_perf_context()->block_read_count, 1);
+    ASSERT_EQ(get_perf_context()->index_block_read_count, 1);
+    ASSERT_EQ(get_perf_context()->filter_block_read_count, 0);
+    ASSERT_EQ(get_perf_context()->compression_dict_block_read_count, 0);
+    ASSERT_GT(get_perf_context()->index_block_read_byte, 0);
+    ASSERT_EQ(get_perf_context()->block_read_byte,
+              get_perf_context()->index_block_read_byte);
+    ASSERT_EQ(get_perf_context()->metadata_block_read_byte, 0);
+  }
+
  private:
   std::string test_dir_;
   Env* env_;
@@ -238,13 +280,6 @@ class BlockFetcherTest : public testing::Test {
   Options options_;
 
   std::string Path(const std::string& fname) { return test_dir_ + "/" + fname; }
-
-  void WriteToFile(const std::string& content, const std::string& filename) {
-    std::unique_ptr<FSWritableFile> f;
-    ASSERT_OK(fs_->NewWritableFile(Path(filename), FileOptions(), &f, nullptr));
-    ASSERT_OK(f->Append(content, IOOptions(), nullptr));
-    ASSERT_OK(f->Close(IOOptions(), nullptr));
-  }
 
   void NewFileWriter(const std::string& filename,
                      std::unique_ptr<WritableFileWriter>* writer) {
@@ -409,6 +444,20 @@ TEST_F(BlockFetcherTest, FetchIndexBlock) {
       AssertSameBlock(index_datas[i], index_datas[i + 1]);
     }
   }
+}
+
+TEST_F(BlockFetcherTest, UserDefinedIndexUsesIndexCacheHelpers) {
+  ASSERT_NE(nullptr, GetCacheItemHelper(BlockType::kUserDefinedIndex,
+                                        CacheTier::kVolatileTier));
+  ASSERT_NE(nullptr, GetCacheItemHelper(BlockType::kUserDefinedIndex,
+                                        CacheTier::kNonVolatileBlockTier));
+}
+
+TEST_F(BlockFetcherTest, UserDefinedIndexReadCountsAsIndexBlock) {
+  std::string table_name = "UserDefinedIndexReadCountsAsIndexBlock";
+  CreateTable(table_name, kNoCompression);
+
+  VerifyUserDefinedIndexReadCountsAsIndexBlock(table_name);
 }
 
 // Data blocks are not compressed,

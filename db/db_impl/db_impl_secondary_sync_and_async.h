@@ -87,6 +87,9 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImplSecondary::GetImpl)
     }
   }
 
+  MergeContext merge_context;
+  PrepareGetMergeOperands(get_impl_options, &merge_context);
+
   // Acquire SuperVersion, or use the batch's shared one for a batched lazy read
   // (see GetImplOptions::lazy_columns_shared_sv), skipping the per-key
   // reference and its release.
@@ -116,10 +119,6 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImplSecondary::GetImpl)
       CO_RETURN s;
     }
   }
-  MergeContext merge_context;
-  // TODO - Large Result Optimization for Secondary DB
-  // (https://github.com/facebook/rocksdb/pull/10458)
-
   SequenceNumber max_covering_tombstone_seq = 0;
   LookupKey lkey(key, snapshot, read_options.timestamp);
   PERF_TIMER_STOP(get_snapshot_time);
@@ -202,9 +201,11 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImplSecondary::GetImpl)
     }
     CO_RETURN s;
   }
+  // SST-backed operands borrow block memory pinned here, so this must outlive
+  // FinalizeGetMergeOperands below.
+  PinnedIteratorsManager pinned_iters_mgr;
   if (!done) {
     PERF_TIMER_GUARD(get_from_output_files_time);
-    PinnedIteratorsManager pinned_iters_mgr;
     CO_AWAIT(super_version->current->Get, read_options, lkey,
              get_impl_options.value, get_impl_options.columns, ts, &s,
              &merge_context, &max_covering_tombstone_seq, &pinned_iters_mgr,
@@ -231,13 +232,6 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImplSecondary::GetImpl)
       // batch holds one shared pin per column family instead.
       TransferSuperVersionPin(super_version, get_impl_options.lazy_columns_pin);
     }
-    if (own_super_version) {
-#if defined(WITH_COROUTINES)
-      CleanupSuperVersion(super_version);
-#else
-      ReturnAndCleanupSuperVersion(cfd, super_version);
-#endif
-    }
     RecordTick(stats_, NUMBER_KEYS_READ);
     size_t size = 0;
     // Mirror DBImpl::GetImpl: only produce merge-operand output and count bytes
@@ -249,17 +243,24 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImplSecondary::GetImpl)
       } else if (get_impl_options.columns) {
         size = get_impl_options.columns->payload_size();
       } else if (get_impl_options.merge_operands) {
-        *get_impl_options.number_of_operands =
-            static_cast<int>(merge_context.GetNumOperands());
-        for (const Slice& sl : merge_context.GetOperands()) {
-          size += sl.size();
-          get_impl_options.merge_operands->PinSelf(sl);
-          get_impl_options.merge_operands++;
-        }
+        s = FinalizeGetMergeOperands(get_impl_options, super_version,
+                                     &merge_context, &pinned_iters_mgr, &size);
       }
       RecordTick(stats_, BYTES_READ, size);
       RecordTimeToHistogram(stats_, BYTES_PER_READ, size);
       PERF_COUNTER_ADD(get_read_bytes, size);
+    }
+    // Finalization may copy from the SuperVersion or transfer its ownership to
+    // returned operands, so release this call's reference only afterwards.
+    // Memtable operands are borrowed slices, and a concurrent
+    // TryCatchUpWithPrimary can retire their memtable, leaving this reference
+    // as the last one keeping it alive.
+    if (own_super_version) {
+#if defined(WITH_COROUTINES)
+      CleanupSuperVersion(super_version);
+#else
+      ReturnAndCleanupSuperVersion(cfd, super_version);
+#endif
     }
   }
   CO_RETURN s;

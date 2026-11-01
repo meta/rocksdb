@@ -10,7 +10,9 @@
 #include "db/db_test_util.h"
 #include "db/wide/wide_column_test_util.h"
 #include "port/stack_trace.h"
+#include "rocksdb/utilities/stackable_db.h"
 #include "test_util/testutil.h"
+#include "util/defer.h"
 #include "util/overload.h"
 #include "utilities/merge_operators.h"
 
@@ -3541,6 +3543,718 @@ TEST_F(DBWideBasicTest, EntityBlobReverseIteration) {
     ASSERT_EQ(iter->columns(), columns1);
     ASSERT_EQ(iter->value(), blob_value);
   }
+}
+
+namespace {
+OutputMetadata NewerVersionOutputMetadata() {
+  OutputMetadata output_metadata;
+  output_metadata.WantNewerVersionPresent();
+  return output_metadata;
+}
+
+MultiGetOutputMetadata NewerVersionMultiGetOutputMetadata() {
+  MultiGetOutputMetadata output_metadata;
+  output_metadata.WantNewerVersionPresent();
+  return output_metadata;
+}
+}  // namespace
+
+TEST_F(DBWideBasicTest, MultiGetEntityWithMetadataNewerVersionPresent) {
+  // A mixed batch reports newer writes independently for each key, whether
+  // the versions live in the mutable memtable, an immutable memtable, or SSTs.
+  Options options = GetDefaultOptions();
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  Reopen(options);
+
+  const WideColumns updated_columns{{"a", "1"}, {"b", "2"}};
+  const WideColumns unchanged_columns{{"c", "3"}};
+  const WideColumns deleted_columns{{"d", "4"}};
+  const WideColumns range_deleted_columns{{"f", "6"}};
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "updated", updated_columns));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "unchanged", unchanged_columns));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "deleted", deleted_columns));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "range_deleted", range_deleted_columns));
+  ASSERT_OK(Put("plain_updated", "old"));
+  ASSERT_OK(Put("merged", "old"));
+  ManagedSnapshot snapshot(db_.get());
+
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "updated", WideColumns{{"a", "10"}}));
+  ASSERT_OK(Delete("deleted"));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "plain_updated", WideColumns{{"e", "5"}}));
+  ASSERT_OK(Merge("merged", "new"));
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                             "range_deleted", "range_deleted~"));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "created", WideColumns{{"g", "7"}}));
+
+  constexpr size_t num_keys = 8;
+  const std::array<Slice, num_keys> keys{
+      {"updated", "unchanged", "deleted", "plain_updated", "merged",
+       "range_deleted", "created", "missing"}};
+  ReadOptions read_options;
+  read_options.snapshot = snapshot.snapshot();
+
+  auto verify = [&]() {
+    std::array<ColumnFamilyHandle*, num_keys> column_families{};
+    column_families.fill(db_->DefaultColumnFamily());
+    std::array<PinnableWideColumns, num_keys> results;
+    std::array<Status, num_keys> statuses;
+    MultiGetOutputMetadata output_metadata =
+        NewerVersionMultiGetOutputMetadata();
+    db_->MultiGetEntityWithMetadata(
+        read_options, num_keys, column_families.data(), keys.data(),
+        results.data(), statuses.data(), &output_metadata);
+    ASSERT_EQ(output_metadata.newer_version_present->size(), num_keys);
+    const std::vector<uint8_t>& newer = *output_metadata.newer_version_present;
+
+    ASSERT_OK(statuses[0]);
+    ASSERT_EQ(results[0].columns(), updated_columns);
+    ASSERT_TRUE(newer[0]);
+
+    ASSERT_OK(statuses[1]);
+    ASSERT_EQ(results[1].columns(), unchanged_columns);
+    ASSERT_FALSE(newer[1]);
+
+    ASSERT_OK(statuses[2]);
+    ASSERT_EQ(results[2].columns(), deleted_columns);
+    ASSERT_TRUE(newer[2]);
+
+    ASSERT_OK(statuses[3]);
+    ASSERT_EQ(results[3].columns(),
+              (WideColumns{{kDefaultWideColumnName, "old"}}));
+    ASSERT_TRUE(newer[3]);
+
+    ASSERT_OK(statuses[4]);
+    ASSERT_EQ(results[4].columns(),
+              (WideColumns{{kDefaultWideColumnName, "old"}}));
+    ASSERT_TRUE(newer[4]);
+
+    ASSERT_OK(statuses[5]);
+    ASSERT_EQ(results[5].columns(), range_deleted_columns);
+    ASSERT_TRUE(newer[5]);
+
+    ASSERT_TRUE(statuses[6].IsNotFound());
+    ASSERT_TRUE(newer[6]);
+
+    ASSERT_TRUE(statuses[7].IsNotFound());
+    ASSERT_FALSE(newer[7]);
+
+    for (size_t i = 0; i < num_keys; ++i) {
+      SCOPED_TRACE(keys[i].ToString());
+      PinnableWideColumns get_result;
+      OutputMetadata get_output_metadata = NewerVersionOutputMetadata();
+      const Status get_status = db_->GetEntityWithMetadata(
+          read_options, keys[i], &get_result, &get_output_metadata);
+      ASSERT_EQ(get_status.code(), statuses[i].code()) << get_status.ToString();
+      if (get_status.ok()) {
+        ASSERT_EQ(get_result.columns(), results[i].columns());
+      }
+      ASSERT_EQ(*get_output_metadata.newer_version_present, newer[i] != 0);
+    }
+  };
+
+  {
+    SCOPED_TRACE("mutable memtable");
+    verify();
+  }
+  Status resume_status;
+  {
+    SCOPED_TRACE("immutable memtable");
+    ASSERT_OK(db_->PauseBackgroundWork());
+    Defer resume_background(
+        [&] { resume_status = db_->ContinueBackgroundWork(); });
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    verify();
+  }
+  ASSERT_OK(resume_status);
+  {
+    SCOPED_TRACE("SST files");
+    ASSERT_OK(Flush());
+    verify();
+  }
+
+  // ignore_range_deletions affects the returned entity, not newer-version
+  // metadata about covering range tombstones.
+  read_options.ignore_range_deletions = true;
+  const Slice range_deleted_key("range_deleted");
+  PinnableWideColumns result;
+  OutputMetadata get_output_metadata = NewerVersionOutputMetadata();
+  ASSERT_OK(db_->GetEntityWithMetadata(read_options, range_deleted_key, &result,
+                                       &get_output_metadata));
+  ASSERT_EQ(result.columns(), range_deleted_columns);
+  ASSERT_TRUE(*get_output_metadata.newer_version_present);
+
+  Status status;
+  MultiGetOutputMetadata output_metadata = NewerVersionMultiGetOutputMetadata();
+  db_->MultiGetEntityWithMetadata(read_options, db_->DefaultColumnFamily(), 1,
+                                  &range_deleted_key, &result, &status,
+                                  &output_metadata);
+  ASSERT_OK(status);
+  ASSERT_EQ(result.columns(), range_deleted_columns);
+  ASSERT_TRUE((*output_metadata.newer_version_present)[0]);
+}
+
+TEST_F(DBWideBasicTest, MultiGetEntityWithMetadataAsPinnableAttributeGroups) {
+  CreateAndReopenWithCF({"hot_cf", "cold_cf"}, GetDefaultOptions());
+
+  const WideColumns first_default_old{{"d", "1"}};
+  const WideColumns first_hot_unchanged{{"h", "1"}};
+  const WideColumns first_cold_range_deleted{{"c", "1"}};
+  const WideColumns second_hot_deleted{{"h", "2"}};
+  ASSERT_OK(db_->PutEntity(
+      WriteOptions(), "first",
+      AttributeGroups{AttributeGroup(handles_[0], first_default_old),
+                      AttributeGroup(handles_[1], first_hot_unchanged),
+                      AttributeGroup(handles_[2], first_cold_range_deleted)}));
+  ASSERT_OK(db_->PutEntity(
+      WriteOptions(), "second",
+      AttributeGroups{AttributeGroup(handles_[1], second_hot_deleted)}));
+  ManagedSnapshot snapshot(db_.get());
+
+  ASSERT_OK(db_->PutEntity(
+      WriteOptions(), "first",
+      AttributeGroups{AttributeGroup(handles_[0], WideColumns{{"d", "2"}})}));
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), handles_[2], "first", "first~"));
+  ASSERT_OK(db_->PutEntity(
+      WriteOptions(), "second",
+      AttributeGroups{AttributeGroup(handles_[0], WideColumns{{"d", "new"}})}));
+  ASSERT_OK(db_->Delete(WriteOptions(), handles_[1], "second"));
+
+  constexpr size_t num_keys = 2;
+  const std::array<Slice, num_keys> keys{{"first", "second"}};
+  ReadOptions read_options;
+  read_options.snapshot = snapshot.snapshot();
+
+  auto verify = [&]() {
+    // Key 0 queries 3 CFs; key 1 queries 2 CFs (varying group counts per key).
+    std::array<PinnableAttributeGroups, num_keys> results;
+    results[0].emplace_back(handles_[0]);
+    results[0].emplace_back(handles_[1]);
+    results[0].emplace_back(handles_[2]);
+    results[1].emplace_back(handles_[0]);
+    results[1].emplace_back(handles_[1]);
+    MultiGetOutputMetadata output_metadata =
+        NewerVersionMultiGetOutputMetadata();
+    db_->MultiGetEntityWithMetadata(read_options, num_keys, keys.data(),
+                                    results.data(), &output_metadata);
+
+    ASSERT_OK(results[0][0].status());
+    ASSERT_EQ(results[0][0].columns(), first_default_old);
+    ASSERT_OK(results[0][1].status());
+    ASSERT_EQ(results[0][1].columns(), first_hot_unchanged);
+    ASSERT_OK(results[0][2].status());
+    ASSERT_EQ(results[0][2].columns(), first_cold_range_deleted);
+
+    ASSERT_TRUE(results[1][0].status().IsNotFound());
+    ASSERT_OK(results[1][1].status());
+    ASSERT_EQ(results[1][1].columns(), second_hot_deleted);
+
+    ASSERT_EQ(*output_metadata.newer_version_present,
+              (std::vector<uint8_t>{1, 0, 1, 1, 1}));
+  };
+
+  {
+    SCOPED_TRACE("mutable memtable");
+    verify();
+  }
+  Status resume_status;
+  {
+    SCOPED_TRACE("immutable memtable");
+    ASSERT_OK(db_->PauseBackgroundWork());
+    Defer resume_background(
+        [&] { resume_status = db_->ContinueBackgroundWork(); });
+    for (int cf = 0; cf < 3; ++cf) {
+      auto* cfd =
+          static_cast_with_check<ColumnFamilyHandleImpl>(handles_[cf])->cfd();
+      ASSERT_OK(dbfull()->TEST_SwitchMemtable(cfd));
+    }
+    verify();
+  }
+  ASSERT_OK(resume_status);
+  {
+    SCOPED_TRACE("SST files");
+    for (int cf = 0; cf < 3; ++cf) {
+      ASSERT_OK(Flush(cf));
+    }
+    verify();
+  }
+}
+
+TEST_F(DBWideBasicTest, MultiGetEntityWithMetadataAcrossColumnFamilies) {
+  // Unsorted mixed-CF reads keep metadata aligned with input order.
+  CreateAndReopenWithCF({"corinthian"}, GetDefaultOptions());
+
+  const WideColumns default_old{{"x", "1"}};
+  const WideColumns cf_old{{"y", "1"}};
+  const WideColumns cf_stable{{"z", "1"}};
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "k1",
+                           default_old));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), handles_[1], "k2", cf_old));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), handles_[1], "k3", cf_stable));
+  ManagedSnapshot snapshot(db_.get());
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "k1",
+                           WideColumns{{"x", "2"}}));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), handles_[1], "k2",
+                           WideColumns{{"y", "2"}}));
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Flush(1));
+
+  constexpr size_t num_keys = 3;
+  const std::array<ColumnFamilyHandle*, num_keys> column_families{
+      {handles_[1], db_->DefaultColumnFamily(), handles_[1]}};
+  const std::array<Slice, num_keys> keys{{"k2", "k1", "k3"}};
+  std::array<PinnableWideColumns, num_keys> results;
+  std::array<Status, num_keys> statuses;
+  MultiGetOutputMetadata output_metadata = NewerVersionMultiGetOutputMetadata();
+  ReadOptions read_options;
+  read_options.snapshot = snapshot.snapshot();
+  db_->MultiGetEntityWithMetadata(
+      read_options, num_keys, column_families.data(), keys.data(),
+      results.data(), statuses.data(), &output_metadata);
+
+  for (const Status& s : statuses) {
+    ASSERT_OK(s);
+  }
+  ASSERT_EQ(results[0].columns(), cf_old);
+  ASSERT_EQ(results[1].columns(), default_old);
+  ASSERT_EQ(results[2].columns(), cf_stable);
+  ASSERT_EQ(*output_metadata.newer_version_present,
+            (std::vector<uint8_t>{1, 1, 0}));
+}
+
+TEST_F(DBWideBasicTest, MultiGetEntityWithMetadataWithoutSnapshotOrRequest) {
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "key",
+                           WideColumns{{"a", "1"}}));
+  ManagedSnapshot snapshot(db_.get());
+  const WideColumns latest_columns{{"a", "2"}};
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "key",
+                           latest_columns));
+
+  const Slice key("key");
+  PinnableWideColumns result;
+  Status status;
+
+  // Without a snapshot the flag is requested but always left false.
+  OutputMetadata get_output_metadata = NewerVersionOutputMetadata();
+  ASSERT_OK(db_->GetEntityWithMetadata(ReadOptions(), key, &result,
+                                       &get_output_metadata));
+  ASSERT_EQ(result.columns(), latest_columns);
+  ASSERT_FALSE(*get_output_metadata.newer_version_present);
+
+  MultiGetOutputMetadata output_metadata = NewerVersionMultiGetOutputMetadata();
+  db_->MultiGetEntityWithMetadata(ReadOptions(), db_->DefaultColumnFamily(), 1,
+                                  &key, &result, &status, &output_metadata);
+  ASSERT_OK(status);
+  ASSERT_EQ(result.columns(), latest_columns);
+  ASSERT_EQ(*output_metadata.newer_version_present, std::vector<uint8_t>{0});
+
+  PinnableAttributeGroups attribute_groups;
+  attribute_groups.emplace_back(db_->DefaultColumnFamily());
+  db_->MultiGetEntityWithMetadata(ReadOptions(), 1, &key, &attribute_groups,
+                                  &output_metadata);
+  ASSERT_OK(attribute_groups[0].status());
+  ASSERT_EQ(attribute_groups[0].columns(), latest_columns);
+  ASSERT_EQ(*output_metadata.newer_version_present, std::vector<uint8_t>{0});
+
+  // Unrequested metadata stays disengaged, and null metadata is allowed.
+  ReadOptions read_options;
+  read_options.snapshot = snapshot.snapshot();
+  OutputMetadata get_unrequested;
+  ASSERT_OK(
+      db_->GetEntityWithMetadata(read_options, key, &result, &get_unrequested));
+  ASSERT_EQ(result.columns(), (WideColumns{{"a", "1"}}));
+  ASSERT_FALSE(get_unrequested.newer_version_present.has_value());
+  ASSERT_FALSE(get_unrequested.timestamp.has_value());
+  ASSERT_OK(db_->GetEntityWithMetadata(read_options, key, &result,
+                                       /*output_metadata=*/nullptr));
+  ASSERT_EQ(result.columns(), (WideColumns{{"a", "1"}}));
+
+  MultiGetOutputMetadata unrequested;
+  db_->MultiGetEntityWithMetadata(read_options, db_->DefaultColumnFamily(), 1,
+                                  &key, &result, &status, &unrequested);
+  ASSERT_OK(status);
+  ASSERT_EQ(result.columns(), (WideColumns{{"a", "1"}}));
+  ASSERT_FALSE(unrequested.newer_version_present.has_value());
+  ASSERT_FALSE(unrequested.timestamps.has_value());
+
+  db_->MultiGetEntityWithMetadata(read_options, 1, &key, &attribute_groups,
+                                  &unrequested);
+  ASSERT_OK(attribute_groups[0].status());
+  ASSERT_EQ(attribute_groups[0].columns(), (WideColumns{{"a", "1"}}));
+  ASSERT_FALSE(unrequested.newer_version_present.has_value());
+  ASSERT_FALSE(unrequested.timestamps.has_value());
+
+  db_->MultiGetEntityWithMetadata(read_options, db_->DefaultColumnFamily(), 1,
+                                  &key, &result, &status,
+                                  /*output_metadata=*/nullptr);
+  ASSERT_OK(status);
+  ASSERT_EQ(result.columns(), (WideColumns{{"a", "1"}}));
+
+  db_->MultiGetEntityWithMetadata(read_options, 1, &key, &attribute_groups,
+                                  /*output_metadata=*/nullptr);
+  ASSERT_OK(attribute_groups[0].status());
+  ASSERT_EQ(attribute_groups[0].columns(), (WideColumns{{"a", "1"}}));
+}
+
+TEST_F(DBWideBasicTest, MultiGetEntityWithMetadataNotSupported) {
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "key",
+                           WideColumns{{"a", "1"}}));
+  ManagedSnapshot snapshot(db_.get());
+
+  constexpr size_t num_keys = 2;
+  const std::array<Slice, num_keys> keys{{"key", "missing"}};
+  std::array<PinnableWideColumns, num_keys> results;
+  std::array<Status, num_keys> statuses;
+  std::array<PinnableAttributeGroups, num_keys> attribute_groups;
+  attribute_groups[0].emplace_back(db_->DefaultColumnFamily());
+  attribute_groups[1].emplace_back(db_->DefaultColumnFamily());
+
+  // Timestamps are rejected with or without a snapshot.
+  for (const Snapshot* read_snapshot :
+       {static_cast<const Snapshot*>(nullptr), snapshot.snapshot()}) {
+    SCOPED_TRACE(read_snapshot == nullptr ? "no snapshot" : "snapshot");
+    ReadOptions read_options;
+    read_options.snapshot = read_snapshot;
+    OutputMetadata get_output_metadata;
+    get_output_metadata.WantTimestamp().WantNewerVersionPresent();
+    *get_output_metadata.newer_version_present = true;
+    ASSERT_TRUE(db_->GetEntityWithMetadata(read_options, "key", &results[0],
+                                           &get_output_metadata)
+                    .IsNotSupported());
+    ASSERT_FALSE(*get_output_metadata.newer_version_present);
+
+    MultiGetOutputMetadata output_metadata;
+    output_metadata.WantTimestamps().WantNewerVersionPresent();
+    db_->MultiGetEntityWithMetadata(read_options, db_->DefaultColumnFamily(),
+                                    num_keys, keys.data(), results.data(),
+                                    statuses.data(), &output_metadata);
+    for (const Status& s : statuses) {
+      ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    }
+    ASSERT_EQ(output_metadata.timestamps->size(), num_keys);
+    ASSERT_EQ(*output_metadata.newer_version_present,
+              std::vector<uint8_t>(num_keys, 0));
+
+    db_->MultiGetEntityWithMetadata(read_options, num_keys, keys.data(),
+                                    attribute_groups.data(), &output_metadata);
+    for (const auto& group : attribute_groups) {
+      ASSERT_TRUE(group[0].status().IsNotSupported())
+          << group[0].status().ToString();
+    }
+    ASSERT_EQ(output_metadata.timestamps->size(), num_keys);
+    ASSERT_EQ(*output_metadata.newer_version_present,
+              std::vector<uint8_t>(num_keys, 0));
+  }
+
+  // kPersistedTier rejects tracked snapshot reads only.
+  ReadOptions read_options;
+  read_options.read_tier = kPersistedTier;
+  read_options.snapshot = snapshot.snapshot();
+  OutputMetadata get_output_metadata = NewerVersionOutputMetadata();
+  ASSERT_TRUE(db_->GetEntityWithMetadata(read_options, "key", &results[0],
+                                         &get_output_metadata)
+                  .IsNotSupported());
+  ASSERT_FALSE(*get_output_metadata.newer_version_present);
+
+  MultiGetOutputMetadata output_metadata = NewerVersionMultiGetOutputMetadata();
+  db_->MultiGetEntityWithMetadata(read_options, db_->DefaultColumnFamily(),
+                                  num_keys, keys.data(), results.data(),
+                                  statuses.data(), &output_metadata);
+  for (const Status& s : statuses) {
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  }
+  ASSERT_EQ(*output_metadata.newer_version_present,
+            std::vector<uint8_t>(num_keys, 0));
+
+  db_->MultiGetEntityWithMetadata(read_options, num_keys, keys.data(),
+                                  attribute_groups.data(), &output_metadata);
+  for (const auto& group : attribute_groups) {
+    ASSERT_TRUE(group[0].status().IsNotSupported())
+        << group[0].status().ToString();
+  }
+  ASSERT_EQ(*output_metadata.newer_version_present,
+            std::vector<uint8_t>(num_keys, 0));
+
+  read_options.snapshot = nullptr;
+  ASSERT_OK(db_->GetEntityWithMetadata(read_options, "key", &results[0],
+                                       &get_output_metadata));
+  ASSERT_EQ(results[0].columns(), (WideColumns{{"a", "1"}}));
+  db_->MultiGetEntityWithMetadata(read_options, db_->DefaultColumnFamily(),
+                                  num_keys, keys.data(), results.data(),
+                                  statuses.data(), &output_metadata);
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(results[0].columns(), (WideColumns{{"a", "1"}}));
+  ASSERT_TRUE(statuses[1].IsNotFound());
+
+  db_->MultiGetEntityWithMetadata(read_options, num_keys, keys.data(),
+                                  attribute_groups.data(), &output_metadata);
+  ASSERT_OK(attribute_groups[0][0].status());
+  ASSERT_EQ(attribute_groups[0][0].columns(), (WideColumns{{"a", "1"}}));
+  ASSERT_TRUE(attribute_groups[1][0].status().IsNotFound());
+}
+
+TEST_F(DBWideBasicTest, MultiGetEntityWithMetadataInvalidArguments) {
+  const Slice key("key");
+  ColumnFamilyHandle* column_family = db_->DefaultColumnFamily();
+  ColumnFamilyHandle* null_column_family = nullptr;
+  PinnableWideColumns result;
+  Status status;
+  OutputMetadata get_output_metadata = NewerVersionOutputMetadata();
+  MultiGetOutputMetadata output_metadata = NewerVersionMultiGetOutputMetadata();
+  constexpr size_t num_keys = 1;
+
+  ASSERT_TRUE(db_->GetEntityWithMetadata(ReadOptions(),
+                                         /*column_family=*/nullptr, key,
+                                         &result, &get_output_metadata)
+                  .IsInvalidArgument());
+  ASSERT_TRUE(db_->GetEntityWithMetadata(ReadOptions(), column_family, key,
+                                         /*columns=*/nullptr,
+                                         &get_output_metadata)
+                  .IsInvalidArgument());
+
+  db_->MultiGetEntityWithMetadata(
+      ReadOptions(), num_keys, static_cast<ColumnFamilyHandle* const*>(nullptr),
+      &key, &result, &status, &output_metadata);
+  ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+  ASSERT_EQ(*output_metadata.newer_version_present, std::vector<uint8_t>{0});
+
+  db_->MultiGetEntityWithMetadata(ReadOptions(), num_keys, &column_family,
+                                  /*keys=*/nullptr, &result, &status,
+                                  &output_metadata);
+  ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+
+  db_->MultiGetEntityWithMetadata(ReadOptions(), num_keys, &column_family, &key,
+                                  /*results=*/nullptr, &status,
+                                  &output_metadata);
+  ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+
+  db_->MultiGetEntityWithMetadata(ReadOptions(), num_keys, &null_column_family,
+                                  &key, &result, &status, &output_metadata);
+  ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+
+  PinnableAttributeGroups attribute_groups;
+  attribute_groups.emplace_back(column_family);
+  attribute_groups.emplace_back(/*column_family=*/nullptr);
+  db_->MultiGetEntityWithMetadata(
+      ReadOptions(), num_keys, &key,
+      static_cast<PinnableAttributeGroups*>(nullptr), &output_metadata);
+  ASSERT_TRUE(output_metadata.newer_version_present->empty());
+
+  db_->MultiGetEntityWithMetadata(ReadOptions(), num_keys, /*keys=*/nullptr,
+                                  &attribute_groups, &output_metadata);
+  ASSERT_TRUE(attribute_groups[0].status().IsInvalidArgument());
+  ASSERT_TRUE(attribute_groups[1].status().IsInvalidArgument());
+
+  db_->MultiGetEntityWithMetadata(ReadOptions(), num_keys, &key,
+                                  &attribute_groups, &output_metadata);
+  ASSERT_TRUE(attribute_groups[0].status().IsIncomplete());
+  ASSERT_TRUE(attribute_groups[1].status().IsInvalidArgument());
+
+  ReadOptions read_options;
+  read_options.io_activity = Env::IOActivity::kGet;
+  ASSERT_TRUE(db_->GetEntityWithMetadata(read_options, column_family, key,
+                                         &result, &get_output_metadata)
+                  .IsInvalidArgument());
+  db_->MultiGetEntityWithMetadata(read_options, num_keys, &column_family, &key,
+                                  &result, &status, &output_metadata);
+  ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+  db_->MultiGetEntityWithMetadata(read_options, num_keys, &key,
+                                  &attribute_groups, &output_metadata);
+  ASSERT_TRUE(attribute_groups[0].status().IsInvalidArgument());
+  ASSERT_TRUE(attribute_groups[1].status().IsInvalidArgument());
+}
+
+TEST_F(DBWideBasicTest, MultiGetEntityWithMetadataRowCache) {
+  Options options = GetDefaultOptions();
+  options.row_cache = NewLRUCache(1 << 20);
+  options.statistics = CreateDBStatistics();
+  Reopen(options);
+
+  const WideColumns old_columns{{"a", "old"}};
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "sst_key", old_columns));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "memtable_key", old_columns));
+  ASSERT_OK(Flush());
+  ManagedSnapshot snapshot(db_.get());
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "sst_key", WideColumns{{"a", "new"}}));
+  ASSERT_OK(Flush());
+
+  ReadOptions read_options;
+  read_options.snapshot = snapshot.snapshot();
+  constexpr size_t num_keys = 2;
+  const std::array<Slice, num_keys> keys{{"sst_key", "memtable_key"}};
+  std::array<PinnableWideColumns, num_keys> results;
+  std::array<Status, num_keys> statuses;
+
+  // Prime row-cache entries for the snapshot-visible entities.
+  db_->MultiGetEntity(read_options, db_->DefaultColumnFamily(), num_keys,
+                      keys.data(), results.data(), statuses.data());
+  ASSERT_OK(statuses[0]);
+  ASSERT_OK(statuses[1]);
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "memtable_key", WideColumns{{"a", "new"}}));
+
+  // The newer SST version must still be observed even though the snapshot
+  // entity is cached, and the newer memtable version must allow the cached
+  // snapshot entity to be replayed.
+  for (int i = 0; i < 2; ++i) {
+    SCOPED_TRACE(i);
+    const uint64_t row_cache_hits =
+        options.statistics->getTickerCount(ROW_CACHE_HIT);
+    MultiGetOutputMetadata output_metadata =
+        NewerVersionMultiGetOutputMetadata();
+    db_->MultiGetEntityWithMetadata(read_options, db_->DefaultColumnFamily(),
+                                    num_keys, keys.data(), results.data(),
+                                    statuses.data(), &output_metadata);
+    ASSERT_OK(statuses[0]);
+    ASSERT_EQ(results[0].columns(), old_columns);
+    ASSERT_OK(statuses[1]);
+    ASSERT_EQ(results[1].columns(), old_columns);
+    ASSERT_EQ(*output_metadata.newer_version_present,
+              (std::vector<uint8_t>{1, 1}));
+    ASSERT_GE(options.statistics->getTickerCount(ROW_CACHE_HIT),
+              row_cache_hits + 1);
+
+    PinnableWideColumns get_result;
+    OutputMetadata get_output_metadata = NewerVersionOutputMetadata();
+    ASSERT_OK(db_->GetEntityWithMetadata(read_options, "sst_key", &get_result,
+                                         &get_output_metadata));
+    ASSERT_EQ(get_result.columns(), old_columns);
+    ASSERT_TRUE(*get_output_metadata.newer_version_present);
+  }
+}
+
+TEST_F(DBWideBasicTest, MultiGetEntityWithMetadataBlobColumns) {
+  Options options = GetBlobTestOptions();
+  options.min_blob_size = 50;
+  Reopen(options);
+
+  const std::string blob_value = GenerateLargeValue(100);
+  const std::string small_value = GenerateSmallValue();
+  const WideColumns updated_columns{{kDefaultWideColumnName, blob_value},
+                                    {"attr", small_value}};
+  const WideColumns unchanged_columns{{"x", blob_value}, {"y", blob_value}};
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "updated", updated_columns));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "unchanged", unchanged_columns));
+  ASSERT_OK(Flush());
+  ManagedSnapshot snapshot(db_.get());
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "updated", WideColumns{{"attr", blob_value}}));
+  ASSERT_OK(Flush());
+
+  constexpr size_t num_keys = 2;
+  const std::array<Slice, num_keys> keys{{"updated", "unchanged"}};
+  std::array<PinnableWideColumns, num_keys> results;
+  std::array<Status, num_keys> statuses;
+  MultiGetOutputMetadata output_metadata = NewerVersionMultiGetOutputMetadata();
+  ReadOptions read_options;
+  read_options.snapshot = snapshot.snapshot();
+  db_->MultiGetEntityWithMetadata(read_options, db_->DefaultColumnFamily(),
+                                  num_keys, keys.data(), results.data(),
+                                  statuses.data(), &output_metadata);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(results[0].columns(), updated_columns);
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(results[1].columns(), unchanged_columns);
+  ASSERT_EQ(*output_metadata.newer_version_present,
+            (std::vector<uint8_t>{1, 0}));
+
+  PinnableWideColumns get_result;
+  OutputMetadata get_output_metadata = NewerVersionOutputMetadata();
+  ASSERT_OK(db_->GetEntityWithMetadata(read_options, "updated", &get_result,
+                                       &get_output_metadata));
+  ASSERT_EQ(get_result.columns(), updated_columns);
+  ASSERT_TRUE(*get_output_metadata.newer_version_present);
+  ASSERT_OK(db_->GetEntityWithMetadata(read_options, "unchanged", &get_result,
+                                       &get_output_metadata));
+  ASSERT_EQ(get_result.columns(), unchanged_columns);
+  ASSERT_FALSE(*get_output_metadata.newer_version_present);
+}
+
+TEST_F(DBWideBasicTest, MultiGetEntityWithMetadataLargeBatch) {
+  // Exceeds MultiGetContext::MAX_BATCH_SIZE so the single-CF overload builds
+  // its column family array on the heap.
+  constexpr size_t num_keys = MultiGetContext::MAX_BATCH_SIZE + 8;
+  std::vector<std::string> key_strings;
+  for (size_t i = 0; i < num_keys; ++i) {
+    key_strings.push_back("key" + std::to_string(i));
+    ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                             key_strings.back(), WideColumns{{"v", "old"}}));
+  }
+  ManagedSnapshot snapshot(db_.get());
+  for (size_t i = 1; i < num_keys; i += 2) {
+    ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                             key_strings[i], WideColumns{{"v", "new"}}));
+  }
+
+  const std::vector<Slice> keys(key_strings.begin(), key_strings.end());
+  std::vector<PinnableWideColumns> results(num_keys);
+  std::vector<Status> statuses(num_keys);
+  MultiGetOutputMetadata output_metadata = NewerVersionMultiGetOutputMetadata();
+  ReadOptions read_options;
+  read_options.snapshot = snapshot.snapshot();
+  db_->MultiGetEntityWithMetadata(read_options, db_->DefaultColumnFamily(),
+                                  num_keys, keys.data(), results.data(),
+                                  statuses.data(), &output_metadata);
+
+  ASSERT_EQ(output_metadata.newer_version_present->size(), num_keys);
+  for (size_t i = 0; i < num_keys; ++i) {
+    SCOPED_TRACE(i);
+    ASSERT_OK(statuses[i]);
+    ASSERT_EQ(results[i].columns(), (WideColumns{{"v", "old"}}));
+    ASSERT_EQ((*output_metadata.newer_version_present)[i],
+              static_cast<uint8_t>(i % 2));
+  }
+}
+
+TEST_F(DBWideBasicTest, MultiGetEntityWithMetadataThroughStackableDB) {
+  const WideColumns old_columns{{"a", "1"}};
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "key",
+                           old_columns));
+  ManagedSnapshot snapshot(db_.get());
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "key",
+                           WideColumns{{"a", "2"}}));
+
+  StackableDB stackable_db(std::shared_ptr<DB>(db_.get(), [](DB*) {}));
+  const Slice key("key");
+  PinnableWideColumns result;
+  Status status;
+  OutputMetadata get_output_metadata = NewerVersionOutputMetadata();
+  MultiGetOutputMetadata output_metadata = NewerVersionMultiGetOutputMetadata();
+  ReadOptions read_options;
+  read_options.snapshot = snapshot.snapshot();
+  ASSERT_OK(stackable_db.GetEntityWithMetadata(read_options, key, &result,
+                                               &get_output_metadata));
+  ASSERT_EQ(result.columns(), old_columns);
+  ASSERT_TRUE(*get_output_metadata.newer_version_present);
+
+  stackable_db.MultiGetEntityWithMetadata(
+      read_options, stackable_db.DefaultColumnFamily(), 1, &key, &result,
+      &status, &output_metadata);
+
+  ASSERT_OK(status);
+  ASSERT_EQ(result.columns(), old_columns);
+  ASSERT_EQ(*output_metadata.newer_version_present, std::vector<uint8_t>{1});
+
+  PinnableAttributeGroups attribute_groups;
+  attribute_groups.emplace_back(stackable_db.DefaultColumnFamily());
+  output_metadata = NewerVersionMultiGetOutputMetadata();
+  stackable_db.MultiGetEntityWithMetadata(read_options, 1, &key,
+                                          &attribute_groups, &output_metadata);
+  ASSERT_OK(attribute_groups[0].status());
+  ASSERT_EQ(attribute_groups[0].columns(), old_columns);
+  ASSERT_EQ(*output_metadata.newer_version_present, std::vector<uint8_t>{1});
 }
 
 }  // namespace ROCKSDB_NAMESPACE

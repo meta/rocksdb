@@ -6368,7 +6368,6 @@ namespace {
 class TestPrefixExtractor : public ROCKSDB_NAMESPACE::SliceTransform {
  public:
   ~TestPrefixExtractor() override = default;
-  ;
   const char* Name() const override { return "TestPrefixExtractor"; }
 
   ROCKSDB_NAMESPACE::Slice Transform(
@@ -11877,6 +11876,66 @@ TEST(IndexFactoryCompatibilityTest, AuxiliaryReaderMemoryIsFullyCharged) {
     table.Close();
     EXPECT_EQ(table.table_options.block_cache->GetUsage(), 0U);
   }
+}
+
+TEST_P(UserDefinedIndexTest, RawIndexMemoryIsChargedExactlyOnce) {
+  LRUCacheOptions cache_options;
+  cache_options.capacity = 1 << 20;
+  cache_options.metadata_charge_policy = kDontChargeCacheMetadata;
+  auto block_cache = cache_options.MakeSharedCache();
+  auto factory = std::make_shared<TestIndexFactory>();
+
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = block_cache;
+  table_options.cache_index_and_filter_blocks = false;
+  table_options.user_defined_index_factory = factory;
+  table_options.index_mode =
+      BlockBasedTableOptions::IndexMode::kStandardDefault;
+  table_options.flush_block_policy_factory =
+      std::make_shared<CustomFlushBlockPolicyFactory>();
+
+  Options options = options_;
+  options.compression = kNoCompression;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  std::unique_ptr<ImmutableOptions> immutable_options =
+      std::make_unique<ImmutableOptions>(options);
+  MutableCFOptions moptions(options);
+  InternalKeyComparator internal_comparator(options.comparator);
+
+  TableConstructor table(options.comparator,
+                         true /* convert_to_internal_key */);
+  for (const auto& [key, value] : generateKVs(/*key_count=*/30)) {
+    table.Add(key, value);
+  }
+  std::vector<std::string> keys;
+  stl_wrappers::KVMap kvmap;
+  table.Finish(options, *immutable_options, moptions, table_options,
+               internal_comparator, &keys, &kvmap);
+  const size_t owned_memory = table.GetTableReader()->ApproximateMemoryUsage();
+  ASSERT_EQ(block_cache->GetUsage(), 0);
+
+  table.ResetTableReader();
+  table_options.cache_index_and_filter_blocks = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  immutable_options = std::make_unique<ImmutableOptions>(options);
+  MutableCFOptions cached_moptions(options);
+  const size_t cache_usage_before = block_cache->GetUsage();
+  ASSERT_OK(table.Reopen(*immutable_options, cached_moptions));
+  const size_t cached_memory = table.GetTableReader()->ApproximateMemoryUsage();
+  const size_t index_cache_charge =
+      block_cache->GetUsage() - cache_usage_before;
+
+  ASSERT_GT(index_cache_charge, 0);
+  // Block::ApproximateMemoryUsage() adds malloc_usable_size() of the Block
+  // object, so the owned and cached allocations can land in different
+  // allocator size classes and differ by a few bytes. Compare with a
+  // tolerance well under the block size: charging the block twice or not at
+  // all would shift the total by roughly index_cache_charge.
+  const size_t expected_total = cached_memory + index_cache_charge;
+  const size_t accounting_diff = owned_memory > expected_total
+                                     ? owned_memory - expected_total
+                                     : expected_total - owned_memory;
+  EXPECT_LT(accounting_diff, index_cache_charge / 4);
 }
 
 // Verifies that kStandardOnly truly ignores user_defined_index_factory:

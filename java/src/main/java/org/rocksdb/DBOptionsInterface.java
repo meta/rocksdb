@@ -924,8 +924,8 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
    * Use passed {@link WriteBufferManager} to control memory usage across
    * multiple column families and/or DB instances.
    *
-   * Check <a href="https://github.com/facebook/rocksdb/wiki/Write-Buffer-Manager">
-   *     https://github.com/facebook/rocksdb/wiki/Write-Buffer-Manager</a>
+   * Check <a href="https://github.com/meta/rocksdb/wiki/Write-Buffer-Manager">
+   *     https://github.com/meta/rocksdb/wiki/Write-Buffer-Manager</a>
    * for more details on when to use it
    *
    * @param writeBufferManager The WriteBufferManager to use

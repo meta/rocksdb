@@ -121,6 +121,16 @@ uint64_t DBImpl::MinLogNumberToKeep() {
 
 uint64_t DBImpl::MinLogNumberToRecycle() { return min_wal_number_to_recycle_; }
 
+bool DBImpl::IsWalInLogs(uint64_t wal_number) {
+  InstrumentedMutexLock wal_lock(&wal_write_mutex_);
+  for (const auto& wal : logs_) {
+    if (wal.number == wal_number) {
+      return true;
+    }
+  }
+  return false;
+}
+
 uint64_t DBImpl::MinObsoleteSstNumberToKeep() {
   mutex_.AssertHeld();
   if (!pending_outputs_.empty()) {
@@ -292,6 +302,13 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
 
   if (doing_the_full_scan) {
     versions_->AddLiveFiles(&job_context->sst_live, &job_context->blob_live);
+    // Preserve uncommitted ingestion files in this purge snapshot.
+    for (const auto& [first_file_number, num_files] :
+         pending_ingestion_outputs_) {
+      for (uint64_t i = 0; i < num_files; ++i) {
+        job_context->sst_live.push_back(first_file_number + i);
+      }
+    }
     InfoLogPrefix info_log_prefix(!immutable_db_options_.db_log_dir.empty(),
                                   dbname_);
     // PurgeObsoleteFiles will dedupe duplicate files.
@@ -313,7 +330,7 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
         // schedule for purge, we also skip it if we
         // are doing full scan in order to avoid double deletion of the same
         // file under race conditions. See
-        // https://github.com/facebook/rocksdb/issues/3573
+        // https://github.com/meta/rocksdb/issues/3573
         if (!ParseFileName(file, &number, info_log_prefix.prefix, &type) ||
             !ShouldPurge(number)) {
           continue;
@@ -436,7 +453,10 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
       // If it's already closed, then it's been fully synced. If
       // !background_close_inactive_wals then we need to Close it before
       // removing from logs_ but not blocking while holding wal_write_mutex_.
-      if (!immutable_db_options_.background_close_inactive_wals &&
+      // A WAL that may be recycled must also be closed before it leaves
+      // logs_, because it can be reused as soon as it is gone from there.
+      if ((!immutable_db_options_.background_close_inactive_wals ||
+           immutable_db_options_.recycle_log_file_num > 0) &&
           log.writer->file()) {
         // We are taking ownership of and pinning the front entry, so we can
         // expect it to be the same after releasing and re-acquiring the lock

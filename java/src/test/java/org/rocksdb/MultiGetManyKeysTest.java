@@ -38,7 +38,7 @@ public class MultiGetManyKeysTest {
   }
 
   /**
-   * Test for <a link="https://github.com/facebook/rocksdb/issues/8039">multiGet problem</a>
+   * Test for <a link="https://github.com/meta/rocksdb/issues/8039">multiGet problem</a>
    */
   @Test
   public void multiGetAsListLarge() throws RocksDBException {
@@ -54,7 +54,7 @@ public class MultiGetManyKeysTest {
   }
 
   /**
-   * Test for <a link="https://github.com/facebook/rocksdb/issues/9006">transactional multiGet
+   * Test for <a link="https://github.com/meta/rocksdb/issues/9006">transactional multiGet
    * problem</a>
    */
   @Test
@@ -75,7 +75,7 @@ public class MultiGetManyKeysTest {
   }
 
   /**
-   * Test for <a link="https://github.com/facebook/rocksdb/issues/9006">transactional multiGet
+   * Test for <a link="https://github.com/meta/rocksdb/issues/9006">transactional multiGet
    * problem</a>
    */
   @Test
@@ -96,7 +96,7 @@ public class MultiGetManyKeysTest {
   }
 
   /**
-   * Test for <a link="https://github.com/facebook/rocksdb/issues/9006">transactional multiGet
+   * Test for <a link="https://github.com/meta/rocksdb/issues/9006">transactional multiGet
    * problem</a>
    */
   @Test
@@ -130,7 +130,7 @@ public class MultiGetManyKeysTest {
   }
 
   /**
-   * Test for <a link="https://github.com/facebook/rocksdb/issues/9006">transactional multiGet
+   * Test for <a link="https://github.com/meta/rocksdb/issues/9006">transactional multiGet
    * problem</a>
    */
   @Test

@@ -1560,6 +1560,44 @@ TEST_F(DBBasicTest, CompactedDB) {
   ASSERT_FALSE((*multiget_output_metadata.newer_version_present)[0]);
   ASSERT_TRUE(metadata_statuses[1].IsNotFound());
   ASSERT_FALSE((*multiget_output_metadata.newer_version_present)[1]);
+  {
+    const std::string expected_aaa_value = DummyString(kFileSize / 2, 'a');
+    const WideColumns expected_aaa_columns{
+        {kDefaultWideColumnName, expected_aaa_value}};
+    PinnableWideColumns get_entity_result;
+    OutputMetadata get_entity_output_metadata = NewerVersionOutputMetadata();
+    ASSERT_OK(db_->GetEntityWithMetadata(metadata_read_options, "aaa",
+                                         &get_entity_result,
+                                         &get_entity_output_metadata));
+    ASSERT_EQ(get_entity_result.columns(), expected_aaa_columns);
+    ASSERT_FALSE(*get_entity_output_metadata.newer_version_present);
+
+    std::array<PinnableWideColumns, 2> entity_results;
+    std::array<Status, 2> entity_statuses;
+    MultiGetOutputMetadata entity_output_metadata =
+        NewerVersionMultiGetOutputMetadata();
+    db_->MultiGetEntityWithMetadata(
+        metadata_read_options, db_->DefaultColumnFamily(), metadata_keys.size(),
+        metadata_keys.data(), entity_results.data(), entity_statuses.data(),
+        &entity_output_metadata);
+    ASSERT_OK(entity_statuses[0]);
+    ASSERT_EQ(entity_results[0].columns(), expected_aaa_columns);
+    ASSERT_TRUE(entity_statuses[1].IsNotFound());
+    ASSERT_EQ(*entity_output_metadata.newer_version_present,
+              (std::vector<uint8_t>{0, 0}));
+
+    std::array<PinnableAttributeGroups, 2> attribute_group_results;
+    attribute_group_results[0].emplace_back(db_->DefaultColumnFamily());
+    attribute_group_results[1].emplace_back(db_->DefaultColumnFamily());
+    db_->MultiGetEntityWithMetadata(
+        metadata_read_options, metadata_keys.size(), metadata_keys.data(),
+        attribute_group_results.data(), &entity_output_metadata);
+    ASSERT_OK(attribute_group_results[0][0].status());
+    ASSERT_EQ(attribute_group_results[0][0].columns(), expected_aaa_columns);
+    ASSERT_TRUE(attribute_group_results[1][0].status().IsNotFound());
+    ASSERT_EQ(*entity_output_metadata.newer_version_present,
+              (std::vector<uint8_t>{0, 0}));
+  }
   db_->ReleaseSnapshot(metadata_snapshot);
 
   ASSERT_TRUE(db_->GetWithMetadata(ReadOptions(), db_->DefaultColumnFamily(),
@@ -2175,6 +2213,35 @@ TEST_F(DBBasicTest, ReadOnlyNewerVersionPresentReturnsFalse) {
   ASSERT_EQ("value", values[0]);
   ASSERT_EQ(1, multiget_output_metadata.newer_version_present->size());
   ASSERT_FALSE((*multiget_output_metadata.newer_version_present)[0]);
+
+  const WideColumns expected_columns{{kDefaultWideColumnName, "value"}};
+  PinnableWideColumns entity_result;
+  OutputMetadata get_entity_output_metadata = NewerVersionOutputMetadata();
+  ASSERT_OK(db_->GetEntityWithMetadata(read_options, handles_[1], "key",
+                                       &entity_result,
+                                       &get_entity_output_metadata));
+  ASSERT_EQ(entity_result.columns(), expected_columns);
+  ASSERT_FALSE(*get_entity_output_metadata.newer_version_present);
+
+  Status entity_status;
+  MultiGetOutputMetadata entity_output_metadata =
+      NewerVersionMultiGetOutputMetadata();
+  db_->MultiGetEntityWithMetadata(read_options, handles_[1], keys.size(),
+                                  keys.data(), &entity_result, &entity_status,
+                                  &entity_output_metadata);
+  ASSERT_OK(entity_status);
+  ASSERT_EQ(entity_result.columns(), expected_columns);
+  ASSERT_EQ(*entity_output_metadata.newer_version_present,
+            std::vector<uint8_t>{0});
+
+  PinnableAttributeGroups attribute_groups;
+  attribute_groups.emplace_back(handles_[1]);
+  db_->MultiGetEntityWithMetadata(read_options, keys.size(), keys.data(),
+                                  &attribute_groups, &entity_output_metadata);
+  ASSERT_OK(attribute_groups[0].status());
+  ASSERT_EQ(attribute_groups[0].columns(), expected_columns);
+  ASSERT_EQ(*entity_output_metadata.newer_version_present,
+            std::vector<uint8_t>{0});
 
   db_->ReleaseSnapshot(snapshot);
 }
@@ -4609,12 +4676,13 @@ INSTANTIATE_TEST_CASE_P(DBMultiGetTestWithParam, DBMultiGetTestWithParam,
 #if USE_COROUTINES
 class DBMultiGetAsyncIOTest
     : public DBBasicTest,
-      public ::testing::WithParamInterface<std::tuple<bool, bool>> {
+      public ::testing::WithParamInterface<std::tuple<bool, bool, bool>> {
  public:
   DBMultiGetAsyncIOTest()
       : DBBasicTest(),
         optimize_multiget_for_io_(std::get<0>(GetParam())),
         use_coroutine_(std::get<1>(GetParam())),
+        use_direct_io_(std::get<2>(GetParam())),
         statistics_(ROCKSDB_NAMESPACE::CreateDBStatistics()) {
     BlockBasedTableOptions bbto;
     bbto.filter_policy.reset(NewBloomFilterPolicy(10));
@@ -4623,6 +4691,7 @@ class DBMultiGetAsyncIOTest
     options_.statistics = statistics_;
     options_.table_factory.reset(NewBlockBasedTableFactory(bbto));
     options_.env = Env::Default();
+    options_.use_direct_reads = use_direct_io_ && IsDirectIOSupported();
     Reopen(options_);
     int num_keys = 0;
 
@@ -4686,6 +4755,12 @@ class DBMultiGetAsyncIOTest
     EXPECT_EQ(0, num_keys);
   }
 
+  void SetUp() override {
+    if (use_direct_io_ && !options_.use_direct_reads) {
+      ROCKSDB_GTEST_SKIP("Direct IO is not supported");
+    }
+  }
+
   const std::shared_ptr<Statistics>& statistics() { return statistics_; }
 
  protected:
@@ -4720,6 +4795,7 @@ class DBMultiGetAsyncIOTest
 
   const bool optimize_multiget_for_io_;
   const bool use_coroutine_;
+  const bool use_direct_io_;
 
  private:
   std::shared_ptr<Statistics> statistics_;
@@ -5169,7 +5245,8 @@ TEST_P(DBMultiGetAsyncIOTest, MixedReadAsyncFallbackPropagatesPollError) {
 #endif  // ROCKSDB_IOURING_PRESENT
 
 INSTANTIATE_TEST_CASE_P(DBMultiGetAsyncIOTest, DBMultiGetAsyncIOTest,
-                        testing::Combine(testing::Bool(), testing::Bool()));
+                        testing::Combine(testing::Bool(), testing::Bool(),
+                                         testing::Bool()));
 #endif  // USE_COROUTINES
 
 TEST_F(DBBasicTest, MultiGetStats) {
@@ -6216,7 +6293,7 @@ class DBBasicTestTrackWal : public DBTestBase,
     VectorLogPtr log_files;
     EXPECT_OK(dbfull()->GetSortedWalFiles(log_files));
     return static_cast<int>(log_files.size());
-  };
+  }
 };
 
 TEST_P(DBBasicTestTrackWal, DoNotTrackObsoleteWal) {
@@ -6586,7 +6663,6 @@ TEST_P(DBBasicTestWithParallelIO, MultiGet) {
 
 TEST_P(DBBasicTestWithParallelIO, MultiGetDirectIO) {
   class FakeDirectIOEnv : public EnvWrapper {
-    class FakeDirectIOSequentialFile;
     class FakeDirectIORandomAccessFile;
 
    public:
@@ -6610,19 +6686,6 @@ TEST_P(DBBasicTestWithParallelIO, MultiGetDirectIO) {
     }
 
    private:
-    class FakeDirectIOSequentialFile : public SequentialFileWrapper {
-     public:
-      FakeDirectIOSequentialFile(std::unique_ptr<SequentialFile>&& file)
-          : SequentialFileWrapper(file.get()), file_(std::move(file)) {}
-      ~FakeDirectIOSequentialFile() override {}
-
-      bool use_direct_io() const override { return true; }
-      size_t GetRequiredBufferAlignment() const override { return 1; }
-
-     private:
-      std::unique_ptr<SequentialFile> file_;
-    };
-
     class FakeDirectIORandomAccessFile : public RandomAccessFileWrapper {
      public:
       FakeDirectIORandomAccessFile(std::unique_ptr<RandomAccessFile>&& file)

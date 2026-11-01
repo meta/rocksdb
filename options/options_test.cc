@@ -1541,6 +1541,31 @@ TEST_F(OptionsTest, DBOptionsSerialization) {
                                                   new_options));
 }
 
+TEST_F(OptionsTest, RemoteCompactionPoolNotSerialized) {
+  ConfigOptions config_options;
+  config_options.input_strings_escaped = false;
+  DBOptions options;
+  ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(),
+                                   "use_separate_remote_compaction_pool=true",
+                                   &options));
+  ASSERT_TRUE(options.use_separate_remote_compaction_pool);
+  std::string serialized;
+  ASSERT_OK(GetStringFromDBOptions(config_options, options, &serialized));
+  ASSERT_EQ(serialized.find("use_separate_remote_compaction_pool"),
+            std::string::npos);
+  DBOptions restored;
+  ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(), serialized,
+                                   &restored));
+  ASSERT_FALSE(restored.use_separate_remote_compaction_pool);
+  config_options.sanity_level = ConfigOptions::kSanityLevelExactMatch;
+  ASSERT_OK(
+      RocksDBOptionsParser::VerifyDBOptions(config_options, options, restored));
+  ASSERT_OK(GetStringFromMutableDBOptions(
+      config_options, MutableDBOptions(options), &serialized));
+  ASSERT_EQ(serialized.find("use_separate_remote_compaction_pool"),
+            std::string::npos);
+}
+
 TEST_F(OptionsTest, OptionsComposeDecompose) {
   // build an Options from DBOptions + CFOptions, then decompose it to verify
   // we get same constituent options.
@@ -2315,6 +2340,11 @@ TEST_F(OptionsTest, OnlyMutableDBOptions) {
   for (const auto& n : m_names) {
     std::string m;
     std::string d;
+    if (n == "use_separate_remote_compaction_pool") {
+      ASSERT_TRUE(mdb_config->GetOption(cfg_opts, n, &m).IsNotSupported());
+      ASSERT_TRUE(db_config->GetOption(cfg_opts, n, &d).IsNotSupported());
+      continue;
+    }
     ASSERT_OK(mdb_config->GetOption(cfg_opts, n, &m));
     ASSERT_OK(db_config->GetOption(cfg_opts, n, &d));
     ASSERT_EQ(m, d);
@@ -4051,6 +4081,21 @@ void VerifyCFPointerTypedOptions(
   }
 }
 
+TEST_F(OptionsParserTest, RemoteCompactionPoolNotPersisted) {
+  DBOptions options;
+  options.use_separate_remote_compaction_pool = true;
+  const std::string file_name = "remote-compaction-pool-options.ini";
+  ASSERT_OK(PersistRocksDBOptions(WriteOptions(), options, {"default"},
+                                  {ColumnFamilyOptions()}, file_name,
+                                  fs_.get()));
+  RocksDBOptionsParser parser;
+  ConfigOptions config_options;
+  ASSERT_OK(parser.Parse(config_options, file_name, fs_.get()));
+  ASSERT_EQ(parser.db_opt_map()->count("use_separate_remote_compaction_pool"),
+            0U);
+  ASSERT_FALSE(parser.db_opt()->use_separate_remote_compaction_pool);
+}
+
 TEST_F(OptionsParserTest, Readahead) {
   DBOptions base_db_opt;
   std::vector<ColumnFamilyOptions> base_cf_opts;
@@ -4849,6 +4894,25 @@ TEST_F(OptionTypeInfoTest, StringMapRejectsMalformedEntries) {
                     .IsInvalidArgument());
     ASSERT_EQ(parsed, expected);
   }
+}
+
+TEST_F(OptionTypeInfoTest, EncodedStringRejectsMalformedHex) {
+  ConfigOptions config_options;
+  OptionTypeInfo encoded_string(0, OptionType::kEncodedString);
+  const std::string expected = "existing";
+
+  // An odd number of digits, and a digit that is not hex.
+  for (const char* malformed : {"616", "61zz"}) {
+    SCOPED_TRACE(malformed);
+    std::string parsed = expected;
+    ASSERT_TRUE(encoded_string.Parse(config_options, "str", malformed, &parsed)
+                    .IsInvalidArgument());
+    ASSERT_EQ(parsed, expected);
+  }
+
+  std::string parsed;
+  ASSERT_OK(encoded_string.Parse(config_options, "str", "6162", &parsed));
+  ASSERT_EQ(parsed, "ab");
 }
 
 TEST_F(OptionTypeInfoTest, TestParseFunc) {

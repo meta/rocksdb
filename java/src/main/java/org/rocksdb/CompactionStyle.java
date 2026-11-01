@@ -28,10 +28,10 @@ package org.rocksdb;
  * </ol>
  *
  * @see <a
- * href="https://github.com/facebook/rocksdb/wiki/Universal-Compaction">
+ * href="https://github.com/meta/rocksdb/wiki/Universal-Compaction">
  * Universal Compaction</a>
  * @see <a
- * href="https://github.com/facebook/rocksdb/wiki/FIFO-compaction-style">
+ * href="https://github.com/meta/rocksdb/wiki/FIFO-compaction-style">
  * FIFO Compaction</a>
  */
 public enum CompactionStyle {

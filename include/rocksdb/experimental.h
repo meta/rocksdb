@@ -223,14 +223,14 @@ Status UpdateManifestForFilesState(
 //    NOTE: For this discussion, we ignore the detail of inclusive vs.
 //    exclusive bounds by assuming a generalized notion of "bound" (vs. key)
 //    that conveniently represents spaces between keys. For details, see
-//    https://github.com/facebook/rocksdb/pull/11434
+//    https://github.com/meta/rocksdb/pull/11434
 // The DIRECT FILTER for a range query is an order-based filter on the whole
 // key (non-empty intersection of bounds/keys). Simple minimum and maximum
 // keys for each SST file are automatically provided by metadata and used in
 // the read path for filtering (as well as binary search indexing).
 //    PARTITIONING NOTE: SST metadata partitions do not have recorded minimum
 //    and maximum keys, so require some special handling for range query
-//    filtering. See https://github.com/facebook/rocksdb/pull/12872 etc.
+//    filtering. See https://github.com/meta/rocksdb/pull/12872 etc.
 // * Where clauses - Additional constraints that can be put on range queries.
 // Specifically, a where clause is a tuple <i,j,c,b1,b2> representing that the
 // concatenated sequence of segments from i to j (inclusive) compares between

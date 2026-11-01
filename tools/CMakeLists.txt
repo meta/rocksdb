@@ -11,6 +11,7 @@ endforeach()
 
 if(WITH_TOOLS)
   set(TOOLS
+    db_split_merge.cc
     db_sanity_test.cc
     write_stress.cc
     db_repl_stress.cc

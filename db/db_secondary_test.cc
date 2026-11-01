@@ -362,6 +362,67 @@ TEST_F(DBSecondaryTest, ReopenAsSecondary) {
                            &result));
   ASSERT_EQ(result.columns(), columns);
 
+  {
+    PinnableWideColumns get_entity_result;
+    OutputMetadata get_entity_output_metadata;
+    get_entity_output_metadata.WantNewerVersionPresent();
+    ASSERT_OK(db_->GetEntityWithMetadata(
+        ReadOptions(), "baz", &get_entity_result, &get_entity_output_metadata));
+    ASSERT_EQ(get_entity_result.columns(), columns);
+    ASSERT_FALSE(*get_entity_output_metadata.newer_version_present);
+
+    const std::array<Slice, 2> entity_keys{{"baz", "missing"}};
+    std::array<PinnableWideColumns, 2> entity_results;
+    std::array<Status, 2> entity_statuses;
+    MultiGetOutputMetadata entity_output_metadata;
+    entity_output_metadata.WantNewerVersionPresent();
+    db_->MultiGetEntityWithMetadata(
+        ReadOptions(), db_->DefaultColumnFamily(), entity_keys.size(),
+        entity_keys.data(), entity_results.data(), entity_statuses.data(),
+        &entity_output_metadata);
+    ASSERT_OK(entity_statuses[0]);
+    ASSERT_EQ(entity_results[0].columns(), columns);
+    ASSERT_TRUE(entity_statuses[1].IsNotFound());
+    ASSERT_EQ(*entity_output_metadata.newer_version_present,
+              (std::vector<uint8_t>{0, 0}));
+
+    std::array<PinnableAttributeGroups, 2> attribute_group_results;
+    attribute_group_results[0].emplace_back(db_->DefaultColumnFamily());
+    attribute_group_results[1].emplace_back(db_->DefaultColumnFamily());
+    db_->MultiGetEntityWithMetadata(
+        ReadOptions(), entity_keys.size(), entity_keys.data(),
+        attribute_group_results.data(), &entity_output_metadata);
+    ASSERT_OK(attribute_group_results[0][0].status());
+    ASSERT_EQ(attribute_group_results[0][0].columns(), columns);
+    ASSERT_TRUE(attribute_group_results[1][0].status().IsNotFound());
+    ASSERT_EQ(*entity_output_metadata.newer_version_present,
+              (std::vector<uint8_t>{0, 0}));
+
+    // Explicit-snapshot tracking is rejected in secondary mode.
+    ManagedSnapshot snapshot(db_.get());
+    ReadOptions snapshot_read_options;
+    snapshot_read_options.snapshot = snapshot.snapshot();
+    ASSERT_NE(snapshot_read_options.snapshot, nullptr);
+    ASSERT_TRUE(db_->GetEntityWithMetadata(snapshot_read_options, "baz",
+                                           &get_entity_result,
+                                           &get_entity_output_metadata)
+                    .IsNotSupported());
+    db_->MultiGetEntityWithMetadata(
+        snapshot_read_options, db_->DefaultColumnFamily(), entity_keys.size(),
+        entity_keys.data(), entity_results.data(), entity_statuses.data(),
+        &entity_output_metadata);
+    for (const Status& s : entity_statuses) {
+      ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    }
+    db_->MultiGetEntityWithMetadata(
+        snapshot_read_options, entity_keys.size(), entity_keys.data(),
+        attribute_group_results.data(), &entity_output_metadata);
+    for (const auto& group : attribute_group_results) {
+      ASSERT_TRUE(group[0].status().IsNotSupported())
+          << group[0].status().ToString();
+    }
+  }
+
   ReadOptions ropts;
   ropts.verify_checksums = true;
   auto db1 = static_cast<DBImplSecondary*>(db_.get());
@@ -2588,6 +2649,54 @@ TEST_F(DBSecondaryTest, SwitchToNewManifestDuringOpen) {
   });
   Reopen(options);
   ro_db_thread.join();
+}
+
+TEST_F(DBSecondaryTest, CatchUpAfterInitialRecoveryFindsOnlyMissingFiles) {
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
+  Reopen(options);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Flush());
+  // Start recovery from a manifest snapshot containing the old SST.
+  Reopen(options);
+  const std::string old_table =
+      GetNewestTableFilePath(kDefaultColumnFamilyName);
+
+  bool rewritten = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit:Begin1",
+      [&](void*) {
+        if (rewritten) {
+          return;
+        }
+        rewritten = true;
+        // Replace the snapshot's SST before the secondary applies it.
+        ASSERT_OK(Put("foo", "v2"));
+        ASSERT_OK(Flush());
+        CompactRangeOptions compact_options;
+        compact_options.bottommost_level_compaction =
+            BottommostLevelCompaction::kForce;
+        ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+        ASSERT_OK(dbfull()->TEST_WaitForPurge());
+        const Status old_table_status = env_->FileExists(old_table);
+        ASSERT_TRUE(old_table_status.IsNotFound())
+            << old_table_status.ToString();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Defer cleanup_sync_points([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  ASSERT_TRUE(rewritten);
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  VerifySecondaryValue("foo", "v2");
 }
 
 TEST_F(DBSecondaryTest, MissingTableFileDuringOpen) {

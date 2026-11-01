@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -41,6 +42,7 @@
 #include "folly/executors/ManualExecutor.h"
 #include "folly/io/async/EventBase.h"
 #include "folly/io/async/Request.h"
+#include "rocksdb/coro_db.h"
 #include "util/coro_stats_util.h"
 #endif
 
@@ -84,10 +86,20 @@ std::unique_ptr<DB> OpenDb(bool read_only = false) {
   return db;
 }
 
+class NoReadExecutorFileSystem final : public FileSystemWrapper {
+ public:
+  explicit NoReadExecutorFileSystem(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+
+  const char* Name() const override { return "NoReadExecutorFileSystem"; }
+  folly::IOExecutor* GetReadExecutor() override { return nullptr; }
+};
+
 class PerfContextTest : public testing::Test {
  protected:
   void SetUp() override {
     SetPerfLevel(PerfLevel::kEnableCount);
+    SetAsyncReadCPUTimeEnabled(false);
     get_perf_context()->ClearPerLevelPerfContext();
     get_perf_context()->Reset();
     get_iostats_context()->Reset();
@@ -279,6 +291,132 @@ TEST_F(PerfContextTest, CoroutineStatsContextScopeCollectsGetCpuNanos) {
   }
 }
 
+// Runs a stats scope that spends 17 + 7 CPU nanos while active and 13 while its
+// request context is unset, and returns the get_cpu_nanos it recorded.
+static uint64_t GetCpuNanosRecordedByScope(CoroutineStatsConfig stats_config) {
+  auto clock = std::make_shared<MockSystemClock>(SystemClock::Default());
+  CompositeEnvWrapper env(Env::Default(), clock);
+  clock->SetCurrentCPUTimeNanos(0);
+  get_perf_context()->Reset();
+  {
+    CoroutineStatsContextScope scope(std::move(stats_config), &env);
+    clock->MockSleepForCPUNanos(17);
+    {
+      folly::RequestContextScopeGuard context_scope;
+      clock->MockSleepForCPUNanos(13);
+    }
+    clock->MockSleepForCPUNanos(7);
+  }
+  return get_perf_context()->get_cpu_nanos;
+}
+
+TEST_F(PerfContextTest, CoroutineStatsCollectGetCpuNanosWhenOptedIn) {
+  SetPerfLevel(PerfLevel::kEnableCount);
+  SetAsyncReadCPUTimeEnabled(true);
+
+  CoroutineStatsConfig stats_config = CaptureAndDisableCoroutineStatsConfig();
+
+  EXPECT_FALSE(GetAsyncReadCPUTimeEnabled());
+  EXPECT_EQ(24, GetCpuNanosRecordedByScope(std::move(stats_config)));
+}
+
+TEST_F(PerfContextTest, CoroutineStatsSkipGetCpuNanosWithoutOptIn) {
+  SetPerfLevel(PerfLevel::kEnableCount);
+  SetAsyncReadCPUTimeEnabled(false);
+
+  EXPECT_EQ(0, GetCpuNanosRecordedByScope(CaptureCoroutineStatsConfig()));
+}
+
+TEST_F(PerfContextTest, CoroutineStatsIgnoreCpuOptInWhilePerfDisabled) {
+  // IO stats stay enabled, so the scope still collects a request context.
+  SetPerfLevel(PerfLevel::kDisable);
+  SetAsyncReadCPUTimeEnabled(true);
+
+  EXPECT_EQ(0, GetCpuNanosRecordedByScope(CaptureCoroutineStatsConfig()));
+}
+
+TEST_F(PerfContextTest, CoroutineMultiGetAsyncRecordsCpuTimeOnlyWhenOptedIn) {
+  ASSERT_OK(DestroyDB(kDbName, Options()));
+  auto db = OpenDb();
+  if (db->GetCoroDB() == nullptr ||
+      db->GetFileSystem()->GetReadExecutor() == nullptr) {
+    ROCKSDB_GTEST_BYPASS("Needs coroutine reads and a read executor");
+    return;
+  }
+  ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  ASSERT_OK(db->Put(WriteOptions(), "key2", "value2"));
+  ASSERT_OK(db->Flush(FlushOptions()));
+
+  class PerfContextCallback final : public DB::AsyncCallback {
+   public:
+    void OnComplete() override { perf_context.set_value(*get_perf_context()); }
+
+    std::promise<PerfContext> perf_context;
+  };
+
+  auto read_perf_context = [&db](bool opt_in) {
+    SetPerfLevel(PerfLevel::kEnableCount);
+    SetAsyncReadCPUTimeEnabled(opt_in);
+    ColumnFamilyHandle* column_families[] = {db->DefaultColumnFamily(),
+                                             db->DefaultColumnFamily()};
+    const Slice keys[] = {"key", "key2"};
+    PinnableSlice values[2];
+    Status statuses[2];
+    PerfContextCallback callback;
+    db->MultiGetAsync(ReadOptions(), 2, column_families, keys, values, statuses,
+                      /*sorted_input=*/false, callback);
+    PerfContext request_perf_context = callback.perf_context.get_future().get();
+
+    EXPECT_FALSE(GetAsyncReadCPUTimeEnabled());
+    EXPECT_OK(statuses[0]);
+    EXPECT_OK(statuses[1]);
+    EXPECT_EQ("value", values[0].ToString());
+    EXPECT_EQ("value2", values[1].ToString());
+    return request_perf_context;
+  };
+
+  // The first read loads a data block from the SST file.
+  const PerfContext opted_in = read_perf_context(/*opt_in=*/true);
+  EXPECT_GT(opted_in.get_cpu_nanos, 0);
+  ASSERT_GT(opted_in.block_read_count, 0);
+  EXPECT_EQ(0, opted_in.block_read_time);
+
+  EXPECT_EQ(0, read_perf_context(/*opt_in=*/false).get_cpu_nanos);
+
+  db.reset();
+  ASSERT_OK(DestroyDB(kDbName, Options()));
+}
+
+TEST_F(PerfContextTest, CoroutineSyncFallbackRecordsNoCpuTimeWhenOptedIn) {
+  auto file_system =
+      std::make_shared<NoReadExecutorFileSystem>(FileSystem::Default());
+  std::unique_ptr<Env> env = NewCompositeEnv(file_system);
+  Options options;
+  options.create_if_missing = true;
+  options.env = env.get();
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, kDbName, &db));
+  ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+
+  SetPerfLevel(PerfLevel::kEnableCount);
+  SetAsyncReadCPUTimeEnabled(true);
+  ColumnFamilyHandle* column_families[] = {db->DefaultColumnFamily()};
+  const Slice keys[] = {"key"};
+  PinnableSlice values[1];
+  Status statuses[1];
+  folly::coro::blockingWait(CoroDB::CoMultiGet(
+      db.get(), ReadOptions(), 1, column_families, keys, values,
+      /*timestamps=*/nullptr, statuses, /*sorted_input=*/false));
+
+  ASSERT_OK(statuses[0]);
+  EXPECT_EQ(values[0].size(), get_perf_context()->multiget_read_bytes);
+  EXPECT_EQ(0, get_perf_context()->get_cpu_nanos);
+  EXPECT_FALSE(GetAsyncReadCPUTimeEnabled());
+
+  db.reset();
+  ASSERT_OK(DestroyDB(kDbName, options));
+}
+
 TEST_F(PerfContextTest, CoroutineStatsContextRestoredOnForeignThread) {
   SetPerfLevel(PerfLevel::kEnableTimeAndCPUTimeExceptForMutex);
 
@@ -326,15 +464,6 @@ TEST_F(PerfContextTest, CoroutineStatsContextRestoredOnForeignThread) {
 #endif
 
 TEST_F(PerfContextTest, AsyncCallbackStatsStartEmptyOnSyncFallback) {
-  class NoReadExecutorFileSystem final : public FileSystemWrapper {
-   public:
-    explicit NoReadExecutorFileSystem(const std::shared_ptr<FileSystem>& target)
-        : FileSystemWrapper(target) {}
-
-    const char* Name() const override { return "NoReadExecutorFileSystem"; }
-    folly::IOExecutor* GetReadExecutor() override { return nullptr; }
-  };
-
   class StatsCallback final : public DB::AsyncCallback {
    public:
     void OnComplete() override {
@@ -345,11 +474,13 @@ TEST_F(PerfContextTest, AsyncCallbackStatsStartEmptyOnSyncFallback) {
       called = true;
       get_read_bytes = callback_perf_context->get_read_bytes;
       multiget_read_bytes = callback_perf_context->multiget_read_bytes;
+      get_cpu_nanos = callback_perf_context->get_cpu_nanos;
     }
 
     bool called = false;
     uint64_t get_read_bytes = 0;
     uint64_t multiget_read_bytes = 0;
+    uint64_t get_cpu_nanos = 0;
   };
 
   auto file_system =
@@ -380,6 +511,7 @@ TEST_F(PerfContextTest, AsyncCallbackStatsStartEmptyOnSyncFallback) {
   get_perf_context()->multiget_read_bytes = 29;
   SetPerfLevel(PerfLevel::kEnableCount);
   get_iostats_context()->disable_iostats = false;
+  SetAsyncReadCPUTimeEnabled(true);
 
   StatsCallback multiget_callback;
   ColumnFamilyHandle* column_families[] = {db->DefaultColumnFamily(),
@@ -398,6 +530,8 @@ TEST_F(PerfContextTest, AsyncCallbackStatsStartEmptyOnSyncFallback) {
   EXPECT_EQ("value2", values[1].ToString());
   EXPECT_EQ(values[0].size() + values[1].size(),
             multiget_callback.multiget_read_bytes);
+  EXPECT_EQ(0, multiget_callback.get_cpu_nanos);
+  EXPECT_FALSE(GetAsyncReadCPUTimeEnabled());
 
   db.reset();
   ASSERT_OK(DestroyDB(kDbName, options));

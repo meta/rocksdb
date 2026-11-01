@@ -9,7 +9,7 @@
 // write their own extensions and plugins to take use the Options
 // framework in their custom implementations.
 //
-// See https://github.com/facebook/rocksdb/wiki/RocksDB-Configurable-Objects
+// See https://github.com/meta/rocksdb/wiki/RocksDB-Configurable-Objects
 // for more information on how to develop and use custom extensions
 
 #pragma once

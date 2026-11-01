@@ -15,6 +15,7 @@
 #include "table/block_based/block_prefetcher.h"
 #include "table/block_based/multi_scan_index_iterator.h"
 #include "table/block_based/reader_common.h"
+#include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
 // Iterates over the contents of BlockBasedTable.
@@ -196,9 +197,26 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
            block_iter_points_to_real_block_;
   }
 
+  // Pinning this iterator keeps alive the reader (through a table cache
+  // handle), the current block, and any index block a key() may point into.
+  // In an immortal table the reader outlives the Version anyway, and a block
+  // read from its source (such as mmap) stays valid without the Block object;
+  // so if nothing else is held, deleting the iterator frees nothing a returned
+  // slice points into. MultiScan is excluded since the iterator owns its
+  // ReadSet.
+  bool IsSafeToDropWhilePinned() const override {
+    const BlockBasedTable::Rep* rep = table_->get_rep();
+    return rep->immortal_table && !rep->index_has_first_key && !HasCleanups() &&
+           !multi_scan_read_set_ &&
+           (!block_iter_points_to_real_block_ ||
+            IsDataBlockFromImmortalSource());
+  }
+
   void ResetDataIter() {
     if (block_iter_points_to_real_block_) {
-      if (pinned_iters_mgr_ != nullptr && pinned_iters_mgr_->PinningEnabled()) {
+      if (pinned_iters_mgr_ != nullptr && pinned_iters_mgr_->PinningEnabled() &&
+          !IsDataBlockFromImmortalSource()) {
+        TEST_SYNC_POINT("BlockBasedTableIterator::ResetDataIter:DelegateBlock");
         block_iter_.DelegateCleanupsTo(pinned_iters_mgr_);
       }
       block_iter_.Invalidate(Status::OK());
@@ -252,6 +270,13 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   }
 
  private:
+  // Pinned contents without a cache handle means an unowned block of an
+  // immortal table (see NewDataBlockIterator): the bytes belong to the
+  // reader's source and outlive the Block object.
+  bool IsDataBlockFromImmortalSource() const {
+    return block_iter_.IsValuePinned() && block_iter_.cache_handle() == nullptr;
+  }
+
   enum class IterDirection {
     kForward,
     kBackward,

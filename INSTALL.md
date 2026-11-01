@@ -153,7 +153,7 @@ most processors made since roughly 2013.
 
     * Build RocksDB from source:
         cd ~
-        git clone https://github.com/facebook/rocksdb.git
+        git clone https://github.com/meta/rocksdb.git
         cd rocksdb
         gmake static_lib
 
@@ -174,7 +174,7 @@ most processors made since roughly 2013.
 
         ```bash
         cd ~
-        git clone https://github.com/facebook/rocksdb.git
+        git clone https://github.com/meta/rocksdb.git
         cd rocksdb
         gmake static_lib
         ```

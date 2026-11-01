@@ -59,21 +59,6 @@ DEFINE_bool(enable_print, false, "Print options generated to console.");
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
-class StringLogger : public Logger {
- public:
-  using Logger::Logv;
-  void Logv(const char* format, va_list ap) override {
-    char buffer[1000];
-    vsnprintf(buffer, sizeof(buffer), format, ap);
-    string_.append(buffer);
-  }
-  const std::string& str() const { return string_; }
-  void clear() { string_.clear(); }
-
- private:
-  std::string string_;
-};
-
 class TestCustomizable : public Customizable {
  public:
   TestCustomizable(const std::string& name) : name_(name) {}
@@ -216,11 +201,6 @@ class SimpleConfigurable : public Configurable {
 
  public:
   SimpleConfigurable() { RegisterOptions(&simple_, &simple_option_info); }
-
-  explicit SimpleConfigurable(
-      const std::unordered_map<std::string, OptionTypeInfo>* map) {
-    RegisterOptions(&simple_, map);
-  }
 };
 
 static void GetMapFromProperties(

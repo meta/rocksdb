@@ -311,6 +311,8 @@ static const std::string aggregated_table_properties_at_level =
 static const std::string num_running_compactions = "num-running-compactions";
 static const std::string num_running_remote_compactions =
     "num-running-remote-compactions";
+static const std::string num_remote_compaction_pool_threads =
+    "num-remote-compaction-pool-threads";
 static const std::string num_running_bottom_compactions =
     "num-running-bottom-compactions";
 static const std::string num_running_compaction_sorted_runs =
@@ -370,6 +372,8 @@ const std::string DB::Properties::kNumRunningCompactions =
     rocksdb_prefix + num_running_compactions;
 const std::string DB::Properties::kNumRunningRemoteCompactions =
     rocksdb_prefix + num_running_remote_compactions;
+const std::string DB::Properties::kNumRemoteCompactionPoolThreads =
+    rocksdb_prefix + num_remote_compaction_pool_threads;
 const std::string DB::Properties::kNumRunningBottomCompactions =
     rocksdb_prefix + num_running_bottom_compactions;
 const std::string DB::Properties::kNumRunningCompactionSortedRuns =
@@ -609,6 +613,9 @@ const UnorderedMap<std::string, DBPropertyInfo>
           nullptr}},
         {DB::Properties::kNumRunningRemoteCompactions,
          {false, nullptr, &InternalStats::HandleNumRunningRemoteCompactions,
+          nullptr, nullptr}},
+        {DB::Properties::kNumRemoteCompactionPoolThreads,
+         {false, nullptr, &InternalStats::HandleNumRemoteCompactionPoolThreads,
           nullptr, nullptr}},
         {DB::Properties::kNumRunningBottomCompactions,
          {false, nullptr, &InternalStats::HandleNumRunningBottomCompactions,
@@ -1315,6 +1322,14 @@ bool InternalStats::HandleNumRunningRemoteCompactions(uint64_t* value,
       db->num_running_remote_compactions_.load(std::memory_order_relaxed);
   assert(num_running >= 0);
   *value = static_cast<uint64_t>(num_running);
+  return true;
+}
+
+bool InternalStats::HandleNumRemoteCompactionPoolThreads(uint64_t* value,
+                                                         DBImpl* /*db*/,
+                                                         Version* /*version*/) {
+  auto pool = RemoteCompactionThreadPool::GetShared(false);
+  *value = pool ? static_cast<uint64_t>(pool->GetBackgroundThreads()) : 0;
   return true;
 }
 

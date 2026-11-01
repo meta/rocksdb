@@ -3,15 +3,15 @@
   category: docs
 
 - title: GitHub
-  href: https://github.com/facebook/rocksdb/
+  href: https://github.com/meta/rocksdb/
   category: external
 
 - title: API (C++)
-  href: https://github.com/facebook/rocksdb/tree/main/include/rocksdb
+  href: https://github.com/meta/rocksdb/tree/main/include/rocksdb
   category: external
 
 - title: API (Java)
-  href: https://github.com/facebook/rocksdb/tree/main/java/src/main/java/org/rocksdb
+  href: https://github.com/meta/rocksdb/tree/main/java/src/main/java/org/rocksdb
   category: external
 
 - title: Support

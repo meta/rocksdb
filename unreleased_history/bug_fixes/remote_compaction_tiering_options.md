@@ -1,0 +1,1 @@
+Fixed remote compaction ignoring `preclude_last_level_data_seconds` and `preserve_internal_time_seconds`, which caused recent data to be written to the last level and recent sequence numbers to be zeroed. Takes effect once both the primary and the compaction worker are upgraded.

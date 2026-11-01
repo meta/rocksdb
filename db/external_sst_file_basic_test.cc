@@ -2364,6 +2364,472 @@ TEST_F(ExternalSSTFileBasicTest,
   ASSERT_EQ("old-f", Get("f"));
 }
 
+// A universal L0->L0 compaction (always the case with num_levels=1) must not
+// pick a file that a concurrent atomic-replace ingestion is deleting while the
+// ingestion has released the DB mutex to write its MANIFEST record.
+TEST_F(ExternalSSTFileBasicTest,
+       AtomicReplaceRangeRacesWithIntraL0UniversalCompaction) {
+  Options options = CurrentOptions();
+  options.compaction_style = CompactionStyle::kCompactionStyleUniversal;
+  options.num_levels = 1;
+  options.level0_file_num_compaction_trigger = 3;
+  options.force_consistency_checks = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "old-a"));
+  ASSERT_OK(Put("b", "old-b"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("c", "old-c"));
+  ASSERT_OK(Put("d", "old-d"));
+  ASSERT_OK(Flush());
+
+  std::atomic<bool> committing{false};
+  const auto ingest_thread_id = std::this_thread::get_id();
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"AtomicReplaceRangeCompactionRace:ManifestWrite",
+        "BackgroundCallCompaction:0"},
+       {"DBImpl::BackgroundCompaction():AfterPickCompaction",
+        "AtomicReplaceRangeCompactionRace:CompactionPicked"}});
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WriteManifest", [&](void*) {
+        if (!committing.load() ||
+            std::this_thread::get_id() != ingest_thread_id) {
+          return;
+        }
+        // DB mutex is released here. Let the queued background compaction
+        // pick from the current version, which still contains the file this
+        // ingestion is deleting.
+        TEST_SYNC_POINT("AtomicReplaceRangeCompactionRace:ManifestWrite");
+        // The picker can return no compaction when the replaced file is busy.
+        TEST_SYNC_POINT("AtomicReplaceRangeCompactionRace:CompactionPicked");
+      });
+  // Only the MANIFEST write of the commit phase, not of the prepare phase.
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::AddFile:MutexLock", [&](void*) {
+        if (std::this_thread::get_id() == ingest_thread_id) {
+          committing.store(true);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // The third L0 file triggers a compaction that is held before picking.
+  ASSERT_OK(Put("x", "old-x"));
+  ASSERT_OK(Put("y", "old-y"));
+  ASSERT_OK(Flush());
+
+  SstFileWriter sst_file_writer(EnvOptions(), options);
+  const std::string replacement_file = sst_files_dir_ + "replacement.sst";
+  ASSERT_OK(sst_file_writer.Open(replacement_file));
+  ASSERT_OK(sst_file_writer.Put("c", "new-c"));
+  ASSERT_OK(sst_file_writer.Finish());
+
+  IngestExternalFileArg arg;
+  arg.column_family = db_->DefaultColumnFamily();
+  arg.external_files = {replacement_file};
+  arg.options.snapshot_consistency = false;
+  // Fully contains the L0 file with "c" and "d", so it is deleted.
+  arg.atomic_replace_range = {{"c", "e"}};
+  ASSERT_OK(db_->IngestExternalFiles({arg}));
+  committing.store(false);
+
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ("old-a", Get("a"));
+  ASSERT_EQ("new-c", Get("c"));
+  ASSERT_EQ("NOT_FOUND", Get("d"));
+  ASSERT_EQ("old-x", Get("x"));
+}
+
+TEST_F(ExternalSSTFileBasicTest,
+       AtomicReplaceFullRangeRacesWithDeleteFilesInRanges) {
+  Options options = CurrentOptions();
+  options.compaction_style = CompactionStyle::kCompactionStyleUniversal;
+  options.num_levels = 2;
+  options.disable_auto_compactions = true;
+  options.force_consistency_checks = true;
+  DestroyAndReopen(options);
+
+  SstFileWriter sst_file_writer(EnvOptions(), options);
+  std::vector<std::string> old_files;
+  for (const auto& file_contents :
+       std::vector<std::vector<std::pair<std::string, std::string>>>{
+           {{"a", "old-a"}, {"b", "old-b"}},
+           {{"c", "old-c"}, {"d", "old-d"}}}) {
+    std::string file_path =
+        sst_files_dir_ + "old-" + std::to_string(old_files.size()) + ".sst";
+    ASSERT_OK(sst_file_writer.Open(file_path));
+    for (const auto& [key, value] : file_contents) {
+      ASSERT_OK(sst_file_writer.Put(key, value));
+    }
+    ASSERT_OK(sst_file_writer.Finish());
+    old_files.push_back(std::move(file_path));
+  }
+  ASSERT_OK(db_->IngestExternalFile(old_files, IngestExternalFileOptions()));
+  ASSERT_EQ("0,2", FilesPerLevel());
+
+  const std::string replacement_file = sst_files_dir_ + "replacement.sst";
+  ASSERT_OK(sst_file_writer.Open(replacement_file));
+  ASSERT_OK(sst_file_writer.Put("c", "new-c"));
+  ASSERT_OK(sst_file_writer.Finish());
+
+  IngestExternalFileArg arg;
+  arg.column_family = db_->DefaultColumnFamily();
+  arg.external_files = {replacement_file};
+  arg.options.snapshot_consistency = false;
+  arg.atomic_replace_range = {{nullptr, nullptr}};
+  std::unique_ptr<FileIngestionHandle> handle;
+  ASSERT_OK(db_->PrepareFileIngestion({arg}, &handle));
+  std::vector<std::unique_ptr<FileIngestionHandle>> handles;
+  handles.push_back(std::move(handle));
+
+  Status ingestion_status;
+  ColumnFamilyMetaData metadata;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WriteManifest", [&](void*) {
+        SyncPoint::GetInstance()->DisableProcessing();
+        // Commit while deletion owns the file and has released the DB mutex.
+        ingestion_status = db_->CommitFileIngestionHandles(std::move(handles));
+        db_->GetColumnFamilyMetaData(&metadata);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const RangeOpt range{"c", "e"};
+  ASSERT_OK(dbfull()->DeleteFilesInRanges(db_->DefaultColumnFamily(), &range, 1,
+                                          /*include_end=*/false));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_TRUE(ingestion_status.IsInvalidArgument())
+      << ingestion_status.ToString();
+  ASSERT_EQ(2U, metadata.levels[1].files.size());
+  ASSERT_FALSE(metadata.levels[1].files[0].being_compacted);
+  ASSERT_TRUE(metadata.levels[1].files[1].being_compacted);
+  ASSERT_EQ("old-a", Get("a"));
+  ASSERT_EQ("NOT_FOUND", Get("c"));
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+
+  ASSERT_OK(db_->IngestExternalFiles({arg}));
+  ASSERT_EQ("NOT_FOUND", Get("a"));
+  ASSERT_EQ("new-c", Get("c"));
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+}
+
+TEST_F(ExternalSSTFileBasicTest,
+       AtomicReplaceRangeNotSupportedWithFIFOCompaction) {
+  for (bool replace_all : {false, true}) {
+    SCOPED_TRACE(replace_all);
+    Options options = CurrentOptions();
+    options.compaction_style = kCompactionStyleFIFO;
+    options.num_levels = 1;
+    options.max_open_files = -1;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+
+    ASSERT_OK(Put("c", "old-c"));
+    ASSERT_OK(Put("d", "old-d"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("x", "old-x"));
+    ASSERT_OK(Flush());
+    const auto old_files = GetLevelFileMetadatas(0);
+    ASSERT_EQ(2U, old_files.size());
+
+    SstFileWriter sst_file_writer(EnvOptions(), options);
+    const std::string replacement_file = sst_files_dir_ + "replacement.sst";
+    ASSERT_OK(sst_file_writer.Open(replacement_file));
+    ASSERT_OK(sst_file_writer.Put("c", "new-c"));
+    ASSERT_OK(sst_file_writer.Finish());
+
+    IngestExternalFileArg arg;
+    arg.column_family = db_->DefaultColumnFamily();
+    arg.external_files = {replacement_file};
+    arg.options.snapshot_consistency = false;
+    arg.options.move_files = true;
+    arg.atomic_replace_range = RangeOpt{};
+    if (!replace_all) {
+      arg.atomic_replace_range = {{"c", "e"}};
+    }
+    std::unique_ptr<FileIngestionHandle> handle;
+    ASSERT_TRUE(db_->PrepareFileIngestion({arg}, &handle).IsNotSupported());
+    ASSERT_EQ(nullptr, handle);
+    ASSERT_TRUE(db_->IngestExternalFiles({arg}).IsNotSupported());
+
+    ASSERT_OK(env_->FileExists(replacement_file));
+    ASSERT_EQ(old_files, GetLevelFileMetadatas(0));
+    for (auto* f : old_files) {
+      ASSERT_FALSE(f->being_compacted);
+    }
+    ASSERT_EQ("old-c", Get("c"));
+    ASSERT_EQ("old-d", Get("d"));
+    ASSERT_EQ("old-x", Get("x"));
+    ASSERT_OK(dbfull()->TEST_GetBGError());
+
+    arg.atomic_replace_range.reset();
+    ASSERT_OK(db_->IngestExternalFiles({arg}));
+    ASSERT_EQ("new-c", Get("c"));
+    ASSERT_EQ("old-d", Get("d"));
+    ASSERT_EQ("old-x", Get("x"));
+    ASSERT_OK(dbfull()->TEST_GetBGError());
+  }
+}
+
+TEST_F(ExternalSSTFileBasicTest,
+       AtomicReplaceRangeAvoidsRedundantTimestampScans) {
+  class ModificationTimeCountingEnv : public EnvWrapper {
+   public:
+    explicit ModificationTimeCountingEnv(Env* base) : EnvWrapper(base) {}
+    Status GetFileModificationTime(const std::string& fname,
+                                   uint64_t* file_mtime) override {
+      ++calls;
+      return target()->GetFileModificationTime(fname, file_mtime);
+    }
+    std::atomic<int> calls{0};
+  } counting_env(env_);
+  Defer close_db([&] { Close(); });
+
+  for (bool fail_commit : {false, true}) {
+    SCOPED_TRACE(fail_commit);
+    Options options = CurrentOptions();
+    options.env = &counting_env;
+    options.num_levels = 2;
+    options.max_open_files = -1;
+    options.paranoid_checks = true;
+    options.disable_auto_compactions = true;
+    options.periodic_compaction_seconds = 3600;
+    DestroyAndReopen(options);
+
+    bool seed_legacy_files = true;
+    SyncPoint::GetInstance()->SetCallBack(
+        "FileMetaData::FileMetaData", [&](void* p) {
+          if (seed_legacy_files) {
+            auto* f = static_cast<FileMetaData*>(p);
+            f->file_creation_time = kUnknownFileCreationTime;
+            f->oldest_ancestor_time = kUnknownOldestAncestorTime;
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    Defer clear_sync_points([&] {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+    });
+
+    SstFileWriter sst_file_writer(EnvOptions(), options);
+    std::vector<std::string> old_files;
+    for (const auto& contents :
+         std::vector<std::vector<std::pair<std::string, std::string>>>{
+             {{"c", "old-c"}, {"d", "old-d"}}, {{"x", "old-x"}}}) {
+      std::string file_path =
+          sst_files_dir_ + "old-" + std::to_string(old_files.size()) + ".sst";
+      ASSERT_OK(sst_file_writer.Open(file_path));
+      for (const auto& [key, value] : contents) {
+        ASSERT_OK(sst_file_writer.Put(key, value));
+      }
+      ASSERT_OK(sst_file_writer.Finish());
+      old_files.push_back(std::move(file_path));
+    }
+    ASSERT_OK(db_->IngestExternalFile(old_files, IngestExternalFileOptions()));
+    seed_legacy_files = false;
+    const auto legacy_files = GetLevelFileMetadatas(1);
+    ASSERT_EQ(2U, legacy_files.size());
+    for (auto* f : legacy_files) {
+      ASSERT_EQ(kUnknownFileCreationTime, f->TryGetFileCreationTime());
+      ASSERT_EQ(kUnknownOldestAncestorTime, f->TryGetOldestAncestorTime());
+    }
+
+    env_->SetMockSleep();
+    env_->MockSleepForSeconds(3601);
+    auto* cfd =
+        static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+    {
+      InstrumentedMutexLock l(dbfull()->TEST_Mutex());
+      auto* vstorage = cfd->current()->storage_info();
+      vstorage->ComputeCompactionScore(cfd->ioptions(),
+                                       cfd->GetLatestMutableCFOptions(),
+                                       cfd->GetFullHistoryTsLow());
+      ASSERT_EQ(2U, vstorage->FilesMarkedForPeriodicCompaction().size());
+    }
+
+    const std::string replacement_file = sst_files_dir_ + "replacement.sst";
+    ASSERT_OK(sst_file_writer.Open(replacement_file));
+    ASSERT_OK(sst_file_writer.Put("c", "new-c"));
+    ASSERT_OK(sst_file_writer.Finish());
+    IngestExternalFileArg arg;
+    arg.column_family = db_->DefaultColumnFamily();
+    arg.external_files = {replacement_file};
+    arg.options.snapshot_consistency = false;
+    arg.atomic_replace_range = {{"c", "e"}};
+    std::unique_ptr<FileIngestionHandle> handle;
+    ASSERT_OK(db_->PrepareFileIngestion({arg}, &handle));
+
+    SyncPoint::GetInstance()->SetCallBack(
+        "VersionSet::LogAndApply:WriteManifest", [&](void*) {
+          EXPECT_EQ(0, counting_env.calls.load());
+          InstrumentedMutexLock l(dbfull()->TEST_Mutex());
+          const auto& periodic_files = cfd->current()
+                                           ->storage_info()
+                                           ->FilesMarkedForPeriodicCompaction();
+          ASSERT_EQ(1U, periodic_files.size());
+          EXPECT_EQ(legacy_files[1], periodic_files[0].second);
+          EXPECT_TRUE(legacy_files[0]->being_compacted);
+          EXPECT_FALSE(legacy_files[1]->being_compacted);
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "VersionBuilder::Rep::LoadTableHandlers::AfterFindTable", [&](void* p) {
+          if (fail_commit) {
+            *static_cast<Status*>(p) = Status::TryAgain("Failed ingestion");
+          }
+        });
+    counting_env.calls.store(0);
+    Status status = db_->CommitFileIngestionHandle(std::move(handle));
+    if (fail_commit) {
+      ASSERT_TRUE(status.IsTryAgain()) << status.ToString();
+      EXPECT_EQ(2, counting_env.calls.load());
+      for (auto* f : legacy_files) {
+        ASSERT_FALSE(f->being_compacted);
+      }
+      {
+        InstrumentedMutexLock l(dbfull()->TEST_Mutex());
+        const auto& periodic_files =
+            cfd->current()->storage_info()->FilesMarkedForPeriodicCompaction();
+        ASSERT_EQ(2U, periodic_files.size());
+      }
+      ASSERT_EQ("old-c", Get("c"));
+      ASSERT_EQ("old-d", Get("d"));
+    } else {
+      ASSERT_OK(status);
+      EXPECT_EQ(1, counting_env.calls.load());
+      ASSERT_EQ("new-c", Get("c"));
+      ASSERT_EQ("NOT_FOUND", Get("d"));
+    }
+    ASSERT_EQ("old-x", Get("x"));
+    ASSERT_OK(dbfull()->TEST_GetBGError());
+  }
+}
+
+// After a grouped MANIFEST write, a compaction that was a follower releases
+// its inputs before it installs its SuperVersion. Atomic replace must select
+// files and assign levels from the current Version, not that stale
+// SuperVersion.
+TEST_F(ExternalSSTFileBasicTest, AtomicReplaceRangeRacesWithGroupedCompaction) {
+  Options options = CurrentOptions();
+  options.num_levels = 2;
+  options.disable_auto_compactions = true;
+  options.max_background_compactions = 1;
+  options.force_consistency_checks = true;
+  DestroyAndReopen(options);
+  // Deleting this file leads the grouped MANIFEST write.
+  ASSERT_OK(Put("a", "leader-a"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  Options universal_options = options;
+  universal_options.compaction_style = kCompactionStyleUniversal;
+  universal_options.num_levels = 7;
+  universal_options.level0_file_num_compaction_trigger = 2;
+  universal_options.compression = kNoCompression;
+  CreateColumnFamilies({"follower"}, universal_options);
+  ColumnFamilyHandle* follower = handles_.back();
+  // Too large to be compacted with the L0 files, which then go to L5.
+  ASSERT_OK(
+      db_->Put(WriteOptions(), follower, "z", std::string(64 * 1024, 'z')));
+  ASSERT_OK(db_->Flush(FlushOptions(), follower));
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(follower, &metadata);
+  const auto& lmax_file = metadata.levels[0].files[0];
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), follower,
+                              {lmax_file.db_path + lmax_file.name}, 6));
+  // The first L0 file partially overlaps [c, e), and the second is inside it.
+  ASSERT_OK(db_->Put(WriteOptions(), follower, "a", "old-a"));
+  ASSERT_OK(db_->Put(WriteOptions(), follower, "c", "old-c"));
+  ASSERT_OK(db_->Flush(FlushOptions(), follower));
+  ASSERT_OK(db_->Put(WriteOptions(), follower, "cc", "old-cc"));
+  ASSERT_OK(db_->Put(WriteOptions(), follower, "d", "old-d"));
+  ASSERT_OK(db_->Flush(FlushOptions(), follower));
+
+  SstFileWriter sst_file_writer(EnvOptions(), universal_options);
+  const std::string replacement_file = sst_files_dir_ + "replacement.sst";
+  ASSERT_OK(sst_file_writer.Open(replacement_file));
+  ASSERT_OK(sst_file_writer.Put("d", "new-d"));
+  ASSERT_OK(sst_file_writer.Finish());
+  IngestExternalFileArg arg;
+  arg.column_family = follower;
+  arg.external_files = {replacement_file};
+  arg.options.snapshot_consistency = false;
+  arg.atomic_replace_range = {{"c", "e"}};
+  std::unique_ptr<FileIngestionHandle> handle;
+  ASSERT_OK(db_->PrepareFileIngestion({arg}, &handle));
+
+  std::atomic<bool> grouping{false};
+  std::atomic<int> grouped_writers{0};
+  std::atomic<bool> follower_held{false};
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"GroupedCompactionRace:LeaderQueued", "BackgroundCallCompaction:0"},
+       {"GroupedCompactionRace:FollowerQueued",
+        "GroupedCompactionRace:BuildBatch"},
+       {"GroupedCompactionRace:FollowerHeld", "GroupedCompactionRace:Commit"},
+       {"GroupedCompactionRace:Committed",
+        "GroupedCompactionRace:ReleaseFollower"}});
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:BeforeWriterWaiting", [&](void*) {
+        if (!grouping.load()) {
+          return;
+        }
+        if (grouped_writers.fetch_add(1) == 0) {
+          // Let the compaction queue before the leader builds its batch.
+          dbfull()->TEST_UnlockMutex();
+          TEST_SYNC_POINT("GroupedCompactionRace:LeaderQueued");
+          TEST_SYNC_POINT("GroupedCompactionRace:BuildBatch");
+          dbfull()->TEST_LockMutex();
+        } else {
+          TEST_SYNC_POINT("GroupedCompactionRace:FollowerQueued");
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WakeUpAndDone", [&](void* p) {
+        if (follower_held.exchange(true)) {
+          return;
+        }
+        // The compaction released its inputs but has not installed its SV.
+        auto* mutex = static_cast<InstrumentedMutex*>(p);
+        mutex->Unlock();
+        TEST_SYNC_POINT("GroupedCompactionRace:FollowerHeld");
+        TEST_SYNC_POINT("GroupedCompactionRace:ReleaseFollower");
+        mutex->Lock();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Group only the MANIFEST writes after this options update.
+  ASSERT_OK(db_->EnableAutoCompaction({follower}));
+  grouping.store(true);
+  port::Thread leader([&] {
+    const RangeOpt range{"a", "c"};
+    ASSERT_OK(dbfull()->DeleteFilesInRanges(db_->DefaultColumnFamily(), &range,
+                                            1, /*include_end=*/false));
+  });
+  TEST_SYNC_POINT("GroupedCompactionRace:Commit");
+  leader.join();
+  grouping.store(false);
+  {
+    InstrumentedMutexLock l(dbfull()->TEST_Mutex());
+    auto* cfd = static_cast<ColumnFamilyHandleImpl*>(follower)->cfd();
+    ASSERT_NE(cfd->current(), cfd->GetSuperVersion()->current);
+  }
+  // Selecting from the stale SuperVersion would delete the second L0 file,
+  // which the compaction already removed.
+  ASSERT_OK(db_->CommitFileIngestionHandle(std::move(handle)));
+  // Assigning levels from it would place the tombstone below the compaction
+  // output in L5. Read before a later compaction can hide that.
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), follower, "c", &value).IsNotFound());
+  ASSERT_OK(db_->Get(ReadOptions(), follower, "d", &value));
+  ASSERT_EQ("new-d", value);
+  TEST_SYNC_POINT("GroupedCompactionRace:Committed");
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
 TEST_F(ExternalSSTFileBasicTest,
        PartiallyReplaceDataWithMultipleStandaloneRangeDeletions) {
   Options options = CurrentOptions();
@@ -2566,7 +3032,7 @@ TEST_F(ExternalSSTFileBasicTest, StandaloneRangeDeletionEndKeyIsExclusive) {
 }
 
 TEST_F(ExternalSSTFileBasicTest, IngestFileAfterDBPut) {
-  // Repro https://github.com/facebook/rocksdb/issues/6245.
+  // Repro https://github.com/meta/rocksdb/issues/6245.
   // Flush three files to L0. Ingest one more file to trigger L0->L1 compaction
   // via trivial move. The bug happened when L1 files were incorrectly sorted
   // resulting in an old value for "k" returned by `Get()`.

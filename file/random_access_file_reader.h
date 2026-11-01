@@ -89,6 +89,10 @@ class RandomAccessFileReader final : public FSRandomAccessFile {
 
   bool ShouldNotifyListeners() const { return !listeners_.empty(); }
 
+  // Charges `bytes` of reads to the rate limiter at
+  // opts.rate_limiter_priority. No-op without a rate limiter or with IO_TOTAL.
+  void ChargeRateLimiterForRead(const IOOptions& opts, size_t bytes) const;
+
   FileSystem* file_system_;
   FSRandomAccessFilePtr file_;
   std::string file_name_;

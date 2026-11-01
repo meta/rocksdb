@@ -1,0 +1,1 @@
+`DB::GetMergeOperands()` now resets only the `merge_operands` entries it fills, instead of all `expected_max_number_of_operands` entries. Entries past `*number_of_operands`, and the whole array on a non-OK result, are left as the caller passed them.

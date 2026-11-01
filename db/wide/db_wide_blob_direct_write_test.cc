@@ -750,8 +750,9 @@ TEST_F(DBWideBlobDirectWriteTest, DirectWriteWideEntityBeforeAndAfterFlush) {
 
   std::vector<BlobFileAddition> additions;
   std::vector<BlobFileGarbage> garbages;
-  ASSERT_OK(mgr->PrepareFlushAdditions(WriteOptions(), /*num_generations=*/1,
-                                       &additions, &garbages));
+  ASSERT_OK(mgr->PrepareFlushAdditions(
+      WriteOptions(), {cfh->cfd()->imm()->GetEarliestMemTableID()}, &additions,
+      &garbages));
   ASSERT_FALSE(additions.empty());
   ASSERT_TRUE(garbages.empty());
 
@@ -1033,8 +1034,9 @@ TEST_F(DBWideBlobDirectWriteTest,
 
   std::vector<BlobFileAddition> additions;
   std::vector<BlobFileGarbage> garbages;
-  ASSERT_OK(mgr->PrepareFlushAdditions(WriteOptions(), /*num_generations=*/1,
-                                       &additions, &garbages));
+  ASSERT_OK(mgr->PrepareFlushAdditions(
+      WriteOptions(), {cfh->cfd()->imm()->GetEarliestMemTableID()}, &additions,
+      &garbages));
   ASSERT_EQ(additions.size(), 1U);
   ASSERT_TRUE(garbages.empty());
 

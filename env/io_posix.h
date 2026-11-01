@@ -217,7 +217,7 @@ inline void UpdateResult(struct io_uring_cqe* cqe, const std::string& file_name,
     } else if (bytes_read == 0) {
       /// cqe->res == 0 can means EOF, or can mean partial results. See
       // comment
-      // https://github.com/facebook/rocksdb/pull/6441#issuecomment-589843435
+      // https://github.com/meta/rocksdb/pull/6441#issuecomment-589843435
       // Fall back to pread in this case.
       if (use_direct_io && !IsSectorAligned(finished_len, alignment)) {
         // Bytes reads don't fill sectors. Should only happen at the end

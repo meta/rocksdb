@@ -19,7 +19,7 @@ import org.junit.runners.Parameterized;
 
 /**
  * Test for changes made by
- * <a link="https://github.com/facebook/rocksdb/issues/9006">transactional multiGet problem</a>
+ * <a link="https://github.com/meta/rocksdb/issues/9006">transactional multiGet problem</a>
  * the tests here were previously broken by the nonsense removed by that change.
  */
 @RunWith(Parameterized.class)

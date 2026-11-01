@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -73,9 +74,11 @@
 #include "util/autovector.h"
 #include "util/coro_utils.h"
 #include "util/hash.h"
+#include "util/hash_containers.h"
 #include "util/repeatable_thread.h"
 #include "util/stop_watch.h"
 #include "util/thread_local.h"
+#include "util/threadpool_imp.h"
 
 #if USE_COROUTINES
 #include "rocksdb/coro_db.h"
@@ -320,6 +323,12 @@ class DBImpl : public DB
                                   const Slice& key,
                                   PinnableAttributeGroups* result);
 
+  using DB::GetEntityWithMetadata;
+  Status GetEntityWithMetadata(const ReadOptions& _read_options,
+                               ColumnFamilyHandle* column_family,
+                               const Slice& key, PinnableWideColumns* columns,
+                               OutputMetadata* output_metadata) override;
+
   Status GetEntityLazy(const ReadOptions& options,
                        ColumnFamilyHandle* column_family, const Slice& key,
                        LazyWideColumns* result) override;
@@ -383,6 +392,20 @@ class DBImpl : public DB
   void MultiGetEntity(const ReadOptions& options, size_t num_keys,
                       const Slice* keys,
                       PinnableAttributeGroups* results) override;
+
+  using DB::MultiGetEntityWithMetadata;
+  void MultiGetEntityWithMetadata(const ReadOptions& _read_options,
+                                  size_t num_keys,
+                                  ColumnFamilyHandle* const* column_families,
+                                  const Slice* keys,
+                                  PinnableWideColumns* results,
+                                  Status* statuses,
+                                  MultiGetOutputMetadata* output_metadata,
+                                  bool sorted_input = false) override;
+  void MultiGetEntityWithMetadata(
+      const ReadOptions& _read_options, size_t num_keys, const Slice* keys,
+      PinnableAttributeGroups* results,
+      MultiGetOutputMetadata* output_metadata) override;
 
   void MultiGetEntityLazy(const ReadOptions& options,
                           ColumnFamilyHandle* column_family, size_t num_keys,
@@ -1084,6 +1107,12 @@ class DBImpl : public DB
   uint64_t MinLogNumberToKeep();
 
   uint64_t MinLogNumberToRecycle();
+
+  // Whether the WAL is still in logs_, i.e. its writer may still be open. Such
+  // a WAL must not be recycled yet: closing the old writer truncates the file
+  // to its old size.
+  // REQUIRES: wal_write_mutex_ not held
+  bool IsWalInLogs(uint64_t wal_number);
 
   // Returns the lower bound file number for SSTs that won't be deleted, even if
   // they're obsolete. This lower bound is used internally to prevent newly
@@ -2253,6 +2282,7 @@ class DBImpl : public DB
   friend class CompactedDBImpl;
   friend class DBImplFollower;
 #ifndef NDEBUG
+  friend class DedicatedCompactionPoolTest;
   friend class DBTest_ConcurrentFlushWAL_Test;
   friend class DBTest_MixedSlowdownOptionsStop_Test;
   friend class DBCompactionTest_CompactBottomLevelFilesWithDeletions_Test;
@@ -2520,6 +2550,7 @@ class DBImpl : public DB
     // background compaction takes ownership of `prepicked_compaction`.
     PrepickedCompaction* prepicked_compaction;
     Env::Priority compaction_pri_;
+    bool separate_remote_pool = false;
   };
 
   static bool IsRecoveryFlush(FlushReason flush_reason) {
@@ -3051,6 +3082,48 @@ class DBImpl : public DB
                            bool track);
 
   void MaybeScheduleFlushOrCompaction();
+  bool UseSeparateRemoteCompactionPool() const {
+    mutex_.AssertHeld();
+    return immutable_db_options_.compaction_service != nullptr &&
+           mutable_db_options_.use_separate_remote_compaction_pool;
+  }
+  int LocalCompactionsScheduled() const {
+    mutex_.AssertHeld();
+    return bg_compaction_scheduled_ + bg_bottom_compaction_scheduled_;
+  }
+  int CompactionsScheduled() const {
+    mutex_.AssertHeld();
+    return LocalCompactionsScheduled() + remote_coordinators_scheduled_;
+  }
+  Status ScheduleCompaction(CompactionArg* arg, void* tag);
+  class RemoteCompactionCompletionGuard;
+  void ScheduleRemoteCompaction(std::function<void()> work);
+  void ScheduleRemoteCompactionLocked(std::function<void()> work);
+  int RemoteCompactionPoolBaseline() const;
+  void ShrinkRemoteCompactionPool();
+  void ReleaseRemoteCompactionPool();
+  void ConfigureCompactionExecutors(CompactionJob* job, ColumnFamilyData* cfd,
+                                    const std::atomic<bool>& canceled,
+                                    bool is_manual, bool separate_remote_pool);
+  Status LocalCompactionStatus(ColumnFamilyData* cfd,
+                               const std::atomic<bool>& canceled);
+  Status RunLocalCompaction(std::function<void()> work, Env::Priority priority,
+                            ColumnFamilyData* cfd,
+                            const std::atomic<bool>& canceled, bool is_manual);
+  IOStatus CopyTrivialCompactionFiles(Compaction* c, LogBuffer* log_buffer,
+                                      std::vector<FileMetaData>* out_files,
+                                      int job_id, bool db_mutex_held);
+  struct LocalCompactionTask {
+    DBImpl* db;
+    ColumnFamilyData* cfd;
+    const std::atomic<bool>* canceled;
+    std::function<void()> work;
+    Env::Priority priority;
+    Status status;
+    bool done = false;
+  };
+  static void BGWorkLocalCompaction(void* arg);
+  static void UnscheduleLocalCompaction(void* arg);
 
   BackgroundJobPressure CaptureBackgroundJobPressure() const;
   void NotifyOnBackgroundJobPressureChanged();
@@ -3118,7 +3191,8 @@ class DBImpl : public DB
   static void UnscheduleCompactionCallback(void* arg);
   static void UnscheduleFlushCallback(void* arg);
   void BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
-                                Env::Priority thread_pri);
+                                Env::Priority thread_pri,
+                                bool separate_remote_pool);
   void BackgroundCallFlush(Env::Priority thread_pri);
   void BackgroundCallPurge();
   // Recursively removes all children of the DB session temporary directory.
@@ -3127,7 +3201,9 @@ class DBImpl : public DB
   Status BackgroundCompaction(bool* madeProgress, JobContext* job_context,
                               LogBuffer* log_buffer,
                               PrepickedCompaction* prepicked_compaction,
-                              Env::Priority thread_pri);
+                              Env::Priority thread_pri,
+                              bool separate_remote_pool,
+                              int* deferred_compactions);
   Status BackgroundFlush(bool* madeProgress, JobContext* job_context,
                          LogBuffer* log_buffer, FlushReason* reason,
                          bool* flush_rescheduled_to_retain_udt,
@@ -3304,10 +3380,8 @@ class DBImpl : public DB
   // Reserve the next 'num' file numbers for to-be-ingested external SST files,
   // and return the current file_number in 'next_file_number'.
   // Write a version edit to the MANIFEST.
-  Status ReserveFileNumbersBeforeIngestion(
-      ColumnFamilyData* cfd, uint64_t num,
-      std::unique_ptr<std::list<uint64_t>::iterator>& pending_output_elem,
-      uint64_t* next_file_number);
+  Status ReserveFileNumbersBeforeIngestion(ColumnFamilyData* cfd, uint64_t num,
+                                           uint64_t* next_file_number);
 
   bool ShouldPurge(uint64_t file_number) const;
   void MarkAsGrabbedForPurge(uint64_t file_number);
@@ -3499,6 +3573,24 @@ class DBImpl : public DB
 
   Status IncreaseFullHistoryTsLowImpl(ColumnFamilyData* cfd,
                                       std::string ts_low);
+
+  // Passes GetMergeOperands collection options to every lookup layer through
+  // merge_context. The caller's output array is not touched here.
+  static void PrepareGetMergeOperands(const GetImplOptions& get_impl_options,
+                                      MergeContext* merge_context);
+
+  // Publishes a successful GetMergeOperands lookup into the first
+  // *number_of_operands output slots; later slots, and the whole array on an
+  // Incomplete result, are left as the caller passed them. The output either
+  // owns a copy of every operand or shares one cleanup bundle that keeps all
+  // backing resources alive until the last PinnableSlice is reset. Returns
+  // Incomplete when the result exceeds the caller's capacity and a plain OK
+  // otherwise, so a caller must not let that OK replace a subcode it set.
+  Status FinalizeGetMergeOperands(const GetImplOptions& get_impl_options,
+                                  SuperVersion* super_version,
+                                  MergeContext* merge_context,
+                                  PinnedIteratorsManager* pinned_iters_manager,
+                                  size_t* bytes_read);
 
   bool ShouldReferenceSuperVersion(const MergeContext& merge_context);
   // Resolves a plain value whose current payload is an encoded direct-write
@@ -3824,6 +3916,11 @@ class DBImpl : public DB
   // State is protected with db mutex.
   std::list<uint64_t> pending_outputs_;
 
+  // First file number -> reserved file count for external file ingestions.
+  // Full-scan purge snapshots protect these SSTs until commit or cleanup.
+  // State is protected with db mutex.
+  UnorderedMap<uint64_t, uint64_t> pending_ingestion_outputs_;
+
   // Similar to pending_outputs_, FindObsoleteFiles()/PurgeObsoleteFiles() never
   // deletes any OPTIONS file that has number bigger than any of the file number
   // in min_options_file_numbers_.
@@ -3890,6 +3987,11 @@ class DBImpl : public DB
 
   // count how many background compactions are running or have been scheduled
   int bg_compaction_scheduled_ = 0;
+
+  std::shared_ptr<RemoteCompactionThreadPool> remote_compaction_pool_;
+  int remote_compaction_pool_jobs_ = 0;
+  int remote_coordinators_scheduled_ = 0;
+  std::array<int, 2> local_compactions_running_by_priority_{};
 
   // stores the number of compactions are currently running
   int num_running_compactions_ = 0;

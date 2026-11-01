@@ -996,6 +996,9 @@ DEFINE_bool(sync, false, "Sync all writes to disk");
 
 DEFINE_bool(use_fsync, false, "If true, issue fsync instead of fdatasync");
 
+DEFINE_bool(use_separate_remote_compaction_pool, false,
+            "Sets DBOptions.use_separate_remote_compaction_pool");
+
 DEFINE_bool(disable_wal, false, "If true, do not write WAL for write.");
 
 DEFINE_bool(manual_wal_flush, false,
@@ -2220,6 +2223,15 @@ DEFINE_uint64(
     "Maximum per-file prefetch size (in bytes) for MultiScan. "
     "Limits cumulative compressed data block size pinned per SST file. "
     "0 means unlimited.");
+
+DEFINE_bool(
+    multiscan_rolling_prefetch, false,
+    "Enable rolling prefetch with multiscan_rolling_prefetch_window_size-byte "
+    "windows and multiscan_max_prefetch_size as its maximum batch budget.");
+
+DEFINE_uint64(multiscan_rolling_prefetch_window_size, 0,
+              "Physical span and initial batch budget for rolling prefetch. "
+              "Must be nonzero when multiscan_rolling_prefetch is enabled.");
 
 DEFINE_bool(use_multiscan, true,
             "If true, multiscanrandom uses MultiScan API. If false, uses "
@@ -4562,7 +4574,7 @@ class Benchmark {
     fprintf(stderr, "...Verified\n");
   }
 
-  void ErrorExit() {
+  [[noreturn]] void ErrorExit() {
     if (holds_db_use_guard_ || is_secondary_update_thread_) {
       // Neither kind of DB-user context can safely run the mutation cleanup
       // path:
@@ -4799,6 +4811,11 @@ class Benchmark {
                 FLAGS_io_dispatcher_max_prefetch_memory_bytes);
         fprintf(stderr, "multiscan_max_prefetch_size = %" PRIu64 "\n",
                 FLAGS_multiscan_max_prefetch_size);
+        fprintf(stderr, "multiscan_rolling_prefetch = %s\n",
+                FLAGS_multiscan_rolling_prefetch ? "true" : "false");
+        fprintf(stderr,
+                "multiscan_rolling_prefetch_window_size = %" PRIu64 "\n",
+                FLAGS_multiscan_rolling_prefetch_window_size);
         fprintf(stderr, "reverse_iterator = %s\n",
                 FLAGS_reverse_iterator ? "true" : "false");
         method = &Benchmark::MultiScan;
@@ -4814,6 +4831,11 @@ class Benchmark {
                 FLAGS_io_dispatcher_max_prefetch_memory_bytes);
         fprintf(stderr, "multiscan_max_prefetch_size = %" PRIu64 "\n",
                 FLAGS_multiscan_max_prefetch_size);
+        fprintf(stderr, "multiscan_rolling_prefetch = %s\n",
+                FLAGS_multiscan_rolling_prefetch ? "true" : "false");
+        fprintf(stderr,
+                "multiscan_rolling_prefetch_window_size = %" PRIu64 "\n",
+                FLAGS_multiscan_rolling_prefetch_window_size);
         fprintf(stderr, "multiscan_use_async_io = %s\n",
                 FLAGS_multiscan_use_async_io ? "true" : "false");
         fprintf(stderr, "use_multiscan = %s\n",
@@ -5851,6 +5873,8 @@ class Benchmark {
     options.log_readahead_size = FLAGS_log_readahead_size;
     options.writable_file_max_buffer_size = FLAGS_writable_file_max_buffer_size;
     options.use_fsync = FLAGS_use_fsync;
+    options.use_separate_remote_compaction_pool =
+        FLAGS_use_separate_remote_compaction_pool;
     options.num_levels = FLAGS_num_levels;
     options.target_file_size_base = FLAGS_target_file_size_base;
     options.target_file_size_multiplier = FLAGS_target_file_size_multiplier;
@@ -8799,6 +8823,9 @@ class Benchmark {
       opts.io_coalesce_threshold = FLAGS_multiscan_coalesce_threshold;
       opts.use_async_io = FLAGS_multiscan_use_async_io;
       opts.max_prefetch_size = FLAGS_multiscan_max_prefetch_size;
+      opts.rolling_prefetch = FLAGS_multiscan_rolling_prefetch;
+      opts.rolling_prefetch_window_size =
+          FLAGS_multiscan_rolling_prefetch_window_size;
       opts.reverse = FLAGS_reverse_iterator;
       if (io_dispatcher) {
         opts.io_dispatcher = io_dispatcher;
@@ -8935,6 +8962,9 @@ class Benchmark {
         opts.io_coalesce_threshold = FLAGS_multiscan_coalesce_threshold;
         opts.use_async_io = FLAGS_multiscan_use_async_io;
         opts.max_prefetch_size = FLAGS_multiscan_max_prefetch_size;
+        opts.rolling_prefetch = FLAGS_multiscan_rolling_prefetch;
+        opts.rolling_prefetch_window_size =
+            FLAGS_multiscan_rolling_prefetch_window_size;
         opts.reverse = FLAGS_reverse_iterator;
         if (io_dispatcher) {
           opts.io_dispatcher = io_dispatcher;

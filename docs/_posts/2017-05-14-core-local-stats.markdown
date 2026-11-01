@@ -74,7 +74,7 @@ To measure statistics query latency, we ran sysbench with 4K OLTP clients concur
 
 The thread-local approach is working well for applications calling RocksDB from only a few threads, or polling statistics infrequently. Eventually, though, we found use cases where those assumptions do not hold. For example, one application has per-connection threads and typically runs into performance issues when connection count grows very high. For debugging such issues, they want high-frequency statistics polling to correlate issues in their application with changes in RocksDB's state.
 
-Once [PR #2258](https://github.com/facebook/rocksdb/pull/2258) lands, ticker/histogram statistics will be local to each CPU core. Similarly to thread-local, each core updates only its local values, thus avoiding cache line bouncing. Local values are still atomics to make aggregation possible. With this change, query work depends only on number of cores, not the number of threads. So, applications with many more threads than cores can no longer impact statistics query latency.
+Once [PR #2258](https://github.com/meta/rocksdb/pull/2258) lands, ticker/histogram statistics will be local to each CPU core. Similarly to thread-local, each core updates only its local values, thus avoiding cache line bouncing. Local values are still atomics to make aggregation possible. With this change, query work depends only on number of cores, not the number of threads. So, applications with many more threads than cores can no longer impact statistics query latency.
 
 ### Performance
 

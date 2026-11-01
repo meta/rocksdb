@@ -109,6 +109,11 @@ int rocksdb_compactionjobinfo_job_id(const rocksdb_compactionjobinfo_t* info) {
   return info->rep.job_id;
 }
 
+unsigned char rocksdb_compactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_compactionjobinfo_t* info) {
+  return info->rep.use_separate_remote_compaction_pool;
+}
+
 int rocksdb_compactionjobinfo_num_l0_files(
     const rocksdb_compactionjobinfo_t* info) {
   return info->rep.num_l0_files;
@@ -170,6 +175,11 @@ uint64_t rocksdb_subcompactionjobinfo_thread_id(
 int rocksdb_subcompactionjobinfo_job_id(
     const rocksdb_subcompactionjobinfo_t* info) {
   return info->rep.job_id;
+}
+
+unsigned char rocksdb_subcompactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_subcompactionjobinfo_t* info) {
+  return info->rep.use_separate_remote_compaction_pool;
 }
 
 int rocksdb_subcompactionjobinfo_subcompaction_job_id(

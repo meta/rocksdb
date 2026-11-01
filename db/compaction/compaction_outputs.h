@@ -22,7 +22,7 @@ class CompactionOutputs;
 using CompactionFileOpenFunc = std::function<Status(CompactionOutputs&)>;
 using CompactionFileCloseFunc =
     std::function<Status(const Status&, const ParsedInternalKey&, const Slice&,
-                         const CompactionIterator*, CompactionOutputs&)>;
+                         const CompactionIterator*, bool, CompactionOutputs&)>;
 
 // Files produced by subcompaction, most of the functions are used by
 // compaction_job Open/Close compaction file functions.
@@ -278,7 +278,7 @@ class CompactionOutputs {
 
   // Add current key from compaction_iterator to the output file. If needed
   // close and open new compaction output with the functions provided.
-  Status AddToOutput(const CompactionIterator& c_iter,
+  Status AddToOutput(CompactionIterator& c_iter,
                      const CompactionFileOpenFunc& open_file_func,
                      const CompactionFileCloseFunc& close_file_func,
                      const ParsedInternalKey& prev_iter_output_internal_key);
@@ -302,7 +302,8 @@ class CompactionOutputs {
       const ParsedInternalKey empty_internal_key{};
       const Slice empty_key{};
       Status s = close_file_func(status, empty_internal_key, empty_key,
-                                 nullptr /* c_iter */, *this);
+                                 nullptr /* c_iter */,
+                                 /*post_prepare_retry=*/false, *this);
       if (!s.ok() && status.ok()) {
         status = s;
       }

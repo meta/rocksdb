@@ -60,7 +60,6 @@ class DuplicateDetector {
           "Recovering an entry from a dropped column family. "
           "WAL must must have been flushed before dropping the column "
           "family");
-      return;
     }
     auto cmp = h->GetComparator();
     keys_[cf] = CFKeys(SetComparator(cmp));

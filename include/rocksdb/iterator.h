@@ -109,6 +109,10 @@ class Iterator : public IteratorBase {
   // point onwards and behave like a normal iterator. Its the user's
   // responsibility to again call Prepare().
   //
+  // For an iterator from DB::NewIterator(), Prepare() discards any current
+  // position, and Valid() returns false until the iterator is positioned
+  // again, e.g. by Seek().
+  //
   // If Prepare() is called, it overrides the iterate_upper_bound in
   // ReadOptions
   virtual void Prepare(const MultiScanArgs& /*scan_opts*/) {}

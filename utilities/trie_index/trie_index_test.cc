@@ -7,8 +7,11 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <utility>
@@ -46,12 +49,12 @@ namespace trie_index {
 // Helpers: pack sequence numbers with kTypeValue (1) into tags.
 // Tests use plain sequence numbers for readability; these convert them to
 // the tag format that IndexEntryContext and SeekContext expect.
-UserDefinedIndexIterator::SeekContext SeekCtx(SequenceNumber seq) {
+IndexFactoryIterator::SeekContext SeekCtx(SequenceNumber seq) {
   return {PackSequenceAndType(seq, kValueTypeForSeek)};
 }
 
-UserDefinedIndexBuilder::IndexEntryContext EntryCtx(SequenceNumber last_seq,
-                                                    SequenceNumber first_seq) {
+IndexFactoryBuilder::IndexEntryContext EntryCtx(SequenceNumber last_seq,
+                                                SequenceNumber first_seq) {
   return {last_seq ? ((static_cast<uint64_t>(last_seq) << 8) | 1) : 0,
           first_seq ? ((static_cast<uint64_t>(first_seq) << 8) | 1) : 0};
 }
@@ -2374,22 +2377,22 @@ class TrieIndexFactoryTest : public testing::Test {
   // Owns the builder (which holds the serialized data), reader, and iterator.
   // All must stay alive for the iterator to be usable.
   struct TrieTestContext {
-    std::unique_ptr<UserDefinedIndexBuilder> builder;
+    std::unique_ptr<IndexFactoryBuilder> builder;
     Slice index_contents;
-    std::unique_ptr<UserDefinedIndexReader> reader;
-    std::unique_ptr<UserDefinedIndexIterator> iter;
+    std::unique_ptr<IndexFactoryReader> reader;
+    std::unique_ptr<IndexFactoryIterator> iter;
   };
 
   // Build a trie from TestBlocks and return a context with a ready iterator.
   TrieTestContext BuildTrieAndGetIterator(
       const std::vector<TestBlock>& blocks) {
     TrieTestContext ctx;
-    UserDefinedIndexOption option;
+    IndexFactoryOptions option;
     option.comparator = BytewiseComparator();
 
     EXPECT_OK(factory_->NewBuilder(option, ctx.builder));
     for (const auto& b : blocks) {
-      UserDefinedIndexBuilder::BlockHandle h{b.offset, b.size};
+      IndexFactoryBuilder::BlockHandle h{b.offset, b.size};
       std::string scratch;
       if (!b.next_key.empty()) {
         Slice next(b.next_key);
@@ -2408,9 +2411,8 @@ class TrieIndexFactoryTest : public testing::Test {
   }
 
   // Seek and assert the resulting block offset.
-  static void AssertSeekOffset(UserDefinedIndexIterator* iter,
-                               const Slice& target, SequenceNumber seq,
-                               uint64_t expected_offset) {
+  static void AssertSeekOffset(IndexFactoryIterator* iter, const Slice& target,
+                               SequenceNumber seq, uint64_t expected_offset) {
     IterateResult result;
     ASSERT_OK(iter->SeekAndGetResult(target, &result, SeekCtx(seq)));
     ASSERT_EQ(iter->value().offset, expected_offset)
@@ -2423,7 +2425,7 @@ class TrieIndexFactoryTest : public testing::Test {
   // all blocks, asserting each offset matches expected_offsets. Also asserts
   // kUnknown past the end.
   static void AssertFullForwardScan(
-      UserDefinedIndexIterator* iter, const Slice& first_key,
+      IndexFactoryIterator* iter, const Slice& first_key,
       const std::vector<uint64_t>& expected_offsets) {
     ASSERT_FALSE(expected_offsets.empty());
     IterateResult result;
@@ -2579,10 +2581,10 @@ TEST_F(TrieIndexFactoryTest, BlockHandleEncodingLimit) {
 
 TEST_F(TrieIndexFactoryTest, BasicBuildAndRead) {
   // Build a trie index using the factory interface.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
   ASSERT_NE(builder, nullptr);
 
@@ -2593,7 +2595,7 @@ TEST_F(TrieIndexFactoryTest, BasicBuildAndRead) {
                                          "elderberry", ""};
 
   for (size_t i = 0; i < last_keys.size(); i++) {
-    UserDefinedIndexBuilder::BlockHandle handle{i * 1000, 500};
+    IndexFactoryBuilder::BlockHandle handle{i * 1000, 500};
 
     std::string scratch;
     Slice next_slice(first_keys[i]);
@@ -2608,7 +2610,7 @@ TEST_F(TrieIndexFactoryTest, BasicBuildAndRead) {
   ASSERT_GT(index_contents.size(), 0u);
 
   // Read the index.
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
   ASSERT_NE(reader, nullptr);
   ASSERT_GT(reader->ApproximateMemoryUsage(), 0u);
@@ -2630,10 +2632,10 @@ TEST_F(TrieIndexFactoryTest, FactoryName) {
 }
 
 TEST_F(TrieIndexFactoryTest, EmptyIndex) {
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
 
   // Finish without adding any entries.
@@ -2643,10 +2645,10 @@ TEST_F(TrieIndexFactoryTest, EmptyIndex) {
 }
 
 TEST_F(TrieIndexFactoryTest, DoubleFinish) {
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
 
   Slice index_contents;
@@ -2660,10 +2662,10 @@ TEST_F(TrieIndexFactoryTest, DoubleFinish) {
 
 TEST_F(TrieIndexFactoryTest, IteratorBoundsChecking) {
   // Test the bounds checking in the UDI iterator.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> udi_builder;
+  std::unique_ptr<IndexFactoryBuilder> udi_builder;
   ASSERT_OK(factory_->NewBuilder(option, udi_builder));
 
   // Build index with 3 blocks.
@@ -2674,8 +2676,8 @@ TEST_F(TrieIndexFactoryTest, IteratorBoundsChecking) {
     std::string sep = buf;
     separators.push_back(sep);
 
-    UserDefinedIndexBuilder::BlockHandle handle{static_cast<uint64_t>(i) * 1000,
-                                                500};
+    IndexFactoryBuilder::BlockHandle handle{static_cast<uint64_t>(i) * 1000,
+                                            500};
     std::string scratch;
     if (i < 2) {
       char next_buf[16];
@@ -2692,7 +2694,7 @@ TEST_F(TrieIndexFactoryTest, IteratorBoundsChecking) {
   Slice index_contents;
   ASSERT_OK(udi_builder->Finish(&index_contents));
 
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
 
   ReadOptions ro;
@@ -2723,13 +2725,13 @@ TEST_F(TrieIndexFactoryTest, IteratorBoundsChecking) {
 
 TEST_F(TrieIndexFactoryTest, IteratorNoBounds) {
   // Without Prepare(), bounds checking should always return kInbound.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> udi_builder;
+  std::unique_ptr<IndexFactoryBuilder> udi_builder;
   ASSERT_OK(factory_->NewBuilder(option, udi_builder));
 
-  UserDefinedIndexBuilder::BlockHandle handle{0, 500};
+  IndexFactoryBuilder::BlockHandle handle{0, 500};
   std::string scratch;
   udi_builder->AddIndexEntry(Slice("key"), nullptr, handle, &scratch,
                              EntryCtx(100, 100));
@@ -2737,7 +2739,7 @@ TEST_F(TrieIndexFactoryTest, IteratorNoBounds) {
   Slice index_contents;
   ASSERT_OK(udi_builder->Finish(&index_contents));
 
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
 
   ReadOptions ro;
@@ -2757,15 +2759,15 @@ TEST_F(TrieIndexFactoryTest, UpperBoundDoesNotDropValidBlocks) {
   // use the previous separator (or seek target) as the reference key, not
   // the current separator, to avoid prematurely rejecting blocks that
   // contain keys within the limit.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> udi_builder;
+  std::unique_ptr<IndexFactoryBuilder> udi_builder;
   ASSERT_OK(factory_->NewBuilder(option, udi_builder));
 
   // Block 0: last="az", next_first="c" -> separator ~= "b"
   {
-    UserDefinedIndexBuilder::BlockHandle handle{0, 1000};
+    IndexFactoryBuilder::BlockHandle handle{0, 1000};
     std::string scratch;
     Slice next("c");
     udi_builder->AddIndexEntry(Slice("az"), &next, handle, &scratch,
@@ -2773,7 +2775,7 @@ TEST_F(TrieIndexFactoryTest, UpperBoundDoesNotDropValidBlocks) {
   }
   // Block 1: last="cz", next_first="e" -> separator ~= "d"
   {
-    UserDefinedIndexBuilder::BlockHandle handle{1000, 1000};
+    IndexFactoryBuilder::BlockHandle handle{1000, 1000};
     std::string scratch;
     Slice next("e");
     udi_builder->AddIndexEntry(Slice("cz"), &next, handle, &scratch,
@@ -2781,7 +2783,7 @@ TEST_F(TrieIndexFactoryTest, UpperBoundDoesNotDropValidBlocks) {
   }
   // Block 2: last="ez", no next -> separator ~= "f"
   {
-    UserDefinedIndexBuilder::BlockHandle handle{2000, 1000};
+    IndexFactoryBuilder::BlockHandle handle{2000, 1000};
     std::string scratch;
     udi_builder->AddIndexEntry(Slice("ez"), nullptr, handle, &scratch,
                                EntryCtx(100, 100));
@@ -2790,7 +2792,7 @@ TEST_F(TrieIndexFactoryTest, UpperBoundDoesNotDropValidBlocks) {
   Slice index_contents;
   ASSERT_OK(udi_builder->Finish(&index_contents));
 
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
 
   ReadOptions ro;
@@ -2852,10 +2854,10 @@ TEST_F(TrieIndexFactoryTest, MultiScanBoundsAdvanceCorrectly) {
   // Validates that current_scan_idx_ advances correctly when
   // the seek target is past the current scan's limit. Otherwise all
   // bounds checks evaluate against scan 0's limit.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> udi_builder;
+  std::unique_ptr<IndexFactoryBuilder> udi_builder;
   ASSERT_OK(factory_->NewBuilder(option, udi_builder));
 
   // 5 blocks with well-separated keys.
@@ -2869,7 +2871,7 @@ TEST_F(TrieIndexFactoryTest, MultiScanBoundsAdvanceCorrectly) {
       {"gz", "i", 3000}, {"iz", nullptr, 4000},
   };
   for (const auto& b : blocks) {
-    UserDefinedIndexBuilder::BlockHandle handle{b.offset, 500};
+    IndexFactoryBuilder::BlockHandle handle{b.offset, 500};
     std::string scratch;
     if (b.next_first) {
       Slice next(b.next_first);
@@ -2884,7 +2886,7 @@ TEST_F(TrieIndexFactoryTest, MultiScanBoundsAdvanceCorrectly) {
   Slice index_contents;
   ASSERT_OK(udi_builder->Finish(&index_contents));
 
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
 
   ReadOptions ro;
@@ -2939,18 +2941,18 @@ TEST_F(TrieIndexFactoryTest, MultiScanBoundsAdvanceCorrectly) {
 TEST_F(TrieIndexFactoryTest, RejectsNonBytewiseComparator) {
   // The trie index requires bytewise ordering because it traverses keys
   // byte-by-byte. Non-bytewise comparators should be rejected.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
 
   // ReverseBytewiseComparator should be rejected.
   option.comparator = ReverseBytewiseComparator();
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   Status s = factory_->NewBuilder(option, builder);
   ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
   ASSERT_EQ(builder, nullptr);
 
   // NewReader should also reject non-bytewise comparators.
   Slice dummy_data;
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   s = factory_->NewReader(option, dummy_data, reader);
   ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
   ASSERT_EQ(reader, nullptr);
@@ -2964,10 +2966,10 @@ TEST_F(TrieIndexFactoryTest, RejectsNonBytewiseComparator) {
 TEST_F(TrieIndexFactoryTest, ApproximateMemoryUsageReportsOnlyAuxData) {
   // The reader reports its auxiliary heap allocations. The serialized block
   // is accounted separately by the table reader or block cache.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> udi_builder;
+  std::unique_ptr<IndexFactoryBuilder> udi_builder;
   ASSERT_OK(factory_->NewBuilder(option, udi_builder));
 
   // Build a non-trivial index with enough keys to produce sparse internal
@@ -2978,8 +2980,8 @@ TEST_F(TrieIndexFactoryTest, ApproximateMemoryUsageReportsOnlyAuxData) {
     snprintf(last_buf, sizeof(last_buf), "key_%04d", i);
     snprintf(next_buf, sizeof(next_buf), "key_%04d", i + 1);
 
-    UserDefinedIndexBuilder::BlockHandle handle{static_cast<uint64_t>(i) * 1000,
-                                                500};
+    IndexFactoryBuilder::BlockHandle handle{static_cast<uint64_t>(i) * 1000,
+                                            500};
     std::string scratch;
     if (i < 99) {
       Slice next(next_buf);
@@ -2995,7 +2997,7 @@ TEST_F(TrieIndexFactoryTest, ApproximateMemoryUsageReportsOnlyAuxData) {
   ASSERT_OK(udi_builder->Finish(&index_contents));
   size_t serialized_size = index_contents.size();
 
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
 
   size_t mem_usage = reader->ApproximateMemoryUsage();
@@ -3005,16 +3007,16 @@ TEST_F(TrieIndexFactoryTest, ApproximateMemoryUsageReportsOnlyAuxData) {
 
 TEST_F(TrieIndexFactoryTest, EmptyTrieIterator) {
   // Seek on an iterator built from an empty index.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
 
   Slice index_contents;
   ASSERT_OK(builder->Finish(&index_contents));
 
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
 
   ReadOptions ro;
@@ -3107,12 +3109,12 @@ TEST_F(TrieIndexFactoryTest, ScanWithNoLimit) {
 
 TEST_F(TrieIndexFactoryTest, NewReaderWithCorruptedData) {
   // Attempt to create a reader from corrupted data.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
   std::string bad_data(10, '\xff');
   Slice bad_slice(bad_data);
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   Status s = factory_->NewReader(option, bad_slice, reader);
   ASSERT_TRUE(s.IsCorruption()) << s.ToString();
 }
@@ -3120,26 +3122,26 @@ TEST_F(TrieIndexFactoryTest, NewReaderWithCorruptedData) {
 TEST_F(TrieIndexFactoryTest, OnKeyAddedNoOp) {
   // Verify that OnKeyAdded() is a no-op for the trie builder regardless of
   // the ValueType. The trie only uses separator keys from AddIndexEntry().
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
 
   // Call OnKeyAdded with all ValueType variants -- all should be no-ops.
-  builder->OnKeyAdded(Slice("key1"), UserDefinedIndexBuilder::ValueType::kValue,
+  builder->OnKeyAdded(Slice("key1"), IndexFactoryBuilder::ValueType::kValue,
                       Slice("value1"));
-  builder->OnKeyAdded(Slice("key2"),
-                      UserDefinedIndexBuilder::ValueType::kDelete, Slice(""));
-  builder->OnKeyAdded(Slice("key3"), UserDefinedIndexBuilder::ValueType::kMerge,
+  builder->OnKeyAdded(Slice("key2"), IndexFactoryBuilder::ValueType::kDelete,
+                      Slice(""));
+  builder->OnKeyAdded(Slice("key3"), IndexFactoryBuilder::ValueType::kMerge,
                       Slice("merge_operand"));
-  builder->OnKeyAdded(Slice("key4"), UserDefinedIndexBuilder::ValueType::kOther,
+  builder->OnKeyAdded(Slice("key4"), IndexFactoryBuilder::ValueType::kOther,
                       Slice("blob_ref"));
-  builder->OnKeyAdded(Slice(""), UserDefinedIndexBuilder::ValueType::kValue,
+  builder->OnKeyAdded(Slice(""), IndexFactoryBuilder::ValueType::kValue,
                       Slice(""));
 
   // Building should still succeed (OnKeyAdded should not affect state).
-  UserDefinedIndexBuilder::BlockHandle handle{0, 500};
+  IndexFactoryBuilder::BlockHandle handle{0, 500};
   std::string scratch;
   builder->AddIndexEntry(Slice("key5"), nullptr, handle, &scratch,
                          EntryCtx(100, 100));
@@ -3153,24 +3155,24 @@ TEST_F(TrieIndexFactoryTest, NullComparator) {
   // NewBuilder and NewReader with nullptr comparator should default to
   // BytewiseComparator. This tests that the null-comparator guard in both
   // NewBuilder and NewReader prevents null-pointer dereferences.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = nullptr;
 
   // Build a non-trivial index with null comparator. The builder internally
   // defaults to BytewiseComparator.
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
   ASSERT_NE(builder, nullptr);
 
   // Add some entries -- AddIndexEntry uses the defaulted comparator internally.
   std::string scratch;
   {
-    UserDefinedIndexBuilder::BlockHandle h{0, 100};
+    IndexFactoryBuilder::BlockHandle h{0, 100};
     Slice next("b");
     builder->AddIndexEntry(Slice("a"), &next, h, &scratch, EntryCtx(100, 100));
   }
   {
-    UserDefinedIndexBuilder::BlockHandle h{100, 100};
+    IndexFactoryBuilder::BlockHandle h{100, 100};
     builder->AddIndexEntry(Slice("b"), nullptr, h, &scratch,
                            EntryCtx(100, 100));
   }
@@ -3181,7 +3183,7 @@ TEST_F(TrieIndexFactoryTest, NullComparator) {
   // NewReader with nullptr comparator must default to BytewiseComparator.
   // Storing a null comparator would cause a crash on Seek when CheckBounds
   // dereferences it.
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
   ASSERT_NE(reader, nullptr);
 
@@ -3242,7 +3244,7 @@ TEST_F(TrieIndexFactoryTest, SameUserKeyBoundaryTriggersSeqnoEncoding) {
   // trie cannot distinguish the two blocks, causing incorrect Seek.
   auto ctx = BuildTrieAndGetIterator({
       // Block 0: last_key="foo" seq=100, next_first="foo" seq=50.
-      // Same user key at boundary -- triggers must_use_separator_with_seq_.
+      // Same user key at boundary -- the entry gets a real tag.
       {"foo", "foo", 0, 1000, 100, 50},
       // Block 1: last_key="foo" seq=50, next_first="goo" seq=1.
       {"foo", "goo", 1000, 1000, 50, 1},
@@ -3499,16 +3501,16 @@ TEST_F(TrieIndexFactoryTest, LargeOverflowRun) {
   //   "key" (11-block run, seqnos 1200..200) -> "l" (block 11) -> "zzz" (block
   //   12)
   // The overflow run for "key" has 10 overflow entries (blocks 1-10).
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
 
   const int kNumKeyBlocks = 12;
   for (int i = 0; i < kNumKeyBlocks; i++) {
-    UserDefinedIndexBuilder::BlockHandle handle{static_cast<uint64_t>(i) * 1000,
-                                                1000};
+    IndexFactoryBuilder::BlockHandle handle{static_cast<uint64_t>(i) * 1000,
+                                            1000};
     std::string scratch;
     SequenceNumber seq = static_cast<SequenceNumber>((kNumKeyBlocks - i) * 100);
 
@@ -3529,7 +3531,7 @@ TEST_F(TrieIndexFactoryTest, LargeOverflowRun) {
   }
   // Final "zzz" block. Last block uses "zzz" as separator (no shortening).
   {
-    UserDefinedIndexBuilder::BlockHandle handle{
+    IndexFactoryBuilder::BlockHandle handle{
         static_cast<uint64_t>(kNumKeyBlocks) * 1000, 1000};
     std::string scratch;
     builder->AddIndexEntry(Slice("zzz"), nullptr, handle, &scratch,
@@ -3539,7 +3541,7 @@ TEST_F(TrieIndexFactoryTest, LargeOverflowRun) {
   Slice index_contents;
   ASSERT_OK(builder->Finish(&index_contents));
 
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
 
   ReadOptions ro;
@@ -3621,22 +3623,22 @@ TEST_F(TrieIndexFactoryTest, MixedSameKeyRuns) {
   //
   // For a true multi-block overflow run for "aaa", we need 3+ consecutive
   // blocks ALL with "aaa" -> "aaa" boundaries.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
 
   // "aaa" run: 3 blocks (all same-key boundaries).
   {
-    UserDefinedIndexBuilder::BlockHandle h{0, 1000};
+    IndexFactoryBuilder::BlockHandle h{0, 1000};
     std::string scratch;
     Slice next("aaa");
     builder->AddIndexEntry(Slice("aaa"), &next, h, &scratch,
                            EntryCtx(300, 200));
   }
   {
-    UserDefinedIndexBuilder::BlockHandle h{1000, 1000};
+    IndexFactoryBuilder::BlockHandle h{1000, 1000};
     std::string scratch;
     Slice next("aaa");
     builder->AddIndexEntry(Slice("aaa"), &next, h, &scratch,
@@ -3644,28 +3646,28 @@ TEST_F(TrieIndexFactoryTest, MixedSameKeyRuns) {
   }
   // Last "aaa" block transitions to "mmm" -> separator "b".
   {
-    UserDefinedIndexBuilder::BlockHandle h{2000, 1000};
+    IndexFactoryBuilder::BlockHandle h{2000, 1000};
     std::string scratch;
     Slice next("mmm");
     builder->AddIndexEntry(Slice("aaa"), &next, h, &scratch, EntryCtx(100, 60));
   }
   // "mmm" run: 2 blocks (one same-key boundary).
   {
-    UserDefinedIndexBuilder::BlockHandle h{3000, 1000};
+    IndexFactoryBuilder::BlockHandle h{3000, 1000};
     std::string scratch;
     Slice next("mmm");
     builder->AddIndexEntry(Slice("mmm"), &next, h, &scratch, EntryCtx(60, 30));
   }
   // Last "mmm" block transitions to "zzz" -> separator "n".
   {
-    UserDefinedIndexBuilder::BlockHandle h{4000, 1000};
+    IndexFactoryBuilder::BlockHandle h{4000, 1000};
     std::string scratch;
     Slice next("zzz");
     builder->AddIndexEntry(Slice("mmm"), &next, h, &scratch, EntryCtx(30, 10));
   }
   // "zzz": 1 block (last -> separator "zzz", no shortening).
   {
-    UserDefinedIndexBuilder::BlockHandle h{5000, 1000};
+    IndexFactoryBuilder::BlockHandle h{5000, 1000};
     std::string scratch;
     builder->AddIndexEntry(Slice("zzz"), nullptr, h, &scratch, EntryCtx(10, 0));
   }
@@ -3673,7 +3675,7 @@ TEST_F(TrieIndexFactoryTest, MixedSameKeyRuns) {
   Slice index_contents;
   ASSERT_OK(builder->Finish(&index_contents));
 
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
 
   ReadOptions ro;
@@ -3931,11 +3933,11 @@ TEST_F(TrieIndexFactoryTest, SeqnoEncodingOutOfBoundWithOverflow) {
 TEST_F(TrieIndexFactoryTest, SeqnoEncodingConsistentSize) {
   // Verify that tries built with different seqno contexts produce the
   // same serialized size (seqno encoding is always on).
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
   // Build trie with distinct keys, seqno=0.
-  std::unique_ptr<UserDefinedIndexBuilder> builder_no_seq;
+  std::unique_ptr<IndexFactoryBuilder> builder_no_seq;
   ASSERT_OK(factory_->NewBuilder(option, builder_no_seq));
   for (int i = 0; i < 50; i++) {
     char buf[16];
@@ -3943,8 +3945,8 @@ TEST_F(TrieIndexFactoryTest, SeqnoEncodingConsistentSize) {
     char next_buf[16];
     snprintf(next_buf, sizeof(next_buf), "key_%04d", i + 1);
 
-    UserDefinedIndexBuilder::BlockHandle handle{static_cast<uint64_t>(i) * 1000,
-                                                500};
+    IndexFactoryBuilder::BlockHandle handle{static_cast<uint64_t>(i) * 1000,
+                                            500};
     std::string scratch;
     if (i < 49) {
       Slice next(next_buf);
@@ -3960,7 +3962,7 @@ TEST_F(TrieIndexFactoryTest, SeqnoEncodingConsistentSize) {
   size_t size_no_seq = contents_no_seq.size();
 
   // Same keys but with nonzero seqnos (still distinct -> no seqno encoding).
-  std::unique_ptr<UserDefinedIndexBuilder> builder_with_seq;
+  std::unique_ptr<IndexFactoryBuilder> builder_with_seq;
   ASSERT_OK(factory_->NewBuilder(option, builder_with_seq));
   for (int i = 0; i < 50; i++) {
     char buf[16];
@@ -3968,8 +3970,8 @@ TEST_F(TrieIndexFactoryTest, SeqnoEncodingConsistentSize) {
     char next_buf[16];
     snprintf(next_buf, sizeof(next_buf), "key_%04d", i + 1);
 
-    UserDefinedIndexBuilder::BlockHandle handle{static_cast<uint64_t>(i) * 1000,
-                                                500};
+    IndexFactoryBuilder::BlockHandle handle{static_cast<uint64_t>(i) * 1000,
+                                            500};
     std::string scratch;
     if (i < 49) {
       Slice next(next_buf);
@@ -4057,45 +4059,45 @@ TEST_F(TrieIndexFactoryTest, NextTransitionOverflowToOverflow) {
   // Note: the last block's separator is "bbb" (not "c"), matching the standard
   // index builder's behavior with kShortenSeparators (the default). This means
   // the last block joins the "bbb" run, making it a 3-block run.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
 
   {
-    UserDefinedIndexBuilder::BlockHandle h{0, 1000};
+    IndexFactoryBuilder::BlockHandle h{0, 1000};
     std::string scratch;
     Slice next("aaa");
     builder->AddIndexEntry(Slice("aaa"), &next, h, &scratch,
                            EntryCtx(200, 100));
   }
   {
-    UserDefinedIndexBuilder::BlockHandle h{1000, 1000};
+    IndexFactoryBuilder::BlockHandle h{1000, 1000};
     std::string scratch;
     Slice next("aaa");
     builder->AddIndexEntry(Slice("aaa"), &next, h, &scratch, EntryCtx(100, 50));
   }
   {
-    UserDefinedIndexBuilder::BlockHandle h{2000, 1000};
+    IndexFactoryBuilder::BlockHandle h{2000, 1000};
     std::string scratch;
     Slice next("bbb");
     builder->AddIndexEntry(Slice("aaa"), &next, h, &scratch, EntryCtx(50, 90));
   }
   {
-    UserDefinedIndexBuilder::BlockHandle h{3000, 1000};
+    IndexFactoryBuilder::BlockHandle h{3000, 1000};
     std::string scratch;
     Slice next("bbb");
     builder->AddIndexEntry(Slice("bbb"), &next, h, &scratch, EntryCtx(90, 60));
   }
   {
-    UserDefinedIndexBuilder::BlockHandle h{4000, 1000};
+    IndexFactoryBuilder::BlockHandle h{4000, 1000};
     std::string scratch;
     Slice next("bbb");
     builder->AddIndexEntry(Slice("bbb"), &next, h, &scratch, EntryCtx(60, 30));
   }
   {
-    UserDefinedIndexBuilder::BlockHandle h{5000, 1000};
+    IndexFactoryBuilder::BlockHandle h{5000, 1000};
     std::string scratch;
     builder->AddIndexEntry(Slice("bbb"), nullptr, h, &scratch, EntryCtx(30, 0));
   }
@@ -4103,7 +4105,7 @@ TEST_F(TrieIndexFactoryTest, NextTransitionOverflowToOverflow) {
   Slice index_contents;
   ASSERT_OK(builder->Finish(&index_contents));
 
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
 
   ReadOptions ro;
@@ -4185,9 +4187,9 @@ TEST_F(TrieIndexFactoryTest, TagDistinguishesSameSeqDifferentType) {
   // target (12800) < separator (12801) -> advance to Block 1.
   // With seqno-only: 50 < 50 is false -> stay (WRONG -- should advance).
 
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
 
   std::string scratch;
@@ -4201,7 +4203,7 @@ TEST_F(TrieIndexFactoryTest, TagDistinguishesSameSeqDifferentType) {
 
   Slice index_contents;
   ASSERT_OK(builder->Finish(&index_contents));
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
   ReadOptions ro;
   auto iter = reader->NewIterator(ro);
@@ -4435,6 +4437,8 @@ class TrieIndexSSTTest : public testing::Test {
     Options options;
     BlockBasedTableOptions table_options;
     table_options.user_defined_index_factory = trie_factory_;
+    table_options.index_mode =
+        BlockBasedTableOptions::IndexMode::kStandardDefault;
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
     SstFileWriter writer(EnvOptions(), options);
@@ -4486,18 +4490,20 @@ TEST_F(TrieIndexSSTTest, WriteAndReadWithTrieUDI) {
     ASSERT_EQ(count, 100);
   }
 
-  // Read WITH trie UDI -- use table_index_factory in ReadOptions.
+  // Read WITH trie UDI -- use read_index in ReadOptions.
   {
     Options options;
     BlockBasedTableOptions table_options;
     table_options.user_defined_index_factory = trie_factory_;
+    table_options.index_mode =
+        BlockBasedTableOptions::IndexMode::kStandardDefault;
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
     SstFileReader reader(options);
     ASSERT_OK(reader.Open(sst_path_));
 
     ReadOptions ro;
-    ro.table_index_factory = trie_factory_.get();
+    ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
     std::unique_ptr<Iterator> iter(reader.NewIterator(ro));
 
     // Full forward scan via Seek.
@@ -4521,13 +4527,15 @@ TEST_F(TrieIndexSSTTest, SeekWithTrieUDI) {
   Options options;
   BlockBasedTableOptions table_options;
   table_options.user_defined_index_factory = trie_factory_;
+  table_options.index_mode =
+      BlockBasedTableOptions::IndexMode::kStandardDefault;
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
   SstFileReader reader(options);
   ASSERT_OK(reader.Open(sst_path_));
 
   ReadOptions ro;
-  ro.table_index_factory = trie_factory_.get();
+  ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
   std::unique_ptr<Iterator> iter(reader.NewIterator(ro));
 
   // Seek to the middle.
@@ -4560,13 +4568,15 @@ TEST_F(TrieIndexSSTTest, SeekWithUpperBound) {
   Options options;
   BlockBasedTableOptions table_options;
   table_options.user_defined_index_factory = trie_factory_;
+  table_options.index_mode =
+      BlockBasedTableOptions::IndexMode::kStandardDefault;
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
   SstFileReader reader(options);
   ASSERT_OK(reader.Open(sst_path_));
 
   ReadOptions ro;
-  ro.table_index_factory = trie_factory_.get();
+  ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
   Slice upper_bound("key_0075");
   ro.iterate_upper_bound = &upper_bound;
   std::unique_ptr<Iterator> iter(reader.NewIterator(ro));
@@ -4591,13 +4601,15 @@ TEST_F(TrieIndexSSTTest, SmallSST) {
   Options options;
   BlockBasedTableOptions table_options;
   table_options.user_defined_index_factory = trie_factory_;
+  table_options.index_mode =
+      BlockBasedTableOptions::IndexMode::kStandardDefault;
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
   SstFileReader reader(options);
   ASSERT_OK(reader.Open(sst_path_));
 
   ReadOptions ro;
-  ro.table_index_factory = trie_factory_.get();
+  ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
   std::unique_ptr<Iterator> iter(reader.NewIterator(ro));
 
   iter->Seek("key_0000");
@@ -4630,6 +4642,8 @@ TEST_F(TrieIndexSSTTest, MixedKeyTypesWithCompressionDict) {
   table_options.index_type =
       BlockBasedTableOptions::IndexType::kBinarySearchWithFirstKey;
   table_options.user_defined_index_factory = trie_factory_;
+  table_options.index_mode =
+      BlockBasedTableOptions::IndexMode::kStandardDefault;
 
   Options options;
   options.compression = kCompression;
@@ -4855,7 +4869,7 @@ TEST_F(TrieSeekBenchmark, TrieVsRealIndexBlockIter) {
     }
 
     // ---- Benchmark: Trie Seek (full production path) ----
-    // Replicates UserDefinedIndexIteratorWrapper::Seek() ->
+    // Replicates IndexFactoryIteratorWrapper::Seek() ->
     //   TrieIndexIterator::SeekAndGetResult():
     //   1. ParseInternalKey to extract user_key
     //   2. trie_iter.Seek(user_key)
@@ -4939,6 +4953,8 @@ TEST_F(TrieIndexSSTTest, MixedKeyTypesWithTrieUDI) {
   options.merge_operator = MergeOperators::CreateStringAppendOperator();
   BlockBasedTableOptions table_options;
   table_options.user_defined_index_factory = trie_factory_;
+  table_options.index_mode =
+      BlockBasedTableOptions::IndexMode::kStandardDefault;
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
   SstFileWriter writer(EnvOptions(), options);
@@ -4990,6 +5006,8 @@ TEST_F(TrieIndexSSTTest, MixedKeyTypesWithTrieUDI) {
     read_options.merge_operator = MergeOperators::CreateStringAppendOperator();
     BlockBasedTableOptions read_table_options;
     read_table_options.user_defined_index_factory = trie_factory_;
+    read_table_options.index_mode =
+        BlockBasedTableOptions::IndexMode::kStandardDefault;
     read_options.table_factory.reset(
         NewBlockBasedTableFactory(read_table_options));
 
@@ -4997,7 +5015,7 @@ TEST_F(TrieIndexSSTTest, MixedKeyTypesWithTrieUDI) {
     ASSERT_OK(reader.Open(sst_path_));
 
     ReadOptions ro;
-    ro.table_index_factory = trie_factory_.get();
+    ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
     std::unique_ptr<Iterator> iter(reader.NewIterator(ro));
 
     // Full forward scan -- expect 6 logically visible entries.
@@ -5044,6 +5062,8 @@ TEST_F(TrieIndexSSTTest, LargeMixedKeyTypesWithTrieUDI) {
   options.merge_operator = MergeOperators::CreateStringAppendOperator();
   BlockBasedTableOptions table_options;
   table_options.user_defined_index_factory = trie_factory_;
+  table_options.index_mode =
+      BlockBasedTableOptions::IndexMode::kStandardDefault;
   // Use small block size to force many data blocks, stressing the index.
   table_options.block_size = 128;
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
@@ -5117,6 +5137,8 @@ TEST_F(TrieIndexSSTTest, LargeMixedKeyTypesWithTrieUDI) {
     read_options.merge_operator = MergeOperators::CreateStringAppendOperator();
     BlockBasedTableOptions read_table_options;
     read_table_options.user_defined_index_factory = trie_factory_;
+    read_table_options.index_mode =
+        BlockBasedTableOptions::IndexMode::kStandardDefault;
     read_options.table_factory.reset(
         NewBlockBasedTableFactory(read_table_options));
 
@@ -5124,7 +5146,7 @@ TEST_F(TrieIndexSSTTest, LargeMixedKeyTypesWithTrieUDI) {
     ASSERT_OK(reader.Open(sst_path_));
 
     ReadOptions ro;
-    ro.table_index_factory = trie_factory_.get();
+    ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
     std::unique_ptr<Iterator> iter(reader.NewIterator(ro));
 
     // Full forward scan -- only visible keys should appear.
@@ -5167,26 +5189,26 @@ TEST_F(TrieIndexSSTTest, LargeMixedKeyTypesWithTrieUDI) {
 }
 
 TEST_F(TrieIndexFactoryTest, WrapperNextAndGetResultReturnsInternalKey) {
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
 
   // Build a 3-block index: separators "a", "b", "c".
   std::string scratch;
   {
-    UserDefinedIndexBuilder::BlockHandle h{0, 100};
+    IndexFactoryBuilder::BlockHandle h{0, 100};
     Slice next("b");
     builder->AddIndexEntry(Slice("a"), &next, h, &scratch, EntryCtx(100, 100));
   }
   {
-    UserDefinedIndexBuilder::BlockHandle h{100, 100};
+    IndexFactoryBuilder::BlockHandle h{100, 100};
     Slice next("c");
     builder->AddIndexEntry(Slice("b"), &next, h, &scratch, EntryCtx(100, 100));
   }
   {
-    UserDefinedIndexBuilder::BlockHandle h{200, 100};
+    IndexFactoryBuilder::BlockHandle h{200, 100};
     builder->AddIndexEntry(Slice("c"), nullptr, h, &scratch,
                            EntryCtx(100, 100));
   }
@@ -5194,7 +5216,7 @@ TEST_F(TrieIndexFactoryTest, WrapperNextAndGetResultReturnsInternalKey) {
   Slice index_contents;
   ASSERT_OK(builder->Finish(&index_contents));
 
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
 
   ReadOptions ro;
@@ -5275,10 +5297,10 @@ TEST_F(TrieIndexFactoryTest, WrapperNextAndGetResultReturnsInternalKey) {
 //   Without fix: Seek("b") at low seqno gets "ab"'s overflow data (wrong
 //   offset and seqno), while Seek("ab") at low seqno gets "b"'s overflow.
 TEST_F(TrieIndexFactoryTest, OverflowBfsReordering) {
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
 
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
 
   std::string scratch;
@@ -5287,7 +5309,7 @@ TEST_F(TrieIndexFactoryTest, OverflowBfsReordering) {
   // Block 0: last="ab", next="ab" (same-key boundary)
   // -> sep="ab", same_user_key=true, seqno=500
   {
-    UserDefinedIndexBuilder::BlockHandle h{0, 100};
+    IndexFactoryBuilder::BlockHandle h{0, 100};
     Slice next("ab");
     sep = builder->AddIndexEntry(Slice("ab"), &next, h, &scratch,
                                  EntryCtx(500, 0));
@@ -5296,7 +5318,7 @@ TEST_F(TrieIndexFactoryTest, OverflowBfsReordering) {
   // Block 1: last="ab", next="abc" (prefix -- FindShortestSeparator no-op)
   // -> sep="ab", edge-case match with prev sep, same_user_key=true, seqno=400
   {
-    UserDefinedIndexBuilder::BlockHandle h{100, 100};
+    IndexFactoryBuilder::BlockHandle h{100, 100};
     Slice next("abc");
     sep = builder->AddIndexEntry(Slice("ab"), &next, h, &scratch,
                                  EntryCtx(400, 0));
@@ -5307,7 +5329,7 @@ TEST_F(TrieIndexFactoryTest, OverflowBfsReordering) {
   // limit.size()-1=0 so fallback: increment start[1] 'b'->'c' -> "ac"
   // -> sep="ac", different key, seqno=kMax->0
   {
-    UserDefinedIndexBuilder::BlockHandle h{200, 100};
+    IndexFactoryBuilder::BlockHandle h{200, 100};
     Slice next("b");
     sep = builder->AddIndexEntry(Slice("abc"), &next, h, &scratch,
                                  EntryCtx(100, 100));
@@ -5316,7 +5338,7 @@ TEST_F(TrieIndexFactoryTest, OverflowBfsReordering) {
   // Block 3: last="b", next="b" (same-key boundary)
   // -> sep="b", same_user_key=true, seqno=300
   {
-    UserDefinedIndexBuilder::BlockHandle h{300, 100};
+    IndexFactoryBuilder::BlockHandle h{300, 100};
     Slice next("b");
     sep = builder->AddIndexEntry(Slice("b"), &next, h, &scratch,
                                  EntryCtx(300, 0));
@@ -5325,7 +5347,7 @@ TEST_F(TrieIndexFactoryTest, OverflowBfsReordering) {
   // Block 4: last="b", next="ba" (prefix -- FindShortestSeparator no-op)
   // -> sep="b", edge-case match with prev sep, same_user_key=true, seqno=200
   {
-    UserDefinedIndexBuilder::BlockHandle h{400, 100};
+    IndexFactoryBuilder::BlockHandle h{400, 100};
     Slice next("ba");
     sep = builder->AddIndexEntry(Slice("b"), &next, h, &scratch,
                                  EntryCtx(200, 0));
@@ -5336,7 +5358,7 @@ TEST_F(TrieIndexFactoryTest, OverflowBfsReordering) {
   // start_byte+1='c' < 'd' -> increment and truncate -> "c"
   // -> sep="c", different key, seqno=kMax->0
   {
-    UserDefinedIndexBuilder::BlockHandle h{500, 100};
+    IndexFactoryBuilder::BlockHandle h{500, 100};
     Slice next("d");
     sep = builder->AddIndexEntry(Slice("ba"), &next, h, &scratch,
                                  EntryCtx(100, 100));
@@ -5345,7 +5367,7 @@ TEST_F(TrieIndexFactoryTest, OverflowBfsReordering) {
   // Block 6: last="d", next=null (last block, no successor shortening)
   // -> sep="d", different from prev "c", seqno=kMax->0
   {
-    UserDefinedIndexBuilder::BlockHandle h{600, 100};
+    IndexFactoryBuilder::BlockHandle h{600, 100};
     sep = builder->AddIndexEntry(Slice("d"), nullptr, h, &scratch,
                                  EntryCtx(100, 100));
   }
@@ -5366,7 +5388,7 @@ TEST_F(TrieIndexFactoryTest, OverflowBfsReordering) {
   Slice index_contents;
   ASSERT_OK(builder->Finish(&index_contents));
 
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
 
   ReadOptions ro;
@@ -5598,7 +5620,7 @@ TEST_F(TrieIndexFactoryTest, NonBoundarySeparatorSeekWhenShorteningFails) {
   // on separator "acc" with tag=0 (non-boundary sentinel). The post-seek
   // correction must NOT advance past it regardless of the target seqno.
   //
-  // Seqno encoding is always active (must_use_separator_with_seq_=true).
+  // Seqno encoding is always active for a non-empty trie.
   // The key arrangement:
   //   Block 0: separator = FindShortestSeparator("aaa","acc") = "ab"
   //   Block 1: separator = FindShortestSeparator("acc","acd") = "acc"
@@ -5749,13 +5771,13 @@ TEST_F(TrieIndexFactoryTest, PrevLandsOnLeafWithOverflow) {
 
 TEST_F(TrieIndexFactoryTest, SeekToFirstOnEmptyTrie) {
   // SeekToFirstAndGetResult on an empty trie should return kUnknown.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
   Slice index_contents;
   ASSERT_OK(builder->Finish(&index_contents));
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
   ReadOptions ro;
   auto iter = reader->NewIterator(ro);
@@ -5767,13 +5789,13 @@ TEST_F(TrieIndexFactoryTest, SeekToFirstOnEmptyTrie) {
 
 TEST_F(TrieIndexFactoryTest, SeekToLastOnEmptyTrie) {
   // SeekToLastAndGetResult on an empty trie should return kUnknown.
-  UserDefinedIndexOption option;
+  IndexFactoryOptions option;
   option.comparator = BytewiseComparator();
-  std::unique_ptr<UserDefinedIndexBuilder> builder;
+  std::unique_ptr<IndexFactoryBuilder> builder;
   ASSERT_OK(factory_->NewBuilder(option, builder));
   Slice index_contents;
   ASSERT_OK(builder->Finish(&index_contents));
-  std::unique_ptr<UserDefinedIndexReader> reader;
+  std::unique_ptr<IndexFactoryReader> reader;
   ASSERT_OK(factory_->NewReader(option, index_contents, reader));
   ReadOptions ro;
   auto iter = reader->NewIterator(ro);
@@ -5855,6 +5877,343 @@ TEST_F(TrieIndexFactoryTest, AllScansExhaustedThenSeek) {
   ASSERT_OK(ctx.iter->SeekAndGetResult(Slice("e"), &result,
                                        SeekCtx(kMaxSequenceNumber)));
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kOutOfBound);
+}
+
+// ============================================================================
+// Parallel compression protocol tests
+// ============================================================================
+
+TEST_F(TrieIndexFactoryTest, SupportsParallelAddEntry) {
+  // The trie builder must opt into the parallel protocol so the table
+  // builder routes EmitBlockForParallel through PrepareAddEntry /
+  // FinishAddEntry instead of forcing a serial fallback.
+  IndexFactoryOptions option;
+  option.comparator = BytewiseComparator();
+  std::unique_ptr<IndexFactoryBuilder> builder;
+  ASSERT_OK(factory_->NewBuilder(option, builder));
+  EXPECT_TRUE(builder->SupportsParallelAddEntry());
+
+  auto prep = builder->CreatePreparedAddEntry();
+  EXPECT_NE(prep, nullptr);
+}
+
+TEST_F(TrieIndexFactoryTest, ParallelMatchesSerialOutput) {
+  // Drive identical inputs through AddIndexEntry (serial) and through
+  // CreatePreparedAddEntry / PrepareAddEntry / FinishAddEntry (parallel).
+  // The two paths must produce byte-identical serialized index blocks
+  // and identical iterator behavior -- otherwise parallel compression
+  // with a trie index produces silently divergent SSTs.
+  IndexFactoryOptions option;
+  option.comparator = BytewiseComparator();
+
+  // Mix of distinct user keys, same-user-key boundaries (where seqno
+  // disambiguation matters), and a final block.
+  struct Block {
+    std::string last_key;
+    std::string next_key;  // empty = last block (nullptr)
+    uint64_t offset;
+    uint64_t size;
+    SequenceNumber last_seq;
+    SequenceNumber first_seq;
+  };
+  const std::vector<Block> blocks = {
+      {"aaa", "bbb", 0, 100, 100, 90},
+      {"bbb", "bbb", 105, 100, 80, 70},  // same-user-key boundary
+      {"bbb", "ccc", 210, 100, 60, 50},
+      {"ccc", "ddd", 315, 100, 55, 45},
+      // Four blocks split inside user key "kkk". The first three all get
+      // separator "kkk", so Finish() has to collapse them into one
+      // multi-block run with a seqno side-table entry per block. A run
+      // longer than two is the only way that path gets exercised.
+      {"kkk", "kkk", 420, 100, 44, 40},
+      {"kkk", "kkk", 525, 100, 38, 34},
+      {"kkk", "kkk", 630, 100, 32, 28},
+      {"kkk", "lll", 735, 100, 26, 22},
+      {"lll", "", 840, 100, 20, 0},  // last block
+  };
+
+  // --- Serial build ---
+  std::unique_ptr<IndexFactoryBuilder> serial;
+  ASSERT_OK(factory_->NewBuilder(option, serial));
+  std::string scratch_serial;
+  for (const auto& b : blocks) {
+    IndexFactoryBuilder::BlockHandle h{b.offset, b.size};
+    if (!b.next_key.empty()) {
+      Slice next(b.next_key);
+      serial->AddIndexEntry(Slice(b.last_key), &next, h, &scratch_serial,
+                            EntryCtx(b.last_seq, b.first_seq));
+    } else {
+      serial->AddIndexEntry(Slice(b.last_key), nullptr, h, &scratch_serial,
+                            EntryCtx(b.last_seq, 0));
+    }
+  }
+  Slice serial_contents;
+  ASSERT_OK(serial->Finish(&serial_contents));
+
+  // --- Parallel build (Prepare on emit, Finish on writer) ---
+  std::unique_ptr<IndexFactoryBuilder> par;
+  ASSERT_OK(factory_->NewBuilder(option, par));
+  ASSERT_TRUE(par->SupportsParallelAddEntry());
+  std::vector<std::unique_ptr<IndexFactoryBuilder::PreparedAddEntry>> prepared;
+  prepared.reserve(blocks.size());
+  for (const auto& b : blocks) {
+    auto p = par->CreatePreparedAddEntry();
+    ASSERT_NE(p, nullptr);
+    if (!b.next_key.empty()) {
+      Slice next(b.next_key);
+      par->PrepareAddEntry(Slice(b.last_key), &next,
+                           EntryCtx(b.last_seq, b.first_seq), p.get());
+    } else {
+      par->PrepareAddEntry(Slice(b.last_key), nullptr, EntryCtx(b.last_seq, 0),
+                           p.get());
+    }
+    prepared.push_back(std::move(p));
+  }
+  std::string scratch_parallel;
+  for (size_t i = 0; i < blocks.size(); i++) {
+    IndexFactoryBuilder::BlockHandle h{blocks[i].offset, blocks[i].size};
+    par->FinishAddEntry(h, prepared[i].get(), &scratch_parallel,
+                        /*skip_delta_encoding=*/false);
+  }
+  Slice parallel_contents;
+  ASSERT_OK(par->Finish(&parallel_contents));
+
+  EXPECT_EQ(serial_contents.ToString(), parallel_contents.ToString());
+
+  // Verify the parallel output is also functionally correct -- round-trip
+  // a few seeks through it.
+  std::unique_ptr<IndexFactoryReader> reader;
+  ASSERT_OK(factory_->NewReader(option, parallel_contents, reader));
+  ReadOptions ro;
+  auto iter = reader->NewIterator(ro);
+  IterateResult result;
+  ASSERT_OK(iter->SeekAndGetResult(Slice("aaa"), &result,
+                                   SeekCtx(kMaxSequenceNumber)));
+  EXPECT_EQ(iter->value().offset, 0u);
+  ASSERT_OK(iter->SeekAndGetResult(Slice("lll"), &result,
+                                   SeekCtx(kMaxSequenceNumber)));
+  EXPECT_EQ(iter->value().offset, 840u);
+  // Land inside the "kkk" run: the newest block in the run wins.
+  ASSERT_OK(iter->SeekAndGetResult(Slice("kkk"), &result,
+                                   SeekCtx(kMaxSequenceNumber)));
+  EXPECT_EQ(iter->value().offset, 420u);
+}
+
+TEST_F(TrieIndexFactoryTest, ParallelPipelineOverlapsPrepareAndFinish) {
+  // ParallelMatchesSerialOutput drives Prepare and Finish from one thread.
+  // The real table builder calls PrepareAddEntry on the emit thread while
+  // the BG writer thread is still finishing earlier blocks, which is the
+  // arrangement the disjoint-state contract in index_factory.h is about.
+  // Reproduce that overlap and require the output to match a serial build.
+  IndexFactoryOptions option;
+  option.comparator = BytewiseComparator();
+
+  struct Block {
+    std::string last_key;
+    std::string next_key;  // empty = last block (nullptr)
+    uint64_t offset;
+    SequenceNumber last_seq;
+    SequenceNumber first_seq;
+  };
+  // Ascending keys with periodic same-user-key runs, so the concurrent run
+  // covers both the sentinel-tag and real-tag paths.
+  std::vector<Block> blocks;
+  const int kNumKeys = 200;
+  uint64_t offset = 0;
+  for (int i = 0; i < kNumKeys; i++) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "key%06d", i);
+    std::string key(buf);
+    // Every 5th key is split across two blocks.
+    const bool split = (i % 5 == 0);
+    snprintf(buf, sizeof(buf), "key%06d", i + 1);
+    std::string next(buf);
+    if (split) {
+      blocks.push_back({key, key, offset, 1000u - 2 * i, 999u - 2 * i});
+      offset += 105;
+    }
+    blocks.push_back({key, next, offset, 900u - 2 * i, 899u - 2 * i});
+    offset += 105;
+  }
+  blocks.back().next_key.clear();  // final block has no successor
+
+  auto build_serial = [&]() {
+    std::unique_ptr<IndexFactoryBuilder> b;
+    EXPECT_OK(factory_->NewBuilder(option, b));
+    std::string scratch;
+    for (const auto& blk : blocks) {
+      IndexFactoryBuilder::BlockHandle h{blk.offset, 100};
+      if (!blk.next_key.empty()) {
+        Slice next(blk.next_key);
+        b->AddIndexEntry(Slice(blk.last_key), &next, h, &scratch,
+                         EntryCtx(blk.last_seq, blk.first_seq));
+      } else {
+        b->AddIndexEntry(Slice(blk.last_key), nullptr, h, &scratch,
+                         EntryCtx(blk.last_seq, 0));
+      }
+    }
+    Slice contents;
+    EXPECT_OK(b->Finish(&contents));
+    return contents.ToString();
+  };
+  const std::string serial_contents = build_serial();
+
+  // --- Concurrent build ---
+  std::unique_ptr<IndexFactoryBuilder> par;
+  ASSERT_OK(factory_->NewBuilder(option, par));
+  ASSERT_TRUE(par->SupportsParallelAddEntry());
+
+  // Bounded hand-off queue, sized like a small ring buffer so the emit
+  // thread has to keep preparing while the writer thread is finishing.
+  const size_t kQueueDepth = 4;
+  struct Item {
+    std::unique_ptr<IndexFactoryBuilder::PreparedAddEntry> prepared;
+    IndexFactoryBuilder::BlockHandle handle;
+  };
+  std::deque<Item> queue;
+  std::mutex mu;
+  std::condition_variable not_full;
+  std::condition_variable not_empty;
+  bool done_preparing = false;
+
+  port::Thread emitter([&]() {
+    for (const auto& blk : blocks) {
+      auto prepared = par->CreatePreparedAddEntry();
+      if (!blk.next_key.empty()) {
+        Slice next(blk.next_key);
+        par->PrepareAddEntry(Slice(blk.last_key), &next,
+                             EntryCtx(blk.last_seq, blk.first_seq),
+                             prepared.get());
+      } else {
+        par->PrepareAddEntry(Slice(blk.last_key), nullptr,
+                             EntryCtx(blk.last_seq, 0), prepared.get());
+      }
+      std::unique_lock<std::mutex> lock(mu);
+      not_full.wait(lock, [&] { return queue.size() < kQueueDepth; });
+      queue.push_back({std::move(prepared), {blk.offset, 100}});
+      not_empty.notify_one();
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    done_preparing = true;
+    not_empty.notify_one();
+  });
+
+  port::Thread writer([&]() {
+    std::string scratch;
+    for (;;) {
+      Item item;
+      {
+        std::unique_lock<std::mutex> lock(mu);
+        not_empty.wait(lock, [&] { return !queue.empty() || done_preparing; });
+        if (queue.empty()) {
+          return;
+        }
+        item = std::move(queue.front());
+        queue.pop_front();
+        not_full.notify_one();
+      }
+      par->FinishAddEntry(item.handle, item.prepared.get(), &scratch,
+                          /*skip_delta_encoding=*/false);
+    }
+  });
+
+  emitter.join();
+  writer.join();
+
+  Slice parallel_contents;
+  ASSERT_OK(par->Finish(&parallel_contents));
+  EXPECT_EQ(serial_contents, parallel_contents.ToString());
+
+  // Every key must still land on a real data block.
+  std::unique_ptr<IndexFactoryReader> reader;
+  ASSERT_OK(factory_->NewReader(option, parallel_contents, reader));
+  ReadOptions ro;
+  auto iter = reader->NewIterator(ro);
+  for (const auto& blk : blocks) {
+    IterateResult result;
+    ASSERT_OK(iter->SeekAndGetResult(Slice(blk.last_key), &result,
+                                     SeekCtx(kMaxSequenceNumber)));
+    ASSERT_EQ(iter->value().size, 100u) << blk.last_key;
+  }
+}
+
+TEST_F(TrieIndexFactoryTest, ParallelEstimatedSizeStaysMonotonic) {
+  // EstimatedSize() uses state updated by emit-thread PrepareAddEntry calls,
+  // disjoint from state committed by FinishAddEntry on the BG worker.
+  IndexFactoryOptions option;
+  option.comparator = BytewiseComparator();
+  std::unique_ptr<IndexFactoryBuilder> builder;
+  ASSERT_OK(factory_->NewBuilder(option, builder));
+
+  uint64_t last_size = builder->EstimatedSize();
+  EXPECT_GT(last_size, 0u);
+
+  for (int i = 0; i < 8; i++) {
+    std::string key = "key";
+    PutFixed32(&key, i);
+    std::string next_key = "key";
+    PutFixed32(&next_key, i + 1);
+
+    auto p = builder->CreatePreparedAddEntry();
+    Slice next(next_key);
+    builder->PrepareAddEntry(Slice(key), &next, EntryCtx(100, 90), p.get());
+
+    const uint64_t prepared_size = builder->EstimatedSize();
+    EXPECT_GT(prepared_size, last_size)
+        << "EstimatedSize should grow after Prepare";
+
+    IndexFactoryBuilder::BlockHandle h{static_cast<uint64_t>(i * 105), 100};
+    std::string scratch;
+    builder->FinishAddEntry(h, p.get(), &scratch,
+                            /*skip_delta_encoding=*/false);
+    EXPECT_EQ(builder->EstimatedSize(), prepared_size)
+        << "BG-thread FinishAddEntry must not mutate estimation state";
+    last_size = prepared_size;
+  }
+}
+
+TEST_F(TrieIndexFactoryTest, ParallelFinishWithoutPrepareFailsBuild) {
+  // FinishAddEntry() on an entry that PrepareAddEntry() did not fill, or on
+  // one that was already finished, has no separator to commit for its data
+  // block. Skipping the block would leave its keys unreachable through the
+  // index while the SST build succeeds, so Finish() must fail instead.
+  IndexFactoryOptions option;
+  option.comparator = BytewiseComparator();
+  std::string scratch;
+
+  for (bool finish_twice : {false, true}) {
+    SCOPED_TRACE(finish_twice ? "entry finished twice"
+                              : "entry never prepared");
+    std::unique_ptr<IndexFactoryBuilder> builder;
+    ASSERT_OK(factory_->NewBuilder(option, builder));
+
+    // Block 0 holds keys up to "a".
+    auto first = builder->CreatePreparedAddEntry();
+    Slice next("b");
+    builder->PrepareAddEntry(Slice("a"), &next, EntryCtx(100, 90), first.get());
+    builder->FinishAddEntry({0, 100}, first.get(), &scratch,
+                            /*skip_delta_encoding=*/false);
+
+    // Block 1 (keys "b" and up) is committed without a prepared separator.
+    if (finish_twice) {
+      builder->FinishAddEntry({105, 100}, first.get(), &scratch,
+                              /*skip_delta_encoding=*/false);
+    } else {
+      auto unfilled = builder->CreatePreparedAddEntry();
+      builder->FinishAddEntry({105, 100}, unfilled.get(), &scratch,
+                              /*skip_delta_encoding=*/false);
+    }
+
+    // Block 2 is the last block, holding keys up to "c".
+    auto last = builder->CreatePreparedAddEntry();
+    builder->PrepareAddEntry(Slice("c"), nullptr, EntryCtx(80, 0), last.get());
+    builder->FinishAddEntry({210, 100}, last.get(), &scratch,
+                            /*skip_delta_encoding=*/false);
+
+    Slice contents;
+    Status s = builder->Finish(&contents);
+    ASSERT_EQ(s.code(), Status::Code::kInvalidArgument) << s.ToString();
+  }
 }
 
 }  // namespace trie_index

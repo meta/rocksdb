@@ -16,7 +16,7 @@ Currently RocksDB API delivers the following powerful guarantees:
 
 ### `unordered_write`
 
-The `unordered_write` feature, when turned on, relaxes the default guarantees of RocksDB. While it still gives read-your-own-write property, neither atomic reads nor the immutable snapshot properties are provided any longer. However, RocksDB users could still get read-your-own-write and immutable snapshots when using this feature in conjunction with TransactionDB configured with WritePrepared transactions and `two_write_queues`. You can read [here](https://github.com/facebook/rocksdb/wiki/unordered_write) to learn about the design of `unordered_write` and [here](https://github.com/facebook/rocksdb/wiki/WritePrepared-Transactions) to learn more about WritePrepared transactions.
+The `unordered_write` feature, when turned on, relaxes the default guarantees of RocksDB. While it still gives read-your-own-write property, neither atomic reads nor the immutable snapshot properties are provided any longer. However, RocksDB users could still get read-your-own-write and immutable snapshots when using this feature in conjunction with TransactionDB configured with WritePrepared transactions and `two_write_queues`. You can read [here](https://github.com/meta/rocksdb/wiki/unordered_write) to learn about the design of `unordered_write` and [here](https://github.com/meta/rocksdb/wiki/WritePrepared-Transactions) to learn more about WritePrepared transactions.
 
 ### How to use it?
 

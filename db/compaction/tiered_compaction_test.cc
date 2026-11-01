@@ -2112,7 +2112,7 @@ class PrecludeWithCompactStyleTest : public PrecludeLastLevelTestBase,
 
 TEST_P(PrecludeWithCompactStyleTest, RangeTombstoneSnapshotMigrateFromLast) {
   // Reproducer for issue originally described in
-  // https://github.com/facebook/rocksdb/pull/9964/files#r1024449523
+  // https://github.com/meta/rocksdb/pull/9964/files#r1024449523
   const bool universal = GetParam();
   const int kNumLevels = 7;
   auto options = CurrentOptions();

@@ -180,7 +180,7 @@ DEFINE_uint32(
 // than random." Even with this setting, file offsets are not randomized.
 DEFINE_bool(sck_randomize, false,
             "(-stress_cache_key) Randomize (hash) cache key");
-// See https://github.com/facebook/rocksdb/pull/9058
+// See https://github.com/meta/rocksdb/pull/9058
 DEFINE_bool(sck_footer_unique_id, false,
             "(-stress_cache_key) Simulate using proposed footer unique id");
 // ## END stress_cache_key sub-tool options ##

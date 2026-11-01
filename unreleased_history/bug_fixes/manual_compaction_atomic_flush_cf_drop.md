@@ -1,0 +1,1 @@
+Fixed atomic flushes of all column families when another column family is dropped while they wait: `CompactRange()` no longer fails with a "Column family dropped" error, and `WaitForCompact()` and DB close no longer return OK without flushing the remaining column families.

@@ -932,6 +932,12 @@ class SubcompactionProgressTest : public VersionEditTest {
     ASSERT_EQ(actual.num_processed_input_records,
               expected.num_processed_input_records);
 
+    ASSERT_EQ(actual.has_blob_compaction_progress,
+              expected.has_blob_compaction_progress);
+    ASSERT_EQ(actual.blob_file_additions, expected.blob_file_additions);
+    ASSERT_EQ(actual.blob_file_garbages, expected.blob_file_garbages);
+    ASSERT_EQ(actual.next_blob_file_number, expected.next_blob_file_number);
+
     for (const bool is_proximal_level : {false, true}) {
       const SubcompactionProgressPerLevel&
           actual_subcompaction_progress_by_level =
@@ -1093,6 +1099,49 @@ TEST_F(SubcompactionProgressTest, OutputFilesDeltaEncodeDecode) {
   // ===== PART 3: Test Builder Reset =====
   builder.Clear();
   ASSERT_FALSE(builder.HasAccumulatedSubcompactionProgress());
+}
+
+TEST_F(SubcompactionProgressTest, BlobProgressDeltaEncodeDecode) {
+  SubcompactionProgress initial_progress =
+      CreateSubcompactionProgress("key_100", 100, 40, 0, {1});
+  initial_progress.has_blob_compaction_progress = true;
+  initial_progress.blob_file_additions.emplace_back(100, 2, 200, "", "");
+  initial_progress.blob_file_garbages.emplace_back(50, 1, 25);
+  initial_progress.next_blob_file_number = 101;
+
+  auto [initial_decoded_edit, initial_decoded_progress] =
+      EncodeDecodeProgress(initial_progress);
+  VerifyProgressEquality(initial_progress, initial_decoded_progress);
+
+  initial_progress.UpdateLastPersistedBlobFileAdditionsCount();
+  SubcompactionProgress updated_progress = initial_progress;
+  updated_progress.next_internal_key_to_compact = "key_200";
+  updated_progress.blob_file_additions.emplace_back(101, 3, 300, "", "");
+  updated_progress.blob_file_garbages = {BlobFileGarbage(50, 2, 50),
+                                         BlobFileGarbage(51, 1, 10)};
+  updated_progress.next_blob_file_number = 102;
+
+  auto [delta_decoded_edit, delta_decoded_progress] =
+      EncodeDecodeProgress(updated_progress);
+  ASSERT_TRUE(delta_decoded_progress.has_blob_compaction_progress);
+  ASSERT_EQ(delta_decoded_progress.blob_file_additions.size(), 1);
+  ASSERT_EQ(delta_decoded_progress.blob_file_additions.front(),
+            updated_progress.blob_file_additions.back());
+  ASSERT_EQ(delta_decoded_progress.blob_file_garbages,
+            updated_progress.blob_file_garbages);
+  ASSERT_EQ(delta_decoded_progress.next_blob_file_number, 102);
+
+  SubcompactionProgressBuilder builder;
+  ASSERT_TRUE(builder.ProcessVersionEdit(initial_decoded_edit));
+  ASSERT_TRUE(builder.ProcessVersionEdit(delta_decoded_edit));
+  const SubcompactionProgress& accumulated =
+      builder.GetAccumulatedSubcompactionProgress();
+  ASSERT_TRUE(accumulated.has_blob_compaction_progress);
+  ASSERT_EQ(accumulated.blob_file_additions,
+            updated_progress.blob_file_additions);
+  ASSERT_EQ(accumulated.blob_file_garbages,
+            updated_progress.blob_file_garbages);
+  ASSERT_EQ(accumulated.next_blob_file_number, 102);
 }
 
 TEST_F(SubcompactionProgressTest, UnknownTags) {

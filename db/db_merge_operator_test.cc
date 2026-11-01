@@ -440,6 +440,29 @@ TEST_F(DBMergeOperatorTest, MergeOperandThresholdExceeded) {
         ASSERT_EQ(values[i], keys[i].ToString() + std::to_string(i + 1));
       }
     }
+
+    // Check GetMergeOperands(). The base value is returned as the first
+    // operand, so it counts toward the threshold too.
+    {
+      for (size_t i = 0; i < keys.size(); ++i) {
+        const size_t num_operands = i + 2;
+        std::vector<PinnableSlice> values(num_operands);
+        GetMergeOperandsOptions merge_operands_info;
+        merge_operands_info.expected_max_number_of_operands =
+            static_cast<int>(num_operands);
+        int num_operands_found = 0;
+        const Status status = db_->GetMergeOperands(
+            read_options, db_->DefaultColumnFamily(), keys[i], values.data(),
+            &merge_operands_info, &num_operands_found);
+        ASSERT_OK(status);
+        ASSERT_EQ(status.IsOkMergeOperandThresholdExceeded(),
+                  threshold.has_value() && num_operands > threshold.value());
+        ASSERT_EQ(static_cast<int>(num_operands), num_operands_found);
+        for (size_t j = 0; j < num_operands; ++j) {
+          ASSERT_EQ(values[j], keys[i].ToString() + std::to_string(j));
+        }
+      }
+    }
   };
 
   // Test the case when the feature is disabled as well as various thresholds.

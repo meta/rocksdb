@@ -255,6 +255,14 @@ Status WritePreparedTxnDB::GetWithMetadata(const ReadOptions& options,
                              output_metadata);
 }
 
+Status WritePreparedTxnDB::GetEntityWithMetadata(
+    const ReadOptions& options, ColumnFamilyHandle* column_family,
+    const Slice& key, PinnableWideColumns* columns,
+    OutputMetadata* output_metadata) {
+  return DB::GetEntityWithMetadata(options, column_family, key, columns,
+                                   output_metadata);
+}
+
 void WritePreparedTxnDB::UpdateCFComparatorMap(
     const std::vector<ColumnFamilyHandle*>& handles) {
   auto cf_map = new std::map<uint32_t, const Comparator*>();
@@ -298,6 +306,23 @@ void WritePreparedTxnDB::MultiGetWithMetadata(
     MultiGetOutputMetadata* output_metadata, const bool sorted_input) {
   DB::MultiGetWithMetadata(options, num_keys, column_families, keys, values,
                            statuses, output_metadata, sorted_input);
+}
+
+void WritePreparedTxnDB::MultiGetEntityWithMetadata(
+    const ReadOptions& options, size_t num_keys,
+    ColumnFamilyHandle* const* column_families, const Slice* keys,
+    PinnableWideColumns* results, Status* statuses,
+    MultiGetOutputMetadata* output_metadata, bool sorted_input) {
+  DB::MultiGetEntityWithMetadata(options, num_keys, column_families, keys,
+                                 results, statuses, output_metadata,
+                                 sorted_input);
+}
+
+void WritePreparedTxnDB::MultiGetEntityWithMetadata(
+    const ReadOptions& options, size_t num_keys, const Slice* keys,
+    PinnableAttributeGroups* results, MultiGetOutputMetadata* output_metadata) {
+  DB::MultiGetEntityWithMetadata(options, num_keys, keys, results,
+                                 output_metadata);
 }
 
 // Struct to hold ownership of snapshot and read callback for iterator cleanup.

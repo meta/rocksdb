@@ -16,7 +16,7 @@ This document provides guidance for generating and reviewing code in the RocksDB
 
 **Refactoring traps:** At least in production code, avoid constructs that could allow existing code to unexpectedly, quietly change meaning.
 Specifically:
-* Avoid new defaulted parameters. This is the #1 trap on refactoring!
+* Avoid new defaulted parameters. This is the #1 trap on refactoring! (Permitted exception: optional outputs that are generally safe to ignore.)
 * Avoid static_cast, reinterpret_cast, and C-style casts; static_cast_with_check, up_cast, and lossless_cast from cast_util.h are preferred.
 * Avoid declared type `auto` (`auto&`, `auto*` OK).
 
@@ -24,7 +24,8 @@ Specifically:
 
 **Comprehensive Coverage:** Every change should include appropriate test coverage. This includes unit tests for isolated functionality, integration tests for component interactions, and stress tests for concurrency and performance validation. Reviewers will ask for additional tests if coverage is insufficient.
 
-**Edge Cases and Failure Modes:** Tests should explicitly cover edge cases, boundary conditions, and potential failure scenarios. This is especially important for changes affecting core database operations, compaction, or recovery logic.
+**Edge Cases and Failure Modes:** Tests should explicitly cover edge cases, boundary conditions, and potential failure scenarios. This is especially important for changes affecting core database operations, compaction, or recovery logic. For non-OK Statuses, prefer comparing code() rather than using ASSERT_TRUE
+which is bad for debugging.
 
 **Platform-Specific Testing:** RocksDB supports multiple platforms (Linux, Windows, macOS) and compilers (GCC, Clang, MSVC). Changes should be tested across relevant platforms, particularly when touching platform-specific code or using compiler-specific features.
 
@@ -436,7 +437,8 @@ architectures.
     objects are properly checked. This catches missing error handling that can
     lead to silent data corruption. Merely building with ASSERT_STATUS_CHECKED=1
     accomplishes nothing; it enables a runtime check. New unit tests missing
-    Status checks is a common failure point, even from agents.
+    Status checks is a common failure point, even from agents. Avoid new uses
+    of PermitUncheckedError(). That's the lazy solution.
 
 ### Monitoring make check progress
 * Use `make check-progress` to get machine-parseable JSON progress while

@@ -1081,7 +1081,7 @@ want to continue to use force enabling, they need to explicitly pass a `true` to
 * Overload the API CreateColumnFamilyWithImport() to support creating ColumnFamily by importing multiple ColumnFamilies It requires that CFs should not overlap in user key range.
 
 ### Behavior Changes
-* Change the default value for option `level_compaction_dynamic_level_bytes` to true. This affects users who use leveled compaction and do not set this option explicitly. These users may see additional background compactions following DB open. These compactions help to shape the LSM according to `level_compaction_dynamic_level_bytes` such that the size of each level Ln is approximately size of Ln-1 * `max_bytes_for_level_multiplier`. Turning on this option has other benefits too: see more detail in wiki: https://github.com/facebook/rocksdb/wiki/Leveled-Compaction#option-level_compaction_dynamic_level_bytes-and-levels-target-size and in option comment in advanced_options.h (#11525).
+* Change the default value for option `level_compaction_dynamic_level_bytes` to true. This affects users who use leveled compaction and do not set this option explicitly. These users may see additional background compactions following DB open. These compactions help to shape the LSM according to `level_compaction_dynamic_level_bytes` such that the size of each level Ln is approximately size of Ln-1 * `max_bytes_for_level_multiplier`. Turning on this option has other benefits too: see more detail in wiki: https://github.com/meta/rocksdb/wiki/Leveled-Compaction#option-level_compaction_dynamic_level_bytes-and-levels-target-size and in option comment in advanced_options.h (#11525).
 * For Leveled Compaction users, `CompactRange()` will now always try to compact to the last non-empty level. (#11468)
 For Leveled Compaction users, `CompactRange()` with `bottommost_level_compaction = BottommostLevelCompaction::kIfHaveCompactionFilter` will behave similar to `kForceOptimized` in that it will skip files created during this manual compaction when compacting files in the bottommost level. (#11468)
 * RocksDB will try to drop range tombstones during non-bottommost compaction when it is safe to do so. (#11459)
@@ -1126,7 +1126,7 @@ For Leveled Compaction users, `CompactRange()` with `bottommost_level_compaction
 * Remove unnecessary constructor for CompressionOptions.
 
 ### Behavior changes
-* Changed default block cache size from an 8MB to 32MB LRUCache, which increases the default number of cache shards from 16 to 64. This change is intended to minimize cache mutex contention under stress conditions. See https://github.com/facebook/rocksdb/wiki/Block-Cache for more information.
+* Changed default block cache size from an 8MB to 32MB LRUCache, which increases the default number of cache shards from 16 to 64. This change is intended to minimize cache mutex contention under stress conditions. See https://github.com/meta/rocksdb/wiki/Block-Cache for more information.
 * For level compaction with `level_compaction_dynamic_level_bytes=true`, RocksDB now trivially moves levels down to fill LSM starting from bottommost level during DB open. See more in comments for option `level_compaction_dynamic_level_bytes` (#11321).
 * User-provided `ReadOptions` take effect for more reads of non-`CacheEntryRole::kDataBlock` blocks.
 * For level compaction with `level_compaction_dynamic_level_bytes=true`, RocksDB now drains unnecessary levels through background compaction automatically (#11340). This together with #11321 makes it automatic to migrate other compaction settings to level compaction with `level_compaction_dynamic_level_bytes=true`. In addition, a live DB that becomes smaller will now have unnecessary levels drained which can help to reduce read and space amp.
@@ -1290,7 +1290,7 @@ For Leveled Compaction users, `CompactRange()` with `bottommost_level_compaction
 * Only periodic stats dumper triggered by options.stats_dump_period_sec will update stats interval. Ones triggered by DB::GetProperty() will not update stats interval and will report based on an interval since the last time stats dump period.
 
 ### Public API changes
-* Make kXXH3 checksum the new default, because it is faster on common hardware, especially with kCRC32c affected by a performance bug in some versions of clang (https://github.com/facebook/rocksdb/issues/9891). DBs written with this new setting can be read by RocksDB 6.27 and newer.
+* Make kXXH3 checksum the new default, because it is faster on common hardware, especially with kCRC32c affected by a performance bug in some versions of clang (https://github.com/meta/rocksdb/issues/9891). DBs written with this new setting can be read by RocksDB 6.27 and newer.
 * Refactor the classes, APIs and data structures for block cache tracing to allow a user provided trace writer to be used. Introduced an abstract BlockCacheTraceWriter class that takes a structured BlockCacheTraceRecord. The BlockCacheTraceWriter implementation can then format and log the record in whatever way it sees fit. The default BlockCacheTraceWriterImpl does file tracing using a user provided TraceWriter. More details in rocksdb/includb/block_cache_trace_writer.h.
 
 ## 7.7.0 (09/18/2022)
@@ -1410,7 +1410,7 @@ For Leveled Compaction users, `CompactRange()` with `bottommost_level_compaction
 * Fix a bug in which backup/checkpoint can include a WAL deleted by RocksDB.
 * Fix a bug where concurrent compactions might cause unnecessary further write stalling. In some cases, this might cause write rate to drop to minimum.
 * Fix a bug in Logger where if dbname and db_log_dir are on different filesystems, dbname creation would fail wrt to db_log_dir path returning an error and fails to open the DB.
-* Fix a CPU and memory efficiency issue introduce by https://github.com/facebook/rocksdb/pull/8336 which made InternalKeyComparator configurable as an unintended side effect.
+* Fix a CPU and memory efficiency issue introduce by https://github.com/meta/rocksdb/pull/8336 which made InternalKeyComparator configurable as an unintended side effect.
 
 ## Behavior Change
 * In leveled compaction with dynamic levelling, level multiplier is not anymore adjusted due to oversized L0. Instead, compaction score is adjusted by increasing size level target by adding incoming bytes from upper levels. This would deprioritize compactions from upper levels if more data from L0 is coming. This is to fix some unnecessary full stalling due to drastic change of level targets, while not wasting write bandwidth for compaction while writes are overloaded.
@@ -1449,7 +1449,7 @@ For Leveled Compaction users, `CompactRange()` with `bottommost_level_compaction
 * Add User Defined Timestamp in C API.
   * `rocksdb_comparator_with_ts_create` to create timestamp aware comparator
   * Put, Get, Delete, SingleDelete, MultiGet APIs has corresponding timestamp aware APIs with suffix `with_ts`
-  * And Add C API's for Transaction, SstFileWriter, Compaction as mentioned [here](https://github.com/facebook/rocksdb/wiki/User-defined-Timestamp-(Experimental))
+  * And Add C API's for Transaction, SstFileWriter, Compaction as mentioned [here](https://github.com/meta/rocksdb/wiki/User-defined-Timestamp-(Experimental))
 * The contract for implementations of Comparator::IsSameLengthImmediateSuccessor has been updated to work around a design bug in `auto_prefix_mode`.
 * The API documentation for `auto_prefix_mode` now notes some corner cases in which it returns different results than `total_order_seek`, due to design bugs that are not easily fixed. Users using built-in comparators and keys at least the size of a fixed prefix length are not affected.
 * Obsoleted the NUM_DATA_BLOCKS_READ_PER_LEVEL stat and introduced the NUM_LEVEL_READ_PER_MULTIGET and MULTIGET_COROUTINE_COUNT stats
@@ -1680,7 +1680,7 @@ cache at some point (i.e, causing a cache full under `LRUCacheOptions::strict_ca
 * Experimental: Add support for new APIs ReadAsync in FSRandomAccessFile that reads the data asynchronously and Poll API in FileSystem that checks if requested read request has completed or not. ReadAsync takes a callback function. Poll API checks for completion of read IO requests and  should call callback functions to indicate completion of read requests.
 
 ## 6.29.0 (01/21/2022)
-Note: The next release will be major release 7.0. See https://github.com/facebook/rocksdb/issues/9390 for more info.
+Note: The next release will be major release 7.0. See https://github.com/meta/rocksdb/issues/9390 for more info.
 ### Public API change
 * Added values to `TraceFilterType`: `kTraceFilterIteratorSeek`, `kTraceFilterIteratorSeekForPrev`, and `kTraceFilterMultiGet`. They can be set in `TraceOptions` to filter out the operation types after which they are named.
 * Added `TraceOptions::preserve_write_order`. When enabled it  guarantees write records are traced in the same order they are logged to WAL and applied to the DB. By default it is disabled (false) to match the legacy behavior and prevent regression.
@@ -1829,7 +1829,7 @@ Note: The next release will be major release 7.0. See https://github.com/faceboo
 ### Java API Changes
 * Add Java API bindings for new integrated BlobDB options
 * `keyMayExist()` supports ByteBuffer.
-* Fix multiget throwing Null Pointer Exception for num of keys > 70k (https://github.com/facebook/rocksdb/issues/8039).
+* Fix multiget throwing Null Pointer Exception for num of keys > 70k (https://github.com/meta/rocksdb/issues/8039).
 
 ## 6.25.0 (2021-09-20)
 ### Bug Fixes
@@ -2516,7 +2516,7 @@ Note: The next release will be major release 7.0. See https://github.com/faceboo
 * Errors related to the retrieval of the compression dictionary are now propagated to the user.
 * db_bench adds a "benchmark" stats_history, which prints out the whole stats history.
 * Overload GetAllKeyVersions() to support non-default column family.
-* Added new APIs ExportColumnFamily() and CreateColumnFamilyWithImport() to support export and import of a Column Family. https://github.com/facebook/rocksdb/issues/3469
+* Added new APIs ExportColumnFamily() and CreateColumnFamilyWithImport() to support export and import of a Column Family. https://github.com/meta/rocksdb/issues/3469
 * ldb sometimes uses a string-append merge operator if no merge operator is passed in. This is to allow users to print keys from a DB with a merge operator.
 * Replaces old Registra with ObjectRegistry to allow user to create custom object from string, also add LoadEnv() to Env.
 * Added new overload of GetApproximateSizes which gets SizeApproximationOptions object and returns a Status. The older overloads are redirecting their calls to this new method and no longer assert if the include_flags doesn't have either of INCLUDE_MEMTABLES or INCLUDE_FILES bits set. It's recommended to use the new method only, as it is more type safe and returns a meaningful status in case of errors.
@@ -3103,7 +3103,7 @@ if set to something > 0 user will see 2 changes in iterators behavior 1) only ke
 ## 4.8.0 (2016-05-02)
 ### Public API Change
 * Allow preset compression dictionary for improved compression of block-based tables. This is supported for zlib, zstd, and lz4. The compression dictionary's size is configurable via CompressionOptions::max_dict_bytes.
-* Delete deprecated classes for creating backups (BackupableDB) and restoring from backups (RestoreBackupableDB). Now, BackupEngine should be used for creating backups, and BackupEngineReadOnly should be used for restorations. For more details, see https://github.com/facebook/rocksdb/wiki/How-to-backup-RocksDB%3F
+* Delete deprecated classes for creating backups (BackupableDB) and restoring from backups (RestoreBackupableDB). Now, BackupEngine should be used for creating backups, and BackupEngineReadOnly should be used for restorations. For more details, see https://github.com/meta/rocksdb/wiki/How-to-backup-RocksDB%3F
 * Expose estimate of per-level compression ratio via DB property: "rocksdb.compression-ratio-at-levelN".
 * Added EventListener::OnTableFileCreationStarted. EventListener::OnTableFileCreated will be called on failure case. User can check creation status via TableFileCreationInfo::status.
 
@@ -3113,7 +3113,7 @@ if set to something > 0 user will see 2 changes in iterators behavior 1) only ke
 ## 4.7.0 (2016-04-08)
 ### Public API Change
 * rename options compaction_measure_io_stats to report_bg_io_stats and include flush too.
-* Change some default options. Now default options will optimize for server-workloads. Also enable slowdown and full stop triggers for pending compaction bytes. These changes may cause sub-optimal performance or significant increase of resource usage. To avoid these risks, users can open existing RocksDB with options extracted from RocksDB option files. See https://github.com/facebook/rocksdb/wiki/RocksDB-Options-File for how to use RocksDB option files. Or you can call Options.OldDefaults() to recover old defaults. DEFAULT_OPTIONS_HISTORY.md will track change history of default options.
+* Change some default options. Now default options will optimize for server-workloads. Also enable slowdown and full stop triggers for pending compaction bytes. These changes may cause sub-optimal performance or significant increase of resource usage. To avoid these risks, users can open existing RocksDB with options extracted from RocksDB option files. See https://github.com/meta/rocksdb/wiki/RocksDB-Options-File for how to use RocksDB option files. Or you can call Options.OldDefaults() to recover old defaults. DEFAULT_OPTIONS_HISTORY.md will track change history of default options.
 
 ## 4.6.0 (2016-03-10)
 ### Public API Changes
@@ -3410,7 +3410,7 @@ Because of that, Options::disable_seek_compaction is now obsolete. It is still a
 
 ### Public API changes
 * Added _LEVEL to all InfoLogLevel enums
-* Deprecated ReadOptions.prefix and ReadOptions.prefix_seek. Seek() defaults to prefix-based seek when Options.prefix_extractor is supplied. More detail is documented in https://github.com/facebook/rocksdb/wiki/Prefix-Seek-API-Changes
+* Deprecated ReadOptions.prefix and ReadOptions.prefix_seek. Seek() defaults to prefix-based seek when Options.prefix_extractor is supplied. More detail is documented in https://github.com/meta/rocksdb/wiki/Prefix-Seek-API-Changes
 * MemTableRepFactory::CreateMemTableRep() takes info logger as an extra parameter.
 
 ### New Features
@@ -3461,8 +3461,8 @@ Because of that, Options::disable_seek_compaction is now obsolete. It is still a
 
 ### New Features
 
-* Added [BackupableDB](https://github.com/facebook/rocksdb/wiki/How-to-backup-RocksDB%3F)
-* Implemented [TailingIterator](https://github.com/facebook/rocksdb/wiki/Tailing-Iterator), a special type of iterator that
+* Added [BackupableDB](https://github.com/meta/rocksdb/wiki/How-to-backup-RocksDB%3F)
+* Implemented [TailingIterator](https://github.com/meta/rocksdb/wiki/Tailing-Iterator), a special type of iterator that
   doesn't create a snapshot (can be used to read newly inserted data)
   and is optimized for doing sequential reads.
 * Added property block for table, which allows (1) a table to store
@@ -3479,8 +3479,8 @@ Because of that, Options::disable_seek_compaction is now obsolete. It is still a
 
 * Huge benchmark performance improvements by multiple efforts. For example, increase in readonly QPS from about 530k in 2.6 release to 1.1 million in 2.7 [1]
 * Speeding up a way RocksDB deleted obsolete files - no longer listing the whole directory under a lock -- decrease in p99
-* Use raw pointer instead of shared pointer for statistics: [5b825d](https://github.com/facebook/rocksdb/commit/5b825d6964e26ec3b4bb6faa708ebb1787f1d7bd) -- huge increase in performance -- shared pointers are slow
-* Optimized locking for `Get()` -- [1fdb3f](https://github.com/facebook/rocksdb/commit/1fdb3f7dc60e96394e3e5b69a46ede5d67fb976c) -- 1.5x QPS increase for some workloads
-* Cache speedup - [e8d40c3](https://github.com/facebook/rocksdb/commit/e8d40c31b3cca0c3e1ae9abe9b9003b1288026a9)
-* Implemented autovector, which allocates first N elements on stack. Most of vectors in RocksDB are small. Also, we never want to allocate heap objects while holding a mutex. -- [c01676e4](https://github.com/facebook/rocksdb/commit/c01676e46d3be08c3c140361ef1f5884f47d3b3c)
+* Use raw pointer instead of shared pointer for statistics: [5b825d](https://github.com/meta/rocksdb/commit/5b825d6964e26ec3b4bb6faa708ebb1787f1d7bd) -- huge increase in performance -- shared pointers are slow
+* Optimized locking for `Get()` -- [1fdb3f](https://github.com/meta/rocksdb/commit/1fdb3f7dc60e96394e3e5b69a46ede5d67fb976c) -- 1.5x QPS increase for some workloads
+* Cache speedup - [e8d40c3](https://github.com/meta/rocksdb/commit/e8d40c31b3cca0c3e1ae9abe9b9003b1288026a9)
+* Implemented autovector, which allocates first N elements on stack. Most of vectors in RocksDB are small. Also, we never want to allocate heap objects while holding a mutex. -- [c01676e4](https://github.com/meta/rocksdb/commit/c01676e46d3be08c3c140361ef1f5884f47d3b3c)
 * Lots of efforts to move malloc, memcpy and IO outside of locks

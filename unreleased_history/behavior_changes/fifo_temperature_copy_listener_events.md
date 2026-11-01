@@ -1,0 +1,1 @@
+With `CompactionOptionsFIFO::allow_trivial_copy_when_change_temperature`, each file copied for a temperature change is now reported to `EventListener::OnTableFileCreationStarted()` and `OnTableFileCreated()` (with the original file's table properties) and included in `CompactionJobInfo::table_properties`.

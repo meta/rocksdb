@@ -1,0 +1,1 @@
+Fixed blob direct write with more than one concurrent flush of a column family: a later flush sealed and published the blob files of the oldest pending memtable instead of its own, so flushes failed with `Corruption: VersionBuilder: Blob file #N already added` and the database stopped.

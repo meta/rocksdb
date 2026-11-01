@@ -288,7 +288,7 @@ void DecompressorDict::Populate(Decompressor& from_decompressor, Slice dict) {
     dict_allocation_ = {};
     // Appropriately reject bad files with empty dictionary block.
     // It is longstanding not to write an empty dictionary block:
-    // https://github.com/facebook/rocksdb/blame/10.2.fb/table/block_based/block_based_table_builder.cc#L1841
+    // https://github.com/meta/rocksdb/blame/10.2.fb/table/block_based/block_based_table_builder.cc#L1841
     decompressor_ = std::make_unique<FailureDecompressor>(
         Status::Corruption("Decompression dictionary is empty"));
   } else {

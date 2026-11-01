@@ -3,7 +3,7 @@
 ## Overview
 
 This directory contains [fuzz tests](https://en.wikipedia.org/wiki/Fuzzing) for RocksDB.
-RocksDB testing infrastructure currently includes unit tests and [stress tests](https://github.com/facebook/rocksdb/wiki/Stress-test),
+RocksDB testing infrastructure currently includes unit tests and [stress tests](https://github.com/meta/rocksdb/wiki/Stress-test),
 we hope fuzz testing can catch more bugs.
 
 ## Prerequisite

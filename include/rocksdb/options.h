@@ -100,7 +100,7 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Universal style compaction is focused on reducing Write Amplification
   // Factor for big data sets, but increases Space Amplification. You can learn
   // more about the different styles here:
-  // https://github.com/facebook/rocksdb/wiki/Rocksdb-Architecture-Guide
+  // https://github.com/meta/rocksdb/wiki/Rocksdb-Architecture-Guide
   // Make sure to also call IncreaseParallelism(), which will provide the
   // biggest performance gains.
   // Note: we might use more memory than memtable_memory_budget during high
@@ -494,6 +494,10 @@ struct CompactionServiceJobInfo {
   // the output level of the compaction.
   int output_level;
 
+  // The execution pool selected for this job, independent of later DB option
+  // updates.
+  bool use_separate_remote_compaction_pool = false;
+
   CompactionServiceJobInfo() {}
   CompactionServiceJobInfo(std::string db_name_, std::string db_id_,
                            std::string db_session_id_, uint32_t cf_id_,
@@ -553,9 +557,9 @@ class CompactionService : public Customizable {
   // the worker's DB::OpenAndCompact.
   //
   // DB::OpenAndCompact may return Status::Incomplete to *decline* a scheduled
-  // job rather than fail it -- currently when the MANIFEST floor check finds
-  // the worker recovered an older/stale view of the DB than the primary
-  // scheduled from (see DBOptions::remote_compaction_manifest_floor). Whether
+  // job rather than fail it -- for example, when the MANIFEST floor check finds
+  // a stale worker view, the reserved BlobDB file-number range is exhausted, or
+  // the worker's BlobDB capability/options do not match the primary's. Whether
   // to map that to kUseLocal (fall back to a local compaction) or kFailure
   // (surface it) is up to the integrator; both are valid. (Cancellation also
   // surfaces as Status::Incomplete, distinguishable by SubCode
@@ -841,7 +845,7 @@ struct DBOptions {
   //
   // The RocksDB wiki has some discussion about how the WAL interacts
   // with memtables and flushing of column families.
-  // https://github.com/facebook/rocksdb/wiki/Column-Families
+  // https://github.com/meta/rocksdb/wiki/Column-Families
   //
   // This option takes effect only when there are more than one column
   // family as otherwise the wal size is dictated by the write_buffer_size.
@@ -1814,6 +1818,27 @@ struct DBOptions {
   // under development.
   std::shared_ptr<CompactionService> compaction_service = nullptr;
 
+  // When true and compaction_service is configured, remote jobs and
+  // subcompactions use one process-wide pool that grows on demand.
+  // Remote waits do not consume LOW/BOTTOM workers or the local compaction
+  // budget. Background local choices and fallbacks use those pools and count
+  // each subcompaction against the DB's background compaction limit.
+  // CompactFiles keeps synchronous local execution on the caller thread.
+  // On first use, the pool starts with at least one worker and otherwise the
+  // largest LOW + BOTTOM worker count among participating DBs. It grows for
+  // outstanding remote tasks across all DBs and
+  // returns to that baseline after at least 30 seconds of inactivity.
+  // When false, coordinators use LOW/BOTTOM and the existing background
+  // compaction budget; local subcompactions use the existing execution path.
+  // Dynamically changeable through SetDBOptions(). Each coordinator keeps the
+  // setting chosen when it was scheduled, including its local subcompactions.
+  // Disabling does not cancel jobs. After the inactivity period, workers
+  // return to the baseline of participating enabled DBs, or zero if none
+  // remain.
+  // Default: false. Not persisted in OPTIONS files. Set explicitly when opening
+  // the DB or through SetDBOptions().
+  bool use_separate_remote_compaction_pool = false;
+
   // Hardening for remote compaction (CompactionService / DB::OpenAndCompact).
   // When true (default), the primary includes in each remote compaction request
   // the MANIFEST position (file number and size) it scheduled the compaction
@@ -1870,7 +1895,7 @@ struct DBOptions {
   // will be removed in a future release.
   // Warning: do not set to false unless you are trying to migrate existing
   // data in which the contract of single delete
-  // (https://github.com/facebook/rocksdb/wiki/Single-Delete) is not enforced,
+  // (https://github.com/meta/rocksdb/wiki/Single-Delete) is not enforced,
   // thus has Delete mixed with SingleDelete for the same user key. Violation
   // of the contract leads to undefined behaviors with high possibility of data
   // inconsistency, e.g. deleted old data become visible again, etc.
@@ -1946,6 +1971,15 @@ struct DBOptions {
   // expedited but herd-avoiding -- so such a file may be rewritten up to a
   // quarter-interval past its (revised) deadline. To enforce the age limit
   // immediately at such a transition, trigger a manual compaction.
+  //
+  // Files not yet past due at a (re)anchor are steered toward their phase more
+  // gently for up to about two intervals afterward, so that many DBs
+  // anchoring at once (e.g. enabling phasing across a fleet) do not
+  // concentrate periodic compactions shortly after the change. Because DB open
+  // is also a (re)anchor, a DB reopened much more often than once per interval
+  // converges toward its phase more slowly; such re-anchoring is appropriate to
+  // reduce load spikes after some period with the DB closed, without
+  // compromising the periodic_compaction_seconds contract.
   //
   // 0 disables phasing entirely (exact legacy behavior; this is the kill
   // switch). 100 snaps to the preferred phase in a single cycle, which can
@@ -2149,6 +2183,8 @@ class MultiScanArgs {
     original_ranges_ = other.original_ranges_;
     io_coalesce_threshold = other.io_coalesce_threshold;
     max_prefetch_size = other.max_prefetch_size;
+    rolling_prefetch = other.rolling_prefetch;
+    rolling_prefetch_window_size = other.rolling_prefetch_window_size;
     use_async_io = other.use_async_io;
     reverse = other.reverse;
     io_dispatcher = other.io_dispatcher;
@@ -2156,6 +2192,8 @@ class MultiScanArgs {
   MultiScanArgs(MultiScanArgs&& other) noexcept
       : io_coalesce_threshold(other.io_coalesce_threshold),
         max_prefetch_size(other.max_prefetch_size),
+        rolling_prefetch(other.rolling_prefetch),
+        rolling_prefetch_window_size(other.rolling_prefetch_window_size),
         use_async_io(other.use_async_io),
         reverse(other.reverse),
         io_dispatcher(std::move(other.io_dispatcher)),
@@ -2167,6 +2205,8 @@ class MultiScanArgs {
     original_ranges_ = other.original_ranges_;
     io_coalesce_threshold = other.io_coalesce_threshold;
     max_prefetch_size = other.max_prefetch_size;
+    rolling_prefetch = other.rolling_prefetch;
+    rolling_prefetch_window_size = other.rolling_prefetch_window_size;
     use_async_io = other.use_async_io;
     reverse = other.reverse;
     io_dispatcher = other.io_dispatcher;
@@ -2179,6 +2219,8 @@ class MultiScanArgs {
       original_ranges_ = std::move(other.original_ranges_);
       io_coalesce_threshold = other.io_coalesce_threshold;
       max_prefetch_size = other.max_prefetch_size;
+      rolling_prefetch = other.rolling_prefetch;
+      rolling_prefetch_window_size = other.rolling_prefetch_window_size;
       use_async_io = other.use_async_io;
       reverse = other.reverse;
       io_dispatcher = std::move(other.io_dispatcher);
@@ -2243,6 +2285,8 @@ class MultiScanArgs {
   void CopyConfigFrom(const MultiScanArgs& other) {
     io_coalesce_threshold = other.io_coalesce_threshold;
     max_prefetch_size = other.max_prefetch_size;
+    rolling_prefetch = other.rolling_prefetch;
+    rolling_prefetch_window_size = other.rolling_prefetch_window_size;
     use_async_io = other.use_async_io;
     reverse = other.reverse;
     io_dispatcher = other.io_dispatcher;
@@ -2261,6 +2305,21 @@ class MultiScanArgs {
   // I/O.
   // Note that this limit is per file and applies to compressed block size.
   uint64_t max_prefetch_size = 0;
+
+  // Use max_prefetch_size as the maximum adaptive rolling batch size. The
+  // first batch is submitted by Prepare(), and touching a block in that batch
+  // submits the next batch. Iteration waits for submitted I/O at its boundary
+  // rather than falling back to an individual block read. Applied only to
+  // forward scans with use_async_io and a nonzero rolling window. Otherwise it
+  // is ignored, leaving max_prefetch_size with its ordinary one-shot semantics.
+  bool rolling_prefetch = false;
+
+  // Maximum requested physical span of one rolling prefetch window and the
+  // initial rolling batch budget. Must be nonzero. When max_prefetch_size is
+  // nonzero, the effective window is the smaller of the two and a foreground
+  // wait may grow the batch up to max_prefetch_size. Otherwise the batch stays
+  // fixed at this size.
+  uint64_t rolling_prefetch_window_size = 0;
 
   // Enable async I/O for multi-scan operations
   // When true, BlockBasedTableIterator will use ReadAsync() for reading blocks
@@ -3217,6 +3276,7 @@ struct IngestExternalFileArg {
   // * Checks for memtable overlap and possible blocking flush will apply
   //   to this range (not just the file ranges).
   // * Not compatible with ingest_behind=true.
+  // * Not supported with FIFO compaction.
   // * When options.snapshot_consistency = false, the range is cleared
   // similarly to DeleteFilesInRange. With universal compaction and a table
   // factory that supports range deletion, a partial overlap is handled by

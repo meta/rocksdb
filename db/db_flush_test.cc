@@ -3898,7 +3898,7 @@ TEST_F(DBFlushTest, DBStuckAfterAtomicFlushError) {
   // Resume starts and waits for background job to finish, i.e., Flush1
   // Fill memtable again, trigger Flush2 for mem0
   // Flush2 will get error status, and not rollback mem0, see code in
-  // https://github.com/facebook/rocksdb/blob/b927ba5936216861c2c35ab68f50ba4a78e65747/db/db_impl/db_impl_compaction_flush.cc#L725
+  // https://github.com/meta/rocksdb/blob/b927ba5936216861c2c35ab68f50ba4a78e65747/db/db_impl/db_impl_compaction_flush.cc#L725
   //
   // DB is stuck since mem0 can never be picked now
   //

@@ -9,20 +9,20 @@ redirect_from:
 
 ## Introduction
 
-In this post, we are introducing "full filter block" --- a new bloom filter format for [block based table](https://github.com/facebook/rocksdb/wiki/Rocksdb-BlockBasedTable-Format). This could bring about 40% of improvement for key query under in-memory (all data stored in memory, files stored in tmpfs/ramfs, an [example](https://github.com/facebook/rocksdb/wiki/RocksDB-In-Memory-Workload-Performance-Benchmarks) workload. The main idea behind is to generate a big filter that covers all the keys in SST file to avoid lots of unnecessary memory look ups.
+In this post, we are introducing "full filter block" --- a new bloom filter format for [block based table](https://github.com/meta/rocksdb/wiki/Rocksdb-BlockBasedTable-Format). This could bring about 40% of improvement for key query under in-memory (all data stored in memory, files stored in tmpfs/ramfs, an [example](https://github.com/meta/rocksdb/wiki/RocksDB-In-Memory-Workload-Performance-Benchmarks) workload. The main idea behind is to generate a big filter that covers all the keys in SST file to avoid lots of unnecessary memory look ups.
 
 
 <!--truncate-->
 
 ## What is Bloom Filter
 
-In brief, [bloom filter](https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter) is a bits array generated for a set of keys that could tell if an arbitrary key may exist in that set.
+In brief, [bloom filter](https://github.com/meta/rocksdb/wiki/RocksDB-Bloom-Filter) is a bits array generated for a set of keys that could tell if an arbitrary key may exist in that set.
 
 In RocksDB, we generate such a bloom filter for each SST file. When we conduct a query for a key, we first goes to the bloom filter block of SST file. If key may exist in filter, we goes into data block in SST file to search for the key. If not, we would return directly. So it could help speed up point look up operation a lot.
 
 ## Original Bloom Filter Format
 
-Original bloom filter creates filters for each individual data block in SST file. It has complex structure (ref [here](https://github.com/facebook/rocksdb/wiki/Rocksdb-BlockBasedTable-Format#filter-meta-block)) which results in a lot of non-adjacent memory look ups.
+Original bloom filter creates filters for each individual data block in SST file. It has complex structure (ref [here](https://github.com/meta/rocksdb/wiki/Rocksdb-BlockBasedTable-Format#filter-meta-block)) which results in a lot of non-adjacent memory look ups.
 
 Here's the work flow for checking original bloom filter in block based table:
 
@@ -49,4 +49,4 @@ One little draw back is that the new bloom filter introduces more memory consump
 
 ## Usage & Customization
 
-You can refer to the document here for [usage](https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter#usage-of-new-bloom-filter) and [customization](https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter#customize-your-own-filterpolicy).
+You can refer to the document here for [usage](https://github.com/meta/rocksdb/wiki/RocksDB-Bloom-Filter#usage-of-new-bloom-filter) and [customization](https://github.com/meta/rocksdb/wiki/RocksDB-Bloom-Filter#customize-your-own-filterpolicy).

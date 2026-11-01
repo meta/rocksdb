@@ -114,7 +114,7 @@ Status CopyBufferToReadScopedBlockContents(
 
 // Reader class for BlockBasedTable format.
 // For the format of BlockBasedTable refer to
-// https://github.com/facebook/rocksdb/wiki/Rocksdb-BlockBasedTable-Format.
+// https://github.com/meta/rocksdb/wiki/Rocksdb-BlockBasedTable-Format.
 // This is the default table type. Data is chucked into fixed size blocks and
 // each block in-turn stores entries. When storing data, we can compress and/or
 // encode data efficiently within a block, which often results in a much smaller

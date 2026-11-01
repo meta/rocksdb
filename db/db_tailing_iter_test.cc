@@ -585,7 +585,7 @@ TEST_P(DBTestTailingIterator, TailingIteratorGap) {
   // lower level, the key will be skipped if it is within the range between
   // the largest key of index n file and the smallest key of index n+1 file
   // if both file fit in that gap. In this example, 25 < key < 35
-  // https://github.com/facebook/rocksdb/issues/1372
+  // https://github.com/meta/rocksdb/issues/1372
   if (mem_env_ || encrypted_env_) {
     ROCKSDB_GTEST_BYPASS("Test requires non-mem or non-encrypted environment");
     return;

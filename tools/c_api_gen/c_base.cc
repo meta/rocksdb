@@ -8585,6 +8585,74 @@ void rocksdb_transactiondb_multi_get_cf(
   }
 }
 
+void rocksdb_transactiondb_batched_multi_get_cf(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const char* const* keys_list, const size_t* keys_list_sizes,
+    rocksdb_pinnableslice_t** values, char** errs, const bool sorted_input) {
+  Slice* key_slices = new Slice[num_keys];
+  PinnableSlice* value_slices = new PinnableSlice[num_keys];
+  Status* statuses = new Status[num_keys];
+  for (size_t i = 0; i < num_keys; ++i) {
+    key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
+  }
+
+  txn_db->rep->MultiGet(options->rep, column_family->rep, num_keys, key_slices,
+                        value_slices, statuses, sorted_input);
+
+  for (size_t i = 0; i < num_keys; ++i) {
+    if (statuses[i].ok()) {
+      values[i] = new (rocksdb_pinnableslice_t);
+      values[i]->rep = std::move(value_slices[i]);
+      errs[i] = nullptr;
+    } else {
+      values[i] = nullptr;
+      if (!statuses[i].IsNotFound()) {
+        errs[i] = strdup(statuses[i].ToString().c_str());
+      } else {
+        errs[i] = nullptr;
+      }
+    }
+  }
+
+  delete[] key_slices;
+  delete[] value_slices;
+  delete[] statuses;
+}
+
+void rocksdb_transactiondb_batched_multi_get_cf_slice(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const rocksdb_slice_t* keys_list, rocksdb_pinnableslice_t** values,
+    char** errs, const bool sorted_input) {
+  PinnableSlice* value_slices = new PinnableSlice[num_keys];
+  Status* statuses = new Status[num_keys];
+
+  // Cast rocksdb_slice_t* to Slice* - they have identical memory layout
+  const Slice* key_slices = reinterpret_cast<const Slice*>(keys_list);
+
+  txn_db->rep->MultiGet(options->rep, column_family->rep, num_keys, key_slices,
+                        value_slices, statuses, sorted_input);
+
+  for (size_t i = 0; i < num_keys; ++i) {
+    if (statuses[i].ok()) {
+      values[i] = new (rocksdb_pinnableslice_t);
+      values[i]->rep = std::move(value_slices[i]);
+      errs[i] = nullptr;
+    } else {
+      values[i] = nullptr;
+      if (!statuses[i].IsNotFound()) {
+        errs[i] = strdup(statuses[i].ToString().c_str());
+      } else {
+        errs[i] = nullptr;
+      }
+    }
+  }
+
+  delete[] value_slices;
+  delete[] statuses;
+}
+
 void rocksdb_transaction_set_commit_timestamp(rocksdb_transaction_t* txn,
                                               uint64_t commit_timestamp) {
   txn->rep->SetCommitTimestamp(commit_timestamp);

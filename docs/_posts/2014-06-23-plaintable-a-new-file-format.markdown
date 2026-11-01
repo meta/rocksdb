@@ -12,7 +12,7 @@ In this post, we are introducing "PlainTable" -- a file format we designed for R
 Design goals:
 
 1. All data stored in memory, in files stored in tmpfs/ramfs. Support DBs larger than 100GB (may be sharded across multiple RocksDB instance).
-1. Optimize for [prefix hashing](https://github.com/facebook/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Siying-Prefix-Hash.pdf)
+1. Optimize for [prefix hashing](https://github.com/meta/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Siying-Prefix-Hash.pdf)
 1. Less than or around 1 micro-second average latency for single Get() or Seek().
 1. Minimize memory consumption.
 1. Queries efficiently return empty results
@@ -36,7 +36,7 @@ Having addressed our latency goal, the next task was to design a very compact ha
 
 To make sure the format works efficiently with empty queries, we added a bloom filter check before the query. This adds only one cache miss for non-empty cases [1], but avoids multiple cache misses for most empty results queries. This is a good trade-off for use cases with a large percentage of empty results.
 
-These are the design goals and basic ideas of PlainTable file format. For detailed information, see [this wiki page](https://github.com/facebook/rocksdb/wiki/PlainTable-Format).
+These are the design goals and basic ideas of PlainTable file format. For detailed information, see [this wiki page](https://github.com/meta/rocksdb/wiki/PlainTable-Format).
 
 [1] Bloom filter checks typically require multiple memory access. However, because they are independent, they usually do not make the CPU pipeline stale. In any case, we improved the bloom filter to improve data locality - we may cover this further in a future blog post.
 

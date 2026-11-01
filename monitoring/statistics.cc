@@ -343,6 +343,10 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {BLOB_DB_LAZY_PARTIAL_READ_COUNT, "rocksdb.blobdb.lazy.partial.read.count"},
     {BLOB_DB_LAZY_PARTIAL_BYTES_SAVED,
      "rocksdb.blobdb.lazy.partial.bytes.saved"},
+    {REMOTE_COMPACT_INPUT_BLOB_FILE_COUNT,
+     "rocksdb.remote.compact.input.blob.file.count"},
+    {REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT,
+     "rocksdb.remote.compact.blob.result.declined.count"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

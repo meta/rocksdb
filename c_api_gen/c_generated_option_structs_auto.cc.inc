@@ -826,6 +826,16 @@ const char* rocksdb_options_get_db_host_id(rocksdb_options_t* opt,
   return opt->rep.db_host_id.data();
 }
 
+void rocksdb_options_set_use_separate_remote_compaction_pool(
+    rocksdb_options_t* opt, unsigned char v) {
+  opt->rep.use_separate_remote_compaction_pool = v;
+}
+
+unsigned char rocksdb_options_get_use_separate_remote_compaction_pool(
+    rocksdb_options_t* opt) {
+  return opt->rep.use_separate_remote_compaction_pool;
+}
+
 void rocksdb_options_set_remote_compaction_manifest_floor(
     rocksdb_options_t* opt, unsigned char v) {
   opt->rep.remote_compaction_manifest_floor = v;

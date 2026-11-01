@@ -64,6 +64,7 @@ void DisableCoroutineStatsInTLS() {
   // PerfLevel gates per-level updates, so keep published per-level stats
   // readable until the next request installs its configuration.
   SetPerfLevel(PerfLevel::kDisable);
+  SetAsyncReadCPUTimeEnabled(false);
 }
 
 // Owns the counters collected by one request, moving them to and from TLS
@@ -152,9 +153,15 @@ class EnabledCoroutineStatsRequestData final : public folly::RequestData {
 
   bool IsOwnerThread() const { return env_->GetThreadID() == owner_thread_id_; }
 
+  bool GetCpuTimeEnabled() const {
+    return PerfLevelAtLeast(PerfLevel::kEnableTimeAndCPUTimeExceptForMutex) ||
+           (stats_config_.cpu_time_enabled &&
+            PerfLevelAtLeast(PerfLevel::kEnableCount));
+  }
+
   void StartGetCpuTimer() {
 #ifndef NPERF_CONTEXT
-    if (!PerfLevelAtLeast(PerfLevel::kEnableTimeAndCPUTimeExceptForMutex)) {
+    if (!GetCpuTimeEnabled()) {
       return;
     }
     coroutine_stats_thread_local_state.data = this;
@@ -197,12 +204,19 @@ CoroutineStatsConfig CaptureCoroutineStatsConfig() {
 #ifndef NIOSTATS_CONTEXT
   stats_config.iostats_disabled = get_iostats_context()->disable_iostats;
 #endif
+  stats_config.cpu_time_enabled = GetAsyncReadCPUTimeEnabled();
   return stats_config;
 }
 
 CoroutineStatsConfig CaptureAndDisableCoroutineStatsConfig() {
   CoroutineStatsConfig stats_config = CaptureCoroutineStatsConfig();
   DisableCoroutineStatsInTLS();
+  return stats_config;
+}
+
+CoroutineStatsConfig WithoutAsyncReadCPUTime(
+    CoroutineStatsConfig stats_config) {
+  stats_config.cpu_time_enabled = false;
   return stats_config;
 }
 

@@ -285,7 +285,7 @@ for v in "$@" ; do
     env -i "${args_nolim[@]}"                  bash ./benchmark.sh flush_mt_l0
   elif [ "$compaction_style" == "universal" ]; then
     # For universal don't compact L0 as can have too many sorted runs
-    # waitforcompaction can hang, see https://github.com/facebook/rocksdb/issues/9275
+    # waitforcompaction can hang, see https://github.com/meta/rocksdb/issues/9275
     # While this is disabled the test that follows will have more variance from compaction debt.
     # env -i "${args_nolim[@]}"                    bash ./benchmark.sh waitforcompaction
     echo TODO enable when waitforcompaction hang is fixed
@@ -309,7 +309,7 @@ for v in "$@" ; do
     # Use waitforcompaction to get more accurate write-amp measurement
     env -i "${args_nolim[@]}" DURATION="$duration_rw" bash ./benchmark.sh overwriteandwait
   else
-    # waitforcompaction hangs with universal, see https://github.com/facebook/rocksdb/issues/9275
+    # waitforcompaction hangs with universal, see https://github.com/meta/rocksdb/issues/9275
     env -i "${args_nolim[@]}" DURATION="$duration_rw" bash ./benchmark.sh overwrite
   fi
 

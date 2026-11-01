@@ -478,7 +478,7 @@ class DB {
 
   // Manually, synchronously attempt to resume DB writes after a write failure
   // to the underlying filesystem. See
-  // https://github.com/facebook/rocksdb/wiki/Background-Error-Handling
+  // https://github.com/meta/rocksdb/wiki/Background-Error-Handling
   //
   // Returns OK if writes are successfully resumed, or there was no
   // outstanding error to recover from. Returns underlying write error if
@@ -878,6 +878,13 @@ class DB {
     return Status::NotSupported("GetEntity not supported");
   }
 
+  Status GetEntityWithMetadata(const ReadOptions& options, const Slice& key,
+                               PinnableWideColumns* columns,
+                               OutputMetadata* output_metadata) {
+    return GetEntityWithMetadata(options, DefaultColumnFamily(), key, columns,
+                                 output_metadata);
+  }
+
   // Returns logically grouped wide-column entities per column family (a.k.a.
   // attribute groups) for a single key. PinnableAttributeGroups is a vector of
   // PinnableAttributeGroup. Each PinnableAttributeGroup will have
@@ -1240,6 +1247,16 @@ class DB {
     }
   }
 
+  // MultiGetEntity for a single column family with optional output metadata.
+  // See the multiple column family MultiGetEntityWithMetadata() below.
+  void MultiGetEntityWithMetadata(const ReadOptions& options,
+                                  ColumnFamilyHandle* column_family,
+                                  size_t num_keys, const Slice* keys,
+                                  PinnableWideColumns* results,
+                                  Status* statuses,
+                                  MultiGetOutputMetadata* output_metadata,
+                                  bool sorted_input = false);
+
   // Batched MultiGet-like API that returns attribute groups.
   // An "attribute group" refers to a logical grouping of wide-column entities
   // within RocksDB. These attribute groups are implemented using column
@@ -1455,6 +1472,10 @@ class DB {
   // relying on TLS state left by an earlier async read. Disable both perf and
   // IO stats before a call when no stats are needed. Async reads reset the
   // calling thread's configuration to disabled.
+  //
+  // An async read records PerfContext::get_cpu_nanos when the perf level is at
+  // least kEnableTimeAndCPUTimeExceptForMutex, or after
+  // SetAsyncReadCPUTimeEnabled(true) (see rocksdb/perf_level.h).
   class AsyncCallback {
    public:
     virtual ~AsyncCallback() = default;
@@ -1680,6 +1701,13 @@ class DB {
     //      subcompaction, so a single compaction may contribute more than one
     //      to this count. Always 0 when no `compaction_service` is configured.
     static const std::string kNumRunningRemoteCompactions;
+
+    //  "rocksdb.num-remote-compaction-pool-threads" - returns the thread count
+    //      of the process-wide remote compaction pool, including idle workers
+    //      and coordinators waiting for local fallback. This value is shared
+    //      by all DBs and must not be summed across DBs. Returns 0 before first
+    //      use and after releasing all idle workers.
+    static const std::string kNumRemoteCompactionPoolThreads;
 
     //  "rocksdb.num-running-bottom-compactions" - returns the number of
     //      currently running bottom-priority compactions.
@@ -1943,6 +1971,7 @@ class DB {
   //  "rocksdb.estimate-pending-compaction-bytes"
   //  "rocksdb.num-running-compactions"
   //  "rocksdb.num-running-remote-compactions"
+  //  "rocksdb.num-remote-compaction-pool-threads"
   //  "rocksdb.num-running-bottom-compactions"
   //  "rocksdb.num-running-flushes"
   //  "rocksdb.num-unscheduled-compactions"
@@ -2906,6 +2935,16 @@ class DB {
                                  OutputMetadata* output_metadata);
 
   // EXPERIMENTAL, subject to change.
+  // GetEntity equivalent of GetWithMetadata(), with the same newer-version
+  // semantics and support. Entity reads do not return timestamps: requesting a
+  // timestamp returns NotSupported.
+  virtual Status GetEntityWithMetadata(const ReadOptions& options,
+                                       ColumnFamilyHandle* column_family,
+                                       const Slice& key,
+                                       PinnableWideColumns* columns,
+                                       OutputMetadata* output_metadata);
+
+  // EXPERIMENTAL, subject to change.
   // MultiGet equivalent of GetWithMetadata(). For each requested metadata
   // field, the corresponding output vector is resized to num_keys entries.
   virtual void MultiGetWithMetadata(const ReadOptions& options,
@@ -2915,6 +2954,30 @@ class DB {
                                     Status* statuses,
                                     MultiGetOutputMetadata* output_metadata,
                                     const bool sorted_input = false);
+
+  // EXPERIMENTAL, subject to change.
+  // MultiGetEntity equivalent of MultiGetWithMetadata(), with the same
+  // newer-version semantics and support. Entity reads do not return
+  // timestamps: requesting them returns NotSupported for every key. For each
+  // requested metadata field, the corresponding output vector is resized to
+  // num_keys entries.
+  virtual void MultiGetEntityWithMetadata(
+      const ReadOptions& options, size_t num_keys,
+      ColumnFamilyHandle* const* column_families, const Slice* keys,
+      PinnableWideColumns* results, Status* statuses,
+      MultiGetOutputMetadata* output_metadata, bool sorted_input = false);
+
+  // EXPERIMENTAL, subject to change.
+  // Attribute-group MultiGetEntity equivalent of MultiGetWithMetadata(), with
+  // the same newer-version semantics and support. For each requested metadata
+  // field, the corresponding output vector is resized to the total number of
+  // attribute groups across results[0..num_keys-1] in (key, attribute_group)
+  // order. Entity reads do not return timestamps: requesting them sets
+  // NotSupported on every attribute group.
+  virtual void MultiGetEntityWithMetadata(
+      const ReadOptions& options, size_t num_keys, const Slice* keys,
+      PinnableAttributeGroups* results,
+      MultiGetOutputMetadata* output_metadata);
 };
 
 struct WriteStallStatsMapKeys {

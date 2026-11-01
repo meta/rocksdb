@@ -1,0 +1,1 @@
+The new DB option `use_separate_remote_compaction_pool` defaults to false and can be changed through `SetDBOptions()` for newly scheduled jobs. When enabled with CompactionService, remote jobs use a dedicated pool and each local subcompaction uses LOW/BOTTOM and counts against the DB compaction limit. Existing jobs finish using their original scheduling model.

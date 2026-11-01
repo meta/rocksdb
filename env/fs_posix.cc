@@ -1046,7 +1046,7 @@ class PosixFileSystem : public FileSystem {
     FileOptions fo =
         FileSystem::OptimizeForCompactionTableRead(file_options, db_options);
 #ifdef OS_LINUX
-    // To fix https://github.com/facebook/rocksdb/issues/12038
+    // To fix https://github.com/meta/rocksdb/issues/12038
     if (!fo.use_direct_reads && fo.compaction_readahead_size > 0) {
       size_t system_limit =
           GetCompactionReadaheadSizeSystemLimit(db_options.db_paths);

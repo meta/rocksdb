@@ -31,4 +31,4 @@ In this example we have a DB of size 86G on HDD and emulate the small memory tha
 
 In this example we have a DB of size 300G on SSD and emulate the small memory that would be available in presence of other DBs on the same node by by using direct IO (skipping OS file cache) and block cache of size 6G and 2G. Without partitioning the linkbench throughput drops from 38k tps to 23k when reducing block cache size from 6G to 2G. With partitioning the throughput drops from 38k to only 30k.
 
-Learn more [here](https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters).
+Learn more [here](https://github.com/meta/rocksdb/wiki/Partitioned-Index-Filters).

@@ -116,7 +116,8 @@ Status BuildTable(
     // compaction path so the manifest learns about the new garbage.
     blob_garbage_meter.reset(new BlobGarbageMeter());
     blob_counting_iter.reset(
-        new BlobCountingIterator(iter, blob_garbage_meter.get()));
+        new BlobCountingIterator(iter, blob_garbage_meter.get(),
+                                 /*track_current_key_inflow=*/false));
     input = blob_counting_iter.get();
   }
 
@@ -229,7 +230,8 @@ Status BuildTable(
                   &(tboptions.write_options), tboptions.db_id,
                   tboptions.db_session_id, job_id, tboptions.column_family_id,
                   tboptions.column_family_name, write_hint, io_tracer,
-                  blob_callback, blob_creation_reason, &blob_file_paths,
+                  blob_callback, blob_creation_reason,
+                  ioptions.cf_paths.front().path, &blob_file_paths,
                   blob_file_additions)
             : nullptr);
 

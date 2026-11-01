@@ -545,6 +545,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "prefix_seek_opt_in_only=true;"
       "fast_sst_open=true;"
       "remote_compaction_manifest_floor=false;"
+      "use_separate_remote_compaction_pool=true;"
       "use_session_tmp_dir_for_remote_compaction=true;"
       "reuse_manifest_on_open=true;",
       new_options));

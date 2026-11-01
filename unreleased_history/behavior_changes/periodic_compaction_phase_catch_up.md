@@ -1,0 +1,1 @@
+Improved how `periodic_compaction_phase_recovery_percent` spreads catch-up periodic compactions after it is enabled or changed (or the DB is reopened). This reduces a transient burst in periodic compactions when many DBs make such a change at once.

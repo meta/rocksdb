@@ -8,6 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "table/block_based/block_based_table_iterator.h"
 
+#include <algorithm>
+
 #include "monitoring/perf_context_imp.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -1014,8 +1016,10 @@ void BlockBasedTableIterator::BlockCacheLookupForReadAheadSize(
 }
 
 // Note:
-// - Iterator should not be reused for multiple multiscans or mixing
-// multiscan with regular iterator usage.
+// - multiscan_opts == nullptr (no bounded scan ranges) is a no-op.
+// - Prepare() may follow regular positioning (e.g. Seek()); the current
+// position is discarded.
+// - Iterator should not be reused for multiple multiscans.
 // - scan ranges should be non-overlapping, and have increasing start keys.
 // If a scan range's limit is not set, then there should only be one scan range.
 // - After Prepare(), a forward scan expects Seek to be called on the start key
@@ -1037,10 +1041,23 @@ void BlockBasedTableIterator::BlockCacheLookupForReadAheadSize(
 // moving forward.
 void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   assert(!multi_scan_read_set_);
+  if (multiscan_opts == nullptr) {
+    return;
+  }
   RecordTick(table_->GetStatistics(), MULTISCAN_PREPARE_CALLS);
   PERF_COUNTER_ADD(multiscan_prepare_count, 1);
   StopWatch sw(table_->get_rep()->ioptions.clock, table_->GetStatistics(),
                MULTISCAN_PREPARE_MICROS);
+
+  const bool rolling_prefetch =
+      multiscan_opts->rolling_prefetch && multiscan_opts->use_async_io &&
+      !multiscan_opts->reverse &&
+      multiscan_opts->rolling_prefetch_window_size > 0;
+  const uint64_t rolling_prefetch_window_size =
+      multiscan_opts->max_prefetch_size > 0
+          ? std::min(multiscan_opts->rolling_prefetch_window_size,
+                     multiscan_opts->max_prefetch_size)
+          : multiscan_opts->rolling_prefetch_window_size;
 
   if (!index_iter_->status().ok()) {
     multi_scan_status_ = index_iter_->status();
@@ -1053,6 +1070,12 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
     RecordTick(table_->GetStatistics(), MULTISCAN_PREPARE_ERRORS);
     return;
   }
+
+  // CollectBlockHandles() repositions index_iter_ and success replaces it, so
+  // discard the current position and its data block, whatever the outcome.
+  ResetDataIter();
+  is_index_at_curr_block_ = false;
+  is_at_first_key_from_index_ = false;
 
   index_iter_->Prepare(multiscan_opts);
 
@@ -1071,7 +1094,7 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   // Calculate prefetch range (enforces max_prefetch_size)
   size_t prefetch_start_idx = 0;
   size_t prefetch_max_idx = scan_block_handles.size();
-  if (multiscan_opts->max_prefetch_size > 0) {
+  if (multiscan_opts->max_prefetch_size > 0 && !rolling_prefetch) {
     uint64_t total_size = 0;
     if (multiscan_opts->reverse) {
       for (size_t i = scan_block_handles.size(); i > 0; --i) {
@@ -1108,6 +1131,14 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   job->block_handles = std::move(blocks_to_prefetch);
   job->job_options.io_coalesce_threshold =
       multiscan_opts->io_coalesce_threshold;
+  if (rolling_prefetch) {
+    job->job_options.rolling_prefetch_window_size =
+        rolling_prefetch_window_size;
+    job->job_options.rolling_prefetch_max_batch_size =
+        multiscan_opts->max_prefetch_size > 0
+            ? multiscan_opts->max_prefetch_size
+            : rolling_prefetch_window_size;
+  }
   job->job_options.read_options = read_options_;
   job->job_options.read_options.async_io = multiscan_opts->use_async_io;
   // CollectBlockHandles walks sorted scan ranges through the table index, whose
@@ -1148,9 +1179,6 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   prefetch_max_idx_ = prefetch_max_idx;
   original_index_iter_ = std::move(index_iter_);
   index_iter_ = std::move(multi_scan_idx_iter);
-
-  is_index_at_curr_block_ = false;
-  block_iter_points_to_real_block_ = false;
 }
 
 constexpr auto kVerbose = false;

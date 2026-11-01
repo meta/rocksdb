@@ -160,7 +160,7 @@ TEST_F(DBRangeDelTest, CompactionOutputFilesExactlyFilled) {
 TEST_F(DBRangeDelTest, MaxCompactionBytesCutsOutputFiles) {
   // Ensures range deletion spanning multiple compaction output files that are
   // cut by max_compaction_bytes will have non-overlapping key-ranges.
-  // https://github.com/facebook/rocksdb/issues/1778
+  // https://github.com/meta/rocksdb/issues/1778
   const int kNumFiles = 2;
   const int kNumPerFile = 1 << 8;
   const int kBytesPerVal = 1 << 12;
@@ -3667,7 +3667,7 @@ TEST_F(DBRangeDelTest, AtomicFlushReasonStatsMemtableMaxRangeDeletions) {
 
 TEST_F(DBRangeDelTest, RangeDelReseekAfterFileReadError) {
   // This is to test a bug that is fixed in
-  // https://github.com/facebook/rocksdb/pull/11786.
+  // https://github.com/meta/rocksdb/pull/11786.
   Options opts = CurrentOptions();
   opts.num_levels = 7;
 

@@ -253,7 +253,9 @@ class ExternalSstFileIngestionJob {
   ExternalSstFileIngestionJob& operator=(ExternalSstFileIngestionJob&&) =
       delete;
 
-  ~ExternalSstFileIngestionJob() { UnregisterRange(); }
+  ~ExternalSstFileIngestionJob() {
+    UnregisterRange(/*restore_compaction_candidates=*/false);
+  }
 
   ColumnFamilyData* GetColumnFamilyData() const { return cfd_; }
 
@@ -283,13 +285,18 @@ class ExternalSstFileIngestionJob {
   Status Run();
 
   // Register key range involved in this ingestion job
-  // to prevent key range conflict with other ongoing compaction/file ingestion
+  // to prevent key range conflict with other ongoing compaction/file ingestion.
+  // Also marks the existing files this job deletes (atomic replace) as being
+  // compacted, so that no compaction picks them while LogAndApply() releases
+  // the DB mutex to write the MANIFEST.
   // REQUIRES: Mutex held
   void RegisterRange();
 
-  // Unregister key range registered for this ingestion job
+  // Unregister key range registered for this ingestion job, and clear the
+  // being-compacted mark set by RegisterRange() on replaced files.
+  // Restore compaction eligibility when the commit failed.
   // REQUIRES: Mutex held
-  void UnregisterRange();
+  void UnregisterRange(bool restore_compaction_candidates);
 
   // Update column family stats.
   // REQUIRES: Mutex held
@@ -411,9 +418,7 @@ class ExternalSstFileIngestionJob {
   // The uppermost level used by this batch of files is tracked too, so that it
   // can be used by the next batch.
   // REQUIRES: Mutex held
-  Status AssignLevelsForOneBatch(FileBatchInfo& batch,
-                                 SuperVersion* super_version,
-                                 bool force_global_seqno,
+  Status AssignLevelsForOneBatch(FileBatchInfo& batch, bool force_global_seqno,
                                  SequenceNumber* last_seqno,
                                  int* batch_uppermost_level,
                                  std::optional<int> prev_batch_uppermost_level);
@@ -424,9 +429,9 @@ class ExternalSstFileIngestionJob {
   // assigned to levels tha are higher than `prev_batch_uppermost_level`.
   // REQUIRES: Mutex held
   Status AssignLevelAndSeqnoForIngestedFile(
-      SuperVersion* sv, bool force_global_seqno,
-      CompactionStyle compaction_style, SequenceNumber last_seqno,
-      IngestedFileInfo* file_to_ingest, SequenceNumber* assigned_seqno,
+      bool force_global_seqno, CompactionStyle compaction_style,
+      SequenceNumber last_seqno, IngestedFileInfo* file_to_ingest,
+      SequenceNumber* assigned_seqno,
       std::optional<int> prev_batch_uppermost_level);
 
   // File that we want to ingest behind always goes to the lowest level;
@@ -455,6 +460,11 @@ class ExternalSstFileIngestionJob {
   // , which will be used to check range conflict with other ongoing
   // compactions.
   void CreateEquivalentFileIngestingCompactions();
+
+  // Add `file` at `level` to the files deleted by this job's atomic replace.
+  // Fails if `file` is already being compacted.
+  // REQUIRES: Mutex held
+  Status AddFileToReplace(int level, FileMetaData* file);
 
   // Remove all the internal files created, called when ingestion job fails.
   void DeleteInternalFiles();
@@ -496,6 +506,12 @@ class ExternalSstFileIngestionJob {
   std::vector<FileMetaData*> compaction_input_metdatas_;
   // Compactions equivalent to this ingestion job
   std::vector<Compaction*> file_ingesting_compactions_;
+
+  // Existing files deleted by atomic replace. Their version is retained until
+  // UnregisterRange() clears their being_compacted flags.
+  std::vector<FileMetaData*> files_to_replace_;
+  Version* files_to_replace_version_{nullptr};
+  bool files_to_replace_marked_{false};
 };
 
 }  // namespace ROCKSDB_NAMESPACE

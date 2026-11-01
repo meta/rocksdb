@@ -1,0 +1,1 @@
+Fixed a crash in MultiScan `Iterator::Prepare()` with a single scan range without a limit when the DB has L0 files, and an assertion failure in debug builds when `Prepare()` is called on an already-positioned iterator. `Prepare()` now leaves the iterator invalid until it is positioned again (e.g. by `Seek()`).

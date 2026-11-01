@@ -48,6 +48,7 @@ class BlobFileBuilder {
                   const std::shared_ptr<IOTracer>& io_tracer,
                   BlobFileCompletionCallback* blob_callback,
                   BlobFileCreationReason creation_reason,
+                  std::string blob_output_path,
                   std::vector<std::string>* output_file_paths,
                   std::vector<BlobFileAddition>* blob_file_additions);
 
@@ -63,6 +64,7 @@ class BlobFileBuilder {
                   const std::shared_ptr<IOTracer>& io_tracer,
                   BlobFileCompletionCallback* blob_callback,
                   BlobFileCreationReason creation_reason,
+                  std::string blob_output_path,
                   std::vector<std::string>* output_file_paths,
                   std::vector<BlobFileAddition>* blob_file_additions);
 
@@ -112,6 +114,7 @@ class BlobFileBuilder {
   std::shared_ptr<IOTracer> io_tracer_;
   BlobFileCompletionCallback* blob_callback_;
   BlobFileCreationReason creation_reason_;
+  const std::string blob_output_path_;
   std::vector<std::string>* output_file_paths_;
   std::vector<BlobFileAddition>* blob_file_additions_;
   std::unique_ptr<BlobLogWriter> writer_;

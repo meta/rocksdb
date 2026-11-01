@@ -1914,9 +1914,14 @@ void LevelIterator::SetFileIterator(InternalIterator* iter) {
     file_iter_.UpdateReadaheadState(old_iter);
   }
 
-  if (pinned_iters_mgr_ && pinned_iters_mgr_->PinningEnabled()) {
+  if (pinned_iters_mgr_ && pinned_iters_mgr_->PinningEnabled() &&
+      old_iter != nullptr && !old_iter->IsSafeToDropWhilePinned()) {
+    TEST_SYNC_POINT_CALLBACK("LevelIterator::SetFileIterator:PinIterator",
+                             old_iter);
     pinned_iters_mgr_->PinIterator(old_iter);
   } else {
+    TEST_SYNC_POINT_CALLBACK("LevelIterator::SetFileIterator:DeleteIterator",
+                             old_iter);
     delete old_iter;
   }
 }
@@ -3885,6 +3890,29 @@ void VersionStorageInfo::ComputeCompactionScore(
   EstimateCompactionBytesNeeded(mutable_cf_options);
 }
 
+void VersionStorageInfo::RemoveFilesBeingCompactedFromCompactionCandidates() {
+  for (auto* candidates :
+       {&files_marked_for_compaction_, &bottommost_files_marked_for_compaction_,
+        &expired_ttl_files_, &files_marked_for_periodic_compaction_,
+        &files_marked_for_forced_blob_gc_, &read_triggered_compaction_files_}) {
+    const size_t remaining =
+        std::remove_if(candidates->begin(), candidates->end(),
+                       [](const auto& level_file) {
+                         return level_file.second->being_compacted;
+                       }) -
+        candidates->begin();
+    candidates->resize(remaining);
+  }
+  standalone_range_tombstone_files_mark_threshold_ = kMaxSequenceNumber;
+  for (const auto& level_file : files_marked_for_compaction_) {
+    if (level_file.second->FileIsStandAloneRangeTombstone()) {
+      standalone_range_tombstone_files_mark_threshold_ =
+          std::min(standalone_range_tombstone_files_mark_threshold_,
+                   level_file.second->fd.smallest_seqno);
+    }
+  }
+}
+
 void VersionStorageInfo::ComputeFilesMarkedForCompaction(int last_level) {
   files_marked_for_compaction_.clear();
   int last_qualify_level = 0;
@@ -5755,7 +5783,7 @@ void VersionSet::Reset() {
     }
 
     // db_id becomes the source of truth after DBImpl::Recover():
-    // https://github.com/facebook/rocksdb/blob/v7.3.1/db/db_impl/db_impl_open.cc#L527
+    // https://github.com/meta/rocksdb/blob/v7.3.1/db/db_impl/db_impl_open.cc#L527
     // Note: we may not be able to recover db_id from MANIFEST if
     // options.write_dbid_to_manifest is false (default).
     column_family_set_.reset(
@@ -6058,8 +6086,8 @@ Status VersionSet::ProcessManifestWrites(
                                  : MutableCFOptions(*new_cf_options),
                 io_tracer_, current_version_number_++);
             versions.push_back(version);
-            builder_guards.emplace_back(
-                new BaseReferencedVersionBuilder(last_writer->cfd));
+            builder_guards.emplace_back(new BaseReferencedVersionBuilder(
+                last_writer->cfd, last_writer->cfd->current()));
             builder = builder_guards.back()->version_builder();
           }
           assert(last_writer->IsAllVersionIndependentEdits() || builder);

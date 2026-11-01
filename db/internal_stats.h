@@ -856,6 +856,8 @@ class InternalStats {
                                    Version* version);
   bool HandleNumRunningRemoteCompactions(uint64_t* value, DBImpl* db,
                                          Version* version);
+  bool HandleNumRemoteCompactionPoolThreads(uint64_t* value, DBImpl* db,
+                                            Version* version);
   bool HandleNumRunningBottomCompactions(uint64_t* value, DBImpl* db,
                                          Version* version);
   bool HandleNumRunningCompactionSortedRuns(uint64_t* value, DBImpl* db,

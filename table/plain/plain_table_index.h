@@ -123,7 +123,7 @@ class PlainTableIndex {
 // used either to initialize PlainTableIndex or
 // to save index to sst file.
 // For more details about the index, please refer to:
-// https://github.com/facebook/rocksdb/wiki/PlainTable-Format
+// https://github.com/meta/rocksdb/wiki/PlainTable-Format
 // #wiki-in-memory-index-format
 // The class is used by PlainTableBuilder class.
 class PlainTableIndexBuilder {

@@ -300,7 +300,7 @@ static struct BlockBasedTableTypeInfo {
         // affecting SetOptions on BBTO fields. This should be generally
         // acceptable for non-pointer options of 64 bits or less, but a fix
         // is needed to make it mutability general here. See
-        // https://github.com/facebook/rocksdb/issues/10079
+        // https://github.com/meta/rocksdb/issues/10079
         /* currently not supported:
           CacheUsageOptions cache_usage_options;
          */

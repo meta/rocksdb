@@ -71,7 +71,8 @@ TEST(BlobCountingIteratorTest, CountBlobs) {
   VectorIterator input(keys, values);
   BlobGarbageMeter blob_garbage_meter;
 
-  BlobCountingIterator blob_counter(&input, &blob_garbage_meter);
+  BlobCountingIterator blob_counter(&input, &blob_garbage_meter,
+                                    /*track_current_key_inflow=*/false);
 
   constexpr uint64_t first_expected_bytes =
       first_size +
@@ -301,6 +302,58 @@ TEST(BlobCountingIteratorTest, CountBlobs) {
               5 * second_expected_bytes);
 }
 
+TEST(BlobCountingIteratorTest, TracksCurrentKeyOnlyForResumableCompaction) {
+  constexpr size_t kNumEntries = 1000;
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  keys.reserve(kNumEntries);
+  values.reserve(kNumEntries);
+  for (size_t i = 0; i < kNumEntries; ++i) {
+    keys.push_back(
+        test::KeyStr("key" + std::to_string(i), i + 1, kTypeBlobIndex));
+    BlobIndex::EncodeBlob(&values.emplace_back(), /*file_number=*/7,
+                          /*offset=*/i * 100, /*size=*/100, kNoCompression);
+  }
+
+  for (const bool track_current_key : {false, true}) {
+    VectorIterator input(keys, values);
+    BlobGarbageMeter blob_garbage_meter;
+    size_t aggregate_parse_count = 0;
+    size_t current_key_parse_count = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "BlobCountingIterator::UpdateAndCountBlobIfNeeded:AggregateInflow",
+        [&](void*) { ++aggregate_parse_count; });
+    SyncPoint::GetInstance()->SetCallBack(
+        "BlobCountingIterator::UpdateAndCountBlobIfNeeded:CurrentKeyInflow",
+        [&](void*) { ++current_key_parse_count; });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    BlobCountingIterator blob_counter(&input, &blob_garbage_meter,
+                                      track_current_key);
+    EXPECT_EQ(blob_counter.TracksCurrentKeyInflow(), track_current_key);
+    const BlobGarbageMeter* current_key_meter =
+        track_current_key ? &blob_counter.GetCurrentKeyInflow() : nullptr;
+    for (blob_counter.SeekToFirst(); blob_counter.Valid();
+         blob_counter.Next()) {
+      if (track_current_key) {
+        // This checks reuse of the optional meter object, not allocations made
+        // by its internal map while processing each key.
+        EXPECT_EQ(&blob_counter.GetCurrentKeyInflow(), current_key_meter);
+      }
+    }
+
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    ASSERT_OK(blob_counter.status());
+    EXPECT_EQ(aggregate_parse_count, kNumEntries);
+    EXPECT_EQ(current_key_parse_count, track_current_key ? kNumEntries : 0);
+    const auto flow = blob_garbage_meter.flows().find(7);
+    ASSERT_NE(flow, blob_garbage_meter.flows().end());
+    EXPECT_EQ(flow->second.GetInFlow().GetCount(), kNumEntries);
+  }
+}
+
 TEST(BlobCountingIteratorTest, CorruptBlobIndex) {
   const std::vector<std::string> keys{
       test::KeyStr("user_key", 1, kTypeBlobIndex)};
@@ -311,7 +364,8 @@ TEST(BlobCountingIteratorTest, CorruptBlobIndex) {
   VectorIterator input(keys, values);
   BlobGarbageMeter blob_garbage_meter;
 
-  BlobCountingIterator blob_counter(&input, &blob_garbage_meter);
+  BlobCountingIterator blob_counter(&input, &blob_garbage_meter,
+                                    /*track_current_key_inflow=*/false);
 
   blob_counter.SeekToFirst();
   ASSERT_FALSE(blob_counter.Valid());

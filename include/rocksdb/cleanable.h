@@ -47,7 +47,7 @@ class Cleanable {
     cleanup_.next = nullptr;
   }
 
-  inline bool HasCleanups() { return cleanup_.function != nullptr; }
+  inline bool HasCleanups() const { return cleanup_.function != nullptr; }
 
  protected:
   struct Cleanup {

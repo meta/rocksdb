@@ -574,7 +574,7 @@ LRUHandle* LRUCacheShard::CreateStandalone(const Slice& key, uint32_t hash,
 
     if (strict_capacity_limit_ && (usage_ + e->total_charge) > capacity_) {
       if (allow_uncharged) {
-        e->total_charge = 0;
+        e->total_charge = LRUHandle::kUnchargedStandaloneTotalCharge;
       } else {
         free(e);
         e = nullptr;

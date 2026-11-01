@@ -1021,7 +1021,7 @@ Status BlockBasedTable::PrefetchTail(
     // Fallback for SST files, for which tail size is not recorded in the
     // manifest. Eventually, this fallback might be removed, so it's
     // better to make sure that such SST files get compacted.
-    // See https://github.com/facebook/rocksdb/issues/12664
+    // See https://github.com/meta/rocksdb/issues/12664
     if (tail_prefetch_stats != nullptr) {
       // Multiple threads may get a 0 (no history) when running in parallel,
       // but it will get cleared after the first of them finishes.
@@ -2024,7 +2024,7 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
     }
   }
 
-  // NOTE: before the fix to https://github.com/facebook/rocksdb/issues/12409, a
+  // NOTE: before the fix to https://github.com/meta/rocksdb/issues/12409, a
   // file could have a (de)compression dictionary block without a configured
   // compression, so we need to ignore the dictionary in that case.
   if (!rep_->compression_dict_handle.IsNull() && rep_->decompressor) {

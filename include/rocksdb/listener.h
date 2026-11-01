@@ -407,6 +407,9 @@ struct SubcompactionJobInfo {
   // the job id, which is unique in the same thread.
   int job_id;
 
+  // The execution pool selected for the parent job.
+  bool use_separate_remote_compaction_pool = false;
+
   // sub-compaction job id, which is only unique within the same compaction, so
   // use both 'job_id' and 'subcompaction_job_id' to identify a subcompaction
   // within an instance.
@@ -442,6 +445,10 @@ struct CompactionJobInfo {
   uint64_t thread_id;
   // the job id, which is unique in the same thread.
   int job_id;
+
+  // The execution pool selected for this job, independent of later DB option
+  // updates.
+  bool use_separate_remote_compaction_pool = false;
 
   // the number of L0 files in the CF right before and after the compaction
   int num_l0_files;
@@ -562,11 +569,16 @@ struct IOErrorInfo {
 // Point-in-time snapshot of background job pressure for one DB: how busy
 // compaction and flush are, and how close the DB is to write-stalling.
 struct BackgroundJobPressure {
-  // Compaction scheduling (LOW + BOTTOM priority combined)
+  // Scheduled compaction work, including remote coordinators and admitted
+  // local subcompactions.
   int compaction_scheduled = 0;
+  // Running compaction coordinators, including remote coordinators.
   int compaction_running = 0;
 
-  // Per-priority compaction breakdown
+  // Per-priority local pool usage. With the separate remote pool enabled,
+  // these count queued/running local subcompactions and exclude remote
+  // coordinators. Their running sum need not equal compaction_running, which
+  // counts coordinators rather than individual local subcompactions.
   int compaction_low_scheduled = 0;
   int compaction_low_running = 0;
   int compaction_bottom_scheduled = 0;

@@ -59,6 +59,14 @@ class BlobGarbageMeter {
       out_flow_.Add(bytes);
       assert(IsValid());
     }
+    void AddOutFlow(uint64_t count, uint64_t bytes) {
+      out_flow_.Add(count, bytes);
+      assert(IsValid());
+    }
+    void AddGarbage(uint64_t count, uint64_t bytes) {
+      in_flow_.Add(count, bytes);
+      assert(IsValid());
+    }
 
     const BlobStats& GetInFlow() const { return in_flow_; }
     const BlobStats& GetOutFlow() const { return out_flow_; }
@@ -89,6 +97,21 @@ class BlobGarbageMeter {
 
   Status ProcessInFlow(const Slice& key, const Slice& value);
   Status ProcessOutFlow(const Slice& key, const Slice& value);
+
+  void ProcessOutFlow(const BlobGarbageMeter& inflow) {
+    for (const auto& [file_number, flow] : inflow.flows()) {
+      const BlobStats& stats = flow.GetInFlow();
+      flows_[file_number].AddOutFlow(stats.GetCount(), stats.GetBytes());
+    }
+  }
+
+  // Imports a garbage delta computed by another compaction process.
+  void AddGarbage(uint64_t blob_file_number, uint64_t count, uint64_t bytes) {
+    // A garbage delta is equivalent to inflow with no matching outflow.
+    flows_[blob_file_number].AddGarbage(count, bytes);
+  }
+
+  void Clear() { flows_.clear(); }
 
   const std::unordered_map<uint64_t, BlobInOutFlow>& flows() const {
     return flows_;

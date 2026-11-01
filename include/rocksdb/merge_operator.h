@@ -296,7 +296,7 @@ class MergeOperator : public Customizable {
   // Note: the merge operands are passed to this function in the reversed order
   // relative to how they were merged (passed to
   // FullMerge/FullMergeV2/FullMergeV3) for performance reasons, see also:
-  // https://github.com/facebook/rocksdb/issues/3865
+  // https://github.com/meta/rocksdb/issues/3865
   virtual bool ShouldMerge(const std::vector<Slice>& /*operands*/) const {
     return false;
   }

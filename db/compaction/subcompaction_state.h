@@ -163,7 +163,8 @@ class SubcompactionState {
         sub_job_id(state.sub_job_id),
         compaction_outputs_(std::move(state.compaction_outputs_)),
         proximal_level_outputs_(std::move(state.proximal_level_outputs_)),
-        range_del_agg_(std::move(state.range_del_agg_)) {
+        range_del_agg_(std::move(state.range_del_agg_)),
+        blob_garbage_checkpoint_(std::move(state.blob_garbage_checkpoint_)) {
     current_outputs_ = state.current_outputs_ == &state.proximal_level_outputs_
                            ? &proximal_level_outputs_
                            : &compaction_outputs_;
@@ -238,10 +239,15 @@ class SubcompactionState {
   }
 
   // Add compaction_iterator key/value to the `Current` output group.
-  Status AddToOutput(const CompactionIterator& iter, bool use_proximal_output,
+  Status AddToOutput(CompactionIterator& iter, bool use_proximal_output,
                      const CompactionFileOpenFunc& open_file_func,
                      const CompactionFileCloseFunc& close_file_func,
                      const ParsedInternalKey& prev_iter_output_internal_key);
+
+  Status UpdateBlobGarbageCheckpoint(const BlobGarbageMeter* next_key_inflow);
+  const BlobGarbageMeter* GetBlobGarbageCheckpoint() const {
+    return blob_garbage_checkpoint_.get();
+  }
 
   // Close all compaction output files, both output_to_proximal_level outputs
   // and normal outputs.
@@ -271,6 +277,7 @@ class SubcompactionState {
   CompactionOutputs proximal_level_outputs_;
   CompactionOutputs* current_outputs_ = &compaction_outputs_;
   std::unique_ptr<CompactionRangeDelAggregator> range_del_agg_;
+  std::unique_ptr<BlobGarbageMeter> blob_garbage_checkpoint_;
 
   SubcompactionProgress subcompaction_progress_;
 };

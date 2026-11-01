@@ -17,8 +17,8 @@
 # Then in the build_tools/ubuntu22_image directory, (bump minor version for
 # random docker file updates, major version tracks Ubuntu release)
 #
-# $ docker build -t ghcr.io/facebook/rocksdb_ubuntu:22.2
-# $ docker push ghcr.io/facebook/rocksdb_ubuntu:22.2
+# $ docker build -t ghcr.io/meta/rocksdb_ubuntu:22.2
+# $ docker push ghcr.io/meta/rocksdb_ubuntu:22.2
 #
 # Might need to change visibility to public through
 # https://github.com/orgs/facebook/packages/container/rocksdb_ubuntu/settings

@@ -567,7 +567,7 @@ class MySQLStyleTransactionTest
       options.write_buffer_size = 1024;
       EXPECT_OK(ReOpen());
     }
-  };
+  }
 
  protected:
   // Also emulate slow threads by addin artiftial delays

@@ -117,7 +117,7 @@ function assertObsoleteComment(comment, originalBody) {
 
 const context = {
   repo: {
-    owner: 'facebook',
+    owner: 'meta',
     repo: 'rocksdb',
   },
 };

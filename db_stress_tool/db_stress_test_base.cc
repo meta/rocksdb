@@ -613,7 +613,8 @@ bool NeedsFaultInjection() {
          FLAGS_open_read_fault_one_in || FLAGS_open_write_fault_one_in ||
          FLAGS_metadata_read_fault_one_in ||
          FLAGS_metadata_write_fault_one_in || FLAGS_read_fault_one_in ||
-         FLAGS_write_fault_one_in || FLAGS_sync_fault_injection;
+         FLAGS_write_fault_one_in || FLAGS_sync_fault_injection ||
+         FLAGS_test_cf_lifecycle;
 }
 
 std::string GetFaultInjectionLogBaseDir() {
@@ -737,6 +738,26 @@ std::string JoinSorted(std::vector<std::string> names) {
     out += name;
   }
   return out;
+}
+
+Status VerifyColumnFamilyDescriptors(
+    const std::vector<ColumnFamilyDescriptor>& descriptors,
+    const std::vector<std::string>& expected_names, const char* context) {
+  std::vector<std::string> actual_names;
+  actual_names.reserve(descriptors.size());
+  for (const auto& descriptor : descriptors) {
+    actual_names.push_back(descriptor.name);
+  }
+  std::sort(actual_names.begin(), actual_names.end());
+  std::vector<std::string> sorted_expected_names = expected_names;
+  std::sort(sorted_expected_names.begin(), sorted_expected_names.end());
+  if (actual_names == sorted_expected_names) {
+    return Status::OK();
+  }
+  return Status::Corruption(
+      context, "OPTIONS={" + JoinSorted(std::move(actual_names)) +
+                   "}, MANIFEST={" +
+                   JoinSorted(std::move(sorted_expected_names)) + "}");
 }
 
 // Checks that a column-family-subset checkpoint holds exactly the requested
@@ -1350,11 +1371,13 @@ StressTest::StressTest(int db_index, const std::string& db_path,
         FLAGS_file_scope_wal_write_faults);
     db_fault_injection_fs_->SetInjectWriteFaultsOnlyOnWAL(
         FLAGS_file_scope_wal_write_faults);
-    // Set it to direct writable here to initially bypass any fault injection
-    // during DB open. This will correspondingly be overwritten in
-    // StressTest::Open() for open fault injection and in RunStressTestImpl()
-    // for proper fault injection setup.
-    db_fault_injection_fs_->SetFilesystemDirectWritable(true);
+    // Normally bypass filesystem fault injection during DB open. Lifecycle
+    // testing keeps the fresh MANIFEST behind the wrapper while injection
+    // remains disabled until the target setup after open. Other modes
+    // overwrite this in StressTest::Open() for open fault injection and in
+    // RunStressTestImpl() for normal fault injection setup.
+    db_fault_injection_fs_->SetFilesystemDirectWritable(
+        !FLAGS_test_cf_lifecycle);
   }
 
   if (FLAGS_destroy_db_initially) {
@@ -5867,20 +5890,14 @@ void StressTest::Open(SharedState* shared, bool reopen) {
 
   // Remote Compaction
   if (FLAGS_remote_compaction_worker_threads > 0) {
-    if ((options_.enable_blob_files ||
-         options_.enable_blob_garbage_collection ||
-         FLAGS_allow_setting_blob_options_dynamically)) {
-      fprintf(stderr,
-              "Integrated BlobDB is currently incompatible with Remote "
-              "Compaction\n");
-      exit(1);
-    }
     // Each DB open/reopen gets a fresh compaction service instance with a clean
     // aborted_ state
     auto compaction_service = std::make_shared<DbStressCompactionService>(
         shared, FLAGS_remote_compaction_failure_fall_back_to_local);
 
     options_.compaction_service = compaction_service;
+    options_.use_separate_remote_compaction_pool =
+        FLAGS_use_separate_remote_compaction_pool;
   }
 
   if (FLAGS_allow_resumption_one_in > 0) {
@@ -6249,6 +6266,26 @@ Status StressTest::VerifyOptionsFileStateBeforeOpen(
     }
   }
 
+  if (FLAGS_test_cf_lifecycle && expected_options_file_number != 0) {
+    ConfigOptions config_options;
+    config_options.env = GetDbEnv();
+    config_options.ignore_unknown_options = true;
+    DBOptions loaded_db_options;
+    std::vector<ColumnFamilyDescriptor> loaded_cf_descriptors;
+    s = LoadOptionsFromFile(config_options,
+                            GetDbPath() + "/" + selected_options_file,
+                            &loaded_db_options, &loaded_cf_descriptors);
+    if (!s.ok()) {
+      return s;
+    }
+    s = VerifyColumnFamilyDescriptors(
+        loaded_cf_descriptors, column_family_names_,
+        "Persisted OPTIONS do not match live MANIFEST column families");
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
   DBOptions read_only_options(options_);
   read_only_options.create_if_missing = false;
   read_only_options.create_missing_column_families = false;
@@ -6288,8 +6325,20 @@ Status StressTest::VerifyPersistedOptionsAfterOpen() {
   config_options.ignore_unknown_options = true;
   DBOptions loaded_db_options;
   std::vector<ColumnFamilyDescriptor> loaded_cf_descriptors;
-  Status s = LoadLatestOptions(config_options, GetDbPath(), &loaded_db_options,
-                               &loaded_cf_descriptors);
+  Status s;
+  if (FLAGS_test_cf_lifecycle) {
+    std::string selected_options_file;
+    s = GetLatestOptionsFileName(GetDbPath(), GetDbEnv(),
+                                 &selected_options_file);
+    if (s.ok()) {
+      s = LoadOptionsFromFile(config_options,
+                              GetDbPath() + "/" + selected_options_file,
+                              &loaded_db_options, &loaded_cf_descriptors);
+    }
+  } else {
+    s = LoadLatestOptions(config_options, GetDbPath(), &loaded_db_options,
+                          &loaded_cf_descriptors);
+  }
   if (!s.ok()) {
     return s;
   }
@@ -6300,19 +6349,9 @@ Status StressTest::VerifyPersistedOptionsAfterOpen() {
         "Latest OPTIONS file has an unexpected tracking marker");
   }
 
-  std::vector<std::string> loaded_cf_names;
-  loaded_cf_names.reserve(loaded_cf_descriptors.size());
-  for (const auto& descriptor : loaded_cf_descriptors) {
-    loaded_cf_names.push_back(descriptor.name);
-  }
-  std::sort(loaded_cf_names.begin(), loaded_cf_names.end());
-  std::vector<std::string> expected_cf_names = column_family_names_;
-  std::sort(expected_cf_names.begin(), expected_cf_names.end());
-  if (loaded_cf_names != expected_cf_names) {
-    return Status::Corruption(
-        "Latest OPTIONS file does not match live column families");
-  }
-  return Status::OK();
+  return VerifyColumnFamilyDescriptors(
+      loaded_cf_descriptors, column_family_names_,
+      "Latest OPTIONS file does not match live column families");
 }
 
 void StressTest::MaybeOpenReadOnlyOnPrimary(ThreadState* thread) {

@@ -117,6 +117,7 @@ class DBCrashTestTest(unittest.TestCase):
             "test_type": test_type,
             "simple": False,
             "cf_consistency": False,
+            "cf_lifecycle": False,
             "txn": False,
             "optimistic_txn": False,
             "test_best_efforts_recovery": False,
@@ -367,6 +368,221 @@ class DBCrashTestTest(unittest.TestCase):
         with mock.patch.object(db_crashtest.random, "randint", side_effect=[0, 1]):
             self.assertEqual(0, choose_tracking())
             self.assertEqual(1, choose_tracking())
+
+    def test_cf_lifecycle_profile_and_schedule(self):
+        db_crashtest = self.load_db_crashtest()
+        params = db_crashtest.gen_cmd_params(
+            self.build_mode_args("blackbox", cf_lifecycle=True)
+        )
+        finalized_params = db_crashtest.finalize_and_sanitize(
+            self.build_params(params)
+        )
+
+        self.assertEqual(1, params["test_cf_lifecycle"])
+        self.assertEqual(2, params["column_families"])
+        self.assertEqual(1, params["threads"])
+        self.assertEqual(0, params["metadata_write_fault_one_in"])
+        self.assertEqual(0, params["reuse_manifest_on_open"])
+        self.assertEqual(100, params["writepercent"])
+        self.assertEqual(0, params["readpercent"])
+        self.assertEqual(1, params["skip_verifydb"])
+        self.assertEqual(0, params["verify_db_one_in"])
+        self.assertEqual(0, params["verify_iterator_with_expected_state_one_in"])
+        self.assertEqual(0, params["set_options_one_in"])
+        self.assertEqual(0, params["compact_range_one_in"])
+        self.assertEqual(0, params["remote_compaction_worker_threads"])
+        self.assertEqual(1, finalized_params["num_dbs"])
+        self.assertEqual(100, finalized_params["clear_column_family_one_in"])
+        self.assertGreaterEqual(
+            finalized_params["max_key"]
+            >> finalized_params["log2_keys_per_lock"],
+            1,
+        )
+        self.assertLessEqual(
+            finalized_params["max_key"]
+            >> finalized_params["log2_keys_per_lock"],
+            16,
+        )
+        self.assertEqual(
+            {
+                "cf_lifecycle_fault_target": 1,
+                "track_options_file_number_in_manifest": 1,
+                "clear_column_family_one_in": 1,
+            },
+            db_crashtest.cf_lifecycle_iteration_overrides(0),
+        )
+        self.assertEqual(0, db_crashtest.cf_lifecycle_iteration_overrides(1)[
+            "track_options_file_number_in_manifest"
+        ])
+        self.assertEqual(
+            2,
+            db_crashtest.cf_lifecycle_iteration_overrides(2)[
+                "cf_lifecycle_fault_target"
+            ],
+        )
+        self.assertEqual(
+            100,
+            db_crashtest.cf_lifecycle_iteration_overrides(3)[
+                "clear_column_family_one_in"
+            ],
+        )
+
+        params.update(db_crashtest.cf_lifecycle_iteration_overrides(1))
+        params.update(
+            {
+                "destroy_db_initially": 0,
+                "max_key": 10000,
+                "log2_keys_per_lock": 0,
+            }
+        )
+        cmd, _ = db_crashtest.gen_cmd(
+            self.build_params(params),
+            [
+                "-track_options_file_number_in_manifest=true",
+                "--cf_lifecycle_fault_target=2",
+                "--clear_column_family_one_in=1",
+                "-destroy_db_initially=true",
+                "--max_key=1000000",
+                "-log2_keys_per_lock=0",
+            ],
+        )
+        self.assertEqual(
+            [
+                "--cf_lifecycle_fault_target=0",
+                "--track_options_file_number_in_manifest=0",
+                "--clear_column_family_one_in=0",
+                "--destroy_db_initially=0",
+                "--max_key=10000",
+                "--log2_keys_per_lock=10",
+            ],
+            cmd[-6:],
+        )
+
+        params["destroy_db_initially"] = 1
+        first_cmd, _ = db_crashtest.gen_cmd(
+            self.build_params(params), ["-destroy_db_initially=false"]
+        )
+        self.assertEqual("--destroy_db_initially=1", first_cmd[-3])
+
+    def test_generated_command_disables_unmanaged_lifecycle_mode(self):
+        db_crashtest = self.load_db_crashtest()
+        params = db_crashtest.gen_cmd_params(self.build_mode_args("blackbox"))
+
+        cmd, _ = db_crashtest.gen_cmd(
+            self.build_params(params),
+            ["--flagfile=flags.txt", "-test_cf_lifecycle=1", "--", "ignored"],
+        )
+
+        terminator_index = cmd.index("--")
+        self.assertEqual(
+            ["-test_cf_lifecycle=1", "--test_cf_lifecycle=0"],
+            cmd[terminator_index - 2 : terminator_index],
+        )
+
+    def test_cf_lifecycle_rejects_direct_low_level_controls(self):
+        for control in (
+            "--test_cf_lifecycle=1",
+            "--cf_lifecycle_fault_target=1",
+        ):
+            with self.subTest(control=control):
+                db_crashtest = self.load_db_crashtest(["liveness", control])
+                with mock.patch.object(sys, "stderr", io.StringIO()):
+                    with self.assertRaisesRegex(SystemExit, "2"):
+                        db_crashtest.main()
+
+    def test_cf_lifecycle_rejects_argument_terminator(self):
+        db_crashtest = self.load_db_crashtest(
+            ["blackbox", "--cf_lifecycle", "-user_override=true", "--"]
+        )
+
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaisesRegex(SystemExit, "2"):
+                db_crashtest.main()
+
+    def test_expected_cf_lifecycle_fault_requires_exit_and_marker(self):
+        db_crashtest = self.load_db_crashtest()
+        params = {"cf_lifecycle_fault_target": 1}
+        marker = "EXPECTED_CF_LIFECYCLE_FAULT target=options"
+
+        self.assertTrue(
+            db_crashtest.expected_cf_lifecycle_fault_observed(
+                params, False, 86, marker
+            )
+        )
+        self.assertFalse(
+            db_crashtest.expected_cf_lifecycle_fault_observed(
+                params, True, 86, marker
+            )
+        )
+        self.assertFalse(
+            db_crashtest.expected_cf_lifecycle_fault_observed(
+                params, False, 1, marker
+            )
+        )
+        self.assertFalse(
+            db_crashtest.expected_cf_lifecycle_fault_observed(
+                params, False, 86, ""
+            )
+        )
+        self.assertFalse(
+            db_crashtest.expected_cf_lifecycle_fault_observed(
+                params, False, 86, marker + "_extra"
+            )
+        )
+
+    def test_cf_lifecycle_success_count_requires_exact_lines(self):
+        db_crashtest = self.load_db_crashtest()
+
+        self.assertEqual(
+            2,
+            db_crashtest.count_cf_lifecycle_successes(
+                "CF_LIFECYCLE_SUCCESS\n"
+                "NOT_CF_LIFECYCLE_SUCCESS\n"
+                "CF_LIFECYCLE_SUCCESS\n"
+            ),
+        )
+
+    def test_cf_lifecycle_requires_repeated_successful_recreation(self):
+        db_crashtest = self.load_db_crashtest()
+
+        self.assertEqual(
+            ["success"],
+            db_crashtest.missing_cf_lifecycle_coverage(
+                {"options": 1, "manifest": 1, "success": 1}
+            ),
+        )
+        self.assertEqual(
+            [],
+            db_crashtest.missing_cf_lifecycle_coverage(
+                {"options": 1, "manifest": 1, "success": 2}
+            ),
+        )
+
+    def test_final_verification_failure_is_lifecycle_only(self):
+        db_crashtest = self.load_db_crashtest()
+        ordinary_args = self.build_mode_args("blackbox")
+        lifecycle_args = self.build_mode_args("blackbox", cf_lifecycle=True)
+
+        self.assertFalse(
+            db_crashtest.cf_lifecycle_final_verification_failed(
+                ordinary_args, True, -15
+            )
+        )
+        self.assertTrue(
+            db_crashtest.cf_lifecycle_final_verification_failed(
+                lifecycle_args, True, -15
+            )
+        )
+        self.assertTrue(
+            db_crashtest.cf_lifecycle_final_verification_failed(
+                lifecycle_args, False, 1
+            )
+        )
+        self.assertFalse(
+            db_crashtest.cf_lifecycle_final_verification_failed(
+                lifecycle_args, False, 0
+            )
+        )
 
     def test_skip_verifydb_disables_verification_knobs(self):
         db_crashtest = self.load_db_crashtest()
@@ -658,6 +874,24 @@ class DBCrashTestTest(unittest.TestCase):
 
         self.assertEqual(self.expected_dir, expected_dir)
         self.assertTrue(os.path.exists(marker))
+
+    def test_finalize_keeps_parallel_compression_with_trie_index(self):
+        db_crashtest = self.load_db_crashtest()
+        for use_udi_as_primary_index in (0, 1):
+            with self.subTest(use_udi_as_primary_index=use_udi_as_primary_index):
+                params = self.build_params(
+                    db_crashtest.default_params,
+                    {
+                        "use_trie_index": 1,
+                        "use_udi_as_primary_index": use_udi_as_primary_index,
+                        "compression_parallel_threads": 4,
+                    },
+                )
+
+                finalized = db_crashtest.finalize_and_sanitize(params)
+
+                self.assertEqual(1, finalized["use_trie_index"])
+                self.assertEqual(4, finalized["compression_parallel_threads"])
 
     def test_finalize_disables_test_batches_snapshots_when_disable_wal(self):
         db_crashtest = self.load_db_crashtest()

@@ -1,0 +1,1 @@
+Fixed a debug-build assertion failure and incorrect cache charge and block-cache byte statistics in release builds when a full, strict-capacity LRU cache with metadata charging creates an uncharged standalone handle, including during secondary-cache promotion.

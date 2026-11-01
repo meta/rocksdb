@@ -11,10 +11,10 @@
 //      for low query latency on pure-memory or really low-latency media.
 //
 // A tutorial of rocksdb table formats is available here:
-//   https://github.com/facebook/rocksdb/wiki/A-Tutorial-of-RocksDB-SST-formats
+//   https://github.com/meta/rocksdb/wiki/A-Tutorial-of-RocksDB-SST-formats
 //
 // Example code is also available
-//   https://github.com/facebook/rocksdb/wiki/A-Tutorial-of-RocksDB-SST-formats#wiki-examples
+//   https://github.com/meta/rocksdb/wiki/A-Tutorial-of-RocksDB-SST-formats#wiki-examples
 
 #pragma once
 

@@ -65,7 +65,7 @@ Because the tombstone lives in the memtable, it follows the normal lifecycle fro
 
 ## Enabling it
 
-Range tombstone conversion landed in [PR #14448](https://github.com/facebook/rocksdb/pull/14448) (plus a few additional follow-up bug fixes) and is available in RocksDB 11.3.0 and later. It is controlled by the column-family option `min_tombstones_for_range_conversion`: the minimum length of a contiguous point-tombstone run that triggers a conversion. The default is `0`, which disables the feature. Set it to a positive value to turn it on; the option is dynamically changeable through `SetOptions`, so you can enable or tune it without reopening the database.
+Range tombstone conversion landed in [PR #14448](https://github.com/meta/rocksdb/pull/14448) (plus a few additional follow-up bug fixes) and is available in RocksDB 11.3.0 and later. It is controlled by the column-family option `min_tombstones_for_range_conversion`: the minimum length of a contiguous point-tombstone run that triggers a conversion. The default is `0`, which disables the feature. Set it to a positive value to turn it on; the option is dynamically changeable through `SetOptions`, so you can enable or tune it without reopening the database.
 
 ```cpp
 Options options;

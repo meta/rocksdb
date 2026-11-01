@@ -221,6 +221,8 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
       immutable_db_options.metadata_write_temperature;
   options.wal_write_temperature = immutable_db_options.wal_write_temperature;
   options.compaction_service = immutable_db_options.compaction_service;
+  options.use_separate_remote_compaction_pool =
+      mutable_db_options.use_separate_remote_compaction_pool;
   options.use_session_tmp_dir_for_remote_compaction =
       immutable_db_options.use_session_tmp_dir_for_remote_compaction;
   options.calculate_sst_write_lifetime_hint_set =
@@ -665,8 +667,13 @@ static bool ParseOptionHelper(void* opt_address, const OptionType& opt_type,
           compaction_stop_style_string_map, value,
           static_cast<CompactionStopStyle*>(opt_address));
     case OptionType::kEncodedString: {
-      std::string* output_addr = static_cast<std::string*>(opt_address);
-      (Slice(value)).DecodeHex(output_addr);
+      // DecodeHex() can write part of the result before it finds a bad digit,
+      // so keep the option unchanged until the whole value decodes.
+      std::string decoded;
+      if (!Slice(value).DecodeHex(&decoded)) {
+        return false;
+      }
+      *static_cast<std::string*>(opt_address) = std::move(decoded);
       break;
     }
     case OptionType::kTemperature: {

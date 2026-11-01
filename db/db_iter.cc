@@ -1933,6 +1933,15 @@ Status DBIter::ValidateScanOptions(const MultiScanArgs& multiscan_opts) const {
     return Status::InvalidArgument("Empty MultiScanArgs");
   }
 
+  if (multiscan_opts.rolling_prefetch &&
+      (!multiscan_opts.use_async_io || multiscan_opts.reverse ||
+       multiscan_opts.rolling_prefetch_window_size == 0)) {
+    ROCKS_LOG_WARN(
+        logger_,
+        "Ignoring MultiScanArgs::rolling_prefetch because its async, "
+        "forward, nonzero-window prerequisites are not satisfied");
+  }
+
   const std::vector<ScanOptions>& scan_opts = multiscan_opts.GetScanRanges();
   const bool has_limit = scan_opts.front().range.limit.has_value();
   if (multiscan_opts.reverse && !has_limit) {
@@ -1979,6 +1988,9 @@ Status DBIter::ValidateScanOptions(const MultiScanArgs& multiscan_opts) const {
 }
 
 Status DBIter::SetScanOptionsForPrepare(const MultiScanArgs& scan_opts) {
+  // Prepare() discards the current position, because child iterators may
+  // release the data blocks that key() and value() point into.
+  valid_ = false;
   status_ = ValidateScanOptions(scan_opts);
   if (!status_.ok()) {
     return status_;

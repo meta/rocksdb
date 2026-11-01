@@ -106,7 +106,7 @@ Slice SubcompactionState::LargestUserKey() const {
 }
 
 Status SubcompactionState::AddToOutput(
-    const CompactionIterator& iter, bool use_proximal_output,
+    CompactionIterator& iter, bool use_proximal_output,
     const CompactionFileOpenFunc& open_file_func,
     const CompactionFileCloseFunc& close_file_func,
     const ParsedInternalKey& prev_iter_output_internal_key) {
@@ -115,6 +115,22 @@ Status SubcompactionState::AddToOutput(
       use_proximal_output ? &proximal_level_outputs_ : &compaction_outputs_;
   return current_outputs_->AddToOutput(iter, open_file_func, close_file_func,
                                        prev_iter_output_internal_key);
+}
+
+Status SubcompactionState::UpdateBlobGarbageCheckpoint(
+    const BlobGarbageMeter* next_key_inflow) {
+  const BlobGarbageMeter* const meter =
+      compaction_outputs_.GetBlobGarbageMeter();
+  if (meter == nullptr) {
+    blob_garbage_checkpoint_.reset();
+    return Status::OK();
+  }
+  blob_garbage_checkpoint_ = std::make_unique<BlobGarbageMeter>(*meter);
+  if (next_key_inflow == nullptr || next_key_inflow->flows().empty()) {
+    return Status::OK();
+  }
+  blob_garbage_checkpoint_->ProcessOutFlow(*next_key_inflow);
+  return Status::OK();
 }
 
 }  // namespace ROCKSDB_NAMESPACE

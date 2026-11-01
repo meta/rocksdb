@@ -91,6 +91,7 @@ enum SubcompactionProgressCustomTag : uint32_t {
   kNumProcessedInputRecords = 3,
   kOutputLevelProgress = 4,
   kProximalOutputLevelProgress = 5,
+  kBlobCompactionProgress = 6,
   kSubcompactionProgressCustomTagSafeIgnoreMask = 1 << 16,
 };
 
@@ -603,6 +604,15 @@ struct SubcompactionProgress {
 
   SubcompactionProgressPerLevel proximal_output_level_progress;
 
+  // Blob state is checkpointed together with the SSTs that can reference it.
+  // The additions are delta-encoded across progress records, while garbage is
+  // a cumulative snapshot. The next number is the first unused number in the
+  // worker's pre-allocated range.
+  bool has_blob_compaction_progress = false;
+  std::vector<BlobFileAddition> blob_file_additions;
+  std::vector<BlobFileGarbage> blob_file_garbages;
+  uint64_t next_blob_file_number = kInvalidBlobFileNumber;
+
   SubcompactionProgress() = default;
 
   void Clear() {
@@ -610,6 +620,19 @@ struct SubcompactionProgress {
     num_processed_input_records = 0;
     output_level_progress.Clear();
     proximal_output_level_progress.Clear();
+    has_blob_compaction_progress = false;
+    blob_file_additions.clear();
+    blob_file_garbages.clear();
+    next_blob_file_number = kInvalidBlobFileNumber;
+    last_persisted_blob_file_additions_count_ = 0;
+  }
+
+  void UpdateLastPersistedBlobFileAdditionsCount() {
+    last_persisted_blob_file_additions_count_ = blob_file_additions.size();
+  }
+
+  size_t GetLastPersistedBlobFileAdditionsCount() const {
+    return last_persisted_blob_file_additions_count_;
   }
 
   void EncodeTo(std::string* dst) const;
@@ -648,9 +671,15 @@ struct SubcompactionProgress {
     oss << ", output_level_progress=" << output_level_progress.ToString();
     oss << ", proximal_output_level_progress="
         << proximal_output_level_progress.ToString();
+    oss << ", blob_file_additions_count=" << blob_file_additions.size();
+    oss << ", blob_file_garbages_count=" << blob_file_garbages.size();
+    oss << ", next_blob_file_number=" << next_blob_file_number;
     oss << " }";
     return oss.str();
   }
+
+ private:
+  size_t last_persisted_blob_file_additions_count_ = 0;
 };
 
 class VersionEdit;

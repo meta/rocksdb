@@ -208,28 +208,6 @@ class HashSkipListRep : public MemTableRep {
     // the underlying memtable
     const HashSkipListRep& memtable_rep_;
   };
-
-  class EmptyIterator : public MemTableRep::Iterator {
-    // This is used when there wasn't a bucket. It is cheaper than
-    // instantiating an empty bucket over which to iterate.
-   public:
-    EmptyIterator() = default;
-    bool Valid() const override { return false; }
-    const char* key() const override {
-      assert(false);
-      return nullptr;
-    }
-    void Next() override {}
-    void Prev() override {}
-    void Seek(const Slice& /*internal_key*/,
-              const char* /*memtable_key*/) override {}
-    void SeekForPrev(const Slice& /*internal_key*/,
-                     const char* /*memtable_key*/) override {}
-    void SeekToFirst() override {}
-    void SeekToLast() override {}
-
-   private:
-  };
 };
 
 HashSkipListRep::HashSkipListRep(const MemTableRep::KeyComparator& compare,

@@ -106,7 +106,6 @@ class LockTest : public testing::Test {
       fprintf(stderr, "Fork failed\n");
       return false;
     }
-    return false;
 
 #endif
   }

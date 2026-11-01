@@ -1,4 +1,4 @@
-name: facebook/rocksdb/pr-jobs-candidate
+name: meta/rocksdb/pr-jobs-candidate
 on: workflow_dispatch
 permissions: {}
 jobs:
@@ -6,7 +6,7 @@ jobs:
   # some reason.
   # =========================== ARM Jobs ============================ #
   build-linux-arm:
-    if: ${{ github.repository_owner == 'facebook' }}
+    if: ${{ github.repository_owner == 'meta' }}
     runs-on:
       labels: arm64large # GitHub hosted ARM runners do not yet exist
     steps:
@@ -14,9 +14,8 @@ jobs:
     - uses: "./.github/actions/pre-steps"
     - uses: "./.github/actions/install-gflags"
     - run: ROCKSDBTESTS_PLATFORM_DEPENDENT=only make V=1 J=4 -j4 all_but_some_tests check_some
-    - uses: "./.github/actions/post-steps"
   build-linux-arm-cmake-no_test_run:
-    if: ${{ github.repository_owner == 'facebook' }}
+    if: ${{ github.repository_owner == 'meta' }}
     runs-on:
       labels: arm64large # GitHub hosted ARM runners do not yet exist
     env:
@@ -44,4 +43,3 @@ jobs:
         cd build
         cmake -DJNI=1 -DCMAKE_BUILD_TYPE=Release -DWITH_GFLAGS=1 ..
         make -j4 rocksdb rocksdbjni
-    - uses: "./.github/actions/post-steps"

@@ -3,7 +3,10 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <algorithm>
+#include <atomic>
 #include <memory>
+#include <mutex>
 
 #include "db/blob/blob_index.h"
 #include "db/db_impl/db_impl.h"
@@ -11,6 +14,7 @@
 #include "db/dbformat.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
+#include "env/composite_env_wrapper.h"
 #include "file/filename.h"
 #include "monitoring/statistics_impl.h"
 #include "rocksdb/cache.h"
@@ -27,6 +31,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/defer.h"
 #include "util/hash.h"
 #include "util/mutexlock.h"
 #include "util/rate_limiter_impl.h"
@@ -1101,6 +1106,188 @@ TEST_F(EventListenerTest, TableFileCreationListenersTest) {
   ASSERT_TRUE(listener->last_failure_.IsAborted());
 
   Close();  // Avoid UAF on listener
+}
+
+class TableFileCopyListener : public EventListener {
+ public:
+  // Fails creating table files written cold, which here only temperature
+  // change copies are
+  class FailColdWritesFS : public FileSystemWrapper {
+   public:
+    explicit FailColdWritesFS(const std::shared_ptr<FileSystem>& t)
+        : FileSystemWrapper(t) {}
+    static const char* kClassName() { return "FailColdWritesFS"; }
+    const char* Name() const override { return kClassName(); }
+
+    IOStatus NewWritableFile(const std::string& fname, const FileOptions& opts,
+                             std::unique_ptr<FSWritableFile>* result,
+                             IODebugContext* dbg) override {
+      if (fail_cold_writes_.load() && opts.temperature == Temperature::kCold) {
+        return IOStatus::NotSupported("injected");
+      }
+      return target()->NewWritableFile(fname, opts, result, dbg);
+    }
+
+    std::atomic<bool> fail_cold_writes_{false};
+  };
+
+  void OnTableFileCreationStarted(
+      const TableFileCreationBriefInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    started_.push_back(info);
+  }
+
+  void OnTableFileCreated(const TableFileCreationInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    created_.push_back(info);
+  }
+
+  void OnCompactionCompleted(DB* /*db*/, const CompactionJobInfo& ci) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (ci.compaction_reason == CompactionReason::kChangeTemperature) {
+      temperature_changes_.push_back(ci);
+    }
+  }
+
+  // Only after checking every recorded status, as copying or moving a Status
+  // (also by vector growth) leaves the new one unchecked
+  void Clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    started_.clear();
+    created_.clear();
+    temperature_changes_.clear();
+  }
+
+  std::mutex mutex_;
+  std::vector<TableFileCreationBriefInfo> started_;
+  std::vector<TableFileCreationInfo> created_;
+  std::vector<CompactionJobInfo> temperature_changes_;
+};
+
+TEST_F(EventListenerTest, TableFileCreationByFIFOTemperatureChangeCopy) {
+  auto listener = std::make_shared<TableFileCopyListener>();
+  auto test_fs = std::make_shared<TableFileCopyListener::FailColdWritesFS>(
+      env_->GetFileSystem());
+  std::unique_ptr<Env> test_env(new CompositeEnvWrapper(env_, test_fs));
+  Options options = CurrentOptions();
+  options.env = test_env.get();
+  options.listeners.push_back(listener);
+  options.compaction_style = kCompactionStyleFIFO;
+  options.num_levels = 1;
+  // Needed for the newest key times that make files old enough
+  options.max_open_files = -1;
+  options.compaction_options_fifo.file_temperature_age_thresholds = {
+      {Temperature::kCold, 1000}};
+  options.compaction_options_fifo.max_table_files_size = 100000000;
+  options.compaction_options_fifo.allow_trivial_copy_when_change_temperature =
+      true;
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+  // Close before test_env goes away, also on early return
+  const Defer close_db([this]() { Close(); });
+
+  ASSERT_OK(Put("a", "value"));
+  ASSERT_OK(Flush());
+  {
+    std::lock_guard<std::mutex> lock(listener->mutex_);
+    ASSERT_EQ(listener->created_.size(), 1U);
+    ASSERT_EQ(listener->created_[0].reason, TableFileCreationReason::kFlush);
+    ASSERT_OK(listener->created_[0].status);
+  }
+  TablePropertiesCollection old_props;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&old_props));
+  ASSERT_EQ(old_props.size(), 1U);
+  const std::string old_path = old_props.begin()->first;
+  const std::shared_ptr<const TableProperties> old_tp =
+      old_props.begin()->second;
+  listener->Clear();
+
+  // The file becomes old enough to be copied cold
+  env_->MockSleepForSeconds(1200);
+  ASSERT_OK(Put("b", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  {
+    std::lock_guard<std::mutex> lock(listener->mutex_);
+    ASSERT_EQ(listener->temperature_changes_.size(), 1U);
+    const CompactionJobInfo& ci = listener->temperature_changes_[0];
+    ASSERT_OK(ci.status);
+    ASSERT_EQ(ci.input_files, std::vector<std::string>{old_path});
+    ASSERT_EQ(ci.output_files.size(), 1U);
+    const std::string& copy_path = ci.output_files[0];
+    ASSERT_NE(copy_path, old_path);
+
+    // The flush and the copy, each started and created once
+    ASSERT_EQ(listener->started_.size(), 2U);
+    ASSERT_EQ(listener->created_.size(), 2U);
+    for (const TableFileCreationInfo& info : listener->created_) {
+      ASSERT_OK(info.status);
+    }
+    auto started_it =
+        std::find_if(listener->started_.begin(), listener->started_.end(),
+                     [&](const TableFileCreationBriefInfo& i) {
+                       return i.file_path == copy_path;
+                     });
+    ASSERT_NE(started_it, listener->started_.end());
+    ASSERT_EQ(started_it->reason, TableFileCreationReason::kCompaction);
+    auto created_it =
+        std::find_if(listener->created_.begin(), listener->created_.end(),
+                     [&](const TableFileCreationInfo& i) {
+                       return i.file_path == copy_path;
+                     });
+    ASSERT_NE(created_it, listener->created_.end());
+    const TableFileCreationInfo& created = *created_it;
+    ASSERT_EQ(created.reason, TableFileCreationReason::kCompaction);
+    ASSERT_GT(created.job_id, 0);
+    uint64_t copy_size = 0;
+    ASSERT_OK(env_->GetFileSize(copy_path, &copy_size));
+    ASSERT_EQ(created.file_size, copy_size);
+
+    // A copy has exactly the properties of its original, including its
+    // original file number and so its unique ID
+    for (const TableProperties* tp :
+         {&created.table_properties, ci.table_properties.at(copy_path).get()}) {
+      ASSERT_EQ(tp->orig_file_number, old_tp->orig_file_number);
+      ASSERT_EQ(tp->db_session_id, old_tp->db_session_id);
+      ASSERT_EQ(tp->num_entries, old_tp->num_entries);
+      ASSERT_EQ(tp->data_size, old_tp->data_size);
+    }
+  }
+  listener->Clear();
+
+  // A copy that fails to create its file still finishes the creation it
+  // started. The failure is a fatal background error, so there is exactly one,
+  // whether this compaction or an automatic one attempts it.
+  test_fs->fail_cold_writes_ = true;
+  ASSERT_OK(Put("c", "value"));
+  ASSERT_OK(Flush());
+  env_->MockSleepForSeconds(1200);
+  ASSERT_EQ(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr).code(),
+            Status::Code::kNotSupported);
+  ASSERT_EQ(dbfull()->TEST_WaitForCompact().code(),
+            Status::Code::kNotSupported);
+
+  {
+    std::lock_guard<std::mutex> lock(listener->mutex_);
+    ASSERT_EQ(listener->temperature_changes_.size(), 1U);
+    ASSERT_EQ(listener->temperature_changes_[0].status.code(),
+              Status::Code::kNotSupported);
+    // The flush and the failed copy
+    ASSERT_EQ(listener->started_.size(), 2U);
+    ASSERT_EQ(listener->created_.size(), 2U);
+    for (size_t i = 0; i < 2; ++i) {
+      const TableFileCreationInfo& created = listener->created_[i];
+      ASSERT_EQ(created.file_path, listener->started_[i].file_path);
+      if (created.reason == TableFileCreationReason::kFlush) {
+        ASSERT_OK(created.status);
+      } else {
+        ASSERT_EQ(created.reason, TableFileCreationReason::kCompaction);
+        ASSERT_EQ(created.status.code(), Status::Code::kNotSupported);
+      }
+    }
+    ASSERT_NE(listener->created_[0].reason, listener->created_[1].reason);
+  }
 }
 
 class MemTableSealedListener : public EventListener {

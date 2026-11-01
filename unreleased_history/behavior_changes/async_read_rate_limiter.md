@@ -1,0 +1,1 @@
+Asynchronous file reads (`FSRandomAccessFile::ReadAsync`, used with `ReadOptions::async_io` by `MultiGet` and iterator prefetching) are now charged to `DBOptions::rate_limiter` at `ReadOptions::rate_limiter_priority`, like synchronous reads. A read is charged once the file system accepts it.

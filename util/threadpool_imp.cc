@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -101,6 +102,12 @@ struct ThreadPoolImpl::Impl {
   // Set the thread priority.
   void SetThreadPriority(Env::Priority priority) { priority_ = priority; }
 
+  void SetThreadName(const std::string& name) {
+    std::lock_guard<std::mutex> lock(mu_);
+    assert(bgthreads_.empty());
+    thread_name_ = name;
+  }
+
   int ReserveThreads(int threads_to_be_reserved) {
     std::unique_lock<std::mutex> lock(mu_);
     // We can reserve at most num_waiting_threads_ in total so the number of
@@ -131,6 +138,7 @@ struct ThreadPoolImpl::Impl {
   bool low_io_priority_;
   CpuPriority cpu_priority_;
   Env::Priority priority_;
+  std::string thread_name_;
   Env* env_;
 
   int total_threads_limit_;
@@ -371,7 +379,13 @@ void ThreadPoolImpl::Impl::SetBackgroundThreadsInternal(int num,
       (num < total_threads_limit_ && allow_reduce)) {
     total_threads_limit_ = std::max(0, num);
     WakeUpAllThreads();
-    StartBGThreads();
+    try {
+      StartBGThreads();
+    } catch (...) {
+      total_threads_limit_ = static_cast<int>(bgthreads_.size());
+      WakeUpAllThreads();
+      throw;
+    }
   }
 }
 
@@ -381,25 +395,39 @@ int ThreadPoolImpl::Impl::GetBackgroundThreads() {
 }
 
 void ThreadPoolImpl::Impl::StartBGThreads() {
+  if (static_cast<int>(bgthreads_.size()) < total_threads_limit_) {
+    bgthreads_.reserve(static_cast<size_t>(total_threads_limit_));
+  }
   // Start background thread if necessary
   while ((int)bgthreads_.size() < total_threads_limit_) {
-    port::Thread p_t(&BGThreadWrapper,
-                     new BGThreadMetadata(this, bgthreads_.size()));
+    auto metadata = std::make_unique<BGThreadMetadata>(this, bgthreads_.size());
+#ifndef NDEBUG
+    std::function<void()> before_create;
+    TEST_SYNC_POINT_CALLBACK("ThreadPoolImpl::StartBGThreads:BeforeCreate",
+                             &before_create);
+    if (before_create) {
+      before_create();
+    }
+#endif
+    port::Thread p_t(&BGThreadWrapper, metadata.get());
+    metadata.release();
+    bgthreads_.push_back(std::move(p_t));
 
 // Set the thread name to aid debugging
 #if defined(_GNU_SOURCE) && defined(__GLIBC_PREREQ)
 #if __GLIBC_PREREQ(2, 12)
-    auto th_handle = p_t.native_handle();
+    auto th_handle = bgthreads_.back().native_handle();
     std::string thread_priority = Env::PriorityToString(GetThreadPriority());
     std::ostringstream thread_name_stream;
     thread_name_stream << "rocksdb:";
     for (char c : thread_priority) {
       thread_name_stream << static_cast<char>(tolower(c));
     }
-    pthread_setname_np(th_handle, thread_name_stream.str().c_str());
+    const std::string name =
+        thread_name_.empty() ? thread_name_stream.str() : thread_name_;
+    pthread_setname_np(th_handle, name.c_str());
 #endif
 #endif
-    bgthreads_.push_back(std::move(p_t));
   }
 }
 
@@ -412,6 +440,14 @@ void ThreadPoolImpl::Impl::Submit(std::function<void()>&& schedule,
     return;
   }
 
+#ifndef NDEBUG
+  std::function<void()> before_enqueue;
+  TEST_SYNC_POINT_CALLBACK("ThreadPoolImpl::Submit:BeforeEnqueue",
+                           &before_enqueue);
+  if (before_enqueue) {
+    before_enqueue();
+  }
+#endif
   StartBGThreads();
 
   // Add to priority queue
@@ -446,6 +482,14 @@ int ThreadPoolImpl::Impl::UnSchedule(void* arg) {
     BGQueue::iterator it = queue_.begin();
     while (it != queue_.end()) {
       if (arg == (*it).tag) {
+#ifndef NDEBUG
+        std::function<void()> before_remove;
+        TEST_SYNC_POINT_CALLBACK("ThreadPoolImpl::UnSchedule:BeforeRemove",
+                                 &before_remove);
+        if (before_remove) {
+          before_remove();
+        }
+#endif
         if (it->unschedFunction) {
           candidates.push_back(std::move(it->unschedFunction));
         }
@@ -544,6 +588,94 @@ int ThreadPoolImpl::ReserveThreads(int threads_to_be_reserved) {
 // Release a specific number of threads
 int ThreadPoolImpl::ReleaseThreads(int threads_to_be_released) {
   return impl_->ReleaseThreads(threads_to_be_released);
+}
+
+void ThreadPoolImpl::SetThreadName(const std::string& name) {
+  impl_->SetThreadName(name);
+}
+
+std::shared_ptr<RemoteCompactionThreadPool>
+RemoteCompactionThreadPool::GetShared(bool create_if_missing) {
+  static std::mutex mutex;
+  static std::weak_ptr<RemoteCompactionThreadPool> shared;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto pool = shared.lock();
+  if (!pool && create_if_missing) {
+    pool = std::make_shared<RemoteCompactionThreadPool>();
+    shared = pool;
+  }
+  return pool;
+}
+
+RemoteCompactionThreadPool::RemoteCompactionThreadPool() {
+  TEST_SYNC_POINT("RemoteCompactionThreadPool::Created");
+  pool_.SetHostEnv(Env::Default());
+  pool_.SetThreadName("rocksdb:remote");
+}
+
+RemoteCompactionThreadPool::~RemoteCompactionThreadPool() {
+  pool_.WaitForJobsAndJoinAllThreads();
+}
+
+uint64_t RemoteCompactionThreadPool::NowNanos() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+int RemoteCompactionThreadPool::Baseline() const {
+  int baseline = 0;
+  for (const auto& client : client_baselines_) {
+    baseline = std::max(baseline, client.second);
+  }
+  return baseline;
+}
+
+void RemoteCompactionThreadPool::SubmitJob(std::function<void()> work,
+                                           const void* client, int baseline) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  client_baselines_[client] = baseline;
+  pool_.IncBackgroundThreadsIfNeeded(std::max(Baseline(), jobs_ + 1));
+  pool_.SubmitJob(std::move(work));
+  ++jobs_;
+  last_activity_nanos_ = NowNanos();
+}
+
+void RemoteCompactionThreadPool::CompleteJob() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  assert(jobs_ > 0);
+  --jobs_;
+  last_activity_nanos_ = NowNanos();
+}
+
+void RemoteCompactionThreadPool::Shrink(const void* client, int baseline) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (baseline > 0) {
+    client_baselines_[client] = baseline;
+  } else {
+    client_baselines_.erase(client);
+  }
+  if (jobs_ != 0 || pool_.GetBackgroundThreads() == 0) {
+    return;
+  }
+  uint64_t idle_nanos = NowNanos() - last_activity_nanos_;
+  TEST_SYNC_POINT_CALLBACK("RemoteCompactionThreadPool::Shrink:IdleNanos",
+                           &idle_nanos);
+  constexpr uint64_t kIdlePeriodNanos = 30ULL * 1000 * 1000 * 1000;
+  if (idle_nanos >= kIdlePeriodNanos &&
+      pool_.GetBackgroundThreads() > Baseline()) {
+    pool_.SetBackgroundThreads(Baseline());
+  }
+}
+
+void RemoteCompactionThreadPool::RemoveClient(const void* client) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  client_baselines_.erase(client);
+}
+
+int RemoteCompactionThreadPool::GetBackgroundThreads() {
+  return pool_.GetBackgroundThreads();
 }
 
 ThreadPool* NewThreadPool(int num_threads) {

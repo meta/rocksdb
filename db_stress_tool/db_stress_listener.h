@@ -302,7 +302,13 @@ class DbStressListener : public EventListener {
              info.table_properties.num_range_deletions > 0);
       assert(info.table_properties.raw_key_size > 0);
       assert(info.table_properties.num_entries > 0);
-      VerifyTableFileUniqueId(info.table_properties, info.file_path);
+      // A copy of an existing table file (e.g. for a FIFO temperature change)
+      // keeps the original's properties, so its unique ID is not new. It was
+      // verified when the original was created.
+      if (info.table_properties.orig_file_number ==
+          FileNumberFromPath(info.file_path)) {
+        VerifyTableFileUniqueId(info.table_properties, info.file_path);
+      }
     }
     --num_pending_file_creations_;
   }

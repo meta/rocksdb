@@ -475,6 +475,9 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
                     result.preclude_last_level_data_seconds > 0)) {
     // With no writes coming in, we don't need periodic SeqnoToTime entries.
     // Existing SST files may or may not have that info associated with them.
+    // Remote compaction runs in a secondary (read-only) instance but writes
+    // files, so it restores both from the primary. See
+    // DBImplSecondary::CompactWithoutInstallation().
     ROCKS_LOG_WARN(
         db_options.info_log.get(),
         "preserve_internal_time_seconds and preclude_last_level_data_seconds "

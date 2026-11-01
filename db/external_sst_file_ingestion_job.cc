@@ -704,7 +704,11 @@ Status ExternalSstFileIngestionJob::Run() {
   edit_.SetColumnFamily(cfd_->GetID());
 
   if (atomic_replace_range_.has_value()) {
-    auto* vstorage = super_version->current->storage_info();
+    // A grouped MANIFEST write can advance current before publishing its SV.
+    files_to_replace_version_ = cfd_->current();
+    files_to_replace_version_->Ref();
+    auto* vstorage = files_to_replace_version_->storage_info();
+    files_to_replace_.clear();
     if (atomic_replace_range_->unset()) {
       if (cfd_->compaction_picker()->IsCompactionInProgress()) {
         return Status::InvalidArgument(
@@ -712,8 +716,10 @@ Status ExternalSstFileIngestionJob::Run() {
       }
       for (int lvl = 0; lvl < cfd_->NumberLevels(); lvl++) {
         for (auto file : vstorage->LevelFiles(lvl)) {
-          // Set up to delete file to be replaced
-          edit_.DeleteFile(lvl, file->fd.GetNumber());
+          status = AddFileToReplace(lvl, file);
+          if (!status.ok()) {
+            return status;
+          }
         }
       }
     } else {
@@ -733,8 +739,10 @@ Status ExternalSstFileIngestionJob::Run() {
                                            file->smallest, file->largest)) {
             if (file_range_checker_.Contains(*atomic_replace_range_,
                                              file->smallest, file->largest)) {
-              // Set up to delete file to be replaced
-              edit_.DeleteFile(lvl, file->fd.GetNumber());
+              status = AddFileToReplace(lvl, file);
+              if (!status.ok()) {
+                return status;
+              }
             } else {
               has_partial_overlap = true;
             }
@@ -768,8 +776,8 @@ Status ExternalSstFileIngestionJob::Run() {
   // LSM tree than later overlapping batches.
   for (auto& batch : file_batches_to_ingest_) {
     int batch_uppermost_level = 0;
-    status = AssignLevelsForOneBatch(batch, super_version, force_global_seqno,
-                                     &last_seqno, &batch_uppermost_level,
+    status = AssignLevelsForOneBatch(batch, force_global_seqno, &last_seqno,
+                                     &batch_uppermost_level,
                                      prev_batch_uppermost_level);
     if (!status.ok()) {
       ROCKS_LOG_WARN(db_options_.info_log,
@@ -786,9 +794,8 @@ Status ExternalSstFileIngestionJob::Run() {
 }
 
 Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
-    FileBatchInfo& batch, SuperVersion* super_version, bool force_global_seqno,
-    SequenceNumber* last_seqno, int* batch_uppermost_level,
-    std::optional<int> prev_batch_uppermost_level) {
+    FileBatchInfo& batch, bool force_global_seqno, SequenceNumber* last_seqno,
+    int* batch_uppermost_level, std::optional<int> prev_batch_uppermost_level) {
   Status status;
   assert(batch_uppermost_level);
   *batch_uppermost_level = std::numeric_limits<int>::max();
@@ -799,8 +806,8 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
       status = CheckLevelForIngestedBehindFile(file);
     } else {
       status = AssignLevelAndSeqnoForIngestedFile(
-          super_version, force_global_seqno, cfd_->ioptions().compaction_style,
-          *last_seqno, file, &assigned_seqno, prev_batch_uppermost_level);
+          force_global_seqno, cfd_->ioptions().compaction_style, *last_seqno,
+          file, &assigned_seqno, prev_batch_uppermost_level);
     }
 
     // Modify the smallest/largest internal key to include the sequence number
@@ -986,13 +993,42 @@ void ExternalSstFileIngestionJob::CreateEquivalentFileIngestingCompactions() {
   }
 }
 
+Status ExternalSstFileIngestionJob::AddFileToReplace(int level,
+                                                     FileMetaData* file) {
+  // Range checks against registered compactions do not cover every input
+  // file, e.g. inputs of a compaction outputting to a different level or
+  // files marked by DeleteFilesInRanges().
+  if (file->being_compacted) {
+    return Status::InvalidArgument(
+        "Atomic replace range overlaps with pending compaction");
+  }
+  edit_.DeleteFile(level, file->fd.GetNumber());
+  files_to_replace_.push_back(file);
+  return Status::OK();
+}
+
 void ExternalSstFileIngestionJob::RegisterRange() {
   for (const auto& c : file_ingesting_compactions_) {
     cfd_->compaction_picker()->RegisterCompaction(c);
   }
+  // Compaction pickers only skip files marked as being compacted. Universal
+  // compaction does not check range overlap for L0 outputs, so without this a
+  // compaction picked while LogAndApply() has released the DB mutex can take
+  // a replaced file as input and later fail to delete it from the LSM tree.
+  for (FileMetaData* f : files_to_replace_) {
+    assert(!f->being_compacted);
+    f->being_compacted = true;
+  }
+  files_to_replace_marked_ = true;
+  if (!files_to_replace_.empty()) {
+    cfd_->current()
+        ->storage_info()
+        ->RemoveFilesBeingCompactedFromCompactionCandidates();
+  }
 }
 
-void ExternalSstFileIngestionJob::UnregisterRange() {
+void ExternalSstFileIngestionJob::UnregisterRange(
+    bool restore_compaction_candidates) {
   for (const auto& c : file_ingesting_compactions_) {
     cfd_->compaction_picker()->UnregisterCompaction(c);
     delete c;
@@ -1003,6 +1039,24 @@ void ExternalSstFileIngestionJob::UnregisterRange() {
     delete f;
   }
   compaction_input_metdatas_.clear();
+
+  if (files_to_replace_marked_) {
+    for (FileMetaData* f : files_to_replace_) {
+      assert(f->being_compacted);
+      f->being_compacted = false;
+    }
+    files_to_replace_marked_ = false;
+    if (restore_compaction_candidates && !files_to_replace_.empty()) {
+      cfd_->current()->storage_info()->ComputeCompactionScore(
+          cfd_->ioptions(), cfd_->GetLatestMutableCFOptions(),
+          cfd_->GetFullHistoryTsLow());
+    }
+  }
+  files_to_replace_.clear();
+  if (files_to_replace_version_ != nullptr) {
+    files_to_replace_version_->Unref();
+    files_to_replace_version_ = nullptr;
+  }
 }
 
 void ExternalSstFileIngestionJob::UpdateStats() {
@@ -1624,7 +1678,7 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
 }
 
 Status ExternalSstFileIngestionJob::AssignLevelAndSeqnoForIngestedFile(
-    SuperVersion* sv, bool force_global_seqno, CompactionStyle compaction_style,
+    bool force_global_seqno, CompactionStyle compaction_style,
     SequenceNumber last_seqno, IngestedFileInfo* file_to_ingest,
     SequenceNumber* assigned_seqno,
     std::optional<int> prev_batch_uppermost_level) {
@@ -1700,7 +1754,7 @@ Status ExternalSstFileIngestionJob::AssignLevelAndSeqnoForIngestedFile(
       break;
     } else if (vstorage->NumLevelFiles(lvl) > 0) {
       bool overlap_with_level = false;
-      status = sv->current->OverlapWithLevelIterator(
+      status = cfd_->current()->OverlapWithLevelIterator(
           ro, env_options_, file_to_ingest->start_ukey,
           file_to_ingest->limit_ukey, lvl, &overlap_with_level);
       if (!status.ok()) {

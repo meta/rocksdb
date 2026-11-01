@@ -40,7 +40,8 @@ class SstFileReader;
 // CoGet() and CoMultiGet() populate TLS with stats for only that operation.
 // Set the desired stats configuration on the thread that starts or awaits each
 // task. Starting the task captures that configuration and resets it to
-// disabled.
+// disabled. SetAsyncReadCPUTimeEnabled() (rocksdb/perf_level.h) is part of
+// that configuration.
 // They can resume their callers on a different thread, so reading TLS after
 // awaiting them is not valid. To consume coroutine stats, override the
 // protected CoroStackableDB hook and copy the TLS values immediately after

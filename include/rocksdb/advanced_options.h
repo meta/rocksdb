@@ -641,7 +641,7 @@ struct AdvancedColumnFamilyOptions {
   // Compaction priority will take into account estimated bytes to be compacted
   // down to a level and favors compacting lower levels when there is a write
   // traffic spike (and hence more compaction debt). Refer to
-  // https://github.com/facebook/rocksdb/wiki/Leveled-Compactio#option-level_compaction_dynamic_level_bytes-and-levels-target-size
+  // https://github.com/meta/rocksdb/wiki/Leveled-Compactio#option-level_compaction_dynamic_level_bytes-and-levels-target-size
   // for more detailed description. See more implementation detail in:
   // VersionStorageInfo::ComputeCompactionScore().
   //
@@ -660,7 +660,7 @@ struct AdvancedColumnFamilyOptions {
   // - Since RocksDB v8.2, users can just restart DB with this option on, as
   //   long as num_levels is no smaller than number of non-empty levels in the
   //   LSM. Migration will be done automatically by RocksDB. See more in
-  //   https://github.com/facebook/rocksdb/wiki/Leveled-Compaction#migrating-from-level_compaction_dynamic_level_bytesfalse-to-level_compaction_dynamic_level_bytestrue
+  //   https://github.com/meta/rocksdb/wiki/Leveled-Compaction#migrating-from-level_compaction_dynamic_level_bytesfalse-to-level_compaction_dynamic_level_bytestrue
   //
   // Default: true
   bool level_compaction_dynamic_level_bytes = true;
@@ -852,7 +852,7 @@ struct AdvancedColumnFamilyOptions {
   // and it can only be populated through import and ingestion. It is intended
   // to protect "ingestion only" column families. This option is not currently
   // supported on the default column family because of error handling challenges
-  // analogous to https://github.com/facebook/rocksdb/issues/13429
+  // analogous to https://github.com/meta/rocksdb/issues/13429
   //
   // This option is not mutable with SetOptions(). It can be changed between
   // DB::Open() calls, but open will fail if recovering WAL writes to a CF with

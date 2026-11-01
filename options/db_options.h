@@ -163,6 +163,7 @@ struct MutableDBOptions {
   bool optimize_manifest_for_recovery;
   bool fast_sst_open;
   bool remote_compaction_manifest_floor;
+  bool use_separate_remote_compaction_pool;
 };
 
 Status GetStringFromMutableDBOptions(const ConfigOptions& config_options,

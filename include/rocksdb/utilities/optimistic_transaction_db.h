@@ -36,7 +36,7 @@ enum class OccValidationPolicy {
   // Isolation validation is processed single-threaded(since in the
   // write-group).
   // May suffer from high mutex contention, as per this link:
-  // https://github.com/facebook/rocksdb/issues/4402
+  // https://github.com/meta/rocksdb/issues/4402
   kValidateSerial = 0,
   // Validate parallelly before commit stage, BEFORE entering the write-group to
   // reduce mutex contention. Each txn acquires locks for its write-set

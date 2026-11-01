@@ -321,7 +321,7 @@ Status BlobFilePartitionManager::FinalizeBlobFile(
     s = blob_callback_->OnBlobFileCompleted(
         blob_file_path, column_family_name_, /*job_id=*/0, file_number,
         BlobFileCreationReason::kFlush, s, checksum_value, checksum_method,
-        blob_count, total_blob_bytes);
+        blob_count, total_blob_bytes, /*set_bg_error_on_space_limit=*/true);
     if (!s.ok()) {
       return s;
     }
@@ -543,10 +543,11 @@ Status BlobFilePartitionManager::WriteBlob(
   return Status::OK();
 }
 
-void BlobFilePartitionManager::RotateCurrentGeneration() {
+void BlobFilePartitionManager::RotateCurrentGeneration(uint64_t memtable_id) {
   MutexLock lock(&mutex_);
 
   GenerationBatch batch;
+  batch.memtable_id = memtable_id;
   batch.sealed_files = std::move(current_generation_sealed_files_);
   current_generation_sealed_files_.clear();
 
@@ -569,8 +570,19 @@ void BlobFilePartitionManager::RotateCurrentGeneration() {
   pending_generations_.emplace_back(std::move(batch));
 }
 
+BlobFilePartitionManager::GenerationBatch*
+BlobFilePartitionManager::FindPendingGeneration(uint64_t memtable_id) {
+  for (auto& batch : pending_generations_) {
+    if (batch.memtable_id == memtable_id) {
+      return &batch;
+    }
+  }
+  return nullptr;
+}
+
 Status BlobFilePartitionManager::PrepareFlushAdditions(
-    const WriteOptions& write_options, size_t num_generations,
+    const WriteOptions& write_options,
+    const std::vector<uint64_t>& memtable_ids,
     std::vector<BlobFileAddition>* additions,
     std::vector<BlobFileGarbage>* garbages,
     std::vector<std::vector<uint64_t>>* generation_blob_file_numbers) {
@@ -583,13 +595,13 @@ Status BlobFilePartitionManager::PrepareFlushAdditions(
   }
 
   MutexLock lock(&mutex_);
-  if (num_generations > pending_generations_.size()) {
-    return Status::Corruption(
-        "Missing blob direct write generation metadata for flush");
-  }
-
-  for (size_t i = 0; i < num_generations; ++i) {
-    GenerationBatch& batch = pending_generations_[i];
+  for (const uint64_t memtable_id : memtable_ids) {
+    GenerationBatch* const batch_ptr = FindPendingGeneration(memtable_id);
+    if (batch_ptr == nullptr) {
+      return Status::Corruption(
+          "Missing blob direct write generation metadata for flush");
+    }
+    GenerationBatch& batch = *batch_ptr;
     while (!batch.deferred_files.empty()) {
       DeferredFile deferred = std::move(batch.deferred_files.front());
       batch.deferred_files.pop_front();
@@ -668,12 +680,22 @@ Status BlobFilePartitionManager::MarkBlobWriteAsGarbage(uint64_t file_number,
   return Status::Corruption(message);
 }
 
-void BlobFilePartitionManager::CommitPreparedGenerations(
-    size_t num_generations) {
-  MutexLock lock(&mutex_);
-  while (num_generations-- > 0 && !pending_generations_.empty()) {
-    pending_generations_.pop_front();
+void BlobFilePartitionManager::CommitFlushedGenerations(
+    uint64_t earliest_unflushed_memtable_id) {
+  std::vector<uint64_t> sealed_file_numbers;
+  {
+    MutexLock lock(&mutex_);
+    while (!pending_generations_.empty() &&
+           pending_generations_.front().memtable_id <
+               earliest_unflushed_memtable_id) {
+      for (const auto& sealed_file :
+           pending_generations_.front().sealed_files) {
+        sealed_file_numbers.push_back(sealed_file.addition.GetBlobFileNumber());
+      }
+      pending_generations_.pop_front();
+    }
   }
+  RemoveFilePartitionMappings(sealed_file_numbers);
 }
 
 Status BlobFilePartitionManager::SyncAllOpenFiles(

@@ -130,7 +130,7 @@ class Writer {
 
   size_t TEST_block_offset() const { return block_offset_; }
 
-  SequenceNumber GetLastSeqnoRecorded() const { return last_seqno_recorded_; };
+  SequenceNumber GetLastSeqnoRecorded() const { return last_seqno_recorded_; }
 
  private:
   std::unique_ptr<WritableFileWriter> dest_;

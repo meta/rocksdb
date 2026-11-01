@@ -401,7 +401,6 @@ class BackupEngineImpl {
     void SetSequenceNumber(uint64_t sequence_number) {
       sequence_number_ = sequence_number;
     }
-    uint64_t GetSequenceNumber() const { return sequence_number_; }
 
     const std::string& GetAppMetadata() const { return app_metadata_; }
 
@@ -418,14 +417,6 @@ class BackupEngineImpl {
     IOStatus Delete(bool delete_meta = true);
 
     bool Empty() const { return files_.empty(); }
-
-    std::shared_ptr<FileInfo> GetFile(const std::string& filename) const {
-      auto it = file_infos_->find(filename);
-      if (it == file_infos_->end()) {
-        return nullptr;
-      }
-      return it->second;
-    }
 
     const std::vector<std::shared_ptr<FileInfo>>& GetFiles() const {
       return files_;
@@ -606,8 +597,6 @@ class BackupEngineImpl {
     std::string dst_path_tmp;
     std::string dst_path;
     std::string dst_relative;
-    BackupAfterCopyOrCreateWorkItem()
-        : shared(false), needed_to_copy(false), backup_env(nullptr) {}
 
     BackupAfterCopyOrCreateWorkItem(
         BackupAfterCopyOrCreateWorkItem&& o) noexcept {
@@ -679,7 +668,6 @@ class BackupEngineImpl {
     std::string from_file;
     std::string to_file;
     std::string checksum_hex;
-    RestoreAfterCopyOrCreateWorkItem() {}
     RestoreAfterCopyOrCreateWorkItem(std::future<WorkItemResult>&& _result,
                                      const std::string& _from_file,
                                      const std::string& _to_file,

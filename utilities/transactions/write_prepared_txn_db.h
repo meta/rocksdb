@@ -115,6 +115,12 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
                          PinnableSlice* value,
                          OutputMetadata* output_metadata) override;
 
+  using DB::GetEntityWithMetadata;
+  Status GetEntityWithMetadata(const ReadOptions& options,
+                               ColumnFamilyHandle* column_family,
+                               const Slice& key, PinnableWideColumns* columns,
+                               OutputMetadata* output_metadata) override;
+
   using DB::MultiGet;
   DECLARE_SYNC_AND_ASYNC_OVERRIDE(void, MultiGet,
                                   const ReadOptions& _read_options,
@@ -132,6 +138,19 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
                             Status* statuses,
                             MultiGetOutputMetadata* output_metadata,
                             const bool sorted_input) override;
+
+  using DB::MultiGetEntityWithMetadata;
+  void MultiGetEntityWithMetadata(const ReadOptions& options, size_t num_keys,
+                                  ColumnFamilyHandle* const* column_families,
+                                  const Slice* keys,
+                                  PinnableWideColumns* results,
+                                  Status* statuses,
+                                  MultiGetOutputMetadata* output_metadata,
+                                  bool sorted_input) override;
+  void MultiGetEntityWithMetadata(
+      const ReadOptions& options, size_t num_keys, const Slice* keys,
+      PinnableAttributeGroups* results,
+      MultiGetOutputMetadata* output_metadata) override;
 
   using DB::NewIterator;
   Iterator* NewIterator(const ReadOptions& _read_options,

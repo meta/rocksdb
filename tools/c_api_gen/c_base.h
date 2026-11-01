@@ -3433,6 +3433,20 @@ extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_multi_get_cf(
     size_t num_keys, const char* const* keys_list,
     const size_t* keys_list_sizes, char** values_list,
     size_t* values_list_sizes, char** errs);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_batched_multi_get_cf(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const char* const* keys_list, const size_t* keys_list_sizes,
+    rocksdb_pinnableslice_t** values, char** errs, const bool sorted_input);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_transactiondb_batched_multi_get_cf_slice(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const rocksdb_slice_t* keys_list, rocksdb_pinnableslice_t** values,
+    char** errs, const bool sorted_input);
+
 #include "c_api_gen/c_generated_transactiondb_subset.h.inc"
 
 extern ROCKSDB_LIBRARY_API rocksdb_iterator_t*

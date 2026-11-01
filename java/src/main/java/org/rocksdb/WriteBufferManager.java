@@ -12,8 +12,8 @@ public class WriteBufferManager extends RocksObject {
   /**
    * Construct a new instance of WriteBufferManager.
    * <p>
-   * Check <a href="https://github.com/facebook/rocksdb/wiki/Write-Buffer-Manager">
-   *     https://github.com/facebook/rocksdb/wiki/Write-Buffer-Manager</a>
+   * Check <a href="https://github.com/meta/rocksdb/wiki/Write-Buffer-Manager">
+   *     https://github.com/meta/rocksdb/wiki/Write-Buffer-Manager</a>
    * for more details on when to use it
    *
    * @param bufferSizeBytes buffer size(in bytes) to use for native write_buffer_manager

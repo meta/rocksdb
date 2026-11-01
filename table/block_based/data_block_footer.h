@@ -48,7 +48,7 @@ namespace ROCKSDB_NAMESPACE {
 // RocksDB and interpreted as an extremely large num_restarts, which will be
 // caught as a corruption. Bit 30 is special because num_restarts is multipled
 // by 4, causing overflow and the corruption check to be silently ignored
-// (https://github.com/facebook/rocksdb/blob/10.11.fb/table/block_based/block.cc#L1070-L1103)
+// (https://github.com/meta/rocksdb/blob/10.11.fb/table/block_based/block.cc#L1070-L1103)
 // Now format_version >= 8 officially unlocks use of that bit because we know
 // the reader isn't going to ignore it.
 //

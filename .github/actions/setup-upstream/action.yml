@@ -8,7 +8,7 @@ runs:
     run: chown `whoami` . || true
     shell: bash
   - name: Set upstream
-    run: git remote add upstream https://github.com/facebook/rocksdb.git
+    run: git remote add upstream https://github.com/meta/rocksdb.git
     shell: bash
   - name: Fetch upstream
     run: git fetch upstream

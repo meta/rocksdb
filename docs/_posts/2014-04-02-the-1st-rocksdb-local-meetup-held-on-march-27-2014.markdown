@@ -18,22 +18,22 @@ RocksDB team @ Facebook gave four talks about the latest progress and experience
 
 
 
-  * [Supporting a 1PB In-Memory Workload](https://github.com/facebook/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Haobo-RocksDB-In-Memory.pdf)
+  * [Supporting a 1PB In-Memory Workload](https://github.com/meta/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Haobo-RocksDB-In-Memory.pdf)
 
 
 
 
-  * [Column Families in RocksDB](https://github.com/facebook/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Igor-Column-Families.pdf)
+  * [Column Families in RocksDB](https://github.com/meta/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Igor-Column-Families.pdf)
 
 
 
 
-  * ["Lockless" Get() in RocksDB?](https://github.com/facebook/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Lei-Lockless-Get.pdf)
+  * ["Lockless" Get() in RocksDB?](https://github.com/meta/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Lei-Lockless-Get.pdf)
 
 
 
 
-  * [Prefix Hashing in RocksDB](https://github.com/facebook/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Siying-Prefix-Hash.pdf)
+  * [Prefix Hashing in RocksDB](https://github.com/meta/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Siying-Prefix-Hash.pdf)
 
 
 A very interesting question asked by a massive number of guests is: does RocksDB plan to provide replication functionality? Obviously, many applications need a resilient and distributed storage solution, not just single-node storage. We are considering how to approach this issue.

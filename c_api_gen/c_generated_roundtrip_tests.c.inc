@@ -925,6 +925,12 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_use_fsync(obj) == 1);
   rocksdb_options_set_use_fsync(obj, 0);
   CheckCondition(rocksdb_options_get_use_fsync(obj) == 0);
+  rocksdb_options_set_use_separate_remote_compaction_pool(obj, 1);
+  CheckCondition(rocksdb_options_get_use_separate_remote_compaction_pool(obj) ==
+                 1);
+  rocksdb_options_set_use_separate_remote_compaction_pool(obj, 0);
+  CheckCondition(rocksdb_options_get_use_separate_remote_compaction_pool(obj) ==
+                 0);
   rocksdb_options_set_use_session_tmp_dir_for_remote_compaction(obj, 1);
   CheckCondition(
       rocksdb_options_get_use_session_tmp_dir_for_remote_compaction(obj) == 1);

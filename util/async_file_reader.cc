@@ -21,8 +21,14 @@ bool AsyncFileReader::MultiReadAsyncImpl(ReadAwaiter* awaiter) {
   num_reqs_ += awaiter->num_reqs_;
   awaiter->io_handle_.resize(awaiter->num_reqs_);
   awaiter->del_fn_.resize(awaiter->num_reqs_);
+  const bool use_direct_io = awaiter->file_->use_direct_io();
   for (size_t i = 0; i < awaiter->num_reqs_; ++i) {
     FSReadRequest& req = awaiter->read_reqs_[i];
+    // A direct-IO request without a scratch buffer gets an aligned buffer from
+    // ReadAsync, returned through fs_scratch. The caller must keep the request
+    // until it has consumed the result.
+    AlignedBuf* const aligned_buf =
+        use_direct_io && req.scratch == nullptr ? &req.fs_scratch : nullptr;
     IOStatus s = awaiter->file_->ReadAsync(
         req, awaiter->opts_,
         [](FSReadRequest& completed_req, void* cb_arg) {
@@ -33,8 +39,8 @@ bool AsyncFileReader::MultiReadAsyncImpl(ReadAwaiter* awaiter) {
             read_req->fs_scratch = std::move(completed_req.fs_scratch);
           }
         },
-        &req, &awaiter->io_handle_[i], &awaiter->del_fn_[i],
-        /*aligned_buf=*/nullptr, awaiter->dbg_);
+        &req, &awaiter->io_handle_[i], &awaiter->del_fn_[i], aligned_buf,
+        awaiter->dbg_);
     if (s.IsNotSupported()) {
       // SupportedOps is advisory, so ReadAsync can still report NotSupported
       // when the request is submitted. Read synchronously instead so the
@@ -43,8 +49,16 @@ bool AsyncFileReader::MultiReadAsyncImpl(ReadAwaiter* awaiter) {
       TEST_SYNC_POINT("AsyncFileReader::MultiReadAsyncImpl:SyncFallback");
       awaiter->io_handle_[i] = nullptr;
       awaiter->del_fn_[i] = nullptr;
-      awaiter->file_->Read(awaiter->opts_, &req,
-                           /*direct_io_buffer_context=*/nullptr, awaiter->dbg_);
+      if (aligned_buf != nullptr) {
+        AlignedBuffer buffer;
+        AlignedBufferAllocationContext context{&buffer};
+        awaiter->file_->Read(awaiter->opts_, &req, &context, awaiter->dbg_);
+        *aligned_buf = buffer.Release();
+      } else {
+        awaiter->file_->Read(awaiter->opts_, &req,
+                             /*direct_io_buffer_context=*/nullptr,
+                             awaiter->dbg_);
+      }
     } else if (!s.ok()) {
       // For any non-ok status, the FileSystem will not call the callback
       // So let's update the status ourselves

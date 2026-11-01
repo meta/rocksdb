@@ -1,4 +1,4 @@
-name: facebook/rocksdb/benchmark-linux
+name: meta/rocksdb/benchmark-linux
 on: workflow_dispatch
 permissions: {}
   # FIXME: Disabled temporarily
@@ -6,7 +6,7 @@ permissions: {}
   # - cron: 7 */2 * * *  # At minute 7 past every 2nd hour
 jobs:
   benchmark-linux:
-    if: ${{ github.repository_owner == 'facebook' }}
+    if: ${{ github.repository_owner == 'meta' }}
     runs-on: ubuntu-latest # FIXME: change this back to self-hosted when ready
     steps:
     - uses: actions/checkout@v4.1.0

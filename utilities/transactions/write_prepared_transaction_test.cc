@@ -570,6 +570,48 @@ TEST_P(WritePreparedTransactionTest, SnapshotNewerVersionMetadataNotSupported) {
       read_options, keys, &values, &multiget_output_metadata);
   ASSERT_TRUE(statuses[0].IsNotSupported());
 
+  PinnableWideColumns get_entity_result;
+  ASSERT_TRUE(db->GetEntityWithMetadata(read_options, "key", &get_entity_result,
+                                        &output_metadata)
+                  .IsNotSupported());
+
+  PinnableWideColumns entity_result;
+  Status entity_status;
+  db->MultiGetEntityWithMetadata(read_options, db->DefaultColumnFamily(),
+                                 keys.size(), keys.data(), &entity_result,
+                                 &entity_status, &multiget_output_metadata);
+  ASSERT_TRUE(entity_status.IsNotSupported()) << entity_status.ToString();
+
+  PinnableAttributeGroups attribute_groups;
+  attribute_groups.emplace_back(db->DefaultColumnFamily());
+  db->MultiGetEntityWithMetadata(read_options, keys.size(), keys.data(),
+                                 &attribute_groups, &multiget_output_metadata);
+  ASSERT_TRUE(attribute_groups[0].status().IsNotSupported())
+      << attribute_groups[0].status().ToString();
+
+  // Without an explicit snapshot, the base DB defaults forward to GetEntity /
+  // MultiGetEntity and leave newer_version_present false.
+  const WideColumns expected_columns{{kDefaultWideColumnName, "value"}};
+  ASSERT_OK(db->GetEntityWithMetadata(ReadOptions(), "key", &get_entity_result,
+                                      &output_metadata));
+  ASSERT_EQ(get_entity_result.columns(), expected_columns);
+  ASSERT_FALSE(*output_metadata.newer_version_present);
+
+  db->MultiGetEntityWithMetadata(ReadOptions(), db->DefaultColumnFamily(),
+                                 keys.size(), keys.data(), &entity_result,
+                                 &entity_status, &multiget_output_metadata);
+  ASSERT_OK(entity_status);
+  ASSERT_EQ(entity_result.columns(), expected_columns);
+  ASSERT_EQ(*multiget_output_metadata.newer_version_present,
+            std::vector<uint8_t>{0});
+
+  db->MultiGetEntityWithMetadata(ReadOptions(), keys.size(), keys.data(),
+                                 &attribute_groups, &multiget_output_metadata);
+  ASSERT_OK(attribute_groups[0].status());
+  ASSERT_EQ(attribute_groups[0].columns(), expected_columns);
+  ASSERT_EQ(*multiget_output_metadata.newer_version_present,
+            std::vector<uint8_t>{0});
+
   db->ReleaseSnapshot(snapshot);
 }
 
@@ -646,7 +688,7 @@ class SeqAdvanceConcurrentTest
         split_id_(std::get<4>(GetParam())),
         split_cnt_(std::get<5>(GetParam())) {
     special_env.skip_fsync_ = true;
-  };
+  }
 
  protected:
   // A test is split into split_cnt_ tests, each identified with split_id_ where

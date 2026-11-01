@@ -188,8 +188,11 @@ class SyncPointAbortHelper {
 
   // Clean up sync points and wait for abort completion in one call
   void CleanupAndWait() {
-    CleanupSyncPoints();
+    // We hold no DB mutex, and the wait releases abort_mutex_. Keeping sync
+    // points enabled lets the worker observe the abort and exit, so the abort
+    // thread can finish before cleanup.
     WaitForAbortCompletion();
+    CleanupSyncPoints();
   }
 
  private:

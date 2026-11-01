@@ -378,10 +378,7 @@ class LegacyFileSystemWrapper : public FileSystem {
   static const char* kClassName() { return "LegacyFileSystem"; }
   const char* Name() const override { return kClassName(); }
 
-  // Return the target to which this Env forwards all calls
-  Env* target() const { return target_; }
-
-  // The following text is boilerplate that forwards all methods to target()
+  // The following text is boilerplate that forwards all methods to target_
   IOStatus NewSequentialFile(const std::string& f, const FileOptions& file_opts,
                              std::unique_ptr<FSSequentialFile>* r,
                              IODebugContext* /*dbg*/) override {

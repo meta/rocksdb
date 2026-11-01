@@ -48,7 +48,7 @@ class BloomMath {
     double keys_per_cache_line = cache_line_bits / bits_per_key;
     // A reasonable estimate is the average of the FP rates for one standard
     // deviation above and below the mean bucket occupancy. See
-    // https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter#the-math
+    // https://github.com/meta/rocksdb/wiki/RocksDB-Bloom-Filter#the-math
     double keys_stddev = std::sqrt(keys_per_cache_line);
     double crowded_fp = StandardFpRate(
         cache_line_bits / (keys_per_cache_line + keys_stddev), num_probes);
@@ -400,7 +400,7 @@ class LegacyNoLocalityBloomImpl {
 // increment being zero (when cache line size is 512 bits). Thus, there's a
 // 1/512 chance of probing only one index, which we'd expect to incur about
 // a 1/2 * 1/512 or absolute 0.1% FP rate penalty. More detail at
-// https://github.com/facebook/rocksdb/issues/4120
+// https://github.com/meta/rocksdb/issues/4120
 //
 // DO NOT REUSE
 //

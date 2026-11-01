@@ -10,7 +10,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <functional>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <set>
@@ -1460,7 +1462,9 @@ TEST_F(DBBlobDirectWriteTest,
   std::vector<BlobFileGarbage> garbages1;
   // Simulate a flush retry: prepare once, skip commit, then prepare the same
   // generation again and verify it reuses the already sealed blob file.
-  ASSERT_OK(mgr->PrepareFlushAdditions(WriteOptions(), /*num_generations=*/1,
+  const std::vector<uint64_t> memtable_ids = {
+      cfh->cfd()->imm()->GetEarliestMemTableID()};
+  ASSERT_OK(mgr->PrepareFlushAdditions(WriteOptions(), memtable_ids,
                                        &additions1, &garbages1));
   ASSERT_EQ(additions1.size(), 1U);
   ASSERT_TRUE(garbages1.empty());
@@ -1469,7 +1473,7 @@ TEST_F(DBBlobDirectWriteTest,
 
   std::vector<BlobFileAddition> additions2;
   std::vector<BlobFileGarbage> garbages2;
-  ASSERT_OK(mgr->PrepareFlushAdditions(WriteOptions(), /*num_generations=*/1,
+  ASSERT_OK(mgr->PrepareFlushAdditions(WriteOptions(), memtable_ids,
                                        &additions2, &garbages2));
   ASSERT_EQ(additions2.size(), 1U);
   ASSERT_TRUE(garbages2.empty());
@@ -1873,6 +1877,131 @@ TEST_F(DBBlobDirectWriteTest,
 
   options.enable_blob_direct_write = false;
   AssertOrderedTraceStoresLogicalPut(options, /*expect_blob_files=*/false);
+}
+
+TEST_F(DBBlobDirectWriteTest, OverlappingFlushesPublishTheirOwnBlobFiles) {
+  for (bool atomic_flush : {false, true}) {
+    SCOPED_TRACE("atomic_flush=" + std::to_string(atomic_flush));
+    Options options = GetDirectWriteOptions();
+    options.atomic_flush = atomic_flush;
+    options.max_background_jobs = 8;
+    options.max_write_buffer_number = 4;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+    const std::string value(1024, 'v');
+
+    // The flush of the memtable holding "key1" waits while it writes its
+    // table file, until a second flush, of the memtable holding "key2", has
+    // finished its own table file.
+    std::atomic<int> table_writes{0};
+    std::atomic<bool> released{false};
+    std::promise<void> first_flush_writing;
+    std::promise<void> release_first_flush;
+    std::shared_future<void> release_first_flush_future =
+        release_first_flush.get_future().share();
+    SyncPoint::GetInstance()->SetCallBack(
+        "FlushJob::WriteLevel0Table:num_memtables", [&](void*) {
+          if (table_writes.fetch_add(1) == 0) {
+            first_flush_writing.set_value();
+            release_first_flush_future.wait();
+          }
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        atomic_flush ? "DBImpl::AtomicFlushMemTablesToOutputFiles:WaitCV"
+                     : "DBImpl::FlushMemTableToOutputFile:Finish",
+        [&](void*) {
+          if (!released.exchange(true)) {
+            release_first_flush.set_value();
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    FlushOptions no_wait;
+    no_wait.wait = false;
+    no_wait.allow_write_stall = true;
+    ASSERT_OK(Put("key1", value));
+    ASSERT_OK(db_->Flush(no_wait));
+    first_flush_writing.get_future().wait();
+    ASSERT_OK(Put("key2", value));
+    ASSERT_OK(db_->Flush(no_wait));
+
+    ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    ASSERT_OK(dbfull()->TEST_GetBGError());
+    ASSERT_EQ(2, NumTableFilesAtLevel(0));
+
+    Reopen(options);
+    ASSERT_EQ(value, Get("key1"));
+    ASSERT_EQ(value, Get("key2"));
+  }
+}
+
+TEST_F(DBBlobDirectWriteTest, RetryAfterOlderOverlappingFlushFails) {
+  Options options = GetDirectWriteOptions();
+  options.max_background_jobs = 8;
+  options.max_write_buffer_number = 4;
+  options.disable_auto_compactions = true;
+  options.max_bgerror_resume_count = 0;
+  DestroyAndReopen(options);
+  const std::string value(1024, 'v');
+
+  // The flush of the memtable holding "key2" finishes while the older flush,
+  // of the memtable holding "key1", is still writing its table file. The
+  // newer flush's results wait to be installed after the older one's, but the
+  // older flush fails, which rolls the newer memtable back too.
+  std::atomic<int> table_writes{0};
+  std::atomic<bool> released{false};
+  std::atomic<bool> failed{false};
+  std::promise<void> first_flush_writing;
+  std::promise<void> release_first_flush;
+  std::shared_future<void> release_first_flush_future =
+      release_first_flush.get_future().share();
+  SyncPoint::GetInstance()->SetCallBack(
+      "FlushJob::WriteLevel0Table:num_memtables", [&](void*) {
+        if (table_writes.fetch_add(1) == 0) {
+          first_flush_writing.set_value();
+          release_first_flush_future.wait();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::FlushMemTableToOutputFile:Finish", [&](void*) {
+        if (!released.exchange(true)) {
+          release_first_flush.set_value();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "FlushJob::WriteLevel0Table:s", [&](void* arg) {
+        if (released.load() && !failed.exchange(true)) {
+          IOStatus injected = IOStatus::IOError("injected");
+          injected.SetRetryable(true);
+          *static_cast<Status*>(arg) = injected;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  FlushOptions no_wait;
+  no_wait.wait = false;
+  no_wait.allow_write_stall = true;
+  ASSERT_OK(Put("key1", value));
+  ASSERT_OK(db_->Flush(no_wait));
+  first_flush_writing.get_future().wait();
+  ASSERT_OK(Put("key2", value));
+  ASSERT_OK(db_->Flush(no_wait));
+
+  ASSERT_NOK(dbfull()->TEST_WaitForFlushMemTable());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(failed.load());
+
+  // Retrying the flush must still find the blob files of both memtables.
+  ASSERT_OK(dbfull()->Resume());
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+
+  Reopen(options);
+  ASSERT_EQ(value, Get("key1"));
+  ASSERT_EQ(value, Get("key2"));
 }
 
 class DBBlobDirectWriteWithTimestampTest : public DBBasicTestWithTimestampBase {

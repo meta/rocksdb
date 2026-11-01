@@ -505,9 +505,10 @@ ColumnFamilyData* VersionEditHandler::CreateCfAndInit(
   assert(cfd != nullptr);
   cfd->set_initialized();
   assert(builders_.find(cf_id) == builders_.end());
-  builders_.emplace(cf_id, VersionBuilderUPtr(new BaseReferencedVersionBuilder(
-                               cfd, this, track_found_and_missing_files_,
-                               allow_incomplete_valid_version_)));
+  builders_.emplace(
+      cf_id, VersionBuilderUPtr(new BaseReferencedVersionBuilder(
+                 cfd, cfd->current(), this, track_found_and_missing_files_,
+                 allow_incomplete_valid_version_)));
   return cfd;
 }
 
@@ -1114,7 +1115,6 @@ Status ManifestTailer::Initialize() {
     assert(dummy_version);
     Version* base_version = dummy_version->Next();
     assert(base_version);
-    base_version->Ref();
     VersionBuilderUPtr new_builder(new BaseReferencedVersionBuilder(
         default_cfd, base_version, this, track_found_and_missing_files_,
         allow_incomplete_valid_version_));
@@ -1159,7 +1159,6 @@ Status ManifestTailer::OnColumnFamilyAdd(VersionEdit& edit,
   assert(dummy_version);
   Version* base_version = dummy_version->Next();
   assert(base_version);
-  base_version->Ref();
   VersionBuilderUPtr new_builder(new BaseReferencedVersionBuilder(
       tmp_cfd, base_version, this, track_found_and_missing_files_));
   builder_iter->second = std::move(new_builder);

@@ -1892,6 +1892,9 @@ backup_engine_test: $(OBJ_DIR)/utilities/backup/backup_engine_test.o $(TEST_LIBR
 checkpoint_test: $(OBJ_DIR)/utilities/checkpoint/checkpoint_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+db_split_merge_test: $(OBJ_DIR)/utilities/db_split_merge_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 copy_engine_test: $(OBJ_DIR)/utilities/copy_engine/copy_engine_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
@@ -2202,6 +2205,9 @@ ldb_cmd_test: $(OBJ_DIR)/tools/ldb_cmd_test.o $(TOOLS_LIBRARY) $(TEST_LIBRARY) $
 	$(AM_LINK)
 
 ldb: $(OBJ_DIR)/tools/ldb.o $(TOOLS_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+db_split_merge: $(OBJ_DIR)/tools/db_split_merge.o $(LIBRARY)
 	$(AM_LINK)
 
 iostats_context_test: $(OBJ_DIR)/monitoring/iostats_context_test.o $(TEST_LIBRARY) $(LIBRARY)

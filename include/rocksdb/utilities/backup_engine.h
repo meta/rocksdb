@@ -371,7 +371,7 @@ struct RestoreOptions {
   // Specifies the level of incremental restore. 'kPurgeAllFiles' by default.
   Mode mode;
 
-  // FIXME(https://github.com/facebook/rocksdb/issues/13293)
+  // FIXME(https://github.com/meta/rocksdb/issues/13293)
   explicit RestoreOptions(bool _keep_log_files = false,
                           Mode _mode = Mode::kPurgeAllFiles)
       : keep_log_files(_keep_log_files), mode(_mode) {}

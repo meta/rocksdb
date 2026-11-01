@@ -25,10 +25,15 @@ struct CoroutineStatsConfig {
   PerfLevel perf_level = PerfLevel::kEnableCount;
   bool per_level_perf_context_enabled = false;
   bool iostats_disabled = false;
+  bool cpu_time_enabled = false;
 };
 
 CoroutineStatsConfig CaptureCoroutineStatsConfig();
 CoroutineStatsConfig CaptureAndDisableCoroutineStatsConfig();
+// For a coroutine API that serves the read synchronously on the calling
+// thread. SetAsyncReadCPUTimeEnabled() does not time such a read: its caller
+// already measures that thread.
+CoroutineStatsConfig WithoutAsyncReadCPUTime(CoroutineStatsConfig stats_config);
 bool IsCoroutineStatsEnabled(const CoroutineStatsConfig& stats_config);
 
 // Installs the captured stats configuration for one coroutine call. Enabled
