@@ -123,6 +123,8 @@ class ForwardIterator : public InternalIterator {
 
   DBImpl* const db_;
   ReadOptions read_options_;
+  // Direct lifetime reference, released after SV/child cleanup. Required to
+  // keep dropped CF files discoverable by AddLiveFiles during lazy reads.
   ColumnFamilyData* const cfd_;
   const SliceTransform* const prefix_extractor_;
   const Comparator* user_comparator_;
