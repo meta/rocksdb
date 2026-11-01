@@ -1,0 +1,1 @@
+Fixed writes blocking forever on a `WriteBufferManager` with `allow_stall = true` when flushed memtables kept as history (for example by the default `max_write_buffer_size_to_maintain` of a `TransactionDB` or `OptimisticTransactionDB`) held the manager's budget. A flushed memtable no longer counts against the manager once it moves to history.

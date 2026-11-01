@@ -314,6 +314,12 @@ class ReadOnlyMemTable {
   // operations on the same MemTable.
   virtual void MarkFlushed() = 0;
 
+  // Release this memtable's charge to the WriteBufferManager before it is
+  // destroyed. Called when a flushed memtable is kept as history: no flush can
+  // free that memory, so it must not keep writers stalled on the manager's
+  // limit.
+  virtual void ReleaseWriteBufferCharge() {}
+
   struct MemTableStats {
     uint64_t size;
     uint64_t count;
@@ -857,6 +863,8 @@ class MemTable final : public ReadOnlyMemTable {
   }
 
   void MarkFlushed() override { table_->MarkFlushed(); }
+
+  void ReleaseWriteBufferCharge() override { mem_tracker_.FreeMem(); }
 
   // return true if the current MemTableRep supports merge operator.
   bool IsMergeOperatorSupported() const {

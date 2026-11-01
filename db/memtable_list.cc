@@ -406,6 +406,9 @@ void MemTableListVersion::Remove(ReadOnlyMemTable* m,
 
   m->MarkFlushed();
   if (max_write_buffer_size_to_maintain_ > 0) {
+    // History is bounded by max_write_buffer_size_to_maintain, not by the
+    // WriteBufferManager, whose stall only a flush or a free can end.
+    m->ReleaseWriteBufferCharge();
     memlist_history_.push_front(m);
     // Unable to get size of mutable memtable at this point, pass 0 to
     // TrimHistory as a best effort.
