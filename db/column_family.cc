@@ -1522,9 +1522,36 @@ void ColumnFamilyData::ResetThreadLocalSuperVersions() {
   }
 }
 
+Status CheckBlobIndirectionCompactionStyle(CompactionStyle style,
+                                           bool has_blob_indirection) {
+  if (has_blob_indirection && style == kCompactionStyleFIFO) {
+    return Status::NotSupported("Blob indirection is incompatible with FIFO");
+  }
+  return Status::OK();
+}
+
+namespace {
+std::atomic<bool> allow_blob_indirection_for_test{false};
+}  // namespace
+
+void ColumnFamilyData::TEST_SetAllowBlobIndirection(bool allow) {
+  allow_blob_indirection_for_test.store(allow, std::memory_order_relaxed);
+}
+
 Status ColumnFamilyData::ValidateOptions(
     const DBOptions& db_options, const ColumnFamilyOptions& cf_options) {
-  Status s;
+  // Later revisions of this stack complete the feature. Until then, data
+  // written with it may not stay readable or safely activated.
+  if (cf_options.enable_blob_indirection &&
+      !allow_blob_indirection_for_test.load(std::memory_order_relaxed)) {
+    return Status::NotSupported(
+        "enable_blob_indirection is not supported in this revision");
+  }
+  Status s = CheckBlobIndirectionCompactionStyle(
+      cf_options.compaction_style, cf_options.enable_blob_indirection);
+  if (!s.ok()) {
+    return s;
+  }
   s = CheckCompressionSupported(cf_options);
   if (s.ok() && db_options.allow_concurrent_memtable_write) {
     s = CheckConcurrentWritesSupported(cf_options);
@@ -1586,6 +1613,21 @@ Status ColumnFamilyData::ValidateOptions(
       return Status::NotSupported(
           "Blob direct write does not support user-defined timestamps.");
     }
+  }
+  if (cf_options.enable_blob_indirection && !cf_options.enable_blob_files) {
+    return Status::InvalidArgument(
+        "enable_blob_indirection requires enable_blob_files=true");
+  }
+  if (cf_options.enable_blob_indirection &&
+      cf_options.enable_blob_direct_write) {
+    return Status::NotSupported(
+        "Blob indirection and blob direct write cannot be enabled together");
+  }
+  if (cf_options.enable_blob_indirection &&
+      !cf_options.table_factory->IsInstanceOf(
+          TableFactory::kBlockBasedTableName())) {
+    return Status::NotSupported(
+        "Blob indirection requires Block-Based Table format");
   }
   if (ucmp->timestamp_size() > 0 &&
       !cf_options.persist_user_defined_timestamps) {

@@ -24,6 +24,7 @@
 #include "cache/cache_key.h"
 #include "db/blob/blob_gen2_format.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/dbformat.h"
@@ -3203,6 +3204,11 @@ BlockType BlockBasedTable::GetBlockTypeForMetaBlockByName(
   }
 
   if (meta_block_name.starts_with(kIndexFactoryMetaPrefix)) {
+    return BlockType::kUserDefinedIndex;
+  }
+
+  if (meta_block_name == kBlobReferenceIndexBlockName ||
+      meta_block_name == kBlobReferenceDirectoryBlockName) {
     return BlockType::kUserDefinedIndex;
   }
 

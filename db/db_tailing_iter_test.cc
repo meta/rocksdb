@@ -37,6 +37,7 @@ TEST_P(DBTestTailingIterator, DroppedColumnFamilyPinsLazyBlobFiles) {
   Options options = CurrentOptions();
   options.enable_blob_files = true;
   options.min_blob_size = 0;
+  options.enable_blob_indirection = false;
   options.disable_auto_compactions = true;
   CreateAndReopenWithCF({"dropped"}, options);
   const std::string value(1024, 'v');
