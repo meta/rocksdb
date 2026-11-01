@@ -67,7 +67,8 @@ Status HashIndexReader::Create(const BlockBasedTable* table,
   RandomAccessFileReader* const file = rep->file.get();
   const Footer& footer = rep->footer;
   const ImmutableOptions& ioptions = rep->ioptions;
-  const PersistentCacheOptions& cache_options = rep->persistent_cache_options;
+  const PersistentCacheOptions& cache_options =
+      rep->metadata_persistent_cache_options;
   MemoryAllocator* const memory_allocator =
       GetMemoryAllocator(rep->table_options);
 

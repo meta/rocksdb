@@ -53,6 +53,8 @@ void ExtractTimestampFromTableProperties(const TableProperties& tp,
 // metadata. Absence is preserved for legacy/pre-activation SSTs.
 void ExtractBlobReferenceDescriptorFromTableProperties(
     const TableProperties& tp, FileMetaData* meta);
+Status ExtractBlobReferenceClassificationFromTableProperties(
+    const TableProperties& tp, FileMetaData* meta);
 
 // Build a Table file from the contents of *iter.  The generated file
 // will be named according to number specified in meta. On success, the rest of

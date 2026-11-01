@@ -13,6 +13,7 @@
 
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blob/blob_relocation_file.h"
 #include "db/db_impl/db_impl.h"
 #include "db/event_helpers.h"
 #include "db/memtable_list.h"
@@ -84,10 +85,6 @@ bool ShouldKeepFooterlessBlobFile(FileSystem* fs,
     return !io_s.IsPathNotFound();
   }
 
-  if (file_size < BlobLogHeader::kSize + BlobLogFooter::kSize) {
-    return true;
-  }
-
   FileOptions read_file_options = file_options;
   read_file_options.use_direct_reads = false;
 
@@ -95,6 +92,31 @@ bool ShouldKeepFooterlessBlobFile(FileSystem* fs,
   io_s = fs->NewRandomAccessFile(blob_file_path, read_file_options, &file, dbg);
   if (!io_s.ok()) {
     return !io_s.IsPathNotFound();
+  }
+  if (file == nullptr) {
+    return true;
+  }
+
+  if (file_size >= kBlobRelocationFilePrefixSize) {
+    std::array<char, kBlobRelocationFilePrefixSize> prefix_scratch{};
+    Slice prefix_slice;
+    io_s = file->Read(/*offset=*/0, kBlobRelocationFilePrefixSize, io_options,
+                      &prefix_slice, prefix_scratch.data(), dbg);
+    if (!io_s.ok()) {
+      return !io_s.IsPathNotFound();
+    }
+    if (prefix_slice ==
+        Slice(kBlobRelocationFilePrefix, kBlobRelocationFilePrefixSize)) {
+      // Relocation files are always built under a temp name and protected by
+      // pending_outputs_ across rename/publication. They never participate in
+      // the footer-less direct-write protocol, so an obsolete one is safe to
+      // delete despite not having a normal blob-log footer.
+      return false;
+    }
+  }
+
+  if (file_size < BlobLogHeader::kSize + BlobLogFooter::kSize) {
+    return true;
   }
 
   std::array<char, BlobLogFooter::kSize> scratch{};

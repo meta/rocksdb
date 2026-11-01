@@ -68,14 +68,16 @@ class BlockBasedTableBuilder : public TableBuilder {
   // REQUIRES: Finish(), Abandon() have not been called
   void Add(const Slice& key, const Slice& value) override;
 
-  // Keeps block-based builders behind the retry-capable TableBuilder contract
-  // even though the current format accepts every row. Future format-specific
-  // boundary policies can then ask callers to cut the file without changing
-  // compaction's Add() assumptions.
+  // Preflights the per-SST exact-reference budget without consuming the row.
+  // Compaction can cut and retry the same scalar or wide-column entry; an
+  // individually oversized entity fails before any of its references are added.
   TableBuilderAddResult TryAdd(const Slice& key, const Slice& value,
                                TableBuilderAddContext* context) override;
 
   Status StartBlobRelocationFile() override;
+
+  Status AddBlobRelocationRouteSource(uint64_t origin_file_number,
+                                      uint64_t generation_file_number) override;
 
   Status AddBlobRelocation(uint64_t origin_file_number,
                            uint64_t original_value_offset,
@@ -84,6 +86,12 @@ class BlockBasedTableBuilder : public TableBuilder {
 
   Status GetBlobRelocationFileMetadata(
       BlobRelocationFileMetadata* metadata) const override;
+  Status AddBlobRelocation(uint64_t origin_file_number,
+                           uint64_t original_value_offset,
+                           uint64_t stored_value_size,
+                           CompressionType compression,
+                           uint32_t stored_checksum,
+                           const VerifiedBlobStoredSource& source) override;
 
   // Return non-ok iff some error has been detected.
   Status status() const override;

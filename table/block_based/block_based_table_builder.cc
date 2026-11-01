@@ -1310,6 +1310,8 @@ struct BlockBasedTableBuilder::Rep {
   std::shared_ptr<CacheReservationManager>
       compression_dict_buffer_cache_res_mgr;
   std::unique_ptr<BlobReferenceMetadataCollector> blob_reference_collector;
+  bool track_blob_reference_classification = false;
+  uint64_t oldest_coarse_identity_blob_file_number = kInvalidBlobFileNumber;
   std::shared_ptr<const BlobReferenceSstSummary> blob_reference_summary;
   std::unique_ptr<BlobRelocationDirectoryBuilder>
       blob_relocation_directory_builder;
@@ -1841,19 +1843,16 @@ struct BlockBasedTableBuilder::Rep {
       compression_dict_buffer_cache_res_mgr = nullptr;
     }
 
-    // SstFileWriter output has no DB file number and may lack a known CF, so
-    // it cannot carry repair metadata. It stays in the legacy form.
-    if (tbo.moptions.enable_blob_indirection &&
-        tbo.reason != TableFileCreationReason::kSstFileWriter &&
-        tbo.column_family_id !=
-            TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) {
+    track_blob_reference_classification =
+        tbo.track_blob_reference_classification;
+    if (tbo.collect_blob_reference_metadata) {
       std::shared_ptr<CacheReservationManager> reservation_manager =
           GetBlobReferenceReservationManager(table_options);
       blob_reference_collector =
           std::make_unique<BlobReferenceMetadataCollector>(
               std::move(reservation_manager), tbo.column_family_id,
-              tbo.cur_file_num, /*route_snapshot_fingerprint_high=*/0,
-              /*route_snapshot_fingerprint_low=*/0);
+              tbo.cur_file_num, tbo.blob_route_snapshot_fingerprint_high,
+              tbo.blob_route_snapshot_fingerprint_low);
     }
 
     // Common user-key prefix feature (format_version >= 8) for index-like
@@ -2304,9 +2303,27 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
     }
 
     auto* const blob_reference_collector = r->blob_reference_collector.get();
-    if (blob_reference_collector != nullptr) {
-      auto& collector = *blob_reference_collector;
+    if (blob_reference_collector != nullptr ||
+        r->track_blob_reference_classification) {
       const uint64_t user_key_size = ExtractUserKey(entry_ikey).size();
+      const auto add_reference = [&](const BlobIndex& blob_index) -> Status {
+        if (blob_reference_collector != nullptr) {
+          return blob_reference_collector->Add(blob_index, user_key_size);
+        }
+        if (blob_index.IsIndirect()) {
+          if (blob_index.generation_file_number() !=
+              blob_index.origin_file_number()) {
+            return Status::Corruption("Coarse SST cannot contain a blob route");
+          }
+          const uint64_t origin = blob_index.origin_file_number();
+          if (r->oldest_coarse_identity_blob_file_number ==
+                  kInvalidBlobFileNumber ||
+              origin < r->oldest_coarse_identity_blob_file_number) {
+            r->oldest_coarse_identity_blob_file_number = origin;
+          }
+        }
+        return Status::OK();
+      };
       ValueType final_value_type;
       SequenceNumber ignored_seq;
       UnPackSequenceAndType(ExtractInternalKeyFooter(entry_ikey), &ignored_seq,
@@ -2316,12 +2333,12 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
         BlobIndex blob_index;
         reference_status = blob_index.DecodeFrom(entry_value);
         if (reference_status.ok()) {
-          reference_status = collector.Add(blob_index, user_key_size);
+          reference_status = add_reference(blob_index);
         }
       } else if (final_value_type == kTypeWideColumnEntity) {
         reference_status = WideColumnSerialization::ForEachBlobIndex(
             entry_value, [&](const BlobIndex& blob_index) {
-              return collector.Add(blob_index, user_key_size);
+              return add_reference(blob_index);
             });
       }
       if (!reference_status.ok()) {
@@ -2381,8 +2398,69 @@ TableBuilderAddResult BlockBasedTableBuilder::TryAdd(
     const Slice& ikey, const Slice& value, TableBuilderAddContext* context) {
   assert(context != nullptr);
   context->new_table_reason = TableBuilderNewTableReason::kNone;
+  BlobReferenceMetadataCollector* const collector =
+      rep_->blob_reference_collector.get();
+  if (collector != nullptr && ok()) {
+    uint64_t count = 0;
+    const auto count_reference = [&](const BlobIndex& index) -> Status {
+      BlobReference reference;
+      bool included = false;
+      Status status =
+          BlobReference::FromBlobIndex(index, &reference, &included);
+      if (status.ok() && included) {
+        ++count;
+      }
+      return status;
+    };
+    ParsedInternalKey parsed;
+    Status reference_status = ParseInternalKey(ikey, &parsed, false);
+    if (reference_status.ok() && parsed.type == kTypeBlobIndex) {
+      BlobIndex index;
+      reference_status = index.DecodeFrom(value);
+      if (reference_status.ok()) {
+        reference_status = count_reference(index);
+      }
+    } else if (reference_status.ok() && parsed.type == kTypeWideColumnEntity) {
+      reference_status =
+          WideColumnSerialization::ForEachBlobIndex(value, count_reference);
+    }
+    uint64_t soft_limit = kMaxBlobReferencesPerSst - 1024;
+    TEST_SYNC_POINT_CALLBACK(
+        "BlockBasedTableBuilder::TryAdd:BlobReferenceLimit", &soft_limit);
+    uint64_t hard_limit = kMaxBlobReferencesPerSst;
+    TEST_SYNC_POINT_CALLBACK(
+        "BlockBasedTableBuilder::TryAdd:BlobReferenceHardLimit", &hard_limit);
+    if (!reference_status.ok() || count > hard_limit) {
+      rep_->SetStatus(
+          reference_status.ok()
+              ? Status::MemoryLimit(
+                    "One user-key history exceeds the blob reference limit")
+              : reference_status);
+      return TableBuilderAddResult::kError;
+    }
+    // Do not split a user-key history (including timestamp variants) at the
+    // metadata soft cut. L0 same-epoch siblings must be independently ordered
+    // and subsequent partial compactions must see every version of a key.
+    const bool new_user_key =
+        !IsEmpty() &&
+        rep_->internal_comparator.user_comparator()->CompareWithoutTimestamp(
+            ExtractUserKey(rep_->last_ikey), true, parsed.user_key, true) != 0;
+    if (count != 0 &&
+        (count > soft_limit ||
+         collector->reference_count() > soft_limit - count) &&
+        new_user_key) {
+      context->new_table_reason =
+          TableBuilderNewTableReason::kBlobReferenceLimit;
+      return TableBuilderAddResult::kRequiresNewTable;
+    }
+    if (collector->reference_count() > hard_limit - count) {
+      rep_->SetStatus(Status::MemoryLimit(
+          "One user-key history exceeds the blob reference limit"));
+      return TableBuilderAddResult::kError;
+    }
+  }
   Add(ikey, value);
-  return TableBuilderAddResult::kAdded;
+  return ok() ? TableBuilderAddResult::kAdded : TableBuilderAddResult::kError;
 }
 
 void BlockBasedTableBuilder::Flush(const Slice* first_key_in_next_block) {
@@ -3407,6 +3485,69 @@ Status BlockBasedTableBuilder::AddBlobRelocation(uint64_t origin_file_number,
   return status();
 }
 
+Status BlockBasedTableBuilder::AddBlobRelocationRouteSource(
+    uint64_t origin_file_number, uint64_t generation_file_number) {
+  Rep* r = rep_.get();
+  if (r->blob_relocation_directory_builder == nullptr) {
+    return Status::InvalidArgument("Blob relocation file has not been started");
+  }
+  if (!ok()) {
+    return status();
+  }
+  Status add_status =
+      r->blob_relocation_directory_builder->AddServedRouteSource(
+          origin_file_number, generation_file_number);
+  if (!add_status.ok()) {
+    r->SetStatus(add_status);
+  }
+  return add_status;
+}
+
+Status BlockBasedTableBuilder::AddBlobRelocation(
+    uint64_t origin_file_number, uint64_t original_value_offset,
+    uint64_t stored_value_size, CompressionType compression,
+    uint32_t stored_checksum, const VerifiedBlobStoredSource& source) {
+  Rep* r = rep_.get();
+  if (!ok()) {
+    return status();
+  }
+  if (r->blob_relocation_directory_builder == nullptr ||
+      r->embedded_blob_options == nullptr ||
+      stored_value_size > kMaxSimpleGen2BlobPayloadSize ||
+      !CompressionTypeSupported(compression)) {
+    return Status::InvalidArgument("Invalid streaming blob relocation");
+  }
+  assert(!r->IsParallelCompressionActive());
+  const uint64_t offset = r->get_offset();
+  Status status = r->blob_relocation_directory_builder->Add(
+      origin_file_number, original_value_offset, offset, stored_value_size,
+      compression);
+  if (status.ok()) {
+    status = WriteSimpleGen2BlobRecordStream(
+        r->file, r->write_options, r->table_options.checksum,
+        r->base_context_checksum, offset, stored_value_size, compression,
+        stored_checksum, source);
+  }
+  if (!status.ok()) {
+    r->SetStatus(status);
+    return status;
+  }
+  if (!r->embedded_blob_state) {
+    r->embedded_blob_state = std::make_unique<Rep::EmbeddedBlobState>();
+  }
+  r->set_offset(offset + stored_value_size + kSimpleGen2BlobTrailerSize);
+  ++r->embedded_blob_state->stats.blob_count;
+  r->embedded_blob_state->stats.payload_bytes += stored_value_size;
+  BlobIndex::EncodeBlob(&r->embedded_blob_state->blob_index_buf,
+                        kCurrentFileBlobIndexFileNumber, offset,
+                        stored_value_size, compression);
+  const std::string user_key =
+      EncodeBlobRelocationKey(origin_file_number, original_value_offset);
+  const InternalKey internal_key(user_key, 0, kTypeBlobIndex);
+  Add(internal_key.Encode(), r->embedded_blob_state->blob_index_buf);
+  return this->status();
+}
+
 Status BlockBasedTableBuilder::GetBlobRelocationFileMetadata(
     BlobRelocationFileMetadata* metadata) const {
   if (metadata == nullptr) {
@@ -3909,6 +4050,20 @@ void BlockBasedTableBuilder::WriteBlobReferenceMetadata(
     MetaIndexBuilder* meta_index_builder) {
   auto* const blob_reference_collector = rep_->blob_reference_collector.get();
   if (blob_reference_collector == nullptr) {
+    if (rep_->track_blob_reference_classification) {
+      std::string encoded;
+      EncodeBlobReferenceClassification(
+          rep_->oldest_coarse_identity_blob_file_number, &encoded);
+      const bool inserted =
+          rep_->props.user_collected_properties
+              .emplace(kBlobReferenceClassificationPropertyName,
+                       std::move(encoded))
+              .second;
+      if (!inserted) {
+        rep_->SetStatus(
+            Status::Corruption("Duplicate blob reference classification"));
+      }
+    }
     return;
   }
   auto& collector = *blob_reference_collector;

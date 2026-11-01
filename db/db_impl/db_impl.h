@@ -1456,6 +1456,10 @@ class DBImpl : public DB
   Status TEST_WaitForCompact(
       const WaitForCompactOptions& wait_for_compact_options);
 
+  Status TEST_RunStandaloneBlobGCBatch(
+      ColumnFamilyData* cfd,
+      const std::vector<uint64_t>& candidate_physical_file_numbers);
+
   // Wait for any background purge
   Status TEST_WaitForPurge();
   void TEST_WaitForBlobReferenceCensus();
@@ -3232,6 +3236,11 @@ class DBImpl : public DB
       const std::shared_ptr<BlobFileMetaData>& source_metadata,
       bool* made_progress, uint64_t* sfm_reserved_bytes,
       bool* retryable_stale_input, LogBuffer* log_buffer, int job_id);
+  Status RunStandaloneBlobGCBatch(
+      ColumnFamilyData* cfd,
+      const std::vector<uint64_t>& candidate_physical_file_numbers,
+      bool* made_progress, uint64_t* sfm_reserved_bytes,
+      bool* retryable_stale_input, LogBuffer* log_buffer, int job_id);
 
   // Request compaction tasks token from compaction thread limiter.
   // It always succeeds if force = true or limiter is disable.
@@ -4021,9 +4030,9 @@ class DBImpl : public DB
   // CompactionService::Wait(), counted per executed subcompaction.
   std::atomic<int> num_running_remote_compactions_ = 0;
 
-  // Prevents duplicate standalone rewrites of one identity root. Protected by
-  // mutex_.
-  std::set<std::pair<uint32_t, uint64_t>> standalone_blob_gcs_in_progress_;
+  // A batch owns complete physical relocation containers, so only one
+  // standalone relocation GC may run per column family. Protected by mutex_.
+  std::set<uint32_t> standalone_blob_gc_cfs_in_progress_;
 
   // number of background memtable flush jobs, submitted to the HIGH pool
   int bg_flush_scheduled_ = 0;

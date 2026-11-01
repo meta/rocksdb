@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "db/blob/blob_reference_metadata.h"
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
@@ -186,6 +187,49 @@ TEST_F(RepairTest, NeverActivatedRepairWithPolicyEnabledKeepsLegacyOutput) {
     }
   }
   EXPECT_EQ(files, 2U);
+}
+
+TEST_F(RepairTest, PrefixRepairRejectsLegacyClassification) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  for (const char* key : {"a", "b"}) {
+    ASSERT_OK(Put(key, "value"));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  // An L0 output without exact inputs carries only the legacy
+  // classification: no descriptor and no coarse frontier.
+  ColumnFamilyMetaData cf_meta;
+  db_->GetColumnFamilyMetaData(&cf_meta);
+  std::vector<std::string> inputs;
+  for (const SstFileMetaData& file : cf_meta.levels[0].files) {
+    inputs.push_back(file.name);
+  }
+  ASSERT_EQ(inputs.size(), 2U);
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, 0));
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  const UserCollectedProperties& collected =
+      properties.begin()->second->user_collected_properties;
+  ASSERT_EQ(collected.count(kBlobReferenceClassificationPropertyName), 1U);
+  ASSERT_EQ(collected.count(kBlobReferenceDescriptorPropertyName), 0U);
+  const std::string sst_path = properties.begin()->first;
+  const std::string manifest_path =
+      DescriptorFileName(dbname_, dbfull()->TEST_Current_Manifest_FileNo());
+  Close();
+  // Leave the SST as the only feature evidence.
+  ASSERT_OK(env_->DeleteFile(manifest_path));
+
+  ASSERT_TRUE(RepairDB(dbname_, options).IsNotSupported());
+  ASSERT_OK(env_->FileExists(sst_path));
+  ASSERT_TRUE(env_->FileExists(dbname_ + "/lost").IsNotFound());
 }
 
 TEST_F(RepairTest, SortRepairedDBL0ByEpochNumber) {

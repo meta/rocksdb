@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include "db/blob/blob_constants.h"
 #include "rocksdb/rocksdb_namespace.h"
@@ -28,6 +29,21 @@ struct SameFileBlobReadRequest {
   BlobVerifyPolicy verify_policy = BlobVerifyPolicy::kVerifyIfNoAmplification;
   PinnableSlice* result = nullptr;
   Status* status = nullptr;
+  const BlobIndex* stable_blob_index = nullptr;
+};
+
+// One exact stored-byte read used while rebuilding a relocation file. The
+// physical SimpleGen2 checksum and the stable stored-byte checksum are both
+// verified. Experimental checksum v1 instead verifies the decompressed value.
+// The exact compressed payload is returned when
+// stored_payload is non-null; a null output requests validation only.
+struct StoredSameFileBlobReadRequest {
+  const BlobIndex& blob_index;
+  uint32_t stable_checksum_version;
+  uint32_t stable_checksum;
+  std::string* stored_payload;
+  Status& status;
+  uint32_t stored_checksum = 0;
 };
 
 // Narrow interface for resolving a same-file ("embedded") blob reference

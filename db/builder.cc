@@ -86,6 +86,26 @@ void ExtractBlobReferenceDescriptorFromTableProperties(
   }
 }
 
+Status ExtractBlobReferenceClassificationFromTableProperties(
+    const TableProperties& tp, FileMetaData* meta) {
+  meta->oldest_coarse_identity_blob_file_number = kInvalidBlobFileNumber;
+  const auto property = tp.user_collected_properties.find(
+      kBlobReferenceClassificationPropertyName);
+  if (property == tp.user_collected_properties.end()) {
+    return Status::OK();
+  }
+  if (!meta->blob_reference_descriptor.empty()) {
+    return Status::Corruption("Conflicting SST blob reference classifications");
+  }
+  Status status = DecodeBlobReferenceClassification(
+      property->second, &meta->oldest_coarse_identity_blob_file_number);
+  if (status.ok()) {
+    meta->blob_reference_legacy_metadata =
+        meta->oldest_coarse_identity_blob_file_number == kInvalidBlobFileNumber;
+  }
+  return status;
+}
+
 Status BuildTable(
     const std::string& dbname, VersionSet* versions,
     const ImmutableDBOptions& db_options, const TableBuilderOptions& tboptions,
@@ -442,6 +462,7 @@ Status BuildTable(
                ->GetTableProperties();  // refresh now that builder is finished
       ExtractTimestampFromTableProperties(tp, meta);
       ExtractBlobReferenceDescriptorFromTableProperties(tp, meta);
+      s = ExtractBlobReferenceClassificationFromTableProperties(tp, meta);
       meta->blob_reference_summary = builder->GetBlobReferenceSstSummary();
       if (memtable_payload_bytes != nullptr &&
           memtable_garbage_bytes != nullptr) {
