@@ -1095,6 +1095,10 @@ struct AdvancedColumnFamilyOptions {
   // Ordinary FIFO column families that never activated this feature retain
   // their existing BlobDB behavior.
   //
+  // Blob files with no live data are retired by background MANIFEST edits and
+  // deleted even when disable_auto_compactions is true. No SST or value is
+  // rewritten by this cleanup.
+  //
   // The complete relocation feature is shipped as one stack; intermediate stack
   // revisions must remain disabled.
   //

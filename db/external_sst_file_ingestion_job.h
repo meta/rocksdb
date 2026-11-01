@@ -8,22 +8,62 @@
 #include <unordered_set>
 #include <vector>
 
+#include "db/blob/blob_index.h"
 #include "db/column_family.h"
 #include "db/internal_stats.h"
 #include "db/snapshot_impl.h"
 #include "db/version_edit.h"
+#include "db/wide/wide_column_serialization.h"
 #include "env/file_system_tracer.h"
 #include "logging/event_logger.h"
 #include "options/db_options.h"
 #include "rocksdb/db.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/sst_file_writer.h"
+#include "table/table_reader.h"
 #include "util/autovector.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 class Directories;
 class SystemClock;
+
+// Validate internal entries, including hidden versions and blob-backed wide
+// columns. Import/ingestion retain their own acceptance predicate and cache
+// policy; neither a missing property nor the visible user iterator is proof.
+template <typename Validator>
+Status ValidateExternalTableBlobIndexes(TableReader* table,
+                                        const SliceTransform* prefix_extractor,
+                                        bool fill_cache,
+                                        const Validator& validate_blob) {
+  ReadOptions read_options;
+  read_options.total_order_seek = true;
+  read_options.fill_cache = fill_cache;
+  std::unique_ptr<InternalIterator> iter(
+      table->NewIterator(read_options, prefix_extractor, nullptr, false,
+                         TableReaderCaller::kExternalSSTIngestion));
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    ParsedInternalKey key;
+    Status status = ParseInternalKey(iter->key(), &key, false);
+    if (!status.ok()) {
+      return status;
+    }
+    if (key.type == kTypeBlobIndex) {
+      BlobIndex index;
+      status = index.DecodeFrom(iter->value());
+      if (status.ok()) {
+        status = validate_blob(index);
+      }
+    } else if (key.type == kTypeWideColumnEntity) {
+      status = WideColumnSerialization::ForEachBlobIndex(iter->value(),
+                                                         validate_blob);
+    }
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  return iter->status();
+}
 
 struct KeyRangeInfo {
   // Smallest internal key in an external file or for a batch of external files.
@@ -186,6 +226,11 @@ struct IngestedFileInfo : public KeyRangeInfo {
   // input when move_files is enabled.
   bool generated_for_ingestion = false;
 
+  // Prepared outside the DB mutex. Separate-file blob references cannot be
+  // imported without their owning DB's relocation state. Same-file embedded
+  // values are self-contained and do not require that state.
+  bool blob_indirection_ingestion_validated = false;
+
   SequenceNumber largest_seqno = kMaxSequenceNumber;
   SequenceNumber smallest_seqno = kMaxSequenceNumber;
 };
@@ -283,6 +328,10 @@ class ExternalSstFileIngestionJob {
   // Will execute the ingestion job and prepare edit() to be applied.
   // REQUIRES: Mutex held
   Status Run();
+
+  // Queue-head precondition: activation can occur after unlocked Prepare().
+  // REQUIRES: Mutex held. Performs no file I/O.
+  Status ValidateBlobIndirectionPublication() const;
 
   // Register key range involved in this ingestion job
   // to prevent key range conflict with other ongoing compaction/file ingestion.

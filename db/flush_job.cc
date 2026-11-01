@@ -1057,6 +1057,11 @@ Status FlushJob::WriteLevel0Table() {
               ? preclude_last_level_min_seqno_
               : std::min(earliest_snapshot_, preclude_last_level_min_seqno_),
           dbname_ /*db_name*/);
+      tboptions.collect_blob_reference_metadata =
+          mutable_cf_options_.enable_blob_indirection ||
+          // FlushJob pins a non-null base Version for its lifetime.
+          // @lint-ignore NULLSAFECLANG nullable-dereference
+          base_->storage_info()->HasBlobIndirectionFormat();
       TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:TableBuilderOptions",
                                &tboptions);
       s = BuildTable(
@@ -1140,6 +1145,9 @@ Status FlushJob::WriteLevel0Table() {
     TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table", &mems_);
     db_mutex_->Lock();
   }
+  const bool output_predates_blob_indirection =
+      !mutable_cf_options_.enable_blob_indirection &&
+      !base_->storage_info()->HasBlobIndirectionFormat();
   base_->Unref();
 
   // Note that if file_size is zero, the SST has been deleted and should not be
@@ -1149,6 +1157,8 @@ Status FlushJob::WriteLevel0Table() {
 
   if (s.ok()) {
     if (has_output) {
+      meta_.blob_reference_output_predates_indirection =
+          output_predates_blob_indirection;
       TEST_SYNC_POINT("DBImpl::FlushJob:SSTFileCreated");
       // if we have more than 1 background thread, then we cannot
       // insert files directly into higher levels because some other

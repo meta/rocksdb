@@ -11,9 +11,11 @@
 #include <unordered_set>
 #include <vector>
 
+#include "db/blob/blob_index.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/version_edit.h"
+#include "db/wide/wide_column_serialization.h"
 #include "file/file_util.h"
 #include "file/random_access_file_reader.h"
 #include "logging/logging.h"
@@ -899,6 +901,11 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
             : cfd_->NewEpochNumber(),  // orders files ingested to L0
         file->file_checksum, file->file_checksum_func_name, file->unique_id, 0,
         tail_size, file->user_defined_timestamps_persisted, "", "");
+    // Classification is completed outside the DB mutex at the MANIFEST queue
+    // head if activation happened during ingestion. Its precondition requires
+    // proof for active, fenced, or pending activation, even after policy
+    // disable.
+    f_metadata.blob_reference_output_predates_indirection = true;
     f_metadata.temperature = file->file_temperature;
     f_metadata.marked_for_compaction = marked_for_compaction;
     f_metadata.skip_index_and_filter_blocks_prefetch =
@@ -1603,6 +1610,38 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
     return status;
   }
 
+  if (sv->current->storage_info()->HasBlobIndirectionFormat() ||
+      sv->mutable_cf_options.enable_blob_indirection) {
+    if (table_reader == nullptr) {
+      status =
+          ResetTableReader(external_file, new_file_number,
+                           file_to_ingest->user_defined_timestamps_persisted,
+                           sv, file_to_ingest, &table_reader);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    // Check before Prepare() copies or links any input. This uses internal
+    // entries, so hidden versions and blob-backed wide columns are covered.
+    // Never-activated, disabled DBs retain the original PreparedFileInfo fast
+    // path. The queue-head precondition retries unvalidated input if activation
+    // is active, fenced, or pending, including enabled output after disable.
+    const auto validate_blob = [](const BlobIndex& index) {
+      return index.IsSameFile()
+                 ? Status::OK()
+                 : Status::NotSupported(
+                       "External SST ingestion does not support separate-file "
+                       "or relocated blob references");
+    };
+    status = ValidateExternalTableBlobIndexes(
+        table_reader.get(), sv->mutable_cf_options.prefix_extractor.get(),
+        ingestion_options_.fill_cache, validate_blob);
+    if (!status.ok()) {
+      return status;
+    }
+    file_to_ingest->blob_indirection_ingestion_validated = true;
+  }
+
   assert(file_to_ingest->file_size > 0);
   assert(!file_to_ingest->unset());
   assert(file_to_ingest->table_properties.num_entries > 0 ||
@@ -1675,6 +1714,24 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
   }
 
   return status;
+}
+
+Status ExternalSstFileIngestionJob::ValidateBlobIndirectionPublication() const {
+  if (!cfd_->current()->storage_info()->HasBlobIndirectionFormat() &&
+      !cfd_->GetLatestMutableCFOptions().enable_blob_indirection &&
+      !cfd_->HasPendingBlobIndirectionOutput()) {
+    return Status::OK();
+  }
+  for (const IngestedFileInfo& file : files_to_ingest_) {
+    if (!file.blob_indirection_ingestion_validated &&
+        !file.generated_for_ingestion) {
+      return Status::TryAgain(
+          "Blob indirection is active or pending after external SST "
+          "preparation; "
+          "retry ingestion to validate blob ownership");
+    }
+  }
+  return Status::OK();
 }
 
 Status ExternalSstFileIngestionJob::AssignLevelAndSeqnoForIngestedFile(

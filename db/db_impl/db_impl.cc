@@ -2155,6 +2155,7 @@ Status DBImpl::SetOptions(
               cfd->GetLatestMutableCFOptions()
                   .blob_file_writable_file_max_buffer_size);
         }
+        ScheduleBlobReferenceCensus(cfd);
       }
 
       persist_options_status =
@@ -5301,6 +5302,7 @@ Status DBImpl::CreateColumnFamilyWithPreparedOptions(
       cfd->set_initialized();
 
       *handle = new ColumnFamilyHandleImpl(cfd, this, &mutex_);
+      ScheduleBlobReferenceCensus(cfd);
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "Created column family [%s] (ID %u)",
                      column_family_name.c_str(), (unsigned)cfd->GetID());
@@ -7026,11 +7028,30 @@ Status DBImpl::GetPreparedFileInfoForExternalSstIngestion(
   return s;
 }
 
+Status DBImpl::GetColumnFamilyMetaDataForExport(
+    ColumnFamilyHandle* column_family, ColumnFamilyMetaData* metadata) {
+  ColumnFamilyData* const cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+  InstrumentedMutexLock lock(&mutex_);
+  if (cfd->GetLatestMutableCFOptions().enable_blob_indirection ||
+      cfd->HasPendingBlobIndirectionOutput() ||
+      cfd->current()->storage_info()->HasBlobIndirectionFormat()) {
+    return Status::NotSupported(
+        "Column-family export does not carry blob indirection "
+        "ownership/routes");
+  }
+  // Preserve the existing SST metadata capture and its inherited lock cost.
+  // The captured legacy Version needs no relocation append after unlocking.
+  cfd->current()->GetColumnFamilyMetaData(metadata);
+  return Status::OK();
+}
+
 void DBImpl::GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
                                      ColumnFamilyMetaData* cf_meta) {
   assert(column_family);
   auto* cfd =
       static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+  Version* pinned_version = nullptr;
   {
     // Without mutex, Version::GetColumnFamilyMetaData will have data race
     // with Compaction::MarkFilesBeingCompacted. One solution is to use mutex,
@@ -7042,7 +7063,20 @@ void DBImpl::GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
     // DB::GetColumnFamilyMetaData is not called frequently, the regression
     // should not be big. We still need to keep an eye on it.
     InstrumentedMutexLock l(&mutex_);
-    cfd->current()->GetColumnFamilyMetaData(cf_meta);
+    pinned_version = cfd->current();
+    pinned_version->Ref();
+    pinned_version->GetColumnFamilyMetaData(cf_meta);
+  }
+  pinned_version->AppendBlobRelocationFileMetaData(cf_meta);
+  Version* detached_version = nullptr;
+  {
+    InstrumentedMutexLock l(&mutex_);
+    if (pinned_version->UnrefAndTryDetach()) {
+      detached_version = pinned_version;
+    }
+  }
+  if (detached_version != nullptr) {
+    detached_version->DeleteDetached();
   }
 }
 
@@ -7061,11 +7095,57 @@ void DBImpl::GetColumnFamilyMetaData(
 
 void DBImpl::GetAllColumnFamilyMetaData(
     std::vector<ColumnFamilyMetaData>* metadata) {
-  InstrumentedMutexLock l(&mutex_);
+  struct PinnedColumnFamilyVersion {
+    ColumnFamilyData* cfd;
+    Version* version;
+  };
+  std::vector<PinnedColumnFamilyVersion> pinned_versions;
+
+  // Reserve pin storage without the DB mutex. Recheck the live CF count after
+  // every reacquisition so the subsequent capture cannot grow this vector.
+  while (true) {
+    mutex_.Lock();
+    size_t column_family_count = 0;
+    for (auto* cfd : *versions_->GetColumnFamilySet()) {
+      (void)cfd;
+      ++column_family_count;
+    }
+    if (column_family_count <= pinned_versions.capacity()) {
+      break;
+    }
+    mutex_.Unlock();
+    pinned_versions.reserve(column_family_count);
+  }
+
+  const size_t first_metadata_index = metadata->size();
   for (auto cfd : *(versions_->GetColumnFamilySet())) {
+    metadata->emplace_back();
+    Version* const version = cfd->current();
+    version->GetColumnFamilyMetaData(&metadata->back());
+    cfd->Ref();
+    version->Ref();
+    pinned_versions.push_back({cfd, version});
+  }
+  mutex_.Unlock();
+
+  for (size_t index = 0; index < pinned_versions.size(); ++index) {
+    pinned_versions[index].version->AppendBlobRelocationFileMetaData(
+        &(*metadata)[first_metadata_index + index]);
+  }
+  for (const PinnedColumnFamilyVersion& pinned : pinned_versions) {
+    Version* detached_version = nullptr;
     {
-      metadata->emplace_back();
-      cfd->current()->GetColumnFamilyMetaData(&metadata->back());
+      InstrumentedMutexLock l(&mutex_);
+      if (pinned.version->UnrefAndTryDetach()) {
+        detached_version = pinned.version;
+      }
+    }
+    if (detached_version != nullptr) {
+      detached_version->DeleteDetached();
+    }
+    {
+      InstrumentedMutexLock l(&mutex_);
+      pinned.cfd->UnrefAndTryDelete();
     }
   }
 }
@@ -8453,13 +8533,22 @@ Status DBImpl::CommitFileIngestionHandles(
       // LogAndApply releases mutex_ while writing the MANIFEST. GetSnapshot()
       // can acquire it then even though snapshot creation remains blocked from
       // the lock-free path.
-      status = versions_->LogAndApply(
+      // The publication check reads only cached per-file flags and CF state,
+      // so an earlier MANIFEST leader may run it to group this ingestion.
+      status = versions_->LogAndApplyWithJoinablePrecondition(
           cfds_to_commit, read_options, write_options, edit_lists,
           VersionSet::LogAndApplyColumnFamilyMode::kMayRepeatColumnFamilies,
-          /*new_mutable_cf_options=*/nullptr,
-          /*compaction_phase_anchor_time=*/std::nullopt, &mutex_,
-          directories_.GetDbDir(), /*new_descriptor_log=*/false,
-          /*new_cf_options=*/nullptr, manifest_wcbs, /*pre_cb=*/{},
+          &mutex_, directories_.GetDbDir(), manifest_wcbs,
+          /*pre_cb=*/
+          [&ingestion_jobs] {
+            for (const ExternalSstFileIngestionJob* job : ingestion_jobs) {
+              Status precondition = job->ValidateBlobIndirectionPublication();
+              if (!precondition.ok()) {
+                return precondition;
+              }
+            }
+            return Status::OK();
+          },
           max_file_opening_threads);
       // It is safe to update VersionSet last seqno here after LogAndApply since
       // LogAndApply persists last sequence number from VersionEdits,
@@ -8957,23 +9046,35 @@ Status DBImpl::VerifyChecksumInternal(const ReadOptions& read_options,
     }
 
     if (s.ok() && use_file_checksum) {
-      const auto& blob_files = vstorage->GetBlobFiles();
-      for (const auto& meta : blob_files) {
-        assert(meta);
-
-        const uint64_t blob_file_number = meta->GetBlobFileNumber();
-
-        const std::string blob_file_name = BlobFileName(
-            cfd->ioptions().cf_paths.front().path, blob_file_number);
-        s = VerifyFullFileChecksum(meta->GetChecksumValue(),
-                                   meta->GetChecksumMethod(), blob_file_name,
-                                   read_options);
+      const auto verify_blob_file = [&](uint64_t file_number,
+                                        const std::string& checksum,
+                                        const std::string& checksum_method) {
+        const std::string file_name =
+            BlobFileName(cfd->ioptions().cf_paths.front().path, file_number);
+        Status status = VerifyFullFileChecksum(checksum, checksum_method,
+                                               file_name, read_options);
         RecordTick(stats_, VERIFY_CHECKSUM_READ_BYTES,
                    IOSTATS(bytes_read) - prev_bytes_read);
         prev_bytes_read = IOSTATS(bytes_read);
+        return status;
+      };
+      const auto& blob_files = vstorage->GetBlobFiles();
+      for (const auto& meta : blob_files) {
+        assert(meta);
+        s = verify_blob_file(meta->GetBlobFileNumber(),
+                             meta->GetChecksumValue(),
+                             meta->GetChecksumMethod());
         if (!s.ok()) {
           break;
         }
+      }
+      for (const auto& meta : vstorage->GetBlobRelocationFiles()) {
+        if (!s.ok()) {
+          break;
+        }
+        assert(meta != nullptr);
+        s = verify_blob_file(meta->GetFileNumber(), meta->GetChecksumValue(),
+                             meta->GetChecksumMethod());
       }
     }
     if (!s.ok()) {

@@ -548,6 +548,21 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
   }
 }
 
+void MemTableList::BeginBlobIndirectionActivation(ReadOnlyMemTable* memtable) {
+  assert(memtable->flush_in_progress_);
+  assert(!memtable->pending_blob_indirection_activation_);
+  memtable->pending_blob_indirection_activation_ = true;
+  ++pending_blob_indirection_activations_;
+}
+
+void MemTableList::EndBlobIndirectionActivation(ReadOnlyMemTable* memtable) {
+  if (memtable->pending_blob_indirection_activation_) {
+    assert(pending_blob_indirection_activations_ > 0);
+    --pending_blob_indirection_activations_;
+    memtable->pending_blob_indirection_activation_ = false;
+  }
+}
+
 void MemTableList::RollbackMemtableFlush(
     const autovector<ReadOnlyMemTable*>& mems,
     bool rollback_succeeding_memtables) {
@@ -576,6 +591,7 @@ void MemTableList::RollbackMemtableFlush(
       // Only rollback complete, not in-progress,
       // in_progress can be flushes that are still writing SSTs
       if (m->flush_completed_) {
+        EndBlobIndirectionActivation(m);
         m->flush_in_progress_ = false;
         m->flush_completed_ = false;
         m->edit_.Clear();
@@ -590,6 +606,7 @@ void MemTableList::RollbackMemtableFlush(
 
   for (ReadOnlyMemTable* m : mems) {
     if (m->flush_in_progress_) {
+      EndBlobIndirectionActivation(m);
       assert(m->file_number_ == 0);
       m->file_number_ = 0;
       m->flush_in_progress_ = false;
@@ -629,6 +646,7 @@ Status MemTableList::TryInstallMemtableFlushResults(
     mems[i]->flush_completed_ = true;
     mems[i]->file_number_ = file_number;
   }
+  TEST_SYNC_POINT("MemTableList::TryInstallMemtableFlushResults:Completed");
 
   // if some other thread is already committing, then return
   Status s;
@@ -904,6 +922,7 @@ void MemTableList::RemoveMemTablesOrRestoreFlags(
       }
 
       assert(m->file_number_ > 0);
+      EndBlobIndirectionActivation(m);
       current_->Remove(m, to_delete);
       UpdateCachedValuesFromMemTableListVersion();
       ResetTrimHistoryNeeded();
@@ -927,6 +946,7 @@ void MemTableList::RemoveMemTablesOrRestoreFlags(
                          m->edit_.GetBlobFileAdditions().size(), mem_id);
       }
 
+      EndBlobIndirectionActivation(m);
       m->flush_completed_ = false;
       m->flush_in_progress_ = false;
       m->edit_.Clear();
@@ -1085,6 +1105,7 @@ Status InstallMemtableAtomicFlushResults(
                              edit->GetBlobFileAdditions().size(), mem_id);
           }
 
+          imm->EndBlobIndirectionActivation(m);
           imm->current_->Remove(m, to_delete);
           imm->UpdateCachedValuesFromMemTableListVersion();
           imm->ResetTrimHistoryNeeded();
@@ -1114,6 +1135,7 @@ Status InstallMemtableAtomicFlushResults(
                              edit->GetBlobFileAdditions().size(), mem_id);
           }
 
+          imm->EndBlobIndirectionActivation(m);
           m->SetFlushCompleted(false);
           m->SetFlushInProgress(false);
           m->GetEdits()->Clear();
@@ -1161,6 +1183,7 @@ void MemTableList::RemoveOldMemTables(
 
   for (auto it = old_memtables.begin(); it != old_memtables.end(); ++it) {
     ReadOnlyMemTable* mem = *it;
+    EndBlobIndirectionActivation(mem);
     current_->Remove(mem, to_delete);
     --num_flush_not_started_;
     if (0 == num_flush_not_started_) {

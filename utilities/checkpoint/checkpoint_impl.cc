@@ -733,6 +733,18 @@ Status CheckpointImpl::ExportColumnFamily(
 
   assert(metadata != nullptr);
   assert(*metadata == nullptr);
+  DBImpl* const db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+  {
+    InstrumentedMutexLock lock(db_impl->mutex());
+    ColumnFamilyData* const cfd = cfh->cfd();
+    if (cfd->GetLatestMutableCFOptions().enable_blob_indirection ||
+        cfd->HasPendingBlobIndirectionOutput() ||
+        cfd->current()->storage_info()->HasBlobIndirectionFormat()) {
+      return Status::NotSupported(
+          "Column-family export does not carry blob indirection "
+          "ownership/routes");
+    }
+  }
   auto s = db_->GetEnv()->FileExists(export_dir);
   if (s.ok()) {
     return Status::InvalidArgument("Specified export_dir exists");
@@ -764,25 +776,27 @@ Status CheckpointImpl::ExportColumnFamily(
     // Export live sst files with file deletions disabled.
     s = db_->DisableFileDeletions();
     if (s.ok()) {
-      db_->GetColumnFamilyMetaData(handle, &db_metadata);
+      s = db_impl->GetColumnFamilyMetaDataForExport(handle, &db_metadata);
 
-      s = ExportFilesInMetaData(
-          db_options, db_metadata,
-          [&](const std::string& src_dirname, const std::string& fname) {
-            ROCKS_LOG_INFO(db_options.info_log, "[%s] HardLinking %s",
-                           cf_name.c_str(), fname.c_str());
-            return db_->GetEnv()->LinkFile(src_dirname + fname,
-                                           tmp_export_dir + fname);
-          } /*link_file_cb*/,
-          [&](const std::string& src_dirname, const std::string& fname) {
-            ROCKS_LOG_INFO(db_options.info_log, "[%s] Copying %s",
-                           cf_name.c_str(), fname.c_str());
-            // FIXME: temperature handling
-            return CopyFile(db_->GetFileSystem(), src_dirname + fname,
-                            Temperature::kUnknown, tmp_export_dir + fname,
-                            Temperature::kUnknown, 0, db_options.use_fsync,
-                            nullptr);
-          } /*copy_file_cb*/);
+      if (s.ok()) {
+        s = ExportFilesInMetaData(
+            db_options, db_metadata,
+            [&](const std::string& src_dirname, const std::string& fname) {
+              ROCKS_LOG_INFO(db_options.info_log, "[%s] HardLinking %s",
+                             cf_name.c_str(), fname.c_str());
+              return db_->GetEnv()->LinkFile(src_dirname + fname,
+                                             tmp_export_dir + fname);
+            } /*link_file_cb*/,
+            [&](const std::string& src_dirname, const std::string& fname) {
+              ROCKS_LOG_INFO(db_options.info_log, "[%s] Copying %s",
+                             cf_name.c_str(), fname.c_str());
+              // FIXME: temperature handling
+              return CopyFile(db_->GetFileSystem(), src_dirname + fname,
+                              Temperature::kUnknown, tmp_export_dir + fname,
+                              Temperature::kUnknown, 0, db_options.use_fsync,
+                              nullptr);
+            } /*copy_file_cb*/);
+      }
 
       const auto enable_status = db_->EnableFileDeletions();
       if (s.ok()) {

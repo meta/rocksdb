@@ -2633,6 +2633,11 @@ class DBImpl : public DB
 
   // Delete any unneeded files and stale in-memory entries.
   void DeleteObsoleteFiles();
+  friend class CheckpointImpl;
+  // Captures the existing SST-only export image under the same lock as the
+  // own-CF activation check, closing a flag/pending-output race.
+  Status GetColumnFamilyMetaDataForExport(ColumnFamilyHandle* column_family,
+                                          ColumnFamilyMetaData* metadata);
   // Delete obsolete files and log status and information of file deletion
   void DeleteObsoleteFileImpl(int job_id, const std::string& fname,
                               const std::string& path_to_sync, FileType type,

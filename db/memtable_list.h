@@ -316,6 +316,14 @@ class MemTableList {
   // completely flushed and logged.
   int NumFlushed() const;
 
+  // DB mutex held. Enabled flushes can install the sticky format after their
+  // output work, even if SetOptions has already disabled creation. Keep this
+  // intent until the memtable is published/rolled back, not FlushJob teardown.
+  void BeginBlobIndirectionActivation(ReadOnlyMemTable* memtable);
+  bool HasPendingBlobIndirectionActivation() const {
+    return pending_blob_indirection_activations_ != 0;
+  }
+
   // Flush-completion listener notification accounting. All require the DB
   // mutex to be held (this class is not internally synchronized). See
   // num_pending_flush_notifications_ for details.
@@ -561,6 +569,8 @@ class MemTableList {
   // DB mutex held
   void InstallNewVersion();
 
+  void EndBlobIndirectionActivation(ReadOnlyMemTable* memtable);
+
   // DB mutex held
   // Called after writing to MANIFEST
   void RemoveMemTablesOrRestoreFlags(const Status& s, ColumnFamilyData* cfd,
@@ -603,6 +613,7 @@ class MemTableList {
   // FlushOptions::listener_wait, so that Flush(wait=true) does not return
   // before the callbacks complete. Guarded by the DB mutex.
   int num_pending_flush_notifications_ = 0;
+  size_t pending_blob_indirection_activations_ = 0;
 };
 
 // Installs memtable atomic flush results.

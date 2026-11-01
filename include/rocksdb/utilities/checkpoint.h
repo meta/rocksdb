@@ -124,6 +124,9 @@ class CheckpointEngineBase {
 
   // Exports all live SST files of the given column family into destination_dir,
   // returning their metadata in *out_metadata.
+  // Blob-indirection CFs with enabled/pending activation or a sticky format
+  // fence are unsupported by this SST-only export. Full checkpoints remain
+  // supported; disabling GC policy does not erase these dependencies.
   virtual IOStatus ExportColumnFamily(
       DB* source_db, ColumnFamilyHandle* handle,
       const std::string& destination_dir,
@@ -192,6 +195,8 @@ class Checkpoint {
   //   is in the same partition as the db directory, copied otherwise.
   // - export_dir should not already exist and will be created by this API.
   // - Always triggers a flush.
+  // - Blob-indirection CFs with enabled/pending activation or a sticky format
+  //   fence are unsupported; the export does not include their blob routes.
   virtual Status ExportColumnFamily(ColumnFamilyHandle* handle,
                                     const std::string& export_dir,
                                     ExportImportFilesMetaData** metadata);

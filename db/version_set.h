@@ -1364,6 +1364,11 @@ class Version {
 
   void GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta);
 
+  // Appends immutable relocation-file metadata. Callers can pin this Version
+  // and invoke this after releasing the DB mutex, unlike the SST portion above
+  // whose being_compacted field is mutex-protected.
+  void AppendBlobRelocationFileMetaData(ColumnFamilyMetaData* cf_meta) const;
+
   // Get column family metadata with optional filtering by key range and level.
   void GetColumnFamilyMetaData(const GetColumnFamilyMetaDataOptions& options,
                                ColumnFamilyMetaData* cf_meta);
@@ -1657,6 +1662,20 @@ class VersionSet {
       const std::vector<std::function<void(const Status&)>>& manifest_wcbs = {},
       const std::function<Status()>& pre_cb = {},
       int max_file_opening_threads = 1);
+
+  // Like the batch LogAndApply() above, but pre_cb may also be run by an
+  // earlier queue leader, with the DB mutex held, to let this caller join that
+  // leader's MANIFEST batch. pre_cb must then be cheap and must not release the
+  // DB mutex. A failed join never fails the batch; this caller then reaches the
+  // queue head and runs pre_cb as usual. Only file ingestion uses this.
+  Status LogAndApplyWithJoinablePrecondition(
+      const autovector<ColumnFamilyData*>& cfds,
+      const ReadOptions& read_options, const WriteOptions& write_options,
+      const autovector<autovector<VersionEdit*>>& edit_lists,
+      LogAndApplyColumnFamilyMode column_family_mode, InstrumentedMutex* mu,
+      FSDirectory* dir_contains_current_file,
+      const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
+      const std::function<Status()>& pre_cb, int max_file_opening_threads);
 
   void WakeUpWaitingManifestWriters();
 
@@ -2432,7 +2451,8 @@ class VersionSet {
       bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
       bool new_cf_options_are_sanitized,
       const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
-      const std::function<Status()>& pre_cb, int max_file_opening_threads);
+      const std::function<Status()>& pre_cb, bool precondition_may_join_batch,
+      int max_file_opening_threads);
 
   void LogAndApplyCFHelper(VersionEdit* edit,
                            SequenceNumber* max_last_sequence);

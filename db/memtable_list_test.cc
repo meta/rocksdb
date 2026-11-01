@@ -736,7 +736,12 @@ TEST_F(MemTableListTest, FlushPendingTest) {
   ASSERT_FALSE(list.imm_flush_needed.load(std::memory_order_acquire));
 
   // Revert flush
+  for (ReadOnlyMemTable* memtable : to_flush) {
+    list.BeginBlobIndirectionActivation(memtable);
+  }
+  ASSERT_TRUE(list.HasPendingBlobIndirectionActivation());
   list.RollbackMemtableFlush(to_flush, false);
+  ASSERT_FALSE(list.HasPendingBlobIndirectionActivation());
   ASSERT_FALSE(list.IsFlushPending());
   ASSERT_TRUE(list.imm_flush_needed.load(std::memory_order_acquire));
   to_flush.clear();
@@ -851,12 +856,14 @@ TEST_F(MemTableListTest, FlushPendingTest) {
   ASSERT_FALSE(list.imm_flush_needed.load(std::memory_order_acquire));
 
   // Flush the 1 memtable (tables[4]) that was picked in to_flush3
+  list.BeginBlobIndirectionActivation(to_flush3.front());
   s = MemTableListTest::Mock_InstallMemtableFlushResults(&list, to_flush3,
                                                          &to_delete);
   ASSERT_OK(s);
 
   // This will install 0 tables since tables[4] flushed while tables[3] has not
   // yet flushed.
+  ASSERT_TRUE(list.HasPendingBlobIndirectionActivation());
   ASSERT_EQ(2, list.NumNotFlushed());
   ASSERT_EQ(0, to_delete.size());
 
@@ -867,6 +874,7 @@ TEST_F(MemTableListTest, FlushPendingTest) {
 
   // This will actually install 2 tables.  The 1 we told it to flush, and also
   // tables[4] which has been waiting for tables[3] to commit.
+  ASSERT_FALSE(list.HasPendingBlobIndirectionActivation());
   ASSERT_EQ(0, list.NumNotFlushed());
   num_in_history =
       std::min(5, static_cast<int>(max_write_buffer_size_to_maintain) /

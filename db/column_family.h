@@ -602,8 +602,8 @@ class ColumnFamilyData {
     --pending_blob_indirection_compactions_;
   }
   bool HasPendingBlobIndirectionOutput() const {
-    // Flush intent accounting is integrated with dynamic activation later.
-    return pending_blob_indirection_compactions_ != 0;
+    return pending_blob_indirection_compactions_ != 0 ||
+           imm_.HasPendingBlobIndirectionActivation();
   }
   void inc_num_in_flight_compactions(InstrumentedMutex* db_mutex) {
     db_mutex->AssertHeld();

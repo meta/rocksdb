@@ -2285,6 +2285,25 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
   }
 }
 
+void Version::AppendBlobRelocationFileMetaData(
+    ColumnFamilyMetaData* cf_meta) const {
+  assert(cf_meta != nullptr);
+  assert(cfd_ != nullptr);
+  const auto& ioptions = cfd_->ioptions();
+  for (const auto& meta : storage_info_.GetBlobRelocationFiles()) {
+    assert(meta != nullptr);
+    const BlobRelocationDirectory& directory = meta->GetDirectory();
+    cf_meta->blob_files.emplace_back(
+        meta->GetFileNumber(), BlobFileName("", meta->GetFileNumber()),
+        ioptions.cf_paths.front().path, meta->GetFileSize(),
+        directory.total_entries(), directory.total_record_bytes(),
+        /*garbage_blob_count=*/0, /*garbage_blob_bytes=*/0,
+        meta->GetChecksumMethod(), meta->GetChecksumValue());
+    ++cf_meta->blob_file_count;
+    cf_meta->blob_file_size += meta->GetFileSize();
+  }
+}
+
 void Version::GetColumnFamilyMetaData(
     const GetColumnFamilyMetaDataOptions& options,
     ColumnFamilyMetaData* cf_meta) {
@@ -5872,15 +5891,26 @@ struct VersionSet::ManifestWriter {
   const MutableCFOptions* new_mutable_cf_options;
   std::optional<uint64_t> compaction_phase_anchor_time;
   // This writer's caller must run a precondition after reaching the head of
-  // the queue, so an earlier writer must not absorb it into a group commit.
+  // the queue, so an earlier writer must not absorb it into a group commit
+  // unless precondition_may_join_batch allows the leader to run it instead.
   bool requires_precondition;
+  // The caller's precondition, owned by the waiting caller. Set only on the
+  // caller's first writer.
+  const std::function<Status()>* precondition;
+  bool precondition_may_join_batch;
+  bool starts_caller;
+  bool has_predating_blob_reference_output;
+  bool caller_has_predating_blob_reference_output;
+  bool caller_activates_blob_indirection;
   int max_file_opening_threads;
 
   explicit ManifestWriter(
       InstrumentedMutex* mu, ColumnFamilyData* _cfd,
       const autovector<VersionEdit*>& e,
       const std::function<void(const Status&)>& manifest_wcb,
-      bool _requires_precondition,
+      bool _requires_precondition, const std::function<Status()>* _precondition,
+      bool _precondition_may_join_batch, bool _starts_caller,
+      bool _has_predating_blob_reference_output,
       const MutableCFOptions* _new_mutable_cf_options,
       std::optional<uint64_t> _compaction_phase_anchor_time,
       int _max_file_opening_threads = 1)
@@ -5892,6 +5922,13 @@ struct VersionSet::ManifestWriter {
         new_mutable_cf_options(_new_mutable_cf_options),
         compaction_phase_anchor_time(_compaction_phase_anchor_time),
         requires_precondition(_requires_precondition),
+        precondition(_precondition),
+        precondition_may_join_batch(_precondition_may_join_batch),
+        starts_caller(_starts_caller),
+        has_predating_blob_reference_output(
+            _has_predating_blob_reference_output),
+        caller_has_predating_blob_reference_output(false),
+        caller_activates_blob_indirection(false),
         max_file_opening_threads(_max_file_opening_threads) {}
   // No copying allowed
   ManifestWriter(const ManifestWriter&) = delete;
@@ -6368,6 +6405,16 @@ Status VersionSet::ProcessManifestWrites(
   assert(!writers.empty());
   ManifestWriter& first_writer = writers.front();
   ManifestWriter* last_writer = &first_writer;
+  bool batch_has_predating_blob_reference_output = false;
+  bool batch_activates_blob_indirection = false;
+  // An accepted edit sets a per-CF or DB-wide blob indirection fence. A joined
+  // precondition was checked against the current Versions only, so it must
+  // not join a batch whose candidate Versions are fenced.
+  bool batch_sets_blob_indirection_fence = false;
+  // A caller joined this batch after its precondition passed. Like a leader
+  // with a precondition, it ends the batch so no later caller can change the
+  // state its precondition checked.
+  bool batch_has_joined_precondition = false;
 
   bool callbacks_published = false;
   const auto publish_batch_callbacks = [&](const Status& status) {
@@ -6731,6 +6778,39 @@ Status VersionSet::ProcessManifestWrites(
           }
         }
       } else {
+        if (last_writer->has_predating_blob_reference_output &&
+            writer_cfd->current()->storage_info()->HasBlobIndirectionFormat()) {
+          const uint64_t base_version_number =
+              writer_cfd->current()->GetVersionNumber();
+          db_mutex.Unlock();
+          // The queue head prevents another MANIFEST install while the
+          // potentially output-proportional classification runs unlocked.
+          // @lint-ignore NULLSAFECLANG nullable-dereference
+          TEST_SYNC_POINT_CALLBACK(
+              "VersionSet::ProcessManifestWrites:"
+              "MarkPredatingBlobReferenceOutputsUnlocked",
+              &db_mutex);
+          for (VersionEdit* edit : last_writer->edit_list) {
+            edit->MarkBlobReferenceOutputsPredatingIndirectionLegacy();
+          }
+          db_mutex.Lock();
+          if (manifest_writers_.empty() ||
+              manifest_writers_.front() != &first_writer ||
+              writer_cfd->IsDropped() ||
+              writer_cfd->current()->GetVersionNumber() !=
+                  base_version_number ||
+              !writer_cfd->current()
+                   ->storage_info()
+                   ->HasBlobIndirectionFormat()) {
+            const Status ownership_changed = Status::Corruption(
+                "MANIFEST queue or blob indirection fence changed while "
+                "classifying preactivation outputs");
+            discard_candidate_versions();
+            release_builder_guards();
+            finish_batch(ownership_changed);
+            return ownership_changed;
+          }
+        }
         Version* version = nullptr;
         VersionBuilder* builder = nullptr;
         if (column_family_mode ==
@@ -6802,15 +6882,49 @@ Status VersionSet::ProcessManifestWrites(
           } else if (group_start != std::numeric_limits<size_t>::max()) {
             group_start = std::numeric_limits<size_t>::max();
           }
+          // Options preparation can precede format activation by another
+          // queued writer. Also recheck the currently configured writer when
+          // a captured-enabled flush/compaction activates after SetOptions.
+          // The common capability query is constant-sized and performs no I/O.
+          batch_apply_status = CheckBlobIndirectionCompactionStyle(
+              writer_cfd->ioptions().compaction_style,
+              writer_cfd->GetLatestMutableCFOptions().enable_blob_indirection ||
+                  writer_cfd->HasPendingBlobIndirectionOutput() ||
+                  writer_cfd->current()
+                      ->storage_info()
+                      ->HasBlobIndirectionFormat() ||
+                  e->HasBlobIndirectionFormatVersion());
+          if (!batch_apply_status.ok()) {
+            break;
+          }
+          if ((writer_cfd->current()
+                   ->storage_info()
+                   ->HasBlobIndirectionFormat() ||
+               e->HasBlobIndirectionFormatVersion()) &&
+              (GetBlockBasedTableWriterOptions(
+                   writer_cfd->GetLatestMutableCFOptions()
+                       .table_factory.get()) == nullptr ||
+               (last_writer->new_mutable_cf_options != nullptr &&
+                GetBlockBasedTableWriterOptions(
+                    last_writer->new_mutable_cf_options->table_factory.get()) ==
+                    nullptr))) {
+            batch_apply_status = Status::NotSupported(
+                "Blob indirection state requires a Block-Based Table writer");
+            break;
+          }
           batch_apply_status = ValidateAndTrackPhysicalFileOwnership(
               *e, pending_blob_indirection_format_version,
               physical_file_ownership_deltas,
               /*validate_current_owners=*/true,
               &deferred_physical_file_ownership_conflict);
           if (batch_apply_status.ok()) {
+            // Only the queue head applies without the DB mutex. A joined
+            // follower applies with it held: its precondition already passed
+            // under this lock and cannot be rechecked after an unlock.
             batch_apply_status = LogAndApplyHelper(
                 writer_cfd, builder, e, &max_last_sequence, mu,
-                last_writer->requires_precondition && !skip_manifest_write,
+                last_writer == &first_writer &&
+                    last_writer->requires_precondition && !skip_manifest_write,
                 pre_cb);
           }
           if (!batch_apply_status.ok()) {
@@ -6818,6 +6932,9 @@ Status VersionSet::ProcessManifestWrites(
           }
           batch_edits.push_back(e);
           batch_edits_ts_sz.push_back(edit_ts_sz);
+          batch_sets_blob_indirection_fence |=
+              e->HasBlobIndirectionFormatVersion() ||
+              e->HasDbBlobIndirectionFormatVersion();
           if (e->HasBlobIndirectionFormatVersion()) {
             pending_blob_indirection_format_version =
                 e->GetBlobIndirectionFormatVersion();
@@ -6828,8 +6945,35 @@ Status VersionSet::ProcessManifestWrites(
         }
       }
       // Loop increment/conditions
+      if (last_writer->starts_caller) {
+        batch_has_predating_blob_reference_output |=
+            last_writer->caller_has_predating_blob_reference_output;
+        batch_activates_blob_indirection |=
+            last_writer->caller_activates_blob_indirection;
+      }
       ++writer_index;
       if (writer_index == manifest_writers_.size()) {
+        break;
+      }
+      if (first_writer.requires_precondition &&
+          last_writer == &writers.back()) {
+        // A caller whose queue-head state was validated by a precondition is a
+        // batch barrier. Absorbing a later caller could invalidate that state
+        // after the precondition has already run.
+        break;
+      }
+      const ManifestWriter* const next_writer = manifest_writers_[writer_index];
+      if (batch_has_joined_precondition && next_writer->starts_caller) {
+        break;
+      }
+      if (next_writer->starts_caller &&
+          ((batch_has_predating_blob_reference_output &&
+            next_writer->caller_activates_blob_indirection) ||
+           (batch_activates_blob_indirection &&
+            next_writer->caller_has_predating_blob_reference_output))) {
+        // Preactivation output may group with ordinary work. It only needs a
+        // batch boundary when an actual activation could change how that
+        // output is classified in the candidate Version.
         break;
       }
       if (skip_manifest_write ||
@@ -6843,12 +6987,29 @@ Status VersionSet::ProcessManifestWrites(
         }
         continue;
       }
-      if (manifest_writers_[writer_index]->requires_precondition) {
-        // Let this writer become the queue head so its caller can validate the
-        // precondition against all Versions committed before it.
-        break;
+      if (next_writer->requires_precondition) {
+        // By default, let this writer become the queue head so its caller can
+        // validate the precondition against all Versions committed before it.
+        // An opted-in caller may instead join now: the batch is a normal
+        // MANIFEST batch (checked above), no accepted edit sets a format
+        // fence, and its precondition passes now under the DB mutex. A failed
+        // join is not an error; the caller runs the precondition again at the
+        // queue head.
+        if (!next_writer->precondition_may_join_batch ||
+            batch_sets_blob_indirection_fence) {
+          break;
+        }
+        assert(next_writer->precondition != nullptr);
+        Status join_status = (*next_writer->precondition)();
+        TEST_SYNC_POINT_CALLBACK(
+            "VersionSet::ProcessManifestWrites:JoinPrecondition", &join_status);
+        if (!join_status.ok()) {
+          join_status.PermitUncheckedError();
+          break;
+        }
+        batch_has_joined_precondition = true;
       }
-      const auto* next = manifest_writers_[writer_index]->edit_list.front();
+      const auto* next = next_writer->edit_list.front();
       if (next->IsColumnFamilyManipulation() ||
           next->IsNoManifestWriteDummy()) {
         // no group commits for column family add or drop
@@ -6993,7 +7154,8 @@ Status VersionSet::ProcessManifestWrites(
   const bool rebuild_format_activation_owners =
       blob_indirection_format_version_ == 0 &&
       pending_blob_indirection_format_version != 0;
-  const auto needs_census_for_version = [&](Version* version) {
+  std::vector<uint32_t> activating_census_column_families;
+  const auto needs_census_without_batch_activation = [&](Version* version) {
     return version->cfd()
                ->current()
                ->storage_info()
@@ -7001,12 +7163,30 @@ Status VersionSet::ProcessManifestWrites(
            (pending_blob_indirection_format_version != 0 &&
             version->GetMutableCFOptions().enable_blob_indirection);
   };
-  bool needs_census_install = false;
+  bool activates_blob_indirection = false;
+  for (const VersionEdit* edit : batch_edits) {
+    if (!edit->HasBlobIndirectionFormatVersion()) {
+      continue;
+    }
+    ColumnFamilyData* const cfd =
+        column_family_set_->GetColumnFamily(edit->GetColumnFamily());
+    if (cfd != nullptr &&
+        !cfd->current()->storage_info()->HasBlobIndirectionFormat()) {
+      activates_blob_indirection = true;
+      break;
+    }
+  }
+  const auto needs_census_for_version = [&](Version* version) {
+    return needs_census_without_batch_activation(version) ||
+           std::binary_search(activating_census_column_families.begin(),
+                              activating_census_column_families.end(),
+                              version->cfd()->GetID());
+  };
+  bool needs_census_install = activates_blob_indirection;
   if (pending_blob_indirection_format_version != 0) {
     for (Version* version : versions) {
-      if (needs_census_for_version(version)) {
+      if (needs_census_without_batch_activation(version)) {
         needs_census_install = true;
-        break;
       }
     }
   }
@@ -7016,6 +7196,18 @@ Status VersionSet::ProcessManifestWrites(
     // while the DB mutex is dropped, and this avoids heap allocation in the
     // critical section.
     db_mutex.Unlock();
+    activating_census_column_families.reserve(batch_edits.size());
+    for (const VersionEdit* edit : batch_edits) {
+      if (edit->HasBlobIndirectionFormatVersion()) {
+        activating_census_column_families.push_back(edit->GetColumnFamily());
+      }
+    }
+    std::sort(activating_census_column_families.begin(),
+              activating_census_column_families.end());
+    activating_census_column_families.erase(
+        std::unique(activating_census_column_families.begin(),
+                    activating_census_column_families.end()),
+        activating_census_column_families.end());
     census_install_reservations.reserve(versions.size());
     census_reservation_cfds.reserve(versions.size());
     db_mutex.Lock();
@@ -7053,6 +7245,14 @@ Status VersionSet::ProcessManifestWrites(
     if (s.ok()) {
       s = prepare_census_installs();
     }
+#ifndef NDEBUG
+    if (activates_blob_indirection) {
+      TEST_SYNC_POINT(
+          "VersionSet::ProcessManifestWrites:BlobIndirectionActivationReady");
+      TEST_SYNC_POINT(
+          "VersionSet::ProcessManifestWrites:BlobIndirectionActivationWait");
+    }
+#endif
     // See the SyncPoint lifetime note above.
     // @lint-ignore NULLSAFECLANG nullable-dereference
     TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:AfterBlobFinalization");
@@ -7105,6 +7305,14 @@ Status VersionSet::ProcessManifestWrites(
         !first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
       s = prepare_census_installs();
     }
+#ifndef NDEBUG
+    if (activates_blob_indirection) {
+      TEST_SYNC_POINT(
+          "VersionSet::ProcessManifestWrites:BlobIndirectionActivationReady");
+      TEST_SYNC_POINT(
+          "VersionSet::ProcessManifestWrites:BlobIndirectionActivationWait");
+    }
+#endif
     // See the SyncPoint lifetime note above.
     // @lint-ignore NULLSAFECLANG nullable-dereference
     TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:AfterBlobFinalization");
@@ -7563,6 +7771,25 @@ Status VersionSet::LogAndApply(
       column_family_mode, new_mutable_cf_options, compaction_phase_anchor_time,
       mu, dir_contains_current_file, new_descriptor_log, new_cf_options,
       /*new_cf_options_are_sanitized=*/false, manifest_wcbs, pre_cb,
+      /*precondition_may_join_batch=*/false, max_file_opening_threads);
+}
+
+Status VersionSet::LogAndApplyWithJoinablePrecondition(
+    const autovector<ColumnFamilyData*>& column_family_datas,
+    const ReadOptions& read_options, const WriteOptions& write_options,
+    const autovector<autovector<VersionEdit*>>& edit_lists,
+    LogAndApplyColumnFamilyMode column_family_mode, InstrumentedMutex* mu,
+    FSDirectory* dir_contains_current_file,
+    const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
+    const std::function<Status()>& pre_cb, int max_file_opening_threads) {
+  assert(pre_cb);
+  return LogAndApplyImpl(
+      column_family_datas, read_options, write_options, edit_lists,
+      column_family_mode, /*new_mutable_cf_options=*/nullptr,
+      /*compaction_phase_anchor_time=*/std::nullopt, mu,
+      dir_contains_current_file, /*new_descriptor_log=*/false,
+      /*new_cf_options=*/nullptr, /*new_cf_options_are_sanitized=*/false,
+      manifest_wcbs, pre_cb, /*precondition_may_join_batch=*/true,
       max_file_opening_threads);
 }
 
@@ -7584,6 +7811,7 @@ Status VersionSet::LogAndApplyColumnFamilyAddWithSanitizedOptions(
                          /*new_descriptor_log=*/false, &sanitized_options,
                          /*new_cf_options_are_sanitized=*/true,
                          /*manifest_wcbs=*/{}, /*pre_cb=*/{},
+                         /*precondition_may_join_batch=*/false,
                          /*max_file_opening_threads=*/1);
 }
 
@@ -7598,7 +7826,8 @@ Status VersionSet::LogAndApplyImpl(
     const ColumnFamilyOptions* new_cf_options,
     bool new_cf_options_are_sanitized,
     const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
-    const std::function<Status()>& pre_cb, int max_file_opening_threads) {
+    const std::function<Status()>& pre_cb, bool precondition_may_join_batch,
+    int max_file_opening_threads) {
   mu->AssertHeld();
   int num_edits = 0;
   for (const auto& elist : edit_lists) {
@@ -7641,22 +7870,50 @@ Status VersionSet::LogAndApplyImpl(
     assert(new_mutable_cf_options == nullptr ||
            static_cast<size_t>(num_cfds) == new_mutable_cf_options->size());
   }
+  bool caller_has_predating_blob_reference_output = false;
+  bool caller_activates_blob_indirection = false;
   for (int i = 0; i < num_cfds; ++i) {
     const auto wcb =
         manifest_wcbs.empty() ? [](const Status&) {} : manifest_wcbs[i];
+    bool writer_has_predating_blob_reference_output = false;
+    for (const VersionEdit* edit : edit_lists[i]) {
+      writer_has_predating_blob_reference_output |=
+          edit->HasBlobReferenceOutputPredatingIndirection();
+      if (column_family_datas[i] != nullptr &&
+          edit->HasBlobIndirectionFormatVersion() &&
+          !column_family_datas[i]
+               ->current()
+               ->storage_info()
+               ->HasBlobIndirectionFormat()) {
+        caller_activates_blob_indirection = true;
+      }
+    }
+    caller_has_predating_blob_reference_output |=
+        writer_has_predating_blob_reference_output;
     writers.emplace_back(
         mu, column_family_datas[i], edit_lists[i], wcb,
         /*requires_precondition=*/i == 0 && !!pre_cb,
+        /*precondition=*/i == 0 && pre_cb ? &pre_cb : nullptr,
+        /*precondition_may_join_batch=*/i == 0 && !!pre_cb &&
+            precondition_may_join_batch,
+        /*starts_caller=*/i == 0, writer_has_predating_blob_reference_output,
         new_mutable_cf_options == nullptr ? nullptr
                                           : (*new_mutable_cf_options)[i],
         compaction_phase_anchor_time, max_file_opening_threads);
-    manifest_writers_.push_back(&writers[i]);
   }
   assert(!writers.empty());
   ManifestWriter& first_writer = writers.front();
+  first_writer.caller_has_predating_blob_reference_output =
+      caller_has_predating_blob_reference_output;
+  first_writer.caller_activates_blob_indirection =
+      caller_activates_blob_indirection;
+  for (ManifestWriter& writer : writers) {
+    manifest_writers_.push_back(&writer);
+  }
   TEST_SYNC_POINT_CALLBACK("VersionSet::LogAndApply:BeforeWriterWaiting",
                            nullptr);
   while (!first_writer.done && &first_writer != manifest_writers_.front()) {
+    TEST_SYNC_POINT("VersionSet::LogAndApply:WriterWaiting");
     first_writer.cv.Wait();
   }
   if (first_writer.done) {

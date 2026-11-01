@@ -11,8 +11,12 @@
 #include <string>
 #include <vector>
 
+#include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_metadata.h"
+#include "db/builder.h"
 #include "db/version_builder.h"
 #include "db/version_edit.h"
+#include "db/wide/wide_column_serialization.h"
 #include "file/file_util.h"
 #include "file/random_access_file_reader.h"
 #include "logging/logging.h"
@@ -342,6 +346,34 @@ Status ImportColumnFamilyJob::GetIngestedFileInfo(
 
   // Get the external file properties
   auto props = table_reader->GetTableProperties();
+  FileMetaData blob_metadata;
+  ExtractBlobReferenceDescriptorFromTableProperties(*props, &blob_metadata);
+  status = ExtractBlobReferenceClassificationFromTableProperties(
+      *props, &blob_metadata);
+  if (!status.ok()) {
+    return status;
+  }
+  if (!blob_metadata.blob_reference_descriptor.empty() ||
+      blob_metadata.oldest_coarse_identity_blob_file_number !=
+          kInvalidBlobFileNumber) {
+    return Status::NotSupported(
+        "Import does not carry blob indirection ownership/route metadata");
+  }
+  // A missing/malformed property is not proof that internal entries are
+  // feature-free. Validate hidden versions and every blob-backed column,
+  // before Prepare copies/links anything. Legacy/self-contained cases remain.
+  const auto validate_blob = [](const BlobIndex& index) -> Status {
+    return index.IsIndirect() ? Status::NotSupported(
+                                    "Import does not support stable or "
+                                    "relocated blob references")
+                              : Status::OK();
+  };
+  status = ValidateExternalTableBlobIndexes(
+      table_reader.get(), sv->mutable_cf_options.prefix_extractor.get(), false,
+      validate_blob);
+  if (!status.ok()) {
+    return status;
+  }
 
   // Set original_seqno to 0.
   file_to_import->original_seqno = 0;

@@ -608,7 +608,17 @@ Status DBImpl::Recover(
   if (!s.ok()) {
     return s;
   }
-
+  if (!read_only) {
+    for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+      if (cfd == nullptr || cfd->IsDropped()) {
+        continue;
+      }
+      s = cfd->ValidateBlobIndirectionOptionsAfterRecovery();
+      if (!s.ok()) {
+        return s;
+      }
+    }
+  }
   if (s.ok() && !read_only) {
     for (auto cfd : *versions_->GetColumnFamilySet()) {
       const auto& moptions = cfd->GetLatestMutableCFOptions();
@@ -2239,6 +2249,11 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           kMaxSequenceNumber, dbname_ /* db_name */);
       Version* version = cfd->current();
       version->Ref();
+      tboptions.collect_blob_reference_metadata =
+          mutable_cf_options_copy.enable_blob_indirection ||
+          // A live ColumnFamilyData always has a current Version.
+          // @lint-ignore NULLSAFECLANG nullable-dereference
+          version->storage_info()->HasBlobIndirectionFormat();
       TableProperties temp_table_proerties;
       s = BuildTable(
           dbname_, versions_.get(), immutable_db_options_, tboptions,
@@ -2846,7 +2861,6 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   if (s.ok()) {
     s = impl->LogAndApplyForRecovery(recovery_ctx);
   }
-
   if (s.ok() && !impl->immutable_db_options_.write_identity_file) {
     // On successful recovery, delete an obsolete IDENTITY file to avoid DB ID
     // inconsistency
