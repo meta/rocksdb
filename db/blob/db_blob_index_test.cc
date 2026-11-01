@@ -161,6 +161,19 @@ TEST(BlobIndexTest, IndirectBlobIndexRoundTrip) {
   std::string reencoded;
   blob_index.EncodeTo(&reencoded);
   EXPECT_EQ(reencoded, encoded);
+
+  ASSERT_OK(blob_index.SetGenerationFileNumber(/*generation_file_number=*/401));
+  EXPECT_EQ(blob_index.generation_file_number(), 401U);
+  EXPECT_EQ(blob_index.origin_file_number(), kOrigin);
+  EXPECT_EQ(blob_index.original_value_offset(), kOffset);
+  EXPECT_EQ(blob_index.size(), kSize);
+  EXPECT_EQ(blob_index.compression(), kZSTD);
+  EXPECT_EQ(blob_index.stable_checksum(), kChecksum);
+  blob_index.EncodeTo(&reencoded);
+  BlobIndex flattened;
+  ASSERT_OK(flattened.DecodeFrom(reencoded));
+  EXPECT_EQ(flattened.generation_file_number(), 401U);
+  EXPECT_EQ(flattened.origin_file_number(), kOrigin);
 }
 
 TEST(BlobIndexTest, IdentityBlobNormalizesGenerationToOrigin) {
@@ -893,6 +906,28 @@ TEST(BlobGcCandidateHeapTest, RanksUpdatesAndRetiresPhysicalFiles) {
   ASSERT_FALSE(heap.IsIdentityRoot(20));
 }
 
+TEST(BlobReferenceCensusTest, RetirementSkipsLeasedPrefixWithoutStarvation) {
+  BlobReferenceCensus census;
+  auto forward = std::make_shared<BlobRelocationState>();
+  auto dependencies = std::make_shared<BlobRelocationPublicationDependencies>();
+  for (uint64_t generation = 1; generation <= 65; ++generation) {
+    forward->SetRoute(BlobRelocationRoute(generation, 100, 200));
+    if (generation <= 64) {
+      dependencies->sources.push_back({generation, 100});
+    }
+  }
+  const uint64_t token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(token, 7, forward, nullptr));
+  BlobRelocationPublicationReservation lease;
+  lease.dependencies = dependencies;
+  ASSERT_OK(census.RegisterPublication(&lease));
+  const BlobReferenceCensus::RetirementSelection selected =
+      census.SelectWorkerRetirementSources(token);
+  ASSERT_EQ(selected[0].generation_file_number, 65U);
+  ASSERT_EQ(selected[0].origin_file_number, 100U);
+  ASSERT_EQ(selected[1].generation_file_number, 0U);
+  census.UnregisterPublication(&lease);
+}
 TEST(BlobReferenceCensusTest, MetadataIntentFencesLatePublication) {
   BlobReferenceCensus census;
   BlobRelocationPublicationSnapshot snapshot;

@@ -42,8 +42,8 @@ BlobFileBuilder::BlobFileBuilder(
     const std::string& column_family_name, Env::WriteLifeTimeHint write_hint,
     const std::shared_ptr<IOTracer>& io_tracer,
     BlobFileCompletionCallback* blob_callback,
-    BlobFileCreationReason creation_reason, std::string blob_output_path,
-    std::vector<std::string>* output_file_paths,
+    BlobFileCreationReason creation_reason, bool write_repair_metadata,
+    std::string blob_output_path, std::vector<std::string>* output_file_paths,
     std::vector<BlobFileAddition>* blob_file_additions)
     : BlobFileBuilder([versions]() { return versions->NewFileNumber(); }, fs,
                       immutable_options, mutable_cf_options,
@@ -51,8 +51,8 @@ BlobFileBuilder::BlobFileBuilder(
                       std::move(db_id), std::move(db_session_id), job_id,
                       column_family_id, column_family_name, write_hint,
                       io_tracer, blob_callback, creation_reason,
-                      std::move(blob_output_path), output_file_paths,
-                      blob_file_additions) {}
+                      write_repair_metadata, std::move(blob_output_path),
+                      output_file_paths, blob_file_additions) {}
 
 BlobFileBuilder::BlobFileBuilder(
     std::function<uint64_t()> file_number_generator, FileSystem* fs,
@@ -64,8 +64,8 @@ BlobFileBuilder::BlobFileBuilder(
     const std::string& column_family_name, Env::WriteLifeTimeHint write_hint,
     const std::shared_ptr<IOTracer>& io_tracer,
     BlobFileCompletionCallback* blob_callback,
-    BlobFileCreationReason creation_reason, std::string blob_output_path,
-    std::vector<std::string>* output_file_paths,
+    BlobFileCreationReason creation_reason, bool write_repair_metadata,
+    std::string blob_output_path, std::vector<std::string>* output_file_paths,
     std::vector<BlobFileAddition>* blob_file_additions)
     : file_number_generator_(std::move(file_number_generator)),
       fs_(fs),
@@ -86,6 +86,7 @@ BlobFileBuilder::BlobFileBuilder(
                               : Compressor::ManagedWorkingArea{}),
       prepopulate_blob_cache_(mutable_cf_options->prepopulate_blob_cache),
       enable_blob_indirection_(mutable_cf_options->enable_blob_indirection),
+      write_repair_metadata_(write_repair_metadata),
       file_options_(file_options),
       write_options_(write_options),
       db_id_(std::move(db_id)),
@@ -281,6 +282,9 @@ Status BlobFileBuilder::OpenBlobFileIfNeeded() {
 
   BlobLogHeader header(column_family_id_, blob_compression_type_, has_ttl,
                        expiration_range);
+  header.has_repair_metadata = write_repair_metadata_;
+  header.is_identity_root = enable_blob_indirection_;
+  header.repair_file_number = blob_file_number;
 
   {
     Status s = blob_log_writer->WriteHeader(*write_options_, header);
@@ -360,6 +364,17 @@ Status BlobFileBuilder::CloseBlobFile() {
 
   BlobLogFooter footer;
   footer.blob_count = blob_count_;
+  if (write_repair_metadata_) {
+    constexpr bool has_ttl = false;
+    constexpr ExpirationRange expiration_range;
+    BlobLogHeader header(column_family_id_, blob_compression_type_, has_ttl,
+                         expiration_range);
+    header.has_repair_metadata = true;
+    header.is_identity_root = enable_blob_indirection_;
+    header.repair_file_number = writer_->get_log_number();
+    footer.expiration_range =
+        ExpirationRange{blob_bytes_, header.GetRepairMetadataFooterValue()};
+  }
 
   std::string checksum_method;
   std::string checksum_value;

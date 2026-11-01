@@ -50,6 +50,11 @@ class BlobGcCandidateHeap {
   Status AdjustLiveBytes(uint64_t file_number, uint64_t bytes, bool add);
   void DeletePhysicalFile(uint64_t file_number);
   bool IsIdentityRoot(uint64_t file_number) const;
+  bool IsCoarseIdentityPinned(const BlobRelocationRouteSource& source) const {
+    return source.generation_file_number == source.origin_file_number &&
+           coarse_identity_frontier_ != 0 &&
+           source.origin_file_number >= coarse_identity_frontier_;
+  }
   Selection Select() const;
   Selection SelectEmpty() const;
   uint64_t Revision(uint64_t file_number) const;
@@ -398,6 +403,8 @@ class BlobReferenceCensus {
   Status SetWorkerCoarseIdentityFrontier(uint64_t token, uint64_t frontier);
   BlobGcCandidateHeap::Selection SelectWorkerCandidates(uint64_t token);
   BlobGcCandidateHeap::Selection SelectWorkerEmptyCandidates(uint64_t token);
+  using RetirementSelection = std::array<BlobRelocationRouteSource, 64>;
+  RetirementSelection SelectWorkerRetirementSources(uint64_t token);
   uint64_t WorkerRelocationGarbageBytes(uint64_t token) const;
   uint64_t RetryWorkerCandidates(uint64_t token, uint64_t now_micros);
   bool NeedsWorkerRun(uint64_t version_number) const;
@@ -486,6 +493,8 @@ class BlobReferenceCensus {
     uint64_t token = 0;
     uint64_t version_number = 0;
     std::map<BlobRelocationRouteSource, WorkerRoute> routes;
+    std::set<BlobRelocationRouteSource> retirement_sources;
+    BlobRelocationRouteSource retirement_cursor{};
     std::map<uint64_t, std::shared_ptr<const BlobReferenceSstSummary>> files;
     std::shared_ptr<const BlobRelocationState> forward_state;
     std::shared_ptr<Cache> block_cache;

@@ -3579,6 +3579,9 @@ Status DBImpl::BuildBlobReferenceCensus(ColumnFamilyData* cfd,
       census.SelectWorkerEmptyCandidates(context->token);
   const uint64_t relocation_garbage =
       census.WorkerRelocationGarbageBytes(context->token);
+  const BlobReferenceCensus::RetirementSelection retirement_sources =
+      census.SelectWorkerRetirementSources(context->token);
+  bool published = false;
   {
     InstrumentedMutexLock lock(&mutex_);
     if (shutting_down_.load(std::memory_order_acquire) || cfd->IsDropped()) {
@@ -3587,6 +3590,7 @@ Status DBImpl::BuildBlobReferenceCensus(ColumnFamilyData* cfd,
     const BlobReferenceCensus::PublishResult result = census.TryPublishWorker(
         context->token, applied_version, cfd->current()->GetVersionNumber());
     if (result == BlobReferenceCensus::PublishResult::kPublished) {
+      published = true;
       cfd->current()->storage_info()->SetBlobGcCandidates(candidates);
       cfd->current()->storage_info()->SetEmptyBlobGcCandidates(
           empty_candidates);
@@ -3599,6 +3603,19 @@ Status DBImpl::BuildBlobReferenceCensus(ColumnFamilyData* cfd,
     } else {
       *incomplete = true;
     }
+  }
+  if (published) {
+    bool retired = false;
+    status = RetireBlobRelocationRoutes(cfd, retirement_sources, &retired);
+    if (status.IsTryAgain()) {
+      // Cleanup is optional. A competing writer/lease does not invalidate
+      // the ready SST image or force ordinary compaction to wait for census.
+      status = Status::OK();
+    }
+    if (!status.ok()) {
+      return status;
+    }
+    *incomplete |= retired;
   }
   return Status::OK();
 }

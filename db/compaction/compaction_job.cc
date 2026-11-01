@@ -15,6 +15,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,7 +26,7 @@
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_builder.h"
-#include "db/blob/blob_reference_metadata.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/blob/blob_source.h"
 #include "db/builder.h"
 #include "db/compaction/clipping_iterator.h"
@@ -1266,6 +1267,337 @@ Status CompactionJob::VerifyCompactionRecordCounts(
   return status;
 }
 
+Status CompactionJob::PrepareBlobRelocationPublicationReservation() {
+  Compaction* const compaction = compact_->compaction;
+  Version* const input = compaction->input_version();
+  ColumnFamilyData* const cfd = compaction->column_family_data();
+  if (input == nullptr || !input->storage_info()->HasBlobIndirectionFormat()) {
+    return Status::OK();
+  }
+  auto dependencies = std::make_shared<BlobRelocationPublicationDependencies>();
+  const BlockBasedTableOptions* table_options = GetBlockBasedTableWriterOptions(
+      compaction->mutable_cf_options().table_factory.get());
+  if (table_options != nullptr && table_options->block_cache != nullptr &&
+      table_options->cache_usage_options.options_overrides
+              .at(CacheEntryRole::kBlobReferenceMetadataBuildingBuffer)
+              .charged != CacheEntryRoleOptions::Decision::kDisabled) {
+    dependencies->reservation_manager =
+        std::make_shared<CacheReservationManagerImpl<
+            CacheEntryRole::kBlobReferenceMetadataBuildingBuffer>>(
+            table_options->block_cache);
+  }
+  ReadOptions read_options(Env::IOActivity::kCompaction);
+  read_options.fill_cache = false;
+  read_options.rate_limiter_priority = GetRateLimiterPriority();
+  for (const CompactionInputFiles& level : *compaction->inputs()) {
+    for (const FileMetaData* file : level.files) {
+      if (file->blob_reference_descriptor.empty()) {
+        continue;
+      }
+      std::shared_ptr<const BlobReferenceSstSummary> summary;
+      Status status = cfd->table_cache()->ReadBlobReferenceSstSummary(
+          read_options, file_options_, cfd->internal_comparator(), *file,
+          compaction->mutable_cf_options(), &summary);
+      if (!status.ok()) {
+        return status;
+      }
+      if (summary->groups.size() >
+          (dependencies->sources.max_size() - dependencies->sources.size()) /
+              2) {
+        return Status::MemoryLimit("Blob publication dependency overflow");
+      }
+      const size_t required =
+          dependencies->sources.size() + 2 * summary->groups.size();
+      if (required > dependencies->sources.capacity()) {
+        const size_t old_capacity = dependencies->sources.capacity();
+        const size_t capacity = std::max(
+            required, old_capacity <= dependencies->sources.max_size() / 2
+                          ? old_capacity * 2
+                          : required);
+        if (capacity >
+            (std::numeric_limits<size_t>::max() - sizeof(*dependencies)) /
+                sizeof(BlobRelocationRouteSource)) {
+          return Status::MemoryLimit(
+              "Blob publication dependency size overflow");
+        }
+        if (dependencies->reservation_manager != nullptr) {
+          status = dependencies->reservation_manager->UpdateCacheReservation(
+              sizeof(*dependencies) +
+              capacity * sizeof(BlobRelocationRouteSource));
+          if (!status.ok()) {
+            return status;
+          }
+        }
+        dependencies->sources.reserve(capacity);
+      }
+      for (const BlobReferenceGroup& group : summary->groups) {
+        if (group.encoding_class == BlobReferenceEncodingClass::kLegacyDirect) {
+          continue;
+        }
+        const BlobRelocationRouteSource source{group.generation_file_number,
+                                               group.origin_file_number};
+        const BlobRelocationRoute* const route =
+            input->storage_info()->GetBlobRelocationRoute(source);
+        // Flag-off/loss handling may preserve the original pair. Enabled
+        // flattening may emit its physical target as a new generation. Both
+        // publications need protection, independent of physical file pins.
+        dependencies->sources.push_back(source);
+        dependencies->sources.push_back({route != nullptr
+                                             ? route->GetPhysicalFileNumber()
+                                             : source.generation_file_number,
+                                         source.origin_file_number});
+      }
+    }
+  }
+  std::sort(dependencies->sources.begin(), dependencies->sources.end());
+  dependencies->sources.erase(
+      std::unique(dependencies->sources.begin(), dependencies->sources.end()),
+      dependencies->sources.end());
+  if (dependencies->sources.empty()) {
+    return Status::OK();
+  }
+  blob_publication_reservation_ =
+      std::make_shared<BlobRelocationPublicationReservation>();
+  blob_publication_reservation_->dependencies = std::move(dependencies);
+  const auto admission_status = [this](Status status) {
+    if (status.IsBusy()) {
+      // Only this census admission failure means an unresolved MANIFEST
+      // commit. Use the dependency-retry cleanup/backoff path, rather than
+      // reporting a compaction error that could escalate recovery to fatal.
+      blob_dependency_rejected_ = true;
+      return Status::TryAgain("Blob metadata publication requires recovery");
+    }
+    return status;
+  };
+  for (;;) {
+    db_mutex_->Lock();
+    Status status = cfd->IsDropped()
+                        ? Status::ColumnFamilyDropped()
+                        : cfd->blob_reference_census()->RegisterPublication(
+                              blob_publication_reservation_.get());
+    db_mutex_->Unlock();
+    status = admission_status(std::move(status));
+    if (status.ok()) {
+      // A lease prepared from an old Version may have missed a completed
+      // retirement before it registered. Validate both preserved and flattened
+      // sources once after admission; the lease protects them thereafter.
+      db_mutex_->Lock();
+      if (cfd->IsDropped()) {
+        db_mutex_->Unlock();
+        return Status::ColumnFamilyDropped();
+      }
+      Version* const current = cfd->current();
+      current->Ref();
+      db_mutex_->Unlock();
+      for (const BlobRelocationRouteSource& source :
+           blob_publication_reservation_->dependencies->sources) {
+        Status dependency_status = current->ValidateBlobReferenceSource(source);
+        if (!dependency_status.ok()) {
+          status = Status::TryAgain("Blob lease needs a fresh input Version");
+          blob_dependency_rejected_ = true;
+          break;
+        }
+      }
+      db_mutex_->Lock();
+      const bool detached = current->UnrefAndTryDetach();
+      db_mutex_->Unlock();
+      if (detached) {
+        current->DeleteDetached();
+      }
+      return status;
+    }
+    if (!status.IsTryAgain() || blob_dependency_rejected_) {
+      return status;
+    }
+    TEST_SYNC_POINT(
+        "CompactionJob::PrepareBlobRelocationPublicationReservation:"
+        "BeforeWait");
+    status =
+        admission_status(cfd->blob_reference_census()->WaitForMetadataCommit());
+    if (!status.ok()) {
+      return status;
+    }
+  }
+}
+
+Status CompactionJob::ReserveBlobRelocationDependencyMemory(
+    size_t additional_bytes) {
+  if (additional_bytes >
+      std::numeric_limits<size_t>::max() - blob_dependency_reserved_bytes_) {
+    return Status::MemoryLimit("Blob output dependency size overflow");
+  }
+  if (blob_dependency_reservation_manager_ == nullptr &&
+      blob_dependency_reserved_bytes_ == 0) {
+    const BlockBasedTableOptions* options = GetBlockBasedTableWriterOptions(
+        compact_->compaction->mutable_cf_options().table_factory.get());
+    if (options != nullptr && options->block_cache != nullptr &&
+        options->cache_usage_options.options_overrides
+                .at(CacheEntryRole::kBlobReferenceMetadataBuildingBuffer)
+                .charged != CacheEntryRoleOptions::Decision::kDisabled) {
+      blob_dependency_reservation_manager_ =
+          std::make_shared<CacheReservationManagerImpl<
+              CacheEntryRole::kBlobReferenceMetadataBuildingBuffer>>(
+              options->block_cache);
+    }
+  }
+  const size_t bytes = blob_dependency_reserved_bytes_ + additional_bytes;
+  if (blob_dependency_reservation_manager_ != nullptr) {
+    Status status =
+        blob_dependency_reservation_manager_->UpdateCacheReservation(bytes);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  blob_dependency_reserved_bytes_ = bytes;
+  return Status::OK();
+}
+
+Status CompactionJob::PrepareBlobRelocationOutputDependencies() {
+  const VersionStorageInfo* const storage =
+      compact_->compaction->input_version()->storage_info();
+  for (const SubcompactionState& subcompaction : compact_->sub_compact_states) {
+    for (const CompactionOutputs::Output& output : subcompaction.GetOutputs()) {
+      const auto& summary = output.meta.blob_reference_summary;
+      if (summary == nullptr) {
+        continue;
+      }
+      for (const BlobReferenceGroup& group : summary->groups) {
+        if (group.encoding_class == BlobReferenceEncodingClass::kLegacyDirect) {
+          continue;
+        }
+        const BlobRelocationRouteSource source{group.generation_file_number,
+                                               group.origin_file_number};
+        const BlobRelocationRoute* const route =
+            storage->GetBlobRelocationRoute(source);
+        const uint64_t target = route != nullptr
+                                    ? route->GetPhysicalFileNumber()
+                                    : source.generation_file_number;
+        const auto normal = storage->GetBlobFileMetaData(target);
+        const auto relocation = storage->GetBlobRelocationFileMetaData(target);
+        if (normal == nullptr && relocation == nullptr) {
+          // A freshly written identity root belongs to this edit rather than
+          // the input Version. VersionBuilder validates its addition normally.
+          bool fresh_identity = false;
+          for (const auto& file :
+               subcompaction.Current().GetBlobFileAdditions()) {
+            fresh_identity |=
+                file.GetBlobFileNumber() == target && file.IsIdentityRoot();
+          }
+          if (!fresh_identity) {
+            return Status::Corruption(
+                "Compaction emitted an unowned blob dependency");
+          }
+          continue;
+        }
+        auto iterator = blob_output_dependencies_.find(target);
+        if (iterator == blob_output_dependencies_.end()) {
+          Status status = ReserveBlobRelocationDependencyMemory(
+              sizeof(decltype(blob_output_dependencies_)::value_type) +
+              4 * sizeof(void*));
+          if (!status.ok()) {
+            return status;
+          }
+          iterator = blob_output_dependencies_.try_emplace(target).first;
+        }
+        BlobOutputDependency& dependency = iterator->second;
+        dependency.normal =
+            normal != nullptr ? normal->GetSharedMeta() : nullptr;
+        dependency.relocation = relocation;
+        if (dependency.sources.size() == dependency.sources.capacity()) {
+          const size_t old_capacity = dependency.sources.capacity();
+          if (old_capacity > dependency.sources.max_size() / 2) {
+            return Status::MemoryLimit("Blob output dependency count overflow");
+          }
+          const size_t capacity = std::max(size_t{1}, old_capacity * 2);
+          if (capacity > std::numeric_limits<size_t>::max() /
+                             sizeof(BlobRelocationRouteSource)) {
+            return Status::MemoryLimit("Blob output dependency bytes overflow");
+          }
+          Status status = ReserveBlobRelocationDependencyMemory(
+              (capacity - old_capacity) * sizeof(BlobRelocationRouteSource));
+          if (!status.ok()) {
+            return status;
+          }
+          dependency.sources.reserve(capacity);
+        }
+        dependency.sources.push_back(source);
+      }
+    }
+  }
+  for (auto& entry : blob_output_dependencies_) {
+    std::sort(entry.second.sources.begin(), entry.second.sources.end());
+    entry.second.sources.erase(
+        std::unique(entry.second.sources.begin(), entry.second.sources.end()),
+        entry.second.sources.end());
+  }
+  return Status::OK();
+}
+
+Status CompactionJob::PrepareUnpublishedBlobCompactionOutputs() {
+  if (blob_output_dependencies_.empty()) {
+    return Status::OK();
+  }
+  for (SubcompactionState& subcompaction : compact_->sub_compact_states) {
+    for (const bool proximal : {false, true}) {
+      if (proximal && !compact_->compaction->SupportsPerKeyPlacement()) {
+        continue;
+      }
+      for (const std::string& path :
+           subcompaction.Outputs(proximal)->GetOutputFilePaths()) {
+        const size_t slash = path.find_last_of('/');
+        uint64_t number = 0;
+        FileType type;
+        if (!ParseFileName(
+                path.substr(slash == std::string::npos ? 0 : slash + 1),
+                &number, &type) ||
+            (type != kTableFile && type != kBlobFile)) {
+          return Status::Corruption(
+              "Invalid unpublished compaction output path");
+        }
+        Status status = ReserveBlobRelocationDependencyMemory(
+            2 * sizeof(JobContext::UnpublishedCompactionOutput) +
+            2 * path.size() + 2);
+        if (!status.ok()) {
+          return status;
+        }
+        blob_unpublished_outputs_.push_back(
+            {path,
+             slash == std::string::npos ? std::string() : path.substr(0, slash),
+             number, type});
+      }
+    }
+  }
+  return Status::OK();
+}
+
+Status CompactionJob::ValidateBlobRelocationOutputDependencies(
+    const Version& current) const {
+  const VersionStorageInfo* const storage = current.storage_info();
+  for (const auto& entry : blob_output_dependencies_) {
+    const BlobOutputDependency& dependency = entry.second;
+    const auto normal = storage->GetBlobFileMetaData(entry.first);
+    if ((dependency.normal != nullptr && normal != nullptr &&
+         normal->GetSharedMeta() == dependency.normal) ||
+        (dependency.relocation != nullptr &&
+         storage->GetBlobRelocationFileMetaData(entry.first) ==
+             dependency.relocation)) {
+      continue;
+    }
+    // Admission validated preserved and prospective exact sources. Exact
+    // inputs hold leases; coarse L0 inputs pin identity roots through their
+    // frontier. Unchanged targets need no repeated per-pair validation.
+    for (const BlobRelocationRouteSource& source : dependency.sources) {
+      const Status status = current.ValidateBlobReferenceSource(source);
+      if (status.ok()) {
+        continue;
+      }
+      return Status::TryAgain(
+          "Compaction blob dependency requires a fresh input Version");
+    }
+  }
+  return Status::OK();
+}
+
 void CompactionJob::FinalizeCompactionRun(
     const Status& input_status, bool stats_built_from_input_table_prop,
     uint64_t num_input_range_del) {
@@ -1286,6 +1618,12 @@ void CompactionJob::FinalizeCompactionRun(
 
 Status CompactionJob::Run() {
   InitializeCompactionRun();
+  Status reservation_status = PrepareBlobRelocationPublicationReservation();
+  if (!reservation_status.ok()) {
+    compact_->status = reservation_status;
+    ReleaseSubcompactionResources();
+    return reservation_status;
+  }
 
   const uint64_t start_micros = db_options_.clock->NowMicros();
 
@@ -1330,6 +1668,13 @@ Status CompactionJob::Run() {
   if (status.ok()) {
     status = VerifyCompactionRecordCounts(stats_built_from_input_table_prop,
                                           num_input_range_del);
+  }
+
+  if (status.ok()) {
+    status = PrepareBlobRelocationOutputDependencies();
+  }
+  if (status.ok()) {
+    status = PrepareUnpublishedBlobCompactionOutputs();
   }
 
   FinalizeCompactionRun(status, stats_built_from_input_table_prop,
@@ -1513,7 +1858,42 @@ Status CompactionJob::Install(bool* compaction_released) {
     compact_->status = status;
   }
 
-  CleanupCompaction();
+  const bool retry_outputs = blob_dependency_rejected_ && status.IsTryAgain();
+  if (blob_publication_reservation_ != nullptr &&
+      blob_publication_reservation_->registered && !retry_outputs) {
+    cfd->blob_reference_census()->UnregisterPublication(
+        blob_publication_reservation_.get());
+  }
+  if (retry_outputs) {
+    assert(job_context_->unpublished_compaction_outputs.empty());
+    job_context_->unpublished_compaction_outputs =
+        std::move(blob_unpublished_outputs_);
+    job_context_->unpublished_compaction_output_reservation =
+        std::move(blob_dependency_reservation_manager_);
+    job_context_->blob_relocation_retry = true;
+    if (blob_publication_reservation_ != nullptr &&
+        blob_publication_reservation_->registered) {
+      // Intrusive node address stays stable across the handoff. Protection
+      // ends only after exact outputs have been deleted or quarantined.
+      cfd->Ref();
+      job_context_->blob_publication_cfd = cfd;
+      job_context_->blob_publication_reservation =
+          std::move(blob_publication_reservation_);
+    }
+  }
+  if (blob_publication_reservation_ != nullptr ||
+      !blob_output_dependencies_.empty() ||
+      blob_dependency_reservation_manager_ != nullptr) {
+    db_mutex_->Unlock();
+    blob_publication_reservation_.reset();
+    blob_output_dependencies_.clear();
+    blob_unpublished_outputs_.clear();
+    blob_dependency_reservation_manager_.reset();
+    CleanupCompaction();
+    db_mutex_->Lock();
+  } else {
+    CleanupCompaction();
+  }
   return status;
 }
 
@@ -1575,6 +1955,54 @@ void CompactionJob::NotifyOnSubcompactionCompleted(
 
 bool CompactionJob::ShouldUseLocalCompaction(SubcompactionState* sub_compact) {
   if (db_options_.compaction_service) {
+    if (sub_compact == nullptr || sub_compact->compaction == nullptr ||
+        compact_ == nullptr) {
+      return true;
+    }
+    Version* const input_version = sub_compact->compaction->input_version();
+    if (input_version == nullptr) {
+      return true;
+    }
+    const VersionStorageInfo* input_vstorage = input_version->storage_info();
+    const bool input_has_blob_indirection_format =
+        input_vstorage->HasBlobIndirectionFormat();
+    const bool feature_aware_compaction =
+        input_has_blob_indirection_format ||
+        sub_compact->compaction->mutable_cf_options().enable_blob_indirection;
+    if (input_has_blob_indirection_format &&
+        !sub_compact->compaction->mutable_cf_options()
+             .enable_blob_indirection &&
+        sub_compact->compaction->enable_blob_garbage_collection()) {
+      // Disabled-policy materialization and route retirement use a census
+      // captured by the primary. Protocol v1 cannot carry that state or return
+      // the resulting retirement edits.
+      sub_compact->compaction_job_stats.is_remote_compaction = false;
+      return true;
+    }
+    const bool has_blob_gc_override =
+        sub_compact->compaction->enable_blob_garbage_collection() !=
+            sub_compact->compaction->mutable_cf_options()
+                .enable_blob_garbage_collection ||
+        sub_compact->compaction->blob_garbage_collection_age_cutoff() !=
+            sub_compact->compaction->mutable_cf_options()
+                .blob_garbage_collection_age_cutoff;
+    if (feature_aware_compaction && has_blob_gc_override) {
+      // The current CompactionService protocol reconstructs these effective
+      // values from the persisted options file. Keep manual overrides local.
+      sub_compact->compaction_job_stats.is_remote_compaction = false;
+      return true;
+    }
+    if (feature_aware_compaction && (!input_has_blob_indirection_format ||
+                                     compact_->sub_compact_states.size() > 1)) {
+      // Feature-aware output must be accepted or rejected as one coordinated
+      // result. The current CompactionService API schedules subcompactions as
+      // independent jobs, and protocol v1 requires an already-fenced input
+      // Version. Run both multi-subcompaction jobs and the first activation
+      // compaction completely locally instead of risking an unnegotiated or
+      // partially trusted feature result.
+      sub_compact->compaction_job_stats.is_remote_compaction = false;
+      return true;
+    }
     CompactionServiceJobStatus comp_status =
         ProcessKeyValueCompactionWithCompactionService(sub_compact);
     if (comp_status != CompactionServiceJobStatus::kUseLocal) {
@@ -1757,7 +2185,7 @@ void CompactionJob::CreateBlobFileBuilder(
 
   // TODO: BlobDB to support output_to_proximal_level compaction, which needs
   //  2 builders, so may need to move to `CompactionOutputs`
-  if (mutable_cf_options.enable_blob_files &&
+  if (AllowBlobFileCreation() && mutable_cf_options.enable_blob_files &&
       sub_compact->compaction->output_level() >=
           mutable_cf_options.blob_file_starting_level) {
     blob_file_builder = std::make_unique<BlobFileBuilder>(
@@ -1770,8 +2198,15 @@ void CompactionJob::CreateBlobFileBuilder(
                   mutable_cf_options),
         &file_options_, &write_options, db_id_, db_session_id_, job_id_,
         cfd->GetID(), cfd->GetName(), write_hint_, io_tracer_, blob_callback_,
-        BlobFileCreationReason::kCompaction, GetBlobOutputPath(),
-        sub_compact->Current().GetOutputFilePathsPtr(),
+        BlobFileCreationReason::kCompaction,
+        mutable_cf_options.enable_blob_indirection ||
+            (sub_compact->compaction->input_version() != nullptr &&
+             sub_compact->compaction->input_version()->storage_info() !=
+                 nullptr &&
+             sub_compact->compaction->input_version()
+                 ->storage_info()
+                 ->HasBlobIndirectionFormat()),
+        GetBlobOutputPath(), sub_compact->Current().GetOutputFilePathsPtr(),
         sub_compact->Current().GetBlobFileAdditionsPtr());
   } else {
     blob_file_builder = nullptr;
@@ -1783,26 +2218,41 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
     InternalIterator* input, const CompactionFilter* compaction_filter,
     MergeHelper& merge, std::unique_ptr<BlobFileBuilder>& blob_file_builder,
     const WriteOptions& write_options) {
+  if (sub_compact == nullptr || sub_compact->compaction == nullptr) {
+    return nullptr;
+  }
+  const Compaction* const compaction = sub_compact->compaction;
   CreateBlobFileBuilder(sub_compact, cfd, blob_file_builder, write_options);
 
   const std::string* const full_history_ts_low =
       full_history_ts_low_.empty() ? nullptr : &full_history_ts_low_;
   assert(job_context_);
+  const bool allow_blob_index_flattening = AllowBlobIndexFlattening();
 
-  return std::make_unique<CompactionIterator>(
-      input, cfd->user_comparator(), &merge, versions_->LastSequence(),
-      &(job_context_->snapshot_seqs), earliest_snapshot_,
-      job_context_->earliest_write_conflict_snapshot,
-      job_context_->GetJobSnapshotSequence(), job_context_->snapshot_checker,
-      env_, ShouldReportDetailedTime(env_, stats_), sub_compact->RangeDelAgg(),
-      blob_file_builder.get(), db_options_.allow_data_in_errors,
-      db_options_.enforce_single_del_contracts, manual_compaction_canceled_,
-      sub_compact->compaction
-          ->DoesInputReferenceBlobFiles() /* must_count_input_entries */,
-      sub_compact->compaction, compaction_filter, shutting_down_,
-      db_options_.info_log, full_history_ts_low, preserve_seqno_after_,
-      nullptr /* input_version */, Env::IOActivity::kCompaction,
-      GetBlobGarbageCollectionCutoffFileNumber());
+  std::unique_ptr<CompactionIterator> compaction_iterator =
+      std::make_unique<CompactionIterator>(
+          input, cfd->user_comparator(), &merge, versions_->LastSequence(),
+          &(job_context_->snapshot_seqs), earliest_snapshot_,
+          job_context_->earliest_write_conflict_snapshot,
+          job_context_->GetJobSnapshotSequence(),
+          job_context_->snapshot_checker, env_,
+          ShouldReportDetailedTime(env_, stats_), sub_compact->RangeDelAgg(),
+          blob_file_builder.get(), db_options_.allow_data_in_errors,
+          db_options_.enforce_single_del_contracts, manual_compaction_canceled_,
+          compaction
+              ->DoesInputReferenceBlobFiles() /* must_count_input_entries */,
+          allow_blob_index_flattening, compaction, compaction_filter,
+          shutting_down_, db_options_.info_log, full_history_ts_low,
+          preserve_seqno_after_, nullptr /* input_version */,
+          Env::IOActivity::kCompaction,
+          GetBlobGarbageCollectionCutoffFileNumber());
+  const MutableCFOptions& mutable_options = compaction->mutable_cf_options();
+  if (!AllowBlobFileCreation() && mutable_options.enable_blob_files &&
+      compaction->output_level() >= mutable_options.blob_file_starting_level) {
+    compaction_iterator->SetSstOnlyBlobOutputPolicy(
+        mutable_options.min_blob_size);
+  }
+  return compaction_iterator;
 }
 
 std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc>
@@ -2405,6 +2855,8 @@ void CompactionJob::ProcessLocalKeyValueCompaction(
 
   status = FinalizeProcessKeyValueStatus(cfd, input_iter, c_iter.get(), status);
 
+  sub_compact->has_flattened_blob_index |= c_iter->HasFlattenedBlobIndex();
+
   FinalizeSubcompaction(sub_compact, status, open_file_func, close_file_func,
                         blob_file_builder.get(), c_iter.get(), input_iter,
                         start_cpu_micros, prev_cpu_micros, io_stats);
@@ -2932,8 +3384,13 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
   // Add compaction inputs and outputs only after all blob metadata has been
   // validated across subcompactions.
   compaction->AddInputDeletions(edit);
-  for (const auto& sub_compact : compact_->sub_compact_states) {
-    sub_compact.AddOutputsEdit(edit);
+  bool has_flattened_blob_index = false;
+  const bool output_predates_blob_indirection =
+      !compaction->mutable_cf_options().enable_blob_indirection &&
+      !compaction->input_version()->storage_info()->HasBlobIndirectionFormat();
+  for (auto& sub_compact : compact_->sub_compact_states) {
+    has_flattened_blob_index |= sub_compact.has_flattened_blob_index;
+    sub_compact.AddOutputsEdit(edit, output_predates_blob_indirection);
 
     for (const auto& blob : sub_compact.Current().GetBlobFileAdditions()) {
       edit->AddBlobFile(blob);
@@ -2946,10 +3403,17 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
         kBlobIndirectionManifestFormatVersion);
   }
 
+  const auto& route_deletions = edit->GetBlobRelocationRouteDeletions();
+  assert(std::is_sorted(route_deletions.begin(), route_deletions.end()));
   for (const auto& pair : blob_total_garbage) {
     const uint64_t blob_file_number = pair.first;
     const BlobGarbageMeter::BlobStats& stats = pair.second;
 
+    if (std::binary_search(
+            route_deletions.begin(), route_deletions.end(),
+            BlobRelocationRouteSource{blob_file_number, blob_file_number})) {
+      continue;
+    }
     edit->AddBlobFileGarbage(blob_file_number, stats.GetCount(),
                              stats.GetBytes());
   }
@@ -2972,6 +3436,60 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
     *compaction_released = true;
   };
 
+  std::function<Status()> relocation_state_precondition;
+  if (has_flattened_blob_index || !blob_output_dependencies_.empty()) {
+    ColumnFamilyData* const cfd = compaction->column_family_data();
+    Version* const input_version = compaction->input_version();
+    if (cfd == nullptr || input_version == nullptr) {
+      return Status::Corruption(
+          "Missing compaction state for blob relocation update");
+    }
+    ColumnFamilyData& cfd_ref = *cfd;
+    // Independent retirement respects publication leases and coarse identity
+    // pins. This compaction does not retire routes; it revalidates its output
+    // dependencies against each current Version before MANIFEST publication.
+    Version* validated_current = nullptr;
+    relocation_state_precondition = [this, &cfd_ref,
+                                     validated_current]() mutable {
+      Version* const current = cfd_ref.current();
+      if (cfd_ref.IsDropped() || current == nullptr) {
+        return Status::ColumnFamilyDropped(
+            "Column family dropped before blob relocation update");
+      }
+      if (current == validated_current) {
+        return Status::OK();
+      }
+      // The MANIFEST queue head excludes another Version publication while
+      // validation runs. Pin under DB mutex, do all O(P) and exceptional
+      // O(K_changed log R) work unlocked, then compare one pointer on return.
+      current->Ref();
+      db_mutex_->Unlock();
+      Status status = ValidateBlobRelocationOutputDependencies(*current);
+      TEST_SYNC_POINT_CALLBACK(
+          "CompactionJob::ValidateBlobRelocationOutputDependencies", &status);
+      db_mutex_->Lock();
+      const bool unchanged =
+          cfd_ref.current() == current && !cfd_ref.IsDropped();
+      const bool detached = current->UnrefAndTryDetach();
+      if (detached) {
+        db_mutex_->Unlock();
+        current->DeleteDetached();
+        db_mutex_->Lock();
+      }
+      if (!unchanged) {
+        blob_dependency_rejected_ = true;
+        return Status::TryAgain("Compaction blob publication state changed");
+      }
+      if (status.IsTryAgain()) {
+        blob_dependency_rejected_ = true;
+      }
+      if (status.ok()) {
+        validated_current = current;
+      }
+      return status;
+    };
+  }
+
   Status s;
   TEST_SYNC_POINT_CALLBACK(
       "CompactionJob::InstallCompactionResults:BeforeLogAndApply", &s);
@@ -2979,7 +3497,8 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
     s = versions_->LogAndApply(compaction->column_family_data(), read_options,
                                write_options, edit, db_mutex_, db_directory_,
                                /*new_descriptor_log=*/false,
-                               /*column_family_options=*/nullptr, manifest_wcb);
+                               /*column_family_options=*/nullptr, manifest_wcb,
+                               relocation_state_precondition);
   }
   return s;
 }
@@ -3010,6 +3529,10 @@ void CompactionJob::RecordCompactionIOStats() {
 Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
                                                CompactionOutputs& outputs) {
   assert(sub_compact != nullptr);
+  const Compaction* const compaction = sub_compact->compaction;
+  if (compaction == nullptr) {
+    return Status::InvalidArgument("Missing compaction state");
+  }
 
   // no need to lock because VersionSet::next_file_number_ is atomic
   uint64_t file_number = versions_->NewFileNumber();
@@ -3167,7 +3690,6 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
       sub_compact->compaction->max_output_file_size(), file_number,
       proximal_after_seqno_ /*last_level_inclusive_max_seqno_threshold*/,
       dbname_ /*db_name*/, IsRemoteCompaction() /*is_remote_compaction*/);
-  const Compaction* compaction = sub_compact->compaction;
   const Version* input_version = compaction->input_version();
   tboptions.track_blob_reference_classification =
       compaction->mutable_cf_options().enable_blob_indirection ||

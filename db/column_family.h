@@ -323,7 +323,28 @@ class ColumnFamilyData {
   // UnrefAndTryDelete() decreases the reference count and do free if needed,
   // return true if this is freed else false, UnrefAndTryDelete() can only
   // be called while holding a DB mutex, or during single-threaded recovery.
+  // It may also be called by SuperVersion cleanup after this CFD has been
+  // detached under the DB mutex.
   bool UnrefAndTryDelete();
+
+  // Drops a reference and detaches the CFD from mutex-protected lookup state
+  // before potentially large teardown. A non-null pending SuperVersion retains
+  // the final CFD reference while the returned thread-local registry is
+  // destroyed unlocked; FinishSuperVersionDetach() then completes the bounded
+  // transition. On true, either the pending SuperVersion must be cleaned up
+  // (and will delete this CFD) or DeleteDetached() must be called. Both cleanup
+  // operations must run without the mutex.
+  // REQUIRES: DB mutex held.
+  bool UnrefAndTryDetach(
+      SuperVersion** pending_super_version,
+      std::unique_ptr<ThreadLocalPtr>* detached_local_super_versions);
+  // REQUIRES: pending_super_version came from UnrefAndTryDetach() and its
+  // detached thread-local registry has been destroyed.
+  // REQUIRES: DB mutex held.
+  bool FinishSuperVersionDetach(SuperVersion* pending_super_version);
+  // REQUIRES: UnrefAndTryDetach() returned true with no detached SuperVersion.
+  // REQUIRES: DB mutex not held.
+  void DeleteDetached();
 
   // SetDropped() can only be called under following conditions:
   // 1) Holding a DB mutex,
@@ -382,6 +403,9 @@ class ColumnFamilyData {
   // Test-only, not public API. Until the Blob GC stack is complete,
   // ValidateOptions rejects enable_blob_indirection unless a test allows it.
   static void TEST_SetAllowBlobIndirection(bool allow);
+  // Validates writer-only constraints that depend on the recovered sticky
+  // format fence. REQUIRES: DB mutex held after MANIFEST recovery.
+  Status ValidateBlobIndirectionOptionsAfterRecovery() const;
   // Parses and validates a replacement without publishing it. The caller
   // keeps the DB mutex held so the latest-options base remains stable.
   Status PrepareMutableCFOptions(
@@ -567,6 +591,20 @@ class ColumnFamilyData {
     db_mutex->AssertHeld();
     return num_in_flight_compactions_;
   }
+
+  // DB mutex held, paired with Compaction's referenced input lifetime.
+  // Enabled output can publish the first format fence after an option toggle.
+  void BeginBlobIndirectionCompaction() {
+    ++pending_blob_indirection_compactions_;
+  }
+  void EndBlobIndirectionCompaction() {
+    assert(pending_blob_indirection_compactions_ > 0);
+    --pending_blob_indirection_compactions_;
+  }
+  bool HasPendingBlobIndirectionOutput() const {
+    // Flush intent accounting is integrated with dynamic activation later.
+    return pending_blob_indirection_compactions_ != 0;
+  }
   void inc_num_in_flight_compactions(InstrumentedMutex* db_mutex) {
     db_mutex->AssertHeld();
     ++num_in_flight_compactions_;
@@ -694,6 +732,9 @@ class ColumnFamilyData {
       bool options_are_sanitized, bool fast_sst_open = false);
 
   std::vector<std::string> GetDbPaths() const;
+  // Unlinks this CFD from DB-mutex-protected ownership before unlocked
+  // destruction.
+  void DetachFromColumnFamilySet();
 
   uint32_t id_;
   const std::string name_;
@@ -751,6 +792,7 @@ class ColumnFamilyData {
   // be alive as long as client holds a reference)
   ColumnFamilyData* next_;
   ColumnFamilyData* prev_;
+  bool detached_from_column_family_set_ = false;
 
   // This is the earliest log file number that contains data from this
   // Column Family. All earlier log files must be ignored and not
@@ -794,6 +836,7 @@ class ColumnFamilyData {
   // worker invocations, backs the public rocksdb.num-running-compactions
   // property, and excludes CompactFiles). Protected by the DB mutex.
   int num_in_flight_compactions_{0};
+  size_t pending_blob_indirection_compactions_ = 0;
 
   uint64_t prev_compaction_needed_bytes_;
 

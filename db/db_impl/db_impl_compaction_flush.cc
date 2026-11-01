@@ -12,7 +12,6 @@
 #include <deque>
 #include <limits>
 #include <memory>
-#include <set>
 #include <unordered_map>
 
 #include "cache/cache_reservation_manager.h"
@@ -125,6 +124,106 @@ std::vector<uint64_t> MemTableIds(const autovector<ReadOnlyMemTable*>& mems) {
 }
 
 }  // namespace
+
+Status DBImpl::RetireBlobRelocationRoutes(
+    ColumnFamilyData* cfd,
+    const BlobReferenceCensus::RetirementSelection& selected,
+    bool* made_progress) {
+  // The census worker calls this unlocked after publishing a ready epoch.
+  // Membership/lease snapshots and the edit are all prepared outside DB
+  // mutex. Ordinary SST compaction never guesses global death from its inputs.
+  if (selected.front().generation_file_number == 0) {
+    return Status::OK();
+  }
+  mutex_.Lock();
+  Version* const version = cfd->current();
+  if (cfd->IsDropped() || shutting_down_.load(std::memory_order_acquire)) {
+    mutex_.Unlock();
+    return Status::ShutdownInProgress();
+  }
+  version->Ref();
+  mutex_.Unlock();
+  Defer release_version([&] {
+    mutex_.Lock();
+    const bool detached = version->UnrefAndTryDetach();
+    mutex_.Unlock();
+    if (detached) {
+      version->DeleteDetached();
+    }
+  });
+  BlobReferenceCensus& census = *cfd->blob_reference_census();
+  std::set<BlobRelocationRouteSource> sources;
+  for (const BlobRelocationRouteSource& source : selected) {
+    if (source.generation_file_number == 0) {
+      break;
+    }
+    sources.insert(source);
+  }
+  std::shared_ptr<const BlobReferenceCensusState> state;
+  Status status =
+      census.ReadSelectedSnapshot(version->GetVersionNumber(), sources, &state);
+  BlobRelocationPublicationSnapshot publications;
+  if (status.ok()) {
+    status = census.SnapshotPublications(&publications);
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  VersionEdit edit;
+  edit.SetColumnFamily(cfd->GetID());
+  for (const BlobRelocationRouteSource& source : sources) {
+    if (state->GetSstCount(source) == 0 && !publications.Contains(source) &&
+        !version->storage_info()->IsCoarseIdentityBlobPinned(
+            source.generation_file_number) &&
+        version->storage_info()->GetBlobRelocationRoute(source) != nullptr) {
+      edit.DeleteBlobRelocationRoute(source.generation_file_number,
+                                     source.origin_file_number);
+    }
+  }
+  if (edit.GetBlobRelocationRouteDeletions().empty()) {
+    return Status::OK();
+  }
+  SuperVersionContext sv_context(true);
+  bool intent = false;
+  const auto precondition = [&]() -> Status {
+    mutex_.AssertHeld();
+    if (cfd->IsDropped() || cfd->current() != version ||
+        !census.IsReady(version->GetVersionNumber()) ||
+        !census.PublicationsMatch(publications.revision)) {
+      return Status::TryAgain("Blob route retirement proof changed");
+    }
+    if (!intent) {
+      Status result = census.BeginMetadataCommit(publications.revision);
+      intent = result.ok();
+      return result;
+    }
+    return Status::OK();
+  };
+  TEST_SYNC_POINT("DBImpl::RetireBlobRelocationRoutes:BeforeLogAndApply");
+  mutex_.Lock();
+  status = versions_->LogAndApply(
+      cfd, ReadOptions(Env::IOActivity::kCompaction),
+      WriteOptions(Env::IOActivity::kCompaction), &edit, &mutex_,
+      directories_.GetDbDir(), false, nullptr, {}, precondition);
+  if (intent) {
+    if (!status.ok() && !versions_->io_status().ok()) {
+      // This census worker owns a real MANIFEST write, just like compaction.
+      // Keep the ambiguous publication fenced until MANIFEST recovery settles
+      // authority; admission retries must not escalate it to a fatal error.
+      error_handler_.SetBGError(versions_->io_status(),
+                                BackgroundErrorReason::kManifestWrite);
+    }
+    census.EndMetadataCommit(status.ok() || versions_->io_status().ok());
+  }
+  if (status.ok()) {
+    InstallSuperVersionAndScheduleWork(cfd, &sv_context,
+                                       /*defer_snapshot_refresh=*/false);
+    *made_progress = true;
+  }
+  mutex_.Unlock();
+  sv_context.Clean();
+  return status;
+}
 
 Status DBImpl::RunStandaloneBlobGC(
     ColumnFamilyData* cfd,
@@ -3696,7 +3795,7 @@ Status DBImpl::CompactFiles(const CompactionOptions& compact_options,
   TEST_SYNC_POINT_CALLBACK("TestCancelCompactFiles:SuccessfulCompaction",
                            static_cast<void*>(const_cast<std::atomic<int>*>(
                                &manual_compaction_paused_)));
-  {
+  for (;;) {
     InstrumentedMutexLock l(&mutex_);
     auto* current = cfd->current();
     current->Ref();
@@ -3706,6 +3805,21 @@ Status DBImpl::CompactFiles(const CompactionOptions& compact_options,
                          &job_context, &log_buffer, compaction_job_info);
 
     current->Unref();
+    if (!job_context.blob_relocation_retry) {
+      break;
+    }
+    // Dependency conflicts can retry with a fresh Version, but metadata
+    // ambiguity needs MANIFEST recovery. If background work is stopped,
+    // return its error rather than waiting for recovery here.
+    job_context.blob_relocation_retry = false;
+    if (error_handler_.IsBGWorkStopped()) {
+      s = error_handler_.GetBGError();
+      break;
+    }
+    mutex_.Unlock();
+    log_buffer.FlushBufferToLog();
+    immutable_db_options_.clock->SleepForMicroseconds(1000);
+    mutex_.Lock();
   }
 
   // Find and delete obsolete files
@@ -4013,16 +4127,27 @@ Status DBImpl::CompactFilesImpl(
     sfm->OnCompactionCompletion(c.get());
   }
 
+  bool unpublished_cleanup_failed = false;
+  if (job_context->blob_relocation_retry) {
+    mutex_.Unlock();
+    Status cleanup = PurgeUnpublishedCompactionOutputs(job_context);
+    if (!cleanup.ok()) {
+      status = cleanup;
+      unpublished_cleanup_failed = true;
+    }
+    mutex_.Lock();
+  }
   ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
 
   mutex_.Unlock();
   if (compaction_job_info != nullptr) {
-    BuildCompactionJobInfo(cfd, c.get(), s, compaction_job_stats,
+    BuildCompactionJobInfo(cfd, c.get(), status, compaction_job_stats,
                            job_context->job_id, compaction_job_info);
   }
   mutex_.Lock();
 
-  if (status.ok()) {
+  if (status.ok() || job_context->blob_relocation_retry ||
+      unpublished_cleanup_failed) {
     // Done
   } else if (status.IsColumnFamilyDropped() || status.IsShutdownInProgress()) {
     // Ignore compaction errors found during shutting down
@@ -4050,7 +4175,7 @@ Status DBImpl::CompactFilesImpl(
     }
   }
 
-  if (output_file_names != nullptr) {
+  if (status.ok() && output_file_names != nullptr) {
     for (const auto& newf : c->edit()->GetNewFiles()) {
       output_file_names->push_back(TableFileName(
           c->immutable_options().cf_paths, newf.second.fd.GetNumber(),
@@ -6219,6 +6344,9 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
         in_file->blob_reference_descriptor;
     out_file_metadata.blob_reference_legacy_metadata =
         in_file->blob_reference_legacy_metadata;
+    out_file_metadata.blob_reference_output_predates_indirection =
+        in_file->blob_reference_descriptor.empty() &&
+        !in_file->blob_reference_legacy_metadata;
 
     if (out_table_properties) {
       c->SetOutputTableProperties(out_fname, out_table_properties);
@@ -7072,6 +7200,14 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
     }
 
     TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:FlushFinish:0");
+    if (job_context.blob_relocation_retry) {
+      mutex_.Unlock();
+      Status cleanup = PurgeUnpublishedCompactionOutputs(&job_context);
+      if (!cleanup.ok()) {
+        s = cleanup;
+      }
+      mutex_.Lock();
+    }
     ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
     // There is no need to find obsolete files if the flush job is rescheduled
     // to retain user-defined timestamps because the job doesn't get to the
@@ -7197,16 +7333,26 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                        m->cfd->GetName().c_str(), job_context.job_id);
     }
 
+    if (job_context.blob_relocation_retry) {
+      mutex_.Unlock();
+      Status cleanup = PurgeUnpublishedCompactionOutputs(&job_context);
+      if (!cleanup.ok()) {
+        s = cleanup;
+      }
+      mutex_.Lock();
+    }
     ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
 
     // If compaction failed, we want to delete all temporary files that we
     // might have created (they might not be all recorded in job_context in
     // case of a failure). Thus, we force full scan in FindObsoleteFiles()
-    FindObsoleteFiles(&job_context, !s.ok() && !s.IsShutdownInProgress() &&
-                                        !s.IsManualCompactionPaused() &&
-                                        !s.IsCompactionAborted() &&
-                                        !s.IsColumnFamilyDropped() &&
-                                        !s.IsBusy());
+    if (!job_context.blob_relocation_retry) {
+      FindObsoleteFiles(
+          &job_context,
+          (!s.ok() && !s.IsShutdownInProgress() &&
+           !s.IsManualCompactionPaused() && !s.IsCompactionAborted() &&
+           !s.IsColumnFamilyDropped() && !s.IsBusy()));
+    }
     TEST_SYNC_POINT("DBImpl::BackgroundCallCompaction:FoundObsoleteFiles");
 
     // delete unnecessary files if any, this is done outside the mutex
@@ -7522,7 +7668,9 @@ Status DBImpl::BackgroundCompaction(
     // throughout the compaction procedure to make sure consistency. It will
     // eventually be installed into SuperVersion
     const auto& mutable_cf_options = cfd->GetLatestMutableCFOptions();
-    if (!mutable_cf_options.disable_auto_compactions && !cfd->IsDropped()) {
+    if ((!mutable_cf_options.disable_auto_compactions ||
+         cfd->current()->storage_info()->HasEmptyBlobGcCandidate()) &&
+        !cfd->IsDropped()) {
       // NOTE: try to avoid unnecessary copy of MutableCFOptions if
       // compaction is not necessary. Need to make sure mutex is held
       // until we make a copy in the following code
@@ -7534,10 +7682,13 @@ Status DBImpl::BackgroundCompaction(
         InitSnapshotContext(job_context);
         assert(is_snapshot_supported_ || snapshots_.empty());
       }
-      c.reset(cfd->PickCompaction(
-          mutable_cf_options, mutable_db_options_, job_context->snapshot_seqs,
-          job_context->snapshot_checker, log_buffer,
-          thread_pri == Env::Priority::BOTTOM /* require_max_output_level */));
+      if (!mutable_cf_options.disable_auto_compactions) {
+        c.reset(cfd->PickCompaction(
+            mutable_cf_options, mutable_db_options_, job_context->snapshot_seqs,
+            job_context->snapshot_checker, log_buffer,
+            thread_pri ==
+                Env::Priority::BOTTOM /* require_max_output_level */));
+      }
       if (c != nullptr && in_flight_cfd == nullptr) {
         in_flight_cfd = cfd;
         BeginInFlightCompaction(in_flight_cfd);
@@ -7611,15 +7762,20 @@ Status DBImpl::BackgroundCompaction(
           cfd == nullptr ? nullptr : cfd->current();
       if (status.ok() && c == nullptr && !is_prepicked && cfd != nullptr &&
           job_context != nullptr && thread_pri == Env::Priority::LOW &&
-          mutable_cf_options.enable_blob_files &&
-          mutable_cf_options.enable_blob_garbage_collection &&
-          mutable_cf_options.enable_blob_indirection &&
           blob_reference_census != nullptr && current_version != nullptr &&
           blob_reference_census->IsReady(current_version->GetVersionNumber())) {
         VersionStorageInfo* const storage = current_version->storage_info();
         std::vector<uint64_t> candidates;
-        storage->GetBlobPhysicalFilesForStandaloneGC(kStandaloneBlobGCMaxInputs,
-                                                     &candidates);
+        if (mutable_cf_options.enable_blob_files &&
+            mutable_cf_options.enable_blob_garbage_collection &&
+            mutable_cf_options.enable_blob_indirection &&
+            !mutable_cf_options.disable_auto_compactions) {
+          storage->GetBlobPhysicalFilesForStandaloneGC(
+              kStandaloneBlobGCMaxInputs, &candidates);
+        } else {
+          storage->GetEmptyBlobGcCandidates(kStandaloneBlobGCMaxInputs,
+                                            &candidates);
+        }
         if (!candidates.empty() &&
             standalone_blob_gc_cfs_in_progress_.insert(cfd->GetID()).second) {
           const std::shared_ptr<BlobFileMetaData> single_normal =
@@ -7984,6 +8140,13 @@ Status DBImpl::BackgroundCompaction(
     // Should handle error?
     compaction_job.Run().PermitUncheckedError();
     TEST_SYNC_POINT("DBImpl::BackgroundCompaction:NonTrivial:AfterRun");
+#ifndef NDEBUG
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    if (sync_point != nullptr) {
+      sync_point->Process(
+          "DBImpl::BackgroundCompaction:NonTrivial:AfterRun:WaitForRelocation");
+    }
+#endif
     mutex_.Lock();
 
     if (immutable_db_options().compaction_service != nullptr) {
@@ -8075,8 +8238,21 @@ Status DBImpl::BackgroundCompaction(
     }
   };
 
-  if (status.ok() || status.IsCompactionTooLarge() ||
-      status.IsManualCompactionPaused() || status.IsCompactionAborted()) {
+  if (job_context->blob_relocation_retry) {
+    if (c != nullptr && !is_manual && !c->column_family_data()->IsDropped() &&
+        !error_handler_.IsBGWorkStopped()) {
+      const int unscheduled_before_retry = unscheduled_compactions_;
+      EnqueuePendingCompaction(c->column_family_data());
+      if (separate_remote_pool &&
+          unscheduled_compactions_ > unscheduled_before_retry) {
+        --unscheduled_compactions_;
+        restore_compaction_credit();
+      }
+    }
+    status = Status::Busy("Compaction blob dependency changed; retrying");
+  } else if (status.ok() || status.IsCompactionTooLarge() ||
+             status.IsManualCompactionPaused() ||
+             status.IsCompactionAborted()) {
     if (status.IsCompactionTooLarge() || status.IsCompactionAborted()) {
       retry_standalone_blob_gc();
     }
@@ -8132,6 +8308,13 @@ Status DBImpl::BackgroundCompaction(
 
   if (is_manual) {
     ManualCompactionState* m = manual_compaction;
+    if (job_context->blob_relocation_retry) {
+      // The output was not installed. Keep the original range, including the
+      // universal whole-range case, so the next step re-picks the same work.
+      m->in_progress = false;
+      m->incomplete = true;
+      return status;
+    }
     if (!status.ok()) {
       m->status = status;
       m->done = true;
@@ -8461,6 +8644,7 @@ void DBImpl::InstallSuperVersionAndScheduleWork(
   }
   cfd->InstallSuperVersion(sv_context, &mutex_,
                            std::move(new_seqno_to_time_mapping));
+  ScheduleBlobReferenceCensus(cfd);
 
   // Refresh the seqno->time preserve-window bound used to gate bottommost file
   // marking, so a file whose largest seqno is still within the preserve window

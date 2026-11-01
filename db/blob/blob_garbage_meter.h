@@ -55,6 +55,10 @@ class BlobGarbageMeter {
       in_flow_.Add(bytes);
       assert(IsValid());
     }
+    void AddInFlow(uint64_t count, uint64_t bytes) {
+      in_flow_.Add(count, bytes);
+      assert(IsValid());
+    }
     void AddOutFlow(uint64_t bytes) {
       out_flow_.Add(bytes);
       assert(IsValid());

@@ -1191,8 +1191,14 @@ class DBImpl : public DB
   // Un-reference the super version and clean it up if it is the last reference.
   void CleanupSuperVersion(SuperVersion* sv);
 
-  // Releases the CFD pin retained by internal iterators.
+  // Releases an internal CFD pin. The mutex-protected reference/list
+  // transition is bounded; final CFD/SuperVersion teardown and obsolete-file
+  // destruction run without the DB mutex.
   void ReleaseColumnFamilyDataPin(ColumnFamilyData* cfd);
+
+  // Releases a user-visible handle and preserves the existing synchronous
+  // obsolete-file discovery contract after unlocked final teardown.
+  void ReleaseColumnFamilyHandle(ColumnFamilyData* cfd);
 
   // Un-reference the super version and return it to thread local cache if
   // needed. If it is the last reference of the super version. Clean it up
@@ -2279,6 +2285,7 @@ class DBImpl : public DB
   bool opened_successfully_ = false;
 
  private:
+  bool ReleaseColumnFamilyDataReference(ColumnFamilyData* cfd, bool* dropped);
   friend class DB;
   friend class DBImplReadOnly;
   friend class DBImplSecondary;
@@ -2630,6 +2637,10 @@ class DBImpl : public DB
   void DeleteObsoleteFileImpl(int job_id, const std::string& fname,
                               const std::string& path_to_sync, FileType type,
                               uint64_t number);
+  Status DeleteObsoleteFileWithStatus(int job_id, const std::string& fname,
+                                      const std::string& path_to_sync,
+                                      FileType type, uint64_t number);
+  Status PurgeUnpublishedCompactionOutputs(JobContext* job_context);
   // Returns true when a blob file must be preserved because it is still
   // tracked by blob direct write or is still footer-less on disk.
   bool ShouldKeepBlobFileDuringPurge(uint64_t number,
@@ -3236,6 +3247,10 @@ class DBImpl : public DB
       const std::shared_ptr<BlobFileMetaData>& source_metadata,
       bool* made_progress, uint64_t* sfm_reserved_bytes,
       bool* retryable_stale_input, LogBuffer* log_buffer, int job_id);
+  Status RetireBlobRelocationRoutes(
+      ColumnFamilyData* cfd,
+      const BlobReferenceCensus::RetirementSelection& selected,
+      bool* made_progress);
   Status RunStandaloneBlobGCBatch(
       ColumnFamilyData* cfd,
       const std::vector<uint64_t>& candidate_physical_file_numbers,
