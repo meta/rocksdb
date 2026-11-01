@@ -53,6 +53,14 @@ class VersionBuilder {
   // Save the current Version to the provided `vstorage`.
   Status SaveTo(VersionStorageInfo* vstorage) const;
 
+  // Populate SST metadata and compact cursors. The caller must hold the DB
+  // mutex because this increments non-atomic FileMetaData reference counts.
+  Status SaveTableFilesTo(VersionStorageInfo* vstorage) const;
+
+  // Populate blob metadata and run the final consistency check. The builder's
+  // base Version must remain referenced, but the DB mutex is not required.
+  Status FinalizeBlobFilesTo(VersionStorageInfo* vstorage) const;
+
   // Load table handlers for newly added files in the builder. This does not
   // load any files in the base storage.
   Status LoadTableHandlers(InternalStats* internal_stats, int max_threads,
@@ -116,6 +124,7 @@ class BaseReferencedVersionBuilder {
       bool allow_incomplete_valid_version = false);
   ~BaseReferencedVersionBuilder();
   VersionBuilder* version_builder() const { return version_builder_.get(); }
+  Version* base_version() const { return version_; }
 
  private:
   std::unique_ptr<VersionBuilder> version_builder_;
