@@ -4079,6 +4079,51 @@ TEST_P(TransactionTest, LockLimitTest) {
   delete txn2;
 }
 
+TEST_P(TransactionTest, LockLimitWithSharedLocksTest) {
+  WriteOptions write_options;
+  ReadOptions read_options;
+  TransactionOptions txn_options;
+  std::string value;
+
+  delete db;
+  db = nullptr;
+
+  // max_num_locks limits the number of locked keys, not the number of holders
+  txn_db_options.max_num_locks = 1;
+  ASSERT_OK(ReOpen());
+  assert(db != nullptr);
+
+  ASSERT_OK(db->Put(write_options, "a", "a"));
+
+  Transaction* txn1 = db->BeginTransaction(write_options, txn_options);
+  Transaction* txn2 = db->BeginTransaction(write_options, txn_options);
+  Transaction* txn3 = db->BeginTransaction(write_options, txn_options);
+  ASSERT_TRUE(txn1);
+  ASSERT_TRUE(txn2);
+  ASSERT_TRUE(txn3);
+
+  // Two transactions share one key, which counts as one locked key
+  ASSERT_OK(
+      txn1->GetForUpdate(read_options, "a", &value, false /* exclusive */));
+  ASSERT_OK(
+      txn2->GetForUpdate(read_options, "a", &value, false /* exclusive */));
+  ASSERT_TRUE(txn3->Put("b", "b").IsLockLimit());
+
+  // "a" is still locked by txn2 after txn1 releases it, so the limit still
+  // holds
+  ASSERT_OK(txn1->Rollback());
+  ASSERT_TRUE(txn3->Put("b", "b").IsLockLimit());
+
+  // Once the last holder releases "a", the slot is free again
+  ASSERT_OK(txn2->Rollback());
+  ASSERT_OK(txn3->Put("b", "b"));
+  ASSERT_OK(txn3->Commit());
+
+  delete txn1;
+  delete txn2;
+  delete txn3;
+}
+
 TEST_P(TransactionTest, LockLimitWithTimeoutHangTest) {
   // Tests a bug where transaction can infinite-loop during lock acquiry.
   // This happens when lock limit is reached and user specifies a positive

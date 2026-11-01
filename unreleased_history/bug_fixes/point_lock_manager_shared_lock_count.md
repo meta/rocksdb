@@ -1,0 +1,1 @@
+Fixed `PointLockManager` miscounting keys locked in shared mode against `TransactionDBOptions::max_num_locks`. Releasing a shared lock decreased the count even when other transactions still held the key, which let transactions lock more keys than the limit allowed and could fail an assertion in debug builds.
