@@ -22,6 +22,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 class MemTable;
+struct BlobRelocationPublicationReservation;
 struct SuperVersion;
 
 // The purpose of this struct is to simplify pushing work such as
@@ -271,6 +272,25 @@ struct JobContext {
   int job_id;
 
   bool snapshot_context_initialized = false;
+
+  struct UnpublishedCompactionOutput {
+    std::string path;
+    std::string directory;
+    uint64_t number;
+    FileType type;
+  };
+  // Prepared while Run() is unlocked; detach only after a pre-append
+  // dependency rejection proves these files were never published. Other
+  // TryAgain statuses, especially MANIFEST I/O, do not authorize this cleanup.
+  std::vector<UnpublishedCompactionOutput> unpublished_compaction_outputs;
+  std::shared_ptr<CacheReservationManager>
+      unpublished_compaction_output_reservation;
+  bool blob_relocation_retry = false;
+  // Retains the job's stable intrusive lease through unlocked output cleanup.
+  // DBImpl releases the direct CFD pin after unregistering under its mutex.
+  std::shared_ptr<BlobRelocationPublicationReservation>
+      blob_publication_reservation;
+  ColumnFamilyData* blob_publication_cfd = nullptr;
 
   explicit JobContext(int _job_id, bool create_superversion = false) {
     job_id = _job_id;

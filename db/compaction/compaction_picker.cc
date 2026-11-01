@@ -283,10 +283,10 @@ bool CompactionPicker::ExpandInputsToCleanCut(const std::string& /*cf_name*/,
   assert(!inputs->empty());
 
   const int level = inputs->level;
-  // GetOverlappingInputs will always do the right thing for level-0.
-  // So we don't need to do any expansion if level == 0.
+  // Normal L0 overlap expansion is sufficient for legacy one-file runs.
+  // Exact output cuts additionally require the whole same-epoch run.
   if (level == 0) {
-    return true;
+    return vstorage->ExpandExactL0Inputs(&inputs->files);
   }
 
   InternalKey smallest;
@@ -497,6 +497,10 @@ Status CompactionPicker::GetCompactionInputsFromFileNumbers(
       message += std::to_string(fn);
     }
     return Status::InvalidArgument(message);
+  }
+
+  if (!vstorage->ExpandExactL0Inputs(&matched_input_files[0].files)) {
+    return Status::Aborted("Exact L0 input run is unavailable for compaction");
   }
 
   for (int level = first_non_empty_level; level <= last_non_empty_level;
@@ -1315,17 +1319,26 @@ bool CompactionPicker::GetOverlappingL0Files(
   assert(level0_compactions_in_progress()->empty());
   InternalKey smallest;
   InternalKey largest;
-  GetRange(*start_level_inputs, &smallest, &largest);
-  // Note that the next call will discard the file we placed in
-  // c->inputs_[0] earlier and replace it with an overlapping set
-  // which will include the picked file.
-  start_level_inputs->files.clear();
-  vstorage->GetOverlappingInputs(0, &smallest, &largest,
-                                 &(start_level_inputs->files),
-                                 /*hint_index=*/-1,
-                                 /*file_index=*/nullptr,
-                                 /*expand_range=*/true,
-                                 /*starting_l0_file=*/starting_l0_file);
+  size_t previous_size;
+  do {
+    previous_size = start_level_inputs->size();
+    GetRange(*start_level_inputs, &smallest, &largest);
+    // Note that the next call will discard the file we placed in
+    // c->inputs_[0] earlier and replace it with an overlapping set
+    // which will include the picked file.
+    start_level_inputs->files.clear();
+    vstorage->GetOverlappingInputs(0, &smallest, &largest,
+                                   &(start_level_inputs->files),
+                                   /*hint_index=*/-1,
+                                   /*file_index=*/nullptr,
+                                   /*expand_range=*/true,
+                                   /*starting_l0_file=*/starting_l0_file);
+    if (!vstorage->ExpandExactL0Inputs(&start_level_inputs->files)) {
+      return false;
+    }
+    // A same-epoch sibling can widen the range into another run. Close normal
+    // overlap and exact-run membership together before computing parent input.
+  } while (start_level_inputs->size() > previous_size);
 
   // If we include more L0 files in the same compaction run it can
   // cause the 'smallest' and 'largest' key to get extended to a

@@ -23,6 +23,7 @@
 #include <thread>
 
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_relocation_file.h"
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
 #include "db/log_reader.h"
@@ -212,8 +213,9 @@ void DumpSstFile(Options options, std::string filename, bool output_hex,
                  bool show_properties, bool decode_blob_index,
                  std::string from_key = "", std::string to_key = "");
 
-void DumpBlobFile(const std::string& filename, bool is_key_hex,
-                  bool is_value_hex, bool dump_uncompressed_blobs);
+void DumpBlobFile(const Options& options, const std::string& filename,
+                  bool is_key_hex, bool is_value_hex,
+                  bool dump_uncompressed_blobs);
 
 Status EncodeUserProvidedTimestamp(const std::string& user_timestamp,
                                    std::string* ts_buf);
@@ -2464,9 +2466,8 @@ void DBDumperCommand::Help(std::string& ret) {
  * 1) --db is specified - just dump the database.
  *
  * 2) --path is specified - determine based on file extension what dumping
- *    function to call. Please note that we intentionally use the extension
- *    and avoid probing the file contents under the assumption that renaming
- *    the files is not a supported scenario.
+ *    function to call. Renaming files across types is unsupported. Both blob
+ *    formats use .blob, so that decoder additionally checks the format prefix.
  *
  */
 void DBDumperCommand::DoCommand() {
@@ -2501,7 +2502,7 @@ void DBDumperCommand::DoCommand() {
                          /*  json_ */ false, column_families_);
         break;
       case kBlobFile:
-        DumpBlobFile(path_, is_key_hex_, is_value_hex_,
+        DumpBlobFile(options_, path_, is_key_hex_, is_value_hex_,
                      dump_uncompressed_blobs_);
         break;
       default:
@@ -4805,8 +4806,30 @@ void DumpSstFile(Options options, std::string filename, bool output_hex,
   }
 }
 
-void DumpBlobFile(const std::string& filename, bool is_key_hex,
-                  bool is_value_hex, bool dump_uncompressed_blobs) {
+void DumpBlobFile(const Options& options, const std::string& filename,
+                  bool is_key_hex, bool is_value_hex,
+                  bool dump_uncompressed_blobs) {
+  std::unique_ptr<SequentialFile> file;
+  Status prefix_status =
+      options.env->NewSequentialFile(filename, &file, EnvOptions(options));
+  char scratch[kBlobRelocationFilePrefixSize];
+  Slice prefix;
+  if (prefix_status.ok()) {
+    prefix_status = file->Read(sizeof(scratch), &prefix, scratch);
+  }
+  if (!prefix_status.ok()) {
+    fprintf(stderr, "Failed: %s\n", prefix_status.ToString().c_str());
+    return;
+  }
+  if (prefix ==
+      Slice(kBlobRelocationFilePrefix, kBlobRelocationFilePrefixSize)) {
+    // Both file kinds use .blob. A relocation file is an embedded-blob SST,
+    // not a blob log with user keys, so BlobDumpTool cannot decode its records.
+    // This is format dispatch, not a validation of the skipped payload.
+    std::cout << "Relocation file (embedded-blob SST): " << filename
+              << "\nUser-key blob-log dump skipped.\n";
+    return;
+  }
   using ROCKSDB_NAMESPACE::blob_db::BlobDumpTool;
   BlobDumpTool tool;
   BlobDumpTool::DisplayType blob_type = is_value_hex
@@ -4922,8 +4945,8 @@ void DBFileDumperCommand::DoCommand() {
       filename = NormalizePath(filename);
       std::cout << filename << std::endl;
       std::cout << "------------------------------" << std::endl;
-      DumpBlobFile(filename, /* is_key_hex */ false, /* is_value_hex */ false,
-                   dump_uncompressed_blobs_);
+      DumpBlobFile(options_, filename, /* is_key_hex */ false,
+                   /* is_value_hex */ false, dump_uncompressed_blobs_);
       std::cout << std::endl;
     }
   }

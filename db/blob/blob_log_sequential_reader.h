@@ -6,6 +6,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "db/blob/blob_log_format.h"
 #include "rocksdb/slice.h"
@@ -58,6 +59,25 @@ class BlobLogSequentialReader {
   Status ReadRecord(BlobLogRecord* record, ReadLevel level = kReadHeader,
                     uint64_t* blob_offset = nullptr);
 
+  // Reads one record while requiring the complete key/value payload to end no
+  // later than read_limit. This validates allocation sizes before reading.
+  Status ReadRecord(BlobLogRecord* record, ReadLevel level,
+                    uint64_t* blob_offset, uint64_t read_limit);
+
+  // Splits record parsing from payload handling so repair can skip irrelevant
+  // payloads without allocating them.
+  Status ReadRecordHeader(BlobLogRecord* record, uint64_t* blob_offset,
+                          uint64_t read_limit);
+  Status ReadRecordPayload(BlobLogRecord* record, ReadLevel level);
+
+  // Reads the key and value through a fixed-size buffer and verifies the
+  // physical record checksum. The second overload also verifies the key.
+  Status ReadAndVerifyRecordPayload(const BlobLogRecord& record);
+  Status ReadAndVerifyRecordPayload(const BlobLogRecord& record,
+                                    const Slice& expected_key);
+  Status ReadAndVerifyRecordPayloadAndGetKey(const BlobLogRecord& record,
+                                             std::string* key);
+
   Status ReadFooter(BlobLogFooter* footer);
 
   void ResetNextByte() { next_byte_ = 0; }
@@ -66,6 +86,9 @@ class BlobLogSequentialReader {
 
  private:
   Status ReadSlice(uint64_t size, Slice* slice, char* buf);
+  Status ReadAndVerifyRecordPayloadImpl(const BlobLogRecord& record,
+                                        const Slice* expected_key,
+                                        std::string* copied_key);
 
   const std::unique_ptr<RandomAccessFileReader> file_;
   SystemClock* clock_;

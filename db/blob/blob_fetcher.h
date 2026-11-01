@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "db/blob/blob_constants.h"
+#include "db/dbformat.h"
 #include "rocksdb/options.h"
 #include "rocksdb/status.h"
 
@@ -28,6 +29,13 @@ class SameFileBlobReader;
 class BlobFetcher {
  public:
   virtual ~BlobFetcher() = default;
+
+  virtual Status IsBlobValueLost(ValueType /*type*/, const Slice& /*value*/,
+                                 bool* lost) const {
+    *lost = false;
+    return Status::OK();
+  }
+  virtual bool HasBlobValueLoss() const { return false; }
 
   // Convenience overload: decodes `blob_index_slice` into a BlobIndex and
   // dispatches to the virtual overload below. Non-virtual; shared by all

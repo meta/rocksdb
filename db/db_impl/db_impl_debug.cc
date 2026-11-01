@@ -16,6 +16,8 @@
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/periodic_task_scheduler.h"
+#include "file/sst_file_manager_impl.h"
+#include "logging/log_buffer.h"
 #include "monitoring/thread_status_updater.h"
 #include "util/cast_util.h"
 #include "util/hash_containers.h"
@@ -244,6 +246,29 @@ Status DBImpl::TEST_WaitForCompact() {
 Status DBImpl::TEST_WaitForCompact(
     const WaitForCompactOptions& wait_for_compact_options) {
   return WaitForCompact(wait_for_compact_options);
+}
+
+Status DBImpl::TEST_RunStandaloneBlobGCBatch(
+    ColumnFamilyData* cfd,
+    const std::vector<uint64_t>& candidate_physical_file_numbers) {
+  bool made_progress = false;
+  uint64_t sfm_reserved_bytes = 0;
+  bool retryable_stale_input = false;
+  LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL,
+                       immutable_db_options_.info_log.get());
+  InstrumentedMutexLock l(&mutex_);
+  Status status = RunStandaloneBlobGCBatch(cfd, candidate_physical_file_numbers,
+                                           &made_progress, &sfm_reserved_bytes,
+                                           &retryable_stale_input, &log_buffer,
+                                           /*job_id=*/0);
+  if (sfm_reserved_bytes != 0) {
+    auto* const sfm = static_cast<SstFileManagerImpl*>(
+        immutable_db_options_.sst_file_manager.get());
+    assert(sfm != nullptr);
+    sfm->OnCompactionCompletion(sfm_reserved_bytes);
+  }
+  assert(!status.ok() || made_progress);
+  return status;
 }
 
 Status DBImpl::TEST_WaitForPurge() {

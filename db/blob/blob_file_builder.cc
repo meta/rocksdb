@@ -28,44 +28,49 @@
 #include "test_util/sync_point.h"
 #include "trace_replay/io_tracer.h"
 #include "util/compression.h"
+#include "util/crc32c.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 BlobFileBuilder::BlobFileBuilder(
     VersionSet* versions, FileSystem* fs,
     const ImmutableOptions* immutable_options,
-    const MutableCFOptions* mutable_cf_options, const FileOptions* file_options,
+    const MutableCFOptions* mutable_cf_options,
+    std::shared_ptr<Cache> blob_cache, const FileOptions* file_options,
     const WriteOptions* write_options, std::string db_id,
     std::string db_session_id, int job_id, uint32_t column_family_id,
     const std::string& column_family_name, Env::WriteLifeTimeHint write_hint,
     const std::shared_ptr<IOTracer>& io_tracer,
     BlobFileCompletionCallback* blob_callback,
-    BlobFileCreationReason creation_reason, std::string blob_output_path,
-    std::vector<std::string>* output_file_paths,
+    BlobFileCreationReason creation_reason, bool write_repair_metadata,
+    std::string blob_output_path, std::vector<std::string>* output_file_paths,
     std::vector<BlobFileAddition>* blob_file_additions)
     : BlobFileBuilder([versions]() { return versions->NewFileNumber(); }, fs,
-                      immutable_options, mutable_cf_options, file_options,
-                      write_options, std::move(db_id), std::move(db_session_id),
-                      job_id, column_family_id, column_family_name, write_hint,
+                      immutable_options, mutable_cf_options,
+                      std::move(blob_cache), file_options, write_options,
+                      std::move(db_id), std::move(db_session_id), job_id,
+                      column_family_id, column_family_name, write_hint,
                       io_tracer, blob_callback, creation_reason,
-                      std::move(blob_output_path), output_file_paths,
-                      blob_file_additions) {}
+                      write_repair_metadata, std::move(blob_output_path),
+                      output_file_paths, blob_file_additions) {}
 
 BlobFileBuilder::BlobFileBuilder(
     std::function<uint64_t()> file_number_generator, FileSystem* fs,
     const ImmutableOptions* immutable_options,
-    const MutableCFOptions* mutable_cf_options, const FileOptions* file_options,
+    const MutableCFOptions* mutable_cf_options,
+    std::shared_ptr<Cache> blob_cache, const FileOptions* file_options,
     const WriteOptions* write_options, std::string db_id,
     std::string db_session_id, int job_id, uint32_t column_family_id,
     const std::string& column_family_name, Env::WriteLifeTimeHint write_hint,
     const std::shared_ptr<IOTracer>& io_tracer,
     BlobFileCompletionCallback* blob_callback,
-    BlobFileCreationReason creation_reason, std::string blob_output_path,
-    std::vector<std::string>* output_file_paths,
+    BlobFileCreationReason creation_reason, bool write_repair_metadata,
+    std::string blob_output_path, std::vector<std::string>* output_file_paths,
     std::vector<BlobFileAddition>* blob_file_additions)
     : file_number_generator_(std::move(file_number_generator)),
       fs_(fs),
       immutable_options_(immutable_options),
+      blob_cache_(std::move(blob_cache)),
       min_blob_size_(mutable_cf_options->min_blob_size),
       blob_file_size_(mutable_cf_options->blob_file_size),
       blob_file_writable_file_max_buffer_size_(
@@ -80,6 +85,8 @@ BlobFileBuilder::BlobFileBuilder(
                               ? blob_compressor_->ObtainWorkingArea()
                               : Compressor::ManagedWorkingArea{}),
       prepopulate_blob_cache_(mutable_cf_options->prepopulate_blob_cache),
+      enable_blob_indirection_(mutable_cf_options->enable_blob_indirection),
+      write_repair_metadata_(write_repair_metadata),
       file_options_(file_options),
       write_options_(write_options),
       db_id_(std::move(db_id)),
@@ -158,9 +165,20 @@ Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
     }
   }
 
+  const uint32_t stable_checksum =
+      enable_blob_indirection_ ? crc32c::Value(value.data(), value.size()) : 0;
+  const uint32_t stored_checksum =
+      enable_blob_indirection_
+          ? (blob_compression_type_ == kNoCompression
+                 ? BlobIndex::ExtendChecksumWithCompression(
+                       stable_checksum, blob_compression_type_)
+                 : BlobIndex::ComputeStoredChecksum(blob,
+                                                    blob_compression_type_))
+          : 0;
   {
     const Status s =
-        PutBlobIntoCacheIfNeeded(value, blob_file_number, blob_offset);
+        PutBlobIntoCacheIfNeeded(value, blob_file_number, blob_offset,
+                                 blob.size(), stable_checksum, stored_checksum);
     if (!s.ok()) {
       ROCKS_LOG_WARN(immutable_options_->info_log,
                      "Failed to pre-populate the blob into blob cache: %s",
@@ -168,8 +186,14 @@ Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
     }
   }
 
-  BlobIndex::EncodeBlob(blob_index, blob_file_number, blob_offset, blob.size(),
-                        blob_compression_type_);
+  if (enable_blob_indirection_) {
+    BlobIndex::EncodeIdentityBlob(blob_index, blob_file_number, blob_offset,
+                                  blob.size(), blob_compression_type_,
+                                  stable_checksum, stored_checksum);
+  } else {
+    BlobIndex::EncodeBlob(blob_index, blob_file_number, blob_offset,
+                          blob.size(), blob_compression_type_);
+  }
 
   return Status::OK();
 }
@@ -258,6 +282,9 @@ Status BlobFileBuilder::OpenBlobFileIfNeeded() {
 
   BlobLogHeader header(column_family_id_, blob_compression_type_, has_ttl,
                        expiration_range);
+  header.has_repair_metadata = write_repair_metadata_;
+  header.is_identity_root = enable_blob_indirection_;
+  header.repair_file_number = blob_file_number;
 
   {
     Status s = blob_log_writer->WriteHeader(*write_options_, header);
@@ -337,6 +364,17 @@ Status BlobFileBuilder::CloseBlobFile() {
 
   BlobLogFooter footer;
   footer.blob_count = blob_count_;
+  if (write_repair_metadata_) {
+    constexpr bool has_ttl = false;
+    constexpr ExpirationRange expiration_range;
+    BlobLogHeader header(column_family_id_, blob_compression_type_, has_ttl,
+                         expiration_range);
+    header.has_repair_metadata = true;
+    header.is_identity_root = enable_blob_indirection_;
+    header.repair_file_number = writer_->get_log_number();
+    footer.expiration_range =
+        ExpirationRange{blob_bytes_, header.GetRepairMetadataFooterValue()};
+  }
 
   std::string checksum_method;
   std::string checksum_value;
@@ -360,9 +398,9 @@ Status BlobFileBuilder::CloseBlobFile() {
   }
 
   assert(blob_file_additions_);
-  blob_file_additions_->emplace_back(blob_file_number, blob_count_, blob_bytes_,
-                                     std::move(checksum_method),
-                                     std::move(checksum_value));
+  blob_file_additions_->emplace_back(
+      blob_file_number, blob_count_, blob_bytes_, std::move(checksum_method),
+      std::move(checksum_value), enable_blob_indirection_);
 
   assert(immutable_options_);
   ROCKS_LOG_INFO(immutable_options_->logger,
@@ -412,18 +450,44 @@ void BlobFileBuilder::Abandon(const Status& s) {
   blob_bytes_ = 0;
 }
 
-Status BlobFileBuilder::PutBlobIntoCacheIfNeeded(const Slice& blob,
-                                                 uint64_t blob_file_number,
-                                                 uint64_t blob_offset) const {
+Status BlobFileBuilder::PutBlobIntoCacheIfNeeded(
+    const Slice& blob, uint64_t blob_file_number, uint64_t blob_offset,
+    uint64_t stored_blob_size, uint32_t stable_checksum,
+    uint32_t stored_checksum) const {
   Status s = Status::OK();
 
-  BlobSource::SharedCacheInterface blob_cache{immutable_options_->blob_cache};
-  auto statistics = immutable_options_->statistics.get();
-  bool warm_cache =
+  Statistics* const statistics = immutable_options_->statistics.get();
+  const bool warm_cache =
       prepopulate_blob_cache_ == PrepopulateBlobCache::kFlushOnly &&
       creation_reason_ == BlobFileCreationReason::kFlush;
 
-  if (blob_cache && warm_cache) {
+  if (!blob_cache_ || !warm_cache) {
+    return s;
+  }
+
+  if (enable_blob_indirection_) {
+    BlobSource::StableSharedCacheInterface stable_cache{blob_cache_};
+    std::unique_ptr<StableBlobContents> contents;
+    s = StableBlobContents::CreateWithVerifiedValue(
+        blob, stored_blob_size, blob_compression_type_,
+        BlobIndex::kStableChecksumVersion2, stable_checksum, stored_checksum,
+        stable_cache.get()->memory_allocator(), &contents);
+    if (s.ok()) {
+      const CacheKey key = GetStableBlobCacheKey(db_id_, db_session_id_,
+                                                 blob_file_number, blob_offset);
+      BlobSource::StableTypedHandle* handle = nullptr;
+      s = stable_cache.InsertFull(key.AsSlice(), contents.get(),
+                                  contents->ApproximateMemoryUsage(), &handle,
+                                  Cache::Priority::BOTTOM,
+                                  immutable_options_->lowest_used_cache_tier);
+      if (s.ok()) {
+        [[maybe_unused]] StableBlobContents* const released =
+            contents.release();
+        CacheHandleGuard<StableBlobContents> guard(stable_cache.get(), handle);
+      }
+    }
+  } else {
+    BlobSource::SharedCacheInterface blob_cache{blob_cache_};
     const OffsetableCacheKey base_cache_key(db_id_, db_session_id_,
                                             blob_file_number);
     const CacheKey cache_key = base_cache_key.WithOffset(blob_offset);
@@ -433,13 +497,13 @@ Status BlobFileBuilder::PutBlobIntoCacheIfNeeded(const Slice& blob,
 
     s = blob_cache.InsertSaved(key, blob, nullptr /*context*/, priority,
                                immutable_options_->lowest_used_cache_tier);
+  }
 
-    if (s.ok()) {
-      RecordTick(statistics, BLOB_DB_CACHE_ADD);
-      RecordTick(statistics, BLOB_DB_CACHE_BYTES_WRITE, blob.size());
-    } else {
-      RecordTick(statistics, BLOB_DB_CACHE_ADD_FAILURES);
-    }
+  if (s.ok()) {
+    RecordTick(statistics, BLOB_DB_CACHE_ADD);
+    RecordTick(statistics, BLOB_DB_CACHE_BYTES_WRITE, blob.size());
+  } else {
+    RecordTick(statistics, BLOB_DB_CACHE_ADD_FAILURES);
   }
 
   return s;

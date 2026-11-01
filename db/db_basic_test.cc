@@ -1411,6 +1411,81 @@ TEST_F(DBBasicTest, ReadOnlyDBFlushWAL) {
   Close();
 }
 
+TEST_F(DBBasicTest, GetLiveFilesReservesVersionPinsAfterFlush) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+
+  std::mutex pause_mutex;
+  std::condition_variable pause_cv;
+  bool flush_unlocked = false;
+  bool release_flush = false;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::FlushAllColumnFamilies:BeforeFlushMemTable",
+                          [&](void*) {
+                            std::unique_lock<std::mutex> lock(pause_mutex);
+                            if (flush_unlocked) {
+                              return;
+                            }
+                            flush_unlocked = true;
+                            pause_cv.notify_all();
+                            pause_cv.wait(lock, [&] { return release_flush; });
+                          });
+  sync_point->EnableProcessing();
+  auto cleanup_sync_point = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  Status live_files_status;
+  std::vector<LiveFileStorageInfo> live_files;
+  port::Thread snapshot_thread([&] {
+    LiveFilesStorageInfoOptions live_files_options;
+    live_files_options.wal_size_for_flush = 0;
+    live_files_status =
+        db_->GetLiveFilesStorageInfo(live_files_options, &live_files);
+  });
+  bool snapshot_joined = false;
+  auto cleanup_snapshot = Defer([&] {
+    {
+      std::lock_guard<std::mutex> lock(pause_mutex);
+      release_flush = true;
+    }
+    pause_cv.notify_all();
+    if (!snapshot_joined) {
+      snapshot_thread.join();
+    }
+  });
+  {
+    std::unique_lock<std::mutex> lock(pause_mutex);
+    pause_cv.wait(lock, [&] { return flush_unlocked; });
+  }
+
+  std::vector<ColumnFamilyHandle*> handles;
+  for (size_t i = 0; i < 8; ++i) {
+    ColumnFamilyHandle* handle = nullptr;
+    ASSERT_OK(db_->CreateColumnFamily(
+        ColumnFamilyOptions(options),
+        "created_during_snapshot_" + std::to_string(i), &handle));
+    ASSERT_NE(handle, nullptr);
+    handles.push_back(handle);
+  }
+  {
+    std::lock_guard<std::mutex> lock(pause_mutex);
+    release_flush = true;
+  }
+  pause_cv.notify_all();
+  snapshot_thread.join();
+  snapshot_joined = true;
+
+  ASSERT_OK(live_files_status);
+  ASSERT_FALSE(live_files.empty());
+  for (ColumnFamilyHandle* handle : handles) {
+    ASSERT_OK(db_->DestroyColumnFamilyHandle(handle));
+  }
+}
+
 TEST_F(DBBasicTest, ReadOnlyDBWithWriteDBIdToManifestSet) {
   auto options = CurrentOptions();
   options.write_dbid_to_manifest = false;

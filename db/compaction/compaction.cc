@@ -70,6 +70,9 @@ void Compaction::FinalizeInputInfo(Version* _input_version) {
   cfd_ = input_version_->cfd();
 
   cfd_->Ref();
+  if (mutable_cf_options_.enable_blob_indirection) {
+    cfd_->BeginBlobIndirectionCompaction();
+  }
   input_version_->Ref();
   edit_.SetColumnFamily(cfd_->GetID());
 }
@@ -475,6 +478,9 @@ void Compaction::PopulateProximalLevelOutputRange() {
 }
 
 Compaction::~Compaction() {
+  if (cfd_ != nullptr && mutable_cf_options_.enable_blob_indirection) {
+    cfd_->EndBlobIndirectionCompaction();
+  }
   if (input_version_ != nullptr) {
     input_version_->Unref();
   }
@@ -588,6 +594,19 @@ bool Compaction::IsTrivialMove() const {
     return false;
   }
 
+  if (start_level_ == 0 && output_level_ != 0 &&
+      input_vstorage_->OldestCoarseIdentityBlobFileNumber() !=
+          kInvalidBlobFileNumber) {
+    for (const FileMetaData* file : inputs_.front().files) {
+      if (file->oldest_coarse_identity_blob_file_number !=
+          kInvalidBlobFileNumber) {
+        // Crossing the L0 boundary must build exact reference metadata.
+        // Moving the file would retain its conservative pin indefinitely.
+        return false;
+      }
+    }
+  }
+
   // Used in universal compaction, where trivial move can be done if the
   // input files are non overlapping
   if ((mutable_cf_options_.compaction_options_universal.allow_trivial_move) &&
@@ -632,6 +651,24 @@ bool Compaction::IsTrivialMove() const {
   }
 
   return true;
+}
+
+bool Compaction::CollectExactBlobReferences() const {
+  if (!mutable_cf_options_.enable_blob_indirection &&
+      !input_vstorage_->HasBlobIndirectionFormat()) {
+    return false;
+  }
+  if (output_level_ != 0) {
+    return true;
+  }
+  for (const CompactionInputFiles& level : inputs_) {
+    for (const FileMetaData* file : level.files) {
+      if (!file->blob_reference_descriptor.empty()) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 void Compaction::AddInputDeletions(VersionEdit* out_edit) {

@@ -531,6 +531,7 @@ Status FlushJob::MemPurge() {
         ioptions.enforce_single_del_contracts,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse,
         false /* must_count_input_entries */,
+        false /* allow_blob_index_flattening */,
         /*compaction=*/nullptr, compaction_filter.get(),
         /*shutting_down=*/nullptr, ioptions.info_log, full_history_ts_low);
 
@@ -1056,6 +1057,13 @@ Status FlushJob::WriteLevel0Table() {
               ? preclude_last_level_min_seqno_
               : std::min(earliest_snapshot_, preclude_last_level_min_seqno_),
           dbname_ /*db_name*/);
+      tboptions.collect_blob_reference_metadata =
+          mutable_cf_options_.enable_blob_indirection ||
+          // FlushJob pins a non-null base Version for its lifetime.
+          // @lint-ignore NULLSAFECLANG nullable-dereference
+          base_->storage_info()->HasBlobIndirectionFormat();
+      TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:TableBuilderOptions",
+                               &tboptions);
       s = BuildTable(
           dbname_, versions_, db_options_, tboptions, file_options_,
           cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
@@ -1137,6 +1145,9 @@ Status FlushJob::WriteLevel0Table() {
     TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table", &mems_);
     db_mutex_->Lock();
   }
+  const bool output_predates_blob_indirection =
+      !mutable_cf_options_.enable_blob_indirection &&
+      !base_->storage_info()->HasBlobIndirectionFormat();
   base_->Unref();
 
   // Note that if file_size is zero, the SST has been deleted and should not be
@@ -1146,6 +1157,8 @@ Status FlushJob::WriteLevel0Table() {
 
   if (s.ok()) {
     if (has_output) {
+      meta_.blob_reference_output_predates_indirection =
+          output_predates_blob_indirection;
       TEST_SYNC_POINT("DBImpl::FlushJob:SSTFileCreated");
       // if we have more than 1 background thread, then we cannot
       // insert files directly into higher levels because some other
@@ -1154,6 +1167,13 @@ Status FlushJob::WriteLevel0Table() {
       // Add file to L0
       TEST_SYNC_POINT_CALLBACK("FileMetaData::FileMetaData", &meta_);
       edit_->AddFile(0 /* level */, meta_);
+      if (mutable_cf_options_.enable_blob_indirection) {
+        // PickMemTable() establishes edit_ before a nonempty flush can reach
+        // this point; NULLSAFECLANG cannot carry that invariant through Run().
+        // @lint-ignore NULLSAFECLANG nullable-dereference
+        edit_->SetBlobIndirectionFormatVersion(
+            kBlobIndirectionManifestFormatVersion);
+      }
     }
 
     edit_->SetBlobFileAdditions(std::move(blob_file_additions));
