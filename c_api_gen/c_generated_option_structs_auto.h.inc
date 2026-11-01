@@ -425,6 +425,12 @@ rocksdb_options_set_preserve_internal_time_seconds(rocksdb_options_t* opt,
 extern ROCKSDB_LIBRARY_API uint64_t
 rocksdb_options_get_preserve_internal_time_seconds(rocksdb_options_t* opt);
 
+extern ROCKSDB_LIBRARY_API void rocksdb_options_set_enable_blob_indirection(
+    rocksdb_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_options_get_enable_blob_indirection(rocksdb_options_t* opt);
+
 extern ROCKSDB_LIBRARY_API void
 rocksdb_options_set_blob_file_writable_file_max_buffer_size(
     rocksdb_options_t* opt, uint64_t v);

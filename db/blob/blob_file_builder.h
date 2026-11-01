@@ -103,6 +103,7 @@ class BlobFileBuilder {
   std::unique_ptr<Compressor> blob_compressor_;
   mutable Compressor::ManagedWorkingArea blob_compressor_wa_;
   PrepopulateBlobCache prepopulate_blob_cache_;
+  bool enable_blob_indirection_;
   const FileOptions* file_options_;
   const WriteOptions* write_options_;
   const std::string db_id_;
