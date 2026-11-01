@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "db/blob/blob_constants.h"
+#include "db/dbformat.h"
 #include "rocksdb/options.h"
 #include "rocksdb/status.h"
 
@@ -45,6 +46,15 @@ class BlobFetcher {
   // EmbeddedAwareBlobFetcher decorator) to resolve same-file blob references,
   // which need the current read_tier.
   virtual const ReadOptions& read_options() const = 0;
+
+  // Logical deletion is tested before fetching any column or cache entry.
+  // Standalone/self-contained fetchers have no accepted relocation loss state.
+  virtual Status IsBlobValueLost(ValueType /*type*/, const Slice& /*value*/,
+                                 bool* lost) const {
+    *lost = false;
+    return Status::OK();
+  }
+  virtual bool HasBlobValueLoss() const { return false; }
 };
 
 // Shared implementation of the two Version-backed BlobFetchers below. Reads
@@ -63,6 +73,9 @@ class VersionBlobFetcherBase : public BlobFetcher {
                    FilePrefetchBuffer* prefetch_buffer,
                    PinnableSlice* blob_value,
                    uint64_t* bytes_read) const override;
+  Status IsBlobValueLost(ValueType type, const Slice& value,
+                         bool* lost) const override;
+  bool HasBlobValueLoss() const override;
 
   // Fetches the value of a separate-file blob reference into *blob_value,
   // applying `verify_policy` (see BlobVerifyPolicy). range_length ==
@@ -213,6 +226,18 @@ class EmbeddedAwareBlobFetcher : public BlobFetcher {
     // no base (e.g. SstFileReader) a default (kReadAllTier) suffices.
     static const ReadOptions kDefaultReadOptions;
     return base_ != nullptr ? base_->read_options() : kDefaultReadOptions;
+  }
+
+  Status IsBlobValueLost(ValueType type, const Slice& value,
+                         bool* lost) const override {
+    if (base_ != nullptr) {
+      return base_->IsBlobValueLost(type, value, lost);
+    }
+    *lost = false;
+    return Status::OK();
+  }
+  bool HasBlobValueLoss() const override {
+    return base_ != nullptr && base_->HasBlobValueLoss();
   }
 
  private:

@@ -25,6 +25,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/compression.h"
+#include "util/crc32c.h"
 #include "utilities/fault_injection_env.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -145,10 +146,11 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckOneFile) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
-      job_id, column_family_id, column_family_name, write_hint,
-      nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      immutable_options.blob_cache, &file_options_, &write_options_,
+      "" /*db_id*/, "" /*db_session_id*/, job_id, column_family_id,
+      column_family_name, write_hint, nullptr /*IOTracer*/,
+      nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
+      /*write_repair_metadata=*/false, immutable_options.cf_paths.front().path,
       &blob_file_paths, &blob_file_additions);
 
   std::vector<std::pair<std::string, std::string>> expected_key_value_pairs(
@@ -194,10 +196,66 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckOneFile) {
   ASSERT_EQ(
       blob_file_addition.GetTotalBlobBytes(),
       number_of_blobs * (BlobLogRecord::kHeaderSize + key_size + value_size));
+  ASSERT_FALSE(blob_file_addition.IsIdentityRoot());
 
   // Verify the contents of the new blob file as well as the blob references
   VerifyBlobFile(blob_file_number, blob_file_path, column_family_id,
                  kNoCompression, expected_key_value_pairs, blob_indexes);
+}
+
+TEST_F(BlobFileBuilderTest, StableIdentityIndex) {
+  Options options;
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlobFileBuilderTest_StableIdentityIndex"),
+      0);
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.env = mock_env_.get();
+
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_cf_options(options);
+  std::vector<std::string> blob_file_paths;
+  std::vector<BlobFileAddition> blob_file_additions;
+  BlobFileBuilder builder(
+      TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
+      immutable_options.blob_cache, &file_options_, &write_options_,
+      "" /*db_id*/, "" /*db_session_id*/,
+      /*job_id=*/1, /*column_family_id=*/123, "foobar", Env::WLTH_MEDIUM,
+      nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
+      BlobFileCreationReason::kFlush, /*write_repair_metadata=*/true,
+      immutable_options.cf_paths.front().path, &blob_file_paths,
+      &blob_file_additions);
+
+  const std::string value = "logical uncompressed value";
+  std::string encoded;
+  ASSERT_OK(builder.Add("key", value, &encoded));
+  ASSERT_OK(builder.Finish());
+
+  ASSERT_EQ(blob_file_additions.size(), 1U);
+  ASSERT_TRUE(blob_file_additions.front().IsIdentityRoot());
+
+  std::unique_ptr<RandomAccessFileReader> file_reader;
+  ASSERT_OK(RandomAccessFileReader::Create(
+      mock_env_->GetFileSystem(), blob_file_paths.front(), file_options_,
+      &file_reader, /*dbg=*/nullptr));
+  BlobLogSequentialReader log_reader(std::move(file_reader), clock_,
+                                     /*statistics=*/nullptr);
+  BlobLogHeader header;
+  ASSERT_OK(log_reader.ReadHeader(&header));
+  EXPECT_TRUE(header.has_repair_metadata);
+  EXPECT_TRUE(header.is_identity_root);
+  EXPECT_EQ(header.repair_file_number, 2U);
+
+  BlobIndex blob_index;
+  ASSERT_OK(blob_index.DecodeFrom(encoded));
+  ASSERT_TRUE(blob_index.IsIndirect());
+  EXPECT_EQ(blob_index.generation_file_number(), 2);
+  EXPECT_EQ(blob_index.origin_file_number(), 2);
+  EXPECT_EQ(blob_index.stable_checksum_version(),
+            BlobIndex::kStableChecksumVersion2);
+  EXPECT_EQ(blob_index.stable_checksum(),
+            crc32c::Value(value.data(), value.size()));
 }
 
 TEST_F(BlobFileBuilderTest, BuildAndCheckMultipleFiles) {
@@ -230,10 +288,11 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckMultipleFiles) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
-      job_id, column_family_id, column_family_name, write_hint,
-      nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      immutable_options.blob_cache, &file_options_, &write_options_,
+      "" /*db_id*/, "" /*db_session_id*/, job_id, column_family_id,
+      column_family_name, write_hint, nullptr /*IOTracer*/,
+      nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
+      /*write_repair_metadata=*/false, immutable_options.cf_paths.front().path,
       &blob_file_paths, &blob_file_additions);
 
   std::vector<std::pair<std::string, std::string>> expected_key_value_pairs(
@@ -318,10 +377,11 @@ TEST_F(BlobFileBuilderTest, InlinedValues) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
-      job_id, column_family_id, column_family_name, write_hint,
-      nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      immutable_options.blob_cache, &file_options_, &write_options_,
+      "" /*db_id*/, "" /*db_session_id*/, job_id, column_family_id,
+      column_family_name, write_hint, nullptr /*IOTracer*/,
+      nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
+      /*write_repair_metadata=*/false, immutable_options.cf_paths.front().path,
       &blob_file_paths, &blob_file_additions);
 
   for (size_t i = 0; i < number_of_blobs; ++i) {
@@ -373,10 +433,11 @@ TEST_F(BlobFileBuilderTest, Compression) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
-      job_id, column_family_id, column_family_name, write_hint,
-      nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      immutable_options.blob_cache, &file_options_, &write_options_,
+      "" /*db_id*/, "" /*db_session_id*/, job_id, column_family_id,
+      column_family_name, write_hint, nullptr /*IOTracer*/,
+      nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
+      /*write_repair_metadata=*/false, immutable_options.cf_paths.front().path,
       &blob_file_paths, &blob_file_additions);
 
   const std::string key("1");
@@ -453,10 +514,11 @@ TEST_F(BlobFileBuilderTest, CompressionError) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
-      job_id, column_family_id, column_family_name, write_hint,
-      nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      immutable_options.blob_cache, &file_options_, &write_options_,
+      "" /*db_id*/, "" /*db_session_id*/, job_id, column_family_id,
+      column_family_name, write_hint, nullptr /*IOTracer*/,
+      nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
+      /*write_repair_metadata=*/false, immutable_options.cf_paths.front().path,
       &blob_file_paths, &blob_file_additions);
 
   SyncPoint::GetInstance()->SetCallBack(
@@ -534,10 +596,11 @@ TEST_F(BlobFileBuilderTest, Checksum) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
-      job_id, column_family_id, column_family_name, write_hint,
-      nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      immutable_options.blob_cache, &file_options_, &write_options_,
+      "" /*db_id*/, "" /*db_session_id*/, job_id, column_family_id,
+      column_family_name, write_hint, nullptr /*IOTracer*/,
+      nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
+      /*write_repair_metadata=*/false, immutable_options.cf_paths.front().path,
       &blob_file_paths, &blob_file_additions);
 
   const std::string key("1");
@@ -634,10 +697,11 @@ TEST_P(BlobFileBuilderIOErrorTest, IOError) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
-      job_id, column_family_id, column_family_name, write_hint,
-      nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      immutable_options.blob_cache, &file_options_, &write_options_,
+      "" /*db_id*/, "" /*db_session_id*/, job_id, column_family_id,
+      column_family_name, write_hint, nullptr /*IOTracer*/,
+      nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
+      /*write_repair_metadata=*/false, immutable_options.cf_paths.front().path,
       &blob_file_paths, &blob_file_additions);
 
   SyncPoint::GetInstance()->SetCallBack(sync_point_, [this](void* arg) {

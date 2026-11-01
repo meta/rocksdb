@@ -59,7 +59,8 @@ Status DBImpl::GetLiveFiles(std::vector<std::string>& ret,
     if (cfd->IsDropped()) {
       continue;
     }
-    cfd->current()->AddLiveFiles(&live_table_files, &live_blob_files);
+    cfd->current()->AddLiveFiles(&live_table_files, &live_blob_files,
+                                 /*skip_marked_missing=*/true);
   }
 
   ret.clear();
@@ -282,6 +283,32 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   // from the checkpoint.
   std::unordered_set<uint32_t> unseen_include_cf_ids = include_cf_id_set;
 
+  struct PinnedColumnFamilyVersion {
+    ColumnFamilyData* cfd;
+    Version* version;
+  };
+  std::vector<PinnedColumnFamilyVersion> pinned_versions;
+  if (cf_subset) {
+    pinned_versions.reserve(include_cf_ids.size());
+  }
+  const auto ensure_live_cf_pin_capacity = [&]() {
+    assert(!cf_subset);
+    while (true) {
+      size_t live_column_family_count = 0;
+      for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+        if (!cfd->IsDropped()) {
+          ++live_column_family_count;
+        }
+      }
+      if (live_column_family_count <= pinned_versions.capacity()) {
+        return;
+      }
+      mutex_.Unlock();
+      pinned_versions.reserve(live_column_family_count);
+      mutex_.Lock();
+    }
+  };
+
   // NOTE: This implementation was largely migrated from Checkpoint.
 
   VectorWalPtr live_wal_files;
@@ -321,6 +348,11 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   // This is a modified version of GetLiveFiles, to get access to more
   // metadata.
   mutex_.Lock();
+  if (!cf_subset) {
+    // Count under the mutex, reserve without it, and retry if a concurrent CF
+    // creation outgrows the capacity before the capture lock is reacquired.
+    ensure_live_cf_pin_capacity();
+  }
   bool wal_locked = false;
   const bool needs_blob_direct_write_flush =
       HasInFlightBlobDirectWriteFilesWithLockHeld();
@@ -356,7 +388,16 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     }
   }
 
-  // Make a set of all of the live table and blob files
+  // FlushForGetLiveFiles can release the DB mutex. A column family created
+  // during that window can outgrow the earlier reservation, so close the gap
+  // before the lock-held pin loop.
+  if (!cf_subset) {
+    ensure_live_cf_pin_capacity();
+  }
+
+  // Pin the exact Versions and their CF owners under the mutex. File metadata
+  // is immutable in a Version, so the O(files) enumeration and string copying
+  // can run after releasing the mutex.
   for (auto cfd : *versions_->GetColumnFamilySet()) {
     if (cfd->IsDropped()) {
       continue;
@@ -369,8 +410,83 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     if (cf_subset) {
       unseen_include_cf_ids.erase(cfd->GetID());
     }
-    VersionStorageInfo& vsi = *cfd->current()->storage_info();
-    auto& cf_paths = cfd->ioptions().cf_paths;
+    Version* const version = cfd->current();
+    cfd->Ref();
+    version->Ref();
+    assert(pinned_versions.size() < pinned_versions.capacity());
+    pinned_versions.push_back({cfd, version});
+  }
+
+  Status snapshot_status;
+  // Release-build validation: every id the subset-checkpoint caller asked for
+  // must have been observed as live under the mutex. If any is missing, it was
+  // dropped before we ran (stale handle) or lost a race with a concurrent
+  // drop; either way the checkpoint would silently omit it, violating the
+  // caller's contract that the checkpoint contains the requested CFs.
+  if (cf_subset && !unseen_include_cf_ids.empty()) {
+    snapshot_status = Status::InvalidArgument(
+        "Requested column family id was not live at checkpoint time");
+  }
+
+  if (snapshot_status.ok() && cf_subset) {
+    *options_snapshot = SubsetCheckpointOptionsSnapshot();
+    if (!excluded_cf_ids->empty()) {
+      options_snapshot->options_file_number = versions_->NewFileNumber();
+      options_snapshot->commit_options_file_number =
+          versions_->has_committed_options_file_number();
+      options_snapshot->db_options =
+          BuildDBOptions(immutable_db_options_, mutable_db_options_);
+      for (const PinnedColumnFamilyVersion& pinned : pinned_versions) {
+        options_snapshot->cf_names.push_back(pinned.cfd->GetName());
+        options_snapshot->cf_options.push_back(
+            pinned.cfd->GetLatestCFOptions());
+      }
+    }
+  }
+
+  // Capture some final info before releasing mutex.
+  const uint64_t manifest_number = versions_->manifest_file_number();
+  uint64_t manifest_size = versions_->manifest_file_size();
+  if (snapshot_status.ok() && cf_subset && !excluded_cf_ids->empty()) {
+    snapshot_status = versions_->GetManifestAppendBoundary(&manifest_size);
+  }
+  const uint64_t options_number = versions_->options_file_number();
+  const uint64_t min_log_num = MinLogNumberToKeep();
+  // Ensure consistency with manifest for track_and_verify_wals_in_manifest.
+  const uint64_t max_log_num = cur_wal_number_;
+
+  if (snapshot_status.ok() && options_number != 0) {
+    // Protect the captured immutable OPTIONS file until its off-lock size read.
+    DisableFileDeletionsWithLock().PermitUncheckedError();
+  }
+  mutex_.Unlock();
+
+  const auto release_pinned_versions = [&]() {
+    for (const PinnedColumnFamilyVersion& pinned : pinned_versions) {
+      Version* detached_version = nullptr;
+      {
+        InstrumentedMutexLock lock(&mutex_);
+        if (pinned.version->UnrefAndTryDetach()) {
+          detached_version = pinned.version;
+        }
+      }
+      if (detached_version != nullptr) {
+        detached_version->DeleteDetached();
+      }
+      ReleaseColumnFamilyDataPin(pinned.cfd);
+    }
+    pinned_versions.clear();
+  };
+
+  if (!snapshot_status.ok()) {
+    release_pinned_versions();
+    return snapshot_status;
+  }
+
+  for (const PinnedColumnFamilyVersion& pinned : pinned_versions) {
+    ColumnFamilyData* const cfd = pinned.cfd;
+    VersionStorageInfo& vsi = *pinned.version->storage_info();
+    const auto& cf_paths = cfd->ioptions().cf_paths;
 
     auto GetDir = [&](size_t path_id) {
       // Matching TableFileName() behavior
@@ -406,85 +522,43 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
         info.temperature = meta->temperature;
       }
     }
-    const auto& blob_files = vsi.GetBlobFiles();
-    for (const auto& meta : blob_files) {
-      assert(meta);
-
+    const auto AddBlobFile = [&](uint64_t file_number, uint64_t file_size,
+                                 const std::string& checksum_method,
+                                 const std::string& checksum) {
       results.emplace_back();
       LiveFileStorageInfo& info = results.back();
-
-      info.relative_filename = BlobFileName(meta->GetBlobFileNumber());
-      info.directory = GetDir(/* path_id */ 0);
-      info.file_number = meta->GetBlobFileNumber();
+      info.relative_filename = BlobFileName(file_number);
+      info.directory = GetDir(/*path_id=*/0);
+      info.file_number = file_number;
       info.file_type = kBlobFile;
-      info.size = meta->GetBlobFileSize();
+      info.size = file_size;
       if (opts.include_checksum_info) {
-        info.file_checksum_func_name = meta->GetChecksumMethod();
-        info.file_checksum = meta->GetChecksumValue();
+        info.file_checksum_func_name = checksum_method;
+        info.file_checksum = checksum;
         if (info.file_checksum_func_name.empty()) {
           info.file_checksum_func_name = kUnknownFileChecksumFuncName;
           info.file_checksum = kUnknownFileChecksum;
         }
       }
+    };
+    const auto& blob_files = vsi.GetBlobFiles();
+    for (const auto& meta : blob_files) {
+      assert(meta);
+      AddBlobFile(meta->GetBlobFileNumber(), meta->GetBlobFileSize(),
+                  meta->GetChecksumMethod(), meta->GetChecksumValue());
       // TODO?: info.temperature
     }
-  }
-
-  // Release-build validation: every id the subset-checkpoint caller asked for
-  // must have been observed as live under the mutex. If any is missing, it was
-  // dropped before we ran (stale handle) or lost a race with a concurrent
-  // drop; either way the checkpoint would silently omit it, violating the
-  // caller's contract that the checkpoint contains the requested CFs.
-  if (cf_subset && !unseen_include_cf_ids.empty()) {
-    mutex_.Unlock();
-    return Status::InvalidArgument(
-        "Requested column family id was not live at checkpoint time");
-  }
-
-  if (cf_subset) {
-    assert(options_snapshot != nullptr);
-    assert(excluded_cf_ids != nullptr);
-    *options_snapshot = SubsetCheckpointOptionsSnapshot();
-    if (!excluded_cf_ids->empty()) {
-      options_snapshot->options_file_number = versions_->NewFileNumber();
-      options_snapshot->commit_options_file_number =
-          versions_->has_committed_options_file_number();
-      options_snapshot->db_options =
-          BuildDBOptions(immutable_db_options_, mutable_db_options_);
-      ColumnFamilySet* column_family_set = versions_->GetColumnFamilySet();
-      assert(column_family_set != nullptr);
-      for (auto* cfd : *column_family_set) {
-        assert(cfd != nullptr);
-        if (!cfd->IsDropped() &&
-            include_cf_id_set.find(cfd->GetID()) != include_cf_id_set.end()) {
-          options_snapshot->cf_names.push_back(cfd->GetName());
-          options_snapshot->cf_options.push_back(cfd->GetLatestCFOptions());
-        }
+    const auto& relocation_files = vsi.GetBlobRelocationFiles();
+    for (const auto& meta : relocation_files) {
+      assert(meta != nullptr);
+      if (meta->IsMarkedMissing()) {
+        continue;
       }
+      AddBlobFile(meta->GetFileNumber(), meta->GetFileSize(),
+                  meta->GetChecksumMethod(), meta->GetChecksumValue());
     }
   }
-
-  // Capture some final info before releasing mutex
-  const uint64_t manifest_number = versions_->manifest_file_number();
-  uint64_t manifest_size = versions_->manifest_file_size();
-  if (cf_subset && !excluded_cf_ids->empty()) {
-    Status manifest_s = versions_->GetManifestAppendBoundary(&manifest_size);
-    if (!manifest_s.ok()) {
-      mutex_.Unlock();
-      return manifest_s;
-    }
-  }
-  const uint64_t options_number = versions_->options_file_number();
-  const uint64_t min_log_num = MinLogNumberToKeep();
-  // Ensure consistency with manifest for track_and_verify_wals_in_manifest
-  const uint64_t max_log_num = cur_wal_number_;
-
-  if (options_number != 0) {
-    // A concurrent SetOptions() may otherwise delete this OPTIONS file before
-    // its size is read below, even when the caller has not disabled deletions.
-    DisableFileDeletionsWithLock().PermitUncheckedError();
-  }
-  mutex_.Unlock();
+  release_pinned_versions();
 
   uint64_t options_size = 0;
   if (options_number != 0) {

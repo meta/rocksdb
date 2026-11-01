@@ -12,6 +12,7 @@
 #pragma once
 #include <stdint.h>
 
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 class Env;
+struct ColumnFamilyDescriptor;
 class Directory;
 class SystemClock;
 class WritableFileWriter;
@@ -94,6 +96,61 @@ extern const std::string kCurrentFileName;  // = "CURRENT"
 // of the current manifest file.  The result will be prefixed with
 // "dbname".
 std::string CurrentFileName(const std::string& dbname);
+
+// Prevents unfinished repair from looking like a new DB or making an
+// unpublished MANIFEST eligible for best-efforts recovery. While it exists,
+// CURRENT must confirm the image. Dispose only after valid image recovery.
+std::string RepairInProgressFileName(const std::string& dbname);
+
+// Private feature-repair transaction catalog. This is ownership metadata, not
+// a WAL or a new data format. Each record uses the existing checksummed log
+// framing; ordinals, bounded units and a sealed candidate bind retry authority.
+enum class RepairCatalogRecordType : uint32_t {
+  kHeader,
+  kInput,
+  kIntent,
+  kSeal,
+  kArchive,
+  kCoverage,
+  kCandidate,
+  kPolicy
+};
+struct RepairCatalogRecord {
+  RepairCatalogRecordType type = RepairCatalogRecordType::kHeader;
+  uint64_t ordinal = 0;
+  std::string path;
+  std::string identity;
+  uint64_t number = 0;
+  uint64_t size = 0;
+  uint32_t checksum = 0;
+  uint32_t column_family = 0;
+  uint64_t source_wal = 0;
+  void EncodeTo(std::string* output) const;
+};
+struct RepairCatalog {
+  RepairCatalogRecord header;
+  std::map<std::string, RepairCatalogRecord> inputs;
+  std::map<std::string, RepairCatalogRecord> outputs;
+  std::map<std::string, RepairCatalogRecord> archives;
+  std::map<uint32_t, RepairCatalogRecord> policies;
+  RepairCatalogRecord candidate;
+  uint64_t coverage_floor = 0;
+  uint64_t coverage_max_sequence = 0;
+  uint64_t last_ordinal = 0;
+};
+Status ReadRepairCatalog(Env* env, const std::string& dbname,
+                         RepairCatalog* catalog, bool* recognized);
+Status GetRepairFileChecksum(Env* env, const std::string& path,
+                             uint64_t prefix_size, uint32_t* checksum);
+// Retry runs under offline DB LOCK. Ordinary RW open resolves only a proven
+// committed image before allocation/replay/purge; RO/secondary never clean.
+Status ResolveRepairCatalog(Env* env, const std::string& dbname,
+                            const RepairCatalog& catalog, bool read_only,
+                            bool repair_retry, bool* committed);
+Status CheckRepairCatalogForOpen(
+    Env* env, const std::string& dbname, bool read_only,
+    const std::vector<DbPath>& db_paths,
+    const std::vector<ColumnFamilyDescriptor>& cfs);
 
 // Return the name of the lock file for the db named by
 // "dbname".  The result will be prefixed with "dbname".

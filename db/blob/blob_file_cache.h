@@ -6,6 +6,8 @@
 #pragma once
 
 #include <cinttypes>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -13,6 +15,7 @@
 #include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_read_request.h"
 #include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/table.h"
 #include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -30,8 +33,8 @@ class BlobFileCache {
   BlobFileCache(Cache* cache, const ImmutableOptions* immutable_options,
                 const FileOptions* file_options, uint32_t column_family_id,
                 HistogramImpl* blob_file_read_hist,
-                const std::shared_ptr<IOTracer>& io_tracer);
-
+                const std::shared_ptr<IOTracer>& io_tracer,
+                const BlockBasedTableOptions* relocation_file_table_options);
   BlobFileCache(const BlobFileCache&) = delete;
   BlobFileCache& operator=(const BlobFileCache&) = delete;
   BlobFileCache(BlobFileCache&&) = delete;
@@ -47,6 +50,14 @@ class BlobFileCache {
                            const BlobFileOpenInfo& blob_file,
                            CacheHandleGuard<BlobFileReader>* blob_file_reader,
                            bool allow_footer_skip_retry = false);
+
+  Status GetRelocationFileReader(
+      const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
+      uint64_t expected_file_size, uint32_t expected_directory_digest,
+      const std::string& current_db_session_id,
+      CompressionManager* compression_manager,
+      uint8_t block_protection_bytes_per_key,
+      CacheHandleGuard<BlobFileReader>* blob_file_reader);
 
   // Opens a blob file reader without inserting it into the cache.
   Status OpenBlobFileReaderUncached(
@@ -83,15 +94,38 @@ class BlobFileCache {
   // to avoid effectively leaking the open file and assicated memory
   void Evict(uint64_t blob_file_number);
 
+  uint32_t GetColumnFamilyId() const { return column_family_id_; }
+
+  // Serializes final stable-cache admission for one logical blob identity.
+  // The physical read stays outside this lock; callers recheck the cache while
+  // holding it so conflicting fingerprints cannot blindly replace each other.
+  port::Mutex& GetStableCacheAdmissionMutex(const Slice& stable_key) {
+    return stable_cache_admission_mutex_.Get(stable_key);
+  }
+
   // Used to identify cache entries for blob files (not normally useful)
   static const Cache::CacheItemHelper* GetHelper() {
     return CacheInterface::GetBasicHelper();
   }
 
  private:
+  Status GetBlobFileReaderImpl(
+      const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
+      bool allow_footer_skip_retry, uint64_t expected_relocation_file_size,
+      uint32_t expected_directory_digest,
+      const std::string& current_db_session_id,
+      CompressionManager* compression_manager,
+      uint8_t block_protection_bytes_per_key,
+      CacheHandleGuard<BlobFileReader>* blob_file_reader);
+
   Status OpenBlobFileReader(const ReadOptions& read_options,
                             const BlobFileOpenInfo& blob_file,
                             bool allow_footer_skip_retry,
+                            uint64_t expected_relocation_file_size,
+                            uint32_t expected_directory_digest,
+                            const std::string& current_db_session_id,
+                            CompressionManager* compression_manager,
+                            uint8_t block_protection_bytes_per_key,
                             std::unique_ptr<BlobFileReader>* blob_file_reader);
 
   using CacheInterface =
@@ -101,11 +135,15 @@ class BlobFileCache {
   // Note: mutex_ below is used to guard against multiple threads racing to open
   // the same file.
   Striped<CacheAlignedWrapper<port::Mutex>> mutex_;
+  Striped<CacheAlignedWrapper<port::Mutex>> stable_cache_admission_mutex_;
   const ImmutableOptions* immutable_options_;
   const FileOptions* file_options_;
   uint32_t column_family_id_;
   HistogramImpl* blob_file_read_hist_;
   std::shared_ptr<IOTracer> io_tracer_;
+  std::unique_ptr<BlockBasedTableOptions> relocation_file_table_options_;
+  std::once_flag relocation_factory_once_;
+  std::unique_ptr<TableFactory> relocation_factory_;
 
   struct BlobFileChecksum {
     std::string value;

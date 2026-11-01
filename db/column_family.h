@@ -37,6 +37,8 @@ namespace ROCKSDB_NAMESPACE {
 class Version;
 class VersionSet;
 class VersionStorageInfo;
+class BlobReferenceCensus;
+struct BlobReferenceCensusGarbage;
 class MemTable;
 class MemTableListVersion;
 class CompactionPicker;
@@ -284,6 +286,12 @@ Status CheckConcurrentWritesSupported(const ColumnFamilyOptions& cf_options);
 Status CheckCFPathsSupported(const DBOptions& db_options,
                              const ColumnFamilyOptions& cf_options);
 
+// Applies to configured creation and to this CF's sticky/pending format state,
+// including read-only recovery. A DB-wide fence from another CF is not state
+// belonging to this CF.
+Status CheckBlobIndirectionCompactionStyle(CompactionStyle style,
+                                           bool has_blob_indirection);
+
 ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
                                       bool read_only,
                                       const ColumnFamilyOptions& src);
@@ -315,7 +323,28 @@ class ColumnFamilyData {
   // UnrefAndTryDelete() decreases the reference count and do free if needed,
   // return true if this is freed else false, UnrefAndTryDelete() can only
   // be called while holding a DB mutex, or during single-threaded recovery.
+  // It may also be called by SuperVersion cleanup after this CFD has been
+  // detached under the DB mutex.
   bool UnrefAndTryDelete();
+
+  // Drops a reference and detaches the CFD from mutex-protected lookup state
+  // before potentially large teardown. A non-null pending SuperVersion retains
+  // the final CFD reference while the returned thread-local registry is
+  // destroyed unlocked; FinishSuperVersionDetach() then completes the bounded
+  // transition. On true, either the pending SuperVersion must be cleaned up
+  // (and will delete this CFD) or DeleteDetached() must be called. Both cleanup
+  // operations must run without the mutex.
+  // REQUIRES: DB mutex held.
+  bool UnrefAndTryDetach(
+      SuperVersion** pending_super_version,
+      std::unique_ptr<ThreadLocalPtr>* detached_local_super_versions);
+  // REQUIRES: pending_super_version came from UnrefAndTryDetach() and its
+  // detached thread-local registry has been destroyed.
+  // REQUIRES: DB mutex held.
+  bool FinishSuperVersionDetach(SuperVersion* pending_super_version);
+  // REQUIRES: UnrefAndTryDetach() returned true with no detached SuperVersion.
+  // REQUIRES: DB mutex not held.
+  void DeleteDetached();
 
   // SetDropped() can only be called under following conditions:
   // 1) Holding a DB mutex,
@@ -371,12 +400,32 @@ class ColumnFamilyData {
   // Validate CF options against DB options
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
+  // Validates writer-only constraints that depend on the recovered sticky
+  // format fence. REQUIRES: DB mutex held after MANIFEST recovery.
+  Status ValidateBlobIndirectionOptionsAfterRecovery() const;
+  // Parses and validates a replacement without publishing it. The caller
+  // keeps the DB mutex held so the latest-options base remains stable.
+  Status PrepareMutableCFOptions(
+      const DBOptions& db_options,
+      const std::unordered_map<std::string, std::string>& options_map,
+      MutableCFOptions* mutable_cf_options) const;
+  // Publishes a previously prepared replacement. REQUIRES: DB mutex held.
+  void InstallMutableCFOptions(const MutableCFOptions& mutable_cf_options);
   // REQUIRES: DB mutex held
   Status SetOptions(
       const DBOptions& db_options,
       const std::unordered_map<std::string, std::string>& options_map);
 
   InternalStats* internal_stats() { return internal_stats_.get(); }
+
+  BlobReferenceCensus* blob_reference_census() {
+    return blob_reference_census_.get();
+  }
+  const BlobReferenceCensus* blob_reference_census() const {
+    return blob_reference_census_.get();
+  }
+  // REQUIRES: DB mutex held. The returned state must be destroyed unlocked.
+  BlobReferenceCensusGarbage CancelBlobReferenceCensus();
 
   MemTableList* imm() { return &imm_; }
   MemTable* mem() { return mem_; }
@@ -539,6 +588,20 @@ class ColumnFamilyData {
     db_mutex->AssertHeld();
     return num_in_flight_compactions_;
   }
+
+  // DB mutex held, paired with Compaction's referenced input lifetime.
+  // Enabled output can publish the first format fence after an option toggle.
+  void BeginBlobIndirectionCompaction() {
+    ++pending_blob_indirection_compactions_;
+  }
+  void EndBlobIndirectionCompaction() {
+    assert(pending_blob_indirection_compactions_ > 0);
+    --pending_blob_indirection_compactions_;
+  }
+  bool HasPendingBlobIndirectionOutput() const {
+    return pending_blob_indirection_compactions_ != 0 ||
+           imm_.HasPendingBlobIndirectionActivation();
+  }
   void inc_num_in_flight_compactions(InstrumentedMutex* db_mutex) {
     db_mutex->AssertHeld();
     ++num_in_flight_compactions_;
@@ -654,6 +717,7 @@ class ColumnFamilyData {
 
  private:
   friend class ColumnFamilySet;
+  friend class DBImpl;
   ColumnFamilyData(
       uint32_t id, const std::string& name, Version* dummy_versions,
       Cache* table_cache, WriteBufferManager* write_buffer_manager,
@@ -665,6 +729,9 @@ class ColumnFamilyData {
       bool options_are_sanitized, bool fast_sst_open = false);
 
   std::vector<std::string> GetDbPaths() const;
+  // Unlinks this CFD from DB-mutex-protected ownership before unlocked
+  // destruction.
+  void DetachFromColumnFamilySet();
 
   uint32_t id_;
   const std::string name_;
@@ -698,6 +765,7 @@ class ColumnFamilyData {
   std::unique_ptr<BlobSource> blob_source_;
   // Per-CF manager for write-path blob direct-write files.
   std::shared_ptr<BlobFilePartitionManager> blob_partition_manager_;
+  std::unique_ptr<BlobReferenceCensus> blob_reference_census_;
 
   std::unique_ptr<InternalStats> internal_stats_;
 
@@ -721,6 +789,7 @@ class ColumnFamilyData {
   // be alive as long as client holds a reference)
   ColumnFamilyData* next_;
   ColumnFamilyData* prev_;
+  bool detached_from_column_family_set_ = false;
 
   // This is the earliest log file number that contains data from this
   // Column Family. All earlier log files must be ignored and not
@@ -742,6 +811,13 @@ class ColumnFamilyData {
   // compaction set.
   bool queued_for_compaction_;
 
+  // Intrusive DB-mutex-protected queue for background blob-reference census.
+  // The queue owns one ColumnFamilyData reference while this flag is true.
+  bool queued_for_blob_reference_census_ = false;
+  ColumnFamilyData* next_blob_reference_census_ = nullptr;
+  uint64_t blob_reference_census_retry_micros_ = 0;
+  uint32_t blob_reference_census_failures_ = 0;
+
   // Read outside the DB mutex by compaction workers (acquire-loaded roughly
   // every 1024 records in ProcessKeyValueCompaction). Given its own cache line
   // via CacheAlignedWrapper to avoid false sharing with the DB-mutex-written
@@ -757,6 +833,7 @@ class ColumnFamilyData {
   // worker invocations, backs the public rocksdb.num-running-compactions
   // property, and excludes CompactFiles). Protected by the DB mutex.
   int num_in_flight_compactions_{0};
+  size_t pending_blob_indirection_compactions_ = 0;
 
   uint64_t prev_compaction_needed_bytes_;
 

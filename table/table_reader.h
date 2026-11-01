@@ -9,6 +9,7 @@
 
 #pragma once
 #include <memory>
+#include <vector>
 
 #include "db/range_tombstone_fragmenter.h"
 #if USE_COROUTINES
@@ -23,6 +24,11 @@
 #include "util/coro_utils.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+struct BlobReferenceGroup;
+struct BlobReference;
+class BlobReferenceIterator;
+class CacheReservationManager;
 
 class Iterator;
 struct ParsedInternalKey;
@@ -115,6 +121,66 @@ class TableReader {
   virtual void SetupForCompaction() = 0;
 
   virtual std::shared_ptr<const TableProperties> GetTableProperties() const = 0;
+
+  // Reads and validates the exact external-blob route-group directory. The
+  // default is intentionally unsupported because feature SSTs are restricted
+  // to block-based tables.
+  virtual Status ReadBlobReferenceGroups(
+      const Slice& expected_descriptor,
+      std::vector<BlobReferenceGroup>* groups) const {
+    (void)expected_descriptor;
+    (void)groups;
+    return Status::NotSupported(
+        "Exact blob reference metadata is not supported");
+  }
+
+  // Appends one exact route-group range selected from a previously validated
+  // directory. `references` must already have enough capacity for the group,
+  // so its owner can account the allocation before this call. The default is
+  // intentionally unsupported because feature SSTs are restricted to
+  // block-based tables.
+  virtual Status ReadBlobReferences(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      const BlobReferenceGroup& expected_group,
+      std::vector<BlobReference>* references) const {
+    (void)read_options;
+    (void)expected_descriptor;
+    (void)expected_group;
+    (void)references;
+    return Status::NotSupported(
+        "Exact blob reference metadata is not supported");
+  }
+
+  // Reads and validates every exact-reference payload block without scanning
+  // the table's key/value entries. This includes legacy direct references,
+  // which are intentionally absent from the route-group directory.
+  virtual Status VerifyBlobReferenceMetadata(
+      const ReadOptions& read_options, const Slice& expected_descriptor) const {
+    (void)read_options;
+    (void)expected_descriptor;
+    return Status::NotSupported(
+        "Exact blob reference metadata is not supported");
+  }
+
+  // Reads every exact reference, including legacy-direct entries omitted from
+  // the route-group directory. Intended for offline repair and diagnostics.
+  virtual Status ReadAllBlobReferences(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      std::vector<BlobReference>* references) const {
+    (void)read_options;
+    (void)expected_descriptor;
+    (void)references;
+    return Status::NotSupported(
+        "Exact blob reference metadata is not supported");
+  }
+
+  virtual Status NewBlobReferenceIterator(
+      const ReadOptions&, const Slice&,
+      std::shared_ptr<CacheReservationManager>,
+      std::unique_ptr<BlobReferenceIterator>*) const {
+    return Status::NotSupported(
+        "Exact blob reference iteration is not supported");
+  }
 
   // Prepare work that can be done before the real Get()
   virtual void Prepare(const Slice& /*target*/) {}

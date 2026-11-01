@@ -2739,6 +2739,9 @@ class DB {
   // rather than returning in Status. Files are not modified on any error
   // return, and a best effort is made to remove any newly-created files.
   // On error return, column family handle returned will be nullptr.
+  // Feature-bearing blob-indirection SSTs are unsupported: this SST-only
+  // representation does not transfer their routes or external blob ownership.
+  // Legacy and validated self-contained SST import behavior is unchanged.
   // ColumnFamily will be present on successful return and will not be present
   // on error return. ColumnFamily may be present on any crash during this call.
   virtual Status CreateColumnFamilyWithImport(
@@ -3037,6 +3040,13 @@ Status DestroyDB(const std::string& name, const Options& options,
 // specified in column_families.
 //
 // @param column_families Descriptors for known column families
+// Activated blob-indirection images use a private repair transaction catalog.
+// Repair leaves CURRENT unchanged until the complete image and certified WAL
+// prefix are durable. Retry rolls back catalog-owned unpublished outputs or
+// finishes committed cleanup; ambiguous/corrupt provenance is preserved and
+// reported. A cleanup error can follow successful image publication. Never-
+// activated databases retain legacy salvage behavior. This is not recovery
+// to a guaranteed consistent point in time or binary-downgrade support.
 Status RepairDB(const std::string& dbname, const DBOptions& db_options,
                 const std::vector<ColumnFamilyDescriptor>& column_families);
 

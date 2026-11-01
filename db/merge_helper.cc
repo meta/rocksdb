@@ -381,6 +381,17 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
     // At this point we are guaranteed that we need to process this key.
 
     assert(IsValueType(ikey.type));
+    if ((ikey.type == kTypeBlobIndex || ikey.type == kTypeWideColumnEntity) &&
+        blob_fetcher != nullptr && blob_fetcher->HasBlobValueLoss()) {
+      bool lost = false;
+      s = blob_fetcher->IsBlobValueLost(ikey.type, iter->value(), &lost);
+      if (!s.ok()) {
+        return s;
+      }
+      if (lost) {
+        ikey.type = kTypeDeletion;
+      }
+    }
     if (ikey.type != kTypeMerge) {
       // hit a put/delete/single delete
       //   => merge the put value or a nullptr with operands_

@@ -19,6 +19,7 @@
 
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/compaction/compaction_picker_fifo.h"
@@ -39,6 +40,7 @@
 #include "port/port.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/table.h"
+#include "table/adaptive/adaptive_table_factory.h"
 #include "table/merging_iterator.h"
 #include "util/autovector.h"
 #include "util/cast_util.h"
@@ -59,26 +61,7 @@ ColumnFamilyHandleImpl::~ColumnFamilyHandleImpl() {
     for (auto& listener : cfd_->ioptions().listeners) {
       listener->OnColumnFamilyHandleDeletionStarted(this);
     }
-    // Job id == 0 means that this is not our background process, but rather
-    // user thread
-    // Need to hold some shared pointers owned by the initial_cf_options
-    // before final cleaning up finishes.
-    ColumnFamilyOptions initial_cf_options_copy = cfd_->initial_cf_options();
-    JobContext job_context(0);
-    mutex_->Lock();
-    bool dropped = cfd_->IsDropped();
-    if (cfd_->UnrefAndTryDelete()) {
-      if (dropped) {
-        db_->FindObsoleteFiles(&job_context, false, true);
-      }
-    }
-    mutex_->Unlock();
-    if (job_context.HaveSomethingToDelete()) {
-      bool defer_purge =
-          db_->immutable_db_options().avoid_unnecessary_blocking_io;
-      db_->PurgeObsoleteFiles(job_context, defer_purge);
-    }
-    job_context.Clean();
+    db_->ReleaseColumnFamilyHandle(cfd_);
   }
 }
 
@@ -683,9 +666,12 @@ ColumnFamilyData::ColumnFamilyData(
                                       db_session_id, fast_sst_open, name_));
     blob_file_cache_.reset(
         new BlobFileCache(_table_cache, &ioptions(), soptions(), id_,
-                          internal_stats_->GetBlobFileReadHist(), io_tracer));
+                          internal_stats_->GetBlobFileReadHist(), io_tracer,
+                          GetBlockBasedTableWriterOptions(
+                              mutable_cf_options_.table_factory.get())));
     blob_source_.reset(new BlobSource(ioptions_, mutable_cf_options_, db_id,
                                       db_session_id, blob_file_cache_.get()));
+    blob_reference_census_ = std::make_unique<BlobReferenceCensus>();
     // Let the table cache route same-file ("embedded") blob reads through the
     // blob value cache + stats. Both objects share this CFD's lifetime.
     table_cache_->SetBlobSource(blob_source_.get());
@@ -748,20 +734,30 @@ ColumnFamilyData::ColumnFamilyData(
   }
 }
 
-// DB mutex held
+BlobReferenceCensusGarbage ColumnFamilyData::CancelBlobReferenceCensus() {
+  if (blob_reference_census_ == nullptr) {
+    return {};
+  }
+  return blob_reference_census_->Cancel();
+}
+
+// The DB mutex is held unless DetachFromColumnFamilySet() already performed
+// the mutex-protected unlink for an unlocked final teardown.
 ColumnFamilyData::~ColumnFamilyData() {
   assert(refs_.load(std::memory_order_relaxed) == 0);
-  // remove from linked list
-  auto prev = prev_;
-  auto next = next_;
-  prev->next_ = next;
-  next->prev_ = prev;
+  if (!detached_from_column_family_set_) {
+    // remove from linked list
+    auto prev = prev_;
+    auto next = next_;
+    prev->next_ = next;
+    next->prev_ = prev;
 
-  if (!dropped_ && column_family_set_ != nullptr) {
-    // If it's dropped, it's already removed from column family set
-    // If column_family_set_ == nullptr, this is dummy CFD and not in
-    // ColumnFamilySet
-    column_family_set_->RemoveColumnFamily(this);
+    if (!dropped_ && column_family_set_ != nullptr) {
+      // If it's dropped, it's already removed from column family set
+      // If column_family_set_ == nullptr, this is dummy CFD and not in
+      // ColumnFamilySet
+      column_family_set_->RemoveColumnFamily(this);
+    }
   }
 
   if (current_ != nullptr) {
@@ -836,6 +832,66 @@ bool ColumnFamilyData::UnrefAndTryDelete() {
     }
   }
   return false;
+}
+
+void ColumnFamilyData::DetachFromColumnFamilySet() {
+  assert(!detached_from_column_family_set_);
+  ColumnFamilyData* const prev = prev_;
+  ColumnFamilyData* const next = next_;
+  prev->next_ = next;
+  next->prev_ = prev;
+  next_ = this;
+  prev_ = this;
+  if (!dropped_ && column_family_set_ != nullptr) {
+    column_family_set_->RemoveColumnFamily(this);
+  }
+  detached_from_column_family_set_ = true;
+}
+
+bool ColumnFamilyData::UnrefAndTryDetach(
+    SuperVersion** pending_super_version,
+    std::unique_ptr<ThreadLocalPtr>* detached_local_super_versions) {
+  assert(pending_super_version != nullptr);
+  assert(detached_local_super_versions != nullptr);
+  assert(*detached_local_super_versions == nullptr);
+  *pending_super_version = nullptr;
+  const int old_refs = refs_.fetch_sub(1);
+  assert(old_refs > 0);
+
+  if (old_refs == 1) {
+    assert(super_version_ == nullptr);
+    DetachFromColumnFamilySet();
+    return true;
+  }
+
+  if (old_refs == 2 && super_version_ != nullptr) {
+    // The installed SuperVersion owns the only remaining CFD reference. Drain
+    // its thread-local references before dropping the installed reference, as
+    // their cleanup callback cannot delete a SuperVersion.
+    DetachFromColumnFamilySet();
+    *pending_super_version = super_version_;
+    super_version_ = nullptr;
+    *detached_local_super_versions = std::move(local_sv_);
+  }
+  return false;
+}
+
+bool ColumnFamilyData::FinishSuperVersionDetach(
+    SuperVersion* pending_super_version) {
+  assert(pending_super_version != nullptr);
+  assert(super_version_ == nullptr);
+  assert(local_sv_ == nullptr);
+  if (!pending_super_version->Unref()) {
+    return false;
+  }
+  assert(pending_super_version->cfd == this);
+  return true;
+}
+
+void ColumnFamilyData::DeleteDetached() {
+  assert(detached_from_column_family_set_);
+  assert(refs_.load(std::memory_order_relaxed) == 0);
+  delete this;
 }
 
 void ColumnFamilyData::SetDropped() {
@@ -1276,8 +1332,30 @@ void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
 }
 
 bool ColumnFamilyData::NeedsCompaction() const {
-  return !mutable_cf_options_.disable_auto_compactions &&
-         compaction_picker_->NeedsCompaction(current_->storage_info());
+  Version* const current = current_;
+  // Exact empty-file cleanup is not an LSM compaction and copies no values.
+  // The policy knobs disable relocation, not this storage-lifecycle work.
+  if (current != nullptr && blob_reference_census_ != nullptr &&
+      blob_reference_census_->IsReady(current->GetVersionNumber()) &&
+      current->storage_info()->HasEmptyBlobGcCandidate()) {
+    return true;
+  }
+  if (mutable_cf_options_.disable_auto_compactions) {
+    return false;
+  }
+  if (current == nullptr) {
+    return false;
+  }
+  if (compaction_picker_->NeedsCompaction(current->storage_info())) {
+    return true;
+  }
+  return mutable_cf_options_.enable_blob_files &&
+         mutable_cf_options_.enable_blob_garbage_collection &&
+         mutable_cf_options_.enable_blob_indirection &&
+         current->storage_info()->BlobPhysicalFileForStandaloneGC() !=
+             kInvalidBlobFileNumber &&
+         blob_reference_census_ != nullptr &&
+         blob_reference_census_->IsReady(current->GetVersionNumber());
 }
 
 Compaction* ColumnFamilyData::PickCompaction(
@@ -1522,9 +1600,21 @@ void ColumnFamilyData::ResetThreadLocalSuperVersions() {
   }
 }
 
+Status CheckBlobIndirectionCompactionStyle(CompactionStyle style,
+                                           bool has_blob_indirection) {
+  if (has_blob_indirection && style == kCompactionStyleFIFO) {
+    return Status::NotSupported("Blob indirection is incompatible with FIFO");
+  }
+  return Status::OK();
+}
+
 Status ColumnFamilyData::ValidateOptions(
     const DBOptions& db_options, const ColumnFamilyOptions& cf_options) {
-  Status s;
+  Status s = CheckBlobIndirectionCompactionStyle(
+      cf_options.compaction_style, cf_options.enable_blob_indirection);
+  if (!s.ok()) {
+    return s;
+  }
   s = CheckCompressionSupported(cf_options);
   if (s.ok() && db_options.allow_concurrent_memtable_write) {
     s = CheckConcurrentWritesSupported(cf_options);
@@ -1586,6 +1676,21 @@ Status ColumnFamilyData::ValidateOptions(
       return Status::NotSupported(
           "Blob direct write does not support user-defined timestamps.");
     }
+  }
+  if (cf_options.enable_blob_indirection && !cf_options.enable_blob_files) {
+    return Status::InvalidArgument(
+        "enable_blob_indirection requires enable_blob_files=true");
+  }
+  if (cf_options.enable_blob_indirection &&
+      cf_options.enable_blob_direct_write) {
+    return Status::NotSupported(
+        "Blob indirection and blob direct write cannot be enabled together");
+  }
+  if (cf_options.enable_blob_indirection &&
+      !cf_options.table_factory->IsInstanceOf(
+          TableFactory::kBlockBasedTableName())) {
+    return Status::NotSupported(
+        "Blob indirection requires Block-Based Table format");
   }
   if (ucmp->timestamp_size() > 0 &&
       !cf_options.persist_user_defined_timestamps) {
@@ -1719,11 +1824,41 @@ Status ColumnFamilyData::ValidateOptions(
   return s;
 }
 
-Status ColumnFamilyData::SetOptions(
+Status ColumnFamilyData::ValidateBlobIndirectionOptionsAfterRecovery() const {
+  Status s = CheckBlobIndirectionCompactionStyle(
+      ioptions_.compaction_style,
+      GetLatestMutableCFOptions().enable_blob_indirection ||
+          HasPendingBlobIndirectionOutput() ||
+          (current_ != nullptr &&
+           current_->storage_info()->HasBlobIndirectionFormat()));
+  if (!s.ok()) {
+    return s;
+  }
+  if (current_ == nullptr ||
+      !current_->storage_info()->HasBlobIndirectionFormat()) {
+    return Status::OK();
+  }
+  if (ioptions_.enable_blob_direct_write) {
+    return Status::NotSupported(
+        "Blob direct write cannot open a column family with blob indirection "
+        "state");
+  }
+
+  if (GetBlockBasedTableWriterOptions(
+          initial_cf_options_.table_factory.get()) == nullptr) {
+    return Status::NotSupported(
+        "Blob indirection state requires a Block-Based Table writer");
+  }
+  return Status::OK();
+}
+
+Status ColumnFamilyData::PrepareMutableCFOptions(
     const DBOptions& db_opts,
-    const std::unordered_map<std::string, std::string>& options_map) {
+    const std::unordered_map<std::string, std::string>& options_map,
+    MutableCFOptions* mutable_cf_options) const {
+  assert(mutable_cf_options != nullptr);
   ColumnFamilyOptions cf_opts =
-      BuildColumnFamilyOptions(initial_cf_options_, mutable_cf_options_);
+      BuildColumnFamilyOptions(initial_cf_options_, *mutable_cf_options);
   ConfigOptions config_opts;
   config_opts.mutable_options_only = true;
 #ifndef NDEBUG
@@ -1738,9 +1873,43 @@ Status ColumnFamilyData::SetOptions(
     // ValidateOptions().
     s = ValidateOptions(db_opts, cf_opts);
   }
+  if (s.ok() && ((current_ != nullptr &&
+                  current_->storage_info()->HasBlobIndirectionFormat()) ||
+                 HasPendingBlobIndirectionOutput())) {
+    s = CheckBlobIndirectionCompactionStyle(cf_opts.compaction_style, true);
+  }
+  if (s.ok() &&
+      ((current_ != nullptr &&
+        current_->storage_info()->HasBlobIndirectionFormat()) ||
+       HasPendingBlobIndirectionOutput()) &&
+      GetBlockBasedTableWriterOptions(cf_opts.table_factory.get()) == nullptr) {
+    // Turning off creation does not cancel an older enabled output job, which
+    // may still publish the first fence. Its intent is checked in O(1) here.
+    // Turning off the GC policy does not remove the persistent format fence.
+    // Future compactions must still be able to preserve exact references and
+    // read/retire existing relocation files.
+    s = Status::NotSupported(
+        "Blob indirection state requires a Block-Based Table writer");
+  }
   if (s.ok()) {
-    mutable_cf_options_ = MutableCFOptions(cf_opts);
-    mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+    *mutable_cf_options = MutableCFOptions(cf_opts);
+    mutable_cf_options->RefreshDerivedOptions(ioptions_);
+  }
+  return s;
+}
+
+void ColumnFamilyData::InstallMutableCFOptions(
+    const MutableCFOptions& mutable_cf_options) {
+  mutable_cf_options_ = mutable_cf_options;
+}
+
+Status ColumnFamilyData::SetOptions(
+    const DBOptions& db_opts,
+    const std::unordered_map<std::string, std::string>& options_map) {
+  MutableCFOptions mutable_cf_options(mutable_cf_options_);
+  Status s = PrepareMutableCFOptions(db_opts, options_map, &mutable_cf_options);
+  if (s.ok()) {
+    InstallMutableCFOptions(mutable_cf_options);
   }
   return s;
 }

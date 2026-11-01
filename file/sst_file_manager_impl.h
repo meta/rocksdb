@@ -84,9 +84,16 @@ class SstFileManagerImpl : public SstFileManager {
                                const std::vector<CompactionInputFiles>& inputs,
                                const Status& bg_error);
 
+  // Byte-based counterpart for background rewrite work that does not have
+  // CompactionInputFiles.
+  bool EnoughRoomForCompaction(uint64_t estimated_output_size,
+                               const std::string& output_path,
+                               const Status& bg_error);
+
   // Bookkeeping so total_file_sizes_ goes back to normal after compaction
   // finishes
   void OnCompactionCompletion(Compaction* c);
+  void OnCompactionCompletion(uint64_t reserved_size);
 
   uint64_t GetCompactionsReservedSize();
 

@@ -12,6 +12,8 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -20,6 +22,7 @@
 
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_completion_callback.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/column_family.h"
 #include "db/compaction/compaction_iterator.h"
 #include "db/compaction/compaction_outputs.h"
@@ -343,6 +346,11 @@ class CompactionJob {
   void AggregateSubcompactionOutputAndJobStats();
   Status VerifyCompactionRecordCounts(bool stats_built_from_input_table_prop,
                                       uint64_t num_input_range_del);
+  Status PrepareBlobRelocationPublicationReservation();
+  Status PrepareBlobRelocationOutputDependencies();
+  Status ReserveBlobRelocationDependencyMemory(size_t additional_bytes);
+  Status PrepareUnpublishedBlobCompactionOutputs();
+  Status ValidateBlobRelocationOutputDependencies(const Version& current) const;
   void FinalizeCompactionRun(const Status& status,
                              bool stats_built_from_input_table_prop,
                              uint64_t num_input_range_del);
@@ -547,6 +555,20 @@ class CompactionJob {
   // write times.
   SequenceNumber preserve_seqno_after_ = kMaxSequenceNumber;
 
+  std::shared_ptr<BlobRelocationPublicationReservation>
+      blob_publication_reservation_;
+  struct BlobOutputDependency {
+    std::shared_ptr<SharedBlobFileMetaData> normal;
+    std::shared_ptr<BlobRelocationFileMetaData> relocation;
+    std::vector<BlobRelocationRouteSource> sources;
+  };
+  std::map<uint64_t, BlobOutputDependency> blob_output_dependencies_;
+  std::shared_ptr<CacheReservationManager> blob_dependency_reservation_manager_;
+  size_t blob_dependency_reserved_bytes_ = 0;
+  std::vector<JobContext::UnpublishedCompactionOutput>
+      blob_unpublished_outputs_;
+  bool blob_dependency_rejected_ = false;
+
   // Minimal sequence number to preclude the data from the last level. If the
   // key has bigger (newer) sequence number than this, it will be precluded from
   // the last level (output to proximal level).
@@ -594,6 +616,10 @@ class CompactionJob {
   // True if this job builds output files as a remote (offloaded)
   // CompactionService worker. Overridden by CompactionServiceCompactionJob.
   virtual bool IsRemoteCompaction() const { return false; }
+  virtual bool AllowBlobIndexFlattening() const {
+    return !IsRemoteCompaction();
+  }
+  virtual bool AllowBlobFileCreation() const { return true; }
   // The rate limiter priority (io_priority) is determined dynamically here.
   // The Compaction Read and Write priorities are the same for different
   // scenarios, such as write stalled.
@@ -614,7 +640,7 @@ class CompactionJob {
       const FileMetaData* file_meta, const ReadOptions& read_options,
       std::shared_ptr<const TableProperties>* tp);
 
-  void RestoreCompactionOutputs(
+  Status RestoreCompactionOutputs(
       const ColumnFamilyData* cfd,
       const std::vector<std::shared_ptr<const TableProperties>>&
           output_files_table_properties,
@@ -726,6 +752,22 @@ struct CompactionServiceInput {
   int proximal_output_range_type = 0;
   SequenceNumber keep_in_last_level_through_seqno = 0;
 
+  // Non-zero opts into the feature-aware remote compaction contract. Older
+  // workers ignore these fields and return a zero capability, which makes the
+  // primary fall back locally before importing output.
+  uint32_t blob_gc_protocol_version = 0;
+  uint32_t blob_index_format_version = 0;
+  uint32_t blob_reference_metadata_format_version = 0;
+  uint32_t blob_indirection_manifest_format_version = 0;
+  uint32_t blob_relocation_directory_format_version = 0;
+  uint32_t blob_stable_checksum_version = 0;
+  uint32_t blob_repair_metadata_format_version = 0;
+  uint32_t blob_gc_column_family_id = 0;
+  uint64_t blob_gc_options_fingerprint = 0;
+  uint64_t blob_relocation_state_fingerprint_high = 0;
+  uint64_t blob_relocation_state_fingerprint_low = 0;
+  bool allow_blob_index_flattening = false;
+
   // serialization interface to read and write the object
   static Status Read(const std::string& data_str, CompactionServiceInput* obj);
   Status Write(std::string* output);
@@ -824,6 +866,22 @@ struct CompactionServiceResult {
   // proximal_level_stats
   InternalStats::CompactionStatsFull internal_stats;
 
+  // Echoed feature contract. A feature-aware primary accepts the output only
+  // when every field matches its immutable request.
+  uint32_t blob_gc_protocol_version = 0;
+  uint32_t blob_index_format_version = 0;
+  uint32_t blob_reference_metadata_format_version = 0;
+  uint32_t blob_indirection_manifest_format_version = 0;
+  uint32_t blob_relocation_directory_format_version = 0;
+  uint32_t blob_stable_checksum_version = 0;
+  uint32_t blob_repair_metadata_format_version = 0;
+  uint32_t blob_gc_column_family_id = 0;
+  uint64_t blob_gc_options_fingerprint = 0;
+  uint64_t blob_relocation_state_fingerprint_high = 0;
+  uint64_t blob_relocation_state_fingerprint_low = 0;
+  bool allow_blob_index_flattening = false;
+  bool has_flattened_blob_index = false;
+
   // serialization interface to read and write the object
   static Status Read(const std::string& data_str, CompactionServiceResult* obj);
   Status Write(std::string* output);
@@ -833,6 +891,14 @@ struct CompactionServiceResult {
   bool TEST_Equals(CompactionServiceResult* other, std::string* mismatch);
 #endif  // NDEBUG
 };
+
+inline constexpr uint32_t kBlobGCCompactionServiceProtocolVersion = 1;
+
+uint64_t ComputeBlobGCCompactionServiceOptionsFingerprint(
+    uint32_t column_family_id, uint64_t options_file_number,
+    bool enable_blob_indirection, bool allow_blob_index_flattening,
+    bool enable_blob_garbage_collection,
+    double blob_garbage_collection_age_cutoff);
 
 // CompactionServiceCompactionJob is an read-only compaction job, it takes
 // input information from `compaction_service_input` and put result information
@@ -882,6 +948,14 @@ class CompactionServiceCompactionJob : private CompactionJob {
   std::optional<uint64_t> GetBlobGarbageCollectionCutoffFileNumber()
       const override;
   bool IsRemoteCompaction() const override { return true; }
+  bool AllowBlobIndexFlattening() const override {
+    return compaction_input_.blob_gc_protocol_version ==
+               kBlobGCCompactionServiceProtocolVersion &&
+           compaction_input_.allow_blob_index_flattening;
+  }
+  bool AllowBlobFileCreation() const override {
+    return compaction_input_.blob_gc_protocol_version == 0;
+  }
   // Specific the compaction output path, otherwise it uses default DB path
   const std::string output_path_;
 

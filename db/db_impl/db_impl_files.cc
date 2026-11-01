@@ -13,6 +13,7 @@
 
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blob/blob_relocation_file.h"
 #include "db/db_impl/db_impl.h"
 #include "db/event_helpers.h"
 #include "db/memtable_list.h"
@@ -84,10 +85,6 @@ bool ShouldKeepFooterlessBlobFile(FileSystem* fs,
     return !io_s.IsPathNotFound();
   }
 
-  if (file_size < BlobLogHeader::kSize + BlobLogFooter::kSize) {
-    return true;
-  }
-
   FileOptions read_file_options = file_options;
   read_file_options.use_direct_reads = false;
 
@@ -95,6 +92,31 @@ bool ShouldKeepFooterlessBlobFile(FileSystem* fs,
   io_s = fs->NewRandomAccessFile(blob_file_path, read_file_options, &file, dbg);
   if (!io_s.ok()) {
     return !io_s.IsPathNotFound();
+  }
+  if (file == nullptr) {
+    return true;
+  }
+
+  if (file_size >= kBlobRelocationFilePrefixSize) {
+    std::array<char, kBlobRelocationFilePrefixSize> prefix_scratch{};
+    Slice prefix_slice;
+    io_s = file->Read(/*offset=*/0, kBlobRelocationFilePrefixSize, io_options,
+                      &prefix_slice, prefix_scratch.data(), dbg);
+    if (!io_s.ok()) {
+      return !io_s.IsPathNotFound();
+    }
+    if (prefix_slice ==
+        Slice(kBlobRelocationFilePrefix, kBlobRelocationFilePrefixSize)) {
+      // Relocation files are always built under a temp name and protected by
+      // pending_outputs_ across rename/publication. They never participate in
+      // the footer-less direct-write protocol, so an obsolete one is safe to
+      // delete despite not having a normal blob-log footer.
+      return false;
+    }
+  }
+
+  if (file_size < BlobLogHeader::kSize + BlobLogFooter::kSize) {
+    return true;
   }
 
   std::array<char, BlobLogFooter::kSize> scratch{};
@@ -496,11 +518,20 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
 void DBImpl::DeleteObsoleteFileImpl(int job_id, const std::string& fname,
                                     const std::string& path_to_sync,
                                     FileType type, uint64_t number) {
+  DeleteObsoleteFileWithStatus(job_id, fname, path_to_sync, type, number)
+      .PermitUncheckedError();
+}
+
+Status DBImpl::DeleteObsoleteFileWithStatus(int job_id,
+                                            const std::string& fname,
+                                            const std::string& path_to_sync,
+                                            FileType type, uint64_t number) {
   TEST_SYNC_POINT_CALLBACK("DBImpl::DeleteObsoleteFileImpl::BeforeDeletion",
                            const_cast<std::string*>(&fname));
   IGNORE_STATUS_IF_ERROR(Status::IOError());
 
   Status file_deletion_status;
+  bool already_absent = false;
   if (type == kTableFile || type == kBlobFile || type == kWalFile) {
     // Rate limit WAL deletion only if its in the DB dir
     file_deletion_status = DeleteDBFile(
@@ -519,6 +550,7 @@ void DBImpl::DeleteObsoleteFileImpl(int job_id, const std::string& fname,
                     job_id, db_session_id_.c_str(), fname.c_str(), type, number,
                     file_deletion_status.ToString().c_str());
   } else if (env_->FileExists(fname).IsNotFound()) {
+    already_absent = true;
     ROCKS_LOG_INFO(
         immutable_db_options_.info_log,
         "[JOB %d] [db_session_id=%s] Tried to delete a non-existing file %s"
@@ -542,6 +574,49 @@ void DBImpl::DeleteObsoleteFileImpl(int job_id, const std::string& fname,
         &event_logger_, immutable_db_options_.listeners, job_id, number, fname,
         file_deletion_status, GetName(), db_session_id_);
   }
+  return already_absent ? Status::OK() : file_deletion_status;
+}
+
+Status DBImpl::PurgeUnpublishedCompactionOutputs(JobContext* job_context) {
+  // Pending-output protection is still held. No Version owns these files,
+  // and no concurrent generic purge can claim them while deletion runs.
+  // Eviction, SstFileManager deletion, listeners and I/O run outside DB mutex.
+  Status status;
+  for (const JobContext::UnpublishedCompactionOutput& output :
+       job_context->unpublished_compaction_outputs) {
+    TableCache::Evict(table_cache_.get(), output.number);
+    Status deleted = DeleteObsoleteFileWithStatus(job_context->job_id,
+                                                  output.path, output.directory,
+                                                  output.type, output.number);
+    if (!deleted.ok()) {
+      if (status.ok()) {
+        status = deleted;
+      }
+    }
+  }
+  ColumnFamilyData* const cfd = job_context->blob_publication_cfd;
+  mutex_.Lock();
+  if (!status.ok()) {
+    // These files are definitely unpublished, not ambiguous MANIFEST outputs.
+    // Preserve the deletion error for the caller and force its normal full
+    // obsolete-file scan after pending-output protection is released. That
+    // scan owns any surviving orphan; cleanup-only I/O must not stop the DB.
+    job_context->blob_relocation_retry = false;
+  }
+  if (cfd != nullptr) {
+    cfd->blob_reference_census()->UnregisterPublication(
+        job_context->blob_publication_reservation.get());
+    job_context->blob_publication_cfd = nullptr;
+  }
+  mutex_.Unlock();
+  job_context->blob_publication_reservation.reset();
+  if (cfd != nullptr) {
+    ReleaseColumnFamilyDataPin(cfd);
+  }
+  std::vector<JobContext::UnpublishedCompactionOutput>().swap(
+      job_context->unpublished_compaction_outputs);
+  job_context->unpublished_compaction_output_reservation.reset();
+  return status;
 }
 
 // Diffs the files listed in filenames and those that do not
