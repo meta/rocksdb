@@ -40,6 +40,7 @@ struct BlobRelocationFileMetadata {
   uint64_t origin_count = 0;
   uint64_t entry_count = 0;
   uint64_t record_bytes = 0;
+  std::string encoded_directory;
   uint64_t tail_size = 0;
 };
 

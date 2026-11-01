@@ -244,8 +244,7 @@ Status ImportColumnFamilyJob::Run() {
     // Release resources occupied by the dummy VersionStorageInfo
     for (int level = 0; level < dummy_vstorage.num_levels(); level++) {
       for (FileMetaData* file_meta : dummy_vstorage.LevelFiles(level)) {
-        file_meta->refs--;
-        if (file_meta->refs <= 0) {
+        if (file_meta->Unref()) {
           delete file_meta;
         }
       }

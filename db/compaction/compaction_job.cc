@@ -2725,6 +2725,12 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
     }
   }
 
+  if (!edit->GetNewFiles().empty() &&
+      compaction->mutable_cf_options().enable_blob_indirection) {
+    edit->SetBlobIndirectionFormatVersion(
+        kBlobIndirectionManifestFormatVersion);
+  }
+
   for (const auto& pair : blob_total_garbage) {
     const uint64_t blob_file_number = pair.first;
     const BlobGarbageMeter::BlobStats& stats = pair.second;

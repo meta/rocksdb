@@ -1067,6 +1067,8 @@ Status DBImplSecondary::NewIteratorsImpl(
 }
 
 Status DBImplSecondary::TryCatchUpWithPrimary() {
+  TEST_SYNC_POINT("DBImplSecondary::TryCatchUpWithPrimary:BeforeCatchUpLock");
+  std::lock_guard<std::mutex> catch_up_lock(catch_up_mutex_);
   assert(versions_.get() != nullptr);
   Status s;
   // read the manifest and apply new changes to the secondary instance
