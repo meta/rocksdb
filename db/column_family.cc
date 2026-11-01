@@ -19,6 +19,7 @@
 
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/compaction/compaction_picker_fifo.h"
@@ -689,6 +690,7 @@ ColumnFamilyData::ColumnFamilyData(
                               mutable_cf_options_.table_factory.get())));
     blob_source_.reset(new BlobSource(ioptions_, mutable_cf_options_, db_id,
                                       db_session_id, blob_file_cache_.get()));
+    blob_reference_census_ = std::make_unique<BlobReferenceCensus>();
     // Let the table cache route same-file ("embedded") blob reads through the
     // blob value cache + stats. Both objects share this CFD's lifetime.
     table_cache_->SetBlobSource(blob_source_.get());
@@ -749,6 +751,13 @@ ColumnFamilyData::ColumnFamilyData(
               bbto->block_cache)));
     }
   }
+}
+
+BlobReferenceCensusGarbage ColumnFamilyData::CancelBlobReferenceCensus() {
+  if (blob_reference_census_ == nullptr) {
+    return {};
+  }
+  return blob_reference_census_->Cancel();
 }
 
 // DB mutex held

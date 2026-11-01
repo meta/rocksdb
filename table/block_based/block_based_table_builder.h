@@ -132,6 +132,9 @@ class BlockBasedTableBuilder : public TableBuilder {
   // Get table properties
   TableProperties GetTableProperties() const override;
 
+  std::shared_ptr<const BlobReferenceSstSummary> GetBlobReferenceSstSummary()
+      const override;
+
   // Get file checksum
   std::string GetFileChecksum() const override;
 

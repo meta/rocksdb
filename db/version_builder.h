@@ -90,6 +90,9 @@ class VersionBuilder {
 
   bool HasMissingFiles() const;
 
+  // Current replay state only: retired historical additions do not count.
+  bool HasMissingBlobRelocationFiles() const;
+
   // When applying a sequence of VersionEdits, intermediate files are the ones
   // that are added and then deleted. Returns the tracked files and clears them
   // so that subsequent VersionEdits start with a clean state.

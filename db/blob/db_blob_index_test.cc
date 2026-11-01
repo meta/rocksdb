@@ -14,10 +14,12 @@
 #include <utility>
 #include <vector>
 
+#include "cache/cache_reservation_manager.h"
 #include "db/arena_wrapped_db_iter.h"
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/blob/blob_reference_metadata.h"
 #include "db/column_family.h"
 #include "db/db_iter.h"
@@ -31,6 +33,7 @@
 #include "rocksdb/perf_context.h"
 #include "rocksdb/sst_file_writer.h"
 #include "rocksdb/table.h"
+#include "util/defer.h"
 #include "util/string_util.h"
 #include "utilities/merge_operators.h"
 
@@ -515,6 +518,789 @@ TEST(BlobReferenceMetadataTest, RejectsCorruptDescriptorAndBlocks) {
   std::vector<BlobReferenceBlockIndexEntry> block_index;
   EXPECT_TRUE(DecodeBlobReferenceIndex(corrupt_index, descriptor, &block_index)
                   .IsCorruption());
+}
+
+namespace {
+
+BlobReferenceGroup MakeCensusGroup(uint64_t generation, uint64_t origin) {
+  BlobReferenceGroup group;
+  group.encoding_class = generation == origin
+                             ? BlobReferenceEncodingClass::kFeatureIdentity
+                             : BlobReferenceEncodingClass::kRelocated;
+  group.generation_file_number = generation;
+  group.origin_file_number = origin;
+  group.reference_count = 1;
+  group.block_count = 1;
+  return group;
+}
+
+std::shared_ptr<const BlobReferenceSstSummary> MakeCensusFile(
+    uint64_t file_number, std::vector<BlobReferenceGroup> groups) {
+  auto file = std::make_shared<BlobReferenceSstSummary>();
+  file->file_number = file_number;
+  file->groups = std::move(groups);
+  return file;
+}
+
+}  // namespace
+
+TEST(BlobReferenceCensusTest, MutableWorkerPublishesOnlyCaughtUpEpoch) {
+  BlobReferenceCensus census;
+  size_t wakeups = 0;
+  census.SetBuildWakeup(
+      [](void* owner, void* count) {
+        // Also prove the wakeup is invoked outside the short census mutex.
+        EXPECT_TRUE(
+            static_cast<BlobReferenceCensus*>(owner)->NeedsWorkerRun(9));
+        ++*static_cast<size_t*>(count);
+      },
+      &census, &wakeups);
+  const uint64_t token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(token, 7, nullptr, nullptr));
+  ASSERT_OK(census.AddStartingFile(
+      token, MakeCensusFile(100, {MakeCensusGroup(10, 10)})));
+  auto delta = std::make_shared<BlobReferenceCensusDelta>();
+  delta->base_version_number = 7;
+  delta->version_number = 9;
+  delta->removed_files = {100};
+  delta->added_files = {MakeCensusFile(200, {MakeCensusGroup(20, 10)})};
+  BlobReferenceCensusPreparedInstall prepared;
+  const uint64_t reservation = census.BeginInstallPreparation();
+  ASSERT_OK(census.PrepareInstall(delta, reservation, &prepared));
+  ASSERT_NE(prepared.log_entry, nullptr);
+  ASSERT_EQ(census.TryPublishWorker(token, 7, 7),
+            BlobReferenceCensus::PublishResult::kInstallPending);
+  ASSERT_FALSE(census.NeedsWorkerRun(7));
+  auto garbage = census.Install(prepared);
+  ASSERT_EQ(wakeups, 1U);
+  ASSERT_TRUE(census.NeedsWorkerRun(9));
+  ASSERT_FALSE(census.IsReady(9));
+  ASSERT_EQ(census.TryPublishWorker(token, 7, 9),
+            BlobReferenceCensus::PublishResult::kQueueNotEmpty);
+
+  BlobReferenceCensusDeltaQueue deltas;
+  bool overflowed = false;
+  ASSERT_OK(census.TakeBuildDeltas(token, &deltas, &overflowed));
+  ASSERT_FALSE(overflowed);
+  ASSERT_EQ(deltas.size(), 1U);
+  ASSERT_OK(census.ApplyWorkerDelta(token, *deltas.front()));
+  ASSERT_OK(census.AcknowledgeBuildDeltas(token, delta->QueueWeight()));
+  ASSERT_EQ(census.WorkerVersionNumber(), 9U);
+  ASSERT_EQ(census.TryPublishWorker(token, 9, 9),
+            BlobReferenceCensus::PublishResult::kPublished);
+  ASSERT_TRUE(census.IsReady(9));
+
+  uint64_t gc_token = 0;
+  ASSERT_OK(census.BeginGcListener(9, &gc_token));
+  std::shared_ptr<const BlobReferenceCensusState> selected;
+  ASSERT_OK(
+      census.SnapshotSelected(gc_token, 9, {{10, 10}, {20, 10}}, &selected));
+  ASSERT_EQ(selected->GetSstCount({10, 10}), 0U);
+  ASSERT_EQ(selected->GetSstCount({20, 10}), 1U);
+  garbage = census.CancelGcListener(gc_token);
+
+  // The same permanent build cursor receives ordinary subsequent installs.
+  auto empty_delta = std::make_shared<BlobReferenceCensusDelta>();
+  empty_delta->base_version_number = 9;
+  empty_delta->version_number = 12;
+  const uint64_t next_reservation = census.BeginInstallPreparation();
+  ASSERT_OK(census.PrepareInstall(empty_delta, next_reservation, &prepared));
+  garbage = census.Install(prepared);
+  ASSERT_FALSE(census.IsReady(12));
+  deltas.clear();
+  ASSERT_OK(census.TakeBuildDeltas(token, &deltas, &overflowed));
+  ASSERT_OK(census.ApplyWorkerDelta(token, *deltas.front()));
+  ASSERT_OK(census.AcknowledgeBuildDeltas(token, empty_delta->QueueWeight()));
+  ASSERT_EQ(census.TryPublishWorker(token, 12, 12),
+            BlobReferenceCensus::PublishResult::kPublished);
+  ASSERT_TRUE(census.IsReady(12));
+  ASSERT_FALSE(census.IsReady(9));
+}
+
+TEST(BlobReferenceCensusTest,
+     CancelPendingInstallWakesOnlyMatchingReservation) {
+  BlobReferenceCensus census;
+  size_t wakeups = 0;
+  census.SetBuildWakeup(
+      [](void* owner, void* count) {
+        EXPECT_TRUE(
+            static_cast<BlobReferenceCensus*>(owner)->NeedsWorkerRun(7));
+        ++*static_cast<size_t*>(count);
+      },
+      &census, &wakeups);
+  const uint64_t token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(token, 7, nullptr, nullptr));
+  const uint64_t reservation = census.BeginInstallPreparation();
+  ASSERT_EQ(census.TryPublishWorker(token, 7, 7),
+            BlobReferenceCensus::PublishResult::kInstallPending);
+  ASSERT_FALSE(census.NeedsWorkerRun(7));
+  census.CancelInstallPreparation(reservation + 1);
+  ASSERT_EQ(wakeups, 0U);
+  ASSERT_FALSE(census.NeedsWorkerRun(7));
+  census.CancelInstallPreparation(reservation);
+  ASSERT_EQ(wakeups, 1U);
+  ASSERT_TRUE(census.NeedsWorkerRun(7));
+  ASSERT_EQ(census.TryPublishWorker(token, 7, 7),
+            BlobReferenceCensus::PublishResult::kPublished);
+  ASSERT_FALSE(census.NeedsWorkerRun(7));
+}
+
+TEST(BlobReferenceCensusTest, InvalidatedInstallDetachesCanceledBuildContext) {
+  BlobReferenceCensus census;
+  const uint64_t old_token = census.BeginBuild();
+  auto context = std::make_shared<BlobReferenceCensusBuildContext>();
+  context->token = old_token;
+  ASSERT_TRUE(census.TrySetBuildContext(context));
+  ASSERT_OK(census.ResetWorkerState(old_token, 7, nullptr, nullptr));
+  size_t wakeups = 0;
+  census.SetBuildWakeup(
+      [](void* owner, void* count) {
+        EXPECT_EQ(static_cast<BlobReferenceCensus*>(owner)->GetBuildContext(),
+                  nullptr);
+        ++*static_cast<size_t*>(count);
+      },
+      &census, &wakeups);
+  const uint64_t reservation = census.BeginInstallPreparation();
+  ASSERT_EQ(census.TryPublishWorker(old_token, 7, 7),
+            BlobReferenceCensus::PublishResult::kInstallPending);
+  BlobReferenceCensusPreparedInstall prepared;
+  ASSERT_OK(census.PrepareInvalidation(reservation, &prepared));
+  auto garbage = census.Install(prepared);
+  ASSERT_EQ(garbage.build_context, context);
+  ASSERT_EQ(census.GetBuildContext(), nullptr);
+  ASSERT_EQ(wakeups, 1U);
+  ASSERT_EQ(census.TryPublishWorker(old_token, 7, 7),
+            BlobReferenceCensus::PublishResult::kStale);
+  const uint64_t new_token = census.BeginBuild();
+  ASSERT_NE(new_token, old_token);
+  ASSERT_OK(census.ResetWorkerState(new_token, 8, nullptr, nullptr));
+  ASSERT_EQ(census.TryPublishWorker(new_token, 8, 8),
+            BlobReferenceCensus::PublishResult::kPublished);
+  ASSERT_TRUE(census.IsReady(8));
+}
+
+TEST(BlobReferenceCensusTest,
+     CanceledWorkerSliceCannotInvalidateReplacementReadyState) {
+  BlobReferenceCensus census;
+  const uint64_t old_token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(old_token, 7, nullptr, nullptr));
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->LoadDependency(
+      {{"BlobReferenceCensus::AddStartingFile:CapturedWorker",
+        "BlobReferenceCensusTest::OldWorkerCaptured"},
+       {"BlobReferenceCensusTest::ReplacementReady",
+        "BlobReferenceCensus::AddStartingFile:BeforeWorkerLock"}});
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  Status old_status;
+  port::Thread old_slice([&] {
+    old_status = census.AddStartingFile(
+        old_token, MakeCensusFile(100, {MakeCensusGroup(10, 10)}));
+  });
+  TEST_SYNC_POINT("BlobReferenceCensusTest::OldWorkerCaptured");
+  auto garbage = census.FailBuild(old_token);
+  const uint64_t new_token = census.BeginBuild();
+  const Status reset_status =
+      census.ResetWorkerState(new_token, 7, nullptr, nullptr);
+  const BlobReferenceCensus::PublishResult result =
+      census.TryPublishWorker(new_token, 7, 7);
+  TEST_SYNC_POINT("BlobReferenceCensusTest::ReplacementReady");
+  old_slice.join();
+  ASSERT_OK(reset_status);
+  ASSERT_EQ(result, BlobReferenceCensus::PublishResult::kPublished);
+  ASSERT_TRUE(old_status.IsAborted());
+  ASSERT_TRUE(census.IsReady(7));
+}
+
+TEST(BlobReferenceCensusTest,
+     InvalidationBeforeContextAttachmentRejectsOldToken) {
+  BlobReferenceCensus census;
+  const uint64_t old_token = census.BeginBuild();
+  bool released = false;
+  auto context = std::shared_ptr<BlobReferenceCensusBuildContext>(
+      new BlobReferenceCensusBuildContext,
+      [&](BlobReferenceCensusBuildContext* stale) {
+        // Reentering here proves rejected ownership is released after unlock.
+        EXPECT_EQ(census.GetBuildContext(), nullptr);
+        released = true;
+        delete stale;
+      });
+  auto cleanup = Defer([&] {
+    context.reset();
+    auto canceled = census.Cancel();
+  });
+  context->token = old_token;
+  ASSERT_OK(census.ResetWorkerState(old_token, 7, nullptr, nullptr));
+  const uint64_t reservation = census.BeginInstallPreparation();
+  BlobReferenceCensusPreparedInstall prepared;
+  ASSERT_OK(census.PrepareInvalidation(reservation, &prepared));
+  auto garbage = census.Install(prepared);
+  ASSERT_EQ(garbage.build_context, nullptr);
+  ASSERT_FALSE(census.TrySetBuildContext(std::move(context)));
+  ASSERT_TRUE(released);
+  ASSERT_EQ(census.GetBuildContext(), nullptr);
+  garbage = census.FailBuild(old_token);
+  const uint64_t new_token = census.BeginBuild();
+  auto fresh = std::make_shared<BlobReferenceCensusBuildContext>();
+  fresh->token = new_token;
+  ASSERT_TRUE(census.TrySetBuildContext(fresh));
+  ASSERT_OK(census.ResetWorkerState(new_token, 8, nullptr, nullptr));
+  ASSERT_EQ(census.TryPublishWorker(new_token, 8, 8),
+            BlobReferenceCensus::PublishResult::kPublished);
+  ASSERT_TRUE(census.IsReady(8));
+}
+
+TEST(BlobGcCandidateHeapTest, RanksUpdatesAndRetiresPhysicalFiles) {
+  BlobGcCandidateHeap heap;
+  heap.SetPhysicalFile({10, 1000, true});
+  heap.SetPhysicalFile({20, 2000, false});
+  heap.SetPhysicalFile({30, 1000, false});
+  ASSERT_OK(heap.AdjustLiveBytes(10, 300, true));
+  ASSERT_OK(heap.AdjustLiveBytes(20, 200, true));
+  ASSERT_OK(heap.AdjustLiveBytes(30, 800, true));
+  ASSERT_EQ(heap.Select()[0], 20U);
+  ASSERT_EQ(heap.Select()[1], 10U);
+  ASSERT_EQ(heap.Select()[2], 0U);
+  ASSERT_OK(heap.AdjustLiveBytes(30, 800, false));
+  ASSERT_EQ(heap.Select()[0], 30U);
+  heap.DeletePhysicalFile(30);
+  ASSERT_EQ(heap.Select()[0], 20U);
+  ASSERT_EQ(heap.size(), 2U);
+  ASSERT_TRUE(heap.IsIdentityRoot(10));
+  ASSERT_FALSE(heap.IsIdentityRoot(20));
+}
+
+TEST(BlobReferenceCensusTest, MetadataIntentFencesLatePublication) {
+  BlobReferenceCensus census;
+  BlobRelocationPublicationSnapshot snapshot;
+  ASSERT_OK(census.SnapshotPublications(&snapshot));
+  ASSERT_OK(census.BeginMetadataCommit(snapshot.revision));
+  BlobRelocationPublicationReservation late;
+  late.dependencies = std::make_shared<BlobRelocationPublicationDependencies>();
+  ASSERT_TRUE(census.RegisterPublication(&late).IsTryAgain());
+  ASSERT_FALSE(late.registered);
+  census.EndMetadataCommit(true);
+  ASSERT_OK(census.WaitForMetadataCommit());
+  ASSERT_OK(census.RegisterPublication(&late));
+  ASSERT_TRUE(late.registered);
+  ASSERT_TRUE(census.BeginMetadataCommit(snapshot.revision).IsTryAgain());
+  census.UnregisterPublication(&late);
+  ASSERT_FALSE(late.registered);
+}
+
+TEST(BlobReferenceCensusTest, AmbiguousMetadataIntentRequiresRecovery) {
+  BlobReferenceCensus census;
+  BlobRelocationPublicationSnapshot snapshot;
+  ASSERT_OK(census.SnapshotPublications(&snapshot));
+  ASSERT_OK(census.BeginMetadataCommit(snapshot.revision));
+  census.EndMetadataCommit(false);
+  ASSERT_TRUE(census.WaitForMetadataCommit().IsBusy());
+  BlobRelocationPublicationReservation late;
+  late.dependencies = std::make_shared<BlobRelocationPublicationDependencies>();
+  ASSERT_TRUE(census.RegisterPublication(&late).IsBusy());
+  census.ResolveMetadataCommitAmbiguity();
+  ASSERT_OK(census.WaitForMetadataCommit());
+  ASSERT_OK(census.RegisterPublication(&late));
+  census.UnregisterPublication(&late);
+  auto garbage = census.Cancel();
+  census.ResolveMetadataCommitAmbiguity();
+  ASSERT_TRUE(census.WaitForMetadataCommit().IsColumnFamilyDropped());
+}
+
+TEST(BlobGcCandidateHeapTest, ExactPortableRatioOrdering) {
+  const uint64_t max = std::numeric_limits<uint64_t>::max();
+  ASSERT_GT(BlobGcCandidateHeap::CompareRatios(max - 1, max, max - 2, max), 0);
+  ASSERT_LT(BlobGcCandidateHeap::CompareRatios(max - 2, max, max - 1, max), 0);
+  ASSERT_EQ(BlobGcCandidateHeap::CompareRatios(1, 3, 2, 6), 0);
+  ASSERT_GT(BlobGcCandidateHeap::CompareRatios(2, 3, 1, 2), 0);
+  ASSERT_LT(BlobGcCandidateHeap::CompareRatios(1, 3, 1, 2), 0);
+  ASSERT_EQ(BlobGcCandidateHeap::CompareRatios(0, max, 0, 1), 0);
+  ASSERT_LT(BlobGcCandidateHeap::CompareRatios(0, max, 1, max), 0);
+}
+
+TEST(BlobGcCandidateHeapTest, SuppressionIsRelevantAndRetryable) {
+  BlobGcCandidateHeap heap;
+  heap.SetPhysicalFile({10, 1000, false});
+  heap.SetPhysicalFile({20, 1000, false});
+  heap.Suppress(10, /*retry_micros=*/100);
+  ASSERT_EQ(heap.Select()[0], 20U);
+  ASSERT_EQ(heap.RetryDue(99), 100U);
+  ASSERT_EQ(heap.Select()[0], 20U);
+  ASSERT_EQ(heap.RetryDue(100), 0U);
+  ASSERT_EQ(heap.Select()[0], 10U);
+  heap.Suppress(10, /*retry_micros=*/0);
+  heap.SetPhysicalFile({20, 2000, false});
+  ASSERT_EQ(heap.Select()[0], 20U);
+  // An unrelated Version/file change does not clear the corrupt candidate;
+  // an affected route's membership-byte update does.
+  ASSERT_OK(heap.AdjustLiveBytes(10, 100, true));
+  ASSERT_EQ(heap.Select()[1], 10U);
+}
+
+TEST(BlobReferenceCensusTest, HeapMovesLiveBytesWithChangedForwardRoutes) {
+  BlobReferenceCensus census;
+  const uint64_t token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(token, 7, nullptr, nullptr));
+  ASSERT_OK(census.SetWorkerPhysicalFiles(token, {{10, 1000, true}}));
+  BlobReferenceGroup group = MakeCensusGroup(10, 10);
+  group.reference_count = 1;
+  group.stored_value_bytes = 100;
+  group.record_bytes = 150;
+  ASSERT_OK(census.AddStartingFile(token, MakeCensusFile(100, {group})));
+  ASSERT_EQ(census.SelectWorkerCandidates(token)[0], 10U);
+
+  BlobReferenceCensusDelta delta;
+  delta.base_version_number = 7;
+  delta.version_number = 8;
+  delta.physical_files = {{20, 1000, false}, {10, 0, true}};
+  auto forward = std::make_shared<BlobRelocationState>();
+  forward->SetRoute(BlobRelocationRoute(10, 10, 20));
+  delta.forward_state = forward;
+  delta.changed_routes = {{10, 10}};
+  ASSERT_OK(census.ApplyWorkerDelta(token, delta));
+  ASSERT_EQ(census.SelectWorkerCandidates(token)[0], 20U);
+  ASSERT_EQ(census.SelectWorkerCandidates(token)[1], 0U);
+}
+
+TEST(BlobReferenceCensusTest, CandidateFailureUsesRelevantRevision) {
+  BlobReferenceCensus census;
+  const uint64_t token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(token, 7, nullptr, nullptr));
+  ASSERT_OK(census.SetWorkerPhysicalFiles(
+      token, {{10, 1000, true}, {20, 1000, true}}));
+  BlobGcCandidateStamp stamp;
+  ASSERT_OK(census.CaptureCandidateStamp(7, {10}, &stamp));
+  BlobReferenceCensusDelta delta;
+  delta.base_version_number = 7;
+  delta.version_number = 8;
+  delta.physical_files = {{20, 2000, true}};
+  ASSERT_OK(census.ApplyWorkerDelta(token, delta));
+  // Changing a different file does not invalidate the starting failure.
+  census.SuppressWorkerCandidates(stamp, {10}, {}, 0);
+  ASSERT_EQ(census.SelectWorkerCandidates(token)[0], 20U);
+  ASSERT_EQ(census.SelectWorkerCandidates(token)[1], 0U);
+
+  ASSERT_OK(census.CaptureCandidateStamp(8, {20}, &stamp));
+  delta.base_version_number = 8;
+  delta.version_number = 9;
+  delta.physical_files = {{20, 3000, true}};
+  ASSERT_OK(census.ApplyWorkerDelta(token, delta));
+  // An old GC cannot suppress a revised candidate, even at the same file ID.
+  census.SuppressWorkerCandidates(stamp, {20}, {}, 0);
+  ASSERT_EQ(census.SelectWorkerCandidates(token)[0], 20U);
+  ASSERT_OK(census.CaptureCandidateStamp(9, {20}, &stamp));
+  census.SuppressWorkerCandidates(stamp, {20}, {20}, 100);
+  ASSERT_EQ(census.SelectWorkerCandidates(token)[0], 0U);
+  ASSERT_EQ(census.RetryWorkerCandidates(token, 1000099), 1000100U);
+  ASSERT_EQ(census.RetryWorkerCandidates(token, 1000100), 0U);
+  ASSERT_EQ(census.SelectWorkerCandidates(token)[0], 20U);
+  // A repeated transient failure doubles its deadline; relevant state changes
+  // reset the failure count. The tests advance logical time, never sleep.
+  census.SuppressWorkerCandidates(stamp, {20}, {20}, 2000000);
+  ASSERT_EQ(census.RetryWorkerCandidates(token, 2000001), 4000000U);
+  auto canceled = census.FailBuild(token);
+  const uint64_t replacement = census.BeginBuild();
+  ASSERT_NE(replacement, token);
+  ASSERT_OK(census.ResetWorkerState(replacement, 10, nullptr, nullptr));
+  ASSERT_OK(census.SetWorkerPhysicalFiles(replacement, {{20, 1000, true}}));
+  census.SuppressWorkerCandidates(stamp, {20}, {}, 0);
+  ASSERT_EQ(census.SelectWorkerCandidates(replacement)[0], 20U);
+}
+
+TEST(BlobReferenceCensusTest, SelectedSnapshotOwnsItsCacheReservation) {
+  const std::shared_ptr<Cache> cache = NewLRUCache(16 * 1024 * 1024);
+  BlobReferenceCensus census;
+  const uint64_t token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(token, 7, nullptr, cache));
+  ASSERT_OK(census.AddStartingFile(
+      token, MakeCensusFile(100, {MakeCensusGroup(10, 10)})));
+  ASSERT_EQ(census.TryPublishWorker(token, 7, 7),
+            BlobReferenceCensus::PublishResult::kPublished);
+  const size_t worker_charge = cache->GetPinnedUsage();
+  ASSERT_GT(worker_charge, 0U);
+  std::shared_ptr<const BlobReferenceCensusState> selected;
+  ASSERT_OK(census.ReadSelectedSnapshot(7, {{10, 10}}, &selected));
+  ASSERT_GT(cache->GetPinnedUsage(), worker_charge);
+  selected.reset();
+  ASSERT_EQ(cache->GetPinnedUsage(), worker_charge);
+}
+
+TEST(BlobReferenceCensusTest, SelectedSnapshotRejectsUnchargedAllocation) {
+  const std::shared_ptr<Cache> cache =
+      NewLRUCache(2 * 1024 * 1024, /*num_shard_bits=*/0,
+                  /*strict_capacity_limit=*/true);
+  BlobReferenceCensus census;
+  const uint64_t token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(token, 7, nullptr, cache));
+  ASSERT_OK(census.AddStartingFile(
+      token, MakeCensusFile(100, {MakeCensusGroup(10, 10)})));
+  cache->SetCapacity(cache->GetUsage());
+  ASSERT_EQ(census.TryPublishWorker(token, 7, 7),
+            BlobReferenceCensus::PublishResult::kPublished);
+  std::shared_ptr<const BlobReferenceCensusState> selected;
+  ASSERT_TRUE(
+      census.ReadSelectedSnapshot(7, {{10, 10}}, &selected).IsMemoryLimit());
+  ASSERT_EQ(selected, nullptr);
+  ASSERT_TRUE(census.IsReady(7));
+}
+
+TEST(BlobReferenceCensusTest, ConstantSizeSnapshotDoesNotAccumulateCharges) {
+  const std::shared_ptr<Cache> cache = NewLRUCache(16 * 1024 * 1024);
+  BlobReferenceCensus census;
+  const uint64_t token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(token, 7, nullptr, cache));
+  ASSERT_OK(census.AddStartingFile(
+      token, MakeCensusFile(100, {MakeCensusGroup(10, 10)})));
+  ASSERT_EQ(census.TryPublishWorker(token, 7, 7),
+            BlobReferenceCensus::PublishResult::kPublished);
+  std::shared_ptr<const BlobReferenceCensusState> selected;
+  ASSERT_OK(census.ReadSelectedSnapshot(7, {{10, 10}}, &selected));
+  size_t charge = 0;
+  for (uint64_t i = 0; i < 4096; ++i) {
+    BlobReferenceCensusDelta delta;
+    delta.base_version_number = 7 + i;
+    delta.version_number = 8 + i;
+    delta.removed_files = {100 + i};
+    delta.added_files = {MakeCensusFile(101 + i, {MakeCensusGroup(10, 10)})};
+    std::shared_ptr<const BlobReferenceCensusState> next;
+    ASSERT_OK(BlobReferenceCensus::ApplyDelta(*selected, delta, &next));
+    selected = std::move(next);
+    if (i == 0) {
+      charge = cache->GetPinnedUsage();
+    } else {
+      ASSERT_EQ(cache->GetPinnedUsage(), charge);
+    }
+  }
+  ASSERT_EQ(selected->GetSstCount({10, 10}), 1U);
+}
+
+TEST(BlobReferenceCensusTest, LogSharesCacheChargeAndReleasesOnAck) {
+  const std::shared_ptr<Cache> cache = NewLRUCache(16 * 1024 * 1024);
+  BlobReferenceCensus census;
+  const uint64_t token = census.BeginBuild();
+  size_t first_charge = 0;
+  BlobReferenceCensusPreparedInstall prepared;
+  for (uint64_t version = 1; version <= 4; ++version) {
+    auto delta = std::make_shared<BlobReferenceCensusDelta>();
+    delta->base_version_number = version;
+    delta->version_number = version + 1;
+    delta->retained_forward_state_bytes = 32 * 1024;
+    const uint64_t reservation = census.BeginInstallPreparation();
+    ASSERT_OK(
+        census.PrepareInstallWithCache(delta, reservation, cache, &prepared));
+    auto garbage = census.Install(prepared);
+    if (version == 1) {
+      first_charge = cache->GetPinnedUsage();
+      ASSERT_GT(first_charge, 0U);
+    } else {
+      ASSERT_EQ(cache->GetPinnedUsage(), first_charge);
+    }
+  }
+  prepared = {};
+  BlobReferenceCensusDeltaQueue deltas;
+  bool overflowed = false;
+  ASSERT_OK(census.TakeBuildDeltas(token, &deltas, &overflowed));
+  ASSERT_FALSE(overflowed);
+  for (const std::shared_ptr<const BlobReferenceCensusDelta>& delta : deltas) {
+    ASSERT_OK(census.AcknowledgeBuildDeltas(token, delta->QueueWeight()));
+  }
+  ASSERT_EQ(cache->GetPinnedUsage(), 0U);
+}
+
+TEST(BlobReferenceCensusTest, GcListenerCatchesUpBeforeClosing) {
+  const BlobRelocationRouteSource first_source{10, 10};
+  const BlobRelocationRouteSource flattened_source{20, 10};
+  auto first_file = MakeCensusFile(100, {MakeCensusGroup(10, 10)});
+  std::shared_ptr<const BlobReferenceCensusState> state;
+  ASSERT_OK(BlobReferenceCensus::BuildState(7, {first_file}, &state));
+
+  BlobReferenceCensus census;
+  const uint64_t build_token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(build_token, 7, nullptr, nullptr));
+  ASSERT_OK(census.AddStartingFile(build_token, first_file));
+  ASSERT_EQ(census.TryPublishWorker(build_token, 7, 7),
+            BlobReferenceCensus::PublishResult::kPublished);
+
+  uint64_t listener_token = 0;
+  ASSERT_OK(census.BeginGcListener(7, &listener_token));
+  ASSERT_NE(listener_token, 0);
+
+  auto delta = std::make_shared<BlobReferenceCensusDelta>();
+  delta->base_version_number = 7;
+  delta->version_number = 8;
+  delta->removed_files = {100};
+  delta->added_files = {MakeCensusFile(200, {MakeCensusGroup(20, 10)})};
+  BlobReferenceCensusPreparedInstall prepared;
+  const uint64_t reservation = census.BeginInstallPreparation();
+  ASSERT_OK(census.PrepareInstall(delta, reservation, &prepared));
+  ASSERT_EQ(census.TryCloseGcListener(listener_token, 7, 7),
+            BlobReferenceCensus::GcListenerCloseResult::kInstallPending);
+
+  auto install_garbage = census.Install(prepared);
+  ASSERT_EQ(install_garbage.state, nullptr);
+  install_garbage = {};
+  ASSERT_EQ(census.TryCloseGcListener(listener_token, 7, 8),
+            BlobReferenceCensus::GcListenerCloseResult::kQueueNotEmpty);
+
+  BlobReferenceCensusDeltaQueue deltas;
+  bool overflowed = false;
+  ASSERT_OK(census.TakeGcDeltas(listener_token, &deltas, &overflowed));
+  ASSERT_FALSE(overflowed);
+  ASSERT_EQ(deltas.size(), 1);
+  std::shared_ptr<const BlobReferenceCensusState> caught_up;
+  ASSERT_OK(
+      BlobReferenceCensus::ApplyDelta(*state, *deltas.front(), &caught_up));
+  ASSERT_OK(census.AcknowledgeGcDeltas(listener_token,
+                                       deltas.front()->QueueWeight()));
+  ASSERT_EQ(caught_up->GetSstCount(first_source), 0);
+  ASSERT_EQ(caught_up->GetSstCount(flattened_source), 1);
+  ASSERT_EQ(census.TryCloseGcListener(listener_token, 8, 8),
+            BlobReferenceCensus::GcListenerCloseResult::kClosed);
+  ASSERT_TRUE(census.CancelGcListener(listener_token).deltas.empty());
+}
+
+TEST(BlobReferenceCensusTest, GcListenerFailsClosedOnInvalidation) {
+  BlobReferenceCensus census;
+  std::shared_ptr<const BlobReferenceCensusState> state;
+  ASSERT_OK(BlobReferenceCensus::BuildState(3, {}, &state));
+  const uint64_t build_token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(build_token, 3, nullptr, nullptr));
+  ASSERT_EQ(census.TryPublishWorker(build_token, 3, 3),
+            BlobReferenceCensus::PublishResult::kPublished);
+
+  uint64_t listener_token = 0;
+  ASSERT_OK(census.BeginGcListener(3, &listener_token));
+  BlobReferenceCensusPreparedInstall prepared;
+  const uint64_t reservation = census.BeginInstallPreparation();
+  ASSERT_OK(census.PrepareInvalidation(reservation, &prepared));
+  auto garbage = census.Install(prepared);
+  ASSERT_EQ(garbage.state, nullptr);
+  garbage = {};
+
+  BlobReferenceCensusDeltaQueue deltas;
+  bool overflowed = false;
+  ASSERT_OK(census.TakeGcDeltas(listener_token, &deltas, &overflowed));
+  ASSERT_TRUE(overflowed);
+  ASSERT_TRUE(deltas.empty());
+  ASSERT_EQ(census.TryCloseGcListener(listener_token, 3, 4),
+            BlobReferenceCensus::GcListenerCloseResult::kStale);
+  ASSERT_TRUE(census.CancelGcListener(listener_token).deltas.empty());
+}
+
+TEST(BlobReferenceCensusTest, SharedLogHasBoundedReadsAndReclaimsOnDrain) {
+  BlobReferenceCensus census;
+  const uint64_t token = census.BeginBuild();
+  std::weak_ptr<BlobReferenceChangeLogEntry> first_entry;
+  BlobReferenceCensusPreparedInstall prepared;
+  for (uint64_t version = 1; version <= 130; ++version) {
+    auto delta = std::make_shared<BlobReferenceCensusDelta>();
+    delta->base_version_number = version;
+    delta->version_number = version + 1;
+    const uint64_t reservation = census.BeginInstallPreparation();
+    ASSERT_OK(census.PrepareInstall(delta, reservation, &prepared));
+    if (version == 1) {
+      first_entry = prepared.log_entry;
+    }
+    auto garbage = census.Install(prepared);
+  }
+  prepared = {};
+  ASSERT_FALSE(first_entry.expired());
+  size_t total = 0;
+  for (;;) {
+    BlobReferenceCensusDeltaQueue deltas;
+    bool overflowed = false;
+    ASSERT_OK(census.TakeBuildDeltas(token, &deltas, &overflowed));
+    ASSERT_FALSE(overflowed);
+    ASSERT_LE(deltas.size(), BlobReferenceCensus::kMaxDeltasPerRead);
+    if (deltas.empty()) {
+      break;
+    }
+    for (const std::shared_ptr<const BlobReferenceCensusDelta>& delta :
+         deltas) {
+      ASSERT_OK(census.AcknowledgeBuildDeltas(token, delta->QueueWeight()));
+      ++total;
+    }
+  }
+  ASSERT_EQ(total, 130U);
+  ASSERT_TRUE(first_entry.expired());
+  auto garbage = census.FailBuild(token);
+}
+
+TEST(BlobReferenceCensusTest, SlowCursorCancellationDoesNotCancelGcCursor) {
+  BlobReferenceCensus census;
+  std::shared_ptr<const BlobReferenceCensusState> state;
+  ASSERT_OK(BlobReferenceCensus::BuildState(
+      7, {MakeCensusFile(100, {MakeCensusGroup(10, 10)})}, &state));
+  const uint64_t build_token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(build_token, 7, nullptr, nullptr));
+  ASSERT_OK(census.AddStartingFile(
+      build_token, MakeCensusFile(100, {MakeCensusGroup(10, 10)})));
+  ASSERT_EQ(census.TryPublishWorker(build_token, 7, 7),
+            BlobReferenceCensus::PublishResult::kPublished);
+  uint64_t gc_token = 0;
+  ASSERT_OK(census.BeginGcListener(7, &gc_token));
+
+  // A valid small summary with a large retained capacity exercises the real
+  // byte budget without fabricating millions of duplicate route groups.
+  std::vector<BlobReferenceGroup> groups{MakeCensusGroup(10, 10)};
+  groups.reserve(BlobReferenceCensus::kMaxQueuedWeight /
+                 sizeof(BlobReferenceGroup));
+  auto first = std::make_shared<BlobReferenceCensusDelta>();
+  first->base_version_number = 7;
+  first->version_number = 8;
+  first->removed_files = {100};
+  first->added_files = {MakeCensusFile(200, std::move(groups))};
+  BlobReferenceCensusPreparedInstall prepared;
+  uint64_t reservation = census.BeginInstallPreparation();
+  ASSERT_OK(census.PrepareInstall(first, reservation, &prepared));
+  auto garbage = census.Install(prepared);
+  garbage = {};
+
+  BlobReferenceCensusDeltaQueue deltas;
+  bool overflowed = false;
+  ASSERT_OK(census.TakeGcDeltas(gc_token, &deltas, &overflowed));
+  ASSERT_FALSE(overflowed);
+  ASSERT_EQ(deltas.size(), 1U);
+  ASSERT_OK(census.AcknowledgeGcDeltas(gc_token, first->QueueWeight()));
+  deltas.clear();
+
+  auto second = std::make_shared<BlobReferenceCensusDelta>();
+  second->base_version_number = 8;
+  second->version_number = 9;
+  second->removed_files = {200};
+  second->added_files = {MakeCensusFile(201, {MakeCensusGroup(10, 10)})};
+  reservation = census.BeginInstallPreparation();
+  ASSERT_OK(census.PrepareInstall(second, reservation, &prepared));
+  garbage = census.Install(prepared);
+  garbage = {};
+  ASSERT_OK(census.TakeBuildDeltas(build_token, &deltas, &overflowed));
+  ASSERT_TRUE(overflowed);
+  ASSERT_TRUE(deltas.empty());
+  ASSERT_OK(census.TakeGcDeltas(gc_token, &deltas, &overflowed));
+  ASSERT_FALSE(overflowed);
+  ASSERT_EQ(deltas.size(), 1U);
+  ASSERT_EQ(deltas.front(), second);
+  ASSERT_OK(census.AcknowledgeGcDeltas(gc_token, second->QueueWeight()));
+  ASSERT_EQ(census.TryCloseGcListener(gc_token, 9, 9),
+            BlobReferenceCensus::GcListenerCloseResult::kClosed);
+  garbage = census.FailBuild(build_token);
+}
+
+TEST(BlobReferenceCensusTest, SingleOversizedDeltaDoesNotBlockProgress) {
+  BlobReferenceCensus census;
+  const uint64_t token = census.BeginBuild();
+  std::vector<BlobReferenceGroup> groups(
+      BlobReferenceCensus::kMaxQueuedWeight / sizeof(BlobReferenceGroup) + 1,
+      MakeCensusGroup(5, 5));
+  auto delta = std::make_shared<BlobReferenceCensusDelta>();
+  delta->base_version_number = 3;
+  delta->version_number = 4;
+  delta->added_files = {MakeCensusFile(30, std::move(groups))};
+  BlobReferenceCensusPreparedInstall prepared;
+  const uint64_t reservation = census.BeginInstallPreparation();
+  ASSERT_OK(census.PrepareInstall(delta, reservation, &prepared));
+  auto install_garbage = census.Install(prepared);
+  ASSERT_EQ(install_garbage.state, nullptr);
+  ASSERT_TRUE(install_garbage.deltas.empty());
+
+  BlobReferenceCensusDeltaQueue deltas;
+  bool overflowed = false;
+  ASSERT_OK(census.TakeBuildDeltas(token, &deltas, &overflowed));
+  ASSERT_FALSE(overflowed);
+  ASSERT_EQ(deltas.size(), 1U);
+  // The same valid delta is allowed when the cursor was empty. Additional
+  // backlog cancels only this lagging cursor instead of retaining more data.
+  auto next = std::make_shared<BlobReferenceCensusDelta>();
+  next->base_version_number = 4;
+  next->version_number = 5;
+  const uint64_t next_reservation = census.BeginInstallPreparation();
+  ASSERT_OK(census.PrepareInstall(next, next_reservation, &prepared));
+  install_garbage = census.Install(prepared);
+  deltas.clear();
+  ASSERT_OK(census.TakeBuildDeltas(token, &deltas, &overflowed));
+  ASSERT_TRUE(overflowed);
+  ASSERT_TRUE(deltas.empty());
+  auto context = std::make_shared<BlobReferenceCensusBuildContext>();
+  context->token = token;
+  ASSERT_TRUE(census.TrySetBuildContext(context));
+  auto garbage = census.FailBuild(token);
+  ASSERT_EQ(garbage.build_context, context);
+  ASSERT_TRUE(garbage.deltas.empty());
+  ASSERT_EQ(census.IsReady(4), false);
+}
+
+TEST(BlobReferenceCensusTest, DetachedDeltasRemainChargedUntilApplied) {
+  BlobReferenceCensus census;
+  const uint64_t token = census.BeginBuild();
+
+  auto first = std::make_shared<BlobReferenceCensusDelta>();
+  first->base_version_number = 1;
+  first->version_number = 2;
+  first->added_files = {MakeCensusFile(
+      10,
+      std::vector<BlobReferenceGroup>(BlobReferenceCensus::kMaxQueuedWeight /
+                                          (2 * sizeof(BlobReferenceGroup)),
+                                      MakeCensusGroup(5, 5)))};
+  BlobReferenceCensusPreparedInstall prepared;
+  uint64_t reservation = census.BeginInstallPreparation();
+  ASSERT_OK(census.PrepareInstall(first, reservation, &prepared));
+  auto garbage = census.Install(prepared);
+  ASSERT_EQ(garbage.state, nullptr);
+
+  BlobReferenceCensusDeltaQueue detached;
+  bool overflowed = false;
+  ASSERT_OK(census.TakeBuildDeltas(token, &detached, &overflowed));
+  ASSERT_FALSE(overflowed);
+  ASSERT_EQ(detached.size(), 1);
+
+  auto second = std::make_shared<BlobReferenceCensusDelta>();
+  second->base_version_number = 2;
+  second->version_number = 3;
+  second->added_files = {MakeCensusFile(
+      11,
+      std::vector<BlobReferenceGroup>(BlobReferenceCensus::kMaxQueuedWeight /
+                                          (2 * sizeof(BlobReferenceGroup)),
+                                      MakeCensusGroup(6, 6)))};
+  reservation = census.BeginInstallPreparation();
+  ASSERT_OK(census.PrepareInstall(second, reservation, &prepared));
+  garbage = census.Install(prepared);
+  ASSERT_EQ(garbage.state, nullptr);
+
+  BlobReferenceCensusDeltaQueue later;
+  ASSERT_OK(census.TakeBuildDeltas(token, &later, &overflowed));
+  ASSERT_TRUE(overflowed);
+  ASSERT_TRUE(later.empty());
+  garbage = census.FailBuild(token);
+  ASSERT_TRUE(garbage.deltas.empty());
+}
+
+TEST(BlobReferenceCensusTest, CancelDetachesReadyStateAndQueuedDeltas) {
+  BlobReferenceCensus census;
+  std::shared_ptr<const BlobReferenceCensusState> state;
+  ASSERT_OK(BlobReferenceCensus::BuildState(1, {}, &state));
+  const uint64_t catch_up_token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(catch_up_token, 1, nullptr, nullptr));
+  ASSERT_EQ(census.TryPublishWorker(catch_up_token, 1, 1),
+            BlobReferenceCensus::PublishResult::kPublished);
+  auto delta = std::make_shared<BlobReferenceCensusDelta>();
+  delta->base_version_number = 1;
+  delta->version_number = 2;
+  BlobReferenceCensusPreparedInstall prepared;
+  const uint64_t reservation = census.BeginInstallPreparation();
+  ASSERT_OK(census.PrepareInstall(delta, reservation, &prepared));
+  auto install_garbage = census.Install(prepared);
+  ASSERT_EQ(install_garbage.state, nullptr);
+
+  auto canceled = census.Cancel();
+  ASSERT_EQ(canceled.state, nullptr);
+  ASSERT_NE(canceled.log_entries[0], nullptr);
+  ASSERT_EQ(canceled.log_entries[0]->delta, delta);
+  ASSERT_EQ(census.IsReady(2), false);
+  ASSERT_EQ(census.TryPublishWorker(catch_up_token, 1, 2),
+            BlobReferenceCensus::PublishResult::kStale);
 }
 
 // kTypeBlobIndex is a value type used by BlobDB only. The base rocksdb

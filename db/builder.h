@@ -49,6 +49,11 @@ TableBuilder* NewTableBuilder(const TableBuilderOptions& tboptions,
 void ExtractTimestampFromTableProperties(const TableProperties& tp,
                                          FileMetaData* meta);
 
+// Copies the exact external-blob reference descriptor into MANIFEST-owned file
+// metadata. Absence is preserved for legacy/pre-activation SSTs.
+void ExtractBlobReferenceDescriptorFromTableProperties(
+    const TableProperties& tp, FileMetaData* meta);
+
 // Build a Table file from the contents of *iter.  The generated file
 // will be named according to number specified in meta. On success, the rest of
 // *meta will be filled with metadata about the generated table.

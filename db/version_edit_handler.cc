@@ -284,6 +284,66 @@ Status VersionEditHandler::TrackUnopenedPhysicalFileOwnership(
     return Status::OK();
   }
 
+  const uint32_t replay_cf = edit.GetColumnFamily();
+  if (edit.IsColumnFamilyDrop()) {
+    const std::unordered_map<uint32_t, std::set<uint64_t>>::iterator files =
+        replay_relocation_files_by_cf_.find(replay_cf);
+    if (files != replay_relocation_files_by_cf_.end()) {
+      for (uint64_t file_number : files->second) {
+        replay_relocation_file_owners_.erase(file_number);
+      }
+      replay_relocation_files_by_cf_.erase(files);
+    }
+  } else {
+    // Validate this edit before changing its transient live-owner overlay.
+    for (uint64_t file_number : edit.GetBlobRelocationFileDeletions()) {
+      const std::map<uint64_t, uint32_t>::const_iterator owner =
+          replay_relocation_file_owners_.find(file_number);
+      if (owner != replay_relocation_file_owners_.end() &&
+          owner->second != replay_cf) {
+        return Status::Corruption(
+            "Relocation deletion names a live file in another column family");
+      }
+    }
+    for (const BlobRelocationFileAddition& addition :
+         edit.GetBlobRelocationFileAdditions()) {
+      const std::map<uint64_t, uint32_t>::const_iterator owner =
+          replay_relocation_file_owners_.find(addition.GetFileNumber());
+      if (addition.GetColumnFamilyId() != replay_cf ||
+          (owner != replay_relocation_file_owners_.end() &&
+           owner->second != replay_cf)) {
+        return Status::Corruption(
+            "Relocation addition names a live file in another column family");
+      }
+    }
+    for (uint64_t file_number : edit.GetBlobRelocationFileDeletions()) {
+      replay_relocation_file_owners_.erase(file_number);
+      const std::unordered_map<uint32_t, std::set<uint64_t>>::iterator files =
+          replay_relocation_files_by_cf_.find(replay_cf);
+      if (files != replay_relocation_files_by_cf_.end()) {
+        files->second.erase(file_number);
+        if (files->second.empty()) {
+          replay_relocation_files_by_cf_.erase(files);
+        }
+      }
+    }
+    for (const BlobRelocationFileAddition& addition :
+         edit.GetBlobRelocationFileAdditions()) {
+      replay_relocation_file_owners_[addition.GetFileNumber()] = replay_cf;
+      replay_relocation_files_by_cf_[replay_cf].insert(
+          addition.GetFileNumber());
+    }
+    for (uint64_t file_number : edit.GetBlobRelocationFileLosses()) {
+      const std::map<uint64_t, uint32_t>::const_iterator owner =
+          replay_relocation_file_owners_.find(file_number);
+      if (owner == replay_relocation_file_owners_.end() ||
+          owner->second != replay_cf) {
+        return Status::Corruption(
+            "Relocation loss names no CF-owned live file");
+      }
+    }
+  }
+
   bool do_not_open_cf = false;
   bool cf_in_builders = false;
   CheckColumnFamilyId(edit, &do_not_open_cf, &cf_in_builders);
@@ -324,9 +384,8 @@ Status VersionEditHandler::TrackUnopenedPhysicalFileOwnership(
            VersionSet::PhysicalFileOwnerKind::kBlob);
   }
   for (uint64_t file_number : edit.GetBlobRelocationFileDeletions()) {
-    // Relocation IDs remain owned after deletion because retirement is
-    // durable and prevents identity reuse.
-    record(file_number, VersionSet::PhysicalFileOwnerKind::kBlobRelocation);
+    // Only live ownership is reconstructed by a MANIFEST snapshot.
+    erase(file_number, VersionSet::PhysicalFileOwnerKind::kBlobRelocation);
   }
   for (const auto& new_file : edit.GetNewFiles()) {
     record(new_file.second.fd.GetNumber(),
@@ -774,8 +833,17 @@ Status VersionEditHandler::ExtractInfoFromVersionEdit(ColumnFamilyData* cfd,
     return Status::Corruption("null VersionSet while replaying MANIFEST");
   }
   Status s;
-  if (edit.HasBlobIndirectionFormatVersion()) {
-    const uint32_t format_version = edit.GetBlobIndirectionFormatVersion();
+  if (edit.HasBlobIndirectionFormatVersion() &&
+      edit.HasDbBlobIndirectionFormatVersion()) {
+    return Status::Corruption(
+        "Conflicting per-CF and DB-global blob indirection format fences");
+  }
+  if (edit.HasBlobIndirectionFormatVersion() ||
+      edit.HasDbBlobIndirectionFormatVersion()) {
+    const uint32_t format_version =
+        edit.HasBlobIndirectionFormatVersion()
+            ? edit.GetBlobIndirectionFormatVersion()
+            : edit.GetDbBlobIndirectionFormatVersion();
     if (version_set_->blob_indirection_format_version_ != 0 &&
         version_set_->blob_indirection_format_version_ != format_version) {
       return Status::Corruption(
@@ -1028,6 +1096,19 @@ void VersionEditHandlerPointInTime::ResetAtomicUpdateState() {
 
 void VersionEditHandlerPointInTime::CheckIterationResult(
     const log::Reader& reader, Status* s) {
+  if (s->ok() && read_only_ && allow_incomplete_valid_version_) {
+    // Read-only best-efforts open cannot persist sticky loss. Reject rather
+    // than recover a prior Version that resurrects hidden keys. Secondary and
+    // follower catch-up keep their existing complete-Version policy instead.
+    // Check the final builder, not historical additions later retired.
+    for (const auto& entry : builders_) {
+      if (entry.second->version_builder()->HasMissingBlobRelocationFiles()) {
+        *s = Status::NotFound(
+            "Current MANIFEST requires a missing relocation file");
+        break;
+      }
+    }
+  }
   VersionEditHandler::CheckIterationResult(reader, s);
   assert(s != nullptr);
   if (s->ok()) {
@@ -1420,9 +1501,12 @@ Status ManifestTailer::ApplyVersionEdit(VersionEdit& edit,
   // VersionEditHandler's constructor requires a non-null VersionSet.
   // @lint-ignore NULLSAFECLANG nullable-dereference
   VersionSet& version_set = *version_set_;
-  if (edit.HasBlobIndirectionFormatVersion() &&
+  if ((edit.HasBlobIndirectionFormatVersion() ||
+       edit.HasDbBlobIndirectionFormatVersion()) &&
       version_set.blob_indirection_format_version_ == 0 &&
-      edit.GetBlobIndirectionFormatVersion() != 0) {
+      (edit.HasBlobIndirectionFormatVersion()
+           ? edit.GetBlobIndirectionFormatVersion()
+           : edit.GetDbBlobIndirectionFormatVersion()) != 0) {
     format_activation_requires_full_ownership_census_ = true;
   }
   const auto validate_ownership = [&] {
@@ -1466,13 +1550,7 @@ Status ManifestTailer::ApplyVersionEdit(VersionEdit& edit,
 
 Status ManifestTailer::TrackUnopenedPhysicalFileOwnership(
     const VersionEdit& edit) {
-  bool do_not_open_cf = false;
-  bool cf_in_builders = false;
-  if (!edit.IsColumnFamilyAdd() && !edit.IsWalAddition() &&
-      !edit.IsWalDeletion()) {
-    CheckColumnFamilyId(edit, &do_not_open_cf, &cf_in_builders);
-  }
-  if (db_mutex_ == nullptr || !do_not_open_cf) {
+  if (db_mutex_ == nullptr) {
     return VersionEditHandler::TrackUnopenedPhysicalFileOwnership(edit);
   }
   InstrumentedMutexUnlock unlock(db_mutex_);
@@ -1661,6 +1739,14 @@ Status ManifestTailer::PrepareToInstallVersions() {
       assert(owners != nullptr);
       const auto current = owners->find(file_number);
       if (!present) {
+        if (current != owners->end() && !same_owner(current->second, owner) &&
+            enforce_uniqueness) {
+          // An absent relocation file has no durable ownership claim, but a
+          // deletion still cannot name a live file belonging to another CF or
+          // file kind in this same snapshot.
+          return Status::Corruption(
+              "Physical file deletion conflicts with installed ownership");
+        }
         if (current != owners->end() && same_owner(current->second, owner)) {
           owners->erase(current);
         }
@@ -1713,9 +1799,8 @@ Status ManifestTailer::PrepareToInstallVersions() {
             present = storage->GetBlobFileMetaData(file_number) != nullptr;
             break;
           case VersionSet::PhysicalFileOwnerKind::kBlobRelocation:
-            present = storage->GetBlobRelocationFileMetaData(file_number) !=
-                          nullptr ||
-                      storage->IsBlobRelocationFileRetired(file_number);
+            present =
+                storage->GetBlobRelocationFileMetaData(file_number) != nullptr;
             break;
         }
       } else if (rebuild_all_owners && !delta.present) {

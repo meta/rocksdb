@@ -273,6 +273,10 @@ class VersionStorageInfo {
       double blob_garbage_collection_age_cutoff,
       double blob_garbage_collection_force_threshold,
       bool enable_blob_garbage_collection);
+  void ComputeFilesMarkedForForcedBlobGC(
+      double blob_garbage_collection_age_cutoff,
+      double blob_garbage_collection_force_threshold,
+      bool enable_blob_garbage_collection, bool enable_blob_indirection);
 
   // This computes read_triggered_compaction_files_ and is called by
   // ComputeCompactionScore()
@@ -475,6 +479,47 @@ class VersionStorageInfo {
   // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
   using BlobFiles = std::vector<std::shared_ptr<BlobFileMetaData>>;
   const BlobFiles& GetBlobFiles() const { return blob_files_; }
+  uint64_t OldestCoarseIdentityBlobFileNumber() const {
+    return oldest_coarse_identity_blob_file_number_;
+  }
+  bool IsCoarseIdentityBlobPinned(uint64_t file_number) const {
+    return oldest_coarse_identity_blob_file_number_ != kInvalidBlobFileNumber &&
+           file_number >= oldest_coarse_identity_blob_file_number_;
+  }
+
+  // The permanent census worker maintains a per-CF indexed ratio heap and
+  // prepares at most eight hints outside the DB mutex. Publishing this fixed
+  // prefix and consuming it is bounded; Version construction never scans or
+  // sorts all blob files for candidate selection. Exact GC remains
+  // authoritative.
+  void SetBlobGcCandidates(
+      const std::array<uint64_t, kBlobGcMaxSelectedFiles>& files);
+  void SetBlobRelocationGarbageBytes(uint64_t bytes) {
+    blob_relocation_garbage_bytes_.store(
+        std::min(bytes, BlobRelocationStateForRead().RecordBytes()),
+        std::memory_order_relaxed);
+  }
+  void SetEmptyBlobGcCandidates(
+      const std::array<uint64_t, kBlobGcMaxSelectedFiles>& files) {
+    empty_blob_files_for_standalone_gc_ = files;
+  }
+  bool HasEmptyBlobGcCandidate() const {
+    return empty_blob_files_for_standalone_gc_[0] != kInvalidBlobFileNumber;
+  }
+  void GetEmptyBlobGcCandidates(size_t max_files,
+                                std::vector<uint64_t>* files) const;
+  void RecordRemovedBlobFile(uint64_t file_number) {
+    removed_blob_files_.push_back(file_number);
+  }
+  const std::vector<uint64_t>& RemovedBlobFiles() const {
+    return removed_blob_files_;
+  }
+  void SuppressBlobFileForStandaloneGC(uint64_t physical_file_number);
+  void DeferBlobFilesForStandaloneGC(
+      const std::vector<uint64_t>& physical_file_numbers);
+  uint64_t BlobPhysicalFileForStandaloneGC() const;
+  void GetBlobPhysicalFilesForStandaloneGC(
+      size_t max_files, std::vector<uint64_t>* physical_file_numbers) const;
 
   // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
   BlobFiles::const_iterator GetBlobFileMetaDataLB(
@@ -495,51 +540,43 @@ class VersionStorageInfo {
     return std::shared_ptr<BlobFileMetaData>();
   }
 
-  using BlobRelocationFiles =
-      std::vector<std::shared_ptr<BlobRelocationFileMetaData>>;
-  using BlobRelocationRoutes = std::vector<BlobRelocationRoute>;
-  using RetiredBlobRelocationFiles = std::vector<uint64_t>;
-  using RetiredBlobRelocationRoutes = std::vector<BlobRelocationRouteSource>;
+  using BlobRelocationFiles = BlobRelocationState::FileIndex::Values;
+  using BlobRelocationRoutes = BlobRelocationState::RouteIndex::Values;
 
-  void ReserveBlobRelocationFiles(size_t size) {
-    blob_relocation_files_.reserve(size);
+  void ShareBlobRelocationState(const VersionStorageInfo& base) {
+    blob_relocation_state_ = base.blob_relocation_state_;
+    blob_relocation_state_fingerprint_high_ =
+        base.blob_relocation_state_fingerprint_high_;
+    blob_relocation_state_fingerprint_low_ =
+        base.blob_relocation_state_fingerprint_low_;
   }
-  void ReserveBlobRelocationRoutes(size_t size) {
-    blob_relocation_routes_.reserve(size);
-  }
-  void ReserveRetiredBlobRelocationFiles(size_t size) {
-    retired_blob_relocation_files_.reserve(size);
-  }
-  void ReserveRetiredBlobRelocationRoutes(size_t size) {
-    retired_blob_relocation_routes_.reserve(size);
+  std::shared_ptr<const BlobRelocationState> GetBlobRelocationState() const {
+    return blob_relocation_state_;
   }
   void AddBlobRelocationFile(
       std::shared_ptr<BlobRelocationFileMetaData> metadata);
   void AddBlobRelocationRoute(BlobRelocationRoute route);
-  void AddRetiredBlobRelocationFile(uint64_t file_number);
-  void AddRetiredBlobRelocationRoute(BlobRelocationRouteSource source);
+  void DeleteBlobRelocationFile(uint64_t file_number);
+  void DeleteBlobRelocationRoute(const BlobRelocationRouteSource& source);
 
-  const BlobRelocationFiles& GetBlobRelocationFiles() const {
-    return blob_relocation_files_;
+  BlobRelocationFiles GetBlobRelocationFiles() const {
+    return BlobRelocationStateForRead().files();
   }
-  const BlobRelocationRoutes& GetBlobRelocationRoutes() const {
-    return blob_relocation_routes_;
+  BlobRelocationRoutes GetBlobRelocationRoutes() const {
+    return BlobRelocationStateForRead().routes();
   }
-  const RetiredBlobRelocationFiles& GetRetiredBlobRelocationFiles() const {
-    return retired_blob_relocation_files_;
+  bool HasMissingBlobRelocationFiles() const {
+    return BlobRelocationStateForRead().HasMissingFiles();
   }
-  const RetiredBlobRelocationRoutes& GetRetiredBlobRelocationRoutes() const {
-    return retired_blob_relocation_routes_;
-  }
+  bool IsBlobReferenceLost(const BlobIndex& index) const;
 
   std::shared_ptr<BlobRelocationFileMetaData> GetBlobRelocationFileMetaData(
       uint64_t file_number) const;
   const BlobRelocationRoute* GetBlobRelocationRoute(
       const BlobRelocationRouteSource& source) const;
-  bool IsBlobRelocationFileRetired(uint64_t file_number) const;
-  bool IsBlobRelocationRouteRetired(
-      const BlobRelocationRouteSource& source) const;
   size_t GetBlobRelocationRouteTargetCount(uint64_t physical_file_number) const;
+  const std::vector<BlobRelocationRouteSource>*
+  GetBlobRelocationRouteSourcesForTarget(uint64_t physical_file_number) const;
   size_t GetBlobRelocationRouteTargetOriginCount(
       uint64_t physical_file_number, uint64_t origin_file_number) const;
 
@@ -552,7 +589,34 @@ class VersionStorageInfo {
   bool HasBlobIndirectionFormat() const {
     return blob_indirection_format_version_ != 0;
   }
+  uint64_t GetBlobRelocationStateEpoch() const {
+    return blob_relocation_state_epoch_;
+  }
+  uint64_t GetBlobRelocationStateFingerprintHigh() const {
+    return blob_relocation_state_fingerprint_high_;
+  }
+  uint64_t GetBlobRelocationStateFingerprintLow() const {
+    return blob_relocation_state_fingerprint_low_;
+  }
+  // Rehashes only changed fixed shards, then combines cached shard digests.
+  // VersionBuilder calls this outside the DB mutex.
+  void ComputeBlobRelocationStateFingerprint();
+  Status AdvanceBlobRelocationStateEpoch() {
+    if (blob_relocation_state_epoch_ == std::numeric_limits<uint64_t>::max()) {
+      return Status::Corruption("Blob relocation state epoch overflow");
+    }
+    ++blob_relocation_state_epoch_;
+    return Status::OK();
+  }
   Status ValidateBlobRelocationState() const;
+  // The builder has release-checked each atomic edit against the final overlay,
+  // including target existence, membership and chain rejection. Reuse that
+  // proof for immutable inherited state; do not enumerate untouched routes.
+  void MarkBlobRelocationChangesValidated() const {
+    if (blob_relocation_state_ != nullptr) {
+      blob_relocation_state_->MarkValidated();
+    }
+  }
 
   // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
   struct BlobStats {
@@ -571,6 +635,11 @@ class VersionStorageInfo {
       total_file_size += meta->GetBlobFileSize();
       total_garbage_size += meta->GetGarbageBlobBytes();
     }
+    // Physical accounting must not depend on optional census readiness, in
+    // particular when FIFO applies its combined SST/blob capacity limit.
+    total_file_size += BlobRelocationStateForRead().PhysicalFileBytes();
+    total_garbage_size +=
+        blob_relocation_garbage_bytes_.load(std::memory_order_relaxed);
 
     double space_amp = 0.0;
     if (total_file_size > total_garbage_size) {
@@ -830,18 +899,34 @@ class VersionStorageInfo {
 
   // Vector of blob files in version sorted by blob file number.
   BlobFiles blob_files_;
+  uint64_t oldest_coarse_identity_blob_file_number_ = kInvalidBlobFileNumber;
+  // Transient exact removals computed by unlocked finalization, not historical
+  // retirement tombstones and never serialized with a Version snapshot.
+  std::vector<uint64_t> removed_blob_files_;
+  std::array<uint64_t, kBlobGcMaxSelectedFiles> blob_files_for_standalone_gc_{};
+  size_t blob_files_for_standalone_gc_count_ = 0;
+  // Zero until this Version's asynchronous census is ready. Atomic because
+  // approximate live-data properties may read a pinned Version unlocked.
+  std::atomic<uint64_t> blob_relocation_garbage_bytes_{0};
+  std::array<uint64_t, kBlobGcMaxSelectedFiles>
+      empty_blob_files_for_standalone_gc_{};
 
-  // Physical relocation files and pair routes are separate immutable Version
-  // state. Both vectors are sorted, making read routing allocation-free and
-  // preserving old snapshots by ordinary Version ownership.
-  BlobRelocationFiles blob_relocation_files_;
-  BlobRelocationRoutes blob_relocation_routes_;
-  RetiredBlobRelocationFiles retired_blob_relocation_files_;
-  RetiredBlobRelocationRoutes retired_blob_relocation_routes_;
-  std::map<uint64_t, size_t> blob_relocation_route_target_counts_;
-  std::map<std::pair<uint64_t, uint64_t>, size_t>
-      blob_relocation_route_target_origin_counts_;
+  // Unchanged Versions share the whole immutable live state. Only an unlocked
+  // unpublished builder can acquire a mutable copy and clone affected shards.
+  // Old Versions keep their own state alive; durable deletion history is not
+  // retained after the corresponding files/routes leave the live state.
+  std::shared_ptr<BlobRelocationState> blob_relocation_state_;
+  const BlobRelocationState& BlobRelocationStateForRead() const {
+    static const BlobRelocationState empty;
+    return blob_relocation_state_ != nullptr ? *blob_relocation_state_ : empty;
+  }
+  BlobRelocationState& MutableBlobRelocationState();
   uint32_t blob_indirection_format_version_ = 0;
+  // In-memory identity of the relocation files and routes inherited by this
+  // Version. It is not persisted: only concurrent compactions compare epochs.
+  uint64_t blob_relocation_state_epoch_ = 0;
+  uint64_t blob_relocation_state_fingerprint_high_ = 0;
+  uint64_t blob_relocation_state_fingerprint_low_ = 0;
 
   // Level that L0 data should be compacted to. All levels < base_level_ should
   // be empty. -1 if it is not level-compaction so it's not applicable.
@@ -1187,6 +1272,16 @@ class Version {
   // Decrease reference count. Delete the object if no reference left
   // and return true. Otherwise, return false.
   bool Unref();
+
+  // Decrease the reference count without running a potentially large Version
+  // destructor. When the last reference is released, unlink the Version while
+  // the DB mutex is held and return true; the caller must then invoke
+  // DeleteDetached() without the DB mutex.
+  // REQUIRES: DB mutex held.
+  bool UnrefAndTryDetach();
+  // REQUIRES: this Version was returned by UnrefAndTryDetach().
+  // REQUIRES: DB mutex not held.
+  void DeleteDetached();
 
   // Add all files listed in the current version to *live_table_files and
   // *live_blob_files.
@@ -2014,6 +2109,9 @@ class VersionSet {
     const auto owner = physical_file_owners_.find(file_number);
     return owner != physical_file_owners_.end() &&
            owner->second.column_family_id == column_family_id;
+  }
+  uint32_t TEST_GetDbBlobIndirectionFormatVersion() const {
+    return blob_indirection_format_version_;
   }
 
   // Appends a kColumnFamilyDrop record for each id in cf_ids to the MANIFEST
