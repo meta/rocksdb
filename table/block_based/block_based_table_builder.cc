@@ -33,6 +33,7 @@
 #include "db/blob/blob_gen2_format.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_reference_metadata.h"
+#include "db/blob/blob_relocation_file.h"
 #include "db/dbformat.h"
 #include "db/wide/wide_column_serialization.h"
 #include "logging/logging.h"
@@ -1309,6 +1310,9 @@ struct BlockBasedTableBuilder::Rep {
   std::shared_ptr<CacheReservationManager>
       compression_dict_buffer_cache_res_mgr;
   std::unique_ptr<BlobReferenceMetadataCollector> blob_reference_collector;
+  std::unique_ptr<BlobRelocationDirectoryBuilder>
+      blob_relocation_directory_builder;
+  std::optional<BlobRelocationFileMetadata> blob_relocation_file_metadata;
   const bool use_delta_encoding_for_index_values;
   std::unique_ptr<FilterBlockBuilder> filter_builder;
   OffsetableCacheKey base_cache_key;
@@ -3275,7 +3279,9 @@ IOStatus BlockBasedTableBuilder::io_status() const {
 
 bool BlockBasedTableBuilder::ok() const { return rep_->StatusOk(); }
 
-Status BlockBasedTableBuilder::WriteEmbeddedBlobRecord(const Slice& payload) {
+Status BlockBasedTableBuilder::WriteEmbeddedBlobRecord(
+    const Slice& payload, CompressionType compression,
+    uint64_t* record_offset) {
   Rep* r = rep_.get();
   assert(r->embedded_blob_options);
   // Inline blob writing requires single-threaded writes so the running table
@@ -3285,7 +3291,7 @@ Status BlockBasedTableBuilder::WriteEmbeddedBlobRecord(const Slice& payload) {
   // Embedded blob payloads share the 32-bit value-size limit with the rest of
   // the table format; enforcing it here keeps record sizes in range and gives
   // an early, cheap corruption check.
-  if (payload.size() > std::numeric_limits<uint32_t>::max()) {
+  if (payload.size() > kMaxSimpleGen2BlobPayloadSize) {
     return Status::InvalidArgument("Embedded blob value is too large");
   }
 
@@ -3296,8 +3302,6 @@ Status BlockBasedTableBuilder::WriteEmbeddedBlobRecord(const Slice& payload) {
   // The builder's running table offset equals the current file size, so the
   // record begins exactly here.
   const uint64_t offset = r->get_offset();
-  // Placeholder for future embedded blob compression support.
-  const CompressionType compression = kNoCompression;
   IOStatus io_s = WriteSimpleGen2BlobRecord(
       r->file, r->write_options, r->table_options.checksum,
       r->base_context_checksum, offset, payload, compression);
@@ -3314,6 +3318,107 @@ Status BlockBasedTableBuilder::WriteEmbeddedBlobRecord(const Slice& payload) {
   BlobIndex::EncodeBlob(&r->embedded_blob_state->blob_index_buf,
                         kCurrentFileBlobIndexFileNumber, offset, payload.size(),
                         compression);
+  if (record_offset != nullptr) {
+    *record_offset = offset;
+  }
+  return Status::OK();
+}
+
+Status BlockBasedTableBuilder::StartBlobRelocationFile() {
+  Rep* r = rep_.get();
+  if (!ok()) {
+    return status();
+  }
+  if (r->blob_relocation_directory_builder != nullptr ||
+      r->props.num_entries != 0 || r->get_offset() != 0 ||
+      r->embedded_blob_options == nullptr) {
+    return Status::InvalidArgument(
+        "Blob relocation file must start on a fresh embedded table builder");
+  }
+  if (r->props.orig_file_number == 0 || r->props.db_session_id.empty()) {
+    return Status::InvalidArgument(
+        "Blob relocation file requires persisted file identity");
+  }
+  if (r->internal_comparator.user_comparator() != BytewiseComparator()) {
+    return Status::InvalidArgument(
+        "Blob relocation file requires the bytewise comparator without "
+        "timestamps");
+  }
+  assert(!r->IsParallelCompressionActive());
+
+  IOOptions io_options;
+  IOStatus io_status =
+      WritableFileWriter::PrepareIOOptions(r->write_options, io_options);
+  if (io_status.ok()) {
+    io_status = r->file->Append(
+        Slice(kBlobRelocationFilePrefix, kBlobRelocationFilePrefixSize),
+        io_options);
+  }
+  if (!io_status.ok()) {
+    r->SetIOStatus(io_status);
+    return io_status;
+  }
+  r->set_offset(kBlobRelocationFilePrefixSize);
+  r->blob_relocation_directory_builder =
+      std::make_unique<BlobRelocationDirectoryBuilder>();
+  return Status::OK();
+}
+
+Status BlockBasedTableBuilder::AddBlobRelocation(uint64_t origin_file_number,
+                                                 uint64_t original_value_offset,
+                                                 const Slice& stored_payload,
+                                                 CompressionType compression) {
+  Rep* r = rep_.get();
+  if (r->blob_relocation_directory_builder == nullptr) {
+    return Status::InvalidArgument("Blob relocation file has not been started");
+  }
+  if (!ok()) {
+    return status();
+  }
+  if (stored_payload.size() > kMaxSimpleGen2BlobPayloadSize) {
+    return Status::InvalidArgument("Blob relocation value is too large");
+  }
+  if (!CompressionTypeSupported(compression)) {
+    return Status::InvalidArgument(
+        "Blob relocation compression type is not supported");
+  }
+
+  const uint64_t relocated_value_offset = r->get_offset();
+  Status add_status = r->blob_relocation_directory_builder->Add(
+      origin_file_number, original_value_offset, relocated_value_offset,
+      stored_payload.size(), compression);
+  if (!add_status.ok()) {
+    r->SetStatus(add_status);
+    return add_status;
+  }
+  uint64_t written_value_offset = 0;
+  add_status = WriteEmbeddedBlobRecord(stored_payload, compression,
+                                       &written_value_offset);
+  if (!add_status.ok()) {
+    return add_status;
+  }
+  assert(written_value_offset == relocated_value_offset);
+
+  const std::string user_key =
+      EncodeBlobRelocationKey(origin_file_number, original_value_offset);
+  const InternalKey internal_key(user_key, 0, kTypeBlobIndex);
+  Add(internal_key.Encode(), r->embedded_blob_state->blob_index_buf);
+  return status();
+}
+
+Status BlockBasedTableBuilder::GetBlobRelocationFileMetadata(
+    BlobRelocationFileMetadata* metadata) const {
+  if (metadata == nullptr) {
+    return Status::InvalidArgument("Null blob relocation metadata output");
+  }
+  if (!ok()) {
+    return status();
+  }
+  if (!rep_->blob_relocation_file_metadata.has_value()) {
+    return Status::InvalidArgument("Blob relocation file is not finished");
+  }
+  *metadata = *rep_->blob_relocation_file_metadata;
+  metadata->tail_size = GetTailSize();
   return Status::OK();
 }
 
@@ -3339,7 +3444,8 @@ Status BlockBasedTableBuilder::BuildEmbeddedWideColumnEntity(const Slice& value,
     if (column_value.size() < min_blob_size) {
       continue;
     }
-    s = WriteEmbeddedBlobRecord(column_value);
+    s = WriteEmbeddedBlobRecord(column_value, kNoCompression,
+                                /*record_offset=*/nullptr);
     if (!s.ok()) {
       return s;
     }
@@ -3379,7 +3485,8 @@ bool BlockBasedTableBuilder::MaybeExtractEmbeddedBlobs(SequenceNumber seq,
     if (value->size() < r->embedded_blob_options->min_blob_size) {
       return true;  // leave small values inline
     }
-    Status s = WriteEmbeddedBlobRecord(*value);
+    Status s = WriteEmbeddedBlobRecord(*value, kNoCompression,
+                                       /*record_offset=*/nullptr);
     if (!s.ok()) {
       r->SetStatus(std::move(s));
       return false;
@@ -3664,9 +3771,13 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
     // rep_->props.index_size is set in WriteIndexBlock(), which has direct
     // access to the index block handle (needed for accurate kCustomOnly stub
     // reporting).
-    rep_->props.comparator_name = rep_->ioptions.user_comparator != nullptr
-                                      ? rep_->ioptions.user_comparator->Name()
-                                      : "nullptr";
+    const bool is_blob_relocation_file =
+        rep_->blob_relocation_directory_builder != nullptr;
+    rep_->props.comparator_name =
+        is_blob_relocation_file ? BytewiseComparator()->Name()
+                                : (rep_->ioptions.user_comparator != nullptr
+                                       ? rep_->ioptions.user_comparator->Name()
+                                       : "nullptr");
     rep_->props.merge_operator_name =
         rep_->ioptions.merge_operator != nullptr
             ? rep_->ioptions.merge_operator->Name()
@@ -3741,7 +3852,7 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
           rep_->uncompressible_input_data_bytes.LoadRelaxed();
     }
     rep_->props.user_defined_timestamps_persisted =
-        rep_->persist_user_defined_timestamps;
+        is_blob_relocation_file ? false : rep_->persist_user_defined_timestamps;
 
     if (rep_->embedded_blob_state) {
       std::string encoded_stats;
@@ -4165,6 +4276,28 @@ Status BlockBasedTableBuilder::Finish() {
   // if any, have joined so the estimate is now quiescent).
   r->AutoSkipWriteBack();
 
+  if (ok() && r->blob_relocation_directory_builder != nullptr) {
+    BlobRelocationDirectory directory;
+    Status directory_status =
+        r->blob_relocation_directory_builder->Finish(&directory);
+    if (directory_status.ok()) {
+      std::string encoded_directory;
+      directory.EncodeTo(&encoded_directory);
+      r->props.user_collected_properties[kBlobRelocationDirectoryPropertyName] =
+          std::move(encoded_directory);
+      r->blob_relocation_file_metadata = BlobRelocationFileMetadata{
+          directory.directory_digest(),
+          static_cast<uint64_t>(directory.origins().size()),
+          directory.total_entries(), directory.total_record_bytes()};
+    } else {
+      r->SetStatus(std::move(directory_status));
+    }
+  }
+
+  // These GC-only blocks remain addressable through the metaindex, but do not
+  // belong to the ordinary open-time metadata prefetch tail.
+  MetaIndexBuilder meta_index_builder;
+  WriteBlobReferenceMetadata(&meta_index_builder);
   r->props.tail_start_offset = r->offset.LoadRelaxed();
 
   uint64_t last_estimated_tail_size = EstimatedTailSize();
@@ -4174,18 +4307,15 @@ Status BlockBasedTableBuilder::Finish() {
   //    2. [meta block: index]
   //    3. [meta block: compression dictionary]
   //    4. [meta block: range deletion tombstone]
-  //    5. [meta blocks: exact blob references]
-  //    6. [meta block: properties]
-  //    7. [metaindex block]
-  //    8. Footer
+  //    5. [meta block: properties]
+  //    6. [metaindex block]
+  //    7. Footer
   BlockHandle metaindex_block_handle;
   BlockHandle index_block_handle;
-  MetaIndexBuilder meta_index_builder;
   WriteFilterBlock(&meta_index_builder);
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);
-  WriteBlobReferenceMetadata(&meta_index_builder);
   WritePropertiesBlock(&meta_index_builder);
   if (LIKELY(ok())) {
     // flush the meta index block

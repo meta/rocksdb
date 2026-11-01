@@ -2833,6 +2833,15 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
   const BlobFileOpenInfo blob_file{blob_file_number,
                                    blob_file_meta->GetChecksumValue(),
                                    blob_file_meta->GetChecksumMethod()};
+  if (blob_index.IsIndirect()) {
+    return blob_source_->GetIndirectBlob(
+        read_options, user_key, blob_index, blob_file,
+        blob_file_meta->GetBlobFileSize(), /*is_relocation_file=*/false,
+        /*relocation_directory_digest=*/0,
+        /*relocation_compression_manager=*/nullptr,
+        /*block_protection_bytes_per_key=*/0, /*range_offset=*/0,
+        kWholeBlobLength, prefetch_buffer, value, bytes_read);
+  }
   const Status s = blob_source_->GetBlob(
       read_options, user_key, blob_file, blob_index.offset(),
       blob_file_meta->GetBlobFileSize(), blob_index.size(),
@@ -2851,9 +2860,9 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
     return Status::Corruption("Unexpected TTL/inlined blob index");
   }
 
-  // A strict sub-range of a compressed blob cannot be decompressed in
-  // isolation; the caller resolves such columns whole and slices instead.
-  if (blob_index.compression() != kNoCompression) {
+  // Legacy range reads cannot decompress a strict byte range. Indirect reads
+  // can materialize, validate, and slice the whole logical value.
+  if (!blob_index.IsIndirect() && blob_index.compression() != kNoCompression) {
     return Status::Corruption("Cannot range-read a compressed blob");
   }
 
@@ -2872,6 +2881,15 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
   const BlobFileOpenInfo blob_file{blob_file_number,
                                    blob_file_meta->GetChecksumValue(),
                                    blob_file_meta->GetChecksumMethod()};
+  if (blob_index.IsIndirect()) {
+    return blob_source_->GetIndirectBlob(
+        read_options, user_key, blob_index, blob_file,
+        blob_file_meta->GetBlobFileSize(), /*is_relocation_file=*/false,
+        /*relocation_directory_digest=*/0,
+        /*relocation_compression_manager=*/nullptr,
+        /*block_protection_bytes_per_key=*/0, range_offset, range_length,
+        /*prefetch_buffer=*/nullptr, value, bytes_read);
+  }
   return blob_source_->GetBlobRange(
       read_options, user_key, blob_file, blob_index.offset(),
       blob_file_meta->GetBlobFileSize(), blob_index.size(),
@@ -2894,8 +2912,12 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
   // of that file's current (most recently started, still fillable) batch.
   autovector<BlobFileReadRequests> whole_reqs;
   autovector<BlobFileRangeReadRequests> range_reqs;
+  using IndirectFileRequests = std::tuple<BlobFileOpenInfo, uint64_t,
+                                          autovector<IndirectBlobReadRequest>>;
+  autovector<IndirectFileRequests> indirect_reqs;
   std::unordered_map<uint64_t, size_t> whole_idx;
   std::unordered_map<uint64_t, size_t> range_idx;
+  std::unordered_map<uint64_t, size_t> indirect_idx;
 
   for (auto& req : reqs) {
     assert(req.user_key);
@@ -2921,6 +2943,27 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
     const BlobFileOpenInfo blob_file{file_number,
                                      blob_file_meta->GetChecksumValue(),
                                      blob_file_meta->GetChecksumMethod()};
+
+    if (blob_index.IsIndirect()) {
+      size_t idx;
+      const std::unordered_map<uint64_t, size_t>::const_iterator it =
+          indirect_idx.find(file_number);
+      if (it != indirect_idx.end() &&
+          std::get<2>(indirect_reqs[it->second]).size() <
+              MultiGetContext::MAX_BATCH_SIZE) {
+        idx = it->second;
+      } else {
+        idx = indirect_reqs.size();
+        indirect_idx[file_number] = idx;
+        indirect_reqs.emplace_back(blob_file, file_size,
+                                   autovector<IndirectBlobReadRequest>());
+      }
+      std::get<2>(indirect_reqs[idx])
+          .push_back(IndirectBlobReadRequest{*req.user_key, &blob_index,
+                                             req.range_offset, req.range_length,
+                                             req.result, req.status});
+      continue;
+    }
 
     if (req.range_length == kWholeBlobLength) {
       // Append to this file's current batch, or start a new batch when the file
@@ -2980,6 +3023,16 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
     blob_source_->MultiGetBlobRange(read_options, range_reqs,
                                     /*bytes_read=*/nullptr);
   }
+  for (IndirectFileRequests& file_requests : indirect_reqs) {
+    autovector<IndirectBlobReadRequest>& batch = std::get<2>(file_requests);
+    blob_source_->MultiGetIndirectBlobFromOneFile(
+        read_options, std::get<0>(file_requests), std::get<1>(file_requests),
+        /*is_relocation_file=*/false,
+        /*relocation_directory_digest=*/0,
+        /*relocation_compression_manager=*/nullptr,
+        /*block_protection_bytes_per_key=*/0, batch.size(), &batch[0],
+        /*bytes_read=*/nullptr);
+  }
 }
 
 void Version::MultiGetBlob(
@@ -2994,6 +3047,7 @@ void Version::MultiGetBlob(
     const auto blob_file_meta = storage_info_.GetBlobFileMetaData(file_number);
 
     autovector<BlobReadRequest> blob_reqs_in_file;
+    autovector<IndirectBlobReadRequest> indirect_blob_reqs_in_file;
     BlobReadContexts& blobs_in_file = ctx.second;
     for (auto& blob : blobs_in_file) {
       const BlobIndex& blob_index = blob.blob_index;
@@ -3023,6 +3077,14 @@ void Version::MultiGetBlob(
         continue;
       }
 
+      if (blob_index.IsIndirect()) {
+        indirect_blob_reqs_in_file.push_back(IndirectBlobReadRequest{
+            key_context->get_context->ukey_to_get_blob_value(), &blob_index,
+            /*range_offset=*/0, kWholeBlobLength, &blob.result,
+            key_context->s});
+        continue;
+      }
+
       blob_reqs_in_file.emplace_back(
           key_context->get_context->ukey_to_get_blob_value(),
           blob_index.offset(), blob_index.size(), blob_index.compression(),
@@ -3034,6 +3096,19 @@ void Version::MultiGetBlob(
                                        blob_file_meta->GetChecksumValue(),
                                        blob_file_meta->GetChecksumMethod()};
       blob_reqs.emplace_back(blob_file, file_size, blob_reqs_in_file);
+    }
+    if (!indirect_blob_reqs_in_file.empty() && blob_file_meta != nullptr) {
+      const BlobFileOpenInfo blob_file{file_number,
+                                       blob_file_meta->GetChecksumValue(),
+                                       blob_file_meta->GetChecksumMethod()};
+      blob_source_->MultiGetIndirectBlobFromOneFile(
+          read_options, blob_file, blob_file_meta->GetBlobFileSize(),
+          /*is_relocation_file=*/false,
+          /*relocation_directory_digest=*/0,
+          /*relocation_compression_manager=*/nullptr,
+          /*block_protection_bytes_per_key=*/0,
+          indirect_blob_reqs_in_file.size(), &indirect_blob_reqs_in_file[0],
+          /*bytes_read=*/nullptr);
     }
   }
 
