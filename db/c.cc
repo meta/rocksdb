@@ -836,6 +836,8 @@ struct rocksdb_compactionfilter_t : public CompactionFilter {
                            const char* existing_value, size_t value_length,
                            char** new_value, size_t* new_value_length,
                            unsigned char* value_changed) = nullptr;
+  void (*delete_value_)(void*, const char* value,
+                        size_t value_length) = nullptr;
   const char* (*name_)(void*) = nullptr;
   unsigned char ignore_snapshots_ = true;
 
@@ -861,6 +863,13 @@ struct rocksdb_compactionfilter_t : public CompactionFilter {
     if (c_value_changed) {
       new_value->assign(c_new_value, new_value_length);
       *value_changed = true;
+    }
+    if (c_new_value != nullptr) {
+      if (delete_value_ != nullptr) {
+        (*delete_value_)(state_, c_new_value, new_value_length);
+      } else {
+        free(c_new_value);
+      }
     }
     return result;
   }
@@ -6989,6 +6998,8 @@ custom cache
 table_properties_collectors
 */
 
+static void CompactionFilterKeepValue(void*, const char*, size_t) {}
+
 rocksdb_compactionfilter_t* rocksdb_compactionfilter_create(
     void* state, void (*destructor)(void*),
     unsigned char (*filter)(void*, int level, const char* key,
@@ -6997,10 +7008,24 @@ rocksdb_compactionfilter_t* rocksdb_compactionfilter_create(
                             size_t* new_value_length,
                             unsigned char* value_changed),
     const char* (*name)(void*)) {
+  return rocksdb_compactionfilter_create_with_delete_value(
+      state, destructor, filter, CompactionFilterKeepValue, name);
+}
+
+rocksdb_compactionfilter_t* rocksdb_compactionfilter_create_with_delete_value(
+    void* state, void (*destructor)(void*),
+    unsigned char (*filter)(void*, int level, const char* key,
+                            size_t key_length, const char* existing_value,
+                            size_t value_length, char** new_value,
+                            size_t* new_value_length,
+                            unsigned char* value_changed),
+    void (*delete_value)(void*, const char* value, size_t value_length),
+    const char* (*name)(void*)) {
   rocksdb_compactionfilter_t* result = new rocksdb_compactionfilter_t;
   result->state_ = state;
   result->destructor_ = destructor;
   result->filter_ = filter;
+  result->delete_value_ = delete_value;
   result->ignore_snapshots_ = true;
   result->name_ = name;
   return result;
