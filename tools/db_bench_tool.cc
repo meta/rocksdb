@@ -8684,7 +8684,7 @@ class Benchmark {
     for (int j = 0; j < num_jobs; ++j) {
       futures.push_back(
           folly::coro::co_withExecutor(
-              folly::Executor::getKeepAliveToken(read_executor->getEventBase()),
+              read_executor->getEventBaseKeepAlive(),
               ReadRandomCoroutineJob(db_choices, thread->rand.Next(), ops,
                                      &total_ops, &total_found, &total_bytes, j,
                                      job_perf_contexts_ptr))
@@ -8766,7 +8766,7 @@ class Benchmark {
     for (int j = 0; j < num_jobs; ++j) {
       futures.push_back(
           folly::coro::co_withExecutor(
-              folly::Executor::getKeepAliveToken(read_executor->getEventBase()),
+              read_executor->getEventBaseKeepAlive(),
               MultiGetCoroutineJob(db, cfh, thread->rand.Next(), ops,
                                    &total_ops, &total_found, &total_bytes, j,
                                    job_perf_contexts_ptr))
