@@ -488,7 +488,8 @@ Status CompactionOutputs::AddToOutput(
   }
 
   assert(builder_ != nullptr);
-  const Slice& value = c_iter.value();
+  Slice value = c_iter.value();
+  TEST_SYNC_POINT_CALLBACK("CompactionOutputs::AddToOutput:Value", &value);
   bool retried_after_new_table = false;
   while (true) {
     s = current_output().validator.CanAdd(key);

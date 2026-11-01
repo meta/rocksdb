@@ -12,6 +12,10 @@
 
 #include "db/arena_wrapped_db_iter.h"
 #include "db/blob/blob_fetcher.h"
+#include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_metadata.h"
+#include "db/blob/blob_relocation_file.h"
+#include "db/blob/blob_relocation_manifest.h"
 #include "db/db_impl/db_impl_metadata.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
@@ -1874,6 +1878,9 @@ Status DBImplSecondary::HandleInvalidOrNoCompactionProgress(
 Status DBImplSecondary::CompactWithoutInstallation(
     const OpenAndCompactOptions& options, ColumnFamilyHandle* cfh,
     const CompactionServiceInput& input, CompactionServiceResult* result) {
+  if (result == nullptr) {
+    return Status::InvalidArgument("Remote compaction result is null");
+  }
   if (options.canceled && options.canceled->load(std::memory_order_acquire)) {
     return Status::Incomplete(Status::SubCode::kManualCompactionPaused);
   }
@@ -1919,8 +1926,10 @@ Status DBImplSecondary::CompactWithoutInstallation(
       !!(mutable_cf_options.verify_output_flags &
          VerifyOutputFlags::kVerifyIteration);
 
-  bool allow_resumption =
-      options.allow_resumption && !output_hash_verification_enabled;
+  const bool feature_aware_compaction = input.blob_gc_protocol_version != 0;
+  bool allow_resumption = options.allow_resumption &&
+                          !output_hash_verification_enabled &&
+                          !feature_aware_compaction;
 
   if (options.allow_resumption && output_hash_verification_enabled) {
     ROCKS_LOG_WARN(immutable_db_options_.info_log,
@@ -1928,6 +1937,11 @@ Status DBImplSecondary::CompactWithoutInstallation(
                    "incompatibility with output hash verification "
                    "(paranoid_file_checks=true or verify_output_flags "
                    "containing kVerifyIteration)");
+  }
+  if (options.allow_resumption && feature_aware_compaction) {
+    ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                   "Resume compaction configured but disabled because the "
+                   "progress format does not persist the Blob GC contract");
   }
 
   mutex_.Unlock();
@@ -1948,6 +1962,49 @@ Status DBImplSecondary::CompactWithoutInstallation(
   }
 
   auto* version = cfd->current();
+  if (version == nullptr) {
+    return Status::Corruption("Remote compaction has no current version");
+  }
+
+  if (input.blob_gc_protocol_version != 0) {
+    const VersionStorageInfo* input_vstorage = version->storage_info();
+    const bool supported_contract =
+        input.blob_gc_protocol_version ==
+            kBlobGCCompactionServiceProtocolVersion &&
+        input.blob_index_format_version ==
+            BlobIndex::kIndirectBlobFormatVersion &&
+        input.blob_reference_metadata_format_version ==
+            BlobReferenceMetadataDescriptor::kFormatVersion &&
+        input.blob_indirection_manifest_format_version ==
+            kBlobIndirectionManifestFormatVersion &&
+        input.blob_relocation_directory_format_version ==
+            BlobRelocationDirectory::kFormatVersion &&
+        input.blob_stable_checksum_version ==
+            BlobIndex::kStableChecksumVersion2 &&
+        input.blob_repair_metadata_format_version ==
+            kBlobRepairMetadataFormatVersion &&
+        input.blob_gc_column_family_id == cfd->GetID() &&
+        input_vstorage->HasBlobIndirectionFormat() &&
+        input.allow_blob_index_flattening ==
+            mutable_cf_options.enable_blob_indirection &&
+        input.blob_gc_options_fingerprint ==
+            ComputeBlobGCCompactionServiceOptionsFingerprint(
+                cfd->GetID(), input.options_file_number,
+                mutable_cf_options.enable_blob_indirection,
+                input.allow_blob_index_flattening,
+                mutable_cf_options.enable_blob_garbage_collection,
+                mutable_cf_options.blob_garbage_collection_age_cutoff) &&
+        input.blob_relocation_state_fingerprint_high ==
+            input_vstorage->GetBlobRelocationStateFingerprintHigh() &&
+        input.blob_relocation_state_fingerprint_low ==
+            input_vstorage->GetBlobRelocationStateFingerprintLow();
+    if (!supported_contract) {
+      // An empty result is the protocol-level decline response. The primary
+      // rejects its zero capability before importing output.
+      *result = CompactionServiceResult();
+      return Status::OK();
+    }
+  }
 
   ColumnFamilyMetaData cf_meta;
   version->GetColumnFamilyMetaData(&cf_meta);

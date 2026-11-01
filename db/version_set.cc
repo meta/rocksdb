@@ -2780,6 +2780,20 @@ VersionStorageInfo::VersionStorageInfo(
   }
 }
 
+void VersionStorageInfo::ComputeBlobRelocationStateFingerprint() {
+  if (blob_relocation_state_ == nullptr) {
+    BlobRelocationState empty;
+    empty.ComputeFingerprint(blob_indirection_format_version_,
+                             &blob_relocation_state_fingerprint_high_,
+                             &blob_relocation_state_fingerprint_low_);
+  } else {
+    MutableBlobRelocationState().ComputeFingerprint(
+        blob_indirection_format_version_,
+        &blob_relocation_state_fingerprint_high_,
+        &blob_relocation_state_fingerprint_low_);
+  }
+}
+
 Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
                  const FileOptions& file_opt,
                  const MutableCFOptions& mutable_cf_options,
@@ -2846,9 +2860,13 @@ Status Version::ValidateBlobReferenceSource(
   uint64_t physical_file_size = 0;
   bool is_relocation_file = false;
   uint32_t relocation_directory_digest = 0;
-  return ResolveBlobPhysicalFile(source, &physical_file, &physical_file_size,
-                                 &is_relocation_file,
-                                 &relocation_directory_digest);
+  const Status status = ResolveBlobPhysicalFile(
+      source, &physical_file, &physical_file_size, &is_relocation_file,
+      &relocation_directory_digest);
+  // The only NotFound from this metadata-only resolver is an accepted-loss
+  // target, after origin/ownership validation. Such a source is still legal
+  // Put-like compaction output; availability is checked separately on reads.
+  return status.IsNotFound() ? Status::OK() : status;
 }
 
 Status Version::ResolveBlobPhysicalFile(
@@ -4459,6 +4477,16 @@ void VersionStorageInfo::AddBlobFile(
   blob_files_.emplace_back(std::move(blob_file_meta));
 }
 
+BlobRelocationState& VersionStorageInfo::MutableBlobRelocationState() {
+  if (blob_relocation_state_ == nullptr) {
+    blob_relocation_state_ = std::make_shared<BlobRelocationState>();
+  } else if (blob_relocation_state_.use_count() != 1) {
+    blob_relocation_state_ =
+        std::make_shared<BlobRelocationState>(*blob_relocation_state_);
+  }
+  return *blob_relocation_state_;
+}
+
 void VersionStorageInfo::AddBlobRelocationFile(
     std::shared_ptr<BlobRelocationFileMetaData> metadata) {
   MutableBlobRelocationState().SetFile(std::move(metadata));
@@ -4467,8 +4495,6 @@ void VersionStorageInfo::AddBlobRelocationFile(
 void VersionStorageInfo::AddBlobRelocationRoute(BlobRelocationRoute route) {
   MutableBlobRelocationState().SetRoute(std::move(route));
 }
-
-
 
 std::shared_ptr<BlobRelocationFileMetaData>
 VersionStorageInfo::GetBlobRelocationFileMetaData(uint64_t file_number) const {
@@ -4479,8 +4505,6 @@ const BlobRelocationRoute* VersionStorageInfo::GetBlobRelocationRoute(
     const BlobRelocationRouteSource& source) const {
   return BlobRelocationStateForRead().FindRoute(source);
 }
-
-
 
 size_t VersionStorageInfo::GetBlobRelocationRouteTargetCount(
     uint64_t physical_file_number) const {
@@ -7768,8 +7792,9 @@ Status VersionSet::ValidateAndTrackPhysicalFileOwnership(
       column_family_id, PhysicalFileOwnerKind::kBlobRelocation};
 
   // Process deletions first so a table move represented as delete+add retains
-  // ownership. A relocation deletion remains present as a durable retirement
-  // claim, including when the deleted ID was not previously known.
+  // ownership. A relocation deletion removes its live ownership claim; old
+  // Versions still pin the physical file, but snapshots do not retain retired
+  // IDs. The allocator never reuses file numbers.
   for (const auto& deleted_file : edit.GetDeletedFiles()) {
     Status status = record(deleted_file.second, table_owner, false);
     if (!status.ok()) {
@@ -7795,7 +7820,7 @@ Status VersionSet::ValidateAndTrackPhysicalFileOwnership(
     }
   }
   for (uint64_t file_number : edit.GetBlobRelocationFileDeletions()) {
-    Status status = record(file_number, relocation_owner, true);
+    Status status = record(file_number, relocation_owner, false);
     if (!status.ok()) {
       return status;
     }
@@ -10372,20 +10397,6 @@ std::vector<VersionEdit>& ReactiveVersionSet::replay_buffer() {
   return manifest_tailer_->GetReadBuffer().replay_buffer();
 }
 
-void VersionStorageInfo::ComputeBlobRelocationStateFingerprint() {
-  if (blob_relocation_state_ == nullptr) {
-    BlobRelocationState empty;
-    empty.ComputeFingerprint(blob_indirection_format_version_,
-                             &blob_relocation_state_fingerprint_high_,
-                             &blob_relocation_state_fingerprint_low_);
-  } else {
-    MutableBlobRelocationState().ComputeFingerprint(
-        blob_indirection_format_version_,
-        &blob_relocation_state_fingerprint_high_,
-        &blob_relocation_state_fingerprint_low_);
-  }
-}
-
 bool VersionStorageInfo::IsBlobReferenceLost(const BlobIndex& index) const {
   if (!index.IsIndirect() || !HasMissingBlobRelocationFiles()) {
     return false;
@@ -10502,16 +10513,6 @@ void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
   }
 }
 
-BlobRelocationState& VersionStorageInfo::MutableBlobRelocationState() {
-  if (blob_relocation_state_ == nullptr) {
-    blob_relocation_state_ = std::make_shared<BlobRelocationState>();
-  } else if (blob_relocation_state_.use_count() != 1) {
-    blob_relocation_state_ =
-        std::make_shared<BlobRelocationState>(*blob_relocation_state_);
-  }
-  return *blob_relocation_state_;
-}
-
 void VersionStorageInfo::DeleteBlobRelocationFile(uint64_t file_number) {
   MutableBlobRelocationState().DeleteFile(file_number);
 }
@@ -10520,7 +10521,6 @@ void VersionStorageInfo::DeleteBlobRelocationRoute(
     const BlobRelocationRouteSource& source) {
   MutableBlobRelocationState().DeleteRoute(source);
 }
-
 
 void VersionStorageInfo::SetBlobGcCandidates(
     const std::array<uint64_t, kBlobGcMaxSelectedFiles>& files) {
