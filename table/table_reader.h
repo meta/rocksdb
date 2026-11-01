@@ -26,6 +26,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 struct BlobReferenceGroup;
+struct BlobReference;
 
 class Iterator;
 struct ParsedInternalKey;
@@ -127,6 +128,23 @@ class TableReader {
       std::vector<BlobReferenceGroup>* groups) const {
     (void)expected_descriptor;
     (void)groups;
+    return Status::NotSupported(
+        "Exact blob reference metadata is not supported");
+  }
+
+  // Appends one exact route-group range selected from a previously validated
+  // directory. `references` must already have enough capacity for the group,
+  // so its owner can account the allocation before this call. The default is
+  // intentionally unsupported because feature SSTs are restricted to
+  // block-based tables.
+  virtual Status ReadBlobReferences(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      const BlobReferenceGroup& expected_group,
+      std::vector<BlobReference>* references) const {
+    (void)read_options;
+    (void)expected_descriptor;
+    (void)expected_group;
+    (void)references;
     return Status::NotSupported(
         "Exact blob reference metadata is not supported");
   }

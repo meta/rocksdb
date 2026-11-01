@@ -1288,8 +1288,18 @@ void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
 }
 
 bool ColumnFamilyData::NeedsCompaction() const {
-  return !mutable_cf_options_.disable_auto_compactions &&
-         compaction_picker_->NeedsCompaction(current_->storage_info());
+  if (mutable_cf_options_.disable_auto_compactions) {
+    return false;
+  }
+  if (compaction_picker_->NeedsCompaction(current_->storage_info())) {
+    return true;
+  }
+  return mutable_cf_options_.enable_blob_files &&
+         mutable_cf_options_.enable_blob_garbage_collection &&
+         mutable_cf_options_.enable_blob_indirection &&
+         current_->storage_info()->BlobPhysicalFileForStandaloneGC() != 0 &&
+         blob_reference_census_ != nullptr &&
+         blob_reference_census_->IsReady(current_->GetVersionNumber());
 }
 
 Compaction* ColumnFamilyData::PickCompaction(

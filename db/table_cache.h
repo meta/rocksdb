@@ -31,6 +31,7 @@ namespace ROCKSDB_NAMESPACE {
 
 struct BlobReferenceGroup;
 struct BlobReferenceSstSummary;
+struct BlobReference;
 
 class Env;
 class Arena;
@@ -286,6 +287,15 @@ class TableCache {
       const TableReader& reader, const FileMetaData& file_meta,
       const MutableCFOptions& mutable_cf_options,
       std::shared_ptr<const BlobReferenceSstSummary>* summary);
+  // Opens an ephemeral reader and appends the data blocks for one exact group
+  // without inserting table metadata into the shared block cache.
+  Status ReadBlobReferences(const ReadOptions& read_options,
+                            const FileOptions& file_options,
+                            const InternalKeyComparator& internal_comparator,
+                            const FileMetaData& file_meta,
+                            const MutableCFOptions& mutable_cf_options,
+                            const BlobReferenceGroup& group,
+                            std::vector<BlobReference>* references);
 
   Status ApproximateKeyAnchors(const ReadOptions& ro,
                                const InternalKeyComparator& internal_comparator,
