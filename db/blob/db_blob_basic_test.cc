@@ -11,6 +11,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "cache/compressed_secondary_cache.h"
 #include "db/blob/blob_file_partition_manager.h"
@@ -190,6 +191,33 @@ class BlobFileChecksumCapturingFS : public FileSystemWrapper {
   int capture_count_ = 0;
 };
 
+TEST_F(DBBlobBasicTest, PrefixRepairRejectsValidatedRelocationFile) {
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("legacy", "value"));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* const cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+  const ImmutableOptions immutable_options = cfd->ioptions();
+  const MutableCFOptions mutable_options = cfd->GetLatestMutableCFOptions();
+  Close();
+  const std::string payload = "stored";
+  BlobRelocationFileMetadata metadata;
+  uint64_t size = 0;
+  constexpr uint64_t number = 1000000;
+  WriteRelocationFileForDBTest(
+      immutable_options, mutable_options, BlockBasedTableOptions(), 0, number,
+      {{1, 42, payload, kNoCompression}}, &metadata, &size);
+  const std::string path = BlobFileName(dbname_, number);
+  std::string before;
+  ASSERT_OK(ReadFileToString(env_, path, &before));
+  ASSERT_TRUE(RepairDB(dbname_, options).IsNotSupported());
+  std::string after;
+  ASSERT_OK(ReadFileToString(env_, path, &after));
+  ASSERT_EQ(before, after);
+}
 TEST_F(DBBlobBasicTest, BlobReferenceCensusShutdownAfterDispatch) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
@@ -534,6 +562,459 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusRebuildsAndTracksInstalledSsts) {
   census = GetCensusSnapshot(cfd);
   ASSERT_NE(census, nullptr);
   ASSERT_EQ(census->route_source_count(), 0);
+}
+
+TEST_F(DBBlobBasicTest, StandaloneBlobGCRelocatesExactLiveSet) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  ASSERT_OK(Put("older", std::string(4096, 'o')));
+  ASSERT_OK(Flush());
+  const std::array<std::string, 4> keys{{"key0", "key1", "key2", "key3"}};
+  const std::array<std::string, 4> values{
+      {std::string(4096, 'a'), std::string(4096, 'b'), std::string(4096, 'c'),
+       std::string(4096, 'd')}};
+  for (size_t i = 0; i < keys.size(); ++i) {
+    ASSERT_OK(Put(keys[i], values[i]));
+  }
+  ASSERT_OK(Flush());
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 2U);
+  const uint64_t older_file_number = cfd->current()
+                                         ->storage_info()
+                                         ->GetBlobFiles()
+                                         .front()
+                                         ->GetBlobFileNumber();
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .back()
+                                          ->GetBlobFileNumber();
+  ASSERT_LT(older_file_number, origin_file_number);
+
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  std::shared_ptr<BlobFileMetaData> source =
+      cfd->current()->storage_info()->GetBlobFileMetaData(origin_file_number);
+  ASSERT_NE(source, nullptr);
+  ASSERT_GE(source->GetGarbageBlobBytes(),
+            source->GetTotalBlobBytes() - source->GetGarbageBlobBytes());
+  source.reset();
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  const BlobRelocationRoute* const route = storage->GetBlobRelocationRoute(
+      BlobRelocationRouteSource{origin_file_number, origin_file_number});
+  ASSERT_NE(route, nullptr);
+  ASSERT_NE(
+      storage->GetBlobRelocationFileMetaData(route->GetPhysicalFileNumber()),
+      nullptr);
+  ASSERT_NE(storage->GetBlobFileMetaData(older_file_number), nullptr);
+  ASSERT_EQ(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    std::string ignored;
+    ASSERT_TRUE(db_->Get(ReadOptions(), keys[i], &ignored).IsNotFound());
+  }
+  ASSERT_EQ(Get(keys.back()), values.back());
+  ASSERT_EQ(Get("older"), std::string(4096, 'o'));
+
+  // The historical addition for the retired source precedes its authorized
+  // retirement in MANIFEST replay. Verify recovery accepts that source as
+  // intentionally absent even while an older normal blob root remains live.
+  const std::string source_path =
+      BlobFileName(cfd->ioptions().cf_paths.front().path, origin_file_number);
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_TRUE(options.env->FileExists(source_path).IsNotFound());
+  Reopen(options);
+  ASSERT_EQ(Get(keys.back()), values.back());
+  ASSERT_EQ(Get("older"), std::string(4096, 'o'));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobFileMetaData(older_file_number), nullptr);
+  ASSERT_EQ(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  ASSERT_NE(storage->GetBlobRelocationRoute(BlobRelocationRouteSource{
+                origin_file_number, origin_file_number}),
+            nullptr);
+
+  // Legacy compaction garbage metering still sees the stable identity's
+  // origin number. Once the normal source is retired, that approximate delta
+  // must be an idempotent no-op rather than failing the compaction.
+  ASSERT_OK(Delete(keys.back()));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  std::string ignored;
+  ASSERT_TRUE(db_->Get(ReadOptions(), keys.back(), &ignored).IsNotFound());
+  ASSERT_OK(Put("post_gc", "still writable"));
+  ASSERT_OK(Flush());
+
+  Reopen(options);
+  ASSERT_EQ(Get("post_gc"), "still writable");
+}
+
+namespace {
+// Sends every compaction back to local execution. With a separate remote
+// compaction pool, background compactions still start on remote coordinator
+// threads.
+class LocalOnlyCompactionService : public CompactionService {
+ public:
+  const char* Name() const override { return "LocalOnlyCompactionService"; }
+  CompactionServiceScheduleResponse Schedule(
+      const CompactionServiceJobInfo& /*info*/,
+      const std::string& /*compaction_service_input*/) override {
+    return CompactionServiceScheduleResponse(
+        CompactionServiceJobStatus::kUseLocal);
+  }
+  CompactionServiceJobStatus Wait(const std::string& /*scheduled_job_id*/,
+                                  std::string* /*result*/) override {
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+};
+}  // namespace
+
+TEST_F(DBBlobBasicTest, StandaloneBlobGCRunsAsLocalWorkWithSeparateRemotePool) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.compaction_service = std::make_shared<LocalOnlyCompactionService>();
+  options.use_separate_remote_compaction_pool = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+  Reopen(options);
+
+  ASSERT_OK(Put("older", std::string(4096, 'o')));
+  ASSERT_OK(Flush());
+  const std::array<std::string, 4> keys{{"key0", "key1", "key2", "key3"}};
+  for (const std::string& key : keys) {
+    ASSERT_OK(Put(key, std::string(4096, key.back())));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 2U);
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .back()
+                                          ->GetBlobFileNumber();
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  std::mutex threads_mutex;
+  std::set<std::thread::id> local_work_threads;
+  std::atomic<int> gc_output_phases{0};
+  std::atomic<int> gc_output_phases_in_local_work{0};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::BGWorkLocalCompaction:Start", [&](void*) {
+    std::lock_guard<std::mutex> lock(threads_mutex);
+    local_work_threads.insert(std::this_thread::get_id());
+  });
+  sync_point->SetCallBack("DBImpl::BGWorkLocalCompaction:Finished", [&](void*) {
+    std::lock_guard<std::mutex> lock(threads_mutex);
+    local_work_threads.erase(std::this_thread::get_id());
+  });
+  sync_point->SetCallBack(
+      "DBImpl::RunStandaloneBlobGC:AfterLiveSet", [&](void*) {
+        ++gc_output_phases;
+        std::lock_guard<std::mutex> lock(threads_mutex);
+        if (local_work_threads.count(std::this_thread::get_id()) != 0) {
+          ++gc_output_phases_in_local_work;
+        }
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  // GC data work runs in the LOW pool under a local compaction credit, not on
+  // the remote coordinator thread.
+  ASSERT_GT(gc_output_phases.load(), 0);
+  ASSERT_EQ(gc_output_phases_in_local_work.load(), gc_output_phases.load());
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobRelocationRoute(BlobRelocationRouteSource{
+                origin_file_number, origin_file_number}),
+            nullptr);
+  ASSERT_EQ(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  ASSERT_EQ(Get(keys.back()), std::string(4096, keys.back().back()));
+}
+
+TEST_F(DBBlobBasicTest, StandaloneBlobGCCorruptionIsCandidateLocal) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  ASSERT_OK(Put("dead1", std::string(4096, 'a')));
+  ASSERT_OK(Put("dead2", std::string(4096, 'b')));
+  ASSERT_OK(Put("dead3", std::string(4096, 'c')));
+  ASSERT_OK(Put("live", std::string(4096, 'd')));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .front()
+                                          ->GetBlobFileNumber();
+
+  ASSERT_OK(Delete("dead1"));
+  ASSERT_OK(Delete("dead2"));
+  ASSERT_OK(Delete("dead3"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::RunStandaloneBlobGC:AfterLiveSet",
+                          [](void* argument) {
+                            *static_cast<Status*>(argument) =
+                                Status::Corruption("injected candidate fault");
+                          });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  ASSERT_EQ(storage->GetBlobRelocationRoute(BlobRelocationRouteSource{
+                origin_file_number, origin_file_number}),
+            nullptr);
+  ASSERT_EQ(Get("live"), std::string(4096, 'd'));
+  ASSERT_OK(Put("after", "still writable"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get("after"), "still writable");
+}
+
+TEST_F(DBBlobBasicTest, StandaloneBlobGCOutputCorruptionIsBackgroundError) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  ASSERT_OK(Put("dead1", std::string(4096, 'a')));
+  ASSERT_OK(Put("dead2", std::string(4096, 'b')));
+  ASSERT_OK(Put("dead3", std::string(4096, 'c')));
+  ASSERT_OK(Put("live", std::string(4096, 'd')));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .front()
+                                          ->GetBlobFileNumber();
+
+  ASSERT_OK(Delete("dead1"));
+  ASSERT_OK(Delete("dead2"));
+  ASSERT_OK(Delete("dead3"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::RunStandaloneBlobGC:AfterOutputWork",
+                          [](void* argument) {
+                            *static_cast<Status*>(argument) =
+                                Status::Corruption("injected output fault");
+                          });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  const Status wait_status = dbfull()->TEST_WaitForCompact();
+  ASSERT_TRUE(wait_status.IsCorruption()) << wait_status.ToString();
+  const Status background_error = dbfull()->TEST_GetBGError();
+  ASSERT_TRUE(background_error.IsCorruption()) << background_error.ToString();
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  ASSERT_EQ(storage->GetBlobRelocationRoute(BlobRelocationRouteSource{
+                origin_file_number, origin_file_number}),
+            nullptr);
+  ASSERT_EQ(Get("live"), std::string(4096, 'd'));
+}
+
+TEST_F(DBBlobBasicTest, StandaloneBlobGCMixedReadErrorIsBackgroundError) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i),
+                  std::string(4096, static_cast<char>('a' + i))));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .front()
+                                          ->GetBlobFileNumber();
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete("key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "BlobFileReader::MultiGetStoredBlobsForRelocation:TamperWithResult",
+      [](void* argument) {
+        auto* requests = static_cast<std::vector<FSReadRequest>*>(argument);
+        ASSERT_GE(requests->size(), 2U);
+        (*requests)[0].status =
+            IOStatus::Corruption("injected candidate-local read fault");
+        (*requests)[1].status =
+            IOStatus::IOError("injected external read fault");
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  const Status wait_status = dbfull()->TEST_WaitForCompact();
+  ASSERT_TRUE(wait_status.IsIOError()) << wait_status.ToString();
+  const Status background_error = dbfull()->TEST_GetBGError();
+  ASSERT_TRUE(background_error.IsIOError()) << background_error.ToString();
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  ASSERT_EQ(storage->GetBlobRelocationRoute(BlobRelocationRouteSource{
+                origin_file_number, origin_file_number}),
+            nullptr);
+}
+
+TEST_F(DBBlobBasicTest,
+       StandaloneBlobGCOutputCorruptionPrecedesSourceCorruption) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i),
+                  std::string(4096, static_cast<char>('a' + i))));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .front()
+                                          ->GetBlobFileNumber();
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete("key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "BlobFileReader::MultiGetStoredBlobsForRelocation:TamperWithResult",
+      [](void* argument) {
+        auto* requests = static_cast<std::vector<FSReadRequest>*>(argument);
+        ASSERT_GE(requests->size(), 2U);
+        (*requests)[1].status =
+            IOStatus::Corruption("injected source-record fault");
+      });
+  sync_point->SetCallBack(
+      "DBImpl::RunStandaloneBlobGC:AfterAddBlobRelocation", [](void* argument) {
+        *static_cast<Status*>(argument) =
+            Status::Corruption("injected output-format fault");
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  const Status wait_status = dbfull()->TEST_WaitForCompact();
+  ASSERT_TRUE(wait_status.IsCorruption()) << wait_status.ToString();
+  const Status background_error = dbfull()->TEST_GetBGError();
+  ASSERT_TRUE(background_error.IsCorruption()) << background_error.ToString();
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  ASSERT_EQ(storage->GetBlobRelocationRoute(BlobRelocationRouteSource{
+                origin_file_number, origin_file_number}),
+            nullptr);
 }
 
 TEST_F(DBBlobBasicTest, BlobReferenceCensusCatchesDeletionDuringInitialScan) {

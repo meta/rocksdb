@@ -62,6 +62,7 @@
 #include <cinttypes>
 
 #include "db/blob/blob_reference_metadata.h"
+#include "db/blob/blob_relocation_file.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
@@ -73,6 +74,7 @@
 #include "db/version_edit.h"
 #include "db/write_batch_internal.h"
 #include "file/filename.h"
+#include "file/random_access_file_reader.h"
 #include "file/writable_file_writer.h"
 #include "logging/logging.h"
 #include "options/cf_options.h"
@@ -81,6 +83,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
 #include "rocksdb/write_buffer_manager.h"
+#include "table/meta_blocks.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
 #include "util/string_util.h"
@@ -285,6 +288,7 @@ class Repairer {
   InstrumentedMutex mutex_;
 
   std::vector<std::string> manifests_;
+  std::vector<std::string> blob_feature_probe_paths_;
   std::vector<FileDescriptor> table_fds_;
   std::vector<uint64_t> logs_;
   std::vector<TableInfo> tables_;
@@ -402,6 +406,51 @@ class Repairer {
         }
       }
     }
+    for (const std::string& path : blob_feature_probe_paths_) {
+      uint64_t size = 0;
+      Status status = env_->GetFileSize(path, &size);
+      if (!status.ok()) {
+        continue;
+      }
+      std::unique_ptr<RandomAccessFileReader> reader;
+      status = RandomAccessFileReader::Create(env_->GetFileSystem(), path,
+                                              file_options_, &reader, nullptr);
+      if (!status.ok()) {
+        continue;
+      }
+      char scratch[kBlobRelocationFilePrefixSize];
+      Slice prefix;
+      status = reader->Read(0, sizeof(scratch), IOOptions(), &prefix, scratch,
+                            nullptr);
+      if (!status.ok() || prefix != Slice(kBlobRelocationFilePrefix,
+                                          kBlobRelocationFilePrefixSize)) {
+        continue;
+      }
+      // A basename or prefix alone is not enough. Require a validated,
+      // engine-owned relocation directory from the checksummed table metadata.
+      std::unique_ptr<TableProperties> properties;
+      ReadOptions read_options;
+      read_options.fill_cache = false;
+      status = ReadTableProperties(reader.get(), size,
+                                   kBlockBasedTableMagicNumber, default_iopts_,
+                                   read_options, &properties, nullptr, nullptr);
+      if (!status.ok()) {
+        continue;
+      }
+      const auto directory = properties->user_collected_properties.find(
+          kBlobRelocationDirectoryPropertyName);
+      if (directory == properties->user_collected_properties.end()) {
+        continue;
+      }
+      BlobRelocationDirectory decoded;
+      status = BlobRelocationDirectory::DecodeFrom(directory->second, &decoded);
+      if (status.ok()) {
+        status = decoded.ValidateForFileSize(size);
+      }
+      if (status.ok()) {
+        return UnsupportedBlobIndirectionRepair();
+      }
+    }
     return Status::OK();
   }
 
@@ -446,6 +495,9 @@ class Repairer {
             } else if (type == kTableFile) {
               table_fds_.emplace_back(number, static_cast<uint32_t>(path_id),
                                       0);
+            } else if (type == kBlobFile) {
+              blob_feature_probe_paths_.push_back(to_search_paths[path_id] +
+                                                  "/" + filenames[i]);
             } else {
               // Ignore other files
             }

@@ -40,6 +40,7 @@
 #include "util/aligned_buffer.h"
 #include "util/cast_util.h"
 #include "util/compression.h"
+#include "util/crc32c.h"
 #include "util/stop_watch.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -978,6 +979,251 @@ Status BlobFileReader::GetBlobRange(const ReadOptions& read_options,
   }
 
   return Status::OK();
+}
+
+Status BlobFileReader::GetStoredBlobForRelocation(
+    const ReadOptions& read_options, uint64_t offset,
+    uint64_t stored_value_size, CompressionType compression_type,
+    uint32_t stable_checksum_version, uint32_t stable_checksum,
+    uint64_t max_stored_value_size, uint64_t max_logical_value_size,
+    std::string* stored_payload, uint64_t* bytes_read) const {
+  Status status;
+  StoredBlobRelocationReadRequest request{
+      offset,           stored_value_size,
+      compression_type, stable_checksum_version,
+      stable_checksum,  stored_payload,
+      &status};
+  MultiGetStoredBlobsForRelocation(read_options, 1, &request,
+                                   max_stored_value_size,
+                                   max_logical_value_size, bytes_read);
+  return status;
+}
+
+void BlobFileReader::MultiGetStoredBlobsForRelocation(
+    const ReadOptions& read_options, size_t num_requests,
+    StoredBlobRelocationReadRequest* requests, uint64_t max_stored_value_size,
+    uint64_t max_logical_value_size, uint64_t* bytes_read) const {
+  if (bytes_read != nullptr) {
+    *bytes_read = 0;
+  }
+  if (num_requests == 0) {
+    return;
+  }
+  if (requests == nullptr) {
+    return;
+  }
+  assert(num_requests <= MultiGetContext::MAX_BATCH_SIZE);
+
+  std::vector<FSReadRequest> read_requests;
+  std::vector<size_t> request_indexes;
+  read_requests.reserve(num_requests);
+  request_indexes.reserve(num_requests);
+  uint64_t total_read_size = 0;
+  for (size_t i = 0; i < num_requests; ++i) {
+    StoredBlobRelocationReadRequest& request = requests[i];
+    if (request.status == nullptr) {
+      continue;
+    }
+    Status& request_status = *request.status;
+    request_status = Status::OK();
+    if (request.stored_payload != nullptr) {
+      request.stored_payload->clear();
+    }
+    if (IsRelocationFile()) {
+      request_status = Status::InvalidArgument(
+          "Normal stored-blob read used on a relocation file");
+      continue;
+    }
+    if (!BlobIndex::IsSupportedStableChecksumVersion(
+            request.stable_checksum_version)) {
+      request_status =
+          Status::NotSupported("Unsupported stable blob checksum version");
+      continue;
+    }
+    if (request.stored_value_size > max_stored_value_size) {
+      request_status =
+          Status::MemoryLimit("Stored blob exceeds relocation read limit");
+      continue;
+    }
+    if (request.stored_value_size > std::numeric_limits<size_t>::max() ||
+        !IsValidBlobOffset(request.offset, /*key_size=*/0,
+                           request.stored_value_size, file_size_,
+                           has_footer_)) {
+      request_status =
+          Status::Corruption("Invalid stored blob relocation range");
+      continue;
+    }
+    if (request.compression != compression_type_) {
+      request_status =
+          Status::Corruption("Compression type mismatch when relocating blob");
+      continue;
+    }
+    if (!request_indexes.empty()) {
+      assert(requests[request_indexes.back()].offset <= request.offset);
+    }
+    if (request.stored_value_size >
+        std::numeric_limits<uint64_t>::max() - total_read_size) {
+      request_status = Status::Corruption("Stored blob read size overflow");
+      continue;
+    }
+    total_read_size += request.stored_value_size;
+    FSReadRequest read_request;
+    read_request.offset = request.offset;
+    read_request.len = static_cast<size_t>(request.stored_value_size);
+    read_requests.emplace_back(std::move(read_request));
+    request_indexes.push_back(i);
+  }
+
+  if (read_requests.empty()) {
+    return;
+  }
+  if (total_read_size > std::numeric_limits<size_t>::max()) {
+    for (size_t index : request_indexes) {
+      assert(requests[index].status != nullptr);
+      Status& request_status = *requests[index].status;
+      request_status =
+          Status::MemoryLimit("Stored blob read batch is too large");
+    }
+    return;
+  }
+
+  RecordTick(statistics_, BLOB_DB_BLOB_FILE_BYTES_READ, total_read_size);
+  Buffer buffer;
+  AlignedBuffer direct_io_buffer;
+  if (file_reader_->use_direct_io()) {
+    for (FSReadRequest& request : read_requests) {
+      request.scratch = nullptr;
+    }
+  } else {
+    buffer.reset(new char[static_cast<size_t>(total_read_size)]);
+    size_t position = 0;
+    for (FSReadRequest& request : read_requests) {
+      request.scratch = buffer.get() + position;
+      position += request.len;
+    }
+  }
+
+  // SyncPoint's singleton has process lifetime.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT(
+      "BlobFileReader::MultiGetStoredBlobsForRelocation:ReadFromFile");
+  PERF_COUNTER_ADD(blob_read_count, read_requests.size());
+  PERF_COUNTER_ADD(blob_read_byte, total_read_size);
+  PERF_TIMER_GUARD(blob_read_time);
+  IOOptions io_options;
+  IODebugContext debug_context;
+  Status status =
+      file_reader_->PrepareIOOptions(read_options, io_options, &debug_context);
+  if (status.ok()) {
+    AlignedBufferAllocationContext direct_io_context{&direct_io_buffer};
+    status = file_reader_->MultiRead(io_options, read_requests.data(),
+                                     read_requests.size(), &direct_io_context,
+                                     &debug_context);
+  }
+  if (!status.ok()) {
+    for (FSReadRequest& request : read_requests) {
+      request.status.PermitUncheckedError();
+    }
+    for (size_t index : request_indexes) {
+      assert(requests[index].status != nullptr);
+      Status& request_status = *requests[index].status;
+      request_status = status;
+    }
+    return;
+  }
+
+  // SyncPoint's singleton has process lifetime.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT_CALLBACK(
+      "BlobFileReader::MultiGetStoredBlobsForRelocation:TamperWithResult",
+      &read_requests);
+  uint64_t successful_bytes = 0;
+  for (size_t i = 0; i < read_requests.size(); ++i) {
+    StoredBlobRelocationReadRequest& request = requests[request_indexes[i]];
+    assert(request.status != nullptr);
+    Status& request_status = *request.status;
+    FSReadRequest& read_request = read_requests[i];
+    request_status = read_request.status;
+    if (!request_status.ok()) {
+      continue;
+    }
+    if (read_request.result.size() != read_request.len) {
+      request_status = Status::Corruption("Incomplete stored blob read from " +
+                                          file_reader_->file_name());
+      continue;
+    }
+    if (request.stable_checksum_version == BlobIndex::kStableChecksumVersion2) {
+      if (BlobIndex::ComputeStoredChecksum(read_request.result,
+                                           request.compression) !=
+          request.stored_checksum) {
+        request_status = Status::Corruption(
+            "Stored checksum mismatch while relocating blob");
+        continue;
+      }
+      if (request.stored_payload != nullptr) {
+        request.stored_payload->assign(read_request.result.data(),
+                                       read_request.result.size());
+      }
+      successful_bytes += read_request.result.size();
+      continue;
+    }
+    // Only experimental checksum-v1 files need logical-value materialization.
+    uint32_t actual_stable_checksum = 0;
+    if (request.compression == kNoCompression) {
+      if (read_request.result.size() > max_logical_value_size) {
+        request_status =
+            Status::MemoryLimit("Logical blob exceeds relocation read limit");
+        continue;
+      }
+      actual_stable_checksum =
+          crc32c::Value(read_request.result.data(), read_request.result.size());
+    } else {
+      if (decompressor_ == nullptr) {
+        request_status = Status::Corruption("Missing blob decompressor");
+        continue;
+      }
+      Decompressor::Args args;
+      args.compression_type = request.compression;
+      args.compressed_data = read_request.result;
+      Status size_status = decompressor_->ExtractUncompressedSize(args);
+      if (!size_status.ok()) {
+        request_status = Status::Corruption(size_status.ToString());
+        continue;
+      }
+      if (args.uncompressed_size > max_logical_value_size) {
+        request_status =
+            Status::MemoryLimit("Logical blob exceeds relocation read limit");
+        continue;
+      }
+      std::unique_ptr<BlobContents> logical_value;
+      request_status = UncompressBlobContentsIfNeeded(
+          read_request.result, request.compression, decompressor_.get(),
+          /*allocator=*/nullptr, clock_, statistics_, &logical_value);
+      if (!request_status.ok()) {
+        continue;
+      }
+      if (logical_value == nullptr) {
+        request_status = Status::Corruption(
+            "Missing logical value while relocating compressed blob");
+        continue;
+      }
+      actual_stable_checksum =
+          crc32c::Value(logical_value->data().data(), logical_value->size());
+    }
+    if (actual_stable_checksum != request.stable_checksum) {
+      request_status =
+          Status::Corruption("Stable checksum mismatch while relocating blob");
+      continue;
+    }
+    if (request.stored_payload != nullptr) {
+      request.stored_payload->assign(read_request.result.data(),
+                                     read_request.result.size());
+    }
+    successful_bytes += read_request.result.size();
+  }
+  if (bytes_read != nullptr) {
+    *bytes_read = successful_bytes;
+  }
 }
 
 void BlobFileReader::MultiGetBlob(

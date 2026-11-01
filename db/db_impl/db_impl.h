@@ -3227,6 +3227,11 @@ class DBImpl : public DB
   bool EnoughRoomForCompaction(ColumnFamilyData* cfd,
                                const std::vector<CompactionInputFiles>& inputs,
                                bool* sfm_bookkeeping, LogBuffer* log_buffer);
+  Status RunStandaloneBlobGC(
+      ColumnFamilyData* cfd,
+      const std::shared_ptr<BlobFileMetaData>& source_metadata,
+      bool* made_progress, uint64_t* sfm_reserved_bytes,
+      bool* retryable_stale_input, LogBuffer* log_buffer, int job_id);
 
   // Request compaction tasks token from compaction thread limiter.
   // It always succeeds if force = true or limiter is disable.
@@ -4015,6 +4020,10 @@ class DBImpl : public DB
   // Number of compaction service jobs currently waiting in
   // CompactionService::Wait(), counted per executed subcompaction.
   std::atomic<int> num_running_remote_compactions_ = 0;
+
+  // Prevents duplicate standalone rewrites of one identity root. Protected by
+  // mutex_.
+  std::set<std::pair<uint32_t, uint64_t>> standalone_blob_gcs_in_progress_;
 
   // number of background memtable flush jobs, submitted to the HIGH pool
   int bg_flush_scheduled_ = 0;

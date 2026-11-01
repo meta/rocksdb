@@ -7644,7 +7644,8 @@ Status VersionSet::ValidateAndTrackPhysicalFileOwnership(
       !edit.GetBlobRelocationFileAdditions().empty() ||
       !edit.GetBlobRelocationFileDeletions().empty() ||
       !edit.GetBlobRelocationRoutes().empty() ||
-      !edit.GetBlobRelocationRouteDeletions().empty();
+      !edit.GetBlobRelocationRouteDeletions().empty() ||
+      !edit.GetBlobFileRetirements().empty();
   if (enforce_uniqueness && deferred_conflict_state) {
     return Status::Corruption(
         "Physical file number has conflicting ownership before format "
@@ -7713,6 +7714,14 @@ Status VersionSet::ValidateAndTrackPhysicalFileOwnership(
       return status;
     }
   }
+  for (const BlobFileRetirement& retirement : edit.GetBlobFileRetirements()) {
+    // Exact retirement is validated against the final Version below. Keep the
+    // source claim until that Version proves the normal blob file is absent.
+    Status status = record(retirement.GetSourceFileNumber(), blob_owner, true);
+    if (!status.ok()) {
+      return status;
+    }
+  }
   for (uint64_t file_number : edit.GetBlobRelocationFileDeletions()) {
     Status status = record(file_number, relocation_owner, true);
     if (!status.ok()) {
@@ -7764,8 +7773,7 @@ void VersionSet::MarkRemovedBlobFileOwners(
     if (storage == final_storage.end()) {
       continue;
     }
-    for (const BlobFileGarbage& garbage : edit->GetBlobFileGarbages()) {
-      const uint64_t file_number = garbage.GetBlobFileNumber();
+    const auto mark_final_blob_presence = [&](uint64_t file_number) {
       const PhysicalFileOwner owner{edit->GetColumnFamily(),
                                     PhysicalFileOwnerKind::kBlob};
       const bool present =
@@ -7778,6 +7786,13 @@ void VersionSet::MarkRemovedBlobFileOwners(
           result.first->second.owner.kind == owner.kind) {
         result.first->second.present = present;
       }
+    };
+    for (const BlobFileGarbage& garbage : edit->GetBlobFileGarbages()) {
+      mark_final_blob_presence(garbage.GetBlobFileNumber());
+    }
+    for (const BlobFileRetirement& retirement :
+         edit->GetBlobFileRetirements()) {
+      mark_final_blob_presence(retirement.GetSourceFileNumber());
     }
   }
 }

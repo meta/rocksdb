@@ -9,16 +9,29 @@
 #include <algorithm>
 #include <cinttypes>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <unordered_map>
 
+#include "cache/cache_reservation_manager.h"
+#include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_file_reader.h"
+#include "db/blob/blob_index.h"
+#include "db/blob/blob_log_format.h"
+#include "db/blob/blob_reference_census.h"
+#include "db/blob/blob_relocation_file.h"
+#include "db/blob/blob_relocation_gc.h"
+#include "db/blob/blob_relocation_manifest.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "file/file_util.h"
+#include "file/filename.h"
+#include "file/read_write_util.h"
 #include "file/sst_file_manager_impl.h"
+#include "file/writable_file_writer.h"
 #include "logging/logging.h"
 #include "monitoring/iostats_context_imp.h"
 #include "monitoring/perf_context_imp.h"
@@ -29,6 +42,10 @@
 #include "rocksdb/io_status.h"
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
+#include "table/adaptive/adaptive_table_factory.h"
+#include "table/block_based/block_based_table_factory.h"
+#include "table/embedded_blob_sst.h"
+#include "table/table_builder.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
@@ -39,6 +56,10 @@
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
+
+constexpr uint64_t kStandaloneBlobGCAbortCheckMask = (1 << 10) - 1;
+constexpr uint64_t kStandaloneBlobGCReadBatchBytes = 8 * 1024 * 1024;
+constexpr uint64_t kStandaloneBlobGCMaxLogicalValueBytes = 64 * 1024 * 1024;
 
 void RecordAtomicFlushRequestReason(Statistics* stats,
                                     FlushReason flush_reason) {
@@ -72,6 +93,696 @@ std::vector<uint64_t> MemTableIds(const autovector<ReadOnlyMemTable*>& mems) {
 }
 
 }  // namespace
+
+Status DBImpl::RunStandaloneBlobGC(
+    ColumnFamilyData* cfd,
+    const std::shared_ptr<BlobFileMetaData>& source_metadata,
+    bool* made_progress, uint64_t* sfm_reserved_bytes,
+    bool* retryable_stale_input, LogBuffer* log_buffer, int job_id) {
+  mutex_.AssertHeld();
+  assert(cfd != nullptr);
+  assert(source_metadata != nullptr);
+  assert(made_progress != nullptr);
+  assert(sfm_reserved_bytes != nullptr);
+  assert(retryable_stale_input != nullptr);
+  assert(*sfm_reserved_bytes == 0);
+  *retryable_stale_input = false;
+
+  const auto stale_input = [&](const char* message) {
+    *retryable_stale_input = true;
+    return Status::TryAgain(message);
+  };
+
+  const uint64_t origin_file_number = source_metadata->GetBlobFileNumber();
+  if (!source_metadata->IsIdentityRoot() ||
+      origin_file_number == kInvalidBlobFileNumber ||
+      source_metadata->GetTotalBlobCount() == 0 ||
+      source_metadata->GetGarbageBlobCount() >
+          source_metadata->GetTotalBlobCount() ||
+      source_metadata->GetGarbageBlobBytes() >
+          source_metadata->GetTotalBlobBytes()) {
+    return Status::Corruption("Invalid standalone blob GC candidate");
+  }
+
+  const auto source_is_current = [&]() {
+    mutex_.AssertHeld();
+    if (cfd->IsDropped()) {
+      return false;
+    }
+    VersionStorageInfo* const current_storage = cfd->current()->storage_info();
+    const std::shared_ptr<BlobFileMetaData> current_metadata =
+        current_storage->GetBlobFileMetaData(origin_file_number);
+    const BlobRelocationRouteSource source{origin_file_number,
+                                           origin_file_number};
+    return current_metadata != nullptr && current_metadata->IsIdentityRoot() &&
+           current_metadata->GetSharedMeta() ==
+               source_metadata->GetSharedMeta() &&
+           current_metadata->GetGarbageBlobCount() ==
+               source_metadata->GetGarbageBlobCount() &&
+           current_metadata->GetGarbageBlobBytes() ==
+               source_metadata->GetGarbageBlobBytes() &&
+           current_storage->GetBlobRelocationRoute(source) == nullptr;
+  };
+  if (!source_is_current()) {
+    return stale_input("Standalone blob GC source changed");
+  }
+
+  BlobReferenceCensus* const blob_reference_census =
+      cfd->blob_reference_census();
+  if (blob_reference_census == nullptr) {
+    return stale_input("Blob reference census is unavailable");
+  }
+
+  Version* const input_version = cfd->current();
+  input_version->Ref();
+  const uint64_t input_version_number = input_version->GetVersionNumber();
+  std::shared_ptr<const BlobReferenceCensusState> census;
+  if (!blob_reference_census->IsReady(input_version_number)) {
+    Version* detached = nullptr;
+    if (input_version->UnrefAndTryDetach()) {
+      detached = input_version;
+    }
+    mutex_.Unlock();
+    if (detached != nullptr) {
+      detached->DeleteDetached();
+    }
+    mutex_.Lock();
+    return stale_input("Blob reference census is not ready");
+  }
+
+  MutableCFOptions mutable_cf_options = input_version->GetMutableCFOptions();
+  const FileOptions blob_gc_file_options = file_options_for_compaction_;
+  const std::string output_directory = cfd->ioptions().cf_paths.front().path;
+  const uint64_t output_file_number = versions_->NewFileNumber();
+  const std::string output_path =
+      BlobFileName(output_directory, output_file_number);
+  const std::string temporary_output_path =
+      TempFileName(output_directory, output_file_number);
+  const ReadOptions read_options(Env::IOActivity::kCompaction);
+  ReadOptions gc_read_options(read_options);
+  gc_read_options.fill_cache = false;
+  gc_read_options.rate_limiter_priority = Env::IO_LOW;
+  const WriteOptions write_options(Env::IO_LOW, Env::IOActivity::kCompaction);
+  Status sfm_background_error = error_handler_.GetBGError();
+
+  const auto interrupted = [&]() -> Status {
+    if (shutting_down_.load(std::memory_order_acquire)) {
+      return Status::ShutdownInProgress();
+    }
+    if (IsCompactionAborted(cfd)) {
+      return Status::Incomplete(Status::SubCode::kCompactionAborted);
+    }
+    return Status::OK();
+  };
+
+  mutex_.Unlock();
+
+  std::optional<BlockBasedTableOptions> source_table_options;
+  const TableFactory* const table_factory =
+      mutable_cf_options.table_factory.get();
+  if (table_factory != nullptr) {
+    const BlockBasedTableOptions* options =
+        table_factory->GetOptions<BlockBasedTableOptions>();
+    const AdaptiveTableFactory* const adaptive_table_factory =
+        table_factory->CheckedCast<AdaptiveTableFactory>();
+    if (adaptive_table_factory != nullptr) {
+      options = adaptive_table_factory->GetBlockBasedTableWriterOptions();
+    }
+    if (options != nullptr) {
+      source_table_options.emplace(*options);
+    }
+  }
+
+  bool suppress_candidate = !source_table_options.has_value();
+  const char* suppression_reason =
+      suppress_candidate ? "block-based table format is required" : nullptr;
+  std::shared_ptr<CacheReservationManager> reservation_manager;
+  if (source_table_options.has_value()) {
+    const CacheEntryRoleOptions::Decision charged =
+        source_table_options->cache_usage_options.options_overrides
+            .at(CacheEntryRole::kBlobReferenceMetadataBuildingBuffer)
+            .charged;
+    if (source_table_options->block_cache != nullptr &&
+        (charged == CacheEntryRoleOptions::Decision::kEnabled ||
+         charged == CacheEntryRoleOptions::Decision::kFallback)) {
+      reservation_manager = std::make_shared<CacheReservationManagerImpl<
+          CacheEntryRole::kBlobReferenceMetadataBuildingBuffer>>(
+          source_table_options->block_cache);
+    }
+  }
+
+  const BlobRelocationRouteSource source{origin_file_number,
+                                         origin_file_number};
+  BlobRelocationLiveSet live_set(std::move(reservation_manager));
+  enum class CandidateFailure {
+    kNone,
+    kCorruption,
+    kMemoryLimit,
+  };
+  CandidateFailure candidate_failure = CandidateFailure::kNone;
+  Status status = interrupted();
+  if (status.ok() && !suppress_candidate) {
+    // Snapshot only the selected source, without blocking the worker under
+    // DB mutex. A changed census epoch is retried against a fresh Version.
+    status = blob_reference_census->ReadSelectedSnapshot(input_version_number,
+                                                         {source}, &census);
+    if (status.IsTryAgain()) {
+      status = stale_input("Selected blob census epoch changed");
+    }
+  }
+  if (status.ok() && !suppress_candidate) {
+    const std::vector<uint64_t>* const sst_files = census->FindSstFiles(source);
+    if (sst_files != nullptr) {
+      for (size_t i = 0; status.ok() && i < sst_files->size(); ++i) {
+        if ((i & kStandaloneBlobGCAbortCheckMask) == 0) {
+          status = interrupted();
+          if (!status.ok()) {
+            break;
+          }
+        }
+        const uint64_t sst_file_number = (*sst_files)[i];
+        const FileMetaData* const file =
+            input_version->storage_info()->GetFileMetaDataByNumber(
+                sst_file_number);
+        const std::shared_ptr<const BlobReferenceSstSummary> summary =
+            census->FindSstSummary(sst_file_number);
+        if (file == nullptr || summary == nullptr) {
+          status =
+              Status::Corruption("Blob reference census names a missing SST");
+          break;
+        }
+        const BlobReferenceGroup* expected_group = nullptr;
+        for (const BlobReferenceGroup& group : summary->groups) {
+          if (group.encoding_class ==
+                  BlobReferenceEncodingClass::kFeatureIdentity &&
+              group.generation_file_number == origin_file_number &&
+              group.origin_file_number == origin_file_number) {
+            if (expected_group != nullptr) {
+              status = Status::Corruption(
+                  "Duplicate blob reference group in SST summary");
+              break;
+            }
+            expected_group = &group;
+          }
+        }
+        if (!status.ok()) {
+          break;
+        }
+        if (expected_group == nullptr) {
+          status = Status::Corruption(
+              "Blob reference census group is missing from SST summary");
+          break;
+        }
+        if (expected_group->record_bytes == 0) {
+          suppress_candidate = true;
+          suppression_reason =
+              "SST metadata predates exact record-byte accounting";
+          break;
+        }
+        std::vector<BlobReference>* references = nullptr;
+        status = live_set.PrepareAppend(
+            static_cast<size_t>(expected_group->reference_count), &references);
+        if (status.ok()) {
+          status = cfd->table_cache()->ReadBlobReferences(
+              gc_read_options, blob_gc_file_options, cfd->internal_comparator(),
+              *file, mutable_cf_options, *expected_group, references);
+        }
+      }
+    }
+    if (status.ok()) {
+      status = live_set.Finalize(source);
+    }
+  }
+  if (status.IsCorruption()) {
+    candidate_failure = CandidateFailure::kCorruption;
+  }
+
+  const uint64_t total_record_bytes = source_metadata->GetTotalBlobBytes();
+  if (status.IsMemoryLimit()) {
+    suppress_candidate = true;
+    suppression_reason = "exact live set exceeds its memory budget";
+    status = Status::OK();
+    candidate_failure = CandidateFailure::kNone;
+  }
+  if (status.ok() && !suppress_candidate &&
+      live_set.live_record_bytes() > total_record_bytes) {
+    status =
+        Status::Corruption("Exact live bytes exceed blob source record bytes");
+  }
+  if (status.ok() && !suppress_candidate) {
+    const uint64_t garbage_record_bytes =
+        total_record_bytes - live_set.live_record_bytes();
+    if (garbage_record_bytes < live_set.live_record_bytes()) {
+      suppress_candidate = true;
+      suppression_reason = "exact garbage ratio is below 50 percent";
+    }
+  }
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RunStandaloneBlobGC:AfterLiveSet", &status);
+  if (status.IsCorruption()) {
+    candidate_failure = CandidateFailure::kCorruption;
+  }
+
+  std::string checksum_method;
+  std::string checksum_value;
+  BlobRelocationFileMetadata relocation_metadata;
+  uint64_t relocation_file_size = 0;
+  uint64_t relocated_value_bytes = 0;
+  bool creation_started = false;
+  bool temporary_output_created = false;
+  bool output_created = false;
+
+  auto* const sfm = static_cast<SstFileManagerImpl*>(
+      immutable_db_options_.sst_file_manager.get());
+  if (status.ok() && !suppress_candidate && !live_set.references().empty() &&
+      sfm != nullptr) {
+    const bool enough_room =
+        sfm->EnoughRoomForCompaction(source_metadata->GetBlobFileSize(),
+                                     output_directory, sfm_background_error);
+    sfm_background_error.PermitUncheckedError();
+    if (!enough_room) {
+      status = Status::CompactionTooLarge();
+      RecordTick(stats_, COMPACTION_CANCELLED, 1);
+    } else {
+      *sfm_reserved_bytes = source_metadata->GetBlobFileSize();
+    }
+  } else {
+    sfm_background_error.PermitUncheckedError();
+  }
+
+  std::unique_ptr<BlobFileReader> source_reader;
+  if (status.ok() && !suppress_candidate && !live_set.references().empty()) {
+    const BlobFileOpenInfo source_file{origin_file_number,
+                                       source_metadata->GetChecksumValue(),
+                                       source_metadata->GetChecksumMethod()};
+    status = cfd->blob_file_cache()->OpenBlobFileReaderUncached(
+        gc_read_options, source_file, &source_reader,
+        /*allow_footer_skip_retry=*/false);
+    if (status.IsCorruption()) {
+      candidate_failure = CandidateFailure::kCorruption;
+    }
+  }
+
+  std::unique_ptr<WritableFileWriter> file_writer;
+  std::unique_ptr<TableBuilder> table_builder;
+  if (status.ok() && !suppress_candidate && !live_set.references().empty()) {
+    creation_started = true;
+    blob_callback_.OnBlobFileCreationStarted(
+        output_path, cfd->GetName(), job_id,
+        BlobFileCreationReason::kCompaction);
+
+    FileOptions file_options = blob_gc_file_options;
+    file_options.open_contract = FileOpenContract::kNoReopenForWrite |
+                                 FileOpenContract::kNoReadersWhileOpenForWrite;
+    std::unique_ptr<FSWritableFile> file;
+    status =
+        NewWritableFile(fs_.get(), temporary_output_path, &file, file_options);
+    if (status.ok()) {
+      temporary_output_created = true;
+      file->SetIOPriority(write_options.rate_limiter_priority);
+      FileTypeSet checksum_handoff_file_types =
+          immutable_db_options_.checksum_handoff_file_types;
+      file_writer = std::make_unique<WritableFileWriter>(
+          std::move(file), temporary_output_path, file_options,
+          immutable_db_options_.clock, io_tracer_, stats_,
+          Histograms::BLOB_DB_BLOB_FILE_WRITE_MICROS,
+          immutable_db_options_.listeners,
+          immutable_db_options_.file_checksum_gen_factory.get(),
+          checksum_handoff_file_types.Contains(FileType::kBlobFile), false);
+
+      MutableCFOptions relocation_options = mutable_cf_options;
+      relocation_options.enable_blob_indirection = false;
+      relocation_options.prefix_extractor.reset();
+      relocation_options.table_factory =
+          std::make_shared<BlockBasedTableFactory>(
+              MakeBlobRelocationTableOptions(*source_table_options));
+      const InternalKeyComparator relocation_comparator(BytewiseComparator());
+      InternalTblPropCollFactories collectors;
+      CompressionOptions no_compression_options;
+      EmbeddedBlobSstBuilderOptions embedded_options;
+      embedded_options.min_blob_size = 0;
+      TableBuilderOptions builder_options(
+          cfd->ioptions(), relocation_options, gc_read_options, write_options,
+          relocation_comparator, &collectors, kNoCompression,
+          no_compression_options, cfd->GetID(), cfd->GetName(),
+          /*level=*/-1, kUnknownNewestKeyTime,
+          /*is_bottommost=*/false, TableFileCreationReason::kMisc,
+          /*oldest_key_time=*/0, /*file_creation_time=*/0, db_id_,
+          db_session_id_, source_metadata->GetBlobFileSize(),
+          output_file_number, kMaxSequenceNumber, Slice(dbname_),
+          /*is_remote_compaction=*/false, &embedded_options);
+      table_builder.reset(NewTableBuilder(builder_options, file_writer.get()));
+      if (table_builder == nullptr) {
+        status = Status::Corruption("Failed to create blob relocation builder");
+      } else {
+        status = table_builder->StartBlobRelocationFile();
+      }
+    }
+  }
+
+  const std::vector<BlobReference>& live_references = live_set.references();
+  size_t next_reference = 0;
+  while (status.ok() && table_builder != nullptr &&
+         next_reference < live_references.size()) {
+    status = interrupted();
+    if (!status.ok()) {
+      break;
+    }
+    const size_t batch_begin = next_reference;
+    uint64_t batch_bytes = 0;
+    while (next_reference < live_references.size() &&
+           next_reference - batch_begin < MultiGetContext::MAX_BATCH_SIZE) {
+      const uint64_t value_size =
+          live_references[next_reference].stored_value_size;
+      if (value_size > kStandaloneBlobGCReadBatchBytes) {
+        status =
+            Status::MemoryLimit("Stored blob exceeds standalone GC read limit");
+        candidate_failure = CandidateFailure::kMemoryLimit;
+        break;
+      }
+      if (next_reference != batch_begin &&
+          value_size >
+              kStandaloneBlobGCReadBatchBytes -
+                  std::min(batch_bytes, kStandaloneBlobGCReadBatchBytes)) {
+        break;
+      }
+      batch_bytes += value_size;
+      ++next_reference;
+      if (batch_bytes >= kStandaloneBlobGCReadBatchBytes) {
+        break;
+      }
+    }
+    if (!status.ok()) {
+      break;
+    }
+    const size_t batch_size = next_reference - batch_begin;
+    std::vector<std::string> stored_payloads(batch_size);
+    std::vector<Status> read_statuses(batch_size);
+    std::vector<StoredBlobRelocationReadRequest> requests(batch_size);
+    for (size_t i = 0; i < batch_size; ++i) {
+      const BlobReference& reference = live_references[batch_begin + i];
+      requests[i] =
+          StoredBlobRelocationReadRequest{reference.original_value_offset,
+                                          reference.stored_value_size,
+                                          reference.compression,
+                                          reference.stable_checksum_version,
+                                          reference.stable_checksum,
+                                          &stored_payloads[i],
+                                          &read_statuses[i],
+                                          reference.stored_checksum};
+    }
+    uint64_t bytes_read = 0;
+    source_reader->MultiGetStoredBlobsForRelocation(
+        gc_read_options, requests.size(), requests.data(),
+        kStandaloneBlobGCReadBatchBytes, kStandaloneBlobGCMaxLogicalValueBytes,
+        &bytes_read);
+    (void)bytes_read;
+    for (size_t i = 0; i < batch_size; ++i) {
+      if (!read_statuses[i].ok()) {
+        const bool candidate_local_failure =
+            read_statuses[i].IsCorruption() || read_statuses[i].IsMemoryLimit();
+        // MultiRead can report a distinct status for every request while its
+        // aggregate status remains OK. A candidate-local failure must not
+        // mask a later I/O or API failure from the same batch, since only the
+        // former is safe to suppress without entering normal background-error
+        // handling.
+        if (status.ok() ||
+            (!candidate_local_failure &&
+             (status.IsCorruption() || status.IsMemoryLimit()))) {
+          status = read_statuses[i];
+          if (status.IsCorruption()) {
+            candidate_failure = CandidateFailure::kCorruption;
+          } else if (status.IsMemoryLimit()) {
+            candidate_failure = CandidateFailure::kMemoryLimit;
+          } else {
+            candidate_failure = CandidateFailure::kNone;
+          }
+        }
+        continue;
+      }
+      if (!status.ok()) {
+        continue;
+      }
+      const BlobReference& reference = live_references[batch_begin + i];
+      status = table_builder->AddBlobRelocation(
+          reference.origin_file_number, reference.original_value_offset,
+          stored_payloads[i], reference.compression);
+      TEST_SYNC_POINT_CALLBACK(
+          "DBImpl::RunStandaloneBlobGC:AfterAddBlobRelocation", &status);
+      if (status.ok()) {
+        if (reference.stored_value_size >
+            std::numeric_limits<uint64_t>::max() - relocated_value_bytes) {
+          status = Status::Corruption("Relocated blob byte count overflow");
+        } else {
+          relocated_value_bytes += reference.stored_value_size;
+        }
+      }
+    }
+  }
+
+  if (table_builder != nullptr) {
+    if (status.ok()) {
+      status = table_builder->Finish();
+      relocation_file_size = table_builder->FileSize();
+      if (status.ok()) {
+        status =
+            table_builder->GetBlobRelocationFileMetadata(&relocation_metadata);
+      }
+    } else {
+      table_builder->Abandon();
+    }
+    IOStatus builder_io_status = table_builder->io_status();
+    if (status.ok() && !builder_io_status.ok()) {
+      status = builder_io_status;
+    } else {
+      builder_io_status.PermitUncheckedError();
+    }
+    table_builder.reset();
+  }
+
+  if (file_writer != nullptr) {
+    IOOptions io_options;
+    if (status.ok()) {
+      status = WritableFileWriter::PrepareIOOptions(write_options, io_options);
+    }
+    if (status.ok()) {
+      status = immutable_db_options_.use_fsync ? file_writer->Fsync(io_options)
+                                               : file_writer->Sync(io_options);
+    }
+    IOStatus close_status = file_writer->Close(io_options);
+    if (status.ok() && !close_status.ok()) {
+      status = close_status;
+    } else {
+      close_status.PermitUncheckedError();
+    }
+    if (status.ok()) {
+      checksum_value = file_writer->GetFileChecksum();
+      checksum_method = file_writer->GetFileChecksumFuncName();
+      if (checksum_value == kUnknownFileChecksum) {
+        checksum_value.clear();
+      }
+      if (checksum_method == kUnknownFileChecksumFuncName) {
+        checksum_method.clear();
+      }
+      if (checksum_method.empty() != checksum_value.empty()) {
+        status = Status::Corruption(
+            "Incomplete blob relocation file checksum metadata");
+      }
+    }
+    file_writer.reset();
+  }
+
+  if (status.ok() && temporary_output_created) {
+    if (relocation_file_size >= source_metadata->GetBlobFileSize()) {
+      suppress_candidate = true;
+      suppression_reason = "relocation output would not reclaim bytes";
+    } else {
+      IOOptions io_options;
+      status = fs_->RenameFile(temporary_output_path, output_path, io_options,
+                               /*dbg=*/nullptr);
+      if (status.ok()) {
+        temporary_output_created = false;
+        output_created = true;
+        status = GetDataDir(cfd, 0)->FsyncWithDirOptions(
+            IOOptions(), nullptr,
+            DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
+      }
+    }
+  }
+
+  if (creation_started) {
+    Status callback_input_status =
+        suppress_candidate && status.ok()
+            ? Status::TryAgain("Blob relocation output did not shrink")
+            : status;
+    const Status completion_status = blob_callback_.OnBlobFileCompleted(
+        output_path, cfd->GetName(), job_id, output_file_number,
+        BlobFileCreationReason::kCompaction, callback_input_status,
+        checksum_value, checksum_method, live_references.size(),
+        relocation_file_size, /*set_bg_error_on_space_limit=*/true);
+    callback_input_status.PermitUncheckedError();
+    if (status.ok() && !suppress_candidate) {
+      status = completion_status;
+    } else {
+      completion_status.PermitUncheckedError();
+    }
+  }
+
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RunStandaloneBlobGC:AfterOutputWork",
+                           &status);
+
+  source_reader.reset();
+  const size_t live_reference_count = live_references.size();
+  const uint64_t live_record_bytes = live_set.live_record_bytes();
+  Status release_status = live_set.ReleaseWorkingMemory();
+  if (status.ok() && !release_status.ok()) {
+    status = release_status;
+  } else {
+    release_status.PermitUncheckedError();
+  }
+  census.reset();
+
+  if (creation_started && (!status.ok() || suppress_candidate)) {
+    // NewWritableFile/RenameFile are allowed to report an error after their
+    // side effect. Both names are unique to this unpublished file number, so
+    // probe/delete both rather than trusting success-only bookkeeping flags.
+    DeleteObsoleteFileImpl(job_id, temporary_output_path, output_directory,
+                           kTempFile, output_file_number);
+    DeleteObsoleteFileImpl(job_id, output_path, output_directory, kBlobFile,
+                           output_file_number);
+    temporary_output_created = false;
+    output_created = false;
+  } else if (temporary_output_created) {
+    DeleteObsoleteFileImpl(job_id, temporary_output_path, output_directory,
+                           kTempFile, output_file_number);
+    temporary_output_created = false;
+  }
+
+  mutex_.Lock();
+  Version* detached_input_version = nullptr;
+  if (input_version->UnrefAndTryDetach()) {
+    detached_input_version = input_version;
+  }
+  if (detached_input_version != nullptr) {
+    mutex_.Unlock();
+    detached_input_version->DeleteDetached();
+    mutex_.Lock();
+  }
+
+  const auto delete_unpublished_output = [&]() {
+    mutex_.AssertHeld();
+    if (!output_created) {
+      return;
+    }
+    mutex_.Unlock();
+    DeleteObsoleteFileImpl(job_id, output_path, output_directory, kBlobFile,
+                           output_file_number);
+    mutex_.Lock();
+    output_created = false;
+  };
+
+  // Exact SST metadata or source-record corruption is local to this GC
+  // candidate. Fail closed by leaving the source and its existing route state
+  // untouched, suppressing the current hint, and allowing normal background
+  // work to continue. I/O and MANIFEST errors retain their ordinary DB-wide
+  // handling below.
+  if (status.IsCorruption() &&
+      candidate_failure == CandidateFailure::kCorruption) {
+    suppress_candidate = true;
+    suppression_reason = "exact metadata or blob source is corrupt";
+    status = Status::OK();
+  }
+  if (status.IsMemoryLimit() &&
+      candidate_failure == CandidateFailure::kMemoryLimit) {
+    suppress_candidate = true;
+    suppression_reason = "blob value exceeds standalone GC memory budget";
+    status = Status::OK();
+  }
+
+  if (!status.ok()) {
+    return status;
+  }
+  if (suppress_candidate) {
+    // Suppression is derived from the exact SST metadata in input_version.
+    // A concurrent Version can preserve the source counters while replacing
+    // v1 metadata with v2 metadata that makes the candidate eligible, so do
+    // not carry an old decision into a newer Version.
+    if (cfd->current()->GetVersionNumber() != input_version_number ||
+        !source_is_current()) {
+      return stale_input("Standalone blob GC source changed");
+    }
+    VersionStorageInfo* const current_storage = cfd->current()->storage_info();
+    current_storage->SuppressBlobFileForStandaloneGC(origin_file_number);
+    if (current_storage->BlobPhysicalFileForStandaloneGC() != 0) {
+      EnqueuePendingCompaction(cfd);
+    }
+    ROCKS_LOG_BUFFER(
+        log_buffer, "[%s] Standalone blob GC skipped file #%" PRIu64 ": %s",
+        cfd->GetName().c_str(), origin_file_number, suppression_reason);
+    return Status::OK();
+  }
+  status = interrupted();
+  if (!status.ok()) {
+    delete_unpublished_output();
+    return status;
+  }
+  if (!source_is_current()) {
+    delete_unpublished_output();
+    return stale_input("Standalone blob GC source changed");
+  }
+
+  VersionEdit edit;
+  edit.SetColumnFamily(cfd->GetID());
+  if (output_created) {
+    edit.AddBlobRelocationFile(BlobRelocationFileAddition(
+        output_file_number, cfd->GetID(), relocation_file_size,
+        std::move(checksum_method), std::move(checksum_value),
+        std::move(relocation_metadata.encoded_directory),
+        relocation_metadata.tail_size));
+    edit.SetBlobRelocationRoute(BlobRelocationRoute(
+        origin_file_number, origin_file_number, output_file_number));
+  }
+  edit.RetireBlobFile(BlobFileRetirement(
+      origin_file_number, live_reference_count, live_record_bytes,
+      output_created ? relocation_metadata.record_bytes : 0));
+
+  SuperVersionContext superversion_context(/*create_superversion=*/true);
+  status = versions_->LogAndApply(
+      cfd, read_options, write_options, &edit, &mutex_, directories_.GetDbDir(),
+      /*new_descriptor_log=*/false,
+      /*column_family_options=*/nullptr,
+      /*manifest_wcb=*/{}, [&]() {
+        if (source_is_current()) {
+          return Status::OK();
+        }
+        return stale_input("Standalone blob GC source changed");
+      });
+  if (status.ok()) {
+    InstallSuperVersionAndScheduleWork(cfd, &superversion_context,
+                                       /*defer_snapshot_refresh=*/false);
+    *made_progress = true;
+    RecordTick(stats_, BLOB_DB_GC_NUM_KEYS_RELOCATED, live_reference_count);
+    RecordTick(stats_, BLOB_DB_GC_BYTES_RELOCATED, relocated_value_bytes);
+    ROCKS_LOG_BUFFER(log_buffer,
+                     "[%s] Standalone blob GC relocated file #%" PRIu64
+                     " into #%" PRIu64 " (%" ROCKSDB_PRIszt " live blobs)",
+                     cfd->GetName().c_str(), origin_file_number,
+                     output_created ? output_file_number : 0,
+                     live_reference_count);
+  }
+  mutex_.Unlock();
+  superversion_context.Clean();
+  mutex_.Lock();
+
+  if (!status.ok() && output_created) {
+    const autovector<uint64_t>& quarantined =
+        error_handler_.GetFilesToQuarantine();
+    if (std::find(quarantined.begin(), quarantined.end(), output_file_number) ==
+        quarantined.end()) {
+      delete_unpublished_output();
+    }
+  }
+  return status;
+}
 
 bool DBImpl::EnoughRoomForCompaction(
     ColumnFamilyData* cfd, const std::vector<CompactionInputFiles>& inputs,
@@ -5267,6 +5978,21 @@ Status DBImpl::BackgroundCompaction(
       EndInFlightCompaction(in_flight_cfd);
     }
   });
+  std::shared_ptr<BlobFileMetaData> standalone_blob_gc_source;
+  std::shared_ptr<SharedBlobFileMetaData> standalone_blob_gc_shared_meta;
+  Defer release_standalone_blob_gc_metadata([&]() {
+    if (standalone_blob_gc_source == nullptr &&
+        standalone_blob_gc_shared_meta == nullptr) {
+      return;
+    }
+    // BlobFileMetaData can own a large linked-SST set. Destroy its local
+    // reference outside the DB mutex, while keeping SharedBlobFileMetaData's
+    // mutex-required deleter protected.
+    mutex_.Unlock();
+    standalone_blob_gc_source.reset();
+    mutex_.Lock();
+    standalone_blob_gc_shared_meta.reset();
+  });
   if (c != nullptr) {
     in_flight_cfd = c->column_family_data();
     BeginInFlightCompaction(in_flight_cfd);
@@ -5349,6 +6075,14 @@ Status DBImpl::BackgroundCompaction(
   std::unique_ptr<TaskLimiterToken> task_token;
 
   bool sfm_reserved_compact_space = false;
+  uint64_t sfm_reserved_blob_gc_bytes = 0;
+  bool ran_standalone_blob_gc = false;
+  bool standalone_blob_gc_stale_input = false;
+  ColumnFamilyData* standalone_blob_gc_cfd = nullptr;
+  IOStatus io_s;
+  // Several pre-pick paths return before any I/O status exists. Assignments
+  // below replace this permitted default and are checked before returning.
+  io_s.PermitUncheckedError();
   if (is_manual) {
     ManualCompactionState* m = manual_compaction;
     assert(m->in_progress);
@@ -5527,15 +6261,83 @@ Status DBImpl::BackgroundCompaction(
             "but upon re-evaluation, no compaction was found necessary \n",
             cfd->GetName().c_str());
       }
+
+      // Ordinary LSM compaction has priority. Only a normal low-priority
+      // worker that found no LSM compaction may consume the standalone blob GC
+      // hint. Exact eligibility is revalidated by RunStandaloneBlobGC().
+      if (status.ok() && c == nullptr && !is_prepicked &&
+          thread_pri == Env::Priority::LOW &&
+          mutable_cf_options.enable_blob_files &&
+          mutable_cf_options.enable_blob_garbage_collection &&
+          mutable_cf_options.enable_blob_indirection &&
+          cfd->blob_reference_census() != nullptr &&
+          cfd->blob_reference_census()->IsReady(
+              cfd->current()->GetVersionNumber())) {
+        VersionStorageInfo* const storage = cfd->current()->storage_info();
+        const std::shared_ptr<BlobFileMetaData> candidate =
+            storage->GetBlobFileMetaData(
+                storage->BlobPhysicalFileForStandaloneGC());
+        if (candidate != nullptr) {
+          const std::pair<uint32_t, uint64_t> gc_key{
+              cfd->GetID(), candidate->GetBlobFileNumber()};
+          if (standalone_blob_gcs_in_progress_.insert(gc_key).second) {
+            standalone_blob_gc_shared_meta = candidate->GetSharedMeta();
+            standalone_blob_gc_source = candidate;
+            standalone_blob_gc_cfd = cfd;
+            ran_standalone_blob_gc = true;
+            if (in_flight_cfd == nullptr) {
+              in_flight_cfd = cfd;
+              BeginInFlightCompaction(in_flight_cfd);
+            }
+            // With a separate remote compaction pool this thread is a remote
+            // coordinator. GC then runs as local work: it waits for a local
+            // compaction credit, is counted in bg_compaction_scheduled_, and
+            // runs in the LOW pool. If the work never starts, GC never began.
+            const auto run_standalone_blob_gc_job =
+                [&](const std::function<Status()>& gc) {
+                  if (!separate_remote_pool) {
+                    return gc();
+                  }
+                  const std::atomic<bool> never_canceled{false};
+                  bool gc_ran = false;
+                  Status gc_status;
+                  mutex_.Unlock();
+                  Status local_status = RunLocalCompaction(
+                      [&]() {
+                        InstrumentedMutexLock gc_lock(&mutex_);
+                        gc_ran = true;
+                        gc_status = gc();
+                      },
+                      Env::Priority::LOW, cfd, never_canceled,
+                      /*is_manual=*/false);
+                  mutex_.Lock();
+                  if (gc_ran) {
+                    local_status.PermitUncheckedError();
+                    return gc_status;
+                  }
+                  return local_status;
+                };
+            status = run_standalone_blob_gc_job([&]() {
+              return RunStandaloneBlobGC(
+                  cfd, standalone_blob_gc_source, made_progress,
+                  &sfm_reserved_blob_gc_bytes, &standalone_blob_gc_stale_input,
+                  log_buffer, job_context->job_id);
+            });
+            io_s = versions_->io_status();
+            standalone_blob_gcs_in_progress_.erase(gc_key);
+          }
+        }
+      }
     }
   }
 
-  IOStatus io_s;
   bool compaction_released = false;
   if (c) {
     c->SetUseSeparateRemoteCompactionPool(separate_remote_pool);
   }
-  if (!c) {
+  if (ran_standalone_blob_gc) {
+    // RunStandaloneBlobGC() completed the work and returned with mutex_ held.
+  } else if (!c) {
     // Nothing to do
     ROCKS_LOG_BUFFER(log_buffer, "Compaction nothing to do");
   } else if (c->deletion_compaction()) {
@@ -5899,9 +6701,37 @@ Status DBImpl::BackgroundCompaction(
                                 compaction_job_stats, job_context->job_id);
   }
 
+  if (sfm_reserved_blob_gc_bytes != 0) {
+    auto* const sfm = static_cast<SstFileManagerImpl*>(
+        immutable_db_options_.sst_file_manager.get());
+    assert(sfm != nullptr);
+    sfm->OnCompactionCompletion(sfm_reserved_blob_gc_bytes);
+  }
+
+  const auto retry_standalone_blob_gc = [&]() {
+    if (standalone_blob_gc_cfd != nullptr &&
+        !standalone_blob_gc_cfd->IsDropped() &&
+        !error_handler_.IsBGWorkStopped()) {
+      const int unscheduled_before_retry = unscheduled_compactions_;
+      EnqueuePendingCompaction(standalone_blob_gc_cfd);
+      if (separate_remote_pool &&
+          unscheduled_compactions_ > unscheduled_before_retry) {
+        --unscheduled_compactions_;
+        restore_compaction_credit();
+      }
+    }
+  };
+
   if (status.ok() || status.IsCompactionTooLarge() ||
       status.IsManualCompactionPaused() || status.IsCompactionAborted()) {
+    if (status.IsCompactionTooLarge() || status.IsCompactionAborted()) {
+      retry_standalone_blob_gc();
+    }
     // Done
+  } else if (status.IsTryAgain() && ran_standalone_blob_gc &&
+             standalone_blob_gc_stale_input) {
+    retry_standalone_blob_gc();
+    status = Status::Busy("Standalone blob GC input changed");
   } else if (status.IsColumnFamilyDropped() || status.IsShutdownInProgress()) {
     // Ignore compaction errors found during shutting down
   } else {
@@ -5940,6 +6770,8 @@ Status DBImpl::BackgroundCompaction(
         --unscheduled_compactions_;
         restore_compaction_credit();
       }
+    } else if (ran_standalone_blob_gc) {
+      retry_standalone_blob_gc();
     }
   }
   // this will unref its input_version and column_family_data

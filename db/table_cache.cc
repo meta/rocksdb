@@ -895,6 +895,41 @@ Status TableCache::ReadBlobReferenceSstSummary(
   return Status::OK();
 }
 
+Status TableCache::ReadBlobReferences(
+    const ReadOptions& read_options, const FileOptions& file_options,
+    const InternalKeyComparator& internal_comparator,
+    const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+    const BlobReferenceGroup& group, std::vector<BlobReference>* references) {
+  if (file_meta.blob_reference_descriptor.empty()) {
+    return Status::InvalidArgument(
+        "SST does not require exact blob reference metadata");
+  }
+
+  TableCacheOpenOptions open_options;
+  open_options.open_ephemeral_table_reader = true;
+  open_options.avoid_shared_metadata_cache = true;
+  open_options.skip_filters = true;
+  std::unique_ptr<TableReader> reader_owner;
+  TableReader* reader = nullptr;
+  TypedHandle* handle = nullptr;
+  Status status =
+      FindTable(read_options, file_options, internal_comparator, file_meta,
+                &handle, mutable_cf_options, &reader, false /* no_io */,
+                nullptr /* histogram */, true /* skip_filters */,
+                -1 /* level */, false /* prefetch_index_and_filter_in_cache */,
+                0 /* max_file_size_for_l0_meta_pin */, file_meta.temperature,
+                false /* pin_table_handle */, nullptr /* file_open_metadata */,
+                &reader_owner, open_options);
+  assert(handle == nullptr);
+  if (!status.ok()) {
+    return status;
+  }
+  assert(reader != nullptr);
+  assert(reader_owner != nullptr);
+  return reader->ReadBlobReferences(
+      read_options, file_meta.blob_reference_descriptor, group, references);
+}
+
 Status TableCache::ApproximateKeyAnchors(
     const ReadOptions& ro, const InternalKeyComparator& internal_comparator,
     const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,

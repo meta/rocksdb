@@ -2684,6 +2684,13 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
           const std::unordered_map<uint64_t, BlobFileState>::const_iterator
               blob_file = blob_files.find(blob_file_number);
           if (blob_file == blob_files.end()) {
+            // Legacy garbage metering can see a stable identity whose normal
+            // source was retired by exact standalone GC. Its identity route
+            // proves the source is gone on purpose, so the delta is a no-op.
+            if (storage_info->GetBlobRelocationRoute(BlobRelocationRouteSource{
+                    blob_file_number, blob_file_number}) != nullptr) {
+              continue;
+            }
             return Status::Corruption(
                 "Compaction produced garbage for an unknown blob file");
           }

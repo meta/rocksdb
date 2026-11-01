@@ -7,6 +7,7 @@
 
 #include <cinttypes>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "db/blob/blob_read_request.h"
@@ -30,6 +31,17 @@ class BlobContents;
 class Statistics;
 class BlobIndex;
 struct BlockBasedTableOptions;
+
+struct StoredBlobRelocationReadRequest {
+  uint64_t offset = 0;
+  uint64_t stored_value_size = 0;
+  CompressionType compression = kNoCompression;
+  uint32_t stable_checksum_version = 0;
+  uint32_t stable_checksum = 0;
+  std::string* stored_payload = nullptr;
+  Status* status = nullptr;
+  uint32_t stored_checksum = 0;
+};
 
 class BlobFileReader {
  public:
@@ -121,6 +133,24 @@ class BlobFileReader {
                       MemoryAllocator* allocator,
                       std::unique_ptr<BlobContents>* result,
                       uint64_t* bytes_read) const;
+
+  // Reads the exact stored payload bytes of a normal identity-root record,
+  // verifies them by decompressing and checking the stable logical checksum,
+  // and returns the still-compressed representation for relocation. The user
+  // key is intentionally unnecessary because stable integrity is carried by
+  // the feature BlobIndex.
+  Status GetStoredBlobForRelocation(
+      const ReadOptions& read_options, uint64_t offset,
+      uint64_t stored_value_size, CompressionType compression_type,
+      uint32_t stable_checksum_version, uint32_t stable_checksum,
+      uint64_t max_stored_value_size, uint64_t max_logical_value_size,
+      std::string* stored_payload, uint64_t* bytes_read) const;
+
+  // Bounded MultiRead counterpart. Requests must be sorted by offset.
+  void MultiGetStoredBlobsForRelocation(
+      const ReadOptions& read_options, size_t num_requests,
+      StoredBlobRelocationReadRequest* requests, uint64_t max_stored_value_size,
+      uint64_t max_logical_value_size, uint64_t* bytes_read) const;
 
   // offsets must be sorted in ascending order by caller.
   void MultiGetBlob(

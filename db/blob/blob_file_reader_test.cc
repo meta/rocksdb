@@ -16,6 +16,7 @@
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_writer.h"
 #include "db/blob/blob_relocation_file.h"
+#include "db/blob/blob_relocation_gc.h"
 #include "db/blob/blob_source.h"
 #include "db/dbformat.h"
 #include "env/composite_env_wrapper.h"
@@ -296,6 +297,50 @@ TEST(BlobRelocationDirectoryTest, ValidatesOrderingAndChecksums) {
                                     &original_value_offset));
   EXPECT_EQ(origin_file_number, 10U);
   EXPECT_EQ(original_value_offset, 99U);
+}
+
+TEST(BlobRelocationLiveSetTest, DeduplicatesAndRejectsConflicts) {
+  const auto make_reference = [](uint64_t offset, uint64_t stored_value_size,
+                                 uint64_t record_bytes,
+                                 uint32_t stable_checksum) {
+    BlobReference reference;
+    reference.encoding_class = BlobReferenceEncodingClass::kFeatureIdentity;
+    reference.generation_file_number = 10;
+    reference.origin_file_number = 10;
+    reference.original_value_offset = offset;
+    reference.stored_value_size = stored_value_size;
+    reference.record_bytes = record_bytes;
+    reference.compression = kNoCompression;
+    reference.stable_checksum_version = BlobIndex::kStableChecksumVersion1;
+    reference.stable_checksum = stable_checksum;
+    return reference;
+  };
+
+  const BlobReference first = make_reference(/*offset=*/100,
+                                             /*stored_value_size=*/20,
+                                             /*record_bytes=*/40,
+                                             /*stable_checksum=*/1);
+  const BlobReference second = make_reference(/*offset=*/200,
+                                              /*stored_value_size=*/30,
+                                              /*record_bytes=*/50,
+                                              /*stable_checksum=*/2);
+  BlobRelocationLiveSet live_set(/*cache_reservation_manager=*/nullptr);
+  ASSERT_OK(live_set.Add({second, first}));
+  ASSERT_OK(live_set.Add({first}));
+  ASSERT_OK(live_set.Finalize(BlobRelocationRouteSource{10, 10}));
+  ASSERT_EQ(live_set.references().size(), 2U);
+  EXPECT_EQ(live_set.references()[0].original_value_offset, 100U);
+  EXPECT_EQ(live_set.references()[1].original_value_offset, 200U);
+  EXPECT_EQ(live_set.live_stored_value_bytes(), 50U);
+  EXPECT_EQ(live_set.live_record_bytes(), 90U);
+
+  BlobReference conflict = first;
+  ++conflict.stable_checksum;
+  BlobRelocationLiveSet conflicting_set(
+      /*cache_reservation_manager=*/nullptr);
+  ASSERT_OK(conflicting_set.Add({first, conflict}));
+  ASSERT_TRUE(conflicting_set.Finalize(BlobRelocationRouteSource{10, 10})
+                  .IsCorruption());
 }
 
 class BlobFileReaderTest : public testing::Test {
@@ -1265,6 +1310,85 @@ TEST_F(BlobFileReaderTest, CreateReaderAndGetBlob) {
       }
     }
   }
+}
+
+TEST_F(BlobFileReaderTest,
+       MultiGetStoredBlobsForRelocationPreservesCompressedBytes) {
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(
+          mock_env_.get(),
+          "BlobFileReaderTest_MultiGetStoredBlobsForRelocation"),
+      0);
+  options.enable_blob_files = true;
+  const ImmutableOptions immutable_options(options);
+
+  constexpr uint32_t column_family_id = 1;
+  constexpr uint64_t blob_file_number = 1;
+  constexpr ExpirationRange expiration_range;
+  const std::array<std::string, 3> key_strings{{"key1", "key2", "key3"}};
+  const std::array<std::string, 3> blob_strings{
+      {std::string(4096, 'a'), std::string(4096, 'b'), std::string(4096, 'c')}};
+  const std::vector<Slice> keys{key_strings[0], key_strings[1], key_strings[2]};
+  const std::vector<Slice> blobs{blob_strings[0], blob_strings[1],
+                                 blob_strings[2]};
+  std::vector<uint64_t> blob_offsets(keys.size());
+  std::vector<uint64_t> blob_sizes(keys.size());
+  WriteBlobFile(immutable_options, column_family_id,
+                /*has_ttl=*/false, expiration_range, expiration_range,
+                blob_file_number, keys, blobs, kZSTD, blob_offsets, blob_sizes);
+
+  std::unique_ptr<BlobFileReader> reader;
+  const ReadOptions read_options;
+  ASSERT_OK(BlobFileReader::Create(
+      immutable_options, read_options, FileOptions(), column_family_id,
+      /*blob_file_read_hist=*/nullptr, blob_file_number, nullptr /*IOTracer*/,
+      &reader));
+
+  std::array<std::string, 3> stored_payloads;
+  std::array<Status, 3> statuses;
+  std::array<StoredBlobRelocationReadRequest, 3> requests;
+  for (size_t i = 0; i < requests.size(); ++i) {
+    requests[i] = StoredBlobRelocationReadRequest{
+        blob_offsets[i],
+        blob_sizes[i],
+        kZSTD,
+        BlobIndex::kStableChecksumVersion1,
+        crc32c::Value(blob_strings[i].data(), blob_strings[i].size()),
+        &stored_payloads[i],
+        &statuses[i]};
+  }
+  ++requests.back().stable_checksum;
+
+  uint64_t bytes_read = 0;
+  reader->MultiGetStoredBlobsForRelocation(
+      read_options, requests.size(), requests.data(),
+      /*max_stored_value_size=*/1 << 20,
+      /*max_logical_value_size=*/1 << 20, &bytes_read);
+  ASSERT_OK(statuses[0]);
+  ASSERT_OK(statuses[1]);
+  ASSERT_TRUE(statuses[2].IsCorruption());
+  EXPECT_EQ(stored_payloads[0].size(), blob_sizes[0]);
+  EXPECT_EQ(stored_payloads[1].size(), blob_sizes[1]);
+  EXPECT_TRUE(stored_payloads[2].empty());
+  EXPECT_NE(stored_payloads[0], blob_strings[0]);
+  EXPECT_EQ(bytes_read, blob_sizes[0] + blob_sizes[1]);
+
+  --requests.back().stable_checksum;
+  for (std::string& payload : stored_payloads) {
+    payload.clear();
+  }
+  bytes_read = 0;
+  reader->MultiGetStoredBlobsForRelocation(
+      read_options, requests.size(), requests.data(),
+      /*max_stored_value_size=*/1 << 20,
+      /*max_logical_value_size=*/1024, &bytes_read);
+  for (size_t i = 0; i < requests.size(); ++i) {
+    EXPECT_TRUE(statuses[i].IsMemoryLimit());
+    EXPECT_TRUE(stored_payloads[i].empty());
+  }
+  EXPECT_EQ(bytes_read, 0U);
 }
 
 // Verifies Create() prefers the file size reported by the opened handle over a

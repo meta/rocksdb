@@ -33,6 +33,8 @@
 #include "rocksdb/perf_context.h"
 #include "rocksdb/sst_file_writer.h"
 #include "rocksdb/table.h"
+#include "util/coding.h"
+#include "util/crc32c.h"
 #include "util/defer.h"
 #include "util/string_util.h"
 #include "utilities/merge_operators.h"
@@ -106,6 +108,12 @@ BlobIndex DecodeBlobIndexForTest(const std::string& encoded) {
   BlobIndex blob_index;
   EXPECT_OK(blob_index.DecodeFrom(encoded));
   return blob_index;
+}
+
+void SetFixed32ForTest(std::string* output, size_t offset, uint32_t value) {
+  ASSERT_NE(output, nullptr);
+  ASSERT_LE(offset + sizeof(value), output->size());
+  EncodeFixed32(output->data() + offset, value);
 }
 
 }  // namespace
@@ -346,6 +354,118 @@ TEST(BlobReferenceMetadataTest, CollectSortDeduplicateAndDecode) {
   EXPECT_EQ(references[2].generation_file_number, 99);
   EXPECT_EQ(references[2].origin_file_number, 42);
   EXPECT_EQ(references[2].stable_checksum, 456);
+}
+
+TEST(BlobReferenceMetadataTest, DecodesVersionOneWithoutExactRecordBytes) {
+  constexpr uint32_t kDescriptorMagic = 0x42475244U;
+  constexpr uint32_t kDataBlockMagic = 0x42475242U;
+  constexpr uint32_t kIndexBlockMagic = 0x42475249U;
+  constexpr uint32_t kDirectoryMagic = 0x42475247U;
+  constexpr uint32_t kVersionOne = 1;
+  constexpr uint64_t kDataOffset = 1000;
+  constexpr uint64_t kIndexOffset = 2000;
+  constexpr uint64_t kDirectoryOffset = 3000;
+
+  std::string data_block(16, '\0');
+  SetFixed32ForTest(&data_block, 0, kDataBlockMagic);
+  SetFixed32ForTest(&data_block, 4, kVersionOne);
+  SetFixed32ForTest(&data_block, 8, 1);
+  data_block.push_back(
+      static_cast<char>(BlobReferenceEncodingClass::kFeatureIdentity));
+  PutVarint64(&data_block, 42);
+  PutVarint64(&data_block, 42);
+  PutVarint64(&data_block, 700);
+  PutVarint64(&data_block, 800);
+  data_block.push_back(static_cast<char>(kZSTD));
+  PutVarint32(&data_block, BlobIndex::kStableChecksumVersion1);
+  PutFixed32(&data_block, 123);
+  SetFixed32ForTest(
+      &data_block, 12,
+      crc32c::Value(data_block.data() + 16, data_block.size() - 16));
+  const uint32_t data_block_digest =
+      crc32c::Value(data_block.data(), data_block.size());
+
+  std::string index_block(12, '\0');
+  SetFixed32ForTest(&index_block, 0, kIndexBlockMagic);
+  SetFixed32ForTest(&index_block, 4, kVersionOne);
+  PutVarint64(&index_block, 1);
+  PutVarint64(&index_block, 1);
+  PutVarint64(&index_block, 800);
+  PutFixed32(&index_block, data_block_digest);
+  PutVarint64(&index_block, kDataOffset);
+  PutVarint64(&index_block, data_block.size());
+  PutVarint64(&index_block, 0);
+  PutVarint64(&index_block, 1);
+  PutFixed32(&index_block, data_block_digest);
+  SetFixed32ForTest(
+      &index_block, 8,
+      crc32c::Value(index_block.data() + 12, index_block.size() - 12));
+
+  std::string directory_block(12, '\0');
+  SetFixed32ForTest(&directory_block, 0, kDirectoryMagic);
+  SetFixed32ForTest(&directory_block, 4, kVersionOne);
+  PutVarint64(&directory_block, 1);
+  directory_block.push_back(
+      static_cast<char>(BlobReferenceEncodingClass::kFeatureIdentity));
+  PutVarint64(&directory_block, 42);
+  PutVarint64(&directory_block, 42);
+  PutVarint64(&directory_block, 0);
+  PutVarint64(&directory_block, 1);
+  PutVarint64(&directory_block, 800);
+  PutVarint64(&directory_block, 0);
+  PutVarint64(&directory_block, 1);
+  PutFixed32(&directory_block, data_block_digest);
+  SetFixed32ForTest(
+      &directory_block, 8,
+      crc32c::Value(directory_block.data() + 12, directory_block.size() - 12));
+
+  BlobReferenceMetadataDescriptor descriptor;
+  descriptor.index_handle = BlockHandle(kIndexOffset, index_block.size());
+  descriptor.directory_handle =
+      BlockHandle(kDirectoryOffset, directory_block.size());
+  descriptor.reference_count = 1;
+  descriptor.group_count = 1;
+  descriptor.stored_value_bytes = 800;
+  descriptor.data_digest = data_block_digest;
+  descriptor.index_digest =
+      crc32c::Value(index_block.data(), index_block.size());
+  descriptor.directory_digest =
+      crc32c::Value(directory_block.data(), directory_block.size());
+  std::string encoded_descriptor;
+  descriptor.EncodeTo(&encoded_descriptor);
+  encoded_descriptor.resize(
+      BlobReferenceMetadataDescriptor::kLegacyEncodedSize);
+  SetFixed32ForTest(&encoded_descriptor, 0, kDescriptorMagic);
+  SetFixed32ForTest(&encoded_descriptor, 4, kVersionOne);
+  SetFixed32ForTest(
+      &encoded_descriptor, encoded_descriptor.size() - sizeof(uint32_t),
+      crc32c::Value(encoded_descriptor.data(),
+                    encoded_descriptor.size() - sizeof(uint32_t)));
+
+  BlobReferenceMetadataDescriptor decoded_descriptor;
+  ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(encoded_descriptor,
+                                                        &decoded_descriptor));
+  EXPECT_EQ(decoded_descriptor.format_version, kVersionOne);
+  EXPECT_FALSE(decoded_descriptor.HasExactRecordBytes());
+
+  std::vector<BlobReferenceBlockIndexEntry> block_index;
+  ASSERT_OK(
+      DecodeBlobReferenceIndex(index_block, decoded_descriptor, &block_index));
+  ASSERT_EQ(block_index.size(), 1U);
+  EXPECT_EQ(block_index.front().format_version, kVersionOne);
+
+  std::vector<BlobReferenceGroup> groups;
+  ASSERT_OK(DecodeBlobReferenceDirectory(directory_block, decoded_descriptor,
+                                         block_index.size(), &groups));
+  ASSERT_EQ(groups.size(), 1U);
+  EXPECT_EQ(groups.front().record_bytes, 0U);
+
+  std::vector<BlobReference> references;
+  ASSERT_OK(DecodeBlobReferenceDataBlock(data_block, block_index.front(),
+                                         &references));
+  ASSERT_EQ(references.size(), 1U);
+  EXPECT_EQ(references.front().record_bytes, 0U);
+  EXPECT_EQ(references.front().stored_value_size, 800U);
 }
 
 TEST(BlobReferenceMetadataTest, SplitsLargeGroupIntoBoundedDataBlocks) {

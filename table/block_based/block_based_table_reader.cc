@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -82,6 +83,7 @@
 #include "test_util/sync_point.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
+#include "util/defer.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 
@@ -2370,6 +2372,154 @@ Status BlockBasedTable::ReadBlobReferenceGroups(
   }
   return DecodeBlobReferenceDirectory(directory_contents.data, descriptor,
                                       block_index.size(), groups);
+}
+
+Status BlockBasedTable::ReadBlobReferences(
+    const ReadOptions& caller_read_options, const Slice& expected_descriptor,
+    const BlobReferenceGroup& expected_group,
+    std::vector<BlobReference>* references) const {
+  if (references == nullptr) {
+    return Status::InvalidArgument("Null blob reference output");
+  }
+  const size_t output_begin = references->size();
+  bool append_succeeded = false;
+  Defer rollback([&]() {
+    if (!append_succeeded) {
+      references->resize(output_begin);
+    }
+  });
+
+  const auto properties = GetTableProperties();
+  if (properties == nullptr) {
+    return Status::Corruption("Missing table properties");
+  }
+  const auto property = properties->user_collected_properties.find(
+      kBlobReferenceDescriptorPropertyName);
+  if (property == properties->user_collected_properties.end()) {
+    return Status::Corruption("Missing required blob reference descriptor");
+  }
+  if (Slice(property->second) != expected_descriptor) {
+    return Status::Corruption("Blob reference descriptor mismatch");
+  }
+
+  BlobReferenceMetadataDescriptor descriptor;
+  Status status = BlobReferenceMetadataDescriptor::DecodeFrom(
+      expected_descriptor, &descriptor);
+  if (!status.ok()) {
+    return status;
+  }
+
+  ReadOptions read_options(caller_read_options);
+  read_options.fill_cache = false;
+  read_options.verify_checksums = true;
+  const auto read_block = [&](const BlockHandle& handle,
+                              BlockContents* contents) -> Status {
+    IOStatus io_status =
+        BlockFetcher(rep_->file.get(), nullptr /* prefetch_buffer */,
+                     rep_->footer, read_options, handle, contents,
+                     rep_->ioptions, false /* do_uncompress */,
+                     false /* maybe_compressed */, BlockType::kUserDefinedIndex,
+                     nullptr /* decompressor */, rep_->persistent_cache_options)
+            .ReadBlockContents();
+    return io_status;
+  };
+
+  BlockContents index_contents;
+  status = read_block(descriptor.index_handle, &index_contents);
+  if (!status.ok()) {
+    return status;
+  }
+  std::vector<BlobReferenceBlockIndexEntry> block_index;
+  status =
+      DecodeBlobReferenceIndex(index_contents.data, descriptor, &block_index);
+  if (!status.ok()) {
+    return status;
+  }
+
+  BlockContents directory_contents;
+  status = read_block(descriptor.directory_handle, &directory_contents);
+  if (!status.ok()) {
+    return status;
+  }
+  std::vector<BlobReferenceGroup> groups;
+  status = DecodeBlobReferenceDirectory(directory_contents.data, descriptor,
+                                        block_index.size(), &groups);
+  if (!status.ok()) {
+    return status;
+  }
+
+  const auto same_group = [](const BlobReferenceGroup& lhs,
+                             const BlobReferenceGroup& rhs) {
+    return std::tie(lhs.encoding_class, lhs.generation_file_number,
+                    lhs.origin_file_number, lhs.first_reference,
+                    lhs.reference_count, lhs.stored_value_bytes,
+                    lhs.record_bytes, lhs.first_block, lhs.block_count,
+                    lhs.digest) ==
+           std::tie(rhs.encoding_class, rhs.generation_file_number,
+                    rhs.origin_file_number, rhs.first_reference,
+                    rhs.reference_count, rhs.stored_value_bytes,
+                    rhs.record_bytes, rhs.first_block, rhs.block_count,
+                    rhs.digest);
+  };
+  const auto group = std::find_if(
+      groups.begin(), groups.end(), [&](const BlobReferenceGroup& candidate) {
+        return same_group(candidate, expected_group);
+      });
+  if (group == groups.end()) {
+    return Status::Corruption("Blob reference group mismatch");
+  }
+  if (group->first_block > block_index.size() ||
+      group->block_count > block_index.size() - group->first_block ||
+      group->reference_count > references->max_size() - output_begin ||
+      group->reference_count > references->capacity() - output_begin) {
+    return Status::Corruption("Blob reference group range overflow");
+  }
+
+  uint32_t digest = 0;
+  for (uint64_t i = 0; i < group->block_count; ++i) {
+    const BlobReferenceBlockIndexEntry& entry =
+        block_index[static_cast<size_t>(group->first_block + i)];
+    const size_t decoded_count = references->size() - output_begin;
+    if (entry.reference_count > group->reference_count - decoded_count) {
+      return Status::Corruption("Blob reference group count mismatch");
+    }
+    BlockContents data_contents;
+    status = read_block(entry.handle, &data_contents);
+    if (!status.ok()) {
+      return status;
+    }
+    digest = crc32c::Extend(digest, data_contents.data.data(),
+                            data_contents.data.size());
+    status =
+        AppendBlobReferenceDataBlock(data_contents.data, entry, references);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  uint64_t stored_value_bytes = 0;
+  uint64_t record_bytes = 0;
+  for (size_t i = output_begin; i < references->size(); ++i) {
+    const BlobReference& reference = (*references)[i];
+    if (reference.encoding_class != group->encoding_class ||
+        reference.generation_file_number != group->generation_file_number ||
+        reference.origin_file_number != group->origin_file_number ||
+        reference.stored_value_size >
+            std::numeric_limits<uint64_t>::max() - stored_value_bytes ||
+        reference.record_bytes >
+            std::numeric_limits<uint64_t>::max() - record_bytes) {
+      return Status::Corruption("Blob reference group contents mismatch");
+    }
+    stored_value_bytes += reference.stored_value_size;
+    record_bytes += reference.record_bytes;
+  }
+  if (references->size() - output_begin != group->reference_count ||
+      stored_value_bytes != group->stored_value_bytes ||
+      record_bytes != group->record_bytes || digest != group->digest) {
+    return Status::Corruption("Blob reference group totals mismatch");
+  }
+  append_succeeded = true;
+  return Status::OK();
 }
 
 const SeqnoToTimeMapping& BlockBasedTable::GetSeqnoToTimeMapping() const {
