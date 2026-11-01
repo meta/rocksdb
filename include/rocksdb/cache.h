@@ -477,34 +477,41 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
 };
 
 // EXPERIMENTAL: the API is subject to change.
-// FIFOCache - A cache using segmented FIFO eviction to stay at or below a set
-// capacity. The cache is sharded to 2^num_shard_bits shards, by hash of the
-// key. The total capacity is divided and evenly assigned to each shard, and
-// each shard has two FIFO queues for evictions: new entries enter probation,
-// and probation victims with enough access frequency are promoted to resident
-// (second-chance) instead of being evicted. Placement is inferred from access
-// frequency: Cache::Priority is ignored. Lookups take no lock; inserts, erases
-// and eviction take a per-shard mutex. Pinned entries are never evicted;
-// eviction sets long-pinned entries aside instead of rescanning them, and a
-// fully-pinned shard evicts nothing. Under kFullChargeCacheMetadata (the
-// default) the slot table also counts against capacity: 64 bytes per slot the
-// table has grown to, 256 bytes per shard at construction, growing with the
-// entries, and shrinking back once the shard is emptied (by EraseUnRefEntries,
-// or by a capacity cut that evicts every entry). A shard needs well over that
-// much capacity to hold any entry. Each shard reserves address space for
-// max(2048, shard capacity / 64) slots of 64 bytes up front, using max_capacity
-// instead of capacity when it is larger, and touches it as the table grows. On
-// Linux the reservation does not count against the commit limit unless
-// vm.overcommit_memory=2; on Windows it is committed up front. If it cannot be
-// reserved, construction aborts, as for HyperClockCache. The table cannot grow
-// past its reservation, which holds about one entry per 107 bytes of reserved
-// capacity: once SetCapacity raises capacity beyond that (about 38x for 4 KiB
-// entries, with the default max_capacity), new keys are also evicted by
-// occupancy. Each shard also keeps one cache line per thread that has used it
-// (allocated 64 threads at a time, for up to 8192 threads), which is not
-// charged against capacity. A thread that finds all 8192 in use (exited
-// threads' lines are reused) takes the shard mutex instead whenever it pins
-// or unpins an entry still in probation.
+// FIFOCache - A cache using segmented FIFO eviction to stay at or below a
+// set capacity. The cache is sharded to 2^num_shard_bits shards, by hash of
+// the key. The total capacity is divided and evenly assigned to each shard,
+// and each shard has two FIFO queues for evictions: new entries enter
+// probation, and probation victims with enough access frequency are promoted
+// to resident (second-chance) instead of being evicted. Keys (not values)
+// recently evicted from probation are remembered, and re-inserting one goes
+// directly to resident. Placement is inferred
+// from access frequency: Cache::Priority is ignored. Lookups take no lock;
+// inserts, erases and eviction take a per-shard mutex. Pinned entries are
+// never evicted; eviction sets long-pinned entries aside instead of
+// rescanning them, and a fully-pinned shard evicts nothing.
+// The memory that remembers recently evicted keys (a few bytes of ring plus
+// 16 bytes of index per ring slot, for a power-of-two ring of up to twice the
+// most keys remembered so far; at most one remembered key per cached entry,
+// or more for a while after entries are erased) is not charged against
+// capacity; it stays at its peak size after SetCapacity lowers capacity.
+// Under kFullChargeCacheMetadata (the default) the slot table also counts
+// against capacity: 64 bytes per slot the table has grown to, 256 bytes
+// per shard at construction, growing with the entries, and shrinking back
+// once the shard is emptied (by EraseUnRefEntries, or by a capacity cut that
+// evicts every entry). A shard needs well over that much capacity to hold any
+// entry. Each shard reserves address space for max(2048, shard capacity / 64)
+// slots of 64 bytes up front, using max_capacity instead of capacity when it is
+// larger, and touches it as the table grows. On Linux the reservation does not
+// count against the commit limit unless vm.overcommit_memory=2; on Windows it
+// is committed up front. If it cannot be reserved, construction aborts, as for
+// HyperClockCache. The table cannot grow past its reservation, which holds
+// about one entry per 107 bytes of reserved capacity: once SetCapacity raises
+// capacity beyond that (about 38x for 4 KiB entries, with the default
+// max_capacity), new keys are also evicted by occupancy. Each shard also keeps
+// one cache line per thread that has used it (allocated 64 threads at a time,
+// for up to 8192 threads), which is not charged against capacity. A thread that
+// finds all 8192 in use (exited threads' lines are reused) takes the shard
+// mutex instead whenever it pins or unpins an entry still in probation.
 //
 // This is an opt-in implementation reached only by constructing it directly
 // (see MakeSharedCache); no option string or tool selects it and it is not
