@@ -62,7 +62,7 @@ namespace ROCKSDB_NAMESPACE {
 // byte, so GC can authenticate and copy compressed bytes without decompression.
 // (*) For kNoCompression the stored CRC is omitted and derived by extending
 // the logical CRC with the compression byte. Experimental checksum v1 contains
-// only the logical CRC. Feature writes currently use v1; v2 is decodable.
+// only the logical CRC and remains readable, but new feature writes use v2.
 //
 // There isn't a kInlined (without TTL) type since we can store it as a plain
 // value (i.e. ValueType::kTypeValue).

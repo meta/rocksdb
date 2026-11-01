@@ -33,40 +33,37 @@ class Slice;
 class BlobLogWriter;
 class IOTracer;
 class BlobFileCompletionCallback;
+class Cache;
 
 class BlobFileBuilder {
  public:
-  BlobFileBuilder(VersionSet* versions, FileSystem* fs,
-                  const ImmutableOptions* immutable_options,
-                  const MutableCFOptions* mutable_cf_options,
-                  const FileOptions* file_options,
-                  const WriteOptions* write_options, std::string db_id,
-                  std::string db_session_id, int job_id,
-                  uint32_t column_family_id,
-                  const std::string& column_family_name,
-                  Env::WriteLifeTimeHint write_hint,
-                  const std::shared_ptr<IOTracer>& io_tracer,
-                  BlobFileCompletionCallback* blob_callback,
-                  BlobFileCreationReason creation_reason,
-                  std::string blob_output_path,
-                  std::vector<std::string>* output_file_paths,
-                  std::vector<BlobFileAddition>* blob_file_additions);
+  BlobFileBuilder(
+      VersionSet* versions, FileSystem* fs,
+      const ImmutableOptions* immutable_options,
+      const MutableCFOptions* mutable_cf_options,
+      std::shared_ptr<Cache> blob_cache, const FileOptions* file_options,
+      const WriteOptions* write_options, std::string db_id,
+      std::string db_session_id, int job_id, uint32_t column_family_id,
+      const std::string& column_family_name, Env::WriteLifeTimeHint write_hint,
+      const std::shared_ptr<IOTracer>& io_tracer,
+      BlobFileCompletionCallback* blob_callback,
+      BlobFileCreationReason creation_reason, std::string blob_output_path,
+      std::vector<std::string>* output_file_paths,
+      std::vector<BlobFileAddition>* blob_file_additions);
 
-  BlobFileBuilder(std::function<uint64_t()> file_number_generator,
-                  FileSystem* fs, const ImmutableOptions* immutable_options,
-                  const MutableCFOptions* mutable_cf_options,
-                  const FileOptions* file_options,
-                  const WriteOptions* write_options, std::string db_id,
-                  std::string db_session_id, int job_id,
-                  uint32_t column_family_id,
-                  const std::string& column_family_name,
-                  Env::WriteLifeTimeHint write_hint,
-                  const std::shared_ptr<IOTracer>& io_tracer,
-                  BlobFileCompletionCallback* blob_callback,
-                  BlobFileCreationReason creation_reason,
-                  std::string blob_output_path,
-                  std::vector<std::string>* output_file_paths,
-                  std::vector<BlobFileAddition>* blob_file_additions);
+  BlobFileBuilder(
+      std::function<uint64_t()> file_number_generator, FileSystem* fs,
+      const ImmutableOptions* immutable_options,
+      const MutableCFOptions* mutable_cf_options,
+      std::shared_ptr<Cache> blob_cache, const FileOptions* file_options,
+      const WriteOptions* write_options, std::string db_id,
+      std::string db_session_id, int job_id, uint32_t column_family_id,
+      const std::string& column_family_name, Env::WriteLifeTimeHint write_hint,
+      const std::shared_ptr<IOTracer>& io_tracer,
+      BlobFileCompletionCallback* blob_callback,
+      BlobFileCreationReason creation_reason, std::string blob_output_path,
+      std::vector<std::string>* output_file_paths,
+      std::vector<BlobFileAddition>* blob_file_additions);
 
   BlobFileBuilder(const BlobFileBuilder&) = delete;
   BlobFileBuilder& operator=(const BlobFileBuilder&) = delete;
@@ -91,11 +88,15 @@ class BlobFileBuilder {
   Status CloseBlobFileIfNeeded();
 
   Status PutBlobIntoCacheIfNeeded(const Slice& blob, uint64_t blob_file_number,
-                                  uint64_t blob_offset) const;
+                                  uint64_t blob_offset,
+                                  uint64_t stored_blob_size,
+                                  uint32_t stable_checksum,
+                                  uint32_t stored_checksum) const;
 
   std::function<uint64_t()> file_number_generator_;
   FileSystem* fs_;
   const ImmutableOptions* immutable_options_;
+  std::shared_ptr<Cache> blob_cache_;
   uint64_t min_blob_size_;
   uint64_t blob_file_size_;
   uint64_t blob_file_writable_file_max_buffer_size_;

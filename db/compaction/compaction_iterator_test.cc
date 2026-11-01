@@ -13,6 +13,7 @@
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_builder.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_source.h"
 #include "db/dbformat.h"
 #include "db/wide/wide_column_serialization.h"
 #include "env/mock_env.h"
@@ -1913,12 +1914,13 @@ class WideColumnEntityBlobExtractionTest : public testing::Test {
 
     BlobFileBuilder blob_file_builder(
         [this]() { return GetNextFileNumber(); }, fs_, &immutable_options,
-        &mutable_cf_options, &file_options, &write_options, "" /*db_id*/,
-        "" /*db_session_id*/, job_id, column_family_id, column_family_name,
-        write_hint, nullptr /*IOTracer*/,
-        nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
-        immutable_options.cf_paths.front().path, &blob_file_paths_,
-        &blob_file_additions_);
+        &mutable_cf_options,
+        GetBlobCacheWithReservation(immutable_options, mutable_cf_options),
+        &file_options, &write_options, "" /*db_id*/, "" /*db_session_id*/,
+        job_id, column_family_id, column_family_name, write_hint,
+        nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
+        BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+        &blob_file_paths_, &blob_file_additions_);
 
     // Set up the input iterator
     const Comparator* cmp = BytewiseComparator();
@@ -2354,10 +2356,11 @@ class WideColumnEntityBlobGCTest : public testing::Test {
     if (min_blob_size < std::numeric_limits<uint64_t>::max()) {
       blob_file_builder = std::make_unique<BlobFileBuilder>(
           [this]() { return GetNextFileNumber(); }, fs_, &immutable_options,
-          &mutable_cf_options, &file_options, &write_options, "" /*db_id*/,
-          "" /*db_session_id*/, job_id, column_family_id, column_family_name,
-          write_hint, nullptr /*IOTracer*/,
-          nullptr /*BlobFileCompletionCallback*/,
+          &mutable_cf_options,
+          GetBlobCacheWithReservation(immutable_options, mutable_cf_options),
+          &file_options, &write_options, "" /*db_id*/, "" /*db_session_id*/,
+          job_id, column_family_id, column_family_name, write_hint,
+          nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
           BlobFileCreationReason::kCompaction,
           immutable_options.cf_paths.front().path, &blob_file_paths_,
           &blob_file_additions_);
