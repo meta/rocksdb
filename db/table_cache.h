@@ -297,6 +297,14 @@ class TableCache {
                             const BlobReferenceGroup& group,
                             std::vector<BlobReference>* references);
 
+  // Opens an ephemeral reader and validates every exact-reference payload
+  // block without inserting table metadata into the shared block cache.
+  Status VerifyBlobReferenceMetadata(
+      const ReadOptions& read_options, const FileOptions& file_options,
+      const InternalKeyComparator& internal_comparator,
+      const FileMetaData& file_meta,
+      const MutableCFOptions& mutable_cf_options);
+
   Status ApproximateKeyAnchors(const ReadOptions& ro,
                                const InternalKeyComparator& internal_comparator,
                                const FileMetaData& file_meta,

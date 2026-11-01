@@ -1620,6 +1620,18 @@ TEST_F(CompactionJobTest, InputSerialization) {
   input.proximal_level = static_cast<int>(rnd.Uniform(8)) - 1;
   input.proximal_output_range_type = static_cast<int>(rnd.Uniform(4));
   input.keep_in_last_level_through_seqno = rnd64.Uniform(UINT64_MAX);
+  input.blob_gc_protocol_version = kBlobGCCompactionServiceProtocolVersion;
+  input.blob_index_format_version = 1;
+  input.blob_reference_metadata_format_version = 2;
+  input.blob_indirection_manifest_format_version = 1;
+  input.blob_relocation_directory_format_version = 1;
+  input.blob_stable_checksum_version = 1;
+  input.blob_repair_metadata_format_version = 0;
+  input.blob_gc_column_family_id = rnd.Uniform(1000) + 1;
+  input.blob_gc_options_fingerprint = rnd64.Uniform(UINT64_MAX);
+  input.blob_relocation_state_fingerprint_high = rnd64.Uniform(UINT64_MAX);
+  input.blob_relocation_state_fingerprint_low = rnd64.Uniform(UINT64_MAX);
+  input.allow_blob_index_flattening = true;
 
   std::string output;
   ASSERT_OK(input.Write(&output));
@@ -1810,6 +1822,19 @@ TEST_F(CompactionJobTest, ResultSerialization) {
   result.stats.is_full_compaction = rnd.OneIn(2);
   result.stats.num_single_del_mismatch = rnd64.Uniform(UINT64_MAX);
   result.stats.num_input_files = 9;
+  result.blob_gc_protocol_version = kBlobGCCompactionServiceProtocolVersion;
+  result.blob_index_format_version = 1;
+  result.blob_reference_metadata_format_version = 2;
+  result.blob_indirection_manifest_format_version = 1;
+  result.blob_relocation_directory_format_version = 1;
+  result.blob_stable_checksum_version = 1;
+  result.blob_repair_metadata_format_version = 0;
+  result.blob_gc_column_family_id = rnd.Uniform(1000) + 1;
+  result.blob_gc_options_fingerprint = rnd64.Uniform(UINT64_MAX);
+  result.blob_relocation_state_fingerprint_high = rnd64.Uniform(UINT64_MAX);
+  result.blob_relocation_state_fingerprint_low = rnd64.Uniform(UINT64_MAX);
+  result.allow_blob_index_flattening = true;
+  result.has_flattened_blob_index = rnd.OneIn(2);
 
   std::string output;
   ASSERT_OK(result.Write(&output));

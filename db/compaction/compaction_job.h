@@ -752,6 +752,22 @@ struct CompactionServiceInput {
   int proximal_output_range_type = 0;
   SequenceNumber keep_in_last_level_through_seqno = 0;
 
+  // Non-zero opts into the feature-aware remote compaction contract. Older
+  // workers ignore these fields and return a zero capability, which makes the
+  // primary fall back locally before importing output.
+  uint32_t blob_gc_protocol_version = 0;
+  uint32_t blob_index_format_version = 0;
+  uint32_t blob_reference_metadata_format_version = 0;
+  uint32_t blob_indirection_manifest_format_version = 0;
+  uint32_t blob_relocation_directory_format_version = 0;
+  uint32_t blob_stable_checksum_version = 0;
+  uint32_t blob_repair_metadata_format_version = 0;
+  uint32_t blob_gc_column_family_id = 0;
+  uint64_t blob_gc_options_fingerprint = 0;
+  uint64_t blob_relocation_state_fingerprint_high = 0;
+  uint64_t blob_relocation_state_fingerprint_low = 0;
+  bool allow_blob_index_flattening = false;
+
   // serialization interface to read and write the object
   static Status Read(const std::string& data_str, CompactionServiceInput* obj);
   Status Write(std::string* output);
@@ -850,6 +866,22 @@ struct CompactionServiceResult {
   // proximal_level_stats
   InternalStats::CompactionStatsFull internal_stats;
 
+  // Echoed feature contract. A feature-aware primary accepts the output only
+  // when every field matches its immutable request.
+  uint32_t blob_gc_protocol_version = 0;
+  uint32_t blob_index_format_version = 0;
+  uint32_t blob_reference_metadata_format_version = 0;
+  uint32_t blob_indirection_manifest_format_version = 0;
+  uint32_t blob_relocation_directory_format_version = 0;
+  uint32_t blob_stable_checksum_version = 0;
+  uint32_t blob_repair_metadata_format_version = 0;
+  uint32_t blob_gc_column_family_id = 0;
+  uint64_t blob_gc_options_fingerprint = 0;
+  uint64_t blob_relocation_state_fingerprint_high = 0;
+  uint64_t blob_relocation_state_fingerprint_low = 0;
+  bool allow_blob_index_flattening = false;
+  bool has_flattened_blob_index = false;
+
   // serialization interface to read and write the object
   static Status Read(const std::string& data_str, CompactionServiceResult* obj);
   Status Write(std::string* output);
@@ -859,6 +891,14 @@ struct CompactionServiceResult {
   bool TEST_Equals(CompactionServiceResult* other, std::string* mismatch);
 #endif  // NDEBUG
 };
+
+inline constexpr uint32_t kBlobGCCompactionServiceProtocolVersion = 1;
+
+uint64_t ComputeBlobGCCompactionServiceOptionsFingerprint(
+    uint32_t column_family_id, uint64_t options_file_number,
+    bool enable_blob_indirection, bool allow_blob_index_flattening,
+    bool enable_blob_garbage_collection,
+    double blob_garbage_collection_age_cutoff);
 
 // CompactionServiceCompactionJob is an read-only compaction job, it takes
 // input information from `compaction_service_input` and put result information
@@ -908,6 +948,14 @@ class CompactionServiceCompactionJob : private CompactionJob {
   std::optional<uint64_t> GetBlobGarbageCollectionCutoffFileNumber()
       const override;
   bool IsRemoteCompaction() const override { return true; }
+  bool AllowBlobIndexFlattening() const override {
+    return compaction_input_.blob_gc_protocol_version ==
+               kBlobGCCompactionServiceProtocolVersion &&
+           compaction_input_.allow_blob_index_flattening;
+  }
+  bool AllowBlobFileCreation() const override {
+    return compaction_input_.blob_gc_protocol_version == 0;
+  }
   // Specific the compaction output path, otherwise it uses default DB path
   const std::string output_path_;
 

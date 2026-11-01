@@ -1379,9 +1379,9 @@ class Version {
 
   const MutableCFOptions& GetMutableCFOptions() { return mutable_cf_options_; }
 
-  // Checks source ownership with the same rules as an indirect read, without
-  // opening the blob file. Used before accepting imported remote exact metadata
-  // and when revalidating moved local compaction targets.
+  // Checks source ownership without opening the blob file. Accepted-loss
+  // targets remain valid for Put-like compaction output, even though a value
+  // read returns NotFound. Used for local and capable-remote publications.
   Status ValidateBlobReferenceSource(
       const BlobRelocationRouteSource& source) const;
 
