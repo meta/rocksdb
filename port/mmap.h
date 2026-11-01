@@ -41,6 +41,14 @@ class MemMapping {
   // back the full mapping.
   static MemMapping AllocateLazyZeroed(size_t length);
 
+  // Like AllocateLazyZeroed, but on Linux the mapping does not count against
+  // the commit limit (MAP_NORESERVE; Linux ignores it under
+  // vm.overcommit_memory=2), so a large reservation of which little is
+  // touched does not inflate committed memory. As with any overcommitted
+  // memory, touching a page when memory is exhausted fails at that point.
+  // Elsewhere the same as AllocateLazyZeroed.
+  static MemMapping AllocateLazyZeroedNoReserve(size_t length);
+
   // No copies
   MemMapping(const MemMapping&) = delete;
   MemMapping& operator=(const MemMapping&) = delete;
@@ -73,7 +81,8 @@ class MemMapping {
   HANDLE page_file_handle_ = NULL;
 #endif  // OS_WIN
 
-  static MemMapping AllocateAnonymous(size_t length, bool huge);
+  static MemMapping AllocateAnonymous(size_t length, bool huge,
+                                      bool no_reserve);
 };
 
 // Simple MemMapping wrapper that presents the memory as an array of T.

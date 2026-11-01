@@ -767,6 +767,7 @@ set(SOURCES
         cache/charged_cache.cc
         cache/clock_cache.cc
         cache/compressed_secondary_cache.cc
+        cache/fifo_cache.cc
         cache/lru_cache.cc
         cache/secondary_cache.cc
         cache/secondary_cache_adapter.cc
@@ -1473,6 +1474,7 @@ if(WITH_TESTS)
         cache/cache_reservation_manager_test.cc
         cache/cache_test.cc
         cache/compressed_secondary_cache_test.cc
+        cache/fifo_cache_test.cc
         cache/lru_cache_test.cc
         cache/tiered_secondary_cache_test.cc
         db/blob/blob_counting_iterator_test.cc
