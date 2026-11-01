@@ -9,24 +9,50 @@
 #include <memory>
 
 #include "db/blob/blob_file_reader.h"
+#include "db/blob/blob_relocation_file.h"
 #include "logging/logging.h"
 #include "options/cf_options.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/table.h"
+#include "table/block_based/block_based_table_factory.h"
 #include "test_util/sync_point.h"
 #include "trace_replay/io_tracer.h"
 #include "util/hash.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-BlobFileCache::BlobFileCache(Cache* cache,
-                             const ImmutableOptions* immutable_options,
-                             const FileOptions* file_options,
-                             uint32_t column_family_id,
-                             HistogramImpl* blob_file_read_hist,
-                             const std::shared_ptr<IOTracer>& io_tracer)
+namespace {
+
+const std::string kEmptyDbSessionId;
+
+Status ValidateCachedReader(const BlobFileReader& reader,
+                            bool expect_relocation, uint32_t column_family_id,
+                            uint64_t expected_file_size,
+                            uint64_t expected_tail_size,
+                            uint32_t expected_directory_digest) {
+  if (reader.IsRelocationFile() != expect_relocation ||
+      (expect_relocation &&
+       (reader.GetRelocationColumnFamilyId() != column_family_id ||
+        reader.GetFileSize() != expected_file_size ||
+        reader.GetRelocationTailSize() != expected_tail_size ||
+        reader.GetRelocationDirectoryDigest() != expected_directory_digest))) {
+    return Status::Corruption("Blob file reader metadata mismatch");
+  }
+  return Status::OK();
+}
+
+}  // namespace
+
+BlobFileCache::BlobFileCache(
+    Cache* cache, const ImmutableOptions* immutable_options,
+    const FileOptions* file_options, uint32_t column_family_id,
+    HistogramImpl* blob_file_read_hist,
+    const std::shared_ptr<IOTracer>& io_tracer,
+    const BlockBasedTableOptions* relocation_file_table_options)
     : cache_(cache),
       mutex_(kNumberOfMutexStripes),
+      stable_cache_admission_mutex_(kNumberOfMutexStripes),
       immutable_options_(immutable_options),
       file_options_(file_options),
       column_family_id_(column_family_id),
@@ -35,12 +61,51 @@ BlobFileCache::BlobFileCache(Cache* cache,
   assert(cache_);
   assert(immutable_options_);
   assert(file_options_);
+  if (relocation_file_table_options != nullptr) {
+    relocation_file_table_options_ = std::make_unique<BlockBasedTableOptions>(
+        *relocation_file_table_options);
+  }
 }
 
 Status BlobFileCache::GetBlobFileReader(
     const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
     CacheHandleGuard<BlobFileReader>* blob_file_reader,
     bool allow_footer_skip_retry) {
+  return GetBlobFileReaderImpl(
+      read_options, blob_file, allow_footer_skip_retry,
+      /*expected_relocation_file_size=*/0,
+      /*expected_directory_digest=*/0, kEmptyDbSessionId,
+      /*compression_manager=*/nullptr,
+      /*block_protection_bytes_per_key=*/0, blob_file_reader);
+}
+
+Status BlobFileCache::GetRelocationFileReader(
+    const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
+    uint64_t expected_file_size, uint32_t expected_directory_digest,
+    const std::string& current_db_session_id,
+    CompressionManager* compression_manager,
+    uint8_t block_protection_bytes_per_key,
+    CacheHandleGuard<BlobFileReader>* blob_file_reader) {
+  if (expected_file_size == 0 || current_db_session_id.empty() ||
+      blob_file.relocation_tail_size == 0 ||
+      blob_file.relocation_tail_size > expected_file_size) {
+    return Status::InvalidArgument("Missing blob relocation file identity");
+  }
+  return GetBlobFileReaderImpl(
+      read_options, blob_file,
+      /*allow_footer_skip_retry=*/false, expected_file_size,
+      expected_directory_digest, current_db_session_id, compression_manager,
+      block_protection_bytes_per_key, blob_file_reader);
+}
+
+Status BlobFileCache::GetBlobFileReaderImpl(
+    const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
+    bool allow_footer_skip_retry, uint64_t expected_relocation_file_size,
+    uint32_t expected_directory_digest,
+    const std::string& current_db_session_id,
+    CompressionManager* compression_manager,
+    uint8_t block_protection_bytes_per_key,
+    CacheHandleGuard<BlobFileReader>* blob_file_reader) {
   assert(blob_file_reader);
   assert(blob_file_reader->IsEmpty());
 
@@ -53,6 +118,16 @@ Status BlobFileCache::GetBlobFileReader(
 
   TypedHandle* handle = cache_.Lookup(key);
   if (handle) {
+    BlobFileReader* const reader = cache_.Value(handle);
+    const bool expect_relocation = expected_relocation_file_size != 0;
+    Status validation = ValidateCachedReader(
+        *reader, expect_relocation, column_family_id_,
+        expected_relocation_file_size, blob_file.relocation_tail_size,
+        expected_directory_digest);
+    if (!validation.ok()) {
+      cache_.Release(handle);
+      return validation;
+    }
     *blob_file_reader = cache_.Guard(handle);
     return Status::OK();
   }
@@ -64,8 +139,23 @@ Status BlobFileCache::GetBlobFileReader(
 
   handle = cache_.Lookup(key);
   if (handle) {
+    BlobFileReader* const reader = cache_.Value(handle);
+    const bool expect_relocation = expected_relocation_file_size != 0;
+    Status validation = ValidateCachedReader(
+        *reader, expect_relocation, column_family_id_,
+        expected_relocation_file_size, blob_file.relocation_tail_size,
+        expected_directory_digest);
+    if (!validation.ok()) {
+      cache_.Release(handle);
+      return validation;
+    }
     *blob_file_reader = cache_.Guard(handle);
     return Status::OK();
+  }
+
+  if (read_options.read_tier == kBlockCacheTier) {
+    return Status::Incomplete(
+        "Cannot open blob file reader: no disk I/O allowed");
   }
 
   assert(immutable_options_);
@@ -76,8 +166,11 @@ Status BlobFileCache::GetBlobFileReader(
   std::unique_ptr<BlobFileReader> reader;
 
   {
-    Status s = OpenBlobFileReader(read_options, blob_file,
-                                  allow_footer_skip_retry, &reader);
+    Status s = OpenBlobFileReader(
+        read_options, blob_file, allow_footer_skip_retry,
+        expected_relocation_file_size, expected_directory_digest,
+        current_db_session_id, compression_manager,
+        block_protection_bytes_per_key, &reader);
     if (!s.ok()) {
       ROCKS_LOG_WARN(immutable_options_->logger,
                      "BlobFileCache open failed for blob file %" PRIu64
@@ -115,8 +208,12 @@ Status BlobFileCache::OpenBlobFileReaderUncached(
   Statistics* const statistics = immutable_options_->stats;
   RecordTick(statistics, NO_FILE_OPENS);
 
-  Status s = OpenBlobFileReader(read_options, blob_file,
-                                allow_footer_skip_retry, blob_file_reader);
+  Status s = OpenBlobFileReader(
+      read_options, blob_file, allow_footer_skip_retry,
+      /*expected_relocation_file_size=*/0,
+      /*expected_directory_digest=*/0, kEmptyDbSessionId,
+      /*compression_manager=*/nullptr,
+      /*block_protection_bytes_per_key=*/0, blob_file_reader);
   if (!s.ok()) {
     RecordTick(statistics, NO_FILE_ERRORS);
   }
@@ -152,7 +249,11 @@ void BlobFileCache::UnregisterBlobFileChecksum(uint64_t blob_file_number) {
 
 Status BlobFileCache::OpenBlobFileReader(
     const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
-    bool allow_footer_skip_retry,
+    bool allow_footer_skip_retry, uint64_t expected_relocation_file_size,
+    uint32_t expected_directory_digest,
+    const std::string& current_db_session_id,
+    CompressionManager* compression_manager,
+    uint8_t block_protection_bytes_per_key,
     std::unique_ptr<BlobFileReader>* blob_file_reader) {
   assert(file_options_);
   assert(blob_file.file_checksum.empty() ==
@@ -173,6 +274,23 @@ Status BlobFileCache::OpenBlobFileReader(
       file_options.file_checksum.clear();
       file_options.file_checksum_func_name.clear();
     }
+  }
+
+  if (expected_relocation_file_size != 0) {
+    if (relocation_file_table_options_ == nullptr) {
+      return Status::NotSupported(
+          "Blob relocation requires a block-based table factory");
+    }
+    std::call_once(relocation_factory_once_, [&] {
+      relocation_factory_ = std::make_unique<BlockBasedTableFactory>(
+          MakeBlobRelocationTableOptions(*relocation_file_table_options_));
+    });
+    return BlobFileReader::CreateRelocationFileWithFactory(
+        *immutable_options_, read_options, file_options, blob_file_read_hist_,
+        column_family_id_, blob_file.file_number, expected_relocation_file_size,
+        blob_file.relocation_tail_size, expected_directory_digest,
+        current_db_session_id, *relocation_factory_, compression_manager,
+        block_protection_bytes_per_key, io_tracer_, blob_file_reader);
   }
 
   Status s = BlobFileReader::Create(

@@ -91,7 +91,6 @@ Status SstFileManagerImpl::OnDeleteFile(const std::string& file_path) {
 }
 
 void SstFileManagerImpl::OnCompactionCompletion(Compaction* c) {
-  MutexLock l(&mu_);
   uint64_t size_added_by_compaction = 0;
   for (size_t i = 0; i < c->num_input_levels(); i++) {
     for (size_t j = 0; j < c->num_input_files(i); j++) {
@@ -99,8 +98,13 @@ void SstFileManagerImpl::OnCompactionCompletion(Compaction* c) {
       size_added_by_compaction += filemeta->fd.GetFileSize();
     }
   }
-  assert(cur_compactions_reserved_size_ >= size_added_by_compaction);
-  cur_compactions_reserved_size_ -= size_added_by_compaction;
+  OnCompactionCompletion(size_added_by_compaction);
+}
+
+void SstFileManagerImpl::OnCompactionCompletion(uint64_t reserved_size) {
+  MutexLock l(&mu_);
+  assert(cur_compactions_reserved_size_ >= reserved_size);
+  cur_compactions_reserved_size_ -= reserved_size;
 }
 
 Status SstFileManagerImpl::OnMoveFile(const std::string& old_path,
@@ -211,6 +215,41 @@ bool SstFileManagerImpl::EnoughRoomForCompaction(
   cur_compactions_reserved_size_ += size_added_by_compaction;
   // Take a snapshot of cur_compactions_reserved_size_ for when we encounter
   // a NoSpace error.
+  free_space_trigger_ = cur_compactions_reserved_size_;
+  return true;
+}
+
+bool SstFileManagerImpl::EnoughRoomForCompaction(
+    uint64_t size_added_by_compaction, const std::string& output_path,
+    const Status& bg_error) {
+  MutexLock l(&mu_);
+
+  uint64_t needed_headroom = cur_compactions_reserved_size_ +
+                             size_added_by_compaction + compaction_buffer_size_;
+  if (max_allowed_space_ != 0 &&
+      needed_headroom + total_files_size_ > max_allowed_space_) {
+    return false;
+  }
+
+  if (bg_error.IsNoSpace() && CheckFreeSpace()) {
+    uint64_t free_space = 0;
+    Status status =
+        fs_->GetFreeSpace(output_path, IOOptions(), &free_space, nullptr);
+    status.PermitUncheckedError();
+    if (compaction_buffer_size_ == 0) {
+      needed_headroom += reserved_disk_buffer_;
+    }
+    if (free_space < needed_headroom + size_added_by_compaction) {
+      ROCKS_LOG_ERROR(logger_,
+                      "free space [%" PRIu64
+                      " bytes] is less than needed headroom [%" PRIu64
+                      " bytes]\n",
+                      free_space, needed_headroom);
+      return false;
+    }
+  }
+
+  cur_compactions_reserved_size_ += size_added_by_compaction;
   free_space_trigger_ = cur_compactions_reserved_size_;
   return true;
 }

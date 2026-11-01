@@ -33,6 +33,10 @@ class CacheReservationManager {
   class CacheReservationHandle {
    public:
     virtual ~CacheReservationHandle() = default;
+    // Updates this owner's contribution, not the domain's aggregate usage.
+    // Like MakeCacheReservation(), a failed growth remains owned until resized
+    // or released. The caller must not allocate after a failed reservation.
+    virtual Status Resize(std::size_t memory_used) = 0;
   };
   virtual ~CacheReservationManager() = default;
   virtual Status UpdateCacheReservation(std::size_t new_memory_used) = 0;
@@ -68,6 +72,7 @@ class CacheReservationManagerImpl
         std::size_t incremental_memory_used,
         std::shared_ptr<CacheReservationManagerImpl> cache_res_mgr);
     ~CacheReservationHandle() override;
+    Status Resize(std::size_t memory_used) override;
 
    private:
     std::size_t incremental_memory_used_;
@@ -244,6 +249,10 @@ class ConcurrentCacheReservationManager
     ~CacheReservationHandle() override {
       std::lock_guard<std::mutex> lock(cache_res_mgr_->cache_res_mgr_mu_);
       cache_res_handle_.reset();
+    }
+    Status Resize(std::size_t memory_used) override {
+      std::lock_guard<std::mutex> lock(cache_res_mgr_->cache_res_mgr_mu_);
+      return cache_res_handle_->Resize(memory_used);
     }
 
    private:

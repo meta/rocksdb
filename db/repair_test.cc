@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "db/blob/blob_reference_metadata.h"
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
@@ -61,6 +62,175 @@ class RepairTest : public DBTestBase {
     SyncPoint::GetInstance()->DisableProcessing();
   }
 };
+
+TEST_F(RepairTest, PrefixRepairAdmissionPreservesPositiveEvidence) {
+  for (int scenario = 0; scenario != 3; ++scenario) {
+    Options options = CurrentOptions();
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key", "value"));
+    ASSERT_OK(Flush());
+    Close();
+    std::vector<std::string> names;
+    ASSERT_OK(env_->GetChildren(dbname_, &names));
+    std::vector<std::pair<std::string, std::string>> original;
+    for (const std::string& name : names) {
+      uint64_t number = 0;
+      FileType type;
+      if (!ParseFileName(name, &number, &type) ||
+          (type != kCurrentFile && type != kDescriptorFile &&
+           type != kTableFile && type != kBlobFile && type != kWalFile)) {
+        continue;
+      }
+      std::string bytes;
+      ASSERT_OK(ReadFileToString(env_, dbname_ + "/" + name, &bytes));
+      original.emplace_back(name, std::move(bytes));
+    }
+    ASSERT_FALSE(original.empty());
+    if (scenario == 1) {
+      // A failed optional MANIFEST probe must not hide readable SST evidence.
+      SyncPoint::GetInstance()->SetCallBack(
+          "Repairer::FeatureProbe", [](void* arg) {
+            *static_cast<Status*>(arg) = Status::IOError("optional probe");
+          });
+    } else if (scenario == 2) {
+      SyncPoint::GetInstance()->SetCallBack(
+          "Repairer::BlobIndirectionDetected", [](void* arg) {
+            *static_cast<Status*>(arg) =
+                Status::IOError("after positive evidence");
+          });
+    }
+    SyncPoint::GetInstance()->EnableProcessing();
+    // Runtime policy is not an activation certificate in either direction.
+    options.enable_blob_indirection = false;
+    const Status repaired = RepairDB(dbname_, options);
+    if (scenario == 2) {
+      ASSERT_TRUE(repaired.IsIOError());
+    } else {
+      ASSERT_TRUE(repaired.IsNotSupported()) << repaired.ToString();
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    for (const auto& file : original) {
+      std::string bytes;
+      ASSERT_OK(ReadFileToString(env_, dbname_ + "/" + file.first, &bytes));
+      ASSERT_EQ(file.second, bytes) << file.first;
+    }
+  }
+}
+
+TEST_F(RepairTest, PrefixUnknownFeatureProbeRetainsLegacySalvage) {
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  Close();
+  SyncPoint::GetInstance()->SetCallBack(
+      "Repairer::FeatureProbe", [](void* arg) {
+        *static_cast<Status*>(arg) = Status::IOError("optional probe");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  // No positive marker was discovered. This preserves salvage; it does not
+  // prove that an unreadable database has never activated the feature.
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  ASSERT_OK(RepairDB(dbname_, options));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  Reopen(options);
+  ASSERT_EQ("value", Get("key"));
+}
+
+TEST_F(RepairTest, NeverActivatedRepairWithPolicyEnabledKeepsLegacyOutput) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 128;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("legacy", "sst"));
+  ASSERT_OK(Flush());
+  std::unordered_map<std::string, uint64_t> legacy_ssts;
+  ASSERT_OK(GetAllDataFiles(kTableFile, &legacy_ssts));
+  ASSERT_EQ(legacy_ssts.size(), 1U);
+
+  // The policy is configured, but nothing durable has activated the feature.
+  options.enable_blob_indirection = true;
+  Reopen(options);
+  ASSERT_OK(Put("wal", "unflushed"));
+  Close();
+
+  ASSERT_OK(RepairDB(dbname_, options));
+  // Legacy output must not become feature evidence for a later repair.
+  ASSERT_OK(RepairDB(dbname_, options));
+  Reopen(options);
+  EXPECT_EQ(Get("legacy"), "sst");
+  EXPECT_EQ(Get("wal"), "unflushed");
+  for (const auto& sst : legacy_ssts) {
+    ASSERT_OK(env_->FileExists(sst.first));
+  }
+  const VersionStorageInfo* const vstorage = dbfull()
+                                                 ->GetVersionSet()
+                                                 ->GetColumnFamilySet()
+                                                 ->GetDefault()
+                                                 ->current()
+                                                 ->storage_info();
+  size_t files = 0;
+  for (int level = 0; level < vstorage->num_levels(); ++level) {
+    for (const FileMetaData* file : vstorage->LevelFiles(level)) {
+      EXPECT_TRUE(file->blob_reference_descriptor.empty());
+      ++files;
+    }
+  }
+  EXPECT_EQ(files, 2U);
+}
+
+TEST_F(RepairTest, PrefixRepairRejectsLegacyClassification) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  for (const char* key : {"a", "b"}) {
+    ASSERT_OK(Put(key, "value"));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  // An L0 output without exact inputs carries only the legacy
+  // classification: no descriptor and no coarse frontier.
+  ColumnFamilyMetaData cf_meta;
+  db_->GetColumnFamilyMetaData(&cf_meta);
+  std::vector<std::string> inputs;
+  for (const SstFileMetaData& file : cf_meta.levels[0].files) {
+    inputs.push_back(file.name);
+  }
+  ASSERT_EQ(inputs.size(), 2U);
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, 0));
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  const UserCollectedProperties& collected =
+      properties.begin()->second->user_collected_properties;
+  ASSERT_EQ(collected.count(kBlobReferenceClassificationPropertyName), 1U);
+  ASSERT_EQ(collected.count(kBlobReferenceDescriptorPropertyName), 0U);
+  const std::string sst_path = properties.begin()->first;
+  const std::string manifest_path =
+      DescriptorFileName(dbname_, dbfull()->TEST_Current_Manifest_FileNo());
+  Close();
+  // Leave the SST as the only feature evidence.
+  ASSERT_OK(env_->DeleteFile(manifest_path));
+
+  ASSERT_TRUE(RepairDB(dbname_, options).IsNotSupported());
+  ASSERT_OK(env_->FileExists(sst_path));
+  ASSERT_TRUE(env_->FileExists(dbname_ + "/lost").IsNotFound());
+}
 
 TEST_F(RepairTest, SortRepairedDBL0ByEpochNumber) {
   Options options = CurrentOptions();

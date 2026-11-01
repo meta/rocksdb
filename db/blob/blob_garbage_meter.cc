@@ -5,6 +5,8 @@
 
 #include "db/blob/blob_garbage_meter.h"
 
+#include <limits>
+
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/dbformat.h"
@@ -31,6 +33,14 @@ Status BlobGarbageMeter::GetBlobReferenceDetails(const ParsedInternalKey& ikey,
 
   if (blob_index.IsInlined() || blob_index.HasTTL()) {
     return Status::Corruption("Unexpected TTL/inlined blob index");
+  }
+  // Identity indirect references still describe records in normal blob-log
+  // files and must contribute to their legacy garbage accounting. Once an
+  // indirect reference has been flattened to a relocation file, exact census
+  // metadata owns its lifecycle instead.
+  if (blob_index.IsIndirect() &&
+      blob_index.generation_file_number() != blob_index.origin_file_number()) {
+    return Status::OK();
   }
   if (blob_index.IsSameFile()) {
     return Status::OK();
@@ -119,7 +129,14 @@ Status BlobGarbageMeter::ProcessEntityBlobReferences(
     return Status::OK();
   }
 
-  return WideColumnSerialization::ForEachBlobFileNumber(
+  bool has_blob_columns = false;
+  Status status =
+      WideColumnSerialization::HasBlobColumns(value, has_blob_columns);
+  if (!status.ok() || !has_blob_columns) {
+    return status;
+  }
+
+  return WideColumnSerialization::ForEachBlobIndex(
       value, [&](const BlobIndex& blob_index) -> Status {
         uint64_t file_number = kInvalidBlobFileNumber;
         uint64_t blob_bytes = 0;

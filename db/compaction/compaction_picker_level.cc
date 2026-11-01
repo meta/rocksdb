@@ -339,6 +339,10 @@ void LevelCompactionBuilder::SetupInitialFiles() {
 }
 
 bool LevelCompactionBuilder::SetupOtherL0FilesIfNeeded() {
+  if (start_level_ == 0 &&
+      !vstorage_->ExpandExactL0Inputs(&start_level_inputs_.files)) {
+    return false;
+  }
   if (start_level_ == 0 && output_level_ != 0 && !is_l0_trivial_move_) {
     return compaction_picker_->GetOverlappingL0Files(
         vstorage_, &start_level_inputs_, output_level_, &parent_index_);

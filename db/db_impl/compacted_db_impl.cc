@@ -122,6 +122,11 @@ void CompactedDBImpl::MultiGetEntityWithMetadata(
 }
 
 Status CompactedDBImpl::Init(const Options& options) {
+  Status style_status = CheckBlobIndirectionCompactionStyle(
+      options.compaction_style, options.enable_blob_indirection);
+  if (!style_status.ok()) {
+    return style_status;
+  }
   SuperVersionContext sv_context(/* create_superversion */ true);
   mutex_.Lock();
   ColumnFamilyDescriptor cf(kDefaultColumnFamilyName,

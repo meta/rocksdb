@@ -10,6 +10,7 @@
 #include <memory>
 #include <utility>
 
+#include "db/blob/blob_constants.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
@@ -33,7 +34,10 @@ using ExpirationRange = std::pair<uint64_t, uint64_t>;
 //    +--------------+---------+---------+-------+-------------+-------------------+
 //
 // List of flags:
-//   has_ttl: Whether the file contain TTL data.
+//   has_ttl: Whether the file contains TTL data.
+//   has_repair_metadata: The unused expiration-range bytes carry the physical
+//     file number and the file has permanent legacy/identity classification.
+//   is_identity_root: BlobIndexes emitted for this file use stable identity.
 //
 // Expiration range in the header is a rough range based on
 // blob_db_options.ttl_range_secs.
@@ -55,9 +59,17 @@ struct BlobLogHeader {
   uint32_t column_family_id = 0;
   CompressionType compression = kNoCompression;
   bool has_ttl = false;
+  bool has_repair_metadata = false;
+  bool is_identity_root = false;
+  uint64_t repair_file_number = kInvalidBlobFileNumber;
   ExpirationRange expiration_range;
 
-  void EncodeTo(std::string* dst);
+  void EncodeTo(std::string* dst) const;
+
+  // Returns the versioned checksum stored in a repair-aware footer. This
+  // binds the otherwise unchecksummed owner, physical identity, compression,
+  // and permanent legacy/identity-root classification to the footer CRC.
+  uint64_t GetRepairMetadataFooterValue() const;
 
   Status DecodeFrom(Slice slice);
 };
@@ -75,7 +87,9 @@ struct BlobLogHeader {
 // The footer will be presented only when the blob file is properly closed.
 //
 // Unlike the same field in file header, expiration range in the footer is the
-// range of smallest and largest expiration of the data in this file.
+// range of smallest and largest expiration of the data in this file. For a
+// non-TTL file carrying repair metadata, these otherwise-unused fields contain
+// total blob record bytes and the repair metadata format version.
 
 // clang-format on
 
