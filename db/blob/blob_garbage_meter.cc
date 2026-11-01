@@ -119,7 +119,14 @@ Status BlobGarbageMeter::ProcessEntityBlobReferences(
     return Status::OK();
   }
 
-  return WideColumnSerialization::ForEachBlobFileNumber(
+  bool has_blob_columns = false;
+  Status status =
+      WideColumnSerialization::HasBlobColumns(value, has_blob_columns);
+  if (!status.ok() || !has_blob_columns) {
+    return status;
+  }
+
+  return WideColumnSerialization::ForEachBlobIndex(
       value, [&](const BlobIndex& blob_index) -> Status {
         uint64_t file_number = kInvalidBlobFileNumber;
         uint64_t blob_bytes = 0;

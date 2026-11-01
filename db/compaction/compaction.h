@@ -436,6 +436,10 @@ class Compaction {
     return enable_blob_garbage_collection_;
   }
 
+  // Called during unlocked job preparation. Ordinary intra-L0 output uses
+  // coarse identity pins; exceptional exact L0 inputs must remain exact.
+  bool CollectExactBlobReferences() const;
+
   double blob_garbage_collection_age_cutoff() const {
     return blob_garbage_collection_age_cutoff_;
   }

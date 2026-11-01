@@ -11,18 +11,35 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-void BlobLogHeader::EncodeTo(std::string* dst) {
+void BlobLogHeader::EncodeTo(std::string* dst) const {
   assert(dst != nullptr);
   dst->clear();
   dst->reserve(BlobLogHeader::kSize);
   PutFixed32(dst, kMagicNumber);
   PutFixed32(dst, version);
   PutFixed32(dst, column_family_id);
-  unsigned char flags = (has_ttl ? 1 : 0);
+  assert(!has_repair_metadata || !has_ttl);
+  assert(!is_identity_root || has_repair_metadata);
+  assert(!has_repair_metadata || repair_file_number != kInvalidBlobFileNumber);
+  unsigned char flags = (has_ttl ? 1 : 0) |
+                        (has_repair_metadata ? 1U << 1 : 0) |
+                        (is_identity_root ? 1U << 2 : 0);
   dst->push_back(flags);
   dst->push_back(compression);
-  PutFixed64(dst, expiration_range.first);
-  PutFixed64(dst, expiration_range.second);
+  PutFixed64(dst,
+             has_repair_metadata ? repair_file_number : expiration_range.first);
+  PutFixed64(dst, has_repair_metadata ? kBlobRepairMetadataFormatVersion
+                                      : expiration_range.second);
+}
+
+uint64_t BlobLogHeader::GetRepairMetadataFooterValue() const {
+  assert(has_repair_metadata);
+  std::string encoded;
+  EncodeTo(&encoded);
+  const uint32_t checksum =
+      crc32c::Mask(crc32c::Value(encoded.data(), encoded.size()));
+  return (static_cast<uint64_t>(kBlobRepairMetadataFormatVersion) << 32) |
+         checksum;
 }
 
 Status BlobLogHeader::DecodeFrom(Slice src) {
@@ -48,10 +65,25 @@ Status BlobLogHeader::DecodeFrom(Slice src) {
   flags = src.data()[0];
   compression = static_cast<CompressionType>(src.data()[1]);
   has_ttl = (flags & 1) == 1;
+  has_repair_metadata = (flags & (1U << 1)) != 0;
+  is_identity_root = (flags & (1U << 2)) != 0;
   src.remove_prefix(2);
   if (!GetFixed64(&src, &expiration_range.first) ||
       !GetFixed64(&src, &expiration_range.second)) {
     return Status::Corruption(kErrorMessage, "Error decoding expiration range");
+  }
+  if ((flags & ~7U) != 0 || (has_repair_metadata && has_ttl) ||
+      (is_identity_root && !has_repair_metadata)) {
+    return Status::Corruption(kErrorMessage, "Invalid blob file flags");
+  }
+  if (has_repair_metadata) {
+    repair_file_number = expiration_range.first;
+    if (repair_file_number == kInvalidBlobFileNumber ||
+        expiration_range.second != kBlobRepairMetadataFormatVersion) {
+      return Status::Corruption(kErrorMessage,
+                                "Unsupported blob repair metadata");
+    }
+    expiration_range = ExpirationRange{};
   }
   return Status::OK();
 }

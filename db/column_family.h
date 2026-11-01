@@ -37,6 +37,8 @@ namespace ROCKSDB_NAMESPACE {
 class Version;
 class VersionSet;
 class VersionStorageInfo;
+class BlobReferenceCensus;
+struct BlobReferenceCensusGarbage;
 class MemTable;
 class MemTableListVersion;
 class CompactionPicker;
@@ -284,6 +286,12 @@ Status CheckConcurrentWritesSupported(const ColumnFamilyOptions& cf_options);
 Status CheckCFPathsSupported(const DBOptions& db_options,
                              const ColumnFamilyOptions& cf_options);
 
+// Applies to configured creation and to this CF's sticky/pending format state,
+// including read-only recovery. A DB-wide fence from another CF is not state
+// belonging to this CF.
+Status CheckBlobIndirectionCompactionStyle(CompactionStyle style,
+                                           bool has_blob_indirection);
+
 ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
                                       bool read_only,
                                       const ColumnFamilyOptions& src);
@@ -371,12 +379,32 @@ class ColumnFamilyData {
   // Validate CF options against DB options
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
+  // Test-only, not public API. Until the Blob GC stack is complete,
+  // ValidateOptions rejects enable_blob_indirection unless a test allows it.
+  static void TEST_SetAllowBlobIndirection(bool allow);
+  // Parses and validates a replacement without publishing it. The caller
+  // keeps the DB mutex held so the latest-options base remains stable.
+  Status PrepareMutableCFOptions(
+      const DBOptions& db_options,
+      const std::unordered_map<std::string, std::string>& options_map,
+      MutableCFOptions* mutable_cf_options) const;
+  // Publishes a previously prepared replacement. REQUIRES: DB mutex held.
+  void InstallMutableCFOptions(const MutableCFOptions& mutable_cf_options);
   // REQUIRES: DB mutex held
   Status SetOptions(
       const DBOptions& db_options,
       const std::unordered_map<std::string, std::string>& options_map);
 
   InternalStats* internal_stats() { return internal_stats_.get(); }
+
+  BlobReferenceCensus* blob_reference_census() {
+    return blob_reference_census_.get();
+  }
+  const BlobReferenceCensus* blob_reference_census() const {
+    return blob_reference_census_.get();
+  }
+  // REQUIRES: DB mutex held. The returned state must be destroyed unlocked.
+  BlobReferenceCensusGarbage CancelBlobReferenceCensus();
 
   MemTableList* imm() { return &imm_; }
   MemTable* mem() { return mem_; }
@@ -654,6 +682,7 @@ class ColumnFamilyData {
 
  private:
   friend class ColumnFamilySet;
+  friend class DBImpl;
   ColumnFamilyData(
       uint32_t id, const std::string& name, Version* dummy_versions,
       Cache* table_cache, WriteBufferManager* write_buffer_manager,
@@ -698,6 +727,7 @@ class ColumnFamilyData {
   std::unique_ptr<BlobSource> blob_source_;
   // Per-CF manager for write-path blob direct-write files.
   std::shared_ptr<BlobFilePartitionManager> blob_partition_manager_;
+  std::unique_ptr<BlobReferenceCensus> blob_reference_census_;
 
   std::unique_ptr<InternalStats> internal_stats_;
 
@@ -741,6 +771,13 @@ class ColumnFamilyData {
   // If true, this ColumnFamily is in DBImpl::compaction_queue_ or its parked
   // compaction set.
   bool queued_for_compaction_;
+
+  // Intrusive DB-mutex-protected queue for background blob-reference census.
+  // The queue owns one ColumnFamilyData reference while this flag is true.
+  bool queued_for_blob_reference_census_ = false;
+  ColumnFamilyData* next_blob_reference_census_ = nullptr;
+  uint64_t blob_reference_census_retry_micros_ = 0;
+  uint32_t blob_reference_census_failures_ = 0;
 
   // Read outside the DB mutex by compaction workers (acquire-loaded roughly
   // every 1024 records in ProcessKeyValueCompaction). Given its own cache line

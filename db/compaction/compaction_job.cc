@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <cinttypes>
 #include <condition_variable>
+#include <cstring>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -23,6 +25,8 @@
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_builder.h"
+#include "db/blob/blob_reference_metadata.h"
+#include "db/blob/blob_source.h"
 #include "db/builder.h"
 #include "db/compaction/clipping_iterator.h"
 #include "db/compaction/compaction_state.h"
@@ -36,6 +40,7 @@
 #include "db/range_del_aggregator.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
+#include "db/wide/wide_column_serialization.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "file/read_write_util.h"
@@ -55,6 +60,7 @@
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/options_type.h"
+#include "table/adaptive/adaptive_table_factory.h"
 #include "table/format.h"
 #include "table/merging_iterator.h"
 #include "table/meta_blocks.h"
@@ -1757,6 +1763,11 @@ void CompactionJob::CreateBlobFileBuilder(
     blob_file_builder = std::make_unique<BlobFileBuilder>(
         [this]() { return NewBlobFileNumber(); }, fs_.get(),
         &sub_compact->compaction->immutable_options(), &mutable_cf_options,
+        cfd->blob_source() != nullptr
+            ? cfd->blob_source()->GetBlobCacheShared()
+            : GetBlobCacheWithReservation(
+                  sub_compact->compaction->immutable_options(),
+                  mutable_cf_options),
         &file_options_, &write_options, db_id_, db_session_id_, job_id_,
         cfd->GetID(), cfd->GetName(), write_hint_, io_tracer_, blob_callback_,
         BlobFileCreationReason::kCompaction, GetBlobOutputPath(),
@@ -1848,12 +1859,203 @@ Status CompactionJob::ProcessKeyValue(
   IterKey prev_iter_output_key;
   ParsedInternalKey prev_iter_output_internal_key;
 
+  const bool exact_output =
+      sub_compact->compaction->CollectExactBlobReferences();
+  std::shared_ptr<CacheReservationManager> history_reservation_manager;
+  std::unique_ptr<CacheReservationManager::CacheReservationHandle>
+      history_reservation;
+  if (exact_output) {
+    const BlockBasedTableOptions* options = GetBlockBasedTableWriterOptions(
+        sub_compact->compaction->mutable_cf_options().table_factory.get());
+    if (options != nullptr) {
+      history_reservation_manager =
+          GetBlobReferenceReservationManager(*options);
+    }
+    if (history_reservation_manager != nullptr) {
+      status = history_reservation_manager->MakeCacheReservation(
+          0, &history_reservation);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+  }
+  // Buffers die before their reservation. Array allocations have exact byte
+  // capacities; vector growth charges both the old and new allocations.
+  std::vector<CompactionIterator::BufferedOutput> history;
+  size_t history_index = 0;
+  size_t history_bytes = 0;
+  const Defer clear_display([c_iter] { c_iter->output_override_ = nullptr; });
+  const auto reserve_history = [&](size_t bytes) -> Status {
+    return history_reservation != nullptr ? history_reservation->Resize(bytes)
+                                          : Status::OK();
+  };
+  const auto buffer_history = [&]() -> Status {
+    history.clear();
+    history_index = history_bytes = 0;
+    Status result = reserve_history(history.capacity() *
+                                    sizeof(CompactionIterator::BufferedOutput));
+    uint64_t hard_limit = kMaxBlobReferencesPerSst;
+    TEST_SYNC_POINT_CALLBACK(
+        "BlockBasedTableBuilder::TryAdd:BlobReferenceHardLimit", &hard_limit);
+    uint64_t references[2] = {};
+    while (result.ok() && c_iter->Valid() && c_iter->status().ok() &&
+           (history.empty() ||
+            cfd->user_comparator()->EqualWithoutTimestamp(
+                history.front().ikey.user_key, c_iter->user_key()))) {
+      if (cfd->IsDropped()) {
+        return Status::ColumnFamilyDropped();
+      }
+      if (compaction_aborted_.load(std::memory_order_acquire) > 0 ||
+          cfd->compaction_aborted() > 0) {
+        return Status::Incomplete(Status::SubCode::kCompactionAborted);
+      }
+      uint64_t row_references = 0;
+      const auto count_reference = [&](const BlobIndex& index) -> Status {
+        BlobReference reference;
+        bool included = false;
+        Status count_status =
+            BlobReference::FromBlobIndex(index, &reference, &included);
+        if (count_status.ok() && included) {
+          ++row_references;
+        }
+        return count_status;
+      };
+      if (!c_iter->IsDeleteRangeSentinelKey()) {
+        if (c_iter->ikey().type == kTypeBlobIndex) {
+          BlobIndex index;
+          result = index.DecodeFrom(c_iter->value());
+          if (result.ok()) {
+            result = count_reference(index);
+          }
+        } else if (c_iter->ikey().type == kTypeWideColumnEntity) {
+          result = WideColumnSerialization::ForEachBlobIndex(c_iter->value(),
+                                                             count_reference);
+        }
+      }
+      if (!result.ok()) {
+        return result;
+      }
+      const size_t target =
+          c_iter->ikey().sequence > proximal_after_seqno_ ? 1 : 0;
+      if (row_references > hard_limit ||
+          references[target] > hard_limit - row_references) {
+        return Status::MemoryLimit(
+            "One user-key history exceeds the blob reference limit");
+      }
+      references[target] += row_references;
+      const size_t max_bytes = std::numeric_limits<size_t>::max();
+      if (history.size() == history.capacity()) {
+        const size_t capacity = history.capacity();
+        if (capacity >
+            max_bytes / 2 / sizeof(CompactionIterator::BufferedOutput)) {
+          return Status::MemoryLimit("Blob output history capacity overflow");
+        }
+        const size_t next_capacity = capacity == 0 ? 1 : capacity * 2;
+        const size_t growth =
+            next_capacity * sizeof(CompactionIterator::BufferedOutput);
+        const size_t old_bytes =
+            history_bytes +
+            capacity * sizeof(CompactionIterator::BufferedOutput);
+        if (growth > max_bytes - old_bytes) {
+          return Status::MemoryLimit("Blob output history capacity overflow");
+        }
+        result = reserve_history(old_bytes + growth);
+        if (!result.ok()) {
+          return result;
+        }
+        history.reserve(next_capacity);
+      }
+      const size_t container_bytes =
+          history.capacity() * sizeof(CompactionIterator::BufferedOutput);
+      if (c_iter->key().size() > max_bytes - c_iter->value().size()) {
+        return Status::MemoryLimit("Blob output history size overflow");
+      }
+      const size_t row_bytes = c_iter->key().size() + c_iter->value().size();
+      if (history_bytes > max_bytes - container_bytes ||
+          row_bytes > max_bytes - container_bytes - history_bytes) {
+        return Status::MemoryLimit("Blob output history size overflow");
+      }
+      result = reserve_history(container_bytes + history_bytes + row_bytes);
+      if (!result.ok()) {
+        return result;
+      }
+      CompactionIterator::BufferedOutput row;
+      row.data.reset(new char[row_bytes]);
+      memcpy(row.data.get(), c_iter->key().data(), c_iter->key().size());
+      if (!c_iter->value().empty()) {
+        memcpy(row.data.get() + c_iter->key().size(), c_iter->value().data(),
+               c_iter->value().size());
+      }
+      row.key = Slice(row.data.get(), c_iter->key().size());
+      row.value =
+          Slice(row.data.get() + row.key.size(), c_iter->value().size());
+      row.ikey = c_iter->ikey();
+      row.ikey.user_key = ExtractUserKey(row.key);
+      row.references = row_references;
+      row.input_records = c_iter->NumInputEntryScanned();
+      row.already_scanned = c_iter->IsCurrentKeyAlreadyScanned();
+      row.has_input_count = c_iter->HasNumInputEntryScanned();
+      row.is_range_del = c_iter->IsDeleteRangeSentinelKey();
+      history.emplace_back(std::move(row));
+      history_bytes += row_bytes;
+      size_t reserved_bytes = container_bytes + history_bytes;
+      TEST_SYNC_POINT_CALLBACK(
+          "CompactionJob::ProcessKeyValue:BufferedHistoryMemory",
+          &reserved_bytes);
+      c_iter->Next();
+    }
+    if (!result.ok() || !c_iter->status().ok()) {
+      return result.ok() ? c_iter->status() : result;
+    }
+    bool first[2] = {true, true};
+    bool first_point[2] = {true, true};
+    // Bottommost output skips range sentinels, so its first point row must
+    // still perform the pre-history cut. Other output opens an empty builder
+    // at the sentinel and does not cut that empty builder again.
+    for (CompactionIterator::BufferedOutput& row : history) {
+      const size_t target = row.ikey.sequence > proximal_after_seqno_ ? 1 : 0;
+      row.first_in_history =
+          first[target] || (!row.is_range_del && first_point[target]);
+      row.history_references = references[target];
+      first[target] = false;
+      if (!row.is_range_del) {
+        first_point[target] = false;
+      }
+    }
+    return Status::OK();
+  };
+
   TEST_SYNC_POINT_CALLBACK(
       "CompactionJob::ProcessKeyValueCompaction()::Processing",
       static_cast<void*>(const_cast<Compaction*>(sub_compact->compaction)));
 
-  while (status.ok() && !cfd->IsDropped() && c_iter->Valid() &&
+  while (status.ok() && !cfd->IsDropped() &&
+         (history_index < history.size() || c_iter->Valid()) &&
          c_iter->status().ok()) {
+    if (exact_output) {
+      // Displaying a buffered row does not call Next(), so retain its usual
+      // cancellation checks even within a large indivisible history.
+      if (c_iter->IsShuttingDown()) {
+        status = Status::ShutdownInProgress();
+        break;
+      }
+      if (c_iter->IsPausingManualCompaction()) {
+        status = Status::Incomplete(Status::SubCode::kManualCompactionPaused);
+        break;
+      }
+      if (compaction_aborted_.load(std::memory_order_acquire) > 0 ||
+          cfd->compaction_aborted() > 0) {
+        status = Status::Incomplete(Status::SubCode::kCompactionAborted);
+        break;
+      }
+      if (history_index == history.size()) {
+        status = buffer_history();
+        if (!status.ok() || history.empty()) {
+          break;
+        }
+      }
+      c_iter->output_override_ = &history[history_index];
+    }
     assert(!end.has_value() ||
            cfd->user_comparator()->Compare(c_iter->user_key(), *end) < 0);
 
@@ -1920,7 +2122,10 @@ Status CompactionJob::ProcessKeyValue(
                                         &prev_iter_output_internal_key);
     prev_iter_output_internal_key.sequence = ikey.sequence;
     prev_iter_output_internal_key.type = ikey.type;
-    if (defer_blob_output_preparation) {
+    if (exact_output) {
+      c_iter->output_override_ = nullptr;
+      ++history_index;
+    } else if (defer_blob_output_preparation) {
       c_iter->NextWithoutPreparingOutput();
     } else {
       c_iter->Next();
@@ -2171,7 +2376,10 @@ void CompactionJob::ProcessLocalKeyValueCompaction(
       CreateCompactionIterator(sub_compact, cfd, input_iter, compaction_filter,
                                merge, blob_file_builder, write_options);
   assert(c_iter);
+  // Exact output stages whole user-key histories and reads each row's
+  // prepared value while staging, so it never defers preparation.
   const bool defer_blob_output_preparation =
+      !sub_compact->compaction->CollectExactBlobReferences() &&
       compaction_progress_writer_ != nullptr &&
       !sub_compact->compaction->SupportsPerKeyPlacement() &&
       (blob_file_builder != nullptr ||
@@ -2414,7 +2622,7 @@ Status CompactionJob::FinishCompactionOutputFile(
 
   if (s.ok() && (current_entries > 0 || tp.num_range_deletions > 0)) {
     // Output to event logger and fire events.
-    outputs.UpdateTableProperties();
+    s = outputs.UpdateTableProperties();
     ROCKS_LOG_INFO(db_options_.info_log,
                    "[%s] [JOB %d] Generated table #%" PRIu64 ": %" PRIu64
                    " keys, %" PRIu64 " bytes%s, temperature: %s",
@@ -2506,6 +2714,12 @@ bool CompactionJob::ShouldUpdateSubcompactionProgress(
   const auto* cfd = sub_compact->compaction->column_family_data();
   // No need to update when the progress will not get persisted
   if (compaction_progress_writer_ == nullptr) {
+    return false;
+  }
+  // Exact output buffers each user key's history before its first row is
+  // written, so the blob garbage meter already counts inflow past the resume
+  // key. A checkpoint here would count that inflow again after resumption.
+  if (sub_compact->compaction->CollectExactBlobReferences()) {
     return false;
   }
 
@@ -2678,6 +2892,13 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
           const std::unordered_map<uint64_t, BlobFileState>::const_iterator
               blob_file = blob_files.find(blob_file_number);
           if (blob_file == blob_files.end()) {
+            // Legacy garbage metering can see a stable identity whose normal
+            // source was retired by exact standalone GC. Its identity route
+            // proves the source is gone on purpose, so the delta is a no-op.
+            if (storage_info->GetBlobRelocationRoute(BlobRelocationRouteSource{
+                    blob_file_number, blob_file_number}) != nullptr) {
+              continue;
+            }
             return Status::Corruption(
                 "Compaction produced garbage for an unknown blob file");
           }
@@ -2717,6 +2938,12 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
     for (const auto& blob : sub_compact.Current().GetBlobFileAdditions()) {
       edit->AddBlobFile(blob);
     }
+  }
+
+  if (!edit->GetNewFiles().empty() &&
+      compaction->mutable_cf_options().enable_blob_indirection) {
+    edit->SetBlobIndirectionFormatVersion(
+        kBlobIndirectionManifestFormatVersion);
   }
 
   for (const auto& pair : blob_total_garbage) {
@@ -2940,6 +3167,20 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
       sub_compact->compaction->max_output_file_size(), file_number,
       proximal_after_seqno_ /*last_level_inclusive_max_seqno_threshold*/,
       dbname_ /*db_name*/, IsRemoteCompaction() /*is_remote_compaction*/);
+  const Compaction* compaction = sub_compact->compaction;
+  const Version* input_version = compaction->input_version();
+  tboptions.track_blob_reference_classification =
+      compaction->mutable_cf_options().enable_blob_indirection ||
+      (input_version != nullptr && input_version->storage_info() != nullptr &&
+       input_version->storage_info()->HasBlobIndirectionFormat());
+  tboptions.collect_blob_reference_metadata =
+      compaction->CollectExactBlobReferences();
+  if (input_version != nullptr && input_version->storage_info() != nullptr) {
+    tboptions.blob_route_snapshot_fingerprint_high =
+        input_version->storage_info()->GetBlobRelocationStateFingerprintHigh();
+    tboptions.blob_route_snapshot_fingerprint_low =
+        input_version->storage_info()->GetBlobRelocationStateFingerprintLow();
+  }
 
   outputs.NewBuilder(tboptions);
 
@@ -3363,7 +3604,7 @@ Status CompactionJob::ReadOutputFilesTableProperties(
   return s;
 }
 
-void CompactionJob::RestoreCompactionOutputs(
+Status CompactionJob::RestoreCompactionOutputs(
     const ColumnFamilyData* cfd,
     const std::vector<std::shared_ptr<const TableProperties>>&
         output_files_table_properties,
@@ -3385,12 +3626,16 @@ void CompactionJob::RestoreCompactionOutputs(
                                   cfd->internal_comparator(),
                                   enable_output_hash, true /* finished */);
 
-    outputs_to_restore->UpdateTableProperties(
+    const Status status = outputs_to_restore->UpdateTableProperties(
         *output_files_table_properties[i]);
+    if (!status.ok()) {
+      return status;
+    }
   }
 
   outputs_to_restore->SetNumOutputRecords(
       subcompaction_progress_per_level.GetNumProcessedOutputRecords());
+  return Status::OK();
 }
 
 Status CompactionJob::RestoreBlobCompactionProgress(
@@ -3516,9 +3761,12 @@ Status CompactionJob::MaybeResumeSubcompactionProgressOnInputIterator(
           s.ToString());
     }
 
-    RestoreCompactionOutputs(cfd, output_files_table_properties,
-                             subcompaction_progress_per_level,
-                             sub_compact->Outputs(is_proximal_level));
+    s = RestoreCompactionOutputs(cfd, output_files_table_properties,
+                                 subcompaction_progress_per_level,
+                                 sub_compact->Outputs(is_proximal_level));
+    if (!s.ok()) {
+      return s;
+    }
 
     // Skip past all the used file numbers to avoid creating new output files
     // after resumption that conflict with the existing output files

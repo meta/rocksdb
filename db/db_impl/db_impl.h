@@ -1191,6 +1191,9 @@ class DBImpl : public DB
   // Un-reference the super version and clean it up if it is the last reference.
   void CleanupSuperVersion(SuperVersion* sv);
 
+  // Releases the CFD pin retained by internal iterators.
+  void ReleaseColumnFamilyDataPin(ColumnFamilyData* cfd);
+
   // Un-reference the super version and return it to thread local cache if
   // needed. If it is the last reference of the super version. Clean it up
   // after un-referencing it.
@@ -1453,8 +1456,13 @@ class DBImpl : public DB
   Status TEST_WaitForCompact(
       const WaitForCompactOptions& wait_for_compact_options);
 
+  Status TEST_RunStandaloneBlobGCBatch(
+      ColumnFamilyData* cfd,
+      const std::vector<uint64_t>& candidate_physical_file_numbers);
+
   // Wait for any background purge
   Status TEST_WaitForPurge();
+  void TEST_WaitForBlobReferenceCensus();
 
   // Get the background error status
   Status TEST_GetBGError();
@@ -2247,6 +2255,15 @@ class DBImpl : public DB
   // completed. No-op when open_files_async is false. Returns early if
   // shutdown begins.
   void WaitForAsyncFileOpen();
+
+  // Builds the GC-only reverse SST census after open. Forward reads never wait
+  // for this work.
+  void ScheduleBlobReferenceCensus();
+  void ScheduleBlobReferenceCensus(ColumnFamilyData* requested_cfd);
+  static void BGWorkBlobReferenceCensus(void* arg);
+  static void UnscheduleBlobReferenceCensus(void* arg);
+  Status BuildBlobReferenceCensus(ColumnFamilyData* cfd, bool* incomplete);
+  void RetryBlobReferenceCensus();
 
   void InvokeWalFilterIfNeededOnColumnFamilyToWalNumberMap();
 
@@ -3214,6 +3231,16 @@ class DBImpl : public DB
   bool EnoughRoomForCompaction(ColumnFamilyData* cfd,
                                const std::vector<CompactionInputFiles>& inputs,
                                bool* sfm_bookkeeping, LogBuffer* log_buffer);
+  Status RunStandaloneBlobGC(
+      ColumnFamilyData* cfd,
+      const std::shared_ptr<BlobFileMetaData>& source_metadata,
+      bool* made_progress, uint64_t* sfm_reserved_bytes,
+      bool* retryable_stale_input, LogBuffer* log_buffer, int job_id);
+  Status RunStandaloneBlobGCBatch(
+      ColumnFamilyData* cfd,
+      const std::vector<uint64_t>& candidate_physical_file_numbers,
+      bool* made_progress, uint64_t* sfm_reserved_bytes,
+      bool* retryable_stale_input, LogBuffer* log_buffer, int job_id);
 
   // Request compaction tasks token from compaction thread limiter.
   // It always succeeds if force = true or limiter is disable.
@@ -4003,6 +4030,10 @@ class DBImpl : public DB
   // CompactionService::Wait(), counted per executed subcompaction.
   std::atomic<int> num_running_remote_compactions_ = 0;
 
+  // A batch owns complete physical relocation containers, so only one
+  // standalone relocation GC may run per column family. Protected by mutex_.
+  std::set<uint32_t> standalone_blob_gc_cfs_in_progress_;
+
   // number of background memtable flush jobs, submitted to the HIGH pool
   int bg_flush_scheduled_ = 0;
 
@@ -4030,6 +4061,22 @@ class DBImpl : public DB
   // Tracks whether background async file opening has been scheduled/completed.
   AsyncFileOpenState bg_async_file_open_state_ =
       AsyncFileOpenState::kNotScheduled;
+
+  enum class BlobReferenceCensusJobState : uint8_t {
+    kNotScheduled = 0,
+    kScheduled,
+    kComplete,
+  };
+  BlobReferenceCensusJobState bg_blob_reference_census_state_ =
+      BlobReferenceCensusJobState::kNotScheduled;
+  // Intrusive pending queue. Dynamic option changes enqueue in O(1), without
+  // allocating or scanning column families under the DB mutex.
+  ColumnFamilyData* blob_reference_census_queue_head_ = nullptr;
+  ColumnFamilyData* blob_reference_census_queue_tail_ = nullptr;
+  ColumnFamilyData* blob_reference_census_retry_head_ = nullptr;
+  ColumnFamilyData* blob_reference_census_retry_tail_ = nullptr;
+  size_t blob_reference_census_retry_count_ = 0;
+  std::atomic<bool> blob_reference_census_retry_registered_{false};
 
   // State machine for the single async WAL precreation slot protected by
   // mutex_. Background precreation failure returns to kNotScheduled; foreground

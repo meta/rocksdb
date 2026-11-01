@@ -988,8 +988,10 @@ Status BlockBasedTableFactory::ValidateOptions(
     const CacheEntryRoleOptions options = options_overrides_iter->second;
     static const std::set<CacheEntryRole> kMemoryChargingSupported = {
         CacheEntryRole::kCompressionDictionaryBuildingBuffer,
+        CacheEntryRole::kBlobReferenceMetadataBuildingBuffer,
         CacheEntryRole::kFilterConstruction,
-        CacheEntryRole::kBlockBasedTableReader, CacheEntryRole::kFileMetadata,
+        CacheEntryRole::kBlockBasedTableReader,
+        CacheEntryRole::kFileMetadata,
         CacheEntryRole::kBlobCache};
     if (options.charged != CacheEntryRoleOptions::Decision::kFallback &&
         kMemoryChargingSupported.count(role) == 0) {

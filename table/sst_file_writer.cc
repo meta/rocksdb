@@ -577,6 +577,9 @@ Status SstFileWriter::Open(const std::string& file_path, Temperature temp) {
       0 /* target_file_size */, r->next_file_number, kMaxSequenceNumber,
       Slice() /* db_name */, false /* is_remote_compaction */,
       r->embedded_blob_options.get());
+  // External files have fake file numbers and may lack a known CF, so they
+  // cannot carry exact repair metadata. They stay in the legacy form.
+  table_builder_options.collect_blob_reference_metadata = false;
   // External SST files used to each get a unique session id. Now for
   // slightly better uniqueness probability in constructing cache keys, we
   // assign fake file numbers to each file (into table properties) and keep

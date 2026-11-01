@@ -241,6 +241,10 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
 
 void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
                                ColumnFamilyOptions* cf_opts) {
+  assert(cf_opts != nullptr);
+  if (cf_opts == nullptr) {
+    return;
+  }
   // Memtable related options
   cf_opts->write_buffer_size = moptions.write_buffer_size;
   cf_opts->max_write_buffer_number = moptions.max_write_buffer_number;
@@ -306,6 +310,7 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
 
   // Blob file related options
   cf_opts->enable_blob_files = moptions.enable_blob_files;
+  cf_opts->enable_blob_indirection = moptions.enable_blob_indirection;
   cf_opts->min_blob_size = moptions.min_blob_size;
   cf_opts->blob_file_size = moptions.blob_file_size;
   cf_opts->blob_file_writable_file_max_buffer_size =

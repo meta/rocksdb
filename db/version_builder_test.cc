@@ -7,10 +7,12 @@
 
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
 
+#include "db/blob/blob_reference_metadata.h"
 #include "db/db_test_util.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
@@ -19,6 +21,8 @@
 #include "table/unique_id_impl.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/coding.h"
+#include "util/crc32c.h"
 #include "util/defer.h"
 #include "util/string_util.h"
 #include "utilities/fault_injection_fs.h"
@@ -55,7 +59,7 @@ class VersionBuilderTest : public testing::Test {
   ~VersionBuilderTest() override {
     for (int i = 0; i < vstorage_.num_levels(); i++) {
       for (auto* f : vstorage_.LevelFiles(i)) {
-        if (--f->refs == 0) {
+        if (f->Unref()) {
           delete f;
         }
       }
@@ -110,6 +114,50 @@ class VersionBuilderTest : public testing::Test {
     vstorage_.AddBlobFile(std::move(meta));
   }
 
+  Status MakeRelocationAddition(
+      uint64_t file_number, uint32_t column_family_id,
+      const std::vector<uint64_t>& origin_file_numbers,
+      BlobRelocationFileAddition* addition) {
+    if (addition == nullptr) {
+      return Status::InvalidArgument("Null relocation addition output");
+    }
+    BlobRelocationDirectoryBuilder builder;
+    uint64_t relocated_offset = 128;
+    for (uint64_t origin_file_number : origin_file_numbers) {
+      Status status = builder.Add(
+          origin_file_number, /*original_value_offset=*/11, relocated_offset,
+          /*stored_value_size=*/17, kNoCompression);
+      if (!status.ok()) {
+        return status;
+      }
+      relocated_offset += 64;
+    }
+    BlobRelocationDirectory directory;
+    Status status = builder.Finish(&directory);
+    if (!status.ok()) {
+      return status;
+    }
+    std::string encoded_directory;
+    directory.EncodeTo(&encoded_directory);
+    *addition = BlobRelocationFileAddition(
+        file_number, column_family_id, /*file_size=*/4096, "crc32c", "checksum",
+        std::move(encoded_directory), /*tail_size=*/1);
+    return addition->Validate();
+  }
+
+  Status AddRelocationToBase(const BlobRelocationFileAddition& addition) {
+    BlobRelocationDirectory directory;
+    Status status = addition.Validate(&directory);
+    if (!status.ok()) {
+      return status;
+    }
+    vstorage_.SetBlobIndirectionFormatVersion(
+        kBlobIndirectionManifestFormatVersion);
+    vstorage_.AddBlobRelocationFile(
+        BlobRelocationFileMetaData::Create(addition, std::move(directory)));
+    return Status::OK();
+  }
+
   void AddDummyFile(uint64_t table_file_number, uint64_t blob_file_number,
                     uint64_t epoch_number) {
     constexpr int level = 0;
@@ -148,6 +196,21 @@ class VersionBuilderTest : public testing::Test {
         kUnknownOldestAncestorTime, kUnknownFileCreationTime, epoch_number,
         kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2,
         0, 0, /* user_defined_timestamps_persisted */ true);
+  }
+
+  void AddBlobReferenceDescriptorToLastFile(VersionEdit* edit) {
+    assert(edit != nullptr);
+    assert(!edit->GetMutableNewFiles().empty());
+    BlobReferenceMetadataDescriptor descriptor;
+    descriptor.column_family_id = edit->GetColumnFamily();
+    descriptor.repair_metadata_format_version =
+        kBlobRepairMetadataFormatVersion;
+    descriptor.sst_file_number =
+        edit->GetMutableNewFiles().back().second.fd.GetNumber();
+    descriptor.index_handle = BlockHandle(/*offset=*/10, /*size=*/20);
+    descriptor.directory_handle = BlockHandle(/*offset=*/40, /*size=*/20);
+    descriptor.EncodeTo(
+        &edit->GetMutableNewFiles().back().second.blob_reference_descriptor);
   }
 
   void UpdateVersionStorageInfo(VersionStorageInfo* vstorage) {
@@ -280,7 +343,7 @@ TEST_F(VersionBuilderDBTest,
 void UnrefFilesInVersion(VersionStorageInfo* new_vstorage) {
   for (int i = 0; i < new_vstorage->num_levels(); i++) {
     for (auto* f : new_vstorage->LevelFiles(i)) {
-      if (--f->refs == 0) {
+      if (f->Unref()) {
         delete f;
       }
     }
@@ -909,6 +972,864 @@ TEST_F(VersionBuilderTest, ApplyBlobFileAddition) {
   ASSERT_EQ(new_meta->GetGarbageBlobBytes(), 0);
 
   UnrefFilesInVersion(&new_vstorage);
+}
+
+TEST_F(VersionBuilderTest, IdentityRootBlobFileRequiresFormatFence) {
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  VersionEdit addition;
+  addition.AddBlobFile(/*blob_file_number=*/100, /*total_blob_count=*/1,
+                       /*total_blob_bytes=*/10, /*checksum_method=*/{},
+                       /*checksum_value=*/{}, /*is_identity_root=*/true);
+  AddDummyFileToEdit(&addition, /*table_file_number=*/101,
+                     /*blob_file_number=*/100, /*epoch_number=*/1);
+
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    ASSERT_TRUE(builder.Apply(&addition).IsCorruption());
+  }
+
+  addition.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  AddBlobReferenceDescriptorToLastFile(&addition);
+  VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                         &vstorage_, /*version_set=*/nullptr);
+  ASSERT_OK(builder.Apply(&addition));
+
+  VersionStorageInfo output(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      /*force_consistency_checks=*/false, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr, /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(builder.SaveTo(&output));
+  const std::shared_ptr<BlobFileMetaData> meta =
+      output.GetBlobFileMetaData(/*blob_file_number=*/100);
+  ASSERT_NE(meta, nullptr);
+  ASSERT_TRUE(meta->IsIdentityRoot());
+  ASSERT_OK(output.ValidateBlobRelocationState());
+  UnrefFilesInVersion(&output);
+}
+
+TEST_F(VersionBuilderTest, ImplicitNormalBlobPruningReportsPhysicalDeletion) {
+  constexpr uint64_t kBlob = 100;
+  constexpr uint64_t kSst = 101;
+  AddDummyFile(kSst, kBlob, /*epoch_number=*/1);
+  vstorage_.LevelFiles(0).front()->blob_reference_legacy_metadata = true;
+  AddBlob(kBlob, /*total_blob_count=*/1, /*total_blob_bytes=*/100,
+          /*checksum_method=*/{}, /*checksum_value=*/{}, {kSst},
+          /*garbage_blob_count=*/0, /*garbage_blob_bytes=*/0);
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  UpdateVersionStorageInfo();
+  VersionEdit edit;
+  edit.DeleteFile(0, kSst);
+  // No BlobFileGarbage/retirement record accompanies this SST deletion.
+  ASSERT_TRUE(edit.GetBlobFileGarbages().empty());
+  EnvOptions env_options;
+  VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                         &vstorage_, /*version_set=*/nullptr);
+  ASSERT_OK(builder.Apply(&edit));
+  VersionStorageInfo output(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      /*force_consistency_checks=*/false, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr, /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(builder.SaveTo(&output));
+  ASSERT_TRUE(output.GetBlobFiles().empty());
+  ASSERT_EQ(output.RemovedBlobFiles(), std::vector<uint64_t>{kBlob});
+  UnrefFilesInVersion(&output);
+}
+
+TEST_F(VersionBuilderTest, FormatFenceRequiresExactSstMetadata) {
+  AddDummyFile(/*table_file_number=*/200,
+               /*blob_file_number=*/kInvalidBlobFileNumber,
+               /*epoch_number=*/2);
+  UpdateVersionStorageInfo();
+  EnvOptions env_options;
+
+  VersionEdit missing;
+  missing.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  AddDummyFileToEdit(&missing, /*table_file_number=*/101,
+                     /*blob_file_number=*/kInvalidBlobFileNumber,
+                     /*epoch_number=*/1);
+  VersionBuilder missing_builder(env_options, &ioptions_,
+                                 /*table_cache=*/nullptr, &vstorage_,
+                                 /*version_set=*/nullptr);
+  ASSERT_TRUE(missing_builder.Apply(&missing).IsCorruption());
+
+  missing.GetMutableNewFiles().back().second.blob_reference_legacy_metadata =
+      true;
+  VersionBuilder legacy_builder(env_options, &ioptions_,
+                                /*table_cache=*/nullptr, &vstorage_,
+                                /*version_set=*/nullptr);
+  ASSERT_OK(legacy_builder.Apply(&missing));
+
+  missing.GetMutableNewFiles().back().second.blob_reference_legacy_metadata =
+      false;
+  AddBlobReferenceDescriptorToLastFile(&missing);
+  std::string& version_one_descriptor =
+      missing.GetMutableNewFiles().back().second.blob_reference_descriptor;
+  // Version 1 has no repair trailer. Changing only its version word would
+  // produce an invalid 120-byte "legacy" descriptor.
+  version_one_descriptor.resize(
+      BlobReferenceMetadataDescriptor::kLegacyEncodedSize);
+  EncodeFixed32(version_one_descriptor.data() + sizeof(uint32_t), 1);
+  EncodeFixed32(
+      version_one_descriptor.data() + version_one_descriptor.size() -
+          sizeof(uint32_t),
+      crc32c::Value(version_one_descriptor.data(),
+                    version_one_descriptor.size() - sizeof(uint32_t)));
+  VersionBuilder version_one_builder(env_options, &ioptions_,
+                                     /*table_cache=*/nullptr, &vstorage_,
+                                     /*version_set=*/nullptr);
+  ASSERT_OK(version_one_builder.Apply(&missing));
+
+  AddBlobReferenceDescriptorToLastFile(&missing);
+  VersionBuilder complete_builder(env_options, &ioptions_,
+                                  /*table_cache=*/nullptr, &vstorage_,
+                                  /*version_set=*/nullptr);
+  ASSERT_OK(complete_builder.Apply(&missing));
+
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  VersionEdit legacy_move;
+  legacy_move.DeleteFile(/*level=*/0, /*file_number=*/200);
+  AddDummyFileToEdit(&legacy_move, /*table_file_number=*/200,
+                     /*blob_file_number=*/kInvalidBlobFileNumber,
+                     /*epoch_number=*/2);
+  VersionBuilder move_builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                              &vstorage_, /*version_set=*/nullptr);
+  ASSERT_OK(move_builder.Apply(&legacy_move));
+}
+
+TEST_F(VersionBuilderTest, ApplyBlobRelocationStateAtomically) {
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                         &vstorage_, /*version_set=*/nullptr);
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/200,
+                                   /*column_family_id=*/0,
+                                   /*origin_file_numbers=*/{100}, &addition));
+
+  VersionEdit edit;
+  edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+  edit.AddBlobRelocationFile(addition);
+  edit.SetBlobRelocationRoute(BlobRelocationRoute(
+      /*generation_file_number=*/100, /*origin_file_number=*/100,
+      /*physical_file_number=*/200));
+  ASSERT_OK(builder.Apply(&edit));
+  // Replay of a fully identical transition is idempotent.
+  ASSERT_OK(builder.Apply(&edit));
+
+  VersionStorageInfo output(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      /*force_consistency_checks=*/false, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr,
+      /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(builder.SaveTo(&output));
+  ASSERT_EQ(output.GetBlobIndirectionFormatVersion(),
+            kBlobIndirectionManifestFormatVersion);
+  ASSERT_NE(output.GetBlobRelocationFileMetaData(200), nullptr);
+  const BlobRelocationRoute* route = output.GetBlobRelocationRoute(
+      BlobRelocationRouteSource{/*generation_file_number=*/100,
+                                /*origin_file_number=*/100});
+  ASSERT_NE(route, nullptr);
+  ASSERT_EQ(route->GetPhysicalFileNumber(), 200U);
+  ASSERT_EQ(output.GetBlobRelocationRouteTargetCount(200), 1U);
+  ASSERT_EQ(output.GetBlobRelocationRouteTargetOriginCount(200, 100), 1U);
+  ASSERT_OK(output.ValidateBlobRelocationState());
+}
+
+TEST_F(VersionBuilderTest, ExactBlobFileRetirementIsValidatedAndIdempotent) {
+  constexpr uint64_t kSourceFileNumber = 100;
+  constexpr uint64_t kRelocationFileNumber = 200;
+  constexpr uint64_t kTableFileNumber = 101;
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  AddDummyFile(kTableFileNumber, kSourceFileNumber, /*epoch_number=*/1);
+  auto shared = SharedBlobFileMetaData::Create(
+      kSourceFileNumber, /*total_blob_count=*/2,
+      /*total_blob_bytes=*/100, /*checksum_method=*/{},
+      /*checksum_value=*/{}, /*is_identity_root=*/true);
+  vstorage_.AddBlobFile(BlobFileMetaData::Create(
+      std::move(shared), BlobFileMetaData::LinkedSsts{kTableFileNumber},
+      /*garbage_blob_count=*/1, /*garbage_blob_bytes=*/40));
+  UpdateVersionStorageInfo();
+
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(kRelocationFileNumber,
+                                   /*column_family_id=*/0, {kSourceFileNumber},
+                                   &addition));
+  std::shared_ptr<const BlobRelocationDirectory> directory;
+  ASSERT_OK(addition.GetValidatedDirectory(&directory));
+  const BlobRelocationOrigin* origin = directory->Find(kSourceFileNumber);
+  ASSERT_NE(origin, nullptr);
+
+  EnvOptions env_options;
+  {
+    VersionBuilder missing_route_builder(env_options, &ioptions_,
+                                         /*table_cache=*/nullptr, &vstorage_,
+                                         /*version_set=*/nullptr);
+    VersionEdit missing_route;
+    missing_route.RetireBlobFile(BlobFileRetirement(
+        kSourceFileNumber, origin->entry_count,
+        /*live_source_record_bytes=*/60, origin->record_bytes));
+    ASSERT_TRUE(missing_route_builder.Apply(&missing_route).IsCorruption());
+  }
+
+  VersionEdit edit;
+  edit.AddBlobRelocationFile(addition);
+  edit.SetBlobRelocationRoute(BlobRelocationRoute(
+      kSourceFileNumber, kSourceFileNumber, kRelocationFileNumber));
+  const BlobFileRetirement retirement(kSourceFileNumber, origin->entry_count,
+                                      /*live_source_record_bytes=*/60,
+                                      origin->record_bytes);
+  edit.RetireBlobFile(retirement);
+
+  VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                         &vstorage_, /*version_set=*/nullptr);
+  ASSERT_OK(builder.Apply(&edit));
+
+  VersionEdit replay;
+  replay.RetireBlobFile(retirement);
+  ASSERT_OK(builder.Apply(&replay));
+
+  VersionEdit conflict;
+  conflict.RetireBlobFile(BlobFileRetirement(
+      kSourceFileNumber, origin->entry_count,
+      /*live_source_record_bytes=*/59, origin->record_bytes));
+  ASSERT_TRUE(builder.Apply(&conflict).IsCorruption());
+
+  VersionStorageInfo output(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      /*force_consistency_checks=*/false, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr, /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(builder.SaveTo(&output));
+  ASSERT_EQ(output.GetBlobFileMetaData(kSourceFileNumber), nullptr);
+  ASSERT_NE(output.GetBlobRelocationFileMetaData(kRelocationFileNumber),
+            nullptr);
+  ASSERT_NE(output.GetBlobRelocationRoute(BlobRelocationRouteSource{
+                kSourceFileNumber, kSourceFileNumber}),
+            nullptr);
+  ASSERT_OK(output.ValidateBlobRelocationState());
+  UpdateVersionStorageInfo(&output);
+
+  {
+    VersionBuilder post_retirement_builder(env_options, &ioptions_,
+                                           /*table_cache=*/nullptr, &output,
+                                           /*version_set=*/nullptr);
+    VersionEdit post_retirement_garbage;
+    post_retirement_garbage.AddBlobFileGarbage(kSourceFileNumber,
+                                               /*garbage_blob_count=*/1,
+                                               /*garbage_blob_bytes=*/60);
+    ASSERT_OK(post_retirement_builder.Apply(&post_retirement_garbage));
+  }
+  UnrefFilesInVersion(&output);
+}
+
+TEST_F(VersionBuilderTest,
+       IdentityRootApproximateGarbageDoesNotAuthorizeRetirement) {
+  constexpr uint64_t kSourceFileNumber = 100;
+  constexpr uint64_t kTableFileNumber = 101;
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  AddDummyFile(kTableFileNumber, kSourceFileNumber, /*epoch_number=*/1);
+  auto shared = SharedBlobFileMetaData::Create(
+      kSourceFileNumber, /*total_blob_count=*/1,
+      /*total_blob_bytes=*/100, /*checksum_method=*/{},
+      /*checksum_value=*/{}, /*is_identity_root=*/true);
+  vstorage_.AddBlobFile(BlobFileMetaData::Create(
+      std::move(shared), BlobFileMetaData::LinkedSsts{kTableFileNumber},
+      /*garbage_blob_count=*/0, /*garbage_blob_bytes=*/0));
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                         &vstorage_, /*version_set=*/nullptr);
+  VersionEdit approximate;
+  approximate.AddBlobFileGarbage(kSourceFileNumber,
+                                 /*garbage_blob_count=*/1,
+                                 /*garbage_blob_bytes=*/100);
+  ASSERT_OK(builder.Apply(&approximate));
+
+  VersionStorageInfo output(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      /*force_consistency_checks=*/true, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr, /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(builder.SaveTo(&output));
+  const std::shared_ptr<BlobFileMetaData> retained =
+      output.GetBlobFileMetaData(kSourceFileNumber);
+  ASSERT_NE(retained, nullptr);
+  EXPECT_TRUE(retained->IsIdentityRoot());
+  EXPECT_EQ(retained->GetGarbageBlobCount(), 1U);
+  EXPECT_EQ(retained->GetGarbageBlobBytes(), 100U);
+  UnrefFilesInVersion(&output);
+}
+
+TEST_F(VersionBuilderTest, StandaloneBlobGCSuppressionAdvancesCandidate) {
+  auto first_shared = SharedBlobFileMetaData::Create(
+      /*blob_file_number=*/100, /*total_blob_count=*/10,
+      /*total_blob_bytes=*/1000, /*checksum_method=*/{},
+      /*checksum_value=*/{}, /*is_identity_root=*/true);
+  auto second_shared = SharedBlobFileMetaData::Create(
+      /*blob_file_number=*/200, /*total_blob_count=*/10,
+      /*total_blob_bytes=*/1000, /*checksum_method=*/{},
+      /*checksum_value=*/{}, /*is_identity_root=*/true);
+  vstorage_.AddBlobFile(BlobFileMetaData::Create(
+      std::move(first_shared), BlobFileMetaData::LinkedSsts{},
+      /*garbage_blob_count=*/8, /*garbage_blob_bytes=*/800));
+  vstorage_.AddBlobFile(BlobFileMetaData::Create(
+      std::move(second_shared), BlobFileMetaData::LinkedSsts{},
+      /*garbage_blob_count=*/6, /*garbage_blob_bytes=*/600));
+  BlobRelocationFileAddition relocation_addition;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/300,
+                                   /*column_family_id=*/0,
+                                   /*origin_file_numbers=*/{50},
+                                   &relocation_addition));
+  std::shared_ptr<const BlobRelocationDirectory> relocation_directory;
+  ASSERT_OK(relocation_addition.GetValidatedDirectory(&relocation_directory));
+  vstorage_.AddBlobRelocationFile(BlobRelocationFileMetaData::Create(
+      relocation_addition, std::move(relocation_directory)));
+  vstorage_.AddBlobRelocationRoute(
+      BlobRelocationRoute(/*generation_file_number=*/50,
+                          /*origin_file_number=*/50,
+                          /*physical_file_number=*/300));
+
+  vstorage_.SetBlobGcCandidates({100, 200, 300});
+  EXPECT_EQ(vstorage_.BlobPhysicalFileForStandaloneGC(), 100U);
+  std::vector<uint64_t> candidates;
+  vstorage_.GetBlobPhysicalFilesForStandaloneGC(/*max_files=*/3, &candidates);
+  EXPECT_EQ(candidates, (std::vector<uint64_t>{100, 200, 300}));
+  const std::vector<BlobRelocationRouteSource>* const sources =
+      vstorage_.GetBlobRelocationRouteSourcesForTarget(300);
+  ASSERT_NE(sources, nullptr);
+  EXPECT_EQ(*sources, (std::vector<BlobRelocationRouteSource>{{50, 50}}));
+
+  // Capacity-limited jobs rotate their bounded attempted batch so later
+  // candidates can be examined without scanning the whole ranking.
+  vstorage_.DeferBlobFilesForStandaloneGC({100, 200});
+  vstorage_.GetBlobPhysicalFilesForStandaloneGC(/*max_files=*/3, &candidates);
+  EXPECT_EQ(candidates, (std::vector<uint64_t>{300, 100, 200}));
+  vstorage_.SetBlobGcCandidates({100, 200, 300});
+
+  // Suppress a non-prefix candidate first. Batch selection must follow links
+  // rather than scanning over a growing sparse suppression vector.
+  vstorage_.SuppressBlobFileForStandaloneGC(200);
+  vstorage_.GetBlobPhysicalFilesForStandaloneGC(/*max_files=*/3, &candidates);
+  EXPECT_EQ(candidates, (std::vector<uint64_t>{100, 300}));
+  EXPECT_EQ(vstorage_.BlobPhysicalFileForStandaloneGC(), 100U);
+
+  vstorage_.SuppressBlobFileForStandaloneGC(100);
+  EXPECT_EQ(vstorage_.BlobPhysicalFileForStandaloneGC(), 300U);
+
+  vstorage_.SuppressBlobFileForStandaloneGC(300);
+  EXPECT_EQ(vstorage_.BlobPhysicalFileForStandaloneGC(),
+            kInvalidBlobFileNumber);
+}
+
+TEST_F(VersionBuilderTest, BlobRelocationMetadataPinsPhysicalFile) {
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/200,
+                                   /*column_family_id=*/0,
+                                   /*origin_file_numbers=*/{100}, &addition));
+  std::shared_ptr<const BlobRelocationDirectory> directory;
+  ASSERT_OK(addition.GetValidatedDirectory(&directory));
+
+  int destruction_count = 0;
+  std::shared_ptr<BlobRelocationFileMetaData> metadata =
+      BlobRelocationFileMetaData::Create(
+          addition, std::move(directory),
+          [&destruction_count](BlobRelocationFileMetaData* value) {
+            ++destruction_count;
+            delete value;
+          });
+  std::unique_ptr<VersionStorageInfo> first =
+      std::make_unique<VersionStorageInfo>(
+          &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel,
+          /*src_vstorage=*/nullptr, /*force_consistency_checks=*/false,
+          EpochNumberRequirement::kMightMissing, /*clock=*/nullptr,
+          /*bottommost_file_compaction_delay=*/0,
+          OffpeakTimeOption(options_.daily_offpeak_time_utc),
+          PeriodicCompactionPhaseParams{});
+  first->SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+  first->AddBlobRelocationFile(metadata);
+
+  std::unique_ptr<VersionStorageInfo> second =
+      std::make_unique<VersionStorageInfo>(
+          &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel,
+          /*src_vstorage=*/nullptr, /*force_consistency_checks=*/false,
+          EpochNumberRequirement::kMightMissing, /*clock=*/nullptr,
+          /*bottommost_file_compaction_delay=*/0,
+          OffpeakTimeOption(options_.daily_offpeak_time_utc),
+          PeriodicCompactionPhaseParams{});
+  second->SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  second->AddBlobRelocationFile(
+      first->GetBlobRelocationFileMetaData(/*file_number=*/200));
+
+  metadata.reset();
+  first.reset();
+  ASSERT_EQ(destruction_count, 0);
+  second.reset();
+  ASSERT_EQ(destruction_count, 1);
+}
+
+TEST_F(VersionBuilderTest, InvalidBlobRelocationEditHasNoPartialEffect) {
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                         &vstorage_, /*version_set=*/nullptr);
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/200,
+                                   /*column_family_id=*/0,
+                                   /*origin_file_numbers=*/{100}, &addition));
+
+  VersionEdit edit;
+  edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+  edit.AddBlobRelocationFile(addition);
+  edit.SetBlobRelocationRoute(BlobRelocationRoute(
+      /*generation_file_number=*/100, /*origin_file_number=*/999,
+      /*physical_file_number=*/200));
+  ASSERT_TRUE(builder.Apply(&edit).IsCorruption());
+
+  VersionStorageInfo output(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      /*force_consistency_checks=*/false, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr,
+      /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(builder.SaveTo(&output));
+  ASSERT_FALSE(output.HasBlobIndirectionFormat());
+  ASSERT_TRUE(output.GetBlobRelocationFiles().empty());
+  ASSERT_TRUE(output.GetBlobRelocationRoutes().empty());
+}
+
+TEST_F(VersionBuilderTest, BlobRelocationRejectsDuplicateAndCrossCfRecords) {
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/200,
+                                   /*column_family_id=*/0,
+                                   /*origin_file_numbers=*/{100}, &addition));
+
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    VersionEdit duplicate;
+    duplicate.SetBlobIndirectionFormatVersion(
+        kBlobIndirectionManifestFormatVersion);
+    duplicate.AddBlobRelocationFile(addition);
+    duplicate.AddBlobRelocationFile(addition);
+    ASSERT_TRUE(builder.Apply(&duplicate).IsCorruption());
+  }
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    VersionEdit cross_cf;
+    cross_cf.SetColumnFamily(/*column_family_id=*/1);
+    cross_cf.SetBlobIndirectionFormatVersion(
+        kBlobIndirectionManifestFormatVersion);
+    cross_cf.AddBlobRelocationFile(addition);
+    ASSERT_TRUE(builder.Apply(&cross_cf).IsCorruption());
+  }
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    VersionEdit duplicate_route;
+    duplicate_route.SetBlobIndirectionFormatVersion(
+        kBlobIndirectionManifestFormatVersion);
+    duplicate_route.AddBlobRelocationFile(addition);
+    const BlobRelocationRoute route(
+        /*generation_file_number=*/100, /*origin_file_number=*/100,
+        /*physical_file_number=*/200);
+    duplicate_route.SetBlobRelocationRoute(route);
+    duplicate_route.SetBlobRelocationRoute(route);
+    ASSERT_TRUE(builder.Apply(&duplicate_route).IsCorruption());
+  }
+}
+
+TEST_F(VersionBuilderTest, BlobRelocationRejectsPhysicalFileNumberCollisions) {
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/200,
+                                   /*column_family_id=*/0,
+                                   /*origin_file_numbers=*/{100}, &addition));
+
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    VersionEdit edit;
+    edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+    edit.AddBlobRelocationFile(addition);
+    AddDummyFileToEdit(&edit, /*table_file_number=*/200,
+                       /*blob_file_number=*/kInvalidBlobFileNumber,
+                       /*epoch_number=*/1);
+    ASSERT_TRUE(builder.Apply(&edit).IsCorruption());
+  }
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    VersionEdit edit;
+    edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+    edit.AddBlobRelocationFile(addition);
+    edit.AddBlobFile(/*blob_file_number=*/200, /*total_blob_count=*/1,
+                     /*total_blob_bytes=*/10, /*checksum_method=*/{},
+                     /*checksum_value=*/{});
+    ASSERT_TRUE(builder.Apply(&edit).IsCorruption());
+  }
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    VersionEdit install;
+    install.SetBlobIndirectionFormatVersion(
+        kBlobIndirectionManifestFormatVersion);
+    install.AddBlobRelocationFile(addition);
+    ASSERT_OK(builder.Apply(&install));
+
+    VersionEdit deletion;
+    deletion.DeleteBlobRelocationFile(/*file_number=*/200);
+    ASSERT_OK(builder.Apply(&deletion));
+
+    VersionEdit blob_reuse;
+    blob_reuse.AddBlobFile(/*blob_file_number=*/200, /*total_blob_count=*/1,
+                           /*total_blob_bytes=*/10, /*checksum_method=*/{},
+                           /*checksum_value=*/{});
+    ASSERT_TRUE(builder.Apply(&blob_reuse).IsCorruption());
+
+    VersionEdit table_reuse;
+    AddDummyFileToEdit(&table_reuse, /*table_file_number=*/200,
+                       /*blob_file_number=*/kInvalidBlobFileNumber,
+                       /*epoch_number=*/1);
+    ASSERT_TRUE(builder.Apply(&table_reuse).IsCorruption());
+  }
+}
+
+TEST_F(VersionBuilderTest, BlobRelocationRejectsSetAndDeleteSameKey) {
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/200,
+                                   /*column_family_id=*/0,
+                                   /*origin_file_numbers=*/{100}, &addition));
+  ASSERT_OK(AddRelocationToBase(addition));
+  vstorage_.AddBlobRelocationRoute(BlobRelocationRoute(
+      /*generation_file_number=*/100, /*origin_file_number=*/100,
+      /*physical_file_number=*/200));
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    VersionEdit edit;
+    edit.AddBlobRelocationFile(addition);
+    edit.DeleteBlobRelocationFile(/*file_number=*/200);
+    ASSERT_TRUE(builder.Apply(&edit).IsCorruption());
+  }
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    VersionEdit edit;
+    edit.SetBlobRelocationRoute(BlobRelocationRoute(
+        /*generation_file_number=*/100, /*origin_file_number=*/100,
+        /*physical_file_number=*/200));
+    edit.DeleteBlobRelocationRoute(/*generation_file_number=*/100,
+                                   /*origin_file_number=*/100);
+    ASSERT_TRUE(builder.Apply(&edit).IsCorruption());
+  }
+}
+
+TEST_F(VersionBuilderTest, BlobRelocationRouteReplacementAndDeletion) {
+  BlobRelocationFileAddition first_addition;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/200,
+                                   /*column_family_id=*/0,
+                                   /*origin_file_numbers=*/{100},
+                                   &first_addition));
+  ASSERT_OK(AddRelocationToBase(first_addition));
+  vstorage_.AddBlobRelocationRoute(BlobRelocationRoute(
+      /*generation_file_number=*/100, /*origin_file_number=*/100,
+      /*physical_file_number=*/200));
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  VersionBuilder replacement_builder(env_options, &ioptions_,
+                                     /*table_cache=*/nullptr, &vstorage_,
+                                     /*version_set=*/nullptr);
+  BlobRelocationFileAddition second_addition;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/300,
+                                   /*column_family_id=*/0,
+                                   /*origin_file_numbers=*/{100},
+                                   &second_addition));
+  VersionEdit replacement;
+  replacement.AddBlobRelocationFile(second_addition);
+  replacement.DeleteBlobRelocationFile(/*file_number=*/200);
+  replacement.SetBlobRelocationRoute(BlobRelocationRoute(
+      /*generation_file_number=*/100, /*origin_file_number=*/100,
+      /*physical_file_number=*/300));
+  ASSERT_OK(replacement_builder.Apply(&replacement));
+
+  VersionStorageInfo replaced(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      /*force_consistency_checks=*/false, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr,
+      /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(replacement_builder.SaveTo(&replaced));
+  ASSERT_EQ(replaced.GetBlobRelocationFileMetaData(200), nullptr);
+  ASSERT_NE(replaced.GetBlobRelocationFileMetaData(300), nullptr);
+  ASSERT_EQ(replaced.GetBlobRelocationRouteTargetCount(200), 0U);
+  ASSERT_EQ(replaced.GetBlobRelocationRouteTargetCount(300), 1U);
+
+  VersionBuilder deletion_builder(env_options, &ioptions_,
+                                  /*table_cache=*/nullptr, &replaced,
+                                  /*version_set=*/nullptr);
+  VersionEdit deletion;
+  deletion.DeleteBlobRelocationRoute(/*generation_file_number=*/100,
+                                     /*origin_file_number=*/100);
+  deletion.DeleteBlobRelocationFile(/*file_number=*/300);
+  ASSERT_OK(deletion_builder.Apply(&deletion));
+  VersionStorageInfo deleted(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &replaced,
+      /*force_consistency_checks=*/false, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr,
+      /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(deletion_builder.SaveTo(&deleted));
+  ASSERT_TRUE(deleted.GetBlobRelocationFiles().empty());
+  ASSERT_TRUE(deleted.GetBlobRelocationRoutes().empty());
+  // Installed snapshots retain only live state, not historical deletion
+  // tombstones. This replay still remembers its own pending deletions and
+  // rejects conflicting reuse until the replay builder is destroyed.
+  VersionBuilder replay_builder(env_options, &ioptions_,
+                                /*table_cache=*/nullptr, &deleted,
+                                /*version_set=*/nullptr);
+  ASSERT_OK(replay_builder.Apply(&deletion));
+  VersionStorageInfo replayed(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &deleted,
+      /*force_consistency_checks=*/false, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr, /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(replay_builder.SaveTo(&replayed));
+  ASSERT_TRUE(replayed.GetBlobRelocationFiles().empty());
+  ASSERT_TRUE(replayed.GetBlobRelocationRoutes().empty());
+
+  VersionEdit relocation_reuse;
+  relocation_reuse.AddBlobRelocationFile(second_addition);
+  ASSERT_TRUE(replay_builder.Apply(&relocation_reuse).IsCorruption());
+
+  VersionEdit blob_reuse;
+  blob_reuse.AddBlobFile(/*blob_file_number=*/300, /*total_blob_count=*/1,
+                         /*total_blob_bytes=*/10, /*checksum_method=*/{},
+                         /*checksum_value=*/{});
+  ASSERT_TRUE(replay_builder.Apply(&blob_reuse).IsCorruption());
+
+  VersionEdit table_reuse;
+  AddDummyFileToEdit(&table_reuse, /*table_file_number=*/300,
+                     /*blob_file_number=*/kInvalidBlobFileNumber,
+                     /*epoch_number=*/1);
+  ASSERT_TRUE(replay_builder.Apply(&table_reuse).IsCorruption());
+
+  VersionEdit route_reuse;
+  route_reuse.SetBlobRelocationRoute(BlobRelocationRoute(
+      /*generation_file_number=*/100, /*origin_file_number=*/100,
+      /*physical_file_number=*/300));
+  ASSERT_TRUE(replay_builder.Apply(&route_reuse).IsCorruption());
+}
+
+TEST_F(VersionBuilderTest, BlobRelocationUnchangedVersionSharesLiveState) {
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(200, 0, {100}, &addition));
+  ASSERT_OK(AddRelocationToBase(addition));
+  for (uint64_t generation = 1000; generation < 2000; ++generation) {
+    vstorage_.AddBlobRelocationRoute(BlobRelocationRoute(generation, 100, 200));
+  }
+  UpdateVersionStorageInfo();
+  ASSERT_OK(vstorage_.ValidateBlobRelocationState());
+  vstorage_.ComputeBlobRelocationStateFingerprint();
+
+  EnvOptions env_options;
+  VersionBuilder builder(env_options, &ioptions_, nullptr, &vstorage_, nullptr);
+  VersionStorageInfo unchanged(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      false, EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(builder.SaveTo(&unchanged));
+  ASSERT_EQ(unchanged.GetBlobRelocationState(),
+            vstorage_.GetBlobRelocationState());
+  ASSERT_EQ(unchanged.GetBlobRelocationStateFingerprintHigh(),
+            vstorage_.GetBlobRelocationStateFingerprintHigh());
+
+  VersionEdit deletion;
+  deletion.DeleteBlobRelocationRoute(1000, 100);
+  VersionBuilder changed_builder(env_options, &ioptions_, nullptr, &unchanged,
+                                 nullptr);
+  ASSERT_OK(changed_builder.Apply(&deletion));
+  VersionStorageInfo changed(&icmp_, ucmp_, options_.num_levels,
+                             kCompactionStyleLevel, &unchanged, false,
+                             EpochNumberRequirement::kMightMissing, nullptr, 0,
+                             OffpeakTimeOption(options_.daily_offpeak_time_utc),
+                             PeriodicCompactionPhaseParams{});
+  ASSERT_OK(changed_builder.SaveTo(&changed));
+  ASSERT_NE(changed.GetBlobRelocationState(),
+            unchanged.GetBlobRelocationState());
+  ASSERT_EQ(changed.GetBlobRelocationRoute({1000, 100}), nullptr);
+  ASSERT_NE(unchanged.GetBlobRelocationRoute({1000, 100}), nullptr);
+  ASSERT_EQ(changed.GetBlobRelocationRouteTargetCount(200), 999U);
+  ASSERT_EQ(unchanged.GetBlobRelocationRouteTargetCount(200), 1000U);
+}
+
+TEST_F(VersionBuilderTest, BlobRelocationShardFingerprintIsCanonical) {
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(200, 0, {100, 101}, &addition));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(addition.Validate(&directory));
+  const std::shared_ptr<BlobRelocationFileMetaData> file =
+      BlobRelocationFileMetaData::Create(addition, std::move(directory));
+  BlobRelocationState first;
+  first.SetFile(file);
+  first.SetRoute(BlobRelocationRoute(1000, 100, 200));
+  first.SetRoute(BlobRelocationRoute(1065, 101, 200));
+  uint64_t first_high;
+  uint64_t first_low;
+  first.ComputeFingerprint(1, &first_high, &first_low);
+  BlobRelocationState second;
+  second.SetRoute(BlobRelocationRoute(1065, 101, 200));
+  second.SetRoute(BlobRelocationRoute(1000, 100, 200));
+  second.SetFile(file);
+  // Creating and emptying another shard must not change the final digest.
+  second.SetRoute(BlobRelocationRoute(1001, 100, 200));
+  second.DeleteRoute({1001, 100});
+  uint64_t second_high;
+  uint64_t second_low;
+  second.ComputeFingerprint(1, &second_high, &second_low);
+  ASSERT_EQ(first_high, second_high);
+  ASSERT_EQ(first_low, second_low);
+  BlobRelocationState copied(first);
+  copied.DeleteRoute({1000, 100});
+  ASSERT_NE(first.FindRoute({1000, 100}), nullptr);
+  ASSERT_EQ(copied.FindRoute({1000, 100}), nullptr);
+  ASSERT_EQ(first.SourcesForTarget(200)->size(), 2U);
+  ASSERT_EQ(copied.SourcesForTarget(200)->size(), 1U);
+}
+
+TEST_F(VersionBuilderTest, BlobRelocationSupportsMaximumFileNumber) {
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  UpdateVersionStorageInfo();
+
+  constexpr uint64_t kMaxFileNumber = std::numeric_limits<uint64_t>::max();
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(kMaxFileNumber,
+                                   /*column_family_id=*/0,
+                                   /*origin_file_numbers=*/{100}, &addition));
+
+  EnvOptions env_options;
+  VersionBuilder addition_builder(env_options, &ioptions_,
+                                  /*table_cache=*/nullptr, &vstorage_,
+                                  /*version_set=*/nullptr);
+  VersionEdit addition_edit;
+  addition_edit.AddBlobRelocationFile(addition);
+  ASSERT_OK(addition_builder.Apply(&addition_edit));
+  VersionStorageInfo live(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      /*force_consistency_checks=*/false, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr, /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(addition_builder.SaveTo(&live));
+  ASSERT_NE(live.GetBlobRelocationFileMetaData(kMaxFileNumber), nullptr);
+
+  VersionBuilder deletion_builder(env_options, &ioptions_,
+                                  /*table_cache=*/nullptr, &live,
+                                  /*version_set=*/nullptr);
+  VersionEdit deletion_edit;
+  deletion_edit.DeleteBlobRelocationFile(kMaxFileNumber);
+  ASSERT_OK(deletion_builder.Apply(&deletion_edit));
+  VersionStorageInfo retired(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &live,
+      /*force_consistency_checks=*/false, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr, /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(deletion_builder.SaveTo(&retired));
+  ASSERT_EQ(retired.GetBlobRelocationFileMetaData(kMaxFileNumber), nullptr);
+  ASSERT_TRUE(retired.GetBlobRelocationFiles().empty());
+}
+
+TEST_F(VersionBuilderTest, BlobRelocationRejectsRouteChains) {
+  BlobRelocationFileAddition target;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/200,
+                                   /*column_family_id=*/0,
+                                   /*origin_file_numbers=*/{100}, &target));
+  ASSERT_OK(AddRelocationToBase(target));
+  vstorage_.AddBlobRelocationRoute(BlobRelocationRoute(
+      /*generation_file_number=*/100, /*origin_file_number=*/100,
+      /*physical_file_number=*/200));
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  VersionBuilder forward_chain_builder(env_options, &ioptions_,
+                                       /*table_cache=*/nullptr, &vstorage_,
+                                       /*version_set=*/nullptr);
+  BlobRelocationFileAddition later_target;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/300,
+                                   /*column_family_id=*/0,
+                                   /*origin_file_numbers=*/{100},
+                                   &later_target));
+  VersionEdit forward_chain;
+  forward_chain.AddBlobRelocationFile(later_target);
+  forward_chain.SetBlobRelocationRoute(BlobRelocationRoute(
+      /*generation_file_number=*/200, /*origin_file_number=*/100,
+      /*physical_file_number=*/300));
+  ASSERT_TRUE(forward_chain_builder.Apply(&forward_chain).IsCorruption());
+
+  VersionStorageInfo reverse_base(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel,
+      /*src_vstorage=*/nullptr, /*force_consistency_checks=*/false,
+      EpochNumberRequirement::kMightMissing, /*clock=*/nullptr,
+      /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  reverse_base.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  BlobRelocationDirectory later_directory;
+  ASSERT_OK(later_target.Validate(&later_directory));
+  reverse_base.AddBlobRelocationFile(BlobRelocationFileMetaData::Create(
+      later_target, std::move(later_directory)));
+  reverse_base.AddBlobRelocationRoute(BlobRelocationRoute(
+      /*generation_file_number=*/200, /*origin_file_number=*/100,
+      /*physical_file_number=*/300));
+  ASSERT_OK(reverse_base.ValidateBlobRelocationState());
+
+  VersionBuilder reverse_chain_builder(env_options, &ioptions_,
+                                       /*table_cache=*/nullptr, &reverse_base,
+                                       /*version_set=*/nullptr);
+  VersionEdit reverse_chain;
+  reverse_chain.AddBlobRelocationFile(target);
+  reverse_chain.SetBlobRelocationRoute(BlobRelocationRoute(
+      /*generation_file_number=*/100, /*origin_file_number=*/100,
+      /*physical_file_number=*/200));
+  ASSERT_TRUE(reverse_chain_builder.Apply(&reverse_chain).IsCorruption());
 }
 
 TEST_F(VersionBuilderTest, ApplyBlobFileAdditionAlreadyInBase) {

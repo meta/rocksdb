@@ -5,14 +5,22 @@
 
 #include "db/blob/blob_file_reader.h"
 
+#include <atomic>
 #include <cassert>
+#include <limits>
 #include <string>
 #include <utility>
 
 #include "db/blob/blob_contents.h"
+#include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_writer.h"
+#include "db/blob/blob_relocation_file.h"
+#include "db/blob/blob_relocation_gc.h"
+#include "db/blob/blob_source.h"
+#include "db/dbformat.h"
 #include "env/composite_env_wrapper.h"
+#include "env/emulated_clock.h"
 #include "env/mock_env.h"
 #include "file/filename.h"
 #include "file/read_write_util.h"
@@ -21,9 +29,17 @@
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/options.h"
+#include "rocksdb/sst_file_writer.h"
+#include "rocksdb/table.h"
+#include "table/block_based/block_based_table_factory.h"
+#include "table/table_builder.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
+#include "test_util/testutil.h"
+#include "util/cast_util.h"
+#include "util/coding.h"
 #include "util/compression.h"
+#include "util/crc32c.h"
 #include "utilities/fault_injection_env.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -130,13 +146,802 @@ void WriteBlobFile(const ImmutableOptions& immutable_options,
   }
 }
 
+struct RelocationTestRecord {
+  uint64_t origin_file_number;
+  uint64_t original_value_offset;
+  Slice stored_payload;
+  CompressionType compression;
+};
+
+void WriteRelocationFile(const ImmutableOptions& immutable_options,
+                         const MutableCFOptions& mutable_cf_options,
+                         const BlockBasedTableOptions& table_options,
+                         uint32_t column_family_id, uint64_t blob_file_number,
+                         const std::vector<RelocationTestRecord>& records,
+                         BlobRelocationFileMetadata* metadata,
+                         uint64_t* file_size) {
+  assert(metadata != nullptr);
+  assert(file_size != nullptr);
+  const std::string file_path =
+      BlobFileName(immutable_options.cf_paths.front().path, blob_file_number);
+  std::unique_ptr<FSWritableFile> file;
+  ASSERT_OK(immutable_options.fs->NewWritableFile(file_path, FileOptions(),
+                                                  &file, /*dbg=*/nullptr));
+  std::unique_ptr<WritableFileWriter> writer =
+      std::make_unique<WritableFileWriter>(
+          std::move(file), file_path, FileOptions(), immutable_options.clock);
+
+  InternalTblPropCollFactories collector_factories;
+  const InternalKeyComparator comparator(BytewiseComparator());
+  const ReadOptions read_options;
+  const WriteOptions write_options;
+  SstFileWriterEmbeddedBlobOptions embedded_options;
+  embedded_options.min_blob_size = 0;
+  BlockBasedTableFactory factory(MakeBlobRelocationTableOptions(table_options));
+  std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
+      TableBuilderOptions(
+          immutable_options, mutable_cf_options, read_options, write_options,
+          comparator, &collector_factories, kNoCompression,
+          CompressionOptions(), column_family_id, kDefaultColumnFamilyName,
+          /*level=*/-1, kUnknownNewestKeyTime,
+          /*is_bottommost=*/false, TableFileCreationReason::kMisc,
+          /*oldest_key_time=*/0, /*file_creation_time=*/0,
+          /*db_id=*/"test-db", /*db_session_id=*/"test-session",
+          /*target_file_size=*/0, blob_file_number,
+          /*last_level_inclusive_max_seqno_threshold=*/kMaxSequenceNumber,
+          /*db_name=*/Slice(),
+          /*is_remote_compaction=*/false, &embedded_options),
+      writer.get()));
+  ASSERT_NE(builder, nullptr);
+  ASSERT_OK(builder->StartBlobRelocationFile());
+  for (const RelocationTestRecord& record : records) {
+    ASSERT_OK(builder->AddBlobRelocation(
+        record.origin_file_number, record.original_value_offset,
+        record.stored_payload, record.compression));
+  }
+  ASSERT_OK(builder->Finish());
+  const TableProperties properties = builder->GetTableProperties();
+  ASSERT_EQ(properties.comparator_name, BytewiseComparator()->Name());
+  ASSERT_FALSE(properties.user_defined_timestamps_persisted);
+  ASSERT_OK(builder->GetBlobRelocationFileMetadata(metadata));
+  ASSERT_OK(writer->Close(IOOptions(), /*dbg=*/nullptr));
+  ASSERT_OK(immutable_options.fs->GetFileSize(file_path, IOOptions(), file_size,
+                                              /*dbg=*/nullptr));
+}
+
 }  // anonymous namespace
+
+TEST(BlobRelocationDirectoryTest, ValidatesOrderingAndChecksums) {
+  BlobRelocationDirectoryBuilder builder;
+  ASSERT_OK(builder.Add(/*origin_file_number=*/10,
+                        /*original_value_offset=*/2,
+                        /*relocated_value_offset=*/100,
+                        /*stored_value_size=*/3, kNoCompression));
+  ASSERT_OK(builder.Add(/*origin_file_number=*/10,
+                        /*original_value_offset=*/7,
+                        /*relocated_value_offset=*/108,
+                        /*stored_value_size=*/4, kNoCompression));
+  ASSERT_OK(builder.Add(/*origin_file_number=*/20,
+                        /*original_value_offset=*/1,
+                        /*relocated_value_offset=*/117,
+                        /*stored_value_size=*/5, kNoCompression));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(builder.Finish(&directory));
+  ASSERT_EQ(directory.origins().size(), 2U);
+  ASSERT_EQ(directory.total_entries(), 3U);
+  ASSERT_EQ(directory.total_record_bytes(),
+            12U + 3U * kSimpleGen2BlobTrailerSize);
+  ASSERT_NE(directory.Find(10), nullptr);
+  ASSERT_EQ(directory.Find(99), nullptr);
+  ASSERT_OK(directory.ValidateForFileSize(kBlobRelocationFilePrefixSize +
+                                          directory.total_record_bytes()));
+  ASSERT_TRUE(directory
+                  .ValidateForFileSize(kBlobRelocationFilePrefixSize +
+                                       directory.total_record_bytes() - 1)
+                  .IsCorruption());
+
+  std::string encoded;
+  directory.EncodeTo(&encoded);
+  BlobRelocationDirectory decoded;
+  ASSERT_OK(BlobRelocationDirectory::DecodeFrom(encoded, &decoded));
+  ASSERT_EQ(decoded.directory_digest(), directory.directory_digest());
+
+  // Two distinct offsets cannot fit in the single-point inclusive range.
+  std::string impossible_cardinality = encoded;
+  constexpr size_t kDirectoryHeaderSize = 40;
+  constexpr size_t kLastOffsetField = 16;
+  EncodeFixed64(
+      impossible_cardinality.data() + kDirectoryHeaderSize + kLastOffsetField,
+      /*last_original_offset=*/2);
+  EncodeFixed32(
+      impossible_cardinality.data() + 32,
+      crc32c::Value(impossible_cardinality.data() + kDirectoryHeaderSize,
+                    impossible_cardinality.size() - kDirectoryHeaderSize));
+  EncodeFixed32(impossible_cardinality.data() + 36,
+                crc32c::Value(impossible_cardinality.data(), 36));
+  ASSERT_TRUE(
+      BlobRelocationDirectory::DecodeFrom(impossible_cardinality, &decoded)
+          .IsCorruption());
+
+  std::string checksum_corruption = encoded;
+  checksum_corruption.back() ^= 1;
+  ASSERT_TRUE(BlobRelocationDirectory::DecodeFrom(checksum_corruption, &decoded)
+                  .IsCorruption());
+
+  BlobRelocationDirectoryBuilder duplicate;
+  ASSERT_OK(duplicate.Add(10, 2, 100, 3, kNoCompression));
+  ASSERT_TRUE(duplicate.Add(10, 2, 108, 4, kNoCompression).IsInvalidArgument());
+  BlobRelocationDirectoryBuilder unsorted;
+  ASSERT_OK(unsorted.Add(20, 1, 100, 3, kNoCompression));
+  ASSERT_TRUE(unsorted.Add(10, 2, 108, 4, kNoCompression).IsInvalidArgument());
+  BlobRelocationDirectoryBuilder unsupported;
+  ASSERT_TRUE(
+      unsupported.Add(10, 2, 100, 3, kCustomCompression80).IsInvalidArgument());
+
+  // A rejected overflowing addition must not change the current origin.
+  BlobRelocationDirectoryBuilder overflow;
+  ASSERT_OK(overflow.Add(
+      10, 2, 100,
+      std::numeric_limits<uint64_t>::max() - kSimpleGen2BlobTrailerSize,
+      kNoCompression));
+  ASSERT_TRUE(overflow.Add(10, 7, 108, 1, kNoCompression).IsInvalidArgument());
+  BlobRelocationDirectory after_overflow;
+  ASSERT_OK(overflow.Finish(&after_overflow));
+  ASSERT_EQ(after_overflow.total_entries(), 1U);
+
+  EXPECT_LT(EncodeBlobRelocationKey(10, 99), EncodeBlobRelocationKey(11, 1));
+  uint64_t origin_file_number = 0;
+  uint64_t original_value_offset = 0;
+  ASSERT_OK(DecodeBlobRelocationKey(EncodeBlobRelocationKey(10, 99),
+                                    &origin_file_number,
+                                    &original_value_offset));
+  EXPECT_EQ(origin_file_number, 10U);
+  EXPECT_EQ(original_value_offset, 99U);
+}
+
+TEST(BlobRelocationLiveSetTest, DeduplicatesAndRejectsConflicts) {
+  const auto make_reference = [](uint64_t offset, uint64_t stored_value_size,
+                                 uint64_t record_bytes,
+                                 uint32_t stable_checksum) {
+    BlobReference reference;
+    reference.encoding_class = BlobReferenceEncodingClass::kFeatureIdentity;
+    reference.generation_file_number = 10;
+    reference.origin_file_number = 10;
+    reference.original_value_offset = offset;
+    reference.stored_value_size = stored_value_size;
+    reference.record_bytes = record_bytes;
+    reference.compression = kNoCompression;
+    reference.stable_checksum_version = BlobIndex::kStableChecksumVersion1;
+    reference.stable_checksum = stable_checksum;
+    return reference;
+  };
+
+  const BlobReference first = make_reference(/*offset=*/100,
+                                             /*stored_value_size=*/20,
+                                             /*record_bytes=*/40,
+                                             /*stable_checksum=*/1);
+  const BlobReference second = make_reference(/*offset=*/200,
+                                              /*stored_value_size=*/30,
+                                              /*record_bytes=*/50,
+                                              /*stable_checksum=*/2);
+  BlobRelocationLiveSet live_set{std::shared_ptr<CacheReservationManager>()};
+  ASSERT_OK(live_set.Add({second, first}));
+  ASSERT_OK(live_set.Add({first}));
+  ASSERT_OK(live_set.Finalize(BlobRelocationRouteSource{10, 10}));
+  ASSERT_EQ(live_set.references().size(), 2U);
+  EXPECT_EQ(live_set.references()[0].original_value_offset, 100U);
+  EXPECT_EQ(live_set.references()[1].original_value_offset, 200U);
+  EXPECT_EQ(live_set.live_stored_value_bytes(), 50U);
+  EXPECT_EQ(live_set.live_record_bytes(), 90U);
+
+  BlobReference conflict = first;
+  ++conflict.stable_checksum;
+  BlobRelocationLiveSet conflicting_set{
+      std::shared_ptr<CacheReservationManager>()};
+  ASSERT_OK(conflicting_set.Add({first, conflict}));
+  ASSERT_TRUE(conflicting_set.Finalize(BlobRelocationRouteSource{10, 10})
+                  .IsCorruption());
+}
+
+TEST(BlobRelocationPackingTest, FirstFitDecreasingIsDeterministicAndWhole) {
+  const std::vector<BlobRelocationPackingItem> items{
+      {/*origin_file_number=*/30, /*source_generation_file_number=*/300,
+       /*estimated_bytes=*/40},
+      {/*origin_file_number=*/10, /*source_generation_file_number=*/100,
+       /*estimated_bytes=*/60},
+      {/*origin_file_number=*/20, /*source_generation_file_number=*/200,
+       /*estimated_bytes=*/40},
+      {/*origin_file_number=*/40, /*source_generation_file_number=*/400,
+       /*estimated_bytes=*/30}};
+  std::vector<BlobRelocationPackingBin> bins;
+  ASSERT_OK(PlanBlobRelocationPacking(
+      items, /*target_output_bytes=*/100, /*hard_output_bytes=*/120,
+      /*max_origins_per_output=*/3, /*max_outputs=*/3, &bins));
+  ASSERT_EQ(bins.size(), 2U);
+  EXPECT_EQ(bins[0].item_indexes, (std::vector<size_t>{1, 2}));
+  EXPECT_EQ(bins[0].estimated_bytes, 100U);
+  EXPECT_EQ(bins[1].item_indexes, (std::vector<size_t>{0, 3}));
+  EXPECT_EQ(bins[1].estimated_bytes, 70U);
+
+  const std::vector<BlobRelocationPackingItem> duplicate_origins{
+      {/*origin_file_number=*/10, /*source_generation_file_number=*/100,
+       /*estimated_bytes=*/60},
+      {/*origin_file_number=*/10, /*source_generation_file_number=*/200,
+       /*estimated_bytes=*/40}};
+  ASSERT_OK(PlanBlobRelocationPacking(
+      duplicate_origins, /*target_output_bytes=*/100,
+      /*hard_output_bytes=*/120, /*max_origins_per_output=*/3,
+      /*max_outputs=*/3, &bins));
+  ASSERT_EQ(bins.size(), 2U);
+
+  ASSERT_TRUE(PlanBlobRelocationPacking(items, /*target_output_bytes=*/100,
+                                        /*hard_output_bytes=*/50,
+                                        /*max_origins_per_output=*/3,
+                                        /*max_outputs=*/3, &bins)
+                  .IsInvalidArgument());
+  ASSERT_TRUE(PlanBlobRelocationPacking(items, /*target_output_bytes=*/50,
+                                        /*hard_output_bytes=*/100,
+                                        /*max_origins_per_output=*/1,
+                                        /*max_outputs=*/3, &bins)
+                  .IsMemoryLimit());
+
+  const std::vector<BlobRelocationPackingItem> oversized_partition{
+      {/*origin_file_number=*/10, /*source_generation_file_number=*/100,
+       /*estimated_bytes=*/121}};
+  ASSERT_TRUE(PlanBlobRelocationPacking(
+                  oversized_partition, /*target_output_bytes=*/100,
+                  /*hard_output_bytes=*/120, /*max_origins_per_output=*/3,
+                  /*max_outputs=*/3, &bins)
+                  .IsMemoryLimit());
+}
 
 class BlobFileReaderTest : public testing::Test {
  protected:
   BlobFileReaderTest() { mock_env_.reset(MockEnv::Create(Env::Default())); }
   std::unique_ptr<Env> mock_env_;
 };
+
+TEST_F(BlobFileReaderTest, RejectsOversizedCompressedBlobBeforeAllocation) {
+  if (!CompressionTypeSupported(kZlibCompression)) {
+    ROCKSDB_GTEST_SKIP("Zlib is required for this test");
+    return;
+  }
+  std::string stored_value;
+  PutVarint64(&stored_value, std::numeric_limits<uint64_t>::max());
+  const std::shared_ptr<Decompressor> decompressor =
+      GetBuiltinV2CompressionManager()->GetDecompressorOptimizeFor(
+          kZlibCompression);
+  std::unique_ptr<BlobContents> result;
+  ASSERT_TRUE(UncompressBlobContentsIfNeeded(
+                  stored_value, kZlibCompression, decompressor.get(),
+                  /*allocator=*/nullptr, mock_env_->GetSystemClock().get(),
+                  /*statistics=*/nullptr, &result)
+                  .IsCorruption());
+  ASSERT_EQ(result, nullptr);
+}
+
+TEST_F(BlobFileReaderTest,
+       RejectsUnsupportedRelocationComparatorBeforeWritingPrefix) {
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(
+          mock_env_.get(),
+          "BlobFileReaderTest_RejectsUnsupportedRelocationComparator"),
+      0);
+  options.enable_blob_files = true;
+  BlockBasedTableOptions table_options;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  const ImmutableOptions immutable_options(options);
+  const MutableCFOptions mutable_cf_options(options);
+
+  const auto verify_rejected = [&](const Comparator* user_comparator,
+                                   const std::string& db_id,
+                                   const std::string& db_session_id,
+                                   uint64_t file_number) {
+    const std::string file_path =
+        BlobFileName(immutable_options.cf_paths.front().path, file_number);
+    std::unique_ptr<FSWritableFile> file;
+    ASSERT_OK(immutable_options.fs->NewWritableFile(file_path, FileOptions(),
+                                                    &file, /*dbg=*/nullptr));
+    std::unique_ptr<WritableFileWriter> writer =
+        std::make_unique<WritableFileWriter>(
+            std::move(file), file_path, FileOptions(), immutable_options.clock);
+    InternalTblPropCollFactories collector_factories;
+    const InternalKeyComparator comparator(user_comparator);
+    const ReadOptions read_options;
+    const WriteOptions write_options;
+    SstFileWriterEmbeddedBlobOptions embedded_options;
+    embedded_options.min_blob_size = 0;
+    BlockBasedTableFactory factory(
+        MakeBlobRelocationTableOptions(table_options));
+    std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
+        TableBuilderOptions(
+            immutable_options, mutable_cf_options, read_options, write_options,
+            comparator, &collector_factories, kNoCompression,
+            CompressionOptions(), /*column_family_id=*/1,
+            kDefaultColumnFamilyName, /*level=*/-1, kUnknownNewestKeyTime,
+            /*is_bottommost=*/false, TableFileCreationReason::kMisc,
+            /*oldest_key_time=*/0, /*file_creation_time=*/0, db_id,
+            db_session_id,
+            /*target_file_size=*/0, file_number,
+            /*last_level_inclusive_max_seqno_threshold=*/kMaxSequenceNumber,
+            /*db_name=*/Slice(), /*is_remote_compaction=*/false,
+            &embedded_options),
+        writer.get()));
+    ASSERT_NE(builder, nullptr);
+    ASSERT_TRUE(builder->StartBlobRelocationFile().IsInvalidArgument());
+    builder->Abandon();
+    ASSERT_OK(writer->Close(IOOptions(), /*dbg=*/nullptr));
+    uint64_t file_size = 1;
+    ASSERT_OK(immutable_options.fs->GetFileSize(file_path, IOOptions(),
+                                                &file_size, /*dbg=*/nullptr));
+    EXPECT_EQ(file_size, 0U);
+  };
+
+  verify_rejected(ReverseBytewiseComparator(), "test-db", "test-session",
+                  /*file_number=*/301);
+  verify_rejected(test::BytewiseComparatorWithU64TsWrapper(), "test-db",
+                  "test-session",
+                  /*file_number=*/302);
+  verify_rejected(BytewiseComparator(), "test-db", /*db_session_id=*/"",
+                  /*file_number=*/303);
+}
+
+TEST_F(BlobFileReaderTest,
+       RelocationFilePersistsItsDedicatedComparatorMetadata) {
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(
+          mock_env_.get(),
+          "BlobFileReaderTest_RelocationFileDedicatedComparatorMetadata"),
+      0);
+  options.enable_blob_files = true;
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  options.persist_user_defined_timestamps = true;
+  BlockBasedTableOptions table_options;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  const ImmutableOptions immutable_options(options);
+  const MutableCFOptions mutable_cf_options(options);
+  const std::string value = "value";
+  const std::vector<RelocationTestRecord> records{{/*origin_file_number=*/100,
+                                                   /*original_value_offset=*/7,
+                                                   value, kNoCompression}};
+  BlobRelocationFileMetadata metadata;
+  uint64_t file_size = 0;
+  WriteRelocationFile(immutable_options, mutable_cf_options, table_options,
+                      /*column_family_id=*/1, /*blob_file_number=*/304, records,
+                      &metadata, &file_size);
+  EXPECT_GT(file_size, 0U);
+}
+
+TEST_F(BlobFileReaderTest, RelocationFileMultiOriginCompressedRoundTrip) {
+  if (!CompressionTypeSupported(kZSTD)) {
+    ROCKSDB_GTEST_SKIP("ZSTD is required for this test");
+    return;
+  }
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(
+          mock_env_.get(),
+          "BlobFileReaderTest_RelocationFileMultiOriginCompressedRoundTrip"),
+      0);
+  options.enable_blob_files = true;
+  BlockBasedTableOptions table_options;
+  table_options.format_version = 7;
+  table_options.checksum = kCRC32c;
+  table_options.block_cache = NewLRUCache(1 << 20);
+  options.blob_cache = NewLRUCache(1 << 20);
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  const ImmutableOptions immutable_options(options);
+  const MutableCFOptions mutable_cf_options(options);
+  constexpr uint32_t column_family_id = 1;
+  constexpr uint64_t relocation_file_number = 300;
+  constexpr uint64_t first_origin = 100;
+  constexpr uint64_t second_origin = 200;
+  const std::string first_value = "uncompressed-value";
+  const std::string second_value(4096, 'z');
+  const std::string third_value = "other-origin";
+
+  std::unique_ptr<Compressor> compressor =
+      GetBuiltinV2CompressionManager()->GetCompressor({}, kZSTD);
+  GrowableBuffer compressed_second;
+  ASSERT_OK(LegacyForceBuiltinCompression(*compressor, /*working_area=*/nullptr,
+                                          second_value, &compressed_second));
+  const std::vector<RelocationTestRecord> records{
+      {first_origin, 10, first_value, kNoCompression},
+      {first_origin, 20, compressed_second, kZSTD},
+      {second_origin, 7, third_value, kNoCompression}};
+
+  BlobRelocationFileMetadata metadata;
+  uint64_t file_size = 0;
+  WriteRelocationFile(immutable_options, mutable_cf_options, table_options,
+                      column_family_id, relocation_file_number, records,
+                      &metadata, &file_size);
+  ASSERT_EQ(metadata.origin_count, 2U);
+  ASSERT_EQ(metadata.entry_count, records.size());
+  ASSERT_EQ(metadata.record_bytes,
+            first_value.size() + compressed_second.size() + third_value.size() +
+                records.size() * kSimpleGen2BlobTrailerSize);
+
+  std::unique_ptr<BlobFileReader> reader;
+  ReadOptions read_options;
+  read_options.verify_checksums = true;
+  ASSERT_OK(BlobFileReader::CreateRelocationFile(
+      immutable_options, read_options, FileOptions(),
+      /*blob_file_read_hist=*/nullptr, column_family_id, relocation_file_number,
+      file_size, metadata.tail_size, metadata.directory_digest,
+      /*current_db_session_id=*/"reader", table_options,
+      mutable_cf_options.compression_manager.get(),
+      /*block_protection_bytes_per_key=*/0, /*io_tracer=*/nullptr, &reader));
+  ASSERT_NE(reader, nullptr);
+  ASSERT_TRUE(reader->IsRelocationFile());
+
+  std::unique_ptr<BlobFileReader> invalid_reader;
+  ASSERT_TRUE(BlobFileReader::CreateRelocationFile(
+                  immutable_options, read_options, FileOptions(),
+                  /*blob_file_read_hist=*/nullptr, column_family_id,
+                  relocation_file_number, file_size, metadata.tail_size,
+                  metadata.directory_digest,
+                  /*current_db_session_id=*/"", table_options,
+                  mutable_cf_options.compression_manager.get(),
+                  /*block_protection_bytes_per_key=*/0,
+                  /*io_tracer=*/nullptr, &invalid_reader)
+                  .IsInvalidArgument());
+  ASSERT_TRUE(BlobFileReader::CreateRelocationFile(
+                  immutable_options, read_options, FileOptions(),
+                  /*blob_file_read_hist=*/nullptr, column_family_id,
+                  relocation_file_number, file_size, metadata.tail_size,
+                  metadata.directory_digest ^ 1,
+                  /*current_db_session_id=*/"reader", table_options,
+                  mutable_cf_options.compression_manager.get(),
+                  /*block_protection_bytes_per_key=*/0,
+                  /*io_tracer=*/nullptr, &invalid_reader)
+                  .IsCorruption());
+  ASSERT_TRUE(BlobFileReader::CreateRelocationFile(
+                  immutable_options, read_options, FileOptions(),
+                  /*blob_file_read_hist=*/nullptr, column_family_id,
+                  relocation_file_number, file_size + 1, metadata.tail_size,
+                  metadata.directory_digest,
+                  /*current_db_session_id=*/"reader", table_options,
+                  mutable_cf_options.compression_manager.get(),
+                  /*block_protection_bytes_per_key=*/0,
+                  /*io_tracer=*/nullptr, &invalid_reader)
+                  .IsCorruption());
+  ASSERT_TRUE(BlobFileReader::CreateRelocationFile(
+                  immutable_options, read_options, FileOptions(),
+                  /*blob_file_read_hist=*/nullptr, column_family_id + 1,
+                  relocation_file_number, file_size, metadata.tail_size,
+                  metadata.directory_digest,
+                  /*current_db_session_id=*/"reader", table_options,
+                  mutable_cf_options.compression_manager.get(),
+                  /*block_protection_bytes_per_key=*/0,
+                  /*io_tracer=*/nullptr, &invalid_reader)
+                  .IsCorruption());
+
+  const auto make_index = [](uint64_t origin, uint64_t original_offset,
+                             uint64_t stored_size, CompressionType compression,
+                             const Slice& logical_value) {
+    std::string encoded;
+    BlobIndex::EncodeIndirectBlob(
+        &encoded, /*generation_file_number=*/origin, origin, original_offset,
+        stored_size, compression, BlobIndex::kStableChecksumVersion1,
+        crc32c::Value(logical_value.data(), logical_value.size()));
+    BlobIndex index;
+    EXPECT_OK(index.DecodeFrom(encoded));
+    return index;
+  };
+  const BlobIndex first_index = make_index(first_origin, 10, first_value.size(),
+                                           kNoCompression, first_value);
+  const BlobIndex second_index = make_index(
+      first_origin, 20, compressed_second.size(), kZSTD, second_value);
+  const BlobIndex third_index = make_index(second_origin, 7, third_value.size(),
+                                           kNoCompression, third_value);
+
+  std::array<std::string, 3> stored_payloads;
+  std::array<Status, 3> stored_statuses;
+  std::array<StoredRelocationFileReadRequest, 3> stored_requests{
+      StoredRelocationFileReadRequest{
+          first_origin, 10, first_value.size(), kNoCompression,
+          BlobIndex::kStableChecksumVersion1,
+          crc32c::Value(first_value.data(), first_value.size()),
+          &stored_payloads[0], &stored_statuses[0]},
+      StoredRelocationFileReadRequest{
+          first_origin, 20, compressed_second.size(), kZSTD,
+          BlobIndex::kStableChecksumVersion1,
+          crc32c::Value(second_value.data(), second_value.size()),
+          &stored_payloads[1], &stored_statuses[1]},
+      StoredRelocationFileReadRequest{
+          second_origin, 7, third_value.size(), kNoCompression,
+          BlobIndex::kStableChecksumVersion1,
+          crc32c::Value(third_value.data(), third_value.size()) ^ 1,
+          &stored_payloads[2], &stored_statuses[2]}};
+  uint64_t stored_bytes_read = 0;
+  reader->MultiGetStoredBlobsFromRelocationFile(
+      read_options, stored_requests.size(), stored_requests.data(),
+      /*max_stored_value_size=*/1 << 20,
+      /*max_logical_value_size=*/1 << 20, &stored_bytes_read);
+  ASSERT_OK(stored_statuses[0]);
+  ASSERT_OK(stored_statuses[1]);
+  ASSERT_TRUE(stored_statuses[2].IsCorruption());
+  EXPECT_EQ(stored_payloads[0], first_value);
+  EXPECT_EQ(stored_payloads[1], compressed_second.AsSlice().ToString());
+  EXPECT_TRUE(stored_payloads[2].empty());
+  EXPECT_EQ(stored_bytes_read, first_value.size() + compressed_second.size() +
+                                   2 * kSimpleGen2BlobTrailerSize);
+
+  PinnableSlice value;
+  uint64_t bytes_read = 0;
+  ASSERT_OK(reader->GetBlobFromRelocationFile(
+      read_options, first_index, /*range_offset=*/0, kWholeBlobLength, &value,
+      &bytes_read));
+  EXPECT_EQ(value, first_value);
+  EXPECT_EQ(bytes_read, first_value.size() + kSimpleGen2BlobTrailerSize);
+
+  value.Reset();
+  ASSERT_OK(reader->GetBlobFromRelocationFile(
+      read_options, first_index, /*range_offset=*/2, /*range_length=*/5, &value,
+      &bytes_read));
+  EXPECT_EQ(value, Slice(first_value.data() + 2, 5));
+  EXPECT_EQ(bytes_read, 5U);
+
+  value.Reset();
+  ASSERT_OK(reader->GetBlobFromRelocationFile(
+      read_options, second_index, /*range_offset=*/3, /*range_length=*/7,
+      &value, &bytes_read));
+  EXPECT_EQ(value, Slice(second_value.data() + 3, 7));
+  EXPECT_EQ(bytes_read, compressed_second.size() + kSimpleGen2BlobTrailerSize);
+
+  value.Reset();
+  value.PinSelf("stale");
+  EXPECT_TRUE(reader
+                  ->GetBlobFromRelocationFile(
+                      read_options, first_index,
+                      /*range_offset=*/first_value.size(),
+                      /*range_length=*/std::numeric_limits<size_t>::max() - 1,
+                      &value, &bytes_read)
+                  .IsInvalidArgument());
+
+  const BlobIndex unsupported_index =
+      make_index(first_origin, 10, first_value.size(), kFirstCustomCompression,
+                 first_value);
+  EXPECT_TRUE(reader
+                  ->GetBlobFromRelocationFile(
+                      read_options, unsupported_index, /*range_offset=*/0,
+                      kWholeBlobLength, &value, &bytes_read)
+                  .IsCorruption());
+  const BlobIndex oversized_index =
+      make_index(first_origin, 10, kMaxSimpleGen2BlobPayloadSize + 1,
+                 kNoCompression, first_value);
+  EXPECT_TRUE(reader
+                  ->GetBlobFromRelocationFile(
+                      read_options, oversized_index, /*range_offset=*/0,
+                      kWholeBlobLength, &value, &bytes_read)
+                  .IsCorruption());
+
+  std::array<PinnableSlice, 3> invalid_values;
+  std::array<Status, 3> invalid_statuses;
+  std::array<RelocationBlobReadRequest, 3> invalid_requests{
+      RelocationBlobReadRequest{&first_index, first_value.size(),
+                                std::numeric_limits<size_t>::max() - 1,
+                                &invalid_values[0], &invalid_statuses[0]},
+      RelocationBlobReadRequest{&unsupported_index, 0, kWholeBlobLength,
+                                &invalid_values[1], &invalid_statuses[1]},
+      RelocationBlobReadRequest{&oversized_index, 0, kWholeBlobLength,
+                                &invalid_values[2], &invalid_statuses[2]}};
+  bytes_read = std::numeric_limits<uint64_t>::max();
+  reader->MultiGetBlobFromRelocationFile(read_options, invalid_requests.size(),
+                                         invalid_requests.data(), &bytes_read);
+  EXPECT_TRUE(invalid_statuses[0].IsInvalidArgument());
+  EXPECT_TRUE(invalid_statuses[1].IsCorruption());
+  EXPECT_TRUE(invalid_statuses[2].IsCorruption());
+  EXPECT_EQ(bytes_read, 0U);
+
+  std::array<PinnableSlice, 3> values;
+  std::array<Status, 3> statuses;
+  std::array<RelocationBlobReadRequest, 3> requests;
+  const std::array<const BlobIndex*, 3> indexes{&third_index, &first_index,
+                                                &second_index};
+  for (size_t i = 0; i < requests.size(); ++i) {
+    requests[i].blob_index = indexes[i];
+    requests[i].result = &values[i];
+    requests[i].status = &statuses[i];
+  }
+  std::atomic<size_t> relocation_multiread_calls{0};
+  std::atomic<size_t> relocation_multiread_requests{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "MultiReadGen2:Requests", [&](void* arg) {
+        const std::vector<FSReadRequest>* const aligned_reqs =
+            static_cast<std::vector<FSReadRequest>*>(arg);
+        ++relocation_multiread_calls;
+        relocation_multiread_requests += aligned_reqs->size();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  reader->MultiGetBlobFromRelocationFile(read_options, requests.size(),
+                                         requests.data(), &bytes_read);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(statuses[0]);
+  ASSERT_OK(statuses[1]);
+  ASSERT_OK(statuses[2]);
+  EXPECT_EQ(values[0], third_value);
+  EXPECT_EQ(values[1], first_value);
+  EXPECT_EQ(values[2], second_value);
+  EXPECT_EQ(bytes_read, metadata.record_bytes);
+  EXPECT_EQ(relocation_multiread_calls.load(), 1U);
+  EXPECT_EQ(relocation_multiread_requests.load(), requests.size());
+
+  std::array<PinnableSlice, 2> duplicate_values;
+  std::array<Status, 2> duplicate_statuses;
+  std::array<RelocationBlobReadRequest, 2> duplicate_requests{
+      RelocationBlobReadRequest{&first_index, 0, kWholeBlobLength,
+                                &duplicate_values[0], &duplicate_statuses[0]},
+      RelocationBlobReadRequest{&first_index, 0, kWholeBlobLength,
+                                &duplicate_values[1], &duplicate_statuses[1]}};
+  std::atomic<size_t> duplicate_multiread_calls{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "MultiReadGen2:Requests", [&](void* arg) {
+        const std::vector<FSReadRequest>* const read_reqs =
+            static_cast<std::vector<FSReadRequest>*>(arg);
+        ++duplicate_multiread_calls;
+        for (size_t i = 1; i < read_reqs->size(); ++i) {
+          EXPECT_LE((*read_reqs)[i - 1].offset + (*read_reqs)[i - 1].len,
+                    (*read_reqs)[i].offset);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  reader->MultiGetBlobFromRelocationFile(
+      read_options, duplicate_requests.size(), duplicate_requests.data(),
+      &bytes_read);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(duplicate_statuses[0]);
+  ASSERT_OK(duplicate_statuses[1]);
+  EXPECT_EQ(duplicate_values[0], first_value);
+  EXPECT_EQ(duplicate_values[1], first_value);
+  EXPECT_EQ(duplicate_multiread_calls.load(), 2U);
+
+  std::array<PinnableSlice, 2> overlapping_values;
+  std::array<Status, 2> overlapping_statuses;
+  std::array<RelocationBlobReadRequest, 2> overlapping_requests{
+      RelocationBlobReadRequest{&first_index, 0, 5, &overlapping_values[0],
+                                &overlapping_statuses[0]},
+      RelocationBlobReadRequest{&first_index, 3, 5, &overlapping_values[1],
+                                &overlapping_statuses[1]}};
+  std::atomic<size_t> overlapping_multiread_calls{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "MultiReadGen2:Requests", [&](void* arg) {
+        const std::vector<FSReadRequest>* const read_reqs =
+            static_cast<std::vector<FSReadRequest>*>(arg);
+        ++overlapping_multiread_calls;
+        for (size_t i = 1; i < read_reqs->size(); ++i) {
+          EXPECT_LE((*read_reqs)[i - 1].offset + (*read_reqs)[i - 1].len,
+                    (*read_reqs)[i].offset);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  reader->MultiGetBlobFromRelocationFile(
+      read_options, overlapping_requests.size(), overlapping_requests.data(),
+      &bytes_read);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(overlapping_statuses[0]);
+  ASSERT_OK(overlapping_statuses[1]);
+  EXPECT_EQ(overlapping_values[0], Slice(first_value.data(), 5));
+  EXPECT_EQ(overlapping_values[1], Slice(first_value.data() + 3, 5));
+  EXPECT_EQ(overlapping_multiread_calls.load(), 2U);
+
+  for (PinnableSlice& overlapping_value : overlapping_values) {
+    overlapping_value.Reset();
+  }
+  overlapping_statuses = {};
+  ReadOptions deadline_options(read_options);
+  deadline_options.deadline =
+      std::chrono::microseconds(mock_env_->NowMicros() + 1000);
+  EmulatedSystemClock* const mock_clock =
+      static_cast_with_check<EmulatedSystemClock>(
+          mock_env_->GetSystemClock().get());
+  std::atomic<size_t> deadline_multiread_calls{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "MultiReadGen2:Requests", [&](void* /*arg*/) {
+        if (++deadline_multiread_calls == 1) {
+          mock_clock->MockSleepForMicroseconds(2000);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  reader->MultiGetBlobFromRelocationFile(
+      deadline_options, overlapping_requests.size(),
+      overlapping_requests.data(), &bytes_read);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(overlapping_statuses[0]);
+  EXPECT_TRUE(overlapping_statuses[1].IsTimedOut());
+  EXPECT_EQ(overlapping_values[0], Slice(first_value.data(), 5));
+  EXPECT_TRUE(overlapping_values[1].empty());
+  EXPECT_EQ(deadline_multiread_calls.load(), 1U);
+
+  const BlobIndex missing =
+      make_index(/*origin=*/999, /*original_offset=*/1, first_value.size(),
+                 kNoCompression, first_value);
+  value.Reset();
+  EXPECT_TRUE(reader
+                  ->GetBlobFromRelocationFile(
+                      read_options, missing, /*range_offset=*/0,
+                      kWholeBlobLength, &value, /*bytes_read=*/nullptr)
+                  .IsCorruption());
+
+  std::shared_ptr<Cache> file_cache = NewLRUCache(1024);
+  FileOptions file_options;
+  BlobFileCache blob_file_cache(
+      file_cache.get(), &immutable_options, &file_options, column_family_id,
+      /*blob_file_read_hist=*/nullptr, /*io_tracer=*/nullptr, &table_options);
+  const std::string db_id = "relocation-test-db";
+  const std::string db_session_id = "relocation-test-session";
+  BlobSource blob_source(immutable_options, mutable_cf_options, db_id,
+                         db_session_id, &blob_file_cache);
+  std::array<PinnableSlice, 3> source_values;
+  std::array<Status, 3> source_statuses;
+  std::array<IndirectBlobReadRequest, 3> source_requests;
+  const std::array<const BlobIndex*, 3> source_indexes{
+      &second_index, &third_index, &first_index};
+  for (size_t i = 0; i < source_requests.size(); ++i) {
+    source_requests[i].user_key = "unused";
+    source_requests[i].blob_index = source_indexes[i];
+    source_requests[i].result = &source_values[i];
+    source_requests[i].status = &source_statuses[i];
+  }
+  blob_source.MultiGetIndirectBlobFromOneFile(
+      read_options,
+      BlobFileOpenInfo{relocation_file_number, Slice(), Slice(),
+                       metadata.tail_size},
+      file_size, /*is_relocation_file=*/true, metadata.directory_digest,
+      mutable_cf_options.compression_manager.get(),
+      /*block_protection_bytes_per_key=*/0, source_requests.size(),
+      source_requests.data(), &bytes_read);
+  ASSERT_OK(source_statuses[0]);
+  ASSERT_OK(source_statuses[1]);
+  ASSERT_OK(source_statuses[2]);
+  EXPECT_EQ(source_values[0], second_value);
+  EXPECT_EQ(source_values[1], third_value);
+  EXPECT_EQ(source_values[2], first_value);
+  EXPECT_EQ(bytes_read, metadata.record_bytes);
+
+  CacheHandleGuard<BlobFileReader> invalid_cached_reader;
+  EXPECT_TRUE(blob_file_cache
+                  .GetRelocationFileReader(
+                      read_options,
+                      BlobFileOpenInfo{relocation_file_number, Slice(), Slice(),
+                                       metadata.tail_size},
+                      file_size, metadata.directory_digest,
+                      /*current_db_session_id=*/"",
+                      mutable_cf_options.compression_manager.get(),
+                      /*block_protection_bytes_per_key=*/0,
+                      &invalid_cached_reader)
+                  .IsInvalidArgument());
+
+  for (PinnableSlice& source_value : source_values) {
+    source_value.Reset();
+  }
+  read_options.read_tier = kBlockCacheTier;
+  blob_source.MultiGetIndirectBlobFromOneFile(
+      read_options, BlobFileOpenInfo{/*file_number=*/999, Slice(), Slice()},
+      file_size,
+      /*is_relocation_file=*/true,
+      /*relocation_directory_digest=*/metadata.directory_digest ^ 1,
+      mutable_cf_options.compression_manager.get(),
+      /*block_protection_bytes_per_key=*/0, source_requests.size(),
+      source_requests.data(), &bytes_read);
+  ASSERT_OK(source_statuses[0]);
+  ASSERT_OK(source_statuses[1]);
+  ASSERT_OK(source_statuses[2]);
+  EXPECT_EQ(source_values[0], second_value);
+  EXPECT_EQ(source_values[1], third_value);
+  EXPECT_EQ(source_values[2], first_value);
+  EXPECT_EQ(bytes_read, 0U);
+}
 
 namespace {
 
@@ -589,6 +1394,85 @@ TEST_F(BlobFileReaderTest, CreateReaderAndGetBlob) {
       }
     }
   }
+}
+
+TEST_F(BlobFileReaderTest,
+       MultiGetStoredBlobsForRelocationPreservesCompressedBytes) {
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(
+          mock_env_.get(),
+          "BlobFileReaderTest_MultiGetStoredBlobsForRelocation"),
+      0);
+  options.enable_blob_files = true;
+  const ImmutableOptions immutable_options(options);
+
+  constexpr uint32_t column_family_id = 1;
+  constexpr uint64_t blob_file_number = 1;
+  constexpr ExpirationRange expiration_range;
+  const std::array<std::string, 3> key_strings{{"key1", "key2", "key3"}};
+  const std::array<std::string, 3> blob_strings{
+      {std::string(4096, 'a'), std::string(4096, 'b'), std::string(4096, 'c')}};
+  const std::vector<Slice> keys{key_strings[0], key_strings[1], key_strings[2]};
+  const std::vector<Slice> blobs{blob_strings[0], blob_strings[1],
+                                 blob_strings[2]};
+  std::vector<uint64_t> blob_offsets(keys.size());
+  std::vector<uint64_t> blob_sizes(keys.size());
+  WriteBlobFile(immutable_options, column_family_id,
+                /*has_ttl=*/false, expiration_range, expiration_range,
+                blob_file_number, keys, blobs, kZSTD, blob_offsets, blob_sizes);
+
+  std::unique_ptr<BlobFileReader> reader;
+  const ReadOptions read_options;
+  ASSERT_OK(BlobFileReader::Create(
+      immutable_options, read_options, FileOptions(), column_family_id,
+      /*blob_file_read_hist=*/nullptr, blob_file_number, nullptr /*IOTracer*/,
+      &reader));
+
+  std::array<std::string, 3> stored_payloads;
+  std::array<Status, 3> statuses;
+  std::array<StoredBlobRelocationReadRequest, 3> requests;
+  for (size_t i = 0; i < requests.size(); ++i) {
+    requests[i] = StoredBlobRelocationReadRequest{
+        blob_offsets[i],
+        blob_sizes[i],
+        kZSTD,
+        BlobIndex::kStableChecksumVersion1,
+        crc32c::Value(blob_strings[i].data(), blob_strings[i].size()),
+        &stored_payloads[i],
+        &statuses[i]};
+  }
+  ++requests.back().stable_checksum;
+
+  uint64_t bytes_read = 0;
+  reader->MultiGetStoredBlobsForRelocation(
+      read_options, requests.size(), requests.data(),
+      /*max_stored_value_size=*/1 << 20,
+      /*max_logical_value_size=*/1 << 20, &bytes_read);
+  ASSERT_OK(statuses[0]);
+  ASSERT_OK(statuses[1]);
+  ASSERT_TRUE(statuses[2].IsCorruption());
+  EXPECT_EQ(stored_payloads[0].size(), blob_sizes[0]);
+  EXPECT_EQ(stored_payloads[1].size(), blob_sizes[1]);
+  EXPECT_TRUE(stored_payloads[2].empty());
+  EXPECT_NE(stored_payloads[0], blob_strings[0]);
+  EXPECT_EQ(bytes_read, blob_sizes[0] + blob_sizes[1]);
+
+  --requests.back().stable_checksum;
+  for (std::string& payload : stored_payloads) {
+    payload.clear();
+  }
+  bytes_read = 0;
+  reader->MultiGetStoredBlobsForRelocation(
+      read_options, requests.size(), requests.data(),
+      /*max_stored_value_size=*/1 << 20,
+      /*max_logical_value_size=*/1024, &bytes_read);
+  for (size_t i = 0; i < requests.size(); ++i) {
+    EXPECT_TRUE(statuses[i].IsMemoryLimit());
+    EXPECT_TRUE(stored_payloads[i].empty());
+  }
+  EXPECT_EQ(bytes_read, 0U);
 }
 
 // Verifies Create() prefers the file size reported by the opened handle over a

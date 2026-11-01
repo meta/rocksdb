@@ -12,6 +12,7 @@
 
 #include <inttypes.h>
 
+#include "db/blob/blob_reference_metadata.h"
 #include "db/builder.h"
 #include "logging/logging.h"
 
@@ -19,6 +20,7 @@ namespace ROCKSDB_NAMESPACE {
 
 void CompactionOutputs::NewBuilder(const TableBuilderOptions& tboptions) {
   builder_.reset(NewTableBuilder(tboptions, file_writer_.get()));
+  current_output_blob_references_ = 0;
 }
 
 Status CompactionOutputs::Finish(
@@ -56,6 +58,9 @@ Status CompactionOutputs::Finish(
     meta->user_defined_timestamps_persisted =
         static_cast<bool>(tp.user_defined_timestamps_persisted);
     ExtractTimestampFromTableProperties(tp, meta);
+    ExtractBlobReferenceDescriptorFromTableProperties(tp, meta);
+    s = ExtractBlobReferenceClassificationFromTableProperties(tp, meta);
+    meta->blob_reference_summary = builder_->GetBlobReferenceSstSummary();
   }
   current_output().finished = true;
   stats_.bytes_written += current_bytes;
@@ -64,6 +69,21 @@ Status CompactionOutputs::Finish(
   worker_cpu_micros_ += builder_->GetWorkerCPUMicros();
 
   return s;
+}
+
+Status CompactionOutputs::UpdateTableProperties(
+    const TableProperties& table_properties) {
+  current_output().table_properties =
+      std::make_shared<TableProperties>(table_properties);
+  ExtractBlobReferenceDescriptorFromTableProperties(table_properties,
+                                                    &current_output().meta);
+  return ExtractBlobReferenceClassificationFromTableProperties(
+      table_properties, &current_output().meta);
+}
+
+Status CompactionOutputs::UpdateTableProperties() {
+  TableProperties table_properties = GetTableProperties();
+  return UpdateTableProperties(table_properties);
 }
 
 IOStatus CompactionOutputs::WriterSyncClose(const Status& input_status,
@@ -406,7 +426,20 @@ Status CompactionOutputs::AddToOutput(
     // 2. range tombstone may be dropped at bottommost level.
     return s;
   }
-  if (ShouldStopBefore(c_iter) && HasBuilder()) {
+  bool budget_cut = false;
+  const auto* buffered = c_iter.output_override_;
+  if (buffered != nullptr && buffered->first_in_history &&
+      buffered->history_references != 0 && HasBuilder() &&
+      !builder_->IsEmpty()) {
+    uint64_t soft_limit = kMaxBlobReferencesPerSst - 1024;
+    TEST_SYNC_POINT_CALLBACK(
+        "BlockBasedTableBuilder::TryAdd:BlobReferenceLimit", &soft_limit);
+    budget_cut = buffered->history_references > soft_limit ||
+                 current_output_blob_references_ >
+                     soft_limit - buffered->history_references;
+  }
+  // Update the ordinary file-boundary state even when the history budget cuts.
+  if ((ShouldStopBefore(c_iter) || budget_cut) && HasBuilder()) {
     const Slice next_table_min_key = c_iter.key();
     s = close_file_func(c_iter.InputStatus(), prev_iter_output_internal_key,
                         next_table_min_key, &c_iter,
@@ -478,6 +511,9 @@ Status CompactionOutputs::AddToOutput(
 
     if (add_result == TableBuilderAddResult::kAdded) {
       current_output().validator.AddValidated(key, value);
+      if (buffered != nullptr) {
+        current_output_blob_references_ += buffered->references;
+      }
       break;
     }
 

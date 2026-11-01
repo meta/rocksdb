@@ -272,7 +272,12 @@ Status OpenForReadOnlyCheckExistence(const DBOptions& db_options,
 Status DB::OpenForReadOnly(const Options& options, const std::string& dbname,
                            std::unique_ptr<DB>* dbptr,
                            bool /*error_if_wal_file_exists*/) {
-  Status s = OpenForReadOnlyCheckExistence(options, dbname);
+  Status s = CheckBlobIndirectionCompactionStyle(
+      options.compaction_style, options.enable_blob_indirection);
+  if (!s.ok()) {
+    return s;
+  }
+  s = OpenForReadOnlyCheckExistence(options, dbname);
   if (!s.ok()) {
     return s;
   }
@@ -308,6 +313,13 @@ Status DB::OpenForReadOnly(
     std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool error_if_wal_file_exists) {
   // If dbname does not exist in the file system, should not do anything
+  for (const ColumnFamilyDescriptor& cf : column_families) {
+    const Status s = CheckBlobIndirectionCompactionStyle(
+        cf.options.compaction_style, cf.options.enable_blob_indirection);
+    if (!s.ok()) {
+      return s;
+    }
+  }
   Status s = OpenForReadOnlyCheckExistence(db_options, dbname);
   if (!s.ok()) {
     return s;
@@ -325,6 +337,14 @@ Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
     bool error_if_wal_file_exists) {
   *dbptr = nullptr;
   handles->clear();
+
+  for (const ColumnFamilyDescriptor& cf : column_families) {
+    const Status s = CheckBlobIndirectionCompactionStyle(
+        cf.options.compaction_style, cf.options.enable_blob_indirection);
+    if (!s.ok()) {
+      return s;
+    }
+  }
 
   SuperVersionContext sv_context(/* create_superversion */ true);
   DBImplReadOnly* impl = new DBImplReadOnly(db_options, dbname);
