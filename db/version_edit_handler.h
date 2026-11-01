@@ -44,6 +44,8 @@ class VersionEditHandlerBase {
   virtual Status ApplyVersionEdit(VersionEdit& edit,
                                   ColumnFamilyData** cfd) = 0;
 
+  virtual Status DecodeVersionEdit(const Slice& record, VersionEdit* edit);
+
   virtual Status OnAtomicGroupReplayBegin() { return Status::OK(); }
   virtual Status OnAtomicGroupReplayEnd() { return Status::OK(); }
 
@@ -190,6 +192,19 @@ class VersionEditHandler : public VersionEditHandlerBase {
                                 const BlobFileAddition& /*blob_addition*/) {
     return Status::OK();
   }
+  virtual Status VerifyBlobRelocationFile(
+      ColumnFamilyData* /*cfd*/,
+      const BlobRelocationFileAddition& /*addition*/) {
+    return Status::OK();
+  }
+
+  // Durable loss-marker recovery is integrated by the later recovery layer.
+  // Until then, missing targets use existing point-in-time fallback.
+  bool CanMarkMissingBlobRelocationFiles() const { return false; }
+
+  // Rebuilds the startup ownership index from opened Versions plus raw claims
+  // retained for column families omitted by a read-only open.
+  Status RebuildPhysicalFileOwnershipIndex();
 
  protected:
   explicit VersionEditHandler(
@@ -219,6 +234,17 @@ class VersionEditHandler : public VersionEditHandlerBase {
   void CheckColumnFamilyId(const VersionEdit& edit, bool* do_not_open_cf,
                            bool* cf_in_builders) const;
 
+  virtual Status TrackUnopenedPhysicalFileOwnership(const VersionEdit& edit);
+
+  Status AddUnopenedPhysicalFileOwnership(
+      VersionSet::PhysicalFileOwnershipIndex* index) const;
+
+  void ResetUnopenedPhysicalFileOwnership() {
+    unopened_physical_file_owners_.clear();
+    replay_relocation_file_owners_.clear();
+    replay_relocation_files_by_cf_.clear();
+  }
+
   void CheckIterationResult(const log::Reader& reader, Status* s) override;
 
   ColumnFamilyData* CreateCfAndInit(const ColumnFamilyOptions& cf_options,
@@ -226,9 +252,16 @@ class VersionEditHandler : public VersionEditHandlerBase {
 
   virtual ColumnFamilyData* DestroyCfAndCleanup(const VersionEdit& edit);
 
+  virtual void DestroyVersionBuilder(uint32_t column_family_id);
+
   virtual Status MaybeCreateVersionBeforeApplyEdit(const VersionEdit& edit,
                                                    ColumnFamilyData* cfd,
                                                    bool force_create_version);
+
+  virtual Status ApplyVersionBuilderEdit(VersionBuilder* builder,
+                                         const VersionEdit& edit);
+
+  virtual Status ValidateVersionBuilderBeforeDrop(VersionBuilder* builder);
 
   virtual Status LoadTables(ColumnFamilyData* cfd,
                             bool prefetch_index_and_filter_in_cache,
@@ -249,6 +282,19 @@ class VersionEditHandler : public VersionEditHandlerBase {
   // families. In non read only mode, if those column families are not dropped
   // by subsequent manifest records, Recover() will return failure status.
   std::unordered_map<uint32_t, std::string> do_not_open_column_families_;
+  using UnopenedPhysicalFileKinds =
+      std::map<uint64_t, std::set<VersionSet::PhysicalFileOwnerKind>>;
+  // Unlike the published ownership index, this can retain every conflicting
+  // claim while the format fence is inactive. It is needed because read-only
+  // recovery intentionally does not instantiate omitted column families.
+  std::unordered_map<uint32_t, UnopenedPhysicalFileKinds>
+      unopened_physical_file_owners_;
+  // Live-only replay ownership also covers opened CFs whose candidate
+  // Versions have not been installed yet. It catches a foreign deletion
+  // without retaining durable deleted-ID tombstones after reopen/snapshot.
+  std::map<uint64_t, uint32_t> replay_relocation_file_owners_;
+  std::unordered_map<uint32_t, std::set<uint64_t>>
+      replay_relocation_files_by_cf_;
   VersionEditParams version_edit_params_;
   bool no_error_if_files_missing_;
   std::shared_ptr<IOTracer> io_tracer_;
@@ -323,6 +369,9 @@ class VersionEditHandlerPointInTime : public VersionEditHandler {
                     const FileMetaData& fmeta) override;
   Status VerifyBlobFile(ColumnFamilyData* cfd, uint64_t blob_file_num,
                         const BlobFileAddition& blob_addition) override;
+  Status VerifyBlobRelocationFile(
+      ColumnFamilyData* cfd,
+      const BlobRelocationFileAddition& addition) override;
 
  protected:
   Status OnAtomicGroupReplayBegin() override;
@@ -343,6 +392,20 @@ class VersionEditHandlerPointInTime : public VersionEditHandler {
                     bool prefetch_index_and_filter_in_cache,
                     bool is_initial_load) override;
 
+  virtual Status SaveVersionTo(VersionBuilder* builder,
+                               VersionStorageInfo* storage);
+
+  virtual void CommitVersionBuilderApply(VersionBuilder* builder);
+
+  // Gives subclasses an opportunity to validate and prepare state derived from
+  // the complete candidate Versions before any of them are installed.
+  virtual Status PrepareToInstallVersions();
+
+  // Aborts incomplete AtomicGroup state before replay starts from a new
+  // complete MANIFEST snapshot. The caller is responsible for releasing the DB
+  // mutex before invoking this method when staged Versions can be large.
+  void ResetAtomicUpdateState();
+
   // A Version built from the MANIFEST records read up to some point in time,
   // together with the column family's log number that those records had put in
   // effect. Keeping the two together is what lets an installed Version report
@@ -352,12 +415,17 @@ class VersionEditHandlerPointInTime : public VersionEditHandler {
     uint64_t log_number = 0;
   };
 
-  std::unordered_map<uint32_t, PointInTimeVersion> versions_;
+  using PointInTimeVersions = std::unordered_map<uint32_t, PointInTimeVersion>;
+
+  virtual void DeleteVersion(Version* version);
+  virtual void DiscardVersions(PointInTimeVersions* versions);
+
+  PointInTimeVersions versions_;
 
   // `atomic_update_versions_` is for ensuring all-or-nothing AtomicGroup
   // recoveries.  When `atomic_update_versions_` is nonempty, it serves as a
   // barrier to updating `versions_` until all its values are populated.
-  std::unordered_map<uint32_t, PointInTimeVersion> atomic_update_versions_;
+  PointInTimeVersions atomic_update_versions_;
   // `atomic_update_versions_missing_` counts the null `version`s in
   // `atomic_update_versions_`.
   size_t atomic_update_versions_missing_;
@@ -435,10 +503,7 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
   Status VerifyFile(ColumnFamilyData* cfd, const std::string& fpath, int level,
                     const FileMetaData& fmeta) override;
 
-  void PrepareToReadNewManifest() {
-    initialized_ = false;
-    ResetReadState();
-  }
+  void PrepareToReadNewManifest(InstrumentedMutex* db_mutex);
 
   std::unordered_set<ColumnFamilyData*>& GetUpdatedColumnFamilies() {
     return cfds_changed_;
@@ -446,12 +511,55 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
 
   std::vector<std::string> GetAndClearIntermediateFiles();
 
+  void SetCatchUpDBMutex(InstrumentedMutex* db_mutex) {
+    assert(db_mutex_ == nullptr);
+    assert(db_mutex != nullptr);
+    db_mutex_ = db_mutex;
+  }
+
+  void ClearCatchUpDBMutex() {
+    assert(db_mutex_ != nullptr);
+    db_mutex_ = nullptr;
+  }
+
  protected:
   Status Initialize() override;
 
   bool MustOpenAllColumnFamilies() const override { return false; }
 
   Status ApplyVersionEdit(VersionEdit& edit, ColumnFamilyData** cfd) override;
+
+  Status TrackUnopenedPhysicalFileOwnership(const VersionEdit& edit) override;
+
+  Status DecodeVersionEdit(const Slice& record, VersionEdit* edit) override;
+
+  Status VerifyBlobRelocationFile(
+      ColumnFamilyData* cfd,
+      const BlobRelocationFileAddition& addition) override;
+
+  Status ApplyVersionBuilderEdit(VersionBuilder* builder,
+                                 const VersionEdit& edit) override;
+
+  Status SaveVersionTo(VersionBuilder* builder,
+                       VersionStorageInfo* storage) override;
+
+  void CommitVersionBuilderApply(VersionBuilder* builder) override;
+
+  Status PrepareToInstallVersions() override;
+
+  Status ValidateVersionBuilderBeforeDrop(VersionBuilder* builder) override;
+
+  void DeleteVersion(Version* version) override;
+  void DiscardVersions(PointInTimeVersions* versions) override;
+
+  ColumnFamilyData* DestroyCfAndCleanup(const VersionEdit& edit) override;
+
+  void DestroyVersionBuilder(uint32_t column_family_id) override;
+
+  void PrepareColumnFamilyDropOwnership(uint32_t column_family_id);
+
+  void ReplaceBuilder(uint32_t column_family_id,
+                      VersionBuilderUPtr replacement);
 
   Status OnColumnFamilyAdd(VersionEdit& edit, ColumnFamilyData** cfd) override;
 
@@ -464,6 +572,23 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
 
   Mode mode_;
   std::unordered_set<ColumnFamilyData*> cfds_changed_;
+  // Ownership edits are staged across one complete MANIFEST tail attempt and
+  // published only when the corresponding Versions are accepted together.
+  VersionSet::PhysicalFileOwnershipDeltas physical_file_ownership_deltas_;
+  std::optional<VersionSet::PhysicalFileOwnershipIndex>
+      prepared_column_family_drop_owners_;
+  std::optional<VersionSet::PhysicalFileOwnershipIndex>
+      prepared_physical_file_owners_;
+  // Initial recovery and every MANIFEST switch replay a complete snapshot.
+  // Their successful ownership result replaces, rather than patches, the
+  // prior index so files omitted by the snapshot cannot remain as stale owners.
+  bool replace_physical_file_ownership_on_success_ = true;
+  bool deferred_physical_file_ownership_conflict_ = false;
+  bool format_activation_requires_full_ownership_census_ = false;
+  // True only while the serialized tailer applies one edit to its private
+  // VersionBuilder with the DB mutex released.
+  bool version_builder_apply_unlocked_ = false;
+  InstrumentedMutex* db_mutex_ = nullptr;
 };
 
 class DumpManifestHandler : public VersionEditHandler {

@@ -128,15 +128,9 @@ class CompactionOutputs {
 
   // Update output table properties from already populated TableProperties.
   // Used for remote compaction
-  void UpdateTableProperties(const TableProperties& table_properties) {
-    current_output().table_properties =
-        std::make_shared<TableProperties>(table_properties);
-  }
+  void UpdateTableProperties(const TableProperties& table_properties);
   // Update output table properties from table builder
-  void UpdateTableProperties() {
-    current_output().table_properties =
-        std::make_shared<TableProperties>(GetTableProperties());
-  }
+  void UpdateTableProperties();
 
   IOStatus WriterSyncClose(const Status& intput_status, SystemClock* clock,
                            Statistics* statistics, bool use_fsync);

@@ -29,9 +29,19 @@ class SharedBlobFileMetaData {
       uint64_t blob_file_number, uint64_t total_blob_count,
       uint64_t total_blob_bytes, std::string checksum_method,
       std::string checksum_value) {
+    return Create(blob_file_number, total_blob_count, total_blob_bytes,
+                  std::move(checksum_method), std::move(checksum_value),
+                  /*is_identity_root=*/false);
+  }
+
+  static std::shared_ptr<SharedBlobFileMetaData> Create(
+      uint64_t blob_file_number, uint64_t total_blob_count,
+      uint64_t total_blob_bytes, std::string checksum_method,
+      std::string checksum_value, bool is_identity_root) {
     return std::shared_ptr<SharedBlobFileMetaData>(new SharedBlobFileMetaData(
         blob_file_number, total_blob_count, total_blob_bytes,
-        std::move(checksum_method), std::move(checksum_value)));
+        std::move(checksum_method), std::move(checksum_value),
+        is_identity_root));
   }
 
   template <typename Deleter>
@@ -39,11 +49,21 @@ class SharedBlobFileMetaData {
       uint64_t blob_file_number, uint64_t total_blob_count,
       uint64_t total_blob_bytes, std::string checksum_method,
       std::string checksum_value, Deleter deleter) {
+    return Create(blob_file_number, total_blob_count, total_blob_bytes,
+                  std::move(checksum_method), std::move(checksum_value),
+                  /*is_identity_root=*/false, std::move(deleter));
+  }
+
+  template <typename Deleter>
+  static std::shared_ptr<SharedBlobFileMetaData> Create(
+      uint64_t blob_file_number, uint64_t total_blob_count,
+      uint64_t total_blob_bytes, std::string checksum_method,
+      std::string checksum_value, bool is_identity_root, Deleter deleter) {
     return std::shared_ptr<SharedBlobFileMetaData>(
         new SharedBlobFileMetaData(blob_file_number, total_blob_count,
                                    total_blob_bytes, std::move(checksum_method),
-                                   std::move(checksum_value)),
-        deleter);
+                                   std::move(checksum_value), is_identity_root),
+        std::move(deleter));
   }
 
   SharedBlobFileMetaData(const SharedBlobFileMetaData&) = delete;
@@ -60,18 +80,20 @@ class SharedBlobFileMetaData {
   uint64_t GetTotalBlobBytes() const { return total_blob_bytes_; }
   const std::string& GetChecksumMethod() const { return checksum_method_; }
   const std::string& GetChecksumValue() const { return checksum_value_; }
+  bool IsIdentityRoot() const { return is_identity_root_; }
 
   std::string DebugString() const;
 
  private:
   SharedBlobFileMetaData(uint64_t blob_file_number, uint64_t total_blob_count,
                          uint64_t total_blob_bytes, std::string checksum_method,
-                         std::string checksum_value)
+                         std::string checksum_value, bool is_identity_root)
       : blob_file_number_(blob_file_number),
         total_blob_count_(total_blob_count),
         total_blob_bytes_(total_blob_bytes),
         checksum_method_(std::move(checksum_method)),
-        checksum_value_(std::move(checksum_value)) {
+        checksum_value_(std::move(checksum_value)),
+        is_identity_root_(is_identity_root) {
     assert(checksum_method_.empty() == checksum_value_.empty());
   }
 
@@ -80,6 +102,7 @@ class SharedBlobFileMetaData {
   uint64_t total_blob_bytes_;
   std::string checksum_method_;
   std::string checksum_value_;
+  bool is_identity_root_;
 };
 
 std::ostream& operator<<(std::ostream& os,
@@ -142,6 +165,10 @@ class BlobFileMetaData {
   const std::string& GetChecksumValue() const {
     assert(shared_meta_);
     return shared_meta_->GetChecksumValue();
+  }
+  bool IsIdentityRoot() const {
+    assert(shared_meta_);
+    return shared_meta_->IsIdentityRoot();
   }
 
   const LinkedSsts& GetLinkedSsts() const { return linked_ssts_; }

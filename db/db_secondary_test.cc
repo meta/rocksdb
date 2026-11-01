@@ -2377,6 +2377,69 @@ TEST_F(DBSecondaryTest, CatchUpKeepsUnflushedWalData) {
   VerifySecondaryValue(handles_secondary_[1], "bar", "v1");
 }
 
+TEST_F(DBSecondaryTest, ConcurrentCatchUpWaitsAcrossUnlockedManifestWork) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("key", "old"));
+  ASSERT_OK(Flush());
+  options.max_open_files = -1;
+  OpenSecondary(options);
+  ASSERT_OK(Put("key", "new"));
+  ASSERT_OK(Flush());
+
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool paused = false;
+  bool release = false;
+  unsigned attempts = 0;
+  std::atomic<bool> second_completed{false};
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "DBImplSecondary::TryCatchUpWithPrimary:BeforeCatchUpLock", [&](void*) {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        ++attempts;
+        gate_cv.notify_all();
+      });
+  sync_point->SetCallBack("ManifestTailer::DecodeVersionEdit:Unlocked",
+                          [&](void*) {
+                            std::unique_lock<std::mutex> lock(gate_mutex);
+                            if (paused) {
+                              return;
+                            }
+                            paused = true;
+                            gate_cv.notify_all();
+                            gate_cv.wait(lock, [&] { return release; });
+                          });
+  sync_point->EnableProcessing();
+  Status first_status;
+  Status second_status;
+  port::Thread first(
+      [&] { first_status = db_secondary_->TryCatchUpWithPrimary(); });
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    gate_cv.wait(lock, [&] { return paused; });
+  }
+  port::Thread second([&] {
+    second_status = db_secondary_->TryCatchUpWithPrimary();
+    second_completed.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    gate_cv.wait(lock, [&] { return attempts == 2; });
+    EXPECT_FALSE(second_completed.load());
+    release = true;
+    gate_cv.notify_all();
+  }
+  first.join();
+  second.join();
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+  ASSERT_OK(first_status);
+  ASSERT_OK(second_status);
+  VerifySecondaryValue("key", "new");
+}
+
 TEST_F(DBSecondaryTest, NewIteratorsConsistentViewDuringCatchUp) {
   Options options;
   options.env = env_;

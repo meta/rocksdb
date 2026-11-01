@@ -6,12 +6,17 @@
 
 #include "db/periodic_task_scheduler.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <set>
 
+#include "db/blob/blob_reference_census.h"
 #include "db/column_family.h"
 #include "db/db_test_util.h"
 #include "env/composite_env_wrapper.h"
 #include "test_util/mock_time_env.h"
+#include "util/defer.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -79,7 +84,7 @@ TEST_F(PeriodicTaskSchedulerTest, Basic) {
 
   const PeriodicTaskScheduler& scheduler =
       dbfull()->TEST_GetPeriodicTaskScheduler();
-  ASSERT_EQ((int)PeriodicTaskType::kMax - 1, scheduler.TEST_GetValidTaskNum());
+  ASSERT_EQ((int)PeriodicTaskType::kMax - 2, scheduler.TEST_GetValidTaskNum());
 
   ASSERT_EQ(1, dump_st_counter);
   ASSERT_EQ(1, pst_st_counter);
@@ -142,6 +147,211 @@ TEST_F(PeriodicTaskSchedulerTest, Basic) {
   ASSERT_EQ(5, trigger_compaction_counter);
 
   Close();
+}
+
+TEST_F(PeriodicTaskSchedulerTest, CensusFailureHonorsExponentialBackoff) {
+  Options options = CurrentOptions();
+  options.env = mock_env_.get();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->EnableProcessing();
+  Reopen(options);
+  ASSERT_OK(Put("key", std::string(4096, 'v')));
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.change_level = true;
+  compact_options.target_level = 1;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  Close();
+
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  size_t completed_workers = 0;
+  bool inject_failure = true;
+  sync_point->SetCallBack("DBImpl::BuildBlobReferenceCensus:ReadFileStatus",
+                          [&](void* arg) {
+                            std::lock_guard<std::mutex> lock(gate_mutex);
+                            if (inject_failure) {
+                              *static_cast<Status*>(arg) =
+                                  Status::IOError("Injected census failure");
+                            }
+                          });
+  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:Done", [&](void*) {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    ++completed_workers;
+    gate_cv.notify_all();
+  });
+  auto cleanup = Defer([&] {
+    // Callback captures and mock Env outlive all workers.
+    Close();
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  Reopen(options);
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds(30),
+                                 [&] { return completed_workers == 1; }));
+  }
+  for (int retry = 0; retry != 6; ++retry) {
+    const int delay_seconds = 1 << retry;
+    if (delay_seconds > 1) {
+      dbfull()->TEST_WaitForPeriodicTaskRun(
+          [&] { mock_clock_->MockSleepForSeconds(delay_seconds - 1); });
+      std::lock_guard<std::mutex> lock(gate_mutex);
+      // Not-ready after failure cannot bypass the remaining deadline.
+      ASSERT_EQ(completed_workers, static_cast<size_t>(retry + 1));
+    }
+    dbfull()->TEST_WaitForPeriodicTaskRun(
+        [&] { mock_clock_->MockSleepForSeconds(1); });
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds(30), [&] {
+      return completed_workers == static_cast<size_t>(retry + 2);
+    }));
+  }
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    inject_failure = false;
+  }
+  dbfull()->TEST_WaitForPeriodicTaskRun(
+      [&] { mock_clock_->MockSleepForSeconds(32); });
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(Get("key"), std::string(4096, 'v'));
+}
+
+TEST_F(PeriodicTaskSchedulerTest, CensusPendingInstallReturnsLowWorker) {
+  Options options = CurrentOptions();
+  options.env = mock_env_.get();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+  ASSERT_OK(Put("key", std::string(4096, 'v')));
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.change_level = true;
+  compact_options.target_level = 1;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  Close();
+
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool read_started = false;
+  bool allow_read = false;
+  std::atomic<size_t> started_workers{0};
+  bool manifest_started = false;
+  bool allow_manifest = false;
+  bool inject_manifest_failure = false;
+  std::unique_ptr<port::Thread> install_thread;
+  Status install_status;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:Start",
+                          [&](void*) { ++started_workers; });
+  sync_point->SetCallBack("DBImpl::BuildBlobReferenceCensus:ReadFileStatus",
+                          [&](void*) {
+                            std::unique_lock<std::mutex> lock(gate_mutex);
+                            read_started = true;
+                            gate_cv.notify_all();
+                            gate_cv.wait(lock, [&] { return allow_read; });
+                          });
+  sync_point->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeBlobFinalization", [&](void*) {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        if (!inject_manifest_failure) {
+          return;
+        }
+        manifest_started = true;
+        gate_cv.notify_all();
+        gate_cv.wait(lock, [&] { return allow_manifest; });
+      });
+  sync_point->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterSyncManifest", [&](void* arg) {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        if (inject_manifest_failure) {
+          *static_cast<IOStatus*>(arg) = IOStatus::IOError("injected failure");
+        }
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    {
+      std::lock_guard<std::mutex> lock(gate_mutex);
+      allow_read = true;
+      allow_manifest = true;
+      inject_manifest_failure = false;
+      gate_cv.notify_all();
+    }
+    if (install_thread != nullptr) {
+      install_thread->join();
+    }
+    // An early assertion can bypass the joined result check below.
+    install_status.PermitUncheckedError();
+    Close();
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  Reopen(options);
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds(30),
+                                 [&] { return read_started; }));
+  }
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  BlobReferenceCensus* const census = cfd->blob_reference_census();
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    inject_manifest_failure = true;
+  }
+  install_thread = std::make_unique<port::Thread>([&] {
+    InstrumentedMutexLock lock(dbfull()->TEST_Mutex());
+    VersionEdit edit;
+    edit.SetColumnFamily(cfd->GetID());
+    edit.SetLogNumber(cfd->GetLogNumber());
+    install_status = dbfull()->GetVersionSet()->LogAndApply(
+        cfd, ReadOptions(), WriteOptions(), &edit, dbfull()->TEST_Mutex(),
+        /*dir_contains_current_file=*/nullptr);
+  });
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds(30),
+                                 [&] { return manifest_started; }));
+  }
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    allow_read = true;
+    gate_cv.notify_all();
+  }
+  // This must return while the reservation is still held, leaving LOW free
+  // and the census unavailable. The old generic-incomplete path spins here.
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(started_workers.load(), 1U);
+  ASSERT_FALSE(census->IsReady(cfd->current()->GetVersionNumber()));
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    allow_manifest = true;
+    gate_cv.notify_all();
+  }
+  install_thread->join();
+  install_thread.reset();
+  ASSERT_TRUE(install_status.IsIOError());
+  // Failed MANIFEST cleanup must cancel under DB mutex and enqueue the parked
+  // CF itself, with no timer, unrelated write or sleep.
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(started_workers.load(), 2U);
+  ASSERT_TRUE(census->IsReady(cfd->current()->GetVersionNumber()));
+  ASSERT_EQ(Get("key"), std::string(4096, 'v'));
 }
 
 TEST_F(PeriodicTaskSchedulerTest, TriggerCompactionPeriodComputation) {
@@ -481,8 +691,8 @@ TEST_F(PeriodicTaskSchedulerTest, MultiInstances) {
   auto dbi = static_cast_with_check<DBImpl>(dbs[kInstanceNum - 1].get());
 
   const PeriodicTaskScheduler& scheduler = dbi->TEST_GetPeriodicTaskScheduler();
-  // kRecordSeqnoTime is not registered since the feature is not enabled
-  ASSERT_EQ(kInstanceNum * ((int)PeriodicTaskType::kMax - 1),
+  // Neither record-seqno-time nor blob-census retry is enabled in these DBs.
+  ASSERT_EQ(kInstanceNum * ((int)PeriodicTaskType::kMax - 2),
             scheduler.TEST_GetValidTaskNum());
 
   int expected_run = kInstanceNum;

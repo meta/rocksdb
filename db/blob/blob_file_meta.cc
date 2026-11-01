@@ -30,7 +30,8 @@ std::ostream& operator<<(std::ostream& os,
      << " total_blob_bytes: " << shared_meta.GetTotalBlobBytes()
      << " checksum_method: " << shared_meta.GetChecksumMethod()
      << " checksum_value: "
-     << Slice(shared_meta.GetChecksumValue()).ToString(/* hex */ true);
+     << Slice(shared_meta.GetChecksumValue()).ToString(/* hex */ true)
+     << " identity_root: " << shared_meta.IsIdentityRoot();
 
   return os;
 }

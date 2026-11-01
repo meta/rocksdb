@@ -11,6 +11,18 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+const BlockBasedTableOptions* GetBlockBasedTableWriterOptions(
+    const TableFactory* table_factory) {
+  if (table_factory == nullptr) {
+    return nullptr;
+  }
+  const AdaptiveTableFactory* adaptive =
+      table_factory->CheckedCast<AdaptiveTableFactory>();
+  return adaptive != nullptr
+             ? adaptive->GetBlockBasedTableWriterOptions()
+             : table_factory->GetOptions<BlockBasedTableOptions>();
+}
+
 AdaptiveTableFactory::AdaptiveTableFactory(
     std::shared_ptr<TableFactory> table_factory_to_write,
     std::shared_ptr<TableFactory> block_based_table_factory,
@@ -103,6 +115,11 @@ std::string AdaptiveTableFactory::GetPrintableOptions() const {
     ret.append(buffer);
   }
   return ret;
+}
+
+const BlockBasedTableOptions*
+AdaptiveTableFactory::GetBlockBasedTableWriterOptions() const {
+  return table_factory_to_write_->GetOptions<BlockBasedTableOptions>();
 }
 
 TableFactory* NewAdaptiveTableFactory(

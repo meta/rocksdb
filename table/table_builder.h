@@ -34,6 +34,16 @@ namespace ROCKSDB_NAMESPACE {
 
 class Slice;
 class BlobSource;
+struct BlobReferenceSstSummary;
+
+struct BlobRelocationFileMetadata {
+  uint32_t directory_digest = 0;
+  uint64_t origin_count = 0;
+  uint64_t entry_count = 0;
+  uint64_t record_bytes = 0;
+  std::string encoded_directory;
+  uint64_t tail_size = 0;
+};
 
 struct TableReaderOptions {
   // @param skip_filters Disables loading/accessing the filter block
@@ -283,6 +293,32 @@ class TableBuilder {
     return TableBuilderAddResult::kAdded;
   }
 
+  // Starts a block-based relocation file. Implementations that do not support
+  // raw embedded blob records return NotSupported.
+  virtual Status StartBlobRelocationFile() {
+    return Status::NotSupported("Blob relocation files are not supported");
+  }
+
+  // Adds one stored blob payload under its stable identity. The payload is
+  // already compressed according to `compression` and is written verbatim.
+  virtual Status AddBlobRelocation(uint64_t origin_file_number,
+                                   uint64_t original_value_offset,
+                                   const Slice& stored_payload,
+                                   CompressionType compression) {
+    (void)origin_file_number;
+    (void)original_value_offset;
+    (void)stored_payload;
+    (void)compression;
+    return Status::NotSupported("Blob relocation files are not supported");
+  }
+
+  // Returns immutable directory metadata after Finish() succeeds.
+  virtual Status GetBlobRelocationFileMetadata(
+      BlobRelocationFileMetadata* metadata) const {
+    (void)metadata;
+    return Status::NotSupported("Blob relocation files are not supported");
+  }
+
   // Return non-ok iff some error has been detected.
   virtual Status status() const = 0;
 
@@ -333,6 +369,14 @@ class TableBuilder {
 
   // Returns table properties
   virtual TableProperties GetTableProperties() const = 0;
+
+  // Available only after successful Finish() when exact metadata was enabled.
+  // Passing this immutable handle to FileMetaData avoids reopening a newly
+  // built output at the MANIFEST queue head.
+  virtual std::shared_ptr<const BlobReferenceSstSummary>
+  GetBlobReferenceSstSummary() const {
+    return nullptr;
+  }
 
   // Return file checksum
   virtual std::string GetFileChecksum() const = 0;

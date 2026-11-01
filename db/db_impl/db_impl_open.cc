@@ -7,8 +7,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include <cinttypes>
+#include <limits>
+#include <set>
 
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
@@ -27,6 +30,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
 #include "rocksdb/wal_filter.h"
+#include "table/adaptive/adaptive_table_factory.h"
 #include "test_util/sync_point.h"
 #include "util/rate_limiter_impl.h"
 #include "util/string_util.h"
@@ -679,19 +683,9 @@ Status DBImpl::Recover(
             edit.SetColumnFamily(cfd->GetID());
             for (const FileMetaData* f : level_files) {
               edit.DeleteFile(from_level, f->fd.GetNumber());
-              edit.AddFile(to_level, f->fd.GetNumber(), f->fd.GetPathId(),
-                           f->fd.GetFileSize(), f->smallest, f->largest,
-                           f->fd.smallest_seqno, f->fd.largest_seqno,
-                           f->marked_for_compaction,
-                           f->temperature,  // this can be different from
-                           // `last_level_temperature`
-                           f->oldest_blob_file_number, f->oldest_ancestor_time,
-                           f->file_creation_time, f->epoch_number,
-                           f->file_checksum, f->file_checksum_func_name,
-                           f->unique_id, f->compensated_range_deletion_size,
-                           f->tail_size, f->user_defined_timestamps_persisted,
-                           f->min_timestamp, f->max_timestamp,
-                           f->file_open_metadata);
+              // Preserve all persisted metadata. In particular, exact blob
+              // references remain attached to the same physical SST.
+              edit.AddFileFromExisting(to_level, *f);
               ROCKS_LOG_WARN(immutable_db_options_.info_log,
                              "[%s] Moving #%" PRIu64
                              " from from_level-%d to from_level-%d %" PRIu64
@@ -1092,9 +1086,12 @@ Status DBImpl::LogAndApplyForRecovery(RecoveryContext& recovery_ctx) {
     recovery_ctx.UpdateVersionEdits(default_cfd, edit);
   }
 
-  Status s = versions_->LogAndApply(recovery_ctx.cfds_, read_options,
-                                    write_options, recovery_ctx.edit_lists_,
-                                    &mutex_, directories_.GetDbDir());
+  Status s = versions_->LogAndApply(
+      recovery_ctx.cfds_, read_options, write_options, recovery_ctx.edit_lists_,
+      VersionSet::LogAndApplyColumnFamilyMode::kMayRepeatColumnFamilies,
+      /*new_mutable_cf_options=*/nullptr,
+      /*compaction_phase_anchor_time=*/std::nullopt, &mutex_,
+      directories_.GetDbDir());
   if (s.ok()) {
     versions_->force_new_manifest_on_open_ = false;
   }
@@ -2178,6 +2175,14 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
     // Get the latest mutable cf options while the mutex is still locked
     const MutableCFOptions mutable_cf_options_copy =
         cfd->GetLatestMutableCFOptions();
+    // WAL recovery can be the first writer of feature identity BlobIndexes.
+    // Fence its edit before releasing the mutex, so successful SST/blob
+    // additions never depend on a later ordinary flush for format activation.
+    if (mutable_cf_options_copy.enable_blob_indirection ||
+        cfd->current()->storage_info()->HasBlobIndirectionFormat()) {
+      edit->SetBlobIndirectionFormatVersion(
+          kBlobIndirectionManifestFormatVersion);
+    }
     bool paranoid_file_checks =
         cfd->GetLatestMutableCFOptions().paranoid_file_checks;
 
@@ -2316,15 +2321,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
   }
 
   if (s.ok() && has_output) {
-    edit->AddFile(level, meta.fd.GetNumber(), meta.fd.GetPathId(),
-                  meta.fd.GetFileSize(), meta.smallest, meta.largest,
-                  meta.fd.smallest_seqno, meta.fd.largest_seqno,
-                  meta.marked_for_compaction, meta.temperature,
-                  meta.oldest_blob_file_number, meta.oldest_ancestor_time,
-                  meta.file_creation_time, meta.epoch_number,
-                  meta.file_checksum, meta.file_checksum_func_name,
-                  meta.unique_id, meta.compensated_range_deletion_size,
-                  meta.tail_size, meta.user_defined_timestamps_persisted);
+    edit->AddFile(level, meta);
 
     for (const auto& blob : blob_file_additions) {
       edit->AddBlobFile(blob);
@@ -3031,6 +3028,12 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     if (impl->immutable_db_options_.open_files_async) {
       impl->ScheduleAsyncFileOpening();
     }
+    if (!impl->read_only_) {
+      impl->ScheduleBlobReferenceCensus();
+    } else {
+      impl->bg_blob_reference_census_state_ =
+          DBImpl::BlobReferenceCensusJobState::kComplete;
+    }
     impl->MaybeScheduleAsyncWALPrecreate(
         impl->GetWalPreallocateBlockSize(max_write_buffer_size));
     impl->mutex_.Unlock();
@@ -3231,4 +3234,524 @@ void DBImpl::BGWorkAsyncFileOpen(void* arg) {
   TEST_SYNC_POINT("DBImpl::BGWorkAsyncFileOpen:Done");
 }
 
+void DBImpl::ScheduleBlobReferenceCensus() {
+  ScheduleBlobReferenceCensus(/*requested_cfd=*/nullptr);
+}
+
+void DBImpl::ScheduleBlobReferenceCensus(ColumnFamilyData* requested_cfd) {
+  mutex_.AssertHeld();
+  if (read_only_ || shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  const auto needs_census = [](ColumnFamilyData* cfd) {
+    if (cfd == nullptr || cfd->IsDropped()) {
+      return false;
+    }
+    Version* const current = cfd->current();
+    BlobReferenceCensus* const census = cfd->blob_reference_census();
+    return current != nullptr && census != nullptr &&
+           current->storage_info()->HasBlobIndirectionFormat() &&
+           census->NeedsWorkerRun(current->GetVersionNumber());
+  };
+
+  const auto enqueue = [this, &needs_census](ColumnFamilyData* cfd) {
+    if (!needs_census(cfd) || cfd->queued_for_blob_reference_census_) {
+      return;
+    }
+    cfd->blob_reference_census()->SetBuildWakeup(
+        [](void* db, void* owner) {
+          static_cast<DBImpl*>(db)->ScheduleBlobReferenceCensus(
+              static_cast<ColumnFamilyData*>(owner));
+        },
+        this, cfd);
+    cfd->Ref();
+    cfd->queued_for_blob_reference_census_ = true;
+    cfd->next_blob_reference_census_ = nullptr;
+    if (blob_reference_census_queue_tail_ == nullptr) {
+      assert(blob_reference_census_queue_head_ == nullptr);
+      blob_reference_census_queue_head_ = cfd;
+    } else {
+      blob_reference_census_queue_tail_->next_blob_reference_census_ = cfd;
+    }
+    blob_reference_census_queue_tail_ = cfd;
+  };
+
+  if (requested_cfd != nullptr) {
+    enqueue(requested_cfd);
+  } else {
+    TEST_SYNC_POINT("DBImpl::ScheduleBlobReferenceCensus:AllColumnFamilies");
+    // VersionSet owns a ColumnFamilySet for the DB lifetime.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+      enqueue(cfd);
+    }
+  }
+  if (bg_blob_reference_census_state_ ==
+      BlobReferenceCensusJobState::kScheduled) {
+    return;
+  }
+  if (blob_reference_census_queue_head_ == nullptr) {
+    bg_blob_reference_census_state_ = BlobReferenceCensusJobState::kComplete;
+    return;
+  }
+
+  bg_blob_reference_census_state_ = BlobReferenceCensusJobState::kScheduled;
+  env_->Schedule(&DBImpl::BGWorkBlobReferenceCensus, this, Env::Priority::LOW,
+                 &bg_blob_reference_census_state_,
+                 &DBImpl::UnscheduleBlobReferenceCensus);
+}
+
+void DBImpl::UnscheduleBlobReferenceCensus(void* arg) {
+  auto* db = static_cast<DBImpl*>(arg);
+  db->mutex_.AssertHeld();
+
+  ColumnFamilyData* pending = db->blob_reference_census_queue_head_;
+  if (db->blob_reference_census_queue_tail_ != nullptr) {
+    db->blob_reference_census_queue_tail_->next_blob_reference_census_ =
+        db->blob_reference_census_retry_head_;
+  } else {
+    pending = db->blob_reference_census_retry_head_;
+  }
+  db->blob_reference_census_queue_head_ = nullptr;
+  db->blob_reference_census_queue_tail_ = nullptr;
+  db->blob_reference_census_retry_head_ = nullptr;
+  db->blob_reference_census_retry_tail_ = nullptr;
+  db->blob_reference_census_retry_count_ = 0;
+  // Release each retained CF in a separate critical section. A dropped CF can
+  // run nontrivial destruction from its final UnrefAndTryDelete().
+  db->mutex_.Unlock();
+  while (pending != nullptr) {
+    db->mutex_.Lock();
+    ColumnFamilyData* const next = pending->next_blob_reference_census_;
+    pending->next_blob_reference_census_ = nullptr;
+    pending->queued_for_blob_reference_census_ = false;
+    BlobReferenceCensusGarbage garbage = pending->CancelBlobReferenceCensus();
+    db->mutex_.Unlock();
+    // A parked initial build pins its CFD through its Version deleter. Break
+    // CFD -> census -> build context -> CFD before dropping the queue's pin,
+    // including dropped CFs no longer visited by ColumnFamilySet iteration.
+    garbage = {};
+    db->ReleaseColumnFamilyDataPin(pending);
+    pending = next;
+  }
+  db->mutex_.Lock();
+  db->bg_blob_reference_census_state_ = BlobReferenceCensusJobState::kComplete;
+  db->bg_cv_.SignalAll();
+}
+
+Status DBImpl::BuildBlobReferenceCensus(ColumnFamilyData* cfd,
+                                        bool* incomplete) {
+  assert(cfd != nullptr && incomplete != nullptr);
+  *incomplete = false;
+  if (!blob_reference_census_retry_registered_.exchange(
+          true, std::memory_order_acq_rel)) {
+    const Status registration = periodic_task_scheduler_.Register(
+        PeriodicTaskType::kBlobReferenceCensus,
+        [this]() { RetryBlobReferenceCensus(); },
+        /*run_immediately=*/false);
+    if (!registration.ok()) {
+      blob_reference_census_retry_registered_.store(false,
+                                                    std::memory_order_release);
+      return registration;
+    }
+  }
+  BlobReferenceCensus& census = *cfd->blob_reference_census();
+  std::shared_ptr<BlobReferenceCensusBuildContext> context =
+      census.GetBuildContext();
+  Status status;
+  if (context == nullptr) {
+    Version* starting_version = nullptr;
+    uint64_t token = 0;
+    {
+      InstrumentedMutexLock lock(&mutex_);
+      if (shutting_down_.load(std::memory_order_acquire) || cfd->IsDropped()) {
+        status = Status::ShutdownInProgress();
+        return status;
+      }
+      starting_version = cfd->current();
+      starting_version->Ref();
+      cfd->Ref();
+      token = census.BeginBuild();
+    }
+    context = std::make_shared<BlobReferenceCensusBuildContext>();
+    context->token = token;
+    context->starting_version = std::shared_ptr<Version>(
+        starting_version, [this, cfd](Version* version) {
+          bool detached = false;
+          {
+            InstrumentedMutexLock lock(&mutex_);
+            detached = version->UnrefAndTryDetach();
+          }
+          if (detached) {
+            version->DeleteDetached();
+          }
+          ReleaseColumnFamilyDataPin(cfd);
+        });
+    const BlockBasedTableOptions* table_options =
+        GetBlockBasedTableWriterOptions(
+            starting_version->GetMutableCFOptions().table_factory.get());
+    std::shared_ptr<Cache> block_cache;
+    if (table_options != nullptr && table_options->block_cache != nullptr) {
+      const CacheEntryRoleOptions::Decision charged =
+          table_options->cache_usage_options.options_overrides
+              .at(CacheEntryRole::kBlobReferenceMetadataBuildingBuffer)
+              .charged;
+      if (charged != CacheEntryRoleOptions::Decision::kDisabled) {
+        block_cache = table_options->block_cache;
+        context->reservation_manager =
+            std::make_shared<CacheReservationManagerImpl<
+                CacheEntryRole::kBlobReferenceMetadataBuildingBuffer>>(
+                block_cache);
+      }
+    }
+    size_t starting_file_count = 0;
+    for (int level = 0; level < starting_version->storage_info()->num_levels();
+         ++level) {
+      starting_file_count +=
+          starting_version->storage_info()->LevelFiles(level).size();
+    }
+    status = context->ReserveInitialFiles(starting_file_count);
+    if (status.ok()) {
+      status = census.ResetWorkerState(
+          token, starting_version->GetVersionNumber(),
+          starting_version->storage_info()->GetBlobRelocationState(),
+          std::move(block_cache));
+    }
+    if (status.ok()) {
+      std::vector<BlobGcPhysicalFileSummary> physical_files;
+      physical_files.reserve(
+          starting_version->storage_info()->GetBlobFiles().size());
+      for (const std::shared_ptr<BlobFileMetaData>& file :
+           starting_version->storage_info()->GetBlobFiles()) {
+        if (file->IsIdentityRoot()) {
+          physical_files.push_back({file->GetBlobFileNumber(),
+                                    file->GetTotalBlobBytes(),
+                                    /*is_identity_root=*/true});
+        }
+      }
+      status = census.SetWorkerPhysicalFiles(token, physical_files);
+      if (status.ok()) {
+        status = census.SetWorkerCoarseIdentityFrontier(
+            token, starting_version->storage_info()
+                       ->OldestCoarseIdentityBlobFileNumber());
+      }
+    }
+    if (!census.TrySetBuildContext(context) && status.ok()) {
+      status = Status::Aborted("Blob reference census build became stale");
+    }
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  const auto catch_up = [&]() -> Status {
+    bool overflowed = false;
+    if (context->pending_deltas.empty()) {
+      Status take_status = census.TakeBuildDeltas(
+          context->token, &context->pending_deltas, &overflowed);
+      if (!take_status.ok()) {
+        return take_status;
+      }
+      if (overflowed) {
+        return Status::Aborted("Blob reference census listener overflow");
+      }
+    }
+    while (!context->pending_deltas.empty()) {
+      const std::shared_ptr<const BlobReferenceCensusDelta>& delta =
+          context->pending_deltas.front();
+      if (delta == nullptr) {
+        return Status::Corruption("Null blob reference census delta");
+      }
+      Status apply_status = census.ApplyWorkerDelta(context->token, *delta);
+      if (!apply_status.ok()) {
+        return apply_status;
+      }
+      if (!context->scan_complete) {
+        for (uint64_t file_number : delta->removed_files) {
+          if (context->starting_version->storage_info()
+                  ->GetFileMetaDataByNumber(file_number) != nullptr) {
+            context->deleted_starting_files.insert(file_number);
+          }
+        }
+      }
+      apply_status =
+          census.AcknowledgeBuildDeltas(context->token, delta->QueueWeight());
+      if (!apply_status.ok()) {
+        return apply_status;
+      }
+      context->pending_deltas.pop_front();
+    }
+    return Status::OK();
+  };
+
+  // One LOW task reads at most sixteen SST summaries. A complete initial
+  // Version remains pinned across slices, but installed edits are applied and
+  // acknowledged between reads, not accumulated until the whole scan ends.
+  constexpr size_t kMaxFilesPerSlice = 16;
+  size_t visited = 0;
+  TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:BeforeCatchUpReady");
+  TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:BeforeCatchUpWait");
+  status = catch_up();
+  if (status.IsTryAgain()) {
+    *incomplete = true;
+    return Status::OK();
+  }
+  if (!context->scan_complete && status.ok()) {
+    Version& version = *context->starting_version;
+    VersionStorageInfo* const storage = version.storage_info();
+    const MutableCFOptions& options = version.GetMutableCFOptions();
+    ReadOptions read_options(Env::IOActivity::kCompaction);
+    read_options.fill_cache = false;
+    read_options.rate_limiter_priority = Env::IO_LOW;
+    while (status.ok() && context->level < storage->num_levels() &&
+           visited < kMaxFilesPerSlice) {
+      const std::vector<FileMetaData*>& files =
+          storage->LevelFiles(context->level);
+      if (context->next_file == files.size()) {
+        ++context->level;
+        context->next_file = 0;
+        continue;
+      }
+      FileMetaData* const file = files[context->next_file++];
+      ++visited;
+      if (shutting_down_.load(std::memory_order_acquire)) {
+        return Status::ShutdownInProgress();
+      }
+      if (file->blob_reference_descriptor.empty()) {
+        continue;
+      }
+      const uint64_t file_number = file->fd.GetNumber();
+      TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:BeforeReadFileReady");
+      TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:BeforeReadFileWait");
+      TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:BeforeReadFile");
+      status = catch_up();
+      if (!status.ok()) {
+        break;
+      }
+      if (context->deleted_starting_files.count(file_number) != 0) {
+        continue;
+      }
+      std::shared_ptr<const BlobReferenceSstSummary> summary;
+      status = cfd->table_cache()->ReadBlobReferenceSstSummary(
+          read_options, versions_->file_options(), cfd->internal_comparator(),
+          *file, options, &summary);
+      TEST_SYNC_POINT_CALLBACK(
+          "DBImpl::BuildBlobReferenceCensus:ReadFileStatus", &status);
+      if (!status.ok()) {
+        break;
+      }
+      TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:AfterReadFile");
+      status = catch_up();
+      if (status.ok() &&
+          context->deleted_starting_files.count(file_number) == 0) {
+        status = census.AddStartingFile(context->token, std::move(summary));
+      }
+    }
+    if (status.ok() && context->level == storage->num_levels()) {
+      context->scan_complete = true;
+      context->starting_version.reset();
+      std::set<uint64_t>().swap(context->deleted_starting_files);
+      status = context->ReserveInitialFiles(0);
+    }
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  if (!context->scan_complete) {
+    *incomplete = true;
+    return Status::OK();
+  }
+  status = catch_up();
+  if (status.IsTryAgain()) {
+    *incomplete = true;
+    return Status::OK();
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  const uint64_t applied_version = census.WorkerVersionNumber();
+  context->candidate_retry_micros = census.RetryWorkerCandidates(
+      context->token, immutable_db_options_.clock->NowMicros());
+  const BlobGcCandidateHeap::Selection candidates =
+      census.SelectWorkerCandidates(context->token);
+  const BlobGcCandidateHeap::Selection empty_candidates =
+      census.SelectWorkerEmptyCandidates(context->token);
+  const uint64_t relocation_garbage =
+      census.WorkerRelocationGarbageBytes(context->token);
+  {
+    InstrumentedMutexLock lock(&mutex_);
+    if (shutting_down_.load(std::memory_order_acquire) || cfd->IsDropped()) {
+      return Status::ShutdownInProgress();
+    }
+    const BlobReferenceCensus::PublishResult result = census.TryPublishWorker(
+        context->token, applied_version, cfd->current()->GetVersionNumber());
+    if (result == BlobReferenceCensus::PublishResult::kPublished) {
+      cfd->current()->storage_info()->SetBlobGcCandidates(candidates);
+      cfd->current()->storage_info()->SetEmptyBlobGcCandidates(
+          empty_candidates);
+      cfd->current()->storage_info()->SetBlobRelocationGarbageBytes(
+          relocation_garbage);
+      EnqueuePendingCompaction(cfd);
+      MaybeScheduleFlushOrCompaction();
+    } else if (result == BlobReferenceCensus::PublishResult::kStale) {
+      return Status::Aborted("Blob reference census epoch became stale");
+    } else {
+      *incomplete = true;
+    }
+  }
+  return Status::OK();
+}
+
+void DBImpl::RetryBlobReferenceCensus() {
+  InstrumentedMutexLock lock(&mutex_);
+  if (shutting_down_.load(std::memory_order_acquire) || read_only_) {
+    return;
+  }
+  const uint64_t now = immutable_db_options_.clock->NowMicros();
+  // Bounded round-robin retry checks, never an all-CF walk under DB mutex.
+  const size_t count = std::min<size_t>(32, blob_reference_census_retry_count_);
+  for (size_t index = 0; index < count; ++index) {
+    ColumnFamilyData* const cfd = blob_reference_census_retry_head_;
+    blob_reference_census_retry_head_ = cfd->next_blob_reference_census_;
+    --blob_reference_census_retry_count_;
+    if (blob_reference_census_retry_head_ == nullptr) {
+      blob_reference_census_retry_tail_ = nullptr;
+    }
+    cfd->next_blob_reference_census_ = nullptr;
+    // Not-ready is also true after a failed build. It must not bypass that
+    // build's exponential backoff; only a successful worker waiting for
+    // candidates or snapshot publication can wake early for installed work.
+    if (cfd->IsDropped() || cfd->blob_reference_census_retry_micros_ <= now ||
+        (cfd->blob_reference_census_failures_ == 0 &&
+         cfd->blob_reference_census()->NeedsWorkerRun(
+             cfd->current()->GetVersionNumber()))) {
+      if (blob_reference_census_queue_tail_ == nullptr) {
+        blob_reference_census_queue_head_ = cfd;
+      } else {
+        blob_reference_census_queue_tail_->next_blob_reference_census_ = cfd;
+      }
+      blob_reference_census_queue_tail_ = cfd;
+    } else {
+      if (blob_reference_census_retry_tail_ == nullptr) {
+        blob_reference_census_retry_head_ = cfd;
+      } else {
+        blob_reference_census_retry_tail_->next_blob_reference_census_ = cfd;
+      }
+      blob_reference_census_retry_tail_ = cfd;
+      ++blob_reference_census_retry_count_;
+    }
+  }
+  if (blob_reference_census_queue_head_ != nullptr) {
+    // Passing an already queued CF dispatches the existing queue without
+    // adding a reference or scanning the ColumnFamilySet.
+    ScheduleBlobReferenceCensus(blob_reference_census_queue_head_);
+  }
+}
+
+void DBImpl::BGWorkBlobReferenceCensus(void* arg) {
+  TEST_SYNC_POINT("DBImpl::BGWorkBlobReferenceCensus:Start");
+  DBImpl* const db = static_cast<DBImpl*>(arg);
+  ColumnFamilyData* cfd = nullptr;
+  bool should_build = false;
+  {
+    InstrumentedMutexLock lock(&db->mutex_);
+    cfd = db->blob_reference_census_queue_head_;
+    assert(cfd != nullptr);
+    db->blob_reference_census_queue_head_ = cfd->next_blob_reference_census_;
+    if (db->blob_reference_census_queue_head_ == nullptr) {
+      db->blob_reference_census_queue_tail_ = nullptr;
+    }
+    cfd->next_blob_reference_census_ = nullptr;
+    // Keep queued=true while running: concurrent installs must not start a
+    // second worker or duplicate this CF's intrusive queue entry.
+    should_build = !db->shutting_down_.load(std::memory_order_acquire) &&
+                   !cfd->IsDropped();
+  }
+  bool incomplete = false;
+  TEST_SYNC_POINT("DBImpl::BGWorkBlobReferenceCensus:BeforeBuildReady");
+  TEST_SYNC_POINT("DBImpl::BGWorkBlobReferenceCensus:BeforeBuildWait");
+  Status status = should_build ? db->BuildBlobReferenceCensus(cfd, &incomplete)
+                               : Status::ShutdownInProgress();
+  if (!status.ok() && !status.IsShutdownInProgress()) {
+    ROCKS_LOG_WARN(db->immutable_db_options_.info_log,
+                   "Blob reference census unavailable for CF %s: %s",
+                   cfd->GetName().c_str(), status.ToString().c_str());
+  }
+  BlobReferenceCensusGarbage garbage;
+  bool retained_for_retry = false;
+  {
+    InstrumentedMutexLock lock(&db->mutex_);
+    cfd->queued_for_blob_reference_census_ = false;
+    if (!status.ok()) {
+      const std::shared_ptr<BlobReferenceCensusBuildContext> context =
+          cfd->blob_reference_census()->GetBuildContext();
+      if (context != nullptr) {
+        garbage = cfd->blob_reference_census()->FailBuild(context->token);
+      }
+    }
+    const bool snapshot_paused =
+        status.ok() && incomplete &&
+        cfd->blob_reference_census()->IsSnapshotPending();
+    const std::shared_ptr<BlobReferenceCensusBuildContext> retry_context =
+        cfd->blob_reference_census()->GetBuildContext();
+    const bool waiting_for_candidates =
+        status.ok() && !incomplete && retry_context != nullptr &&
+        retry_context->candidate_retry_micros != 0 &&
+        !cfd->blob_reference_census()->NeedsWorkerRun(
+            cfd->current()->GetVersionNumber());
+    if (status.ok()) {
+      cfd->blob_reference_census_failures_ = 0;
+    }
+    if ((!status.ok() || snapshot_paused || waiting_for_candidates) &&
+        !db->shutting_down_.load(std::memory_order_acquire) &&
+        !cfd->IsDropped()) {
+      uint64_t delay = 1000;
+      if (!status.ok()) {
+        cfd->blob_reference_census_failures_ =
+            std::min<uint32_t>(cfd->blob_reference_census_failures_ + 1, 6);
+        delay = uint64_t{1000000} << (cfd->blob_reference_census_failures_ - 1);
+      }
+      cfd->blob_reference_census_retry_micros_ =
+          waiting_for_candidates
+              ? retry_context->candidate_retry_micros
+              : db->immutable_db_options_.clock->NowMicros() + delay;
+      cfd->queued_for_blob_reference_census_ = true;
+      if (db->blob_reference_census_retry_tail_ == nullptr) {
+        db->blob_reference_census_retry_head_ = cfd;
+      } else {
+        db->blob_reference_census_retry_tail_->next_blob_reference_census_ =
+            cfd;
+      }
+      db->blob_reference_census_retry_tail_ = cfd;
+      ++db->blob_reference_census_retry_count_;
+      retained_for_retry = true;
+    } else {
+      cfd->blob_reference_census_failures_ = 0;
+    }
+    if (!db->shutting_down_.load(std::memory_order_acquire)) {
+      // An incomplete CF goes to the back. Every invocation returns to LOW,
+      // allowing ordinary compactions and other CFs to run between slices.
+      db->ScheduleBlobReferenceCensus(cfd);
+    }
+  }
+  garbage = {};
+  if (!retained_for_retry) {
+    db->ReleaseColumnFamilyDataPin(cfd);
+  }
+  TEST_SYNC_POINT("DBImpl::BGWorkBlobReferenceCensus:Done");
+  // Close and the next worker must wait for unlocked Version/CFD/log cleanup,
+  // not merely the last index mutation. Otherwise teardown could free this DB
+  // while the callback's deleters still acquire its mutex.
+  {
+    InstrumentedMutexLock lock(&db->mutex_);
+    db->bg_blob_reference_census_state_ =
+        BlobReferenceCensusJobState::kComplete;
+    if (!db->shutting_down_.load(std::memory_order_acquire) &&
+        db->blob_reference_census_queue_head_ != nullptr) {
+      db->ScheduleBlobReferenceCensus(db->blob_reference_census_queue_head_);
+    }
+    db->bg_cv_.SignalAll();
+  }
+}
 }  // namespace ROCKSDB_NAMESPACE

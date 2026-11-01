@@ -23,6 +23,7 @@
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_builder.h"
+#include "db/blob/blob_source.h"
 #include "db/builder.h"
 #include "db/compaction/clipping_iterator.h"
 #include "db/compaction/compaction_state.h"
@@ -1757,6 +1758,11 @@ void CompactionJob::CreateBlobFileBuilder(
     blob_file_builder = std::make_unique<BlobFileBuilder>(
         [this]() { return NewBlobFileNumber(); }, fs_.get(),
         &sub_compact->compaction->immutable_options(), &mutable_cf_options,
+        cfd->blob_source() != nullptr
+            ? cfd->blob_source()->GetBlobCacheShared()
+            : GetBlobCacheWithReservation(
+                  sub_compact->compaction->immutable_options(),
+                  mutable_cf_options),
         &file_options_, &write_options, db_id_, db_session_id_, job_id_,
         cfd->GetID(), cfd->GetName(), write_hint_, io_tracer_, blob_callback_,
         BlobFileCreationReason::kCompaction, GetBlobOutputPath(),
@@ -2717,6 +2723,12 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
     for (const auto& blob : sub_compact.Current().GetBlobFileAdditions()) {
       edit->AddBlobFile(blob);
     }
+  }
+
+  if (!edit->GetNewFiles().empty() &&
+      compaction->mutable_cf_options().enable_blob_indirection) {
+    edit->SetBlobIndirectionFormatVersion(
+        kBlobIndirectionManifestFormatVersion);
   }
 
   for (const auto& pair : blob_total_garbage) {

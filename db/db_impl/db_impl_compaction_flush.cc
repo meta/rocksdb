@@ -1702,16 +1702,7 @@ void DBImpl::PrepareTrivialMoveEdit(Compaction& c, LogBuffer* log_buffer,
     for (size_t i = 0; i < c.num_input_files(l); i++) {
       FileMetaData* f = c.input(l, i);
       c.edit()->DeleteFile(c.level(l), f->fd.GetNumber());
-      c.edit()->AddFile(
-          c.output_level(), f->fd.GetNumber(), f->fd.GetPathId(),
-          f->fd.GetFileSize(), f->smallest, f->largest, f->fd.smallest_seqno,
-          f->fd.largest_seqno, f->marked_for_compaction, f->temperature,
-          f->oldest_blob_file_number, f->oldest_ancestor_time,
-          f->file_creation_time, f->epoch_number, f->file_checksum,
-          f->file_checksum_func_name, f->unique_id,
-          f->compensated_range_deletion_size, f->tail_size,
-          f->user_defined_timestamps_persisted, f->min_timestamp,
-          f->max_timestamp, f->file_open_metadata);
+      c.edit()->AddFileFromExisting(c.output_level(), *f);
       moved_bytes += static_cast<size_t>(c.input(l, i)->fd.GetFileSize());
       ROCKS_LOG_BUFFER(
           log_buffer, "[%s] Moved #%" PRIu64 " to level-%d %" PRIu64 " bytes\n",
@@ -2292,15 +2283,7 @@ Status DBImpl::ReFitLevel(ColumnFamilyData* cfd, int level, int target_level) {
 
     for (const auto& f : vstorage->LevelFiles(level)) {
       edit.DeleteFile(level, f->fd.GetNumber());
-      edit.AddFile(
-          to_level, f->fd.GetNumber(), f->fd.GetPathId(), f->fd.GetFileSize(),
-          f->smallest, f->largest, f->fd.smallest_seqno, f->fd.largest_seqno,
-          f->marked_for_compaction, f->temperature, f->oldest_blob_file_number,
-          f->oldest_ancestor_time, f->file_creation_time, f->epoch_number,
-          f->file_checksum, f->file_checksum_func_name, f->unique_id,
-          f->compensated_range_deletion_size, f->tail_size,
-          f->user_defined_timestamps_persisted, f->min_timestamp,
-          f->max_timestamp, f->file_open_metadata);
+      edit.AddFileFromExisting(to_level, *f);
     }
     ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
                     "[%s] Apply version edit:\n%s", cfd->GetName().c_str(),
@@ -4181,6 +4164,10 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
                                    in_file->user_defined_timestamps_persisted,
                                    in_file->min_timestamp,
                                    in_file->max_timestamp};
+    out_file_metadata.blob_reference_descriptor =
+        in_file->blob_reference_descriptor;
+    out_file_metadata.blob_reference_legacy_metadata =
+        in_file->blob_reference_legacy_metadata;
 
     if (out_table_properties) {
       c->SetOutputTableProperties(out_fname, out_table_properties);

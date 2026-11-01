@@ -9,6 +9,7 @@
 
 #pragma once
 #include <memory>
+#include <vector>
 
 #include "db/range_tombstone_fragmenter.h"
 #if USE_COROUTINES
@@ -23,6 +24,8 @@
 #include "util/coro_utils.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+struct BlobReferenceGroup;
 
 class Iterator;
 struct ParsedInternalKey;
@@ -115,6 +118,18 @@ class TableReader {
   virtual void SetupForCompaction() = 0;
 
   virtual std::shared_ptr<const TableProperties> GetTableProperties() const = 0;
+
+  // Reads and validates the exact external-blob route-group directory. The
+  // default is intentionally unsupported because feature SSTs are restricted
+  // to block-based tables.
+  virtual Status ReadBlobReferenceGroups(
+      const Slice& expected_descriptor,
+      std::vector<BlobReferenceGroup>* groups) const {
+    (void)expected_descriptor;
+    (void)groups;
+    return Status::NotSupported(
+        "Exact blob reference metadata is not supported");
+  }
 
   // Prepare work that can be done before the real Get()
   virtual void Prepare(const Slice& /*target*/) {}
