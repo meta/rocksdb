@@ -1555,6 +1555,49 @@ TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
   EXPECT_EQ(kGroupSize - 1, count);
 }
 
+TEST_F(VersionSetTest, UnlockedApplyRevalidatesPrecondition) {
+  NewDB();
+  ColumnFamilyData* const cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(cfd, nullptr);
+  const uint64_t original_version_number = cfd->current()->GetVersionNumber();
+
+  std::atomic<bool> precondition_valid{true};
+  size_t precondition_checks = 0;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+  sync_point->SetCallBack("VersionSet::LogAndApplyHelper:ApplyUnlocked",
+                          [&](void*) {
+                            ASSERT_TRUE(mutex_.TryLock());
+                            mutex_.Unlock();
+                            precondition_valid.store(false);
+                          });
+  sync_point->EnableProcessing();
+
+  VersionEdit edit;
+  edit.SetDBId("candidate");
+  mutex_.Lock();
+  const Status status = versions_->LogAndApply(
+      cfd, read_options_, write_options_, &edit, &mutex_,
+      /*dir_contains_current_file=*/nullptr,
+      /*new_descriptor_log=*/false,
+      /*column_family_options=*/nullptr,
+      /*manifest_wcb=*/{}, [&]() {
+        ++precondition_checks;
+        if (!precondition_valid.load()) {
+          return Status::Incomplete("precondition changed during apply");
+        }
+        return Status::OK();
+      });
+  mutex_.Unlock();
+
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+  ASSERT_TRUE(status.IsIncomplete()) << status.ToString();
+  ASSERT_EQ(precondition_checks, 2U);
+  ASSERT_EQ(cfd->current()->GetVersionNumber(), original_version_number);
+}
+
 TEST_F(VersionSetTest, BlobFinalizationDoesNotHoldDBMutex) {
   NewDB();
 

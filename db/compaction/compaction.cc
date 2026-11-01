@@ -634,6 +634,24 @@ bool Compaction::IsTrivialMove() const {
   return true;
 }
 
+bool Compaction::CollectExactBlobReferences() const {
+  if (!mutable_cf_options_.enable_blob_indirection &&
+      !input_vstorage_->HasBlobIndirectionFormat()) {
+    return false;
+  }
+  if (output_level_ != 0) {
+    return true;
+  }
+  for (const CompactionInputFiles& level : inputs_) {
+    for (const FileMetaData* file : level.files) {
+      if (!file->blob_reference_descriptor.empty()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 void Compaction::AddInputDeletions(VersionEdit* out_edit) {
   for (size_t which = 0; which < num_input_levels(); which++) {
     for (size_t i = 0; i < inputs_[which].size(); i++) {

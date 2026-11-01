@@ -128,9 +128,9 @@ class CompactionOutputs {
 
   // Update output table properties from already populated TableProperties.
   // Used for remote compaction
-  void UpdateTableProperties(const TableProperties& table_properties);
+  Status UpdateTableProperties(const TableProperties& table_properties);
   // Update output table properties from table builder
-  void UpdateTableProperties();
+  Status UpdateTableProperties();
 
   IOStatus WriterSyncClose(const Status& intput_status, SystemClock* clock,
                            Statistics* statistics, bool use_fsync);
@@ -323,6 +323,7 @@ class CompactionOutputs {
   std::unique_ptr<TableBuilder> builder_;
   std::unique_ptr<WritableFileWriter> file_writer_;
   uint64_t current_output_file_size_ = 0;
+  uint64_t current_output_blob_references_ = 0;
   SequenceNumber smallest_preferred_seqno_ = kMaxSequenceNumber;
 
   // Sum of all the GetWorkerCPUMicros() for all the closed builders so far.

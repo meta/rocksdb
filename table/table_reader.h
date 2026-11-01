@@ -27,6 +27,8 @@ namespace ROCKSDB_NAMESPACE {
 
 struct BlobReferenceGroup;
 struct BlobReference;
+class BlobReferenceIterator;
+class CacheReservationManager;
 
 class Iterator;
 struct ParsedInternalKey;
@@ -147,6 +149,37 @@ class TableReader {
     (void)references;
     return Status::NotSupported(
         "Exact blob reference metadata is not supported");
+  }
+
+  // Reads and validates every exact-reference payload block without scanning
+  // the table's key/value entries. This includes legacy direct references,
+  // which are intentionally absent from the route-group directory.
+  virtual Status VerifyBlobReferenceMetadata(
+      const ReadOptions& read_options, const Slice& expected_descriptor) const {
+    (void)read_options;
+    (void)expected_descriptor;
+    return Status::NotSupported(
+        "Exact blob reference metadata is not supported");
+  }
+
+  // Reads every exact reference, including legacy-direct entries omitted from
+  // the route-group directory. Intended for offline repair and diagnostics.
+  virtual Status ReadAllBlobReferences(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      std::vector<BlobReference>* references) const {
+    (void)read_options;
+    (void)expected_descriptor;
+    (void)references;
+    return Status::NotSupported(
+        "Exact blob reference metadata is not supported");
+  }
+
+  virtual Status NewBlobReferenceIterator(
+      const ReadOptions&, const Slice&,
+      std::shared_ptr<CacheReservationManager>,
+      std::unique_ptr<BlobReferenceIterator>*) const {
+    return Status::NotSupported(
+        "Exact blob reference iteration is not supported");
   }
 
   // Prepare work that can be done before the real Get()

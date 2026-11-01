@@ -33,12 +33,17 @@ struct BlobRelocationOrigin {
   uint64_t entry_count = 0;
   uint64_t record_bytes = 0;
   uint32_t entries_digest = 0;
+  // Generation components of every RouteSourceID this origin partition can
+  // serve. The origin component is `origin_file_number` above.
+  std::vector<uint64_t> served_generation_file_numbers;
 };
 
 class BlobRelocationDirectory {
  public:
-  static constexpr uint32_t kFormatVersion = 1;
+  static constexpr uint32_t kFormatVersion = 2;
+  static constexpr uint32_t kOldestReadableFormatVersion = 1;
   static constexpr uint64_t kMaxOrigins = 1ULL << 20;
+  static constexpr uint64_t kMaxRouteSources = 1ULL << 20;
 
   void EncodeTo(std::string* output) const;
   static Status DecodeFrom(const Slice& input,
@@ -55,6 +60,8 @@ class BlobRelocationDirectory {
   uint64_t total_entries() const { return total_entries_; }
   uint64_t total_record_bytes() const { return total_record_bytes_; }
   uint32_t directory_digest() const { return directory_digest_; }
+  uint32_t format_version() const { return format_version_; }
+  bool HasRepairMetadata() const;
 
  private:
   friend class BlobRelocationDirectoryBuilder;
@@ -63,12 +70,15 @@ class BlobRelocationDirectory {
   uint64_t total_entries_ = 0;
   uint64_t total_record_bytes_ = 0;
   uint32_t directory_digest_ = 0;
+  uint32_t format_version_ = kFormatVersion;
 };
 
 // Accumulates the directory while records are appended in relocation-key
 // order. It does not retain one object per value.
 class BlobRelocationDirectoryBuilder {
  public:
+  Status AddServedRouteSource(uint64_t origin_file_number,
+                              uint64_t generation_file_number);
   Status Add(uint64_t origin_file_number, uint64_t original_value_offset,
              uint64_t relocated_value_offset, uint64_t stored_value_size,
              CompressionType compression);
@@ -81,6 +91,7 @@ class BlobRelocationDirectoryBuilder {
   BlobRelocationOrigin current_;
   bool has_current_ = false;
   bool finished_ = false;
+  std::vector<std::pair<uint64_t, uint64_t>> served_route_sources_;
 };
 
 // Fixed-width big-endian components preserve numeric pair ordering under the

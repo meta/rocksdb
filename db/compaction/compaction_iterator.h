@@ -336,24 +336,41 @@ class CompactionIterator {
   void PrepareOutputIfNeeded();
 
   // Getters
-  const Slice& key() const { return key_; }
-  const Slice& value() const { return value_; }
+  const Slice& key() const {
+    return output_override_ != nullptr ? output_override_->key : key_;
+  }
+  const Slice& value() const {
+    return output_override_ != nullptr ? output_override_->value : value_;
+  }
   const Status& status() const { return status_; }
-  const ParsedInternalKey& ikey() const { return ikey_; }
-  inline bool Valid() const { return validity_info_.IsValid(); }
+  const ParsedInternalKey& ikey() const {
+    return output_override_ != nullptr ? output_override_->ikey : ikey_;
+  }
+  inline bool Valid() const {
+    return output_override_ != nullptr || validity_info_.IsValid();
+  }
   const Slice& user_key() const {
+    if (output_override_ != nullptr) {
+      return output_override_->ikey.user_key;
+    }
     if (UNLIKELY(is_range_del_)) {
       return ikey_.user_key;
     }
     return current_user_key_;
   }
   const CompactionIterationStats& iter_stats() const { return iter_stats_; }
-  bool HasNumInputEntryScanned() const { return input_.HasNumItered(); }
+  bool HasNumInputEntryScanned() const {
+    return output_override_ != nullptr ? output_override_->has_input_count
+                                       : input_.HasNumItered();
+  }
 
   // This method should only be used when `HasNumInputEntryScanned()` returns
   // true, unless `must_count_input_entries=true` was specified during iterator
   // creation (which ensures the count is always accurate).
-  uint64_t NumInputEntryScanned() const { return input_.NumItered(); }
+  uint64_t NumInputEntryScanned() const {
+    return output_override_ != nullptr ? output_override_->input_records
+                                       : input_.NumItered();
+  }
 
   // Returns true if the current valid key was already scanned/counted during
   // a lookahead operation in a previous iteration.
@@ -361,7 +378,8 @@ class CompactionIterator {
   // REQUIRED: Valid() must be true
   bool IsCurrentKeyAlreadyScanned() const {
     assert(Valid());
-    return at_next_ || merge_out_iter_.Valid();
+    return output_override_ != nullptr ? output_override_->already_scanned
+                                       : at_next_ || merge_out_iter_.Valid();
   }
 
   // Returns true if an earlier input entry for the current valid user key was
@@ -375,9 +393,35 @@ class CompactionIterator {
 
   Status InputStatus() const { return input_.status(); }
 
-  bool IsDeleteRangeSentinelKey() const { return is_range_del_; }
+  bool IsDeleteRangeSentinelKey() const {
+    return output_override_ != nullptr ? output_override_->is_range_del
+                                       : is_range_del_;
+  }
 
  private:
+  friend class CompactionJob;
+  friend class CompactionOutputs;
+
+  // Exact output budgets are decided before emitting a history's first SST row.
+  // The job owns these final, transformed records while the input cursor is
+  // ahead. Output callbacks see the displayed record and its pre-lookahead
+  // input count, not the cursor's next key. No input transformation is
+  // replayed.
+  struct BufferedOutput {
+    std::unique_ptr<char[]> data;
+    Slice key;
+    Slice value;
+    ParsedInternalKey ikey;
+    uint64_t references = 0;
+    uint64_t history_references = 0;
+    uint64_t input_records = 0;
+    bool already_scanned = false;
+    bool has_input_count = false;
+    bool is_range_del = false;
+    bool first_in_history = false;
+  };
+  const BufferedOutput* output_override_ = nullptr;
+
   // Processes the input stream to find the next output
   void NextFromInput();
 

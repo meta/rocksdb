@@ -614,7 +614,7 @@ class CompactionJob {
       const FileMetaData* file_meta, const ReadOptions& read_options,
       std::shared_ptr<const TableProperties>* tp);
 
-  void RestoreCompactionOutputs(
+  Status RestoreCompactionOutputs(
       const ColumnFamilyData* cfd,
       const std::vector<std::shared_ptr<const TableProperties>>&
           output_files_table_properties,

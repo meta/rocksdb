@@ -355,6 +355,7 @@ class TableCache {
   }
 
  private:
+  friend class DBImpl;  // Job-scoped selected-SST readers, outside DB mutex.
   Status OpenEphemeralBlobReferenceReader(
       const ReadOptions& read_options, const FileOptions& file_options,
       const InternalKeyComparator& internal_comparator,

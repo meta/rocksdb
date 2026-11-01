@@ -16,6 +16,7 @@
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
 #include "cache/cache_reservation_manager.h"
+#include "db/blob/blob_gen2_format.h"
 #include "db/blob/same_file_blob_reader.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/seqno_to_time_mapping.h"
@@ -150,8 +151,8 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   //    are set.
   // @param force_direct_prefetch if true, always prefetching to RocksDB
   //    buffer, rather than calling RandomAccessFile::Prefetch().
-  // @param avoid_shared_metadata_cache if true, open-time index/filter/
-  //    dictionary reads must not insert into the shared block cache.
+  // @param avoid_shared_metadata_cache if true, metadata reads avoid shared
+  //    block and persistent caches.
   static Status Open(
       const ReadOptions& ro, const ImmutableOptions& ioptions,
       const EnvOptions& env_options,
@@ -270,6 +271,19 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   void MultiGetSameFileBlob(const ReadOptions& read_options, size_t num_reads,
                             SameFileBlobReadRequest* reqs) const override;
 
+  // GC-only counterpart that preserves the exact stored representation while
+  // verifying both the physical record and stable logical checksums.
+  void MultiGetStoredSameFileBlob(const ReadOptions& read_options,
+                                  size_t num_reads,
+                                  StoredSameFileBlobReadRequest* reqs,
+                                  uint64_t max_stored_bytes,
+                                  uint64_t max_logical_value_bytes,
+                                  uint64_t* bytes_read) const;
+  Status StreamStoredSameFileBlob(const ReadOptions& read_options,
+                                  const BlobIndex& blob_index,
+                                  uint32_t stored_checksum,
+                                  const BlobChunkConsumer& consumer) const;
+
   // If `value` is a same-file BlobIndex, materializes the referenced payload
   // and updates `resolved_internal_key` to the corresponding value type. Leaves
   // `resolved`. When `pinned_value` is non-null, a whole-value same-file blob
@@ -386,6 +400,18 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
       const ReadOptions& read_options, const Slice& expected_descriptor,
       const BlobReferenceGroup& expected_group,
       std::vector<BlobReference>* references) const override;
+  Status VerifyBlobReferenceMetadata(
+      const ReadOptions& read_options,
+      const Slice& expected_descriptor) const override;
+
+  Status ReadAllBlobReferences(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      std::vector<BlobReference>* references) const override;
+
+  Status NewBlobReferenceIterator(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      std::shared_ptr<CacheReservationManager> reservation_manager,
+      std::unique_ptr<BlobReferenceIterator>* iterator) const override;
 
   const SeqnoToTimeMapping& GetSeqnoToTimeMapping() const;
 
@@ -542,6 +568,10 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   friend class MockedBlockBasedTable;
   friend class BlockBasedTableReaderTestVerifyChecksum_ChecksumMismatch_Test;
   BlockCacheTracer* const block_cache_tracer_;
+
+  Status VerifyBlobReferenceMetadataAndReadAll(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      std::vector<BlobReference>* references) const;
 
   void UpdateCacheHitMetrics(BlockType block_type, GetContext* get_context,
                              size_t usage) const;
@@ -827,6 +857,12 @@ struct BlockBasedTable::Rep {
   std::unique_ptr<RandomAccessFileReader> file;
   OffsetableCacheKey base_cache_key;
   PersistentCacheOptions persistent_cache_options;
+  PersistentCacheOptions metadata_persistent_cache_options;
+
+  const PersistentCacheOptions& PersistentCacheFor(BlockType type) const {
+    return type == BlockType::kData ? persistent_cache_options
+                                    : metadata_persistent_cache_options;
+  }
 
   // Footer contains the fixed table information
   Footer footer;

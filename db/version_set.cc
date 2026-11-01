@@ -3559,6 +3559,56 @@ void VersionStorageInfo::GenerateLevelFilesBrief() {
   }
 }
 
+bool VersionStorageInfo::ExpandExactL0Inputs(
+    std::vector<FileMetaData*>* inputs) const {
+  if (inputs->empty() || !HasBlobIndirectionFormat()) {
+    return true;
+  }
+  const std::vector<FileMetaData*>& l0 = files_[0];
+  std::vector<FileMetaData*> expanded;
+  size_t input = 0;
+  while (input < inputs->size()) {
+    const uint64_t epoch = (*inputs)[input]->epoch_number;
+    const size_t first_input = input++;
+    while (input < inputs->size() && (*inputs)[input]->epoch_number == epoch) {
+      ++input;
+    }
+    // All picker input lists are subsequences of Version's epoch order.
+    // Diagnose an invalid caller rather than silently losing its input files.
+    if (input < inputs->size() && (*inputs)[input]->epoch_number > epoch) {
+      return false;
+    }
+    const std::vector<FileMetaData*>::const_iterator first =
+        std::lower_bound(l0.begin(), l0.end(), epoch,
+                         [](const FileMetaData* file, uint64_t value) {
+                           return file->epoch_number > value;
+                         });
+    std::vector<FileMetaData*>::const_iterator last = first;
+    bool exact = false;
+    while (last != l0.end() && (*last)->epoch_number == epoch) {
+      exact |= !(*last)->blob_reference_descriptor.empty();
+      ++last;
+    }
+    if (exact) {
+      if (epoch == kUnknownEpochNumber) {
+        return false;
+      }
+      for (std::vector<FileMetaData*>::const_iterator file = first;
+           file != last; ++file) {
+        if ((*file)->being_compacted) {
+          return false;
+        }
+        expanded.push_back(*file);
+      }
+    } else {
+      expanded.insert(expanded.end(), inputs->begin() + first_input,
+                      inputs->begin() + input);
+    }
+  }
+  inputs->swap(expanded);
+  return true;
+}
+
 void VersionStorageInfo::PrepareForVersionAppend(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options) {
@@ -6267,7 +6317,7 @@ Status VersionSet::ProcessManifestWrites(
     FSDirectory* dir_contains_current_file, bool new_descriptor_log,
     const ColumnFamilyOptions* new_cf_options,
     bool new_cf_options_are_sanitized, const ReadOptions& read_options,
-    const WriteOptions& write_options) {
+    const WriteOptions& write_options, const std::function<Status()>& pre_cb) {
   // LogAndApply requires a non-null DB mutex, but NULLSAFECLANG cannot carry
   // that API contract into this private helper.
   // @lint-ignore NULLSAFECLANG nullable-dereference
@@ -6585,12 +6635,14 @@ Status VersionSet::ProcessManifestWrites(
     batch_edits.push_back(first_writer.edit_list.front());
     batch_edits_ts_sz.push_back(std::nullopt);
   } else {
-    auto it = manifest_writers_.cbegin();
+    size_t writer_index = 0;
     size_t group_start = std::numeric_limits<size_t>::max();
     Status batch_apply_status;
     for (;;) {
-      assert(!(*it)->edit_list.front()->IsColumnFamilyManipulation());
-      last_writer = *it;
+      assert(!manifest_writers_[writer_index]
+                  ->edit_list.front()
+                  ->IsColumnFamilyManipulation());
+      last_writer = manifest_writers_[writer_index];
       batch_max_file_opening_threads =
           std::max(batch_max_file_opening_threads,
                    last_writer->max_file_opening_threads);
@@ -6714,8 +6766,10 @@ Status VersionSet::ProcessManifestWrites(
               /*validate_current_owners=*/true,
               &deferred_physical_file_ownership_conflict);
           if (batch_apply_status.ok()) {
-            batch_apply_status = LogAndApplyHelper(writer_cfd, builder, e,
-                                                   &max_last_sequence, mu);
+            batch_apply_status = LogAndApplyHelper(
+                writer_cfd, builder, e, &max_last_sequence, mu,
+                last_writer->requires_precondition && !skip_manifest_write,
+                pre_cb);
           }
           if (!batch_apply_status.ok()) {
             break;  // inner for-`e` loop
@@ -6732,8 +6786,8 @@ Status VersionSet::ProcessManifestWrites(
         }
       }
       // Loop increment/conditions
-      ++it;
-      if (it == manifest_writers_.cend()) {
+      ++writer_index;
+      if (writer_index == manifest_writers_.size()) {
         break;
       }
       if (skip_manifest_write ||
@@ -6747,12 +6801,12 @@ Status VersionSet::ProcessManifestWrites(
         }
         continue;
       }
-      if ((*it)->requires_precondition) {
+      if (manifest_writers_[writer_index]->requires_precondition) {
         // Let this writer become the queue head so its caller can validate the
         // precondition against all Versions committed before it.
         break;
       }
-      const auto* next = (*it)->edit_list.front();
+      const auto* next = manifest_writers_[writer_index]->edit_list.front();
       if (next->IsColumnFamilyManipulation() ||
           next->IsNoManifestWriteDummy()) {
         // no group commits for column family add or drop
@@ -7609,7 +7663,7 @@ Status VersionSet::LogAndApplyImpl(
     return ProcessManifestWrites(writers, column_family_mode, mu,
                                  dir_contains_current_file, new_descriptor_log,
                                  new_cf_options, new_cf_options_are_sanitized,
-                                 read_options, write_options);
+                                 read_options, write_options, pre_cb);
   }
 }
 
@@ -8016,7 +8070,11 @@ Status VersionSet::BuildPhysicalFileOwnershipIndex(
 Status VersionSet::LogAndApplyHelper(ColumnFamilyData* cfd,
                                      VersionBuilder* builder, VersionEdit* edit,
                                      SequenceNumber* max_last_sequence,
-                                     InstrumentedMutex* mu) {
+                                     InstrumentedMutex* mu, bool apply_unlocked,
+                                     const std::function<Status()>& pre_cb) {
+  if (mu == nullptr) {
+    return Status::InvalidArgument("Null DB mutex in LogAndApply");
+  }
 #ifdef NDEBUG
   (void)cfd;
 #endif
@@ -8043,7 +8101,29 @@ Status VersionSet::LogAndApplyHelper(ColumnFamilyData* cfd,
   // LSM Version, so they do not need a VersionBuilder.
   assert(builder || edit->IsWalManipulation() ||
          edit->IsOptionsFileManipulation());
-  return builder ? builder->Apply(edit) : Status::OK();
+  if (builder == nullptr) {
+    return Status::OK();
+  }
+  if (!apply_unlocked) {
+    return builder->Apply(edit);
+  }
+
+  // A writer with a precondition cannot be grouped behind an earlier writer:
+  // it reaches the queue head and validates first. Keeping it at the queue
+  // head also prevents another Version installation while its potentially
+  // route-sized builder delta is prepared without the DB mutex.
+  mu->Unlock();
+  // SyncPoint's singleton has process lifetime.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT("VersionSet::LogAndApplyHelper:ApplyUnlocked");
+  Status status = builder->Apply(edit);
+  mu->Lock();
+  // The caller's state may change while Apply() runs without the DB mutex.
+  // Revalidate before this candidate Version can be written or installed.
+  if (status.ok() && pre_cb) {
+    status = pre_cb();
+  }
+  return status;
 }
 
 FileOptions VersionSet::GetFileOptionsForManifestWrite() const {
@@ -10423,11 +10503,6 @@ void VersionStorageInfo::DeleteBlobRelocationRoute(
   MutableBlobRelocationState().DeleteRoute(source);
 }
 
-const std::vector<BlobRelocationRouteSource>*
-VersionStorageInfo::GetBlobRelocationRouteSourcesForTarget(
-    uint64_t physical_file_number) const {
-  return BlobRelocationStateForRead().SourcesForTarget(physical_file_number);
-}
 
 void VersionStorageInfo::SetBlobGcCandidates(
     const std::array<uint64_t, kBlobGcMaxSelectedFiles>& files) {
@@ -10512,6 +10587,12 @@ void VersionStorageInfo::GetEmptyBlobGcCandidates(
     }
     files->push_back(empty_blob_files_for_standalone_gc_[i]);
   }
+}
+
+const std::vector<BlobRelocationRouteSource>*
+VersionStorageInfo::GetBlobRelocationRouteSourcesForTarget(
+    uint64_t physical_file_number) const {
+  return BlobRelocationStateForRead().SourcesForTarget(physical_file_number);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -1291,15 +1291,20 @@ bool ColumnFamilyData::NeedsCompaction() const {
   if (mutable_cf_options_.disable_auto_compactions) {
     return false;
   }
-  if (compaction_picker_->NeedsCompaction(current_->storage_info())) {
+  Version* const current = current_;
+  if (current == nullptr) {
+    return false;
+  }
+  if (compaction_picker_->NeedsCompaction(current->storage_info())) {
     return true;
   }
   return mutable_cf_options_.enable_blob_files &&
          mutable_cf_options_.enable_blob_garbage_collection &&
          mutable_cf_options_.enable_blob_indirection &&
-         current_->storage_info()->BlobPhysicalFileForStandaloneGC() != 0 &&
+         current->storage_info()->BlobPhysicalFileForStandaloneGC() !=
+             kInvalidBlobFileNumber &&
          blob_reference_census_ != nullptr &&
-         blob_reference_census_->IsReady(current_->GetVersionNumber());
+         blob_reference_census_->IsReady(current->GetVersionNumber());
 }
 
 Compaction* ColumnFamilyData::PickCompaction(

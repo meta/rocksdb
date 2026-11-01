@@ -9,6 +9,7 @@
 #include <limits>
 
 #include "db/blob/blob_gen2_format.h"
+#include "test_util/sync_point.h"
 #include "util/coding.h"
 #include "util/compression.h"
 #include "util/crc32c.h"
@@ -19,7 +20,8 @@ namespace {
 
 constexpr uint32_t kRelocationDirectoryMagic = 0x524C4344U;  // RLCD
 constexpr size_t kDirectoryHeaderSize = 40;
-constexpr size_t kOriginEntrySize = 48;
+constexpr size_t kLegacyOriginEntrySize = 48;
+constexpr size_t kOriginEntrySize = 56;
 constexpr size_t kMaxDirectorySize = 64 * 1024 * 1024;
 
 bool AddRelocationBytesWithoutOverflow(uint64_t lhs, uint64_t rhs,
@@ -63,9 +65,23 @@ void ExtendDigest(uint64_t original_value_offset,
 void BlobRelocationDirectory::EncodeTo(std::string* output) const {
   assert(output != nullptr);
   output->clear();
-  output->reserve(kDirectoryHeaderSize + origins_.size() * kOriginEntrySize);
+  uint32_t format_version = format_version_;
+  TEST_SYNC_POINT_CALLBACK("BlobRelocationDirectory::EncodeTo:FormatVersion",
+                           &format_version);
+  assert(format_version >= kOldestReadableFormatVersion &&
+         format_version <= kFormatVersion);
+  size_t route_source_count = 0;
+  if (format_version >= 2) {
+    for (const BlobRelocationOrigin& origin : origins_) {
+      route_source_count += origin.served_generation_file_numbers.size();
+    }
+  }
+  const size_t origin_entry_size =
+      format_version >= 2 ? kOriginEntrySize : kLegacyOriginEntrySize;
+  output->reserve(kDirectoryHeaderSize + origins_.size() * origin_entry_size +
+                  route_source_count * sizeof(uint64_t));
   PutFixed32(output, kRelocationDirectoryMagic);
-  PutFixed32(output, kFormatVersion);
+  PutFixed32(output, format_version);
   PutFixed64(output, origins_.size());
   PutFixed64(output, total_entries_);
   PutFixed64(output, total_record_bytes_);
@@ -81,9 +97,13 @@ void BlobRelocationDirectory::EncodeTo(std::string* output) const {
     PutFixed64(output, origin.record_bytes);
     PutFixed32(output, origin.entries_digest);
     PutFixed32(output, 0);
+    if (format_version >= 2) {
+      PutFixed64(output, origin.served_generation_file_numbers.size());
+      for (uint64_t generation : origin.served_generation_file_numbers) {
+        PutFixed64(output, generation);
+      }
+    }
   }
-  assert(output->size() ==
-         kDirectoryHeaderSize + origins_.size() * kOriginEntrySize);
   const uint32_t digest = crc32c::Value(output->data() + kDirectoryHeaderSize,
                                         output->size() - kDirectoryHeaderSize);
   EncodeFixed32(output->data() + 32, digest);
@@ -115,14 +135,17 @@ Status BlobRelocationDirectory::DecodeFrom(const Slice& input,
       !GetFixed32(&cursor, &header_checksum)) {
     return Status::Corruption("Truncated blob relocation directory");
   }
-  if (magic != kRelocationDirectoryMagic || version != kFormatVersion) {
+  if (magic != kRelocationDirectoryMagic ||
+      version < kOldestReadableFormatVersion || version > kFormatVersion) {
     return Status::Corruption("Unsupported blob relocation directory");
   }
+  const size_t minimum_origin_entry_size =
+      version >= 2 ? kOriginEntrySize : kLegacyOriginEntrySize;
   if (origin_count == 0 || origin_count > kMaxOrigins ||
       origin_count > std::numeric_limits<size_t>::max() ||
-      origin_count >
-          (kMaxDirectorySize - kDirectoryHeaderSize) / kOriginEntrySize ||
-      cursor.size() != origin_count * kOriginEntrySize) {
+      origin_count > (kMaxDirectorySize - kDirectoryHeaderSize) /
+                         minimum_origin_entry_size ||
+      cursor.size() < origin_count * minimum_origin_entry_size) {
     return Status::Corruption("Invalid blob relocation origin count");
   }
   if (crc32c::Value(input.data(), kDirectoryHeaderSize - 4) !=
@@ -135,8 +158,10 @@ Status BlobRelocationDirectory::DecodeFrom(const Slice& input,
   }
 
   decoded.origins_.reserve(static_cast<size_t>(origin_count));
+  decoded.format_version_ = version;
   uint64_t computed_entries = 0;
   uint64_t computed_record_bytes = 0;
+  uint64_t total_route_sources = 0;
   for (uint64_t i = 0; i < origin_count; ++i) {
     BlobRelocationOrigin origin;
     uint32_t reserved = 0;
@@ -149,6 +174,25 @@ Status BlobRelocationDirectory::DecodeFrom(const Slice& input,
         !GetFixed32(&cursor, &reserved)) {
       return Status::Corruption("Truncated blob relocation origin entry");
     }
+    uint64_t route_source_count = 0;
+    if (version >= 2 &&
+        (!GetFixed64(&cursor, &route_source_count) ||
+         route_source_count > kMaxRouteSources - total_route_sources ||
+         route_source_count > cursor.size() / sizeof(uint64_t))) {
+      return Status::Corruption("Invalid blob relocation route-source count");
+    }
+    origin.served_generation_file_numbers.reserve(
+        static_cast<size_t>(route_source_count));
+    for (uint64_t source = 0; source < route_source_count; ++source) {
+      uint64_t generation = 0;
+      if (!GetFixed64(&cursor, &generation) || generation == 0 ||
+          (!origin.served_generation_file_numbers.empty() &&
+           origin.served_generation_file_numbers.back() >= generation)) {
+        return Status::Corruption("Invalid blob relocation route source");
+      }
+      origin.served_generation_file_numbers.push_back(generation);
+    }
+    total_route_sources += route_source_count;
     if (reserved != 0 || origin.origin_file_number == 0 ||
         origin.entry_count == 0 ||
         origin.first_original_offset > origin.last_original_offset ||
@@ -174,6 +218,14 @@ Status BlobRelocationDirectory::DecodeFrom(const Slice& input,
   decoded.directory_digest_ = directory_digest;
   *directory = std::move(decoded);
   return Status::OK();
+}
+
+bool BlobRelocationDirectory::HasRepairMetadata() const {
+  return format_version_ >= 2 &&
+         std::all_of(origins_.begin(), origins_.end(),
+                     [](const BlobRelocationOrigin& origin) {
+                       return !origin.served_generation_file_numbers.empty();
+                     });
 }
 
 Status BlobRelocationDirectory::ValidateForFileSize(uint64_t file_size) const {
@@ -255,6 +307,24 @@ Status BlobRelocationDirectoryBuilder::Add(uint64_t origin_file_number,
   return Status::OK();
 }
 
+Status BlobRelocationDirectoryBuilder::AddServedRouteSource(
+    uint64_t origin_file_number, uint64_t generation_file_number) {
+  if (finished_) {
+    return Status::InvalidArgument(
+        "Cannot add to finished blob relocation directory");
+  }
+  if (origin_file_number == 0 || generation_file_number == 0) {
+    return Status::InvalidArgument("Invalid blob relocation route source");
+  }
+  if (served_route_sources_.size() >=
+      BlobRelocationDirectory::kMaxRouteSources) {
+    return Status::MemoryLimit("Too many blob relocation route sources");
+  }
+  served_route_sources_.emplace_back(origin_file_number,
+                                     generation_file_number);
+  return Status::OK();
+}
+
 Status BlobRelocationDirectoryBuilder::FinishCurrentOrigin() {
   if (!has_current_) {
     return Status::OK();
@@ -293,6 +363,23 @@ Status BlobRelocationDirectoryBuilder::Finish(
   }
   if (directory_.origins_.empty()) {
     return Status::InvalidArgument("Empty blob relocation directory");
+  }
+  std::sort(served_route_sources_.begin(), served_route_sources_.end());
+  served_route_sources_.erase(
+      std::unique(served_route_sources_.begin(), served_route_sources_.end()),
+      served_route_sources_.end());
+  for (const auto& source : served_route_sources_) {
+    const auto origin = std::lower_bound(
+        directory_.origins_.begin(), directory_.origins_.end(), source.first,
+        [](const BlobRelocationOrigin& value, uint64_t origin_file_number) {
+          return value.origin_file_number < origin_file_number;
+        });
+    if (origin == directory_.origins_.end() ||
+        origin->origin_file_number != source.first) {
+      return Status::InvalidArgument(
+          "Blob relocation route source has no origin partition");
+    }
+    origin->served_generation_file_numbers.push_back(source.second);
   }
   std::string encoded;
   directory_.EncodeTo(&encoded);
@@ -333,6 +420,13 @@ Status DecodeBlobRelocationKey(const Slice& key, uint64_t* origin_file_number,
 BlockBasedTableOptions MakeBlobRelocationTableOptions(
     const BlockBasedTableOptions& source) {
   BlockBasedTableOptions options(source);
+  // Dedicated relocation outputs reuse the stable stored-byte CRC in their
+  // physical trailer. This permits bounded streaming without a second payload
+  // checksum pass. Normal SST/blob writers retain their configured checksums;
+  // disabling physical checksums remains supported for relocation files.
+  if (options.checksum != kNoChecksum) {
+    options.checksum = kCRC32c;
+  }
   options.index_type = BlockBasedTableOptions::kBinarySearch;
   options.data_block_index_type =
       BlockBasedTableOptions::kDataBlockBinarySearch;

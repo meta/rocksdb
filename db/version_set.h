@@ -405,6 +405,13 @@ class VersionStorageInfo {
     return files_[level];
   }
 
+  // Exceptional exact L0 output can contain several files with one epoch.
+  // Keep that output run indivisible on subsequent input selection. L0 is
+  // epoch ordered, not key ordered: taking only a middle file cannot prove
+  // that all versions of a boundary user key were selected. Legacy runs are
+  // unchanged. Only selected epoch runs are inspected, not the whole Version.
+  bool ExpandExactL0Inputs(std::vector<FileMetaData*>* inputs) const;
+
   bool HasMissingEpochNumber() const;
   uint64_t GetMaxEpochNumberOfFiles() const;
   EpochNumberRequirement GetEpochNumberRequirement() const {
@@ -2395,15 +2402,13 @@ class VersionSet {
 
  private:
   // REQUIRES db mutex at beginning. may release and re-acquire db mutex
-  Status ProcessManifestWrites(std::deque<ManifestWriter>& writers,
-                               LogAndApplyColumnFamilyMode column_family_mode,
-                               InstrumentedMutex* mu,
-                               FSDirectory* dir_contains_current_file,
-                               bool new_descriptor_log,
-                               const ColumnFamilyOptions* new_cf_options,
-                               bool new_cf_options_are_sanitized,
-                               const ReadOptions& read_options,
-                               const WriteOptions& write_options);
+  Status ProcessManifestWrites(
+      std::deque<ManifestWriter>& writers,
+      LogAndApplyColumnFamilyMode column_family_mode, InstrumentedMutex* mu,
+      FSDirectory* dir_contains_current_file, bool new_descriptor_log,
+      const ColumnFamilyOptions* new_cf_options,
+      bool new_cf_options_are_sanitized, const ReadOptions& read_options,
+      const WriteOptions& write_options, const std::function<Status()>& pre_cb);
 
   Status LogAndApplyImpl(
       const autovector<ColumnFamilyData*>& column_family_datas,
@@ -2422,7 +2427,8 @@ class VersionSet {
                            SequenceNumber* max_last_sequence);
   Status LogAndApplyHelper(ColumnFamilyData* cfd, VersionBuilder* b,
                            VersionEdit* edit, SequenceNumber* max_last_sequence,
-                           InstrumentedMutex* mu);
+                           InstrumentedMutex* mu, bool apply_unlocked,
+                           const std::function<Status()>& pre_cb);
   Status ValidateAndTrackPhysicalFileOwnership(
       const VersionEdit& edit, uint32_t active_format_version,
       PhysicalFileOwnershipDeltas& deltas, bool validate_current_owners,
