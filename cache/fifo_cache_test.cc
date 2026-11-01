@@ -99,7 +99,15 @@ class FIFOCacheTest : public testing::Test {
     return false;
   }
 
-  // Presence probe that performs no Lookup.
+  void HitNTimes(const std::string& key, int times) {
+    for (int i = 0; i < times; i++) {
+      FIFOHandle* h = Lookup(key);
+      ASSERT_NE(nullptr, h);
+      EXPECT_FALSE(cache_->Release(h, true, false));
+    }
+  }
+
+  // Presence probe that performs no Lookup, so it never credits frequency.
   bool ContainsForTest(const std::string& key) {
     bool found = false;
     size_t state = 0;
@@ -116,8 +124,68 @@ class FIFOCacheTest : public testing::Test {
     return found;
   }
 
+  // Drives resident second-chance laps around "k" and returns the number of
+  // resident evictions before "k" itself is evicted. "k" travels the public
+  // path throughout (pressure promotion, saturating lookups); only the cold
+  // filler entries use TEST_PromoteToResident, and only for placement (their
+  // frequency is 0 either way). Resident holds exactly 10 entries whenever
+  // pressure is applied, so k is visited once per 9 evictions: counter n
+  // means exactly 9n evictions before k. Rounds are capped so a broken
+  // termination bound fails instead of hanging.
+  int CountEvictionsBeforeK(int hits) {
+    NewCache(/*capacity*/ 10);
+    EXPECT_OK(Insert("k"));
+    HitNTimes("k", 2);
+    for (int i = 0; i < 9; i++) {
+      EXPECT_OK(Insert("f" + std::to_string(i)));
+    }
+    // Promotes k (resetting its counter) and evicts f0.
+    EXPECT_OK(Insert("p"));
+    HitNTimes("k", hits);
+    for (int i = 1; i < 9; i++) {
+      Erase("f" + std::to_string(i));
+    }
+    Erase("p");
+    int evicted = 0;
+    int tag = 0;
+    // Refill resident to 10 (k plus 9 cold) without pressure.
+    for (int i = 0; i < 9; i++) {
+      std::string y = "y" + std::to_string(tag++);
+      EXPECT_OK(Insert(y));
+      cache_->TEST_PromoteToResident(y);
+    }
+    for (int round = 0; round < 40; round++) {
+      std::string l = "l" + std::to_string(round);
+      EXPECT_OK(Insert(l));
+      if (!ContainsForTest("k")) {
+        break;
+      }
+      Erase(l);
+      evicted++;
+      // Restore resident to 10 without pressure.
+      std::string y = "y" + std::to_string(tag++);
+      EXPECT_OK(Insert(y));
+      cache_->TEST_PromoteToResident(y);
+    }
+    EXPECT_FALSE(ContainsForTest("k"));
+    return evicted;
+  }
+
   void Erase(const std::string& key) {
     cache_->Erase(key, FIFOCacheShard::ComputeHash(key, 0));
+  }
+
+  // Whether key is linked in probation. Performs no Lookup.
+  bool InProbationForTest(const std::string& key) {
+    FIFOHandle* fifo;
+    cache_->TEST_GetFIFOList(&fifo);
+    for (FIFOHandle* h = cache_->TEST_Next(fifo); h != fifo;
+         h = cache_->TEST_Next(h)) {
+      if (h->key().ToString() == key) {
+        return true;
+      }
+    }
+    return false;
   }
 
   void InsertN(const std::string& prefix, int n) {
@@ -1353,6 +1421,249 @@ TEST_F(FIFOCacheTest, UsageStaysPayloadOnlyAcrossResizeWithNoMetadataCharge) {
   EXPECT_EQ(600, cache_->GetUsage());
 }
 
+// Rules out promoting at >= 1 (b would survive), at >= 3 or never (a would
+// be evicted), and plain FIFO (a, the oldest, would be evicted).
+TEST_F(FIFOCacheTest, TwoHitsPromoteOneHitEvicts) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a"));
+  HitNTimes("a", 2);
+  EXPECT_OK(Insert("b"));
+  HitNTimes("b", 1);
+  for (int i = 0; i < 8; i++) {
+    EXPECT_OK(Insert("c" + std::to_string(i)));
+  }
+  EXPECT_OK(Insert("x"));
+  EXPECT_TRUE(LookupBool("a"));
+  EXPECT_FALSE(LookupBool("b"));
+  EXPECT_EQ(10, cache_->GetUsage());
+}
+
+// Rules out plain FIFO and never-promote: the oldest entry survives pressure
+// that evicts newer cold entries because its hits promoted it.
+TEST_F(FIFOCacheTest, PromotedEntrySurvivesColdPressure) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("old"));
+  HitNTimes("old", 2);
+  for (int i = 0; i < 9; i++) {
+    EXPECT_OK(Insert("c" + std::to_string(i)));
+  }
+  EXPECT_OK(Insert("new"));
+  EXPECT_TRUE(LookupBool("old"));
+  EXPECT_FALSE(LookupBool("c0"));
+  EXPECT_EQ(10, cache_->GetUsage());
+}
+
+// A resident entry with counter n is evicted after exactly 9n other resident
+// evictions. Rules out moving to the head instead of the tail (k would go
+// after 0), a single reference bit (k with 2 hits would go after 9), and not
+// decrementing (k would never go).
+TEST_F(FIFOCacheTest, ResidentSecondChanceExactLaps) {
+  EXPECT_EQ(0, CountEvictionsBeforeK(0));
+  EXPECT_EQ(9, CountEvictionsBeforeK(1));
+  EXPECT_EQ(18, CountEvictionsBeforeK(2));
+}
+
+// The resident clock evicts in FIFO-reinsertion order: an entry promoted
+// while the hand is mid-ring becomes the newest, and erasing the entry under
+// the hand moves the hand to the next oldest. Reinsertion order, traced:
+// [a1 b0 c0] +u -> a rotates, b evicted -> [c0 u0 a0]; +w -> c evicted
+// -> [u0 a0 w0]; erase u -> [a0 w1]; +p -> a evicted. A hand left on the
+// erased entry, or moved to its predecessor, would evict w or p instead.
+TEST_F(FIFOCacheTest, ResidentClockKeepsReinsertionOrder) {
+  std::vector<std::string> evicted;
+  eviction_callback_ = [&evicted](const Slice& key, Cache::Handle* /*h*/,
+                                  bool /*was_hit*/) {
+    evicted.push_back(key.ToString());
+    return false;
+  };
+  NewCache(/*capacity*/ 4);
+  for (const char* k : {"a", "b", "c"}) {
+    EXPECT_OK(Insert(k));
+    HitNTimes(k, 2);
+  }
+  EXPECT_OK(Insert("s"));
+  // Promotes a, b, c in that order and evicts s.
+  EXPECT_OK(Insert("t"));
+  Erase("t");
+  HitNTimes("a", 1);
+  EXPECT_OK(Insert("u"));
+  HitNTimes("u", 2);
+  EXPECT_OK(Insert("v"));
+  Erase("v");
+  EXPECT_OK(Insert("w"));
+  HitNTimes("w", 2);
+  EXPECT_OK(Insert("x"));
+  Erase("x");
+  Erase("u");
+  HitNTimes("w", 1);
+  EXPECT_OK(Insert("p"));
+  HitNTimes("p", 2);
+  EXPECT_OK(Insert("q", /*charge*/ 2));
+  EXPECT_EQ((std::vector<std::string>{"s", "b", "c", "a"}), evicted);
+  EXPECT_TRUE(ContainsForTest("w"));
+  EXPECT_TRUE(ContainsForTest("p"));
+  EXPECT_TRUE(ContainsForTest("q"));
+  EXPECT_EQ(4, cache_->GetUsage());
+  eviction_callback_ = nullptr;
+}
+
+// Rules out an unbounded counter (100 hits would survive 100 laps worth of
+// evictions) and saturation at any value other than 3.
+TEST_F(FIFOCacheTest, FrequencySaturatesAtThree) {
+  EXPECT_EQ(27, CountEvictionsBeforeK(3));
+  EXPECT_EQ(27, CountEvictionsBeforeK(100));
+}
+
+// Rules out counting a promoted entry's charge again on entering resident,
+// and dropping it.
+TEST_F(FIFOCacheTest, PromotionPreservesUsage) {
+  NewCache(/*capacity*/ 30);
+  EXPECT_OK(Insert("k", /*charge*/ 10));
+  HitNTimes("k", 2);
+  EXPECT_OK(Insert("a", /*charge*/ 9));
+  EXPECT_OK(Insert("b", /*charge*/ 9));
+  EXPECT_OK(Insert("c", /*charge*/ 2));
+  EXPECT_EQ(30, cache_->GetUsage());
+  // Promotes k and evicts a: 30 - 9 + 5.
+  EXPECT_OK(Insert("d", /*charge*/ 5));
+  EXPECT_TRUE(LookupBool("k"));
+  EXPECT_FALSE(LookupBool("a"));
+  EXPECT_TRUE(LookupBool("b"));
+  EXPECT_TRUE(LookupBool("c"));
+  EXPECT_TRUE(LookupBool("d"));
+  EXPECT_EQ(26, cache_->GetUsage());
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+}
+
+// Priority is ignored: HIGH and LOW entries with the same access pattern
+// behave identically. Rules out seeding the counter from priority and
+// bypassing probation for HIGH. The first scenario passes on plain FIFO too
+// (it pins the R7 decision); the second fails there (it pins promotion).
+TEST_F(FIFOCacheTest, PriorityIgnoredForPlacement) {
+  NewCache(/*capacity*/ 6);
+  EXPECT_OK(Insert("h", /*charge*/ 1, nullptr, Cache::Priority::HIGH));
+  EXPECT_OK(Insert("l", /*charge*/ 1, nullptr, Cache::Priority::LOW));
+  for (int i = 0; i < 4; i++) {
+    EXPECT_OK(Insert("c" + std::to_string(i)));
+  }
+  EXPECT_OK(Insert("x"));
+  EXPECT_FALSE(LookupBool("h"));
+  EXPECT_TRUE(LookupBool("l"));
+
+  NewCache(/*capacity*/ 6);
+  EXPECT_OK(Insert("h2", /*charge*/ 1, nullptr, Cache::Priority::HIGH));
+  HitNTimes("h2", 2);
+  EXPECT_OK(Insert("l2", /*charge*/ 1, nullptr, Cache::Priority::LOW));
+  HitNTimes("l2", 2);
+  for (int i = 0; i < 4; i++) {
+    EXPECT_OK(Insert("c" + std::to_string(i)));
+  }
+  EXPECT_OK(Insert("y"));
+  EXPECT_TRUE(LookupBool("h2"));
+  EXPECT_TRUE(LookupBool("l2"));
+}
+
+// Rules out an eviction loop that re-reads a queue head, which would spin on
+// a pinned head forever.
+TEST_F(FIFOCacheTest, FullyPinnedTerminates) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a"));
+  HitNTimes("a", 2);
+  EXPECT_OK(Insert("b"));
+  HitNTimes("b", 2);
+  for (int i = 0; i < 8; i++) {
+    EXPECT_OK(Insert("c" + std::to_string(i)));
+  }
+  // Promotes a and b and evicts c0, populating both queues.
+  EXPECT_OK(Insert("g"));
+  EXPECT_EQ(10, cache_->GetOccupancyCount());
+
+  std::vector<std::string> keys = {"a", "b", "g"};
+  for (int i = 1; i < 8; i++) {
+    keys.push_back("c" + std::to_string(i));
+  }
+  std::vector<FIFOHandle*> pinned;
+  for (const auto& key : keys) {
+    FIFOHandle* h = Lookup(key);
+    ASSERT_NE(nullptr, h);
+    pinned.push_back(h);
+  }
+  EXPECT_OK(Insert("h"));
+  EXPECT_FALSE(LookupBool("h"));
+  EXPECT_EQ(10, cache_->GetOccupancyCount());
+  FIFOHandle* pi = nullptr;
+  EXPECT_OK(Insert("i", /*charge*/ 1, &pi));
+  ASSERT_NE(nullptr, pi);
+  EXPECT_EQ(11, cache_->GetUsage());
+  EXPECT_EQ(11, cache_->GetPinnedUsage());
+
+  pinned.push_back(pi);
+  for (FIFOHandle* h : pinned) {
+    cache_->Release(h, true, false);
+  }
+  EXPECT_EQ(10, cache_->GetUsage());
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+}
+
+// C1: the adaptive-mutex option is threaded from the options struct into the
+// shard constructor. DMutex exposes no introspection, so this pins the
+// plumbing: both values construct a working shard and cache.
+TEST_F(FIFOCacheTest, UseAdaptiveMutexReachesShard) {
+  for (bool adaptive : {false, true}) {
+    FIFOCacheShard* shard = static_cast<FIFOCacheShard*>(
+        port::cacheline_aligned_alloc(sizeof(FIFOCacheShard)));
+    Cache::EvictionCallback no_cb;
+    new (shard)
+        FIFOCacheShard(/*capacity*/ 10,
+                       /*strict_capacity_limit*/ false, adaptive,
+                       kDontChargeCacheMetadata, /*max_upper_hash_bits*/ 24,
+                       /*allocator*/ nullptr, &no_cb, /*max_capacity*/ 0);
+    EXPECT_OK(shard->Insert("a", kNullUniqueId64x2, nullptr,
+                            &kNoopCacheItemHelper, 1, nullptr,
+                            Cache::Priority::LOW));
+    FIFOHandle* h = shard->Lookup("a", kNullUniqueId64x2, nullptr, nullptr,
+                                  Cache::Priority::LOW, nullptr);
+    EXPECT_NE(nullptr, h);
+    if (h != nullptr) {
+      EXPECT_FALSE(shard->Release(h, true, false));
+    }
+    shard->~FIFOCacheShard();
+    port::cacheline_aligned_free(shard);
+
+    FIFOCacheOptions opts(/*capacity*/ 10, /*num_shard_bits*/ 0,
+                          /*strict_capacity_limit*/ false, nullptr,
+                          kDefaultToAdaptiveMutex, kDontChargeCacheMetadata);
+    opts.use_adaptive_mutex = adaptive;
+    std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+    ASSERT_NE(nullptr, cache);
+    EXPECT_OK(cache->Insert("a", nullptr, &kNoopCacheItemHelper, 1));
+    Cache::Handle* ch = cache->Lookup("a");
+    EXPECT_NE(nullptr, ch);
+    if (ch != nullptr) {
+      cache->Release(ch);
+    }
+  }
+}
+
+// C2: a configured secondary cache wraps the primary instead of failing.
+TEST_F(FIFOCacheTest, SecondaryCacheWrapped) {
+  FIFOCacheOptions opts(/*capacity*/ 10, /*num_shard_bits*/ 0,
+                        /*strict_capacity_limit*/ false, nullptr,
+                        kDefaultToAdaptiveMutex, kDontChargeCacheMetadata);
+  opts.secondary_cache =
+      CompressedSecondaryCacheOptions(/*capacity*/ 1000, /*num_shard_bits*/ 0,
+                                      /*strict_capacity_limit*/ false, 0.5)
+          .MakeSharedSecondaryCache();
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  ASSERT_NE(nullptr, cache);
+  EXPECT_OK(cache->Insert("a", nullptr, &kNoopCacheItemHelper, 1));
+  Cache::Handle* h = cache->Lookup("a");
+  EXPECT_NE(nullptr, h);
+  if (h != nullptr) {
+    cache->Release(h);
+  }
+}
+
 // Values that detect use after free and double free: the deleter marks the
 // value dead before freeing it, and holders check that what they read is
 // alive and belongs to the key they looked up. LiveValues() counts the
@@ -1390,18 +1701,22 @@ void CheckStressValue(Cache* cache, Cache::Handle* h, uint32_t k) {
 }
 }  // namespace
 
-// Populates the queue, oldest first: a, c0..c7, g.
-void PopulateQueue(FIFOCacheTest* t) {
+// Populates both queues: resident holds a and b, probation c1..c7 and g.
+void PopulateBothQueues(FIFOCacheTest* t) {
   t->NewCache(/*capacity*/ 10);
   ASSERT_OK(t->Insert("a"));
+  t->HitNTimes("a", 2);
+  ASSERT_OK(t->Insert("b"));
+  t->HitNTimes("b", 2);
   for (int i = 0; i < 8; i++) {
     ASSERT_OK(t->Insert("c" + std::to_string(i)));
   }
   ASSERT_OK(t->Insert("g"));
+  ASSERT_FALSE(t->InProbationForTest("a"));
+  ASSERT_TRUE(t->InProbationForTest("g"));
 }
 
-// Hits on the oldest and newest entries, Ref, non-erasing Release and a
-// miss.
+// Hits on both queues, Ref, non-erasing Release and a miss.
 void HitLoop(FIFOCacheTest* t, int rounds) {
   for (int i = 0; i < rounds; ++i) {
     for (const char* key : {"a", "g"}) {
@@ -1419,7 +1734,7 @@ void HitLoop(FIFOCacheTest* t, int rounds) {
 // the shard lock: another thread completes them while this one holds it,
 // including registering its thread's reader.
 TEST_F(FIFOCacheTest, HitsNeverTakeShardLock) {
-  PopulateQueue(this);
+  PopulateBothQueues(this);
   std::atomic<bool> done{false};
   bool completed = false;
   port::Thread hitter;
@@ -1444,7 +1759,7 @@ TEST_F(FIFOCacheTest, HitsNeverTakeShardLock) {
 // Q2: hits write no byte of the shard object: only the entries and the
 // thread's reader change.
 TEST_F(FIFOCacheTest, HitsWriteNoShardState) {
-  PopulateQueue(this);
+  PopulateBothQueues(this);
   HitLoop(this, 1);
   const std::string before(reinterpret_cast<const char*>(cache_),
                            sizeof(FIFOCacheShard));
@@ -1812,7 +2127,7 @@ Status InsertCounted(FIFOCacheShard* shard, const std::string& key,
                        Cache::Priority::LOW);
 }
 
-std::string QueueHeadKey(FIFOCacheTest* t) {
+std::string ProbationHeadKey(FIFOCacheTest* t) {
   FIFOHandle* fifo;
   t->cache_->TEST_GetFIFOList(&fifo);
   return t->cache_->TEST_Next(fifo)->key().ToString();
@@ -1821,11 +2136,12 @@ std::string QueueHeadKey(FIFOCacheTest* t) {
 
 // Overwriting a key at max table length: the occupancy eviction, which the
 // overwrite does not need, must not evict the entry being replaced, here
-// the queue head (the next victim). The overwrite replaces it like any
-// other: the new value is visible, occupancy is unchanged, the old value is
-// deleted exactly once.
+// the probation head and then the resident hand (the next victim of each
+// queue). The overwrite replaces it like any other: the new value is
+// visible, occupancy is unchanged, the old value is deleted exactly once.
 TEST_F(FIFOCacheTest, OverwriteAtMaxLengthKeepsReplacedEntry) {
-  {
+  for (bool resident_victim : {false, true}) {
+    SCOPED_TRACE("resident_victim=" + std::to_string(resident_victim));
     // 2048 homes, the table's floor; charge never runs out.
     NewCache(/*capacity*/ 2048 * 64);
     InsertN("u", 3000);
@@ -1834,8 +2150,17 @@ TEST_F(FIFOCacheTest, OverwriteAtMaxLengthKeepsReplacedEntry) {
     CountedValue new_value;
     ASSERT_OK(InsertCounted(cache_, "victim", &old_value, nullptr));
     int filler = 0;
-    while (QueueHeadKey(this) != "victim") {
-      ASSERT_OK(Insert("f" + std::to_string(filler++)));
+    if (resident_victim) {
+      HitNTimes("victim", 2);
+      // Resident is empty, so the probation pass that reaches victim
+      // promotes it; it is then resident's only entry, the hand.
+      while (InProbationForTest("victim")) {
+        ASSERT_OK(Insert("f" + std::to_string(filler++)));
+      }
+    } else {
+      while (ProbationHeadKey(this) != "victim") {
+        ASSERT_OK(Insert("f" + std::to_string(filler++)));
+      }
     }
     // The next new entry would run occupancy eviction.
     const size_t occupancy = cache_->GetOccupancyCount();
@@ -2009,14 +2334,18 @@ TEST_F(FIFOCacheTest, ConcurrentMaxLengthOverwritesKeepLifetimeExact) {
 }
 
 // GetPinnedUsage takes no shard lock and is exact for every kind of pin:
-// inserts with a handle and lock-free hits, from two threads, an erased
-// entry still pinned, and a standalone entry.
+// inserts with a handle and lock-free hits, in both queues and from two
+// threads, an erased entry still pinned, and a standalone entry.
 TEST_F(FIFOCacheTest, GetPinnedUsageTakesNoShardLock) {
   NewCache(/*capacity*/ 1000);
   ASSERT_OK(Insert("r", /*charge*/ 2));
+  HitNTimes("r", 2);
   for (int i = 0; i < 8; ++i) {
     ASSERT_OK(Insert("c" + std::to_string(i)));
   }
+  cache_->SetCapacity(9);
+  ASSERT_FALSE(InProbationForTest("r"));
+  cache_->SetCapacity(1000);
   std::vector<FIFOHandle*> held;
   FIFOHandle* h = nullptr;
   ASSERT_OK(Insert("p", /*charge*/ 3, &h));
@@ -2078,6 +2407,75 @@ size_t CountEvictionVisits(const std::function<void()>& op) {
   return visits.load();
 }
 
+// Q2: in a shard whose entries are all pinned, or all but one percent, an
+// insert visits a bounded number of entries once the first eviction has set
+// the long pins aside, instead of rotating past every pinned entry of both
+// queues each time.
+TEST_F(FIFOCacheTest, MostlyPinnedEvictionVisitsBounded) {
+  // At most kPinnedRotationsPerPass (64) rotations per lap: one probation
+  // lap and up to kMaxResidentIdlePasses (4) resident laps, plus two aside
+  // checks and one evicted entry per insert.
+  constexpr size_t kBound = 64 + 4 * 64 + 2 + 1;
+  std::vector<FIFOHandle*> pinned;
+  auto release_all = [&] {
+    for (FIFOHandle* h : pinned) {
+      cache_->Release(h, true, false);
+    }
+    pinned.clear();
+  };
+
+  // Fully pinned: 500 resident and 500 probation entries.
+  NewCache(/*capacity*/ 1000);
+  for (int i = 0; i < 500; ++i) {
+    ASSERT_OK(Insert("r" + std::to_string(i)));
+    HitNTimes("r" + std::to_string(i), 2);
+  }
+  InsertN("p", 500);
+  // Promotes r0..r499, evicts p0.
+  ASSERT_OK(Insert("x"));
+  ASSERT_FALSE(InProbationForTest("r0"));
+  for (const char* prefix : {"r", "p"}) {
+    for (int i = 0; i < 500; ++i) {
+      FIFOHandle* h = Lookup(prefix + std::to_string(i));
+      if (h != nullptr) {
+        pinned.push_back(h);
+      }
+    }
+  }
+  pinned.push_back(Lookup("x"));
+  ASSERT_EQ(1000, pinned.size());
+  ASSERT_OK(Insert("first"));
+  size_t most = 0;
+  for (int i = 0; i < 100; ++i) {
+    most = std::max(most, CountEvictionVisits([&] {
+                      ASSERT_OK(Insert("y" + std::to_string(i)));
+                    }));
+  }
+  EXPECT_LE(most, kBound);
+  EXPECT_EQ(1000, cache_->GetPinnedUsage());
+  release_all();
+
+  // 99% pinned: each insert evicts one of the unpinned entries.
+  NewCache(/*capacity*/ 1000);
+  for (int i = 0; i < 990; ++i) {
+    FIFOHandle* h = nullptr;
+    ASSERT_OK(Insert("p" + std::to_string(i), /*charge*/ 1, &h));
+    pinned.push_back(h);
+  }
+  InsertN("u", 10);
+  ASSERT_OK(Insert("first"));
+  most = 0;
+  for (int i = 0; i < 100; ++i) {
+    most = std::max(most, CountEvictionVisits([&] {
+                      ASSERT_OK(Insert("y" + std::to_string(i)));
+                    }));
+    ASSERT_TRUE(ContainsForTest("y" + std::to_string(i)));
+  }
+  EXPECT_LE(most, kBound);
+  EXPECT_EQ(1000, cache_->GetUsage());
+  EXPECT_EQ(990, cache_->GetPinnedUsage());
+  release_all();
+}
 #endif  // !NDEBUG
 
 // Entries set aside stay in the table, charged to their queue, findable
@@ -2298,7 +2696,7 @@ TEST_F(FIFOCacheTest, EraseUnRefEntriesShrinksEmptyTable) {
   const size_t initial_homes = cache_->GetTableAddressCount();
   const size_t highest = InsertNAndGetHighestSlot(this, "k", 100);
   const size_t grown = cache_->GetTableAddressCount();
-  ASSERT_GT(highest, initial_homes);
+  ASSERT_GT(highest - 1, initial_homes);
   std::string pinned_key;
   FIFOHandle* fifo;
   cache_->TEST_GetFIFOList(&fifo);
@@ -2323,7 +2721,7 @@ TEST_F(FIFOCacheTest, EraseUnRefEntriesShrinksEmptyTable) {
   Erase(pinned_key);
   cache_->EraseUnRefEntries();
   EXPECT_EQ(0, cache_->GetOccupancyCount());
-  EXPECT_EQ(highest, cache_->GetTableAddressCount());
+  EXPECT_EQ(highest - 1, cache_->GetTableAddressCount());
   EXPECT_EQ(cache_->GetUsage(),
             cache_->GetPinnedUsage() +
                 cache_->GetTableAddressCount() * sizeof(FIFOHandle));
@@ -2350,14 +2748,14 @@ TEST_F(FIFOCacheTest, ShrinkKeepsSlotsOfInFlightLookup) {
   const size_t baseline_usage = cache_->GetUsage();
   const size_t initial_homes = cache_->GetTableAddressCount();
   const size_t highest = InsertNAndGetHighestSlot(this, "k", 100);
-  ASSERT_GT(highest, initial_homes);
+  ASSERT_GT(highest - 1, initial_homes);
   FIFOHandle* found = nullptr;
   RunWhileParked(
       "FIFOCacheShard::Lookup:Found", [&] { found = Lookup("k0"); },
       [&] {
         cache_->EraseUnRefEntries();
         EXPECT_EQ(0, cache_->GetOccupancyCount());
-        EXPECT_EQ(highest, cache_->GetTableAddressCount());
+        EXPECT_EQ(highest - 1, cache_->GetTableAddressCount());
       });
   EXPECT_EQ(nullptr, found);
   cache_->EraseUnRefEntries();
@@ -2474,7 +2872,7 @@ TEST_F(FIFOCacheTest, LookupAtThreadExitKeepsItsAnnouncement) {
   NewCache(/*capacity*/ 1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
   const size_t initial_homes = cache_->GetTableAddressCount();
   const size_t highest = InsertNAndGetHighestSlot(this, "k", 100);
-  ASSERT_GT(highest, initial_homes);
+  ASSERT_GT(highest - 1, initial_homes);
   std::string late_key;
   FIFOHandle* fifo;
   cache_->TEST_GetFIFOList(&fifo);
@@ -2516,7 +2914,7 @@ TEST_F(FIFOCacheTest, LookupAtThreadExitKeepsItsAnnouncement) {
   port::Thread([&] { EXPECT_TRUE(LookupBool("k0")); }).join();
   cache_->EraseUnRefEntries();
   EXPECT_EQ(0, cache_->GetOccupancyCount());
-  EXPECT_EQ(highest, cache_->GetTableAddressCount());
+  EXPECT_EQ(highest - 1, cache_->GetTableAddressCount());
   resume.set_value();
   exiting.join();
   SyncPoint::GetInstance()->DisableProcessing();
@@ -2591,6 +2989,43 @@ TEST_F(FIFOCacheTest, ConcurrentShrinkKeepsLifetimeExact) {
     EXPECT_EQ(baseline_usage, cache->GetUsage());
   }
   EXPECT_EQ(0, LiveValues().load());
+}
+
+// A shard sets pinned entries aside only when one lap over a queue meets
+// more than kPinnedRotationsPerPass of them. Here 30 of 501 entries are
+// pinned and one eviction takes three decay laps over resident before it
+// evicts: each lap meets the 30 pins once, so none is set aside.
+TEST_F(FIFOCacheTest, ModestPinCountSetsNothingAside) {
+  NewCache(/*capacity*/ 600);
+  for (int i = 0; i < 500; ++i) {
+    ASSERT_OK(Insert("r" + std::to_string(i)));
+    HitNTimes("r" + std::to_string(i), 2);
+  }
+  InsertN("p", 100);
+  // Promotes r0..r499, evicts p0.
+  ASSERT_OK(Insert("x"));
+  ASSERT_FALSE(InProbationForTest("r0"));
+  for (int i = 1; i < 100; ++i) {
+    const std::string key = "p" + std::to_string(i);
+    cache_->Erase(key, FIFOCacheShard::ComputeHash(key, 0));
+  }
+  for (int i = 0; i < 500; ++i) {
+    HitNTimes("r" + std::to_string(i), 3);
+  }
+  std::vector<FIFOHandle*> pinned;
+  for (int i = 0; i < 30; ++i) {
+    pinned.push_back(Lookup("r" + std::to_string(i)));
+    ASSERT_NE(nullptr, pinned.back());
+  }
+  ASSERT_EQ(501, cache_->GetUsage());
+  // Needs one unit; resident pays.
+  cache_->SetCapacity(500);
+  EXPECT_EQ(500, cache_->GetUsage());
+  EXPECT_EQ(0, cache_->TEST_GetAsideSize());
+  for (FIFOHandle* h : pinned) {
+    cache_->Release(h, true, false);
+  }
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
 }
 
 #ifndef NDEBUG

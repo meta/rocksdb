@@ -39,25 +39,27 @@ namespace fifo_cache {
 //
 // FIFOHandle can be in these states:
 // 1. Referenced externally AND in hash table.
-//    The entry stays in the FIFO queue. An eviction scan that meets it
-//    moves it to the tail, so later scans do not re-walk it. In a mostly
-//    pinned shard the scan sets it aside instead, until it is unpinned (see
-//    aside_slot_).
+//    The entry stays in its queue. A probation scan that meets it moves it
+//    to the probation tail so later scans do not re-walk it; resident
+//    rotates under pressure (see EvictFromFIFO). In a mostly pinned shard
+//    the scan sets it aside instead, until it is unpinned (see aside_slot_).
 //    (refs >= 1 && in_cache == true)
 // 2. Not referenced externally AND in hash table.
-//    The entry is in the FIFO queue and can be evicted.
+//    The entry is in one of the queues and can be evicted.
 //    (refs == 0 && in_cache == true)
 // 3. Referenced externally AND not in hash table.
-//    The entry is in neither the queue nor the hash table. It is freed
+//    The entry is in neither queue nor the hash table. It is freed
 //    when refs drops to 0.
 //    (refs >= 1 && in_cache == false)
-// Unlike LRU, Lookup and Release never reorder the queue; only an eviction
-// scan moves a pinned entry it meets to the tail. While refs > 0, public
-// properties like value and deleter must not change.
+// Unlike LRU, Lookup never moves an entry, between queues or within one:
+// a hit only increments freq. While refs > 0, public properties like value
+// and deleter must not change.
 //
-// Lookup, Ref and most Releases run without the shard lock, so refs and the
-// in-cache bit share one atomic word (state). The bit changes only under the
-// shard lock, in the same atomic operation that checks refs.
+// Lookup, Ref and most Releases run without the shard lock, so refs and the two
+// membership bits share one atomic word (state). The bits change only
+// under the shard lock, in the same atomic operation that checks refs, so
+// every lock-free 0 <-> 1 ref change sees, in its own CAS snapshot, the
+// queue it must be credited to.
 struct FIFOHandle : public Cache::Handle {
   // A key of length 16 (every block cache key) is stored as its bijective
   // 128-bit hash, as in HyperClockCache: exact, and reversible with the
@@ -68,11 +70,14 @@ struct FIFOHandle : public Cache::Handle {
   const Cache::CacheItemHelper* helper = nullptr;
   size_t total_charge = 0;
   // External refs (the cache itself is not counted) in the low bits, plus
-  // kInCache.
+  // kInCache and kInProbation.
   std::atomic<uint32_t> state{0};
   static constexpr uint32_t kRefMask = (uint32_t{1} << 30) - 1;
   // Whether this entry is referenced by the hash table.
   static constexpr uint32_t kInCache = uint32_t{1} << 30;
+  // Whether this entry is linked in the probation queue (as opposed to
+  // resident or neither).
+  static constexpr uint32_t kInProbation = uint32_t{1} << 31;
   // First entry of the chain of entries whose home is this slot's index;
   // 0 when empty (slot 0 never holds an entry). It belongs to the index,
   // not to the entry stored here. Written under the shard lock.
@@ -84,6 +89,12 @@ struct FIFOHandle : public Cache::Handle {
   // Queue links, as slot indices. Under the shard lock.
   uint32_t next = 0;
   uint32_t prev = 0;
+  // Saturating access counter, range 0..kMaxFrequency. Incremented by Lookup
+  // only (never by Ref); promotion and second-chance decisions read it at
+  // eviction time. Reset to 0 on promotion to resident. Lock-free hits and
+  // the locked clock may race on it; a lost update only shifts one
+  // decision.
+  std::atomic<uint8_t> freq{0};
   uint8_t flags = 0;
   enum Flags : uint8_t {
     // The slot holds an entry, or one retired and not yet reclaimed.
@@ -110,6 +121,9 @@ struct FIFOHandle : public Cache::Handle {
   }
   bool InCache() const {
     return (state.load(std::memory_order_relaxed) & kInCache) != 0;
+  }
+  bool InProbation() const {
+    return (state.load(std::memory_order_relaxed) & kInProbation) != 0;
   }
   bool IsStandalone() const { return (flags & kStandalone) != 0; }
   bool HasHeapKey() const { return (flags & kHeapKey) != 0; }
@@ -162,7 +176,7 @@ static_assert(sizeof(FIFOHandle::HeapKey*) <= sizeof(uint64_t),
 //
 // Table: HyperClockCache-style open addressing over 64-byte slots that
 // never move, in an address range reserved up front and mapped lazily.
-// Slot 0 is the dummy head of the FIFO queue; slot kFirstSlot + i
+// Slots 0 and 1 are the dummy heads of the two queues; slot kFirstSlot + i
 // is the home of index i, holds the head of the chain of entries homed at
 // i, and may store any entry. An entry prefers its home slot, so a hit
 // usually reads one line. The number of homes grows one at a time by
@@ -234,7 +248,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   void SetStrictCapacityLimit(bool strict_capacity_limit);
 
   // Like Cache methods, but with an extra "hash" parameter.
-  // priority is ignored: FIFO has no priority pools.
+  // priority is deliberately ignored: placement is inferred from access
+  // frequency (freq), not declared by the caller, so HIGH entries must earn
+  // residency through re-access like any other entry.
   Status Insert(const Slice& key, HashCref hash, Cache::ObjectPtr value,
                 const Cache::CacheItemHelper* helper, size_t charge,
                 FIFOHandle** handle, Cache::Priority priority);
@@ -247,7 +263,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   // helper, create_context, priority and stats are ignored: with no secondary
   // cache configured this is a primary-only lookup. Secondary promotion is
   // handled by CacheWithSecondaryAdapter above the shard, as with LRU.
-  // A hit moves nothing.
+  // A hit increments freq (saturating) and moves nothing.
   FIFOHandle* Lookup(const Slice& key, HashCref hash,
                      const Cache::CacheItemHelper* helper,
                      Cache::CreateContext* create_context,
@@ -281,12 +297,18 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   Slice KeyOf(const FIFOHandle* h, UniqueId64x2* buf) const;
 
  public:  // other function definitions
-  // The FIFO queue. Walk it with TEST_Next.
+  // Test-only: moves a probation entry to the resident tail without the
+  // promotion-threshold check, so tests can build exact resident layouts
+  // that pressure-driven promotion cannot assemble without disturbing the
+  // entry under test. The entry must be unpinned.
+  void TEST_PromoteToResident(const Slice& key);
+
+  // Probation list only; resident entries are not visible here. Walk it
+  // with TEST_Next.
   void TEST_GetFIFOList(FIFOHandle** fifo);
   FIFOHandle* TEST_Next(const FIFOHandle* h) const { return Next(h); }
 
-  // Retrieves number of elements in the FIFO queue, for unit test purpose
-  // only.
+  // Retrieves number of elements in probation, for unit test purpose only.
   // Not threadsafe.
   size_t TEST_GetFIFOSize();
 
@@ -304,9 +326,10 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
  private:
   friend class FIFOCache;
 
-  // Slot 0 is the queue dummy head; homes start at kFirstSlot.
-  static constexpr uint32_t kFifoSlot = 0;
-  static constexpr uint32_t kFirstSlot = 1;
+  // Slots 0 and 1 are the queue dummy heads; homes start at kFirstSlot.
+  static constexpr uint32_t kProbationSlot = 0;
+  static constexpr uint32_t kResidentSlot = 1;
+  static constexpr uint32_t kFirstSlot = 2;
   // Homes the table starts with and the load factor it grows at: more
   // occupied slots than kGrowNumerator / kGrowDenominator of the homes
   // grows the table by one home, until max_length_. A table out of free
@@ -341,9 +364,8 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   }
   FIFOHandle* Next(const FIFOHandle* h) const { return Slot(h->next); }
   FIFOHandle* Prev(const FIFOHandle* h) const { return Slot(h->prev); }
-  // The FIFO queue: oldest at the head, newest at the tail. It contains all
-  // in-cache items, pinned and unpinned, except those set aside.
-  FIFOHandle* fifo() const { return Slot(kFifoSlot); }
+  FIFOHandle* probation() const { return Slot(kProbationSlot); }
+  FIFOHandle* resident() const { return Slot(kResidentSlot); }
   FIFOHandle* aside() const { return Slot(aside_slot_); }
 
   // Home index of hash for the given linear-hashing length info.
@@ -380,7 +402,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   bool TableAboveInitialLength() const {
     return used_length_ > std::min(kInitialLength, max_length_);
   }
-  // Insert an item into the hash table and append it to the FIFO queue.
+  // Insert an item into the hash table and append it to probation.
   // Older unpinned items are evicted as necessary. Frees heap_key on a
   // non-OK status.
   Status InsertItem(const Slice& key, HashCref hash,
@@ -394,45 +416,71 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
                                    size_t total_charge);
   static void FreeStandalone(FIFOHandle* h);
 
-  // Unlinks e from the queue or the aside list.
-  void FIFO_Remove(FIFOHandle* e);
-  // Links e at the tail of the FIFO queue; neither function touches state.
-  void FIFO_Append(FIFOHandle* e);
-  // FIFO_Append for either list: the FIFO queue or the aside list.
+  // Unlinks e from its queue or the aside list.
+  void FIFO_Remove(FIFOHandle* e, bool in_probation);
+  // Links e at the tail of queue. Appending to probation requires
+  // kInProbation already set; neither function touches state.
+  void FIFO_Append(FIFOHandle* queue, FIFOHandle* e);
+  // FIFO_Append, also for the aside list.
   void LinkAtTail(FIFOHandle* queue, FIFOHandle* e);
-  // Moves a linked entry to the tail of queue (the FIFO queue or aside)
-  // without changing any charge.
+  // Moves a linked entry to the tail of queue (probation, resident or
+  // aside) without changing any charge: an entry set aside stays charged
+  // to its queue.
   void MoveToTail(FIFOHandle* e, FIFOHandle* queue);
   // Checks up to kAsideChecksPerEviction entries at the head of the aside
-  // list: an unpinned one returns to the tail of the FIFO queue, a pinned
-  // one to the aside tail.
+  // list: an unpinned one returns to the tail of its queue, a pinned one to
+  // the aside tail.
   void ReturnUnpinnedAside();
-  // Returns every unpinned aside entry to the tail of the FIFO queue.
+  // Returns every unpinned aside entry to the tail of its queue.
   void ReturnAllUnpinnedAside();
   // Moves a linked, pinned entry to the aside tail.
   void SetAside(FIFOHandle* e);
   // Release of the last ref when it must erase or free: takes mutex_.
   bool ReleaseLocked(FIFOHandle* e, bool erase_if_last_ref);
-  // Erase or overwrite: clears kInCache in one step, unlinks e from the
-  // queue and the table. Returns true when no ref held it, so the
+  // Erase or overwrite: clears both bits of e in one step, unlinks it from
+  // its queue and the table. Returns true when no ref held it, so the
   // caller frees it; otherwise it stays charged until its last Release.
   bool Detach(FIFOHandle* e);
   // Under mutex_: removes a claimed or detached entry from the table.
   void RemoveFromTable(FIFOHandle* e);
+  // The resident entry after e in clock order, skipping the dummy head.
+  FIFOHandle* ResidentNext(FIFOHandle* e);
   // Keeps over_capacity_ equal to usage_ > capacity_. Needs mutex_.
   void SyncOverCapacity();
 
-  // Pinned entries one pass over the queue rotates (moves to the tail)
-  // before it sets the next ones aside. A pass meets each pinned entry once,
-  // and this is far more than a shard normally has pinned at once, so only
-  // a mostly pinned shard sets entries aside.
+  // Frequency counter range and promotion threshold. A Lookup saturates at
+  // kMaxFrequency; a probation head at or above kPromoteThreshold is
+  // promoted, below it is evicted.
+  static constexpr uint8_t kMaxFrequency = 3;
+  static constexpr uint8_t kPromoteThreshold = 2;
+  // Resident second-chance bound: each eviction costs at most this many
+  // passes over resident (3 to drain a saturated counter, 1 to reap). That
+  // many consecutive eviction-free passes mean every remaining entry is
+  // pinned, or is hit (lock-free, refilling its counter) faster than the
+  // hand sweeps. Eviction stops either way, and the insert is dropped or
+  // refused: a shard whose every entry is that hot keeps them rather than
+  // evict one for a new key, which measured faster and with a higher hit
+  // ratio than evicting.
+  static constexpr int kMaxResidentIdlePasses = 4;
+  // Pinned entries one lap over a queue rotates (moves to the probation
+  // tail, or passes with the resident hand) before it sets the next ones
+  // aside. A lap meets each pinned entry once, and this is far more than a
+  // shard normally has pinned at once, so only a mostly pinned shard sets
+  // entries aside.
   static constexpr size_t kPinnedRotationsPerPass = 64;
   static constexpr int kAsideChecksPerEviction = 2;
-  // Free some space following strict FIFO policy until enough space
-  // to hold (usage_ + charge) is freed or no unpinned entry remains.
-  // Pinned entries the scan meets move to the tail, so long-lived pins
-  // are not re-walked by every eviction. Terminates after a single pass
-  // even if everything is pinned.
+  // Free some space until enough to hold (usage_ + charge) is freed or no
+  // unpinned entry remains. Probation drains first: one pass over its head,
+  // promoting freq >= kPromoteThreshold to the resident tail (reset to 0)
+  // and evicting below it; pinned entries move to the probation tail.
+  // Resident follows with second-chance: head with freq > 0 is decremented
+  // and moved to the tail, head at 0 is evicted, pinned heads rotate
+  // undecayed. Promotion touches only links: usage_ is unchanged by a move
+  // between queues.
+  // The probation pass consumes its head each step, so it ends after at
+  // most the initial number of entries; the resident scan is bounded by
+  // kMaxResidentIdlePasses per eviction. An all-pinned shard terminates
+  // having evicted nothing.
   // This function is not thread safe - it needs to be executed while
   // holding the mutex_.
   void EvictFromFIFO(size_t charge, autovector<FIFOHandle*>* deleted);
@@ -448,19 +496,34 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
       return freed_charge >= need_charge && freed_count >= need_count;
     }
   };
-  // EvictFromFIFO's pass, until data is Done.
+  // EvictFromFIFO's queue choice and passes, until data is Done.
   void EvictNeed(EvictionData* data, autovector<FIFOHandle*>* deleted);
+  // EvictNeed's queue choice and passes, once.
+  void EvictFromQueues(EvictionData* data, autovector<FIFOHandle*>* deleted);
   // Under mutex_: takes a claimed entry out of the table and the usage, and
   // records it in data and deleted.
   void EvictClaimed(FIFOHandle* e, EvictionData* data,
                     autovector<FIFOHandle*>* deleted);
 
-  // One sweep over the queue from the head: unpinned entries are evicted,
-  // pinned entries move to the tail, so long-lived pins are not re-walked
-  // by every eviction, or aside once the pass has rotated
-  // kPinnedRotationsPerPass of them. Stops once data is Done. Not thread
+  // One sweep over probation from the head: unpinned entries at or above
+  // kPromoteThreshold move to the resident tail (counter reset), unpinned
+  // entries below it are evicted, pinned entries move to the probation
+  // tail, so long-lived pins
+  // are not re-walked by every eviction, or aside once the pass has
+  // rotated kPinnedRotationsPerPass of them.
+  // Stops once data is Done. Returns whether it promoted anything. Not
+  // thread safe - call with mutex_ held.
+  bool EvictFromProbation(EvictionData* data, autovector<FIFOHandle*>* deleted);
+
+  // Second-chance over resident: head with freq > 0 is decremented and
+  // moved to the tail, head at 0 is evicted, pinned heads rotate undecayed
+  // until the current lap has rotated kPinnedRotationsPerPass of them, then
+  // go aside.
+  // The head is resident_hand_, so moving it to the tail is advancing the
+  // hand: no relinking.
+  // Stops once data is Done or the idle-pass bound is hit. Not thread
   // safe - call with mutex_ held.
-  void EvictFromQueue(EvictionData* data, autovector<FIFOHandle*>* deleted);
+  void EvictFromResident(EvictionData* data, autovector<FIFOHandle*>* deleted);
 
   void NotifyEvicted(const autovector<FIFOHandle*>& evicted_handles);
 
@@ -542,7 +605,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
 
   // Layout. Lookup and a Release that neither erases nor frees run without
   // mutex_ and write only the slot
-  // (state) and the caller's ThreadReader. What they read sits on
+  // (state, freq) and the caller's ThreadReader. What they read sits on
   // lines that no hit and no insert writes:
   // 1. Read on every hit, written only by SetCapacity,
   //    SetStrictCapacityLimit, a table growth step, an epoch advance (which
@@ -593,11 +656,26 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   // overwrite while pinned, or standalone.
   LockedSize detached_pinned_usage_;
 
+  // Resident is a clock: its oldest entry is resident_hand_ and its newest
+  // the entry linked just before the hand, so a second chance advances the
+  // hand instead of relinking the entry. New resident entries are linked
+  // just before the hand, and the hand moves past an entry that leaves, so
+  // the order is the FIFO-reinsertion order. The resident dummy head when
+  // resident is empty.
+  // New entries enter probation. Eviction drains probation first: a head
+  // with enough frequency is promoted to resident, any other is evicted,
+  // and resident is evicted only when probation cannot free enough.
+  // Probation has no size bound, so a burst of promotions can leave it
+  // holding only the newest entries.
+  // Together they contain all in-cache items, pinned and unpinned.
+  FIFOHandle* resident_hand_;
+
   // Aside list: pinned entries an eviction pass met after rotating
   // kPinnedRotationsPerPass others, so that a mostly pinned shard is not
   // re-walked by every insert. An aside entry is still in the table and
-  // charged as before; ReturnUnpinnedAside relinks it into the FIFO queue
-  // once it is unpinned. Its dummy head is the slot after the last home.
+  // charged to its queue (kInProbation unchanged); ReturnUnpinnedAside
+  // relinks it into its queue once it is unpinned. Its dummy head is the
+  // slot after the last home.
   uint32_t aside_slot_;
   // Set when an aside entry may have become unpinned: by its last Release,
   // or by SetAside if that Release raced with it. An eviction that falls

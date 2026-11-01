@@ -317,6 +317,7 @@ FIFOCacheShard::FIFOCacheShard(size_t capacity, bool strict_capacity_limit,
       max_length_(MaxLengthFor(std::max(capacity, max_capacity))),
       occupancy_(0),
       detached_pinned_usage_(0),
+      resident_hand_(nullptr),
       aside_slot_(SlotIndexAt(max_length_)),
       aside_unpinned_(false),
       mutex_(use_adaptive_mutex),
@@ -335,10 +336,11 @@ FIFOCacheShard::FIFOCacheShard(size_t capacity, bool strict_capacity_limit,
     std::terminate();
   }
   // Make empty circular linked lists.
-  for (uint32_t queue : {kFifoSlot, aside_slot_}) {
+  for (uint32_t queue : {kProbationSlot, kResidentSlot, aside_slot_}) {
     Slot(queue)->next = queue;
     Slot(queue)->prev = queue;
   }
+  resident_hand_ = resident();
   used_length_ = std::min(kInitialLength, max_length_);
   length_info_.store(UsedLengthToLengthInfo(used_length_),
                      std::memory_order_relaxed);
@@ -387,7 +389,7 @@ void FIFOCacheShard::EraseUnRefEntries() {
   autovector<FIFOHandle*> last_reference_list;
   {
     DMutexLock l(mutex_);
-    for (FIFOHandle* queue : {fifo(), aside()}) {
+    for (FIFOHandle* queue : {probation(), resident(), aside()}) {
       FIFOHandle* cur = Next(queue);
       while (cur != queue) {
         FIFOHandle* next = Next(cur);
@@ -396,7 +398,7 @@ void FIFOCacheShard::EraseUnRefEntries() {
             cur->state.compare_exchange_strong(s, 0,
                                                std::memory_order_acquire)) {
           assert(s & FIFOHandle::kInCache);
-          FIFO_Remove(cur);
+          FIFO_Remove(cur, (s & FIFOHandle::kInProbation) != 0);
           RemoveFromTable(cur);
           assert(usage_.Get() >= cur->total_charge);
           usage_ -= cur->total_charge;
@@ -482,9 +484,18 @@ void FIFOCacheShard::ApplyToSomeEntries(
   }
 }
 
+void FIFOCacheShard::TEST_PromoteToResident(const Slice& key) {
+  DMutexLock l(mutex_);
+  FIFOHandle* h = FindInTable(key, ComputeHash(key, hash_seed_));
+  assert(h != nullptr && h->InProbation());
+  FIFO_Remove(h, /*in_probation=*/true);
+  h->state.fetch_and(~FIFOHandle::kInProbation, std::memory_order_relaxed);
+  FIFO_Append(resident(), h);
+}
+
 void FIFOCacheShard::TEST_GetFIFOList(FIFOHandle** fifo) {
   DMutexLock l(mutex_);
-  *fifo = Slot(kFifoSlot);
+  *fifo = probation();
 }
 
 size_t FIFOCacheShard::TEST_GetAsideSize() {
@@ -499,15 +510,19 @@ size_t FIFOCacheShard::TEST_GetAsideSize() {
 size_t FIFOCacheShard::TEST_GetFIFOSize() {
   DMutexLock l(mutex_);
   size_t size = 0;
-  for (FIFOHandle* h = Next(fifo()); h != fifo(); h = Next(h)) {
+  for (FIFOHandle* h = Next(probation()); h != probation(); h = Next(h)) {
     size++;
   }
   return size;
 }
 
-void FIFOCacheShard::FIFO_Remove(FIFOHandle* e) {
+void FIFOCacheShard::FIFO_Remove(FIFOHandle* e, bool /*in_probation*/) {
   assert(e->next != kNoLink);
   assert(e->prev != kNoLink);
+  if (e == resident_hand_) {
+    FIFOHandle* next = ResidentNext(e);
+    resident_hand_ = next == e ? resident() : next;
+  }
   Next(e)->prev = e->prev;
   Prev(e)->next = e->next;
   e->prev = e->next = kNoLink;
@@ -516,21 +531,30 @@ void FIFOCacheShard::FIFO_Remove(FIFOHandle* e) {
   // detached-pinned).
 }
 
-void FIFOCacheShard::FIFO_Append(FIFOHandle* e) { LinkAtTail(fifo(), e); }
+void FIFOCacheShard::FIFO_Append(FIFOHandle* queue, FIFOHandle* e) {
+  assert(e->InProbation() == (queue == probation()));
+  LinkAtTail(queue, e);
+}
 
 void FIFOCacheShard::LinkAtTail(FIFOHandle* queue, FIFOHandle* e) {
   assert(e->next == kNoLink);
   assert(e->prev == kNoLink);
-  // Append to tail: queue->prev is newest and queue->next is oldest.
+  // Append to tail. For probation and aside queue->prev is newest and
+  // queue->next is oldest. For resident the tail is just before the hand,
+  // which is the dummy head itself when resident is empty.
+  FIFOHandle* before = queue == resident() ? resident_hand_ : queue;
   const uint32_t idx = IndexOf(e);
-  e->next = IndexOf(queue);
-  e->prev = queue->prev;
+  e->next = IndexOf(before);
+  e->prev = before->prev;
   Prev(e)->next = idx;
-  queue->prev = idx;
+  before->prev = idx;
+  if (queue == resident() && resident_hand_ == resident()) {
+    resident_hand_ = e;
+  }
 }
 
 void FIFOCacheShard::MoveToTail(FIFOHandle* e, FIFOHandle* queue) {
-  FIFO_Remove(e);
+  FIFO_Remove(e, /*in_probation=*/false);
   LinkAtTail(queue, e);
 }
 
@@ -546,30 +570,30 @@ void FIFOCacheShard::SetAside(FIFOHandle* e) {
   }
 }
 
-void FIFOCacheShard::ReturnUnpinnedAside() {
-  for (int i = 0; i < kAsideChecksPerEviction && Next(aside()) != aside();
-       ++i) {
-    TEST_SYNC_POINT("FIFOCacheShard::EvictionVisit");
-    FIFOHandle* e = Next(aside());
-    // A Lookup may pin e right after this check; it is then a pinned entry
-    // in the queue, as after any other race with a hit.
-    if (e->HasRefs()) {
-      SetAside(e);
-    } else {
-      MoveToTail(e, fifo());
-    }
-  }
-}
-
 void FIFOCacheShard::ReturnAllUnpinnedAside() {
   FIFOHandle* cur = Next(aside());
   while (cur != aside()) {
     TEST_SYNC_POINT("FIFOCacheShard::EvictionVisit");
     FIFOHandle* next = Next(cur);
     if (!cur->HasRefs()) {
-      MoveToTail(cur, fifo());
+      MoveToTail(cur, cur->InProbation() ? probation() : resident());
     }
     cur = next;
+  }
+}
+
+void FIFOCacheShard::ReturnUnpinnedAside() {
+  for (int i = 0; i < kAsideChecksPerEviction && Next(aside()) != aside();
+       ++i) {
+    TEST_SYNC_POINT("FIFOCacheShard::EvictionVisit");
+    FIFOHandle* e = Next(aside());
+    // A Lookup may pin e right after this check; it is then a pinned entry
+    // in its queue, as after any other race with a hit.
+    if (e->HasRefs()) {
+      SetAside(e);
+    } else {
+      MoveToTail(e, e->InProbation() ? probation() : resident());
+    }
   }
 }
 
@@ -578,6 +602,11 @@ void FIFOCacheShard::SyncOverCapacity() {
   if (over_capacity_.load(std::memory_order_relaxed) != over) {
     over_capacity_.store(over, std::memory_order_relaxed);
   }
+}
+
+FIFOHandle* FIFOCacheShard::ResidentNext(FIFOHandle* e) {
+  FIFOHandle* next = Next(e);
+  return next == resident() ? Next(next) : next;
 }
 
 void FIFOCacheShard::EvictFromFIFO(size_t charge,
@@ -593,7 +622,7 @@ void FIFOCacheShard::EvictFromFIFO(size_t charge,
 void FIFOCacheShard::EvictNeed(EvictionData* data,
                                autovector<FIFOHandle*>* deleted) {
   ReturnUnpinnedAside();
-  EvictFromQueue(data, deleted);
+  EvictFromQueues(data, deleted);
   // Eviction returns only kAsideChecksPerEviction aside entries per call,
   // so after a burst of pins is released most of the shard may wait on the
   // aside list. When it falls short, return every unpinned one and go once
@@ -601,7 +630,16 @@ void FIFOCacheShard::EvictNeed(EvictionData* data,
   if (!data->Done() && aside_unpinned_.load(std::memory_order_relaxed) &&
       aside_unpinned_.exchange(false, std::memory_order_acquire)) {
     ReturnAllUnpinnedAside();
-    EvictFromQueue(data, deleted);
+    EvictFromQueues(data, deleted);
+  }
+}
+
+void FIFOCacheShard::EvictFromQueues(EvictionData* data,
+                                     autovector<FIFOHandle*>* deleted) {
+  // Probation drains first, then resident second-chance.
+  EvictFromProbation(data, deleted);
+  if (!data->Done()) {
+    EvictFromResident(data, deleted);
   }
 }
 
@@ -615,34 +653,106 @@ void FIFOCacheShard::EvictClaimed(FIFOHandle* e, EvictionData* data,
   deleted->push_back(e);
 }
 
-void FIFOCacheShard::EvictFromQueue(EvictionData* data,
-                                    autovector<FIFOHandle*>* deleted) {
-  // Each step consumes the head: evict it, or move it to the tail (or aside)
-  // if pinned. The pass ends after the entry that was newest when it began,
-  // so it visits each entry at most once and an all-pinned shard terminates
-  // having evicted nothing. Eviction claims the entry with a CAS that
-  // requires refs == 0, so a concurrent Lookup either pins it first (and it
-  // moves to the tail as pinned) or misses. The pinned move never touches
-  // state.
+bool FIFOCacheShard::EvictFromProbation(EvictionData* data,
+                                        autovector<FIFOHandle*>* deleted) {
+  // Each step consumes the head: promote, evict, or move a pinned entry to
+  // the tail (or aside). The pass ends after the entry that was newest when it
+  // began, so it visits at most the initial number of entries and never
+  // revisits a moved pin. Promotion frees nothing; the pass continues. Moves
+  // touch only links and the probation charge: usage_ is unchanged. Promotion
+  // and eviction claim the entry with a CAS that requires refs == 0, so a
+  // concurrent Lookup either pins it first (and it moves to the tail as pinned)
+  // or misses. The pinned move never touches state.
+  bool promoted = false;
   size_t rotated = 0;
-  FIFOHandle* const last = Prev(fifo());
-  bool at_last = Next(fifo()) == fifo();
+  FIFOHandle* const last = Prev(probation());
+  bool at_last = Next(probation()) == probation();
   while (!at_last && !data->Done()) {
     TEST_SYNC_POINT("FIFOCacheShard::EvictionVisit");
-    FIFOHandle* cur = Next(fifo());
+    FIFOHandle* cur = Next(probation());
     at_last = cur == last;
     uint32_t s = cur->state.load(std::memory_order_relaxed);
     assert(s & FIFOHandle::kInCache);
+    assert(s & FIFOHandle::kInProbation);
+    const bool promote =
+        cur->freq.load(std::memory_order_relaxed) >= kPromoteThreshold;
     if ((s & FIFOHandle::kRefMask) != 0 ||
-        !cur->state.compare_exchange_strong(s, 0, std::memory_order_acquire)) {
+        !cur->state.compare_exchange_strong(
+            s, promote ? s & ~FIFOHandle::kInProbation : 0,
+            std::memory_order_acquire)) {
       if (rotated++ < kPinnedRotationsPerPass) {
-        MoveToTail(cur, fifo());
+        MoveToTail(cur, probation());
       } else {
         SetAside(cur);
       }
     } else {
-      FIFO_Remove(cur);
-      EvictClaimed(cur, data, deleted);
+      if (promote) {
+        FIFO_Remove(cur, /*in_probation=*/true);
+        FIFO_Append(resident(), cur);
+        cur->freq.store(0, std::memory_order_relaxed);
+        promoted = true;
+      } else {
+        FIFO_Remove(cur, /*in_probation=*/true);
+        EvictClaimed(cur, data, deleted);
+      }
+    }
+  }
+  return promoted;
+}
+
+void FIFOCacheShard::EvictFromResident(EvictionData* data,
+                                       autovector<FIFOHandle*>* deleted) {
+  // Every step rotates (advances the hand past), evicts or sets aside the
+  // head; a pass ends when the hand cycles back to its marker. The marker
+  // is re-anchored by breaking out on every eviction. An eviction claims the
+  // head with a CAS that requires refs == 0; losing it to a concurrent Lookup
+  // is the same as meeting a pinned head.
+  int idle_passes = 0;
+  // Pinned entries rotated since the last full lap. A pass that evicts or
+  // re-anchors ends early and does not reset it, so a lap counts each pinned
+  // entry once.
+  size_t rotated = 0;
+  while (!data->Done() && Next(resident()) != resident() &&
+         idle_passes < kMaxResidentIdlePasses) {
+    FIFOHandle* start = resident_hand_;
+    bool evicted_this_pass = false;
+    bool reanchored = false;
+    do {
+      TEST_SYNC_POINT("FIFOCacheShard::EvictionVisit");
+      FIFOHandle* head = resident_hand_;
+      uint32_t s = head->state.load(std::memory_order_relaxed);
+      const uint8_t freq = head->freq.load(std::memory_order_relaxed);
+      if ((s & FIFOHandle::kRefMask) == 0 && freq > 0) {
+        head->freq.store(freq - 1, std::memory_order_relaxed);
+        resident_hand_ = ResidentNext(head);
+      } else if ((s & FIFOHandle::kRefMask) != 0 ||
+                 !head->state.compare_exchange_strong(
+                     s, 0, std::memory_order_acquire)) {
+        if (rotated++ < kPinnedRotationsPerPass) {
+          resident_hand_ = ResidentNext(head);
+        } else {
+          // FIFO_Remove moves the hand past head. Setting the marker aside
+          // re-anchors the pass, as an eviction does, without counting it
+          // idle: every such step removes an entry.
+          SetAside(head);
+          if (head == start) {
+            reanchored = true;
+            break;
+          }
+        }
+      } else {
+        assert(s == FIFOHandle::kInCache);
+        FIFO_Remove(head, /*in_probation=*/false);
+        EvictClaimed(head, data, deleted);
+        evicted_this_pass = true;
+        idle_passes = 0;
+        break;
+      }
+    } while (!data->Done() && Next(resident()) != resident() &&
+             resident_hand_ != start);
+    if (!evicted_this_pass && !reanchored) {
+      ++idle_passes;
+      rotated = 0;
     }
   }
 }
@@ -652,8 +762,8 @@ void FIFOCacheShard::NotifyEvicted(
   autovector<FIFOHandle*> slots;
   UniqueId64x2 buf;
   for (FIFOHandle* entry : evicted_handles) {
-    // was_hit is always false: FIFO keeps no hit state (frequency tracking
-    // is out of scope), so eviction callbacks cannot distinguish hits.
+    // was_hit stays false: freq is net of decay and promotion resets, so it
+    // cannot report ever-hit. Sticky hit tracking waits for a consumer.
     // A callback returning true took ownership of obj.
     if (!eviction_callback_ ||
         !eviction_callback_(KeyOf(entry, &buf), entry, false)) {
@@ -986,10 +1096,12 @@ Status FIFOCacheShard::InsertItem(const Slice& key, HashCref hash,
         e->helper = helper;
         e->total_charge = total_charge;
         e->next = e->prev = kNoLink;
+        e->freq.store(0, std::memory_order_relaxed);
         // The final state, set before the chain publishes e to Lookup.
         // Release: GetPinnedUsage reads total_charge after an acquire load
         // of state, without the chain.
-        e->state.store(FIFOHandle::kInCache | (handle != nullptr ? 1 : 0),
+        e->state.store(FIFOHandle::kInCache | FIFOHandle::kInProbation |
+                           (handle != nullptr ? 1 : 0),
                        std::memory_order_release);
         LinkIntoChain(e);
         ++occupancy_;
@@ -1000,7 +1112,7 @@ Status FIFOCacheShard::InsertItem(const Slice& key, HashCref hash,
           }
         }
         usage_ += total_charge;
-        FIFO_Append(e);
+        FIFO_Append(probation(), e);
         if (handle != nullptr) {
           *handle = e;
         }
@@ -1082,7 +1194,11 @@ FIFOHandle* FIFOCacheShard::Lookup(const Slice& key, HashCref hash,
     return nullptr;
   }
   TEST_SYNC_POINT_CALLBACK("FIFOCacheShard::Lookup:AfterRef", e);
-  // A hit moves nothing.
+  // A hit only credits frequency; the entry stays where it is.
+  const uint8_t freq = e->freq.load(std::memory_order_relaxed);
+  if (freq < kMaxFrequency) {
+    e->freq.store(freq + 1, std::memory_order_relaxed);
+  }
   return e;
 }
 
@@ -1147,7 +1263,7 @@ bool FIFOCacheShard::ReleaseLocked(FIFOHandle* e, bool erase_if_last_ref) {
       }
       // The FIFO queue may still hold pinned entries, so unlike LRU there
       // is no emptiness assertion here.
-      FIFO_Remove(e);
+      FIFO_Remove(e, (s & FIFOHandle::kInProbation) != 0);
       RemoveFromTable(e);
     } else {
       // Detached (erased/overwritten) or standalone.
@@ -1173,7 +1289,8 @@ bool FIFOCacheShard::Detach(FIFOHandle* e) {
   const uint32_t s =
       e->state.fetch_and(FIFOHandle::kRefMask, std::memory_order_acq_rel);
   assert(s & FIFOHandle::kInCache);
-  FIFO_Remove(e);
+  const bool in_probation = (s & FIFOHandle::kInProbation) != 0;
+  FIFO_Remove(e, in_probation);
   RemoveFromTable(e);
   if ((s & FIFOHandle::kRefMask) == 0) {
     assert(usage_.Get() >= e->total_charge);

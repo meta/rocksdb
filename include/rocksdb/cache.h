@@ -477,14 +477,16 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
 };
 
 // EXPERIMENTAL: the API is subject to change.
-// FIFOCache - A cache using plain FIFO eviction to stay at or below a set
+// FIFOCache - A cache using segmented FIFO eviction to stay at or below a set
 // capacity. The cache is sharded to 2^num_shard_bits shards, by hash of the
 // key. The total capacity is divided and evenly assigned to each shard, and
-// each shard has its own FIFO queue for evictions: the oldest unpinned entry is
-// evicted first, with no frequency or recency tracking. Lookups take no lock;
-// inserts, erases and eviction take a per-shard mutex. Pinned entries are never
-// evicted; eviction sets long-pinned entries aside instead of rescanning them,
-// and a fully-pinned shard evicts nothing. Under kFullChargeCacheMetadata (the
+// each shard has two FIFO queues for evictions: new entries enter probation,
+// and probation victims with enough access frequency are promoted to resident
+// (second-chance) instead of being evicted. Placement is inferred from access
+// frequency: Cache::Priority is ignored. Lookups take no lock; inserts, erases
+// and eviction take a per-shard mutex. Pinned entries are never evicted;
+// eviction sets long-pinned entries aside instead of rescanning them, and a
+// fully-pinned shard evicts nothing. Under kFullChargeCacheMetadata (the
 // default) the slot table also counts against capacity: 64 bytes per slot the
 // table has grown to, 256 bytes per shard at construction, growing with the
 // entries, and shrinking back once the shard is emptied (by EraseUnRefEntries,
