@@ -8450,6 +8450,20 @@ class Benchmark {
   }
 
 #if USE_COROUTINES
+  template <typename IOExecutor>
+  static folly::Executor::KeepAlive<folly::EventBase>
+  GetEventBaseKeepAliveForCoroutineBenchmark(IOExecutor* executor) {
+    // Public builds can pin Folly before the owning acquisition API.
+    constexpr auto kHasEBKA = requires(IOExecutor& io_executor) {
+      io_executor.getEventBaseKeepAlive();
+    };
+    if constexpr (kHasEBKA) {
+      return executor->getEventBaseKeepAlive();
+    } else {
+      return folly::getKeepAliveToken(executor->getEventBase());
+    }
+  }
+
   folly::IOExecutor* GetReadExecutorForCoroutineBenchmark(
       DB* db, const char* benchmark_name, int pool_threads) {
     auto* fs = db->GetFileSystem();
@@ -8684,7 +8698,7 @@ class Benchmark {
     for (int j = 0; j < num_jobs; ++j) {
       futures.push_back(
           folly::coro::co_withExecutor(
-              folly::Executor::getKeepAliveToken(read_executor->getEventBase()),
+              GetEventBaseKeepAliveForCoroutineBenchmark(read_executor),
               ReadRandomCoroutineJob(db_choices, thread->rand.Next(), ops,
                                      &total_ops, &total_found, &total_bytes, j,
                                      job_perf_contexts_ptr))
@@ -8766,7 +8780,7 @@ class Benchmark {
     for (int j = 0; j < num_jobs; ++j) {
       futures.push_back(
           folly::coro::co_withExecutor(
-              folly::Executor::getKeepAliveToken(read_executor->getEventBase()),
+              GetEventBaseKeepAliveForCoroutineBenchmark(read_executor),
               MultiGetCoroutineJob(db, cfh, thread->rand.Next(), ops,
                                    &total_ops, &total_found, &total_bytes, j,
                                    job_perf_contexts_ptr))
