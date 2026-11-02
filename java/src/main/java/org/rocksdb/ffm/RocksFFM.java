@@ -28,8 +28,8 @@ public final class RocksFFM {
   }
 
   interface DB {
-    public DB option();
-    public OpenDB open(String path);
+    DB option();
+    OpenDB open(String path);
   }
 
   private final static class DBImpl extends ArenaHolder implements DB {
@@ -64,10 +64,10 @@ public final class RocksFFM {
   }
 
   interface OpenDB {
-    public Getter get(MemorySegment key);
-    public Getter get(String key);
-    public Putter put(MemorySegment key, MemorySegment value);
-    public Putter put(String key, MemorySegment value);
+    Getter get(MemorySegment key);
+    Getter get(String key);
+    Putter put(MemorySegment key, MemorySegment value);
+    Putter put(String key, MemorySegment value);
   }
 
   private final static class OpenDBImpl extends WithDB implements OpenDB {
@@ -80,7 +80,7 @@ public final class RocksFFM {
     }
 
     public Getter get(String key) {
-      return new GetterImpl(arena, db, string(arena, key));
+      return new GetterImpl(arena, db, segmentOf(arena, key));
     }
 
     public Putter put(MemorySegment key, MemorySegment value) {
@@ -88,12 +88,12 @@ public final class RocksFFM {
     }
 
     public Putter put(String key, MemorySegment value) {
-      return new PutterImpl(arena, db, string(arena, key), value);
+      return new PutterImpl(arena, db, segmentOf(arena, key), value);
     }
   }
 
   interface Putter {
-    MemorySegment invoke() throws RocksDBException;
+    void invoke() throws RocksDBException;
   }
 
   private final static class PutterImpl extends WithDB implements Putter {
@@ -109,8 +109,11 @@ public final class RocksFFM {
     }
 
     @Override
-    public MemorySegment invoke() throws RocksDBException {
-      return null;
+    public void invoke() throws RocksDBException {
+      MemorySegment error = arena.allocateFrom(ValueLayout.ADDRESS, NULL);
+      rocksdb_c_api_2.rocksdb_put(
+          db, writeOptions, key, key.byteSize(), value, value.byteSize(), error);
+      throwOnError(error, message -> String.format("rocksdb_get() %s", message));
     }
   }
 
@@ -157,8 +160,23 @@ public final class RocksFFM {
     }
   }
 
-  private static MemorySegment string(Arena arena, String s) {
+  public static MemorySegment segmentOf(Arena arena, String s) {
     MemorySegment segment = arena.allocateFrom(s, UTF_8);
     return segment.asSlice(0, segment.byteSize() - 1);
+  }
+
+  /**
+   * Extract a string from a segment
+   * `MemorySegment.getString(offset, charset)` doesn't work for us, as it expects a C-style
+   * null-terminated string
+   *
+   * @param segment to interpret as a String
+   * @return the Java string contained in `segment`
+   */
+  public static String stringOf(MemorySegment segment) {
+    int byteSize = (int) segment.byteSize();
+    byte[] bytes = new byte[byteSize];
+    MemorySegment.copy(segment, ValueLayout.JAVA_BYTE, 0, bytes, 0, byteSize);
+    return new String(bytes, UTF_8);
   }
 }

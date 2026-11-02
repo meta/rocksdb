@@ -2,6 +2,7 @@ package org.rocksdb.ffm;
 
 import static org.assertj.core.api.Java6Assertions.assertThat;
 import static org.assertj.core.api.Java6Assertions.assertThatThrownBy;
+import static org.rocksdb.ffm.RocksFFM.stringOf;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -46,7 +47,7 @@ public class RocksFFMBasicTest {
 
       // value exists
       MemorySegment value2 = rocksFFMBasic.get("key2");
-      assertThat(RocksFFMBasic.stringFromSegment(value2)).isEqualTo("value2");
+      assertThat(stringOf(value2)).isEqualTo("value2");
 
       // value doesn't exist
       MemorySegment value4 = rocksFFMBasic.get("key4");

@@ -77,21 +77,6 @@ public class RocksFFMBasic {
     }
   }
 
-  /**
-   * Extract a string from a segment
-   * `MemorySegment.getString(offset, charset)` doesn't work for us, as it expects a C-style
-   * null-terminated string
-   *
-   * @param segment to interpret as a String
-   * @return the Java string contained in `segment`
-   */
-  public static String stringFromSegment(MemorySegment segment) {
-    int byteSize = (int) segment.byteSize();
-    byte[] bytes = new byte[byteSize];
-    MemorySegment.copy(segment, ValueLayout.JAVA_BYTE, 0, bytes, 0, byteSize);
-    return new String(bytes, UTF_8);
-  }
-
   // TODO (AP) - multiGet is ***INTERESTING***
   // Investigate efficient calling via:
   //

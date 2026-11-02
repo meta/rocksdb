@@ -1,6 +1,8 @@
 package org.rocksdb.ffm;
 
 import static org.assertj.core.api.Java6Assertions.assertThat;
+import static org.rocksdb.ffm.RocksFFM.segmentOf;
+import static org.rocksdb.ffm.RocksFFM.stringOf;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -11,7 +13,6 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.rocksdb.RocksDBException;
-import org.rocksdb.ffm.RocksFFM.*;
 
 public class RocksFFMTest {
   @Rule public TemporaryFolder dbFolder = new TemporaryFolder();
@@ -35,12 +36,31 @@ public class RocksFFMTest {
 
       var get2 = db.get("key2");
       MemorySegment value2 = get2.invoke();
-      assertThat(RocksFFMBasic.stringFromSegment(value2)).isEqualTo("value2");
+      assertThat(stringOf(value2)).isEqualTo("value2");
 
       // value doesn't exist
       var get4 = db.get("key4");
       MemorySegment value4 = get4.invoke();
       assertThat(value4).isNull();
+    }
+  }
+
+  @Test
+  public void readWriteRead() throws RocksDBException {
+    try (Arena arena = Arena.ofConfined()) {
+      var db = RocksFFM.db(arena).open(dbPath);
+
+      // value doesn't exist
+      var get4 = db.get("key4");
+      MemorySegment value4 = get4.invoke();
+      assertThat(value4).isNull();
+
+      var put4 = db.put("key4", segmentOf(arena, "wroteValue4"));
+      put4.invoke();
+
+      var get4_2 = db.get("key4");
+      MemorySegment value4_2 = get4_2.invoke();
+      assertThat(stringOf(value4_2)).isEqualTo("wroteValue4");
     }
   }
 }
