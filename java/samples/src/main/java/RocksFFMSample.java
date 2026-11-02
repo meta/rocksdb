@@ -9,7 +9,7 @@ import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import org.rocksdb.*;
-import org.rocksdb.ffm.RocksFFM;
+import org.rocksdb.ffm.RocksFFMBasic;
 
 public class RocksFFMSample {
   private final static String NAME = "RocksFFMSample";
@@ -30,11 +30,11 @@ public class RocksFFMSample {
 
     try (Arena arena = Arena.ofConfined()) {
       System.err.println("Open DB (FFM)");
-      RocksFFM rocksFFM = RocksFFM.open(arena, args[0]);
+      RocksFFMBasic rocksFFM = RocksFFMBasic.open(arena, args[0]);
       System.err.println("Read from DB");
       MemorySegment value2 = rocksFFM.get("key2");
-      System.err.printf(
-          "Read %d bytes (%s) from DB\n", value2.byteSize(), RocksFFM.stringFromSegment(value2));
+      System.err.printf("Read %d bytes (%s) from DB\n", value2.byteSize(),
+          RocksFFMBasic.stringFromSegment(value2));
 
       MemorySegment value4 = rocksFFM.get("key4");
       if (value4 == null) {

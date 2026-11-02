@@ -7,7 +7,7 @@ import org.rocksdb.*;
 public class RocksFFMHelperJNI {
   void createDB(String db_path, Map<String, String> entries) {
     try (final RocksDB db = RocksDB.open(db_path)) {
-      for (var entry : entries.entrySet()) {
+      for (Map.Entry<String, String> entry : entries.entrySet()) {
         db.put(entry.getKey().getBytes(StandardCharsets.UTF_8),
             entry.getValue().getBytes(StandardCharsets.UTF_8));
       }
