@@ -215,6 +215,15 @@ Slightly incidentally to this argument, it is perfectly reasonable to generate a
 
 Nonetheless, we still need a linker, so to support 32bit we still need a custom 32bit JDK which is stuck at JDK23 forever, because 32bit support is deprecated in 24 and removed in 25. So I very strongly recommend that a new RocksFFM API can be 64bit only. I think it is reasonable to tell the 32bit world that they are dinosaurs, and their only option is the existing JNI API, which may be supported for some time, but never taken forward.
 
+### 32 bit is deprecated - some references
+- [No 32-bit JDK maintainer](https://mail.openjdk.org/pipermail/jdk-dev/2024-July/009223.html)
+- [JEP - Deprecate 32-bit](https://openjdk.org/jeps/501)
+- [Canonical Layouts](https://bugs.openjdk.org/browse/JDK-8312523)
+- [Require Linker API](https://github.com/openjdk/panama-foreign/pull/850)
+- [State of `jextract`](https://cr.openjdk.org/~mcimadamore/panama/jextract_changes.html)
+- [Guide - `jextract`](https://github.com/openjdk/jextract/blob/master/doc/GUIDE.md)
+- [Heap Segments via `MemorySegment`](https://bugs.openjdk.org/browse/JDK-8318645)
+
 ## Outstanding Items to think about
 
 ### How to assess new API
