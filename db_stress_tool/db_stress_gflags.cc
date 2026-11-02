@@ -770,15 +770,21 @@ DEFINE_bool(use_trie_index, false,
             "Use trie-based user defined index (UDI) for SST files. "
             "Compatible with all operation types (Put, Delete, Merge, etc.) "
             "and all iteration directions (forward and reverse). "
-            "Combined with use_udi_as_primary_index to control whether the "
-            "UDI is the primary or secondary index.");
+            "Combined with index_mode to control the UDI role.");
 
-DEFINE_bool(use_udi_as_primary_index, false,
-            "When use_trie_index is enabled, use the UDI as the primary "
-            "index. All reads automatically go through the UDI (both "
-            "the standard index and UDI are always built). When false, "
-            "the UDI is a secondary index and reads require "
-            "ReadOptions::table_index_factory to be set.");
+DEFINE_int32(index_mode,
+             static_cast<int32_t>(
+                 ROCKSDB_NAMESPACE::BlockBasedTableOptions().index_mode),
+             "BlockBasedTableOptions::index_mode: 0=kStandardOnly, "
+             "1=kStandardDefault, 2=kCustomDefault, 3=kCustomOnly, "
+             "4=kStandardRequired. Values 2-4 require use_trie_index.");
+
+DEFINE_int32(read_index, -1,
+             "Per-read index selection (ReadOptions::read_index). -1=auto "
+             "(kPreferCustom when use_trie_index=1 and the custom index is "
+             "secondary, kDefault otherwise), 0=kDefault, 1=kBuiltin, "
+             "2=kPreferCustom. A value above 0 requires use_trie_index; "
+             "kBuiltin is incompatible with index_mode=3 (kCustomOnly).");
 
 DEFINE_bool(use_full_external_table, false,
             "Use the simple full external table test factory.");
