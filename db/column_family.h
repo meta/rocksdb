@@ -375,6 +375,19 @@ class ColumnFamilyData {
   Status SetOptions(
       const DBOptions& db_options,
       const std::unordered_map<std::string, std::string>& options_map);
+  // REQUIRES: DB mutex held
+  // Returns true if the column family is not dropped, SetOptions(db_options,
+  // options_map) would succeed without changing any option, and options from
+  // an earlier SetOptions() are not still waiting for MarkOptionsInstalled().
+  // Can return false for a request that changes nothing, for example one that
+  // sets a table factory field.
+  bool SetOptionsIsNoOp(
+      const DBOptions& db_options,
+      const std::unordered_map<std::string, std::string>& options_map) const;
+  // REQUIRES: DB mutex held
+  // Call after the options from SetOptions() are in the current SuperVersion
+  // and every other user of them is updated.
+  void MarkOptionsInstalled() { options_install_pending_ = false; }
 
   InternalStats* internal_stats() { return internal_stats_.get(); }
 
@@ -692,6 +705,11 @@ class ColumnFamilyData {
   MutableCFOptions mutable_cf_options_;
 
   const bool is_delete_range_supported_;
+
+  // True from a successful SetOptions() until MarkOptionsInstalled(). A
+  // DB::SetOptions() call that fails on a later column family leaves it set
+  // for the column families it already changed.
+  bool options_install_pending_ = false;
 
   std::unique_ptr<TableCache> table_cache_;
   std::unique_ptr<BlobFileCache> blob_file_cache_;

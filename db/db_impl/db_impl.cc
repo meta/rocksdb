@@ -1592,6 +1592,7 @@ Status DBImpl::RegisterRecordSeqnoTimeWorker() {
         periodic_task_functions_.at(PeriodicTaskType::kRecordSeqnoTime),
         seqno_time_cadence, /*run_immediately=*/true);
   }
+  seqno_time_worker_stale_ = !s.ok();
 
   return s;
 }
@@ -1931,13 +1932,38 @@ Status DBImpl::SetOptions(
   DeferredInstrumentedMutexLock ol(
       &options_mutex_,
       stats_ != nullptr && immutable_db_options_.info_log != nullptr);
+  const DBOptions db_options = GetDBOptions();
+  // As in SetDBOptions(), a request that changes no option returns early,
+  // without a new Version, SuperVersion, or OPTIONS file. When an earlier
+  // update left the OPTIONS file or the seqno-to-time worker behind, this call
+  // applies in full to bring them up to date.
+  const bool update_seqno_worker = seqno_time_worker_stale_;
+  if (!options_file_stale_ && !update_seqno_worker) {
+    bool unchanged = true;
+    {
+      InstrumentedMutexLock l(&mutex_);
+      for (const auto& cfd_opts : column_family_datas) {
+        if (!cfd_opts.first->SetOptionsIsNoOp(db_options, *cfd_opts.second)) {
+          unchanged = false;
+          break;
+        }
+      }
+    }
+    if (unchanged) {
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "SetOptions() on [%zu] column families, input option "
+                     "values are not changed, skipping updating.",
+                     column_family_datas.size());
+      return Status::OK();
+    }
+  }
+
   autovector<MutableCFOptions>
       new_options_copy;  // For logging outside of DB mutex
   Status s;
   Status persist_options_status;
   SuperVersionContext sv_context(/* create_superversion */ true);
   {
-    auto db_options = GetDBOptions();
     InstrumentedMutexLock l(&mutex_);
     // Manifest writers + Version appenders like flush and compaction use
     // LogAndApply, which releases DB mutex to wait for other manifest writers
@@ -1994,6 +2020,13 @@ Status DBImpl::SetOptions(
                                   BackgroundErrorReason::kManifestWrite);
       }
       if (!s.ok()) {
+        if (!new_options_copy.empty()) {
+          // The options that this call already changed are not in the OPTIONS
+          // file or the seqno-to-time worker. A failure that changed nothing
+          // leaves both up to date.
+          options_file_stale_ = true;
+          seqno_time_worker_stale_ = true;
+        }
         break;
       }
     }
@@ -2004,12 +2037,14 @@ Status DBImpl::SetOptions(
       // thread.
       for (const auto& cfd_opts : column_family_datas) {
         auto* cfd = cfd_opts.first;
+        assert(cfd != nullptr);
         InstallSuperVersionForConfigChange(cfd, &sv_context);
         if (auto* blob_partition_manager = cfd->blob_partition_manager()) {
           blob_partition_manager->SetBlobWriterMaxBufferSize(
               cfd->GetLatestMutableCFOptions()
                   .blob_file_writable_file_max_buffer_size);
         }
+        cfd->MarkOptionsInstalled();
       }
 
       persist_options_status =
@@ -2031,7 +2066,9 @@ Status DBImpl::SetOptions(
   sv_context.Clean();
 
   if (s.ok()) {
-    bool needs_seqno_worker = false;
+    // A stale worker can lag the time options of any column family, so update
+    // it even if this request sets no time option.
+    bool needs_seqno_worker = update_seqno_worker;
     for (const auto& cf_opts : column_families_opts_map) {
       if (cf_opts.second.count("preserve_internal_time_seconds") > 0 ||
           cf_opts.second.count("preclude_last_level_data_seconds") > 0) {
@@ -2106,7 +2143,10 @@ Status DBImpl::SetDBOptions(
       new_options.bytes_per_sync = 1024 * 1024;
     }
 
-    if (MutableDBOptionsAreEqual(mutable_db_options_, new_options)) {
+    // A stale OPTIONS file (see options_file_stale_) is written again even if
+    // no DB option changes.
+    if (MutableDBOptionsAreEqual(mutable_db_options_, new_options) &&
+        !options_file_stale_) {
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "SetDBOptions(), input option value is not changed, "
                      "skipping updating.");
@@ -5071,6 +5111,13 @@ Status DBImpl::CreateColumnFamiliesImpl(
     }
     handles->push_back(handle);
   }
+  if (options_file_number != 0) {
+    // The first create commits a tracked OPTIONS snapshot that lists every
+    // prepared column family, so the snapshot is current only if every create
+    // succeeds. The flag is also set when the first create fails, which costs
+    // at most one extra OPTIONS file write.
+    options_file_stale_ = handles->size() != prepared_column_families.size();
+  }
   if (s.ok() && !preparation_status.ok()) {
     s = preparation_status;
   }
@@ -5348,6 +5395,12 @@ Status DBImpl::DropColumnFamilyWithOptionsFile(
       s = versions_->LogAndApply(cfd, read_options, write_options, &edit,
                                  &mutex_, directories_.GetDbDir());
       write_thread_.ExitUnbatched(&w);
+      if (s.ok() &&
+          immutable_db_options_.track_options_file_number_in_manifest) {
+        // A drop without a snapshot leaves the OPTIONS file stale. Record its
+        // state before a worker update can fail after the MANIFEST commit.
+        options_file_stale_ = options_file_number == 0;
+      }
       if (s.ok() && options_file_number != 0) {
         versions_->options_file_size_ = options_file_size;
       }
@@ -7324,6 +7377,7 @@ Status DBImpl::WriteOptionsFile(const WriteOptions& write_options,
     mutex_.Unlock();
   }
 
+  options_file_stale_ = !s.ok();
   if (s.ok()) {
     MaybeDeleteObsoleteOptionsFiles();
   }

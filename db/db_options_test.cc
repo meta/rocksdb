@@ -6,6 +6,7 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -13,6 +14,8 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
@@ -22,12 +25,15 @@
 #include "port/stack_trace.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/filter_policy.h"
 #include "rocksdb/rate_limiter.h"
 #include "rocksdb/stats_history.h"
 #include "rocksdb/utilities/options_util.h"
 #include "test_util/mock_time_env.h"
 #include "test_util/sync_point.h"
 #include "test_util/testutil.h"
+#include "util/cast_util.h"
+#include "util/defer.h"
 #include "util/random.h"
 #include "utilities/fault_injection_fs.h"
 
@@ -101,6 +107,103 @@ class DBOptionsTest : public DBTestBase {
     test::RandomInitDBOptions(&db_options, rnd);
     auto sanitized_options = SanitizeOptions(dbname_, db_options);
     return GetMutableDBOptionsMap(sanitized_options);
+  }
+
+  std::string LatestOptionsFileName() {
+    std::string file_name;
+    EXPECT_OK(GetLatestOptionsFileName(dbname_, env_, &file_name));
+    return file_name;
+  }
+
+  // Returns the options of column family cf_name in the latest OPTIONS file.
+  ColumnFamilyOptions PersistedCFOptions(const std::string& cf_name) {
+    DBOptions db_options;
+    std::vector<ColumnFamilyDescriptor> cf_descs;
+    ConfigOptions config_options;
+    config_options.env = env_;
+    EXPECT_OK(
+        LoadLatestOptions(config_options, dbname_, &db_options, &cf_descs));
+    for (const auto& cf_desc : cf_descs) {
+      if (cf_desc.name == cf_name) {
+        return cf_desc.options;
+      }
+    }
+    ADD_FAILURE() << "Column family " << cf_name
+                  << " is not in the OPTIONS file";
+    return ColumnFamilyOptions();
+  }
+
+  // Returns the sorted column family names in the latest OPTIONS file. Unlike
+  // LoadLatestOptions(), this keeps the names that MANIFEST does not list.
+  std::vector<std::string> PersistedCFNames() {
+    DBOptions db_options;
+    std::vector<ColumnFamilyDescriptor> cf_descs;
+    ConfigOptions config_options;
+    config_options.env = env_;
+    EXPECT_OK(LoadOptionsFromFile(config_options,
+                                  dbname_ + "/" + LatestOptionsFileName(),
+                                  &db_options, &cf_descs));
+    std::vector<std::string> names;
+    names.reserve(cf_descs.size());
+    for (const auto& cf_desc : cf_descs) {
+      names.push_back(cf_desc.name);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+  }
+
+  // Returns true if fn() succeeds and writes a new OPTIONS file.
+  bool WritesOptionsFile(const std::function<Status()>& fn) {
+    const std::string file_before = LatestOptionsFileName();
+    const Status s = fn();
+    EXPECT_OK(s);
+    return s.ok() && LatestOptionsFileName() != file_before;
+  }
+
+  // SetOptions() writes a new OPTIONS file exactly when it applies the request
+  // instead of skipping it.
+  bool SetOptionsWritesOptionsFile(
+      ColumnFamilyHandle* cfh,
+      const std::unordered_map<std::string, std::string>& opts) {
+    return WritesOptionsFile([&]() { return db_->SetOptions(cfh, opts); });
+  }
+
+  // Runs fn() while OPTIONS file writes on fs fail, and returns its status.
+  static Status FailOptionsFileWrites(FaultInjectionTestFS* fs,
+                                      const std::function<Status()>& fn) {
+    SyncPoint::GetInstance()->SetCallBack(
+        "PersistRocksDBOptions:create",
+        [fs](void* /*arg*/) { fs->SetFilesystemActive(false); });
+    SyncPoint::GetInstance()->SetCallBack(
+        "PersistRocksDBOptions:written",
+        [fs](void* /*arg*/) { fs->SetFilesystemActive(true); });
+    SyncPoint::GetInstance()->EnableProcessing();
+    const Status s = fn();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    return s;
+  }
+
+  // Runs fn() while the second and later MANIFEST writes on this thread fail,
+  // and returns its status.
+  static Status FailSecondManifestWrite(FaultInjectionTestFS* fs,
+                                        const std::function<Status()>& fn) {
+    std::atomic<int> manifest_writes{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "VersionSet::LogAndApply:WriteManifest", [&](void* /*arg*/) {
+          if (manifest_writes.fetch_add(1, std::memory_order_relaxed) == 1) {
+            fs->SetThreadLocalErrorContext(
+                FaultInjectionIOType::kWrite, /*seed=*/0, /*one_in=*/1,
+                /*retryable=*/false, /*has_data_loss=*/false);
+            fs->EnableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    const Status s = fn();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    fs->DisableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+    return s;
   }
 };
 
@@ -1878,6 +1981,270 @@ TEST_F(DBOptionsTest, SetOptionsMultipleColumnFamilies) {
   ASSERT_FALSE(dbfull()->GetOptions(handles_[0]).disable_auto_compactions);
   ASSERT_TRUE(dbfull()->GetOptions(handles_[1]).disable_auto_compactions);
   ASSERT_TRUE(dbfull()->GetOptions(handles_[2]).disable_auto_compactions);
+}
+
+TEST_F(DBOptionsTest, SetOptionsSkipsUnchangedValues) {
+  ColumnFamilyHandle* const cfh = db_->DefaultColumnFamily();
+  const std::unordered_map<std::string, std::string> opts = {
+      {"periodic_compaction_seconds", "4800"},
+      {"memtable_prefix_bloom_size_ratio", "0.1"},
+      {"compaction_options_universal", "{min_merge_width=4}"}};
+  ASSERT_TRUE(SetOptionsWritesOptionsFile(cfh, opts));
+  ASSERT_FALSE(SetOptionsWritesOptionsFile(cfh, opts));
+
+  // A request that does not parse changes nothing, so the next request that
+  // changes nothing is still skipped.
+  ASSERT_EQ(db_->SetOptions(cfh, {{"no_such_option", "1"}}).code(),
+            Status::Code::kInvalidArgument);
+  ASSERT_FALSE(SetOptionsWritesOptionsFile(cfh, opts));
+
+  ASSERT_TRUE(SetOptionsWritesOptionsFile(
+      cfh, {{"periodic_compaction_seconds", "9600"}}));
+  ASSERT_EQ(db_->GetOptions(cfh).periodic_compaction_seconds, 9600);
+
+  // A very small change to a double value is still a change.
+  ASSERT_TRUE(SetOptionsWritesOptionsFile(
+      cfh, {{"memtable_prefix_bloom_size_ratio", "0"}}));
+  ASSERT_TRUE(SetOptionsWritesOptionsFile(
+      cfh, {{"memtable_prefix_bloom_size_ratio", "0.0000001"}}));
+}
+
+TEST_F(DBOptionsTest, SetOptionsAlwaysAppliesTableFactoryFields) {
+  Options options = CurrentOptions();
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(
+      NewRibbonFilterPolicy(10, /*bloom_before_level=*/1));
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  Reopen(options);
+
+  // SetOptions() changes this field in place on the live filter policy, so the
+  // MutableCFOptions from before and after compare equal.
+  const std::unordered_map<std::string, std::string> opts = {
+      {"table_factory.filter_policy.bloom_before_level", "2"}};
+  ASSERT_TRUE(SetOptionsWritesOptionsFile(db_->DefaultColumnFamily(), opts));
+  ASSERT_TRUE(SetOptionsWritesOptionsFile(db_->DefaultColumnFamily(), opts));
+}
+
+TEST_F(DBOptionsTest, SetOptionsRewritesOptionsFileAfterWriteFailure) {
+  auto fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env = NewCompositeEnv(fs);
+  // Close the DB before env is destroyed, also when an assertion fails.
+  Defer close_db([this]() { Close(); });
+  Options options = CurrentOptions();
+  options.env = env.get();
+  Reopen(options);
+
+  const std::unordered_map<std::string, std::string> opts = {
+      {"write_buffer_size", "1048576"}};
+  ASSERT_EQ(
+      FailOptionsFileWrites(fs.get(), [&]() { return db_->SetOptions(opts); })
+          .code(),
+      Status::Code::kIOError);
+  ASSERT_EQ(db_->GetOptions().write_buffer_size, 1048576);
+
+  // Only the OPTIONS file has the old value, so the same request is applied
+  // again before it is skipped.
+  ASSERT_TRUE(SetOptionsWritesOptionsFile(db_->DefaultColumnFamily(), opts));
+  ASSERT_EQ(PersistedCFOptions(kDefaultColumnFamilyName).write_buffer_size,
+            1048576);
+  ASSERT_FALSE(SetOptionsWritesOptionsFile(db_->DefaultColumnFamily(), opts));
+}
+
+TEST_F(DBOptionsTest, SetDBOptionsRewritesStaleOptionsFile) {
+  auto fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env = NewCompositeEnv(fs);
+  // Close the DB before env is destroyed, also when an assertion fails.
+  Defer close_db([this]() { Close(); });
+  Options options = CurrentOptions();
+  options.env = env.get();
+  // SetDBOptions() changes a bytes_per_sync of 0 to 1MB. Start with 1MB, so a
+  // request with the current values changes nothing.
+  options.bytes_per_sync = 1024 * 1024;
+  Reopen(options);
+
+  const std::unordered_map<std::string, std::string> db_opts = {
+      {"max_background_jobs",
+       std::to_string(db_->GetDBOptions().max_background_jobs)}};
+  ASSERT_FALSE(WritesOptionsFile([&]() { return db_->SetDBOptions(db_opts); }));
+
+  const std::unordered_map<std::string, std::string> cf_opts = {
+      {"write_buffer_size", "1048576"}};
+  ASSERT_EQ(FailOptionsFileWrites(fs.get(),
+                                  [&]() { return db_->SetOptions(cf_opts); })
+                .code(),
+            Status::Code::kIOError);
+
+  // The same SetDBOptions() request now writes the stale OPTIONS file again,
+  // and then it is skipped.
+  ASSERT_TRUE(WritesOptionsFile([&]() { return db_->SetDBOptions(db_opts); }));
+  ASSERT_EQ(PersistedCFOptions(kDefaultColumnFamilyName).write_buffer_size,
+            1048576);
+  ASSERT_FALSE(WritesOptionsFile([&]() { return db_->SetDBOptions(db_opts); }));
+
+  // The OPTIONS file is up to date, so SetOptions() skips the same request.
+  ASSERT_FALSE(
+      SetOptionsWritesOptionsFile(db_->DefaultColumnFamily(), cf_opts));
+}
+
+TEST_F(DBOptionsTest, SetOptionsFinishesUpdateLeftIncompleteByFailure) {
+  Options options = CurrentOptions();
+  CreateAndReopenWithCF({"one", "two"}, options);
+
+  // DB::SetOptions() changes the column families in the iteration order of
+  // the map and stops at the first error.
+  std::unordered_map<ColumnFamilyHandle*,
+                     std::unordered_map<std::string, std::string>>
+      opts_map = {{handles_[1], {}}, {handles_[2], {}}};
+  auto it = opts_map.begin();
+  ColumnFamilyHandle* const changed_cfh = it->first;
+  it->second = {{"preserve_internal_time_seconds", "3600"}};
+  (++it)->second = {{"no_such_option", "1"}};
+  ASSERT_EQ(db_->SetOptions(opts_map).code(), Status::Code::kInvalidArgument);
+
+  // The first column family has the new value, but its SuperVersion, the
+  // OPTIONS file and the seqno-to-time worker do not.
+  ColumnFamilyData* const changed_cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(changed_cfh)->cfd();
+  ASSERT_EQ(db_->GetOptions(changed_cfh).preserve_internal_time_seconds, 3600);
+  {
+    InstrumentedMutexLock l(dbfull()->mutex());
+    ASSERT_EQ(changed_cfd->GetCurrentMutableCFOptions()
+                  .preserve_internal_time_seconds,
+              0);
+  }
+  ASSERT_EQ(
+      PersistedCFOptions(changed_cfh->GetName()).preserve_internal_time_seconds,
+      0);
+  const PeriodicTaskScheduler& scheduler =
+      dbfull()->TEST_GetPeriodicTaskScheduler();
+  ASSERT_FALSE(scheduler.TEST_HasTask(PeriodicTaskType::kRecordSeqnoTime));
+
+  // A request on another column family that changes nothing is applied, and
+  // it updates the OPTIONS file and the worker.
+  ASSERT_TRUE(SetOptionsWritesOptionsFile(
+      handles_[0],
+      {{"write_buffer_size", std::to_string(options.write_buffer_size)}}));
+  ASSERT_EQ(
+      PersistedCFOptions(changed_cfh->GetName()).preserve_internal_time_seconds,
+      3600);
+  ASSERT_TRUE(scheduler.TEST_HasTask(PeriodicTaskType::kRecordSeqnoTime));
+
+  // The changed column family still needs a new SuperVersion, so the same
+  // request on it is applied once more before it is skipped.
+  const std::unordered_map<std::string, std::string> opts = {
+      {"preserve_internal_time_seconds", "3600"}};
+  ASSERT_TRUE(SetOptionsWritesOptionsFile(changed_cfh, opts));
+  {
+    InstrumentedMutexLock l(dbfull()->mutex());
+    ASSERT_EQ(changed_cfd->GetCurrentMutableCFOptions()
+                  .preserve_internal_time_seconds,
+              3600);
+  }
+  ASSERT_FALSE(SetOptionsWritesOptionsFile(changed_cfh, opts));
+}
+
+TEST_F(DBOptionsTest, SetOptionsReportsDroppedColumnFamily) {
+  Options options = CurrentOptions();
+  CreateColumnFamilies({"one"}, options);
+  ASSERT_OK(db_->DropColumnFamily(handles_[0]));
+
+  // A request that changes nothing still fails on a dropped column family.
+  ASSERT_EQ(db_->SetOptions(handles_[0],
+                            {{"write_buffer_size",
+                              std::to_string(options.write_buffer_size)}})
+                .code(),
+            Status::Code::kColumnFamilyDropped);
+}
+
+TEST_F(DBOptionsTest, SetOptionsRewritesSnapshotAfterPartialTrackedBatch) {
+  auto fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env = NewCompositeEnv(fs);
+  // Close the DB before env is destroyed, also when an assertion fails.
+  Defer close_db([this]() { Close(); });
+  Options options = CurrentOptions();
+  options.env = env.get();
+  options.track_options_file_number_in_manifest = true;
+  Reopen(options);
+  ColumnFamilyHandle* const default_cfh = db_->DefaultColumnFamily();
+  const std::unordered_map<std::string, std::string> opts = {
+      {"write_buffer_size",
+       std::to_string(db_->GetOptions().write_buffer_size)}};
+
+  // The first create commits a snapshot that lists both new column families,
+  // and then the second create fails.
+  std::vector<ColumnFamilyHandle*> created;
+  ASSERT_NOK(FailSecondManifestWrite(fs.get(), [&]() {
+    return db_->CreateColumnFamilies(ColumnFamilyOptions(), {"one", "two"},
+                                     &created);
+  }));
+  handles_.insert(handles_.end(), created.begin(), created.end());
+  ASSERT_EQ(created.size(), 1U);
+  ASSERT_EQ(PersistedCFNames(),
+            (std::vector<std::string>{kDefaultColumnFamilyName, "one", "two"}));
+
+  // So a request that changes no option writes a current snapshot, and then
+  // the same request is skipped.
+  ASSERT_TRUE(SetOptionsWritesOptionsFile(default_cfh, opts));
+  ASSERT_EQ(PersistedCFNames(),
+            (std::vector<std::string>{kDefaultColumnFamilyName, "one"}));
+  ASSERT_FALSE(SetOptionsWritesOptionsFile(default_cfh, opts));
+
+  // Only the last drop of a batch commits the new snapshot. Here the second
+  // drop fails, so the committed snapshot still lists the dropped column
+  // family.
+  ColumnFamilyHandle* two = nullptr;
+  ASSERT_OK(db_->CreateColumnFamily(ColumnFamilyOptions(), "two", &two));
+  handles_.push_back(two);
+  ASSERT_NOK(FailSecondManifestWrite(
+      fs.get(), [&]() { return db_->DropColumnFamilies({created[0], two}); }));
+  ASSERT_EQ(PersistedCFNames(),
+            (std::vector<std::string>{kDefaultColumnFamilyName, "one", "two"}));
+
+  ASSERT_TRUE(SetOptionsWritesOptionsFile(default_cfh, opts));
+  ASSERT_EQ(PersistedCFNames(),
+            (std::vector<std::string>{kDefaultColumnFamilyName, "two"}));
+  ASSERT_FALSE(SetOptionsWritesOptionsFile(default_cfh, opts));
+}
+
+TEST_F(DBOptionsTest, TrackedColumnFamilyChangeCommitsCurrentSnapshot) {
+  auto fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env = NewCompositeEnv(fs);
+  // Close the DB before env is destroyed, also when an assertion fails.
+  Defer close_db([this]() { Close(); });
+  Options options = CurrentOptions();
+  options.env = env.get();
+  options.track_options_file_number_in_manifest = true;
+  Reopen(options);
+  ColumnFamilyHandle* const default_cfh = db_->DefaultColumnFamily();
+
+  // After a failed OPTIONS file write, each tracked column family change
+  // commits a snapshot of the options in effect. So the request that failed is
+  // then skipped.
+  std::vector<ColumnFamilyHandle*> created;
+  const std::vector<std::pair<size_t, std::function<Status()>>> changes = {
+      {1048576,
+       [&]() {
+         const Status s = db_->CreateColumnFamilies(ColumnFamilyOptions(),
+                                                    {"one", "two"}, &created);
+         handles_.insert(handles_.end(), created.begin(), created.end());
+         return s;
+       }},
+      {2097152, [&]() { return db_->DropColumnFamily(created[0]); }},
+      {3145728, [&]() { return db_->DropColumnFamilies({created[1]}); }},
+  };
+  for (const auto& [write_buffer_size, change] : changes) {
+    SCOPED_TRACE("write_buffer_size=" + std::to_string(write_buffer_size));
+    const std::unordered_map<std::string, std::string> opts = {
+        {"write_buffer_size", std::to_string(write_buffer_size)}};
+    ASSERT_EQ(
+        FailOptionsFileWrites(fs.get(), [&]() { return db_->SetOptions(opts); })
+            .code(),
+        Status::Code::kIOError);
+    ASSERT_OK(change());
+    ASSERT_EQ(PersistedCFOptions(kDefaultColumnFamilyName).write_buffer_size,
+              write_buffer_size);
+    ASSERT_FALSE(SetOptionsWritesOptionsFile(default_cfh, opts));
+  }
 }
 
 // Confirms the default value and serialization/parse round-trip of the new
