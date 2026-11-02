@@ -17,6 +17,8 @@
 #include "db/arena_wrapped_db_iter.h"
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_log_format.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/column_family.h"
 #include "db/db_iter.h"
 #include "db/db_test_util.h"
@@ -43,6 +45,66 @@ void CorruptPinnedBlobIndexOnCleanup(void* arg1, void* /*arg2*/) {
   (*blob_index)[0] = static_cast<char>(BlobIndex::Type::kUnknown);
 }
 
+class RejectingReservationManager : public CacheReservationManager {
+ public:
+  explicit RejectingReservationManager(size_t limit) : limit_(limit) {}
+
+  class Handle : public CacheReservationHandle {
+   public:
+    explicit Handle(RejectingReservationManager* manager) : manager_(manager) {}
+    ~Handle() override {
+      manager_->UpdateCacheReservation(memory_used_, false)
+          .PermitUncheckedError();
+    }
+    Status Resize(size_t memory_used) override {
+      Status status = manager_->UpdateCacheReservation(
+          memory_used > memory_used_ ? memory_used - memory_used_
+                                     : memory_used_ - memory_used,
+          memory_used > memory_used_);
+      memory_used_ = memory_used;
+      return status;
+    }
+
+   private:
+    RejectingReservationManager* manager_;
+    size_t memory_used_ = 0;
+  };
+
+  Status UpdateCacheReservation(size_t new_memory_used) override {
+    memory_used_ = new_memory_used;
+    if (new_memory_used > limit_) {
+      return Status::MemoryLimit("test reservation limit");
+    }
+    return Status::OK();
+  }
+
+  Status UpdateCacheReservation(size_t memory_used_delta,
+                                bool increase) override {
+    return UpdateCacheReservation(increase ? memory_used_ + memory_used_delta
+                                           : memory_used_ - memory_used_delta);
+  }
+
+  Status MakeCacheReservation(
+      size_t incremental_memory_used,
+      std::unique_ptr<CacheReservationHandle>* handle) override {
+    handle->reset(new Handle(this));
+    return (*handle)->Resize(incremental_memory_used);
+  }
+
+  size_t GetTotalReservedCacheSize() override { return memory_used_; }
+  size_t GetTotalMemoryUsed() override { return memory_used_; }
+
+ private:
+  size_t limit_;
+  size_t memory_used_ = 0;
+};
+
+BlobIndex DecodeBlobIndexForTest(const std::string& encoded) {
+  BlobIndex blob_index;
+  EXPECT_OK(blob_index.DecodeFrom(encoded));
+  return blob_index;
+}
+
 }  // namespace
 
 TEST(BlobIndexTest, SameFileBlobIndex) {
@@ -55,6 +117,404 @@ TEST(BlobIndexTest, SameFileBlobIndex) {
   EXPECT_TRUE(blob_index.IsSameFile());
   EXPECT_EQ(blob_index.file_number(), kCurrentFileBlobIndexFileNumber);
   EXPECT_NE(blob_index.DebugString(false).find("file:same"), std::string::npos);
+}
+
+TEST(BlobIndexTest, IndirectBlobIndexRoundTrip) {
+  constexpr uint64_t kGeneration = 301;
+  constexpr uint64_t kOrigin = 101;
+  constexpr uint64_t kOffset = 123456;
+  constexpr uint64_t kSize = 789;
+  constexpr uint32_t kChecksum = 0x89abcdefU;
+
+  std::string encoded;
+  BlobIndex::EncodeIndirectBlob(&encoded, kGeneration, kOrigin, kOffset, kSize,
+                                kZSTD, BlobIndex::kStableChecksumVersion1,
+                                kChecksum);
+
+  BlobIndex blob_index;
+  ASSERT_OK(blob_index.DecodeFrom(encoded));
+  EXPECT_TRUE(blob_index.IsIndirect());
+  EXPECT_FALSE(blob_index.IsInlined());
+  EXPECT_FALSE(blob_index.IsSameFile());
+  EXPECT_EQ(blob_index.file_number(), kGeneration);
+  EXPECT_EQ(blob_index.generation_file_number(), kGeneration);
+  EXPECT_EQ(blob_index.origin_file_number(), kOrigin);
+  EXPECT_EQ(blob_index.offset(), kOffset);
+  EXPECT_EQ(blob_index.original_value_offset(), kOffset);
+  EXPECT_EQ(blob_index.size(), kSize);
+  EXPECT_EQ(blob_index.compression(), kZSTD);
+  EXPECT_EQ(blob_index.stable_checksum_version(),
+            BlobIndex::kStableChecksumVersion1);
+  EXPECT_EQ(blob_index.stable_checksum(), kChecksum);
+
+  std::string reencoded;
+  blob_index.EncodeTo(&reencoded);
+  EXPECT_EQ(reencoded, encoded);
+}
+
+TEST(BlobIndexTest, IdentityBlobNormalizesGenerationToOrigin) {
+  std::string encoded;
+  BlobIndex::EncodeIdentityBlob(&encoded, /*origin_file_number=*/77,
+                                /*original_value_offset=*/88,
+                                /*stored_value_size=*/99, kLZ4Compression,
+                                /*stable_checksum=*/1234);
+
+  BlobIndex blob_index;
+  ASSERT_OK(blob_index.DecodeFrom(encoded));
+  EXPECT_EQ(blob_index.generation_file_number(), 77);
+  EXPECT_EQ(blob_index.origin_file_number(), 77);
+}
+
+TEST(BlobIndexTest, IndirectBlobIndexRejectsMalformedEncoding) {
+  std::string encoded;
+  BlobIndex::EncodeIdentityBlob(&encoded, /*origin_file_number=*/77,
+                                /*original_value_offset=*/88,
+                                /*stored_value_size=*/99, kNoCompression,
+                                /*stable_checksum=*/1234);
+
+  for (size_t size = 0; size < encoded.size(); ++size) {
+    BlobIndex blob_index;
+    EXPECT_TRUE(
+        blob_index.DecodeFrom(Slice(encoded.data(), size)).IsCorruption())
+        << "accepted truncated size " << size;
+  }
+
+  {
+    std::string unsupported_version(encoded);
+    unsupported_version[1] = 2;
+    BlobIndex blob_index;
+    EXPECT_TRUE(blob_index.DecodeFrom(unsupported_version).IsCorruption());
+  }
+  {
+    std::string noncanonical_version(encoded);
+    noncanonical_version[1] = static_cast<char>(0x81);
+    noncanonical_version.insert(noncanonical_version.begin() + 2, '\0');
+    BlobIndex blob_index;
+    EXPECT_TRUE(blob_index.DecodeFrom(noncanonical_version).IsCorruption());
+  }
+  {
+    std::string trailing(encoded);
+    trailing.push_back('x');
+    BlobIndex blob_index;
+    EXPECT_TRUE(blob_index.DecodeFrom(trailing).IsCorruption());
+  }
+  {
+    std::string invalid_compression(encoded);
+    // The compression byte follows four one-byte identity fields here.
+    invalid_compression[6] = static_cast<char>(kDisableCompressionOption);
+    BlobIndex blob_index;
+    EXPECT_TRUE(blob_index.DecodeFrom(invalid_compression).IsCorruption());
+  }
+}
+
+TEST(BlobReferenceMetadataTest, CompleteEmptyRoundTrip) {
+  BlobReferenceMetadataCollector collector(nullptr);
+  std::vector<std::string> data_blocks;
+  ASSERT_OK(
+      collector.Finish([&](const Slice& block, BlockHandle* handle) -> Status {
+        data_blocks.emplace_back(block.data(), block.size());
+        *handle = BlockHandle(1000, block.size());
+        return Status::OK();
+      }));
+  EXPECT_TRUE(data_blocks.empty());
+  EXPECT_TRUE(collector.descriptor().IsCompleteEmpty());
+
+  BlobReferenceMetadataDescriptor descriptor = collector.descriptor();
+  descriptor.index_handle = BlockHandle(2000, collector.index_block().size());
+  descriptor.directory_handle =
+      BlockHandle(3000, collector.directory_block().size());
+  std::string encoded_descriptor;
+  descriptor.EncodeTo(&encoded_descriptor);
+  EXPECT_EQ(encoded_descriptor.size(),
+            BlobReferenceMetadataDescriptor::kEncodedSize);
+
+  BlobReferenceMetadataDescriptor decoded_descriptor;
+  ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(encoded_descriptor,
+                                                        &decoded_descriptor));
+  EXPECT_TRUE(decoded_descriptor.IsCompleteEmpty());
+
+  // Persisted count limits are independent of the ABI size of the decoded
+  // group struct. In particular, this count exceeds the old x86-64
+  // sizeof-derived limit but remains valid on every supported architecture.
+  constexpr uint64_t kPortableGroupCountLimit = 1ULL << 20;
+  BlobReferenceMetadataDescriptor portable_descriptor = descriptor;
+  portable_descriptor.reference_count = kPortableGroupCountLimit;
+  portable_descriptor.group_count = kPortableGroupCountLimit;
+  portable_descriptor.stored_value_bytes = kPortableGroupCountLimit;
+  encoded_descriptor.clear();
+  portable_descriptor.EncodeTo(&encoded_descriptor);
+  ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(encoded_descriptor,
+                                                        &decoded_descriptor));
+  EXPECT_EQ(decoded_descriptor.group_count, kPortableGroupCountLimit);
+
+  std::vector<BlobReferenceBlockIndexEntry> block_index;
+  ASSERT_OK(DecodeBlobReferenceIndex(collector.index_block(), descriptor,
+                                     &block_index));
+  EXPECT_TRUE(block_index.empty());
+  std::vector<BlobReferenceGroup> groups;
+  ASSERT_OK(DecodeBlobReferenceDirectory(
+      collector.directory_block(), descriptor, block_index.size(), &groups));
+  EXPECT_TRUE(groups.empty());
+}
+
+TEST(BlobReferenceMetadataTest, CollectSortDeduplicateAndDecode) {
+  std::string legacy_encoded;
+  BlobIndex::EncodeBlob(&legacy_encoded, /*file_number=*/41, /*offset=*/500,
+                        /*size=*/1000, kLZ4Compression);
+  const BlobIndex legacy = DecodeBlobIndexForTest(legacy_encoded);
+
+  std::string identity_encoded;
+  BlobIndex::EncodeIdentityBlob(&identity_encoded, /*origin_file_number=*/42,
+                                /*original_value_offset=*/700,
+                                /*stored_value_size=*/800, kZSTD,
+                                /*stable_checksum=*/123);
+  const BlobIndex identity = DecodeBlobIndexForTest(identity_encoded);
+
+  std::string relocated_encoded;
+  BlobIndex::EncodeIndirectBlob(
+      &relocated_encoded, /*generation_file_number=*/99,
+      /*origin_file_number=*/42, /*original_value_offset=*/900,
+      /*stored_value_size=*/600, kSnappyCompression,
+      BlobIndex::kStableChecksumVersion1, /*stable_checksum=*/456);
+  const BlobIndex relocated = DecodeBlobIndexForTest(relocated_encoded);
+
+  std::string same_file_encoded;
+  BlobIndex::EncodeBlob(&same_file_encoded, kCurrentFileBlobIndexFileNumber,
+                        /*offset=*/100, /*size=*/200, kNoCompression);
+  const BlobIndex same_file = DecodeBlobIndexForTest(same_file_encoded);
+
+  std::string inline_encoded;
+  BlobIndex::EncodeInlinedTTL(&inline_encoded, /*expiration=*/123, "inline");
+  const BlobIndex inlined = DecodeBlobIndexForTest(inline_encoded);
+
+  BlobReferenceMetadataCollector collector(nullptr);
+  ASSERT_OK(collector.Add(relocated));
+  ASSERT_OK(collector.Add(identity));
+  ASSERT_OK(collector.Add(legacy));
+  ASSERT_OK(collector.Add(identity));  // exact duplicate
+  ASSERT_OK(collector.Add(same_file));
+  ASSERT_OK(collector.Add(inlined));
+
+  std::vector<std::string> data_blocks;
+  uint64_t next_offset = 1000;
+  ASSERT_OK(
+      collector.Finish([&](const Slice& block, BlockHandle* handle) -> Status {
+        data_blocks.emplace_back(block.data(), block.size());
+        *handle = BlockHandle(next_offset, block.size());
+        next_offset += block.size() + 5;
+        return Status::OK();
+      }));
+  EXPECT_EQ(collector.descriptor().reference_count, 3);
+  EXPECT_EQ(collector.descriptor().group_count, 2);
+  EXPECT_EQ(collector.descriptor().stored_value_bytes, 2400);
+
+  BlobReferenceMetadataDescriptor descriptor = collector.descriptor();
+  descriptor.index_handle =
+      BlockHandle(next_offset, collector.index_block().size());
+  next_offset += collector.index_block().size() + 5;
+  descriptor.directory_handle =
+      BlockHandle(next_offset, collector.directory_block().size());
+
+  std::vector<BlobReferenceBlockIndexEntry> block_index;
+  ASSERT_OK(DecodeBlobReferenceIndex(collector.index_block(), descriptor,
+                                     &block_index));
+  ASSERT_EQ(block_index.size(), data_blocks.size());
+  std::vector<BlobReferenceGroup> groups;
+  ASSERT_OK(DecodeBlobReferenceDirectory(
+      collector.directory_block(), descriptor, block_index.size(), &groups));
+  ASSERT_EQ(groups.size(), 2);
+  EXPECT_EQ(groups[0].encoding_class,
+            BlobReferenceEncodingClass::kFeatureIdentity);
+  EXPECT_EQ(groups[0].first_reference, 1);
+  EXPECT_EQ(groups[1].encoding_class, BlobReferenceEncodingClass::kRelocated);
+
+  std::vector<BlobReference> references;
+  for (size_t i = 0; i < data_blocks.size(); ++i) {
+    ASSERT_OK(DecodeBlobReferenceDataBlock(data_blocks[i], block_index[i],
+                                           &references));
+  }
+  ASSERT_EQ(references.size(), 3);
+  EXPECT_EQ(references[0].encoding_class,
+            BlobReferenceEncodingClass::kLegacyDirect);
+  EXPECT_EQ(references[1].encoding_class,
+            BlobReferenceEncodingClass::kFeatureIdentity);
+  EXPECT_EQ(references[2].encoding_class,
+            BlobReferenceEncodingClass::kRelocated);
+  EXPECT_EQ(references[2].generation_file_number, 99);
+  EXPECT_EQ(references[2].origin_file_number, 42);
+  EXPECT_EQ(references[2].stable_checksum, 456);
+}
+
+TEST(BlobReferenceMetadataTest, SplitsLargeGroupIntoBoundedDataBlocks) {
+  constexpr uint64_t kReferenceCount = 20000;
+  constexpr uint64_t kOriginFileNumber = 42;
+  BlobReferenceMetadataCollector collector(nullptr);
+  for (uint64_t i = 0; i < kReferenceCount; ++i) {
+    std::string encoded;
+    BlobIndex::EncodeIdentityBlob(&encoded, kOriginFileNumber,
+                                  /*original_value_offset=*/1000 + i * 100,
+                                  /*stored_value_size=*/80, kNoCompression,
+                                  /*stable_checksum=*/static_cast<uint32_t>(i));
+    ASSERT_OK(collector.Add(DecodeBlobIndexForTest(encoded)));
+  }
+
+  std::vector<std::string> data_blocks;
+  uint64_t next_offset = 1000;
+  ASSERT_OK(
+      collector.Finish([&](const Slice& block, BlockHandle* handle) -> Status {
+        data_blocks.emplace_back(block.data(), block.size());
+        *handle = BlockHandle(next_offset, block.size());
+        next_offset += block.size() + 5;
+        return Status::OK();
+      }));
+  ASSERT_GT(data_blocks.size(), 1);
+  EXPECT_EQ(collector.descriptor().reference_count, kReferenceCount);
+  EXPECT_EQ(collector.descriptor().group_count, 1);
+  EXPECT_EQ(collector.descriptor().stored_value_bytes, kReferenceCount * 80);
+
+  BlobReferenceMetadataDescriptor descriptor = collector.descriptor();
+  descriptor.index_handle =
+      BlockHandle(next_offset, collector.index_block().size());
+  next_offset += collector.index_block().size() + 5;
+  descriptor.directory_handle =
+      BlockHandle(next_offset, collector.directory_block().size());
+
+  std::vector<BlobReferenceBlockIndexEntry> block_index;
+  ASSERT_OK(DecodeBlobReferenceIndex(collector.index_block(), descriptor,
+                                     &block_index));
+  ASSERT_EQ(block_index.size(), data_blocks.size());
+  std::vector<BlobReferenceGroup> groups;
+  ASSERT_OK(DecodeBlobReferenceDirectory(
+      collector.directory_block(), descriptor, block_index.size(), &groups));
+  ASSERT_EQ(groups.size(), 1);
+  EXPECT_EQ(groups[0].block_count, block_index.size());
+
+  std::vector<BlobReference> references;
+  for (size_t i = 0; i < data_blocks.size(); ++i) {
+    ASSERT_OK(DecodeBlobReferenceDataBlock(data_blocks[i], block_index[i],
+                                           &references));
+  }
+  ASSERT_EQ(references.size(), kReferenceCount);
+  EXPECT_EQ(references.front().original_value_offset, 1000);
+  EXPECT_EQ(references.back().original_value_offset,
+            1000 + (kReferenceCount - 1) * 100);
+}
+
+TEST(BlobReferenceMetadataTest, ConflictingStableIdentityFailsClosed) {
+  std::string first_encoded;
+  BlobIndex::EncodeIndirectBlob(
+      &first_encoded, /*generation_file_number=*/42,
+      /*origin_file_number=*/42, /*original_value_offset=*/700,
+      /*stored_value_size=*/800, kZSTD, BlobIndex::kStableChecksumVersion1,
+      /*stable_checksum=*/123);
+  std::string second_encoded;
+  BlobIndex::EncodeIndirectBlob(
+      &second_encoded, /*generation_file_number=*/99,
+      /*origin_file_number=*/42, /*original_value_offset=*/700,
+      /*stored_value_size=*/800, kZSTD, BlobIndex::kStableChecksumVersion1,
+      /*stable_checksum=*/456);
+
+  BlobReferenceMetadataCollector collector(nullptr);
+  ASSERT_OK(collector.Add(DecodeBlobIndexForTest(first_encoded)));
+  ASSERT_OK(collector.Add(DecodeBlobIndexForTest(second_encoded)));
+  Status status =
+      collector.Finish([](const Slice&, BlockHandle*) { return Status::OK(); });
+  EXPECT_TRUE(status.IsCorruption()) << status.ToString();
+}
+
+TEST(BlobReferenceMetadataTest, ValidatesExcludedSameFileReference) {
+  std::string encoded;
+  BlobIndex::EncodeBlob(&encoded, kCurrentFileBlobIndexFileNumber,
+                        /*offset=*/500,
+                        /*size=*/1000, static_cast<CompressionType>(0xff));
+  BlobIndex blob_index;
+  ASSERT_OK(blob_index.DecodeFrom(encoded));
+  EXPECT_TRUE(blob_index.Validate().IsCorruption());
+
+  BlobReferenceMetadataCollector collector(nullptr);
+  EXPECT_TRUE(collector.Add(blob_index).IsCorruption());
+}
+
+TEST(BlobReferenceMetadataTest, ReservationFailureFailsCollection) {
+  auto reservation_manager =
+      std::make_shared<RejectingReservationManager>(/*limit=*/1);
+  BlobReferenceMetadataCollector collector(reservation_manager);
+  std::string encoded;
+  BlobIndex::EncodeBlob(&encoded, /*file_number=*/41, /*offset=*/500,
+                        /*size=*/1000, kNoCompression);
+  Status status = collector.Add(DecodeBlobIndexForTest(encoded));
+  EXPECT_TRUE(status.IsMemoryLimit()) << status.ToString();
+  EXPECT_GT(reservation_manager->GetTotalMemoryUsed(), 1);
+  ASSERT_OK(collector.ReleaseWorkingMemory());
+  EXPECT_EQ(reservation_manager->GetTotalMemoryUsed(), 0);
+}
+
+TEST(BlobReferenceMetadataTest, ReleasesReservedWorkingMemory) {
+  auto reservation_manager =
+      std::make_shared<RejectingReservationManager>(/*limit=*/1024 * 1024);
+  BlobReferenceMetadataCollector collector(reservation_manager);
+  std::string encoded;
+  BlobIndex::EncodeBlob(&encoded, /*file_number=*/41, /*offset=*/500,
+                        /*size=*/1000, kNoCompression);
+  ASSERT_OK(collector.Add(DecodeBlobIndexForTest(encoded)));
+  ASSERT_OK(
+      collector.Finish([](const Slice& block, BlockHandle* handle) -> Status {
+        *handle = BlockHandle(1000, block.size());
+        return Status::OK();
+      }));
+  EXPECT_GT(reservation_manager->GetTotalMemoryUsed(), 0);
+
+  ASSERT_OK(collector.ReleaseWorkingMemory());
+  EXPECT_EQ(reservation_manager->GetTotalMemoryUsed(), 0);
+  EXPECT_TRUE(
+      collector.Add(DecodeBlobIndexForTest(encoded)).IsInvalidArgument());
+}
+
+TEST(BlobReferenceMetadataTest, ReleasesReservationOnDestruction) {
+  auto reservation_manager =
+      std::make_shared<RejectingReservationManager>(/*limit=*/1024 * 1024);
+  {
+    BlobReferenceMetadataCollector collector(reservation_manager);
+    std::string encoded;
+    BlobIndex::EncodeBlob(&encoded, /*file_number=*/41, /*offset=*/500,
+                          /*size=*/1000, kNoCompression);
+    ASSERT_OK(collector.Add(DecodeBlobIndexForTest(encoded)));
+    EXPECT_GT(reservation_manager->GetTotalMemoryUsed(), 0);
+  }
+  EXPECT_EQ(reservation_manager->GetTotalMemoryUsed(), 0);
+}
+
+TEST(BlobReferenceMetadataTest, RejectsCorruptDescriptorAndBlocks) {
+  BlobReferenceMetadataCollector collector(nullptr);
+  ASSERT_OK(
+      collector.Finish([](const Slice& block, BlockHandle* handle) -> Status {
+        *handle = BlockHandle(1000, block.size());
+        return Status::OK();
+      }));
+  BlobReferenceMetadataDescriptor descriptor = collector.descriptor();
+  descriptor.index_handle = BlockHandle(2000, collector.index_block().size());
+  descriptor.directory_handle =
+      BlockHandle(3000, collector.directory_block().size());
+
+  std::string encoded_descriptor;
+  descriptor.EncodeTo(&encoded_descriptor);
+  std::string corrupt_descriptor = encoded_descriptor;
+  corrupt_descriptor[32] ^= 1;
+  BlobReferenceMetadataDescriptor decoded;
+  EXPECT_TRUE(
+      BlobReferenceMetadataDescriptor::DecodeFrom(corrupt_descriptor, &decoded)
+          .IsCorruption());
+
+  encoded_descriptor.pop_back();
+  EXPECT_TRUE(
+      BlobReferenceMetadataDescriptor::DecodeFrom(encoded_descriptor, &decoded)
+          .IsCorruption());
+
+  std::string corrupt_index = collector.index_block();
+  corrupt_index.back() ^= 1;
+  std::vector<BlobReferenceBlockIndexEntry> block_index;
+  EXPECT_TRUE(DecodeBlobReferenceIndex(corrupt_index, descriptor, &block_index)
+                  .IsCorruption());
 }
 
 // kTypeBlobIndex is a value type used by BlobDB only. The base rocksdb
@@ -210,6 +670,123 @@ class DBBlobIndexTest : public DBTestBase {
 // Note: the following test case pertains to the StackableDB-based BlobDB
 // implementation. We should be able to write kTypeBlobIndex to memtables and
 // SST files.
+TEST_F(DBBlobIndexTest, PrefixGateRejectsBlobIndirection) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  DestroyAndReopen(options);
+  ColumnFamilyData::TEST_SetAllowBlobIndirection(false);
+  struct RestoreGate {
+    ~RestoreGate() { ColumnFamilyData::TEST_SetAllowBlobIndirection(true); }
+  } restore_gate;
+
+  ASSERT_TRUE(dbfull()
+                  ->SetOptions({{"enable_blob_indirection", "true"}})
+                  .IsNotSupported());
+  Options gated = options;
+  gated.enable_blob_indirection = true;
+  ColumnFamilyHandle* handle = nullptr;
+  ASSERT_TRUE(
+      db_->CreateColumnFamily(gated, "gated", &handle).IsNotSupported());
+  ASSERT_EQ(handle, nullptr);
+  Close();
+  ASSERT_TRUE(TryReopen(gated).IsNotSupported());
+}
+
+TEST_F(DBBlobIndexTest, SstFileWriterOutputStaysLegacy) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  // SstFileWriter output never has a DB file number, and without a CF handle
+  // it cannot name a CF, so it must not carry exact repair metadata.
+  const auto write_external = [&](ColumnFamilyHandle* handle,
+                                  const std::string& key) {
+    const std::string path = dbname_ + "_" + key + ".sst";
+    SstFileWriter writer(EnvOptions(), options, handle);
+    EXPECT_OK(writer.Open(path));
+    EXPECT_OK(writer.Put(key, "value"));
+    EXPECT_OK(writer.Finish());
+    return path;
+  };
+  ASSERT_OK(
+      db_->IngestExternalFile({write_external(/*handle=*/nullptr, "no_handle")},
+                              IngestExternalFileOptions()));
+  ASSERT_OK(db_->IngestExternalFile(
+      {write_external(db_->DefaultColumnFamily(), "with_handle")},
+      IngestExternalFileOptions()));
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 2U);
+  for (const auto& table : properties) {
+    EXPECT_EQ(table.second->user_collected_properties.count(
+                  kBlobReferenceDescriptorPropertyName),
+              0U);
+  }
+
+  // Base RepairDB sets aside an SST without a CF name; the one written with
+  // a CF handle must survive repair.
+  Close();
+  ASSERT_OK(RepairDB(dbname_, options));
+  Reopen(options);
+  ASSERT_EQ(Get("with_handle"), "value");
+}
+
+TEST_F(DBBlobIndexTest, FlushRecordsExactReferenceMetadata) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"exact"}, options);
+  const std::string key = "exact-key";
+  const std::string value(100, 'v');
+  ASSERT_OK(Put(1, key, value));
+  ASSERT_OK(Flush(1));
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(handles_[1], &properties));
+  ASSERT_EQ(properties.size(), 1U);
+  const std::string& sst_path = properties.begin()->first;
+  const TableProperties& table_properties = *properties.begin()->second;
+  const auto encoded = table_properties.user_collected_properties.find(
+      kBlobReferenceDescriptorPropertyName);
+  ASSERT_NE(encoded, table_properties.user_collected_properties.end());
+  BlobReferenceMetadataDescriptor descriptor;
+  ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(encoded->second,
+                                                        &descriptor));
+  // The descriptor names the real CF and file, not placeholder values.
+  ASSERT_TRUE(descriptor.HasRepairMetadata());
+  EXPECT_EQ(descriptor.column_family_id, handles_[1]->GetID());
+  EXPECT_EQ(descriptor.sst_file_number, table_properties.orig_file_number);
+  ASSERT_EQ(descriptor.reference_count, 1U);
+  ASSERT_EQ(descriptor.group_count, 1U);
+
+  // The metadata blocks are written uncompressed.
+  std::string sst;
+  ASSERT_OK(ReadFileToString(env_, sst_path, &sst));
+  const auto block = [&](const BlockHandle& handle) {
+    return Slice(sst.data() + handle.offset(),
+                 static_cast<size_t>(handle.size()));
+  };
+  std::vector<BlobReferenceBlockIndexEntry> block_index;
+  ASSERT_OK(DecodeBlobReferenceIndex(block(descriptor.index_handle), descriptor,
+                                     &block_index));
+  std::vector<BlobReferenceGroup> groups;
+  ASSERT_OK(DecodeBlobReferenceDirectory(block(descriptor.directory_handle),
+                                         descriptor, block_index.size(),
+                                         &groups));
+  ASSERT_EQ(groups.size(), 1U);
+  // A normal blob record holds its header, the user key and the value.
+  EXPECT_EQ(groups[0].record_bytes,
+            BlobLogRecord::kHeaderSize + key.size() + value.size());
+}
+
 TEST_F(DBBlobIndexTest, Write) {
   for (auto tier : kAllTiers) {
     DestroyAndReopen(GetTestOptions());

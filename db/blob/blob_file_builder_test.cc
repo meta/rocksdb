@@ -25,6 +25,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/compression.h"
+#include "util/crc32c.h"
 #include "utilities/fault_injection_env.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -198,6 +199,44 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckOneFile) {
   // Verify the contents of the new blob file as well as the blob references
   VerifyBlobFile(blob_file_number, blob_file_path, column_family_id,
                  kNoCompression, expected_key_value_pairs, blob_indexes);
+}
+
+TEST_F(BlobFileBuilderTest, StableIdentityIndex) {
+  Options options;
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlobFileBuilderTest_StableIdentityIndex"),
+      0);
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.env = mock_env_.get();
+
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_cf_options(options);
+  std::vector<std::string> blob_file_paths;
+  std::vector<BlobFileAddition> blob_file_additions;
+  BlobFileBuilder builder(
+      TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
+      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
+      /*job_id=*/1, /*column_family_id=*/123, "foobar", Env::WLTH_MEDIUM,
+      nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
+      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      &blob_file_paths, &blob_file_additions);
+
+  const std::string value = "logical uncompressed value";
+  std::string encoded;
+  ASSERT_OK(builder.Add("key", value, &encoded));
+  ASSERT_OK(builder.Finish());
+
+  BlobIndex blob_index;
+  ASSERT_OK(blob_index.DecodeFrom(encoded));
+  ASSERT_TRUE(blob_index.IsIndirect());
+  EXPECT_EQ(blob_index.generation_file_number(), 2);
+  EXPECT_EQ(blob_index.origin_file_number(), 2);
+  EXPECT_EQ(blob_index.stable_checksum_version(),
+            BlobIndex::kStableChecksumVersion1);
+  EXPECT_EQ(blob_index.stable_checksum(),
+            crc32c::Value(value.data(), value.size()));
 }
 
 TEST_F(BlobFileBuilderTest, BuildAndCheckMultipleFiles) {

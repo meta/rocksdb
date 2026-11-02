@@ -537,6 +537,7 @@ Status VersionEditHandler::MaybeCreateVersionBeforeApplyEdit(
   if (force_create_version) {
     auto* v = new Version(cfd, version_set_, version_set_->file_options_,
                           cfd->GetLatestMutableCFOptions(), io_tracer_,
+                          /*periodic_compaction_phase_params=*/std::nullopt,
                           version_set_->current_version_number_++,
                           epoch_number_requirement_);
     s = builder->SaveTo(v->storage_info());
@@ -924,6 +925,7 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
     const auto& mopts = cfd->GetLatestMutableCFOptions();
     auto* version = new Version(
         cfd, version_set_, version_set_->file_options_, mopts, io_tracer_,
+        /*periodic_compaction_phase_params=*/std::nullopt,
         version_set_->current_version_number_++, epoch_number_requirement_);
     if (!trust_manifest_recovery_ && !defer_sst_file_opening_) {
       s = builder->LoadTableHandlers(

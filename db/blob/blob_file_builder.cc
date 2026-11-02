@@ -28,6 +28,7 @@
 #include "test_util/sync_point.h"
 #include "trace_replay/io_tracer.h"
 #include "util/compression.h"
+#include "util/crc32c.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -80,6 +81,7 @@ BlobFileBuilder::BlobFileBuilder(
                               ? blob_compressor_->ObtainWorkingArea()
                               : Compressor::ManagedWorkingArea{}),
       prepopulate_blob_cache_(mutable_cf_options->prepopulate_blob_cache),
+      enable_blob_indirection_(mutable_cf_options->enable_blob_indirection),
       file_options_(file_options),
       write_options_(write_options),
       db_id_(std::move(db_id)),
@@ -168,8 +170,15 @@ Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
     }
   }
 
-  BlobIndex::EncodeBlob(blob_index, blob_file_number, blob_offset, blob.size(),
-                        blob_compression_type_);
+  if (enable_blob_indirection_) {
+    const uint32_t stable_checksum = crc32c::Value(value.data(), value.size());
+    BlobIndex::EncodeIdentityBlob(blob_index, blob_file_number, blob_offset,
+                                  blob.size(), blob_compression_type_,
+                                  stable_checksum);
+  } else {
+    BlobIndex::EncodeBlob(blob_index, blob_file_number, blob_offset,
+                          blob.size(), blob_compression_type_);
+  }
 
   return Status::OK();
 }

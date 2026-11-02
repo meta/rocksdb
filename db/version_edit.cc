@@ -107,10 +107,16 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
       return s;
     }
   } else if (value_type == kTypeWideColumnEntity) {
-    if (Status s = WideColumnSerialization::ForEachBlobFileNumber(
-            value, update_oldest_blob);
-        !s.ok()) {
+    bool has_blob_columns = false;
+    Status s = WideColumnSerialization::HasBlobColumns(value, has_blob_columns);
+    if (!s.ok()) {
       return s;
+    }
+    if (has_blob_columns) {
+      s = WideColumnSerialization::ForEachBlobIndex(value, update_oldest_blob);
+      if (!s.ok()) {
+        return s;
+      }
     }
   }
 

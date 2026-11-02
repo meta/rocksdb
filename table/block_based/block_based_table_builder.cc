@@ -32,6 +32,7 @@
 #include "db/blob/blob_constants.h"
 #include "db/blob/blob_gen2_format.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/dbformat.h"
 #include "db/wide/wide_column_serialization.h"
 #include "logging/logging.h"
@@ -1307,6 +1308,7 @@ struct BlockBasedTableBuilder::Rep {
   uint64_t buffer_limit = 0;
   std::shared_ptr<CacheReservationManager>
       compression_dict_buffer_cache_res_mgr;
+  std::unique_ptr<BlobReferenceMetadataCollector> blob_reference_collector;
   const bool use_delta_encoding_for_index_values;
   std::unique_ptr<FilterBlockBuilder> filter_builder;
   OffsetableCacheKey base_cache_key;
@@ -1834,6 +1836,21 @@ struct BlockBasedTableBuilder::Rep {
       compression_dict_buffer_cache_res_mgr = nullptr;
     }
 
+    // SstFileWriter output has no DB file number and may lack a known CF, so
+    // it cannot carry repair metadata. It stays in the legacy form.
+    if (tbo.moptions.enable_blob_indirection &&
+        tbo.reason != TableFileCreationReason::kSstFileWriter &&
+        tbo.column_family_id !=
+            TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) {
+      std::shared_ptr<CacheReservationManager> reservation_manager =
+          GetBlobReferenceReservationManager(table_options);
+      blob_reference_collector =
+          std::make_unique<BlobReferenceMetadataCollector>(
+              std::move(reservation_manager), tbo.column_family_id,
+              tbo.cur_file_num, /*route_snapshot_fingerprint_high=*/0,
+              /*route_snapshot_fingerprint_low=*/0);
+    }
+
     // Common user-key prefix feature (format_version >= 8) for index-like
     // blocks: gated uniformly for all index tiers (leaf/partition and the
     // partitioned index / partitioned filter top-level). See
@@ -2209,6 +2226,10 @@ BlockBasedTableBuilder::~BlockBasedTableBuilder() {
 
 void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
   Rep* r = rep_.get();
+  assert(r != nullptr);
+  if (UNLIKELY(r == nullptr)) {
+    return;
+  }
   assert(rep_->state != Rep::State::kClosed);
   if (UNLIKELY(!ok())) {
     return;
@@ -2274,6 +2295,33 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
             r->last_ikey.empty()
                 ? Slice{}
                 : ExtractUserKeyAndStripTimestamp(r->last_ikey, r->ts_sz));
+      }
+    }
+
+    auto* const blob_reference_collector = r->blob_reference_collector.get();
+    if (blob_reference_collector != nullptr) {
+      auto& collector = *blob_reference_collector;
+      const uint64_t user_key_size = ExtractUserKey(entry_ikey).size();
+      ValueType final_value_type;
+      SequenceNumber ignored_seq;
+      UnPackSequenceAndType(ExtractInternalKeyFooter(entry_ikey), &ignored_seq,
+                            &final_value_type);
+      Status reference_status;
+      if (final_value_type == kTypeBlobIndex) {
+        BlobIndex blob_index;
+        reference_status = blob_index.DecodeFrom(entry_value);
+        if (reference_status.ok()) {
+          reference_status = collector.Add(blob_index, user_key_size);
+        }
+      } else if (final_value_type == kTypeWideColumnEntity) {
+        reference_status = WideColumnSerialization::ForEachBlobIndex(
+            entry_value, [&](const BlobIndex& blob_index) {
+              return collector.Add(blob_index, user_key_size);
+            });
+      }
+      if (!reference_status.ok()) {
+        r->SetStatus(reference_status);
+        return;
       }
     }
 
@@ -3745,6 +3793,75 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
   }
 }
 
+void BlockBasedTableBuilder::WriteBlobReferenceMetadata(
+    MetaIndexBuilder* meta_index_builder) {
+  auto* const blob_reference_collector = rep_->blob_reference_collector.get();
+  if (blob_reference_collector == nullptr) {
+    return;
+  }
+  auto& collector = *blob_reference_collector;
+  if (meta_index_builder == nullptr) {
+    rep_->SetStatus(Status::InvalidArgument("Null metadata index builder"));
+    collector.ReleaseWorkingMemory().PermitUncheckedError();
+    return;
+  }
+
+  const auto release_working_memory = [&]() {
+    Status release_status = collector.ReleaseWorkingMemory();
+    if (!release_status.ok()) {
+      rep_->SetStatus(release_status);
+    }
+  };
+  if (!ok()) {
+    release_working_memory();
+    return;
+  }
+
+  Status status =
+      collector.Finish([&](const Slice& block, BlockHandle* handle) -> Status {
+        WriteMaybeCompressedBlock(block, kNoCompression, handle,
+                                  BlockType::kUserDefinedIndex);
+        return rep_->GetStatus();
+      });
+  if (!status.ok()) {
+    rep_->SetStatus(status);
+    release_working_memory();
+    return;
+  }
+
+  BlockHandle index_handle;
+  WriteMaybeCompressedBlock(collector.index_block(), kNoCompression,
+                            &index_handle, BlockType::kUserDefinedIndex);
+  if (!ok()) {
+    release_working_memory();
+    return;
+  }
+  meta_index_builder->Add(kBlobReferenceIndexBlockName, index_handle);
+
+  BlockHandle directory_handle;
+  WriteMaybeCompressedBlock(collector.directory_block(), kNoCompression,
+                            &directory_handle, BlockType::kUserDefinedIndex);
+  if (!ok()) {
+    release_working_memory();
+    return;
+  }
+  meta_index_builder->Add(kBlobReferenceDirectoryBlockName, directory_handle);
+
+  auto* descriptor = collector.mutable_descriptor();
+  descriptor->index_handle = index_handle;
+  descriptor->directory_handle = directory_handle;
+  std::string encoded_descriptor;
+  descriptor->EncodeTo(&encoded_descriptor);
+  const auto [unused, inserted] = rep_->props.user_collected_properties.emplace(
+      kBlobReferenceDescriptorPropertyName, std::move(encoded_descriptor));
+  (void)unused;
+  if (!inserted) {
+    rep_->SetStatus(Status::Corruption(
+        "Duplicate blob reference descriptor table property"));
+  }
+  release_working_memory();
+}
+
 void BlockBasedTableBuilder::WriteCompressionDictBlock(
     MetaIndexBuilder* meta_index_builder) {
   Slice compression_dict;
@@ -4057,9 +4174,10 @@ Status BlockBasedTableBuilder::Finish() {
   //    2. [meta block: index]
   //    3. [meta block: compression dictionary]
   //    4. [meta block: range deletion tombstone]
-  //    5. [meta block: properties]
-  //    6. [metaindex block]
-  //    7. Footer
+  //    5. [meta blocks: exact blob references]
+  //    6. [meta block: properties]
+  //    7. [metaindex block]
+  //    8. Footer
   BlockHandle metaindex_block_handle;
   BlockHandle index_block_handle;
   MetaIndexBuilder meta_index_builder;
@@ -4067,6 +4185,7 @@ Status BlockBasedTableBuilder::Finish() {
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);
+  WriteBlobReferenceMetadata(&meta_index_builder);
   WritePropertiesBlock(&meta_index_builder);
   if (LIKELY(ok())) {
     // flush the meta index block
@@ -4104,6 +4223,10 @@ void BlockBasedTableBuilder::Abandon() {
   assert(rep_->state != Rep::State::kClosed);
   if (rep_->IsParallelCompressionActive()) {
     StopParallelCompression(/*abort=*/true);
+  }
+  if (rep_->blob_reference_collector) {
+    rep_->blob_reference_collector->ReleaseWorkingMemory()
+        .PermitUncheckedError();
   }
   rep_->state = Rep::State::kClosed;
   rep_->GetIOStatus().PermitUncheckedError();
@@ -4170,13 +4293,19 @@ uint64_t BlockBasedTableBuilder::EstimatedTailSize() const {
     estimated_tail_size += rep_->range_del_block.CurrentSizeEstimate();
   }
 
-  // 5. Estimate properties block size conservatively (~1-2KB)
+  // 5. Conservatively bound exact external-blob reference metadata.
+  if (rep_->blob_reference_collector) {
+    estimated_tail_size +=
+        rep_->blob_reference_collector->EstimatedEncodedSize();
+  }
+
+  // 6. Estimate properties block size conservatively (~1-2KB)
   estimated_tail_size += 2048;
 
-  // 6. Estimate meta-index block size conservatively (~1KB)
+  // 7. Estimate meta-index block size conservatively (~1KB)
   estimated_tail_size += 1024;
 
-  // 7. Add footer size
+  // 8. Add footer size
   estimated_tail_size += Footer::kMaxEncodedLength;
 
   return estimated_tail_size;

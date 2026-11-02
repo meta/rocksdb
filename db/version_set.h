@@ -564,6 +564,11 @@ class VersionStorageInfo {
     files_marked_for_periodic_compaction_.emplace_back(level, f);
   }
 
+  const PeriodicCompactionPhaseParams& TEST_GetPeriodicCompactionPhaseParams()
+      const {
+    return periodic_compaction_phase_params_;
+  }
+
   // REQUIRES: PrepareForVersionAppend has been called
   const autovector<std::pair<int, FileMetaData*>>& BottommostFiles() const {
     assert(finalized_);
@@ -1292,6 +1297,8 @@ class Version {
   Version(ColumnFamilyData* cfd, VersionSet* vset, const FileOptions& file_opt,
           const MutableCFOptions& mutable_cf_options,
           const std::shared_ptr<IOTracer>& io_tracer,
+          std::optional<PeriodicCompactionPhaseParams>
+              periodic_compaction_phase_params,
           uint64_t version_number = 0,
           EpochNumberRequirement epoch_number_requirement =
               EpochNumberRequirement::kMustPresent);
@@ -1361,6 +1368,15 @@ class VersionSet {
   void UpdatedMutableDbOptions(const MutableDBOptions& updated_options,
                                InstrumentedMutex* mu);
 
+  // `kUniqueColumnFamilies` is a caller contract that every writer in this
+  // LogAndApply call has a different, non-null ColumnFamilyData. It lets
+  // ProcessManifestWrites create one Version per writer without searching for
+  // an earlier writer for the same column family.
+  enum class LogAndApplyColumnFamilyMode {
+    kMayRepeatColumnFamilies,
+    kUniqueColumnFamilies,
+  };
+
   Status LogAndApplyToDefaultColumnFamily(
       const ReadOptions& read_options, const WriteOptions& write_options,
       VersionEdit* edit, InstrumentedMutex* mu,
@@ -1392,7 +1408,10 @@ class VersionSet {
     autovector<VersionEdit*> edit_list;
     edit_list.emplace_back(edit);
     edit_lists.emplace_back(edit_list);
-    return LogAndApply(cfds, read_options, write_options, edit_lists, mu,
+    return LogAndApply(cfds, read_options, write_options, edit_lists,
+                       LogAndApplyColumnFamilyMode::kMayRepeatColumnFamilies,
+                       /*new_mutable_cf_options=*/nullptr,
+                       /*compaction_phase_anchor_time=*/std::nullopt, mu,
                        dir_contains_current_file, new_descriptor_log,
                        column_family_options, {manifest_wcb}, pre_cb);
   }
@@ -1420,18 +1439,25 @@ class VersionSet {
     cfds.emplace_back(column_family_data);
     autovector<autovector<VersionEdit*>> edit_lists;
     edit_lists.emplace_back(edit_list);
-    return LogAndApply(cfds, read_options, write_options, edit_lists, mu,
+    return LogAndApply(cfds, read_options, write_options, edit_lists,
+                       LogAndApplyColumnFamilyMode::kMayRepeatColumnFamilies,
+                       /*new_mutable_cf_options=*/nullptr,
+                       /*compaction_phase_anchor_time=*/std::nullopt, mu,
                        dir_contains_current_file, new_descriptor_log,
                        column_family_options, {manifest_wcb}, pre_cb);
   }
 
-  // The across-multi-cf batch version. If edit_lists contain more than
-  // 1 version edits, caller must ensure that no edit in the []list is column
-  // family manipulation.
+  // The across-multi-cf batch version. If edit_lists contain more than one
+  // version edit, caller must ensure that no edit in the lists is column family
+  // manipulation. `column_family_mode` is an explicit caller contract and must
+  // not be inferred from the edit contents or other arguments.
   virtual Status LogAndApply(
       const autovector<ColumnFamilyData*>& cfds,
       const ReadOptions& read_options, const WriteOptions& write_options,
       const autovector<autovector<VersionEdit*>>& edit_lists,
+      LogAndApplyColumnFamilyMode column_family_mode,
+      const autovector<const MutableCFOptions*>* new_mutable_cf_options,
+      std::optional<uint64_t> compaction_phase_anchor_time,
       InstrumentedMutex* mu, FSDirectory* dir_contains_current_file,
       bool new_descriptor_log = false,
       const ColumnFamilyOptions* new_cf_options = nullptr,
@@ -1839,12 +1865,17 @@ class VersionSet {
   PeriodicCompactionPhaseParams GetPeriodicCompactionPhaseParams(
       uint32_t cf_id) const;
 
-  // (Re)anchor periodic-compaction phasing to now and refresh the cached phase
-  // params on every column family's current Version. Called when a CF's
-  // periodic_compaction_seconds changes via SetOptions, so a turn-down's newly
-  // past-due cohort is spread (over the phase grid within ~N/4 of now) instead
-  // of firing all at once. Caller must hold the DB mutex.
-  void ReanchorCompactionPhase();
+  // Prepares a new anchor without mutating live phasing state. If the clock is
+  // unavailable, returns no anchor and SetOptions retains the current one.
+  std::optional<uint64_t> PrepareCompactionPhaseReanchor() const;
+
+  PeriodicCompactionPhaseParams GetPeriodicCompactionPhaseParamsAtAnchor(
+      uint32_t cf_id, uint64_t anchor_time) const;
+
+  // Atomically commits an anchor and refreshes every live Version's cached
+  // parameters. Replacement Versions prepared for SetOptions already carry
+  // these parameters. Caller must hold the DB mutex.
+  void CommitCompactionPhaseReanchor(uint64_t anchor_time);
 
   const ImmutableDBOptions* db_options() const { return db_options_; }
 
@@ -1864,7 +1895,8 @@ class VersionSet {
     assert(cfd);
 
     Version* const version = new Version(
-        cfd, this, file_options_, cfd->GetLatestMutableCFOptions(), io_tracer_);
+        cfd, this, file_options_, cfd->GetLatestMutableCFOptions(), io_tracer_,
+        /*periodic_compaction_phase_params=*/std::nullopt);
 
     constexpr bool update_stats = false;
     // TODO: plumb Env::IOActivity, Env::IOPriority
@@ -1979,6 +2011,8 @@ class VersionSet {
       uint64_t initial_file_size = 0) const;
 
   void AppendVersion(ColumnFamilyData* column_family_data, Version* v);
+
+  void RefreshCurrentVersionCompactionPhaseParams();
 
   ColumnFamilyData* CreateColumnFamily(const ColumnFamilyOptions& cf_options,
                                        const ReadOptions& read_options,
@@ -2124,6 +2158,7 @@ class VersionSet {
  private:
   // REQUIRES db mutex at beginning. may release and re-acquire db mutex
   Status ProcessManifestWrites(std::deque<ManifestWriter>& writers,
+                               LogAndApplyColumnFamilyMode column_family_mode,
                                InstrumentedMutex* mu,
                                FSDirectory* dir_contains_current_file,
                                bool new_descriptor_log,
@@ -2136,6 +2171,9 @@ class VersionSet {
       const autovector<ColumnFamilyData*>& column_family_datas,
       const ReadOptions& read_options, const WriteOptions& write_options,
       const autovector<autovector<VersionEdit*>>& edit_lists,
+      LogAndApplyColumnFamilyMode column_family_mode,
+      const autovector<const MutableCFOptions*>* new_mutable_cf_options,
+      std::optional<uint64_t> compaction_phase_anchor_time,
       InstrumentedMutex* mu, FSDirectory* dir_contains_current_file,
       bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
       bool new_cf_options_are_sanitized,
@@ -2246,6 +2284,10 @@ class ReactiveVersionSet : public VersionSet {
       const ReadOptions& /* read_options */,
       const WriteOptions& /* write_options */,
       const autovector<autovector<VersionEdit*>>& /*edit_lists*/,
+      LogAndApplyColumnFamilyMode /*column_family_mode*/,
+      const autovector<const MutableCFOptions*>*
+      /*new_mutable_cf_options*/,
+      std::optional<uint64_t> /*compaction_phase_anchor_time*/,
       InstrumentedMutex* /*mu*/, FSDirectory* /*dir_contains_current_file*/,
       bool /*new_descriptor_log*/, const ColumnFamilyOptions* /*new_cf_option*/,
       const std::vector<std::function<void(const Status&)>>& /*manifest_wcbs*/,
