@@ -70,6 +70,8 @@ class BlobLogWriter {
 
   uint64_t get_log_number() const { return log_number_; }
 
+  uint64_t get_file_size() const { return block_offset_; }
+
   Status Sync(const WriteOptions& write_options);
 
  private:
