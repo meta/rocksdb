@@ -1,0 +1,1 @@
+Added `CompactionFilter::GetMergeOrder()` and `CompactionFilterFactory::GetMergeOrder()` to optionally run the merge operator before the compaction filter during compaction, so that the filter sees merge results. The default behavior is unchanged.

@@ -448,7 +448,12 @@ class CompactionIterator {
 
   // Invoke compaction filter if needed.
   // Return true on success, false on failures (e.g.: kIOError).
-  bool InvokeFilterIfNeeded(bool* need_skip, Slice* skip_until);
+  bool InvokeFilterIfNeeded(bool* need_skip, Slice* skip_until,
+                            bool merge_output);
+  bool SelectMergeOutput(uint8_t valid_context);
+  bool PrefilterUncombinedOutputs(uint8_t valid_context);
+  bool ProcessDeletion(SequenceNumber prev_snapshot,
+                       bool input_already_advanced);
 
   // Given a sequence number, return the sequence number of the
   // earliest snapshot that this sequence number is visible in.
@@ -509,6 +514,7 @@ class CompactionIterator {
   BlobFileBuilder* blob_file_builder_;
   std::unique_ptr<CompactionProxy> compaction_;
   const CompactionFilter* compaction_filter_;
+  const CompactionFilter::MergeOrder merge_order_;
   const bool filter_supports_v4_;
   const std::atomic<bool>* shutting_down_;
   const std::atomic<bool>& manual_compaction_canceled_;
@@ -601,6 +607,17 @@ class CompactionIterator {
   bool clear_and_output_next_key_ = false;
 
   MergeOutputIterator merge_out_iter_;
+  // Merge-before-filter decisions for the current batch of uncombined
+  // operands. They are made before any operand is output, so
+  // kRemoveAndSkipUntil drops the whole batch, as in the legacy order.
+  struct UncombinedDecision {
+    bool keep = true;
+    bool changed = false;
+    std::string value;
+  };
+  std::vector<UncombinedDecision> uncombined_decisions_;
+  size_t uncombined_index_ = 0;
+  bool uncombined_prefiltered_ = false;
   Status merge_until_status_;
   // PinnedIteratorsManager used to pin input_ Iterator blocks while reading
   // merge operands and then releasing them after consuming them.

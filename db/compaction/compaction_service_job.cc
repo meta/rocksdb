@@ -110,13 +110,15 @@ Status ValidateRemoteBlobFile(FileSystem* fs, const FileOptions& file_options,
 
 CompactionServiceJobStatus
 CompactionJob::ProcessKeyValueCompactionWithCompactionService(
-    SubcompactionState* sub_compact) {
+    SubcompactionState* sub_compact, CompactionFilter::MergeOrder merge_order) {
   assert(sub_compact);
   assert(sub_compact->compaction);
   assert(db_options_.compaction_service);
 
   const Compaction* const compaction = sub_compact->compaction;
   CompactionServiceInput compaction_input;
+  compaction_input.merge_before_filter =
+      merge_order == CompactionFilter::MergeOrder::kMergeBeforeFilter;
   compaction_input.output_level = compaction->output_level();
   compaction_input.db_id = db_id_;
 
@@ -295,6 +297,7 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       compaction->output_level());
   info.use_separate_remote_compaction_pool =
       compaction->use_separate_remote_compaction_pool();
+  info.merge_before_filter = compaction_input.merge_before_filter;
   CompactionServiceScheduleResponse response =
       db_options_.compaction_service->Schedule(info, compaction_input_binary);
   switch (response.status) {
@@ -396,6 +399,31 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
   s = CompactionServiceResult::Read(compaction_result_binary,
                                     &compaction_result);
 
+  if (s.ok() && compaction_result.merge_order_mismatch &&
+      (compaction_status == CompactionServiceJobStatus::kSuccess ||
+       compaction_status == CompactionServiceJobStatus::kFailure)) {
+    if (!compaction_result.status.IsNotSupported() ||
+        !compaction_result.output_files.empty() ||
+        !compaction_result.blob_file_additions.empty() ||
+        !compaction_result.blob_file_garbages.empty() ||
+        compaction_result.stats.num_input_records != 0 ||
+        compaction_result.merge_before_filter_version != 0) {
+      sub_compact->status =
+          Status::Corruption("Invalid remote compaction filter order decline");
+      db_options_.compaction_service->OnInstallation(
+          response.scheduled_job_id, CompactionServiceJobStatus::kFailure);
+      return CompactionServiceJobStatus::kFailure;
+    }
+    ROCKS_LOG_WARN(db_options_.info_log,
+                   "[%s] [JOB %d] Worker declined compaction filter order; "
+                   "falling back to local compaction",
+                   compaction->column_family_data()->GetName().c_str(),
+                   job_id_);
+    db_options_.compaction_service->OnInstallation(
+        response.scheduled_job_id, CompactionServiceJobStatus::kUseLocal);
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+
   if (compaction_status == CompactionServiceJobStatus::kFailure) {
     if (s.ok()) {
       if (compaction_result.status.ok()) {
@@ -470,6 +498,21 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     db_options_.compaction_service->OnInstallation(
         response.scheduled_job_id, CompactionServiceJobStatus::kFailure);
     return CompactionServiceJobStatus::kFailure;
+  }
+
+  const uint64_t expected_merge_version =
+      compaction_input.merge_before_filter
+          ? kCompactionServiceMergeBeforeFilterVersion
+          : 0;
+  if (compaction_result.merge_before_filter_version != expected_merge_version) {
+    ROCKS_LOG_WARN(db_options_.info_log,
+                   "[%s] [JOB %d] Declining remote compaction filter order "
+                   "acknowledgment; falling back to local compaction",
+                   compaction->column_family_data()->GetName().c_str(),
+                   job_id_);
+    db_options_.compaction_service->OnInstallation(
+        response.scheduled_job_id, CompactionServiceJobStatus::kUseLocal);
+    return CompactionServiceJobStatus::kUseLocal;
   }
 
   auto decline_blob_result = [&](const std::string& reason) {
@@ -1151,6 +1194,25 @@ void CompactionServiceCompactionJob::Prepare(
                          compaction_progress_writer);
 }
 
+Status CompactionServiceCompactionJob::ValidateCompactionFilterMergeOrder(
+    const CompactionFilter* compaction_filter,
+    CompactionFilter::MergeOrder merge_order) {
+  // Without an active filter, both orders produce the same output.
+  const bool actual_merge_before_filter =
+      compaction_filter == nullptr
+          ? compaction_input_.merge_before_filter
+          : merge_order == CompactionFilter::MergeOrder::kMergeBeforeFilter;
+  if (actual_merge_before_filter != compaction_input_.merge_before_filter) {
+    compaction_result_->merge_order_mismatch = true;
+    return Status::NotSupported(
+        "Remote compaction filter order does not match the primary request");
+  }
+  compaction_result_->merge_before_filter_version =
+      actual_merge_before_filter ? kCompactionServiceMergeBeforeFilterVersion
+                                 : 0;
+  return Status::OK();
+}
+
 Status CompactionServiceCompactionJob::Run() {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_RUN);
@@ -1375,6 +1437,9 @@ static std::unordered_map<std::string, OptionTypeInfo> cfd_type_info = {
 };
 
 static std::unordered_map<std::string, OptionTypeInfo> cs_input_type_info = {
+    {"merge_before_filter",
+     {offsetof(struct CompactionServiceInput, merge_before_filter),
+      OptionType::kBoolean}},
     {"cf_name",
      {offsetof(struct CompactionServiceInput, cf_name),
       OptionType::kEncodedString}},
@@ -1888,6 +1953,12 @@ static std::unordered_map<std::string, OptionTypeInfo>
 };
 
 static std::unordered_map<std::string, OptionTypeInfo> cs_result_type_info = {
+    {"merge_before_filter_version",
+     {offsetof(struct CompactionServiceResult, merge_before_filter_version),
+      OptionType::kUInt64T}},
+    {"merge_order_mismatch",
+     {offsetof(struct CompactionServiceResult, merge_order_mismatch),
+      OptionType::kBoolean}},
     {"status",
      {offsetof(struct CompactionServiceResult, status),
       OptionType::kCustomizable, OptionVerificationType::kNormal,
@@ -1979,6 +2050,7 @@ Status CompactionServiceInput::Read(const std::string& data_str,
   }
   auto format_version = DecodeFixed32(data_str.data());
   if (format_version == kOptionsString) {
+    obj->merge_before_filter = false;
     obj->input_blob_files.clear();
     obj->has_blob_gc_cutoff_file_number = false;
     obj->blob_gc_cutoff_file_number = 0;
@@ -2030,6 +2102,8 @@ Status CompactionServiceResult::Read(const std::string& data_str,
   }
   auto format_version = DecodeFixed32(data_str.data());
   if (format_version == kOptionsString) {
+    obj->merge_before_filter_version = 0;
+    obj->merge_order_mismatch = false;
     obj->blob_file_additions.clear();
     obj->blob_file_garbages.clear();
     obj->blob_compaction_version = 0;

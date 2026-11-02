@@ -2086,6 +2086,9 @@ std::string StressTest::DebugString(const Slice& value,
 }
 
 void StressTest::PrintStatistics() {
+  if (FLAGS_merge_before_compaction_filter) {
+    GetDbStressMergeFilterCounters().Print();
+  }
   // Print statistics from the DB instance instead of global dbstats
   if (db_) {
     auto stats = db_->GetOptions().statistics;

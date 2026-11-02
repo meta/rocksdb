@@ -30,6 +30,91 @@
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+namespace {
+// Merge-before-filter runs only in compaction; flush, recovery and other table
+// creation paths do not run the merge-before-filter logic. No default case, so
+// that -Wswitch flags a new reason, which must also be added to
+// kAllTableFileCreationReasons.
+bool SupportsMergeBeforeFilter(TableFileCreationReason reason) {
+  switch (reason) {
+    case TableFileCreationReason::kCompaction:
+      return true;
+    case TableFileCreationReason::kFlush:
+    case TableFileCreationReason::kRecovery:
+    case TableFileCreationReason::kMisc:
+    case TableFileCreationReason::kSstFileWriter:
+      return false;
+  }
+  return false;
+}
+
+constexpr TableFileCreationReason kAllTableFileCreationReasons[] = {
+    TableFileCreationReason::kFlush, TableFileCreationReason::kCompaction,
+    TableFileCreationReason::kRecovery, TableFileCreationReason::kMisc,
+    TableFileCreationReason::kSstFileWriter};
+}  // namespace
+
+Status GetCompactionFilterMergeOrder(const CompactionFilter* filter,
+                                     const CompactionFilterFactory* factory,
+                                     TableFileCreationReason reason,
+                                     CompactionFilter::MergeOrder* order) {
+  using Order = CompactionFilter::MergeOrder;
+  const Order filter_order =
+      filter ? filter->GetMergeOrder() : Order::kFilterBeforeMerge;
+  const Order factory_order =
+      factory ? factory->GetMergeOrder() : Order::kFilterBeforeMerge;
+  if (factory && filter && filter_order != factory_order) {
+    return Status::InvalidArgument(
+        "Compaction filter/factory merge order mismatch");
+  }
+  *order = factory ? factory_order : filter_order;
+  if (*order == Order::kMergeBeforeFilter &&
+      !SupportsMergeBeforeFilter(reason)) {
+    return Status::InvalidArgument(
+        "Merge-before-filter is supported only during compaction");
+  }
+  return Status::OK();
+}
+
+bool DeclaresMergeBeforeFilter(const ColumnFamilyOptions& cf_opts) {
+  using Order = CompactionFilter::MergeOrder;
+  return (cf_opts.compaction_filter &&
+          cf_opts.compaction_filter->GetMergeOrder() ==
+              Order::kMergeBeforeFilter) ||
+         (cf_opts.compaction_filter_factory &&
+          cf_opts.compaction_filter_factory->GetMergeOrder() ==
+              Order::kMergeBeforeFilter);
+}
+
+Status MergeBeforeFilterTransactionError() {
+  return Status::NotSupported(
+      "Merge-before-filter does not support WritePrepared or WriteUnprepared "
+      "transactions");
+}
+
+Status ValidateCompactionFilterOptions(const ColumnFamilyOptions& cf_opts) {
+  if (!DeclaresMergeBeforeFilter(cf_opts)) {
+    return Status::OK();
+  }
+  const CompactionFilterFactory* factory =
+      cf_opts.compaction_filter_factory.get();
+  if (factory && factory->GetMergeOrder() ==
+                     CompactionFilter::MergeOrder::kMergeBeforeFilter) {
+    for (TableFileCreationReason reason : kAllTableFileCreationReasons) {
+      if (!SupportsMergeBeforeFilter(reason) &&
+          factory->ShouldFilterTableFileCreation(reason)) {
+        return Status::InvalidArgument(
+            "Merge-before-filter factory selects non-compaction creation");
+      }
+    }
+  }
+  if (cf_opts.comparator && cf_opts.comparator->timestamp_size() != 0) {
+    return Status::NotSupported(
+        "Merge-before-filter does not support user-defined timestamps");
+  }
+  return Status::OK();
+}
+
 ConfigOptions::ConfigOptions() : registry(ObjectRegistry::NewInstance()) {
   env = Env::Default();
 }

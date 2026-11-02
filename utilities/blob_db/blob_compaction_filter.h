@@ -44,6 +44,11 @@ class BlobIndexCompactionFilterBase : public LayeredCompactionFilterBase {
 
   ~BlobIndexCompactionFilterBase() override;
 
+  MergeOrder GetMergeOrder() const override {
+    return user_comp_filter() ? user_comp_filter()->GetMergeOrder()
+                              : MergeOrder::kFilterBeforeMerge;
+  }
+
   // Filter expired blob indexes regardless of snapshots.
   bool IgnoreSnapshots() const override { return true; }
 

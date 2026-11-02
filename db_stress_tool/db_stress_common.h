@@ -82,6 +82,9 @@ using GFLAGS_NAMESPACE::SetUsageMessage;
 
 DECLARE_uint64(seed);
 DECLARE_bool(read_only);
+DECLARE_bool(merge_before_compaction_filter);
+DECLARE_uint32(merge_before_filter_change_one_in);
+DECLARE_bool(merge_before_filter_remove_deleted);
 DECLARE_int64(max_key);
 DECLARE_double(hot_key_alpha);
 DECLARE_int32(max_key_len);

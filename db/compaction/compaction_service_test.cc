@@ -38,6 +38,7 @@
 #include "rocksdb/utilities/options_util.h"
 #include "table/block_based/block_based_table_factory.h"
 #include "table/unique_id_impl.h"
+#include "test_util/merge_filter_test_util.h"
 #include "test_util/mock_time_env.h"
 #include "util/cast_util.h"
 #include "util/defer.h"
@@ -326,6 +327,21 @@ class MyTestCompactionService : public CompactionService {
 
   const char* Name() const override { return kClassName(); }
 
+  bool SupportsMergeBeforeFilter() const override {
+    return supports_merge_before_filter_;
+  }
+
+  void SetSupportsMergeBeforeFilter(bool value) {
+    supports_merge_before_filter_ = value;
+  }
+
+  void SetWorkerCompactionFilter(
+      const CompactionFilter* filter,
+      std::shared_ptr<CompactionFilterFactory> factory) {
+    options_.compaction_filter = filter;
+    options_.compaction_filter_factory = std::move(factory);
+  }
+
   CompactionServiceScheduleResponse Schedule(
       const CompactionServiceJobInfo& info,
       const std::string& compaction_service_input) override {
@@ -564,6 +580,7 @@ class MyTestCompactionService : public CompactionService {
  private:
   std::atomic_int compaction_num_{0};
   Options options_;
+  bool supports_merge_before_filter_ = false;
   CompactionServiceJobInfo start_info_;
   CompactionServiceJobInfo wait_info_;
   bool is_override_start_status_ = false;
@@ -746,6 +763,521 @@ TEST_F(CompactionServiceTest, RemotePoolPropertyDoesNotCreatePool) {
   EXPECT_EQ(pools_created, 1);
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteFullResults) {
+  for (bool use_factory : {false, true}) {
+    for (bool blobs : {false, true}) {
+      for (CompactionFilter::Decision decision :
+           {CompactionFilter::Decision::kKeep,
+            CompactionFilter::Decision::kChangeValue,
+            CompactionFilter::Decision::kRemove,
+            CompactionFilter::Decision::kPurge}) {
+        if (use_factory &&
+            decision == CompactionFilter::Decision::kChangeValue) {
+          continue;
+        }
+        SCOPED_TRACE(blobs);
+        SCOPED_TRACE(use_factory);
+        SCOPED_TRACE(static_cast<int>(decision));
+        test::MergeFilterTrace trace;
+        test::RecordingMergeFilter filter(
+            CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+        filter.replacement = "replacement";
+        auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+            CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+        Options options = CurrentOptions();
+        options.disable_auto_compactions = true;
+        options.enable_blob_files = blobs;
+        options.min_blob_size = 1;
+        options.merge_operator =
+            std::make_shared<test::RecordingMergeOperator>(&trace);
+        if (use_factory) {
+          options.compaction_filter_factory = factory;
+        } else {
+          options.compaction_filter = &filter;
+        }
+        ReopenWithCompactionService(&options);
+        GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+        ASSERT_OK(Put("a", "older"));
+        ASSERT_OK(Flush());
+        const Snapshot* snapshot = db_->GetSnapshot();
+        MoveFilesToLevel(2);
+        const int previous_jobs = GetCompactionService()->GetCompactionNum();
+        filter.value_decision = decision;
+        factory->value_decision = decision;
+        ASSERT_OK(Put("a", "base"));
+        ASSERT_OK(Flush());
+        ASSERT_OK(Merge("a", "M"));
+        ASSERT_OK(Flush());
+        trace.Clear();
+        std::vector<LiveFileMetaData> files;
+        db_->GetLiveFilesMetaData(&files);
+        std::vector<std::string> inputs;
+        for (const auto& file : files) {
+          if (file.level == 0) {
+            inputs.push_back(file.relative_filename);
+          }
+        }
+        CompactionOptions compact;
+        ASSERT_OK(db_->CompactFiles(compact, inputs, 1));
+        ASSERT_EQ(previous_jobs + 1,
+                  GetCompactionService()->GetCompactionNum());
+        ASSERT_TRUE(GetCompactionService()
+                        ->GetCompactionInfoForStart()
+                        .merge_before_filter);
+        ASSERT_EQ((std::vector<std::string>{"full:a:baseM", "value:a:baseM"}),
+                  trace.Events());
+        CompactionServiceResult result;
+        GetCompactionService()->GetResult(&result);
+        ASSERT_OK(result.status);
+        ASSERT_EQ(kCompactionServiceMergeBeforeFilterVersion,
+                  result.merge_before_filter_version);
+        ASSERT_FALSE(result.merge_order_mismatch);
+        const std::string expected =
+            decision == CompactionFilter::Decision::kKeep ? "baseM"
+            : decision == CompactionFilter::Decision::kChangeValue
+                ? "replacement"
+                : "NOT_FOUND";
+        ASSERT_EQ(expected, Get("a"));
+        ReadOptions read;
+        read.snapshot = snapshot;
+        std::string old_value;
+        ASSERT_OK(db_->Get(read, "a", &old_value));
+        ASSERT_EQ("older", old_value);
+        db_->ReleaseSnapshot(snapshot);
+      }
+    }
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteAcknowledgmentFallback) {
+  for (uint64_t acknowledgment : {uint64_t{0}, uint64_t{2}}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    filter.value_decision = CompactionFilter::Decision::kPurge;
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.merge_operator =
+        std::make_shared<test::RecordingMergeOperator>(&trace);
+    options.compaction_filter = &filter;
+    ReopenWithCompactionService(&options);
+    GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+    GetCompactionService()->SetWaitResultMutator(
+        [acknowledgment](std::string* serialized) {
+          CompactionServiceResult result;
+          ASSERT_OK(CompactionServiceResult::Read(*serialized, &result));
+          ASSERT_OK(result.status);
+          result.merge_before_filter_version = acknowledgment;
+          serialized->clear();
+          ASSERT_OK(result.Write(serialized));
+        });
+    ASSERT_OK(Put("a", "base"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Merge("a", "M"));
+    ASSERT_OK(Flush());
+    trace.Clear();
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    ASSERT_EQ("NOT_FOUND", Get("a"));
+    ASSERT_EQ(1, GetCompactionService()->GetCompactionNum());
+    ASSERT_EQ(1, GetCompactionService()->GetUseLocalInstallationCount());
+    ASSERT_EQ((std::vector<std::string>{"full:a:baseM", "value:a:baseM",
+                                        "full:a:baseM", "value:a:baseM"}),
+              trace.Events());
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemotePartialAndDeclined) {
+  for (bool partial_success : {false, true}) {
+    for (CompactionFilter::Decision decision :
+         {CompactionFilter::Decision::kKeep,
+          CompactionFilter::Decision::kChangeValue,
+          CompactionFilter::Decision::kRemove}) {
+      SCOPED_TRACE(partial_success);
+      SCOPED_TRACE(static_cast<int>(decision));
+      test::MergeFilterTrace trace;
+      auto merge = std::make_shared<test::RecordingMergeOperator>(&trace);
+      merge->partial_success = partial_success;
+      test::RecordingMergeFilter filter(
+          CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+      filter.operand_decision = decision;
+      filter.replacement = "X";
+      Options options = CurrentOptions();
+      options.disable_auto_compactions = true;
+      options.compaction_filter = &filter;
+      options.merge_operator = merge;
+      ReopenWithCompactionService(&options);
+      GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+      ASSERT_OK(Put("a", "base"));
+      ASSERT_OK(Flush());
+      MoveFilesToLevel(2);
+      ASSERT_OK(Merge("a", "A"));
+      ASSERT_OK(Flush());
+      ASSERT_OK(Merge("a", "B"));
+      ASSERT_OK(Flush());
+      trace.Clear();
+      std::vector<LiveFileMetaData> files;
+      db_->GetLiveFilesMetaData(&files);
+      std::vector<std::string> inputs;
+      for (const auto& file : files) {
+        if (file.level == 0) {
+          inputs.push_back(file.relative_filename);
+        }
+      }
+      CompactionOptions compact;
+      ASSERT_OK(db_->CompactFiles(compact, inputs, 1));
+      ASSERT_EQ(0, GetCompactionService()->GetUseLocalInstallationCount());
+      ASSERT_EQ(partial_success
+                    ? (std::vector<std::string>{"partial:a:AB", "operand:a:AB"})
+                    : (std::vector<std::string>{"partial:a:AB", "operand:a:B",
+                                                "operand:a:A"}),
+                trace.Events());
+      const std::string expected =
+          decision == CompactionFilter::Decision::kKeep ? "baseAB"
+          : decision == CompactionFilter::Decision::kChangeValue
+              ? (partial_success ? "baseX" : "baseXX")
+              : "base";
+      ASSERT_EQ(expected, Get("a"));
+    }
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteErrorsDoNotFallback) {
+  for (bool factory_mismatch : {false, true}) {
+    test::MergeFilterTrace trace;
+    auto merge = std::make_shared<test::RecordingMergeOperator>(&trace);
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.merge_operator = merge;
+    options.compaction_filter = &filter;
+    ReopenWithCompactionService(&options);
+    GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+    if (factory_mismatch) {
+      factory->instance_order =
+          CompactionFilter::MergeOrder::kFilterBeforeMerge;
+      GetCompactionService()->SetWorkerCompactionFilter(nullptr, factory);
+    } else {
+      merge->fail_full = true;
+      merge->failure_scope = MergeOperator::OpFailureScope::kTryMerge;
+    }
+    ASSERT_OK(Put("a", "base"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Merge("a", "M"));
+    ASSERT_OK(Flush());
+    trace.Clear();
+    Status status = db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+    ASSERT_FALSE(status.ok());
+    ASSERT_EQ(0, GetCompactionService()->GetUseLocalInstallationCount());
+    CompactionServiceResult result;
+    GetCompactionService()->GetResult(&result);
+    ASSERT_FALSE(result.status.ok());
+    ASSERT_FALSE(result.merge_order_mismatch);
+    ASSERT_TRUE(result.output_files.empty());
+    if (factory_mismatch) {
+      ASSERT_TRUE(status.IsInvalidArgument());
+      ASSERT_TRUE(trace.Events().empty());
+    }
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteInvalidDecline) {
+  test::MergeFilterTrace trace;
+  test::RecordingMergeFilter filter(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.compaction_filter = &filter;
+  options.merge_operator =
+      std::make_shared<test::RecordingMergeOperator>(&trace);
+  ReopenWithCompactionService(&options);
+  GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+  GetCompactionService()->SetWaitResultMutator([](std::string* serialized) {
+    CompactionServiceResult result;
+    ASSERT_OK(CompactionServiceResult::Read(*serialized, &result));
+    ASSERT_OK(result.status);
+    result.status = Status::IOError("Injected worker error");
+    result.merge_order_mismatch = true;
+    result.merge_before_filter_version = 0;
+    result.stats.num_input_records = 0;
+    result.output_files.clear();
+    serialized->clear();
+    ASSERT_OK(result.Write(serialized));
+  });
+  ASSERT_OK(Put("a", "base"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Merge("a", "M"));
+  ASSERT_OK(Flush());
+  Status status = db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_TRUE(status.IsCorruption());
+  ASSERT_EQ("baseM", Get("a"));
+  ASSERT_EQ(0, GetCompactionService()->GetUseLocalInstallationCount());
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteWorkerOrderMismatch) {
+  for (bool new_order_primary : {false, true}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeFilter legacy(
+        CompactionFilter::MergeOrder::kFilterBeforeMerge, &trace);
+    test::RecordingMergeFilter newer(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.merge_operator =
+        std::make_shared<test::RecordingMergeOperator>(&trace);
+    options.compaction_filter = new_order_primary ? &newer : &legacy;
+    ReopenWithCompactionService(&options);
+    GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+    GetCompactionService()->SetWorkerCompactionFilter(
+        new_order_primary ? &legacy : &newer, nullptr);
+    ASSERT_OK(Put("a", "base"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Merge("a", "M"));
+    ASSERT_OK(Flush());
+    trace.Clear();
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    ASSERT_EQ("baseM", Get("a"));
+    ASSERT_EQ(1, GetCompactionService()->GetUseLocalInstallationCount());
+    CompactionServiceResult result;
+    GetCompactionService()->GetResult(&result);
+    ASSERT_TRUE(result.status.IsNotSupported());
+    ASSERT_TRUE(result.merge_order_mismatch);
+    ASSERT_TRUE(result.output_files.empty());
+    ASSERT_EQ(0, result.stats.num_input_records);
+    ASSERT_EQ(0, GetCompactorStatistics()->getTickerCount(COMPACT_WRITE_BYTES));
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterNullWorkerFilterRunsRemotely) {
+  test::MergeFilterTrace trace;
+  auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  factory->return_null = true;
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.merge_operator =
+      std::make_shared<test::RecordingMergeOperator>(&trace);
+  options.compaction_filter_factory = factory;
+  ReopenWithCompactionService(&options);
+  GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+  GetCompactionService()->SetWorkerCompactionFilter(nullptr, factory);
+  ASSERT_OK(Put("a", "base"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Merge("a", "M"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ("baseM", Get("a"));
+  // Without a filter both orders give the same output, so the worker accepts.
+  ASSERT_EQ(1, GetCompactionService()->GetCompactionNum());
+  ASSERT_EQ(0, GetCompactionService()->GetUseLocalInstallationCount());
+  CompactionServiceResult result;
+  GetCompactionService()->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_FALSE(result.merge_order_mismatch);
+  ASSERT_EQ(kCompactionServiceMergeBeforeFilterVersion,
+            result.merge_before_filter_version);
+  for (const std::string& event : trace.Events()) {
+    ASSERT_EQ(0, event.rfind("full:", 0)) << event;
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteEntityAndStoredPurge) {
+  for (bool blobs : {false, true}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.enable_blob_files = blobs;
+    options.min_blob_size = 0;
+    options.compaction_filter = &filter;
+    options.merge_operator =
+        std::make_shared<test::RecordingMergeOperator>(&trace);
+    ReopenWithCompactionService(&options);
+    GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+    ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "a",
+                             {{"", "A"}, {"extra", "payload"}}));
+    ASSERT_OK(Put("b", "base"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Merge("a", "B"));
+    ASSERT_OK(Merge("b", "operand"));
+    ASSERT_OK(Flush());
+    trace.Clear();
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    std::vector<std::string> inputs;
+    inputs.reserve(files.size());
+    for (const auto& file : files) {
+      inputs.push_back(file.relative_filename);
+    }
+    ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, 1));
+    ASSERT_EQ(
+        (std::vector<std::string>{"full:a:AB", "entity:a:AB",
+                                  "full:b:baseoperand", "value:b:baseoperand"}),
+        trace.Events());
+    PinnableWideColumns columns;
+    ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(), "a",
+                             &columns));
+    ASSERT_EQ((WideColumns{{"", "AB"}, {"extra", "payload"}}),
+              columns.columns());
+    filter.value_decision = CompactionFilter::Decision::kPurge;
+    filter.blob_decision = CompactionFilter::Decision::kPurge;
+    trace.Clear();
+    files.clear();
+    inputs.clear();
+    db_->GetLiveFilesMetaData(&files);
+    inputs.reserve(files.size());
+    for (const auto& file : files) {
+      inputs.push_back(file.relative_filename);
+    }
+    ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, 2));
+    ASSERT_EQ("NOT_FOUND", Get("a"));
+    ASSERT_EQ("NOT_FOUND", Get("b"));
+    ASSERT_EQ(2, GetCompactionService()->GetCompactionNum());
+    ASSERT_EQ(0, GetCompactionService()->GetUseLocalInstallationCount());
+    if (blobs) {
+      ASSERT_GT(filter.blob_key_calls.load(), 0);
+    }
+    CompactRangeOptions compact;
+    compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+    ASSERT_EQ("NOT_FOUND", Get("a"));
+    ASSERT_EQ("NOT_FOUND", Get("b"));
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteWireVersions) {
+  for (bool new_order : {false, true}) {
+    CompactionServiceInput input;
+    input.merge_before_filter = new_order;
+    std::string serialized;
+    ASSERT_OK(input.Write(&serialized));
+    // Both orders use the existing format; old workers ignore the new field.
+    ASSERT_EQ(1, DecodeFixed32(serialized.data()));
+    CompactionServiceInput decoded;
+    ASSERT_OK(CompactionServiceInput::Read(serialized, &decoded));
+    ASSERT_EQ(new_order, decoded.merge_before_filter);
+  }
+  {
+    // A request from an old primary has no field and decodes as legacy order.
+    CompactionServiceInput decoded;
+    decoded.merge_before_filter = true;
+    std::string legacy(sizeof(uint32_t), '\0');
+    EncodeFixed32(&legacy[0], 1);
+    legacy += "output_level=0;";
+    ASSERT_OK(CompactionServiceInput::Read(legacy, &decoded));
+    ASSERT_FALSE(decoded.merge_before_filter);
+  }
+  CompactionServiceResult decoded;
+  decoded.merge_before_filter_version = 1;
+  decoded.merge_order_mismatch = true;
+  std::string legacy(sizeof(uint32_t), '\0');
+  EncodeFixed32(&legacy[0], 1);
+  legacy += "output_level=0;";
+  ASSERT_OK(CompactionServiceResult::Read(legacy, &decoded));
+  ASSERT_OK(decoded.status);
+  ASSERT_EQ(0, decoded.merge_before_filter_version);
+  ASSERT_FALSE(decoded.merge_order_mismatch);
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterLocalSubcompactions) {
+  class CompletionCounter : public EventListener {
+   public:
+    void OnSubcompactionCompleted(const SubcompactionJobInfo& info) override {
+      EXPECT_FALSE(info.stats.is_remote_compaction);
+      completions.fetch_add(1);
+    }
+    std::atomic<uint64_t> completions{0};
+  };
+  for (bool use_factory : {false, true}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeFilter direct(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    factory->value_decision = CompactionFilter::Decision::kPurge;
+    auto listener = std::make_shared<CompletionCounter>();
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.max_subcompactions = 4;
+    options.target_file_size_base = 32 << 10;
+    options.compression = kNoCompression;
+    options.merge_operator =
+        std::make_shared<test::RecordingMergeOperator>(&trace);
+    options.listeners.push_back(listener);
+    if (use_factory) {
+      options.compaction_filter_factory = factory;
+    } else {
+      options.compaction_filter = &direct;
+    }
+    ReopenWithCompactionService(&options);
+    constexpr int kKeys = 4096;
+    const std::string base(1024, 'A');
+    for (int i = 0; i < kKeys; ++i) {
+      ASSERT_OK(Put(Key(i), base));
+    }
+    ASSERT_OK(Flush());
+    for (int i = 0; i < kKeys; ++i) {
+      ASSERT_OK(Merge(Key(i), "B"));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_EQ(0, factory->creations.load());
+    trace.Clear();
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    std::vector<std::string> inputs;
+    for (const auto& file : files) {
+      inputs.push_back(file.relative_filename);
+    }
+    std::atomic<uint64_t> local_routes{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "CompactionJob::ShouldUseLocalCompaction:MergeBeforeFilterLocal",
+        [&](void*) { local_routes.fetch_add(1); });
+    SyncPoint::GetInstance()->EnableProcessing();
+    CompactionOptions compact;
+    compact.max_subcompactions = 4;
+    ASSERT_OK(db_->CompactFiles(compact, inputs, 1));
+    const uint64_t subcompactions = listener->completions.load();
+    ASSERT_GT(subcompactions, 1);
+    ASSERT_EQ(use_factory ? subcompactions : 0, factory->creations.load());
+    ASSERT_EQ(0, GetCompactionService()->GetCompactionNum());
+    ASSERT_EQ(0, GetCompactorStatistics()->getTickerCount(COMPACT_WRITE_BYTES));
+    if (use_factory) {
+      ASSERT_EQ(0, GetPrimaryStatistics()->getTickerCount(COMPACT_WRITE_BYTES));
+    } else {
+      ASSERT_GT(GetPrimaryStatistics()->getTickerCount(COMPACT_WRITE_BYTES), 0);
+    }
+    std::map<std::string, size_t> full_positions;
+    size_t values = 0;
+    const std::vector<std::string> events = trace.Events();
+    for (size_t i = 0; i < events.size(); ++i) {
+      const size_t colon = events[i].find(':');
+      const size_t last_colon = events[i].find(':', colon + 1);
+      const std::string key =
+          events[i].substr(colon + 1, last_colon - colon - 1);
+      if (events[i].compare(0, colon, "full") == 0) {
+        ASSERT_TRUE(full_positions.emplace(key, i).second);
+      } else {
+        ASSERT_EQ("value", events[i].substr(0, colon));
+        ASSERT_EQ(1, full_positions.count(key));
+        ASSERT_LT(full_positions.at(key), i);
+        ++values;
+      }
+    }
+    ASSERT_EQ(kKeys, full_positions.size());
+    ASSERT_EQ(kKeys, values);
+    for (int i = 0; i < kKeys; ++i) {
+      ASSERT_EQ(use_factory ? "NOT_FOUND" : base + "B", Get(Key(i)));
+    }
+    ASSERT_EQ(subcompactions, local_routes.load());
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    Close();
+  }
 }
 
 TEST_F(CompactionServiceTest, BasicCompactions) {

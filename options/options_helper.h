@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "rocksdb/advanced_options.h"
+#include "rocksdb/compaction_filter.h"
 #include "rocksdb/options.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
@@ -48,6 +49,16 @@ inline bool HasTableFilter(const ReadOptions& read_options) {
 // Checks that the combination of DBOptions and ColumnFamilyOptions are valid
 Status ValidateOptions(const DBOptions& db_opts,
                        const ColumnFamilyOptions& cf_opts);
+
+// Configuration queries: callers must not hold the DB mutex.
+Status GetCompactionFilterMergeOrder(const CompactionFilter* filter,
+                                     const CompactionFilterFactory* factory,
+                                     TableFileCreationReason reason,
+                                     CompactionFilter::MergeOrder* order);
+Status ValidateCompactionFilterOptions(const ColumnFamilyOptions& cf_opts);
+// Whether the direct filter or the factory declares merge-before-filter.
+bool DeclaresMergeBeforeFilter(const ColumnFamilyOptions& cf_opts);
+Status MergeBeforeFilterTransactionError();
 
 DBOptions BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
                          const MutableDBOptions& mutable_db_options);

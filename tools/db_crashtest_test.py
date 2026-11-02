@@ -130,6 +130,74 @@ class DBCrashTestTest(unittest.TestCase):
         args.update(overrides)
         return SimpleNamespace(**args)
 
+    def test_merge_before_filter_profile_selection_and_snapshots(self):
+        db_crashtest = self.load_db_crashtest()
+        compatible = {
+            "enable_compaction_filter": 1,
+            "merge_before_compaction_filter": 1,
+            "merge_before_filter_remove_deleted": 0,
+            "test_batches_snapshots": 0,
+            "sync_fault_injection": 0,
+            "disable_wal": 0,
+            "manual_wal_flush_one_in": 0,
+            "inplace_update_support": 0,
+            "enable_blob_direct_write": 0,
+            "remote_compaction_worker_threads": 0,
+            "ingest_external_file_atomic_replace_one_in": 0,
+            "use_txn": 0,
+            "use_optimistic_txn": 0,
+            "test_multi_ops_txns": 0,
+            "user_timestamp_size": 0,
+            "persist_user_defined_timestamps": 1,
+            "use_blob_db": 0,
+            "acquire_snapshot_one_in": 100,
+            "compact_range_one_in": 100,
+            "prefix_size": -1,
+            "prefixpercent": 0,
+            "iterpercent": 10,
+        }
+        for overrides in ({}, {"merge_before_compaction_filter": 0}):
+            params = self.build_params(db_crashtest.default_params, compatible)
+            params.update(overrides)
+            finalized = db_crashtest.finalize_and_sanitize(params)
+            post = finalized["merge_before_compaction_filter"]
+            self.assertEqual(
+                compatible["acquire_snapshot_one_in"] if post else 0,
+                finalized["acquire_snapshot_one_in"],
+            )
+            self.assertEqual(10 if post else 0, finalized["iterpercent"])
+            command, _ = db_crashtest.gen_cmd(finalized, [])
+            self.assertIn(f"--merge_before_compaction_filter={post}", command)
+            if not post:
+                self.assertEqual(0, finalized["merge_before_filter_remove_deleted"])
+                self.assertEqual(0, finalized["merge_before_filter_change_one_in"])
+        # Removing records can change what a snapshot reads, so the remove/skip
+        # mode uses the same no-snapshot settings as the default-order filter.
+        params = self.build_params(db_crashtest.default_params, compatible)
+        params["merge_before_filter_remove_deleted"] = 1
+        finalized = db_crashtest.finalize_and_sanitize(params)
+        self.assertEqual(1, finalized["merge_before_compaction_filter"])
+        self.assertEqual(1, finalized["merge_before_filter_remove_deleted"])
+        self.assertEqual(0, finalized["acquire_snapshot_one_in"])
+        self.assertEqual(0, finalized["compact_range_one_in"])
+        self.assertEqual(0, finalized["iterpercent"])
+        for name in (
+            "enable_compaction_filter",
+            "use_txn",
+            "use_optimistic_txn",
+            "test_multi_ops_txns",
+            "user_timestamp_size",
+            "use_blob_db",
+            "test_batches_snapshots",
+            "sync_fault_injection",
+            "disable_wal",
+        ):
+            with self.subTest(name=name):
+                params = self.build_params(db_crashtest.default_params, compatible)
+                params[name] = 0 if name == "enable_compaction_filter" else 1
+                finalized = db_crashtest.finalize_and_sanitize(params)
+                self.assertEqual(0, finalized["merge_before_compaction_filter"])
+
     def test_stress_cmd_env_defaults_tsan_suppressions(self):
         os.environ.pop(_TSAN_OPTIONS_ENV_VAR, None)
         db_crashtest = self.load_db_crashtest()

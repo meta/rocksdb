@@ -1432,6 +1432,21 @@ DEFINE_bool(enable_compaction_filter, false,
             "If true, configures a compaction filter that returns a kRemove "
             "decision for deleted keys.");
 
+DEFINE_bool(merge_before_compaction_filter, false,
+            "Make the compaction filter declare merge-before-filter order. "
+            "Requires enable_compaction_filter. Its decisions never change "
+            "what a reader sees.");
+
+DEFINE_uint32(merge_before_filter_change_one_in, 0,
+              "With merge_before_compaction_filter, return kChangeValue with "
+              "the same bytes for about 1 in N records. 0 disables it.");
+
+DEFINE_bool(merge_before_filter_remove_deleted, false,
+            "With merge_before_compaction_filter, remove records of keys that "
+            "are deleted in the expected state, and skip them in full "
+            "compactions. Requires the same no-snapshot settings as the "
+            "default-order compaction filter.");
+
 DEFINE_bool(paranoid_file_checks, true,
             "After writing every SST file, reopen it and read all the keys "
             "and validate checksums");

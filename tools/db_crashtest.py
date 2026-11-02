@@ -324,6 +324,9 @@ default_params = {
     "num_dbs": 1,
     "enable_pipelined_write": lambda: random.randint(0, 1),
     "enable_compaction_filter": lambda: random.choice([0, 0, 0, 1]),
+    "merge_before_compaction_filter": lambda: random.randint(0, 1),
+    "merge_before_filter_change_one_in": lambda: random.choice([0, 1, 10, 100]),
+    "merge_before_filter_remove_deleted": lambda: random.randint(0, 1),
     "enable_compaction_on_deletion_trigger": lambda: random.choice([0, 0, 0, 1]),
     # `inplace_update_support` is incompatible with a wide range of features.
     # The current sanitization process is not sufficient to reliably handle
@@ -1422,6 +1425,14 @@ multiops_txn_params = {
 def finalize_and_sanitize(src_params):
     dest_params = {k: v() if callable(v) else v for (k, v) in src_params.items()}
     apply_cache_and_write_buffer_size_multiplier(dest_params)
+    # Merge-before-filter is only interesting with merges, so use them in about
+    # 3/4 of those runs. Later rules can still turn merges off.
+    if (
+        dest_params.get("enable_compaction_filter", 0) == 1
+        and dest_params.get("merge_before_compaction_filter", 0) == 1
+        and dest_params.get("use_merge", 0) == 0
+    ):
+        dest_params["use_merge"] = random.randint(0, 1)
     if is_release_mode():
         dest_params["read_fault_one_in"] = 0
     if dest_params.get("compression_max_dict_bytes") == 0:
@@ -1896,10 +1907,30 @@ def finalize_and_sanitize(src_params):
         dest_params["index_block_search_type"] = 0
         # TrieIndexFactory requires BytewiseComparator.
         dest_params["use_trie_index"] = 0
+    # Select the new-order stress filter only with a compatible active filter;
+    # other profiles keep their existing filter policy and
+    # unsupported-configuration coverage.
+    if (
+        dest_params.get("enable_compaction_filter", 0) != 1
+        or dest_params.get("use_txn", 0) == 1
+        or dest_params.get("use_optimistic_txn", 0) == 1
+        or dest_params.get("test_multi_ops_txns", 0) == 1
+        or dest_params.get("user_timestamp_size", 0) > 0
+        or dest_params.get("use_blob_db", 0) == 1
+    ):
+        dest_params["merge_before_compaction_filter"] = 0
+    if dest_params.get("merge_before_compaction_filter", 0) == 0:
+        dest_params["merge_before_filter_change_one_in"] = 0
+        dest_params["merge_before_filter_remove_deleted"] = 0
+    # Removing records (either order) can change what a snapshot reads. The
+    # new-order filter without removal never changes what a reader sees.
     if (
         dest_params.get("enable_compaction_filter", 0) == 1
-        or dest_params.get("inplace_update_support", 0) == 1
-    ):
+        and (
+            dest_params.get("merge_before_compaction_filter", 0) == 0
+            or dest_params.get("merge_before_filter_remove_deleted", 0) == 1
+        )
+    ) or dest_params.get("inplace_update_support", 0) == 1:
         # Compaction filter, inplace update support are incompatible with snapshots. Need to avoid taking
         # snapshots, as well as avoid operations that use snapshots for
         # verification.

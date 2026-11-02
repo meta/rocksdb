@@ -125,6 +125,56 @@ class WideColumnBlobResolver {
 // including data loss, unreported corruption, deadlocks, and more.
 class CompactionFilter : public Customizable {
  public:
+  // Determines how the compaction filter interacts with the merge operator
+  // during compaction.
+  enum class MergeOrder {
+    // (Default) Merge operands are offered to the filter individually before
+    // the merge operator combines them. Results of merging are not offered
+    // to the filter in the same compaction.
+    kFilterBeforeMerge,
+    // The merge operator runs first and the filter sees its results.
+    // Merging only combines a key's entries that are among the inputs of the
+    // current compaction (and not across snapshot boundaries); data in files
+    // outside the compaction is not visible to the merge or the filter. So:
+    // * If the inputs include the key's base (a Put or a tombstone), or the
+    //   compaction is bottommost and no older entries for the key remain,
+    //   the full merge result is offered as kValue or kWideColumnEntity.
+    // * Otherwise, the key's operands in the inputs are offered as
+    //   kMergeOperand: combined into one by PartialMergeMulti when possible,
+    //   or individually if partial merge declines or there is only one.
+    //   The base and any older operands outside the compaction are not seen.
+    // Results changed by the filter are not merged again in the same
+    // compaction. Only applies to compaction (not flush or recovery).
+    // Filters that implement only FilterV2 or FilterV3 also work.
+    kMergeBeforeFilter,
+  };
+
+  // Returns the merge order this filter requires. Must return the same value
+  // for the lifetime of the filter. Can be called concurrently and without
+  // the DB mutex, so it must be cheap, must not block, and must not call
+  // into the DB.
+  //
+  // Notes on kMergeBeforeFilter:
+  // * A merge result is offered to the filter only if none of its operands
+  //   is visible to any snapshot. Plain values are still offered regardless
+  //   of snapshots, as with kFilterBeforeMerge.
+  // * kPurge on a value or entity is treated as kRemove (ordinary Delete),
+  //   because SingleDelete is incompatible with Merge history. Do not use
+  //   SingleDelete on affected keys, even after switching back to
+  //   kFilterBeforeMerge.
+  // * kPurge and kChangeWideColumnEntity are not supported for kMergeOperand
+  //   and fail the compaction.
+  // * How operands are grouped into partial results can differ between
+  //   compactions, and SST files keep no record of earlier groupings, so
+  //   filter decisions must be correct for any grouping.
+  // * Not supported with user-defined timestamps, WritePrepared or
+  //   WriteUnprepared transactions (SnapshotChecker), or stacked BlobDB.
+  //   DB open and column family creation reject these configurations.
+  // * Filter wrappers must forward this value from the wrapped filter.
+  virtual MergeOrder GetMergeOrder() const {
+    return MergeOrder::kFilterBeforeMerge;
+  }
+
   // Value type of the key-value passed to the compaction filter's
   // FilterV2/V3/V4 methods.
   enum ValueType {
@@ -263,8 +313,10 @@ class CompactionFilter : public Customizable {
   // The application can inspect the existing value of the key and make decision
   // based on it.
   //
-  // Key-Values that are results of merge operation during table file creation
-  // are not passed into this function. Currently, when you have a mix of Put()s
+  // With the default merge order, key-values that are results of merge
+  // operations during table file creation are not passed into this function.
+  // kMergeBeforeFilter offers eligible full results through FilterV4, which
+  // can delegate here. With the default order and a mix of Put()s
   // and Merge()s on a same key, we only guarantee to process the merge operands
   // through the `CompactionFilter`s. Put()s might be processed, or might not.
   //
@@ -480,6 +532,22 @@ class CompactionFilter : public Customizable {
 // including data loss, unreported corruption, deadlocks, and more.
 class CompactionFilterFactory : public Customizable {
  public:
+  // Returns the merge order of filters created by this factory. Every
+  // non-null filter it creates must return the same value from
+  // CompactionFilter::GetMergeOrder(); otherwise the compaction fails with
+  // InvalidArgument. A null filter means no filtering for that compaction,
+  // which is allowed with either order. Same stability and concurrency
+  // requirements as CompactionFilter::GetMergeOrder().
+  //
+  // With kMergeBeforeFilter, ShouldFilterTableFileCreation() must return
+  // false for every reason other than kCompaction (checked at DB open and
+  // column family creation). Flush, recovery, and other table file creation
+  // do not run this order, because they can see only part of a key's history
+  // and would offer the filter results that differ from compaction.
+  virtual CompactionFilter::MergeOrder GetMergeOrder() const {
+    return CompactionFilter::MergeOrder::kFilterBeforeMerge;
+  }
+
   ~CompactionFilterFactory() override = default;
   static const char* Type() { return "CompactionFilterFactory"; }
   static Status CreateFromString(

@@ -498,6 +498,11 @@ struct CompactionServiceJobInfo {
   // updates.
   bool use_separate_remote_compaction_pool = false;
 
+  // True if the compaction filter uses
+  // CompactionFilter::MergeOrder::kMergeBeforeFilter, so the worker must
+  // support that order.
+  bool merge_before_filter = false;
+
   CompactionServiceJobInfo() {}
   CompactionServiceJobInfo(std::string db_name_, std::string db_id_,
                            std::string db_session_id_, uint32_t cf_id_,
@@ -542,6 +547,15 @@ class CompactionService : public Customizable {
 
   // Returns the name of this compaction service.
   const char* Name() const override = 0;
+
+  // Returns true if RocksDB may send compactions whose filter uses
+  // CompactionFilter::MergeOrder::kMergeBeforeFilter to this service. A
+  // worker that cannot honor the order (for example, an older RocksDB
+  // version) causes a local fallback after the remote attempt, before any
+  // output is imported. With the default (false), such compactions run
+  // locally. Called without the DB mutex; must be cheap, must not block, and
+  // must not call into the DB.
+  virtual bool SupportsMergeBeforeFilter() const { return false; }
 
   // Schedule compaction to be processed remotely.
   virtual CompactionServiceScheduleResponse Schedule(
