@@ -565,7 +565,7 @@ Status WideColumnSerialization::HasBlobColumns(const Slice& input,
   return Status::OK();
 }
 
-Status WideColumnSerialization::ForEachBlobFileNumber(
+Status WideColumnSerialization::ForEachBlobIndex(
     const Slice& input,
     const std::function<Status(const BlobIndex&)>& callback) {
   Slice input_ref = input;
@@ -575,9 +575,6 @@ Status WideColumnSerialization::ForEachBlobFileNumber(
     return Status::Corruption("Error decoding wide column version");
   }
 
-  if (version < kVersion2) {
-    return Status::OK();
-  }
   if (version > kVersion2) {
     return Status::Corruption("Corrupt or unsupported wide column version");
   }
@@ -587,7 +584,33 @@ Status WideColumnSerialization::ForEachBlobFileNumber(
     return Status::Corruption("Error decoding number of wide columns");
   }
 
-  if (!num_columns) {
+  if (version < kVersion2) {
+    uint64_t values_bytes = 0;
+    Slice previous_name;
+    bool has_previous_name = false;
+    for (uint32_t i = 0; i < num_columns; ++i) {
+      Slice name;
+      uint32_t value_size = 0;
+      if (!GetLengthPrefixedSlice(&input_ref, &name)) {
+        return Status::Corruption("Error decoding wide column name");
+      }
+      if (has_previous_name && previous_name.compare(name) >= 0) {
+        return Status::Corruption("Wide column names are not strictly ordered");
+      }
+      if (!GetVarint32(&input_ref, &value_size)) {
+        return Status::Corruption("Error decoding wide column value size");
+      }
+      if (values_bytes > input_ref.size() ||
+          value_size > input_ref.size() - values_bytes) {
+        return Status::Corruption("Wide column values exceed entity size");
+      }
+      values_bytes += value_size;
+      previous_name = name;
+      has_previous_name = true;
+    }
+    if (values_bytes != input_ref.size()) {
+      return Status::Corruption("Wide column values do not match framing");
+    }
     return Status::OK();
   }
 
@@ -601,7 +624,7 @@ Status WideColumnSerialization::ForEachBlobFileNumber(
     return Status::Corruption("Error decoding wide column skip info");
   }
 
-  // Read COLUMN TYPES
+  // Read and validate COLUMN TYPES.
   if (input_ref.size() < num_columns) {
     return Status::Corruption("Error decoding wide column types");
   }
@@ -621,65 +644,136 @@ Status WideColumnSerialization::ForEachBlobFileNumber(
     }
   }
 
+  const Slice type_bytes(input_ref.data(), num_columns);
+  input_ref.remove_prefix(num_columns);
+
+  // Validate NAME SIZES exactly and compute the names payload size.
+  if (input_ref.size() < name_sizes_bytes) {
+    return Status::Corruption("Error decoding wide column name sizes");
+  }
+  const Slice encoded_name_sizes(input_ref.data(), name_sizes_bytes);
+  Slice name_sizes = encoded_name_sizes;
+  input_ref.remove_prefix(name_sizes_bytes);
+  uint64_t decoded_names_bytes = 0;
+  for (uint32_t i = 0; i < num_columns; ++i) {
+    uint32_t name_size = 0;
+    if (!GetVarint32(&name_sizes, &name_size)) {
+      return Status::Corruption("Error decoding wide column name size");
+    }
+    if (name_size > names_bytes - decoded_names_bytes) {
+      return Status::Corruption("Wide column names exceed declared size");
+    }
+    decoded_names_bytes += name_size;
+  }
+  if (!name_sizes.empty() || decoded_names_bytes != names_bytes) {
+    return Status::Corruption("Wide column name sizes do not match framing");
+  }
+
+  // Validate VALUE SIZES exactly and compute the values payload size.
+  if (input_ref.size() < value_sizes_bytes) {
+    return Status::Corruption("Error decoding wide column value sizes");
+  }
+  const Slice encoded_value_sizes(input_ref.data(), value_sizes_bytes);
+  Slice value_sizes = encoded_value_sizes;
+  input_ref.remove_prefix(value_sizes_bytes);
+  uint64_t values_bytes = 0;
+  for (uint32_t i = 0; i < num_columns; ++i) {
+    uint32_t value_size = 0;
+    if (!GetVarint32(&value_sizes, &value_size)) {
+      return Status::Corruption("Error decoding wide column value size");
+    }
+    if (values_bytes > input.size() ||
+        value_size > input.size() - values_bytes) {
+      return Status::Corruption("Wide column values exceed entity size");
+    }
+    values_bytes += value_size;
+  }
+  if (!value_sizes.empty()) {
+    return Status::Corruption("Wide column value sizes do not match framing");
+  }
+
+  // Validate NAMES, including strict lexical ordering.
+  if (input_ref.size() < names_bytes) {
+    return Status::Corruption("Error decoding wide column names");
+  }
+  const Slice names(input_ref.data(), names_bytes);
+  input_ref.remove_prefix(names_bytes);
+  name_sizes = encoded_name_sizes;
+  size_t name_pos = 0;
+  Slice previous_name;
+  bool has_previous_name = false;
+  for (uint32_t i = 0; i < num_columns; ++i) {
+    uint32_t name_size = 0;
+    if (!GetVarint32(&name_sizes, &name_size) ||
+        name_size > names.size() - name_pos) {
+      return Status::Corruption("Error decoding wide column name payload");
+    }
+    Slice name(names.data() + name_pos, name_size);
+    if (has_previous_name && previous_name.compare(name) >= 0) {
+      return Status::Corruption("Wide column names are not strictly ordered");
+    }
+    previous_name = name;
+    has_previous_name = true;
+    name_pos += name_size;
+  }
+  if (name_pos != names.size()) {
+    return Status::Corruption("Wide column names do not match framing");
+  }
+
+  if (values_bytes != input_ref.size()) {
+    return Status::Corruption("Wide column values do not match framing");
+  }
+
   if (!has_any_blob) {
     return Status::OK();
   }
 
-  // Need to skip to value sizes to find blob column value offsets,
-  // then skip to the values section to decode blob indices.
-  const char* type_bytes = input_ref.data();
-  input_ref.remove_prefix(num_columns);
-
-  // Skip NAME SIZES section
-  if (input_ref.size() < name_sizes_bytes) {
-    return Status::Corruption("Error decoding wide column name sizes");
-  }
-  input_ref.remove_prefix(name_sizes_bytes);
-
-  // Read VALUE SIZES section to find blob column value offsets
-  if (input_ref.size() < value_sizes_bytes) {
-    return Status::Corruption("Error decoding wide column value sizes");
-  }
-  const char* vs_ptr = input_ref.data();
-  const char* vs_limit = vs_ptr + value_sizes_bytes;
-  input_ref.remove_prefix(value_sizes_bytes);
-
-  // Skip NAMES section
-  if (input_ref.size() < names_bytes) {
-    return Status::Corruption("Error decoding wide column names");
-  }
-  input_ref.remove_prefix(names_bytes);
-
-  // Now input_ref points to VALUES section. Walk through value sizes
-  // and decode only blob column values.
+  // Validate every blob index before invoking callbacks. This prevents a
+  // malformed late column from exposing a partial enumeration to callers.
+  value_sizes = encoded_value_sizes;
   size_t value_pos = 0;
   for (uint32_t i = 0; i < num_columns; ++i) {
     uint32_t vs = 0;
-    const char* vs_next = GetVarint32Ptr(vs_ptr, vs_limit, &vs);
-    if (vs_next == nullptr) {
+    if (!GetVarint32(&value_sizes, &vs)) {
       return Status::Corruption("Error decoding wide column value size");
     }
-    vs_ptr = vs_next;
-
     if (static_cast<uint8_t>(type_bytes[i]) == kTypeBlobIndex) {
-      if (value_pos + vs > input_ref.size()) {
-        return Status::Corruption("Error decoding wide column blob index");
-      }
       Slice blob_slice(input_ref.data() + value_pos, vs);
       if (blob_slice.empty()) {
         return Status::Corruption("Empty blob index in wide column");
       }
       BlobIndex blob_idx;
       Status s = blob_idx.DecodeFrom(blob_slice);
+      if (s.ok()) {
+        s = blob_idx.Validate();
+      }
       if (!s.ok()) {
         return Status::Corruption("Error decoding blob index in wide column");
       }
-      Status cb_s = callback(blob_idx);
-      if (!cb_s.ok()) {
-        return cb_s;
-      }
     }
     value_pos += vs;
+  }
+
+  value_sizes = encoded_value_sizes;
+  value_pos = 0;
+  for (uint32_t i = 0; i < num_columns; ++i) {
+    uint32_t value_size = 0;
+    if (!GetVarint32(&value_sizes, &value_size)) {
+      return Status::Corruption("Error decoding wide column value size");
+    }
+    if (static_cast<uint8_t>(type_bytes[i]) == kTypeBlobIndex) {
+      BlobIndex blob_index;
+      const Status decode_status = blob_index.DecodeFrom(
+          Slice(input_ref.data() + value_pos, value_size));
+      if (!decode_status.ok()) {
+        return Status::Corruption("Error decoding blob index in wide column");
+      }
+      Status callback_status = callback(blob_index);
+      if (!callback_status.ok()) {
+        return callback_status;
+      }
+    }
+    value_pos += value_size;
   }
 
   return Status::OK();

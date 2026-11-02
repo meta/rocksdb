@@ -1032,6 +1032,7 @@ VersionStorageInfo::~VersionStorageInfo() { delete[] files_; }
 Version::~Version() {
   assert(refs_ == 0);
 
+  const bool was_never_installed = prev_ == this && next_ == this;
   // Remove from linked list
   prev_->next_ = next_;
   next_->prev_ = prev_;
@@ -1040,18 +1041,28 @@ Version::~Version() {
   for (int level = 0; level < storage_info_.num_levels_; level++) {
     for (size_t i = 0; i < storage_info_.files_[level].size(); i++) {
       FileMetaData* f = storage_info_.files_[level][i];
-      assert(f->refs > 0);
-      f->refs--;
-      if (f->refs <= 0) {
+      assert(f != nullptr);
+      if (f == nullptr) {
+        continue;
+      }
+      assert(f->NumRefs() > 0);
+      if (f->Unref()) {
         assert(cfd_ != nullptr);
-        // When not in the process of closing the DB, we'll have a superversion
-        // to get current mutable options from
-        auto* sv = cfd_->GetSuperVersion();
+        // Installed Versions are destroyed under the DB mutex and can read the
+        // current SuperVersion. Rejected point-in-time candidates can be
+        // destroyed unlocked; use their immutable option snapshot so teardown
+        // never races SuperVersion publication.
+        auto* sv = was_never_installed ? nullptr : cfd_->GetSuperVersion();
         uint32_t path_id = f->fd.GetPathId();
         assert(path_id < cfd_->ioptions().cf_paths.size());
-        vset_->obsolete_files_.emplace_back(
+        assert(vset_ != nullptr);
+        // Every Version has an owning VersionSet.
+        // @lint-ignore NULLSAFECLANG nullable-dereference
+        vset_->AddObsoleteFile(
             f, cfd_->ioptions().cf_paths[path_id].path,
-            sv ? sv->mutable_cf_options.uncache_aggressiveness : 0,
+            was_never_installed
+                ? mutable_cf_options_.uncache_aggressiveness
+                : (sv ? sv->mutable_cf_options.uncache_aggressiveness : 0),
             cfd_->GetFileMetadataCacheReservationManager());
       }
     }
@@ -2762,6 +2773,8 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
                  const FileOptions& file_opt,
                  const MutableCFOptions& mutable_cf_options,
                  const std::shared_ptr<IOTracer>& io_tracer,
+                 std::optional<PeriodicCompactionPhaseParams>
+                     periodic_compaction_phase_params,
                  uint64_t version_number,
                  EpochNumberRequirement epoch_number_requirement)
     : env_(vset->env_),
@@ -2790,7 +2803,8 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
           vset->offpeak_time_option(),
           cfd_ == nullptr
               ? PeriodicCompactionPhaseParams{}
-              : vset->GetPeriodicCompactionPhaseParams(cfd_->GetID())),
+              : periodic_compaction_phase_params.value_or(
+                    vset->GetPeriodicCompactionPhaseParams(cfd_->GetID()))),
       vset_(vset),
       next_(this),
       prev_(this),
@@ -2802,6 +2816,62 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
       version_number_(version_number),
       io_tracer_(io_tracer) {}
 
+Status Version::ResolveBlobPhysicalFile(
+    const BlobIndex& blob_index, BlobFileOpenInfo* physical_file,
+    uint64_t* physical_file_size, bool* is_relocation_file,
+    uint32_t* relocation_directory_digest) const {
+  assert(physical_file != nullptr);
+  assert(physical_file_size != nullptr);
+  assert(is_relocation_file != nullptr);
+  assert(relocation_directory_digest != nullptr);
+  if (!blob_index.IsIndirect()) {
+    return Status::InvalidArgument("BlobIndex does not have a stable identity");
+  }
+
+  const BlobRelocationRouteSource source{blob_index.generation_file_number(),
+                                         blob_index.origin_file_number()};
+  const BlobRelocationRoute* route =
+      storage_info_.GetBlobRelocationRoute(source);
+  const uint64_t selected_file_number = route == nullptr
+                                            ? source.generation_file_number
+                                            : route->GetPhysicalFileNumber();
+  const std::shared_ptr<BlobFileMetaData> normal =
+      storage_info_.GetBlobFileMetaData(selected_file_number);
+  const std::shared_ptr<BlobRelocationFileMetaData> relocation =
+      storage_info_.GetBlobRelocationFileMetaData(selected_file_number);
+  if ((normal == nullptr) == (relocation == nullptr)) {
+    return Status::Corruption("Invalid indirect blob physical file");
+  }
+  if (route != nullptr && relocation == nullptr) {
+    return Status::Corruption("Blob relocation route targets a normal file");
+  }
+
+  if (normal != nullptr) {
+    if (!normal->IsIdentityRoot() ||
+        source.generation_file_number != source.origin_file_number) {
+      return Status::Corruption("Indirect blob generation is not relocatable");
+    }
+    *physical_file =
+        BlobFileOpenInfo{selected_file_number, normal->GetChecksumValue(),
+                         normal->GetChecksumMethod()};
+    *physical_file_size = normal->GetBlobFileSize();
+    *is_relocation_file = false;
+    *relocation_directory_digest = 0;
+    return Status::OK();
+  }
+
+  if (relocation->GetDirectory().Find(source.origin_file_number) == nullptr) {
+    return Status::Corruption("Relocation file does not contain blob origin");
+  }
+  *physical_file = BlobFileOpenInfo{
+      selected_file_number, relocation->GetChecksumValue(),
+      relocation->GetChecksumMethod(), relocation->GetTailSize()};
+  *physical_file_size = relocation->GetFileSize();
+  *is_relocation_file = true;
+  *relocation_directory_digest = relocation->GetDirectoryDigest();
+  return Status::OK();
+}
+
 Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
                         const BlobIndex& blob_index,
                         FilePrefetchBuffer* prefetch_buffer,
@@ -2812,9 +2882,33 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
     return Status::Corruption("Unexpected TTL/inlined blob index");
   }
 
-  const uint64_t blob_file_number = blob_index.file_number();
+  assert(blob_source_);
+  value->Reset();
+  if (blob_index.IsIndirect()) {
+    BlobFileOpenInfo physical_file;
+    uint64_t physical_file_size = 0;
+    bool is_relocation_file = false;
+    uint32_t relocation_directory_digest = 0;
+    Status status = ResolveBlobPhysicalFile(
+        blob_index, &physical_file, &physical_file_size, &is_relocation_file,
+        &relocation_directory_digest);
+    if (!status.ok()) {
+      return status;
+    }
+    return blob_source_->GetIndirectBlob(
+        read_options, user_key, blob_index, physical_file, physical_file_size,
+        is_relocation_file, relocation_directory_digest,
+        is_relocation_file ? mutable_cf_options_.compression_manager.get()
+                           : nullptr,
+        is_relocation_file ? mutable_cf_options_.block_protection_bytes_per_key
+                           : 0,
+        /*range_offset=*/0, kWholeBlobLength, prefetch_buffer, value,
+        bytes_read);
+  }
 
-  auto blob_file_meta = storage_info_.GetBlobFileMetaData(blob_file_number);
+  const uint64_t blob_file_number = blob_index.file_number();
+  const std::shared_ptr<BlobFileMetaData> blob_file_meta =
+      storage_info_.GetBlobFileMetaData(blob_file_number);
   if (!blob_file_meta) {
     // INTEGRITY CHECK -- do not weaken. The blob index must reference a known
     // external blob file. No metadata (including file_number 0, the
@@ -2825,8 +2919,6 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
     return Status::Corruption("Invalid blob file number");
   }
 
-  assert(blob_source_);
-  value->Reset();
   const BlobFileOpenInfo blob_file{blob_file_number,
                                    blob_file_meta->GetChecksumValue(),
                                    blob_file_meta->GetChecksumMethod()};
@@ -2848,15 +2940,39 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
     return Status::Corruption("Unexpected TTL/inlined blob index");
   }
 
-  // A strict sub-range of a compressed blob cannot be decompressed in
-  // isolation; the caller resolves such columns whole and slices instead.
-  if (blob_index.compression() != kNoCompression) {
+  // Legacy range reads cannot decompress a strict byte range. Indirect reads
+  // can materialize, validate, and slice the whole logical value.
+  if (!blob_index.IsIndirect() && blob_index.compression() != kNoCompression) {
     return Status::Corruption("Cannot range-read a compressed blob");
   }
 
-  const uint64_t blob_file_number = blob_index.file_number();
+  assert(blob_source_);
+  value->Reset();
+  if (blob_index.IsIndirect()) {
+    BlobFileOpenInfo physical_file;
+    uint64_t physical_file_size = 0;
+    bool is_relocation_file = false;
+    uint32_t relocation_directory_digest = 0;
+    Status status = ResolveBlobPhysicalFile(
+        blob_index, &physical_file, &physical_file_size, &is_relocation_file,
+        &relocation_directory_digest);
+    if (!status.ok()) {
+      return status;
+    }
+    return blob_source_->GetIndirectBlob(
+        read_options, user_key, blob_index, physical_file, physical_file_size,
+        is_relocation_file, relocation_directory_digest,
+        is_relocation_file ? mutable_cf_options_.compression_manager.get()
+                           : nullptr,
+        is_relocation_file ? mutable_cf_options_.block_protection_bytes_per_key
+                           : 0,
+        range_offset, range_length, /*prefetch_buffer=*/nullptr, value,
+        bytes_read);
+  }
 
-  auto blob_file_meta = storage_info_.GetBlobFileMetaData(blob_file_number);
+  const uint64_t blob_file_number = blob_index.file_number();
+  const std::shared_ptr<BlobFileMetaData> blob_file_meta =
+      storage_info_.GetBlobFileMetaData(blob_file_number);
   if (!blob_file_meta) {
     // INTEGRITY CHECK -- see Version::GetBlob. No metadata (including
     // file_number 0, the same-file "embedded" sentinel) means a corrupt index
@@ -2864,8 +2980,6 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
     return Status::Corruption("Invalid blob file number");
   }
 
-  assert(blob_source_);
-  value->Reset();
   const BlobFileOpenInfo blob_file{blob_file_number,
                                    blob_file_meta->GetChecksumValue(),
                                    blob_file_meta->GetChecksumMethod()};
@@ -2874,6 +2988,41 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
       blob_file_meta->GetBlobFileSize(), blob_index.size(),
       blob_index.compression(), range_offset, range_length, value, bytes_read);
 }
+
+namespace {
+
+struct IndirectFileRequests {
+  BlobFileOpenInfo file;
+  uint64_t file_size{};
+  bool is_relocation_file{};
+  uint32_t directory_digest{};
+  // BlobSource takes a contiguous pointer/count range. autovector splits its
+  // inline and overflow storage, so &requests[0] is not such a range.
+  std::vector<IndirectBlobReadRequest> requests;
+};
+
+size_t GetOrCreateIndirectFileBatch(
+    BlobFileOpenInfo file, uint64_t file_size, bool is_relocation_file,
+    uint32_t directory_digest, autovector<IndirectFileRequests>* batches,
+    std::unordered_map<uint64_t, size_t>* current_batch_by_file) {
+  assert(batches != nullptr);
+  assert(current_batch_by_file != nullptr);
+  const auto existing = current_batch_by_file->find(file.file_number);
+  if (existing != current_batch_by_file->end() &&
+      (*batches)[existing->second].requests.size() <
+          MultiGetContext::MAX_BATCH_SIZE) {
+    return existing->second;
+  }
+
+  const size_t index = batches->size();
+  (*current_batch_by_file)[file.file_number] = index;
+  batches->push_back(IndirectFileRequests{
+      std::move(file), file_size, is_relocation_file, directory_digest,
+      std::vector<IndirectBlobReadRequest>()});
+  return index;
+}
+
+}  // namespace
 
 void Version::MultiGetBlobLazy(const ReadOptions& read_options,
                                autovector<LazyBlobReadRequest>& reqs) const {
@@ -2891,8 +3040,10 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
   // of that file's current (most recently started, still fillable) batch.
   autovector<BlobFileReadRequests> whole_reqs;
   autovector<BlobFileRangeReadRequests> range_reqs;
+  autovector<IndirectFileRequests> indirect_reqs;
   std::unordered_map<uint64_t, size_t> whole_idx;
   std::unordered_map<uint64_t, size_t> range_idx;
+  std::unordered_map<uint64_t, size_t> indirect_idx;
 
   for (auto& req : reqs) {
     assert(req.user_key);
@@ -2906,8 +3057,29 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
       continue;
     }
 
+    if (blob_index.IsIndirect()) {
+      BlobFileOpenInfo physical_file;
+      uint64_t physical_file_size = 0;
+      bool is_relocation_file = false;
+      uint32_t directory_digest = 0;
+      *req.status = ResolveBlobPhysicalFile(
+          blob_index, &physical_file, &physical_file_size, &is_relocation_file,
+          &directory_digest);
+      if (!req.status->ok()) {
+        continue;
+      }
+      const size_t idx = GetOrCreateIndirectFileBatch(
+          std::move(physical_file), physical_file_size, is_relocation_file,
+          directory_digest, &indirect_reqs, &indirect_idx);
+      indirect_reqs[idx].requests.push_back(
+          IndirectBlobReadRequest{*req.user_key, &blob_index, req.range_offset,
+                                  req.range_length, req.result, req.status});
+      continue;
+    }
+
     const uint64_t file_number = blob_index.file_number();
-    auto blob_file_meta = storage_info_.GetBlobFileMetaData(file_number);
+    const std::shared_ptr<BlobFileMetaData> blob_file_meta =
+        storage_info_.GetBlobFileMetaData(file_number);
     if (!blob_file_meta) {
       // INTEGRITY CHECK -- see Version::GetBlob. A same-file/embedded reference
       // (file_number 0) must be resolved via SameFileBlobReader, not here.
@@ -2977,6 +3149,20 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
     blob_source_->MultiGetBlobRange(read_options, range_reqs,
                                     /*bytes_read=*/nullptr);
   }
+  for (IndirectFileRequests& file_requests : indirect_reqs) {
+    std::vector<IndirectBlobReadRequest>& batch = file_requests.requests;
+    blob_source_->MultiGetIndirectBlobFromOneFile(
+        read_options, file_requests.file, file_requests.file_size,
+        file_requests.is_relocation_file, file_requests.directory_digest,
+        file_requests.is_relocation_file
+            ? mutable_cf_options_.compression_manager.get()
+            : nullptr,
+        file_requests.is_relocation_file
+            ? mutable_cf_options_.block_protection_bytes_per_key
+            : 0,
+        batch.size(), batch.data(),
+        /*bytes_read=*/nullptr);
+  }
 }
 
 void Version::MultiGetBlob(
@@ -2985,6 +3171,8 @@ void Version::MultiGetBlob(
   assert(!blob_ctxs.empty());
 
   autovector<BlobFileReadRequests> blob_reqs;
+  autovector<IndirectFileRequests> indirect_file_reqs;
+  std::unordered_map<uint64_t, size_t> indirect_file_indexes;
 
   for (auto& ctx : blob_ctxs) {
     const auto file_number = ctx.first;
@@ -3006,17 +3194,39 @@ void Version::MultiGetBlob(
         key_context->columns->Reset();
       }
 
+      if (blob_index.HasTTL() || blob_index.IsInlined()) {
+        *key_context->s =
+            Status::Corruption("Unexpected TTL/inlined blob index");
+        continue;
+      }
+
+      if (blob_index.IsIndirect()) {
+        BlobFileOpenInfo physical_file;
+        uint64_t physical_file_size = 0;
+        bool is_relocation_file = false;
+        uint32_t directory_digest = 0;
+        *key_context->s = ResolveBlobPhysicalFile(
+            blob_index, &physical_file, &physical_file_size,
+            &is_relocation_file, &directory_digest);
+        if (!key_context->s->ok()) {
+          continue;
+        }
+        const size_t request_index = GetOrCreateIndirectFileBatch(
+            std::move(physical_file), physical_file_size, is_relocation_file,
+            directory_digest, &indirect_file_reqs, &indirect_file_indexes);
+        indirect_file_reqs[request_index].requests.push_back(
+            IndirectBlobReadRequest{
+                key_context->get_context->ukey_to_get_blob_value(), &blob_index,
+                /*range_offset=*/0, kWholeBlobLength, &blob.result,
+                key_context->s});
+        continue;
+      }
+
       if (!blob_file_meta) {
         // INTEGRITY CHECK -- do not weaken; see Version::GetBlob and
         // FileMetaData::UpdateBoundaries. A same-file/embedded reference must
         // be resolved before reaching the integrated-BlobDB read path.
         *key_context->s = Status::Corruption("Invalid blob file number");
-        continue;
-      }
-
-      if (blob_index.HasTTL() || blob_index.IsInlined()) {
-        *key_context->s =
-            Status::Corruption("Unexpected TTL/inlined blob index");
         continue;
       }
 
@@ -3037,6 +3247,22 @@ void Version::MultiGetBlob(
   if (blob_reqs.size() > 0) {
     blob_source_->MultiGetBlob(read_options, blob_reqs,
                                /*bytes_read=*/nullptr);
+  }
+  for (IndirectFileRequests& file_requests : indirect_file_reqs) {
+    std::vector<IndirectBlobReadRequest>& requests = file_requests.requests;
+    // Every Version is constructed with a BlobSource and keeps it alive;
+    // NULLSAFECLANG cannot carry the constructor invariant into this method.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    blob_source_->MultiGetIndirectBlobFromOneFile(
+        read_options, file_requests.file, file_requests.file_size,
+        file_requests.is_relocation_file, file_requests.directory_digest,
+        file_requests.is_relocation_file
+            ? mutable_cf_options_.compression_manager.get()
+            : nullptr,
+        file_requests.is_relocation_file
+            ? mutable_cf_options_.block_protection_bytes_per_key
+            : 0,
+        requests.size(), requests.data(), /*bytes_read=*/nullptr);
   }
 
   for (auto& ctx : blob_ctxs) {
@@ -4217,10 +4443,14 @@ bool CompareCompensatedSizeDescending(const Fsize& first, const Fsize& second) {
 }  // anonymous namespace
 
 void VersionStorageInfo::AddFile(int level, FileMetaData* f) {
+  assert(f != nullptr);
+  if (f == nullptr) {
+    return;
+  }
   auto& level_files = files_[level];
   level_files.push_back(f);
 
-  f->refs++;
+  f->Ref();
 }
 
 void VersionStorageInfo::AddBlobFile(
@@ -4232,6 +4462,205 @@ void VersionStorageInfo::AddBlobFile(
                                     blob_file_meta->GetBlobFileNumber()));
 
   blob_files_.emplace_back(std::move(blob_file_meta));
+}
+
+void VersionStorageInfo::AddBlobRelocationFile(
+    std::shared_ptr<BlobRelocationFileMetaData> metadata) {
+  assert(metadata);
+  assert(blob_relocation_files_.empty() ||
+         blob_relocation_files_.back()->GetFileNumber() <
+             metadata->GetFileNumber());
+  blob_relocation_files_.emplace_back(std::move(metadata));
+}
+
+void VersionStorageInfo::AddBlobRelocationRoute(BlobRelocationRoute route) {
+  assert(route.Validate().ok());
+  assert(blob_relocation_routes_.empty() ||
+         blob_relocation_routes_.back().GetSource() < route.GetSource());
+  ++blob_relocation_route_target_counts_[route.GetPhysicalFileNumber()];
+  ++blob_relocation_route_target_origin_counts_[{route.GetPhysicalFileNumber(),
+                                                 route.GetOriginFileNumber()}];
+  blob_relocation_routes_.emplace_back(std::move(route));
+}
+
+void VersionStorageInfo::AddRetiredBlobRelocationFile(uint64_t file_number) {
+  assert(file_number != kInvalidBlobFileNumber);
+  assert(retired_blob_relocation_files_.empty() ||
+         retired_blob_relocation_files_.back() < file_number);
+  retired_blob_relocation_files_.push_back(file_number);
+}
+
+void VersionStorageInfo::AddRetiredBlobRelocationRoute(
+    BlobRelocationRouteSource source) {
+  assert(source.generation_file_number != kInvalidBlobFileNumber);
+  assert(source.origin_file_number != kInvalidBlobFileNumber);
+  assert(retired_blob_relocation_routes_.empty() ||
+         retired_blob_relocation_routes_.back() < source);
+  retired_blob_relocation_routes_.push_back(source);
+}
+
+std::shared_ptr<BlobRelocationFileMetaData>
+VersionStorageInfo::GetBlobRelocationFileMetaData(uint64_t file_number) const {
+  const auto iterator = std::lower_bound(
+      blob_relocation_files_.begin(), blob_relocation_files_.end(), file_number,
+      [](const std::shared_ptr<BlobRelocationFileMetaData>& metadata,
+         uint64_t target) { return metadata->GetFileNumber() < target; });
+  if (iterator == blob_relocation_files_.end() ||
+      (*iterator)->GetFileNumber() != file_number) {
+    return nullptr;
+  }
+  return *iterator;
+}
+
+const BlobRelocationRoute* VersionStorageInfo::GetBlobRelocationRoute(
+    const BlobRelocationRouteSource& source) const {
+  const auto iterator = std::lower_bound(
+      blob_relocation_routes_.begin(), blob_relocation_routes_.end(), source,
+      [](const BlobRelocationRoute& route,
+         const BlobRelocationRouteSource& target) {
+        return route.GetSource() < target;
+      });
+  if (iterator == blob_relocation_routes_.end() ||
+      iterator->GetSource() != source) {
+    return nullptr;
+  }
+  return &*iterator;
+}
+
+bool VersionStorageInfo::IsBlobRelocationFileRetired(
+    uint64_t file_number) const {
+  return std::binary_search(retired_blob_relocation_files_.begin(),
+                            retired_blob_relocation_files_.end(), file_number);
+}
+
+bool VersionStorageInfo::IsBlobRelocationRouteRetired(
+    const BlobRelocationRouteSource& source) const {
+  return std::binary_search(retired_blob_relocation_routes_.begin(),
+                            retired_blob_relocation_routes_.end(), source);
+}
+
+size_t VersionStorageInfo::GetBlobRelocationRouteTargetCount(
+    uint64_t physical_file_number) const {
+  const auto iterator =
+      blob_relocation_route_target_counts_.find(physical_file_number);
+  return iterator == blob_relocation_route_target_counts_.end()
+             ? 0
+             : iterator->second;
+}
+
+size_t VersionStorageInfo::GetBlobRelocationRouteTargetOriginCount(
+    uint64_t physical_file_number, uint64_t origin_file_number) const {
+  const auto iterator = blob_relocation_route_target_origin_counts_.find(
+      {physical_file_number, origin_file_number});
+  return iterator == blob_relocation_route_target_origin_counts_.end()
+             ? 0
+             : iterator->second;
+}
+
+Status VersionStorageInfo::ValidateBlobRelocationState() const {
+  if (blob_indirection_format_version_ == 0) {
+    for (const std::shared_ptr<BlobFileMetaData>& metadata : blob_files_) {
+      if (metadata != nullptr && metadata->IsIdentityRoot()) {
+        return Status::Corruption(
+            "Identity-root blob file exists without the format fence");
+      }
+    }
+    if (!blob_relocation_files_.empty() || !blob_relocation_routes_.empty() ||
+        !retired_blob_relocation_files_.empty() ||
+        !retired_blob_relocation_routes_.empty()) {
+      return Status::Corruption(
+          "Blob relocation state exists without the format fence");
+    }
+    return Status::OK();
+  }
+  if (blob_indirection_format_version_ !=
+      kBlobIndirectionManifestFormatVersion) {
+    return Status::NotSupported("Unknown blob indirection format fence");
+  }
+
+  uint64_t previous_file_number = 0;
+  for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
+       blob_relocation_files_) {
+    if (metadata == nullptr ||
+        metadata->GetFileNumber() <= previous_file_number ||
+        GetBlobFileMetaData(metadata->GetFileNumber()) != nullptr ||
+        GetFileLocation(metadata->GetFileNumber()).IsValid()) {
+      return Status::Corruption("Invalid blob relocation file index");
+    }
+    Status status = metadata->GetAddition().Validate();
+    if (!status.ok()) {
+      return status;
+    }
+    previous_file_number = metadata->GetFileNumber();
+  }
+
+  previous_file_number = 0;
+  for (uint64_t file_number : retired_blob_relocation_files_) {
+    if (file_number == kInvalidBlobFileNumber ||
+        file_number <= previous_file_number ||
+        GetBlobRelocationFileMetaData(file_number) != nullptr ||
+        GetBlobFileMetaData(file_number) != nullptr ||
+        GetFileLocation(file_number).IsValid()) {
+      return Status::Corruption("Invalid retired blob relocation file index");
+    }
+    previous_file_number = file_number;
+  }
+
+  BlobRelocationRouteSource previous_source;
+  bool has_previous_source = false;
+  std::map<uint64_t, size_t> expected_target_counts;
+  std::map<std::pair<uint64_t, uint64_t>, size_t> expected_target_origin_counts;
+  for (const BlobRelocationRoute& route : blob_relocation_routes_) {
+    Status status = route.Validate();
+    if (!status.ok()) {
+      return status;
+    }
+    if (has_previous_source && !(previous_source < route.GetSource())) {
+      return Status::Corruption("Duplicate blob relocation route source");
+    }
+    const std::shared_ptr<BlobRelocationFileMetaData> target =
+        GetBlobRelocationFileMetaData(route.GetPhysicalFileNumber());
+    if (target == nullptr ||
+        target->GetDirectory().Find(route.GetOriginFileNumber()) == nullptr) {
+      return Status::Corruption("Invalid blob relocation route target");
+    }
+    if (GetBlobRelocationRoute(BlobRelocationRouteSource{
+            route.GetPhysicalFileNumber(), route.GetOriginFileNumber()}) !=
+        nullptr) {
+      return Status::Corruption("Blob relocation route chain");
+    }
+    size_t& target_count =
+        expected_target_counts[route.GetPhysicalFileNumber()];
+    size_t& target_origin_count = expected_target_origin_counts[{
+        route.GetPhysicalFileNumber(), route.GetOriginFileNumber()}];
+    if (target_count == std::numeric_limits<size_t>::max() ||
+        target_origin_count == std::numeric_limits<size_t>::max()) {
+      return Status::Corruption("Blob relocation route count overflow");
+    }
+    ++target_count;
+    ++target_origin_count;
+    previous_source = route.GetSource();
+    has_previous_source = true;
+  }
+  previous_source = BlobRelocationRouteSource{};
+  has_previous_source = false;
+  for (const BlobRelocationRouteSource& source :
+       retired_blob_relocation_routes_) {
+    if (source.generation_file_number == kInvalidBlobFileNumber ||
+        source.origin_file_number == kInvalidBlobFileNumber ||
+        (has_previous_source && !(previous_source < source)) ||
+        GetBlobRelocationRoute(source) != nullptr) {
+      return Status::Corruption("Invalid retired blob relocation route index");
+    }
+    previous_source = source;
+    has_previous_source = true;
+  }
+  if (expected_target_counts != blob_relocation_route_target_counts_ ||
+      expected_target_origin_counts !=
+          blob_relocation_route_target_origin_counts_) {
+    return Status::Corruption("Invalid blob relocation route target index");
+  }
+  return Status::OK();
 }
 
 VersionStorageInfo::BlobFiles::const_iterator
@@ -5373,6 +5802,11 @@ void Version::AddLiveFiles(std::vector<uint64_t>* live_table_files,
 
     live_blob_files->emplace_back(meta->GetBlobFileNumber());
   }
+  for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
+       storage_info_.GetBlobRelocationFiles()) {
+    assert(metadata != nullptr);
+    live_blob_files->emplace_back(metadata->GetFileNumber());
+  }
 }
 
 void Version::RemoveLiveFiles(
@@ -5390,7 +5824,9 @@ void Version::RemoveLiveFiles(
       std::remove_if(
           blob_delete_candidates.begin(), blob_delete_candidates.end(),
           [this](ObsoleteBlobFileInfo& x) {
-            return storage_info()->GetBlobFileMetaData(x.GetBlobFileNumber());
+            return storage_info()->GetBlobFileMetaData(x.GetBlobFileNumber()) ||
+                   storage_info()->GetBlobRelocationFileMetaData(
+                       x.GetBlobFileNumber());
           }),
       blob_delete_candidates.end());
 }
@@ -5468,18 +5904,29 @@ struct VersionSet::ManifestWriter {
   ColumnFamilyData* cfd;
   const autovector<VersionEdit*>& edit_list;
   const std::function<void(const Status&)> manifest_write_callback;
+  const MutableCFOptions* new_mutable_cf_options;
+  std::optional<uint64_t> compaction_phase_anchor_time;
+  // This writer's caller must run a precondition after reaching the head of
+  // the queue, so an earlier writer must not absorb it into a group commit.
+  bool requires_precondition;
   int max_file_opening_threads;
 
   explicit ManifestWriter(
       InstrumentedMutex* mu, ColumnFamilyData* _cfd,
       const autovector<VersionEdit*>& e,
       const std::function<void(const Status&)>& manifest_wcb,
+      bool _requires_precondition,
+      const MutableCFOptions* _new_mutable_cf_options,
+      std::optional<uint64_t> _compaction_phase_anchor_time,
       int _max_file_opening_threads = 1)
       : done(false),
         cv(mu),
         cfd(_cfd),
         edit_list(e),
         manifest_write_callback(manifest_wcb),
+        new_mutable_cf_options(_new_mutable_cf_options),
+        compaction_phase_anchor_time(_compaction_phase_anchor_time),
+        requires_precondition(_requires_precondition),
         max_file_opening_threads(_max_file_opening_threads) {}
   // No copying allowed
   ManifestWriter(const ManifestWriter&) = delete;
@@ -5734,6 +6181,7 @@ VersionSet::~VersionSet() {
   // Must clean up column families to make all files "obsolete"
   column_family_set_.reset();
 
+  MutexLock lock(&obsolete_files_mutex_);
   for (auto& file : obsolete_files_) {
     // NOTE: DB is shutting down, so file is probably not obsolete, just
     // no longer referenced by Versions in memory.
@@ -5749,6 +6197,7 @@ VersionSet::~VersionSet() {
     file.DeleteMetadata();
   }
   obsolete_files_.clear();
+  obsolete_blob_files_.clear();
   io_status_.PermitUncheckedError();
 }
 
@@ -5800,6 +6249,8 @@ void VersionSet::Reset() {
   options_file_size_ = 0;
   has_committed_options_file_number_ = false;
   pending_manifest_file_number_ = 0;
+  blob_indirection_format_version_ = 0;
+  physical_file_owners_.clear();
   last_sequence_.store(0);
   last_allocated_sequence_.store(0);
   last_published_sequence_.store(0);
@@ -5814,7 +6265,11 @@ void VersionSet::Reset() {
   force_new_manifest_on_open_ = false;
   last_compacted_manifest_file_size_ = 0;
   TuneMaxManifestFileSize();
-  obsolete_files_.clear();
+  {
+    MutexLock lock(&obsolete_files_mutex_);
+    obsolete_files_.clear();
+    obsolete_blob_files_.clear();
+  }
   obsolete_manifests_.clear();
   wals_.Reset();
 }
@@ -5853,16 +6308,7 @@ void VersionSet::UpdatedMutableDbOptions(
       // the current Version) rather than only when the next Version is built.
       // Safe because periodic_compaction_phase_params_ is read only under the
       // DB mutex, which is held here.
-      for (auto* cfd : *column_family_set_) {
-        if (cfd->IsDropped()) {
-          continue;
-        }
-        Version* v = cfd->current();
-        if (v != nullptr) {
-          v->storage_info_.periodic_compaction_phase_params_ =
-              GetPeriodicCompactionPhaseParams(cfd->GetID());
-        }
-      }
+      RefreshCurrentVersionCompactionPhaseParams();
     }
   }
 
@@ -5874,17 +6320,26 @@ PeriodicCompactionPhaseParams VersionSet::GetPeriodicCompactionPhaseParams(
   return periodic_compaction_phaser_.ParamsForCf(cf_id);
 }
 
-void VersionSet::ReanchorCompactionPhase() {
-  // Caller holds the DB mutex. Move the phasing anchor to now and refresh each
-  // CF's current Version's cached params, mirroring the refresh done for
-  // seed/recovery changes in UpdatedMutableDbOptions(). Used when a CF's
-  // periodic_compaction_seconds changes, so a turn-down's newly past-due cohort
-  // is spread rather than fired at once. Re-anchoring is DB-level and benign to
-  // CFs whose interval did not change (their not-past-due files keep phasing).
+std::optional<uint64_t> VersionSet::PrepareCompactionPhaseReanchor() const {
   int64_t now = 0;
   if (clock_ != nullptr && clock_->GetCurrentTime(&now).ok()) {
-    periodic_compaction_phaser_.Reanchor(static_cast<uint64_t>(now));
+    return static_cast<uint64_t>(now);
   }
+  return std::nullopt;
+}
+
+PeriodicCompactionPhaseParams
+VersionSet::GetPeriodicCompactionPhaseParamsAtAnchor(
+    uint32_t cf_id, uint64_t anchor_time) const {
+  return periodic_compaction_phaser_.ParamsForCfAtAnchor(cf_id, anchor_time);
+}
+
+void VersionSet::CommitCompactionPhaseReanchor(uint64_t anchor_time) {
+  periodic_compaction_phaser_.Reanchor(anchor_time);
+  RefreshCurrentVersionCompactionPhaseParams();
+}
+
+void VersionSet::RefreshCurrentVersionCompactionPhaseParams() {
   for (auto* cfd : *column_family_set_) {
     if (cfd->IsDropped()) {
       continue;
@@ -5934,15 +6389,41 @@ void VersionSet::AppendVersion(ColumnFamilyData* column_family_data,
 }
 
 Status VersionSet::ProcessManifestWrites(
-    std::deque<ManifestWriter>& writers, InstrumentedMutex* mu,
+    std::deque<ManifestWriter>& writers,
+    LogAndApplyColumnFamilyMode column_family_mode, InstrumentedMutex* mu,
     FSDirectory* dir_contains_current_file, bool new_descriptor_log,
     const ColumnFamilyOptions* new_cf_options,
     bool new_cf_options_are_sanitized, const ReadOptions& read_options,
     const WriteOptions& write_options) {
-  mu->AssertHeld();
+  // LogAndApply requires a non-null DB mutex, but NULLSAFECLANG cannot carry
+  // that API contract into this private helper.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  InstrumentedMutex& db_mutex = *mu;
+  db_mutex.AssertHeld();
   assert(!writers.empty());
   ManifestWriter& first_writer = writers.front();
   ManifestWriter* last_writer = &first_writer;
+
+  bool callbacks_published = false;
+  const auto publish_batch_callbacks = [&](const Status& status) {
+    db_mutex.AssertHeld();
+    if (callbacks_published) {
+      return;
+    }
+    callbacks_published = true;
+    // Internal publication callbacks complete related in-memory transitions
+    // (notably removing flushed memtables) before any post-install unlock.
+    // They must not invoke user code or perform I/O. Keep writers queued and
+    // unfinished until unlocked cleanup ends: their owners can then return.
+    for (ManifestWriter* writer : manifest_writers_) {
+      if (writer->manifest_write_callback) {
+        writer->manifest_write_callback(status);
+      }
+      if (writer == last_writer) {
+        break;
+      }
+    }
+  };
 
   // Takes this batch, from the queue head through `last_writer`, off
   // manifest_writers_: records `s` on each writer, runs its callback, and wakes
@@ -5950,24 +6431,19 @@ Status VersionSet::ProcessManifestWrites(
   // path must do this, because the writers in `writers` live on the caller's
   // stack and a queued pointer to one would outlive them.
   auto finish_batch = [&](const Status& s) {
+    // Early failure paths have no installed Version and publish here.
+    publish_batch_callbacks(s);
     while (true) {
       ManifestWriter* ready = manifest_writers_.front();
       manifest_writers_.pop_front();
-      bool need_signal = true;
-      for (const auto& w : writers) {
-        if (&w == ready) {
-          need_signal = false;
-          break;
-        }
-      }
       ready->status = s;
       ready->done = true;
-      if (ready->manifest_write_callback) {
-        (ready->manifest_write_callback)(s);
-      }
-      if (need_signal) {
-        ready->cv.Signal();
-      }
+      // Signalling is harmless for this leader's caller-owned writers, which
+      // have no waiter, and avoids a quadratic membership scan for large
+      // multi-column-family batches.
+      // `manifest_writers_` contains only live writer addresses.
+      // @lint-ignore NULLSAFECLANG nullable-dereference
+      ready->cv.Signal();
       if (ready == last_writer) {
         break;
       }
@@ -5985,6 +6461,9 @@ Status VersionSet::ProcessManifestWrites(
   assert(manifest_writers_.front() == &first_writer);
 
   autovector<VersionEdit*> batch_edits;
+  PhysicalFileOwnershipDeltas physical_file_ownership_deltas;
+  std::optional<PhysicalFileOwnershipIndex> prepared_column_family_drop_owners;
+  std::optional<PhysicalFileOwnershipIndex> prepared_format_activation_owners;
   // This vector keeps track of the corresponding user-defined timestamp size
   // for `batch_edits` side by side, which is only needed for encoding a
   // `VersionEdit` that adds new SST files.
@@ -5996,12 +6475,62 @@ Status VersionSet::ProcessManifestWrites(
   autovector<const autovector<uint64_t>*> files_to_quarantine_if_commit_fail;
   autovector<uint64_t> limbo_descriptor_log_file_number;
 
+  const auto discard_candidate_versions = [&] {
+    if (versions.empty()) {
+      return;
+    }
+    db_mutex.Unlock();
+    // SyncPoint's singleton has process lifetime.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT_CALLBACK(
+        "VersionSet::ProcessManifestWrites:CandidateVersionsDestroyedUnlocked",
+        &db_mutex);
+    for (Version* version : versions) {
+      delete version;
+    }
+    versions.clear();
+    db_mutex.Lock();
+  };
+  const auto release_builder_guards = [&] {
+    if (builder_guards.empty()) {
+      return;
+    }
+    // Detach only the potentially large builder state. The guards keep their
+    // base-Version references until the mutex is reacquired because Version
+    // refs are not atomic.
+    std::vector<std::unique_ptr<VersionBuilder>> builders;
+    builders.reserve(builder_guards.size());
+    for (const auto& guard : builder_guards) {
+      assert(guard != nullptr);
+      // Every stored builder guard is non-null.
+      // @lint-ignore NULLSAFECLANG nullable-dereference
+      builders.push_back(guard->ReleaseVersionBuilder());
+    }
+    db_mutex.Unlock();
+    // SyncPoint's singleton has process lifetime.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT_CALLBACK(
+        "VersionSet::ProcessManifestWrites:BuilderGuardsDestroyedUnlocked",
+        &db_mutex);
+    builders.clear();
+    db_mutex.Lock();
+    builder_guards.clear();
+    // SyncPoint's singleton has process lifetime.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT_CALLBACK(
+        "VersionSet::ProcessManifestWrites:BuilderGuardsReleasedLocked",
+        &db_mutex);
+  };
+
   // Tracking `max_last_sequence` is needed to ensure we write
   // `VersionEdit::last_sequence_`s in non-decreasing order according to the
   // recovery code's requirement. It also allows us to defer updating
   // `descriptor_last_sequence_` until the apply phase, after the log phase
   // succeeds.
   SequenceNumber max_last_sequence = descriptor_last_sequence_;
+  uint32_t pending_blob_indirection_format_version =
+      blob_indirection_format_version_;
+  bool deferred_physical_file_ownership_conflict = false;
 
   bool skip_manifest_write =
       first_writer.edit_list.front()->IsNoManifestWriteDummy();
@@ -6022,13 +6551,16 @@ Status VersionSet::ProcessManifestWrites(
           std::max(batch_max_file_opening_threads,
                    last_writer->max_file_opening_threads);
       assert(last_writer != nullptr);
-      assert(last_writer->cfd != nullptr);
-      if (!batch_apply_status.ok()) {
+      ColumnFamilyData* const writer_cfd = last_writer->cfd;
+      if (writer_cfd == nullptr) {
+        batch_apply_status =
+            Status::Corruption("null column family in MANIFEST writer");
+      } else if (!batch_apply_status.ok()) {
         // An earlier edit failed, so apply no more edits, but keep grouping
         // until the loop conditions below end the batch as usual. LogAndApply()
         // returns once a caller's first writer is done, so none of its writers
         // may be left queued.
-      } else if (last_writer->cfd->IsDropped()) {
+      } else if (writer_cfd->IsDropped()) {
         // If we detect a dropped CF at this point, and the corresponding
         // version edits belong to an atomic group, then we need to find out
         // the preceding version edits in the same atomic group, and update
@@ -6061,33 +6593,57 @@ Status VersionSet::ProcessManifestWrites(
           }
         }
       } else {
-        // We do a linear search on versions because versions is small.
-        // TODO(yanqin) maybe consider unordered_map
         Version* version = nullptr;
         VersionBuilder* builder = nullptr;
-        for (int i = 0; i != static_cast<int>(versions.size()); ++i) {
-          uint32_t cf_id = last_writer->cfd->GetID();
-          if (versions[i]->cfd()->GetID() == cf_id) {
-            version = versions[i];
-            assert(!builder_guards.empty() &&
-                   builder_guards.size() == versions.size());
-            builder = builder_guards[i]->version_builder();
-            TEST_SYNC_POINT_CALLBACK(
-                "VersionSet::ProcessManifestWrites:SameColumnFamily", &cf_id);
-            break;  // inner for-`i` loop
+        if (column_family_mode ==
+            LogAndApplyColumnFamilyMode::kMayRepeatColumnFamilies) {
+          // Normal MANIFEST group commits can contain multiple writers for one
+          // column family, so they share one VersionBuilder. The explicit
+          // unique-column-family mode bypasses this search.
+          for (int i = 0; i != static_cast<int>(versions.size()); ++i) {
+            // SyncPoint's singleton has process lifetime, which NULLSAFECLANG
+            // cannot infer through the test-only macro expansion.
+            // @lint-ignore NULLSAFECLANG nullable-dereference
+            TEST_SYNC_POINT(
+                "VersionSet::ProcessManifestWrites:ColumnFamilyLookup");
+            uint32_t cf_id = writer_cfd->GetID();
+            Version* const existing_version = versions[i];
+            ColumnFamilyData* const existing_cfd =
+                existing_version != nullptr ? existing_version->cfd() : nullptr;
+            if (existing_version != nullptr && existing_cfd != nullptr &&
+                existing_cfd->GetID() == cf_id) {
+              version = versions[i];
+              assert(!builder_guards.empty() &&
+                     builder_guards.size() == versions.size());
+              builder = builder_guards[i]->version_builder();
+              // See the SyncPoint lifetime note above.
+              // @lint-ignore NULLSAFECLANG nullable-dereference
+              TEST_SYNC_POINT_CALLBACK(
+                  "VersionSet::ProcessManifestWrites:SameColumnFamily", &cf_id);
+              break;  // inner for-`i` loop
+            }
           }
         }
         if (version == nullptr) {
           // WAL and OPTIONS protocol manipulations do not change LSM Versions.
           if (!last_writer->IsAllVersionIndependentEdits()) {
             version = new Version(
-                last_writer->cfd, this, file_options_,
-                last_writer->cfd ? last_writer->cfd->GetLatestMutableCFOptions()
-                                 : MutableCFOptions(*new_cf_options),
-                io_tracer_, current_version_number_++);
+                writer_cfd, this, file_options_,
+                last_writer->new_mutable_cf_options != nullptr
+                    ? *last_writer->new_mutable_cf_options
+                    : writer_cfd->GetLatestMutableCFOptions(),
+                io_tracer_,
+                last_writer->compaction_phase_anchor_time.has_value()
+                    ? std::make_optional(
+                          GetPeriodicCompactionPhaseParamsAtAnchor(
+                              writer_cfd->GetID(),
+                              *last_writer->compaction_phase_anchor_time))
+                    : std::nullopt,
+                current_version_number_++,
+                EpochNumberRequirement::kMustPresent);
             versions.push_back(version);
             builder_guards.emplace_back(new BaseReferencedVersionBuilder(
-                last_writer->cfd, last_writer->cfd->current()));
+                writer_cfd, writer_cfd->current()));
             builder = builder_guards.back()->version_builder();
           }
           assert(last_writer->IsAllVersionIndependentEdits() || builder);
@@ -6095,7 +6651,7 @@ Status VersionSet::ProcessManifestWrites(
           TEST_SYNC_POINT_CALLBACK(
               "VersionSet::ProcessManifestWrites:NewVersion", version);
         }
-        const Comparator* ucmp = last_writer->cfd->user_comparator();
+        const Comparator* ucmp = writer_cfd->user_comparator();
         assert(ucmp);
         std::optional<size_t> edit_ts_sz = ucmp->timestamp_size();
         for (const auto& e : last_writer->edit_list) {
@@ -6108,13 +6664,24 @@ Status VersionSet::ProcessManifestWrites(
           } else if (group_start != std::numeric_limits<size_t>::max()) {
             group_start = std::numeric_limits<size_t>::max();
           }
-          batch_apply_status = LogAndApplyHelper(last_writer->cfd, builder, e,
-                                                 &max_last_sequence, mu);
+          batch_apply_status = ValidateAndTrackPhysicalFileOwnership(
+              *e, pending_blob_indirection_format_version,
+              physical_file_ownership_deltas,
+              /*validate_current_owners=*/true,
+              &deferred_physical_file_ownership_conflict);
+          if (batch_apply_status.ok()) {
+            batch_apply_status = LogAndApplyHelper(writer_cfd, builder, e,
+                                                   &max_last_sequence, mu);
+          }
           if (!batch_apply_status.ok()) {
             break;  // inner for-`e` loop
           }
           batch_edits.push_back(e);
           batch_edits_ts_sz.push_back(edit_ts_sz);
+          if (e->HasBlobIndirectionFormatVersion()) {
+            pending_blob_indirection_format_version =
+                e->GetBlobIndirectionFormatVersion();
+          }
         }
       }
       // Loop increment/conditions
@@ -6122,8 +6689,20 @@ Status VersionSet::ProcessManifestWrites(
       if (it == manifest_writers_.cend()) {
         break;
       }
-      if (skip_manifest_write) {
-        // no grouping when skipping manifest write
+      if (skip_manifest_write ||
+          column_family_mode ==
+              LogAndApplyColumnFamilyMode::kUniqueColumnFamilies) {
+        // A no-MANIFEST or unique-column-family batch can span the writers
+        // supplied by one caller, but must never absorb a later caller. A later
+        // caller could repeat one of the column families.
+        if (last_writer == &writers.back()) {
+          break;
+        }
+        continue;
+      }
+      if ((*it)->requires_precondition) {
+        // Let this writer become the queue head so its caller can validate the
+        // precondition against all Versions committed before it.
         break;
       }
       const auto* next = (*it)->edit_list.front();
@@ -6135,9 +6714,8 @@ Status VersionSet::ProcessManifestWrites(
       }
     }
     if (!batch_apply_status.ok()) {
-      for (auto v : versions) {
-        delete v;
-      }
+      discard_candidate_versions();
+      release_builder_guards();
       finish_batch(batch_apply_status);
       return batch_apply_status;
     }
@@ -6145,12 +6723,12 @@ Status VersionSet::ProcessManifestWrites(
       assert(!builder_guards.empty() &&
              builder_guards.size() == versions.size());
       auto* builder = builder_guards[i]->version_builder();
-      Status s = builder->SaveTo(versions[i]->storage_info());
+      // BaseReferencedVersionBuilder owns this builder for its full lifetime.
+      // @lint-ignore NULLSAFECLANG nullable-dereference
+      Status s = builder->SaveTableFilesTo(versions[i]->storage_info());
       if (!s.ok()) {
-        // free up the allocated memory
-        for (auto v : versions) {
-          delete v;
-        }
+        discard_candidate_versions();
+        release_builder_guards();
         finish_batch(s);
         return s;
       }
@@ -6192,8 +6770,7 @@ Status VersionSet::ProcessManifestWrites(
     k = i;
   }
   if (skip_manifest_write) {
-    // no grouping when skipping manifest write
-    assert(last_writer == &first_writer);
+    assert(last_writer == &writers.back());
   }
 #endif  // NDEBUG
 
@@ -6262,27 +6839,104 @@ Status VersionSet::ProcessManifestWrites(
 
   uint64_t new_manifest_file_size = 0;
   Status s;
+  // Finalization fails before any MANIFEST record is written.
+  bool blob_finalization_failed = false;
   IOStatus io_s;
   IOStatus manifest_io_status;
   manifest_io_status.PermitUncheckedError();
   std::unique_ptr<log::Writer> new_desc_log_ptr;
   // Save before releasing mu
   uint64_t manifest_preallocation_size = manifest_preallocation_size_;
+  const bool rebuild_format_activation_owners =
+      blob_indirection_format_version_ == 0 &&
+      pending_blob_indirection_format_version != 0;
   if (skip_manifest_write) {
+    db_mutex.Unlock();
+    // SyncPoint's singleton has process lifetime, which NULLSAFECLANG cannot
+    // infer through the test-only macro expansion.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:BeforeBlobFinalization");
+    if (s.ok()) {
+      for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
+        assert(!builder_guards.empty() &&
+               builder_guards.size() == versions.size());
+        // BaseReferencedVersionBuilder owns this builder for its full lifetime.
+        // @lint-ignore NULLSAFECLANG nullable-dereference
+        s = builder_guards[i]->version_builder()->FinalizeBlobFilesTo(
+            versions[i]->storage_info());
+        if (!s.ok()) {
+          blob_finalization_failed = true;
+          break;
+        }
+      }
+    }
+    // See the SyncPoint lifetime note above.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:AfterBlobFinalization");
+    if (s.ok()) {
+      MarkRemovedBlobFileOwners(batch_edits, versions,
+                                physical_file_ownership_deltas);
+    }
+    if (s.ok() && rebuild_format_activation_owners) {
+      prepared_format_activation_owners.emplace();
+      s = BuildPhysicalFileOwnershipIndex(versions, &db_mutex,
+                                          &*prepared_format_activation_owners);
+    }
     if (s.ok()) {
       constexpr bool update_stats = true;
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
-        // NOTE: normally called with DB mutex released, but we don't
-        // want to release the DB mutex in this mode of LogAndApply
         versions[i]->PrepareAppend(read_options, update_stats);
       }
     }
+    db_mutex.Lock();
   } else {
     FileOptions opt_file_opts = GetFileOptionsForManifestWrite();
-    mu->Unlock();
+    db_mutex.Unlock();
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifestStart");
     TEST_SYNC_POINT_CALLBACK("VersionSet::LogAndApply:WriteManifest", nullptr);
+    if (s.ok() && first_writer.edit_list.front()->IsColumnFamilyDrop()) {
+      assert(first_writer.cfd != nullptr);
+      prepared_column_family_drop_owners.emplace();
+      PrepareColumnFamilyDropOwnershipIndex(
+          first_writer.cfd->GetID(), &*prepared_column_family_drop_owners);
+    }
+    // SyncPoint's singleton has process lifetime, which NULLSAFECLANG cannot
+    // infer through the test-only macro expansion.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:BeforeBlobFinalization");
     if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
+      for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
+        assert(!builder_guards.empty() &&
+               builder_guards.size() == versions.size());
+        // BaseReferencedVersionBuilder owns this builder for its full lifetime.
+        // @lint-ignore NULLSAFECLANG nullable-dereference
+        s = builder_guards[i]->version_builder()->FinalizeBlobFilesTo(
+            versions[i]->storage_info());
+        if (!s.ok()) {
+          blob_finalization_failed = true;
+          break;
+        }
+      }
+    }
+    // See the SyncPoint lifetime note above.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:AfterBlobFinalization");
+    if (s.ok() &&
+        !first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
+      MarkRemovedBlobFileOwners(batch_edits, versions,
+                                physical_file_ownership_deltas);
+    }
+    if (s.ok() && rebuild_format_activation_owners) {
+      // The manifest-writer queue prevents any other Version installation
+      // while the DB mutex is released. Rebuild from the exact final candidate
+      // and retained current Versions so conflicts accumulated before feature
+      // activation cannot hide behind the incremental owner index.
+      prepared_format_activation_owners.emplace();
+      s = BuildPhysicalFileOwnershipIndex(versions, &db_mutex,
+                                          &*prepared_format_activation_owners);
+    }
+    if (s.ok() &&
+        !first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
         assert(!builder_guards.empty() &&
                builder_guards.size() == versions.size());
@@ -6317,9 +6971,9 @@ Status VersionSet::ProcessManifestWrites(
             CreateManifestWriter(std::move(descriptor_file), descriptor_fname,
                                  opt_file_opts, manifest_preallocation_size);
         raw_desc_log_ptr = new_desc_log_ptr.get();
-        s = WriteCurrentStateToManifest(write_options, curr_state,
-                                        wal_additions, options_manifest_state,
-                                        raw_desc_log_ptr, io_s);
+        s = WriteCurrentStateToManifest(
+            write_options, curr_state, wal_additions, options_manifest_state,
+            pending_blob_indirection_format_version, raw_desc_log_ptr, io_s);
         assert(s == io_s);
       }
       if (!io_s.ok()) {
@@ -6432,9 +7086,21 @@ Status VersionSet::ProcessManifestWrites(
     LogFlush(db_options_->info_log);
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifestDone");
     mu->Lock();
+#ifndef NDEBUG
+    assert(!manifest_writers_.empty());
+    assert(manifest_writers_.front() == &first_writer);
+    if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
+      assert(builder_guards.size() == versions.size());
+      for (size_t i = 0; i < versions.size(); ++i) {
+        assert(versions[i]->cfd_->current() ==
+               builder_guards[i]->base_version());
+      }
+    }
+#endif
   }
 
   if (s.ok()) {
+    blob_indirection_format_version_ = pending_blob_indirection_format_version;
     // Apply WAL edits, DB mutex must be held.
     for (auto& e : batch_edits) {
       if (e->IsWalAddition()) {
@@ -6518,10 +7184,31 @@ Status VersionSet::ProcessManifestWrites(
         MarkMinLogNumberToKeep(last_min_log_number_to_keep);
       }
 
+      if (first_writer.new_mutable_cf_options != nullptr) {
+        if (first_writer.compaction_phase_anchor_time.has_value()) {
+          CommitCompactionPhaseReanchor(
+              *first_writer.compaction_phase_anchor_time);
+        }
+        for (Version* version : versions) {
+          // ProcessManifestWrites only stores successfully allocated Versions.
+          // @lint-ignore NULLSAFECLANG nullable-dereference
+          const auto& mutable_options = version->GetMutableCFOptions();
+          // @lint-ignore NULLSAFECLANG nullable-dereference
+          version->cfd_->InstallMutableCFOptions(mutable_options);
+        }
+      }
+
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
         ColumnFamilyData* cfd = versions[i]->cfd_;
         AppendVersion(cfd, versions[i]);
       }
+    }
+    if (prepared_column_family_drop_owners.has_value()) {
+      physical_file_owners_.swap(*prepared_column_family_drop_owners);
+    } else if (prepared_format_activation_owners.has_value()) {
+      physical_file_owners_.swap(*prepared_format_activation_owners);
+    } else {
+      ApplyPhysicalFileOwnershipDeltas(physical_file_ownership_deltas);
     }
     if (!skip_manifest_write) {
       for (const auto* edit : batch_edits) {
@@ -6539,6 +7226,10 @@ Status VersionSet::ProcessManifestWrites(
       manifest_last_valid_record_end_file_number_ = manifest_file_number_;
       prev_log_number_ = first_writer.edit_list.front()->GetPrevLogNumber();
     }
+    publish_batch_callbacks(s);
+  } else if (blob_finalization_failed) {
+    // Like a SaveTableFilesTo failure: keep the current MANIFEST writer.
+    discard_candidate_versions();
   } else {
     std::string version_edits;
     for (auto& e : batch_edits) {
@@ -6547,9 +7238,7 @@ Status VersionSet::ProcessManifestWrites(
     ROCKS_LOG_ERROR(db_options_->info_log,
                     "Error in committing version edit to MANIFEST: %s",
                     version_edits.c_str());
-    for (auto v : versions) {
-      delete v;
-    }
+    discard_candidate_versions();
     // If manifest append failed for whatever reason, the file could be
     // corrupted. So we need to force the next version update to start a
     // new manifest file.
@@ -6597,6 +7286,16 @@ Status VersionSet::ProcessManifestWrites(
     }
   }
 
+  if (prepared_column_family_drop_owners.has_value() ||
+      prepared_format_activation_owners.has_value()) {
+    // The replacement index is already installed on success. Destroy either
+    // the old index or the unused prepared copy without holding the DB mutex.
+    db_mutex.Unlock();
+    prepared_column_family_drop_owners.reset();
+    prepared_format_activation_owners.reset();
+    db_mutex.Lock();
+  }
+
   pending_manifest_file_number_ = 0;
 
 #ifndef NDEBUG
@@ -6616,6 +7315,7 @@ Status VersionSet::ProcessManifestWrites(
   }
 #endif  // NDEBUG
 
+  release_builder_guards();
   finish_batch(s);
   return s;
 }
@@ -6634,15 +7334,19 @@ Status VersionSet::LogAndApply(
     const autovector<ColumnFamilyData*>& column_family_datas,
     const ReadOptions& read_options, const WriteOptions& write_options,
     const autovector<autovector<VersionEdit*>>& edit_lists,
-    InstrumentedMutex* mu, FSDirectory* dir_contains_current_file,
-    bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
+    LogAndApplyColumnFamilyMode column_family_mode,
+    const autovector<const MutableCFOptions*>* new_mutable_cf_options,
+    std::optional<uint64_t> compaction_phase_anchor_time, InstrumentedMutex* mu,
+    FSDirectory* dir_contains_current_file, bool new_descriptor_log,
+    const ColumnFamilyOptions* new_cf_options,
     const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
     const std::function<Status()>& pre_cb, int max_file_opening_threads) {
-  return LogAndApplyImpl(column_family_datas, read_options, write_options,
-                         edit_lists, mu, dir_contains_current_file,
-                         new_descriptor_log, new_cf_options,
-                         /*new_cf_options_are_sanitized=*/false, manifest_wcbs,
-                         pre_cb, max_file_opening_threads);
+  return LogAndApplyImpl(
+      column_family_datas, read_options, write_options, edit_lists,
+      column_family_mode, new_mutable_cf_options, compaction_phase_anchor_time,
+      mu, dir_contains_current_file, new_descriptor_log, new_cf_options,
+      /*new_cf_options_are_sanitized=*/false, manifest_wcbs, pre_cb,
+      max_file_opening_threads);
 }
 
 Status VersionSet::LogAndApplyColumnFamilyAddWithSanitizedOptions(
@@ -6655,7 +7359,10 @@ Status VersionSet::LogAndApplyColumnFamilyAddWithSanitizedOptions(
   autovector<ColumnFamilyData*> cfds{nullptr};
   autovector<VersionEdit*> edit_list{edit};
   autovector<autovector<VersionEdit*>> edit_lists{edit_list};
-  return LogAndApplyImpl(cfds, read_options, write_options, edit_lists, mu,
+  return LogAndApplyImpl(cfds, read_options, write_options, edit_lists,
+                         LogAndApplyColumnFamilyMode::kMayRepeatColumnFamilies,
+                         /*new_mutable_cf_options=*/nullptr,
+                         /*compaction_phase_anchor_time=*/std::nullopt, mu,
                          dir_contains_current_file,
                          /*new_descriptor_log=*/false, &sanitized_options,
                          /*new_cf_options_are_sanitized=*/true,
@@ -6667,8 +7374,11 @@ Status VersionSet::LogAndApplyImpl(
     const autovector<ColumnFamilyData*>& column_family_datas,
     const ReadOptions& read_options, const WriteOptions& write_options,
     const autovector<autovector<VersionEdit*>>& edit_lists,
-    InstrumentedMutex* mu, FSDirectory* dir_contains_current_file,
-    bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
+    LogAndApplyColumnFamilyMode column_family_mode,
+    const autovector<const MutableCFOptions*>* new_mutable_cf_options,
+    std::optional<uint64_t> compaction_phase_anchor_time, InstrumentedMutex* mu,
+    FSDirectory* dir_contains_current_file, bool new_descriptor_log,
+    const ColumnFamilyOptions* new_cf_options,
     bool new_cf_options_are_sanitized,
     const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
     const std::function<Status()>& pre_cb, int max_file_opening_threads) {
@@ -6681,16 +7391,28 @@ Status VersionSet::LogAndApplyImpl(
     return Status::OK();
   } else if (num_edits > 1) {
 #ifndef NDEBUG
+    const bool no_manifest_batch =
+        edit_lists.front().front()->IsNoManifestWriteDummy();
     for (const auto& edit_list : edit_lists) {
       for (const auto& edit : edit_list) {
         assert(!edit->IsColumnFamilyManipulation());
-        assert(!edit->IsNoManifestWriteDummy());
+        assert(edit->IsNoManifestWriteDummy() == no_manifest_batch);
       }
     }
 #endif /* ! NDEBUG */
   }
 
   int num_cfds = static_cast<int>(column_family_datas.size());
+#ifndef NDEBUG
+  if (column_family_mode ==
+      LogAndApplyColumnFamilyMode::kUniqueColumnFamilies) {
+    std::unordered_set<ColumnFamilyData*> unique_cfds;
+    for (ColumnFamilyData* cfd : column_family_datas) {
+      assert(cfd != nullptr);
+      assert(unique_cfds.insert(cfd).second);
+    }
+  }
+#endif
   if (num_cfds == 1 && column_family_datas[0] == nullptr) {
     assert(edit_lists.size() == 1 && edit_lists[0].size() == 1);
     assert(edit_lists[0][0]->IsColumnFamilyAdd());
@@ -6699,12 +7421,18 @@ Status VersionSet::LogAndApplyImpl(
   std::deque<ManifestWriter> writers;
   if (num_cfds > 0) {
     assert(static_cast<size_t>(num_cfds) == edit_lists.size());
+    assert(new_mutable_cf_options == nullptr ||
+           static_cast<size_t>(num_cfds) == new_mutable_cf_options->size());
   }
   for (int i = 0; i < num_cfds; ++i) {
     const auto wcb =
         manifest_wcbs.empty() ? [](const Status&) {} : manifest_wcbs[i];
-    writers.emplace_back(mu, column_family_datas[i], edit_lists[i], wcb,
-                         max_file_opening_threads);
+    writers.emplace_back(
+        mu, column_family_datas[i], edit_lists[i], wcb,
+        /*requires_precondition=*/i == 0 && !!pre_cb,
+        new_mutable_cf_options == nullptr ? nullptr
+                                          : (*new_mutable_cf_options)[i],
+        compaction_phase_anchor_time, max_file_opening_threads);
     manifest_writers_.push_back(&writers[i]);
   }
   assert(!writers.empty());
@@ -6757,10 +7485,10 @@ Status VersionSet::LogAndApplyImpl(
     }
     return s;
   } else {
-    return ProcessManifestWrites(writers, mu, dir_contains_current_file,
-                                 new_descriptor_log, new_cf_options,
-                                 new_cf_options_are_sanitized, read_options,
-                                 write_options);
+    return ProcessManifestWrites(writers, column_family_mode, mu,
+                                 dir_contains_current_file, new_descriptor_log,
+                                 new_cf_options, new_cf_options_are_sanitized,
+                                 read_options, write_options);
   }
 }
 
@@ -6776,6 +7504,384 @@ void VersionSet::LogAndApplyCFHelper(VersionEdit* edit,
     // family, so that we don't reuse existing ID
     edit->SetMaxColumnFamily(column_family_set_->GetMaxColumnFamily());
   }
+}
+
+Status VersionSet::ValidateAndTrackPhysicalFileOwnership(
+    const VersionEdit& edit, uint32_t active_format_version,
+    PhysicalFileOwnershipDeltas& deltas, bool validate_current_owners,
+    bool* deferred_conflict) const {
+  if (deferred_conflict == nullptr) {
+    return Status::InvalidArgument("null deferred ownership conflict state");
+  }
+  bool& deferred_conflict_state = *deferred_conflict;
+  const bool enforce_uniqueness =
+      active_format_version != 0 ||
+      (edit.HasBlobIndirectionFormatVersion() &&
+       edit.GetBlobIndirectionFormatVersion() != 0) ||
+      !edit.GetBlobRelocationFileAdditions().empty() ||
+      !edit.GetBlobRelocationFileDeletions().empty() ||
+      !edit.GetBlobRelocationRoutes().empty() ||
+      !edit.GetBlobRelocationRouteDeletions().empty();
+  if (enforce_uniqueness && deferred_conflict_state) {
+    return Status::Corruption(
+        "Physical file number has conflicting ownership before format "
+        "activation");
+  }
+  const auto same_owner = [](const PhysicalFileOwner& lhs,
+                             const PhysicalFileOwner& rhs) {
+    return lhs.column_family_id == rhs.column_family_id && lhs.kind == rhs.kind;
+  };
+  const auto record = [&](uint64_t file_number, PhysicalFileOwner owner,
+                          bool present) -> Status {
+    const auto delta = deltas.find(file_number);
+    if (delta != deltas.end()) {
+      if (!same_owner(delta->second.owner, owner)) {
+        if (enforce_uniqueness) {
+          return Status::Corruption(
+              "Physical file number has conflicting ownership in a MANIFEST "
+              "batch");
+        }
+        deferred_conflict_state = true;
+        return Status::OK();
+      }
+      delta->second.present = present;
+      return Status::OK();
+    }
+
+    const auto current = physical_file_owners_.find(file_number);
+    if (validate_current_owners && current != physical_file_owners_.end() &&
+        !same_owner(current->second, owner)) {
+      if (enforce_uniqueness) {
+        return Status::Corruption(
+            "Physical file number is reused across column families or file "
+            "kinds");
+      }
+      deferred_conflict_state = true;
+      return Status::OK();
+    }
+    deltas.emplace(file_number, PhysicalFileOwnershipDelta{owner, present});
+    return Status::OK();
+  };
+
+  const uint32_t column_family_id = edit.GetColumnFamily();
+  const PhysicalFileOwner table_owner{column_family_id,
+                                      PhysicalFileOwnerKind::kTable};
+  const PhysicalFileOwner blob_owner{column_family_id,
+                                     PhysicalFileOwnerKind::kBlob};
+  const PhysicalFileOwner relocation_owner{
+      column_family_id, PhysicalFileOwnerKind::kBlobRelocation};
+
+  // Process deletions first so a table move represented as delete+add retains
+  // ownership. A relocation deletion remains present as a durable retirement
+  // claim, including when the deleted ID was not previously known.
+  for (const auto& deleted_file : edit.GetDeletedFiles()) {
+    Status status = record(deleted_file.second, table_owner, false);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  for (const BlobFileGarbage& garbage : edit.GetBlobFileGarbages()) {
+    // Garbage accounting does not by itself prove the file is obsolete. The
+    // final Version reconciles opened CFs exactly. For unopened CFs, retain a
+    // conservative ownership claim until a complete snapshot or CF drop proves
+    // removal.
+    Status status = record(garbage.GetBlobFileNumber(), blob_owner, true);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  for (uint64_t file_number : edit.GetBlobRelocationFileDeletions()) {
+    Status status = record(file_number, relocation_owner, true);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  for (const auto& new_file : edit.GetNewFiles()) {
+    Status status = record(new_file.second.fd.GetNumber(), table_owner, true);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  for (const BlobFileAddition& addition : edit.GetBlobFileAdditions()) {
+    Status status = record(addition.GetBlobFileNumber(), blob_owner, true);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  for (const BlobRelocationFileAddition& addition :
+       edit.GetBlobRelocationFileAdditions()) {
+    if (addition.GetColumnFamilyId() != column_family_id) {
+      return Status::Corruption(
+          "Blob relocation file belongs to another column family");
+    }
+    Status status = record(addition.GetFileNumber(), relocation_owner, true);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  return Status::OK();
+}
+
+void VersionSet::MarkRemovedBlobFileOwners(
+    const autovector<VersionEdit*>& edits, const autovector<Version*>& versions,
+    PhysicalFileOwnershipDeltas& deltas) const {
+  std::unordered_map<uint32_t, const VersionStorageInfo*> final_storage;
+  for (const Version* version : versions) {
+    ColumnFamilyData* version_cfd =
+        version != nullptr ? version->cfd() : nullptr;
+    if (version == nullptr || version_cfd == nullptr) {
+      continue;
+    }
+    final_storage.emplace(version_cfd->GetID(), version->storage_info());
+  }
+
+  for (const VersionEdit* edit : edits) {
+    assert(edit != nullptr);
+    const auto storage = final_storage.find(edit->GetColumnFamily());
+    if (storage == final_storage.end()) {
+      continue;
+    }
+    for (const BlobFileGarbage& garbage : edit->GetBlobFileGarbages()) {
+      const uint64_t file_number = garbage.GetBlobFileNumber();
+      const PhysicalFileOwner owner{edit->GetColumnFamily(),
+                                    PhysicalFileOwnerKind::kBlob};
+      const bool present =
+          storage->second->GetBlobFileMetaData(file_number) != nullptr;
+      const auto result = deltas.emplace(
+          file_number, PhysicalFileOwnershipDelta{owner, present});
+      if (!result.second &&
+          result.first->second.owner.column_family_id ==
+              owner.column_family_id &&
+          result.first->second.owner.kind == owner.kind) {
+        result.first->second.present = present;
+      }
+    }
+  }
+}
+
+void VersionSet::PrepareColumnFamilyDropOwnershipIndex(
+    uint32_t column_family_id, PhysicalFileOwnershipIndex* index) const {
+  assert(index != nullptr);
+  *index = physical_file_owners_;
+  RemoveColumnFamilyPhysicalFileOwners(column_family_id, index);
+}
+
+void VersionSet::RemoveColumnFamilyPhysicalFileOwners(
+    uint32_t column_family_id, PhysicalFileOwnershipIndex* index) {
+  assert(index != nullptr);
+  for (auto entry = index->begin(); entry != index->end();) {
+    if (entry->second.column_family_id == column_family_id) {
+      entry = index->erase(entry);
+    } else {
+      ++entry;
+    }
+  }
+}
+
+void VersionSet::MarkColumnFamilyDroppedOwnershipDeltas(
+    uint32_t column_family_id, PhysicalFileOwnershipDeltas& deltas) {
+  for (auto& entry : deltas) {
+    if (entry.second.owner.column_family_id == column_family_id) {
+      entry.second.present = false;
+    }
+  }
+}
+
+void VersionSet::ApplyPhysicalFileOwnershipDeltas(
+    const PhysicalFileOwnershipDeltas& deltas) {
+  ApplyPhysicalFileOwnershipDeltasToIndex(deltas, &physical_file_owners_);
+}
+
+void VersionSet::ApplyPhysicalFileOwnershipDeltasToIndex(
+    const PhysicalFileOwnershipDeltas& deltas,
+    PhysicalFileOwnershipIndex* index) {
+  assert(index != nullptr);
+  for (const auto& entry : deltas) {
+    const uint64_t file_number = entry.first;
+    const PhysicalFileOwnershipDelta& delta = entry.second;
+    if (delta.present) {
+      (*index)[file_number] = delta.owner;
+      continue;
+    }
+    const auto current = index->find(file_number);
+    if (current != index->end() &&
+        current->second.column_family_id == delta.owner.column_family_id &&
+        current->second.kind == delta.owner.kind) {
+      index->erase(current);
+    }
+  }
+}
+
+Status VersionSet::BuildPhysicalFileOwnershipIndex(
+    const autovector<Version*>& candidate_versions, InstrumentedMutex* db_mutex,
+    PhysicalFileOwnershipIndex* index) const {
+  if (index == nullptr) {
+    return Status::InvalidArgument("null physical ownership output");
+  }
+
+  // Candidate lookup allocation is intentionally outside the DB mutex. Each
+  // candidate Version remains owned by its caller until this method returns.
+  std::unordered_map<uint32_t, Version*> candidates_by_cf;
+  candidates_by_cf.reserve(candidate_versions.size());
+  for (Version* version : candidate_versions) {
+    if (version == nullptr || version->cfd() == nullptr) {
+      return Status::Corruption("Physical ownership candidate has no CF");
+    }
+    // The check above establishes that the candidate has a CF.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    const uint32_t column_family_id = version->cfd()->GetID();
+    if (!candidates_by_cf.emplace(column_family_id, version).second) {
+      return Status::Corruption(
+          "Duplicate column family physical ownership candidate");
+    }
+  }
+
+  PhysicalFileOwnershipIndex rebuilt;
+  const auto register_owner = [&](uint64_t file_number,
+                                  PhysicalFileOwner owner) -> Status {
+    const auto result = rebuilt.emplace(file_number, owner);
+    if (result.second ||
+        (result.first->second.column_family_id == owner.column_family_id &&
+         result.first->second.kind == owner.kind)) {
+      return Status::OK();
+    }
+    return Status::Corruption(
+        "Physical file number has conflicting ownership in installed "
+        "Versions");
+  };
+
+  const auto scan_version = [&](uint32_t column_family_id,
+                                const Version* selected) -> Status {
+    if (selected == nullptr) {
+      return Status::OK();
+    }
+    const VersionStorageInfo* storage = selected->storage_info();
+    assert(storage != nullptr);
+    for (int level = 0; level < storage->num_levels(); ++level) {
+      for (const FileMetaData* file : storage->LevelFiles(level)) {
+        assert(file != nullptr);
+        Status status = register_owner(
+            file->fd.GetNumber(),
+            PhysicalFileOwner{column_family_id, PhysicalFileOwnerKind::kTable});
+        if (!status.ok()) {
+          return status;
+        }
+      }
+    }
+    for (const auto& file : storage->GetBlobFiles()) {
+      assert(file != nullptr);
+      Status status = register_owner(
+          file->GetBlobFileNumber(),
+          PhysicalFileOwner{column_family_id, PhysicalFileOwnerKind::kBlob});
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    for (const auto& file : storage->GetBlobRelocationFiles()) {
+      assert(file != nullptr);
+      Status status = register_owner(
+          file->GetFileNumber(),
+          PhysicalFileOwner{column_family_id,
+                            PhysicalFileOwnerKind::kBlobRelocation});
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    for (uint64_t file_number : storage->GetRetiredBlobRelocationFiles()) {
+      Status status = register_owner(
+          file_number,
+          PhysicalFileOwner{column_family_id,
+                            PhysicalFileOwnerKind::kBlobRelocation});
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    return Status::OK();
+  };
+
+  const auto select_version = [&](ColumnFamilyData* cfd,
+                                  Version* expected_current,
+                                  Version** selected) -> Status {
+    assert(cfd != nullptr);
+    assert(selected != nullptr);
+    const auto candidate = candidates_by_cf.find(cfd->GetID());
+    *selected = candidate != candidates_by_cf.end() ? candidate->second
+                                                    : expected_current;
+    if (candidate != candidates_by_cf.end() && (*selected)->cfd() != cfd) {
+      return Status::Corruption(
+          "Physical ownership candidate has mismatched CF");
+    }
+    return Status::OK();
+  };
+
+  Status status;
+  if (db_mutex == nullptr) {
+    // Initial recovery is single-threaded, so no lifetime pins are needed.
+    for (ColumnFamilyData* cfd : *column_family_set_) {
+      if (cfd == nullptr || cfd->IsDropped()) {
+        continue;
+      }
+      Version* selected = nullptr;
+      status = select_version(cfd, cfd->current(), &selected);
+      if (status.ok()) {
+        status = scan_version(cfd->GetID(), selected);
+      }
+      if (!status.ok()) {
+        break;
+      }
+    }
+  } else {
+    // RefedColumnFamilySet pins only the current CFD. This lets the scan yield
+    // the DB mutex once per CF instead of doing an all-CF capture/revalidation
+    // interval while still preventing concurrent handle destruction.
+    db_mutex->Lock();
+    for (ColumnFamilyData* cfd :
+         RefedColumnFamilySet(column_family_set_.get())) {
+      assert(cfd != nullptr);
+      if (cfd->IsDropped()) {
+        // Keep even a long run of dropped CFDs from forming an unbounded mutex
+        // interval. Iterator advancement and its unref remain serialized.
+        db_mutex->Unlock();
+        db_mutex->Lock();
+        continue;
+      }
+
+      const uint32_t column_family_id = cfd->GetID();
+      Version* const expected_current = cfd->current();
+      if (expected_current != nullptr) {
+        expected_current->Ref();
+      }
+      Version* selected = nullptr;
+      status = select_version(cfd, expected_current, &selected);
+      if (status.ok()) {
+        db_mutex->Unlock();
+        // SyncPoint's singleton has process lifetime.
+        // @lint-ignore NULLSAFECLANG nullable-dereference
+        TEST_SYNC_POINT_CALLBACK(
+            "VersionSet::BuildPhysicalFileOwnershipIndex:Unlocked", cfd);
+        status = scan_version(column_family_id, selected);
+        db_mutex->Lock();
+        if (cfd->IsDropped() || cfd->GetID() != column_family_id ||
+            cfd->current() != expected_current) {
+          status = Status::Corruption(
+              "Column family changed during physical ownership census");
+        }
+      }
+      if (expected_current != nullptr) {
+        expected_current->Unref();
+      }
+      if (!status.ok()) {
+        break;
+      }
+    }
+    db_mutex->Unlock();
+  }
+
+  if (!status.ok()) {
+    return status;
+  }
+  index->swap(rebuilt);
+  return Status::OK();
 }
 
 Status VersionSet::LogAndApplyHelper(ColumnFamilyData* cfd,
@@ -7170,6 +8276,9 @@ Status VersionSet::Recover(
       handler.GetDbId(db_id);
     }
     if (s.ok()) {
+      s = handler.RebuildPhysicalFileOwnershipIndex();
+    }
+    if (s.ok()) {
       RecoverEpochNumbers();
     }
     if (log_status) {
@@ -7353,6 +8462,9 @@ Status VersionSet::TryRecoverFromOneManifest(
   *has_missing_table_file = handler_pit.HasMissingFiles();
 
   s = handler_pit.status();
+  if (s.ok()) {
+    s = handler_pit.RebuildPhysicalFileOwnershipIndex();
+  }
   if (s.ok()) {
     RecoverEpochNumbers();
   }
@@ -7835,6 +8947,22 @@ Status VersionSet::GetLiveFilesChecksumInfo(FileChecksumList* checksum_list) {
         return s;
       }
     }
+
+    for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
+         vstorage->GetBlobRelocationFiles()) {
+      assert(metadata != nullptr);
+      std::string checksum_value = metadata->GetChecksumValue();
+      std::string checksum_method = metadata->GetChecksumMethod();
+      if (checksum_method.empty()) {
+        checksum_value = kUnknownFileChecksum;
+        checksum_method = kUnknownFileChecksumFuncName;
+      }
+      s = checksum_list->InsertOneFileChecksum(metadata->GetFileNumber(),
+                                               checksum_value, checksum_method);
+      if (!s.ok()) {
+        return s;
+      }
+    }
   }
 
   return s;
@@ -7915,7 +9043,8 @@ Status VersionSet::WriteCurrentStateToManifest(
     const std::unordered_map<uint32_t, MutableCFState>& curr_state,
     const VersionEdit& wal_additions,
     const OptionsFileManifestState& options_file_manifest_state,
-    log::Writer* log, IOStatus& io_s) {
+    uint32_t blob_indirection_format_version, log::Writer* log,
+    IOStatus& io_s) {
   // TODO: Break up into multiple records to reduce memory usage on recovery?
 
   // WARNING: This method doesn't hold a mutex!!
@@ -7925,6 +9054,24 @@ Status VersionSet::WriteCurrentStateToManifest(
   // LogAndApply (the same single thread), so we're safe to iterate.
 
   assert(io_s.ok());
+  if (log == nullptr) {
+    return Status::InvalidArgument("null MANIFEST writer");
+  }
+  if (blob_indirection_format_version != 0) {
+    VersionEdit format_fence;
+    format_fence.SetColumnFamily(0);
+    format_fence.SetBlobIndirectionFormatVersion(
+        blob_indirection_format_version);
+    std::string record;
+    if (!format_fence.EncodeTo(&record)) {
+      return Status::Corruption(
+          "Unable to encode DB-global blob indirection format fence");
+    }
+    io_s = log->AddRecord(write_options, record);
+    if (!io_s.ok()) {
+      return io_s;
+    }
+  }
   if (db_options_->write_dbid_to_manifest) {
     VersionEdit edit_for_db_id;
     assert(!db_id_.empty());
@@ -8046,11 +9193,33 @@ Status VersionSet::WriteCurrentStateToManifest(
 
         edit.AddBlobFile(blob_file_number, meta->GetTotalBlobCount(),
                          meta->GetTotalBlobBytes(), meta->GetChecksumMethod(),
-                         meta->GetChecksumValue());
+                         meta->GetChecksumValue(), meta->IsIdentityRoot());
         if (meta->GetGarbageBlobCount() > 0) {
           edit.AddBlobFileGarbage(blob_file_number, meta->GetGarbageBlobCount(),
                                   meta->GetGarbageBlobBytes());
         }
+      }
+
+      if (vstorage->HasBlobIndirectionFormat()) {
+        edit.SetBlobIndirectionFormatVersion(
+            vstorage->GetBlobIndirectionFormatVersion());
+      }
+      for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
+           vstorage->GetBlobRelocationFiles()) {
+        assert(metadata != nullptr);
+        edit.AddBlobRelocationFile(metadata->GetAddition());
+      }
+      for (const BlobRelocationRoute& route :
+           vstorage->GetBlobRelocationRoutes()) {
+        edit.SetBlobRelocationRoute(route);
+      }
+      for (uint64_t file_number : vstorage->GetRetiredBlobRelocationFiles()) {
+        edit.DeleteBlobRelocationFile(file_number);
+      }
+      for (const BlobRelocationRouteSource& source :
+           vstorage->GetRetiredBlobRelocationRoutes()) {
+        edit.DeleteBlobRelocationRoute(source.generation_file_number,
+                                       source.origin_file_number);
       }
 
       const auto iter = curr_state.find(cfd->GetID());
@@ -8401,7 +9570,8 @@ void VersionSet::AddLiveFiles(std::vector<uint64_t>* live_table_files,
         total_table_files += vstorage->LevelFiles(level).size();
       }
 
-      total_blob_files += vstorage->GetBlobFiles().size();
+      total_blob_files += vstorage->GetBlobFiles().size() +
+                          vstorage->GetBlobRelocationFiles().size();
     }
   }
 
@@ -8629,30 +9799,37 @@ void VersionSet::GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
   assert(blob_files->empty());
   assert(manifest_filenames->empty());
 
-  std::vector<ObsoleteFileInfo> pending_files;
-  for (auto& f : obsolete_files_) {
-    if (f.metadata->fd.GetNumber() < min_pending_output) {
-      files->emplace_back(std::move(f));
-    } else {
-      pending_files.emplace_back(std::move(f));
+  {
+    MutexLock lock(&obsolete_files_mutex_);
+    std::vector<ObsoleteFileInfo> pending_files;
+    for (auto& f : obsolete_files_) {
+      assert(f.metadata != nullptr);
+      // ObsoleteFileInfo entries in this queue always own metadata.
+      // @lint-ignore NULLSAFECLANG nullable-dereference
+      if (f.metadata->fd.GetNumber() < min_pending_output) {
+        files->emplace_back(std::move(f));
+      } else {
+        pending_files.emplace_back(std::move(f));
+      }
     }
-  }
-  obsolete_files_.swap(pending_files);
+    obsolete_files_.swap(pending_files);
 
-  std::vector<ObsoleteBlobFileInfo> pending_blob_files;
-  for (auto& blob_file : obsolete_blob_files_) {
-    if (blob_file.GetBlobFileNumber() < min_pending_output) {
-      blob_files->emplace_back(std::move(blob_file));
-    } else {
-      pending_blob_files.emplace_back(std::move(blob_file));
+    std::vector<ObsoleteBlobFileInfo> pending_blob_files;
+    for (auto& blob_file : obsolete_blob_files_) {
+      if (blob_file.GetBlobFileNumber() < min_pending_output) {
+        blob_files->emplace_back(std::move(blob_file));
+      } else {
+        pending_blob_files.emplace_back(std::move(blob_file));
+      }
     }
+    obsolete_blob_files_.swap(pending_blob_files);
   }
-  obsolete_blob_files_.swap(pending_blob_files);
 
   obsolete_manifests_.swap(*manifest_filenames);
 }
 
 uint64_t VersionSet::GetObsoleteSstFilesSize() const {
+  MutexLock lock(&obsolete_files_mutex_);
   uint64_t ret = 0;
   for (auto& f : obsolete_files_) {
     if (f.metadata != nullptr) {
@@ -8671,7 +9848,8 @@ ColumnFamilyData* VersionSet::CreateColumnFamily(
 
   MutableCFOptions dummy_cf_options;
   Version* dummy_versions =
-      new Version(nullptr, this, file_options_, dummy_cf_options, io_tracer_);
+      new Version(nullptr, this, file_options_, dummy_cf_options, io_tracer_,
+                  /*periodic_compaction_phase_params=*/std::nullopt);
   // Ref() dummy version once so that later we can call Unref() to delete it
   // by avoiding calling "delete" explicitly (~Version is private)
   dummy_versions->Ref();
@@ -8681,6 +9859,7 @@ ColumnFamilyData* VersionSet::CreateColumnFamily(
 
   Version* v = new Version(new_cfd, this, file_options_,
                            new_cfd->GetLatestMutableCFOptions(), io_tracer_,
+                           /*periodic_compaction_phase_params=*/std::nullopt,
                            current_version_number_++);
 
   constexpr bool update_stats = false;
@@ -8742,6 +9921,13 @@ uint64_t VersionSet::GetTotalBlobFileSize(Version* dummy_versions) {
         // find Blob file that has not been counted
         unique_blob_files.insert(blob_file_number);
         all_versions_blob_file_size += meta->GetBlobFileSize();
+      }
+    }
+    for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
+         vstorage->GetBlobRelocationFiles()) {
+      assert(metadata != nullptr);
+      if (unique_blob_files.insert(metadata->GetFileNumber()).second) {
+        all_versions_blob_file_size += metadata->GetFileSize();
       }
     }
   }
@@ -8823,7 +10009,8 @@ Status ReactiveVersionSet::Recover(
   manifest_reporter->reset(new LogReporter());
   static_cast_with_check<LogReporter>(manifest_reporter->get())->status =
       manifest_reader_status->get();
-  Status s = MaybeSwitchManifest(manifest_reporter->get(), manifest_reader);
+  Status s = MaybeSwitchManifest(manifest_reporter->get(), manifest_reader,
+                                 /*db_mutex=*/nullptr);
   if (!s.ok()) {
     return s;
   }
@@ -8853,15 +10040,27 @@ Status ReactiveVersionSet::ReadAndApply(
   assert(manifest_reader != nullptr);
   assert(cfds_changed != nullptr);
   mu->AssertHeld();
+  if (manifest_tail_in_progress_) {
+    return Status::TryAgain("MANIFEST catch-up is already in progress");
+  }
+  manifest_tail_in_progress_ = true;
 
   Status s;
   log::Reader* reader = manifest_reader->get();
   assert(reader);
-  s = MaybeSwitchManifest(reader->GetReporter(), manifest_reader);
+  s = MaybeSwitchManifest(reader->GetReporter(), manifest_reader, mu);
   if (!s.ok()) {
+    manifest_tail_in_progress_ = false;
     return s;
   }
+  if (!manifest_tailer_->status().ok()) {
+    manifest_tail_in_progress_ = false;
+    return manifest_tailer_->status();
+  }
+  manifest_tailer_->SetCatchUpDBMutex(mu);
   manifest_tailer_->Iterate(*(manifest_reader->get()), manifest_read_status);
+  manifest_tailer_->ClearCatchUpDBMutex();
+  manifest_tail_in_progress_ = false;
   s = manifest_tailer_->status();
   if (s.ok()) {
     *cfds_changed = std::move(manifest_tailer_->GetUpdatedColumnFamilies());
@@ -8881,7 +10080,8 @@ uint64_t ReactiveVersionSet::GetInstalledVersionLogNumber(
 
 Status ReactiveVersionSet::MaybeSwitchManifest(
     log::Reader::Reporter* reporter,
-    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader) {
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+    InstrumentedMutex* db_mutex) {
   assert(manifest_reader != nullptr);
   Status s;
   std::string manifest_path;
@@ -8930,7 +10130,7 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
     ROCKS_LOG_INFO(db_options_->info_log, "Switched to new manifest: %s\n",
                    manifest_path.c_str());
     if (manifest_tailer_) {
-      manifest_tailer_->PrepareToReadNewManifest();
+      manifest_tailer_->PrepareToReadNewManifest(db_mutex);
     }
   } else if (s.IsPathNotFound()) {
     // This can happen if the primary switches to a new MANIFEST after the

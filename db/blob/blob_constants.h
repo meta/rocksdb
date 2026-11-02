@@ -13,6 +13,13 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// Version shared by the file-local metadata that lets feature-aware RepairDB
+// reconstruct blob indirection without a surviving MANIFEST. This version is
+// negotiated by CompactionService and is deliberately separate from the
+// normal read-format versions.
+inline constexpr uint32_t kBlobRepairMetadataFormatVersion = 1;
+inline constexpr size_t kBlobGcMaxSelectedFiles = 8;
+
 // WARNING: This value is == kCurrentFileBlobIndexFileNumber.
 // Use this name only where file number zero means "no valid blob file" or
 // "current file" is not understood/supported.

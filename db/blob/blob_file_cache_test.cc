@@ -114,7 +114,8 @@ TEST_F(BlobFileCacheTest, GetBlobFileReader) {
 
   BlobFileCache blob_file_cache(backing_cache.get(), &immutable_options,
                                 &file_options, column_family_id,
-                                blob_file_read_hist, nullptr /*IOTracer*/);
+                                blob_file_read_hist, nullptr /*IOTracer*/,
+                                /*relocation_file_table_options=*/nullptr);
   const BlobFileOpenInfo blob_file{blob_file_number, Slice(), Slice()};
 
   // First try: reader should be opened and put in cache
@@ -162,7 +163,8 @@ TEST_F(BlobFileCacheTest, GetBlobFileReader_Race) {
 
   BlobFileCache blob_file_cache(backing_cache.get(), &immutable_options,
                                 &file_options, column_family_id,
-                                blob_file_read_hist, nullptr /*IOTracer*/);
+                                blob_file_read_hist, nullptr /*IOTracer*/,
+                                /*relocation_file_table_options=*/nullptr);
   const BlobFileOpenInfo blob_file{blob_file_number, Slice(), Slice()};
 
   CacheHandleGuard<BlobFileReader> first;
@@ -244,7 +246,8 @@ TEST_F(BlobFileCacheTest, RefreshBlobFileReaderPrefersLargestObservedFileSize) {
   constexpr HistogramImpl* blob_file_read_hist = nullptr;
   BlobFileCache blob_file_cache(backing_cache.get(), &immutable_options,
                                 &file_options, column_family_id,
-                                blob_file_read_hist, nullptr /*IOTracer*/);
+                                blob_file_read_hist, nullptr /*IOTracer*/,
+                                /*relocation_file_table_options=*/nullptr);
   const BlobFileOpenInfo blob_file{blob_file_number, Slice(), Slice()};
 
   const ReadOptions read_options;
@@ -309,7 +312,8 @@ TEST_F(BlobFileCacheTest, GetBlobFileReader_IOError) {
 
   BlobFileCache blob_file_cache(backing_cache.get(), &immutable_options,
                                 &file_options, column_family_id,
-                                blob_file_read_hist, nullptr /*IOTracer*/);
+                                blob_file_read_hist, nullptr /*IOTracer*/,
+                                /*relocation_file_table_options=*/nullptr);
 
   // Note: there is no blob file with the below number
   constexpr uint64_t blob_file_number = 123;
@@ -353,7 +357,8 @@ TEST_F(BlobFileCacheTest, GetBlobFileReader_CacheFull) {
 
   BlobFileCache blob_file_cache(backing_cache.get(), &immutable_options,
                                 &file_options, column_family_id,
-                                blob_file_read_hist, nullptr /*IOTracer*/);
+                                blob_file_read_hist, nullptr /*IOTracer*/,
+                                /*relocation_file_table_options=*/nullptr);
   const BlobFileOpenInfo blob_file{blob_file_number, Slice(), Slice()};
 
   // Insert into cache should fail since it has zero capacity and

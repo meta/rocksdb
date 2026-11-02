@@ -51,7 +51,20 @@ class VersionBuilder {
   Status Apply(const VersionEdit* edit);
 
   // Save the current Version to the provided `vstorage`.
-  Status SaveTo(VersionStorageInfo* vstorage) const;
+  Status SaveTo(VersionStorageInfo* vstorage);
+
+  // Populate SST metadata and compact cursors. The caller must hold the DB
+  // mutex because this increments non-atomic FileMetaData reference counts.
+  Status SaveTableFilesTo(VersionStorageInfo* vstorage) const;
+
+  // Populate blob metadata and run the final consistency check. The builder's
+  // base Version must remain referenced, but the DB mutex is not required.
+  Status FinalizeBlobFilesTo(VersionStorageInfo* vstorage);
+
+  // Validate and release any deferred exact-replay comparisons. The caller
+  // must invoke this before discarding a builder that will not be finalized.
+  // The DB mutex is not required.
+  Status ValidatePendingBlobRelocationReplays();
 
   // Load table handlers for newly added files in the builder. This does not
   // load any files in the base storage.
@@ -116,6 +129,15 @@ class BaseReferencedVersionBuilder {
       bool allow_incomplete_valid_version = false);
   ~BaseReferencedVersionBuilder();
   VersionBuilder* version_builder() const { return version_builder_.get(); }
+  Version* base_version() const { return version_; }
+
+  // Transfers the potentially large builder state without changing the base
+  // Version reference. The returned builder can be destroyed outside the DB
+  // mutex; this guard must still be destroyed under the mutex so Version::Unref
+  // remains serialized.
+  std::unique_ptr<VersionBuilder> ReleaseVersionBuilder() {
+    return std::move(version_builder_);
+  }
 
  private:
   std::unique_ptr<VersionBuilder> version_builder_;

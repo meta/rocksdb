@@ -1191,6 +1191,9 @@ class DBImpl : public DB
   // Un-reference the super version and clean it up if it is the last reference.
   void CleanupSuperVersion(SuperVersion* sv);
 
+  // Releases the CFD pin retained by internal iterators.
+  void ReleaseColumnFamilyDataPin(ColumnFamilyData* cfd);
+
   // Un-reference the super version and return it to thread local cache if
   // needed. If it is the last reference of the super version. Clean it up
   // after un-referencing it.

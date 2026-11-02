@@ -33,7 +33,7 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
   while (reader.LastRecordEnd() < max_manifest_read_size_ && s.ok() &&
          reader.ReadRecord(&record, &scratch) && log_read_status->ok()) {
     VersionEdit edit;
-    s = edit.DecodeFrom(record);
+    s = DecodeVersionEdit(record, &edit);
     if (s.ok()) {
       s = read_buffer_.AddEdit(&edit);
     }
@@ -45,6 +45,14 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
           s = OnAtomicGroupReplayBegin();
           for (size_t i = 0; s.ok() && i < read_buffer_.replay_buffer().size();
                i++) {
+            // SyncPoint's singleton has process lifetime.
+            // @lint-ignore NULLSAFECLANG nullable-dereference
+            TEST_SYNC_POINT_CALLBACK(
+                "VersionEditHandlerBase::Iterate:BeforeApplyAtomicGroupEdit",
+                &s);
+            if (!s.ok()) {
+              break;
+            }
             auto& e = read_buffer_.replay_buffer()[i];
             s = ApplyVersionEdit(e, &cfd);
             if (s.ok()) {
@@ -97,6 +105,14 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
   }
   TEST_SYNC_POINT_CALLBACK("VersionEditHandlerBase::Iterate:Finish",
                            &recovered_edits);
+}
+
+Status VersionEditHandlerBase::DecodeVersionEdit(const Slice& record,
+                                                 VersionEdit* edit) {
+  if (edit == nullptr) {
+    return Status::InvalidArgument("null VersionEdit output");
+  }
+  return edit->DecodeFrom(record);
 }
 
 Status ListColumnFamiliesHandler::ApplyVersionEdit(
@@ -169,6 +185,24 @@ Status FileChecksumRetriever::ApplyVersionEdit(VersionEdit& edit,
         new_blob_file.GetBlobFileNumber(),
         std::make_pair(checksum_value, checksum_method));
   }
+  for (uint64_t file_number : edit.GetBlobRelocationFileDeletions()) {
+    const auto cf = cf_file_checksums_.find(column_family_id);
+    if (cf != cf_file_checksums_.end()) {
+      cf->second.erase(file_number);
+    }
+  }
+  for (const BlobRelocationFileAddition& addition :
+       edit.GetBlobRelocationFileAdditions()) {
+    std::string checksum_value = addition.GetChecksumValue();
+    std::string checksum_method = addition.GetChecksumMethod();
+    if (checksum_method.empty()) {
+      checksum_value = kUnknownFileChecksum;
+      checksum_method = kUnknownFileChecksumFuncName;
+    }
+    cf_file_checksums_[column_family_id].emplace(
+        addition.GetFileNumber(),
+        std::make_pair(std::move(checksum_value), std::move(checksum_method)));
+  }
   return Status::OK();
 }
 
@@ -221,7 +255,10 @@ Status VersionEditHandler::Initialize() {
 
 Status VersionEditHandler::ApplyVersionEdit(VersionEdit& edit,
                                             ColumnFamilyData** cfd) {
-  Status s;
+  Status s = TrackUnopenedPhysicalFileOwnership(edit);
+  if (!s.ok()) {
+    return s;
+  }
   if (edit.IsColumnFamilyAdd()) {
     s = OnColumnFamilyAdd(edit, cfd);
   } else if (edit.IsColumnFamilyDrop()) {
@@ -238,6 +275,127 @@ Status VersionEditHandler::ApplyVersionEdit(VersionEdit& edit,
     s = ExtractInfoFromVersionEdit(*cfd, edit);
   }
   return s;
+}
+
+Status VersionEditHandler::TrackUnopenedPhysicalFileOwnership(
+    const VersionEdit& edit) {
+  if (edit.IsColumnFamilyAdd() || edit.IsWalAddition() ||
+      edit.IsWalDeletion()) {
+    return Status::OK();
+  }
+
+  bool do_not_open_cf = false;
+  bool cf_in_builders = false;
+  CheckColumnFamilyId(edit, &do_not_open_cf, &cf_in_builders);
+  if (!do_not_open_cf) {
+    return Status::OK();
+  }
+
+  const uint32_t column_family_id = edit.GetColumnFamily();
+  if (edit.IsColumnFamilyDrop()) {
+    unopened_physical_file_owners_.erase(column_family_id);
+    return Status::OK();
+  }
+
+  UnopenedPhysicalFileKinds& files =
+      unopened_physical_file_owners_[column_family_id];
+  const auto erase = [&](uint64_t file_number,
+                         VersionSet::PhysicalFileOwnerKind kind) {
+    const auto file = files.find(file_number);
+    if (file == files.end()) {
+      return;
+    }
+    file->second.erase(kind);
+    if (file->second.empty()) {
+      files.erase(file);
+    }
+  };
+  const auto record = [&](uint64_t file_number,
+                          VersionSet::PhysicalFileOwnerKind kind) {
+    files[file_number].insert(kind);
+  };
+
+  for (const auto& deleted_file : edit.GetDeletedFiles()) {
+    erase(deleted_file.second, VersionSet::PhysicalFileOwnerKind::kTable);
+  }
+  for (const BlobFileGarbage& garbage : edit.GetBlobFileGarbages()) {
+    // A garbage record does not prove that the physical blob file is gone.
+    record(garbage.GetBlobFileNumber(),
+           VersionSet::PhysicalFileOwnerKind::kBlob);
+  }
+  for (uint64_t file_number : edit.GetBlobRelocationFileDeletions()) {
+    // Relocation IDs remain owned after deletion because retirement is
+    // durable and prevents identity reuse.
+    record(file_number, VersionSet::PhysicalFileOwnerKind::kBlobRelocation);
+  }
+  for (const auto& new_file : edit.GetNewFiles()) {
+    record(new_file.second.fd.GetNumber(),
+           VersionSet::PhysicalFileOwnerKind::kTable);
+  }
+  for (const BlobFileAddition& addition : edit.GetBlobFileAdditions()) {
+    record(addition.GetBlobFileNumber(),
+           VersionSet::PhysicalFileOwnerKind::kBlob);
+  }
+  for (const BlobRelocationFileAddition& addition :
+       edit.GetBlobRelocationFileAdditions()) {
+    if (addition.GetColumnFamilyId() != column_family_id) {
+      return Status::Corruption(
+          "Blob relocation file belongs to another column family");
+    }
+    record(addition.GetFileNumber(),
+           VersionSet::PhysicalFileOwnerKind::kBlobRelocation);
+  }
+  return Status::OK();
+}
+
+Status VersionEditHandler::AddUnopenedPhysicalFileOwnership(
+    VersionSet::PhysicalFileOwnershipIndex* index) const {
+  if (index == nullptr) {
+    return Status::InvalidArgument("null physical ownership output");
+  }
+  assert(version_set_ != nullptr);
+  // VersionEditHandler's constructor requires a non-null VersionSet.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  const bool enforce_uniqueness =
+      version_set_->blob_indirection_format_version_ != 0;
+  for (const auto& cf_entry : unopened_physical_file_owners_) {
+    const uint32_t column_family_id = cf_entry.first;
+    for (const auto& file_entry : cf_entry.second) {
+      const uint64_t file_number = file_entry.first;
+      for (VersionSet::PhysicalFileOwnerKind kind : file_entry.second) {
+        const VersionSet::PhysicalFileOwner owner{column_family_id, kind};
+        const auto result = index->emplace(file_number, owner);
+        if (result.second ||
+            (result.first->second.column_family_id == column_family_id &&
+             result.first->second.kind == kind)) {
+          continue;
+        }
+        if (enforce_uniqueness) {
+          return Status::Corruption(
+              "Physical file number has conflicting ownership in an "
+              "unopened column family");
+        }
+      }
+    }
+  }
+  return Status::OK();
+}
+
+Status VersionEditHandler::RebuildPhysicalFileOwnershipIndex() {
+  assert(version_set_ != nullptr);
+  // VersionEditHandler's constructor requires a non-null VersionSet.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  VersionSet& version_set = *version_set_;
+  VersionSet::PhysicalFileOwnershipIndex rebuilt;
+  Status status = version_set.BuildPhysicalFileOwnershipIndex(
+      {}, /*db_mutex=*/nullptr, &rebuilt);
+  if (status.ok()) {
+    status = AddUnopenedPhysicalFileOwnership(&rebuilt);
+  }
+  if (status.ok()) {
+    version_set.physical_file_owners_.swap(rebuilt);
+  }
+  return status;
 }
 
 Status VersionEditHandler::OnColumnFamilyAdd(VersionEdit& edit,
@@ -289,7 +447,12 @@ Status VersionEditHandler::OnColumnFamilyDrop(VersionEdit& edit,
   ColumnFamilyData* tmp_cfd = nullptr;
   Status s;
   if (cf_in_builders) {
-    tmp_cfd = DestroyCfAndCleanup(edit);
+    auto builder = builders_.find(edit.GetColumnFamily());
+    assert(builder != builders_.end());
+    s = ValidateVersionBuilderBeforeDrop(builder->second->version_builder());
+    if (s.ok()) {
+      tmp_cfd = DestroyCfAndCleanup(edit);
+    }
   } else if (do_not_open_cf) {
     do_not_open_column_families_.erase(edit.GetColumnFamily());
   } else {
@@ -515,9 +678,7 @@ ColumnFamilyData* VersionEditHandler::CreateCfAndInit(
 ColumnFamilyData* VersionEditHandler::DestroyCfAndCleanup(
     const VersionEdit& edit) {
   uint32_t cf_id = edit.GetColumnFamily();
-  auto builder_iter = builders_.find(cf_id);
-  assert(builder_iter != builders_.end());
-  builders_.erase(builder_iter);
+  DestroyVersionBuilder(cf_id);
   ColumnFamilyData* ret =
       version_set_->GetColumnFamilySet()->GetColumnFamily(cf_id);
   assert(ret != nullptr);
@@ -525,6 +686,12 @@ ColumnFamilyData* VersionEditHandler::DestroyCfAndCleanup(
   ret->UnrefAndTryDelete();
   ret = nullptr;
   return ret;
+}
+
+void VersionEditHandler::DestroyVersionBuilder(uint32_t column_family_id) {
+  const auto builder = builders_.find(column_family_id);
+  assert(builder != builders_.end());
+  builders_.erase(builder);
 }
 
 Status VersionEditHandler::MaybeCreateVersionBeforeApplyEdit(
@@ -537,6 +704,7 @@ Status VersionEditHandler::MaybeCreateVersionBeforeApplyEdit(
   if (force_create_version) {
     auto* v = new Version(cfd, version_set_, version_set_->file_options_,
                           cfd->GetLatestMutableCFOptions(), io_tracer_,
+                          /*periodic_compaction_phase_params=*/std::nullopt,
                           version_set_->current_version_number_++,
                           epoch_number_requirement_);
     s = builder->SaveTo(v->storage_info());
@@ -550,8 +718,22 @@ Status VersionEditHandler::MaybeCreateVersionBeforeApplyEdit(
       delete v;
     }
   }
-  s = builder->Apply(&edit);
+  s = ApplyVersionBuilderEdit(builder, edit);
   return s;
+}
+
+Status VersionEditHandler::ApplyVersionBuilderEdit(VersionBuilder* builder,
+                                                   const VersionEdit& edit) {
+  assert(builder != nullptr);
+  return builder->Apply(&edit);
+}
+
+Status VersionEditHandler::ValidateVersionBuilderBeforeDrop(
+    VersionBuilder* builder) {
+  if (builder == nullptr) {
+    return Status::InvalidArgument("null VersionBuilder before CF drop");
+  }
+  return builder->ValidatePendingBlobRelocationReplays();
 }
 
 Status VersionEditHandler::LoadTables(ColumnFamilyData* cfd,
@@ -588,7 +770,19 @@ Status VersionEditHandler::LoadTables(ColumnFamilyData* cfd,
 
 Status VersionEditHandler::ExtractInfoFromVersionEdit(ColumnFamilyData* cfd,
                                                       const VersionEdit& edit) {
+  if (version_set_ == nullptr) {
+    return Status::Corruption("null VersionSet while replaying MANIFEST");
+  }
   Status s;
+  if (edit.HasBlobIndirectionFormatVersion()) {
+    const uint32_t format_version = edit.GetBlobIndirectionFormatVersion();
+    if (version_set_->blob_indirection_format_version_ != 0 &&
+        version_set_->blob_indirection_format_version_ != format_version) {
+      return Status::Corruption(
+          "Conflicting DB-global blob indirection format fence");
+    }
+    version_set_->blob_indirection_format_version_ = format_version;
+  }
   if (edit.HasDbId()) {
     version_set_->db_id_ = edit.GetDbId();
     version_edit_params_.SetDBId(edit.GetDbId());
@@ -737,17 +931,29 @@ VersionEditHandlerPointInTime::VersionEditHandlerPointInTime(
                          /*no_error_if_files_missing=*/true, io_tracer,
                          read_options, allow_incomplete_valid_version,
                          epoch_number_requirement),
+      atomic_update_versions_missing_(0),
       trust_manifest_recovery_(trust_manifest_recovery),
       defer_sst_file_opening_(defer_sst_file_opening) {}
 
 VersionEditHandlerPointInTime::~VersionEditHandlerPointInTime() {
-  for (const auto& cfid_and_version : atomic_update_versions_) {
-    delete cfid_and_version.second.version;
+  VersionEditHandlerPointInTime::DiscardVersions(&atomic_update_versions_);
+  VersionEditHandlerPointInTime::DiscardVersions(&versions_);
+}
+
+void VersionEditHandlerPointInTime::DeleteVersion(Version* version) {
+  delete version;
+}
+
+void VersionEditHandlerPointInTime::DiscardVersions(
+    PointInTimeVersions* versions) {
+  assert(versions != nullptr);
+  if (versions == nullptr) {
+    return;
   }
-  for (const auto& elem : versions_) {
+  for (const auto& elem : *versions) {
     delete elem.second.version;
   }
-  versions_.clear();
+  versions->clear();
 }
 
 Status VersionEditHandlerPointInTime::OnAtomicGroupReplayBegin() {
@@ -774,9 +980,7 @@ Status VersionEditHandlerPointInTime::OnAtomicGroupReplayBegin() {
   // An old AtomicGroup is incomplete. Throw away the versions that failed to
   // complete it. They must not be used for completing the upcoming
   // AtomicGroup since they are too old.
-  for (auto& cfid_and_version : atomic_update_versions_) {
-    delete cfid_and_version.second.version;
-  }
+  ResetAtomicUpdateState();
 
   in_atomic_group_ = true;
   // We lazily assume the column families that exist at this point are all
@@ -816,10 +1020,19 @@ Status VersionEditHandlerPointInTime::OnAtomicGroupReplayEnd() {
   return Status::OK();
 }
 
+void VersionEditHandlerPointInTime::ResetAtomicUpdateState() {
+  DiscardVersions(&atomic_update_versions_);
+  atomic_update_versions_missing_ = 0;
+  in_atomic_group_ = false;
+}
+
 void VersionEditHandlerPointInTime::CheckIterationResult(
     const log::Reader& reader, Status* s) {
   VersionEditHandler::CheckIterationResult(reader, s);
   assert(s != nullptr);
+  if (s->ok()) {
+    *s = PrepareToInstallVersions();
+  }
   if (s->ok()) {
     for (auto* cfd : *(version_set_->column_family_set_)) {
       if (cfd->IsDropped()) {
@@ -843,17 +1056,17 @@ void VersionEditHandlerPointInTime::CheckIterationResult(
       }
     }
   } else {
-    for (const auto& elem : versions_) {
-      delete elem.second.version;
-    }
-    versions_.clear();
+    DiscardVersions(&versions_);
   }
 }
 
 ColumnFamilyData* VersionEditHandlerPointInTime::DestroyCfAndCleanup(
     const VersionEdit& edit) {
-  ColumnFamilyData* cfd = VersionEditHandler::DestroyCfAndCleanup(edit);
   uint32_t cfid = edit.GetColumnFamily();
+  // Release uninstalled candidates while the builder still owns every added
+  // FileMetaData and the current Version still owns every base file. This
+  // keeps unlocked ManifestTailer destruction from becoming the last physical
+  // file reference and publishing obsolete-file state without the DB mutex.
   if (AtomicUpdateVersionsContains(cfid)) {
     AtomicUpdateVersionsDropCf(cfid);
     if (AtomicUpdateVersionsCompleted()) {
@@ -862,9 +1075,10 @@ ColumnFamilyData* VersionEditHandlerPointInTime::DestroyCfAndCleanup(
   }
   auto v_iter = versions_.find(cfid);
   if (v_iter != versions_.end()) {
-    delete v_iter->second.version;
+    DeleteVersion(v_iter->second.version);
     versions_.erase(v_iter);
   }
+  ColumnFamilyData* cfd = VersionEditHandler::DestroyCfAndCleanup(edit);
   installed_version_log_numbers_.erase(cfid);
   return cfd;
 }
@@ -891,7 +1105,7 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
   assert(builder_iter != builders_.end());
   VersionBuilder* builder = builder_iter->second->version_builder();
   const bool valid_pit_before_edit = builder->ValidVersionAvailable();
-  s = builder->Apply(&edit);
+  s = ApplyVersionBuilderEdit(builder, edit);
   const bool valid_pit_after_edit = builder->ValidVersionAvailable();
 
   // A new version will be created if:
@@ -924,6 +1138,7 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
     const auto& mopts = cfd->GetLatestMutableCFOptions();
     auto* version = new Version(
         cfd, version_set_, version_set_->file_options_, mopts, io_tracer_,
+        /*periodic_compaction_phase_params=*/std::nullopt,
         version_set_->current_version_number_++, epoch_number_requirement_);
     if (!trust_manifest_recovery_ && !defer_sst_file_opening_) {
       s = builder->LoadTableHandlers(
@@ -931,7 +1146,7 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
           version_set_->db_options_->max_file_opening_threads, false, true,
           mopts, MaxFileSizeForL0MetaPin(mopts), read_options_);
       if (!s.ok()) {
-        delete version;
+        DeleteVersion(version);
         if (negative_edge) {
           builder->RedoLastApply();
         }
@@ -945,11 +1160,11 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
           // latching the error, the same tolerance LoadTables() applies.
           s = Status::OK();
         }
-        builder->CommitLastApply();
+        CommitVersionBuilderApply(builder);
         return s;
       }
     }
-    s = builder->SaveTo(version->storage_info());
+    s = SaveVersionTo(builder, version->storage_info());
     if (negative_edge) {
       builder->RedoLastApply();
     }
@@ -965,7 +1180,7 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
             !version_set_->db_options_->skip_stats_update_on_db_open);
         auto v_iter = versions_.find(cfd->GetID());
         if (v_iter != versions_.end()) {
-          delete v_iter->second.version;
+          DeleteVersion(v_iter->second.version);
           v_iter->second = PointInTimeVersion{version, log_number};
         } else {
           versions_.emplace(cfd->GetID(),
@@ -973,11 +1188,11 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
         }
       }
     } else {
-      delete version;
+      DeleteVersion(version);
     }
   }
 
-  builder->CommitLastApply();
+  CommitVersionBuilderApply(builder);
   return s;
 }
 
@@ -1017,9 +1232,53 @@ Status VersionEditHandlerPointInTime::VerifyBlobFile(
   return s;
 }
 
+Status VersionEditHandlerPointInTime::VerifyBlobRelocationFile(
+    ColumnFamilyData* cfd, const BlobRelocationFileAddition& addition) {
+  if (trust_manifest_recovery_) {
+    return Status::OK();
+  }
+  assert(cfd != nullptr);
+  std::shared_ptr<const BlobRelocationDirectory> directory;
+  Status status = addition.GetValidatedDirectory(&directory);
+  if (!status.ok()) {
+    return status;
+  }
+  CacheHandleGuard<BlobFileReader> reader;
+  const MutableCFOptions& mutable_options = cfd->GetLatestMutableCFOptions();
+  BlobFileCache* const blob_file_cache = cfd->blob_file_cache();
+  if (blob_file_cache == nullptr || version_set_ == nullptr) {
+    return Status::Corruption("Missing blob relocation recovery dependency");
+  }
+  return blob_file_cache->GetRelocationFileReader(
+      read_options_,
+      BlobFileOpenInfo{addition.GetFileNumber(), addition.GetChecksumValue(),
+                       addition.GetChecksumMethod(), addition.GetTailSize()},
+      addition.GetFileSize(), directory->directory_digest(),
+      version_set_->DbSessionId(), mutable_options.compression_manager.get(),
+      mutable_options.block_protection_bytes_per_key, &reader);
+}
+
 Status VersionEditHandlerPointInTime::LoadTables(
     ColumnFamilyData* /*cfd*/, bool /*prefetch_index_and_filter_in_cache*/,
     bool /*is_initial_load*/) {
+  return Status::OK();
+}
+
+Status VersionEditHandlerPointInTime::SaveVersionTo(
+    VersionBuilder* builder, VersionStorageInfo* storage) {
+  if (builder == nullptr || storage == nullptr) {
+    return Status::InvalidArgument("null point-in-time Version output");
+  }
+  return builder->SaveTo(storage);
+}
+
+void VersionEditHandlerPointInTime::CommitVersionBuilderApply(
+    VersionBuilder* builder) {
+  assert(builder != nullptr);
+  builder->CommitLastApply();
+}
+
+Status VersionEditHandlerPointInTime::PrepareToInstallVersions() {
   return Status::OK();
 }
 
@@ -1057,7 +1316,7 @@ void VersionEditHandlerPointInTime::AtomicUpdateVersionsDropCf(uint32_t cfid) {
   if (atomic_update_versions_iter->second.version == nullptr) {
     atomic_update_versions_missing_--;
   } else {
-    delete atomic_update_versions_iter->second.version;
+    DeleteVersion(atomic_update_versions_iter->second.version);
   }
   atomic_update_versions_.erase(atomic_update_versions_iter);
 }
@@ -1072,7 +1331,7 @@ void VersionEditHandlerPointInTime::AtomicUpdateVersionsPut(
   if (atomic_update_versions_iter->second.version == nullptr) {
     atomic_update_versions_missing_--;
   } else {
-    delete atomic_update_versions_iter->second.version;
+    DeleteVersion(atomic_update_versions_iter->second.version);
   }
   atomic_update_versions_iter->second = pit_version;
 }
@@ -1088,7 +1347,7 @@ void VersionEditHandlerPointInTime::AtomicUpdateVersionsApply() {
         !version_set_->db_options_->skip_stats_update_on_db_open);
     auto versions_iter = versions_.find(cfid);
     if (versions_iter != versions_.end()) {
-      delete versions_iter->second.version;
+      DeleteVersion(versions_iter->second.version);
       versions_iter->second = pit_version;
     } else {
       versions_.emplace(cfid, pit_version);
@@ -1097,7 +1356,38 @@ void VersionEditHandlerPointInTime::AtomicUpdateVersionsApply() {
   atomic_update_versions_.clear();
 }
 
+void ManifestTailer::PrepareToReadNewManifest(InstrumentedMutex* db_mutex) {
+  if (db_mutex != nullptr) {
+    assert(db_mutex_ == nullptr);
+    db_mutex_ = db_mutex;
+    ResetAtomicUpdateState();
+    db_mutex_ = nullptr;
+  } else {
+    ResetAtomicUpdateState();
+  }
+  const auto reset_replay_state = [&] {
+    ResetReadState();
+    ResetUnopenedPhysicalFileOwnership();
+    physical_file_ownership_deltas_.clear();
+    prepared_column_family_drop_owners_.reset();
+    prepared_physical_file_owners_.reset();
+  };
+  if (db_mutex != nullptr) {
+    InstrumentedMutexUnlock unlock(db_mutex);
+    reset_replay_state();
+  } else {
+    reset_replay_state();
+  }
+  initialized_ = false;
+  status_ = Status::OK();
+  replace_physical_file_ownership_on_success_ = true;
+}
+
 Status ManifestTailer::Initialize() {
+  physical_file_ownership_deltas_.clear();
+  prepared_column_family_drop_owners_.reset();
+  deferred_physical_file_ownership_conflict_ = false;
+  format_activation_requires_full_ownership_census_ = false;
   if (Mode::kRecovery == mode_) {
     return VersionEditHandler::Initialize();
   }
@@ -1108,8 +1398,7 @@ Status ManifestTailer::Initialize() {
     assert(cfd_set);
     ColumnFamilyData* default_cfd = cfd_set->GetDefault();
     assert(default_cfd);
-    auto builder_iter = builders_.find(default_cfd->GetID());
-    assert(builder_iter != builders_.end());
+    assert(builders_.find(default_cfd->GetID()) != builders_.end());
 
     Version* dummy_version = default_cfd->dummy_versions();
     assert(dummy_version);
@@ -1118,7 +1407,7 @@ Status ManifestTailer::Initialize() {
     VersionBuilderUPtr new_builder(new BaseReferencedVersionBuilder(
         default_cfd, base_version, this, track_found_and_missing_files_,
         allow_incomplete_valid_version_));
-    builder_iter->second = std::move(new_builder);
+    ReplaceBuilder(default_cfd->GetID(), std::move(new_builder));
 
     initialized_ = true;
   }
@@ -1127,7 +1416,45 @@ Status ManifestTailer::Initialize() {
 
 Status ManifestTailer::ApplyVersionEdit(VersionEdit& edit,
                                         ColumnFamilyData** cfd) {
-  Status s = VersionEditHandler::ApplyVersionEdit(edit, cfd);
+  assert(version_set_ != nullptr);
+  // VersionEditHandler's constructor requires a non-null VersionSet.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  VersionSet& version_set = *version_set_;
+  if (edit.HasBlobIndirectionFormatVersion() &&
+      version_set.blob_indirection_format_version_ == 0 &&
+      edit.GetBlobIndirectionFormatVersion() != 0) {
+    format_activation_requires_full_ownership_census_ = true;
+  }
+  const auto validate_ownership = [&] {
+    return version_set.ValidateAndTrackPhysicalFileOwnership(
+        edit, version_set.blob_indirection_format_version_,
+        physical_file_ownership_deltas_,
+        /*validate_current_owners=*/
+        !replace_physical_file_ownership_on_success_,
+        &deferred_physical_file_ownership_conflict_);
+  };
+  Status s;
+  if (db_mutex_ != nullptr) {
+    InstrumentedMutexUnlock unlock(db_mutex_);
+    // SyncPoint's singleton has process lifetime.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT_CALLBACK(
+        "ManifestTailer::ValidatePhysicalFileOwnership:Unlocked", db_mutex_);
+    s = validate_ownership();
+  } else {
+    s = validate_ownership();
+  }
+  if (s.ok() && edit.IsColumnFamilyDrop()) {
+    bool do_not_open_cf = false;
+    bool cf_in_builders = false;
+    CheckColumnFamilyId(edit, &do_not_open_cf, &cf_in_builders);
+    if (do_not_open_cf) {
+      PrepareColumnFamilyDropOwnership(edit.GetColumnFamily());
+    }
+  }
+  if (s.ok()) {
+    s = VersionEditHandler::ApplyVersionEdit(edit, cfd);
+  }
   if (s.ok()) {
     assert(cfd);
     if (*cfd) {
@@ -1135,6 +1462,429 @@ Status ManifestTailer::ApplyVersionEdit(VersionEdit& edit,
     }
   }
   return s;
+}
+
+Status ManifestTailer::TrackUnopenedPhysicalFileOwnership(
+    const VersionEdit& edit) {
+  bool do_not_open_cf = false;
+  bool cf_in_builders = false;
+  if (!edit.IsColumnFamilyAdd() && !edit.IsWalAddition() &&
+      !edit.IsWalDeletion()) {
+    CheckColumnFamilyId(edit, &do_not_open_cf, &cf_in_builders);
+  }
+  if (db_mutex_ == nullptr || !do_not_open_cf) {
+    return VersionEditHandler::TrackUnopenedPhysicalFileOwnership(edit);
+  }
+  InstrumentedMutexUnlock unlock(db_mutex_);
+  // SyncPoint's singleton has process lifetime.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT_CALLBACK(
+      "ManifestTailer::TrackUnopenedPhysicalFileOwnership:Unlocked", db_mutex_);
+  return VersionEditHandler::TrackUnopenedPhysicalFileOwnership(edit);
+}
+
+Status ManifestTailer::DecodeVersionEdit(const Slice& record,
+                                         VersionEdit* edit) {
+  if (db_mutex_ == nullptr) {
+    return VersionEditHandlerBase::DecodeVersionEdit(record, edit);
+  }
+  InstrumentedMutexUnlock unlock(db_mutex_);
+  // SyncPoint's singleton has process lifetime.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT_CALLBACK("ManifestTailer::DecodeVersionEdit:Unlocked",
+                           db_mutex_);
+  return VersionEditHandlerBase::DecodeVersionEdit(record, edit);
+}
+
+Status ManifestTailer::VerifyBlobRelocationFile(
+    ColumnFamilyData* cfd, const BlobRelocationFileAddition& addition) {
+  if (db_mutex_ == nullptr) {
+    return VersionEditHandlerPointInTime::VerifyBlobRelocationFile(cfd,
+                                                                   addition);
+  }
+  if (version_builder_apply_unlocked_) {
+    // SyncPoint's singleton has process lifetime.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT_CALLBACK(
+        "ManifestTailer::VerifyBlobRelocationFile:Unlocked", db_mutex_);
+    return VersionEditHandlerPointInTime::VerifyBlobRelocationFile(cfd,
+                                                                   addition);
+  }
+  InstrumentedMutexUnlock unlock(db_mutex_);
+  // SyncPoint's singleton has process lifetime.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT_CALLBACK("ManifestTailer::VerifyBlobRelocationFile:Unlocked",
+                           db_mutex_);
+  return VersionEditHandlerPointInTime::VerifyBlobRelocationFile(cfd, addition);
+}
+
+Status ManifestTailer::ApplyVersionBuilderEdit(VersionBuilder* builder,
+                                               const VersionEdit& edit) {
+  if (db_mutex_ == nullptr) {
+    return VersionEditHandler::ApplyVersionBuilderEdit(builder, edit);
+  }
+  assert(!version_builder_apply_unlocked_);
+  Status status;
+  {
+    InstrumentedMutexUnlock unlock(db_mutex_);
+    version_builder_apply_unlocked_ = true;
+    // SyncPoint's singleton has process lifetime.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT_CALLBACK("ManifestTailer::ApplyVersionBuilderEdit:Unlocked",
+                             db_mutex_);
+    status = VersionEditHandler::ApplyVersionBuilderEdit(builder, edit);
+    version_builder_apply_unlocked_ = false;
+  }
+  return status;
+}
+
+Status ManifestTailer::SaveVersionTo(VersionBuilder* builder,
+                                     VersionStorageInfo* storage) {
+  if (db_mutex_ == nullptr) {
+    return VersionEditHandlerPointInTime::SaveVersionTo(builder, storage);
+  }
+  InstrumentedMutexUnlock unlock(db_mutex_);
+  // SyncPoint's singleton has process lifetime.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT_CALLBACK("ManifestTailer::SaveVersionTo:Unlocked", db_mutex_);
+  return VersionEditHandlerPointInTime::SaveVersionTo(builder, storage);
+}
+
+void ManifestTailer::CommitVersionBuilderApply(VersionBuilder* builder) {
+  if (db_mutex_ == nullptr) {
+    VersionEditHandlerPointInTime::CommitVersionBuilderApply(builder);
+    return;
+  }
+  InstrumentedMutexUnlock unlock(db_mutex_);
+  // Commit can release the final relocation-metadata reference, evict the
+  // corresponding reader, and destroy a bounded but large directory.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT_CALLBACK("ManifestTailer::CommitVersionBuilderApply:Unlocked",
+                           db_mutex_);
+  VersionEditHandlerPointInTime::CommitVersionBuilderApply(builder);
+}
+
+Status ManifestTailer::ValidateVersionBuilderBeforeDrop(
+    VersionBuilder* builder) {
+  if (db_mutex_ == nullptr) {
+    return VersionEditHandler::ValidateVersionBuilderBeforeDrop(builder);
+  }
+  InstrumentedMutexUnlock unlock(db_mutex_);
+  // SyncPoint's singleton has process lifetime.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT_CALLBACK(
+      "ManifestTailer::ValidateVersionBuilderBeforeDrop:Unlocked", db_mutex_);
+  return VersionEditHandler::ValidateVersionBuilderBeforeDrop(builder);
+}
+
+void ManifestTailer::DeleteVersion(Version* version) {
+  if (db_mutex_ == nullptr) {
+    VersionEditHandlerPointInTime::DeleteVersion(version);
+    return;
+  }
+  InstrumentedMutexUnlock unlock(db_mutex_);
+  // SyncPoint's singleton has process lifetime.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT_CALLBACK("ManifestTailer::DeleteVersion:Unlocked", db_mutex_);
+  // An older atomic candidate can be the final physical-metadata owner after
+  // the builder advances past it. VersionSet serializes obsolete publication
+  // independently, allowing the large candidate state and cache callbacks to
+  // remain outside the DB mutex even in that case.
+  VersionEditHandlerPointInTime::DeleteVersion(version);
+}
+
+void ManifestTailer::DiscardVersions(PointInTimeVersions* versions) {
+  if (db_mutex_ == nullptr) {
+    VersionEditHandlerPointInTime::DiscardVersions(versions);
+    return;
+  }
+  InstrumentedMutexUnlock unlock(db_mutex_);
+  // SyncPoint's singleton has process lifetime.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT_CALLBACK("ManifestTailer::DiscardVersions:Unlocked",
+                           db_mutex_);
+  VersionEditHandlerPointInTime::DiscardVersions(versions);
+}
+
+Status ManifestTailer::PrepareToInstallVersions() {
+  assert(version_set_ != nullptr);
+  // VersionEditHandler's constructor requires a non-null VersionSet.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  VersionSet& version_set = *version_set_;
+  Status status;
+  const bool rebuild_all_owners =
+      replace_physical_file_ownership_on_success_ ||
+      format_activation_requires_full_ownership_census_;
+  const auto prepare_ownership = [&] {
+    VersionSet::PhysicalFileOwnershipIndex* replacement_owners = nullptr;
+    if (rebuild_all_owners) {
+      // SyncPoint's singleton has process lifetime.
+      // @lint-ignore NULLSAFECLANG nullable-dereference
+      TEST_SYNC_POINT(
+          "ManifestTailer::PrepareToInstallVersions:FullOwnershipCensus");
+      VersionSet::PhysicalFileOwnershipIndex next_owners;
+      autovector<Version*> candidate_versions;
+      candidate_versions.reserve(versions_.size());
+      for (const auto& entry : versions_) {
+        if (entry.second.version != nullptr) {
+          candidate_versions.push_back(entry.second.version);
+        }
+      }
+      status = version_set.BuildPhysicalFileOwnershipIndex(
+          candidate_versions, db_mutex_, &next_owners);
+      if (!status.ok()) {
+        return;
+      }
+      status = AddUnopenedPhysicalFileOwnership(&next_owners);
+      if (!status.ok()) {
+        return;
+      }
+      prepared_physical_file_owners_.emplace(std::move(next_owners));
+      replacement_owners = &*prepared_physical_file_owners_;
+    } else if (prepared_column_family_drop_owners_.has_value()) {
+      // A CF drop already needed one bulk copy to remove all of that CF's
+      // owners. Reconcile this attempt's remaining deltas into that copy.
+      replacement_owners = &*prepared_column_family_drop_owners_;
+    }
+
+    const bool enforce_uniqueness =
+        version_set.blob_indirection_format_version_ != 0;
+    const auto same_owner = [](const VersionSet::PhysicalFileOwner& lhs,
+                               const VersionSet::PhysicalFileOwner& rhs) {
+      return lhs.column_family_id == rhs.column_family_id &&
+             lhs.kind == rhs.kind;
+    };
+    const auto record = [&](VersionSet::PhysicalFileOwnershipIndex* owners,
+                            uint64_t file_number,
+                            VersionSet::PhysicalFileOwner owner,
+                            bool present) -> Status {
+      assert(owners != nullptr);
+      const auto current = owners->find(file_number);
+      if (!present) {
+        if (current != owners->end() && same_owner(current->second, owner)) {
+          owners->erase(current);
+        }
+        return Status::OK();
+      }
+      if (current == owners->end()) {
+        owners->emplace(file_number, owner);
+        return Status::OK();
+      }
+      if (same_owner(current->second, owner)) {
+        return Status::OK();
+      }
+      if (!enforce_uniqueness) {
+        deferred_physical_file_ownership_conflict_ = true;
+        return Status::OK();
+      }
+      return Status::Corruption(
+          "Physical file number is reused across column families or file "
+          "kinds in installed Versions");
+    };
+
+    for (auto& entry : physical_file_ownership_deltas_) {
+      const uint64_t file_number = entry.first;
+      VersionSet::PhysicalFileOwnershipDelta& delta = entry.second;
+      bool present = delta.present;
+      const VersionStorageInfo* storage = nullptr;
+      const auto candidate = versions_.find(delta.owner.column_family_id);
+      if (candidate != versions_.end() &&
+          candidate->second.version != nullptr) {
+        storage = candidate->second.version->storage_info();
+      } else {
+        ColumnFamilySet* cfd_set = version_set.GetColumnFamilySet();
+        assert(cfd_set != nullptr);
+        // VersionSet always owns a ColumnFamilySet.
+        // @lint-ignore NULLSAFECLANG nullable-dereference
+        ColumnFamilyData* cfd =
+            cfd_set->GetColumnFamily(delta.owner.column_family_id);
+        Version* current =
+            cfd != nullptr && !cfd->IsDropped() ? cfd->current() : nullptr;
+        if (current != nullptr) {
+          storage = current->storage_info();
+        }
+      }
+      if (storage != nullptr) {
+        switch (delta.owner.kind) {
+          case VersionSet::PhysicalFileOwnerKind::kTable:
+            present = storage->GetFileLocation(file_number).IsValid();
+            break;
+          case VersionSet::PhysicalFileOwnerKind::kBlob:
+            present = storage->GetBlobFileMetaData(file_number) != nullptr;
+            break;
+          case VersionSet::PhysicalFileOwnerKind::kBlobRelocation:
+            present = storage->GetBlobRelocationFileMetaData(file_number) !=
+                          nullptr ||
+                      storage->IsBlobRelocationFileRetired(file_number);
+            break;
+        }
+      } else if (rebuild_all_owners && !delta.present) {
+        // A complete snapshot starts from an empty index, so absent raw claims
+        // for unopened or dropped CFs require no work.
+        continue;
+      }
+      delta.present = present;
+      if (replacement_owners != nullptr) {
+        status = record(replacement_owners, file_number, delta.owner, present);
+      } else if (present) {
+        // Ordinary catch-up is serialized by manifest_tail_in_progress_, so
+        // the published index cannot change while the mutex is released. Keep
+        // the update proportional to this attempt's deltas and apply it only
+        // after the candidate Versions are installed.
+        const auto current =
+            version_set.physical_file_owners_.find(file_number);
+        if (current != version_set.physical_file_owners_.end() &&
+            !same_owner(current->second, delta.owner)) {
+          if (enforce_uniqueness) {
+            status = Status::Corruption(
+                "Physical file number is reused across column families or "
+                "file kinds in installed Versions");
+          } else {
+            deferred_physical_file_ownership_conflict_ = true;
+          }
+        }
+      }
+      if (!status.ok()) {
+        return;
+      }
+    }
+  };
+
+  if (status.ok()) {
+    if (db_mutex_ != nullptr) {
+      InstrumentedMutexUnlock unlock(db_mutex_);
+      // SyncPoint's singleton has process lifetime.
+      // @lint-ignore NULLSAFECLANG nullable-dereference
+      TEST_SYNC_POINT_CALLBACK(
+          "ManifestTailer::PrepareToInstallVersions:Unlocked", db_mutex_);
+      prepare_ownership();
+    } else {
+      prepare_ownership();
+    }
+  }
+
+  if (!status.ok() && prepared_physical_file_owners_.has_value()) {
+    if (db_mutex_ != nullptr) {
+      InstrumentedMutexUnlock unlock(db_mutex_);
+      prepared_physical_file_owners_.reset();
+    } else {
+      prepared_physical_file_owners_.reset();
+    }
+  }
+  return status;
+}
+
+ColumnFamilyData* ManifestTailer::DestroyCfAndCleanup(const VersionEdit& edit) {
+  assert(version_set_ != nullptr);
+  // VersionEditHandler's constructor requires a non-null VersionSet.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  VersionSet& version_set = *version_set_;
+  PrepareColumnFamilyDropOwnership(edit.GetColumnFamily());
+  ColumnFamilySet* cfd_set = version_set.GetColumnFamilySet();
+  assert(cfd_set != nullptr);
+  // Every drop reaching this override passed CheckColumnFamilyId.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  ColumnFamilyData* cfd = cfd_set->GetColumnFamily(edit.GetColumnFamily());
+  assert(cfd != nullptr);
+  // The successful ID check above guarantees a live CFD until the base drop.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  ColumnFamilyData& dropped_cfd = *cfd;
+  cfds_changed_.erase(cfd);
+  (void)dropped_cfd;
+
+  ColumnFamilyData* result =
+      VersionEditHandlerPointInTime::DestroyCfAndCleanup(edit);
+  assert(result == nullptr);
+  return result;
+}
+
+void ManifestTailer::DestroyVersionBuilder(uint32_t column_family_id) {
+  const auto existing = builders_.find(column_family_id);
+  assert(existing != builders_.end());
+  assert(existing->second != nullptr);
+  VersionBuilderUPtr guard = std::move(existing->second);
+  builders_.erase(existing);
+  // The assertions above establish that the moved guard is non-null.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  std::unique_ptr<VersionBuilder> builder = guard->ReleaseVersionBuilder();
+  if (db_mutex_ != nullptr) {
+    InstrumentedMutexUnlock unlock(db_mutex_);
+    // SyncPoint's singleton has process lifetime.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT_CALLBACK("ManifestTailer::DestroyVersionBuilder:Unlocked",
+                             db_mutex_);
+    builder.reset();
+  } else {
+    builder.reset();
+  }
+  // Release the guard's non-atomic base-Version reference after the DB mutex
+  // has been reacquired.
+  guard.reset();
+  // SyncPoint's singleton has process lifetime.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT_CALLBACK(
+      "ManifestTailer::DestroyVersionBuilder:GuardReleasedLocked", db_mutex_);
+}
+
+void ManifestTailer::PrepareColumnFamilyDropOwnership(
+    uint32_t column_family_id) {
+  assert(version_set_ != nullptr);
+  // VersionEditHandler's constructor requires a non-null VersionSet.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  VersionSet& version_set = *version_set_;
+  const auto prepare_ownership_index = [&] {
+    if (!prepared_column_family_drop_owners_.has_value()) {
+      prepared_column_family_drop_owners_.emplace();
+      version_set.PrepareColumnFamilyDropOwnershipIndex(
+          column_family_id, &*prepared_column_family_drop_owners_);
+    } else {
+      VersionSet::RemoveColumnFamilyPhysicalFileOwners(
+          column_family_id, &*prepared_column_family_drop_owners_);
+    }
+    VersionSet::MarkColumnFamilyDroppedOwnershipDeltas(
+        column_family_id, physical_file_ownership_deltas_);
+  };
+  if (db_mutex_ != nullptr) {
+    InstrumentedMutexUnlock unlock(db_mutex_);
+    // SyncPoint's singleton has process lifetime.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT_CALLBACK(
+        "ManifestTailer::PrepareColumnFamilyDropOwnershipDeltas:Unlocked",
+        db_mutex_);
+    prepare_ownership_index();
+  } else {
+    prepare_ownership_index();
+  }
+}
+
+void ManifestTailer::ReplaceBuilder(uint32_t column_family_id,
+                                    VersionBuilderUPtr replacement) {
+  assert(replacement != nullptr);
+  const auto existing = builders_.find(column_family_id);
+  assert(existing != builders_.end());
+  assert(existing->second != nullptr);
+  VersionBuilderUPtr old = std::move(existing->second);
+  existing->second = std::move(replacement);
+  // The assertions above establish that the moved guard is non-null.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  std::unique_ptr<VersionBuilder> old_builder = old->ReleaseVersionBuilder();
+  if (db_mutex_ != nullptr) {
+    InstrumentedMutexUnlock unlock(db_mutex_);
+    // SyncPoint's singleton has process lifetime.
+    // @lint-ignore NULLSAFECLANG nullable-dereference
+    TEST_SYNC_POINT_CALLBACK("ManifestTailer::ReplaceBuilder:Unlocked",
+                             db_mutex_);
+    old_builder.reset();
+  } else {
+    old_builder.reset();
+  }
+  // BaseReferencedVersionBuilder releases the non-atomic Version reference
+  // here, after InstrumentedMutexUnlock has reacquired the DB mutex.
+  old.reset();
+  // SyncPoint's singleton has process lifetime.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  TEST_SYNC_POINT_CALLBACK("ManifestTailer::ReplaceBuilder:GuardReleasedLocked",
+                           db_mutex_);
 }
 
 Status ManifestTailer::OnColumnFamilyAdd(VersionEdit& edit,
@@ -1152,8 +1902,7 @@ Status ManifestTailer::OnColumnFamilyAdd(VersionEdit& edit,
     // For now, ignore new column families created after Recover() succeeds.
     return Status::OK();
   }
-  auto builder_iter = builders_.find(edit.GetColumnFamily());
-  assert(builder_iter != builders_.end());
+  assert(builders_.find(edit.GetColumnFamily()) != builders_.end());
 
   Version* dummy_version = tmp_cfd->dummy_versions();
   assert(dummy_version);
@@ -1161,7 +1910,7 @@ Status ManifestTailer::OnColumnFamilyAdd(VersionEdit& edit,
   assert(base_version);
   VersionBuilderUPtr new_builder(new BaseReferencedVersionBuilder(
       tmp_cfd, base_version, this, track_found_and_missing_files_));
-  builder_iter->second = std::move(new_builder);
+  ReplaceBuilder(edit.GetColumnFamily(), std::move(new_builder));
 
 #ifndef NDEBUG
   auto version_iter = versions_.find(edit.GetColumnFamily());
@@ -1174,7 +1923,26 @@ void ManifestTailer::CheckIterationResult(const log::Reader& reader,
                                           Status* s) {
   VersionEditHandlerPointInTime::CheckIterationResult(reader, s);
   assert(s);
+  assert(version_set_ != nullptr);
+  // VersionEditHandler's constructor requires a non-null VersionSet.
+  // @lint-ignore NULLSAFECLANG nullable-dereference
+  VersionSet& version_set = *version_set_;
+  std::optional<VersionSet::PhysicalFileOwnershipIndex> owners_to_destroy;
   if (s->ok()) {
+    if (prepared_physical_file_owners_.has_value()) {
+      version_set.physical_file_owners_.swap(*prepared_physical_file_owners_);
+      owners_to_destroy = std::move(prepared_physical_file_owners_);
+      prepared_physical_file_owners_.reset();
+    } else if (prepared_column_family_drop_owners_.has_value()) {
+      version_set.physical_file_owners_.swap(
+          *prepared_column_family_drop_owners_);
+      owners_to_destroy = std::move(prepared_column_family_drop_owners_);
+      prepared_column_family_drop_owners_.reset();
+    } else {
+      version_set.ApplyPhysicalFileOwnershipDeltas(
+          physical_file_ownership_deltas_);
+    }
+    replace_physical_file_ownership_on_success_ = false;
     if (Mode::kRecovery == mode_) {
       if (defer_sst_file_opening_) {
         // Deferred verification treats each added SST as found. Discard files
@@ -1187,6 +1955,33 @@ void ManifestTailer::CheckIterationResult(const log::Reader& reader,
     } else {
       assert(Mode::kCatchUp == mode_);
     }
+  } else if (prepared_column_family_drop_owners_.has_value()) {
+    // Column-family destruction is immediate during replay even if a later
+    // record fails. Keep current ownership aligned with that actual state,
+    // without applying unrelated deltas from the failed tail attempt.
+    version_set.physical_file_owners_.swap(
+        *prepared_column_family_drop_owners_);
+    owners_to_destroy = std::move(prepared_column_family_drop_owners_);
+    prepared_column_family_drop_owners_.reset();
+  }
+  VersionSet::PhysicalFileOwnershipDeltas deltas_to_destroy;
+  deltas_to_destroy.swap(physical_file_ownership_deltas_);
+  const auto release_staged_ownership = [&] {
+    deltas_to_destroy.clear();
+    owners_to_destroy.reset();
+    prepared_column_family_drop_owners_.reset();
+    prepared_physical_file_owners_.reset();
+  };
+  if (deltas_to_destroy.empty() && !owners_to_destroy.has_value() &&
+      !prepared_column_family_drop_owners_.has_value() &&
+      !prepared_physical_file_owners_.has_value()) {
+    return;
+  }
+  if (db_mutex_ != nullptr) {
+    InstrumentedMutexUnlock unlock(db_mutex_);
+    release_staged_ownership();
+  } else {
+    release_staged_ownership();
   }
 }
 
