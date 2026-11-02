@@ -1423,6 +1423,25 @@ Status GetMutableOptionsFromStrings(
   return s;
 }
 
+bool MutableCFOptionsUnchangedByMap(
+    const MutableCFOptions& base_options,
+    const std::unordered_map<std::string, std::string>& options_map) {
+  for (const auto& opt : options_map) {
+    std::string elem_name;
+    const OptionTypeInfo* opt_info = OptionTypeInfo::Find(
+        opt.first, cf_mutable_options_type_info, &elem_name);
+    if (opt_info == nullptr || !opt_info->IsMutable() ||
+        opt_info->IsConfigurable()) {
+      return false;
+    }
+  }
+  MutableCFOptions new_options;
+  return GetMutableOptionsFromStrings(base_options, options_map,
+                                      /*info_log=*/nullptr, &new_options)
+             .ok() &&
+         new_options == base_options;
+}
+
 Status GetStringFromMutableCFOptions(const ConfigOptions& config_options,
                                      const MutableCFOptions& mutable_opts,
                                      std::string* opt_string) {

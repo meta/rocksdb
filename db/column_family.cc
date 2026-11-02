@@ -1741,8 +1741,19 @@ Status ColumnFamilyData::SetOptions(
   if (s.ok()) {
     mutable_cf_options_ = MutableCFOptions(cf_opts);
     mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+    options_install_pending_ = true;
   }
   return s;
+}
+
+bool ColumnFamilyData::SetOptionsIsNoOp(
+    const DBOptions& db_opts,
+    const std::unordered_map<std::string, std::string>& options_map) const {
+  // SetOptions() validates the resulting options, so a request that changes
+  // nothing must pass the same check to return the same status.
+  return !IsDropped() && !options_install_pending_ &&
+         MutableCFOptionsUnchangedByMap(mutable_cf_options_, options_map) &&
+         ValidateOptions(db_opts, GetLatestCFOptions()).ok();
 }
 
 Status ColumnFamilyData::AddDirectories(

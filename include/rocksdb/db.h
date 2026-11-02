@@ -2102,7 +2102,13 @@ class DB {
   //
   // RELIABILITY & PERFORMANCE NOTE: SetOptions is not fully stress-tested for
   // reliability, and this is a slow call because a new OPTIONS file is
-  // serialized and persisted for each call. Use only infrequently.
+  // serialized and persisted for each call. Use only infrequently. As with
+  // SetDBOptions, a valid call that changes no option value returns OK without
+  // doing anything. This does not apply to a call that sets an object option
+  // such as table_factory or one of its fields. It also does not apply after
+  // an options or column family update fails part way or fails to write the
+  // OPTIONS file. Then SetOptions applies in full, and SetDBOptions writes the
+  // OPTIONS file even if no option value changes.
   //
   // EXAMPLES:
   //  s = db->SetOptions(cfh, {{"ttl", "36000"}});
