@@ -1,0 +1,1 @@
+The JSON written to the info LOG by `EventLogger` (`EVENT_LOG_v1` lines) and by `VersionEdit::DebugJSON()` now escapes special characters in keys and string values, and writes non-finite floating-point values as `null`, so the output is always valid JSON.
