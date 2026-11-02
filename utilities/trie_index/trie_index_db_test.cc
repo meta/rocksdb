@@ -3797,6 +3797,65 @@ TEST_P(TrieIndexDBTest, ReopenWithoutTrieUDI) {
   ASSERT_EQ(keys[1], "key_b");
 }
 
+TEST_P(TrieIndexDBTest, EmptyUserKey) {
+  ASSERT_OK(OpenDB(/*block_size=*/256));
+  // The empty key's value fills a data block, so that block's separator is
+  // the empty key.
+  ASSERT_OK(db_->Put(WriteOptions(), "", std::string(1000, 'E')));
+  std::vector<std::string> expected_keys = {""};
+  for (char c = 'b'; c <= 'f'; c++) {
+    expected_keys.emplace_back(1, c);
+    ASSERT_OK(
+        db_->Put(WriteOptions(), expected_keys.back(), std::string(300, c)));
+  }
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes("", std::string(1000, 'E')));
+  ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes("d", std::string(300, 'd')));
+  ASSERT_NO_FATAL_FAILURE(VerifyScanBothIndexes(expected_keys));
+}
+
+TEST_P(TrieIndexDBTest, OnlyEmptyUserKey) {
+  ASSERT_OK(OpenDB());
+  ASSERT_OK(db_->Put(WriteOptions(), "", "v"));
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes("", "v"));
+  ASSERT_NO_FATAL_FAILURE(VerifyScanBothIndexes({""}));
+}
+
+TEST_P(TrieIndexDBTest, OpenRejectsNonBytewiseComparator) {
+  options_.comparator = ReverseBytewiseComparator();
+  ASSERT_EQ(OpenDB().code(), Status::Code::kNotSupported);
+}
+
+TEST_P(TrieIndexDBTest, CreateColumnFamilyRejectsNonBytewiseComparator) {
+  ASSERT_OK(OpenDB());
+  ColumnFamilyOptions cf_options(options_);
+  cf_options.comparator = ReverseBytewiseComparator();
+  ColumnFamilyHandle* handle = nullptr;
+  ASSERT_EQ(db_->CreateColumnFamily(cf_options, "reverse", &handle).code(),
+            Status::Code::kNotSupported);
+  ASSERT_EQ(handle, nullptr);
+}
+
+// kStandardOnly ignores the factory, so the trie's comparator requirement must
+// not stop a DB from opening and working.
+TEST_F(TrieIndexDBTest, StandardOnlyIgnoresTrieComparatorRequirement) {
+  options_.comparator = ReverseBytewiseComparator();
+  ASSERT_OK(OpenDBImpl(/*block_size=*/0,
+                       BlockBasedTableOptions::IndexMode::kStandardOnly));
+  ASSERT_OK(db_->Put(WriteOptions(), "a", "1"));
+  ASSERT_OK(db_->Put(WriteOptions(), "b", "2"));
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  std::string value;
+  ASSERT_OK(db_->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ(value, "1");
+  std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+  it->SeekToFirst();
+  ASSERT_TRUE(it->Valid());
+  ASSERT_EQ(it->key(), "b");
+  ASSERT_OK(it->status());
+}
+
 // Mixed SSTs: some written with UDI, some without. Both should be readable
 // through both index paths.
 TEST_P(TrieIndexDBTest, MixedSSTsWithAndWithoutUDI) {

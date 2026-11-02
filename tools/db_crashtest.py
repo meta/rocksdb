@@ -2291,6 +2291,17 @@ def gen_cmd_params(args, unknown_params=None):
         if v is not None:
             params[k] = v
 
+    # With the default 16 KiB blocks an SST has only a few dozen separators.
+    # Smaller blocks give the trie more buckets and nodes, and user keys whose
+    # versions span several blocks. kStandardOnly (index_mode 0) never builds
+    # the trie, and an explicit --block_size wins.
+    if (
+        getattr(args, "block_size", None) is None
+        and params.get("use_trie_index") == 1
+        and params.get("index_mode") != 0
+    ):
+        params["block_size"] = lambda: random.choice([1024, 4096, 16384])
+
     # Reserve a small fraction of ordinary crash-test invocations for the
     # file-scoped WAL recovery state machine. Do this after merging command
     # line arguments so automatic selection cannot override an explicit opt-out

@@ -961,6 +961,33 @@ class DBCrashTestTest(unittest.TestCase):
                 self.assertEqual(1, finalized["use_trie_index"])
                 self.assertEqual(4, finalized["compression_parallel_threads"])
 
+    def test_trie_block_size_draw(self):
+        db_crashtest = self.load_db_crashtest()
+
+        def block_sizes(**overrides):
+            # auto_readahead_size=0 keeps the unrelated 1 KiB block shrink off.
+            args = self.build_mode_args(
+                test_type="blackbox", use_trie_index=1, auto_readahead_size=0,
+                **overrides
+            )
+            params = db_crashtest.gen_cmd_params(args)
+            params["db"] = self.test_tmpdir
+            return {
+                db_crashtest.finalize_and_sanitize(dict(params))["block_size"]
+                for _ in range(60)
+            }
+
+        # Smaller blocks are drawn for the modes that build the trie.
+        drawn = block_sizes(index_mode=1)
+        self.assertTrue(drawn <= {1024, 4096, 16384}, drawn)
+        self.assertGreater(len(drawn), 1)
+        # An explicit --block_size is kept.
+        self.assertEqual({8192}, block_sizes(index_mode=1, block_size=8192))
+        # kStandardOnly never builds the trie, so it keeps the default.
+        self.assertEqual(
+            {db_crashtest.default_params["block_size"]}, block_sizes(index_mode=0)
+        )
+
     def test_finalize_disables_test_batches_snapshots_when_disable_wal(self):
         db_crashtest = self.load_db_crashtest()
         params = self.build_params(

@@ -421,7 +421,14 @@ static struct BlockBasedTableTypeInfo {
          OptionTypeInfo::AsCustomSharedPtr<IndexFactory>(
              offsetof(struct BlockBasedTableOptions,
                       user_defined_index_factory),
-             OptionVerificationType::kByNameAllowFromNull)},
+             OptionVerificationType::kByNameAllowFromNull)
+             // BlockBasedTableFactory::ValidateOptions() validates the factory
+             // only in the index modes that use it.
+             .SetValidateFunc(
+                 [](const DBOptions& /*db_opts*/,
+                    const ColumnFamilyOptions& /*cf_opts*/,
+                    const std::string& /*name*/,
+                    const void* /*addr*/) { return Status::OK(); })},
         {"whole_key_filtering",
          {offsetof(struct BlockBasedTableOptions, whole_key_filtering),
           OptionType::kBoolean, OptionVerificationType::kNormal}},
@@ -825,6 +832,18 @@ Status BlockBasedTableFactory::ValidateOptions(
     return Status::InvalidArgument(
         "user_defined_index_factory is incompatible with user-defined "
         "timestamps");
+  }
+  // kStandardOnly ignores the factory, so only the other modes are bound by
+  // its requirements. The user_defined_index_factory option's validate func
+  // skips the generic Configurable check so that this one decides.
+  if (table_options_.GetEffectiveIndexMode() !=
+          BlockBasedTableOptions::IndexMode::kStandardOnly &&
+      table_options_.user_defined_index_factory != nullptr) {
+    Status s = table_options_.user_defined_index_factory->ValidateOptions(
+        db_opts, cf_opts);
+    if (!s.ok()) {
+      return s;
+    }
   }
   if (table_options_.cache_index_and_filter_blocks &&
       table_options_.no_block_cache) {
