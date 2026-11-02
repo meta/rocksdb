@@ -752,7 +752,9 @@ struct CompactionServiceInput {
 #endif  // NDEBUG
 };
 
-// CompactionServiceOutputFile is the metadata for the output SST file
+// CompactionServiceOutputFile is the metadata for the output SST file. Parsing
+// a serialized result sets only the fields present in it, so every member
+// needs a default value.
 struct CompactionServiceOutputFile {
   std::string file_name;
   uint64_t file_size{};
@@ -767,10 +769,10 @@ struct CompactionServiceOutputFile {
   std::string file_checksum = kUnknownFileChecksum;
   std::string file_checksum_func_name = kUnknownFileChecksumFuncName;
   uint64_t paranoid_hash{};
-  bool marked_for_compaction;
+  bool marked_for_compaction = false;
   UniqueId64x2 unique_id{};
   TableProperties table_properties;
-  bool is_proximal_level_output;
+  bool is_proximal_level_output = false;
   Temperature file_temperature = Temperature::kUnknown;
 
   CompactionServiceOutputFile() = default;
