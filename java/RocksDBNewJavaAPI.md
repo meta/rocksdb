@@ -194,6 +194,27 @@ We can also control what we want
 to generate from `jextract`, in the sense that we don't need to expose *everything*.
 This is slightly incidental, and more about hygiene, and not creating reams of unused stuff.
 
+## Portability
+
+`jextract` has to map the types declared in `C` APIs to Java types. These are then exposed at the generated
+Java API. How is this made portable ? In [JEP 454, Describing C types in Java code](https://openjdk.org/jeps/454#:~:text=Describing%20C%20types%20in%20Java%20code) we see that this is done via `Linker.nativeLinker().canonicalLayouts()`, so for example a `long` in `C` is always represented as a `C_LONG` in Java, but that value
+layout is calculated dynamically through the current linker:
+```java
+public static final ValueLayout.OfLong C_LONG = (ValueLayout.OfLong) Linker.nativeLinker().canonicalLayouts().get("long");
+```
+Earlier versions of `jextract` generated hard constants for these values, based on the platform on which it was
+being run. These were definitively non-portable.
+
+Current, platform independent (JDK24+) jextract-ed code gets to be platform independent by generating code which references at runtime `Linker.nativeLinker().canonicalLayouts()` when defining the sizes/types of C_LONG, C_POINTER etc which are used as the parameter types for the method handles for extracted methods.
+The NativeLinker is implemented only for common 64bit platforms (aarch64, x64, not much else).
+The NativeLinker is also necessary to actually link and call native methods.
+
+32bit builds of the JDK do not have a native linker (e.g. Liberica 23). You can build a 32bit JDK with a fallback linker (which uses libffm, and which is a confusing name, as it's not "native", but it implements the interface). You do this by explicitly configuring the JDK build (I did this with my JDK22 build and it works). BUT if there is a supported-ish 32bit distribution with the fallback linker, I don't know of it.
+
+Slightly incidentally to this argument, it is perfectly reasonable to generate an API without using jextract, we don't need all the things jextract does, the boilerplate is pretty straightforward, and I think it's a good approach to take because we could drive it from the C API generation, we can make our API higher level (RocksFFM objects), and it lets us be flexible with choosing which methods to make critical or allow heap segments.
+
+Nonetheless, we still need a linker, so to support 32bit we still need a custom 32bit JDK which is stuck at JDK23 forever, because 32bit support is deprecated in 24 and removed in 25. So I very strongly recommend that a new RocksFFM API can be 64bit only. I think it is reasonable to tell the 32bit world that they are dinosaurs, and their only option is the existing JNI API, which may be supported for some time, but never taken forward.
+
 ## Outstanding Items to think about
 
 ### How to assess new API
