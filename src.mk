@@ -243,6 +243,7 @@ LIB_SOURCES =                                                   \
   test_util/transaction_test_util.cc                            \
   tools/dump/db_dump_tool.cc                                    \
   trace_replay/trace_record_handler.cc                          \
+  trace_replay/trace_analyzer.cc                                \
   trace_replay/trace_record_result.cc                           \
   trace_replay/trace_record.cc                                  \
   trace_replay/trace_replay.cc                                  \
