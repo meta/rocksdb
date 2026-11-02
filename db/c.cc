@@ -13028,6 +13028,19 @@ void rocksdb_transaction_delete_cf(
   SaveError(errptr, txn->rep->Delete(column_family->rep, Slice(key, klen)));
 }
 
+void rocksdb_transaction_singledelete(rocksdb_transaction_t* txn,
+                                      const char* key, size_t klen,
+                                      char** errptr) {
+  SaveError(errptr, txn->rep->SingleDelete(Slice(key, klen)));
+}
+
+void rocksdb_transaction_singledelete_cf(
+    rocksdb_transaction_t* txn, rocksdb_column_family_handle_t* column_family,
+    const char* key, size_t klen, char** errptr) {
+  SaveError(errptr,
+            txn->rep->SingleDelete(column_family->rep, Slice(key, klen)));
+}
+
 void rocksdb_transaction_commit(rocksdb_transaction_t* txn, char** errptr) {
   SaveError(errptr, txn->rep->Commit());
 }
