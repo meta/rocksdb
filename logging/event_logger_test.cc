@@ -5,6 +5,7 @@
 
 #include "logging/event_logger.h"
 
+#include <limits>
 #include <string>
 
 #include "test_util/testharness.h"
@@ -33,6 +34,21 @@ TEST_F(EventLoggerTest, SimpleTest) {
   ASSERT_TRUE(output.find("\"event\": \"just_testing\"") != std::string::npos);
   ASSERT_TRUE(output.find("\"id\": 5") != std::string::npos);
   ASSERT_TRUE(output.find("\"time_micros\"") != std::string::npos);
+}
+
+TEST_F(EventLoggerTest, EscapesStrings) {
+  JSONWriter jw;
+  jw << "key \"q\"" << "a\\b\nc\td\x01";
+  jw.EndObject();
+  ASSERT_EQ(jw.Get(), "{\"key \\\"q\\\"\": \"a\\\\b\\nc\\td\\u0001\"}");
+}
+
+TEST_F(EventLoggerTest, NonFiniteNumbersAreNull) {
+  JSONWriter jw;
+  jw << "nan" << std::numeric_limits<double>::quiet_NaN() << "inf"
+     << std::numeric_limits<double>::infinity() << "finite" << 1.5;
+  jw.EndObject();
+  ASSERT_EQ(jw.Get(), "{\"nan\": null, \"inf\": null, \"finite\": 1.5}");
 }
 
 }  // namespace ROCKSDB_NAMESPACE
