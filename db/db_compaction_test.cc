@@ -13906,6 +13906,107 @@ TEST_F(DBCompactionTest, CompactionFilterLargeValueRejected) {
   ASSERT_TRUE(s.ToString().find("4GB") != std::string::npos) << s.ToString();
 }
 
+namespace {
+// Drops entries whose value is "expired", but only after `enabled` is set, so
+// that the setup compactions do not drop the key early.
+class DropExpiredValueFilter : public CompactionFilter {
+ public:
+  bool Filter(int /*level*/, const Slice& /*key*/, const Slice& value,
+              std::string* /*new_value*/,
+              bool* /*value_changed*/) const override {
+    return enabled.load(std::memory_order_relaxed) && value == Slice("expired");
+  }
+  const char* Name() const override { return "DropExpiredValueFilter"; }
+  std::atomic<bool> enabled{false};
+};
+}  // namespace
+
+class DBCompactionBottommostSkipNewFilesTest
+    : public DBCompactionTest,
+      public ::testing::WithParamInterface<BottommostLevelCompaction> {};
+
+// With kForceOptimized and kIfHaveCompactionFilter, the bottommost pass of a
+// manual compaction skips files created by the same manual compaction. Old
+// bottommost files to the right of such a new file must still be compacted.
+// Found by a Lean model of the compaction picker.
+TEST_P(DBCompactionBottommostSkipNewFilesTest, CompactsOldFilesAfterNewFile) {
+  const BottommostLevelCompaction blc = GetParam();
+  DropExpiredValueFilter filter;
+  Options options = CurrentOptions();
+  options.num_levels = 3;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  if (blc == BottommostLevelCompaction::kIfHaveCompactionFilter) {
+    options.compaction_filter = &filter;
+  }
+  DestroyAndReopen(options);
+
+  // Three non-overlapping L2 files: A=[a1,a2], C=[c1,c2], B=[e1,e2].
+  ASSERT_OK(Put("a1", "va"));
+  ASSERT_OK(Put("a2", "va"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_OK(Put("c1", "vc"));
+  ASSERT_OK(Put("c2", "vc"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_OK(Put("e1", "expired"));
+  ASSERT_OK(Put("e2", "vb"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_EQ("0,0,3", FilesPerLevel());
+  // An L1 file that overlaps only C, so L1->L2 writes one new L2 file in the
+  // middle of the bottommost level.
+  ASSERT_OK(Put("c1", "vc_new"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ("0,1,3", FilesPerLevel());
+
+  std::vector<std::vector<FileMetaData>> files;
+  dbfull()->TEST_GetFilesMetaData(db_->DefaultColumnFamily(), &files);
+  ASSERT_EQ(3u, files[2].size());
+  const uint64_t file_a = files[2][0].fd.GetNumber();
+  const uint64_t file_b = files[2][2].fd.GetNumber();
+
+  int bottommost_compactions = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionPicker::CompactRange:Return", [&](void* arg) {
+        Compaction* c = static_cast<Compaction*>(arg);
+        if (c->start_level() == 2 && c->output_level() == 2) {
+          ++bottommost_compactions;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = blc;
+  filter.enabled.store(true, std::memory_order_relaxed);
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // One bottommost compaction for A, and one more for B after skipping the
+  // new file in the middle.
+  ASSERT_EQ(2, bottommost_compactions);
+  dbfull()->TEST_GetFilesMetaData(db_->DefaultColumnFamily(), &files);
+  for (const auto& f : files[2]) {
+    ASSERT_NE(file_a, f.fd.GetNumber());
+    ASSERT_NE(file_b, f.fd.GetNumber()) << "old bottommost file B was skipped";
+  }
+  if (blc == BottommostLevelCompaction::kIfHaveCompactionFilter) {
+    // The compaction filter must have dropped e1 from B.
+    ASSERT_EQ("NOT_FOUND", Get("e1"));
+  }
+  ASSERT_EQ("vb", Get("e2"));
+  ASSERT_EQ("vc_new", Get("c1"));
+}
+
+INSTANTIATE_TEST_CASE_P(
+    DBCompactionBottommostSkipNewFilesTest,
+    DBCompactionBottommostSkipNewFilesTest,
+    ::testing::Values(BottommostLevelCompaction::kForceOptimized,
+                      BottommostLevelCompaction::kIfHaveCompactionFilter));
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
