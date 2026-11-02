@@ -2102,10 +2102,6 @@ Status DBImpl::SetDBOptions(
     s = GetMutableDBOptionsFromStrings(mutable_db_options_, options_map,
                                        &new_options);
 
-    if (new_options.bytes_per_sync == 0) {
-      new_options.bytes_per_sync = 1024 * 1024;
-    }
-
     if (MutableDBOptionsAreEqual(mutable_db_options_, new_options)) {
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "SetDBOptions(), input option value is not changed, "
