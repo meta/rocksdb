@@ -47,12 +47,13 @@ public class MultiColumnRegressionTest {
     this.params = params;
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void transactionDB() throws RocksDBException {
     final List<ColumnFamilyDescriptor> columnFamilyDescriptors = new ArrayList<>();
     for (int i = 0; i < params.numColumns; i++) {
       final StringBuilder sb = new StringBuilder();
-      sb.append("cf" + i);
+      sb.append("cf").append(i);
       for (int j = 0; j < params.keySize; j++) sb.append("_cf");
       columnFamilyDescriptors.add(new ColumnFamilyDescriptor(sb.toString().getBytes()));
     }
@@ -63,42 +64,47 @@ public class MultiColumnRegressionTest {
 
     columnFamilyDescriptors.add(new ColumnFamilyDescriptor("default".getBytes()));
     final List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>();
-    try (final TransactionDB tdb = TransactionDB.open(new DBOptions().setCreateIfMissing(true),
-             new TransactionDBOptions(), dbFolder.getRoot().getAbsolutePath(),
-             columnFamilyDescriptors, columnFamilyHandles)) {
-      final WriteOptions writeOptions = new WriteOptions();
-      try (final Transaction transaction = tdb.beginTransaction(writeOptions)) {
-        for (int i = 0; i < params.numColumns; i++) {
-          transaction.put(
-              columnFamilyHandles.get(i), ("key" + i).getBytes(), ("value" + (i - 7)).getBytes());
+    try (final DBOptions dbOptions = new DBOptions().setCreateIfMissing(true)) {
+      try (
+          final TransactionDB tdb = TransactionDB.open(dbOptions, new TransactionDBOptions(),
+              dbFolder.getRoot().getAbsolutePath(), columnFamilyDescriptors, columnFamilyHandles)) {
+        final WriteOptions writeOptions = new WriteOptions();
+        try (final Transaction transaction = tdb.beginTransaction(writeOptions)) {
+          for (int i = 0; i < params.numColumns; i++) {
+            transaction.put(
+                columnFamilyHandles.get(i), ("key" + i).getBytes(), ("value" + (i - 7)).getBytes());
+          }
+          transaction.put("key".getBytes(), "value".getBytes());
+          transaction.commit();
         }
-        transaction.put("key".getBytes(), "value".getBytes());
-        transaction.commit();
-      }
-      for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles) {
-        columnFamilyHandle.close();
+        for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles) {
+          columnFamilyHandle.close();
+        }
       }
     }
 
     final List<ColumnFamilyHandle> columnFamilyHandles2 = new ArrayList<>();
-    try (final TransactionDB tdb = TransactionDB.open(new DBOptions().setCreateIfMissing(true),
-             new TransactionDBOptions(), dbFolder.getRoot().getAbsolutePath(),
-             columnFamilyDescriptors, columnFamilyHandles2)) {
-      try (final Transaction transaction = tdb.beginTransaction(new WriteOptions())) {
-        final ReadOptions readOptions = new ReadOptions();
-        for (int i = 0; i < params.numColumns; i++) {
-          final byte[] value =
-              transaction.get(columnFamilyHandles2.get(i), readOptions, ("key" + i).getBytes());
-          assertThat(value).isEqualTo(("value" + (i - 7)).getBytes());
+    try (final DBOptions dbOptions = new DBOptions().setCreateIfMissing(true)) {
+      try (final TransactionDB tdb = TransactionDB.open(dbOptions, new TransactionDBOptions(),
+               dbFolder.getRoot().getAbsolutePath(), columnFamilyDescriptors,
+               columnFamilyHandles2)) {
+        try (final Transaction transaction = tdb.beginTransaction(new WriteOptions())) {
+          final ReadOptions readOptions = new ReadOptions();
+          for (int i = 0; i < params.numColumns; i++) {
+            final byte[] value =
+                transaction.get(columnFamilyHandles2.get(i), readOptions, ("key" + i).getBytes());
+            assertThat(value).isEqualTo(("value" + (i - 7)).getBytes());
+          }
+          transaction.commit();
         }
-        transaction.commit();
-      }
-      for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles2) {
-        columnFamilyHandle.close();
+        for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles2) {
+          columnFamilyHandle.close();
+        }
       }
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void optimisticDB() throws RocksDBException {
     final List<ColumnFamilyDescriptor> columnFamilyDescriptors = new ArrayList<>();
@@ -108,37 +114,41 @@ public class MultiColumnRegressionTest {
 
     columnFamilyDescriptors.add(new ColumnFamilyDescriptor("default".getBytes()));
     final List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>();
-    try (final OptimisticTransactionDB otdb = OptimisticTransactionDB.open(
-             new DBOptions().setCreateIfMissing(true), dbFolder.getRoot().getAbsolutePath(),
-             columnFamilyDescriptors, columnFamilyHandles)) {
-      try (final Transaction transaction = otdb.beginTransaction(new WriteOptions())) {
-        for (int i = 0; i < params.numColumns; i++) {
-          transaction.put(
-              columnFamilyHandles.get(i), ("key" + i).getBytes(), ("value" + (i - 7)).getBytes());
+    try (final DBOptions dbOptions = new DBOptions().setCreateIfMissing(true)) {
+      try (
+          final OptimisticTransactionDB otdb = OptimisticTransactionDB.open(dbOptions,
+              dbFolder.getRoot().getAbsolutePath(), columnFamilyDescriptors, columnFamilyHandles)) {
+        try (final Transaction transaction = otdb.beginTransaction(new WriteOptions())) {
+          for (int i = 0; i < params.numColumns; i++) {
+            transaction.put(
+                columnFamilyHandles.get(i), ("key" + i).getBytes(), ("value" + (i - 7)).getBytes());
+          }
+          transaction.put("key".getBytes(), "value".getBytes());
+          transaction.commit();
         }
-        transaction.put("key".getBytes(), "value".getBytes());
-        transaction.commit();
-      }
-      for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles) {
-        columnFamilyHandle.close();
+        for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles) {
+          columnFamilyHandle.close();
+        }
       }
     }
 
     final List<ColumnFamilyHandle> columnFamilyHandles2 = new ArrayList<>();
-    try (final OptimisticTransactionDB otdb = OptimisticTransactionDB.open(
-             new DBOptions().setCreateIfMissing(true), dbFolder.getRoot().getAbsolutePath(),
-             columnFamilyDescriptors, columnFamilyHandles2)) {
-      try (final Transaction transaction = otdb.beginTransaction(new WriteOptions())) {
-        final ReadOptions readOptions = new ReadOptions();
-        for (int i = 0; i < params.numColumns; i++) {
-          final byte[] value =
-              transaction.get(columnFamilyHandles2.get(i), readOptions, ("key" + i).getBytes());
-          assertThat(value).isEqualTo(("value" + (i - 7)).getBytes());
+    try (final DBOptions dbOptions = new DBOptions().setCreateIfMissing(true)) {
+      try (final OptimisticTransactionDB otdb =
+               OptimisticTransactionDB.open(dbOptions, dbFolder.getRoot().getAbsolutePath(),
+                   columnFamilyDescriptors, columnFamilyHandles2)) {
+        try (final Transaction transaction = otdb.beginTransaction(new WriteOptions())) {
+          final ReadOptions readOptions = new ReadOptions();
+          for (int i = 0; i < params.numColumns; i++) {
+            final byte[] value =
+                transaction.get(columnFamilyHandles2.get(i), readOptions, ("key" + i).getBytes());
+            assertThat(value).isEqualTo(("value" + (i - 7)).getBytes());
+          }
+          transaction.commit();
         }
-        transaction.commit();
-      }
-      for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles2) {
-        columnFamilyHandle.close();
+        for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles2) {
+          columnFamilyHandle.close();
+        }
       }
     }
   }

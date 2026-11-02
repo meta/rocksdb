@@ -175,6 +175,7 @@ public abstract class AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void getPut_cf() throws RocksDBException {
     final byte[] k1 = "key1".getBytes(UTF_8);
@@ -333,6 +334,7 @@ public abstract class AbstractTransactionTest {
     getPutByteBuffer_cf(ByteBuffer::allocate);
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void multiGetPut_cf() throws RocksDBException {
     final byte[][] keys = new byte[][] {"key1".getBytes(UTF_8), "key2".getBytes(UTF_8)};
@@ -373,6 +375,7 @@ public abstract class AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void multiGetPut() throws RocksDBException {
     final byte[][] keys = new byte[][] {"key1".getBytes(UTF_8), "key2".getBytes(UTF_8)};
@@ -589,6 +592,7 @@ public abstract class AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void multiGetForUpdate_cf() throws RocksDBException {
     final byte[][] keys = new byte[][] {"key1".getBytes(UTF_8), "key2".getBytes(UTF_8)};
@@ -610,6 +614,7 @@ public abstract class AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void multiGetForUpdate() throws RocksDBException {
     final byte[][] keys = new byte[][] {"key1".getBytes(UTF_8), "key2".getBytes(UTF_8)};
@@ -728,6 +733,7 @@ public abstract class AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void merge_cf() throws RocksDBException {
     final byte[] k1 = "key1".getBytes(UTF_8);
@@ -795,6 +801,7 @@ public abstract class AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void mergeDirectByteBuffer_cf() throws RocksDBException {
     final ByteBuffer k1 = ByteBuffer.allocateDirect(100).put("key1".getBytes(UTF_8));
@@ -817,6 +824,8 @@ public abstract class AbstractTransactionTest {
           .isEqualTo("value1**value2".getBytes());
     }
   }
+
+  @SuppressWarnings("deprecation")
   public void mergeIndirectByteBuffer_cf() throws RocksDBException {
     final ByteBuffer k1 = ByteBuffer.allocate(100).put("key1".getBytes(UTF_8));
     k1.flip();
@@ -837,6 +846,7 @@ public abstract class AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void delete_cf() throws RocksDBException {
     final byte[] k1 = "key1".getBytes(UTF_8);
@@ -872,6 +882,7 @@ public abstract class AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void delete_parts_cf() throws RocksDBException {
     final byte[][] keyParts = new byte[][] {"ke".getBytes(UTF_8), "y1".getBytes(UTF_8)};
@@ -915,6 +926,7 @@ public abstract class AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void getPutUntracked_cf() throws RocksDBException {
     final byte[] k1 = "key1".getBytes(UTF_8);
@@ -1127,6 +1139,7 @@ public abstract class AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void deleteUntracked_cf() throws RocksDBException {
     final byte[] k1 = "key1".getBytes(UTF_8);
@@ -1162,6 +1175,7 @@ public abstract class AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void deleteUntracked_parts_cf() throws RocksDBException {
     final byte[][] keyParts = new byte[][] {"ke".getBytes(UTF_8), "y1".getBytes(UTF_8)};

@@ -45,6 +45,7 @@ public class PerfLevelTest {
     }
     db.close();
   }
+  @SuppressWarnings("deprecation")
   @Test
   public void testForInvalidValues() {
     assertThatThrownBy(() -> db.setPerfLevel(UNINITIALIZED))

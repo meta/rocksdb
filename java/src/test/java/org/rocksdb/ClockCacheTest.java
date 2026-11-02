@@ -13,13 +13,14 @@ public class ClockCacheTest {
     RocksDB.loadLibrary();
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void newClockCache() {
     final long capacity = 1000;
     final int numShardBits = 16;
     final boolean strictCapacityLimit = true;
     try (final Cache ignored = new ClockCache(capacity, numShardBits, strictCapacityLimit)) {
-      //no op
+      ; // no op
     }
   }
 }

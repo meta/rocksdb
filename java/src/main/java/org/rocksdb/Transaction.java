@@ -185,6 +185,7 @@ public class Transaction extends RocksObject {
 
   /**
    * Prepare the current transaction for 2PC
+   * @throws RocksDBException if an error occurs when preparing the transaction
    */
   public void prepare() throws RocksDBException {
     //TODO(AR) consider a Java'ish version of this function, which returns an AutoCloseable (commit)

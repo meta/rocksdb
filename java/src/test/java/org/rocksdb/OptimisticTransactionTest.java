@@ -39,6 +39,7 @@ public class OptimisticTransactionTest extends AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void getForUpdate_cf_conflict() throws RocksDBException {
     final byte[] k1 = "key1".getBytes(UTF_8);
@@ -158,6 +159,7 @@ public class OptimisticTransactionTest extends AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void multiGetAsListForUpdate_cf_conflict() throws RocksDBException {
     final byte[][] keys = new byte[][] {"key1".getBytes(UTF_8), "key2".getBytes(UTF_8)};
@@ -281,6 +283,7 @@ public class OptimisticTransactionTest extends AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void undoGetForUpdate_cf_conflict() throws RocksDBException {
     final byte[] k1 = "key1".getBytes(UTF_8);

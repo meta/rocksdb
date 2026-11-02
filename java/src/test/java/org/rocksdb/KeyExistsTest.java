@@ -6,13 +6,13 @@ package org.rocksdb;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import org.junit.*;
-import org.junit.rules.ExpectedException;
 import org.junit.rules.TemporaryFolder;
 
 public class KeyExistsTest {
@@ -21,8 +21,6 @@ public class KeyExistsTest {
       new RocksNativeLibraryResource();
 
   @Rule public TemporaryFolder dbFolder = new TemporaryFolder();
-
-  @Rule public ExpectedException exceptionRule = ExpectedException.none();
 
   List<ColumnFamilyDescriptor> cfDescriptors;
   List<ColumnFamilyHandle> columnFamilyHandleList = new ArrayList<>();
@@ -109,15 +107,15 @@ public class KeyExistsTest {
   @Test
   public void keyExistsArrayIndexOutOfBoundsException() throws RocksDBException {
     db.put("key".getBytes(UTF_8), "value".getBytes(UTF_8));
-    exceptionRule.expect(IndexOutOfBoundsException.class);
-    db.keyExists(null, null, "key".getBytes(UTF_8), 0, 5);
+    assertThatThrownBy(() -> db.keyExists(null, null, "key".getBytes(UTF_8), 0, 5))
+        .isInstanceOf(IndexOutOfBoundsException.class);
   }
 
   @Test()
   public void keyExistsArrayIndexOutOfBoundsExceptionWrongOffset() throws RocksDBException {
     db.put("key".getBytes(UTF_8), "value".getBytes(UTF_8));
-    exceptionRule.expect(IndexOutOfBoundsException.class);
-    db.keyExists(null, null, "key".getBytes(UTF_8), 6, 2);
+    assertThatThrownBy(() -> db.keyExists(null, null, "key".getBytes(UTF_8), 6, 2))
+        .isInstanceOf(IndexOutOfBoundsException.class);
   }
 
   @Test

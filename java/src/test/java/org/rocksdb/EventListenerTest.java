@@ -73,6 +73,7 @@ public class EventListenerTest {
     flushDb(onFlushBeginListener, wasCbCalled);
   }
 
+  @SuppressWarnings("deprecation")
   void deleteTableFile(final AbstractEventListener el, final AtomicBoolean wasCbCalled)
       throws RocksDBException {
     final int KEY_SIZE = 20;

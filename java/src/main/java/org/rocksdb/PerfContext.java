@@ -243,6 +243,8 @@ public class PerfContext extends RocksObject {
    *    hidden by the tombstones will be included here.
    * 4. symmetric cases for Prev() and SeekToLast()
    * internal_recent_skipped_count is not included in this counter.
+   *
+   * @return total number of internal keys skipped over during iteration
    */
   public long getInternalKeySkippedCount() {
     return getInternalKeySkippedCount(nativeHandle_);
@@ -255,6 +257,8 @@ public class PerfContext extends RocksObject {
    * SeekToFirst(), there may be one or more deleted keys before the next valid
    * key. Every deleted key is counted once. We don't recount here if there are
    * still older updates invalidated by the tombstones.
+   *
+   * @return Total number of deletes and single deletes skipped over during iteration
    */
   public long getInternalDeleteSkippedCount() {
     return getInternalDeleteSkippedCount(nativeHandle_);
@@ -263,6 +267,8 @@ public class PerfContext extends RocksObject {
   /**
    * How many times iterators skipped over internal keys that are more recent
    * than the snapshot that iterator is using.
+   *
+   * @return number of skipped recent internal keys
    */
   public long getInternalRecentSkippedCount() {
     return getInternalRecentSkippedCount(nativeHandle_);
@@ -271,6 +277,8 @@ public class PerfContext extends RocksObject {
   /**
    * How many merge operands were fed into the merge operator by iterators.
    * Note: base values are not included in the count.
+   *
+   * @return How many merge operands were fed into the merge operator by iterator
    */
   public long getInternalMergeCount() {
     return getInternalMergeCount(nativeHandle_);
@@ -279,6 +287,8 @@ public class PerfContext extends RocksObject {
   /**
    * How many merge operands were fed into the merge operator by point lookups.
    * Note: base values are not included in the count.
+   *
+   * @return How many merge operands were fed into the merge operator by point lookups
    */
   public long getInternalMergePointLookupCount() {
     return getInternalMergePointLookupCount(nativeHandle_);
@@ -288,6 +298,8 @@ public class PerfContext extends RocksObject {
    * Number of times we reseeked inside a merging iterator, specifically to skip
    * after or before a range of keys covered by a range deletion in a newer LSM
    * component.
+   *
+   * @return Number of times we reseeked inside a merging iterator
    */
   public long getInternalRangeDelReseekCount() {
     return getInternalRangeDelReseekCount(nativeHandle_);

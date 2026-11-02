@@ -808,6 +808,8 @@ public class RocksDB extends RocksObject {
    * The ColumnFamilyHandle is automatically disposed with DB disposal.
    *
    * @param columnFamilyDescriptor column family to be created.
+   * @param importColumnFamilyOptions options for the files being imported.
+   * @param metadata description of the column family
    * @return {@link org.rocksdb.ColumnFamilyHandle} instance.
    *
    * @throws RocksDBException thrown if error happens in underlying
@@ -3957,10 +3959,11 @@ public class RocksDB extends RocksObject {
 
   /**
    * Set performance level for rocksdb performance measurement.
-   * @param level
+   * @param level to set
    * @throws IllegalArgumentException for UNINITIALIZED and OUT_OF_BOUNDS values
    *    as they can't be used for settings.
    */
+  @SuppressWarnings("deprecation")
   public void setPerfLevel(final PerfLevel level) {
     if (level == PerfLevel.UNINITIALIZED) {
       throw new IllegalArgumentException("Unable to set UNINITIALIZED level");
@@ -3973,7 +3976,7 @@ public class RocksDB extends RocksObject {
 
   /**
    * Return current performance level measurement settings.
-   * @return
+   * @return current performance level measurement settings
    */
   public PerfLevel getPerfLevel() {
     byte level = getPerfLevelNative();
@@ -3982,7 +3985,7 @@ public class RocksDB extends RocksObject {
 
   /**
    * Return perf context bound to this thread.
-   * @return
+   * @return perf context bound to this thread
    */
   public PerfContext getPerfContext() {
     long native_handle = getPerfContextNative();

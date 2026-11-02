@@ -198,6 +198,7 @@ public class TransactionTest extends AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void multiGetForUpdate_cf_conflict() throws RocksDBException {
     final byte[][] keys = new byte[][] {"key1".getBytes(UTF_8), "key2".getBytes(UTF_8)};
@@ -275,6 +276,7 @@ public class TransactionTest extends AbstractTransactionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void multiGetForUpdate_conflict() throws RocksDBException {
     final byte[][] keys = new byte[][] {"key1".getBytes(UTF_8), "key2".getBytes(UTF_8)};

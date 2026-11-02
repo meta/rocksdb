@@ -473,6 +473,7 @@ public interface MutableDBOptionsInterface<T extends MutableDBOptionsInterface<T
    * this field blank. Default: Empty string (no offpeak).
    *
    * @param offpeakTimeUTC String value from which to parse offpeak time range
+   * @return the reference to the current options.
    */
   T setDailyOffpeakTimeUTC(final String offpeakTimeUTC);
 

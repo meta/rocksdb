@@ -11,6 +11,7 @@ import static org.junit.Assert.*;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
 import org.junit.ClassRule;
 import org.junit.Test;
 import org.rocksdb.test.RemoveEmptyValueCompactionFilterFactory;
@@ -45,7 +46,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void writeBufferSize() throws RocksDBException {
+  public void writeBufferSize() {
     try (final Options opt = new Options()) {
       final long longValue = rand.nextLong();
       opt.setWriteBufferSize(longValue);
@@ -219,7 +220,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void arenaBlockSize() throws RocksDBException {
+  public void arenaBlockSize() {
     try (final Options opt = new Options()) {
       final long longValue = rand.nextLong();
       opt.setArenaBlockSize(longValue);
@@ -255,7 +256,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void inplaceUpdateNumLocks() throws RocksDBException {
+  public void inplaceUpdateNumLocks() {
     try (final Options opt = new Options()) {
       final long longValue = rand.nextLong();
       opt.setInplaceUpdateNumLocks(longValue);
@@ -309,7 +310,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void maxSuccessiveMerges() throws RocksDBException {
+  public void maxSuccessiveMerges() {
     try (final Options opt = new Options()) {
       final long longValue = rand.nextLong();
       opt.setMaxSuccessiveMerges(longValue);
@@ -446,7 +447,7 @@ public class OptionsTest {
     }
   }
 
-  @SuppressWarnings("deprecated")
+  @SuppressWarnings("deprecation")
   @Test
   public void maxBackgroundCompactions() {
     try (final Options opt = new Options()) {
@@ -467,7 +468,7 @@ public class OptionsTest {
     }
   }
 
-  @SuppressWarnings("deprecated")
+  @SuppressWarnings("deprecation")
   @Test
   public void maxBackgroundFlushes() {
     try (final Options opt = new Options()) {
@@ -488,7 +489,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void maxLogFileSize() throws RocksDBException {
+  public void maxLogFileSize() {
     try (final Options opt = new Options()) {
       final long longValue = rand.nextLong();
       opt.setMaxLogFileSize(longValue);
@@ -497,7 +498,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void logFileTimeToRoll() throws RocksDBException {
+  public void logFileTimeToRoll() {
     try (final Options opt = new Options()) {
       final long longValue = rand.nextLong();
       opt.setLogFileTimeToRoll(longValue);
@@ -507,7 +508,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void keepLogFileNum() throws RocksDBException {
+  public void keepLogFileNum() {
     try (final Options opt = new Options()) {
       final long longValue = rand.nextLong();
       opt.setKeepLogFileNum(longValue);
@@ -516,7 +517,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void recycleLogFileNum() throws RocksDBException {
+  public void recycleLogFileNum() {
     try (final Options opt = new Options()) {
       final long longValue = rand.nextLong();
       opt.setRecycleLogFileNum(longValue);
@@ -563,7 +564,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void manifestPreallocationSize() throws RocksDBException {
+  public void manifestPreallocationSize() {
     try (final Options opt = new Options()) {
       final long longValue = rand.nextLong();
       opt.setManifestPreallocationSize(longValue);
@@ -672,7 +673,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void setWriteBufferManager() throws RocksDBException {
+  public void setWriteBufferManager() {
     try (final Options opt = new Options(); final Cache cache = new LRUCache(1024 * 1024);
          final WriteBufferManager writeBufferManager = new WriteBufferManager(2000L, cache)) {
       opt.setWriteBufferManager(writeBufferManager);
@@ -681,7 +682,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void setWriteBufferManagerWithZeroBufferSize() throws RocksDBException {
+  public void setWriteBufferManagerWithZeroBufferSize() {
     try (final Options opt = new Options(); final Cache cache = new LRUCache(1024 * 1024);
          final WriteBufferManager writeBufferManager = new WriteBufferManager(0L, cache)) {
       opt.setWriteBufferManager(writeBufferManager);
@@ -690,7 +691,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void setWriteBufferManagerWithAllowStall() throws RocksDBException {
+  public void setWriteBufferManagerWithAllowStall() {
     try (final Options opt = new Options(); final Cache cache = new LRUCache(1024 * 1024);
          final WriteBufferManager writeBufferManager = new WriteBufferManager(2000L, cache, true)) {
       opt.setWriteBufferManager(writeBufferManager);
@@ -869,6 +870,7 @@ public class OptionsTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void rowCache() {
     try (final Options opt = new Options()) {
@@ -1181,8 +1183,7 @@ public class OptionsTest {
   }
 
   @Test
-  public void shouldTestMemTableFactoryName()
-      throws RocksDBException {
+  public void shouldTestMemTableFactoryName() {
     try (final Options options = new Options()) {
       options.setMemTableConfig(new VectorMemTableConfig());
       assertThat(options.memTableFactoryName()).
@@ -1496,14 +1497,18 @@ public class OptionsTest {
     try (final Options options = new Options()) {
       try (TablePropertiesCollectorFactory collectorFactory =
                TablePropertiesCollectorFactory.NewCompactOnDeletionCollectorFactory(10, 10, 1.0)) {
-        List<TablePropertiesCollectorFactory> factories = Arrays.asList(collectorFactory);
+        List<TablePropertiesCollectorFactory> factories =
+            Collections.singletonList(collectorFactory);
         options.setTablePropertiesCollectorFactory(factories);
       }
       List<TablePropertiesCollectorFactory> factories = options.tablePropertiesCollectorFactory();
       try {
         assertThat(factories).hasSize(1);
       } finally {
-        factories.stream().forEach(TablePropertiesCollectorFactory::close);
+        Optional.ofNullable(factories)
+            .map(Collection::stream)
+            .orElseGet(Stream::empty)
+            .forEach(TablePropertiesCollectorFactory::close);
       }
     }
   }

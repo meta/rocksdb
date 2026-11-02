@@ -5,24 +5,21 @@
 
 package org.rocksdb;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
 import java.util.Arrays;
 import java.util.Random;
-
+import java.util.function.Consumer;
 import org.junit.ClassRule;
-import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
-
-import static org.assertj.core.api.Assertions.assertThat;
 
 public class ReadOptionsTest {
 
   @ClassRule
   public static final RocksNativeLibraryResource ROCKS_NATIVE_LIBRARY_RESOURCE =
       new RocksNativeLibraryResource();
-
-  @Rule
-  public ExpectedException exception = ExpectedException.none();
 
   @Test
   public void altConstructor() {
@@ -256,98 +253,62 @@ public class ReadOptionsTest {
 
   @Test
   public void failSetVerifyChecksumUninitialized() {
-    try (final ReadOptions readOptions =
-             setupUninitializedReadOptions(exception)) {
-      readOptions.setVerifyChecksums(true);
-    }
+    failOperationWithClosedOptions(options -> options.setVerifyChecksums(true));
   }
 
   @Test
   public void failVerifyChecksumUninitialized() {
-    try (final ReadOptions readOptions =
-             setupUninitializedReadOptions(exception)) {
-      readOptions.verifyChecksums();
-    }
+    failOperationWithClosedOptions(ReadOptions::verifyChecksums);
   }
 
   @Test
   public void failSetFillCacheUninitialized() {
-    try (final ReadOptions readOptions =
-             setupUninitializedReadOptions(exception)) {
-      readOptions.setFillCache(true);
-    }
+    failOperationWithClosedOptions(options -> options.setFillCache(true));
   }
 
   @Test
   public void failFillCacheUninitialized() {
-    try (final ReadOptions readOptions =
-             setupUninitializedReadOptions(exception)) {
-      readOptions.fillCache();
-    }
+    failOperationWithClosedOptions(ReadOptions::fillCache);
   }
 
   @Test
   public void failSetTailingUninitialized() {
-    try (final ReadOptions readOptions =
-             setupUninitializedReadOptions(exception)) {
-      readOptions.setTailing(true);
-    }
+    failOperationWithClosedOptions(options -> options.setTailing(true));
   }
 
   @Test
   public void failTailingUninitialized() {
-    try (final ReadOptions readOptions =
-             setupUninitializedReadOptions(exception)) {
-      readOptions.tailing();
-    }
+    failOperationWithClosedOptions(ReadOptions::tailing);
   }
 
   @Test
   public void failSetSnapshotUninitialized() {
-    try (final ReadOptions readOptions =
-             setupUninitializedReadOptions(exception)) {
-      readOptions.setSnapshot(null);
-    }
+    failOperationWithClosedOptions(options -> options.setSnapshot(null));
   }
 
   @Test
   public void failSnapshotUninitialized() {
-    try (final ReadOptions readOptions =
-             setupUninitializedReadOptions(exception)) {
-      readOptions.snapshot();
-    }
+    failOperationWithClosedOptions(ReadOptions::snapshot);
   }
 
   @Test
   public void failSetIterateUpperBoundUninitialized() {
-    try (final ReadOptions readOptions =
-             setupUninitializedReadOptions(exception)) {
-      readOptions.setIterateUpperBound(null);
-    }
+    failOperationWithClosedOptions(options -> options.setIterateUpperBound(null));
   }
 
   @Test
   public void failIterateUpperBoundUninitialized() {
-    try (final ReadOptions readOptions =
-             setupUninitializedReadOptions(exception)) {
-      readOptions.iterateUpperBound();
-    }
+    failOperationWithClosedOptions(ReadOptions::iterateUpperBound);
   }
 
   @Test
   public void failSetIterateLowerBoundUninitialized() {
-    try (final ReadOptions readOptions =
-             setupUninitializedReadOptions(exception)) {
-      readOptions.setIterateLowerBound(null);
-    }
+    failOperationWithClosedOptions(options -> options.setIterateLowerBound(null));
   }
 
   @Test
   public void failIterateLowerBoundUninitialized() {
-    try (final ReadOptions readOptions =
-             setupUninitializedReadOptions(exception)) {
-      readOptions.iterateLowerBound();
-    }
+    failOperationWithClosedOptions(ReadOptions::iterateLowerBound);
   }
 
   private ReadOptions setupUninitializedReadOptions(final ExpectedException exception) {
@@ -355,6 +316,13 @@ public class ReadOptionsTest {
     readOptions.close();
     exception.expect(AssertionError.class);
     return readOptions;
+  }
+
+  private void failOperationWithClosedOptions(Consumer<ReadOptions> operation) {
+    try (final ReadOptions readOptions = new ReadOptions()) {
+      readOptions.close();
+      assertThatThrownBy(() -> operation.accept(readOptions)).isInstanceOf(AssertionError.class);
+    }
   }
 
   private Slice buildRandomSlice() {

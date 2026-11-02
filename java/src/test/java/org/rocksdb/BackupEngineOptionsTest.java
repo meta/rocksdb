@@ -6,13 +6,12 @@
 package org.rocksdb;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.Random;
-
+import java.util.function.Consumer;
 import org.junit.ClassRule;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.ExpectedException;
 
 public class BackupEngineOptionsTest {
   private static final String ARBITRARY_PATH = System.getProperty("java.io.tmpdir");
@@ -20,9 +19,6 @@ public class BackupEngineOptionsTest {
   @ClassRule
   public static final RocksNativeLibraryResource ROCKS_NATIVE_LIBRARY_RESOURCE =
       new RocksNativeLibraryResource();
-
-  @Rule
-  public ExpectedException exception = ExpectedException.none();
 
   public static final Random rand = PlatformRandomHelper.
       getPlatformSpecificRandomFactory();
@@ -60,7 +56,8 @@ public class BackupEngineOptionsTest {
     try (final BackupEngineOptions backupEngineOptions = new BackupEngineOptions(ARBITRARY_PATH)) {
       assertThat(backupEngineOptions.infoLog()).isNull();
 
-      try (final Options options = new Options(); final Logger logger = new Logger(options) {
+      try (final Options options = new Options(); final Logger logger = new Logger(
+                                                      options.infoLogLevel()) {
         @Override
         protected void log(final InfoLogLevel infoLogLevel, final String logMsg) {}
       }) {
@@ -176,122 +173,93 @@ public class BackupEngineOptionsTest {
 
   @Test
   public void failBackupDirIsNull() {
-    exception.expect(IllegalArgumentException.class);
-    try (final BackupEngineOptions ignored = new BackupEngineOptions(null)) {
-      //no-op
-    }
+    assertThatThrownBy(() -> {
+      try (final BackupEngineOptions ignored = new BackupEngineOptions(null)) {
+        ; // no-op
+      }
+    }).isInstanceOf(IllegalArgumentException.class);
   }
 
   @Test
   public void failBackupDirIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.backupDir();
-    }
+    failOperationWithClosedOptions(BackupEngineOptions::backupDir);
   }
 
   @Test
   public void failSetShareTableFilesIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.setShareTableFiles(true);
-    }
+    failOperationWithClosedOptions(options -> options.setShareTableFiles(true));
   }
 
   @Test
   public void failShareTableFilesIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.shareTableFiles();
-    }
+    failOperationWithClosedOptions(BackupEngineOptions::shareTableFiles);
   }
 
   @Test
   public void failSetSyncIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.setSync(true);
-    }
+    failOperationWithClosedOptions(options -> options.setSync(true));
   }
 
   @Test
   public void failSyncIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.sync();
-    }
+    failOperationWithClosedOptions(BackupEngineOptions::sync);
   }
 
   @Test
   public void failSetDestroyOldDataIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.setDestroyOldData(true);
-    }
+    failOperationWithClosedOptions(options -> options.setDestroyOldData(true));
   }
 
   @Test
   public void failDestroyOldDataIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.destroyOldData();
-    }
+    failOperationWithClosedOptions(BackupEngineOptions::destroyOldData);
   }
 
   @Test
   public void failSetBackupLogFilesIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.setBackupLogFiles(true);
-    }
+    failOperationWithClosedOptions(options -> options.setBackupLogFiles(true));
   }
 
   @Test
   public void failBackupLogFilesIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.backupLogFiles();
-    }
+    failOperationWithClosedOptions(BackupEngineOptions::backupLogFiles);
   }
 
   @Test
   public void failSetBackupRateLimitIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.setBackupRateLimit(1);
-    }
+    failOperationWithClosedOptions(options -> options.setBackupRateLimit(1));
   }
 
   @Test
   public void failBackupRateLimitIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.backupRateLimit();
-    }
+    failOperationWithClosedOptions(BackupEngineOptions::backupRateLimit);
   }
 
   @Test
   public void failSetRestoreRateLimitIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.setRestoreRateLimit(1);
-    }
+    failOperationWithClosedOptions(options -> options.setRestoreRateLimit(1));
   }
 
   @Test
   public void failRestoreRateLimitIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.restoreRateLimit();
-    }
+    failOperationWithClosedOptions(BackupEngineOptions::restoreRateLimit);
   }
 
   @Test
   public void failSetShareFilesWithChecksumIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.setShareFilesWithChecksum(true);
-    }
+    failOperationWithClosedOptions(options -> options.setShareFilesWithChecksum(true));
   }
 
   @Test
   public void failShareFilesWithChecksumIfDisposed() {
-    try (final BackupEngineOptions options = setupUninitializedBackupEngineOptions(exception)) {
-      options.shareFilesWithChecksum();
-    }
+    failOperationWithClosedOptions(BackupEngineOptions::shareFilesWithChecksum);
   }
 
-  private BackupEngineOptions setupUninitializedBackupEngineOptions(
-      final ExpectedException exception) {
-    final BackupEngineOptions backupEngineOptions = new BackupEngineOptions(ARBITRARY_PATH);
-    backupEngineOptions.close();
-    exception.expect(AssertionError.class);
-    return backupEngineOptions;
+  private void failOperationWithClosedOptions(Consumer<BackupEngineOptions> operation) {
+    try (final BackupEngineOptions backupEngineOptions = new BackupEngineOptions(ARBITRARY_PATH)) {
+      backupEngineOptions.close();
+      assertThatThrownBy(() -> operation.accept(backupEngineOptions))
+          .isInstanceOf(AssertionError.class);
+    }
   }
 }

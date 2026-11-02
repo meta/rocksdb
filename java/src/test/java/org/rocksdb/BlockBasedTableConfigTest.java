@@ -14,7 +14,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.stream.Stream;
 import org.junit.ClassRule;
-import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -215,15 +214,14 @@ public class BlockBasedTableConfigTest {
 
   @Test
   public void persistentCache() throws RocksDBException {
-    try (final DBOptions dbOptions = new DBOptions().
-        setInfoLogLevel(InfoLogLevel.INFO_LEVEL).
-        setCreateIfMissing(true);
-        final Logger logger = new Logger(dbOptions) {
-      @Override
-      protected void log(final InfoLogLevel infoLogLevel, final String logMsg) {
-        System.out.println(infoLogLevel.name() + ": " + logMsg);
-      }
-    }) {
+    try (final DBOptions dbOptions =
+             new DBOptions().setInfoLogLevel(InfoLogLevel.INFO_LEVEL).setCreateIfMissing(true);
+        final Logger logger = new Logger(dbOptions.infoLogLevel()) {
+          @Override
+          protected void log(final InfoLogLevel infoLogLevel, final String logMsg) {
+            System.out.println(infoLogLevel.name() + ": " + logMsg);
+          }
+        }) {
       try (final PersistentCache persistentCache =
                new PersistentCache(Env.getDefault(), dbFolder.getRoot().getPath(), 1024 * 1024 * 100, logger, false);
            final Options options = new Options().setTableFormatConfig(

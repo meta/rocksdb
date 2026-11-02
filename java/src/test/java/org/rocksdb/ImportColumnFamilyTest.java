@@ -7,24 +7,15 @@
 package org.rocksdb;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.Assert.fail;
 
-import java.io.File;
-import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.rocksdb.util.BytewiseComparator;
 
 public class ImportColumnFamilyTest {
-  private static final String SST_FILE_NAME = "test.sst";
-  private static final String DB_DIRECTORY_NAME = "test_db";
-
   @ClassRule
   public static final RocksNativeLibraryResource ROCKS_NATIVE_LIBRARY_RESOURCE =
       new RocksNativeLibraryResource();
@@ -81,7 +72,7 @@ public class ImportColumnFamilyTest {
           ColumnFamilyDescriptor columnFamilyDescriptor =
               new ColumnFamilyDescriptor("new_cf".getBytes());
 
-          List<ExportImportFilesMetaData> importMetaDatas = new ArrayList();
+          List<ExportImportFilesMetaData> importMetaDatas = new ArrayList<>();
           importMetaDatas.add(default_cf_metadata1);
           importMetaDatas.add(default_cf_metadata2);
 

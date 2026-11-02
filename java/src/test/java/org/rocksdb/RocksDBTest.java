@@ -4,16 +4,15 @@
 //  (found in the LICENSE.Apache file in the root directory).
 package org.rocksdb;
 
-import org.junit.*;
-import org.junit.rules.ExpectedException;
-import org.junit.rules.TemporaryFolder;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.Assert.fail;
 
 import java.nio.ByteBuffer;
 import java.util.*;
-
-import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.Assert.fail;
+import org.junit.*;
+import org.junit.rules.TemporaryFolder;
 
 public class RocksDBTest {
 
@@ -434,9 +433,6 @@ public class RocksDBTest {
     }
   }
 
-  @Rule
-  public ExpectedException thrown = ExpectedException.none();
-
   @Test
   public void getOutOfArrayMaxSizeValue() throws RocksDBException {
     final int numberOfValueSplits = 10;
@@ -450,21 +446,21 @@ public class RocksDBTest {
     final byte[] valueSplit = new byte[splitSize];
     final byte[] key = "key".getBytes();
 
-    thrown.expect(RocksDBException.class);
-    thrown.expectMessage("Requested array size exceeds VM limit");
-
-    // merge (numberOfValueSplits + 1) valueSplit's to get value size exceeding Integer.MAX_VALUE
-    try (final StringAppendOperator stringAppendOperator = new StringAppendOperator();
-         final Options opt = new Options()
-                 .setCreateIfMissing(true)
-                 .setMergeOperator(stringAppendOperator);
-         final RocksDB db = RocksDB.open(opt, dbFolder.getRoot().getAbsolutePath())) {
-      db.put(key, valueSplit);
-      for (int i = 0; i < numberOfValueSplits; i++) {
-        db.merge(key, valueSplit);
+    assertThatThrownBy(() -> {
+      // merge (numberOfValueSplits + 1) valueSplit's to get value size exceeding Integer.MAX_VALUE
+      try (final StringAppendOperator stringAppendOperator = new StringAppendOperator();
+          final Options opt =
+              new Options().setCreateIfMissing(true).setMergeOperator(stringAppendOperator);
+          final RocksDB db = RocksDB.open(opt, dbFolder.getRoot().getAbsolutePath())) {
+        db.put(key, valueSplit);
+        for (int i = 0; i < numberOfValueSplits; i++) {
+          db.merge(key, valueSplit);
+        }
+        db.get(key);
       }
-      db.get(key);
-    }
+    })
+        .isInstanceOf(RocksDBException.class)
+        .hasMessageContaining("Requested array size exceeds VM limit");
   }
 
   @Test
@@ -1656,6 +1652,7 @@ public class RocksDBTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void getLiveFilesMetaData() throws RocksDBException {
     try (final Options options = new Options().setCreateIfMissing(true)) {

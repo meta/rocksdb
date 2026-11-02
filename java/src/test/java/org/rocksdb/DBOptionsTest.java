@@ -64,16 +64,15 @@ public class DBOptionsTest {
 
   @Test(expected = IllegalArgumentException.class)
   public void failDBOptionsFromPropsWithNullValue() {
-    try(final DBOptions opt = DBOptions.getDBOptionsFromProps(null)) {
-      //no-op
+    try (final DBOptions ignored = DBOptions.getDBOptionsFromProps(null)) {
+      ; // no-op
     }
   }
 
   @Test(expected = IllegalArgumentException.class)
   public void failDBOptionsFromPropsWithEmptyProps() {
-    try(final DBOptions opt = DBOptions.getDBOptionsFromProps(
-        new Properties())) {
-      //no-op
+    try (final DBOptions ignored = DBOptions.getDBOptionsFromProps(new Properties())) {
+      ; // no-op
     }
   }
 
@@ -216,7 +215,7 @@ public class DBOptionsTest {
     }
   }
 
-  @SuppressWarnings("deprecated")
+  @SuppressWarnings({"deprecated", "deprecation"})
   @Test
   public void maxBackgroundCompactions() {
     try(final DBOptions opt = new DBOptions()) {
@@ -236,7 +235,7 @@ public class DBOptionsTest {
     }
   }
 
-  @SuppressWarnings("deprecated")
+  @SuppressWarnings("deprecation")
   @Test
   public void maxBackgroundFlushes() {
     try(final DBOptions opt = new DBOptions()) {
@@ -256,7 +255,7 @@ public class DBOptionsTest {
   }
 
   @Test
-  public void maxLogFileSize() throws RocksDBException {
+  public void maxLogFileSize() {
     try(final DBOptions opt = new DBOptions()) {
       final long longValue = rand.nextLong();
       opt.setMaxLogFileSize(longValue);
@@ -265,7 +264,7 @@ public class DBOptionsTest {
   }
 
   @Test
-  public void logFileTimeToRoll() throws RocksDBException {
+  public void logFileTimeToRoll() {
     try(final DBOptions opt = new DBOptions()) {
       final long longValue = rand.nextLong();
       opt.setLogFileTimeToRoll(longValue);
@@ -274,7 +273,7 @@ public class DBOptionsTest {
   }
 
   @Test
-  public void keepLogFileNum() throws RocksDBException {
+  public void keepLogFileNum() {
     try(final DBOptions opt = new DBOptions()) {
       final long longValue = rand.nextLong();
       opt.setKeepLogFileNum(longValue);
@@ -283,7 +282,7 @@ public class DBOptionsTest {
   }
 
   @Test
-  public void recycleLogFileNum() throws RocksDBException {
+  public void recycleLogFileNum() {
     try(final DBOptions opt = new DBOptions()) {
       final long longValue = rand.nextLong();
       opt.setRecycleLogFileNum(longValue);
@@ -328,7 +327,7 @@ public class DBOptionsTest {
   }
 
   @Test
-  public void manifestPreallocationSize() throws RocksDBException {
+  public void manifestPreallocationSize() {
     try(final DBOptions opt = new DBOptions()) {
       final long longValue = rand.nextLong();
       opt.setManifestPreallocationSize(longValue);
@@ -436,7 +435,7 @@ public class DBOptionsTest {
   }
 
   @Test
-  public void setWriteBufferManager() throws RocksDBException {
+  public void setWriteBufferManager() {
     try (final DBOptions opt = new DBOptions(); final Cache cache = new LRUCache(1024 * 1024);
          final WriteBufferManager writeBufferManager = new WriteBufferManager(2000L, cache)) {
       opt.setWriteBufferManager(writeBufferManager);
@@ -445,7 +444,7 @@ public class DBOptionsTest {
   }
 
   @Test
-  public void setWriteBufferManagerWithZeroBufferSize() throws RocksDBException {
+  public void setWriteBufferManagerWithZeroBufferSize() {
     try (final DBOptions opt = new DBOptions(); final Cache cache = new LRUCache(1024 * 1024);
          final WriteBufferManager writeBufferManager = new WriteBufferManager(0L, cache)) {
       opt.setWriteBufferManager(writeBufferManager);
@@ -607,6 +606,7 @@ public class DBOptionsTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Test
   public void rowCache() {
     try (final DBOptions opt = new DBOptions()) {

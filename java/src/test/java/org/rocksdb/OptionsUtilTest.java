@@ -188,71 +188,73 @@ public class OptionsUtilTest {
                                 .setParanoidChecks(false)
                                 .setMaxOpenFiles(478)
                                 .setDelayedWriteRate(1234567L);
-    final ColumnFamilyOptions baseDefaultCFOpts = new ColumnFamilyOptions();
-    final byte[] secondCFName = "new_cf".getBytes();
-    final ColumnFamilyOptions baseSecondCFOpts =
-        new ColumnFamilyOptions()
-            .setWriteBufferSize(70 * 1024)
-            .setMaxWriteBufferNumber(7)
-            .setMaxBytesForLevelBase(53 * 1024 * 1024)
-            .setLevel0FileNumCompactionTrigger(3)
-            .setLevel0SlowdownWritesTrigger(51)
-            .setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION);
+    try (final ColumnFamilyOptions baseDefaultCFOpts = new ColumnFamilyOptions()) {
+      final byte[] secondCFName = "new_cf".getBytes();
+      final ColumnFamilyOptions baseSecondCFOpts =
+          new ColumnFamilyOptions()
+              .setWriteBufferSize(70 * 1024)
+              .setMaxWriteBufferNumber(7)
+              .setMaxBytesForLevelBase(53 * 1024 * 1024)
+              .setLevel0FileNumCompactionTrigger(3)
+              .setLevel0SlowdownWritesTrigger(51)
+              .setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION);
 
-    // Create a database with a new column family
-    try (final RocksDB db = RocksDB.open(options, dbPath)) {
-      assertThat(db).isNotNull();
+      // Create a database with a new column family
+      try (final RocksDB db = RocksDB.open(options, dbPath)) {
+        assertThat(db).isNotNull();
 
-      // create column family
-      try (final ColumnFamilyHandle columnFamilyHandle =
-               db.createColumnFamily(new ColumnFamilyDescriptor(secondCFName, baseSecondCFOpts))) {
-        assert(columnFamilyHandle != null);
+        // create column family
+        try (final ColumnFamilyHandle columnFamilyHandle = db.createColumnFamily(
+                 new ColumnFamilyDescriptor(secondCFName, baseSecondCFOpts))) {
+          assert (columnFamilyHandle != null);
+        }
       }
-    }
 
-    // Read the options back and verify
-    try (DBOptions dbOptions = new DBOptions()) {
-      final List<ColumnFamilyDescriptor> cfDescs = loaderUnderTest.loadOptions(dbPath, dbOptions);
+      // Read the options back and verify
+      try (DBOptions dbOptions = new DBOptions()) {
+        final List<ColumnFamilyDescriptor> cfDescs = loaderUnderTest.loadOptions(dbPath, dbOptions);
 
-      assertThat(dbOptions.createIfMissing()).isEqualTo(options.createIfMissing());
-      assertThat(dbOptions.paranoidChecks()).isEqualTo(options.paranoidChecks());
-      assertThat(dbOptions.maxOpenFiles()).isEqualTo(options.maxOpenFiles());
-      assertThat(dbOptions.delayedWriteRate()).isEqualTo(options.delayedWriteRate());
+        assertThat(dbOptions.createIfMissing()).isEqualTo(options.createIfMissing());
+        assertThat(dbOptions.paranoidChecks()).isEqualTo(options.paranoidChecks());
+        assertThat(dbOptions.maxOpenFiles()).isEqualTo(options.maxOpenFiles());
+        assertThat(dbOptions.delayedWriteRate()).isEqualTo(options.delayedWriteRate());
 
-      assertThat(cfDescs.size()).isEqualTo(2);
-      assertThat(cfDescs.get(0)).isNotNull();
-      assertThat(cfDescs.get(1)).isNotNull();
-      assertThat(cfDescs.get(0).getName()).isEqualTo(RocksDB.DEFAULT_COLUMN_FAMILY);
-      assertThat(cfDescs.get(1).getName()).isEqualTo(secondCFName);
+        assertThat(cfDescs.size()).isEqualTo(2);
+        assertThat(cfDescs.get(0)).isNotNull();
+        assertThat(cfDescs.get(1)).isNotNull();
+        assertThat(cfDescs.get(0).getName()).isEqualTo(RocksDB.DEFAULT_COLUMN_FAMILY);
+        assertThat(cfDescs.get(1).getName()).isEqualTo(secondCFName);
 
-      final ColumnFamilyOptions defaultCFOpts = cfDescs.get(0).getOptions();
-      assertThat(defaultCFOpts.writeBufferSize()).isEqualTo(baseDefaultCFOpts.writeBufferSize());
-      assertThat(defaultCFOpts.maxWriteBufferNumber())
-          .isEqualTo(baseDefaultCFOpts.maxWriteBufferNumber());
-      assertThat(defaultCFOpts.maxBytesForLevelBase())
-          .isEqualTo(baseDefaultCFOpts.maxBytesForLevelBase());
-      assertThat(defaultCFOpts.level0FileNumCompactionTrigger())
-          .isEqualTo(baseDefaultCFOpts.level0FileNumCompactionTrigger());
-      assertThat(defaultCFOpts.level0SlowdownWritesTrigger())
-          .isEqualTo(baseDefaultCFOpts.level0SlowdownWritesTrigger());
-      assertThat(defaultCFOpts.bottommostCompressionType())
-          .isEqualTo(baseDefaultCFOpts.bottommostCompressionType());
+        final ColumnFamilyOptions defaultCFOpts = cfDescs.get(0).getOptions();
+        assertThat(defaultCFOpts.writeBufferSize()).isEqualTo(baseDefaultCFOpts.writeBufferSize());
+        assertThat(defaultCFOpts.maxWriteBufferNumber())
+            .isEqualTo(baseDefaultCFOpts.maxWriteBufferNumber());
+        assertThat(defaultCFOpts.maxBytesForLevelBase())
+            .isEqualTo(baseDefaultCFOpts.maxBytesForLevelBase());
+        assertThat(defaultCFOpts.level0FileNumCompactionTrigger())
+            .isEqualTo(baseDefaultCFOpts.level0FileNumCompactionTrigger());
+        assertThat(defaultCFOpts.level0SlowdownWritesTrigger())
+            .isEqualTo(baseDefaultCFOpts.level0SlowdownWritesTrigger());
+        assertThat(defaultCFOpts.bottommostCompressionType())
+            .isEqualTo(baseDefaultCFOpts.bottommostCompressionType());
 
-      final ColumnFamilyOptions secondCFOpts = cfDescs.get(1).getOptions();
-      assertThat(secondCFOpts.writeBufferSize()).isEqualTo(baseSecondCFOpts.writeBufferSize());
-      assertThat(secondCFOpts.maxWriteBufferNumber())
-          .isEqualTo(baseSecondCFOpts.maxWriteBufferNumber());
-      assertThat(secondCFOpts.maxBytesForLevelBase())
-          .isEqualTo(baseSecondCFOpts.maxBytesForLevelBase());
-      assertThat(secondCFOpts.level0FileNumCompactionTrigger())
-          .isEqualTo(baseSecondCFOpts.level0FileNumCompactionTrigger());
-      assertThat(secondCFOpts.level0SlowdownWritesTrigger())
-          .isEqualTo(baseSecondCFOpts.level0SlowdownWritesTrigger());
-      assertThat(secondCFOpts.bottommostCompressionType())
-          .isEqualTo(baseSecondCFOpts.bottommostCompressionType());
+        final ColumnFamilyOptions secondCFOpts = cfDescs.get(1).getOptions();
+        assertThat(secondCFOpts.writeBufferSize()).isEqualTo(baseSecondCFOpts.writeBufferSize());
+        assertThat(secondCFOpts.maxWriteBufferNumber())
+            .isEqualTo(baseSecondCFOpts.maxWriteBufferNumber());
+        assertThat(secondCFOpts.maxBytesForLevelBase())
+            .isEqualTo(baseSecondCFOpts.maxBytesForLevelBase());
+        assertThat(secondCFOpts.level0FileNumCompactionTrigger())
+            .isEqualTo(baseSecondCFOpts.level0FileNumCompactionTrigger());
+        assertThat(secondCFOpts.level0SlowdownWritesTrigger())
+            .isEqualTo(baseSecondCFOpts.level0SlowdownWritesTrigger());
+        assertThat(secondCFOpts.bottommostCompressionType())
+            .isEqualTo(baseSecondCFOpts.bottommostCompressionType());
+      }
     }
   }
 
+  @SuppressWarnings("deprecation")
   private void verifyTableFormatOptions(final LoaderUnderTest loaderUnderTest)
       throws RocksDBException {
     final String dbPath = dbFolder.getRoot().getAbsolutePath();
@@ -261,81 +263,82 @@ public class OptionsUtilTest {
                                 .setParanoidChecks(false)
                                 .setMaxOpenFiles(478)
                                 .setDelayedWriteRate(1234567L);
-    final ColumnFamilyOptions defaultCFOptions = new ColumnFamilyOptions();
-    defaultCFOptions.setTableFormatConfig(new BlockBasedTableConfig());
-    final byte[] altCFName = "alt_cf".getBytes();
-    final ColumnFamilyOptions altCFOptions =
-        new ColumnFamilyOptions()
-            .setWriteBufferSize(70 * 1024)
-            .setMaxWriteBufferNumber(7)
-            .setMaxBytesForLevelBase(53 * 1024 * 1024)
-            .setLevel0FileNumCompactionTrigger(3)
-            .setLevel0SlowdownWritesTrigger(51)
-            .setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION);
+    try (final ColumnFamilyOptions defaultCFOptions = new ColumnFamilyOptions()) {
+      defaultCFOptions.setTableFormatConfig(new BlockBasedTableConfig());
+      final byte[] altCFName = "alt_cf".getBytes();
+      try (final ColumnFamilyOptions altCFOptions = new ColumnFamilyOptions()
+               .setWriteBufferSize(70 * 1024)
+               .setMaxWriteBufferNumber(7)
+               .setMaxBytesForLevelBase(53 * 1024 * 1024)
+               .setLevel0FileNumCompactionTrigger(3)
+               .setLevel0SlowdownWritesTrigger(51)
+               .setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION)) {
+        final BlockBasedTableConfig altCFTableConfig = new BlockBasedTableConfig();
+        altCFTableConfig.setCacheIndexAndFilterBlocks(true);
+        altCFTableConfig.setCacheIndexAndFilterBlocksWithHighPriority(false);
+        altCFTableConfig.setPinL0FilterAndIndexBlocksInCache(true);
+        altCFTableConfig.setPinTopLevelIndexAndFilter(false);
+        altCFTableConfig.setIndexType(IndexType.kTwoLevelIndexSearch);
+        altCFTableConfig.setDataBlockIndexType(DataBlockIndexType.kDataBlockBinaryAndHash);
+        altCFTableConfig.setDataBlockHashTableUtilRatio(0.65);
+        altCFTableConfig.setChecksumType(ChecksumType.kxxHash64);
+        altCFTableConfig.setNoBlockCache(true);
+        altCFTableConfig.setBlockSize(35 * 1024);
+        altCFTableConfig.setBlockSizeDeviation(20);
+        altCFTableConfig.setBlockRestartInterval(12);
+        altCFTableConfig.setIndexBlockRestartInterval(6);
+        altCFTableConfig.setMetadataBlockSize(12 * 1024);
+        altCFTableConfig.setPartitionFilters(true);
+        altCFTableConfig.setOptimizeFiltersForMemory(false);
+        altCFTableConfig.setUseDeltaEncoding(false);
+        altCFTableConfig.setFilterPolicy(new BloomFilter(7.5));
+        altCFTableConfig.setWholeKeyFiltering(false);
+        altCFTableConfig.setVerifyCompression(true);
+        altCFTableConfig.setReadAmpBytesPerBit(2);
+        altCFTableConfig.setFormatVersion(8);
+        altCFTableConfig.setSeparateKeyValueInDataBlock(true);
+        altCFTableConfig.setEnableIndexCompression(false);
+        altCFTableConfig.setBlockAlign(true);
+        altCFTableConfig.setSuperBlockAlignmentSize(1024 * 1024);
+        altCFTableConfig.setSuperBlockAlignmentSpaceOverheadRatio(4 * 1024);
+        altCFTableConfig.setIndexShortening(IndexShorteningMode.kShortenSeparatorsAndSuccessor);
+        altCFTableConfig.setBlockCacheSize(3 * 1024 * 1024);
+        // Note cache objects are not set here, as they are not read back when reading config.
 
-    final BlockBasedTableConfig altCFTableConfig = new BlockBasedTableConfig();
-    altCFTableConfig.setCacheIndexAndFilterBlocks(true);
-    altCFTableConfig.setCacheIndexAndFilterBlocksWithHighPriority(false);
-    altCFTableConfig.setPinL0FilterAndIndexBlocksInCache(true);
-    altCFTableConfig.setPinTopLevelIndexAndFilter(false);
-    altCFTableConfig.setIndexType(IndexType.kTwoLevelIndexSearch);
-    altCFTableConfig.setDataBlockIndexType(DataBlockIndexType.kDataBlockBinaryAndHash);
-    altCFTableConfig.setDataBlockHashTableUtilRatio(0.65);
-    altCFTableConfig.setChecksumType(ChecksumType.kxxHash64);
-    altCFTableConfig.setNoBlockCache(true);
-    altCFTableConfig.setBlockSize(35 * 1024);
-    altCFTableConfig.setBlockSizeDeviation(20);
-    altCFTableConfig.setBlockRestartInterval(12);
-    altCFTableConfig.setIndexBlockRestartInterval(6);
-    altCFTableConfig.setMetadataBlockSize(12 * 1024);
-    altCFTableConfig.setPartitionFilters(true);
-    altCFTableConfig.setOptimizeFiltersForMemory(false);
-    altCFTableConfig.setUseDeltaEncoding(false);
-    altCFTableConfig.setFilterPolicy(new BloomFilter(7.5));
-    altCFTableConfig.setWholeKeyFiltering(false);
-    altCFTableConfig.setVerifyCompression(true);
-    altCFTableConfig.setReadAmpBytesPerBit(2);
-    altCFTableConfig.setFormatVersion(8);
-    altCFTableConfig.setSeparateKeyValueInDataBlock(true);
-    altCFTableConfig.setEnableIndexCompression(false);
-    altCFTableConfig.setBlockAlign(true);
-    altCFTableConfig.setSuperBlockAlignmentSize(1024 * 1024);
-    altCFTableConfig.setSuperBlockAlignmentSpaceOverheadRatio(4 * 1024);
-    altCFTableConfig.setIndexShortening(IndexShorteningMode.kShortenSeparatorsAndSuccessor);
-    altCFTableConfig.setBlockCacheSize(3 * 1024 * 1024);
-    // Note cache objects are not set here, as they are not read back when reading config.
+        altCFOptions.setTableFormatConfig(altCFTableConfig);
 
-    altCFOptions.setTableFormatConfig(altCFTableConfig);
+        // Create a database with a new column family
+        try (final RocksDB db = RocksDB.open(options, dbPath)) {
+          assertThat(db).isNotNull();
 
-    // Create a database with a new column family
-    try (final RocksDB db = RocksDB.open(options, dbPath)) {
-      assertThat(db).isNotNull();
+          // create column family
+          try (final ColumnFamilyHandle columnFamilyHandle =
+                   db.createColumnFamily(new ColumnFamilyDescriptor(altCFName, altCFOptions))) {
+            assert (columnFamilyHandle != null);
+          }
+        }
 
-      // create column family
-      try (final ColumnFamilyHandle columnFamilyHandle =
-               db.createColumnFamily(new ColumnFamilyDescriptor(altCFName, altCFOptions))) {
-        assert (columnFamilyHandle != null);
+        // Read the options back and verify
+        final DBOptions dbOptions = new DBOptions();
+        final List<ColumnFamilyDescriptor> cfDescs = loaderUnderTest.loadOptions(dbPath, dbOptions);
+
+        assertThat(dbOptions.createIfMissing()).isEqualTo(options.createIfMissing());
+        assertThat(dbOptions.paranoidChecks()).isEqualTo(options.paranoidChecks());
+        assertThat(dbOptions.maxOpenFiles()).isEqualTo(options.maxOpenFiles());
+        assertThat(dbOptions.delayedWriteRate()).isEqualTo(options.delayedWriteRate());
+
+        assertThat(cfDescs.size()).isEqualTo(2);
+        assertThat(cfDescs.get(0)).isNotNull();
+        assertThat(cfDescs.get(1)).isNotNull();
+        assertThat(cfDescs.get(0).getName()).isEqualTo(RocksDB.DEFAULT_COLUMN_FAMILY);
+        assertThat(cfDescs.get(1).getName()).isEqualTo(altCFName);
+
+        verifyBlockBasedTableConfig(
+            cfDescs.get(0).getOptions().tableFormatConfig(), new BlockBasedTableConfig());
+        verifyBlockBasedTableConfig(
+            cfDescs.get(1).getOptions().tableFormatConfig(), altCFTableConfig);
       }
     }
-
-    // Read the options back and verify
-    final DBOptions dbOptions = new DBOptions();
-    final List<ColumnFamilyDescriptor> cfDescs = loaderUnderTest.loadOptions(dbPath, dbOptions);
-
-    assertThat(dbOptions.createIfMissing()).isEqualTo(options.createIfMissing());
-    assertThat(dbOptions.paranoidChecks()).isEqualTo(options.paranoidChecks());
-    assertThat(dbOptions.maxOpenFiles()).isEqualTo(options.maxOpenFiles());
-    assertThat(dbOptions.delayedWriteRate()).isEqualTo(options.delayedWriteRate());
-
-    assertThat(cfDescs.size()).isEqualTo(2);
-    assertThat(cfDescs.get(0)).isNotNull();
-    assertThat(cfDescs.get(1)).isNotNull();
-    assertThat(cfDescs.get(0).getName()).isEqualTo(RocksDB.DEFAULT_COLUMN_FAMILY);
-    assertThat(cfDescs.get(1).getName()).isEqualTo(altCFName);
-
-    verifyBlockBasedTableConfig(
-        cfDescs.get(0).getOptions().tableFormatConfig(), new BlockBasedTableConfig());
-    verifyBlockBasedTableConfig(cfDescs.get(1).getOptions().tableFormatConfig(), altCFTableConfig);
   }
 
   private void verifyBlockBasedTableConfig(
@@ -377,6 +380,7 @@ public class OptionsUtilTest {
     if (expected.filterPolicy() == null) {
       assertThat(actual.filterPolicy()).isNull();
     } else {
+      // TODO (AP) this test is a no-op and the true test fails
       assertThat(expected.filterPolicy().equals(actual.filterPolicy()));
     }
   }

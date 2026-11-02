@@ -6,6 +6,7 @@ package org.rocksdb;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
@@ -13,7 +14,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import org.junit.*;
-import org.junit.rules.ExpectedException;
 import org.junit.rules.TemporaryFolder;
 
 public class KeyMayExistTest {
@@ -23,8 +23,6 @@ public class KeyMayExistTest {
 
   @Rule
   public TemporaryFolder dbFolder = new TemporaryFolder();
-
-  @Rule public ExpectedException exceptionRule = ExpectedException.none();
 
   List<ColumnFamilyDescriptor> cfDescriptors;
   List<ColumnFamilyHandle> columnFamilyHandleList = new ArrayList<>();
@@ -286,9 +284,10 @@ public class KeyMayExistTest {
     valueBuffer.get(valueGet);
     assertThat(valueGet).isEqualTo(Arrays.copyOfRange(value, 0, value.length - 1));
 
-    exceptionRule.expect(BufferUnderflowException.class);
-    valueGet = new byte[value.length];
-    valueBuffer.get(valueGet);
+    assertThatThrownBy(() -> {
+      byte[] valueGet2 = new byte[value.length];
+      valueBuffer.get(valueGet2);
+    }).isInstanceOf(BufferUnderflowException.class);
   }
 
   @Test
@@ -330,9 +329,10 @@ public class KeyMayExistTest {
       valueBuffer.get(valueGet);
       assertThat(valueGet).isEqualTo(Arrays.copyOfRange(value, 0, value.length - 1));
 
-      exceptionRule.expect(BufferUnderflowException.class);
-      valueGet = new byte[value.length];
-      valueBuffer.get(valueGet);
+      assertThatThrownBy(() -> {
+        byte[] valueGet2 = new byte[value.length];
+        valueBuffer.get(valueGet2);
+      }).isInstanceOf(BufferUnderflowException.class);
     }
   }
 
@@ -347,10 +347,10 @@ public class KeyMayExistTest {
     keyBuffer.put(key, 0, key.length);
     keyBuffer.flip();
 
-    exceptionRule.expect(AssertionError.class);
-    exceptionRule.expectMessage(
-        "value ByteBuffer parameter cannot be null. If you do not need the value, use a different version of the method");
-    final KeyMayExist keyMayExist = db.keyMayExist(keyBuffer, null);
+    assertThatThrownBy(() -> db.keyMayExist(keyBuffer, null))
+        .isInstanceOf(AssertionError.class)
+        .hasMessageContaining("value ByteBuffer parameter cannot be null. If you do not need the "
+            + "value, use a different version of the method");
   }
 
   @Test
@@ -384,10 +384,11 @@ public class KeyMayExistTest {
     assertThat(db.keyMayExist(columnFamilyHandleList.get(0), keyBuffer)).isEqualTo(false);
     keyBuffer.flip();
 
-    exceptionRule.expect(AssertionError.class);
-    exceptionRule.expectMessage(
-        "value ByteBuffer parameter cannot be null. If you do not need the value, use a different version of the method");
-    final KeyMayExist keyMayExist = db.keyMayExist(columnFamilyHandleList.get(0), keyBuffer, null);
+    final ByteBuffer keyBuffer2 = keyBuffer;
+    assertThatThrownBy(() -> db.keyMayExist(columnFamilyHandleList.get(0), keyBuffer2, null))
+        .isInstanceOf(AssertionError.class)
+        .hasMessageContaining("value ByteBuffer parameter cannot be null. If you do not need the "
+            + "value, use a different version of the method");
   }
 
   @Test
@@ -425,11 +426,12 @@ public class KeyMayExistTest {
       assertThat(db.keyMayExist(columnFamilyHandleList.get(0), readOptions, keyBuffer))
           .isEqualTo(false);
 
-      exceptionRule.expect(AssertionError.class);
-      exceptionRule.expectMessage(
-          "value ByteBuffer parameter cannot be null. If you do not need the value, use a different version of the method");
-      final KeyMayExist keyMayExist =
-          db.keyMayExist(columnFamilyHandleList.get(0), readOptions, keyBuffer, null);
+      final ByteBuffer keyBufferCopy = keyBuffer;
+      assertThatThrownBy(
+          () -> db.keyMayExist(columnFamilyHandleList.get(0), readOptions, keyBufferCopy, null))
+          .isInstanceOf(AssertionError.class)
+          .hasMessageContaining("value ByteBuffer parameter cannot be null. If you do not need the "
+              + "value, use a different version of the method");
     }
   }
 
@@ -469,9 +471,9 @@ public class KeyMayExistTest {
     valueBuffer.get(valueGet);
     assertThat(valueGet).isEqualTo(Arrays.copyOfRange(value, 0, value.length - 1));
 
-    exceptionRule.expect(BufferUnderflowException.class);
-    valueGet = new byte[value.length];
-    valueBuffer.get(valueGet);
+    final byte[] valueGet2 = new byte[value.length];
+    assertThatThrownBy(() -> valueBuffer.get(valueGet2))
+        .isInstanceOf(BufferUnderflowException.class);
   }
 
   @Test
@@ -515,9 +517,9 @@ public class KeyMayExistTest {
       valueBuffer.get(valueGet);
       assertThat(valueGet).isEqualTo(Arrays.copyOfRange(value, 0, value.length - 1));
 
-      exceptionRule.expect(BufferUnderflowException.class);
-      valueGet = new byte[value.length];
-      valueBuffer.get(valueGet);
+      byte[] valueGet2 = new byte[value.length];
+      assertThatThrownBy(() -> valueBuffer.get(valueGet2))
+          .isInstanceOf(BufferUnderflowException.class);
     }
   }
 
