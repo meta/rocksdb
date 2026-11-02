@@ -1910,9 +1910,11 @@ namespace {
 // this is a helper struct to serialize and deserialize class Status, because
 // Status's members are not public.
 struct StatusSerializationAdapter {
-  uint8_t code;
-  uint8_t subcode;
-  uint8_t severity;
+  // Parsing sets only the fields present in the input, so a missing field
+  // keeps its value in `Status::OK()`.
+  uint8_t code = Status::kOk;
+  uint8_t subcode = Status::kNone;
+  uint8_t severity = Status::kNoError;
   std::string message;
 
   StatusSerializationAdapter() = default;
@@ -1922,6 +1924,13 @@ struct StatusSerializationAdapter {
     severity = s.severity();
     auto msg = s.getState();
     message = msg ? msg : "";
+  }
+
+  // The `Status` constructor and `ToString()` assume in-range values. Only a
+  // damaged result or a newer writer can send a value outside these enums.
+  bool IsValid() const {
+    return code < Status::kMaxCode && subcode < Status::kMaxSubCode &&
+           severity < Status::kMaxSeverity;
   }
 
   Status GetStatus() const {
@@ -1969,8 +1978,18 @@ static std::unordered_map<std::string, OptionTypeInfo> cs_result_type_info = {
         StatusSerializationAdapter adapter;
         Status s = OptionTypeInfo::ParseType(
             opts, value, status_adapter_type_info, &adapter);
+        if (!s.ok()) {
+          return s;
+        }
+        if (!adapter.IsValid()) {
+          return Status::InvalidArgument(
+              "CompactionServiceResult has an out-of-range status: code=" +
+              std::to_string(adapter.code) +
+              ", subcode=" + std::to_string(adapter.subcode) +
+              ", severity=" + std::to_string(adapter.severity));
+        }
         *status_obj = adapter.GetStatus();
-        return s;
+        return Status::OK();
       },
       [](const ConfigOptions& opts, const std::string& /*name*/,
          const void* addr, std::string* value) {
