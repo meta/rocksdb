@@ -159,6 +159,12 @@ BlobFilePartitionManager::~BlobFilePartitionManager() {
   }
 }
 
+BlobFilePartitionManager::DeferredFile::~DeferredFile() {
+  // Only a later flush of the generation reads `seal_status`, and the DB may
+  // close before one runs.
+  seal_status.PermitUncheckedError();
+}
+
 void BlobFilePartitionManager::ResetPartitionState(Partition* partition) {
   partition->writer.reset();
   partition->file_number = 0;
@@ -170,6 +176,19 @@ void BlobFilePartitionManager::ResetPartitionState(Partition* partition) {
   partition->column_family_id = 0;
   partition->compression = kNoCompression;
   partition->sync_required = false;
+}
+
+BlobFilePartitionManager::DeferredFile
+BlobFilePartitionManager::DetachPartitionFile(Partition* partition) {
+  DeferredFile deferred;
+  deferred.writer = std::move(partition->writer);
+  deferred.file_number = partition->file_number;
+  deferred.blob_count = partition->blob_count;
+  deferred.total_blob_bytes = partition->total_blob_bytes;
+  deferred.garbage_blob_count = partition->garbage_blob_count;
+  deferred.garbage_blob_bytes = partition->garbage_blob_bytes;
+  ResetPartitionState(partition);
+  return deferred;
 }
 
 void BlobFilePartitionManager::AddFilePartitionMapping(uint64_t file_number,
@@ -267,8 +286,6 @@ Status BlobFilePartitionManager::SealActiveBlobFile(
                        partition->blob_count, partition->total_blob_bytes,
                        &sealed_file->addition, space_limit_reached);
   if (!s.ok()) {
-    RemoveFilePartitionMapping(file_number);
-    ResetPartitionState(partition);
     return s;
   }
 
@@ -294,7 +311,6 @@ Status BlobFilePartitionManager::SealDeferredFile(
                               deferred->total_blob_bytes,
                               &sealed_file->addition, &space_limit_reached);
   if (!s.ok()) {
-    RemoveFilePartitionMapping(deferred->file_number);
     return s;
   }
 
@@ -504,10 +520,14 @@ Status BlobFilePartitionManager::WriteBlob(
       SealedFile sealed_file;
       Status s = SealActiveBlobFile(write_options, partition, &sealed_file,
                                     &space_limit_reached);
-      if (s.ok()) {
-        current_generation_sealed_files_.push_back(std::move(sealed_file));
+      if (!s.ok()) {
+        DeferredFile failed = DetachPartitionFile(partition);
+        failed.seal_status = s;
+        current_generation_failed_files_.push_back(std::move(failed));
+        return s;
       }
-      return s;
+      current_generation_sealed_files_.push_back(std::move(sealed_file));
+      return Status::OK();
     };
 
     const uint64_t record_size =
@@ -567,21 +587,16 @@ void BlobFilePartitionManager::RotateCurrentGeneration(uint64_t memtable_id) {
   batch.memtable_id = memtable_id;
   batch.sealed_files = std::move(current_generation_sealed_files_);
   current_generation_sealed_files_.clear();
+  for (auto& failed : current_generation_failed_files_) {
+    batch.deferred_files.emplace_back(std::move(failed));
+  }
+  current_generation_failed_files_.clear();
 
   for (auto& partition : partitions_) {
     if (!partition->writer) {
       continue;
     }
-
-    DeferredFile deferred;
-    deferred.writer = std::move(partition->writer);
-    deferred.file_number = partition->file_number;
-    deferred.blob_count = partition->blob_count;
-    deferred.total_blob_bytes = partition->total_blob_bytes;
-    deferred.garbage_blob_count = partition->garbage_blob_count;
-    deferred.garbage_blob_bytes = partition->garbage_blob_bytes;
-    ResetPartitionState(partition.get());
-    batch.deferred_files.emplace_back(std::move(deferred));
+    batch.deferred_files.emplace_back(DetachPartitionFile(partition.get()));
   }
 
   pending_generations_.emplace_back(std::move(batch));
@@ -620,14 +635,18 @@ Status BlobFilePartitionManager::PrepareFlushAdditions(
     }
     GenerationBatch& batch = *batch_ptr;
     while (!batch.deferred_files.empty()) {
-      DeferredFile deferred = std::move(batch.deferred_files.front());
-      batch.deferred_files.pop_front();
+      DeferredFile& deferred = batch.deferred_files.front();
+      if (!deferred.seal_status.ok()) {
+        return deferred.seal_status;
+      }
 
       SealedFile sealed_file;
       Status s = SealDeferredFile(write_options, &deferred, &sealed_file);
       if (!s.ok()) {
+        deferred.seal_status = s;
         return s;
       }
+      batch.deferred_files.pop_front();
       // Keep each successfully sealed file attached to the generation
       // immediately. If a later seal or the flush job itself fails, retry must
       // reuse these exact on-disk files instead of finalizing replacements.
@@ -673,6 +692,12 @@ Status BlobFilePartitionManager::MarkBlobWriteAsGarbage(uint64_t file_number,
   if (MarkSealedFileGarbage(&current_generation_sealed_files_, file_number,
                             blob_count, blob_bytes)) {
     return Status::OK();
+  }
+
+  for (auto& failed : current_generation_failed_files_) {
+    if (MarkDeferredFileGarbage(&failed, file_number, blob_count, blob_bytes)) {
+      return Status::OK();
+    }
   }
 
   for (auto& batch : pending_generations_) {

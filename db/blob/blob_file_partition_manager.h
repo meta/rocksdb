@@ -183,6 +183,11 @@ class BlobFilePartitionManager {
   };
 
   struct DeferredFile {
+    DeferredFile() = default;
+    DeferredFile(DeferredFile&&) = default;
+    DeferredFile& operator=(DeferredFile&&) = default;
+    ~DeferredFile();
+
     // Blob writer moved out of an active partition at memtable rotation.
     std::unique_ptr<BlobLogWriter> writer;
     // Metadata preserved until flush preparation seals the file.
@@ -192,6 +197,10 @@ class BlobFilePartitionManager {
     // Failed transformed writes already appended before the file is sealed.
     uint64_t garbage_blob_count = 0;
     uint64_t garbage_blob_bytes = 0;
+    // Set once sealing fails. The writer cannot be finalized again, and
+    // memtables still reference the file, so every flush of its generation
+    // fails with this status.
+    Status seal_status;
   };
 
   struct SealedFile {
@@ -216,9 +225,11 @@ class BlobFilePartitionManager {
   void ResetPartitionState(Partition* partition);
   // Returns the queued generation of `memtable_id`, or null.
   GenerationBatch* FindPendingGeneration(uint64_t memtable_id);
+  // Moves a partition's open file out of the partition and resets it.
+  DeferredFile DetachPartitionFile(Partition* partition);
   // Marks a blob file as manager-owned until it is committed or abandoned.
   void AddFilePartitionMapping(uint64_t file_number, uint32_t partition_idx);
-  // Stops tracking a blob file after open/seal failure.
+  // Stops tracking a blob file after open failure.
   void RemoveFilePartitionMapping(uint64_t file_number);
 
   // Opens a new active blob file for one partition.
@@ -298,6 +309,8 @@ class BlobFilePartitionManager {
   mutable port::Mutex mutex_;
   // Files already sealed while the current mutable memtable was active.
   std::vector<SealedFile> current_generation_sealed_files_;
+  // Files whose seal failed while the current mutable memtable was active.
+  std::vector<DeferredFile> current_generation_failed_files_;
   // FIFO immutable memtable generations waiting to be flushed.
   std::deque<GenerationBatch> pending_generations_;
 

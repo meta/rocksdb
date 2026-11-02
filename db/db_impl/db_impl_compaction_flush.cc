@@ -403,6 +403,8 @@ Status DBImpl::FlushMemTableToOutputFile(
   }
 
   if (!s.ok() && need_cancel) {
+    cfd->imm()->RollbackMemtableFlush(flush_job.GetMemTables(),
+                                      /*rollback_succeeding_memtables=*/false);
     flush_job.Cancel();
   }
 
@@ -786,9 +788,11 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
     // Need to undo atomic flush if something went wrong, i.e. s is not OK and
     // it is not because of CF drop.
     // Have to cancel the flush jobs that have NOT executed because we need to
-    // unref the versions.
+    // unref the versions and make their picked memtables flushable again.
     for (int i = 0; i != num_cfs; ++i) {
       if (pick_status[i] && !exec_status[i].first) {
+        cfds[i]->imm()->RollbackMemtableFlush(
+            jobs[i]->GetMemTables(), /*rollback_succeeding_memtables=*/false);
         jobs[i]->Cancel();
       }
     }

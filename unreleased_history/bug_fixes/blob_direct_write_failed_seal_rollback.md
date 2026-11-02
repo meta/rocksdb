@@ -1,0 +1,1 @@
+Fixed blob direct write when sealing a blob file fails during a flush or a write: the flush left its memtables marked as being flushed, so no later flush picked them up and error recovery waited for them forever, and the blob file was dropped from tracking, so a retried flush could install table files whose blob file was never added to the MANIFEST.
