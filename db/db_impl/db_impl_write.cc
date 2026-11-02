@@ -639,6 +639,9 @@ Status DBImpl::MaybeTransformBatchForBlobDirectWrite(
   Status s = BlobWriteBatchTransformer::TransformBatch(
       write_options, *batch, transformed_storage, partition_mgr_provider,
       settings_provider, &transformed, &batch_managers, &batch_rollbacks);
+  blob_direct_write_ctx->rollback_infos.insert(
+      blob_direct_write_ctx->rollback_infos.end(), batch_rollbacks.begin(),
+      batch_rollbacks.end());
   if (!s.ok()) {
     return s;
   }
@@ -646,9 +649,6 @@ Status DBImpl::MaybeTransformBatchForBlobDirectWrite(
     *batch = transformed_storage;
     blob_direct_write_ctx->touched_managers.insert(batch_managers.begin(),
                                                    batch_managers.end());
-    blob_direct_write_ctx->rollback_infos.insert(
-        blob_direct_write_ctx->rollback_infos.end(), batch_rollbacks.begin(),
-        batch_rollbacks.end());
   }
   return Status::OK();
 }
@@ -3583,6 +3583,7 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
   }
 
   if (cfd->blob_partition_manager() != nullptr) {
+    TEST_SYNC_POINT("DBImpl::SwitchMemtable:BeforeRotateBlobGeneration");
     cfd->blob_partition_manager()->RotateCurrentGeneration(cfd->mem()->GetID());
   }
 

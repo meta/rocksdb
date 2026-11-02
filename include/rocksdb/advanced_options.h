@@ -1231,6 +1231,16 @@ struct AdvancedColumnFamilyOptions {
   //  - read-only and secondary opens can read flushed/manifest-visible blob
   //    files, but do not resolve still-active direct-write blob files.
   //
+  // An SstFileManager max allowed space is a soft limit for direct-write blob
+  // files. Their bytes are already on disk when a file is sealed, so the seal
+  // and the write or flush that triggered it still succeed, the file is kept,
+  // and writes then stop with a SpaceLimit background error. A direct-write
+  // blob file is counted only once it is sealed, and memtables waiting for a
+  // flush are not flushed after the error, so usage can exceed the limit by up
+  // to about blob_file_size * blob_direct_write_partitions for each memtable
+  // not flushed yet (up to max_write_buffer_number). Blob files written by
+  // flush or compaction instead fail that job and are deleted.
+  //
   // Default: false
   //
   // Not dynamically changeable through the SetOptions() API.

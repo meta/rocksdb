@@ -27,6 +27,7 @@
 #include "rocksdb/file_system.h"
 #include "util/aligned_buffer.h"
 #include "util/compression.h"
+#include "util/defer.h"
 #include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -255,7 +256,7 @@ Status BlobFilePartitionManager::OpenNewBlobFile(Partition* partition,
 
 Status BlobFilePartitionManager::SealActiveBlobFile(
     const WriteOptions& write_options, Partition* partition,
-    SealedFile* sealed_file) {
+    SealedFile* sealed_file, bool* space_limit_reached) {
   assert(partition != nullptr);
   assert(partition->writer);
   assert(sealed_file != nullptr);
@@ -264,7 +265,7 @@ Status BlobFilePartitionManager::SealActiveBlobFile(
   Status s =
       FinalizeBlobFile(write_options, partition->writer.get(), file_number,
                        partition->blob_count, partition->total_blob_bytes,
-                       &sealed_file->addition);
+                       &sealed_file->addition, space_limit_reached);
   if (!s.ok()) {
     RemoveFilePartitionMapping(file_number);
     ResetPartitionState(partition);
@@ -284,9 +285,14 @@ Status BlobFilePartitionManager::SealDeferredFile(
   assert(deferred->writer);
   assert(sealed_file != nullptr);
 
-  Status s = FinalizeBlobFile(
-      write_options, deferred->writer.get(), deferred->file_number,
-      deferred->blob_count, deferred->total_blob_bytes, &sealed_file->addition);
+  // As for its SST file, the flush sets a reached space limit as the
+  // background error after it commits. An error set earlier would make the
+  // flush roll back instead.
+  bool space_limit_reached = false;
+  Status s = FinalizeBlobFile(write_options, deferred->writer.get(),
+                              deferred->file_number, deferred->blob_count,
+                              deferred->total_blob_bytes,
+                              &sealed_file->addition, &space_limit_reached);
   if (!s.ok()) {
     RemoveFilePartitionMapping(deferred->file_number);
     return s;
@@ -301,9 +307,10 @@ Status BlobFilePartitionManager::SealDeferredFile(
 Status BlobFilePartitionManager::FinalizeBlobFile(
     const WriteOptions& write_options, BlobLogWriter* writer,
     uint64_t file_number, uint64_t blob_count, uint64_t total_blob_bytes,
-    BlobFileAddition* addition) {
+    BlobFileAddition* addition, bool* space_limit_reached) {
   assert(writer != nullptr);
   assert(addition != nullptr);
+  assert(space_limit_reached != nullptr);
 
   BlobLogFooter footer;
   footer.blob_count = blob_count;
@@ -317,13 +324,13 @@ Status BlobFilePartitionManager::FinalizeBlobFile(
   }
 
   if (blob_callback_ != nullptr) {
+    // `mutex_` is held, and the DB mutex must not be acquired under it.
     const std::string blob_file_path = BlobFileName(db_path_, file_number);
-    s = blob_callback_->OnBlobFileCompleted(
-        blob_file_path, column_family_name_, /*job_id=*/0, file_number,
-        BlobFileCreationReason::kFlush, s, checksum_value, checksum_method,
-        blob_count, total_blob_bytes, /*set_bg_error_on_space_limit=*/true);
-    if (!s.ok()) {
-      return s;
+    if (blob_callback_->OnKeptBlobFileCompleted(
+            blob_file_path, column_family_name_, /*job_id=*/0, file_number,
+            BlobFileCreationReason::kFlush, checksum_value, checksum_method,
+            blob_count, total_blob_bytes, writer->get_file_size())) {
+      *space_limit_reached = true;
     }
   }
 
@@ -477,6 +484,15 @@ Status BlobFilePartitionManager::WriteBlob(
                                         value) %
              num_partitions_);
 
+  bool space_limit_reached = false;
+  // Setting the background error takes the DB mutex, so it must run after
+  // `mutex_` is released.
+  Defer set_space_limit_error([&]() {
+    if (space_limit_reached) {
+      blob_callback_->SetBGError(
+          Status::SpaceLimit("Max allowed space was reached"));
+    }
+  });
   {
     MutexLock lock(&mutex_);
     Partition* partition = partitions_[selected_partition_idx].get();
@@ -486,7 +502,8 @@ Status BlobFilePartitionManager::WriteBlob(
         return Status::OK();
       }
       SealedFile sealed_file;
-      Status s = SealActiveBlobFile(write_options, partition, &sealed_file);
+      Status s = SealActiveBlobFile(write_options, partition, &sealed_file,
+                                    &space_limit_reached);
       if (s.ok()) {
         current_generation_sealed_files_.push_back(std::move(sealed_file));
       }

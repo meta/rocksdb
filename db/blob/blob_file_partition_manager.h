@@ -225,8 +225,11 @@ class BlobFilePartitionManager {
   Status OpenNewBlobFile(Partition* partition, uint32_t column_family_id,
                          CompressionType compression, uint32_t partition_idx);
   // Finalizes one active partition file and returns the MANIFEST addition.
+  // Sets `*space_limit_reached` if the SstFileManager's max allowed space is
+  // reached; the seal still succeeds.
   Status SealActiveBlobFile(const WriteOptions& write_options,
-                            Partition* partition, SealedFile* sealed_file);
+                            Partition* partition, SealedFile* sealed_file,
+                            bool* space_limit_reached);
   // Finalizes one deferred file that was carried over to flush preparation.
   Status SealDeferredFile(const WriteOptions& write_options,
                           DeferredFile* deferred, SealedFile* sealed_file);
@@ -235,7 +238,8 @@ class BlobFilePartitionManager {
   Status FinalizeBlobFile(const WriteOptions& write_options,
                           BlobLogWriter* writer, uint64_t file_number,
                           uint64_t blob_count, uint64_t total_blob_bytes,
-                          BlobFileAddition* addition);
+                          BlobFileAddition* addition,
+                          bool* space_limit_reached);
   // Appends one initial-garbage record to the flush output if any failed
   // transformed writes targeted the sealed blob file.
   static void AddSealedFileGarbage(const SealedFile& sealed_file,
