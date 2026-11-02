@@ -912,6 +912,75 @@ TEST_F(TraceAnalyzerTest, MultiGet) {
   */
 }
 
+// TraceAnalyzer as a library: options instead of flags, no output files, and
+// the statistics in memory.
+TEST_F(TraceAnalyzerTest, LibraryResultWithoutOutputFiles) {
+  std::string trace_path = test_path_ + "/trace_library";
+  GenerateTrace(trace_path);
+
+  TraceAnalyzerOptions options;
+  options.analyze_get = true;
+  options.analyze_put = true;
+  options.analyze_delete = true;
+  options.analyze_single_delete = true;
+  options.analyze_range_delete = true;
+  options.analyze_merge = true;
+  options.analyze_iterator = true;
+  options.analyze_multiget = true;
+  options.output_qps_stats = true;
+  options.output_access_count_stats = true;
+  options.print_top_k_access = 2;
+  std::unique_ptr<TraceReader> reader;
+  ASSERT_OK(NewFileTraceReader(env_, env_options_, trace_path, &reader));
+  TraceAnalyzer analyzer(std::move(reader), options);
+  ASSERT_OK(analyzer.Analyze());
+  const TraceAnalyzerResult result = analyzer.GetResult();
+
+  EXPECT_EQ(result.total_gets, 2u);
+  EXPECT_EQ(result.total_write_batches, 1u);
+  EXPECT_EQ(result.total_multigets, 3u);
+  EXPECT_EQ(result.total_seeks, 1u);
+  EXPECT_EQ(result.total_seek_for_prevs, 1u);
+  EXPECT_EQ(result.sample_max, 1u);
+  EXPECT_GE(result.end_micros, result.begin_micros);
+
+  std::map<std::string, TraceAnalyzerResult::OperationStats> ops;
+  for (const auto& op : result.operations) {
+    EXPECT_EQ(op.cf_id, 0u);
+    ops[op.type] = op;
+  }
+  ASSERT_EQ(ops.size(), 9u);
+  EXPECT_EQ(ops["get"].count, 2u);
+  EXPECT_EQ(ops["get"].unique_keys, 2u);
+  EXPECT_EQ(ops["put"].count, 1u);
+  EXPECT_EQ(ops["put"].key_size_sum, 1u);
+  EXPECT_EQ(ops["put"].value_size_sum, 9u);
+  EXPECT_EQ(ops["merge"].value_size_sum, 20u);
+  EXPECT_EQ(ops["range_delete"].count, 2u);
+  EXPECT_EQ(ops["iterator_Seek"].count, 1u);
+  EXPECT_EQ(ops["iterator_SeekForPrev"].count, 1u);
+  // MultiGet keys a, b, df, gege, hjhjhj, then a, b, then gege, hjhjhj.
+  const TraceAnalyzerResult::OperationStats& multiget = ops["multiget"];
+  EXPECT_EQ(multiget.count, 9u);
+  EXPECT_EQ(multiget.unique_keys, 5u);
+  const std::map<uint64_t, uint64_t> distribution{{1, 1}, {2, 4}};
+  EXPECT_EQ(multiget.access_count_distribution, distribution);
+  ASSERT_EQ(multiget.top_keys.size(), 2u);
+  EXPECT_EQ(multiget.top_keys[0].second, 2u);
+  EXPECT_EQ(multiget.top_keys[1].second, 2u);
+  EXPECT_GT(multiget.peak_qps, 0u);
+
+  // A bad option is an error, not an exit (or a division by zero).
+  TraceAnalyzerOptions bad_correlation = options;
+  bad_correlation.print_correlation = "[get,nope]";
+  TraceAnalyzer bad(trace_path, bad_correlation);
+  EXPECT_TRUE(bad.Analyze().IsInvalidArgument());
+  TraceAnalyzerOptions zero_interval = options;
+  zero_interval.value_interval = 0;
+  TraceAnalyzer zero(trace_path, zero_interval);
+  EXPECT_TRUE(zero.Analyze().IsInvalidArgument());
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
