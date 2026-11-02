@@ -20,8 +20,16 @@ class WritableFile;
 class Table;
 class TableBuilder;
 
+// Shared capability/options query for a direct or adaptive block-based writer.
+// A null result means that newly written tables cannot carry Blob GC metadata.
+const BlockBasedTableOptions* GetBlockBasedTableWriterOptions(
+    const TableFactory* table_factory);
+
 class AdaptiveTableFactory : public TableFactory {
  public:
+  // Method to allow CheckedCast to work for this class.
+  static const char* kClassName() { return "AdaptiveTableFactory"; }
+
   explicit AdaptiveTableFactory(
       std::shared_ptr<TableFactory> table_factory_to_write,
       std::shared_ptr<TableFactory> block_based_table_factory,
@@ -42,6 +50,10 @@ class AdaptiveTableFactory : public TableFactory {
       WritableFileWriter* file) const override;
 
   std::string GetPrintableOptions() const override;
+
+  // Returns the block-based options used for newly written tables, or nullptr
+  // when the configured write factory uses another table format.
+  const BlockBasedTableOptions* GetBlockBasedTableWriterOptions() const;
 
   std::unique_ptr<TableFactory> Clone() const override {
     return std::make_unique<AdaptiveTableFactory>(*this);

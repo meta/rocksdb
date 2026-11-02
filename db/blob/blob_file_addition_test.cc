@@ -37,6 +37,7 @@ TEST_F(BlobFileAdditionTest, Empty) {
   ASSERT_EQ(blob_file_addition.GetTotalBlobBytes(), 0);
   ASSERT_TRUE(blob_file_addition.GetChecksumMethod().empty());
   ASSERT_TRUE(blob_file_addition.GetChecksumValue().empty());
+  ASSERT_FALSE(blob_file_addition.IsIdentityRoot());
 
   TestEncodeDecode(blob_file_addition);
 }
@@ -59,7 +60,17 @@ TEST_F(BlobFileAdditionTest, NonEmpty) {
   ASSERT_EQ(blob_file_addition.GetTotalBlobBytes(), total_blob_bytes);
   ASSERT_EQ(blob_file_addition.GetChecksumMethod(), checksum_method);
   ASSERT_EQ(blob_file_addition.GetChecksumValue(), checksum_value);
+  ASSERT_FALSE(blob_file_addition.IsIdentityRoot());
 
+  TestEncodeDecode(blob_file_addition);
+}
+
+TEST_F(BlobFileAdditionTest, IdentityRoot) {
+  BlobFileAddition blob_file_addition(
+      /*blob_file_number=*/123, /*total_blob_count=*/2,
+      /*total_blob_bytes=*/456, "crc32c", "checksum",
+      /*is_identity_root=*/true);
+  ASSERT_TRUE(blob_file_addition.IsIdentityRoot());
   TestEncodeDecode(blob_file_addition);
 }
 

@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -22,8 +23,10 @@
 #include "block_cache.h"
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
+#include "db/blob/blob_contents.h"
 #include "db/blob/blob_gen2_format.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/dbformat.h"
@@ -80,6 +83,7 @@
 #include "test_util/sync_point.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
+#include "util/defer.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 
@@ -93,11 +97,10 @@ CacheAllocationPtr CopyBufferToHeap(MemoryAllocator* allocator, Slice& buf) {
   return heap_buf;
 }
 
-// Cleanup function for a Cleanable/PinnableSlice that owns a `new char[]`
-// buffer (used to pin embedded blob payloads without copying).
-void DeleteCharArray(void* arg1, void* /*arg2*/) {
+void DeleteEmbeddedBlobBuffer(void* arg1, void* /*arg2*/) {
   delete[] static_cast<char*>(arg1);
 }
+
 }  // namespace
 
 Status AllocateReadScopedBlockBuffer(
@@ -1203,10 +1206,10 @@ Status BlockBasedTable::ValidateEmbeddedBlobIndex(const BlobIndex& blob_index,
   }
 
   const uint64_t payload_size_u64 = blob_index.size();
-  if (payload_size_u64 >
-      static_cast<uint64_t>(std::numeric_limits<size_t>::max()) -
-          kSimpleGen2BlobTrailerSize) {
-    return Status::Corruption("Embedded blob record is too large");
+  if (payload_size_u64 > kMaxSimpleGen2BlobPayloadSize ||
+      !CompressionTypeSupported(blob_index.compression())) {
+    return Status::Corruption(
+        "Embedded blob record size or compression is not supported");
   }
   const uint64_t record_size_u64 =
       payload_size_u64 + kSimpleGen2BlobTrailerSize;
@@ -1239,18 +1242,39 @@ Status BlockBasedTable::ResolveEmbeddedBlob(const ReadOptions& read_options,
     return Status::Incomplete(
         "Cannot read embedded blob in block-cache-only mode");
   }
-  // Read the record (payload + trailer) directly into `value`, then drop the
-  // trailer with a shrink (no extra copy on the common non-mmap path).
-  value->resize(record_size);
+  if (blob_index.compression() == kNoCompression) {
+    value->resize(record_size);
+    s = ReadAndVerifySimpleGen2BlobRecord(
+        read_options, rep_->file.get(), blob_index.offset(), payload_size,
+        record_size, rep_->footer.checksum_type(),
+        rep_->footer.base_context_checksum(), blob_index.compression(),
+        &(*value)[0]);
+    if (s.ok()) {
+      value->resize(payload_size);
+    }
+    return s;
+  }
+  CacheAllocationPtr stored_record = AllocateBlock(record_size, nullptr);
   s = ReadAndVerifySimpleGen2BlobRecord(
       read_options, rep_->file.get(), blob_index.offset(), payload_size,
       record_size, rep_->footer.checksum_type(),
       rep_->footer.base_context_checksum(), blob_index.compression(),
-      &(*value)[0]);
+      stored_record.get());
   if (!s.ok()) {
     return s;
   }
-  value->resize(payload_size);
+  std::shared_ptr<Decompressor> decompressor =
+      GetBuiltinV2CompressionManager()->GetDecompressorOptimizeFor(
+          blob_index.compression());
+  std::unique_ptr<BlobContents> contents;
+  s = UncompressBlobContentsIfNeeded(
+      Slice(stored_record.get(), payload_size), blob_index.compression(),
+      decompressor.get(), /*allocator=*/nullptr, rep_->ioptions.clock,
+      rep_->ioptions.stats, &contents);
+  if (!s.ok()) {
+    return s;
+  }
+  value->assign(contents->data().data(), contents->data().size());
   return Status::OK();
 }
 
@@ -1269,20 +1293,48 @@ Status BlockBasedTable::ResolveEmbeddedBlobPinned(
     return Status::Incomplete(
         "Cannot read embedded blob in block-cache-only mode");
   }
-  // Read into a heap buffer owned by `value` via a registered cleanup, so the
-  // payload can be pinned (no copy) and outlive this reader. The trailer just
-  // sits unused at the tail of the buffer.
-  std::unique_ptr<char[]> buf(new char[record_size]);
+  if (blob_index.compression() == kNoCompression) {
+    std::unique_ptr<char[]> buffer(new char[record_size]);
+    s = ReadAndVerifySimpleGen2BlobRecord(
+        read_options, rep_->file.get(), blob_index.offset(), payload_size,
+        record_size, rep_->footer.checksum_type(),
+        rep_->footer.base_context_checksum(), blob_index.compression(),
+        buffer.get());
+    if (!s.ok()) {
+      return s;
+    }
+    char* const raw = buffer.release();
+    value->PinSlice(Slice(raw, payload_size), &DeleteEmbeddedBlobBuffer, raw,
+                    nullptr);
+    return Status::OK();
+  }
+  CacheAllocationPtr stored_record = AllocateBlock(record_size, nullptr);
   s = ReadAndVerifySimpleGen2BlobRecord(
       read_options, rep_->file.get(), blob_index.offset(), payload_size,
       record_size, rep_->footer.checksum_type(),
       rep_->footer.base_context_checksum(), blob_index.compression(),
-      buf.get());
+      stored_record.get());
   if (!s.ok()) {
     return s;
   }
-  char* raw = buf.release();
-  value->PinSlice(Slice(raw, payload_size), &DeleteCharArray, raw, nullptr);
+  std::shared_ptr<Decompressor> decompressor =
+      GetBuiltinV2CompressionManager()->GetDecompressorOptimizeFor(
+          blob_index.compression());
+  std::unique_ptr<BlobContents> contents;
+  s = UncompressBlobContentsIfNeeded(
+      Slice(stored_record.get(), payload_size), blob_index.compression(),
+      decompressor.get(), /*allocator=*/nullptr, rep_->ioptions.clock,
+      rep_->ioptions.stats, &contents);
+  if (!s.ok()) {
+    return s;
+  }
+  BlobContents* const owned = contents.release();
+  value->PinSlice(
+      owned->data(),
+      [](void* arg1, void* /*arg2*/) {
+        delete static_cast<BlobContents*>(arg1);
+      },
+      owned, nullptr);
   return Status::OK();
 }
 
@@ -1316,22 +1368,67 @@ Status BlockBasedTable::GetSameFileBlob(const ReadOptions& read_options,
                                         BlobVerifyPolicy verify_policy,
                                         PinnableSlice* value) const {
   if (range_length != kWholeBlobLength) {
-    // Byte-range embedded read: value bytes only, no whole-record checksum, no
-    // cache fill (see ResolveEmbeddedBlobRangeCached). Only issued while
-    // resolving a lazy result, which always runs against an open column family
-    // (so a BlobSource is wired) and never forces verification of a strict
-    // sub-range. Reaching here without a BlobSource means a same-file reference
-    // was routed from an unexpected context (a corrupt index can produce the
-    // file_number 0 same-file sentinel), so report corruption -- mirroring
-    // Version::GetBlobRange's "Invalid blob file number".
-    assert(verify_policy != BlobVerifyPolicy::kVerifyIfPresent);
-    assert(rep_->blob_source_ != nullptr);
-    if (rep_->blob_source_ == nullptr) {
-      return Status::Corruption(
-          "Invalid same-file blob reference (no BlobSource for range read)");
+    if (blob_index.compression() != kNoCompression) {
+      PinnableSlice whole_value;
+      Status whole_status = GetSameFileBlob(
+          read_options, blob_index, /*range_offset=*/0, kWholeBlobLength,
+          BlobVerifyPolicy::kVerifyIfPresent, &whole_value);
+      if (!whole_status.ok()) {
+        return whole_status;
+      }
+      if (range_offset > whole_value.size() ||
+          range_length > whole_value.size() - range_offset) {
+        return Status::InvalidArgument(
+            "Compressed blob range is out of bounds");
+      }
+      const Slice subrange(
+          whole_value.data() + static_cast<size_t>(range_offset), range_length);
+      value->Reset();
+      value->PinSlice(subrange, &whole_value);
+      return Status::OK();
     }
-    return ResolveEmbeddedBlobRangeCached(read_options, blob_index,
-                                          range_offset, range_length, value);
+    // Byte-range embedded read: value bytes only, no whole-record checksum and
+    // no cache fill. DB-owned SSTs route through BlobSource. Relocation tables
+    // are opened as standalone block-based readers, so they use the same raw
+    // range primitive directly.
+    assert(verify_policy != BlobVerifyPolicy::kVerifyIfPresent);
+    if (rep_->blob_source_ != nullptr) {
+      return ResolveEmbeddedBlobRangeCached(read_options, blob_index,
+                                            range_offset, range_length, value);
+    }
+    size_t payload_size = 0;
+    size_t record_size = 0;
+    Status status =
+        ValidateEmbeddedBlobIndex(blob_index, &payload_size, &record_size);
+    if (!status.ok()) {
+      return status;
+    }
+    if (range_offset > payload_size ||
+        range_length > payload_size - range_offset) {
+      return Status::InvalidArgument("Embedded blob range is out of bounds");
+    }
+    if (read_options.read_tier == kBlockCacheTier) {
+      return Status::Incomplete(
+          "Cannot read embedded blob in block-cache-only mode");
+    }
+    CacheAllocationPtr buffer =
+        AllocateBlock(range_length, /*allocator=*/nullptr);
+    status = ReadSimpleGen2BlobRange(
+        read_options, rep_->file.get(), blob_index.offset(), payload_size,
+        range_offset, range_length, blob_index.compression(), buffer.get());
+    if (!status.ok()) {
+      return status;
+    }
+    BlobContents* const owned =
+        new BlobContents(std::move(buffer), range_length);
+    value->Reset();
+    value->PinSlice(
+        owned->data(),
+        [](void* arg1, void* /*arg2*/) {
+          delete static_cast<BlobContents*>(arg1);
+        },
+        owned, nullptr);
+    return Status::OK();
   }
 
   // Whole-value read: prefer the blob-cache-backed read (BLOB_DB_* stats) when
@@ -1379,11 +1476,172 @@ Status BlockBasedTable::ResolveEmbeddedBlobRangeCached(
 void BlockBasedTable::MultiGetSameFileBlob(
     const ReadOptions& read_options, size_t num_reads,
     SameFileBlobReadRequest* reqs) const {
+  if (rep_->blob_source_ == nullptr) {
+    struct WholePending {
+      size_t request_index;
+      size_t payload_size;
+      size_t record_size;
+      uint64_t range_offset;
+      size_t range_length;
+      CacheAllocationPtr buffer;
+    };
+    struct RangePending {
+      size_t request_index;
+      size_t range_length;
+      CacheAllocationPtr buffer;
+    };
+
+    std::vector<WholePending> whole_pending;
+    std::vector<RangePending> range_pending;
+    std::vector<SimpleGen2RecordReadRequest> whole_reads;
+    std::vector<SimpleGen2RecordReadRequest> verified_whole_reads;
+    std::vector<SimpleGen2RangeReadRequest> range_reads;
+    whole_pending.reserve(num_reads);
+    range_pending.reserve(num_reads);
+    whole_reads.reserve(num_reads);
+    verified_whole_reads.reserve(num_reads);
+    range_reads.reserve(num_reads);
+
+    for (size_t i = 0; i < num_reads; ++i) {
+      SameFileBlobReadRequest& req = reqs[i];
+      assert(req.blob_index != nullptr);
+      assert(req.result != nullptr);
+      assert(req.status != nullptr);
+      req.result->Reset();
+      *req.status = Status::OK();
+
+      size_t payload_size = 0;
+      size_t record_size = 0;
+      *req.status = ValidateEmbeddedBlobIndex(*req.blob_index, &payload_size,
+                                              &record_size);
+      if (!req.status->ok()) {
+        continue;
+      }
+      if (read_options.read_tier == kBlockCacheTier) {
+        *req.status = Status::Incomplete(
+            "Cannot read embedded blob in block-cache-only mode");
+        continue;
+      }
+
+      const bool strict_uncompressed_range =
+          req.range_length != kWholeBlobLength &&
+          req.blob_index->compression() == kNoCompression;
+      if (strict_uncompressed_range) {
+        assert(req.verify_policy != BlobVerifyPolicy::kVerifyIfPresent);
+        if (req.range_offset > payload_size ||
+            req.range_length > payload_size - req.range_offset) {
+          *req.status =
+              Status::InvalidArgument("Embedded blob range is out of bounds");
+          continue;
+        }
+        CacheAllocationPtr buffer =
+            AllocateBlock(req.range_length, /*allocator=*/nullptr);
+        range_reads.push_back(SimpleGen2RangeReadRequest{
+            req.blob_index->offset(), payload_size, req.range_offset,
+            req.range_length, req.blob_index->compression(), buffer.get(),
+            req.status});
+        range_pending.push_back(
+            RangePending{i, req.range_length, std::move(buffer)});
+        continue;
+      }
+
+      CacheAllocationPtr buffer =
+          AllocateBlock(record_size, /*allocator=*/nullptr);
+      SimpleGen2RecordReadRequest read{
+          req.blob_index->offset(),      payload_size, record_size,
+          req.blob_index->compression(), buffer.get(), req.status};
+      if (req.verify_policy == BlobVerifyPolicy::kVerifyIfPresent &&
+          !read_options.verify_checksums) {
+        verified_whole_reads.push_back(read);
+      } else {
+        whole_reads.push_back(read);
+      }
+      whole_pending.push_back(WholePending{i, payload_size, record_size,
+                                           req.range_offset, req.range_length,
+                                           std::move(buffer)});
+    }
+
+    if (!whole_reads.empty()) {
+      ReadAndVerifySimpleGen2BlobRecords(
+          read_options, rep_->file.get(), rep_->footer.checksum_type(),
+          rep_->footer.base_context_checksum(), whole_reads.size(),
+          whole_reads.data());
+    }
+    if (!verified_whole_reads.empty()) {
+      ReadOptions verified_options = read_options;
+      verified_options.verify_checksums = true;
+      ReadAndVerifySimpleGen2BlobRecords(
+          verified_options, rep_->file.get(), rep_->footer.checksum_type(),
+          rep_->footer.base_context_checksum(), verified_whole_reads.size(),
+          verified_whole_reads.data());
+    }
+    if (!range_reads.empty()) {
+      ReadSimpleGen2BlobRanges(read_options, rep_->file.get(),
+                               range_reads.size(), range_reads.data());
+    }
+
+    std::shared_ptr<Decompressor> decompressor =
+        GetBuiltinV2CompressionManager()->GetDecompressor();
+    for (WholePending& pending : whole_pending) {
+      SameFileBlobReadRequest& req = reqs[pending.request_index];
+      if (!req.status->ok()) {
+        continue;
+      }
+      std::unique_ptr<BlobContents> contents;
+      if (req.blob_index->compression() == kNoCompression) {
+        contents.reset(
+            new BlobContents(std::move(pending.buffer), pending.payload_size));
+      } else {
+        *req.status = UncompressBlobContentsIfNeeded(
+            Slice(pending.buffer.get(), pending.payload_size),
+            req.blob_index->compression(), decompressor.get(),
+            /*allocator=*/nullptr, rep_->ioptions.clock, rep_->ioptions.stats,
+            &contents);
+        if (!req.status->ok()) {
+          continue;
+        }
+      }
+
+      Slice result_slice = contents->data();
+      if (pending.range_length != kWholeBlobLength) {
+        if (pending.range_offset > result_slice.size() ||
+            pending.range_length > result_slice.size() - pending.range_offset) {
+          *req.status =
+              Status::InvalidArgument("Compressed blob range is out of bounds");
+          continue;
+        }
+        result_slice = Slice(
+            result_slice.data() + static_cast<size_t>(pending.range_offset),
+            pending.range_length);
+      }
+      BlobContents* const owned = contents.release();
+      req.result->PinSlice(
+          result_slice,
+          [](void* arg1, void* /*arg2*/) {
+            delete static_cast<BlobContents*>(arg1);
+          },
+          owned, nullptr);
+    }
+    for (RangePending& pending : range_pending) {
+      SameFileBlobReadRequest& req = reqs[pending.request_index];
+      if (!req.status->ok()) {
+        continue;
+      }
+      BlobContents* const owned =
+          new BlobContents(std::move(pending.buffer), pending.range_length);
+      req.result->PinSlice(
+          owned->data(),
+          [](void* arg1, void* /*arg2*/) {
+            delete static_cast<BlobContents*>(arg1);
+          },
+          owned, nullptr);
+    }
+    return;
+  }
+
   // Partition the requests into coalesceable whole-record and sub-range groups
-  // (dispatched to BlobSource as one MultiRead each). Force-verify reads
-  // (kVerifyIfPresent) and the no-BlobSource fallback go through the scalar
-  // GetSameFileBlob path since they cannot share the batch's single verify flag
-  // / BlobSource-backed cache path.
+  // (dispatched to BlobSource as one MultiRead each). Force-verify reads use
+  // the scalar path because they cannot share the batch's read options.
   std::vector<SimpleGen2BlobReadRequest> whole_reqs;
   std::vector<SimpleGen2BlobRangeReadRequest> range_reqs;
 
@@ -1394,7 +1652,8 @@ void BlockBasedTable::MultiGetSameFileBlob(
     assert(req.status);
 
     if (req.verify_policy == BlobVerifyPolicy::kVerifyIfPresent ||
-        rep_->blob_source_ == nullptr) {
+        (req.range_length != kWholeBlobLength &&
+         req.blob_index->compression() != kNoCompression)) {
       *req.status =
           GetSameFileBlob(read_options, *req.blob_index, req.range_offset,
                           req.range_length, req.verify_policy, req.result);
@@ -1430,8 +1689,9 @@ void BlockBasedTable::MultiGetSameFileBlob(
   }
   if (!range_reqs.empty()) {
     rep_->blob_source_->MultiGetSimpleGen2BlobRange(
-        read_options, rep_->base_cache_key, rep_->file.get(), range_reqs.size(),
-        range_reqs.data());
+        read_options, rep_->base_cache_key, rep_->file.get(),
+        rep_->footer.checksum_type(), rep_->footer.base_context_checksum(),
+        range_reqs.size(), range_reqs.data());
   }
 }
 
@@ -2048,6 +2308,218 @@ void BlockBasedTable::SetupForCompaction() {}
 std::shared_ptr<const TableProperties> BlockBasedTable::GetTableProperties()
     const {
   return rep_->table_properties;
+}
+
+Status BlockBasedTable::ReadBlobReferenceGroups(
+    const Slice& expected_descriptor,
+    std::vector<BlobReferenceGroup>* groups) const {
+  if (groups == nullptr) {
+    return Status::InvalidArgument("Null blob reference group output");
+  }
+  groups->clear();
+
+  const auto properties = GetTableProperties();
+  if (properties == nullptr) {
+    return Status::Corruption("Missing table properties");
+  }
+  const auto property = properties->user_collected_properties.find(
+      kBlobReferenceDescriptorPropertyName);
+  if (property == properties->user_collected_properties.end()) {
+    return Status::Corruption("Missing required blob reference descriptor");
+  }
+  if (Slice(property->second) != expected_descriptor) {
+    return Status::Corruption("Blob reference descriptor mismatch");
+  }
+
+  BlobReferenceMetadataDescriptor descriptor;
+  Status status = BlobReferenceMetadataDescriptor::DecodeFrom(
+      expected_descriptor, &descriptor);
+  if (!status.ok()) {
+    return status;
+  }
+
+  ReadOptions read_options;
+  read_options.fill_cache = false;
+  read_options.verify_checksums = true;
+  const auto read_block = [&](const BlockHandle& handle,
+                              BlockContents* contents) -> Status {
+    IOStatus io_status =
+        BlockFetcher(rep_->file.get(), nullptr /* prefetch_buffer */,
+                     rep_->footer, read_options, handle, contents,
+                     rep_->ioptions, false /* do_uncompress */,
+                     false /* maybe_compressed */, BlockType::kUserDefinedIndex,
+                     nullptr /* decompressor */, rep_->persistent_cache_options)
+            .ReadBlockContents();
+    return io_status;
+  };
+
+  BlockContents index_contents;
+  status = read_block(descriptor.index_handle, &index_contents);
+  if (!status.ok()) {
+    return status;
+  }
+  std::vector<BlobReferenceBlockIndexEntry> block_index;
+  status =
+      DecodeBlobReferenceIndex(index_contents.data, descriptor, &block_index);
+  if (!status.ok()) {
+    return status;
+  }
+
+  BlockContents directory_contents;
+  status = read_block(descriptor.directory_handle, &directory_contents);
+  if (!status.ok()) {
+    return status;
+  }
+  return DecodeBlobReferenceDirectory(directory_contents.data, descriptor,
+                                      block_index.size(), groups);
+}
+
+Status BlockBasedTable::ReadBlobReferences(
+    const ReadOptions& caller_read_options, const Slice& expected_descriptor,
+    const BlobReferenceGroup& expected_group,
+    std::vector<BlobReference>* references) const {
+  if (references == nullptr) {
+    return Status::InvalidArgument("Null blob reference output");
+  }
+  const size_t output_begin = references->size();
+  bool append_succeeded = false;
+  Defer rollback([&]() {
+    if (!append_succeeded) {
+      references->resize(output_begin);
+    }
+  });
+
+  const auto properties = GetTableProperties();
+  if (properties == nullptr) {
+    return Status::Corruption("Missing table properties");
+  }
+  const auto property = properties->user_collected_properties.find(
+      kBlobReferenceDescriptorPropertyName);
+  if (property == properties->user_collected_properties.end()) {
+    return Status::Corruption("Missing required blob reference descriptor");
+  }
+  if (Slice(property->second) != expected_descriptor) {
+    return Status::Corruption("Blob reference descriptor mismatch");
+  }
+
+  BlobReferenceMetadataDescriptor descriptor;
+  Status status = BlobReferenceMetadataDescriptor::DecodeFrom(
+      expected_descriptor, &descriptor);
+  if (!status.ok()) {
+    return status;
+  }
+
+  ReadOptions read_options(caller_read_options);
+  read_options.fill_cache = false;
+  read_options.verify_checksums = true;
+  const auto read_block = [&](const BlockHandle& handle,
+                              BlockContents* contents) -> Status {
+    IOStatus io_status =
+        BlockFetcher(rep_->file.get(), nullptr /* prefetch_buffer */,
+                     rep_->footer, read_options, handle, contents,
+                     rep_->ioptions, false /* do_uncompress */,
+                     false /* maybe_compressed */, BlockType::kUserDefinedIndex,
+                     nullptr /* decompressor */, rep_->persistent_cache_options)
+            .ReadBlockContents();
+    return io_status;
+  };
+
+  BlockContents index_contents;
+  status = read_block(descriptor.index_handle, &index_contents);
+  if (!status.ok()) {
+    return status;
+  }
+  std::vector<BlobReferenceBlockIndexEntry> block_index;
+  status =
+      DecodeBlobReferenceIndex(index_contents.data, descriptor, &block_index);
+  if (!status.ok()) {
+    return status;
+  }
+
+  BlockContents directory_contents;
+  status = read_block(descriptor.directory_handle, &directory_contents);
+  if (!status.ok()) {
+    return status;
+  }
+  std::vector<BlobReferenceGroup> groups;
+  status = DecodeBlobReferenceDirectory(directory_contents.data, descriptor,
+                                        block_index.size(), &groups);
+  if (!status.ok()) {
+    return status;
+  }
+
+  const auto same_group = [](const BlobReferenceGroup& lhs,
+                             const BlobReferenceGroup& rhs) {
+    return std::tie(lhs.encoding_class, lhs.generation_file_number,
+                    lhs.origin_file_number, lhs.first_reference,
+                    lhs.reference_count, lhs.stored_value_bytes,
+                    lhs.record_bytes, lhs.first_block, lhs.block_count,
+                    lhs.digest) ==
+           std::tie(rhs.encoding_class, rhs.generation_file_number,
+                    rhs.origin_file_number, rhs.first_reference,
+                    rhs.reference_count, rhs.stored_value_bytes,
+                    rhs.record_bytes, rhs.first_block, rhs.block_count,
+                    rhs.digest);
+  };
+  const auto group = std::find_if(
+      groups.begin(), groups.end(), [&](const BlobReferenceGroup& candidate) {
+        return same_group(candidate, expected_group);
+      });
+  if (group == groups.end()) {
+    return Status::Corruption("Blob reference group mismatch");
+  }
+  if (group->first_block > block_index.size() ||
+      group->block_count > block_index.size() - group->first_block ||
+      group->reference_count > references->max_size() - output_begin ||
+      group->reference_count > references->capacity() - output_begin) {
+    return Status::Corruption("Blob reference group range overflow");
+  }
+
+  uint32_t digest = 0;
+  for (uint64_t i = 0; i < group->block_count; ++i) {
+    const BlobReferenceBlockIndexEntry& entry =
+        block_index[static_cast<size_t>(group->first_block + i)];
+    const size_t decoded_count = references->size() - output_begin;
+    if (entry.reference_count > group->reference_count - decoded_count) {
+      return Status::Corruption("Blob reference group count mismatch");
+    }
+    BlockContents data_contents;
+    status = read_block(entry.handle, &data_contents);
+    if (!status.ok()) {
+      return status;
+    }
+    digest = crc32c::Extend(digest, data_contents.data.data(),
+                            data_contents.data.size());
+    status =
+        AppendBlobReferenceDataBlock(data_contents.data, entry, references);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  uint64_t stored_value_bytes = 0;
+  uint64_t record_bytes = 0;
+  for (size_t i = output_begin; i < references->size(); ++i) {
+    const BlobReference& reference = (*references)[i];
+    if (reference.encoding_class != group->encoding_class ||
+        reference.generation_file_number != group->generation_file_number ||
+        reference.origin_file_number != group->origin_file_number ||
+        reference.stored_value_size >
+            std::numeric_limits<uint64_t>::max() - stored_value_bytes ||
+        reference.record_bytes >
+            std::numeric_limits<uint64_t>::max() - record_bytes) {
+      return Status::Corruption("Blob reference group contents mismatch");
+    }
+    stored_value_bytes += reference.stored_value_size;
+    record_bytes += reference.record_bytes;
+  }
+  if (references->size() - output_begin != group->reference_count ||
+      stored_value_bytes != group->stored_value_bytes ||
+      record_bytes != group->record_bytes || digest != group->digest) {
+    return Status::Corruption("Blob reference group totals mismatch");
+  }
+  append_succeeded = true;
+  return Status::OK();
 }
 
 const SeqnoToTimeMapping& BlockBasedTable::GetSeqnoToTimeMapping() const {
@@ -3203,6 +3675,11 @@ BlockType BlockBasedTable::GetBlockTypeForMetaBlockByName(
   }
 
   if (meta_block_name.starts_with(kIndexFactoryMetaPrefix)) {
+    return BlockType::kUserDefinedIndex;
+  }
+
+  if (meta_block_name == kBlobReferenceIndexBlockName ||
+      meta_block_name == kBlobReferenceDirectoryBlockName) {
     return BlockType::kUserDefinedIndex;
   }
 

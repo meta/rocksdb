@@ -1081,6 +1081,28 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through the SetOptions() API
   bool enable_blob_files = false;
 
+  // Experimental creation and metadata policy for standalone blob relocation
+  // GC. When enabled, newly written blob values use a stable logical identity
+  // and output SSTs persist checked reference classification. Ordinary L0
+  // output is conservative; exact-aware L1+ and route-dependent output carries
+  // the complete exact-reference section. Reads and legacy compaction GC
+  // continue to work before any value is relocated.
+  //
+  // This option is mutually exclusive with enable_blob_direct_write. The
+  // FIFO compaction style is also unsupported, including reopening an activated
+  // column family as FIFO after disabling this flag. Disabling the flag stops
+  // new relocation policy; it does not remove persisted format dependencies.
+  // Ordinary FIFO column families that never activated this feature retain
+  // their existing BlobDB behavior.
+  //
+  // The complete relocation feature is shipped as one stack; intermediate stack
+  // revisions must remain disabled.
+  //
+  // Default: false
+  //
+  // Dynamically changeable through the SetOptions() API
+  bool enable_blob_indirection = false;
+
   // The size of the smallest value to be stored separately in a blob file.
   // Values which have an uncompressed size smaller than this threshold are
   // stored alongside the keys in SST files in the usual fashion. A value of

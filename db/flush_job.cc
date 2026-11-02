@@ -1154,6 +1154,13 @@ Status FlushJob::WriteLevel0Table() {
       // Add file to L0
       TEST_SYNC_POINT_CALLBACK("FileMetaData::FileMetaData", &meta_);
       edit_->AddFile(0 /* level */, meta_);
+      if (mutable_cf_options_.enable_blob_indirection) {
+        // PickMemTable() establishes edit_ before a nonempty flush can reach
+        // this point; NULLSAFECLANG cannot carry that invariant through Run().
+        // @lint-ignore NULLSAFECLANG nullable-dereference
+        edit_->SetBlobIndirectionFormatVersion(
+            kBlobIndirectionManifestFormatVersion);
+      }
     }
 
     edit_->SetBlobFileAdditions(std::move(blob_file_additions));

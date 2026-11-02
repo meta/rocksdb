@@ -16,6 +16,8 @@
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_builder.h"
 #include "db/blob/blob_garbage_meter.h"
+#include "db/blob/blob_reference_metadata.h"
+#include "db/blob/blob_source.h"
 #include "db/column_family.h"
 #include "db/compaction/compaction_iterator.h"
 #include "db/dbformat.h"
@@ -68,6 +70,19 @@ void ExtractTimestampFromTableProperties(const TableProperties& tp,
   auto max_ts_iter = tp.user_collected_properties.find("rocksdb.timestamp_max");
   if (max_ts_iter != tp.user_collected_properties.end()) {
     meta->max_timestamp = max_ts_iter->second;
+  }
+}
+
+void ExtractBlobReferenceDescriptorFromTableProperties(
+    const TableProperties& tp, FileMetaData* meta) {
+  assert(meta != nullptr);
+  meta->blob_reference_legacy_metadata = false;
+  const auto descriptor =
+      tp.user_collected_properties.find(kBlobReferenceDescriptorPropertyName);
+  if (descriptor == tp.user_collected_properties.end()) {
+    meta->blob_reference_descriptor.clear();
+  } else {
+    meta->blob_reference_descriptor = descriptor->second;
   }
 }
 
@@ -226,8 +241,12 @@ Status BuildTable(
              mutable_cf_options.blob_file_starting_level &&
          blob_file_additions)
             ? new BlobFileBuilder(
-                  versions, fs, &ioptions, &mutable_cf_options, &file_options,
-                  &(tboptions.write_options), tboptions.db_id,
+                  versions, fs, &ioptions, &mutable_cf_options,
+                  version != nullptr && version->cfd()->blob_source() != nullptr
+                      ? version->cfd()->blob_source()->GetBlobCacheShared()
+                      : GetBlobCacheWithReservation(ioptions,
+                                                    mutable_cf_options),
+                  &file_options, &(tboptions.write_options), tboptions.db_id,
                   tboptions.db_session_id, job_id, tboptions.column_family_id,
                   tboptions.column_family_name, write_hint, io_tracer,
                   blob_callback, blob_creation_reason,
@@ -422,6 +441,8 @@ Status BuildTable(
       tp = builder
                ->GetTableProperties();  // refresh now that builder is finished
       ExtractTimestampFromTableProperties(tp, meta);
+      ExtractBlobReferenceDescriptorFromTableProperties(tp, meta);
+      meta->blob_reference_summary = builder->GetBlobReferenceSstSummary();
       if (memtable_payload_bytes != nullptr &&
           memtable_garbage_bytes != nullptr) {
         const CompactionIterationStats& ci_stats = c_iter.iter_stats();

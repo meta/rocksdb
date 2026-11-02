@@ -13,8 +13,10 @@
 #include <memory>
 
 #include "cache/cache_entry_roles.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/table.h"
 #include "test_util/testharness.h"
 #include "util/coding.h"
 
@@ -36,6 +38,69 @@ class CacheReservationManagerTest : public ::testing::Test {
             cache);
   }
 };
+
+TEST_F(CacheReservationManagerTest, ResizeKeepsOtherOwnersCharged) {
+  std::shared_ptr<CacheReservationManager> manager =
+      std::make_shared<ConcurrentCacheReservationManager>(test_cache_rev_mng);
+  std::unique_ptr<CacheReservationManager::CacheReservationHandle> first;
+  std::unique_ptr<CacheReservationManager::CacheReservationHandle> second;
+  ASSERT_OK(manager->MakeCacheReservation(100, &first));
+  ASSERT_OK(manager->MakeCacheReservation(200, &second));
+  ASSERT_OK(first->Resize(400));
+  ASSERT_EQ(manager->GetTotalMemoryUsed(), 600U);
+  ASSERT_OK(second->Resize(0));
+  ASSERT_EQ(manager->GetTotalMemoryUsed(), 400U);
+  first.reset();
+  ASSERT_EQ(manager->GetTotalMemoryUsed(), 0U);
+  second.reset();
+}
+
+TEST_F(CacheReservationManagerTest, BlobSummariesShareOneReservationQuantum) {
+  BlockBasedTableOptions options;
+  options.block_cache = cache;
+  options.cache_usage_options
+      .options_overrides[CacheEntryRole::kBlobReferenceMetadataBuildingBuffer]
+      .charged = CacheEntryRoleOptions::Decision::kEnabled;
+  std::shared_ptr<CacheReservationManager> first =
+      GetBlobReferenceReservationManager(options);
+  std::shared_ptr<CacheReservationManager> second =
+      GetBlobReferenceReservationManager(options);
+  ASSERT_EQ(first, second);
+  std::vector<std::unique_ptr<CacheReservationManager::CacheReservationHandle>>
+      owners;
+  for (size_t i = 0; i < 1000; ++i) {
+    std::unique_ptr<CacheReservationManager::CacheReservationHandle> owner;
+    ASSERT_OK(first->MakeCacheReservation(100, &owner));
+    owners.push_back(std::move(owner));
+  }
+  ASSERT_EQ(first->GetTotalMemoryUsed(), 100000U);
+  ASSERT_EQ(first->GetTotalReservedCacheSize(), kSizeDummyEntry);
+  owners.front().reset();
+  ASSERT_EQ(second->GetTotalMemoryUsed(), 99900U);
+  owners.clear();
+  ASSERT_EQ(first->GetTotalMemoryUsed(), 0U);
+  ASSERT_EQ(first->GetTotalReservedCacheSize(), 0U);
+  first.reset();
+  second.reset();
+  ASSERT_EQ(cache->GetPinnedUsage(), 0U);
+}
+
+TEST_F(CacheReservationManagerTest, FailedResizeRemainsLocallyOwned) {
+  cache->SetCapacity(2 * kSizeDummyEntry);
+  cache->SetStrictCapacityLimit(true);
+  std::shared_ptr<CacheReservationManager> manager =
+      std::make_shared<ConcurrentCacheReservationManager>(test_cache_rev_mng);
+  std::unique_ptr<CacheReservationManager::CacheReservationHandle> first;
+  std::unique_ptr<CacheReservationManager::CacheReservationHandle> second;
+  ASSERT_OK(manager->MakeCacheReservation(10, &first));
+  ASSERT_OK(manager->MakeCacheReservation(20, &second));
+  ASSERT_TRUE(second->Resize(3 * kSizeDummyEntry).IsMemoryLimit());
+  ASSERT_EQ(manager->GetTotalMemoryUsed(), 10 + 3 * kSizeDummyEntry);
+  second.reset();
+  ASSERT_EQ(manager->GetTotalMemoryUsed(), 10U);
+  first.reset();
+  ASSERT_EQ(manager->GetTotalMemoryUsed(), 0U);
+}
 
 TEST_F(CacheReservationManagerTest, GenerateCacheKey) {
   std::size_t new_mem_used = 1 * kSizeDummyEntry;

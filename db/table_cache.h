@@ -29,6 +29,10 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+struct BlobReferenceGroup;
+struct BlobReferenceSstSummary;
+struct BlobReference;
+
 class Env;
 class Arena;
 struct FileDescriptor;
@@ -260,6 +264,39 @@ class TableCache {
                             const MutableCFOptions& mutable_cf_options,
                             bool no_io = false);
 
+  // Opens an ephemeral reader and reads only the exact external-blob group
+  // metadata. The open avoids inserting metadata into the shared block cache.
+  Status ReadBlobReferenceGroups(
+      const ReadOptions& read_options, const FileOptions& file_options,
+      const InternalKeyComparator& internal_comparator,
+      const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+      std::vector<BlobReferenceGroup>* groups);
+
+  // Returns a prepared builder handle, or reads/validates groups before a
+  // remote output is queued (and during asynchronous recovery). Never call
+  // this I/O fallback at the MANIFEST queue head.
+  Status ReadBlobReferenceSstSummary(
+      const ReadOptions& read_options, const FileOptions& file_options,
+      const InternalKeyComparator& internal_comparator,
+      const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+      std::shared_ptr<const BlobReferenceSstSummary>* summary);
+
+  // Reuses an already pinned reader, including RepairDB's cache-isolated
+  // reader. The immutable summary is prepared before MANIFEST installation.
+  Status ReadBlobReferenceSstSummary(
+      const TableReader& reader, const FileMetaData& file_meta,
+      const MutableCFOptions& mutable_cf_options,
+      std::shared_ptr<const BlobReferenceSstSummary>* summary);
+  // Opens an ephemeral reader and appends the data blocks for one exact group
+  // without inserting table metadata into the shared block cache.
+  Status ReadBlobReferences(const ReadOptions& read_options,
+                            const FileOptions& file_options,
+                            const InternalKeyComparator& internal_comparator,
+                            const FileMetaData& file_meta,
+                            const MutableCFOptions& mutable_cf_options,
+                            const BlobReferenceGroup& group,
+                            std::vector<BlobReference>* references);
+
   Status ApproximateKeyAnchors(const ReadOptions& ro,
                                const InternalKeyComparator& internal_comparator,
                                const FileMetaData& file_meta,
@@ -318,6 +355,12 @@ class TableCache {
   }
 
  private:
+  Status OpenEphemeralBlobReferenceReader(
+      const ReadOptions& read_options, const FileOptions& file_options,
+      const InternalKeyComparator& internal_comparator,
+      const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+      std::unique_ptr<TableReader>* reader);
+
   // Build a table reader
   Status GetTableReader(const ReadOptions& ro, const FileOptions& file_options,
                         const InternalKeyComparator& internal_comparator,

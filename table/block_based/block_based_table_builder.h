@@ -75,6 +75,16 @@ class BlockBasedTableBuilder : public TableBuilder {
   TableBuilderAddResult TryAdd(const Slice& key, const Slice& value,
                                TableBuilderAddContext* context) override;
 
+  Status StartBlobRelocationFile() override;
+
+  Status AddBlobRelocation(uint64_t origin_file_number,
+                           uint64_t original_value_offset,
+                           const Slice& stored_payload,
+                           CompressionType compression) override;
+
+  Status GetBlobRelocationFileMetadata(
+      BlobRelocationFileMetadata* metadata) const override;
+
   // Return non-ok iff some error has been detected.
   Status status() const override;
 
@@ -121,6 +131,9 @@ class BlockBasedTableBuilder : public TableBuilder {
 
   // Get table properties
   TableProperties GetTableProperties() const override;
+
+  std::shared_ptr<const BlobReferenceSstSummary> GetBlobReferenceSstSummary()
+      const override;
 
   // Get file checksum
   std::string GetFileChecksum() const override;
@@ -194,6 +207,7 @@ class BlockBasedTableBuilder : public TableBuilder {
   void WritePropertiesBlock(MetaIndexBuilder* meta_index_builder);
   void WriteCompressionDictBlock(MetaIndexBuilder* meta_index_builder);
   void WriteRangeDelBlock(MetaIndexBuilder* meta_index_builder);
+  void WriteBlobReferenceMetadata(MetaIndexBuilder* meta_index_builder);
   void WriteFooter(BlockHandle& metaindex_block_handle,
                    BlockHandle& index_block_handle);
 
@@ -216,11 +230,13 @@ class BlockBasedTableBuilder : public TableBuilder {
   // original value should be used as-is).
   Status BuildEmbeddedWideColumnEntity(const Slice& value, bool* rewritten);
 
-  // Appends one uncompressed same-file blob record for `payload` at the current
-  // table offset, advances the offset, lazily allocates and updates the
-  // embedded-blob state (counters), and encodes a same-file BlobIndex into
-  // rep_->embedded_blob_state->blob_index_buf.
-  Status WriteEmbeddedBlobRecord(const Slice& payload);
+  // Appends one same-file blob record for the already-stored representation in
+  // `payload`, advances the table offset, updates the embedded-blob counters,
+  // and encodes a same-file BlobIndex. When non-null, `record_offset` receives
+  // the payload's physical offset.
+  Status WriteEmbeddedBlobRecord(const Slice& payload,
+                                 CompressionType compression,
+                                 uint64_t* record_offset);
 
   struct Rep;
   class BlockBasedTablePropertiesCollectorFactory;

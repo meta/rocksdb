@@ -264,8 +264,9 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
 
   // Batched counterpart of GetSameFileBlob: coalesces the cache-miss reads of
   // multiple embedded (same-file) records in this SST into a single MultiRead
-  // (one for whole records, one for sub-ranges). Force-verify reads
-  // (kVerifyIfPresent) fall back to per-record GetSameFileBlob.
+  // per checksum policy for whole records and one MultiRead for sub-ranges.
+  // Standalone readers use the raw SimpleGen2 batch primitives; DB-owned SSTs
+  // route through BlobSource for cache integration.
   void MultiGetSameFileBlob(const ReadOptions& read_options, size_t num_reads,
                             SameFileBlobReadRequest* reqs) const override;
 
@@ -377,6 +378,14 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   void SetupForCompaction() override;
 
   std::shared_ptr<const TableProperties> GetTableProperties() const override;
+
+  Status ReadBlobReferenceGroups(
+      const Slice& expected_descriptor,
+      std::vector<BlobReferenceGroup>* groups) const override;
+  Status ReadBlobReferences(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      const BlobReferenceGroup& expected_group,
+      std::vector<BlobReference>* references) const override;
 
   const SeqnoToTimeMapping& GetSeqnoToTimeMapping() const;
 

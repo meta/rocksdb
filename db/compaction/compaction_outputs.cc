@@ -56,6 +56,8 @@ Status CompactionOutputs::Finish(
     meta->user_defined_timestamps_persisted =
         static_cast<bool>(tp.user_defined_timestamps_persisted);
     ExtractTimestampFromTableProperties(tp, meta);
+    ExtractBlobReferenceDescriptorFromTableProperties(tp, meta);
+    meta->blob_reference_summary = builder_->GetBlobReferenceSstSummary();
   }
   current_output().finished = true;
   stats_.bytes_written += current_bytes;
@@ -64,6 +66,19 @@ Status CompactionOutputs::Finish(
   worker_cpu_micros_ += builder_->GetWorkerCPUMicros();
 
   return s;
+}
+
+void CompactionOutputs::UpdateTableProperties(
+    const TableProperties& table_properties) {
+  current_output().table_properties =
+      std::make_shared<TableProperties>(table_properties);
+  ExtractBlobReferenceDescriptorFromTableProperties(table_properties,
+                                                    &current_output().meta);
+}
+
+void CompactionOutputs::UpdateTableProperties() {
+  TableProperties table_properties = GetTableProperties();
+  UpdateTableProperties(table_properties);
 }
 
 IOStatus CompactionOutputs::WriterSyncClose(const Status& input_status,

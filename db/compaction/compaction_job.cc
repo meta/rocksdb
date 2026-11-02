@@ -23,6 +23,7 @@
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_builder.h"
+#include "db/blob/blob_source.h"
 #include "db/builder.h"
 #include "db/compaction/clipping_iterator.h"
 #include "db/compaction/compaction_state.h"
@@ -1757,6 +1758,11 @@ void CompactionJob::CreateBlobFileBuilder(
     blob_file_builder = std::make_unique<BlobFileBuilder>(
         [this]() { return NewBlobFileNumber(); }, fs_.get(),
         &sub_compact->compaction->immutable_options(), &mutable_cf_options,
+        cfd->blob_source() != nullptr
+            ? cfd->blob_source()->GetBlobCacheShared()
+            : GetBlobCacheWithReservation(
+                  sub_compact->compaction->immutable_options(),
+                  mutable_cf_options),
         &file_options_, &write_options, db_id_, db_session_id_, job_id_,
         cfd->GetID(), cfd->GetName(), write_hint_, io_tracer_, blob_callback_,
         BlobFileCreationReason::kCompaction, GetBlobOutputPath(),
@@ -2679,6 +2685,13 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
           const std::unordered_map<uint64_t, BlobFileState>::const_iterator
               blob_file = blob_files.find(blob_file_number);
           if (blob_file == blob_files.end()) {
+            // Legacy garbage metering can see a stable identity whose normal
+            // source was retired by exact standalone GC. Its identity route
+            // proves the source is gone on purpose, so the delta is a no-op.
+            if (storage_info->GetBlobRelocationRoute(BlobRelocationRouteSource{
+                    blob_file_number, blob_file_number}) != nullptr) {
+              continue;
+            }
             return Status::Corruption(
                 "Compaction produced garbage for an unknown blob file");
           }
@@ -2718,6 +2731,12 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
     for (const auto& blob : sub_compact.Current().GetBlobFileAdditions()) {
       edit->AddBlobFile(blob);
     }
+  }
+
+  if (!edit->GetNewFiles().empty() &&
+      compaction->mutable_cf_options().enable_blob_indirection) {
+    edit->SetBlobIndirectionFormatVersion(
+        kBlobIndirectionManifestFormatVersion);
   }
 
   for (const auto& pair : blob_total_garbage) {

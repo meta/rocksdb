@@ -17,6 +17,7 @@
 
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_garbage.h"
+#include "db/blob/blob_relocation_manifest.h"
 #include "db/dbformat.h"
 #include "db/wal_edit.h"
 #include "memory/arena.h"
@@ -26,9 +27,12 @@
 #include "table/table_reader.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
+#include "util/atomic.h"
 #include "util/autovector.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+struct BlobReferenceSstSummary;
 
 // Tag numbers for serialized VersionEdit.  These numbers are written to
 // disk and should not be changed. The number should be forward compatible so
@@ -59,6 +63,15 @@ enum Tag : uint32_t {
 
   kBlobFileAddition = 400,
   kBlobFileGarbage,
+  kBlobIndirectionFormatVersion,
+  kBlobRelocationFileAddition,
+  kBlobRelocationFileDeletion,
+  kBlobRelocationRoute,
+  kBlobRelocationRouteDeletion,
+  kDbBlobIndirectionFormatVersion,
+  kBlobFileRetirement,
+  // Required: ignoring accepted loss can resurrect an older value or cache hit.
+  kBlobRelocationFileLoss,
 
   // Mask for an unidentified tag from the future which can be safely ignored.
   kTagSafeIgnoreMask = 1 << 13,
@@ -123,9 +136,13 @@ enum NewFileCustomTag : uint32_t {
 
   // Forward incompatible (aka unignorable) fields
   kPathId,
+  kBlobReferenceDescriptor = kCustomTagNonSafeIgnoreMask | 18,
+  kBlobReferenceLegacyMetadata = kCustomTagNonSafeIgnoreMask | 19,
+  kOldestCoarseIdentityBlobFileNumber = kCustomTagNonSafeIgnoreMask | 20,
 };
 
 class VersionSet;
+class VersionStorageInfo;
 
 constexpr uint64_t kFileNumberMask = 0x3FFFFFFFFFFFFFFF;
 constexpr uint64_t kUnknownOldestAncestorTime = 0;
@@ -242,6 +259,22 @@ struct FileSampledStats {
   mutable std::atomic<uint64_t> num_collapsible_entry_reads_sampled;
 };
 
+// Copying metadata copies the counter value; Version ownership is acquired
+// explicitly through FileMetaData::Ref. This uses portable std::atomic storage.
+struct FileReferenceCount : RelaxedAtomic<int> {
+  FileReferenceCount() : RelaxedAtomic<int>(0) {}
+  FileReferenceCount(const FileReferenceCount& other)
+      : RelaxedAtomic<int>(other.LoadRelaxed()) {}
+  FileReferenceCount& operator=(const FileReferenceCount& other) {
+    StoreRelaxed(other.LoadRelaxed());
+    return *this;
+  }
+  FileReferenceCount& operator=(int value) {
+    StoreRelaxed(value);
+    return *this;
+  }
+};
+
 struct FileMetaData {
   FileDescriptor fd;
   InternalKey smallest;  // Smallest internal key served by table
@@ -270,7 +303,19 @@ struct FileMetaData {
   // next level covered by range tombstones in this file.
   uint64_t compensated_range_deletion_size = 0;
 
-  int refs = 0;  // Reference count
+  // Construction and reclamation can adjust ownership concurrently. Object
+  // publication has separate synchronization, so relaxed ordering suffices.
+  FileReferenceCount refs;
+
+  void Ref() { refs.FetchAddRelaxed(1); }
+
+  bool Unref() {
+    const int old_refs = refs.FetchSubRelaxed(1);
+    assert(old_refs > 0);
+    return old_refs == 1;
+  }
+
+  int NumRefs() const { return refs.LoadRelaxed(); }
 
   bool being_compacted = false;       // Is this file undergoing compaction?
   bool init_stats_from_file = false;  // true if the data-entry stats of this
@@ -336,6 +381,25 @@ struct FileMetaData {
   // via FileOptions::file_metadata on subsequent opens. Empty if not available.
   std::string file_open_metadata;
 
+  // Checksummed descriptor for the exact external-blob reference metadata in
+  // this SST. Empty identifies an SST created before exact metadata was
+  // required. A nonempty value is a required NewFile field so recovery can
+  // distinguish missing metadata from a complete-empty reference set.
+  std::string blob_reference_descriptor;
+  // Unpersisted builder-validated summary. Recovery reconstructs this lazily;
+  // local outputs and validated remote imports provide it before queueing.
+  std::shared_ptr<const BlobReferenceSstSummary> blob_reference_summary;
+  // Required marker when a MANIFEST snapshot re-emits an SST that predates
+  // feature activation and therefore has no exact-reference descriptor.
+  bool blob_reference_legacy_metadata = false;
+  // Only coarse-feature SSTs set this field. It is independent of the legacy
+  // oldest_blob_file_number and pins all identity roots at or above this ID.
+  uint64_t oldest_coarse_identity_blob_file_number = kInvalidBlobFileNumber;
+  // Transient provenance for an output built from a pre-activation Version.
+  // The MANIFEST writer resolves it against the fence visible when this edit
+  // reaches the queue head. This field is never encoded.
+  bool blob_reference_output_predates_indirection = false;
+
   // Skips prefetching index and filter blocks into block cache on file open,
   // not persisted in MANIFEST. NOTE: false does not guarantee prefetching
   // either (e.g. when index and filter blocks are not cached in block cache).
@@ -380,6 +444,13 @@ struct FileMetaData {
   // the last key to be the largest).
   Status UpdateBoundaries(const Slice& key, const Slice& value,
                           SequenceNumber seqno, ValueType value_type);
+  // Compaction must resolve indirect indexes against its pinned input Version
+  // before updating normal blob-file liveness. A stable origin can already be
+  // backed by a relocation file and must not keep, or stand in for, a normal
+  // blob file.
+  Status UpdateBoundaries(const Slice& key, const Slice& value,
+                          SequenceNumber seqno, ValueType value_type,
+                          const VersionStorageInfo& blob_relocation_storage);
 
   // Unlike UpdateBoundaries, ranges do not need to be presented in any
   // particular order.
@@ -457,7 +528,8 @@ struct FileMetaData {
 #endif  // ROCKSDB_MALLOC_USABLE_SIZE
     usage += smallest.size() + largest.size() + file_checksum.size() +
              file_checksum_func_name.size() + min_timestamp.size() +
-             max_timestamp.size() + file_open_metadata.size();
+             max_timestamp.size() + file_open_metadata.size() +
+             blob_reference_descriptor.size();
     return usage;
   }
 
@@ -862,15 +934,43 @@ class VersionEdit {
   void AddFile(int level, const FileMetaData& f) {
     assert(f.fd.smallest_seqno <= f.fd.largest_seqno);
     new_files_.emplace_back(level, f);
+    has_blob_reference_output_predating_indirection_ |=
+        f.blob_reference_output_predates_indirection;
     files_to_quarantine_.push_back(f.fd.GetNumber());
     if (!HasLastSequence() || f.fd.largest_seqno > GetLastSequence()) {
       SetLastSequence(f.fd.largest_seqno);
     }
   }
 
+  // Re-record an existing physical SST while copying only persisted metadata.
+  // FileMetaData also owns runtime handles and refcounts, so the regular copy
+  // overload above is reserved for freshly constructed output metadata.
+  void AddFileFromExisting(int level, const FileMetaData& f) {
+    AddFile(level, f.fd.GetNumber(), f.fd.GetPathId(), f.fd.GetFileSize(),
+            f.smallest, f.largest, f.fd.smallest_seqno, f.fd.largest_seqno,
+            f.marked_for_compaction, f.temperature, f.oldest_blob_file_number,
+            f.oldest_ancestor_time, f.file_creation_time, f.epoch_number,
+            f.file_checksum, f.file_checksum_func_name, f.unique_id,
+            f.compensated_range_deletion_size, f.tail_size,
+            f.user_defined_timestamps_persisted, f.min_timestamp,
+            f.max_timestamp, f.file_open_metadata);
+    FileMetaData& added = new_files_.back().second;
+    added.blob_reference_descriptor = f.blob_reference_descriptor;
+    added.blob_reference_summary = f.blob_reference_summary;
+    added.blob_reference_legacy_metadata = f.blob_reference_legacy_metadata;
+    added.oldest_coarse_identity_blob_file_number =
+        f.oldest_coarse_identity_blob_file_number;
+  }
+
   const NewFiles& GetNewFiles() const { return new_files_; }
 
   NewFiles& GetMutableNewFiles() { return new_files_; }
+
+  bool HasBlobReferenceOutputPredatingIndirection() const {
+    return has_blob_reference_output_predating_indirection_;
+  }
+
+  void MarkBlobReferenceOutputsPredatingIndirectionLegacy();
 
   // Retrieve all the compact cursors
   using CompactCursors = std::vector<std::pair<int, InternalKey>>;
@@ -897,6 +997,16 @@ class VersionEdit {
     blob_file_additions_.emplace_back(
         blob_file_number, total_blob_count, total_blob_bytes,
         std::move(checksum_method), std::move(checksum_value));
+    files_to_quarantine_.push_back(blob_file_number);
+  }
+
+  void AddBlobFile(uint64_t blob_file_number, uint64_t total_blob_count,
+                   uint64_t total_blob_bytes, std::string checksum_method,
+                   std::string checksum_value, bool is_identity_root) {
+    blob_file_additions_.emplace_back(
+        blob_file_number, total_blob_count, total_blob_bytes,
+        std::move(checksum_method), std::move(checksum_value),
+        is_identity_root);
     files_to_quarantine_.push_back(blob_file_number);
   }
 
@@ -946,6 +1056,82 @@ class VersionEdit {
     blob_file_garbages_ = std::move(blob_file_garbages);
   }
 
+  void SetBlobIndirectionFormatVersion(uint32_t format_version) {
+    has_blob_indirection_format_version_ = true;
+    blob_indirection_format_version_ = format_version;
+  }
+  bool HasBlobIndirectionFormatVersion() const {
+    return has_blob_indirection_format_version_;
+  }
+  uint32_t GetBlobIndirectionFormatVersion() const {
+    assert(HasBlobIndirectionFormatVersion());
+    return blob_indirection_format_version_;
+  }
+
+  // A DB-global compatibility fence is distinct from the per-column-family
+  // activation above. In particular, a MANIFEST snapshot must not activate
+  // the default column family merely because another column family uses blob
+  // indirection.
+  void SetDbBlobIndirectionFormatVersion(uint32_t format_version) {
+    has_db_blob_indirection_format_version_ = true;
+    db_blob_indirection_format_version_ = format_version;
+  }
+  bool HasDbBlobIndirectionFormatVersion() const {
+    return has_db_blob_indirection_format_version_;
+  }
+  uint32_t GetDbBlobIndirectionFormatVersion() const {
+    assert(HasDbBlobIndirectionFormatVersion());
+    return db_blob_indirection_format_version_;
+  }
+
+  void AddBlobRelocationFile(BlobRelocationFileAddition addition) {
+    blob_relocation_file_additions_.emplace_back(std::move(addition));
+    files_to_quarantine_.push_back(
+        blob_relocation_file_additions_.back().GetFileNumber());
+  }
+  const std::vector<BlobRelocationFileAddition>&
+  GetBlobRelocationFileAdditions() const {
+    return blob_relocation_file_additions_;
+  }
+
+  void DeleteBlobRelocationFile(uint64_t file_number) {
+    blob_relocation_file_deletions_.push_back(file_number);
+  }
+  const std::vector<uint64_t>& GetBlobRelocationFileDeletions() const {
+    return blob_relocation_file_deletions_;
+  }
+
+  void MarkBlobRelocationFileMissing(uint64_t file_number) {
+    blob_relocation_file_losses_.push_back(file_number);
+  }
+  const std::vector<uint64_t>& GetBlobRelocationFileLosses() const {
+    return blob_relocation_file_losses_;
+  }
+
+  void SetBlobRelocationRoute(BlobRelocationRoute route) {
+    blob_relocation_routes_.emplace_back(std::move(route));
+  }
+  const std::vector<BlobRelocationRoute>& GetBlobRelocationRoutes() const {
+    return blob_relocation_routes_;
+  }
+
+  void DeleteBlobRelocationRoute(uint64_t generation_file_number,
+                                 uint64_t origin_file_number) {
+    blob_relocation_route_deletions_.push_back(
+        BlobRelocationRouteSource{generation_file_number, origin_file_number});
+  }
+  const std::vector<BlobRelocationRouteSource>&
+  GetBlobRelocationRouteDeletions() const {
+    return blob_relocation_route_deletions_;
+  }
+
+  void RetireBlobFile(BlobFileRetirement retirement) {
+    blob_file_retirements_.emplace_back(std::move(retirement));
+  }
+  const std::vector<BlobFileRetirement>& GetBlobFileRetirements() const {
+    return blob_file_retirements_;
+  }
+
   // Add a WAL (either just created or closed).
   // AddWal and DeleteWalsBefore cannot be called on the same VersionEdit.
   void AddWal(WalNumber number, WalMetadata metadata = WalMetadata()) {
@@ -979,7 +1165,15 @@ class VersionEdit {
   size_t NumEntries() const {
     return new_files_.size() + deleted_files_.size() +
            blob_file_additions_.size() + blob_file_garbages_.size() +
-           wal_additions_.size() + !wal_deletion_.IsEmpty();
+           blob_relocation_file_additions_.size() +
+           blob_relocation_file_deletions_.size() +
+           blob_relocation_file_losses_.size() +
+           blob_relocation_routes_.size() +
+           blob_relocation_route_deletions_.size() +
+           blob_file_retirements_.size() +
+           has_blob_indirection_format_version_ +
+           has_db_blob_indirection_format_version_ + wal_additions_.size() +
+           !wal_deletion_.IsEmpty();
   }
 
   void SetColumnFamily(uint32_t column_family_id) {
@@ -1152,8 +1346,22 @@ class VersionEdit {
   // Compaction cursors for round-robin compaction policy
   CompactCursors compact_cursors_;
   NewFiles new_files_;
+  bool has_blob_reference_output_predating_indirection_ = false;
+
   BlobFileAdditions blob_file_additions_;
   BlobFileGarbages blob_file_garbages_;
+
+  bool has_blob_indirection_format_version_ = false;
+  uint32_t blob_indirection_format_version_ = 0;
+  bool has_db_blob_indirection_format_version_ = false;
+  uint32_t db_blob_indirection_format_version_ = 0;
+  std::vector<BlobRelocationFileAddition> blob_relocation_file_additions_;
+  std::vector<uint64_t> blob_relocation_file_deletions_;
+  std::vector<uint64_t> blob_relocation_file_losses_;
+  std::vector<BlobRelocationRoute> blob_relocation_routes_;
+  std::vector<BlobRelocationRouteSource> blob_relocation_route_deletions_;
+  std::vector<BlobFileRetirement> blob_file_retirements_;
+
   WalAdditions wal_additions_;
 
   std::string db_id_;

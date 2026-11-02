@@ -26,7 +26,25 @@ class Status;
 class FilePrefetchBuffer;
 class Slice;
 class RandomAccessFileReader;
+class Decompressor;
+class CompressionManager;
+class SystemClock;
 enum ChecksumType : char;
+
+// Stable feature values deliberately exclude physical generation/location
+// from their cache identity so relocation does not duplicate or invalidate
+// them. Shared by flush prepopulation and the read path.
+CacheKey GetStableBlobCacheKey(const std::string& db_id,
+                               const std::string& db_session_id,
+                               uint64_t origin_file_number,
+                               uint64_t original_value_offset);
+
+// Applies the configured blob-cache memory charging policy. Flush-time cache
+// prepopulation and reads must use the same wrapper so both are accounted
+// against the block cache when charging is enabled.
+std::shared_ptr<Cache> GetBlobCacheWithReservation(
+    const ImmutableOptions& immutable_options,
+    const MutableCFOptions& mutable_cf_options);
 
 // One whole-record request for BlobSource::MultiGetSimpleGen2Blob (the batched
 // counterpart of GetSimpleGen2Blob). The per-file context (base cache key,
@@ -38,6 +56,7 @@ struct SimpleGen2BlobReadRequest {
   CompressionType expected_compression = kNoCompression;
   PinnableSlice* result = nullptr;
   Status* status = nullptr;
+  const BlobIndex* stable_blob_index = nullptr;
 };
 
 // One sub-range request for BlobSource::MultiGetSimpleGen2BlobRange (the
@@ -113,6 +132,30 @@ class BlobSource {
                       CompressionType compression_type, uint64_t range_offset,
                       size_t range_length, PinnableSlice* value,
                       uint64_t* bytes_read);
+
+  // Reads one indirect BlobIndex from an already resolved physical file. The
+  // stable cache is keyed only by the BlobIndex's logical identity; route
+  // selection stays outside this class so it uses the pinned Version.
+  Status GetIndirectBlob(const ReadOptions& read_options, const Slice& user_key,
+                         const BlobIndex& blob_index,
+                         const BlobFileOpenInfo& physical_file,
+                         uint64_t physical_file_size, bool is_relocation_file,
+                         uint32_t relocation_directory_digest,
+                         CompressionManager* relocation_compression_manager,
+                         uint8_t block_protection_bytes_per_key,
+                         uint64_t range_offset, size_t range_length,
+                         FilePrefetchBuffer* prefetch_buffer,
+                         PinnableSlice* value, uint64_t* bytes_read);
+
+  // Batched counterpart of GetIndirectBlob for requests whose pinned Version
+  // resolved to one physical file.
+  void MultiGetIndirectBlobFromOneFile(
+      const ReadOptions& read_options, const BlobFileOpenInfo& physical_file,
+      uint64_t physical_file_size, bool is_relocation_file,
+      uint32_t relocation_directory_digest,
+      CompressionManager* relocation_compression_manager,
+      uint8_t block_protection_bytes_per_key, size_t num_requests,
+      IndirectBlobReadRequest* requests, uint64_t* bytes_read);
 
   // Reads a SimpleGen2Blob payload (see db/blob/blob_gen2_format.h) through the
   // blob value cache and BLOB_DB_* statistics. This is the counterpart to
@@ -198,6 +241,8 @@ class BlobSource {
   void MultiGetSimpleGen2BlobRange(const ReadOptions& read_options,
                                    const OffsetableCacheKey& base_cache_key,
                                    RandomAccessFileReader* file,
+                                   ChecksumType checksum_type,
+                                   uint32_t base_context_checksum,
                                    size_t num_records,
                                    SimpleGen2BlobRangeReadRequest* reqs);
 
@@ -268,6 +313,9 @@ class BlobSource {
   }
 
   inline Cache* GetBlobCache() const { return blob_cache_.get(); }
+  const std::shared_ptr<Cache>& GetBlobCacheShared() const {
+    return blob_cache_storage_;
+  }
 
   bool TEST_BlobInCache(uint64_t file_number, uint64_t file_size,
                         uint64_t offset, size_t* charge = nullptr) const;
@@ -279,6 +327,10 @@ class BlobSource {
   using SharedCacheInterface =
       FullTypedSharedCacheInterface<BlobContents, BlobContentsCreator>;
   using TypedHandle = SharedCacheInterface::TypedHandle;
+  using StableSharedCacheInterface =
+      FullTypedSharedCacheInterface<StableBlobContents,
+                                    StableBlobContentsCreator>;
+  using StableTypedHandle = StableSharedCacheInterface::TypedHandle;
 
  private:
   Status GetBlobFromCache(const Slice& cache_key,
@@ -288,11 +340,33 @@ class BlobSource {
                           std::unique_ptr<BlobContents>* blob,
                           CacheHandleGuard<BlobContents>* cached_blob) const;
 
+  Status GetStableBlobFromCache(
+      const Slice& cache_key, const BlobIndex& blob_index,
+      CacheHandleGuard<StableBlobContents>* cached_blob,
+      bool record_statistics) const;
+
+  Status PutStableBlobIntoCache(
+      const Slice& cache_key, const BlobIndex& blob_index,
+      const Slice& logical_value,
+      CacheHandleGuard<StableBlobContents>* cached_blob) const;
+
+  Status FinishIndirectBlobRead(const ReadOptions& read_options,
+                                const BlobIndex& blob_index,
+                                const Slice& stable_cache_key,
+                                bool materialized_whole, uint64_t range_offset,
+                                size_t range_length,
+                                PinnableSlice* physical_value,
+                                PinnableSlice* result) const;
+
   static void PinCachedBlob(CacheHandleGuard<BlobContents>* cached_blob,
                             PinnableSlice* value);
 
   static void PinOwnedBlob(std::unique_ptr<BlobContents>* owned_blob,
                            PinnableSlice* value);
+
+  static void PinStableCachedBlob(
+      CacheHandleGuard<StableBlobContents>* cached_blob, uint64_t range_offset,
+      size_t range_length, PinnableSlice* value);
 
   TypedHandle* GetEntryFromCache(const Slice& key) const;
 
@@ -310,12 +384,24 @@ class BlobSource {
   const std::string& db_session_id_;
 
   Statistics* statistics_;
+  SystemClock* clock_;
 
   // A cache to store blob file reader.
   BlobFileCache* blob_file_cache_;
 
+  // Shared ownership of the raw or memory-charging blob cache wrapper used by
+  // both typed interfaces below.
+  std::shared_ptr<Cache> blob_cache_storage_;
+
   // A cache to store uncompressed blobs.
   mutable SharedCacheInterface blob_cache_;
+
+  // Feature values use a distinct logical key and persisted cache value type,
+  // but share the configured blob cache and its charge policy.
+  mutable StableSharedCacheInterface stable_blob_cache_;
+
+  // SimpleGen2 records can mix built-in blob compression types in one table.
+  std::shared_ptr<Decompressor> simple_gen2_decompressor_;
 
   // The control option of how the cache tiers will be used. Currently rocksdb
   // support block/blob cache (volatile tier) and secondary cache (this tier

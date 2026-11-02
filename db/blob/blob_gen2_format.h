@@ -7,6 +7,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <limits>
 
 #include "cache/cache_key.h"
 #include "rocksdb/compression_type.h"
@@ -33,7 +35,8 @@ enum ChecksumType : char;
 // context-modified by the record's absolute file offset (see
 // ChecksumModifierForContext / ComputeBuiltinChecksumWithLastByte in
 // table/format.h) so that an identical payload at a different offset gets a
-// different stored checksum. Payloads are currently uncompressed only.
+// different stored checksum. The payload bytes are the caller-supplied stored
+// representation; the compression marker describes how to decode them.
 //
 // This format is deliberately decoupled from any particular file type: the same
 // record shape is read out of SST files (embedded blobs) and is intended to be
@@ -41,6 +44,18 @@ enum ChecksumType : char;
 // the byte source (a RandomAccessFileReader) and the checksum context (checksum
 // type + base context checksum), both passed in by the caller.
 inline constexpr size_t kSimpleGen2BlobTrailerSize = 5;
+inline constexpr size_t kBlobRelocationStreamChunkSize = 64 * 1024;
+using BlobChunkConsumer = std::function<Status(const Slice&)>;
+// Success promises that exactly the declared stored payload was delivered and
+// its checksum-v2 CRC (payload plus compression byte) was verified. A consumer
+// error must stop the source immediately, without retaining any chunk Slice.
+using VerifiedBlobStoredSource =
+    std::function<Status(const BlobChunkConsumer&)>;
+inline constexpr uint64_t kMaxSimpleGen2BlobPayloadSize =
+    std::numeric_limits<size_t>::max() - kSimpleGen2BlobTrailerSize <
+            std::numeric_limits<uint32_t>::max()
+        ? std::numeric_limits<size_t>::max() - kSimpleGen2BlobTrailerSize
+        : std::numeric_limits<uint32_t>::max();
 
 // Cache key for the SimpleGen2Blob record at byte `record_offset` within a file
 // whose base cache key is `base_cache_key`. Delegates to the shared
@@ -63,10 +78,10 @@ inline CacheKey GetSimpleGen2BlobCacheKey(
 // `checksum_type` and `base_context_checksum` are the file's checksum context
 // (e.g. from the SST footer). `expected_compression` is the compression type
 // the caller expects the record to carry (from the blob index); it must match
-// the record's marker, and currently must be kNoCompression.
+// the record's marker.
 //
-// On success, buf[0, payload_size) holds the verified, uncompressed payload
-// (the trailer remains at the tail of `buf` and can be ignored).
+// On success, buf[0, payload_size) holds the verified stored payload. The
+// caller decompresses it when the marker is not kNoCompression.
 Status ReadAndVerifySimpleGen2BlobRecord(
     const ReadOptions& read_options, RandomAccessFileReader* file,
     uint64_t record_offset, size_t payload_size, size_t record_size,
@@ -149,13 +164,32 @@ void ReadSimpleGen2BlobRanges(const ReadOptions& read_options,
 // record format lives in one module.
 //
 // `checksum_type` and `base_context_checksum` are the file's checksum context
-// (e.g. from the SST footer). `compression` is the payload's compression type,
-// which currently must be kNoCompression.
+// (e.g. from the SST footer). `compression` describes the supplied stored
+// payload. This function never recompresses it.
 IOStatus WriteSimpleGen2BlobRecord(WritableFileWriter* file,
                                    const WriteOptions& write_options,
                                    ChecksumType checksum_type,
                                    uint32_t base_context_checksum,
                                    uint64_t record_offset, const Slice& payload,
                                    CompressionType compression);
+
+// Reads one payload with bounded scratch memory and mandatory stored-byte CRC
+// verification. File-kind-specific bounds and trailer validation belong to
+// the caller. The consumer can receive bytes before verification completes;
+// its output must not be published unless this function returns OK.
+Status StreamAndVerifyBlobStoredPayload(
+    const ReadOptions& read_options, RandomAccessFileReader* file,
+    uint64_t record_offset, uint64_t payload_size, CompressionType compression,
+    uint32_t stored_checksum, const BlobChunkConsumer& consumer);
+
+// Writes a verified streaming source without materializing the payload. A
+// checksum-v2 source already computed the CRC used by the CRC32c trailer, so
+// only masking and destination-context adjustment remain. kNoChecksum is also
+// supported. A failed/short/long source leaves an unpublished partial file.
+Status WriteSimpleGen2BlobRecordStream(
+    WritableFileWriter* file, const WriteOptions& write_options,
+    ChecksumType checksum_type, uint32_t base_context_checksum,
+    uint64_t record_offset, uint64_t payload_size, CompressionType compression,
+    uint32_t stored_checksum, const VerifiedBlobStoredSource& source);
 
 }  // namespace ROCKSDB_NAMESPACE
