@@ -13,7 +13,7 @@ import java.lang.foreign.ValueLayout;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 
-public class RocksFFM {
+public class RocksFFMBasic {
   static {
     RocksDB.loadLibrary();
   }
@@ -21,14 +21,14 @@ public class RocksFFM {
   final Arena dbArena;
   final MemorySegment db;
 
-  private RocksFFM(final Arena dbArena, final MemorySegment db) {
+  private RocksFFMBasic(final Arena dbArena, final MemorySegment db) {
     this.db = db;
     this.dbArena = dbArena;
   }
 
   private static final MemorySegment NULL = MemorySegment.ofAddress(0L);
 
-  public static RocksFFM open(Arena dbArena, String dbPath) throws RocksDBException {
+  public static RocksFFMBasic open(Arena dbArena, String dbPath) throws RocksDBException {
     // TODO (AP) -- Options lifecycle may not be safely confined to a confined arena ?
     // See RocksDB rules on options structs
     MemorySegment options = rocksdb_c_api_2.rocksdb_options_create();
@@ -38,7 +38,7 @@ public class RocksFFM {
 
     MemorySegment err = errptr.get(ValueLayout.ADDRESS, 0L);
     if (err.address() == NULL.address()) {
-      return new RocksFFM(dbArena, db);
+      return new RocksFFMBasic(dbArena, db);
     } else {
       err = err.reinterpret(Long.MAX_VALUE);
       String message = err.getString(0, UTF_8);
