@@ -815,11 +815,35 @@ class BlockIter : public InternalIteratorBase<TValue> {
   // all keys in the block (per the user comparator).
   bool StripSeekTargetPrefix(const Slice& target, Slice* target_suffix,
                              bool* before_all) const;
+  // Whether StripSeekTargetPrefix()'s before/after result remains conclusive.
+  // A legacy reverse-bytewise prefix can extend into a non-restart key's
+  // footer by at most kNumInternalBytes. A target that differs before those
+  // bytes still compares to every key with the same sign as to the full prefix.
+  bool CanClassifyPrefixMismatch(const Slice& target) const {
+    assert(has_common_prefix());
+    const Comparator* ucmp = icmp_.user_comparator();
+    assert(ucmp == BytewiseComparator() || ucmp == ReverseBytewiseComparator());
+    if (ucmp == BytewiseComparator() || raw_key_.IsUserKey()) {
+      return true;
+    }
+
+    const size_t guaranteed_prefix_size =
+        common_prefix_size_ > kNumInternalBytes
+            ? common_prefix_size_ - kNumInternalBytes
+            : 0;
+    if (guaranteed_prefix_size == 0) {
+      return false;
+    }
+    return !ExtractUserKey(target).starts_with(
+        Slice(data_, guaranteed_prefix_size));
+  }
   template <typename DecodeKeyFunc>
   bool BinarySeekSuffix(const Slice& target_suffix, uint32_t* index,
                         bool* skip_linear_scan);
-  void FindKeyAfterBinarySeekSuffix(const Slice& target_suffix, uint32_t index,
-                                    bool skip_linear_scan);
+  template <bool kCompareFullKeyForShortUserKey>
+  void FindKeyAfterBinarySeekSuffixImpl(const Slice& target_suffix,
+                                        const Slice& target, uint32_t index,
+                                        bool skip_linear_scan);
   // Compares the current (full) key against `target_suffix`, skipping the
   // common prefix bytes on the current key. REQUIRES: has_common_prefix().
   int CompareCurrentKeySuffix(const Slice& target_suffix) const {
@@ -828,6 +852,17 @@ class BlockIter : public InternalIteratorBase<TValue> {
     Slice suffix(full.data() + common_prefix_size_,
                  full.size() - common_prefix_size_);
     return CompareKey(suffix, target_suffix);
+  }
+  int CompareCurrentKeySuffix(const Slice& target_suffix,
+                              const Slice& target) const {
+    // An internal-key block may have a non-restart user key shorter than the
+    // stored prefix. Its delta encoding still reconstructs the full key, so
+    // compare it directly instead of slicing through the internal-key footer.
+    assert(!raw_key_.IsUserKey());
+    if (raw_key_.GetUserKey().size() < common_prefix_size_) {
+      return CompareCurrentKey(target);
+    }
+    return CompareCurrentKeySuffix(target_suffix);
   }
 };
 

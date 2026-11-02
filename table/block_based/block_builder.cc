@@ -339,11 +339,10 @@ inline void BlockBuilder::AddWithLastKeyImpl(
   // RewriteRestartKeysStrippingPrefix() at Finish(). To keep this nearly free
   // in the common (stable-prefix) case, we exploit `shared` (bytes shared with
   // the previous key): a non-restart key that shares >= prefix_len bytes with
-  // its predecessor still starts with the whole running prefix (keys are
-  // sorted), so the prefix can only shrink when shared < prefix_len, in which
-  // case the new prefix length is exactly `shared`. Restart entries have shared
-  // forced to 0, so they are rechecked with a real comparison (cheap:
-  // 1/restart_interval).
+  // its predecessor still starts with the whole running prefix. For internal
+  // keys, shared can extend into the footer, so cap it at the current user-key
+  // length. Restart entries have shared forced to 0, so they are rechecked with
+  // a real comparison (cheap: 1/restart_interval).
   if (use_common_prefix_) {
     // The reader treats every shared==0 entry as a stripped restart key and
     // prepends the block's common prefix. skip_delta_encoding would create a
@@ -364,8 +363,13 @@ inline void BlockBuilder::AddWithLastKeyImpl(
       if (common < first_key_prefix_.size()) {
         first_key_prefix_.resize(common);
       }
-    } else if (shared < first_key_prefix_.size()) {
-      first_key_prefix_.resize(shared);
+    } else {
+      const Slice uk =
+          is_user_key_ ? key_to_persist : ExtractUserKey(key_to_persist);
+      const size_t shared_user_key = std::min<size_t>(shared, uk.size());
+      if (shared_user_key < first_key_prefix_.size()) {
+        first_key_prefix_.resize(shared_user_key);
+      }
     }
   }
 

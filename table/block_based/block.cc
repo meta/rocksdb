@@ -188,8 +188,9 @@ void DataBlockIter::SeekImpl(const Slice& target) {
   if (has_common_prefix()) {
     const Comparator* ucmp = icmp_.user_comparator();
     if (ucmp == BytewiseComparator() || ucmp == ReverseBytewiseComparator()) {
-      // Bytewise: strip the block's common prefix from the target once and
-      // compare shortened suffixes (no per-probe key materialization).
+      // For bytewise comparators, strip the block's common prefix from the
+      // target once and compare shortened suffixes (no per-probe key
+      // materialization).
       Slice target_suffix;
       bool before_all = false;
       if (StripSeekTargetPrefix(target, &target_suffix, &before_all)) {
@@ -199,23 +200,31 @@ void DataBlockIter::SeekImpl(const Slice& target) {
                                          &skip_linear_scan)) {
           return;
         }
-        FindKeyAfterBinarySeekSuffix(target_suffix, index, skip_linear_scan);
-      } else if (before_all) {
-        // Target sorts before all keys in the block: position at the first key.
-        SeekToRestartPoint(0);
-        NextImpl();
-      } else {
-        // Target sorts after all keys in the block: no key is >= target.
-        current_ = GetKeysEndOffset();
-        restart_index_ = num_restarts_;
+        FindKeyAfterBinarySeekSuffixImpl<true>(target_suffix, target, index,
+                                               skip_linear_scan);
+        return;
       }
-      return;
+      if (CanClassifyPrefixMismatch(target)) {
+        if (before_all) {
+          // Target sorts before all keys in the block: position at the first
+          // key.
+          SeekToRestartPoint(0);
+          NextImpl();
+        } else {
+          // Target sorts after all keys in the block: no key is >= target.
+          current_ = GetKeysEndOffset();
+          restart_index_ = num_restarts_;
+        }
+        return;
+      }
+      // A reverse-bytewise internal-key target sharing the guaranteed prefix
+      // needs full-key search.
     }
-    // Non-(reverse-)bytewise comparator (optimize_key_common_prefix=kEnabled):
-    // the suffix-seek shortcut is not order-preserving, so fall through to the
-    // standard binary search below, which reconstructs each probed restart key
-    // (see BinarySeekRestartPointIndex) and compares full keys with the real
-    // comparator; the linear scan reconstructs via ParseNextKey.
+    // Other comparators (optimize_key_common_prefix=kEnabled) cannot use the
+    // suffix-seek shortcut because it is not order-preserving. The reverse-
+    // bytewise mismatch case above also falls through to this full-key search.
+    // BinarySeekRestartPointIndex reconstructs each restart key, and the linear
+    // scan reconstructs keys via ParseNextKey.
   }
   uint32_t index = 0;
   bool skip_linear_scan = false;
@@ -408,14 +417,14 @@ void IndexBlockIter::SeekImpl(const Slice& target) {
   } else if (has_common_prefix() &&
              (icmp_.user_comparator() == BytewiseComparator() ||
               icmp_.user_comparator() == ReverseBytewiseComparator())) {
-    // Stripped index block (format_version >= 8), (reverse-)bytewise: use the
-    // binary suffix-seek path. It reads the identical on-disk format and is
-    // correct for every index_search_type_, so interpolation on a stripped
-    // block falls back to binary here (its suffix-aware optimization is
-    // deferred; see plan Phase 3). Non-(reverse-)bytewise stripped blocks
-    // (optimize_key_common_prefix=kEnabled) fall through to the standard binary
-    // search below, which reconstructs each probed restart key. Hash
-    // (prefix_index_) is handled above and reconstructs in CompareBlockKey.
+    // For stripped (reverse-)bytewise index blocks, use binary suffix search
+    // when the target shares the stored prefix. It is valid for every
+    // index_search_type_; interpolation on a stripped block falls back to
+    // binary here. Internal-key blocks with a non-matching target use the
+    // reconstructing full-key binary search below because a non-restart key
+    // can be shorter than the stored prefix. Other comparators also use full
+    // keys. Hash (prefix_index_) is handled above and reconstructs in
+    // CompareBlockKey.
     Slice target_suffix;
     bool before_all = false;
     if (StripSeekTargetPrefix(seek_key, &target_suffix, &before_all)) {
@@ -427,15 +436,34 @@ void IndexBlockIter::SeekImpl(const Slice& target) {
       if (!sok) {
         return;
       }
-      FindKeyAfterBinarySeekSuffix(target_suffix, index, skip_linear_scan);
-    } else if (before_all) {
-      // Target sorts before all keys: position at the first key.
-      SeekToRestartPoint(0);
-      ParseNextIndexKey();
+      if (raw_key_.IsUserKey()) {
+        FindKeyAfterBinarySeekSuffixImpl<false>(target_suffix, Slice(), index,
+                                                skip_linear_scan);
+      } else {
+        FindKeyAfterBinarySeekSuffixImpl<true>(target_suffix, seek_key, index,
+                                               skip_linear_scan);
+      }
+    } else if (CanClassifyPrefixMismatch(seek_key)) {
+      if (before_all) {
+        // Target sorts before all keys: position at the first key.
+        SeekToRestartPoint(0);
+        ParseNextIndexKey();
+      } else {
+        // Target sorts after all keys: no key is >= target.
+        current_ = GetKeysEndOffset();
+        restart_index_ = num_restarts_;
+      }
     } else {
-      // Target sorts after all keys: no key is >= target.
-      current_ = GetKeysEndOffset();
-      restart_index_ = num_restarts_;
+      // A reverse-bytewise internal-key target sharing the guaranteed prefix
+      // needs full-key binary search instead of classification.
+      ok = value_delta_encoded_ ? BinarySeekRestartPointIndex<DecodeKeyV4>(
+                                      seek_key, &index, &skip_linear_scan)
+                                : BinarySeekRestartPointIndex<DecodeKey>(
+                                      seek_key, &index, &skip_linear_scan);
+      if (!ok) {
+        return;
+      }
+      FindKeyAfterBinarySeek(seek_key, index, skip_linear_scan);
     }
     return;
   } else {
@@ -484,29 +512,37 @@ void DataBlockIter::SeekForPrevImpl(const Slice& target) {
                                          &skip_linear_scan)) {
           return;
         }
-        FindKeyAfterBinarySeekSuffix(target_suffix, index, skip_linear_scan);
+        FindKeyAfterBinarySeekSuffixImpl<true>(target_suffix, seek_key, index,
+                                               skip_linear_scan);
         if (!Valid()) {
           if (status_.ok()) {
             SeekToLastImpl();
           }
         } else {
-          while (Valid() && CompareCurrentKeySuffix(target_suffix) > 0) {
+          while (Valid() &&
+                 CompareCurrentKeySuffix(target_suffix, seek_key) > 0) {
             PrevImpl();
           }
         }
-      } else if (before_all) {
-        // Target sorts before all keys: no key is <= target.
-        current_ = GetKeysEndOffset();
-        restart_index_ = num_restarts_;
-      } else {
-        // Target sorts after all keys: the last key is <= target.
-        SeekToLastImpl();
+        return;
       }
-      return;
+      if (CanClassifyPrefixMismatch(target)) {
+        if (before_all) {
+          // Target sorts before all keys: no key is <= target.
+          current_ = GetKeysEndOffset();
+          restart_index_ = num_restarts_;
+        } else {
+          // Target sorts after all keys: the last key is <= target.
+          SeekToLastImpl();
+        }
+        return;
+      }
+      // A reverse-bytewise internal-key target sharing the guaranteed prefix
+      // needs the comparator-aware full-key search below.
     }
-    // Non-(reverse-)bytewise comparator (optimize_key_common_prefix=kEnabled):
-    // fall through to the standard binary search below, which reconstructs each
-    // probed restart key and compares full keys with the real comparator.
+    // Other comparators (optimize_key_common_prefix=kEnabled) cannot use the
+    // suffix-seek shortcut because it is not order-preserving. The reverse-
+    // bytewise mismatch case above also falls through to full-key search.
   }
   uint32_t index = 0;
   bool skip_linear_scan = false;
@@ -1054,9 +1090,10 @@ bool BlockIter<TValue>::BinarySeekSuffix(const Slice& target_suffix,
 // Mirrors FindKeyAfterBinarySeek but uses CompareCurrentKeySuffix so the common
 // prefix bytes are skipped on every comparison.
 template <class TValue>
-void BlockIter<TValue>::FindKeyAfterBinarySeekSuffix(const Slice& target_suffix,
-                                                     uint32_t index,
-                                                     bool skip_linear_scan) {
+template <bool kCompareFullKeyForShortUserKey>
+void BlockIter<TValue>::FindKeyAfterBinarySeekSuffixImpl(
+    const Slice& target_suffix, const Slice& target, uint32_t index,
+    bool skip_linear_scan) {
   SeekToRestartPoint(index);
   NextImpl();
   assert(cur_entry_idx_ >= 0);
@@ -1074,9 +1111,20 @@ void BlockIter<TValue>::FindKeyAfterBinarySeekSuffix(const Slice& target_suffix,
         break;
       }
       if (current_ == max_offset) {
-        assert(CompareCurrentKeySuffix(target_suffix) > 0);
+        if constexpr (kCompareFullKeyForShortUserKey) {
+          assert(CompareCurrentKeySuffix(target_suffix, target) > 0);
+        } else {
+          assert(CompareCurrentKeySuffix(target_suffix) > 0);
+        }
         break;
-      } else if (CompareCurrentKeySuffix(target_suffix) >= 0) {
+      }
+      int comparison;
+      if constexpr (kCompareFullKeyForShortUserKey) {
+        comparison = CompareCurrentKeySuffix(target_suffix, target);
+      } else {
+        comparison = CompareCurrentKeySuffix(target_suffix);
+      }
+      if (comparison >= 0) {
         break;
       }
     }

@@ -182,6 +182,339 @@ TEST_P(BlockTest, SimpleTest) {
   delete iter;
 }
 
+TEST(BlockCommonPrefixTest, PrefixDoesNotIncludeInternalKeyFooter) {
+  const SequenceNumber sequence = 0x123456789abc;
+  for (const std::string& user_key : {std::string(), std::string("user1")}) {
+    for (ValueType type :
+         {kTypeValue, kTypeDeletion, kTypeMerge, kTypeSingleDeletion}) {
+      std::string key = user_key;
+      AppendInternalKeyFooter(&key, sequence, type);
+      for (size_t extension_size : {size_t{1}, size_t{8}}) {
+        std::string neighbor = user_key;
+        neighbor.append(key.data() + user_key.size(), extension_size);
+        AppendInternalKeyFooter(&neighbor, sequence + 1, kTypeValue);
+        for (int restart_interval : {1, 16}) {
+          for (bool separated : {false, true}) {
+            SCOPED_TRACE(testing::Message()
+                         << "user_key_size=" << user_key.size() << " type="
+                         << type << " extension_size=" << extension_size
+                         << " restart_interval=" << restart_interval
+                         << " separated=" << separated);
+            BlockBuilder builder(
+                restart_interval, true /* use_delta_encoding */,
+                false /* use_value_delta_encoding */,
+                BlockBasedTableOptions::kDataBlockBinarySearch, 0.75,
+                0 /* ts_sz */, true /* persist_user_defined_timestamps */,
+                false /* is_user_key */, separated, nullptr /* statistics */,
+                -1.0 /* uniform_cv_threshold */, true /* use_common_prefix */);
+            builder.Add(neighbor, "neighbor");
+            builder.Add(key, "value");
+            Slice data = builder.Finish();
+            DataBlockFooter footer;
+            ASSERT_OK(footer.DecodeFrom(&data));
+            const uint32_t prefix_size =
+                DecodeFixed32(data.data() + data.size() -
+                              footer.num_restarts * sizeof(uint32_t));
+            ASSERT_EQ(user_key.size(), prefix_size);
+          }
+        }
+      }
+    }
+  }
+}
+
+namespace {
+
+// Immutable pre-fix format-v8 block bytes. These are derived from the legacy
+// encoding, not generated with the current BlockBuilder. The two-byte values
+// are ASCII in data-block tests and valid varint BlockHandles in index tests.
+const char kLegacyValueTagOverlapRestartBoundary[] =
+    "\x75\x73\x65\x72\x31\x01"
+    "\x00\x09\x02\x7a\x01\x09\x00\x00\x00\x00\x00\x00\x76\x30"
+    "\x06\x09\x02\x79\x01\x08\x00\x00\x00\x00\x00\x00\x76\x31"
+    "\x00\x08\x02\x01\x03\x00\x00\x00\x00\x00\x00\x76\x32"
+    "\x06\x07\x02\x02\x00\x00\x00\x00\x00\x00\x76\x33"
+    "\x06\x00\x00\x00\x22\x00\x00\x00\x02\x00\x00\x00";
+static_assert(sizeof(kLegacyValueTagOverlapRestartBoundary) - 1 == 71);
+
+const char kLegacyDeleteTagOverlap[] =
+    "\x75\x73\x65\x72\x31\x00"
+    "\x00\x08\x02\x01\x03\x00\x00\x00\x00\x00\x00\x76\x30"
+    "\x06\x07\x02\x02\x00\x00\x00\x00\x00\x00\x76\x31"
+    "\x06\x00\x00\x00\x01\x00\x00\x00";
+static_assert(sizeof(kLegacyDeleteTagOverlap) - 1 == 39);
+
+const char kLegacyEmptyUserFullFooterOverlap[] =
+    "\x01\x00\x00\x00\x00\x00\x00\x00"
+    "\x00\x08\x02\x01\x01\x00\x00\x00\x00\x00\x00\x6e\x30"
+    "\x08\x00\x02\x76\x30"
+    "\x08\x00\x00\x00\x01\x00\x00\x00";
+static_assert(sizeof(kLegacyEmptyUserFullFooterOverlap) - 1 == 34);
+
+// The 40-byte stored prefix contains a 32-byte user key and its whole footer.
+// This makes the guaranteed user-key prefix exactly 32 bytes, not 33.
+const char kLegacyLongUserFullFooterOverlap[] =
+    "\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70"
+    "\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70\x70"
+    "\x01\x00\x00\x00\x00\x00\x00\x00"
+    "\x00\x08\x02\x01\x01\x00\x00\x00\x00\x00\x00\x6e\x30"
+    "\x28\x00\x02\x76\x30"
+    "\x28\x00\x00\x00\x01\x00\x00\x00";
+static_assert(sizeof(kLegacyLongUserFullFooterOverlap) - 1 == 66);
+
+struct LegacyCommonPrefixBlock {
+  const char* name;
+  const char* bytes;
+  size_t size;
+  uint32_t restart_interval;
+  std::vector<std::pair<std::string, std::string>> entries;
+  std::vector<std::string> seek_targets;
+};
+
+std::vector<LegacyCommonPrefixBlock> GetLegacyCommonPrefixBlocks() {
+  const std::string empty_footer_user("\x01\x00\x00\x00\x00\x00\x00\x00", 8);
+  const std::string long_user(32, 'p');
+  const std::string long_footer_user = long_user + empty_footer_user;
+  return {
+      {"value_tag_overlap_restart_boundary",
+       kLegacyValueTagOverlapRestartBoundary,
+       sizeof(kLegacyValueTagOverlapRestartBoundary) - 1,
+       2,
+       {{InternalKey(std::string("user1\x01z", 7), 9, kTypeValue)
+             .Encode()
+             .ToString(),
+         "v0"},
+        {InternalKey(std::string("user1\x01y", 7), 8, kTypeValue)
+             .Encode()
+             .ToString(),
+         "v1"},
+        {InternalKey(std::string("user1\x01", 6), 3, kTypeValue)
+             .Encode()
+             .ToString(),
+         "v2"},
+        {InternalKey("user1", 2, kTypeValue).Encode().ToString(), "v3"}},
+       {InternalKey("user1", kMaxSequenceNumber, kValueTypeForSeek)
+            .Encode()
+            .ToString(),
+        InternalKey(std::string("user1\x01", 6), 2, kTypeValue)
+            .Encode()
+            .ToString(),
+        InternalKey(std::string("user1\x02", 6), 5, kTypeValue)
+            .Encode()
+            .ToString(),
+        InternalKey(std::string("user1\x01z", 7), 9, kTypeValue)
+            .Encode()
+            .ToString()}},
+      {"delete_tag_overlap",
+       kLegacyDeleteTagOverlap,
+       sizeof(kLegacyDeleteTagOverlap) - 1,
+       2,
+       {{InternalKey(std::string("user1\x00", 6), 3, kTypeValue)
+             .Encode()
+             .ToString(),
+         "v0"},
+        {InternalKey("user1", 2, kTypeDeletion).Encode().ToString(), "v1"}},
+       {InternalKey("user1", kMaxSequenceNumber, kValueTypeForSeek)
+            .Encode()
+            .ToString(),
+        InternalKey(std::string("user1\x00", 6), 2, kTypeValue)
+            .Encode()
+            .ToString()}},
+      {"empty_user_full_footer_overlap",
+       kLegacyEmptyUserFullFooterOverlap,
+       sizeof(kLegacyEmptyUserFullFooterOverlap) - 1,
+       16,
+       {{InternalKey(empty_footer_user, 1, kTypeValue).Encode().ToString(),
+         "n0"},
+        {InternalKey("", 0, kTypeValue).Encode().ToString(), "v0"}},
+       {InternalKey(empty_footer_user, 0, kTypeValue).Encode().ToString(),
+        InternalKey("", 0, kTypeValue).Encode().ToString()}},
+      {"long_user_full_footer_overlap",
+       kLegacyLongUserFullFooterOverlap,
+       sizeof(kLegacyLongUserFullFooterOverlap) - 1,
+       16,
+       {{InternalKey(long_footer_user, 1, kTypeValue).Encode().ToString(),
+         "n0"},
+        {InternalKey(long_user, 0, kTypeValue).Encode().ToString(), "v0"}},
+       {InternalKey(long_user, kMaxSequenceNumber, kValueTypeForSeek)
+            .Encode()
+            .ToString(),
+        InternalKey(long_user, 0, kTypeValue).Encode().ToString(),
+        InternalKey(long_footer_user, 0, kTypeValue).Encode().ToString(),
+        // Mismatches before the guaranteed boundary can use the shortcut.
+        InternalKey(std::string(31, 'p') + 'q', 0, kTypeValue)
+            .Encode()
+            .ToString(),
+        InternalKey(std::string(31, 'p') + 'o', 0, kTypeValue)
+            .Encode()
+            .ToString(),
+        // A mismatch at that boundary can still precede the shorter key.
+        InternalKey(long_user + '\x00', 0, kTypeValue).Encode().ToString(),
+        InternalKey(long_user + '\x02', 0, kTypeValue).Encode().ToString()}},
+  };
+}
+
+}  // namespace
+
+TEST(BlockCommonPrefixTest, LegacyDataBlocksPreserveSeekAndIteration) {
+  const std::vector<LegacyCommonPrefixBlock> fixtures =
+      GetLegacyCommonPrefixBlocks();
+  const InternalKeyComparator comparator(ReverseBytewiseComparator());
+  for (const LegacyCommonPrefixBlock& fixture : fixtures) {
+    SCOPED_TRACE(fixture.name);
+    BlockContents contents;
+    contents.data = Slice(fixture.bytes, fixture.size);
+    Block block(std::move(contents), 0 /* read_amp_bytes_per_bit */,
+                nullptr /* statistics */, fixture.restart_interval);
+    std::unique_ptr<DataBlockIter> iter(block.NewDataIterator(
+        ReverseBytewiseComparator(), kDisableGlobalSequenceNumber, nullptr,
+        nullptr, true /* block_contents_pinned */,
+        true /* user_defined_timestamps_persisted */));
+
+    ASSERT_OK(iter->status());
+    for (size_t i = 1; i < fixture.entries.size(); ++i) {
+      ASSERT_LE(comparator.Compare(fixture.entries[i - 1].first,
+                                   fixture.entries[i].first),
+                0);
+    }
+
+    for (const std::string& target : fixture.seek_targets) {
+      size_t seek_index = fixture.entries.size();
+      size_t seek_for_prev_index = fixture.entries.size();
+      for (size_t i = 0; i < fixture.entries.size(); ++i) {
+        const int cmp = comparator.Compare(fixture.entries[i].first, target);
+        if (seek_index == fixture.entries.size() && cmp >= 0) {
+          seek_index = i;
+        }
+        if (cmp <= 0) {
+          seek_for_prev_index = i;
+        }
+      }
+
+      iter->Seek(target);
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(iter->Valid(), seek_index < fixture.entries.size());
+      if (seek_index < fixture.entries.size()) {
+        EXPECT_EQ(fixture.entries[seek_index].first, iter->key().ToString());
+        EXPECT_EQ(fixture.entries[seek_index].second, iter->value().ToString());
+        if (seek_index > 0) {
+          iter->Prev();
+          ASSERT_OK(iter->status());
+          ASSERT_TRUE(iter->Valid());
+          EXPECT_EQ(fixture.entries[seek_index - 1].first,
+                    iter->key().ToString());
+          iter->Next();
+          ASSERT_OK(iter->status());
+          ASSERT_TRUE(iter->Valid());
+          EXPECT_EQ(fixture.entries[seek_index].first, iter->key().ToString());
+        }
+      }
+
+      iter->SeekForPrev(target);
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(iter->Valid(), seek_for_prev_index < fixture.entries.size());
+      if (seek_for_prev_index < fixture.entries.size()) {
+        EXPECT_EQ(fixture.entries[seek_for_prev_index].first,
+                  iter->key().ToString());
+        EXPECT_EQ(fixture.entries[seek_for_prev_index].second,
+                  iter->value().ToString());
+        if (seek_for_prev_index + 1 < fixture.entries.size()) {
+          iter->Next();
+          ASSERT_OK(iter->status());
+          ASSERT_TRUE(iter->Valid());
+          EXPECT_EQ(fixture.entries[seek_for_prev_index + 1].first,
+                    iter->key().ToString());
+          iter->Prev();
+          ASSERT_OK(iter->status());
+          ASSERT_TRUE(iter->Valid());
+          EXPECT_EQ(fixture.entries[seek_for_prev_index].first,
+                    iter->key().ToString());
+        }
+      }
+    }
+
+    iter->SeekToFirst();
+    for (const auto& entry : fixture.entries) {
+      ASSERT_OK(iter->status());
+      ASSERT_TRUE(iter->Valid());
+      EXPECT_EQ(entry.first, iter->key().ToString());
+      EXPECT_EQ(entry.second, iter->value().ToString());
+      iter->Next();
+    }
+    ASSERT_OK(iter->status());
+    EXPECT_FALSE(iter->Valid());
+
+    iter->SeekToLast();
+    for (auto entry = fixture.entries.rbegin(); entry != fixture.entries.rend();
+         ++entry) {
+      ASSERT_OK(iter->status());
+      ASSERT_TRUE(iter->Valid());
+      EXPECT_EQ(entry->first, iter->key().ToString());
+      EXPECT_EQ(entry->second, iter->value().ToString());
+      iter->Prev();
+    }
+    ASSERT_OK(iter->status());
+    EXPECT_FALSE(iter->Valid());
+  }
+}
+
+TEST(BlockCommonPrefixTest, LegacyInternalKeyIndexBlockPreservesSeek) {
+  const InternalKeyComparator comparator(ReverseBytewiseComparator());
+  const std::vector<LegacyCommonPrefixBlock> fixtures =
+      GetLegacyCommonPrefixBlocks();
+  for (const LegacyCommonPrefixBlock& fixture : fixtures) {
+    SCOPED_TRACE(fixture.name);
+    BlockContents contents;
+    contents.data = Slice(fixture.bytes, fixture.size);
+    Block block(std::move(contents), 0 /* read_amp_bytes_per_bit */,
+                nullptr /* statistics */, fixture.restart_interval);
+    std::unique_ptr<IndexBlockIter> iter(block.NewIndexIterator(
+        ReverseBytewiseComparator(), kDisableGlobalSequenceNumber, nullptr,
+        nullptr, true /* total_order_seek */, false /* have_first_key */,
+        true /* key_includes_seq */, true /* value_is_full */,
+        true /* block_contents_pinned */,
+        true /* user_defined_timestamps_persisted */,
+        nullptr /* prefix_index */, BlockBasedTableOptions::kBinary,
+        false /* value_delta_escape */));
+
+    ASSERT_OK(iter->status());
+    for (const std::string& target : fixture.seek_targets) {
+      size_t seek_index = fixture.entries.size();
+      for (size_t i = 0; i < fixture.entries.size(); ++i) {
+        if (comparator.Compare(fixture.entries[i].first, target) >= 0) {
+          seek_index = i;
+          break;
+        }
+      }
+
+      iter->Seek(target);
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(iter->Valid(), seek_index < fixture.entries.size());
+      if (seek_index < fixture.entries.size()) {
+        EXPECT_EQ(fixture.entries[seek_index].first, iter->key().ToString());
+        const IndexValue value = iter->value();
+        EXPECT_EQ(static_cast<uint64_t>(fixture.entries[seek_index].second[0]),
+                  value.handle.offset());
+        EXPECT_EQ(static_cast<uint64_t>(fixture.entries[seek_index].second[1]),
+                  value.handle.size());
+      }
+    }
+
+    iter->SeekToFirst();
+    for (const auto& entry : fixture.entries) {
+      ASSERT_OK(iter->status());
+      ASSERT_TRUE(iter->Valid());
+      EXPECT_EQ(entry.first, iter->key().ToString());
+      const IndexValue value = iter->value();
+      EXPECT_EQ(static_cast<uint64_t>(entry.second[0]), value.handle.offset());
+      EXPECT_EQ(static_cast<uint64_t>(entry.second[1]), value.handle.size());
+      iter->Next();
+    }
+    ASSERT_OK(iter->status());
+    EXPECT_FALSE(iter->Valid());
+  }
+}
+
 // return the block contents
 BlockContents GetBlockContents(
     std::unique_ptr<BlockBuilder>* builder,

@@ -134,6 +134,96 @@ TEST_F(DBBasicTest, OpenWhenOpen) {
   ASSERT_TRUE(strstr(s.getState(), "lock ") != nullptr);
 }
 
+// Regression coverage for issue #15439: the neighbor key's first byte can
+// overlap the value-type byte in an internal key when ReverseBytewiseComparator
+// orders the longer neighbor first. The reported reader-visible behavior was a
+// stale value, a resurrected deleted value, or a missing newly written key.
+TEST_F(DBBasicTest, ReverseBytewiseCommonPrefixKeepsLatestValueVisible) {
+  struct Scenario {
+    const char* name;
+    bool write_old_value;
+    bool delete_key;
+    const char* expected_value;
+    char neighbor_suffix;
+  };
+  const Scenario scenarios[] = {
+      {"update", true, false, "balance=250", '\x01'},
+      {"delete", true, true, nullptr, '\x00'},
+      {"new_key", false, false, "balance=250", '\x01'},
+  };
+
+  const std::string key = "user1";
+  for (uint32_t format_version : {7U, 8U}) {
+    for (const Scenario& scenario : scenarios) {
+      SCOPED_TRACE(testing::Message() << "format_version=" << format_version
+                                      << " scenario=" << scenario.name);
+
+      Options options = CurrentOptions();
+      options.comparator = ReverseBytewiseComparator();
+      BlockBasedTableOptions table_options;
+      table_options.format_version = format_version;
+      options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+      DestroyAndReopen(options);
+
+      if (scenario.write_old_value) {
+        ASSERT_OK(Put(key, "balance=100"));
+        ASSERT_OK(Flush());
+      }
+      if (scenario.delete_key) {
+        ASSERT_OK(dbfull()->Delete(WriteOptions(), key));
+      } else {
+        ASSERT_OK(Put(key, scenario.expected_value));
+      }
+      std::string neighbor = key + scenario.neighbor_suffix;
+      ASSERT_OK(Put(neighbor, "another row"));
+      ASSERT_OK(Flush());
+      Reopen(options);
+
+      auto verify_reads = [&]() {
+        std::string value;
+        Status get_status = dbfull()->Get(ReadOptions(), key, &value);
+
+        std::vector<Slice> keys{Slice(key)};
+        std::vector<std::string> values;
+        std::vector<Status> multi_get_status =
+            dbfull()->MultiGet(ReadOptions(), keys, &values);
+
+        std::unique_ptr<Iterator> iter(dbfull()->NewIterator(ReadOptions()));
+        iter->Seek(key);
+        ASSERT_OK(iter->status());
+
+        if (scenario.expected_value == nullptr) {
+          ASSERT_EQ(Status::Code::kNotFound, get_status.code());
+          ASSERT_EQ(1U, multi_get_status.size());
+          ASSERT_EQ(Status::Code::kNotFound, multi_get_status[0].code());
+          ASSERT_FALSE(iter->Valid());
+        } else {
+          ASSERT_OK(get_status);
+          ASSERT_EQ(scenario.expected_value, value);
+          ASSERT_EQ(1U, multi_get_status.size());
+          ASSERT_OK(multi_get_status[0]);
+          ASSERT_EQ(1U, values.size());
+          ASSERT_EQ(scenario.expected_value, values[0]);
+          ASSERT_TRUE(iter->Valid());
+          ASSERT_EQ(key, iter->key().ToString());
+          ASSERT_EQ(scenario.expected_value, iter->value().ToString());
+        }
+      };
+
+      verify_reads();
+
+      CompactRangeOptions compact_options;
+      compact_options.bottommost_level_compaction =
+          BottommostLevelCompaction::kForce;
+      ASSERT_OK(dbfull()->CompactRange(compact_options, nullptr, nullptr));
+      verify_reads();
+      Close();
+      Reopen(options);
+      verify_reads();
+    }
+  }
+}
+
 namespace {
 // Helper that captures per-branch SkippedNoopEdit counts for tests.
 struct RecoveryOptimizationCounters {

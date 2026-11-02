@@ -1,0 +1,1 @@
+Fix stale values, missed keys, and deleted values reappearing in reads with `ReverseBytewiseComparator()` and `format_version=8` common-prefix optimization, including reads of affected files written before this fix.
