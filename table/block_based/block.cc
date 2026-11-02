@@ -179,6 +179,39 @@ void DataBlockIter::PrevImpl() {
   cur_entry_idx_ = prev_entry_idx;
 }
 
+template <class TValue>
+inline int BlockIter<TValue>::CompareKeyForPrefixOptimizedSeek(
+    const Slice& a, const Slice& b) const {
+  assert(use_prefix_optimized_seek());
+  const bool reverse =
+      prefix_optimized_seek_ == PrefixOptimizedSeek::kReverseBytewise;
+  if (raw_key_.IsUserKey()) {
+    assert(global_seqno_ == kDisableGlobalSequenceNumber);
+    const int r = a.compare(b);
+    return reverse ? -r : r;
+  }
+  // As in InternalKeyComparator::Compare() (with global_seqno_ applied to `a`,
+  // as in CompareKey()), including its count of user key comparisons
+  // (UserComparatorWrapper).
+  PERF_COUNTER_ADD(user_key_comparison_count, 1);
+  assert(a.size() >= kNumInternalBytes && b.size() >= kNumInternalBytes);
+  const size_t a_user_size = a.size() - kNumInternalBytes;
+  const size_t b_user_size = b.size() - kNumInternalBytes;
+  const int r =
+      Slice(a.data(), a_user_size).compare(Slice(b.data(), b_user_size));
+  if (r != 0) {
+    return reverse ? -r : r;
+  }
+  // Same user key: decreasing sequence number and type.
+  uint64_t a_footer = DecodeFixed64(a.data() + a_user_size);
+  if (global_seqno_ != kDisableGlobalSequenceNumber) {
+    a_footer = PackSequenceAndType(global_seqno_,
+                                   static_cast<ValueType>(a_footer & 0xff));
+  }
+  const uint64_t b_footer = DecodeFixed64(b.data() + b_user_size);
+  return a_footer > b_footer ? -1 : (a_footer < b_footer ? 1 : 0);
+}
+
 void DataBlockIter::SeekImpl(const Slice& target) {
   Slice seek_key = target;
   PERF_TIMER_GUARD(block_seek_nanos);
@@ -186,8 +219,7 @@ void DataBlockIter::SeekImpl(const Slice& target) {
     return;
   }
   if (has_common_prefix()) {
-    const Comparator* ucmp = icmp_.user_comparator();
-    if (ucmp == BytewiseComparator() || ucmp == ReverseBytewiseComparator()) {
+    if (use_prefix_optimized_seek()) {
       // Bytewise: strip the block's common prefix from the target once and
       // compare shortened suffixes (no per-probe key materialization).
       Slice target_suffix;
@@ -211,10 +243,12 @@ void DataBlockIter::SeekImpl(const Slice& target) {
       }
       return;
     }
-    // Non-(reverse-)bytewise comparator (optimize_key_common_prefix=kEnabled):
-    // the suffix-seek shortcut is not order-preserving, so fall through to the
-    // standard binary search below, which reconstructs each probed restart key
-    // (see BinarySeekRestartPointIndex) and compares full keys with the real
+    // Non-(reverse-)bytewise comparator (optimize_key_common_prefix=kEnabled),
+    // or a block whose last user key is shorter than the common prefix (see
+    // Block::last_user_key_shorter_than_common_prefix_): the prefix-optimized
+    // seek is not order-preserving, so fall through to the standard binary
+    // search below, which reconstructs each probed restart key (see
+    // BinarySeekRestartPointIndex) and compares full keys with the real
     // comparator; the linear scan reconstructs via ParseNextKey.
   }
   uint32_t index = 0;
@@ -405,17 +439,18 @@ void IndexBlockIter::SeekImpl(const Slice& target) {
     // restart interval must be one when hash search is enabled so the binary
     // search simply lands at the right place.
     skip_linear_scan = true;
-  } else if (has_common_prefix() &&
-             (icmp_.user_comparator() == BytewiseComparator() ||
-              icmp_.user_comparator() == ReverseBytewiseComparator())) {
+  } else if (use_prefix_optimized_seek()) {
     // Stripped index block (format_version >= 8), (reverse-)bytewise: use the
-    // binary suffix-seek path. It reads the identical on-disk format and is
-    // correct for every index_search_type_, so interpolation on a stripped
+    // binary prefix-optimized seek. It reads the identical on-disk format and
+    // is correct for every index_search_type_, so interpolation on a stripped
     // block falls back to binary here (its suffix-aware optimization is
     // deferred; see plan Phase 3). Non-(reverse-)bytewise stripped blocks
-    // (optimize_key_common_prefix=kEnabled) fall through to the standard binary
-    // search below, which reconstructs each probed restart key. Hash
-    // (prefix_index_) is handled above and reconstructs in CompareBlockKey.
+    // (optimize_key_common_prefix=kEnabled) and blocks whose last user key is
+    // shorter than the common prefix (see
+    // Block::last_user_key_shorter_than_common_prefix_) fall through to the
+    // standard binary search below, which reconstructs each probed restart
+    // key. Hash (prefix_index_) is handled above and reconstructs in
+    // CompareBlockKey.
     Slice target_suffix;
     bool before_all = false;
     if (StripSeekTargetPrefix(seek_key, &target_suffix, &before_all)) {
@@ -473,8 +508,7 @@ void DataBlockIter::SeekForPrevImpl(const Slice& target) {
     return;
   }
   if (has_common_prefix()) {
-    const Comparator* ucmp = icmp_.user_comparator();
-    if (ucmp == BytewiseComparator() || ucmp == ReverseBytewiseComparator()) {
+    if (use_prefix_optimized_seek()) {
       Slice target_suffix;
       bool before_all = false;
       if (StripSeekTargetPrefix(target, &target_suffix, &before_all)) {
@@ -504,9 +538,11 @@ void DataBlockIter::SeekForPrevImpl(const Slice& target) {
       }
       return;
     }
-    // Non-(reverse-)bytewise comparator (optimize_key_common_prefix=kEnabled):
-    // fall through to the standard binary search below, which reconstructs each
-    // probed restart key and compares full keys with the real comparator.
+    // Non-(reverse-)bytewise comparator (optimize_key_common_prefix=kEnabled),
+    // or a block whose last user key is shorter than the common prefix (see
+    // Block::last_user_key_shorter_than_common_prefix_): fall through to the
+    // standard binary search below, which reconstructs each probed restart key
+    // and compares full keys with the real comparator.
   }
   uint32_t index = 0;
   bool skip_linear_scan = false;
@@ -947,9 +983,12 @@ bool BlockIter<TValue>::BinarySeekRestartPointIndex(const Slice& target,
       // Stripped block (format_version >= 8): the restart key is stored without
       // the block's common user-key prefix; reconstruct the full key so the
       // comparison against the (full) target is correct. This serves the index
-      // non-suffix-seek paths and any non-(reverse-)bytewise data block
-      // (optimize_key_common_prefix=kEnabled). (Reverse-)bytewise blocks take
-      // the suffix-seek path and never reach here.
+      // paths other than the prefix-optimized seek and any
+      // non-(reverse-)bytewise data block
+      // (optimize_key_common_prefix=kEnabled). (Reverse-)bytewise blocks use
+      // the prefix-optimized seek and only reach here when their last user key
+      // is shorter than the common prefix (see
+      // Block::last_user_key_shorter_than_common_prefix_).
       raw_key_.SetKeyPrependingPrefix(common_prefix(), mid_key);
     } else {
       UpdateRawKeyAndMaybePadMinTimestamp(mid_key);
@@ -986,6 +1025,7 @@ bool BlockIter<TValue>::StripSeekTargetPrefix(const Slice& target,
                                               Slice* target_suffix,
                                               bool* before_all) const {
   assert(has_common_prefix());
+  assert(use_prefix_optimized_seek());
   // For a user-key block (index without seq) `target` is already a user key;
   // for an internal-key block (data, index with seq) strip the 8-byte footer to
   // compare the user-key portion against the block's common user-key prefix.
@@ -1001,7 +1041,10 @@ bool BlockIter<TValue>::StripSeekTargetPrefix(const Slice& target,
   // Target diverges from the block prefix (within the first `p` user bytes, or
   // is shorter). All block keys share the prefix, so the target compares to
   // every block key with the same sign as (target_user vs common prefix).
-  int sign = icmp_.user_comparator()->Compare(target_user, common_prefix());
+  int sign = target_user.compare(common_prefix());
+  if (prefix_optimized_seek_ == PrefixOptimizedSeek::kReverseBytewise) {
+    sign = -sign;
+  }
   *before_all = sign <= 0;
   return false;
 }
@@ -1030,7 +1073,7 @@ bool BlockIter<TValue>::BinarySeekSuffix(const Slice& target_suffix,
     if (!GetRestartKey<DecodeKeyFunc>(static_cast<uint32_t>(mid), &mid_key)) {
       return false;
     }
-    int cmp = CompareKey(mid_key, target_suffix);
+    int cmp = CompareKeyForPrefixOptimizedSeek(mid_key, target_suffix);
     if (cmp < 0) {
       left = mid;
     } else if (cmp > 0) {
@@ -1555,7 +1598,9 @@ Block::Block(BlockContents&& contents, size_t read_amp_bytes_per_bit,
     : contents_(std::move(contents)),
       restart_offset_(0),
       num_restarts_(0),
-      block_restart_interval_(restart_interval) {
+      block_restart_interval_(restart_interval),
+      is_uniform_(false),
+      last_user_key_shorter_than_common_prefix_(false) {
   TEST_SYNC_POINT("Block::Block:0");
   auto& size = contents_.data.size_;
   // `contents` is assumed to be uncompressed in the proper format
@@ -1781,6 +1826,117 @@ void Block::InitializeMetaIndexBlockProtectionInfo(
   }
 }
 
+void Block::InitializeDataBlockCommonPrefixCheck() {
+  if (common_prefix_size_ == 0 || size() == 0 || num_restarts_ == 0) {
+    return;
+  }
+  // The writer limits the prefix to the user key at every restart point, so
+  // only keys after the last restart point can be shorter than the prefix,
+  // and such a key can only be followed by other versions of its user key.
+  // Checking the last key is thus enough, and only takes decoding the entry
+  // headers of the last restart interval.
+  const char* p =
+      data() + DecodeFixed32(data() + restart_offset_ +
+                             (num_restarts_ - 1) * sizeof(uint32_t));
+  const char* limit =
+      values_section_ != nullptr ? values_section_ : data() + restart_offset_;
+  uint64_t last_key_size = std::numeric_limits<uint64_t>::max();
+  bool at_restart = true;
+  while (p < limit) {
+    uint32_t shared;
+    uint32_t non_shared;
+    uint32_t value_length;
+    // With separated KV storage, a restart entry also encodes its value
+    // offset, and values are stored apart from the keys.
+    const bool has_value_offset = values_section_ != nullptr && at_restart;
+    const auto* u = reinterpret_cast<const unsigned char*>(p);
+    if (limit - p >= 3 && !has_value_offset && ((u[0] | u[1] | u[2]) < 128)) {
+      // Common case of one byte per length, decoded here because using
+      // DecodeEntry() for every entry measured up to 80% more instructions for
+      // this check (with clang; 26% with GCC).
+      shared = u[0];
+      non_shared = u[1];
+      value_length = u[2];
+      p += 3;
+    } else {
+      uint32_t value_offset = 0;
+      uint32_t decoded[3] = {};
+      p = DecodeEntry()(p, limit, &decoded[0], &decoded[1], &decoded[2],
+                        has_value_offset ? &value_offset : nullptr);
+      if (p == nullptr) {
+        return;  // Corruption is reported when an iterator parses the entry
+      }
+      shared = decoded[0];
+      non_shared = decoded[1];
+      value_length = decoded[2];
+    }
+    const uint64_t skip =
+        uint64_t{non_shared} + (values_section_ != nullptr ? 0 : value_length);
+    if (skip > static_cast<uint64_t>(limit - p)) {
+      return;  // Corruption is reported when an iterator parses the entry
+    }
+    p += skip;
+    // A restart entry stores its key without the common prefix; other entries
+    // store the bytes not shared with the previous key.
+    last_key_size =
+        uint64_t{shared == 0 ? common_prefix_size_ : shared} + non_shared;
+    at_restart = false;
+  }
+  last_user_key_shorter_than_common_prefix_ =
+      last_key_size < uint64_t{common_prefix_size_} + kNumInternalBytes;
+  if (last_user_key_shorter_than_common_prefix_) {
+    TEST_SYNC_POINT(
+        "Block::InitializeDataBlockCommonPrefixCheck:LastUserKeyShorter");
+  }
+}
+
+void Block::InitializeIndexBlockCommonPrefixCheck(const Comparator* raw_ucmp,
+                                                  bool key_includes_seq,
+                                                  bool value_is_full,
+                                                  bool index_has_first_key,
+                                                  bool value_delta_escape) {
+  // As in InitializeDataBlockCommonPrefixCheck(), only the last key needs
+  // checking. Index blocks of user keys need no check: their writer counted
+  // only user key bytes as shared with the previous key, which cannot extend
+  // past a user key. Skipping an index entry can require decoding its value,
+  // so the last key is found with an iterator; with the default
+  // index_block_restart_interval of 1, that parses a single entry.
+  if (common_prefix_size_ == 0 || size() == 0 || num_restarts_ == 0 ||
+      !key_includes_seq) {
+    return;
+  }
+  IndexBlockIter iter;
+  NewIndexIterator(
+      raw_ucmp, kDisableGlobalSequenceNumber, &iter, nullptr /* stats */,
+      true /* total_order_seek */, index_has_first_key, key_includes_seq,
+      value_is_full, true /* block_contents_pinned */,
+      true /* user_defined_timestamps_persisted */, nullptr /* prefix_index */,
+      BlockBasedTableOptions::kBinary, value_delta_escape);
+  iter.SeekToLast();
+  if (iter.Valid()) {
+    last_user_key_shorter_than_common_prefix_ =
+        iter.key().size() < size_t{common_prefix_size_} + kNumInternalBytes;
+    if (last_user_key_shorter_than_common_prefix_) {
+      TEST_SYNC_POINT(
+          "Block::InitializeIndexBlockCommonPrefixCheck:LastUserKeyShorter");
+    }
+  }
+}
+
+PrefixOptimizedSeek Block::GetPrefixOptimizedSeek(
+    const Comparator* raw_ucmp) const {
+  if (common_prefix_size_ == 0 || last_user_key_shorter_than_common_prefix_) {
+    return PrefixOptimizedSeek::kNone;
+  }
+  if (raw_ucmp == BytewiseComparator()) {
+    return PrefixOptimizedSeek::kBytewise;
+  }
+  if (raw_ucmp == ReverseBytewiseComparator()) {
+    return PrefixOptimizedSeek::kReverseBytewise;
+  }
+  return PrefixOptimizedSeek::kNone;
+}
+
 MetaBlockIter* Block::NewMetaIterator(bool block_contents_pinned) {
   MetaBlockIter* iter = new MetaBlockIter();
   if (size() < 2 * sizeof(uint32_t)) {
@@ -1823,7 +1979,8 @@ DataBlockIter* Block::NewDataIterator(const Comparator* raw_ucmp,
         user_defined_timestamps_persisted,
         data_block_hash_index_.Valid() ? &data_block_hash_index_ : nullptr,
         protection_bytes_per_key_, kv_checksum_, block_restart_interval_,
-        values_section_, Slice(data(), common_prefix_size_));
+        values_section_, Slice(data(), common_prefix_size_),
+        GetPrefixOptimizedSeek(raw_ucmp));
     if (read_amp_bitmap_) {
       if (read_amp_bitmap_->GetStatistics() != stats) {
         // DB changed the Statistics pointer, we need to notify
@@ -1878,7 +2035,7 @@ IndexBlockIter* Block::NewIndexIterator(
         block_contents_pinned, user_defined_timestamps_persisted,
         protection_bytes_per_key_, kv_checksum_, block_restart_interval_,
         values_section_, resolved_search_type, value_delta_escape,
-        Slice(data(), common_prefix_size_));
+        Slice(data(), common_prefix_size_), GetPrefixOptimizedSeek(raw_ucmp));
   }
 
   return ret_iter;

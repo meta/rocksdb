@@ -16,6 +16,9 @@ void BlockCreateContext::Create(std::unique_ptr<Block_kData>* parsed_out,
                                     statistics, data_block_restart_interval));
   parsed_out->get()->InitializeDataBlockProtectionInfo(protection_bytes_per_key,
                                                        raw_ucmp);
+  if (check_common_prefix) {
+    parsed_out->get()->InitializeDataBlockCommonPrefixCheck();
+  }
 }
 void BlockCreateContext::Create(std::unique_ptr<Block_kIndex>* parsed_out,
                                 BlockContents&& block) {
@@ -25,6 +28,11 @@ void BlockCreateContext::Create(std::unique_ptr<Block_kIndex>* parsed_out,
   parsed_out->get()->InitializeIndexBlockProtectionInfo(
       protection_bytes_per_key, raw_ucmp, index_value_is_full,
       index_has_first_key, index_value_delta_escape);
+  if (check_common_prefix) {
+    parsed_out->get()->InitializeIndexBlockCommonPrefixCheck(
+        raw_ucmp, index_key_includes_seq, index_value_is_full,
+        index_has_first_key, index_value_delta_escape);
+  }
 }
 void BlockCreateContext::Create(
     std::unique_ptr<Block_kFilterPartitionIndex>* parsed_out,
@@ -35,6 +43,13 @@ void BlockCreateContext::Create(
   parsed_out->get()->InitializeIndexBlockProtectionInfo(
       protection_bytes_per_key, raw_ucmp, index_value_is_full,
       index_has_first_key, index_value_delta_escape);
+  if (check_common_prefix) {
+    // Same iterator parameters as
+    // PartitionedFilterBlockReader::NewFilterPartitionIndexIterator().
+    parsed_out->get()->InitializeIndexBlockCommonPrefixCheck(
+        raw_ucmp, index_key_includes_seq, index_value_is_full,
+        /*index_has_first_key=*/false, index_value_delta_escape);
+  }
 }
 void BlockCreateContext::Create(
     std::unique_ptr<Block_kRangeDeletion>* parsed_out, BlockContents&& block) {
