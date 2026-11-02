@@ -39,6 +39,7 @@
 #include "port/port.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/table.h"
+#include "table/adaptive/adaptive_table_factory.h"
 #include "table/merging_iterator.h"
 #include "util/autovector.h"
 #include "util/cast_util.h"
@@ -683,7 +684,9 @@ ColumnFamilyData::ColumnFamilyData(
                                       db_session_id, fast_sst_open, name_));
     blob_file_cache_.reset(
         new BlobFileCache(_table_cache, &ioptions(), soptions(), id_,
-                          internal_stats_->GetBlobFileReadHist(), io_tracer));
+                          internal_stats_->GetBlobFileReadHist(), io_tracer,
+                          GetBlockBasedTableWriterOptions(
+                              mutable_cf_options_.table_factory.get())));
     blob_source_.reset(new BlobSource(ioptions_, mutable_cf_options_, db_id,
                                       db_session_id, blob_file_cache_.get()));
     // Let the table cache route same-file ("embedded") blob reads through the
@@ -1522,9 +1525,36 @@ void ColumnFamilyData::ResetThreadLocalSuperVersions() {
   }
 }
 
+Status CheckBlobIndirectionCompactionStyle(CompactionStyle style,
+                                           bool has_blob_indirection) {
+  if (has_blob_indirection && style == kCompactionStyleFIFO) {
+    return Status::NotSupported("Blob indirection is incompatible with FIFO");
+  }
+  return Status::OK();
+}
+
+namespace {
+std::atomic<bool> allow_blob_indirection_for_test{false};
+}  // namespace
+
+void ColumnFamilyData::TEST_SetAllowBlobIndirection(bool allow) {
+  allow_blob_indirection_for_test.store(allow, std::memory_order_relaxed);
+}
+
 Status ColumnFamilyData::ValidateOptions(
     const DBOptions& db_options, const ColumnFamilyOptions& cf_options) {
-  Status s;
+  // Later revisions of this stack complete the feature. Until then, data
+  // written with it may not stay readable or safely activated.
+  if (cf_options.enable_blob_indirection &&
+      !allow_blob_indirection_for_test.load(std::memory_order_relaxed)) {
+    return Status::NotSupported(
+        "enable_blob_indirection is not supported in this revision");
+  }
+  Status s = CheckBlobIndirectionCompactionStyle(
+      cf_options.compaction_style, cf_options.enable_blob_indirection);
+  if (!s.ok()) {
+    return s;
+  }
   s = CheckCompressionSupported(cf_options);
   if (s.ok() && db_options.allow_concurrent_memtable_write) {
     s = CheckConcurrentWritesSupported(cf_options);
@@ -1586,6 +1616,21 @@ Status ColumnFamilyData::ValidateOptions(
       return Status::NotSupported(
           "Blob direct write does not support user-defined timestamps.");
     }
+  }
+  if (cf_options.enable_blob_indirection && !cf_options.enable_blob_files) {
+    return Status::InvalidArgument(
+        "enable_blob_indirection requires enable_blob_files=true");
+  }
+  if (cf_options.enable_blob_indirection &&
+      cf_options.enable_blob_direct_write) {
+    return Status::NotSupported(
+        "Blob indirection and blob direct write cannot be enabled together");
+  }
+  if (cf_options.enable_blob_indirection &&
+      !cf_options.table_factory->IsInstanceOf(
+          TableFactory::kBlockBasedTableName())) {
+    return Status::NotSupported(
+        "Blob indirection requires Block-Based Table format");
   }
   if (ucmp->timestamp_size() > 0 &&
       !cf_options.persist_user_defined_timestamps) {
@@ -1719,11 +1764,13 @@ Status ColumnFamilyData::ValidateOptions(
   return s;
 }
 
-Status ColumnFamilyData::SetOptions(
+Status ColumnFamilyData::PrepareMutableCFOptions(
     const DBOptions& db_opts,
-    const std::unordered_map<std::string, std::string>& options_map) {
+    const std::unordered_map<std::string, std::string>& options_map,
+    MutableCFOptions* mutable_cf_options) const {
+  assert(mutable_cf_options != nullptr);
   ColumnFamilyOptions cf_opts =
-      BuildColumnFamilyOptions(initial_cf_options_, mutable_cf_options_);
+      BuildColumnFamilyOptions(initial_cf_options_, *mutable_cf_options);
   ConfigOptions config_opts;
   config_opts.mutable_options_only = true;
 #ifndef NDEBUG
@@ -1739,8 +1786,24 @@ Status ColumnFamilyData::SetOptions(
     s = ValidateOptions(db_opts, cf_opts);
   }
   if (s.ok()) {
-    mutable_cf_options_ = MutableCFOptions(cf_opts);
-    mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+    *mutable_cf_options = MutableCFOptions(cf_opts);
+    mutable_cf_options->RefreshDerivedOptions(ioptions_);
+  }
+  return s;
+}
+
+void ColumnFamilyData::InstallMutableCFOptions(
+    const MutableCFOptions& mutable_cf_options) {
+  mutable_cf_options_ = mutable_cf_options;
+}
+
+Status ColumnFamilyData::SetOptions(
+    const DBOptions& db_opts,
+    const std::unordered_map<std::string, std::string>& options_map) {
+  MutableCFOptions mutable_cf_options(mutable_cf_options_);
+  Status s = PrepareMutableCFOptions(db_opts, options_map, &mutable_cf_options);
+  if (s.ok()) {
+    InstallMutableCFOptions(mutable_cf_options);
   }
   return s;
 }

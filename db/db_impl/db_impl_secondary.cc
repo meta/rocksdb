@@ -1232,6 +1232,13 @@ Status DBImplSecondary::OpenAsSecondaryImpl(
     std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool recover_wal, bool trust_manifest_recovery) {
   *dbptr = nullptr;
+  for (const ColumnFamilyDescriptor& cf : column_families) {
+    const Status s = CheckBlobIndirectionCompactionStyle(
+        cf.options.compaction_style, cf.options.enable_blob_indirection);
+    if (!s.ok()) {
+      return s;
+    }
+  }
   // Only normal DB::OpenAsSecondary recovery can defer SST opening.
   // `recover_wal` excludes OpenAndCompact even when no snapshot floor is
   // supplied, `open_files_async` is the explicit opt-in, and trust-MANIFEST

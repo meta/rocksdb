@@ -734,6 +734,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "read_triggered_compaction_threshold=0.5;"
       "sample_for_compression=0;"
       "enable_blob_files=true;"
+      "enable_blob_indirection=true;"
       "enable_blob_direct_write=true;"
       "min_blob_size=256;"
       "blob_file_size=1000000;"

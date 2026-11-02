@@ -284,6 +284,12 @@ Status CheckConcurrentWritesSupported(const ColumnFamilyOptions& cf_options);
 Status CheckCFPathsSupported(const DBOptions& db_options,
                              const ColumnFamilyOptions& cf_options);
 
+// Applies to configured creation and to this CF's sticky/pending format state,
+// including read-only recovery. A DB-wide fence from another CF is not state
+// belonging to this CF.
+Status CheckBlobIndirectionCompactionStyle(CompactionStyle style,
+                                           bool has_blob_indirection);
+
 ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
                                       bool read_only,
                                       const ColumnFamilyOptions& src);
@@ -371,6 +377,17 @@ class ColumnFamilyData {
   // Validate CF options against DB options
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
+  // Test-only, not public API. Until the Blob GC stack is complete,
+  // ValidateOptions rejects enable_blob_indirection unless a test allows it.
+  static void TEST_SetAllowBlobIndirection(bool allow);
+  // Parses and validates a replacement without publishing it. The caller
+  // keeps the DB mutex held so the latest-options base remains stable.
+  Status PrepareMutableCFOptions(
+      const DBOptions& db_options,
+      const std::unordered_map<std::string, std::string>& options_map,
+      MutableCFOptions* mutable_cf_options) const;
+  // Publishes a previously prepared replacement. REQUIRES: DB mutex held.
+  void InstallMutableCFOptions(const MutableCFOptions& mutable_cf_options);
   // REQUIRES: DB mutex held
   Status SetOptions(
       const DBOptions& db_options,

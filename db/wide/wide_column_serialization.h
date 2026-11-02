@@ -184,11 +184,12 @@ class WideColumnSerialization {
   // Returns Status::Corruption on decode errors.
   static Status HasBlobColumns(const Slice& input, bool& has_blob_columns);
 
-  // Lightweight extraction of blob file numbers from a V2 entity.
-  // Calls the callback for each blob column's BlobIndex. Avoids full
-  // deserialization of column names and inline values.
-  // Returns OK if no blob columns or not V2 (callback not invoked).
-  static Status ForEachBlobFileNumber(
+  // Fully validates one serialized entity and calls the callback once for each
+  // blob column's BlobIndex. The implementation avoids materializing column
+  // names and inline values, but validates their framing, ordering, section
+  // sizes, and exact input consumption before invoking any callback.
+  // Returns OK with no callbacks for a valid entity without blob columns.
+  static Status ForEachBlobIndex(
       const Slice& input,
       const std::function<Status(const BlobIndex&)>& callback);
 
