@@ -5,13 +5,14 @@
 
 package org.rocksdb.ffm;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
+import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import org.rocksdb.RocksDB;
-import org.rocksdb.RocksDBException;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 public class RocksFFMBasic {
   static {

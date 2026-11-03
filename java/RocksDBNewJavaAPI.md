@@ -238,6 +238,14 @@ therefore wrappable in Java ? Do we need to add some methods to the `C` API to h
 to the `C` API; we would like these to be an official part of the `C` API, from a support/maintenance point-of-view.
 7. Performance again; returning *pinned* buffers to Java as `MemorySegment`s as in the early FFM Preview prototype.
 8. Do we need or want any code generation tools ? Both [Spoon](https://spoon.gforge.inria.fr/) and [Java Poet](https://www.baeldung.com/java-poet) are familiar to Evolved Binary, and may have a role to play.
+9. Memory ownership and lifecycle. Sometimes we get memory returned from an API (as a `MemorySegment`) which is
+owned by `malloc()` on the native side. Sometimes we create memory using FFM with `Arena.allocate()`. We should rely on the arena lifecycle to handle the disposal of FFM memory; perhaps we can create shorter-lived arenas for things like
+result message pointers.
+10. Disposal of `malloc()`-ed error messages. This is yet another thing to remember to do when checking the error
+status of an operation, we need to wrap it into the helpers that do this. The small `Arena`-allocated segments
+which receive the pointer to error message can just go in an `Arena.ofAuto()`. 
+11. General disposal of large `malloc()`-ed results. One idea is to have a `Lifetime implements AutoClosable` object to which these results are added. Then we just need to implement a small stub in the `C` API to do the disposal of
+a list of pointers supplied to it.
 
 There's a blended approach which is:
 1. We will use a subset of the `C` API for our purposes; probably fetched using `jextract` and restricted to the methods that we need, but maybe generated.

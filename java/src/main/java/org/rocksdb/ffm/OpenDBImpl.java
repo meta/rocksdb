@@ -2,7 +2,6 @@ package org.rocksdb.ffm;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import org.rocksdb.ffm.RocksFFM.*;
 
 final class OpenDBImpl extends WithDB implements RocksFFM.OpenDB {
   OpenDBImpl(Arena arena, MemorySegment db) {
