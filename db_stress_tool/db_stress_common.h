@@ -236,6 +236,7 @@ DECLARE_int64(target_file_size_base);
 DECLARE_int32(target_file_size_multiplier);
 DECLARE_uint64(max_bytes_for_level_base);
 DECLARE_double(max_bytes_for_level_multiplier);
+DECLARE_double(max_bytes_for_level_multiplier_slack);
 DECLARE_uint64(rate_limiter_bytes_per_sec);
 DECLARE_bool(rate_limit_bg_reads);
 DECLARE_bool(rate_limit_user_ops);

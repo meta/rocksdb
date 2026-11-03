@@ -245,6 +245,7 @@ int db_stress_tool(int argc, char** argv) {
   SanitizeDoubleParam(&FLAGS_bloom_bits);
   SanitizeDoubleParam(&FLAGS_memtable_prefix_bloom_size_ratio);
   SanitizeDoubleParam(&FLAGS_max_bytes_for_level_multiplier);
+  SanitizeDoubleParam(&FLAGS_max_bytes_for_level_multiplier_slack);
 
   // db_stress may read and write in-development draft format_versions that are
   // not yet published to users. Enable the TEST-only opt-in once, centrally,

@@ -556,6 +556,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct MutableCFOptions, max_bytes_for_level_multiplier),
           OptionType::kDouble, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"max_bytes_for_level_multiplier_slack",
+         {offsetof(struct MutableCFOptions,
+                   max_bytes_for_level_multiplier_slack),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"max_bytes_for_level_multiplier_additional",
          OptionTypeInfo::Vector<int>(
              offsetof(struct MutableCFOptions,
@@ -1290,6 +1295,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  max_bytes_for_level_base);
   ROCKS_LOG_INFO(log, "           max_bytes_for_level_multiplier: %f",
                  max_bytes_for_level_multiplier);
+  ROCKS_LOG_INFO(log, "     max_bytes_for_level_multiplier_slack: %f",
+                 max_bytes_for_level_multiplier_slack);
   ROCKS_LOG_INFO(log, "                                      ttl: %" PRIu64,
                  ttl);
   ROCKS_LOG_INFO(log, "              periodic_compaction_seconds: %" PRIu64,

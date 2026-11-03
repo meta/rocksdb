@@ -765,6 +765,80 @@ TEST_F(DBOptionsTest, SetOptionsAndReopen) {
   ASSERT_OK(TryReopen(options));
 }
 
+TEST_F(DBOptionsTest, DynamicLevelFanoutSlackValidation) {
+  Options options;
+  options.env = env_;
+  options.create_if_missing = true;
+  ASSERT_EQ(options.max_bytes_for_level_multiplier_slack, 0);
+
+  for (double invalid_slack : {-0.1, std::numeric_limits<double>::infinity(),
+                               -std::numeric_limits<double>::infinity(),
+                               std::numeric_limits<double>::quiet_NaN()}) {
+    options.max_bytes_for_level_multiplier_slack = invalid_slack;
+    Status s = TryReopen(options);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  }
+
+  options.max_bytes_for_level_multiplier =
+      std::numeric_limits<double>::max() / 2;
+  options.max_bytes_for_level_multiplier_slack = 2;
+  Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+
+  // A zero slack must not add restrictions to the existing multiplier.
+  options.max_bytes_for_level_multiplier_slack = 0;
+  ASSERT_OK(ColumnFamilyData::ValidateOptions(options, options));
+  options.max_bytes_for_level_multiplier = 1;
+  options.max_bytes_for_level_multiplier_slack = 0.25;
+  ASSERT_OK(TryReopen(options));
+
+  // An unused cap does not impose constraints in other compaction modes.
+  options.max_bytes_for_level_multiplier =
+      std::numeric_limits<double>::max() / 2;
+  options.max_bytes_for_level_multiplier_slack = 2;
+  options.level_compaction_dynamic_level_bytes = false;
+  ASSERT_OK(ColumnFamilyData::ValidateOptions(options, options));
+  options.level_compaction_dynamic_level_bytes = true;
+  options.compaction_style = kCompactionStyleUniversal;
+  ASSERT_OK(ColumnFamilyData::ValidateOptions(options, options));
+}
+
+TEST_F(DBOptionsTest, DynamicLevelFanoutSlackSetOptionsAndPersist) {
+  Options options;
+  options.env = env_;
+  options.create_if_missing = true;
+  Reopen(options);
+  ASSERT_OK(
+      db_->SetOptions({{"max_bytes_for_level_multiplier_slack", "0.25"}}));
+  ASSERT_EQ(db_->GetOptions().max_bytes_for_level_multiplier_slack, 0.25);
+
+  for (const char* invalid_slack : {"-0.1", "nan", "inf", "-inf"}) {
+    Status s = db_->SetOptions(
+        {{"max_bytes_for_level_multiplier_slack", invalid_slack}});
+    ASSERT_TRUE(s.IsInvalidArgument()) << invalid_slack << ": " << s.ToString();
+    ASSERT_EQ(db_->GetOptions().max_bytes_for_level_multiplier_slack, 0.25);
+  }
+  Status s = db_->SetOptions({{"max_bytes_for_level_multiplier", "1e308"},
+                              {"max_bytes_for_level_multiplier_slack", "10"}});
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_EQ(db_->GetOptions().max_bytes_for_level_multiplier, 10);
+  ASSERT_EQ(db_->GetOptions().max_bytes_for_level_multiplier_slack, 0.25);
+
+  DBOptions db_options;
+  std::vector<ColumnFamilyDescriptor> cf_descs;
+  ConfigOptions config_options;
+  config_options.env = env_;
+  ASSERT_OK(LoadLatestOptions(config_options, dbname_, &db_options, &cf_descs,
+                              nullptr));
+  ASSERT_EQ(cf_descs.size(), 1U);
+  ASSERT_EQ(cf_descs[0].options.max_bytes_for_level_multiplier_slack, 0.25);
+  Options persisted_options(db_options, cf_descs[0].options);
+  ASSERT_OK(TryReopen(persisted_options));
+  ASSERT_EQ(db_->GetOptions().max_bytes_for_level_multiplier_slack, 0.25);
+  ASSERT_OK(db_->SetOptions({{"max_bytes_for_level_multiplier_slack", "0"}}));
+  ASSERT_EQ(db_->GetOptions().max_bytes_for_level_multiplier_slack, 0);
+}
+
 TEST_F(DBOptionsTest, SetBlobFileWritableFileMaxBufferSize) {
   constexpr uint64_t kBlobWriterBufferSize = 128 * 1024;
 

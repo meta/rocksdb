@@ -12497,6 +12497,117 @@ TEST_F(DBCompactionTest, DrainUnnecessaryLevelsAfterMultiplierChanged) {
   ASSERT_GT(init_num_nonempty, final_num_nonempty);
 }
 
+TEST_F(DBCompactionTest, DynamicLevelMultiplierSlackDrainsUnnecessaryLevel) {
+  constexpr int kBaseLevelBytes = 256 << 10;
+  constexpr int kValueBytes = 1 << 10;
+  constexpr int kBottomKeys = 2600;
+  constexpr int kUpperKeys = 32;
+  constexpr int kOverwrittenKeys = 16;
+  constexpr int kNewKeys = 16;
+
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleLevel;
+  options.compression = kNoCompression;
+  options.num_levels = 5;
+  options.level_compaction_dynamic_level_bytes = true;
+  options.max_bytes_for_level_base = kBaseLevelBytes;
+  options.max_bytes_for_level_multiplier = 10;
+  options.target_file_size_base = 4 << 20;
+  options.write_buffer_size = 8 << 20;
+  options.level0_file_num_compaction_trigger = 1;
+  options.disable_auto_compactions = true;
+  std::shared_ptr<CompactionStatsCollector> collector =
+      std::make_shared<CompactionStatsCollector>();
+  options.listeners.emplace_back(collector);
+  DestroyAndReopen(options);
+
+  Random rnd(301);
+  const std::string bottom_value = rnd.RandomString(kValueBytes);
+  const std::string upper_value = rnd.RandomString(kValueBytes);
+  const std::string updated_value = rnd.RandomString(kValueBytes);
+  for (int i = 0; i < kBottomKeys; ++i) {
+    ASSERT_OK(Put(Key(i), bottom_value));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(4);
+  ASSERT_EQ("0,0,0,0,1", FilesPerLevel());
+
+  // The bottom level is slightly larger than ten base-level budgets. Without
+  // slack, the nominal fanout needs three levels even though L2 is small.
+  for (int i = 0; i < kUpperKeys; ++i) {
+    ASSERT_OK(Put(Key(kBottomKeys + i), upper_value));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(3);
+  for (int i = 0; i < kOverwrittenKeys; ++i) {
+    ASSERT_OK(Put(Key(kBottomKeys + i), updated_value));
+  }
+  for (int i = 0; i < kNewKeys; ++i) {
+    ASSERT_OK(Put(Key(kBottomKeys + kUpperKeys + i), updated_value));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_EQ("0,0,1,1,1", FilesPerLevel());
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_GT(metadata.levels[4].size, 10U * kBaseLevelBytes);
+  ASSERT_LT(metadata.size, 11U * kBaseLevelBytes);
+  uint64_t base_level = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBaseLevel, &base_level));
+  ASSERT_EQ(2, base_level);
+
+  // SetOptions must schedule a real drain of the existing shallow level,
+  // rather than just changing targets or silently skipping its contents.
+  ASSERT_OK(db_->SetOptions({{"max_bytes_for_level_multiplier_slack", "0.1"},
+                             {"disable_auto_compactions", "false"}}));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(0, NumTableFilesAtLevel(0));
+  ASSERT_EQ(0, NumTableFilesAtLevel(1));
+  ASSERT_EQ(0, NumTableFilesAtLevel(2));
+  ASSERT_GT(NumTableFilesAtLevel(3), 0);
+  ASSERT_GT(NumTableFilesAtLevel(4), 0);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBaseLevel, &base_level));
+  ASSERT_EQ(3, base_level);
+  ASSERT_GT(
+      collector->NumberOfCompactions(CompactionReason::kLevelMaxLevelSize), 0);
+
+  const int num_keys = kBottomKeys + kUpperKeys + kNewKeys;
+  const auto verify_data = [&]() {
+    for (int i = 0; i < num_keys; ++i) {
+      if (i < kBottomKeys) {
+        ASSERT_EQ(bottom_value, Get(Key(i)));
+      } else if (i < kBottomKeys + kOverwrittenKeys ||
+                 i >= kBottomKeys + kUpperKeys) {
+        ASSERT_EQ(updated_value, Get(Key(i)));
+      } else {
+        ASSERT_EQ(upper_value, Get(Key(i)));
+      }
+    }
+  };
+  verify_data();
+
+  options.max_bytes_for_level_multiplier_slack = 0.1;
+  options.disable_auto_compactions = false;
+  Reopen(options);
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(0, NumTableFilesAtLevel(2));
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBaseLevel, &base_level));
+  ASSERT_EQ(3, base_level);
+  verify_data();
+
+  // Turning slack off restores the nominal fanout and sends new L0 data to
+  // the shallower base level, without losing the previously compacted data.
+  ASSERT_OK(db_->SetOptions({{"max_bytes_for_level_multiplier_slack", "0"}}));
+  ASSERT_OK(Put(Key(num_keys), updated_value));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBaseLevel, &base_level));
+  ASSERT_EQ(2, base_level);
+  ASSERT_GT(NumTableFilesAtLevel(2), 0);
+  verify_data();
+  ASSERT_EQ(updated_value, Get(Key(num_keys)));
+}
+
 TEST_F(DBCompactionTest, DrainUnnecessaryLevelsAfterDBBecomesSmall) {
   // When the DB size is smaller, e.g., large chunk of data deleted by
   // DeleteRange(), unnecessary levels should to be drained.

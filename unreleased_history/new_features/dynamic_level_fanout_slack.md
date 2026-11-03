@@ -1,0 +1,1 @@
+Added the mutable CF option `max_bytes_for_level_multiplier_slack` to allow dynamic leveled compaction to increase per-level fanout within a configured bound and avoid an extra level with a small target size. The default of 0 preserves existing behavior.

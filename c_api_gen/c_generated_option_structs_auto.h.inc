@@ -357,6 +357,14 @@ extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_options_get_target_file_size_is_upper_bound(rocksdb_options_t* opt);
 
 extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_max_bytes_for_level_multiplier_slack(rocksdb_options_t* opt,
+                                                         double v);
+
+extern ROCKSDB_LIBRARY_API double
+rocksdb_options_get_max_bytes_for_level_multiplier_slack(
+    rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
 rocksdb_options_set_strict_max_successive_merges(rocksdb_options_t* opt,
                                                  unsigned char v);
 

@@ -1677,6 +1677,13 @@ bool StressTest::BuildOptionsTable() {
            "1",
            "2",
        }},
+      {"max_bytes_for_level_multiplier_slack",
+       {
+           std::to_string(options_.max_bytes_for_level_multiplier_slack),
+           "0",
+           "0.1",
+           "0.25",
+       }},
       {"block_based_table_factory",
        {
            keepRibbonFilterPolicyOnly ? "{filter_policy=ribbonfilter:2.35}"
@@ -7128,6 +7135,8 @@ void InitializeOptionsFromFlags(
   options.target_file_size_multiplier = FLAGS_target_file_size_multiplier;
   options.max_bytes_for_level_base = FLAGS_max_bytes_for_level_base;
   options.max_bytes_for_level_multiplier = FLAGS_max_bytes_for_level_multiplier;
+  options.max_bytes_for_level_multiplier_slack =
+      FLAGS_max_bytes_for_level_multiplier_slack;
   options.level0_stop_writes_trigger = FLAGS_level0_stop_writes_trigger;
   options.level0_slowdown_writes_trigger = FLAGS_level0_slowdown_writes_trigger;
   options.level0_file_num_compaction_trigger =

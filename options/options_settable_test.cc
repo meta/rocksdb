@@ -689,6 +689,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "max_compaction_bytes=64;"
       "ignore_max_compaction_bytes_for_input=true;"
       "max_bytes_for_level_multiplier=60;"
+      "max_bytes_for_level_multiplier_slack=0.25;"
       "memtable_factory=SkipListFactory;"
       "compression=kNoCompression;"
       "compression_opts={max_dict_buffer_bytes=5;use_zstd_dict_trainer=true;"

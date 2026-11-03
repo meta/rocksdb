@@ -151,6 +151,8 @@ struct MutableCFOptions {
             options.target_file_size_is_upper_bound),
         max_bytes_for_level_base(options.max_bytes_for_level_base),
         max_bytes_for_level_multiplier(options.max_bytes_for_level_multiplier),
+        max_bytes_for_level_multiplier_slack(
+            options.max_bytes_for_level_multiplier_slack),
         ttl(options.ttl),
         periodic_compaction_seconds(options.periodic_compaction_seconds),
         read_triggered_compaction_threshold(
@@ -234,6 +236,7 @@ struct MutableCFOptions {
         target_file_size_is_upper_bound(false),
         max_bytes_for_level_base(0),
         max_bytes_for_level_multiplier(0),
+        max_bytes_for_level_multiplier_slack(0),
         ttl(0),
         periodic_compaction_seconds(0),
         read_triggered_compaction_threshold(0.0),
@@ -338,6 +341,7 @@ struct MutableCFOptions {
   bool target_file_size_is_upper_bound;
   uint64_t max_bytes_for_level_base;
   double max_bytes_for_level_multiplier;
+  double max_bytes_for_level_multiplier_slack;
   uint64_t ttl;
   uint64_t periodic_compaction_seconds;
   double read_triggered_compaction_threshold;

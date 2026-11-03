@@ -605,6 +605,7 @@ struct AdvancedColumnFamilyOptions {
   // extra size. After the data accumulates more so that we need to move the
   // base level to the third last one, and so on.
   //
+  // The following examples assume max_bytes_for_level_multiplier_slack=0.
   // For example, assume max_bytes_for_level_multiplier=10, num_levels=6,
   // and max_bytes_for_level_base=10MB.
   // Target sizes of level 1 to 5 starts with:
@@ -669,6 +670,26 @@ struct AdvancedColumnFamilyOptions {
   //
   // Dynamically changeable through SetOptions() API
   double max_bytes_for_level_multiplier = 10;
+
+  // Maximum relative increase in the effective per-level fanout used to avoid
+  // an extra level with a small target size. For example, a multiplier of 10
+  // and slack of 0.1 allow an effective fanout up to 11. The policy tries to
+  // eliminate one level relative to the nominal fanout. It uses the smallest
+  // continuous multiplier that fits when it is within the cap; integer
+  // truncation can instead make the cap eligible. It does not minimize the
+  // number of levels for a large slack. A larger fanout can increase write
+  // amplification, while fewer levels can reduce read amplification. Existing
+  // shallow levels are drained before the base level moves down.
+  //
+  // Only applies to leveled compaction with
+  // level_compaction_dynamic_level_bytes enabled and
+  // max_bytes_for_level_multiplier > 1. Ignored otherwise. The value must be
+  // finite and non-negative. When enabled, the resulting fanout cap,
+  // max_bytes_for_level_multiplier * (1 + slack), must be finite.
+  //
+  // Default: 0 (disabled, preserving the existing level targets).
+  // Dynamically changeable through SetOptions() API.
+  double max_bytes_for_level_multiplier_slack = 0;
 
   // Different max-size multipliers for different levels.
   // These are multiplied by max_bytes_for_level_multiplier to arrive

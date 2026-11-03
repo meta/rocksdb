@@ -12,8 +12,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <future>
+#include <limits>
 #include <tuple>
 
 #include "db/blob/blob_log_writer.h"
@@ -504,6 +506,164 @@ TEST_F(VersionStorageInfoTest, DrainUnnecessaryLevel) {
   ASSERT_GT(vstorage_.CompactionScore(0), 10);
   ASSERT_EQ(3, vstorage_.CompactionScoreLevel(1));
   ASSERT_GT(vstorage_.CompactionScore(1), 10);
+}
+
+struct DynamicFanoutSlackCase {
+  uint64_t base_bytes;
+  uint64_t last_level_bytes;
+  double multiplier;
+  double slack;
+  int expected_base_level;
+  double expected_multiplier;
+};
+
+class DynamicFanoutSlackTest
+    : public VersionStorageInfoTest,
+      public testing::WithParamInterface<DynamicFanoutSlackCase> {};
+
+TEST_P(DynamicFanoutSlackTest, Targets) {
+  const DynamicFanoutSlackCase& c = GetParam();
+  ioptions_.level_compaction_dynamic_level_bytes = true;
+  mutable_cf_options_.max_bytes_for_level_base = c.base_bytes;
+  mutable_cf_options_.max_bytes_for_level_multiplier = c.multiplier;
+  mutable_cf_options_.max_bytes_for_level_multiplier_slack = c.slack;
+  if (c.last_level_bytes > 0) {
+    Add(5, 1U, "a", "z", c.last_level_bytes);
+  }
+  UpdateVersionStorageInfo();
+
+  ASSERT_EQ(c.expected_base_level, vstorage_.base_level());
+  ASSERT_NEAR(c.expected_multiplier, vstorage_.level_multiplier(), 1e-12);
+  for (int level = vstorage_.base_level(); level < 6; ++level) {
+    ASSERT_GE(vstorage_.MaxBytesForLevel(level), c.base_bytes);
+    if (level > vstorage_.base_level()) {
+      ASSERT_GE(vstorage_.MaxBytesForLevel(level),
+                vstorage_.MaxBytesForLevel(level - 1));
+    }
+  }
+  ASSERT_EQ(0, logger_->log_count);
+}
+
+INSTANTIATE_TEST_CASE_P(
+    DynamicLevelFanout, DynamicFanoutSlackTest,
+    testing::Values(
+        // Disabled, or no level can be removed.
+        DynamicFanoutSlackCase{1000, 10100, 10, 0, 3, 10},
+        DynamicFanoutSlackCase{1000, 1000, 10, 0.1, 5, 10},
+        DynamicFanoutSlackCase{1000, 10009, 10, 0.1, 4, 10},
+        DynamicFanoutSlackCase{1000, 100000, 10, 0.1, 3, 10},
+        // One interval, cap boundary, and a boundary due to truncation.
+        DynamicFanoutSlackCase{1000, 10100, 10, 0.1, 4, 10.1},
+        DynamicFanoutSlackCase{1000, 11000, 10, 0.1, 4, 11},
+        DynamicFanoutSlackCase{1000, 11010, 10, 0.1, 4, 11},
+        DynamicFanoutSlackCase{1000, 11011, 10, 0.1, 3, 10},
+        // More than one interval, including fractional configured fanout.
+        DynamicFanoutSlackCase{1000, 101000, 10, 0.1, 3, std::sqrt(101.0)},
+        DynamicFanoutSlackCase{1000, 121000, 10, 0.1, 3, 11},
+        DynamicFanoutSlackCase{1000, 121120, 10, 0.1, 3, 11},
+        DynamicFanoutSlackCase{1000, 121121, 10, 0.1, 2, 10},
+        DynamicFanoutSlackCase{1000, 8500, 2.5, 0.2, 3, std::sqrt(8.5)},
+        DynamicFanoutSlackCase{1, 10, 2, 0.5, 3, 3},
+        // Empty shape and large integer boundaries.
+        DynamicFanoutSlackCase{1000, 0, 10, 0.1, 5, 0},
+        DynamicFanoutSlackCase{uint64_t{1} << 50, (uint64_t{1} << 50) * 101, 10,
+                               0.1, 3, std::sqrt(101.0)},
+        DynamicFanoutSlackCase{uint64_t{1} << 40,
+                               std::numeric_limits<uint64_t>::max(), 10, 29, 2,
+                               256}));
+
+TEST_F(VersionStorageInfoTest,
+       DynamicFanoutSlackAvoidsTargetOverflowWithShallowLevels) {
+  ioptions_.level_compaction_dynamic_level_bytes = true;
+  mutable_cf_options_.max_bytes_for_level_base = uint64_t{1} << 40;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 10;
+  mutable_cf_options_.max_bytes_for_level_multiplier_slack = 29;
+  Add(1, 1U, "a", "z", 1);
+  Add(5, 2U, "a", "z", std::numeric_limits<uint64_t>::max());
+  UpdateVersionStorageInfo();
+  ASSERT_EQ(1, vstorage_.base_level());
+  ASSERT_EQ(10, vstorage_.level_multiplier());
+}
+
+TEST_F(VersionStorageInfoTest, DynamicFanoutSlackOnlyL0) {
+  ioptions_.level_compaction_dynamic_level_bytes = true;
+  mutable_cf_options_.max_bytes_for_level_base = 1000;
+  mutable_cf_options_.max_bytes_for_level_multiplier_slack = 0.1;
+  Add(0, 1U, "a", "z", 10100);
+  UpdateVersionStorageInfo();
+  ASSERT_EQ(5, vstorage_.base_level());
+  ASSERT_EQ(std::numeric_limits<uint64_t>::max(),
+            vstorage_.MaxBytesForLevel(5));
+}
+
+TEST_F(VersionStorageInfoTest, DynamicFanoutSlackIgnoredForStaticLevels) {
+  ioptions_.level_compaction_dynamic_level_bytes = false;
+  mutable_cf_options_.max_bytes_for_level_base = 1000;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 10;
+  mutable_cf_options_.max_bytes_for_level_multiplier_slack = 0.1;
+  Add(5, 1U, "a", "z", 10100);
+  UpdateVersionStorageInfo();
+  ASSERT_EQ(1, vstorage_.base_level());
+  ASSERT_EQ(1000, vstorage_.MaxBytesForLevel(1));
+  ASSERT_EQ(10000, vstorage_.MaxBytesForLevel(2));
+  ASSERT_EQ(100000, vstorage_.MaxBytesForLevel(3));
+}
+
+TEST_F(VersionStorageInfoTest, DynamicFanoutSlackDrainPreservesProximalLevel) {
+  ioptions_.level_compaction_dynamic_level_bytes = true;
+  mutable_cf_options_.max_bytes_for_level_base = 1000;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 10;
+  mutable_cf_options_.max_bytes_for_level_multiplier_slack = 0.1;
+  mutable_cf_options_.preclude_last_level_data_seconds = 1;
+  Add(3, 1U, "a", "z", 500);
+  Add(4, 2U, "a", "z", 1000);
+  Add(5, 3U, "a", "z", 10100);
+  UpdateVersionStorageInfo();
+  ASSERT_EQ(3, vstorage_.base_level());
+  ASSERT_NEAR(10.1, vstorage_.level_multiplier(), 1e-12);
+  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_, "");
+  ASSERT_EQ(3, vstorage_.CompactionScoreLevel(0));
+  ASSERT_GT(vstorage_.CompactionScore(0), 10);
+  ASSERT_LT(vstorage_.CompactionScore(1), 1);
+}
+
+TEST_F(VersionStorageInfoTest, DynamicFanoutSlackLargestLevelIsNotLast) {
+  ioptions_.level_compaction_dynamic_level_bytes = true;
+  mutable_cf_options_.max_bytes_for_level_base = 1000;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 10;
+  mutable_cf_options_.max_bytes_for_level_multiplier_slack = 0.1;
+  // The last level can shrink below a higher level after compaction.
+  Add(4, 1U, "a", "z", 10100);
+  Add(5, 2U, "a", "z", 1000);
+  UpdateVersionStorageInfo();
+  ASSERT_EQ(4, vstorage_.base_level());
+  ASSERT_NEAR(10.1, vstorage_.level_multiplier(), 1e-12);
+  ASSERT_EQ(1000, vstorage_.MaxBytesForLevel(4));
+  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_, "");
+  ASSERT_EQ(4, vstorage_.CompactionScoreLevel(0));
+  ASSERT_GT(vstorage_.CompactionScore(0), 10);
+}
+
+TEST_F(VersionStorageInfoTest, DynamicFanoutSlackPendingCompactionBytes) {
+  ioptions_.level_compaction_dynamic_level_bytes = true;
+  mutable_cf_options_.max_bytes_for_level_base = 1000;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 10;
+  mutable_cf_options_.max_bytes_for_level_multiplier_slack = 0.1;
+  mutable_cf_options_.level0_file_num_compaction_trigger = 2;
+  Add(0, 1U, "a", "m", 250);
+  Add(0, 2U, "n", "z", 250);
+  Add(4, 3U, "a", "z", 2000);
+  Add(5, 4U, "a", "z", 10100);
+  UpdateVersionStorageInfo();
+  ASSERT_EQ(4, vstorage_.base_level());
+  ASSERT_EQ(1000, vstorage_.MaxBytesForLevel(4));
+  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_, "");
+  // L0 contributes 500 bytes and overlaps 2000 base-level bytes. Of the
+  // resulting 2500 bytes, 1500 exceed the new target. Their fanout cost is
+  // 1500 * (10100 / 2500 + 1) = 7560, for a total debt of 10060 bytes.
+  ASSERT_EQ(10060, vstorage_.estimated_compaction_needed_bytes());
+  ASSERT_EQ(4, vstorage_.CompactionScoreLevel(0));
+  ASSERT_GT(vstorage_.CompactionScore(0), 10);
 }
 
 TEST_F(VersionStorageInfoTest, EstimateLiveDataSize) {

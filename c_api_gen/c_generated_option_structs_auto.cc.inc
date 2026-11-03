@@ -1143,6 +1143,16 @@ double rocksdb_options_get_max_bytes_for_level_multiplier(
   return opt->rep.max_bytes_for_level_multiplier;
 }
 
+void rocksdb_options_set_max_bytes_for_level_multiplier_slack(
+    rocksdb_options_t* opt, double v) {
+  opt->rep.max_bytes_for_level_multiplier_slack = v;
+}
+
+double rocksdb_options_get_max_bytes_for_level_multiplier_slack(
+    rocksdb_options_t* opt) {
+  return opt->rep.max_bytes_for_level_multiplier_slack;
+}
+
 void rocksdb_options_set_max_compaction_bytes(rocksdb_options_t* opt,
                                               uint64_t v) {
   opt->rep.max_compaction_bytes = v;

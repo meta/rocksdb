@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <list>
 #include <map>
@@ -5096,6 +5097,101 @@ uint64_t VersionStorageInfo::MaxBytesForLevel(int level) const {
   return level_max_bytes_[level];
 }
 
+namespace {
+
+uint64_t DynamicLevelBytesAfterDivisions(uint64_t bytes, double multiplier,
+                                         int num_divisions) {
+  // multiplier > 1 keeps the truncated quotient in the uint64_t range.
+  for (int i = 0; i < num_divisions; ++i) {
+    bytes = static_cast<uint64_t>(bytes / multiplier);
+  }
+  return bytes;
+}
+
+double ChooseDynamicLevelMultiplier(uint64_t max_level_size,
+                                    uint64_t base_bytes_max, double multiplier,
+                                    double slack, int first_non_empty_level,
+                                    int num_levels) {
+  // Use the existing policy unless increasing the multiplier can remove a
+  // level. In particular, a single non-L0 level cannot be made smaller this
+  // way.
+  if (slack <= 0 || !std::isfinite(slack) || multiplier <= 1 ||
+      !std::isfinite(multiplier) || base_bytes_max == 0 ||
+      max_level_size <= base_bytes_max) {
+    return multiplier;
+  }
+  const double max_multiplier = multiplier * (1 + slack);
+  if (!std::isfinite(max_multiplier) || max_multiplier <= multiplier) {
+    return multiplier;
+  }
+
+  // Match CalculateBaseBytes' truncation at each division rather than using
+  // logarithms to decide how many levels are needed. multiplier > 1 keeps
+  // these floating-point-to-integer conversions in the uint64_t range.
+  uint64_t level_size = max_level_size;
+  int num_divisions = 0;
+  while (level_size > base_bytes_max && num_divisions < num_levels - 2) {
+    level_size = static_cast<uint64_t>(level_size / multiplier);
+    ++num_divisions;
+  }
+  if (num_divisions <= 1) {
+    return multiplier;
+  }
+  const int candidate_divisions = num_divisions - 1;
+  if (DynamicLevelBytesAfterDivisions(max_level_size, max_multiplier,
+                                      candidate_divisions) > base_bytes_max) {
+    return multiplier;
+  }
+
+  // Choose the smallest continuous multiplier that fits one fewer level.
+  // Integer truncation can allow a value below that root, including the cap.
+  // Round the root upwards and verify using the actual division policy; if
+  // floating-point rounding still misses the boundary, the cap already fits.
+  const long double ratio = static_cast<long double>(max_level_size) /
+                            static_cast<long double>(base_bytes_max);
+  const double required =
+      static_cast<double>(std::pow(ratio, 1.0L / candidate_divisions));
+  double candidate =
+      std::min(max_multiplier,
+               std::max(multiplier, std::nextafter(required, max_multiplier)));
+  if (DynamicLevelBytesAfterDivisions(max_level_size, candidate,
+                                      candidate_divisions) > base_bytes_max) {
+    candidate = max_multiplier;
+  }
+
+  // Existing shallow levels are drained before the base level can move down.
+  // Their raw target starts at base_bytes_min + 1, which can be much larger
+  // than the fitted shape at its deepest level. Reject a multiplier that
+  // would overflow target generation, where MultiplyCheckOverflow keeps the
+  // previous size instead of satisfying the requested multiplier.
+  int base_level = first_non_empty_level;
+  level_size = max_level_size;
+  for (int i = num_levels - 2; i >= first_non_empty_level; --i) {
+    level_size = static_cast<uint64_t>(level_size / candidate);
+  }
+  const uint64_t base_bytes_min =
+      static_cast<uint64_t>(base_bytes_max / candidate);
+  if (level_size <= base_bytes_min) {
+    level_size = base_bytes_min + 1;
+  } else {
+    while (base_level > 1 && level_size > base_bytes_max) {
+      --base_level;
+      level_size = static_cast<uint64_t>(level_size / candidate);
+    }
+    level_size = std::min(base_bytes_max, std::max(uint64_t{1}, level_size));
+  }
+  for (int i = base_level + 1; i < num_levels; ++i) {
+    if (level_size * candidate >=
+        static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+      return multiplier;
+    }
+    level_size = MultiplyCheckOverflow(level_size, candidate);
+  }
+  return candidate;
+}
+
+}  // namespace
+
 void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
                                             const MutableCFOptions& options) {
   // Special logic to set number of sorted runs.
@@ -5164,15 +5260,19 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
     } else {
       assert(first_non_empty_level >= 1);
       uint64_t base_bytes_max = options.max_bytes_for_level_base;
-      uint64_t base_bytes_min = static_cast<uint64_t>(
-          base_bytes_max / options.max_bytes_for_level_multiplier);
+      const double multiplier = ChooseDynamicLevelMultiplier(
+          max_level_size, base_bytes_max,
+          options.max_bytes_for_level_multiplier,
+          options.max_bytes_for_level_multiplier_slack, first_non_empty_level,
+          num_levels_);
+      uint64_t base_bytes_min =
+          static_cast<uint64_t>(base_bytes_max / multiplier);
 
       // Try whether we can make last level's target size to be max_level_size
       uint64_t cur_level_size = max_level_size;
       for (int i = num_levels_ - 2; i >= first_non_empty_level; i--) {
         // Round up after dividing
-        cur_level_size = static_cast<uint64_t>(
-            cur_level_size / options.max_bytes_for_level_multiplier);
+        cur_level_size = static_cast<uint64_t>(cur_level_size / multiplier);
         if (lowest_unnecessary_level_ == -1 &&
             cur_level_size <= base_bytes_min &&
             (options.preclude_last_level_data_seconds == 0 ||
@@ -5212,8 +5312,7 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
         base_level_ = first_non_empty_level;
         while (base_level_ > 1 && cur_level_size > base_bytes_max) {
           --base_level_;
-          cur_level_size = static_cast<uint64_t>(
-              cur_level_size / options.max_bytes_for_level_multiplier);
+          cur_level_size = static_cast<uint64_t>(cur_level_size / multiplier);
         }
         if (cur_level_size > base_bytes_max) {
           // Even L1 will be too large
@@ -5224,7 +5323,7 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
         }
       }
 
-      level_multiplier_ = options.max_bytes_for_level_multiplier;
+      level_multiplier_ = multiplier;
       assert(base_level_size > 0);
 
       uint64_t level_size = base_level_size;

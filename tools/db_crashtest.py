@@ -372,6 +372,9 @@ default_params = {
     "max_background_compactions": lambda: random.choice([2, 20]),
     "num_bottom_pri_threads": lambda: random.choice([0, 1, 20]),
     "max_bytes_for_level_base": 10485760,
+    "max_bytes_for_level_multiplier_slack": lambda: random.choice(
+        [0, 0, 0.05, 0.1, 0.25]
+    ),
     # max_key has to be the same across invocations for verification to work, hence no lambda
     "max_key": random.choice([100000, 25000000]),
     "max_sequential_skip_in_iterations": lambda: random.choice([1, 2, 8, 16]),

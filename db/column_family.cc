@@ -1524,6 +1524,21 @@ void ColumnFamilyData::ResetThreadLocalSuperVersions() {
 
 Status ColumnFamilyData::ValidateOptions(
     const DBOptions& db_options, const ColumnFamilyOptions& cf_options) {
+  const double fanout_slack = cf_options.max_bytes_for_level_multiplier_slack;
+  if (!std::isfinite(fanout_slack) || fanout_slack < 0) {
+    return Status::InvalidArgument(
+        "max_bytes_for_level_multiplier_slack must be finite and non-negative");
+  }
+  if (fanout_slack > 0 &&
+      cf_options.compaction_style == kCompactionStyleLevel &&
+      cf_options.level_compaction_dynamic_level_bytes &&
+      !std::isfinite(cf_options.max_bytes_for_level_multiplier *
+                     (1 + fanout_slack))) {
+    return Status::InvalidArgument(
+        "max_bytes_for_level_multiplier_slack produces a non-finite fanout "
+        "cap");
+  }
+
   Status s;
   s = CheckCompressionSupported(cf_options);
   if (s.ok() && db_options.allow_concurrent_memtable_write) {
