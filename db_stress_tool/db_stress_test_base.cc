@@ -6610,7 +6610,7 @@ void StressTest::VerifyManifestNotRewritten() {
               "Before: MANIFEST-%06" PRIu64 ", After: MANIFEST-%06" PRIu64 "\n",
               manifest_file_number_before_reopen_, current_manifest_number);
       fprintf(stderr, "This indicates a bug in the MANIFEST optimization.\n");
-      exit(1);
+      port::ImmediateExit(1);
     } else {
       fprintf(stdout,
               "WARNING: MANIFEST file was recreated despite "
@@ -6644,7 +6644,7 @@ void StressTest::VerifyManifestNotRewritten() {
                   "Expected complete avoidance (0 bytes growth). "
                   "This indicates a bug in the MANIFEST optimization.\n",
                   size_growth);
-          exit(1);
+          port::ImmediateExit(1);
         } else {
           fprintf(stdout,
                   "WARNING: MANIFEST file grew by %" PRIu64
@@ -6683,7 +6683,7 @@ void StressTest::VerifyManifestNotRewritten() {
               "FATAL: CURRENT file was updated despite ALL conditions for "
               "complete avoidance being met. MANIFEST was reused but CURRENT "
               "was modified. This indicates a bug.\n");
-          exit(1);
+          port::ImmediateExit(1);
         } else if (manifest_verify_mode_ == MANIFEST_VERIFY_NO_WRITE) {
           fprintf(stdout,
                   "WARNING: CURRENT file was updated despite both "
