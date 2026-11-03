@@ -2200,6 +2200,8 @@ class MultiScanArgs {
     rolling_prefetch = other.rolling_prefetch;
     rolling_prefetch_window_size = other.rolling_prefetch_window_size;
     use_async_io = other.use_async_io;
+    use_parallel_async_io_block_decompression =
+        other.use_parallel_async_io_block_decompression;
     reverse = other.reverse;
     io_dispatcher = other.io_dispatcher;
   }
@@ -2209,6 +2211,8 @@ class MultiScanArgs {
         rolling_prefetch(other.rolling_prefetch),
         rolling_prefetch_window_size(other.rolling_prefetch_window_size),
         use_async_io(other.use_async_io),
+        use_parallel_async_io_block_decompression(
+            other.use_parallel_async_io_block_decompression),
         reverse(other.reverse),
         io_dispatcher(std::move(other.io_dispatcher)),
         comp_(other.comp_),
@@ -2222,6 +2226,8 @@ class MultiScanArgs {
     rolling_prefetch = other.rolling_prefetch;
     rolling_prefetch_window_size = other.rolling_prefetch_window_size;
     use_async_io = other.use_async_io;
+    use_parallel_async_io_block_decompression =
+        other.use_parallel_async_io_block_decompression;
     reverse = other.reverse;
     io_dispatcher = other.io_dispatcher;
     return *this;
@@ -2236,6 +2242,8 @@ class MultiScanArgs {
       rolling_prefetch = other.rolling_prefetch;
       rolling_prefetch_window_size = other.rolling_prefetch_window_size;
       use_async_io = other.use_async_io;
+      use_parallel_async_io_block_decompression =
+          other.use_parallel_async_io_block_decompression;
       reverse = other.reverse;
       io_dispatcher = std::move(other.io_dispatcher);
     }
@@ -2302,6 +2310,8 @@ class MultiScanArgs {
     rolling_prefetch = other.rolling_prefetch;
     rolling_prefetch_window_size = other.rolling_prefetch_window_size;
     use_async_io = other.use_async_io;
+    use_parallel_async_io_block_decompression =
+        other.use_parallel_async_io_block_decompression;
     reverse = other.reverse;
     io_dispatcher = other.io_dispatcher;
   }
@@ -2339,6 +2349,12 @@ class MultiScanArgs {
   // When true, BlockBasedTableIterator will use ReadAsync() for reading blocks
   // When false, it will use synchronous MultiRead().
   bool use_async_io = false;
+
+  // EXPERIMENTAL: Materialize asynchronously read blocks in parallel using
+  // the Env::Priority::READ thread pool. If that pool has no workers,
+  // materialization remains inline. PerfContext counters for blocks
+  // materialized on pool threads are not attributed to the calling thread.
+  bool use_parallel_async_io_block_decompression = false;
 
   // Scan ranges in reverse order. Ranges are still specified in comparator
   // order as [start, limit), and reverse scans require bounded ranges.

@@ -68,8 +68,10 @@ class IndexFactory;
 // preserve provider-backed block ownership.
 //
 // Requirements:
-// - If the same provider instance is shared by multiple concurrently active
-//   readers, `Allocate()` must be safe to call concurrently.
+// - `Allocate()` must be safe to call concurrently if the same provider is
+//   shared by multiple active readers or if parallel block decompression is
+//   enabled. Parallel decompression may call `Allocate()` concurrently from
+//   multiple block-materialization workers for one reader.
 // - `Lease::data` must point to at least `size` bytes of writable contiguous
 //   memory that remains valid until every copy of `Lease::cleanup` is reset.
 // - `Lease::data` must be aligned to `alignment` bytes, where `alignment` is a

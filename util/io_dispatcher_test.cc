@@ -12,9 +12,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 #include "db/db_test_util.h"
@@ -34,6 +38,8 @@
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/aligned_buffer.h"
+#include "util/compression.h"
+#include "util/parallel_async_io_materializer.h"
 
 // Enable io_uring support for this test
 extern "C" bool RocksDbIOUringEnable() { return true; }
@@ -46,6 +52,162 @@ static constexpr bool kIOUringPresent = false;
 #endif
 
 namespace ROCKSDB_NAMESPACE {
+
+class ScopedSyncPointCallbacks {
+ public:
+  explicit ScopedSyncPointCallbacks(SyncPoint* sync_point)
+      : sync_point_(sync_point) {}
+  ~ScopedSyncPointCallbacks() {
+    sync_point_->DisableProcessing();
+    sync_point_->ClearAllCallBacks();
+  }
+
+ private:
+  SyncPoint* sync_point_;
+};
+
+class ScopedReadPoolThreads {
+ public:
+  ScopedReadPoolThreads(Env* env, int thread_count)
+      : env_(env),
+        original_thread_count_(env->GetBackgroundThreads(Env::Priority::READ)) {
+    env_->SetBackgroundThreads(thread_count, Env::Priority::READ);
+  }
+  ~ScopedReadPoolThreads() {
+    env_->SetBackgroundThreads(original_thread_count_, Env::Priority::READ);
+  }
+
+ private:
+  Env* env_;
+  int original_thread_count_;
+};
+
+class RejectingEnv : public EnvWrapper {
+ public:
+  RejectingEnv() : EnvWrapper(Env::Default()) {}
+
+  void Schedule(void (*function)(void*), void* arg, Priority pri, void* tag,
+                void (*unsched_function)(void*)) override {
+    if (pri == Env::Priority::READ) {
+      throw std::runtime_error("submission rejected");
+    }
+    EnvWrapper::Schedule(function, arg, pri, tag, unsched_function);
+  }
+
+  int GetBackgroundThreads(Priority pri) override {
+    return pri == Env::Priority::READ ? 1
+                                      : EnvWrapper::GetBackgroundThreads(pri);
+  }
+
+  unsigned int GetThreadPoolQueueLen(Priority pri) const override {
+    return pri == Env::Priority::READ ? 0
+                                      : EnvWrapper::GetThreadPoolQueueLen(pri);
+  }
+};
+
+class StalledEnv : public EnvWrapper {
+ public:
+  explicit StalledEnv(int thread_count)
+      : EnvWrapper(Env::Default()), thread_count_(thread_count) {}
+  ~StalledEnv() override {
+    std::vector<ScheduledJob> jobs;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      jobs.swap(jobs_);
+    }
+    for (const ScheduledJob& job : jobs) {
+      if (job.unsched_function != nullptr) {
+        job.unsched_function(job.arg);
+      }
+    }
+  }
+
+  void SetBackgroundThreads(int num, Priority pri) override {
+    if (pri == Env::Priority::READ) {
+      thread_count_ = num;
+      return;
+    }
+    EnvWrapper::SetBackgroundThreads(num, pri);
+  }
+
+  int GetBackgroundThreads(Priority pri) override {
+    return pri == Env::Priority::READ ? thread_count_
+                                      : EnvWrapper::GetBackgroundThreads(pri);
+  }
+
+  unsigned int GetThreadPoolQueueLen(Priority pri) const override {
+    if (pri != Env::Priority::READ) {
+      return EnvWrapper::GetThreadPoolQueueLen(pri);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<unsigned int>(jobs_.size());
+  }
+
+  void Schedule(void (*function)(void*), void* arg, Priority pri, void* tag,
+                void (*unsched_function)(void*)) override {
+    if (pri != Env::Priority::READ) {
+      EnvWrapper::Schedule(function, arg, pri, tag, unsched_function);
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    jobs_.push_back({function, arg, tag, unsched_function});
+  }
+
+  int UnSchedule(void* tag, Priority pri) override {
+    if (pri != Env::Priority::READ) {
+      return EnvWrapper::UnSchedule(tag, pri);
+    }
+    std::vector<ScheduledJob> removed_jobs;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++read_unschedule_calls_;
+      auto job = jobs_.begin();
+      while (job != jobs_.end()) {
+        if (job->tag == tag) {
+          removed_jobs.push_back(*job);
+          job = jobs_.erase(job);
+        } else {
+          ++job;
+        }
+      }
+    }
+    for (const ScheduledJob& job : removed_jobs) {
+      if (job.unsched_function != nullptr) {
+        job.unsched_function(job.arg);
+      }
+    }
+    return static_cast<int>(removed_jobs.size());
+  }
+
+  size_t read_unschedule_calls() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return read_unschedule_calls_;
+  }
+
+  void RunQueuedJobs() {
+    std::vector<ScheduledJob> jobs;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      jobs.swap(jobs_);
+    }
+    for (const ScheduledJob& job : jobs) {
+      job.function(job.arg);
+    }
+  }
+
+ private:
+  struct ScheduledJob {
+    void (*function)(void*);
+    void* arg;
+    void* tag;
+    void (*unsched_function)(void*);
+  };
+
+  int thread_count_;
+  mutable std::mutex mutex_;
+  std::vector<ScheduledJob> jobs_;
+  size_t read_unschedule_calls_ = 0;
+};
 
 // Represents a single read operation recorded by the tracking file system
 struct ReadOp {
@@ -354,6 +516,7 @@ class ControlledAsyncFS : public ReadTrackingFS {
 
   IOStatus Poll(std::vector<void*>& io_handles,
                 size_t /*min_completions*/) override {
+    poll_thread_ = std::this_thread::get_id();
     assert(!io_handles.empty());
     if (poll_delay_us_ > 0) {
       Env::Default()->SleepForMicroseconds(poll_delay_us_);
@@ -430,6 +593,7 @@ class ControlledAsyncFS : public ReadTrackingFS {
 
   size_t abort_count() const { return abort_count_; }
   size_t stray_completion_count() const { return stray_completion_count_; }
+  std::thread::id poll_thread() const { return poll_thread_; }
 
  private:
   void CompleteHandle(ControlledAsyncHandle* handle) {
@@ -453,6 +617,7 @@ class ControlledAsyncFS : public ReadTrackingFS {
   int poll_delay_us_ = 0;
   size_t abort_count_ = 0;
   size_t stray_completion_count_ = 0;
+  std::thread::id poll_thread_;
 };
 
 IOStatus ControlledAsyncRandomAccessFile::ReadAsync(
@@ -609,6 +774,9 @@ class IODispatcherTest : public DBTestBase {
       if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
         return Status::InvalidArgument("alignment must be a power of two");
       }
+      if (before_allocate_) {
+        before_allocate_();
+      }
       auto* allocation = new Allocation();
       allocation->owner = this;
       allocation->size = size;
@@ -647,6 +815,10 @@ class IODispatcherTest : public DBTestBase {
 
     size_t max_requested_alignment() const {
       return max_requested_alignment_.load(std::memory_order_relaxed);
+    }
+
+    void SetBeforeAllocate(std::function<void()> before_allocate) {
+      before_allocate_ = std::move(before_allocate);
     }
 
     bool OwnsLiveAddressRange(const char* data, size_t size) const {
@@ -691,6 +863,7 @@ class IODispatcherTest : public DBTestBase {
     std::atomic<size_t> allocations_{0};
     std::atomic<size_t> bytes_outstanding_{0};
     std::atomic<size_t> max_requested_alignment_{1};
+    std::function<void()> before_allocate_;
     mutable std::mutex live_allocations_mutex_;
     std::vector<AllocationRange> live_allocations_;
   };
@@ -1077,6 +1250,296 @@ TEST_F(IODispatcherTest,
   EXPECT_EQ(statistics->getTickerCount(BLOCK_CHECKSUM_MISMATCH_COUNT), 1);
   EXPECT_EQ(read_set->GetNumAsyncReads(), 2);
   EXPECT_EQ(read_set->GetNumSyncReads(), 1);
+}
+
+TEST(ParallelAsyncIOMaterializerTest, CallerHandlesRejectedJobs) {
+  RejectingEnv env;
+  std::atomic<size_t> materialized_items{0};
+  ParallelAsyncIOMaterializer::Materialize(
+      &env, 4, [&](size_t begin, size_t end) {
+        materialized_items.fetch_add(end - begin, std::memory_order_relaxed);
+      });
+  EXPECT_EQ(materialized_items.load(std::memory_order_relaxed), 4);
+}
+
+TEST(ParallelAsyncIOMaterializerTest, CallerHandlesPoolResizeToZero) {
+  Env* env = Env::Default();
+  ScopedReadPoolThreads scoped_read_pool(env, 1);
+  env->SetBackgroundThreads(0, Env::Priority::READ);
+
+  std::atomic<size_t> materialized_items{0};
+  ParallelAsyncIOMaterializer::Materialize(
+      env, 4, [&](size_t begin, size_t end) {
+        materialized_items.fetch_add(end - begin, std::memory_order_relaxed);
+      });
+  EXPECT_EQ(materialized_items.load(std::memory_order_relaxed), 4);
+}
+
+TEST(ParallelAsyncIOMaterializerTest, CallerHandlesInvocationFromPoolWorker) {
+  Env* env = Env::Default();
+  ScopedReadPoolThreads scoped_read_pool(env, 1);
+
+  std::promise<void> finished;
+  std::future<void> finished_future = finished.get_future();
+  std::atomic<size_t> materialized_items{0};
+  struct WorkerState {
+    Env* env;
+    std::atomic<size_t>* materialized_items;
+    std::promise<void>* finished;
+  } worker_state{env, &materialized_items, &finished};
+  env->Schedule(
+      [](void* arg) {
+        auto* state = static_cast<WorkerState*>(arg);
+        ParallelAsyncIOMaterializer::Materialize(
+            state->env, 4, [&](size_t begin, size_t end) {
+              state->materialized_items->fetch_add(end - begin,
+                                                   std::memory_order_relaxed);
+            });
+        state->finished->set_value();
+      },
+      &worker_state, Env::Priority::READ);
+
+  const std::future_status wait_status =
+      finished_future.wait_for(std::chrono::seconds(10));
+  if (wait_status != std::future_status::ready) {
+    env->SetBackgroundThreads(2, Env::Priority::READ);
+    finished_future.wait();
+  }
+  EXPECT_EQ(wait_status, std::future_status::ready);
+  EXPECT_EQ(materialized_items.load(std::memory_order_relaxed), 4);
+}
+
+TEST(ParallelAsyncIOMaterializerTest,
+     RethrowsMaterializationExceptionAfterJoin) {
+  Env* env = Env::Default();
+  ScopedReadPoolThreads scoped_read_pool(env, 2);
+
+  std::atomic<size_t> finished_ranges{0};
+  EXPECT_THROW(ParallelAsyncIOMaterializer::Materialize(
+                   env, 3,
+                   [&](size_t begin, size_t /*end*/) {
+                     if (begin == 0) {
+                       throw std::runtime_error("materialization failed");
+                     }
+                     finished_ranges.fetch_add(1, std::memory_order_relaxed);
+                   }),
+               std::runtime_error);
+  EXPECT_EQ(finished_ranges.load(std::memory_order_relaxed), 2);
+}
+
+TEST(ParallelAsyncIOMaterializerTest, DoesNotAccumulateJobsBehindStalledPool) {
+  StalledEnv env(4);
+
+  std::atomic<size_t> materialized_items{0};
+  for (size_t batch = 0; batch < 32; ++batch) {
+    ParallelAsyncIOMaterializer::Materialize(
+        &env, 4, [&](size_t begin, size_t end) {
+          materialized_items.fetch_add(end - begin, std::memory_order_relaxed);
+        });
+  }
+  EXPECT_EQ(materialized_items.load(std::memory_order_relaxed), 128);
+  EXPECT_EQ(env.GetThreadPoolQueueLen(Env::Priority::READ), 0);
+  EXPECT_EQ(env.read_unschedule_calls(), 32);
+}
+
+TEST(ParallelAsyncIOMaterializerTest, BusyPoolRunsInlineWithoutUnschedule) {
+  StalledEnv env(4);
+  env.Schedule([](void*) {}, nullptr, Env::Priority::READ, nullptr, nullptr);
+
+  std::atomic<size_t> materialized_items{0};
+  ParallelAsyncIOMaterializer::Materialize(
+      &env, 4, [&](size_t begin, size_t end) {
+        materialized_items.fetch_add(end - begin, std::memory_order_relaxed);
+      });
+  EXPECT_EQ(materialized_items.load(std::memory_order_relaxed), 4);
+  EXPECT_EQ(env.GetThreadPoolQueueLen(Env::Priority::READ), 1);
+  EXPECT_EQ(env.read_unschedule_calls(), 0);
+}
+
+TEST_F(IODispatcherTest, ZeroThreadPoolPreservesInlineMaterialization) {
+  std::shared_ptr<ControlledAsyncFS> controlled_fs =
+      std::make_shared<ControlledAsyncFS>(base_fs_);
+  controlled_fs->SetCompleteStrayFirst(false);
+  tracking_fs_ = controlled_fs;
+  std::unique_ptr<Env> controlled_env = NewCompositeEnv(controlled_fs);
+  ScopedReadPoolThreads scoped_read_pool(controlled_env.get(), 0);
+
+  std::unique_ptr<BlockBasedTable> table;
+  std::vector<BlockHandle> block_handles;
+  ASSERT_OK(CreateAndOpenSST(4, &table, &block_handles, nullptr, false,
+                             kNoCompression, false, controlled_env.get()));
+
+  std::shared_ptr<IOJob> job = std::make_shared<IOJob>();
+  job->block_handles = block_handles;
+  job->table = table.get();
+  job->job_options.read_options.async_io = true;
+  job->job_options.io_coalesce_threshold = 1024 * 1024;
+  job->job_options.use_parallel_async_io_block_decompression = true;
+
+  std::unique_ptr<IODispatcher> dispatcher(NewIODispatcher());
+  std::shared_ptr<ReadSet> read_set;
+  ASSERT_OK(dispatcher->SubmitJob(job, &read_set));
+  ASSERT_EQ(controlled_fs->GetReadAsyncCount(), 1);
+
+  std::atomic<bool> parallel_materialization_seen{false};
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  ScopedSyncPointCallbacks sync_point_callbacks(sync_point);
+  sync_point->SetCallBack("ParallelAsyncIOMaterializer::MaterializeBlock",
+                          [&](void*) { parallel_materialization_seen = true; });
+  sync_point->EnableProcessing();
+
+  const std::thread::id reader_thread = std::this_thread::get_id();
+  CachableEntry<Block> block;
+  ASSERT_OK(read_set->ReadIndex(0, &block));
+  EXPECT_NE(block.GetValue(), nullptr);
+  EXPECT_EQ(controlled_fs->poll_thread(), reader_thread);
+  EXPECT_FALSE(parallel_materialization_seen);
+}
+
+TEST_F(IODispatcherTest, ParallelMaterializationUsesWorkersAndJoins) {
+  std::shared_ptr<ControlledAsyncFS> controlled_fs =
+      std::make_shared<ControlledAsyncFS>(base_fs_);
+  controlled_fs->SetCompleteStrayFirst(false);
+  tracking_fs_ = controlled_fs;
+  std::unique_ptr<Env> controlled_env = NewCompositeEnv(controlled_fs);
+  ScopedReadPoolThreads scoped_read_pool(controlled_env.get(), 4);
+
+  std::unique_ptr<BlockBasedTable> table;
+  std::vector<BlockHandle> block_handles;
+  ASSERT_OK(CreateAndOpenSST(4, &table, &block_handles, nullptr, false,
+                             kSnappyCompression, false, controlled_env.get()));
+  ASSERT_EQ(block_handles.size(), 4);
+
+  std::promise<void> all_workers_entered;
+  auto all_workers_entered_future = all_workers_entered.get_future();
+  std::promise<void> allow_materialization;
+  auto allow_materialization_future =
+      allow_materialization.get_future().share();
+  std::atomic<size_t> workers_entered{0};
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  ScopedSyncPointCallbacks sync_point_callbacks(sync_point);
+  sync_point->SetCallBack("ParallelAsyncIOMaterializer::MaterializeBlock",
+                          [&](void*) {
+                            if (workers_entered.fetch_add(1) + 1 == 4) {
+                              all_workers_entered.set_value();
+                            }
+                            allow_materialization_future.wait();
+                          });
+  sync_point->EnableProcessing();
+
+  std::shared_ptr<IOJob> job = std::make_shared<IOJob>();
+  job->block_handles = block_handles;
+  job->table = table.get();
+  job->job_options.read_options.async_io = true;
+  job->job_options.io_coalesce_threshold = 1024 * 1024;
+  job->job_options.use_parallel_async_io_block_decompression = true;
+
+  std::unique_ptr<IODispatcher> dispatcher(NewIODispatcher());
+  std::shared_ptr<ReadSet> read_set;
+  ASSERT_OK(dispatcher->SubmitJob(job, &read_set));
+  ASSERT_EQ(controlled_fs->GetReadAsyncCount(), 1);
+
+  std::promise<std::thread::id> reader_thread;
+  auto reader_thread_future = reader_thread.get_future();
+  std::future<std::pair<Status, bool>> read_result =
+      std::async(std::launch::async, [&]() {
+        reader_thread.set_value(std::this_thread::get_id());
+        CachableEntry<Block> block;
+        Status status = read_set->ReadIndex(0, &block);
+        return std::make_pair(std::move(status), block.GetValue() != nullptr);
+      });
+
+  const std::future_status entered_status =
+      all_workers_entered_future.wait_for(std::chrono::seconds(10));
+  if (entered_status != std::future_status::ready) {
+    allow_materialization.set_value();
+  }
+  ASSERT_EQ(entered_status, std::future_status::ready);
+  EXPECT_EQ(read_result.wait_for(std::chrono::seconds(0)),
+            std::future_status::timeout);
+
+  allow_materialization.set_value();
+  std::pair<Status, bool> result = read_result.get();
+  ASSERT_OK(result.first);
+  EXPECT_TRUE(result.second);
+  EXPECT_EQ(controlled_fs->poll_thread(), reader_thread_future.get());
+
+  for (size_t i = 1; i < block_handles.size(); ++i) {
+    CachableEntry<Block> block;
+    ASSERT_OK(read_set->ReadIndex(i, &block));
+    EXPECT_NE(block.GetValue(), nullptr);
+  }
+}
+
+TEST_F(IODispatcherTest, ReadScopedProviderSupportsParallelMaterialization) {
+  if (!Snappy_Supported()) {
+    ROCKSDB_GTEST_SKIP("Test requires Snappy support");
+    return;
+  }
+
+  std::shared_ptr<ControlledAsyncFS> controlled_fs =
+      std::make_shared<ControlledAsyncFS>(base_fs_);
+  controlled_fs->SetCompleteStrayFirst(false);
+  tracking_fs_ = controlled_fs;
+  std::unique_ptr<Env> controlled_env = NewCompositeEnv(controlled_fs);
+  ScopedReadPoolThreads scoped_read_pool(controlled_env.get(), 4);
+
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = nullptr;
+  table_options.no_block_cache = true;
+  std::unique_ptr<BlockBasedTable> table;
+  std::vector<BlockHandle> block_handles;
+  ASSERT_OK(CreateAndOpenSST(4, &table, &block_handles, &table_options, false,
+                             kSnappyCompression, false, controlled_env.get()));
+
+  TestReadScopedBlockBufferProvider provider;
+  std::shared_ptr<IOJob> job = std::make_shared<IOJob>();
+  job->block_handles = block_handles;
+  job->table = table.get();
+  job->job_options.read_options.async_io = true;
+  job->job_options.read_options.read_scoped_block_buffer_provider = &provider;
+  job->job_options.io_coalesce_threshold = 1024 * 1024;
+  job->job_options.use_parallel_async_io_block_decompression = true;
+
+  std::unique_ptr<IODispatcher> dispatcher(NewIODispatcher());
+  std::shared_ptr<ReadSet> read_set;
+  ASSERT_OK(dispatcher->SubmitJob(job, &read_set));
+
+  std::promise<void> all_allocations_entered;
+  std::future<void> all_allocations_entered_future =
+      all_allocations_entered.get_future();
+  std::promise<void> allow_allocations;
+  std::shared_future<void> allow_allocations_future =
+      allow_allocations.get_future().share();
+  std::atomic<size_t> allocations_entered{0};
+  provider.SetBeforeAllocate([&]() {
+    if (allocations_entered.fetch_add(1) + 1 == 4) {
+      all_allocations_entered.set_value();
+    }
+    allow_allocations_future.wait();
+  });
+
+  std::future<std::pair<Status, bool>> read_result =
+      std::async(std::launch::async, [&]() {
+        CachableEntry<Block> block;
+        Status status = read_set->ReadIndex(0, &block);
+        return std::make_pair(std::move(status), block.GetValue() != nullptr);
+      });
+
+  const std::future_status entered_status =
+      all_allocations_entered_future.wait_for(std::chrono::seconds(10));
+  if (entered_status != std::future_status::ready) {
+    allow_allocations.set_value();
+  }
+  ASSERT_EQ(entered_status, std::future_status::ready);
+  EXPECT_EQ(read_result.wait_for(std::chrono::seconds(0)),
+            std::future_status::timeout);
+
+  allow_allocations.set_value();
+  std::pair<Status, bool> result = read_result.get();
+  ASSERT_OK(result.first);
+  EXPECT_TRUE(result.second);
+  EXPECT_EQ(allocations_entered.load(), 4);
 }
 
 // Verifies that setting a read-scoped provider makes IODispatcher data-block

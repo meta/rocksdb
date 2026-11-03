@@ -1141,6 +1141,8 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   }
   job->job_options.read_options = read_options_;
   job->job_options.read_options.async_io = multiscan_opts->use_async_io;
+  job->job_options.use_parallel_async_io_block_decompression =
+      multiscan_opts->use_parallel_async_io_block_decompression;
   // CollectBlockHandles walks sorted scan ranges through the table index, whose
   // key order matches data block offset order.
   job->job_options.block_handles_are_sorted = true;
