@@ -3378,10 +3378,9 @@ Status CompactionJob::ReadOutputFilesTableProperties(
     std::vector<std::shared_ptr<const TableProperties>>&
         output_files_table_properties,
     bool is_proximal_level) {
-  assert(!output_files.empty());
-
-  static const char* level_type =
-      is_proximal_level ? "proximal output" : "output";
+  // `output_files` can be empty: with per-key placement, one of the two output
+  // levels may have no output file yet when the progress was saved.
+  const char* level_type = is_proximal_level ? "proximal output" : "output";
 
   output_files_table_properties.reserve(output_files.size());
 
@@ -3556,14 +3555,15 @@ Status CompactionJob::MaybeResumeSubcompactionProgressOnInputIterator(
     // TODO(hx235): investigate if we can skip reading properties to save read
     // IO
     s = ReadOutputFilesTableProperties(output_files, read_options,
-                                       output_files_table_properties);
+                                       output_files_table_properties,
+                                       is_proximal_level);
     if (!s.ok()) {
       ROCKS_LOG_ERROR(
           db_options_.info_log,
-          "[%s] [JOB %d] Failed to read table properties for %s output level"
-          "files "
-          "during resume: %s.",
-          cfd->GetName().c_str(), job_id_, is_proximal_level ? "proximal" : "",
+          "[%s] [JOB %d] Failed to read table properties for %s level output "
+          "files during resume: %s.",
+          cfd->GetName().c_str(), job_id_,
+          is_proximal_level ? "proximal output" : "output",
           s.ToString().c_str());
       return Status::Corruption(
           "Not able to resume due to table property reading error " +

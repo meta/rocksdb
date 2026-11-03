@@ -9490,6 +9490,51 @@ TEST_F(ResumableCompactionServiceTest,
 }
 
 TEST_F(ResumableCompactionServiceTest,
+       PerKeyPlacementResumesWithoutProximalLevelOutput) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  // Compact L0 straight into the last level, which per-key placement needs.
+  options.num_levels = 3;
+  options.level_compaction_dynamic_level_bytes = true;
+  std::shared_ptr<Statistics> statistics = CreateDBStatistics();
+
+  auto resume_cs = std::make_shared<ResumableCompactionService>(
+      dbname_, options, statistics,
+      ResumableCompactionService::TestScenario::kCancelThenResume,
+      /*output_file_key_interval=*/1);
+  resume_cs->SetCancelAtKey("c", kMaxSequenceNumber);
+  options.compaction_service = resume_cs;
+
+  DestroyAndReopen(options);
+  for (const char* const key : {"a", "b", "c", "d"}) {
+    ASSERT_OK(Put(key, std::string(100, key[0])));
+  }
+  ASSERT_OK(Flush());
+
+  // Per-key placement without a preclude threshold sends every key to the last
+  // level, so the saved progress has no proximal level output files.
+  SyncPoint::GetInstance()->SetCallBack(
+      "Compaction::SupportsPerKeyPlacement:Enabled",
+      [&](void* arg) { *static_cast<bool*>(arg) = true; });
+  std::atomic<size_t> persisted_progress{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::PersistSubcompactionProgress:Complete",
+      [&](void*) { ++persisted_progress; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  EXPECT_GT(persisted_progress.load(), 0);
+  EXPECT_GT(statistics->getTickerCount(REMOTE_COMPACT_RESUMED_BYTES), 0);
+  for (const char* const key : {"a", "b", "c", "d"}) {
+    EXPECT_EQ(Get(key), std::string(100, key[0]));
+  }
+}
+
+TEST_F(ResumableCompactionServiceTest,
        BlobCompactionResumePreservesFilteredBoundaryInflow) {
   for (const BoundaryFilterDecision decision :
        {BoundaryFilterDecision::kChangeValue, BoundaryFilterDecision::kRemove,

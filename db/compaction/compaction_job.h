@@ -617,7 +617,7 @@ class CompactionJob {
       const ReadOptions& read_options,
       std::vector<std::shared_ptr<const TableProperties>>&
           output_files_table_properties,
-      bool is_proximal_level = false);
+      bool is_proximal_level);
 
   Status ReadTablePropertiesDirectly(
       const ImmutableOptions& ioptions, const MutableCFOptions& moptions,
