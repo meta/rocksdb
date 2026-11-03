@@ -34,12 +34,12 @@ public class RocksFFMTest {
     try (Arena arena = Arena.ofConfined()) {
       var db = RocksFFM.db(arena).open(dbPath);
 
-      var get2 = db.get("key2");
+      var get2 = db.get(segmentOf(arena, "key2"));
       MemorySegment value2 = get2.invoke();
       assertThat(stringOf(value2)).isEqualTo("value2");
 
       // value doesn't exist
-      var get4 = db.get("key4");
+      var get4 = db.get(segmentOf(arena, "key4"));
       MemorySegment value4 = get4.invoke();
       assertThat(value4).isNull();
     }
@@ -49,16 +49,17 @@ public class RocksFFMTest {
   public void readWriteRead() throws RocksDBException {
     try (Arena arena = Arena.ofConfined()) {
       var db = RocksFFM.db(arena).open(dbPath);
+      var key4 = segmentOf(arena, "key4");
 
       // value doesn't exist
-      var get4 = db.get("key4");
+      var get4 = db.get(key4);
       MemorySegment value4 = get4.invoke();
       assertThat(value4).isNull();
 
-      var put4 = db.put("key4", segmentOf(arena, "wroteValue4"));
+      var put4 = db.put(key4, segmentOf(arena, "wroteValue4"));
       put4.invoke();
 
-      var get4_2 = db.get("key4");
+      var get4_2 = db.get(key4);
       MemorySegment value4_2 = get4_2.invoke();
       assertThat(stringOf(value4_2)).isEqualTo("wroteValue4");
     }
