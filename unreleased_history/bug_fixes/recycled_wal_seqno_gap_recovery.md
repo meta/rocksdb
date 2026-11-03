@@ -1,0 +1,1 @@
+Fixed a bug with `recycle_log_file_num > 0` and `WALRecoveryMode::kPointInTimeRecovery` where recovery could drop WAL data written after an operation that consumes sequence numbers without writing to the WAL, such as external file ingestion.
