@@ -407,6 +407,72 @@ TEST_F(DBFollowerTest, RetryCatchupManifestRollover) {
   SyncPoint::GetInstance()->DisableProcessing();
 }
 
+TEST_F(DBFollowerTest, CatchUpKeepsViewWhenNewManifestListsDeletedFiles) {
+  Options opts = CurrentOptions();
+  opts.disable_auto_compactions = true;
+  opts.max_manifest_file_size = 1;
+  opts.max_manifest_space_amp_pct = 0;
+  Reopen(opts);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Flush());
+
+  SyncPoint::GetInstance()->LoadDependency({
+      {"DBImplFollower::TryCatchupWithLeader:Begin1", "Leader::Start"},
+      {"Leader::Done", "DBImplFollower::TryCatchupWithLeader:Begin2"},
+      {"DBImplFollower::TryCatchupWithLeader:End",
+       "Follower::WaitForCatchup:1"},
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(OpenAsFollower());
+  ASSERT_EQ(FollowerGet("foo"), "v1");
+
+  std::atomic<bool> compacted{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit:Begin1",
+      [&](void*) {
+        if (compacted.exchange(true)) {
+          return;
+        }
+        std::vector<LiveFileMetaData> tables;
+        db_->GetLiveFilesMetaData(&tables);
+        CompactRangeOptions compact_options;
+        compact_options.bottommost_level_compaction =
+            BottommostLevelCompaction::kForce;
+        ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+        ASSERT_OK(dbfull()->TEST_WaitForPurge());
+        for (const auto& table : tables) {
+          const Status table_status =
+              env_->FileExists(MakeTableFileName(dbname_, table.file_number));
+          ASSERT_TRUE(table_status.IsNotFound()) << table_status.ToString();
+        }
+      });
+
+  TEST_SYNC_POINT("Leader::Start");
+  // The second flush rolls the MANIFEST again, so that the newest one lists
+  // the file of the first flush in its snapshot.
+  ASSERT_OK(Put("bar", "v1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("baz", "v1"));
+  ASSERT_OK(Flush());
+  TEST_SYNC_POINT("Leader::Done");
+
+  TEST_SYNC_POINT("Follower::WaitForCatchup:1");
+  ASSERT_TRUE(compacted.load());
+  ASSERT_EQ(FollowerGet("foo"), "v1");
+
+  SyncPoint::GetInstance()->LoadDependency({
+      {"DBImplFollower::TryCatchupWithLeader:End",
+       "Follower::WaitForCatchup:2"},
+  });
+  TEST_SYNC_POINT("Follower::WaitForCatchup:2");
+  ASSERT_EQ(FollowerGet("foo"), "v1");
+  ASSERT_EQ(FollowerGet("bar"), "v1");
+  ASSERT_EQ(FollowerGet("baz"), "v1");
+
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->DisableProcessing();
+}
+
 // This test creates 4 L0 files and compacts them. The follower, during catchup,
 // successfully instantiates 4 Versions corresponding to the 4 files (but
 // doesn't install them yet), followed by deleting those 4 and adding a new

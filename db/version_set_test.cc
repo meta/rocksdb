@@ -14,6 +14,7 @@
 #include <chrono>
 #include <functional>
 #include <future>
+#include <set>
 #include <tuple>
 
 #include "db/blob/blob_log_writer.h"
@@ -1864,6 +1865,71 @@ TEST_F(VersionSetTest, PersistBlobFileStateInNewManifest) {
 
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// ManifestTailer relies on this layout to know when a new MANIFEST has listed
+// a column family's files, and when it has listed every column family.
+TEST_F(VersionSetTest, NewManifestListsColumnFamilyFilesInRecordSettingLog) {
+  NewDB();
+
+  std::vector<SstInfo> file_infos;
+  uint64_t file_number = 100;
+  for (const auto& cf : column_families_) {
+    for (const char* key : {"a", "b"}) {
+      file_infos.emplace_back(file_number, cf.name, key, /*lvl=*/1,
+                              /*_epoch_number=*/file_number);
+      ++file_number;
+    }
+  }
+  std::vector<FileMetaData> file_metas;
+  CreateDummyTableFiles(file_infos, &file_metas);
+
+  std::map<uint32_t, std::set<uint64_t>> live_files;
+  for (size_t i = 0; i < file_infos.size(); ++i) {
+    ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetColumnFamily(
+        file_infos[i].column_family);
+    ASSERT_NE(nullptr, cfd);
+    VersionEdit edit;
+    edit.SetColumnFamily(cfd->GetID());
+    edit.AddFile(file_infos[i].level, file_metas[i]);
+    mutex_.Lock();
+    const Status s = versions_->LogAndApply(cfd, read_options_, write_options_,
+                                            &edit, &mutex_, nullptr);
+    mutex_.Unlock();
+    ASSERT_OK(s);
+    live_files[cfd->GetID()].insert(file_infos[i].file_number);
+  }
+
+  CreateNewManifest();
+
+  std::string manifest_path;
+  GetManifestPath(&manifest_path);
+  std::unique_ptr<SequentialFileReader> file_reader;
+  ASSERT_OK(SequentialFileReader::Create(fs_, manifest_path, FileOptions(),
+                                         &file_reader, /*dbg=*/nullptr,
+                                         /*rate_limiter=*/nullptr));
+  log::Reader reader(/*info_log=*/nullptr, std::move(file_reader),
+                     /*reporter=*/nullptr, /*checksum=*/true, /*log_num=*/0);
+  std::map<uint32_t, std::set<uint64_t>> listed_files;
+  bool snapshot_ended = false;
+  Slice record;
+  std::string scratch;
+  while (!snapshot_ended && reader.ReadRecord(&record, &scratch)) {
+    VersionEdit edit;
+    ASSERT_OK(edit.DecodeFrom(record));
+    snapshot_ended = edit.HasNextFile();
+    const uint32_t cf_id = edit.GetColumnFamily();
+    if (snapshot_ended || edit.IsColumnFamilyAdd() || !edit.HasLogNumber() ||
+        listed_files.count(cf_id) > 0) {
+      continue;
+    }
+    std::set<uint64_t>& files = listed_files[cf_id];
+    for (const auto& [level, meta] : edit.GetNewFiles()) {
+      files.insert(meta.fd.GetNumber());
+    }
+  }
+  ASSERT_TRUE(snapshot_ended);
+  ASSERT_EQ(live_files, listed_files);
 }
 
 TEST_F(VersionSetTest, AddLiveBlobFiles) {

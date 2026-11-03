@@ -890,6 +890,7 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
   auto builder_iter = builders_.find(cfd->GetID());
   assert(builder_iter != builders_.end());
   VersionBuilder* builder = builder_iter->second->version_builder();
+  const bool holds_point_in_time = BuilderHoldsPointInTime(cfd->GetID());
   const bool valid_pit_before_edit = builder->ValidVersionAvailable();
   s = builder->Apply(&edit);
   const bool valid_pit_after_edit = builder->ValidVersionAvailable();
@@ -897,13 +898,14 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
   // A new version will be created if:
   // 1) no error has occurred so far, and
   // 2) log_number_, next_file_number_ and last_sequence_ are known, and
-  // 3) not in an AtomicGroup
-  // 4) any of the following:
+  // 3) not in an AtomicGroup, and
+  // 4) the builder held a point in time of the MANIFEST before the edit, and
+  // 5) any of the following:
   //   a) a valid Version is available before applying the edit
   //      and a valid Version is not available after the edit.
   //   b) a valid Version is available after the edit and the
   //      caller explicitly request that a new version be created.
-  if (s.ok() && !missing_info && !in_atomic_group_ &&
+  if (s.ok() && !missing_info && !in_atomic_group_ && holds_point_in_time &&
       ((!valid_pit_after_edit && valid_pit_before_edit) ||
        (valid_pit_after_edit && force_create_version))) {
     // The Version to be created reflects the state *before* this edit. On a
@@ -1119,6 +1121,7 @@ Status ManifestTailer::Initialize() {
         default_cfd, base_version, this, track_found_and_missing_files_,
         allow_incomplete_valid_version_));
     builder_iter->second = std::move(new_builder);
+    AwaitFileList(default_cfd->GetID());
 
     initialized_ = true;
   }
@@ -1132,6 +1135,20 @@ Status ManifestTailer::ApplyVersionEdit(VersionEdit& edit,
     assert(cfd);
     if (*cfd) {
       cfds_changed_.insert(*cfd);
+      // VersionSet::WriteCurrentStateToManifest() lists a column family's
+      // files in the first record for it that sets a log number.
+      if (!edit.IsColumnFamilyAdd() && edit.HasLogNumber()) {
+        cfs_awaiting_file_list_.erase((*cfd)->GetID());
+      }
+    }
+    // The snapshot that opens a MANIFEST sets no next file number, and every
+    // record after it does. The snapshot leaves out only dropped column
+    // families, so the ones it did not add again never get a file list.
+    if (edit.HasNextFile()) {
+      for (uint32_t cf_id : cfs_awaiting_from_previous_manifest_) {
+        cfs_awaiting_file_list_.erase(cf_id);
+      }
+      cfs_awaiting_from_previous_manifest_.clear();
     }
   }
   return s;
@@ -1162,12 +1179,18 @@ Status ManifestTailer::OnColumnFamilyAdd(VersionEdit& edit,
   VersionBuilderUPtr new_builder(new BaseReferencedVersionBuilder(
       tmp_cfd, base_version, this, track_found_and_missing_files_));
   builder_iter->second = std::move(new_builder);
+  AwaitFileList(tmp_cfd->GetID());
 
 #ifndef NDEBUG
   auto version_iter = versions_.find(edit.GetColumnFamily());
   assert(version_iter == versions_.end());
 #endif  // !NDEBUG
   return Status::OK();
+}
+
+void ManifestTailer::AwaitFileList(uint32_t cf_id) {
+  cfs_awaiting_file_list_.insert(cf_id);
+  cfs_awaiting_from_previous_manifest_.erase(cf_id);
 }
 
 void ManifestTailer::CheckIterationResult(const log::Reader& reader,

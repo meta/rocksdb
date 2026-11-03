@@ -343,6 +343,12 @@ class VersionEditHandlerPointInTime : public VersionEditHandler {
                     bool prefetch_index_and_filter_in_cache,
                     bool is_initial_load) override;
 
+  // Returns whether the builder of column family `cf_id` holds a state of the
+  // MANIFEST being read, so that a Version may be created from it.
+  virtual bool BuilderHoldsPointInTime(uint32_t /*cf_id*/) const {
+    return true;
+  }
+
   // A Version built from the MANIFEST records read up to some point in time,
   // together with the column family's log number that those records had put in
   // effect. Keeping the two together is what lets an installed Version report
@@ -438,6 +444,7 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
   void PrepareToReadNewManifest() {
     initialized_ = false;
     ResetReadState();
+    cfs_awaiting_from_previous_manifest_ = cfs_awaiting_file_list_;
   }
 
   std::unordered_set<ColumnFamilyData*>& GetUpdatedColumnFamilies() {
@@ -455,7 +462,13 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
 
   Status OnColumnFamilyAdd(VersionEdit& edit, ColumnFamilyData** cfd) override;
 
+  bool BuilderHoldsPointInTime(uint32_t cf_id) const override {
+    return cfs_awaiting_file_list_.count(cf_id) == 0;
+  }
+
   void CheckIterationResult(const log::Reader& reader, Status* s) override;
+
+  void AwaitFileList(uint32_t cf_id);
 
   enum Mode : uint8_t {
     kRecovery = 0,
@@ -464,6 +477,13 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
 
   Mode mode_;
   std::unordered_set<ColumnFamilyData*> cfds_changed_;
+  // Column families whose builder was reset to their empty initial Version to
+  // replay a new MANIFEST, and that have not yet applied the record in it that
+  // lists their files.
+  std::unordered_set<uint32_t> cfs_awaiting_file_list_;
+  // Column families that were awaiting their file list when the tailer
+  // switched to the current MANIFEST, and that it has not added again.
+  std::unordered_set<uint32_t> cfs_awaiting_from_previous_manifest_;
 };
 
 class DumpManifestHandler : public VersionEditHandler {
