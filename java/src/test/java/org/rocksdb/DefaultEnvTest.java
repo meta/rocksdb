@@ -38,6 +38,9 @@ public class DefaultEnvTest {
 
       defaultEnv.setBackgroundThreads(5, Priority.HIGH);
       assertThat(defaultEnv.getBackgroundThreads(Priority.HIGH)).isEqualTo(5);
+
+      defaultEnv.setBackgroundThreads(5, Priority.READ);
+      assertThat(defaultEnv.getBackgroundThreads(Priority.READ)).isEqualTo(5);
     }
   }
 
@@ -47,6 +50,7 @@ public class DefaultEnvTest {
       assertThat(defaultEnv.getThreadPoolQueueLen(Priority.BOTTOM)).isEqualTo(0);
       assertThat(defaultEnv.getThreadPoolQueueLen(Priority.LOW)).isEqualTo(0);
       assertThat(defaultEnv.getThreadPoolQueueLen(Priority.HIGH)).isEqualTo(0);
+      assertThat(defaultEnv.getThreadPoolQueueLen(Priority.READ)).isEqualTo(0);
     }
   }
 

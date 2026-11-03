@@ -343,13 +343,35 @@ static void SetBool(void* ptr) {
 }
 
 TEST_F(EnvPosixTest, DISABLED_RunImmediately) {
-  for (int pri = Env::BOTTOM; pri < Env::TOTAL; ++pri) {
+  for (int pri = Env::BOTTOM; pri < Env::USER; ++pri) {
     std::atomic<bool> called(false);
     env_->SetBackgroundThreads(1, static_cast<Env::Priority>(pri));
     env_->Schedule(&SetBool, &called, static_cast<Env::Priority>(pri));
     Env::Default()->SleepForMicroseconds(kDelayMicros);
     ASSERT_TRUE(called.load());
   }
+}
+
+TEST_F(EnvPosixTest, ReadPoolRunsWhileLowPoolIsBlocked) {
+  env_->SetBackgroundThreads(1, Env::Priority::LOW);
+  env_->SetBackgroundThreads(1, Env::Priority::READ);
+
+  test::SleepingBackgroundTask low_task;
+  env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &low_task,
+                 Env::Priority::LOW);
+  low_task.WaitUntilSleeping();
+
+  test::SleepingBackgroundTask read_task;
+  env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &read_task,
+                 Env::Priority::READ);
+  read_task.WaitUntilSleeping();
+  ASSERT_EQ(0u, env_->GetThreadPoolQueueLen(Env::Priority::READ));
+
+  read_task.WakeUp();
+  read_task.WaitUntilDone();
+  low_task.WakeUp();
+  low_task.WaitUntilDone();
+  env_->SetBackgroundThreads(0, Env::Priority::READ);
 }
 
 TEST_F(EnvPosixTest, RunEventually) {

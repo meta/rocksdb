@@ -27,6 +27,8 @@ std::string ThreadStatus::GetThreadTypeName(
       return "User";
     case ThreadStatus::ThreadType::BOTTOM_PRIORITY:
       return "Bottom Pri";
+    case ThreadStatus::ThreadType::READ_PRIORITY:
+      return "Read Pri";
     case ThreadStatus::ThreadType::NUM_THREAD_TYPES:
       assert(false);
   }
