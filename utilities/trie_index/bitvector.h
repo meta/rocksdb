@@ -107,7 +107,14 @@ inline uint64_t FindNthSetBitInWord(uint64_t word, uint64_t i) {
 // Popcount-based binary search: O(log 64) = 6 steps (5 popcounts + 1 bit test).
 // Matches the SuRF reference implementation's select64_popcount_search().
 inline uint64_t FindNthSetBitInWord(uint64_t word, uint64_t i) {
-  // Binary search: narrow down which 32-bit half, then 16, 8, 4, 2, 1.
+  if (i < 4) {
+    for (uint64_t k = 0; k < i; ++k) {
+      word &= word - 1ULL;
+    }
+    return CtzNonZero(word);
+  }
+
+  // Binary search to target byte (32 -> 16 -> 8), then clear remaining bits.
   uint64_t pos = 0;
   uint64_t pc;
 
@@ -129,23 +136,10 @@ inline uint64_t FindNthSetBitInWord(uint64_t word, uint64_t i) {
     pos += 8;
     i -= pc;
   }
-  pc = Popcount(word & 0xFULL);
-  if (i >= pc) {
-    word >>= 4;
-    pos += 4;
-    i -= pc;
+  for (uint64_t k = 0; k < i; ++k) {
+    word &= word - 1ULL;
   }
-  pc = Popcount(word & 0x3ULL);
-  if (i >= pc) {
-    word >>= 2;
-    pos += 2;
-    i -= pc;
-  }
-  pc = word & 1;
-  if (i >= pc) {
-    pos += 1;
-  }
-  return pos;
+  return pos + CtzNonZero(word);
 }
 #endif
 
