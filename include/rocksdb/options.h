@@ -496,7 +496,7 @@ struct CompactionServiceJobInfo {
 
   // The execution pool selected for this job, independent of later DB option
   // updates.
-  bool use_separate_remote_compaction_pool = false;
+  bool separate_remote_compaction_pool_selected = false;
 
   // True if the compaction filter uses
   // CompactionFilter::MergeOrder::kMergeBeforeFilter, so the worker must

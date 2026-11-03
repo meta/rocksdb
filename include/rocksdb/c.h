@@ -1555,7 +1555,7 @@ extern ROCKSDB_LIBRARY_API int rocksdb_compactionjobinfo_job_id(
     const rocksdb_compactionjobinfo_t* info);
 
 extern ROCKSDB_LIBRARY_API unsigned char
-rocksdb_compactionjobinfo_use_separate_remote_compaction_pool(
+rocksdb_compactionjobinfo_separate_remote_compaction_pool_selected(
     const rocksdb_compactionjobinfo_t* info);
 
 extern ROCKSDB_LIBRARY_API int rocksdb_compactionjobinfo_num_l0_files(
@@ -1598,7 +1598,7 @@ extern ROCKSDB_LIBRARY_API int rocksdb_subcompactionjobinfo_job_id(
     const rocksdb_subcompactionjobinfo_t* info);
 
 extern ROCKSDB_LIBRARY_API unsigned char
-rocksdb_subcompactionjobinfo_use_separate_remote_compaction_pool(
+rocksdb_subcompactionjobinfo_separate_remote_compaction_pool_selected(
     const rocksdb_subcompactionjobinfo_t* info);
 
 extern ROCKSDB_LIBRARY_API int
@@ -2106,6 +2106,13 @@ extern ROCKSDB_LIBRARY_API uint64_t
 rocksdb_blob_file_garbage_info_garbage_blob_bytes(
     const rocksdb_blob_file_garbage_info_t* info);
 // END generated: c_generated_metadata_structs_auto.h.inc
+/* Compatibility aliases for the captured compaction pool selection. */
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_compactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_compactionjobinfo_t* info);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_subcompactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_subcompactionjobinfo_t* info);
 extern ROCKSDB_LIBRARY_API rocksdb_compactionjobinfo_t*
 rocksdb_compactionjobinfo_create(void);
 extern ROCKSDB_LIBRARY_API void rocksdb_compactionjobinfo_destroy(

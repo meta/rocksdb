@@ -79,7 +79,7 @@ extern ROCKSDB_LIBRARY_API int rocksdb_compactionjobinfo_job_id(
     const rocksdb_compactionjobinfo_t* info);
 
 extern ROCKSDB_LIBRARY_API unsigned char
-rocksdb_compactionjobinfo_use_separate_remote_compaction_pool(
+rocksdb_compactionjobinfo_separate_remote_compaction_pool_selected(
     const rocksdb_compactionjobinfo_t* info);
 
 extern ROCKSDB_LIBRARY_API int rocksdb_compactionjobinfo_num_l0_files(
@@ -122,7 +122,7 @@ extern ROCKSDB_LIBRARY_API int rocksdb_subcompactionjobinfo_job_id(
     const rocksdb_subcompactionjobinfo_t* info);
 
 extern ROCKSDB_LIBRARY_API unsigned char
-rocksdb_subcompactionjobinfo_use_separate_remote_compaction_pool(
+rocksdb_subcompactionjobinfo_separate_remote_compaction_pool_selected(
     const rocksdb_subcompactionjobinfo_t* info);
 
 extern ROCKSDB_LIBRARY_API int

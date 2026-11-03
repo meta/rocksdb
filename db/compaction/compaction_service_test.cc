@@ -4807,18 +4807,18 @@ class ShortcutCompactionListener : public EventListener {
   explicit ShortcutCompactionListener(bool gate) : gate_(gate) {}
 
   void OnCompactionBegin(DB*, const CompactionJobInfo& info) override {
-    EXPECT_EQ(info.use_separate_remote_compaction_pool, gate_);
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected, gate_);
     moved_files = info.stats.num_input_files_trivially_moved;
     ++begun;
   }
 
   void OnCompactionPreCommit(DB*, const CompactionJobInfo& info) override {
-    EXPECT_EQ(info.use_separate_remote_compaction_pool, gate_);
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected, gate_);
     ++precommitted;
   }
 
   void OnCompactionCompleted(DB*, const CompactionJobInfo& info) override {
-    EXPECT_EQ(info.use_separate_remote_compaction_pool, gate_);
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected, gate_);
     ++completed;
   }
 
@@ -4841,19 +4841,20 @@ class CompactionContextListener : public EventListener {
  public:
   void OnCompactionBegin(DB*, const CompactionJobInfo& info) override {
     std::lock_guard<std::mutex> lock(mutex_);
-    EXPECT_TRUE(jobs_
-                    .emplace(std::make_pair(info.cf_id, info.job_id),
-                             Counts{info.use_separate_remote_compaction_pool})
-                    .second);
+    EXPECT_TRUE(
+        jobs_
+            .emplace(std::make_pair(info.cf_id, info.job_id),
+                     Counts{info.separate_remote_compaction_pool_selected})
+            .second);
     ++begun_;
-    gated_jobs_ += info.use_separate_remote_compaction_pool ? 1 : 0;
+    gated_jobs_ += info.separate_remote_compaction_pool_selected ? 1 : 0;
   }
 
   void OnSchedule(const CompactionServiceJobInfo& info) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = jobs_.find({info.cf_id, static_cast<int>(info.job_id >> 32)});
     ASSERT_NE(it, jobs_.end());
-    EXPECT_EQ(info.use_separate_remote_compaction_pool,
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected,
               it->second.separate_pool);
     ++scheduled_;
   }
@@ -4862,7 +4863,7 @@ class CompactionContextListener : public EventListener {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = jobs_.find({info.cf_id, info.job_id});
     ASSERT_NE(it, jobs_.end());
-    EXPECT_EQ(info.use_separate_remote_compaction_pool,
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected,
               it->second.separate_pool);
     ++it->second.begun;
   }
@@ -4871,7 +4872,7 @@ class CompactionContextListener : public EventListener {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = jobs_.find({info.cf_id, info.job_id});
     ASSERT_NE(it, jobs_.end());
-    EXPECT_EQ(info.use_separate_remote_compaction_pool,
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected,
               it->second.separate_pool);
     ++it->second.completed;
   }
@@ -4880,7 +4881,7 @@ class CompactionContextListener : public EventListener {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = jobs_.find({info.cf_id, info.job_id});
     ASSERT_NE(it, jobs_.end());
-    EXPECT_EQ(info.use_separate_remote_compaction_pool,
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected,
               it->second.separate_pool);
     EXPECT_EQ(it->second.begun, 3);
     EXPECT_EQ(it->second.completed, 3);
@@ -4891,7 +4892,7 @@ class CompactionContextListener : public EventListener {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = jobs_.find({info.cf_id, info.job_id});
     ASSERT_NE(it, jobs_.end());
-    EXPECT_EQ(info.use_separate_remote_compaction_pool,
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected,
               it->second.separate_pool);
     EXPECT_TRUE(it->second.precommitted);
     jobs_.erase(it);
@@ -4927,15 +4928,15 @@ class CompactFilesPoolGateListener : public EventListener {
   explicit CompactFilesPoolGateListener(bool gate) : gate_(gate) {}
   void OnCompactionBegin(DB*, const CompactionJobInfo&) override { ++parents; }
   void OnSchedule(const CompactionServiceJobInfo& info) {
-    EXPECT_EQ(info.use_separate_remote_compaction_pool, gate_);
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected, gate_);
     ++scheduled;
   }
   void OnSubcompactionBegin(const SubcompactionJobInfo& info) override {
-    EXPECT_EQ(info.use_separate_remote_compaction_pool, gate_);
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected, gate_);
     ++begun;
   }
   void OnSubcompactionCompleted(const SubcompactionJobInfo& info) override {
-    EXPECT_EQ(info.use_separate_remote_compaction_pool, gate_);
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected, gate_);
     ++completed;
   }
   std::atomic<int> parents{0};

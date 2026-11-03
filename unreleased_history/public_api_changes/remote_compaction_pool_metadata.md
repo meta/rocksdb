@@ -1,0 +1,1 @@
+The captured pool selection in `CompactionJobInfo`, `SubcompactionJobInfo`, and `CompactionServiceJobInfo` is now named `separate_remote_compaction_pool_selected`. The DB option remains `use_separate_remote_compaction_pool`. New C getters use the metadata name; the previous C getters remain available as compatibility aliases.
