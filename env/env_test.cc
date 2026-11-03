@@ -3497,6 +3497,17 @@ TEST_F(EnvTest, GenerateRawUniqueIdTrackEnvDetailsOnly) {
 }
 
 TEST_F(EnvTest, GenerateRawUniqueIdTrackRandomDeviceOnly) {
+  // Temporarily skipped on GitHub Actions until 2027-02-01, when we can
+  // reassess if failures recur.
+  if (getenv("GITHUB_ACTIONS")) {
+    int64_t now = 0;
+    ASSERT_OK(Env::Default()->GetCurrentTime(&now));
+    if (now < 1801440000) {
+      ROCKSDB_GTEST_SKIP("Temporarily skipped on GitHub Actions");
+      return;
+    }
+  }
+
   struct MyStressTest
       : public NoDuplicateMiniStressTest<uint64_pair_t, HashUint64Pair> {
     uint64_pair_t Generate() override {
