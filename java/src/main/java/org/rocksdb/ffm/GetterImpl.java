@@ -1,14 +1,12 @@
 package org.rocksdb.ffm;
 
-import static java.lang.foreign.MemorySegment.NULL;
-import static org.rocksdb.ffm.RocksFFM.dereference;
-import static org.rocksdb.ffm.RocksFFM.throwOnError;
-
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import org.rocksdb.RocksDBException;
-import org.rocksdb.ffm.RocksFFM.*;
+
+import static java.lang.foreign.MemorySegment.NULL;
+import static org.rocksdb.ffm.RocksFFM.dereference;
+import static org.rocksdb.ffm.RocksFFM.throwOnError;
 
 final class GetterImpl extends WithDB implements RocksFFM.Getter {
   private final MemorySegment key;
@@ -20,7 +18,7 @@ final class GetterImpl extends WithDB implements RocksFFM.Getter {
     readOptions = rocksdb_c_api.rocksdb_readoptions_create();
   }
 
-  public MemorySegment invoke() throws RocksDBException {
+  public MemorySegment invoke() throws RocksFFMException {
     MemorySegment valueLength = arena.allocateFrom(ValueLayout.JAVA_LONG, 0L);
     MemorySegment error = arena.allocateFrom(ValueLayout.ADDRESS, NULL);
     MemorySegment value =

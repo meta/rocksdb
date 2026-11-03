@@ -1,12 +1,11 @@
 package org.rocksdb.ffm;
 
-import static java.lang.foreign.MemorySegment.NULL;
-import static org.rocksdb.ffm.RocksFFM.throwOnError;
-
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import org.rocksdb.RocksDBException;
+
+import static java.lang.foreign.MemorySegment.NULL;
+import static org.rocksdb.ffm.RocksFFM.throwOnError;
 
 final class PutterImpl extends WithDB implements RocksFFM.Putter {
   private final MemorySegment key;
@@ -21,7 +20,7 @@ final class PutterImpl extends WithDB implements RocksFFM.Putter {
   }
 
   @Override
-  public void invoke() throws RocksDBException {
+  public void invoke() throws RocksFFMException {
     MemorySegment error = arena.allocateFrom(ValueLayout.ADDRESS, NULL);
     rocksdb_c_api_2.rocksdb_put(
         db, writeOptions, key, key.byteSize(), value, value.byteSize(), error);

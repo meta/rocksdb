@@ -1,6 +1,7 @@
 package org.rocksdb.ffm;
 
 import static org.assertj.core.api.Java6Assertions.assertThat;
+import static org.assertj.core.api.Java6Assertions.assertThatThrownBy;
 import static org.rocksdb.ffm.RocksFFM.segmentOf;
 import static org.rocksdb.ffm.RocksFFM.stringOf;
 
@@ -12,7 +13,6 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.rocksdb.RocksDBException;
 
 public class RocksFFMTest {
   @Rule public TemporaryFolder dbFolder = new TemporaryFolder();
@@ -24,13 +24,25 @@ public class RocksFFMTest {
 
   @Before
   public void setup() throws IOException {
-    final RocksFFMHelperJNI helper = new RocksFFMHelperJNI();
     dbPath = dbFolder.newFolder().getAbsolutePath();
+    /*
+    final RocksFFMHelperJNI helper = new RocksFFMHelperJNI();
     helper.createDB(dbPath, values);
+
+     */
   }
 
   @Test
-  public void read() throws RocksDBException {
+  public void openNonExistent() {
+    try (Arena arena = Arena.ofConfined()) {
+      assertThatThrownBy(() -> RocksFFM.db(arena).open(dbPath))
+          .isInstanceOf(RocksFFMException.class)
+          .hasMessageContaining("does not exist (create_if_missing is false)");
+    }
+  }
+
+  @Test
+  public void read() throws RocksFFMException {
     try (Arena arena = Arena.ofConfined()) {
       var db = RocksFFM.db(arena).open(dbPath);
 
@@ -46,7 +58,7 @@ public class RocksFFMTest {
   }
 
   @Test
-  public void readWriteRead() throws RocksDBException {
+  public void readWriteRead() throws RocksFFMException {
     try (Arena arena = Arena.ofConfined()) {
       var db = RocksFFM.db(arena).open(dbPath);
       var key4 = segmentOf(arena, "key4");
