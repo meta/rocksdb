@@ -858,15 +858,35 @@ Compaction* CompactionPicker::PickCompactionForCompactRange(
       }
     }
     if (inputs_shrunk.empty()) {
-      return nullptr;
+      if (covering_the_whole_range) {
+        // All files in the entire range were filtered out, nothing to do
+        return nullptr;
+      } else {
+        // All files in current batch were filtered out, but there are more
+        // files beyond the size limit. We do not compact this batch due to
+        // max_file_num_to_ignore, but
+        // we should signal the caller to continue with the remaining files.
+        if (skip_input_index < inputs.size()) {
+          // Set compaction_end to the smallest key of the first file we skipped
+          InternalKey* next_start = &inputs.files[skip_input_index]->smallest;
+          **compaction_end = *next_start;
+        } else {
+          // Shouldn't happen, but handle gracefully
+          *compaction_end = nullptr;
+        }
+        return nullptr;
+      }
     }
+
     if (inputs.size() != inputs_shrunk.size()) {
       inputs.files.swap(inputs_shrunk);
     }
-    // set covering_the_whole_range to false if there is any file that need to
-    // be compacted in the range of inputs[skip_input_index+1, inputs.size())
-    for (size_t i = skip_input_index + 1; i < inputs.size(); ++i) {
-      if (inputs[i]->fd.GetNumber() < max_file_num_to_ignore) {
+
+    // Check if there are any files in the range beyond skip_input_index that
+    // still need to be compacted. After the swap above, inputs_shrunk contains
+    // the original file list.
+    for (size_t i = skip_input_index + 1; i < inputs_shrunk.size(); ++i) {
+      if (inputs_shrunk[i]->fd.GetNumber() < max_file_num_to_ignore) {
         covering_the_whole_range = false;
       }
     }

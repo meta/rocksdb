@@ -8899,6 +8899,90 @@ TEST_F(DBCompactionTest, ManualCompactionBottomLevelOptimized) {
   ASSERT_EQ(num, 0);
 }
 
+// Test for GitHub issue #12702:
+// CompactRange with kForceOptimized should work correctly when:
+// 1. max_compaction_bytes limit causes input resizing (covering_the_whole_range
+// = false)
+// 2. kForceOptimized filtering removes all selected files (inputs_shrunk =
+// empty) This scenario happens in range split situations where some files were
+// recently recompacted (high file numbers) while others were not (low file
+// numbers).
+TEST_F(DBCompactionTest, ManualCompactionBottomLevelOptimizedWithSizeLimit) {
+  Options opts = CurrentOptions();
+  opts.num_levels = 3;
+  opts.compression = kNoCompression;
+  opts.target_file_size_base = 10 << 20;  // 10MB
+  opts.disable_auto_compactions = true;
+  DestroyAndReopen(opts);
+
+  Random rnd(301);
+
+  // Step 1: Create initial files across the full key range [0, 200)
+  // This simulates the initial state before a partition split
+  for (int i = 0; i < 200; i++) {
+    ASSERT_OK(Put(Key(i), rnd.RandomString(100)));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);  // Move to bottommost level
+
+  // Step 2: Simulate writes only to left partition [0, 100)
+  // This causes recompaction of files in the left range
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put(Key(i), rnd.RandomString(100)));
+  }
+  ASSERT_OK(Flush());
+
+  // Compact to merge with bottommost level
+  // This creates NEW files for [0, 100) range with HIGH file numbers
+  CompactRangeOptions cro_initial;
+  cro_initial.bottommost_level_compaction =
+      BottommostLevelCompaction::kForceOptimized;
+  std::string start_key = Key(0);
+  std::string end_key = Key(100);
+  Slice start_slice(start_key);
+  Slice end_slice(end_key);
+  ASSERT_OK(dbfull()->CompactRange(cro_initial, &start_slice, &end_slice));
+
+  // At this point:
+  // - Files covering [0, 100) have HIGH file numbers (recently compacted)
+  // - Files covering [100, 200) have LOW file numbers (not recompacted)
+
+  // Step 3: Set a small max_compaction_bytes to trigger the bug
+  // We want the limit to cause input resizing (covering_the_whole_range =
+  // false) while kForceOptimized filters out all files in the first batch
+  std::string prop;
+  EXPECT_TRUE(dbfull()->GetProperty(DB::Properties::kLiveSstFilesSize, &prop));
+  uint64_t total_size = atoi(prop.c_str());
+  // Set limit to about 30% of total size to ensure we hit the bug scenario
+  uint64_t max_compaction_bytes = total_size / 3;
+  ASSERT_OK(dbfull()->SetOptions(
+      {{"max_compaction_bytes", std::to_string(max_compaction_bytes)}}));
+
+  // Step 4: Try to compact the left partition [0, 100)
+  // Before the fix: This would return nullptr and fail to compact
+  // After the fix: This should succeed even though first batch is filtered out
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForceOptimized;
+  ASSERT_OK(dbfull()->CompactRange(cro, &start_slice, &end_slice));
+
+  // Verify the compaction succeeded (data is still readable)
+  for (int i = 0; i < 100; i++) {
+    ASSERT_NE("NOT_FOUND", Get(Key(i)));
+  }
+
+  // Step 5: Also verify right partition [100, 200) works
+  // (This should have always worked, even before the fix)
+  std::string start_key_right = Key(100);
+  std::string end_key_right = Key(200);
+  Slice start_slice_right(start_key_right);
+  Slice end_slice_right(end_key_right);
+  ASSERT_OK(dbfull()->CompactRange(cro, &start_slice_right, &end_slice_right));
+
+  for (int i = 100; i < 200; i++) {
+    ASSERT_NE("NOT_FOUND", Get(Key(i)));
+  }
+}
+
 TEST_F(DBCompactionTest, ManualCompactionMax) {
   uint64_t l1_avg_size = 0;
   uint64_t l2_avg_size = 0;
