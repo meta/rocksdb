@@ -4679,6 +4679,11 @@ TEST_F(CompactionServiceTest, RejectsExcessiveCrossSubcompactionBlobGarbage) {
   ASSERT_OK(Put("post-fallback", "writable"));
 }
 
+// Bounds each wait for background progress in the remote compaction pool
+// tests, so that a hang fails the test instead of blocking it. It is only meant
+// to catch hangs, not to bound how long a slow host may take.
+constexpr std::chrono::minutes kProgressTimeout{10};
+
 enum class LocalRouting { kRemote, kSchedule, kWait, kInvalidResult };
 
 class PoolTestCompactionService : public MyTestCompactionService {
@@ -4737,7 +4742,7 @@ class PoolTestCompactionService : public MyTestCompactionService {
 
   bool WaitForRemote(int count) {
     std::unique_lock<std::mutex> lock(wait_mutex_);
-    bool ready = wait_cv_.wait_for(lock, std::chrono::seconds(10),
+    bool ready = wait_cv_.wait_for(lock, kProgressTimeout,
                                    [&] { return waiting_ >= count; });
     EXPECT_GE(waiting_, count);
     return ready;
@@ -4780,7 +4785,7 @@ class PoolPressureListener : public EventListener {
 
   BackgroundJobPressure WaitForCompactionPressure() {
     std::unique_lock<std::mutex> lock(mutex_);
-    EXPECT_TRUE(cv_.wait_for(lock, std::chrono::seconds(10), [&] {
+    EXPECT_TRUE(cv_.wait_for(lock, kProgressTimeout, [&] {
       return pressure_.compaction_scheduled > 0;
     }));
     return pressure_;
@@ -4944,6 +4949,12 @@ class CompactFilesPoolGateListener : public EventListener {
 
 class DedicatedCompactionPoolTest : public CompactionServiceTest {
  protected:
+  DedicatedCompactionPoolTest() {
+    // Durability is not under test, and each fsync can take seconds on a busy
+    // shared disk.
+    env_->skip_fsync_ = true;
+  }
+
   Options SetUpCompactions(
       LocalRouting routing, int subcompactions = 1, int local_threads = 1,
       int local_limit = 1, int num_levels = 7, bool separate_pool = true,
@@ -5060,7 +5071,7 @@ class DedicatedCompactionPoolTest : public CompactionServiceTest {
 
   bool WaitForLocal(int started, int credit_waits, int finished = 0) {
     std::unique_lock<std::mutex> lock(local_mutex_);
-    bool ready = local_cv_.wait_for(lock, std::chrono::seconds(10), [&] {
+    bool ready = local_cv_.wait_for(lock, kProgressTimeout, [&] {
       return local_started_ >= started && credit_waits_ >= credit_waits &&
              local_finished_ >= finished;
     });
@@ -5165,7 +5176,7 @@ class DedicatedCompactionPoolTest : public CompactionServiceTest {
     });
     {
       std::unique_lock<std::mutex> lock(local_mutex_);
-      EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10),
+      EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout,
                                      [&] { return completed; }));
     }
     coordinator.join();
@@ -5252,13 +5263,13 @@ class DedicatedCompactionPoolTest : public CompactionServiceTest {
         &occupy, priority);
     {
       std::unique_lock<std::mutex> lock(local_mutex_);
-      EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10),
-                                     [&] { return occupied; }));
+      EXPECT_TRUE(
+          local_cv_.wait_for(lock, kProgressTimeout, [&] { return occupied; }));
     }
     EXPECT_OK(dbfull()->EnableAutoCompaction({handles_[0], handles_[1]}));
     {
       std::unique_lock<std::mutex> lock(local_mutex_);
-      EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10), [&] {
+      EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout, [&] {
         return queued >= std::min(4, 2 * subcompactions);
       }));
       abort_requested = true;
@@ -5276,11 +5287,11 @@ class DedicatedCompactionPoolTest : public CompactionServiceTest {
     bool abort_finished;
     {
       std::unique_lock<std::mutex> lock(local_mutex_);
-      abort_finished = local_cv_.wait_for(lock, std::chrono::seconds(10),
-                                          [&] { return aborted; });
+      abort_finished =
+          local_cv_.wait_for(lock, kProgressTimeout, [&] { return aborted; });
       EXPECT_TRUE(abort_finished);
       if (abort_finished) {
-        EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10), [&] {
+        EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout, [&] {
           return env_->GetThreadPoolQueueLen(priority) ==
                  static_cast<unsigned int>(subcompactions);
         }));
@@ -5381,7 +5392,7 @@ class DedicatedCompactionPoolTest : public CompactionServiceTest {
     });
     {
       std::unique_lock<std::mutex> lock(local_mutex_);
-      EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10), [&] {
+      EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout, [&] {
         return queued == 1 && credit_waits_ >= 2;
       }));
     }
@@ -5402,8 +5413,8 @@ class DedicatedCompactionPoolTest : public CompactionServiceTest {
     });
     {
       std::unique_lock<std::mutex> lock(local_mutex_);
-      EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10),
-                                     [&] { return canceled; }));
+      EXPECT_TRUE(
+          local_cv_.wait_for(lock, kProgressTimeout, [&] { return canceled; }));
     }
     ReleaseLocal();
     ReleasePools();
@@ -5440,8 +5451,8 @@ class DedicatedCompactionPoolTest : public CompactionServiceTest {
     canceled.store(true, std::memory_order_release);
     {
       std::unique_lock<std::mutex> lock(local_mutex_);
-      EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10),
-                                     [&] { return done; }));
+      EXPECT_TRUE(
+          local_cv_.wait_for(lock, kProgressTimeout, [&] { return done; }));
       EXPECT_EQ(local_started_, 1);
       EXPECT_EQ(local_finished_, 0);
     }
@@ -5636,7 +5647,7 @@ TEST_P(RemoteCompactionLifecycleTest, WaitsForRemoteCoordinators) {
   });
   {
     std::unique_lock<std::mutex> lock(local_mutex_);
-    EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10),
+    EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout,
                                    [&] { return waiting || done; }));
     EXPECT_TRUE(waiting);
     EXPECT_FALSE(done);
@@ -5949,7 +5960,7 @@ class RemoteCompactionRetryTest : public DedicatedCompactionPoolTest,
       schedule();
       {
         std::unique_lock<std::mutex> lock(mutex);
-        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(10), [&] {
+        ASSERT_TRUE(cv.wait_for(lock, kProgressTimeout, [&] {
           return backoffs >= expected_coordinators;
         }));
       }
@@ -6108,8 +6119,7 @@ TEST_F(DedicatedCompactionPoolTest, MultipleDBsShareRemotePoolAndLifetime) {
   });
   {
     std::unique_lock<std::mutex> lock(mutex);
-    EXPECT_TRUE(
-        cv.wait_for(lock, std::chrono::seconds(10), [&] { return closed; }));
+    EXPECT_TRUE(cv.wait_for(lock, kProgressTimeout, [&] { return closed; }));
   }
   other_service->Release();
   close.join();
@@ -6353,11 +6363,11 @@ TEST_P(CoordinatorSubmissionFailureTest,
       &schedule, Env::Priority::HIGH);
   {
     std::unique_lock<std::mutex> lock(local_mutex_);
-    EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10),
-                                   [&] { return finished; }));
+    EXPECT_TRUE(
+        local_cv_.wait_for(lock, kProgressTimeout, [&] { return finished; }));
   }
   WaitForCompactOptions wait;
-  wait.timeout = std::chrono::seconds(10);
+  wait.timeout = kProgressTimeout;
   EXPECT_TRUE(db_->WaitForCompact(wait).IsAborted());
   WaitForRemotePoolIdle();
   EXPECT_EQ(LocalScheduled(), 0);
@@ -6426,7 +6436,7 @@ TEST_P(CoordinatorSubmissionModeTest,
   SyncPoint::GetInstance()->EnableProcessing();
   ASSERT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
   WaitForCompactOptions wait;
-  wait.timeout = std::chrono::seconds(10);
+  wait.timeout = kProgressTimeout;
   EXPECT_TRUE(db_->WaitForCompact(wait).IsAborted());
   ASSERT_OK(db_->PauseBackgroundWork());
   WaitForRemotePoolIdle();
@@ -6470,8 +6480,8 @@ TEST_P(ShortcutCompactionGateTest, CallbacksPreserveSubmittedMode) {
   EXPECT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
   {
     std::unique_lock<std::mutex> lock(local_mutex_);
-    EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10),
-                                   [&] { return started; }));
+    EXPECT_TRUE(
+        local_cv_.wait_for(lock, kProgressTimeout, [&] { return started; }));
   }
   EXPECT_OK(db_->SetDBOptions(
       {{"use_separate_remote_compaction_pool", gate ? "false" : "true"}}));
@@ -6533,7 +6543,7 @@ TEST_F(DedicatedCompactionPoolTest, FifoCopiesShareLocalWorkersAcrossDBs) {
   EXPECT_OK(second->EnableAutoCompaction({second->DefaultColumnFamily()}));
   {
     std::unique_lock<std::mutex> lock(local_mutex_);
-    EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10), [&] {
+    EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout, [&] {
       return scheduled == 2 && copies_started == 1;
     }));
     EXPECT_EQ(copies_started, 1);
@@ -6547,7 +6557,7 @@ TEST_F(DedicatedCompactionPoolTest, FifoCopiesShareLocalWorkersAcrossDBs) {
   }
   EXPECT_OK(dbfull()->TEST_WaitForCompact());
   WaitForCompactOptions wait;
-  wait.timeout = std::chrono::seconds(10);
+  wait.timeout = kProgressTimeout;
   EXPECT_OK(second->WaitForCompact(wait));
   EXPECT_EQ(copies_started, 2);
   listener->Verify(2);
@@ -6580,8 +6590,8 @@ TEST_F(DedicatedCompactionPoolTest, AbortQueuedFifoCopyReleasesLocalCredit) {
   EXPECT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
   {
     std::unique_lock<std::mutex> lock(local_mutex_);
-    EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10),
-                                   [&] { return scheduled; }));
+    EXPECT_TRUE(
+        local_cv_.wait_for(lock, kProgressTimeout, [&] { return scheduled; }));
   }
   db_->AbortCompactions(handles_[0]);
   WaitForRemotePoolIdle();
@@ -6639,8 +6649,8 @@ TEST_P(DedicatedCompactionSubmissionExceptionTest,
   });
   {
     std::unique_lock<std::mutex> lock(local_mutex_);
-    EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10),
-                                   [&] { return draining; }));
+    EXPECT_TRUE(
+        local_cv_.wait_for(lock, kProgressTimeout, [&] { return draining; }));
     if (failed_sibling > 1) {
       EXPECT_FALSE(manual_done);
     }
@@ -6651,7 +6661,7 @@ TEST_P(DedicatedCompactionSubmissionExceptionTest,
   service_->Release();
   {
     std::unique_lock<std::mutex> lock(local_mutex_);
-    EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10),
+    EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout,
                                    [&] { return manual_done; }));
   }
   manual.join();
@@ -6786,8 +6796,7 @@ TEST_P(DedicatedCompactionFallbackTest, CompactFilesFromLowWorker) {
       &compact, Env::Priority::LOW);
   {
     std::unique_lock<std::mutex> lock(mutex);
-    EXPECT_TRUE(
-        cv.wait_for(lock, std::chrono::seconds(10), [&] { return done; }));
+    EXPECT_TRUE(cv.wait_for(lock, kProgressTimeout, [&] { return done; }));
   }
   // Allow cleanup to complete if a regression queues work behind the caller.
   env_->SetBackgroundThreads(2, Env::Priority::LOW);
@@ -6873,8 +6882,8 @@ TEST_P(DedicatedCompactionFallbackTest,
   });
   {
     std::unique_lock<std::mutex> lock(local_mutex_);
-    EXPECT_TRUE(local_cv_.wait_for(lock, std::chrono::seconds(10),
-                                   [&] { return flushed; }));
+    EXPECT_TRUE(
+        local_cv_.wait_for(lock, kProgressTimeout, [&] { return flushed; }));
     EXPECT_EQ(local_finished_, 0);
   }
   env_->SetBackgroundThreads(high_threads, Env::Priority::HIGH);
