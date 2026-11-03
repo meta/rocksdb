@@ -395,7 +395,6 @@ Status TraceAnalyzer::StartProcessing() {
 // distribution, these data structures are re-processed here.
 Status TraceAnalyzer::MakeStatistics() {
   int ret;
-  Status s;
   for (int type = 0; type < kTaTypeNum; type++) {
     if (!ta_[type].enabled) {
       continue;
@@ -431,7 +430,7 @@ Status TraceAnalyzer::MakeStatistics() {
         }
 
         if (!options_.print_correlation.empty()) {
-          s = MakeStatisticCorrelation(stat.second, record.second);
+          Status s = MakeStatisticCorrelation(stat.second, record.second);
           if (!s.ok()) {
             return s;
           }
@@ -440,7 +439,7 @@ Status TraceAnalyzer::MakeStatistics() {
 
       // Output the prefix cut or the whole content of the accessed key space
       if (options_.output_key_stats || options_.output_prefix_cut > 0) {
-        s = MakeStatisticKeyStatsOrPrefix(stat.second);
+        Status s = MakeStatisticKeyStatsOrPrefix(stat.second);
         if (!s.ok()) {
           return s;
         }
@@ -456,7 +455,7 @@ Status TraceAnalyzer::MakeStatistics() {
             return Status::IOError("Format the output failed");
           }
           std::string printout(buffer_);
-          s = stat.second.a_count_dist_f->Append(printout);
+          Status s = stat.second.a_count_dist_f->Append(printout);
           if (!s.ok()) {
             fprintf(stderr, "Write access count distribution file failed\n");
             return s;
@@ -480,7 +479,7 @@ Status TraceAnalyzer::MakeStatistics() {
             return Status::IOError("Format output failed");
           }
           std::string printout(buffer_);
-          s = stat.second.a_key_size_f->Append(printout);
+          Status s = stat.second.a_key_size_f->Append(printout);
           if (!s.ok()) {
             fprintf(stderr, "Write key size distribution file failed\n");
             return s;
@@ -512,7 +511,7 @@ Status TraceAnalyzer::MakeStatistics() {
             return Status::IOError("Format output failed");
           }
           std::string printout(buffer_);
-          s = stat.second.a_value_size_f->Append(printout);
+          Status s = stat.second.a_value_size_f->Append(printout);
           if (!s.ok()) {
             fprintf(stderr, "Write value size distribution file failed\n");
             return s;
@@ -524,7 +523,7 @@ Status TraceAnalyzer::MakeStatistics() {
 
   // Make the QPS statistics
   if (options_.output_qps_stats) {
-    s = MakeStatisticQPS();
+    Status s = MakeStatisticQPS();
     if (!s.ok()) {
       return s;
     }
@@ -667,7 +666,6 @@ Status TraceAnalyzer::MakeStatisticQPS() {
   uint32_t duration =
       static_cast<uint32_t>((end_time_ - begin_time_) / 1000000);
   int ret;
-  Status s;
   std::vector<std::vector<uint32_t>> type_qps(
       duration, std::vector<uint32_t>(kTaTypeNum + 1, 0));
   std::vector<uint64_t> qps_sum(kTaTypeNum + 1, 0);
@@ -698,7 +696,7 @@ Status TraceAnalyzer::MakeStatisticQPS() {
               return Status::IOError("Format the output failed");
             }
             std::string printout(buffer_);
-            s = stat.second.a_qps_f->Append(printout);
+            Status s = stat.second.a_qps_f->Append(printout);
             if (!s.ok()) {
               fprintf(stderr, "Write QPS file failed\n");
               return s;
@@ -710,7 +708,7 @@ Status TraceAnalyzer::MakeStatisticQPS() {
             return Status::IOError("Format the output failed");
           }
           std::string printout(buffer_);
-          s = stat.second.a_qps_f->Append(printout);
+          Status s = stat.second.a_qps_f->Append(printout);
           if (!s.ok()) {
             fprintf(stderr, "Write QPS file failed\n");
             return s;
@@ -760,7 +758,7 @@ Status TraceAnalyzer::MakeStatisticQPS() {
             return Status::IOError("Format the output failed");
           }
           std::string printout(buffer_);
-          s = stat.second.a_key_num_f->Append(printout);
+          Status s = stat.second.a_key_num_f->Append(printout);
           if (!s.ok()) {
             fprintf(stderr,
                     "Write accessed unique key number change file failed\n");
@@ -779,7 +777,7 @@ Status TraceAnalyzer::MakeStatisticQPS() {
             return Status::IOError("Format the output failed");
           }
           std::string printout(buffer_);
-          s = stat.second.a_top_qps_prefix_f->Append(printout);
+          Status s = stat.second.a_top_qps_prefix_f->Append(printout);
           if (!s.ok()) {
             fprintf(stderr, "Write prefix QPS top K file failed\n");
             return s;
@@ -797,10 +795,10 @@ Status TraceAnalyzer::MakeStatisticQPS() {
                 return Status::IOError("Format the output failed");
               }
               std::string pout(buffer_);
-              s = stat.second.a_top_qps_prefix_f->Append(pout);
-              if (!s.ok()) {
+              Status prefix_s = stat.second.a_top_qps_prefix_f->Append(pout);
+              if (!prefix_s.ok()) {
                 fprintf(stderr, "Write prefix QPS top K file failed\n");
-                return s;
+                return prefix_s;
               }
             }
           }
@@ -821,7 +819,7 @@ Status TraceAnalyzer::MakeStatisticQPS() {
           return Status::IOError("Format the output failed");
         }
         std::string printout(buffer_);
-        s = qps_f_->Append(printout);
+        Status s = qps_f_->Append(printout);
         if (!s.ok()) {
           return s;
         }
@@ -852,7 +850,7 @@ Status TraceAnalyzer::MakeStatisticQPS() {
           return Status::IOError("Format the output failed");
         }
         std::string printout(buffer_);
-        s = cf_qps_f_->Append(printout);
+        Status s = cf_qps_f_->Append(printout);
         if (!s.ok()) {
           return s;
         }
@@ -878,7 +876,6 @@ Status TraceAnalyzer::MakeStatisticQPS() {
 // also, we output the top k accessed keys here
 Status TraceAnalyzer::ReProcessing() {
   int ret;
-  Status s;
   for (auto& cf_it : cfs_) {
     uint32_t cf_id = cf_it.first;
 
@@ -907,7 +904,7 @@ Status TraceAnalyzer::ReProcessing() {
             return Status::IOError("Format the output failed");
           }
           std::string printout(buffer_);
-          s = stat.time_series_f->Append(printout);
+          Status s = stat.time_series_f->Append(printout);
           if (!s.ok()) {
             fprintf(stderr, "Write time series file failed\n");
             return s;
@@ -926,7 +923,7 @@ Status TraceAnalyzer::ReProcessing() {
       std::vector<std::string> prefix(kTaTypeNum);
       std::unique_ptr<FSSequentialFile> file;
 
-      s = env_->GetFileSystem()->NewSequentialFile(
+      Status s = env_->GetFileSystem()->NewSequentialFile(
           whole_key_path, FileOptions(env_options_), &file, nullptr);
       if (!s.ok()) {
         fprintf(stderr, "Cannot open the whole key space file of CF: %u\n",
@@ -1066,7 +1063,11 @@ Status TraceAnalyzer::Analyze() {
     s = ReProcessing();
   }
   Status end = EndProcessing();
-  return s.ok() ? end : s;
+  if (!s.ok()) {
+    end.PermitUncheckedError();
+    return s;
+  }
+  return end;
 }
 
 TraceAnalyzerResult TraceAnalyzer::GetResult() const {
