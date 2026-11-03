@@ -16,10 +16,14 @@
 #include "db/db_impl/db_impl_secondary.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
+#include "db/log_reader.h"
+#include "db/manifest_ops.h"
+#include "db/version_edit.h"
 #include "db/wide/wide_column_test_util.h"
 #include "db/write_batch_internal.h"
 #include "env/composite_env_wrapper.h"
 #include "file/filename.h"
+#include "file/sequence_file_reader.h"
 #include "port/stack_trace.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "test_util/sync_point.h"
@@ -2697,6 +2701,272 @@ TEST_F(DBSecondaryTest, CatchUpAfterInitialRecoveryFindsOnlyMissingFiles) {
   ASSERT_TRUE(rewritten);
   ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
   VerifySecondaryValue("foo", "v2");
+}
+
+TEST_F(DBSecondaryTest, CatchUpKeepsViewWhenNewManifestListsDeletedFiles) {
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
+  const std::string cf_name = "pikachu";
+  CreateAndReopenWithCF({cf_name}, options);
+  for (int cf : {0, 1}) {
+    ASSERT_OK(Put(cf, "foo", "v1"));
+    ASSERT_OK(Flush(cf));
+  }
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondaryWithColumnFamilies({cf_name}, secondary_options);
+  ASSERT_EQ(2, handles_secondary_.size());
+
+  // Roll the MANIFEST past the one the secondary opened.
+  std::vector<std::string> newest_tables;
+  for (int cf : {0, 1}) {
+    ASSERT_OK(Put(cf, "bar", "v1"));
+    ASSERT_OK(Flush(cf));
+  }
+  for (const std::string& name : {kDefaultColumnFamilyName, cf_name}) {
+    newest_tables.push_back(GetNewestTableFilePath(name));
+  }
+
+  bool compacted = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit:Begin1",
+      [&](void*) {
+        if (compacted) {
+          return;
+        }
+        compacted = true;
+        // Delete every file the new MANIFEST lists before the secondary
+        // applies its snapshot, recording the deletions in a newer MANIFEST.
+        CompactRangeOptions compact_options;
+        compact_options.bottommost_level_compaction =
+            BottommostLevelCompaction::kForce;
+        for (auto* handle : handles_) {
+          ASSERT_OK(
+              db_->CompactRange(compact_options, handle, nullptr, nullptr));
+        }
+        ASSERT_OK(dbfull()->TEST_WaitForPurge());
+        for (const std::string& table : newest_tables) {
+          const Status table_status = env_->FileExists(table);
+          ASSERT_TRUE(table_status.IsNotFound()) << table_status.ToString();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Defer cleanup_sync_points([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_TRUE(compacted);
+  for (auto* handle : handles_secondary_) {
+    VerifySecondaryValue(handle, "foo", "v1");
+  }
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  for (auto* handle : handles_secondary_) {
+    VerifySecondaryValue(handle, "foo", "v1");
+    VerifySecondaryValue(handle, "bar", "v1");
+  }
+}
+
+// Makes the MANIFEST files opened while a cap is set appear to end after `cap`
+// bytes until the cap is lifted, as a file system can show a new MANIFEST
+// before all of it is visible.
+class CappedManifestFS : public FileSystemWrapper {
+ public:
+  explicit CappedManifestFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+
+  static const char* kClassName() { return "CappedManifestFS"; }
+  const char* Name() const override { return kClassName(); }
+
+  // A cap of 0 lifts it.
+  void SetCap(uint64_t cap) { cap_.store(cap); }
+
+  IOStatus NewSequentialFile(const std::string& fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSSequentialFile>* result,
+                             IODebugContext* dbg) override {
+    IOStatus s = target()->NewSequentialFile(fname, file_opts, result, dbg);
+    uint64_t number = 0;
+    FileType type = kWalFile;
+    if (s.ok() && cap_.load() > 0 &&
+        ParseFileName(fname.substr(fname.find_last_of('/') + 1), &number,
+                      &type) &&
+        type == kDescriptorFile) {
+      *result = std::make_unique<CappedFile>(std::move(*result), &cap_);
+    }
+    return s;
+  }
+
+ private:
+  class CappedFile : public FSSequentialFileOwnerWrapper {
+   public:
+    CappedFile(std::unique_ptr<FSSequentialFile>&& target,
+               const std::atomic<uint64_t>* cap)
+        : FSSequentialFileOwnerWrapper(std::move(target)), cap_(cap) {}
+
+    IOStatus Read(size_t n, const IOOptions& options, Slice* result,
+                  char* scratch, IODebugContext* dbg) override {
+      const uint64_t cap = cap_->load();
+      if (cap > 0) {
+        n = static_cast<size_t>(
+            std::min<uint64_t>(n, cap - std::min(cap, offset_)));
+      }
+      IOStatus s =
+          FSSequentialFileOwnerWrapper::Read(n, options, result, scratch, dbg);
+      if (s.ok()) {
+        offset_ += result->size();
+      }
+      return s;
+    }
+
+   private:
+    const std::atomic<uint64_t>* const cap_;
+    uint64_t offset_ = 0;
+  };
+
+  std::atomic<uint64_t> cap_{0};
+};
+
+// The destructor closes the secondary before the capped Env it was opened on is
+// destroyed.
+class DBSecondaryPartialManifestTest : public DBSecondaryTestBase {
+ public:
+  DBSecondaryPartialManifestTest()
+      : DBSecondaryTestBase("db_secondary_partial_manifest_test"),
+        capped_fs_(std::make_shared<CappedManifestFS>(env_->GetFileSystem())),
+        capped_env_(new CompositeEnvWrapper(env_, capped_fs_)) {}
+
+  ~DBSecondaryPartialManifestTest() override { CloseSecondary(); }
+
+ protected:
+  static Options PrimaryOptions(Env* env) {
+    Options options;
+    options.env = env;
+    options.disable_auto_compactions = true;
+    options.max_manifest_file_size = 1;
+    options.max_manifest_space_amp_pct = 0;
+    return options;
+  }
+
+  Options SecondaryOptions(const Options& primary_options) const {
+    Options options = primary_options;
+    options.env = capped_env_.get();
+    options.max_open_files = -1;
+    return options;
+  }
+
+  // Returns the offset where the first record adding a column family ends in
+  // the primary's current MANIFEST.
+  uint64_t EndOfFirstColumnFamilyAddRecord() {
+    std::string manifest_path;
+    uint64_t manifest_number = 0;
+    EXPECT_OK(GetCurrentManifestPath(dbname_, env_->GetFileSystem().get(),
+                                     /*is_retry=*/false, &manifest_path,
+                                     &manifest_number));
+    std::unique_ptr<SequentialFileReader> file_reader;
+    EXPECT_OK(SequentialFileReader::Create(
+        env_->GetFileSystem(), manifest_path, FileOptions(), &file_reader,
+        /*dbg=*/nullptr, /*rate_limiter=*/nullptr));
+    log::Reader reader(/*info_log=*/nullptr, std::move(file_reader),
+                       /*reporter=*/nullptr, /*checksum=*/true,
+                       /*log_num=*/0);
+    Slice record;
+    std::string scratch;
+    while (reader.ReadRecord(&record, &scratch)) {
+      VersionEdit edit;
+      EXPECT_OK(edit.DecodeFrom(record));
+      if (edit.IsColumnFamilyAdd()) {
+        return reader.LastRecordEnd();
+      }
+    }
+    ADD_FAILURE() << "No column family add record in " << manifest_path;
+    return 0;
+  }
+
+  std::shared_ptr<CappedManifestFS> capped_fs_;
+  std::unique_ptr<Env> capped_env_;
+};
+
+// With the parameter false, catch-up sees no record of the new MANIFEST, so the
+// default column family has not been listed. With it true, catch-up sees the
+// records up to the one adding "pikachu", which has not been listed.
+class DBSecondaryManifestCutTest : public DBSecondaryPartialManifestTest,
+                                   public testing::WithParamInterface<bool> {};
+
+TEST_P(DBSecondaryManifestCutTest, CatchUpKeepsViewOfColumnFamilyNotListed) {
+  const Options options = PrimaryOptions(env_);
+  const std::string cf_name = "pikachu";
+  CreateAndReopenWithCF({cf_name}, options);
+  for (int cf : {0, 1}) {
+    ASSERT_OK(Put(cf, "foo", "v1"));
+    ASSERT_OK(Flush(cf));
+  }
+  OpenSecondaryWithColumnFamilies({cf_name}, SecondaryOptions(options));
+  ASSERT_EQ(2, handles_secondary_.size());
+
+  for (int cf : {0, 1}) {
+    ASSERT_OK(Put(cf, "bar", "v1"));
+    ASSERT_OK(Flush(cf));
+  }
+  capped_fs_->SetCap(GetParam() ? EndOfFirstColumnFamilyAddRecord() : 1);
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  for (auto* handle : handles_secondary_) {
+    VerifySecondaryValue(handle, "foo", "v1");
+  }
+
+  capped_fs_->SetCap(0);
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  for (auto* handle : handles_secondary_) {
+    VerifySecondaryValue(handle, "foo", "v1");
+    VerifySecondaryValue(handle, "bar", "v1");
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(DBSecondaryManifestCutTest, DBSecondaryManifestCutTest,
+                        ::testing::Bool());
+
+// Catch-up sees the new MANIFEST only up to the record adding "pikachu". The
+// primary then drops "pikachu", so no later MANIFEST lists it, and atomically
+// flushes the other column families.
+TEST_F(DBSecondaryPartialManifestTest,
+       CatchUpReleasesColumnFamilyDroppedBeforeItWasListed) {
+  Options options = PrimaryOptions(env_);
+  options.atomic_flush = true;
+  CreateAndReopenWithCF({"pikachu", "eevee"}, options);
+  for (int cf : {0, 1, 2}) {
+    ASSERT_OK(Put(cf, "foo", "v1"));
+  }
+  ASSERT_OK(Flush({0, 1, 2}));
+  OpenSecondaryWithColumnFamilies({"pikachu", "eevee"},
+                                  SecondaryOptions(options));
+  ASSERT_EQ(3, handles_secondary_.size());
+
+  for (int cf : {0, 1, 2}) {
+    ASSERT_OK(Put(cf, "bar", "v1"));
+  }
+  ASSERT_OK(Flush({0, 1, 2}));
+  capped_fs_->SetCap(EndOfFirstColumnFamilyAddRecord());
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  capped_fs_->SetCap(0);
+
+  ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  for (int cf : {0, 2}) {
+    ASSERT_OK(Put(cf, "baz", "v1", no_wal));
+  }
+  ASSERT_OK(Flush({0, 2}));
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  for (auto* handle : {handles_secondary_[0], handles_secondary_[2]}) {
+    VerifySecondaryValue(handle, "baz", "v1");
+  }
 }
 
 TEST_F(DBSecondaryTest, MissingTableFileDuringOpen) {
