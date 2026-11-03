@@ -5246,6 +5246,20 @@ int main(int argc, char** argv) {
     rocksdb_cache_destroy(co);
   }
 
+  StartPhase("lru_cache_options");
+  {
+    rocksdb_lru_cache_options_t* copts = rocksdb_lru_cache_options_create();
+    rocksdb_lru_cache_options_set_capacity(copts, 100);
+    rocksdb_lru_cache_options_set_num_shard_bits(copts, 2);
+    rocksdb_lru_cache_options_set_high_pri_pool_ratio(copts, 0.2);
+
+    rocksdb_cache_t* co = rocksdb_cache_create_lru_opts(copts);
+    CheckCondition(100 == rocksdb_cache_get_capacity(co));
+
+    rocksdb_cache_destroy(co);
+    rocksdb_lru_cache_options_destroy(copts);
+  }
+
   StartPhase("jemalloc_nodump_allocator");
   {
     rocksdb_memory_allocator_t* allocator;
