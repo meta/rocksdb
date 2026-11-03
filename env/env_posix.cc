@@ -354,12 +354,12 @@ class PosixEnv : public CompositeEnv {
 
   // Allow increasing the number of worker threads.
   void SetBackgroundThreads(int num, Priority pri) override {
-    assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+    assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
     thread_pools_[pri].SetBackgroundThreads(num);
   }
 
   int GetBackgroundThreads(Priority pri) override {
-    assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+    assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
     return thread_pools_[pri].GetBackgroundThreads();
   }
 
@@ -370,12 +370,12 @@ class PosixEnv : public CompositeEnv {
 
   // Allow increasing the number of worker threads.
   void IncBackgroundThreadsIfNeeded(int num, Priority pri) override {
-    assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+    assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
     thread_pools_[pri].IncBackgroundThreadsIfNeeded(num);
   }
 
   void LowerThreadPoolIOPriority(Priority pool) override {
-    assert(pool >= Priority::BOTTOM && pool <= Priority::HIGH);
+    assert(pool >= Priority::BOTTOM && pool <= Priority::READ);
 #ifdef OS_LINUX
     thread_pools_[pool].LowerIOPriority();
 #else
@@ -384,12 +384,12 @@ class PosixEnv : public CompositeEnv {
   }
 
   void LowerThreadPoolCPUPriority(Priority pool) override {
-    assert(pool >= Priority::BOTTOM && pool <= Priority::HIGH);
+    assert(pool >= Priority::BOTTOM && pool <= Priority::READ);
     thread_pools_[pool].LowerCPUPriority(CpuPriority::kLow);
   }
 
   Status LowerThreadPoolCPUPriority(Priority pool, CpuPriority pri) override {
-    assert(pool >= Priority::BOTTOM && pool <= Priority::HIGH);
+    assert(pool >= Priority::BOTTOM && pool <= Priority::READ);
     thread_pools_[pool].LowerCPUPriority(pri);
     return Status::OK();
   }
@@ -435,26 +435,27 @@ PosixEnv::PosixEnv()
 
 void PosixEnv::Schedule(void (*function)(void* arg1), void* arg, Priority pri,
                         void* tag, void (*unschedFunction)(void* arg)) {
-  assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+  assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
   thread_pools_[pri].Schedule(function, arg, tag, unschedFunction);
 }
 
 int PosixEnv::UnSchedule(void* arg, Priority pri) {
+  assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
   return thread_pools_[pri].UnSchedule(arg);
 }
 
 unsigned int PosixEnv::GetThreadPoolQueueLen(Priority pri) const {
-  assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+  assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
   return thread_pools_[pri].GetQueueLen();
 }
 
 int PosixEnv::ReserveThreads(int threads_to_reserved, Priority pri) {
-  assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+  assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
   return thread_pools_[pri].ReserveThreads(threads_to_reserved);
 }
 
 int PosixEnv::ReleaseThreads(int threads_to_released, Priority pri) {
-  assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+  assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
   return thread_pools_[pri].ReleaseThreads(threads_to_released);
 }
 

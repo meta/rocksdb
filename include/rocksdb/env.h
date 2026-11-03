@@ -439,8 +439,12 @@ class Env : public Customizable {
     return Status::NotSupported("LoadLibrary is not implemented in this Env");
   }
 
-  // Priority for scheduling job in thread pool
-  enum Priority { BOTTOM, LOW, HIGH, USER, TOTAL };
+  // BOTTOM through READ identify Env-managed thread pools. The READ pool is
+  // for work done on behalf of foreground reads; it has no threads until
+  // configured and runs at normal CPU and I/O priority unless lowered. USER is
+  // not a thread-pool priority; it is used to attribute work performed by user
+  // threads in internal statistics. TOTAL is a sentinel.
+  enum Priority { BOTTOM, LOW, HIGH, READ, USER, TOTAL };
 
   static std::string PriorityToString(Priority priority);
 

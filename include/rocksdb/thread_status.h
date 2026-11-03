@@ -38,6 +38,7 @@ struct ThreadStatus {
     LOW_PRIORITY,       // RocksDB BG thread in low-pri thread pool
     USER,               // User thread (Non-RocksDB BG thread)
     BOTTOM_PRIORITY,    // RocksDB BG thread in bottom-pri thread pool
+    READ_PRIORITY,      // RocksDB BG thread in read thread pool
     NUM_THREAD_TYPES
   };
 
@@ -129,8 +130,7 @@ struct ThreadStatus {
   // An unique ID for the thread.
   const uint64_t thread_id;
 
-  // The type of the thread, it could be HIGH_PRIORITY,
-  // LOW_PRIORITY, and USER
+  // The type of the thread.
   const ThreadType thread_type;
 
   // The name of the DB instance where the thread is currently

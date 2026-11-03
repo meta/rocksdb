@@ -7372,8 +7372,10 @@ class PriorityJni {
         return 0x1;
       case ROCKSDB_NAMESPACE::Env::Priority::HIGH:
         return 0x2;
-      case ROCKSDB_NAMESPACE::Env::Priority::TOTAL:
+      case ROCKSDB_NAMESPACE::Env::Priority::READ:
         return 0x3;
+      case ROCKSDB_NAMESPACE::Env::Priority::TOTAL:
+        return 0x4;
       default:
         return 0x7F;  // undefined
     }
@@ -7390,6 +7392,8 @@ class PriorityJni {
       case 0x2:
         return ROCKSDB_NAMESPACE::Env::Priority::HIGH;
       case 0x3:
+        return ROCKSDB_NAMESPACE::Env::Priority::READ;
+      case 0x4:
         return ROCKSDB_NAMESPACE::Env::Priority::TOTAL;
       default:
         // undefined/default
@@ -7414,6 +7418,8 @@ class ThreadTypeJni {
         return 0x2;
       case ROCKSDB_NAMESPACE::ThreadStatus::ThreadType::BOTTOM_PRIORITY:
         return 0x3;
+      case ROCKSDB_NAMESPACE::ThreadStatus::ThreadType::READ_PRIORITY:
+        return 0x4;
       default:
         return 0x7F;  // undefined
     }
@@ -7432,6 +7438,8 @@ class ThreadTypeJni {
         return ThreadStatus::ThreadType::USER;
       case 0x3:
         return ROCKSDB_NAMESPACE::ThreadStatus::ThreadType::BOTTOM_PRIORITY;
+      case 0x4:
+        return ROCKSDB_NAMESPACE::ThreadStatus::ThreadType::READ_PRIORITY;
       default:
         // undefined/default
         return ROCKSDB_NAMESPACE::ThreadStatus::ThreadType::LOW_PRIORITY;

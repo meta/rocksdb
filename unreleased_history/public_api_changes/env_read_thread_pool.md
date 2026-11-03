@@ -1,0 +1,1 @@
+Added `Env::Priority::READ` and `ThreadStatus::READ_PRIORITY` for a dedicated Env-managed read-work thread pool. `Env::Priority::USER` remains reserved for internal statistics and is not backed by a thread pool.

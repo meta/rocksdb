@@ -12,7 +12,8 @@ public enum Priority {
   BOTTOM((byte) 0x0),
   LOW((byte) 0x1),
   HIGH((byte)0x2),
-  TOTAL((byte)0x3);
+  READ((byte) 0x3),
+  TOTAL((byte) 0x4);
 
   private final byte value;
 
