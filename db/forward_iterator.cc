@@ -25,6 +25,20 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+bool MinIterComparator::operator()(InternalIterator* a,
+                                   InternalIterator* b) const {
+  assert(a != nullptr);
+  assert(b != nullptr);
+  assert(comparator_ != nullptr);
+  assert(source_priority_ != nullptr);
+  assert(source_ranks_ != nullptr);
+  if (!*source_priority_) {
+    return comparator_->Compare(a->key(), b->key()) > 0;
+  }
+  const int cmp = comparator_->CompareKeySeq(a->key(), b->key());
+  return cmp != 0 ? cmp > 0 : source_ranks_->at(a) > source_ranks_->at(b);
+}
+
 // Usage:
 //     ForwardLevelIterator iter;
 //     iter.SetFileIndex(file_index);
@@ -233,7 +247,9 @@ ForwardIterator::ForwardIterator(DBImpl* db, const ReadOptions& read_options,
       prefix_extractor_(current_sv->mutable_cf_options.prefix_extractor.get()),
       user_comparator_(cfd->user_comparator()),
       allow_unprepared_value_(allow_unprepared_value),
-      immutable_min_heap_(MinIterComparator(&cfd_->internal_comparator())),
+      immutable_min_heap_(MinIterComparator(
+          &cfd_->internal_comparator(), &source_priority_for_equal_sequences_,
+          &source_ranks_)),
       sv_(current_sv),
       mutable_iter_(nullptr),
       current_(nullptr),
@@ -322,6 +338,8 @@ void ForwardIterator::SVCleanup() {
 }
 
 void ForwardIterator::Cleanup(bool release_sv) {
+  ClearImmutableHeap();
+  source_ranks_.clear();
   if (mutable_iter_ != nullptr) {
     DeleteIterator(mutable_iter_, true /* is_arena */);
   }
@@ -419,10 +437,7 @@ void ForwardIterator::SeekInternal(const Slice& internal_key,
         seek_to_first ? mutable_iter_->SeekToFirst()
                       : mutable_iter_->Seek(internal_key);
       }
-      {
-        auto tmp = MinIterHeap(MinIterComparator(&cfd_->internal_comparator()));
-        immutable_min_heap_.swap(tmp);
-      }
+      ClearImmutableHeap();
       for (size_t i = 0; i < imm_iters_.size(); i++) {
         auto* m = imm_iters_[i];
         seek_to_first ? m->SeekToFirst() : m->Seek(internal_key);
@@ -763,6 +778,7 @@ void ForwardIterator::RebuildIterators(bool refresh_sv) {
         /*largest_compaction_key=*/nullptr, allow_unprepared_value_));
   }
   BuildLevelIterators(vstorage, sv_);
+  UpdateSourcePriority();
   current_ = nullptr;
   is_prev_set_ = false;
 
@@ -775,6 +791,7 @@ void ForwardIterator::RebuildIterators(bool refresh_sv) {
 }
 
 void ForwardIterator::RenewIterators() {
+  ClearImmutableHeap();
   SuperVersion* svnew;
   assert(sv_);
   svnew = cfd_->GetReferencedSuperVersion(db_);
@@ -867,6 +884,7 @@ void ForwardIterator::RenewIterators() {
   is_prev_set_ = false;
   SVCleanup();
   sv_ = svnew;
+  UpdateSourcePriority();
 
   UpdateChildrenPinnedItersMgr();
   if (!range_del_agg.IsEmpty()) {
@@ -899,6 +917,7 @@ void ForwardIterator::BuildLevelIterators(const VersionStorageInfo* vstorage,
 }
 
 void ForwardIterator::ResetIncompleteIterators() {
+  ClearImmutableHeap();
   const auto& l0_files = sv_->current->storage_info()->LevelFiles(0);
   for (size_t i = 0; i < l0_iters_.size(); ++i) {
     assert(i < l0_files.size());
@@ -926,9 +945,54 @@ void ForwardIterator::ResetIncompleteIterators() {
 
   current_ = nullptr;
   is_prev_set_ = false;
+  UpdateSourcePriority();
+}
+
+void ForwardIterator::ClearImmutableHeap() {
+  assert(cfd_ != nullptr);
+  MinIterHeap empty(MinIterComparator(&cfd_->internal_comparator(),
+                                      &source_priority_for_equal_sequences_,
+                                      &source_ranks_));
+  immutable_min_heap_.swap(empty);
+}
+
+void ForwardIterator::UpdateSourcePriority() {
+  assert(sv_ != nullptr);
+  assert(sv_->current != nullptr);
+  const VersionStorageInfo* storage = sv_->current->storage_info();
+  source_priority_for_equal_sequences_ = storage->MayHaveEqualSequenceRuns();
+  if (version_change_callback_) {
+    version_change_callback_(*storage);
+  }
+  source_ranks_.clear();
+  if (!source_priority_for_equal_sequences_) {
+    return;
+  }
+  source_ranks_.reserve(1 + imm_iters_.size() + l0_iters_.size() +
+                        level_iters_.size());
+  source_ranks_.emplace(mutable_iter_, 0);
+  for (size_t i = 0; i < imm_iters_.size(); ++i) {
+    if (imm_iters_[i]) {
+      source_ranks_.emplace(imm_iters_[i], 1 + i);
+    }
+  }
+  const size_t l0_rank = 1 + imm_iters_.size();
+  for (size_t i = 0; i < l0_iters_.size(); ++i) {
+    if (l0_iters_[i]) {
+      source_ranks_.emplace(l0_iters_[i], l0_rank + i);
+    }
+  }
+  const size_t level_rank = l0_rank + l0_iters_.size();
+  for (size_t i = 0; i < level_iters_.size(); ++i) {
+    if (level_iters_[i]) {
+      source_ranks_.emplace(level_iters_[i], level_rank + i);
+    }
+  }
 }
 
 void ForwardIterator::UpdateCurrent() {
+  assert(cfd_ != nullptr);
+  assert(mutable_iter_ != nullptr);
   if (immutable_min_heap_.empty() && !mutable_iter_->Valid()) {
     current_ = nullptr;
   } else if (immutable_min_heap_.empty()) {
@@ -940,9 +1004,13 @@ void ForwardIterator::UpdateCurrent() {
     current_ = immutable_min_heap_.top();
     assert(current_ != nullptr);
     assert(current_->Valid());
-    int cmp = cfd_->internal_comparator().InternalKeyComparator::Compare(
-        mutable_iter_->key(), current_->key());
-    assert(cmp != 0);
+    const int cmp =
+        source_priority_for_equal_sequences_
+            ? cfd_->internal_comparator().CompareKeySeq(mutable_iter_->key(),
+                                                        current_->key())
+            : cfd_->internal_comparator().InternalKeyComparator::Compare(
+                  mutable_iter_->key(), current_->key());
+    assert(source_priority_for_equal_sequences_ || cmp != 0);
     if (cmp > 0) {
       immutable_min_heap_.pop();
     } else {

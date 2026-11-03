@@ -1226,6 +1226,11 @@ Status CompactionPicker::SanitizeAndConvertCompactionInputFiles(
 }
 
 void CompactionPicker::RegisterCompaction(Compaction* c) {
+  RegisterCompaction(c, false);
+}
+
+void CompactionPicker::RegisterCompaction(Compaction* c,
+                                          bool has_live_l0_inputs) {
   if (c == nullptr) {
     return;
   }
@@ -1237,7 +1242,8 @@ void CompactionPicker::RegisterCompaction(Compaction* c) {
   // number without actual meaning as file ingestion technically does not have
   // an input level like other compactions
   if ((c->start_level() == 0 &&
-       c->compaction_reason() != CompactionReason::kExternalSstIngestion) ||
+       (c->compaction_reason() != CompactionReason::kExternalSstIngestion ||
+        has_live_l0_inputs)) ||
       ioptions_.compaction_style == kCompactionStyleUniversal) {
     level0_compactions_in_progress_.insert(c);
   }

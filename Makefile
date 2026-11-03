@@ -1841,6 +1841,9 @@ external_sst_file_test: $(OBJ_DIR)/db/external_sst_file_test.o $(TEST_LIBRARY) $
 import_column_family_test: $(OBJ_DIR)/db/import_column_family_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+lsm_edit_test: $(OBJ_DIR)/db/lsm_edit_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 db_tailing_iter_test: $(OBJ_DIR)/db/db_tailing_iter_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 

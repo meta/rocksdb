@@ -4245,6 +4245,44 @@ VersionStorageInfo::GetBlobFileMetaDataLB(uint64_t blob_file_number) const {
 }
 
 void VersionStorageInfo::SetFinalized() {
+  std::vector<std::pair<SequenceNumber, SequenceNumber>> run_sequences;
+  bool has_unknown_sequence_range = false;
+  run_sequences.reserve(files_[0].size() + num_levels_);
+  for (int level = 0; level < num_levels_; ++level) {
+    SequenceNumber smallest = kMaxSequenceNumber;
+    SequenceNumber largest = 0;
+    for (const FileMetaData* file : files_[level]) {
+      const bool unknown = file->fd.smallest_seqno == kMaxSequenceNumber ||
+                           file->fd.largest_seqno == kMaxSequenceNumber;
+      has_unknown_sequence_range |= unknown;
+      const SequenceNumber low = unknown ? 0 : file->fd.smallest_seqno;
+      const SequenceNumber high =
+          unknown ? kMaxSequenceNumber : file->fd.largest_seqno;
+      if (level == 0) {
+        run_sequences.emplace_back(low, high);
+      } else {
+        smallest = std::min(smallest, low);
+        largest = std::max(largest, high);
+      }
+    }
+    if (level > 0 && !files_[level].empty()) {
+      run_sequences.emplace_back(smallest, largest);
+    }
+  }
+  may_have_multiple_zero_sequence_runs_ =
+      has_unknown_sequence_range ||
+      std::count_if(run_sequences.begin(), run_sequences.end(),
+                    [](const auto& range) { return range.first == 0; }) > 1;
+  std::sort(run_sequences.begin(), run_sequences.end());
+  may_have_equal_sequence_runs_ = has_unknown_sequence_range;
+  SequenceNumber previous_max = 0;
+  for (size_t i = 0; i < run_sequences.size(); ++i) {
+    if (i > 0 && run_sequences[i].first <= previous_max) {
+      may_have_equal_sequence_runs_ = true;
+      break;
+    }
+    previous_max = run_sequences[i].second;
+  }
   finalized_ = true;
 
 #ifndef NDEBUG
@@ -8529,7 +8567,9 @@ InternalIterator* VersionSet::MakeInputIterator(
   assert(num <= space);
   InternalIterator* result = NewCompactionMergingIterator(
       &c->column_family_data()->internal_comparator(), list,
-      static_cast<int>(num), range_tombstones, /*arena=*/nullptr,
+      static_cast<int>(num),
+      c->input_version()->storage_info()->MayHaveEqualSequenceRuns(),
+      range_tombstones, /*arena=*/nullptr,
       c->column_family_data()->internal_stats());
   delete[] list;
   return result;

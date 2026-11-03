@@ -88,11 +88,13 @@ void ShardedSnapshotList::GetAll(std::vector<SequenceNumber>* snap_vector,
 
 bool ShardedSnapshotList::empty() const { return count() == 0; }
 
-bool ShardedSnapshotList::AnySnapshotWhileNewBlocked() const {
+bool ShardedSnapshotList::AnySnapshotWhileNewBlocked(
+    const Snapshot* excluded) const {
   for (uint32_t i = 0; i < kNumShards; ++i) {
     MutexLock l(&shards_[i].mu);
     assert(shards_[i].new_blocked > 0);
-    if (!shards_[i].list.empty()) {
+    if (!shards_[i].list.empty() && (shards_[i].list.count() != 1 ||
+                                     shards_[i].list.oldest() != excluded)) {
       return true;
     }
   }

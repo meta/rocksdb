@@ -111,7 +111,9 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       direction_(kForward),
       valid_(false),
       current_entry_is_merged_(false),
-      is_key_seqnum_zero_(false),
+      can_skip_zero_sequence_duplicates_(
+          version != nullptr &&
+          !version->storage_info()->MayHaveMultipleZeroSequenceRuns()),
       prefix_same_as_start_(
           prefix_extractor_ ? read_options.prefix_same_as_start : false),
       pin_thru_lifetime_(read_options.pin_data),
@@ -511,9 +513,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
 
   uint64_t mem_hidden_op_scanned = 0;
   do {
-    // Will update is_key_seqnum_zero_ as soon as we parsed the current key
-    // but we need to save the previous value to be used in the loop.
-    bool is_prev_key_seqnum_zero = is_key_seqnum_zero_;
+    const bool previous_zero = is_key_seqnum_zero_;
     if (!ParseKey(&ikey_)) {
       is_key_seqnum_zero_ = false;
       return false;
@@ -521,7 +521,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
     Slice user_key_without_ts =
         StripTimestampFromUserKey(ikey_.user_key, timestamp_size_);
 
-    is_key_seqnum_zero_ = (ikey_.sequence == 0);
+    is_key_seqnum_zero_ = ikey_.sequence == 0;
 
     assert(iterate_upper_bound_ == nullptr ||
            iter_.UpperBoundCheckResult() != IterBoundCheck::kInbound ||
@@ -560,14 +560,10 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
                                    : Slice();
     bool more_recent = false;
     if (IsVisible(ikey_.sequence, ts, &more_recent)) {
-      // If the previous entry is of seqnum 0, the current entry will not
-      // possibly be skipped. This condition can potentially be relaxed to
-      // prev_key.seq <= ikey_.sequence. We are cautious because it will be more
-      // prone to bugs causing the same user key with the same sequence number.
-      // Note that with current timestamp implementation, the same user key can
-      // have different timestamps and zero sequence number on the bottommost
-      // level. This may change in the future.
-      if ((!is_prev_key_seqnum_zero || timestamp_size_ > 0) &&
+      // A zero-sequence entry ends its key only when at most one sorted run
+      // can contain zero sequences. Unknown layouts retain duplicate checking.
+      if ((!previous_zero || !can_skip_zero_sequence_duplicates_ ||
+           timestamp_size_ > 0) &&
           skipping_saved_key &&
           CompareKeyForSkip(ikey_.user_key, saved_key_.GetUserKey()) <= 0) {
         num_skipped++;  // skip this entry

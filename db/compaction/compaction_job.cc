@@ -36,6 +36,7 @@
 #include "db/range_del_aggregator.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
+#include "file/file_io_listener.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "file/read_write_util.h"
@@ -1536,6 +1537,7 @@ void CompactionJob::NotifyOnSubcompactionBegin(
   info.thread_id = env_->GetThreadID();
 
   for (const auto& listener : db_options_.listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnSubcompactionBegin(info);
   }
   info.status.PermitUncheckedError();
@@ -1563,6 +1565,7 @@ void CompactionJob::NotifyOnSubcompactionCompleted(
   info.thread_id = env_->GetThreadID();
 
   for (const auto& listener : db_options_.listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnSubcompactionCompleted(info);
   }
 }

@@ -207,6 +207,15 @@ class VersionStorageInfo {
   // REQUIRES: PrepareForVersionAppend has been called
   void SetFinalized();
 
+  // Conservative properties of sequence ranges across sorted runs. L0 files
+  // are separate runs; each nonzero level is one run. Recomputed on recovery.
+  bool MayHaveEqualSequenceRuns() const {
+    return may_have_equal_sequence_runs_;
+  }
+  bool MayHaveMultipleZeroSequenceRuns() const {
+    return may_have_multiple_zero_sequence_runs_;
+  }
+
   // Update the accumulated stats from a file-meta.
   void UpdateAccumulatedStats(FileMetaData* file_meta);
 
@@ -784,6 +793,9 @@ class VersionStorageInfo {
 
   // If true, means that files in L0 have keys with non overlapping ranges
   bool level0_non_overlapping_;
+
+  bool may_have_equal_sequence_runs_ = true;
+  bool may_have_multiple_zero_sequence_runs_ = true;
 
   // An index into files_by_compaction_pri_ that specifies the first
   // file that is not yet compacted
@@ -1527,6 +1539,8 @@ class VersionSet {
                       const std::vector<ColumnFamilyDescriptor>& cf_descs = {});
 
   const std::string& DbSessionId() const { return db_session_id_; }
+  const std::string& DbName() const { return dbname_; }
+  const std::string& DbId() const { return db_id_; }
 
   // Return the current manifest file number
   uint64_t manifest_file_number() const { return manifest_file_number_; }

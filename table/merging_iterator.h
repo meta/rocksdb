@@ -58,6 +58,10 @@ class MergeIteratorBuilder {
   // Add point key iterator `iter` to the merging iterator.
   void AddIterator(InternalIterator* iter);
 
+  // Enable source priority for equal user-key/sequence pairs when the input
+  // layout cannot rule them out. Otherwise retain internal-key type ordering.
+  void SetSourcePriorityForEqualSequences(bool enabled);
+
   // Add a point key iterator and a range tombstone iterator.
   // `tombstone_iter_ptr` should and only be set by LevelIterator.
   // *tombstone_iter_ptr will be set to where the merging iterator stores
