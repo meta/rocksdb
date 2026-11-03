@@ -19,6 +19,7 @@
 // synchronization on all accesses.
 
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <limits>
@@ -473,6 +474,32 @@ class VersionStorageInfo {
   using BlobFiles = std::vector<std::shared_ptr<BlobFileMetaData>>;
   const BlobFiles& GetBlobFiles() const { return blob_files_; }
 
+  // Blob files that best-efforts recovery left out of a recovered Version
+  // while table files in this Version might still reference blobs in them.
+  // Sorted and free of duplicates. Each number stays until no table file can
+  // reference it, i.e. it is older than every table file's oldest referenced
+  // blob file.
+  // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
+  const std::vector<uint64_t>& GetDroppedBlobFiles() const {
+    return dropped_blob_files_;
+  }
+
+  // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
+  bool IsDroppedBlobFile(uint64_t blob_file_number) const {
+    return std::binary_search(dropped_blob_files_.begin(),
+                              dropped_blob_files_.end(), blob_file_number);
+  }
+
+  // REQUIRES: `dropped_blob_files` is sorted and free of duplicates.
+  void SetDroppedBlobFiles(std::vector<uint64_t>&& dropped_blob_files) {
+    assert(
+        std::is_sorted(dropped_blob_files.begin(), dropped_blob_files.end()));
+    assert(std::adjacent_find(dropped_blob_files.begin(),
+                              dropped_blob_files.end()) ==
+           dropped_blob_files.end());
+    dropped_blob_files_ = std::move(dropped_blob_files);
+  }
+
   // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
   BlobFiles::const_iterator GetBlobFileMetaDataLB(
       uint64_t blob_file_number) const;
@@ -763,6 +790,9 @@ class VersionStorageInfo {
 
   // Vector of blob files in version sorted by blob file number.
   BlobFiles blob_files_;
+
+  // See GetDroppedBlobFiles().
+  std::vector<uint64_t> dropped_blob_files_;
 
   // Level that L0 data should be compacted to. All levels < base_level_ should
   // be empty. -1 if it is not level-compaction so it's not applicable.

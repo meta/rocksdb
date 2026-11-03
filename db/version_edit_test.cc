@@ -420,6 +420,29 @@ TEST_F(VersionEditTest, BlobFileAdditionAndGarbage) {
   TestEncodeDecode(edit);
 }
 
+TEST_F(VersionEditTest, DroppedBlobFiles) {
+  VersionEdit edit;
+  ASSERT_FALSE(edit.HasDroppedBlobFiles());
+
+  const std::vector<uint64_t> dropped_blob_files{5, 1ull << 40};
+  for (const uint64_t blob_file_number : dropped_blob_files) {
+    edit.AddDroppedBlobFile(blob_file_number);
+  }
+  ASSERT_TRUE(edit.HasDroppedBlobFiles());
+  TestEncodeDecode(edit);
+
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded, 0 /* ts_sz */));
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  ASSERT_EQ(decoded.GetDroppedBlobFiles(), dropped_blob_files);
+  ASSERT_NE(decoded.DebugString().find("DroppedBlobFile: 5"),
+            std::string::npos);
+  ASSERT_NE(
+      decoded.DebugJSON(0).find("\"DroppedBlobFiles\": [5, 1099511627776]"),
+      std::string::npos);
+}
+
 TEST_F(VersionEditTest, AddWalEncodeDecode) {
   VersionEdit edit;
   for (uint64_t log_number = 1; log_number <= 20; log_number++) {
@@ -682,6 +705,7 @@ TEST_F(VersionEditTest, IgnorableTags) {
   edit.SetNextFile(kNextFileNumber);
   // Add more ignorable entries.
   edit.SetFullHistoryTsLow("ts");
+  edit.AddDroppedBlobFile(7);
   // Add unignorable entry.
   edit.SetColumnFamily(kColumnFamilyId);
 
@@ -695,6 +719,7 @@ TEST_F(VersionEditTest, IgnorableTags) {
   ASSERT_FALSE(decoded.HasDbId());
   ASSERT_FALSE(decoded.HasFullHistoryTsLow());
   ASSERT_FALSE(decoded.HasCommittedOptionsFileNumber());
+  ASSERT_FALSE(decoded.HasDroppedBlobFiles());
   ASSERT_FALSE(decoded.IsWalAddition());
   ASSERT_FALSE(decoded.IsWalDeletion());
   ASSERT_TRUE(decoded.GetWalAdditions().empty());

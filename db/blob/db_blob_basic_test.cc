@@ -1483,6 +1483,62 @@ TEST_F(DBBlobBasicTest, BestEffortsRecovery_MissingNewestBlobFile) {
   ASSERT_EQ("value" + std::to_string(kNumTableFiles - 2), value);
 }
 
+TEST_F(DBBlobBasicTest, BestEffortsRecovery_RecordsDroppedBlobFile) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.create_if_missing = true;
+  Reopen(options);
+
+  // Each flush writes one blob file. The overlapping table files are merged
+  // into one that references both blob files, but the MANIFEST only links it
+  // to the older one, its oldest referenced blob file.
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  ASSERT_EQ(TotalTableFiles(), 1);
+
+  const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+  ASSERT_EQ(blob_files.size(), 2);
+  const std::vector<uint64_t> expected_dropped{blob_files[1]};
+  Close();
+
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, blob_files[1])));
+
+  auto get_dropped_blob_files = [&]() {
+    return dbfull()
+        ->GetVersionSet()
+        ->GetColumnFamilySet()
+        ->GetDefault()
+        ->current()
+        ->storage_info()
+        ->GetDroppedBlobFiles();
+  };
+
+  options.best_efforts_recovery = true;
+  Reopen(options);
+  ASSERT_EQ(get_dropped_blob_files(), expected_dropped);
+  std::string value;
+  ASSERT_OK(db_->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ(value, "va");
+  ASSERT_OK(db_->Get(ReadOptions(), "c", &value));
+  ASSERT_EQ(value, "vc");
+  ASSERT_TRUE(db_->Get(ReadOptions(), "b", &value).IsCorruption());
+
+  // A regular open recovers the dropped blob file from the MANIFEST written by
+  // best-efforts recovery and writes it into the next MANIFEST.
+  options.best_efforts_recovery = false;
+  for (int i = 0; i < 2; ++i) {
+    Reopen(options);
+    ASSERT_EQ(get_dropped_blob_files(), expected_dropped);
+  }
+}
+
 TEST_F(DBBlobBasicTest, GetMergeBlobWithPut) {
   Options options = GetDefaultOptions();
   options.merge_operator = MergeOperators::CreateStringAppendOperator();

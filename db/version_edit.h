@@ -76,6 +76,7 @@ enum Tag : uint32_t {
   kSubcompactionProgress,
   kLastCompactedManifestFileSize,
   kCommittedOptionsFileNumber,
+  kDroppedBlobFile,
 };
 
 enum SubcompactionProgressPerLevelCustomTag : uint32_t {
@@ -1096,6 +1097,16 @@ class VersionEdit {
     return is_options_file_manipulation_;
   }
 
+  // Record a blob file that best-efforts recovery left out of the recovered
+  // Version while table files might still reference blobs in it.
+  void AddDroppedBlobFile(uint64_t blob_file_number) {
+    dropped_blob_files_.push_back(blob_file_number);
+  }
+  const std::vector<uint64_t>& GetDroppedBlobFiles() const {
+    return dropped_blob_files_;
+  }
+  bool HasDroppedBlobFiles() const { return !dropped_blob_files_.empty(); }
+
   // Recovery-time per-column-family edits only need to be written when they
   // advance the CF's log number or carry some other manifest state.
   bool ShouldEmitPerColumnFamilyRecoveryEdit(uint64_t current_log_number) const;
@@ -1154,6 +1165,8 @@ class VersionEdit {
   NewFiles new_files_;
   BlobFileAdditions blob_file_additions_;
   BlobFileGarbages blob_file_garbages_;
+  std::vector<uint64_t> dropped_blob_files_;
+
   WalAdditions wal_additions_;
 
   std::string db_id_;
