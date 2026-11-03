@@ -5068,6 +5068,12 @@ Status DBImpl::CreateColumnFamiliesImpl(
           ColumnFamilyData::ValidateOptions(db_options, column_family.options);
     }
     if (preparation_status.ok()) {
+      // Run the table factory and other configurable checks of DB::Open, so
+      // that a column family that could not be reopened is not created.
+      preparation_status =
+          ROCKSDB_NAMESPACE::ValidateOptions(db_options, column_family.options);
+    }
+    if (preparation_status.ok()) {
       for (const auto& cf_path : column_family.options.cf_paths) {
         preparation_status = env_->CreateDirIfMissing(cf_path.path);
         if (!preparation_status.ok()) {

@@ -1212,6 +1212,16 @@ class ExternalTableFactoryAdapter : public TableFactory {
 
   std::unique_ptr<TableFactory> Clone() const override { return nullptr; }
 
+  // Lets the wrapped factory reject column families it cannot serve.
+  Status ValidateOptions(const DBOptions& db_opts,
+                         const ColumnFamilyOptions& cf_opts) const override {
+    Status status = TableFactory::ValidateOptions(db_opts, cf_opts);
+    if (status.ok()) {
+      status = inner_->ValidateOptions(db_opts, cf_opts);
+    }
+    return status;
+  }
+
   const Customizable* Inner() const override { return inner_.get(); }
 
   std::shared_ptr<ExternalTableFactory> inner() const { return inner_; }

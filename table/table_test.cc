@@ -8576,6 +8576,48 @@ TEST_F(ExternalTableTest, BootstrapConfig) {
                                             &invalid_factory));
 }
 
+TEST_F(ExternalTableTest, WrappedFactoryValidatesColumnFamilyOptions) {
+  // Accepts only column families that cannot take memtable writes.
+  class IngestOnlyExternalTableFactory : public SimpleExternalTableFactory {
+   public:
+    Status ValidateOptions(const DBOptions& /*db_opts*/,
+                           const ColumnFamilyOptions& cf_opts) const override {
+      if (!cf_opts.disallow_memtable_writes) {
+        return Status::InvalidArgument("Requires disallow_memtable_writes");
+      }
+      return Status::OK();
+    }
+  };
+
+  Options options = CurrentOptions();
+  Options ingest_only = options;
+  ingest_only.table_factory = NewExternalTableFactory(
+      std::make_shared<IngestOnlyExternalTableFactory>());
+  ASSERT_TRUE(ingest_only.table_factory
+                  ->ValidateOptions(DBOptions(ingest_only),
+                                    ColumnFamilyOptions(ingest_only))
+                  .IsInvalidArgument());
+
+  ColumnFamilyHandle* handle = nullptr;
+  Status s = db_->CreateColumnFamily(ingest_only, "ingest_only", &handle);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_EQ(handle, nullptr);
+
+  ingest_only.disallow_memtable_writes = true;
+  ASSERT_OK(db_->CreateColumnFamily(ingest_only, "ingest_only", &handle));
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(handle));
+
+  const std::vector<std::string> column_families{kDefaultColumnFamilyName,
+                                                 "ingest_only"};
+  ingest_only.disallow_memtable_writes = false;
+  s = TryReopenWithColumnFamilies(column_families,
+                                  std::vector<Options>{options, ingest_only});
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ingest_only.disallow_memtable_writes = true;
+  ASSERT_OK(TryReopenWithColumnFamilies(
+      column_families, std::vector<Options>{options, ingest_only}));
+}
+
 TEST_F(ExternalTableTest, GetWrappedExternalTableFactory) {
   std::shared_ptr<ExternalTableFactory> inner =
       std::make_shared<SimpleExternalTableFactory>();

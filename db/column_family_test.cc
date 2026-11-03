@@ -805,6 +805,26 @@ TEST_P(ColumnFamilyTest, EmptyNameRejected) {
   ASSERT_TRUE(handles.empty());
 }
 
+TEST_P(ColumnFamilyTest, CreateRejectsOptionsThatOpenRejects) {
+  // CreateColumnFamily() used to skip the table factory checks of DB::Open, so
+  // it persisted a column family that made the next DB::Open fail.
+  Open();
+  ColumnFamilyOptions hash_index_options = column_family_options_;
+  BlockBasedTableOptions table_options;
+  table_options.index_type = BlockBasedTableOptions::kHashSearch;
+  hash_index_options.table_factory.reset(
+      NewBlockBasedTableFactory(table_options));
+  hash_index_options.prefix_extractor.reset();
+  ColumnFamilyHandle* handle = nullptr;
+  Status s = db_->CreateColumnFamily(hash_index_options, "hash_index", &handle);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_EQ(handle, nullptr);
+
+  Close();
+  AssertColumnFamilyNames({kDefaultColumnFamilyName});
+  ASSERT_OK(TryOpen({kDefaultColumnFamilyName}));
+}
+
 TEST_P(ColumnFamilyTest, BulkAddDrop) {
   constexpr int kNumCF = 1000;
   ColumnFamilyOptions cf_options;

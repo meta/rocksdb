@@ -1,0 +1,1 @@
+`CreateColumnFamily()` and `CreateColumnFamilies()` now run the table factory option validation that `DB::Open()` runs, so they return `InvalidArgument` instead of creating a column family that the next `DB::Open()` would reject. External table factories wrapped by `NewExternalTableFactory()` now receive `ValidateOptions()` calls.
