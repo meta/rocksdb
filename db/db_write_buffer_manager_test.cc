@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -2262,11 +2263,24 @@ TEST_P(DBWriteBufferManagerTest, FlushLargestAcrossDBsPicksAtomicFlushDB) {
   // Ignore any flush that may have happened during open/setup.
   recorder->Reset();
 
+  // If atomic_db has not switched its memtables before its handoff lease
+  // expires, as can happen on a heavily loaded host, the coordinator moves on
+  // to the next largest DB by design.
+  std::atomic<int> lease_expirations{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteBufferManager::ExpireFlushHandoffLease:Expired",
+      [&](void*) { lease_expirations.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+
   options.write_buffer_manager->SetBufferSize(1 << 20);
 
   recorder->WaitForColumnFamilies(atomic_db.get(), 2);
-  EXPECT_FALSE(recorder->HasFlushed(db_.get()));
+  if (lease_expirations.load() == 0) {
+    EXPECT_FALSE(recorder->HasFlushed(db_.get()));
+  }
   EXPECT_EQ(0, recorder->ManualFlushes());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 
   for (auto* handle : atomic_handles) {
     ASSERT_OK(atomic_db->DestroyColumnFamilyHandle(handle));
