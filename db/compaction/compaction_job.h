@@ -53,6 +53,7 @@ class Arena;
 class CompactionState;
 class ErrorHandler;
 class MemTable;
+class MissingBlobRepairIterator;
 class SnapshotChecker;
 class SystemClock;
 class TableCache;
@@ -395,6 +396,7 @@ class CompactionJob {
     std::unique_ptr<InternalIterator> clip;
     std::unique_ptr<BlobCountingIterator> blob_counter;
     std::unique_ptr<InternalIterator> trim_history_iter;
+    std::unique_ptr<MissingBlobRepairIterator> missing_blob_repair;
   };
 
   bool ShouldUseLocalCompaction(SubcompactionState* sub_compact);

@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1542,6 +1544,182 @@ TEST_F(DBWideBlobDirectWriteTest,
   ASSERT_TRUE(status.IsCorruption() || status.IsIOError() ||
               status.IsNotFound())
       << status.ToString();
+}
+
+TEST_F(DBWideBlobDirectWriteTest,
+       MissingBlobRepairKeepsSurvivingColumnsWithoutPayloadReads) {
+  std::atomic<int> filter_calls{0};
+  std::atomic<int> ttl_columns{0};
+  std::atomic<int> bad_ttl_columns{0};
+  std::atomic<int> missing_ttl_columns{0};
+  std::atomic<int> blob_columns{0};
+  std::atomic<uint64_t> ttl_cutoff{1000};
+  TTLOnlyLazyDropFilter filter(&ttl_cutoff, &filter_calls, &ttl_columns,
+                               &bad_ttl_columns, &missing_ttl_columns,
+                               &blob_columns);
+
+  Options options = GetDirectWriteOptions();
+  options.disable_auto_compactions = true;
+  options.compaction_style = kCompactionStyleUniversal;
+  options.compaction_filter = &filter;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 64;
+  options.blob_file_size = 1;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  const std::string ttl = EncodeFixedTTL(1000);
+  const std::string healthy_a(128, 'a');
+  const std::string healthy_b(128, 'b');
+  const std::string healthy_c(128, 'c');
+  const std::string lost_value(128, 'x');
+  const WideColumns a{{kDefaultWideColumnName, healthy_a}, {"ttl", ttl}};
+  const WideColumns b{{kDefaultWideColumnName, lost_value},
+                      {"healthy", healthy_b},
+                      {"ttl", ttl}};
+  const WideColumns c{{kDefaultWideColumnName, healthy_c},
+                      {"blob_attr", lost_value},
+                      {"ttl", ttl}};
+  const WideColumns d{{kDefaultWideColumnName, lost_value}};
+  const WideColumns f{{kDefaultWideColumnName, "inline"},
+                      {"blob_attr", lost_value},
+                      {"ttl", ttl}};
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "a", a));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "b", b));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "c", c));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "d", d));
+  ASSERT_OK(Put("e", lost_value));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "f", f));
+  ASSERT_OK(Flush());
+
+  using ReferenceKey = std::pair<std::string, std::string>;
+  using Reference = std::pair<uint64_t, std::string>;
+  std::map<ReferenceKey, Reference> references;
+  const auto collect_references = [&] {
+    Arena arena;
+    ReadOptions read_options;
+    ScopedArenaPtr<InternalIterator> iter(dbfull()->NewInternalIterator(
+        read_options, &arena, kMaxSequenceNumber));
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      ParsedInternalKey parsed;
+      ASSERT_OK(ParseInternalKey(iter->key(), &parsed, false));
+      if (parsed.type == kTypeBlobIndex) {
+        BlobIndex index;
+        ASSERT_OK(index.DecodeFrom(iter->value()));
+        references.emplace(
+            ReferenceKey(parsed.user_key.ToString(), ""),
+            Reference(index.file_number(), iter->value().ToString()));
+      } else if (parsed.type == kTypeWideColumnEntity) {
+        WideColumns columns;
+        std::vector<std::pair<size_t, BlobIndex>> indices;
+        ASSERT_OK(WideColumnSerialization::Deserialize(iter->value(), columns,
+                                                       &indices));
+        for (const auto& index : indices) {
+          references.emplace(
+              ReferenceKey(parsed.user_key.ToString(),
+                           columns[index.first].name().ToString()),
+              Reference(index.second.file_number(),
+                        columns[index.first].value().ToString()));
+        }
+      }
+    }
+    ASSERT_OK(iter->status());
+  };
+  collect_references();
+  ASSERT_EQ(references.size(), 8U);
+  ASSERT_EQ(GetBlobFileNumbers().size(), references.size());
+
+  std::set<uint64_t> missing_files;
+  std::map<ReferenceKey, Reference> healthy_references;
+  for (const auto& reference : references) {
+    const std::string& key = reference.first.first;
+    const std::string& column = reference.first.second;
+    if ((key == "b" && column.empty()) ||
+        (key == "c" && column == "blob_attr") || key == "d" || key == "e" ||
+        key == "f") {
+      missing_files.insert(reference.second.first);
+    } else {
+      healthy_references.insert(reference);
+    }
+  }
+  ASSERT_EQ(missing_files.size(), 5U);
+  ASSERT_EQ(healthy_references.size(), 3U);
+  const uint64_t oldest_file = references.at(ReferenceKey("a", "")).first;
+  for (const uint64_t file_number : missing_files) {
+    ASSERT_GT(file_number, oldest_file);
+  }
+
+  Close();
+  for (const uint64_t file_number : missing_files) {
+    ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, file_number)));
+  }
+  options.best_efforts_recovery = true;
+  Reopen(options);
+  ASSERT_EQ(TotalTableFiles(), 1);
+  const std::vector<uint64_t> recovered_blob_files = GetBlobFileNumbers();
+  ASSERT_EQ(recovered_blob_files.size(), healthy_references.size());
+
+  std::atomic<int> payload_reads{0};
+  for (const char* point : {"BlobFileReader::GetBlob:ReadFromFile",
+                            "BlobFileReader::GetBlobRange:ReadFromFile",
+                            "BlobFileReader::MultiGetBlob:ReadFromFile",
+                            "BlobFileReader::MultiGetBlobRange:ReadFromFile"}) {
+    SyncPoint::GetInstance()->SetCallBack(
+        point, [&](void*) { payload_reads.fetch_add(1); });
+  }
+  SyncPoint::GetInstance()->EnableProcessing();
+  CompactRangeOptions compact_options;
+  compact_options.skip_missing_blob_files = true;
+  ASSERT_OK(options.statistics->Reset());
+  payload_reads.store(0);
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_GT(options.statistics->getTickerCount(COMPACT_READ_BYTES), 0);
+  ASSERT_EQ(options.statistics->getTickerCount(BLOB_DB_BLOB_FILE_BYTES_READ),
+            0);
+  ASSERT_EQ(payload_reads.load(), 0);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_GE(filter_calls.load(), 4);
+  ASSERT_EQ(ttl_columns.load(), filter_calls.load());
+  ASSERT_EQ(bad_ttl_columns.load(), 0);
+  ASSERT_EQ(missing_ttl_columns.load(), 0);
+  ASSERT_GE(blob_columns.load(), 3);
+  references.clear();
+  collect_references();
+  ASSERT_EQ(references, healthy_references);
+  ASSERT_EQ(GetBlobFileNumbers(), recovered_blob_files);
+
+  const WideColumns repaired_b{{"healthy", healthy_b}, {"ttl", ttl}};
+  const WideColumns repaired_c{{kDefaultWideColumnName, healthy_c},
+                               {"ttl", ttl}};
+  const WideColumns repaired_f{{kDefaultWideColumnName, "inline"},
+                               {"ttl", ttl}};
+  const auto verify = [&] {
+    for (const auto& entry :
+         {std::pair<const char*, const WideColumns*>("a", &a),
+          std::pair<const char*, const WideColumns*>("b", &repaired_b),
+          std::pair<const char*, const WideColumns*>("c", &repaired_c),
+          std::pair<const char*, const WideColumns*>("f", &repaired_f)}) {
+      PinnableWideColumns result;
+      ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(),
+                               entry.first, &result));
+      ASSERT_EQ(result.columns(), *entry.second);
+    }
+    std::string default_value = "previous value";
+    ASSERT_OK(db_->Get(ReadOptions(), "b", &default_value));
+    ASSERT_EQ(default_value, "");
+    ASSERT_EQ(Get("d"), "NOT_FOUND");
+    ASSERT_EQ(Get("e"), "NOT_FOUND");
+  };
+  verify();
+  options.best_efforts_recovery = false;
+  Reopen(options);
+  ASSERT_EQ(GetBlobFileNumbers(), recovered_blob_files);
+  verify();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(GetBlobFileNumbers(), recovered_blob_files);
+  verify();
 }
 
 TEST_F(DBWideBlobDirectWriteTest,

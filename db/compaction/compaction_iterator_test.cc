@@ -13,7 +13,9 @@
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_builder.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/missing_blob_repair_iterator.h"
 #include "db/dbformat.h"
+#include "db/history_trimming_iterator.h"
 #include "db/wide/wide_column_serialization.h"
 #include "env/mock_env.h"
 #include "file/filename.h"
@@ -32,6 +34,13 @@ std::string ValueWithPreferredSeqno(std::string val,
                                     SequenceNumber preferred_seqno = 0) {
   std::string result = val;
   PutFixed64(&result, preferred_seqno);
+  return result;
+}
+
+std::string BlobIndexForFile(uint64_t file_number) {
+  std::string result;
+  BlobIndex::EncodeBlob(&result, file_number, /*offset=*/100, /*size=*/200,
+                        kNoCompression);
   return result;
 }
 }  // namespace
@@ -305,10 +314,17 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
       // ~CompactionIterator() first.
       c_iter_.reset();
     }
+    repair_iter_.reset();
     iter_.reset(new LoggingForwardVectorIterator(ks, vs));
     iter_->SeekToFirst();
+    InternalIterator* input = iter_.get();
+    if (repair_enabled_) {
+      repair_iter_ = std::make_unique<MissingBlobRepairIterator>(
+          input, repair_storage_.get(), cmp_->timestamp_size());
+      input = repair_iter_.get();
+    }
     c_iter_.reset(new CompactionIterator(
-        iter_.get(), cmp_, merge_helper_.get(), last_sequence, &snapshots_,
+        input, cmp_, merge_helper_.get(), last_sequence, &snapshots_,
         snapshots_.empty() ? kMaxSequenceNumber : snapshots_.at(0),
         earliest_write_conflict_snapshot, kMaxSequenceNumber,
         snapshot_checker_.get(), Env::Default(),
@@ -318,6 +334,21 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse_,
         std::move(compaction), /*must_count_input_entries=*/false, filter,
         &shutting_down_, /*info_log=*/nullptr, full_history_ts_low));
+    c_iter_->SetMissingBlobRepairIterator(repair_iter_.get());
+  }
+
+  void EnableMissingBlobRepair(const std::vector<uint64_t>& healthy_files) {
+    repair_enabled_ = true;
+    repair_storage_ = std::make_unique<VersionStorageInfo>(
+        &icmp_, cmp_, 1, kCompactionStyleLevel, nullptr, false,
+        EpochNumberRequirement::kMustPresent,
+        Env::Default()->GetSystemClock().get(), 0, OffpeakTimeOption(""),
+        PeriodicCompactionPhaseParams{});
+    for (uint64_t file_number : healthy_files) {
+      repair_storage_->AddBlobFile(BlobFileMetaData::Create(
+          SharedBlobFileMetaData::Create(file_number, 1, 1000, "", ""), {}, 0,
+          0));
+    }
   }
 
   void AddSnapshot(SequenceNumber snapshot,
@@ -373,13 +404,16 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
   // A map of valid snapshot to last visible sequence to the snapshot.
   std::unordered_map<SequenceNumber, SequenceNumber> snapshot_map_;
   std::unique_ptr<MergeHelper> merge_helper_;
+  std::unique_ptr<VersionStorageInfo> repair_storage_;
   std::unique_ptr<LoggingForwardVectorIterator> iter_;
+  std::unique_ptr<MissingBlobRepairIterator> repair_iter_;
   std::unique_ptr<CompactionIterator> c_iter_;
   std::unique_ptr<CompactionRangeDelAggregator> range_del_agg_;
   std::unique_ptr<SnapshotChecker> snapshot_checker_;
   std::atomic<bool> shutting_down_{false};
   const std::atomic<bool> kManualCompactionCanceledFalse_{false};
   FakeCompaction* compaction_proxy_;
+  bool repair_enabled_ = false;
 };
 
 TEST_P(CompactionIteratorTest, MergeBeforeFilterFullOrder) {
@@ -872,6 +906,280 @@ TEST_P(CompactionIteratorTest, MergeBeforeFilterSnapshotCheckerRejected) {
   ASSERT_TRUE(c_iter_->status().IsNotSupported());
   ASSERT_FALSE(c_iter_->Valid());
   ASSERT_TRUE(trace.Events().empty());
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairPreservesHealthyScalar) {
+  EnableMissingBlobRepair({20});
+  const std::string healthy = BlobIndexForFile(20);
+  const std::vector<std::string> expected_keys = {
+      test::KeyStr("a", 5, kTypeDeletion),
+      test::KeyStr("b", 4, kTypeBlobIndex)};
+  const std::vector<std::string> expected_values = {"", healthy};
+  RunTest(
+      {test::KeyStr("a", 5, kTypeBlobIndex), test::KeyStr("a", 3, kTypeValue),
+       test::KeyStr("b", 4, kTypeBlobIndex)},
+      {BlobIndexForFile(10), "older", healthy}, expected_keys, expected_values);
+
+  repair_enabled_ = false;
+  RunTest(expected_keys, expected_values, expected_keys, expected_values);
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairPreservesSnapshotHistory) {
+  EnableMissingBlobRepair({});
+  AddSnapshot(4);
+  RunTest(
+      {test::KeyStr("a", 5, kTypeBlobIndex), test::KeyStr("a", 3, kTypeValue)},
+      {BlobIndexForFile(10), "older"},
+      {test::KeyStr("a", 5, kTypeDeletion), test::KeyStr("a", 3, kTypeValue)},
+      {"", "older"});
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairNormalizesMergeBase) {
+  EnableMissingBlobRepair({});
+  const std::shared_ptr<MergeOperator> merge_operator =
+      MergeOperators::CreateStringAppendOperator();
+  RunTest(
+      {test::KeyStr("a", 6, kTypeMerge), test::KeyStr("a", 5, kTypeMerge),
+       test::KeyStr("a", 4, kTypeBlobIndex), test::KeyStr("a", 2, kTypeValue)},
+      {"new", "middle", BlobIndexForFile(10), "older"},
+      {test::KeyStr("a", 6, kTypeValue)}, {"middle,new"}, kMaxSequenceNumber,
+      merge_operator.get());
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairMergesSurvivingWideColumns) {
+  EnableMissingBlobRepair({});
+  BlobIndex missing;
+  ASSERT_OK(missing.DecodeFrom(BlobIndexForFile(10)));
+  std::string entity;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      WideColumns{{"", "base"}, {"a", ""}, {"b", "retained"}}, {{1, missing}},
+      entity));
+  std::string merged;
+  ASSERT_OK(WideColumnSerialization::Serialize(
+      WideColumns{{"", "base,new"}, {"b", "retained"}}, merged));
+  const std::shared_ptr<MergeOperator> merge_operator =
+      MergeOperators::CreateStringAppendOperator();
+  RunTest({test::KeyStr("a", 6, kTypeMerge),
+           test::KeyStr("a", 5, kTypeWideColumnEntity),
+           test::KeyStr("b", 4, kTypeValue)},
+          {"new", entity, "other"},
+          {test::KeyStr("a", 6, kTypeWideColumnEntity),
+           test::KeyStr("b", 4, kTypeValue)},
+          {merged, "other"}, kMaxSequenceNumber, merge_operator.get());
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairRunsBeforeValueFilters) {
+  EnableMissingBlobRepair({20});
+  FilterAllKeysCompactionFilter filter;
+  InitIterators({test::KeyStr("a", 5, kTypeBlobIndex),
+                 test::KeyStr("b", 4, kTypeBlobIndex)},
+                {BlobIndexForFile(10), BlobIndexForFile(20)}, {}, {}, 5,
+                kMaxSequenceNumber, nullptr, &filter);
+  c_iter_->SeekToFirst();
+  ASSERT_OK(c_iter_->status());
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(c_iter_->key(), test::KeyStr("a", 5, kTypeDeletion));
+  c_iter_->Next();
+  ASSERT_FALSE(c_iter_->Valid());
+  ASSERT_EQ(c_iter_->status().code(), Status::Code::kNotSupported);
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairSingleDeleteRemainsValid) {
+  EnableMissingBlobRepair({});
+  const std::vector<std::string> expected_keys = {
+      test::KeyStr("a", 5, kTypeDeletion)};
+  const std::vector<std::string> expected_values = {""};
+  RunTest(
+      {test::KeyStr("a", 5, kTypeSingleDeletion),
+       test::KeyStr("a", 3, kTypeBlobIndex), test::KeyStr("a", 1, kTypeValue)},
+      {"", BlobIndexForFile(10), "older"}, expected_keys, expected_values);
+  repair_enabled_ = false;
+  RunTest(expected_keys, expected_values, expected_keys, expected_values);
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairSingleDeleteSnapshotStripes) {
+  EnableMissingBlobRepair({});
+  AddSnapshot(2);
+  AddSnapshot(4);
+  const std::vector<std::string> expected_keys = {
+      test::KeyStr("a", 5, kTypeDeletion), test::KeyStr("a", 3, kTypeDeletion),
+      test::KeyStr("a", 1, kTypeValue)};
+  const std::vector<std::string> expected_values = {"", "", "older"};
+  RunTest(
+      {test::KeyStr("a", 5, kTypeSingleDeletion),
+       test::KeyStr("a", 3, kTypeBlobIndex), test::KeyStr("a", 1, kTypeValue)},
+      {"", BlobIndexForFile(10), "older"}, expected_keys, expected_values);
+  repair_enabled_ = false;
+  RunTest(expected_keys, expected_values, expected_keys, expected_values);
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairSingleDeleteAtBottommost) {
+  EnableMissingBlobRepair({});
+  RunTest(
+      {test::KeyStr("a", 5, kTypeSingleDeletion),
+       test::KeyStr("a", 3, kTypeBlobIndex), test::KeyStr("b", 2, kTypeValue)},
+      {"", BlobIndexForFile(10), "healthy"}, {test::KeyStr("b", 0, kTypeValue)},
+      {"healthy"}, kMaxSequenceNumber, nullptr, nullptr, true);
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairKeepsSingleDeleteEnforcement) {
+  EnableMissingBlobRepair({});
+  InitIterators({test::KeyStr("a", 5, kTypeSingleDeletion),
+                 test::KeyStr("a", 3, kTypeDeletion)},
+                {"", ""}, {}, {}, 5);
+  c_iter_->SeekToFirst();
+  ASSERT_EQ(c_iter_->status().code(), Status::Code::kCorruption);
+  ASSERT_FALSE(c_iter_->Valid());
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairPreservesSurvivingWideColumns) {
+  EnableMissingBlobRepair({20});
+  BlobIndex missing;
+  BlobIndex healthy;
+  ASSERT_OK(missing.DecodeFrom(BlobIndexForFile(10)));
+  ASSERT_OK(healthy.DecodeFrom(BlobIndexForFile(20)));
+  std::string entity;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      WideColumns{{"", ""}, {"b", ""}, {"c", "inline"}},
+      {{0, missing}, {1, healthy}}, entity));
+  std::string repaired;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      WideColumns{{"b", ""}, {"c", "inline"}}, {{0, healthy}}, repaired));
+  RunTest({test::KeyStr("a", 5, kTypeWideColumnEntity)}, {entity},
+          {test::KeyStr("a", 5, kTypeWideColumnEntity)}, {repaired});
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairDeletesAllLostWideColumns) {
+  EnableMissingBlobRepair({});
+  BlobIndex missing;
+  ASSERT_OK(missing.DecodeFrom(BlobIndexForFile(10)));
+  std::string entity;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(WideColumns{{"a", ""}},
+                                                 {{0, missing}}, entity));
+  RunTest({test::KeyStr("a", 5, kTypeWideColumnEntity),
+           test::KeyStr("a", 3, kTypeValue)},
+          {entity, "older"}, {test::KeyStr("a", 5, kTypeDeletion)}, {""});
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairPreservesExistingEmptyEntity) {
+  EnableMissingBlobRepair({});
+  std::string entity;
+  ASSERT_OK(WideColumnSerialization::Serialize({}, entity));
+  RunTest({test::KeyStr("a", 5, kTypeWideColumnEntity)}, {entity},
+          {test::KeyStr("a", 5, kTypeWideColumnEntity)}, {entity});
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairRejectsMalformedIndices) {
+  EnableMissingBlobRepair({});
+  const std::vector<std::string> malformed_indices = {
+      "", std::string(1, static_cast<char>(BlobIndex::Type::kUnknown)),
+      BlobIndexForFile(10).substr(0, 2)};
+  for (const std::string& index : malformed_indices) {
+    InitIterators({test::KeyStr("a", 5, kTypeBlobIndex)}, {index}, {}, {}, 5);
+    c_iter_->SeekToFirst();
+    ASSERT_EQ(c_iter_->status().code(), Status::Code::kCorruption);
+    ASSERT_FALSE(c_iter_->Valid());
+  }
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairPreservesInputErrors) {
+  EnableMissingBlobRepair({20});
+  std::unique_ptr<InternalIterator> failed_input(
+      NewErrorInternalIterator(Status::IOError("Failed SST read")));
+  MissingBlobRepairIterator failed_repair(failed_input.get(),
+                                          repair_storage_.get(), 0);
+  failed_repair.SeekToFirst();
+  ASSERT_FALSE(failed_repair.Valid());
+  ASSERT_EQ(failed_repair.status().code(), Status::Code::kIOError);
+
+  class FailingNextIterator : public VectorIterator {
+   public:
+    using VectorIterator::VectorIterator;
+
+    bool Valid() const override {
+      return status_.ok() && VectorIterator::Valid();
+    }
+    void SeekToFirst() override {
+      status_ = Status::OK();
+      VectorIterator::SeekToFirst();
+    }
+    void SeekToLast() override {
+      status_ = Status::OK();
+      VectorIterator::SeekToLast();
+    }
+    void Seek(const Slice& target) override {
+      status_ = Status::OK();
+      VectorIterator::Seek(target);
+    }
+    void SeekForPrev(const Slice& target) override {
+      status_ = Status::OK();
+      VectorIterator::SeekForPrev(target);
+    }
+    void Next() override { status_ = Status::IOError("Failed SST scan"); }
+    bool PrepareValue() override {
+      ADD_FAILURE() << "Compaction input values are already prepared";
+      return false;
+    }
+    Status status() const override { return status_; }
+
+   private:
+    Status status_;
+  };
+
+  FailingNextIterator input({test::KeyStr("a", 5, kTypeBlobIndex)},
+                            {BlobIndexForFile(20)}, &icmp_);
+  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0);
+  repair.SeekToFirst();
+  ASSERT_OK(repair.status());
+  ASSERT_TRUE(repair.Valid());
+  ASSERT_TRUE(repair.PrepareValue());
+  ASSERT_EQ(repair.value(), BlobIndexForFile(20));
+  repair.Next();
+  ASSERT_FALSE(repair.Valid());
+  ASSERT_EQ(repair.status().code(), Status::Code::kIOError);
+  ASSERT_FALSE(repair.IsRepairDeletion());
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairSeekAndNextUseRewrittenKeys) {
+  EnableMissingBlobRepair({});
+  VectorIterator input(
+      {test::KeyStr("a", 5, kTypeBlobIndex), test::KeyStr("b", 4, kTypeValue)},
+      {BlobIndexForFile(10), "healthy"}, &icmp_);
+  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0);
+  const std::string deletion = test::KeyStr("a", 5, kTypeDeletion);
+  repair.Seek(deletion);
+  ASSERT_OK(repair.status());
+  ASSERT_TRUE(repair.Valid());
+  ASSERT_EQ(repair.key(), deletion);
+  ASSERT_TRUE(repair.IsRepairDeletion());
+  ASSERT_FALSE(repair.IsKeyPinned());
+  ASSERT_FALSE(repair.IsValuePinned());
+  repair.Seek(repair.key());
+  ASSERT_OK(repair.status());
+  ASSERT_EQ(repair.key(), deletion);
+  IterateResult result;
+  ASSERT_TRUE(repair.NextAndGetResult(&result));
+  ASSERT_EQ(result.key, test::KeyStr("b", 4, kTypeValue));
+  ASSERT_FALSE(repair.IsRepairDeletion());
+  ASSERT_TRUE(repair.IsKeyPinned());
+  ASSERT_TRUE(repair.IsValuePinned());
+  ASSERT_OK(repair.status());
+}
+
+TEST_P(CompactionIteratorTest,
+       MissingBlobRepairChecksCachedStatusWhenDiscarded) {
+  EnableMissingBlobRepair({});
+  {
+    std::unique_ptr<InternalIterator> input(
+        NewErrorInternalIterator(Status::IOError("Failed SST read")));
+    MissingBlobRepairIterator repair(input.get(), repair_storage_.get(), 0);
+    ASSERT_FALSE(repair.Valid());
+  }
+  VectorIterator input({test::KeyStr("a", 5, kTypeWideColumnEntity)},
+                       {"invalid entity"});
+  input.SeekToFirst();
+  ASSERT_TRUE(input.Valid());
+  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0);
 }
 
 // It is possible that the output of the compaction iterator is empty even if
@@ -1427,6 +1735,22 @@ class CompactionIteratorWithSnapshotCheckerTest
  public:
   bool UseSnapshotChecker() const override { return true; }
 };
+
+TEST_F(CompactionIteratorWithSnapshotCheckerTest,
+       MissingBlobRepairSingleDeletePreservesWriteConflictCheck) {
+  EnableMissingBlobRepair({});
+  AddSnapshot(2, 0);
+  const std::vector<std::string> expected_keys = {
+      test::KeyStr("a", 2, kTypeDeletion)};
+  const std::vector<std::string> expected_values = {""};
+  RunTest({test::KeyStr("a", 2, kTypeSingleDeletion),
+           test::KeyStr("a", 1, kTypeBlobIndex)},
+          {"", BlobIndexForFile(10)}, expected_keys, expected_values,
+          kMaxSequenceNumber, nullptr, nullptr, false, 0);
+  repair_enabled_ = false;
+  RunTest(expected_keys, expected_values, expected_keys, expected_values,
+          kMaxSequenceNumber, nullptr, nullptr, false, 0);
+}
 
 // Uncommitted keys (keys with seq > last_committed_seq) should be output as-is
 // while committed version of these keys should get compacted as usual.
@@ -1989,17 +2313,191 @@ class CompactionIteratorTsGcTest : public CompactionIteratorTest {
       : CompactionIteratorTest(test::BytewiseComparatorWithU64TsWrapper()) {}
 };
 
-TEST_P(CompactionIteratorTsGcTest, MergeBeforeFilterTimestampRejected) {
-  test::MergeFilterTrace trace;
-  test::RecordingMergeOperator merge(&trace);
-  test::RecordingMergeFilter filter(
-      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
-  InitIterators({test::KeyStr(10002, "a", 5, kTypeMerge)}, {"A"}, {}, {}, 5,
-                kMaxSequenceNumber, &merge, &filter);
+TEST_P(CompactionIteratorTsGcTest,
+       MissingBlobRepairChecksCachedTimestampErrorWhenDiscarded) {
+  EnableMissingBlobRepair({});
+  VectorIterator input({test::KeyStr("a", 5, kTypeBlobIndex)},
+                       {BlobIndexForFile(10)});
+  input.SeekToFirst();
+  ASSERT_TRUE(input.Valid());
+  MissingBlobRepairIterator repair(&input, repair_storage_.get(),
+                                   cmp_->timestamp_size());
+}
+
+TEST_P(CompactionIteratorTsGcTest, MissingBlobRepairRespectsHistoryTrimming) {
+  EnableMissingBlobRepair({20});
+  VectorIterator input(
+      {test::KeyStr(104, "a", 5, kTypeBlobIndex),
+       test::KeyStr(103, "b", 4, kTypeBlobIndex),
+       test::KeyStr(101, "c", 3, kTypeBlobIndex)},
+      {BlobIndexForFile(10), BlobIndexForFile(10), BlobIndexForFile(20)},
+      &icmp_);
+  std::string trim_timestamp;
+  PutFixed64(&trim_timestamp, 103);
+  HistoryTrimmingIterator trimmed(&input, cmp_, trim_timestamp);
+  MissingBlobRepairIterator repair(&trimmed, repair_storage_.get(),
+                                   cmp_->timestamp_size());
+  repair.SeekToFirst();
+  ASSERT_OK(repair.status());
+  ASSERT_TRUE(repair.Valid());
+  ASSERT_EQ(repair.key(),
+            test::KeyStr(103, "b", 4, kTypeDeletionWithTimestamp));
+  ASSERT_TRUE(repair.IsRepairDeletion());
+  repair.Next();
+  ASSERT_OK(repair.status());
+  ASSERT_TRUE(repair.Valid());
+  ASSERT_EQ(repair.key(), test::KeyStr(101, "c", 3, kTypeBlobIndex));
+  ASSERT_EQ(repair.value(), BlobIndexForFile(20));
+  ASSERT_FALSE(repair.IsRepairDeletion());
+  repair.Next();
+  ASSERT_OK(repair.status());
+  ASSERT_FALSE(repair.Valid());
+}
+
+TEST_P(CompactionIteratorTsGcTest, MissingBlobRepairPreservesTimestampHistory) {
+  EnableMissingBlobRepair({});
+  const std::vector<std::string> expected_keys = {
+      test::KeyStr(103, "a", 5, kTypeDeletionWithTimestamp),
+      test::KeyStr(101, "a", 3, kTypeValue)};
+  const std::vector<std::string> expected_values = {"", "older"};
+  RunTest({test::KeyStr(103, "a", 5, kTypeBlobIndex),
+           test::KeyStr(101, "a", 3, kTypeValue)},
+          {BlobIndexForFile(10), "older"}, expected_keys, expected_values,
+          kMaxSequenceNumber, nullptr, nullptr, true);
+  repair_enabled_ = false;
+  RunTest(expected_keys, expected_values, expected_keys, expected_values,
+          kMaxSequenceNumber, nullptr, nullptr, true);
+}
+
+TEST_P(CompactionIteratorTsGcTest,
+       MissingBlobRepairSingleDeletePreservesTimestampHistory) {
+  EnableMissingBlobRepair({});
+  const std::vector<std::string> expected_keys = {
+      test::KeyStr(104, "a", 6, kTypeDeletionWithTimestamp),
+      test::KeyStr(103, "a", 5, kTypeDeletionWithTimestamp),
+      test::KeyStr(101, "a", 3, kTypeValue)};
+  const std::vector<std::string> expected_values = {"", "", "older"};
+  RunTest({test::KeyStr(104, "a", 6, kTypeSingleDeletion),
+           test::KeyStr(103, "a", 5, kTypeBlobIndex),
+           test::KeyStr(101, "a", 3, kTypeValue)},
+          {"", BlobIndexForFile(10), "older"}, expected_keys, expected_values,
+          kMaxSequenceNumber, nullptr, nullptr, true);
+  repair_enabled_ = false;
+  RunTest(expected_keys, expected_values, expected_keys, expected_values,
+          kMaxSequenceNumber, nullptr, nullptr, true);
+}
+
+TEST_P(CompactionIteratorTsGcTest, MissingBlobRepairRespectsHistoryGcFloor) {
+  EnableMissingBlobRepair({});
+  std::string history_low;
+  PutFixed64(&history_low, 102);
+  RunTest({test::KeyStr(104, "a", 6, kTypeSingleDeletion),
+           test::KeyStr(103, "a", 5, kTypeBlobIndex),
+           test::KeyStr(101, "a", 3, kTypeValue)},
+          {"", BlobIndexForFile(10), "older"},
+          {test::KeyStr(104, "a", 6, kTypeDeletionWithTimestamp),
+           test::KeyStr(103, "a", 5, kTypeDeletionWithTimestamp),
+           test::KeyStr(0, "a", 0, kTypeValue)},
+          {"", "", "older"}, kMaxSequenceNumber, nullptr, nullptr, true,
+          kMaxSequenceNumber, false, &history_low);
+}
+
+TEST_P(CompactionIteratorTsGcTest, HistoryGcKeepsScalarBlobTimestamp) {
+  std::string history_low;
+  PutFixed64(&history_low, 104);
+  const std::string blob = BlobIndexForFile(20);
+  RunTest({test::KeyStr(103, "a", 5, kTypeBlobIndex),
+           test::KeyStr(101, "a", 3, kTypeValue),
+           test::KeyStr(102, "b", 4, kTypeValue)},
+          {blob, "older", "inline"},
+          {test::KeyStr(103, "a", 0, kTypeBlobIndex),
+           test::KeyStr(0, "b", 0, kTypeValue)},
+          {blob, "inline"}, kMaxSequenceNumber, nullptr, nullptr, true,
+          kMaxSequenceNumber, false, &history_low);
+  ASSERT_EQ(c_iter_->iter_stats().num_blobs_read, 0);
+}
+
+TEST_P(CompactionIteratorTsGcTest, HistoryGcKeepsWideBlobTimestamp) {
+  std::string history_low;
+  PutFixed64(&history_low, 104);
+  BlobIndex blob;
+  ASSERT_OK(blob.DecodeFrom(BlobIndexForFile(20)));
+  std::string entity;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      WideColumns{{"", "inline"}, {"b", ""}}, {{1, blob}}, entity));
+  std::string inline_entity;
+  ASSERT_OK(WideColumnSerialization::Serialize(WideColumns{{"", "inline"}},
+                                               inline_entity));
+  RunTest({test::KeyStr(103, "a", 5, kTypeWideColumnEntity),
+           test::KeyStr(101, "a", 3, kTypeValue),
+           test::KeyStr(102, "b", 4, kTypeWideColumnEntity)},
+          {entity, "older", inline_entity},
+          {test::KeyStr(103, "a", 0, kTypeWideColumnEntity),
+           test::KeyStr(0, "b", 0, kTypeWideColumnEntity)},
+          {entity, inline_entity}, kMaxSequenceNumber, nullptr, nullptr, true,
+          kMaxSequenceNumber, false, &history_low);
+  ASSERT_EQ(c_iter_->iter_stats().num_blobs_read, 0);
+}
+
+TEST_P(CompactionIteratorTsGcTest, HistoryGcKeepsBlobSnapshotStripes) {
+  AddSnapshot(4, 4);
+  std::string history_low;
+  PutFixed64(&history_low, 104);
+  const std::string newer = BlobIndexForFile(10);
+  const std::string older = BlobIndexForFile(20);
+  RunTest({test::KeyStr(103, "a", 5, kTypeBlobIndex),
+           test::KeyStr(101, "a", 3, kTypeBlobIndex),
+           test::KeyStr(100, "a", 1, kTypeValue)},
+          {newer, older, "oldest"},
+          {test::KeyStr(103, "a", 5, kTypeBlobIndex),
+           test::KeyStr(101, "a", 0, kTypeBlobIndex)},
+          {newer, older}, kMaxSequenceNumber, nullptr, nullptr, true,
+          kMaxSequenceNumber, false, &history_low);
+  ASSERT_EQ(c_iter_->iter_stats().num_blobs_read, 0);
+}
+
+TEST_P(CompactionIteratorTsGcTest,
+       MissingBlobRepairHistoryGcKeepsSurvivingBlobTimestamp) {
+  EnableMissingBlobRepair({20});
+  std::string history_low;
+  PutFixed64(&history_low, 104);
+  BlobIndex missing;
+  BlobIndex healthy;
+  ASSERT_OK(missing.DecodeFrom(BlobIndexForFile(10)));
+  ASSERT_OK(healthy.DecodeFrom(BlobIndexForFile(20)));
+  std::string blob_entity;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      WideColumns{{"", ""}, {"b", ""}}, {{0, missing}, {1, healthy}},
+      blob_entity));
+  std::string inline_entity;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      WideColumns{{"", ""}, {"c", "inline"}}, {{0, missing}}, inline_entity));
+  std::string repaired_blob_entity;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      WideColumns{{"b", ""}}, {{0, healthy}}, repaired_blob_entity));
+  std::string repaired_inline_entity;
+  ASSERT_OK(WideColumnSerialization::Serialize(WideColumns{{"c", "inline"}},
+                                               repaired_inline_entity));
+  RunTest({test::KeyStr(103, "a", 5, kTypeWideColumnEntity),
+           test::KeyStr(102, "b", 4, kTypeWideColumnEntity),
+           test::KeyStr(101, "c", 3, kTypeBlobIndex)},
+          {blob_entity, inline_entity, BlobIndexForFile(10)},
+          {test::KeyStr(103, "a", 0, kTypeWideColumnEntity),
+           test::KeyStr(0, "b", 0, kTypeWideColumnEntity)},
+          {repaired_blob_entity, repaired_inline_entity}, kMaxSequenceNumber,
+          nullptr, nullptr, true, kMaxSequenceNumber, false, &history_low);
+  ASSERT_EQ(c_iter_->iter_stats().num_blobs_read, 0);
+}
+
+TEST_P(CompactionIteratorTsGcTest, HistoryGcRejectsMalformedBlobIndex) {
+  std::string history_low;
+  PutFixed64(&history_low, 104);
+  InitIterators({test::KeyStr(103, "a", 5, kTypeBlobIndex)}, {""}, {}, {}, 5,
+                kMaxSequenceNumber, nullptr, nullptr, true, kMaxSequenceNumber,
+                false, &history_low);
   c_iter_->SeekToFirst();
-  ASSERT_TRUE(c_iter_->status().IsNotSupported());
   ASSERT_FALSE(c_iter_->Valid());
-  ASSERT_TRUE(trace.Events().empty());
+  ASSERT_EQ(c_iter_->status().code(), Status::Code::kCorruption);
 }
 
 TEST_P(CompactionIteratorTsGcTest, NoKeyEligibleForGC) {

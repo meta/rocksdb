@@ -1376,6 +1376,63 @@ TEST_F(VersionBuilderTest, SaveBlobFilesTo) {
   UnrefFilesInVersion(&new_vstorage);
 }
 
+TEST_F(VersionBuilderTest, SaveBlobFilesToWithMissingOldestReference) {
+  AddDummyFile(/*table_file_number=*/9, /*blob_file_number=*/7,
+               /*epoch_number=*/2);
+  AddDummyFile(/*table_file_number=*/1, /*blob_file_number=*/3,
+               /*epoch_number=*/1);
+  AddBlob(3, 10, 1000, std::string(), std::string(),
+          BlobFileMetaData::LinkedSsts{1}, 0, 0);
+  AddBlob(11, 10, 1000, std::string(), std::string(),
+          BlobFileMetaData::LinkedSsts{}, 0, 0);
+  AddBlob(12, 10, 1000, std::string(), std::string(),
+          BlobFileMetaData::LinkedSsts{}, 0, 0);
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  VersionBuilder builder(env_options, &ioptions_, nullptr, &vstorage_, nullptr);
+  VersionEdit edit;
+  edit.DeleteFile(/*level=*/0, /*file_number=*/1);
+  edit.AddBlobFileGarbage(3, 10, 1000);
+  edit.AddBlobFileGarbage(12, 10, 1000);
+  ASSERT_OK(builder.Apply(&edit));
+
+  VersionStorageInfo retained(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      /*force_consistency_checks=*/true, EpochNumberRequirement::kMightMissing,
+      nullptr, 0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(builder.SaveTo(&retained));
+  UpdateVersionStorageInfo(&retained);
+  ASSERT_EQ(retained.GetBlobFiles().size(), 1);
+  ASSERT_EQ(retained.GetBlobFileMetaData(3), nullptr);
+  ASSERT_EQ(retained.GetBlobFileMetaData(7), nullptr);
+  ASSERT_EQ(retained.GetBlobFileMetaData(12), nullptr);
+  const std::shared_ptr<BlobFileMetaData> healthy =
+      retained.GetBlobFileMetaData(11);
+  ASSERT_NE(healthy, nullptr);
+  ASSERT_TRUE(healthy->GetLinkedSsts().empty());
+  ASSERT_EQ(healthy->GetGarbageBlobCount(), 0);
+  ASSERT_EQ(healthy->GetGarbageBlobBytes(), 0);
+
+  VersionBuilder cleanup_builder(env_options, &ioptions_, nullptr, &retained,
+                                 nullptr);
+  VersionEdit cleanup;
+  cleanup.DeleteFile(/*level=*/0, /*file_number=*/9);
+  ASSERT_OK(cleanup_builder.Apply(&cleanup));
+
+  VersionStorageInfo unreferenced(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &retained,
+      /*force_consistency_checks=*/true, EpochNumberRequirement::kMightMissing,
+      nullptr, 0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(cleanup_builder.SaveTo(&unreferenced));
+  ASSERT_TRUE(unreferenced.GetBlobFiles().empty());
+
+  UnrefFilesInVersion(&unreferenced);
+  UnrefFilesInVersion(&retained);
+}
+
 TEST_F(VersionBuilderTest, SaveBlobFilesToConcurrentJobs) {
   // When multiple background jobs (flushes/compactions) are executing in
   // parallel, it is possible for the VersionEdit adding blob file K to be

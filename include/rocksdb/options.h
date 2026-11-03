@@ -3010,6 +3010,30 @@ struct CompactRangeOptions {
   // Default: false
   bool exclusive_manual_compaction = false;
 
+  // If true, discard values referencing integrated external blob files absent
+  // from each compaction's input Version. A lost scalar value becomes a
+  // deletion at its original sequence number and timestamp. Wide entities
+  // retain available columns and become deletions only when no columns remain.
+  // If the default column is lost but other columns survive, Get() returns OK
+  // with an empty value; GetEntity() returns the surviving columns.
+  //
+  // This option deliberately discards unavailable data. It is intended for
+  // offline repair after best-efforts recovery. Legacy BlobDB is unsupported.
+  // The check uses blob indices and Version metadata, so it does not detect
+  // files missing on disk whose metadata is still present. Filters, merges,
+  // and blob garbage collection can still require blob payload reads and
+  // propagate their errors.
+  //
+  // Applies only to this CompactRange call. Selected SST files are rewritten,
+  // including bottommost files even when bottommost_level_compaction is kSkip.
+  // The bottommost pass skips files already rewritten by this call when
+  // selecting inputs.
+  // Repair runs locally and bypasses DBOptions::compaction_service, which does
+  // not currently support this repair policy. FIFO compaction returns
+  // NotSupported.
+  // Default: false
+  bool skip_missing_blob_files = false;
+
   // If true, compacted files will be moved to the minimum level capable
   // of holding the data or given level (specified non-negative target_level).
   bool change_level = false;

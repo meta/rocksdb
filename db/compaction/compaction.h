@@ -151,6 +151,14 @@ class Compaction {
   // Returns input version of the compaction
   Version* input_version() const { return input_version_; }
 
+  bool skip_missing_blob_files() const { return skip_missing_blob_files_; }
+
+  // Set before registering or running this compaction.
+  void SetSkipMissingBlobFiles(bool skip_missing_blob_files) {
+    assert(is_manual_compaction_ || !skip_missing_blob_files);
+    skip_missing_blob_files_ = skip_missing_blob_files;
+  }
+
   // Returns the ColumnFamilyData associated with the compaction.
   ColumnFamilyData* column_family_data() const { return cfd_; }
 
@@ -620,6 +628,7 @@ class Compaction {
 
   // Is this compaction requested by the client?
   const bool is_manual_compaction_;
+  bool skip_missing_blob_files_ = false;
 
   // The data with timestamp > trim_ts_ will be removed
   const std::string trim_ts_;

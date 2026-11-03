@@ -627,6 +627,12 @@ DEFINE_uint64(subcompactions, 1,
 static const bool FLAGS_subcompactions_dummy __attribute__((__unused__)) =
     RegisterFlagValidator(&FLAGS_subcompactions, &ValidateUint32Range);
 
+DEFINE_bool(
+    compact_range_skip_missing_blob_files, false,
+    "Enable offline missing blob reference repair for manual CompactRange "
+    "calls. Deliberately deletes unavailable values whose external blob files "
+    "are absent from the input Version; FIFO compaction is unsupported.");
+
 DEFINE_uint64(compact_all_parallelism, 1,
               "Maximum number of independent DBs compacted concurrently by "
               "the compactall benchmark.");
@@ -7820,7 +7826,16 @@ class Benchmark {
       auto compactionOptions = CompactRangeOptions();
       compactionOptions.max_subcompactions =
           static_cast<uint32_t>(FLAGS_subcompactions);
-      db->CompactRange(compactionOptions, nullptr, nullptr);
+      compactionOptions.skip_missing_blob_files =
+          FLAGS_compact_range_skip_missing_blob_files;
+      const Status status =
+          db->CompactRange(compactionOptions, nullptr, nullptr);
+      if (!status.ok()) {
+        thread->shared->SetFatal(
+            status, "DoDeterministicCompact: CompactRange failed: " +
+                        status.ToString());
+        return status;
+      }
     } else {
       fprintf(stdout,
               "%-12s : skipped (-compaction_stype=kCompactionStyleNone)\n",
@@ -11294,7 +11309,12 @@ class Benchmark {
     cro.bottommost_level_compaction =
         BottommostLevelCompaction::kForceOptimized;
     cro.max_subcompactions = static_cast<uint32_t>(FLAGS_subcompactions);
-    db->CompactRange(cro, nullptr, nullptr);
+    cro.skip_missing_blob_files = FLAGS_compact_range_skip_missing_blob_files;
+    const Status status = db->CompactRange(cro, nullptr, nullptr);
+    if (!status.ok()) {
+      thread->shared->SetFatal(
+          status, "Compact: CompactRange failed: " + status.ToString());
+    }
   }
 
   // Creates SST files with SstFileWriter and ingests them into the DB via
@@ -11619,6 +11639,8 @@ class Benchmark {
 
         CompactRangeOptions cro;
         cro.max_subcompactions = max_subcompactions;
+        cro.skip_missing_blob_files =
+            FLAGS_compact_range_skip_missing_blob_files;
         Status status = db->CompactRange(cro, nullptr, nullptr);
 
         const double elapsed_seconds =

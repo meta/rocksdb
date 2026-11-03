@@ -555,6 +555,10 @@ bool Compaction::InputCompressionMatchesOutput() const {
 }
 
 bool Compaction::IsTrivialMove() const {
+  if (skip_missing_blob_files_) {
+    return false;
+  }
+
   // Avoid a move if there is lots of overlapping grandparent data.
   // Otherwise, the move could create a parent file that will require
   // a very expensive merge later on.

@@ -23,6 +23,7 @@
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_builder.h"
+#include "db/blob/missing_blob_repair_iterator.h"
 #include "db/builder.h"
 #include "db/compaction/clipping_iterator.h"
 #include "db/compaction/compaction_state.h"
@@ -1568,6 +1569,14 @@ void CompactionJob::NotifyOnSubcompactionCompleted(
 }
 
 bool CompactionJob::ShouldUseLocalCompaction(SubcompactionState* sub_compact) {
+  if (sub_compact->compaction->skip_missing_blob_files()) {
+    // Remote workers do not receive this flag and reconstruct their input
+    // Version from the MANIFEST. Result validation rejects garbage updates for
+    // blob files absent from the primary's input Version. Keep repair local
+    // until the service supports this policy.
+    sub_compact->compaction_job_stats.is_remote_compaction = false;
+    return true;
+  }
   if (db_options_.compaction_service) {
     const ImmutableCFOptions& options =
         sub_compact->compaction->column_family_data()->ioptions();
@@ -1775,7 +1784,8 @@ InternalIterator* CompactionJob::CreateInputIterator(
     input = iterators.clip.get();
   }
 
-  if (sub_compact->compaction->DoesInputReferenceBlobFiles()) {
+  if (sub_compact->compaction->DoesInputReferenceBlobFiles() ||
+      sub_compact->compaction->skip_missing_blob_files()) {
     BlobGarbageMeter* meter = sub_compact->Current().GetBlobGarbageMeter();
     if (meter == nullptr) {
       meter = sub_compact->Current().CreateBlobGarbageMeter();
@@ -1789,6 +1799,12 @@ InternalIterator* CompactionJob::CreateInputIterator(
     iterators.trim_history_iter = std::make_unique<HistoryTrimmingIterator>(
         input, cfd->user_comparator(), trim_ts_);
     input = iterators.trim_history_iter.get();
+  }
+
+  if (sub_compact->compaction->skip_missing_blob_files()) {
+    iterators.missing_blob_repair = std::make_unique<MissingBlobRepairIterator>(
+        input, sub_compact->compaction->input_version()->storage_info(), ts_sz);
+    input = iterators.missing_blob_repair.get();
   }
 
   return input;
@@ -1838,8 +1854,9 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
       env_, ShouldReportDetailedTime(env_, stats_), sub_compact->RangeDelAgg(),
       blob_file_builder.get(), db_options_.allow_data_in_errors,
       db_options_.enforce_single_del_contracts, manual_compaction_canceled_,
-      sub_compact->compaction
-          ->DoesInputReferenceBlobFiles() /* must_count_input_entries */,
+      sub_compact->compaction->DoesInputReferenceBlobFiles() ||
+          sub_compact->compaction
+              ->skip_missing_blob_files() /* must_count_input_entries */,
       sub_compact->compaction, compaction_filter, shutting_down_,
       db_options_.info_log, full_history_ts_low, preserve_seqno_after_,
       nullptr /* input_version */, Env::IOActivity::kCompaction,
@@ -2225,6 +2242,7 @@ void CompactionJob::ProcessLocalKeyValueCompaction(
       CreateCompactionIterator(sub_compact, cfd, input_iter, compaction_filter,
                                merge, blob_file_builder, write_options);
   assert(c_iter);
+  c_iter->SetMissingBlobRepairIterator(iterators.missing_blob_repair.get());
   const bool defer_blob_output_preparation =
       compaction_progress_writer_ != nullptr &&
       !sub_compact->compaction->SupportsPerKeyPlacement() &&
@@ -2719,6 +2737,7 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
   }
 
   std::unordered_map<uint64_t, BlobGarbageMeter::BlobStats> blob_total_garbage;
+  uint64_t skipped_missing_blob_flows = 0;
   for (const auto& sub_compact : compact_->sub_compact_states) {
     if (sub_compact.Current().GetBlobGarbageMeter()) {
       const auto& flows = sub_compact.Current().GetBlobGarbageMeter()->flows();
@@ -2732,6 +2751,12 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
           const std::unordered_map<uint64_t, BlobFileState>::const_iterator
               blob_file = blob_files.find(blob_file_number);
           if (blob_file == blob_files.end()) {
+            if (compaction->skip_missing_blob_files() &&
+                blob_file_number != kInvalidBlobFileNumber &&
+                !storage_info->GetBlobFileMetaData(blob_file_number)) {
+              ++skipped_missing_blob_flows;
+              continue;
+            }
             return Status::Corruption(
                 "Compaction produced garbage for an unknown blob file");
           }
@@ -2760,6 +2785,15 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
         }
       }
     }
+  }
+
+  if (skipped_missing_blob_flows != 0) {
+    ROCKS_LOG_BUFFER(
+        log_buffer_,
+        "[%s] [JOB %d] Repair omitted %" PRIu64
+        " garbage flows for blob files absent from the input Version",
+        compaction->column_family_data()->GetName().c_str(), job_id_,
+        skipped_missing_blob_flows);
   }
 
   // Add compaction inputs and outputs only after all blob metadata has been

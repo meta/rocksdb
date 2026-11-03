@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <limits>
@@ -14,6 +15,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include "compaction/compaction_picker_universal.h"
 #include "db/blob/blob_index.h"
@@ -144,6 +146,19 @@ class DBCompactionTest : public DBTestBase {
   }
 
  protected:
+  std::vector<std::pair<std::string, std::string>> TableFileNamesByKey() {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    std::vector<std::pair<std::string, std::string>> files;
+    for (const auto& level : metadata.levels) {
+      for (const auto& file : level.files) {
+        files.emplace_back(file.smallestkey, file.name);
+      }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+  }
+
   /*
    * Verifies compaction stats of cfd are valid.
    *
@@ -4410,6 +4425,150 @@ static std::string ShortKey(int i) {
   char buf[100];
   snprintf(buf, sizeof(buf), "key%04d", i);
   return std::string(buf);
+}
+
+TEST_F(DBCompactionTest, MissingBlobRepairDisablesTrivialMovesPerCall) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.num_levels = 3;
+  options.level_compaction_dynamic_level_bytes = false;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "value-a"));
+  ASSERT_OK(Flush());
+  const auto before = TableFileNamesByKey();
+  ASSERT_EQ(before.size(), 1U);
+
+  std::atomic<int> trivial_moves{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCompaction:TrivialMove",
+      [&](void*) { ++trivial_moves; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  CompactRangeOptions compact_options;
+  compact_options.skip_missing_blob_files = true;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kSkip;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  const auto repaired = TableFileNamesByKey();
+  ASSERT_EQ(repaired.size(), 1U);
+  ASSERT_NE(before[0].second, repaired[0].second);
+  ASSERT_EQ(trivial_moves.load(), 0);
+
+  ASSERT_OK(Put("z", "value-z"));
+  ASSERT_OK(Flush());
+  const auto before_default = TableFileNamesByKey();
+  ASSERT_EQ(before_default.size(), 2U);
+  const Slice key("z");
+  compact_options.skip_missing_blob_files = false;
+  ASSERT_OK(db_->CompactRange(compact_options, &key, &key));
+  ASSERT_EQ(TableFileNamesByKey(), before_default);
+  ASSERT_EQ(trivial_moves.load(), 1);
+  ASSERT_EQ(Get("a"), "value-a");
+  ASSERT_EQ(Get("z"), "value-z");
+  SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBCompactionTest, MissingBlobRepairRewritesSelectedBottommostFiles) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.num_levels = 3;
+  options.level_compaction_dynamic_level_bytes = false;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  for (const char* key : {"a", "m", "z"}) {
+    ASSERT_OK(Put(key, key));
+    ASSERT_OK(Flush());
+  }
+  CompactRangeOptions compact_options;
+  compact_options.change_level = true;
+  compact_options.target_level = 2;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_EQ(NumTableFilesAtLevel(2), 3);
+  const auto before = TableFileNamesByKey();
+  ASSERT_EQ(before.size(), 3U);
+
+  compact_options = CompactRangeOptions();
+  compact_options.skip_missing_blob_files = true;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kSkip;
+  const Slice key("m");
+  ASSERT_OK(db_->CompactRange(compact_options, &key, &key));
+  const auto repaired = TableFileNamesByKey();
+  ASSERT_EQ(repaired.size(), 3U);
+  ASSERT_EQ(before[0], repaired[0]);
+  ASSERT_NE(before[1].second, repaired[1].second);
+  ASSERT_EQ(before[2], repaired[2]);
+
+  compact_options.skip_missing_blob_files = false;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_EQ(TableFileNamesByKey(), repaired);
+  for (const char* retained : {"a", "m", "z"}) {
+    ASSERT_EQ(Get(retained), retained);
+  }
+}
+
+TEST_F(DBCompactionTest, MissingBlobRepairKeepsBottommostProgress) {
+  class KeepFilter : public CompactionFilter {
+   public:
+    const char* Name() const override { return "KeepFilter"; }
+    bool Filter(int, const Slice&, const Slice&, std::string*,
+                bool*) const override {
+      return false;
+    }
+  } keep_filter;
+
+  for (bool repair : {false, true}) {
+    SCOPED_TRACE(repair);
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.num_levels = 3;
+    options.level_compaction_dynamic_level_bytes = false;
+    options.compression = kNoCompression;
+    const auto collector = std::make_shared<CompactionStatsCollector>();
+    options.listeners.push_back(collector);
+    DestroyAndReopen(options);
+
+    for (const char* key : {"a", "z"}) {
+      ASSERT_OK(Put(key, key));
+      ASSERT_OK(Flush());
+    }
+    CompactRangeOptions compact_options;
+    compact_options.change_level = true;
+    compact_options.target_level = 2;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    ASSERT_EQ(NumTableFilesAtLevel(2), 2);
+    const auto before = TableFileNamesByKey();
+    ASSERT_EQ(before.size(), 2U);
+
+    options.compaction_filter = &keep_filter;
+    Reopen(options);
+    ASSERT_OK(Put("m", "m"));
+    ASSERT_OK(Flush());
+    const int compactions_before =
+        collector->NumberOfCompactions(CompactionReason::kManualCompaction);
+
+    compact_options = CompactRangeOptions();
+    compact_options.skip_missing_blob_files = repair;
+    compact_options.bottommost_level_compaction =
+        repair ? BottommostLevelCompaction::kSkip
+               : BottommostLevelCompaction::kForceOptimized;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    const auto after = TableFileNamesByKey();
+    ASSERT_EQ(after.size(), 3U);
+    ASSERT_NE(before[0].second, after[0].second);
+    ASSERT_NE(before[1].second, after[2].second);
+    ASSERT_EQ(
+        collector->NumberOfCompactions(CompactionReason::kManualCompaction) -
+            compactions_before,
+        4);
+    for (const char* retained : {"a", "m", "z"}) {
+      ASSERT_EQ(Get(retained), retained);
+    }
+    Close();
+  }
 }
 
 TEST_P(DBCompactionTestWithParam, ForceBottommostLevelCompaction) {

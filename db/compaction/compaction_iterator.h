@@ -5,11 +5,16 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <cassert>
 #include <cinttypes>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "db/blob/blob_index.h"
@@ -29,6 +34,7 @@ class BlobFileBuilder;
 class BlobFileCache;
 class BlobFetcher;
 class Version;
+class MissingBlobRepairIterator;
 class PrefetchBufferCollection;
 class FilePrefetchBuffer;
 class Version;
@@ -311,6 +317,12 @@ class CompactionIterator {
                       Env::IOActivity io_activity,
                       bool allow_write_path_fallback);
 
+  // Install before the first seek; the normalizer must outlive this iterator.
+  void SetMissingBlobRepairIterator(const MissingBlobRepairIterator* iterator) {
+    assert(key_.empty());
+    missing_blob_repair_iterator_ = iterator;
+  }
+
   static uint64_t ComputeBlobGarbageCollectionCutoffFileNumber(
       const CompactionProxy* compaction);
 
@@ -455,6 +467,10 @@ class CompactionIterator {
   bool ProcessDeletion(SequenceNumber prev_snapshot,
                        bool input_already_advanced);
 
+  bool DeletionIsObsolete();
+
+  Status OutputHasExternalBlobReferences(bool* has_external_refs) const;
+
   // Given a sequence number, return the sequence number of the
   // earliest snapshot that this sequence number is visible in.
   // The snapshots themselves are arranged in ascending order of
@@ -495,6 +511,7 @@ class CompactionIterator {
   CreatePrefetchBufferCollectionIfNeeded(const CompactionProxy* compaction);
 
   SequenceIterWrapper input_;
+  const MissingBlobRepairIterator* missing_blob_repair_iterator_ = nullptr;
   const Comparator* cmp_;
   MergeHelper* merge_helper_;
   const std::vector<SequenceNumber>* snapshots_;
