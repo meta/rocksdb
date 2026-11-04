@@ -257,6 +257,7 @@ DECLARE_int32(ingest_external_file_atomic_replace_one_in);
 DECLARE_bool(ingest_external_file_with_embedded_blobs);
 DECLARE_int32(compact_files_one_in);
 DECLARE_int32(compact_range_one_in);
+DECLARE_bool(compact_range_skip_missing_blob_files);
 DECLARE_int32(promote_l0_one_in);
 DECLARE_int32(mark_for_compaction_one_file_in);
 DECLARE_int32(flush_one_in);

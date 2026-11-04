@@ -309,6 +309,10 @@ static void rocksdb_roundtrip_test_rocksdb_compactoptions(void) {
   rocksdb_compactoptions_set_blob_garbage_collection_policy(obj, 0);
   CheckCondition(
       rocksdb_compactoptions_get_blob_garbage_collection_policy(obj) == 0);
+  rocksdb_compactoptions_set_skip_missing_blob_files(obj, 1);
+  CheckCondition(rocksdb_compactoptions_get_skip_missing_blob_files(obj) == 1);
+  rocksdb_compactoptions_set_skip_missing_blob_files(obj, 0);
+  CheckCondition(rocksdb_compactoptions_get_skip_missing_blob_files(obj) == 0);
   rocksdb_compactoptions_destroy(obj);
 }
 

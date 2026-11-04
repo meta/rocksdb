@@ -1585,6 +1585,61 @@ TEST_F(CompactionServiceTest, SkipWALRecoveryInOpenAndCompact) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
+TEST_F(CompactionServiceTest, MissingBlobRepairRunsLocallyPerCall) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("key", "value" + std::to_string(i)));
+    ASSERT_OK(Flush());
+  }
+
+  MyTestCompactionService* service = GetCompactionService();
+  const int remote_compactions = service->GetCompactionNum();
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  std::atomic<bool> canceled{true};
+  repair.canceled = &canceled;
+  ASSERT_EQ(db_->CompactRange(repair, nullptr, nullptr).code(),
+            Status::kIncomplete);
+  ASSERT_EQ(service->GetCompactionNum(), remote_compactions);
+
+  canceled.store(false);
+  ASSERT_OK(db_->CompactRange(repair, nullptr, nullptr));
+  ASSERT_EQ(service->GetCompactionNum(), remote_compactions);
+  ASSERT_EQ(Get("key"), "value2");
+
+  ASSERT_OK(Put("key", "value3"));
+  ASSERT_OK(Flush());
+  CompactRangeOptions regular;
+  regular.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(regular, nullptr, nullptr));
+  ASSERT_GT(service->GetCompactionNum(), remote_compactions);
+  ASSERT_EQ(Get("key"), "value3");
+}
+
+TEST_F(CompactionServiceTest, MissingBlobRepairRejectsFIFOWithoutFlushing) {
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleFIFO;
+  options.num_levels = 1;
+  options.max_open_files = -1;
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  ASSERT_OK(Put("sst", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("memtable", "value"));
+  ASSERT_EQ(TotalTableFiles(), 1);
+
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  ASSERT_EQ(db_->CompactRange(repair, nullptr, nullptr).code(),
+            Status::kNotSupported);
+  ASSERT_EQ(TotalTableFiles(), 1);
+  ASSERT_EQ(Get("sst"), "value");
+  ASSERT_EQ(Get("memtable"), "value");
+  ASSERT_EQ(GetCompactionService()->GetCompactionNum(), 0);
+}
+
 TEST_F(CompactionServiceTest, ManualCompaction) {
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;

@@ -1306,6 +1306,11 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
     return Status::NotSupported(
         "FIFO compaction does not support change_level.");
   }
+  if (options.skip_missing_blob_files &&
+      cfd->ioptions().compaction_style == kCompactionStyleFIFO) {
+    return Status::NotSupported(
+        "FIFO compaction does not support missing blob file repair.");
+  }
 
   bool flush_needed = true;
 
@@ -1536,7 +1541,8 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
         if (s.ok()) {
           assert(final_output_level > 0);
           // bottommost level intra-level compaction
-          if ((options.bottommost_level_compaction ==
+          if (options.skip_missing_blob_files ||
+              (options.bottommost_level_compaction ==
                    BottommostLevelCompaction::kIfHaveCompactionFilter &&
                (cfd->ioptions().compaction_filter != nullptr ||
                 cfd->ioptions().compaction_filter_factory != nullptr)) ||
@@ -1545,7 +1551,7 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
               options.bottommost_level_compaction ==
                   BottommostLevelCompaction::kForce) {
             // Use `next_file_number` as `max_file_num_to_ignore` to avoid
-            // rewriting newly compacted files when it is kForceOptimized
+            // rewriting newly compacted files during repair, kForceOptimized,
             // or kIfHaveCompactionFilter with compaction filter set.
             s = RunManualCompaction(
                 cfd, final_output_level, final_output_level, options, begin,
@@ -2465,7 +2471,9 @@ Status DBImpl::RunManualCompaction(
 
   ManualCompactionState manual(
       cfd, input_level, output_level, compact_range_options.target_path_id,
-      exclusive, disallow_trivial_move, compact_range_options.canceled);
+      exclusive,
+      disallow_trivial_move || compact_range_options.skip_missing_blob_files,
+      compact_range_options.canceled);
   // For universal compaction, we enforce every manual compaction to compact
   // all files.
   if (begin == nullptr ||

@@ -5464,6 +5464,7 @@ void StressTest::TestCompactRange(ThreadState* thread, int64_t rand_key,
 
   CompactRangeOptions cro;
   cro.exclusive_manual_compaction = static_cast<bool>(thread->rand.Next() % 2);
+  cro.skip_missing_blob_files = FLAGS_compact_range_skip_missing_blob_files;
   if (static_cast<ROCKSDB_NAMESPACE::CompactionStyle>(FLAGS_compaction_style) !=
       ROCKSDB_NAMESPACE::CompactionStyle::kCompactionStyleFIFO) {
     cro.change_level = static_cast<bool>(thread->rand.Next() % 2);
@@ -5512,6 +5513,8 @@ void StressTest::TestCompactRange(ThreadState* thread, int64_t rand_key,
   std::ostringstream compact_range_opt_oss;
   compact_range_opt_oss << "exclusive_manual_compaction: "
                         << cro.exclusive_manual_compaction
+                        << ", skip_missing_blob_files: "
+                        << cro.skip_missing_blob_files
                         << ", change_level: " << cro.change_level
                         << ", target_level: " << cro.target_level
                         << ", bottommost_level_compaction: "

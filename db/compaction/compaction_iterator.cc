@@ -5,6 +5,7 @@
 
 #include "db/compaction/compaction_iterator.h"
 
+#include <cassert>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -12,6 +13,7 @@
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_builder.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/missing_blob_repair_iterator.h"
 #include "db/blob/prefetch_buffer_collection.h"
 #include "db/snapshot_checker.h"
 #include "db/wide/blob_column_resolver_util.h"
@@ -1292,7 +1294,21 @@ void CompactionIterator::NextFromInput() {
         TEST_SYNC_POINT_CALLBACK(
             "CompactionIterator::NextFromInput:SingleDelete:1",
             const_cast<Compaction*>(c));
-        if (last_key_seq_zeroed_) {
+        if (missing_blob_repair_iterator_ &&
+            missing_blob_repair_iterator_->IsRepairDeletion()) {
+          ikey_.type =
+              timestamp_size_ == 0 ? kTypeDeletion : kTypeDeletionWithTimestamp;
+          current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);
+          value_.clear();
+          if (DeletionIsObsolete()) {
+            ++iter_stats_.num_record_drop_obsolete;
+            if (!bottommost_level_) {
+              ++iter_stats_.num_optimized_del_drop_obsolete;
+            }
+          } else {
+            validity_info_.SetValid(ValidContext::kKeepDel);
+          }
+        } else if (last_key_seq_zeroed_) {
           // Drop SD and the next key since they are both in the last
           // snapshot (since last key has seqno zeroed).
           ++iter_stats_.num_record_drop_hidden;
@@ -1466,6 +1482,35 @@ void CompactionIterator::NextFromInput() {
 
       ++iter_stats_.num_record_drop_hidden;
       AdvanceInputIterWithoutOutput();
+    } else if (DeletionIsObsolete()) {
+      // TODO(noetzli): This is the only place where we use compaction_
+      // (besides the constructor). We should probably get rid of this
+      // dependency and find a way to do similar filtering during flushes.
+      //
+      // For this user key:
+      // (1) there is no data in higher levels
+      // (2) data in lower levels will have larger sequence numbers
+      // (3) data in layers that are being compacted here and have
+      //     smaller sequence numbers will be dropped in the next
+      //     few iterations of this loop (by rule (A) above).
+      // Therefore this deletion marker is obsolete and can be dropped.
+      //
+      // Note:  Dropping this Delete will not affect TransactionDB
+      // write-conflict checking since it is earlier than any snapshot.
+      //
+      // It seems that we can also drop deletion later than earliest snapshot
+      // given that:
+      // (1) The deletion is earlier than earliest_write_conflict_snapshot, and
+      // (2) No value exist earlier than the deletion.
+      //
+      // Note also that a deletion marker of type kTypeDeletionWithTimestamp
+      // will be treated as a different user key unless the timestamp is older
+      // than *full_history_ts_low_.
+      ++iter_stats_.num_record_drop_obsolete;
+      if (!bottommost_level_) {
+        ++iter_stats_.num_optimized_del_drop_obsolete;
+      }
+      AdvanceInputIterWithoutOutput();
     } else if ((ikey_.type == kTypeDeletion ||
                 (ikey_.type == kTypeDeletionWithTimestamp &&
                  cmp_with_history_ts_low_ < 0)) &&
@@ -1632,6 +1677,17 @@ void CompactionIterator::NextFromInput() {
       status_ = input_.status();
     }
   }
+}
+
+bool CompactionIterator::DeletionIsObsolete() {
+  return compaction_ &&
+         (ikey_.type == kTypeDeletion ||
+          (ikey_.type == kTypeDeletionWithTimestamp &&
+           cmp_with_history_ts_low_ < 0)) &&
+         !compaction_->allow_ingest_behind() &&
+         DefinitelyInSnapshot(ikey_.sequence, earliest_snapshot_) &&
+         compaction_->KeyNotExistsBeyondOutputLevel(ikey_.user_key,
+                                                    &level_ptrs_);
 }
 
 bool CompactionIterator::ExtractLargeValueIfNeededImpl() {
@@ -2102,6 +2158,31 @@ void CompactionIterator::GarbageCollectEntityBlobsIfNeeded() {
                          fetched_blob_values, new_blob_columns);
 }
 
+Status CompactionIterator::OutputHasExternalBlobReferences(
+    bool* has_external_refs) const {
+  assert(has_external_refs);
+  *has_external_refs = false;
+  if (ikey_.type == kTypeBlobIndex) {
+    BlobIndex index;
+    const Status s = index.DecodeFrom(value_);
+    if (!s.ok()) {
+      return s;
+    }
+    *has_external_refs = !index.IsInlined() && !index.IsSameFile();
+    return Status::OK();
+  }
+  if (ikey_.type == kTypeWideColumnEntity) {
+    return WideColumnSerialization::ForEachBlobFileNumber(
+        value_, [has_external_refs](const BlobIndex& index) {
+          if (!index.IsInlined() && !index.IsSameFile()) {
+            *has_external_refs = true;
+          }
+          return Status::OK();
+        });
+  }
+  return Status::OK();
+}
+
 void CompactionIterator::PrepareOutput() {
   if (Valid()) {
     if (LIKELY(!is_range_del_)) {
@@ -2188,7 +2269,19 @@ void CompactionIterator::PrepareOutput() {
       if (BottommostSeqnoCanBeZeroed(
               ikey_.sequence, preserve_seqno_after_, timestamp_size_,
               full_history_ts_low_ != nullptr, cmp_with_history_ts_low_ < 0)) {
-        if (!timestamp_size_) {
+        bool has_external_blob_refs = false;
+        if (timestamp_size_) {
+          const Status s =
+              OutputHasExternalBlobReferences(&has_external_blob_refs);
+          if (!s.ok()) {
+            status_ = s;
+            (void)status_.ok();
+            validity_info_.Invalidate();
+            return;
+          }
+        }
+        // External blob records include the timestamp in their stored user key.
+        if (!timestamp_size_ || has_external_blob_refs) {
           current_key_.UpdateInternalKey(0, ikey_.type);
         } else {
           // For UDT, the seqno and timestamp could only be zeroed out after the

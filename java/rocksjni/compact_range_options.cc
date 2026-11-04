@@ -103,6 +103,32 @@ void Java_org_rocksdb_CompactRangeOptions_setExclusiveManualCompaction(
 
 /*
  * Class:     org_rocksdb_CompactRangeOptions
+ * Method:    skipMissingBlobFiles
+ * Signature: (J)Z
+ */
+jboolean Java_org_rocksdb_CompactRangeOptions_skipMissingBlobFiles(
+    JNIEnv* /*env*/, jclass /*jobj*/, jlong jhandle) {
+  auto* options =
+      reinterpret_cast<Java_org_rocksdb_CompactRangeOptions*>(jhandle);
+  return options->compactRangeOptions.skip_missing_blob_files;
+}
+
+/*
+ * Class:     org_rocksdb_CompactRangeOptions
+ * Method:    setSkipMissingBlobFiles
+ * Signature: (JZ)V
+ */
+void Java_org_rocksdb_CompactRangeOptions_setSkipMissingBlobFiles(
+    JNIEnv* /*env*/, jclass /*jobj*/, jlong jhandle,
+    jboolean skip_missing_blob_files) {
+  auto* options =
+      reinterpret_cast<Java_org_rocksdb_CompactRangeOptions*>(jhandle);
+  options->compactRangeOptions.skip_missing_blob_files =
+      skip_missing_blob_files != JNI_FALSE;
+}
+
+/*
+ * Class:     org_rocksdb_CompactRangeOptions
  * Method:    bottommostLevelCompaction
  * Signature: (J)I
  */

@@ -57,6 +57,11 @@ TEST(BlobIndexTest, SameFileBlobIndex) {
   EXPECT_NE(blob_index.DebugString(false).find("file:same"), std::string::npos);
 }
 
+TEST(BlobIndexTest, EmptyBlobIndexIsCorruption) {
+  BlobIndex blob_index;
+  ASSERT_EQ(blob_index.DecodeFrom(Slice()).code(), Status::Code::kCorruption);
+}
+
 // kTypeBlobIndex is a value type used by BlobDB only. The base rocksdb
 // should accept the value type on write, and report not supported value
 // for reads, unless caller request for it explicitly. The base rocksdb

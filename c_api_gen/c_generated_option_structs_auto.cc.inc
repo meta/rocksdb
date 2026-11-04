@@ -2018,6 +2018,16 @@ unsigned char rocksdb_compaction_options_get_allow_trivial_move(
 
 /* CompactRangeOptions */
 
+void rocksdb_compactoptions_set_skip_missing_blob_files(
+    rocksdb_compactoptions_t* opt, unsigned char v) {
+  opt->rep.skip_missing_blob_files = v;
+}
+
+unsigned char rocksdb_compactoptions_get_skip_missing_blob_files(
+    rocksdb_compactoptions_t* opt) {
+  return opt->rep.skip_missing_blob_files;
+}
+
 void rocksdb_compactoptions_set_blob_garbage_collection_policy(
     rocksdb_compactoptions_t* opt, int v) {
   opt->rep.blob_garbage_collection_policy =

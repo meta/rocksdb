@@ -27,6 +27,19 @@ public class CompactRangeOptionsTest {
   }
 
   @Test
+  public void skipMissingBlobFiles() {
+    try (final CompactRangeOptions opt = new CompactRangeOptions();
+        final CompactRangeOptions other = new CompactRangeOptions()) {
+      assertThat(opt.skipMissingBlobFiles()).isFalse();
+      assertThat(opt.setSkipMissingBlobFiles(true)).isSameAs(opt);
+      assertThat(opt.skipMissingBlobFiles()).isTrue();
+      assertThat(other.skipMissingBlobFiles()).isFalse();
+      opt.setSkipMissingBlobFiles(false);
+      assertThat(opt.skipMissingBlobFiles()).isFalse();
+    }
+  }
+
+  @Test
   public void bottommostLevelCompaction() {
     try (final CompactRangeOptions opt = new CompactRangeOptions()) {
       BottommostLevelCompaction value = BottommostLevelCompaction.kSkip;

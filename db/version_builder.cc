@@ -1613,7 +1613,8 @@ class VersionBuilder::Rep : public MutableScalars {
 
   // Merge the blob file metadata from the base version with the changes (edits)
   // applied, and save the result into *vstorage.
-  void SaveBlobFilesTo(VersionStorageInfo* vstorage) const {
+  void SaveBlobFilesTo(VersionStorageInfo* vstorage,
+                       uint64_t min_oldest_blob_file_num) const {
     assert(vstorage);
     assert(!track_found_and_missing_files_ || valid_version_available_);
 
@@ -1621,12 +1622,7 @@ class VersionBuilder::Rep : public MutableScalars {
     vstorage->ReserveBlob(base_vstorage_->GetBlobFiles().size() +
                           mutable_blob_file_metas_.size());
 
-    const uint64_t oldest_blob_file_with_linked_ssts =
-        GetMinOldestBlobFileNumber();
-
-    // If there are no blob files with linked SSTs, meaning that there are no
-    // valid blob files
-    if (oldest_blob_file_with_linked_ssts == kInvalidBlobFileNumber) {
+    if (min_oldest_blob_file_num == kInvalidBlobFileNumber) {
       return;
     }
 
@@ -1673,12 +1669,13 @@ class VersionBuilder::Rep : public MutableScalars {
       return true;
     };
 
-    MergeBlobFileMetas(oldest_blob_file_with_linked_ssts, process_base,
-                       process_mutable, process_both);
+    MergeBlobFileMetas(min_oldest_blob_file_num, process_base, process_mutable,
+                       process_both);
   }
 
-  void MaybeAddFile(VersionStorageInfo* vstorage, int level,
-                    FileMetaData* f) const {
+  void MaybeAddFile(VersionStorageInfo* vstorage, int level, FileMetaData* f,
+                    uint64_t* min_oldest_blob_file_num) const {
+    assert(min_oldest_blob_file_num);
     const uint64_t file_number = f->fd.GetNumber();
     if (track_found_and_missing_files_ && level == 0 &&
         l0_missing_files_.find(file_number) != l0_missing_files_.end()) {
@@ -1703,6 +1700,12 @@ class VersionBuilder::Rep : public MutableScalars {
         vstorage->RemoveCurrentStats(f);
       } else {
         vstorage->AddFile(level, f);
+        const uint64_t blob_file_number = f->oldest_blob_file_number;
+        if (blob_file_number != kInvalidBlobFileNumber &&
+            (*min_oldest_blob_file_num == kInvalidBlobFileNumber ||
+             blob_file_number < *min_oldest_blob_file_num)) {
+          *min_oldest_blob_file_num = blob_file_number;
+        }
       }
     }
   }
@@ -1733,7 +1736,8 @@ class VersionBuilder::Rep : public MutableScalars {
   }
 
   template <typename Cmp>
-  void SaveSSTFilesTo(VersionStorageInfo* vstorage, int level, Cmp cmp) const {
+  void SaveSSTFilesTo(VersionStorageInfo* vstorage, int level, Cmp cmp,
+                      uint64_t* min_oldest_blob_file_num) const {
     // Merge the set of added files with the set of pre-existing files.
     // Drop any deleted files.  Store the result in *vstorage.
     const auto& base_files = base_vstorage_->LevelFiles(level);
@@ -1741,8 +1745,9 @@ class VersionBuilder::Rep : public MutableScalars {
     vstorage->Reserve(level, base_files.size() + unordered_added_files.size());
 
     MergeUnorderdAddedFilesWithBase(
-        base_files, unordered_added_files, cmp,
-        [&](FileMetaData* file) { MaybeAddFile(vstorage, level, file); });
+        base_files, unordered_added_files, cmp, [&](FileMetaData* file) {
+          MaybeAddFile(vstorage, level, file, min_oldest_blob_file_num);
+        });
   }
 
   template <typename Cmp, typename AddFileFunc>
@@ -1791,11 +1796,14 @@ class VersionBuilder::Rep : public MutableScalars {
     return true;
   }
 
-  void SaveSSTFilesTo(VersionStorageInfo* vstorage) const {
+  // Returns the oldest blob file number referenced by the retained SSTs, or
+  // kInvalidBlobFileNumber when they contain no blob references.
+  uint64_t SaveSSTFilesTo(VersionStorageInfo* vstorage) const {
     assert(vstorage);
+    uint64_t min_oldest_blob_file_num = kInvalidBlobFileNumber;
 
     if (!num_levels_) {
-      return;
+      return min_oldest_blob_file_num;
     }
 
     EpochNumberRequirement epoch_number_requirement =
@@ -1809,14 +1817,19 @@ class VersionBuilder::Rep : public MutableScalars {
     }
 
     if (epoch_number_requirement == EpochNumberRequirement::kMightMissing) {
-      SaveSSTFilesTo(vstorage, /* level */ 0, level_zero_cmp_by_seqno_);
+      SaveSSTFilesTo(vstorage, /* level */ 0, level_zero_cmp_by_seqno_,
+                     &min_oldest_blob_file_num);
     } else {
-      SaveSSTFilesTo(vstorage, /* level */ 0, level_zero_cmp_by_epochno_);
+      SaveSSTFilesTo(vstorage, /* level */ 0, level_zero_cmp_by_epochno_,
+                     &min_oldest_blob_file_num);
     }
 
     for (int level = 1; level < num_levels_; ++level) {
-      SaveSSTFilesTo(vstorage, level, level_nonzero_cmp_);
+      SaveSSTFilesTo(vstorage, level, level_nonzero_cmp_,
+                     &min_oldest_blob_file_num);
     }
+
+    return min_oldest_blob_file_num;
   }
 
   void SaveCompactCursorsTo(VersionStorageInfo* vstorage) const {
@@ -1946,9 +1959,9 @@ class VersionBuilder::Rep : public MutableScalars {
       return s;
     }
 
-    SaveSSTFilesTo(vstorage);
+    const uint64_t min_oldest_blob_file_num = SaveSSTFilesTo(vstorage);
 
-    SaveBlobFilesTo(vstorage);
+    SaveBlobFilesTo(vstorage, min_oldest_blob_file_num);
 
     SaveCompactCursorsTo(vstorage);
 
