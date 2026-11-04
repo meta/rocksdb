@@ -66,6 +66,7 @@
 #include "db/write_callback.h"
 #include "env/unique_id_gen.h"
 #include "file/delete_scheduler.h"
+#include "file/file_io_listener.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "file/random_access_file_reader.h"
@@ -798,6 +799,7 @@ void DBImpl::NotifyOnDBShutdownBegin() {
   // release lock while notifying events
   mutex_.Unlock();
   for (const auto& listener : immutable_db_options_.listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnDBShutdownBegin(this);
   }
   mutex_.Lock();
@@ -3271,6 +3273,8 @@ InternalIterator* DBImpl::NewInternalIterator(
       // here, and no unit test cares about the value provided here.
       !read_options.total_order_seek && prefix_extractor != nullptr,
       read_options.iterate_upper_bound);
+  merge_iter_builder.SetSourcePriorityForEqualSequences(
+      super_version->current->storage_info()->MayHaveEqualSequenceRuns());
   Status s;
   const Comparator* user_comparator = cfd->user_comparator();
   const bool mem_intersects =
@@ -5647,6 +5651,32 @@ std::unique_ptr<MultiScan> DBImpl::NewMultiScan(
   return ms_iter;
 }
 
+namespace {
+DBIter* NewTailingDBIterator(DBImpl* db, Env* env,
+                             const ReadOptions& read_options,
+                             ColumnFamilyHandleImpl* cfh, SuperVersion* sv) {
+  assert(cfh != nullptr);
+  assert(sv != nullptr);
+  ColumnFamilyData* cfd = cfh->cfd();
+  assert(cfd != nullptr);
+  ForwardIterator* iter = new ForwardIterator(db, read_options, cfd, sv,
+                                              /*allow_unprepared_value=*/true);
+  // TODO(cbi): Add support for `memtable_op_scan_flush_trigger` for tailing
+  // iterators, including renewal of DBIter's active_mem pointer.
+  DBIter* db_iter = DBIter::NewIter(
+      env, read_options, cfd->ioptions(), sv->mutable_cf_options,
+      cfd->user_comparator(), iter, sv->current, kMaxSequenceNumber,
+      /*read_callback=*/nullptr, /*active_mem=*/nullptr, cfh,
+      /*expose_blob_index=*/false, /*arena=*/nullptr);
+  iter->SetVersionChangeCallback([db_iter](const VersionStorageInfo& storage) {
+    assert(db_iter != nullptr);
+    db_iter->SetCanSkipZeroSequenceDuplicates(
+        !storage.MayHaveMultipleZeroSequenceRuns());
+  });
+  return db_iter;
+}
+}  // namespace
+
 Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
                               ColumnFamilyHandle* column_family) {
   if (_read_options.io_activity != Env::IOActivity::kUnknown &&
@@ -5705,16 +5735,7 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
     read_options.total_order_seek |=
         immutable_db_options_.prefix_seek_opt_in_only;
 
-    auto iter = new ForwardIterator(this, read_options, cfd, sv,
-                                    /* allow_unprepared_value */ true);
-    // TODO(cbi): Add support for `memtable_op_scan_flush_trigger` for tailing
-    // iterator. This requires refreshing DBIter's pointer to active_mem when
-    // tailing iterator refreshes to new memtable internally.
-    result = DBIter::NewIter(env_, read_options, cfd->ioptions(),
-                             sv->mutable_cf_options, cfd->user_comparator(),
-                             iter, sv->current, kMaxSequenceNumber,
-                             /*read_callback=*/nullptr, /*active_mem=*/nullptr,
-                             cfh, /*expose_blob_index=*/false);
+    result = NewTailingDBIterator(this, env_, read_options, cfh, sv);
   } else {
     // Note: no need to consider the special case of
     // last_seq_same_as_publish_seq_==false since NewIterator is overridden in
@@ -5996,16 +6017,8 @@ Status DBImpl::NewIterators(
       ReadOptions options(normalized_read_options[i]);
       options.total_order_seek |= immutable_db_options_.prefix_seek_opt_in_only;
       const auto& cf_sv_pair = cf_sv_pairs[i];
-      auto* iter = new ForwardIterator(this, options, cf_sv_pair.cfd,
-                                       cf_sv_pair.super_version,
-                                       /* allow_unprepared_value */ true);
-      iterators->push_back(DBIter::NewIter(
-          env_, options, cf_sv_pair.cfd->ioptions(),
-          cf_sv_pair.super_version->mutable_cf_options,
-          cf_sv_pair.cfd->user_comparator(), iter,
-          cf_sv_pair.super_version->current, kMaxSequenceNumber,
-          nullptr /* read_callback */, /* active_mem */ nullptr, cf_sv_pair.cfh,
-          /* expose_blob_index */ false, /* arena */ nullptr));
+      iterators->push_back(NewTailingDBIterator(
+          this, env_, options, cf_sv_pair.cfh, cf_sv_pair.super_version));
     }
   } else {
     for (size_t i = 0; i < cf_sv_pairs.size(); ++i) {
@@ -6078,6 +6091,12 @@ SnapshotImpl* DBImpl::GetSnapshotImpl(bool is_write_conflict_boundary,
   SnapshotImpl* s = new SnapshotImpl;
   auto try_new = [this, s, unix_time,
                   is_write_conflict_boundary](bool db_mutex_held) {
+    if (db_mutex_held) {
+      while (num_running_lsm_edits_ > 0) {
+        TEST_SYNC_POINT("DBImpl::GetSnapshotImpl:WaitForLsmEdit");
+        bg_cv_.Wait();
+      }
+    }
     return snapshots_.TryNew(
         s, [this]() { return GetLastPublishedSequence(); },
         [this]() {
@@ -6125,6 +6144,12 @@ DBImpl::CreateTimestampedSnapshotImpl(SequenceNumber snapshot_seq, uint64_t ts,
     mutex_.Lock();
   } else {
     mutex_.AssertHeld();
+  }
+  // Preserved-sequence imports must not become visible after a snapshot is
+  // created, even while MANIFEST installation temporarily releases mutex_.
+  while (num_running_lsm_edits_ > 0) {
+    TEST_SYNC_POINT("DBImpl::GetSnapshotImpl:WaitForLsmEdit");
+    bg_cv_.Wait();
   }
   Status status;
   std::shared_ptr<const SnapshotImpl> ret;
@@ -8047,6 +8072,8 @@ class FileIngestionHandleImpl : public FileIngestionHandle {
 };
 
 FileIngestionHandleImpl::~FileIngestionHandleImpl() {
+  TEST_SYNC_POINT(
+      "FileIngestionHandleImpl::~FileIngestionHandleImpl:BeforeJobDestruction");
   if (consumed_ || db_ == nullptr) {
     return;
   }
@@ -8086,6 +8113,14 @@ Status FileIngestionHandleImpl::Abort() {
 Status DBImpl::PrepareFileIngestion(
     const std::vector<IngestExternalFileArg>& args,
     std::unique_ptr<FileIngestionHandle>* handle) {
+  return PrepareFileIngestionImpl(args, {}, handle);
+}
+
+Status DBImpl::PrepareFileIngestionImpl(
+    const std::vector<IngestExternalFileArg>& args,
+    const std::vector<std::optional<LsmEditJobSpec>>& lsm_edit_specs,
+    std::unique_ptr<FileIngestionHandle>* handle) {
+  assert(lsm_edit_specs.empty() || lsm_edit_specs.size() == args.size());
   if (handle == nullptr) {
     return Status::InvalidArgument("file ingestion handle output is null");
   }
@@ -8115,7 +8150,12 @@ Status DBImpl::PrepareFileIngestion(
   // Ingest multiple external SST files atomically.
   const size_t num_cfs = args.size();
   for (size_t i = 0; i != num_cfs; ++i) {
-    if (args[i].external_files.empty()) {
+    const bool explicit_deletion_only =
+        !lsm_edit_specs.empty() && lsm_edit_specs[i].has_value() &&
+        lsm_edit_specs[i]->deletion_mode ==
+            LsmEditDeletionMode::kExplicitFiles &&
+        !lsm_edit_specs[i]->delete_files.empty();
+    if (args[i].external_files.empty() && !explicit_deletion_only) {
       std::string err_msg =
           "external_files[" + std::to_string(i) + "] is empty";
       return Status::InvalidArgument(err_msg);
@@ -8132,7 +8172,8 @@ Status DBImpl::PrepareFileIngestion(
           "fill_cache should be the same across ingestion options.");
     }
   }
-  for (const auto& arg : args) {
+  for (size_t i = 0; i != num_cfs; ++i) {
+    const auto& arg = args[i];
     auto* cfd = static_cast<ColumnFamilyHandleImpl*>(arg.column_family)->cfd();
     const IngestExternalFileOptions& ingest_opts = arg.options;
     if (ingest_opts.ingest_behind) {
@@ -8151,7 +8192,8 @@ Status DBImpl::PrepareFileIngestion(
       }
     }
     if (arg.atomic_replace_range.has_value()) {
-      if (cfd->ioptions().compaction_style == kCompactionStyleFIFO) {
+      if (cfd->ioptions().compaction_style == kCompactionStyleFIFO &&
+          (lsm_edit_specs.empty() || !lsm_edit_specs[i])) {
         return Status::NotSupported(
             "atomic_replace_range is not supported with FIFO compaction.");
       }
@@ -8182,13 +8224,43 @@ Status DBImpl::PrepareFileIngestion(
   }
 
   std::vector<std::unique_ptr<ExternalSstFileIngestionJob>> ingestion_jobs;
+  std::vector<std::shared_ptr<SuperVersion>> preparation_versions;
   ingestion_jobs.reserve(num_cfs);
-  for (const auto& arg : args) {
-    auto* cfd = static_cast<ColumnFamilyHandleImpl*>(arg.column_family)->cfd();
+  preparation_versions.reserve(num_cfs);
+  std::shared_ptr<JobContext> merge_snapshot_context;
+  for (const auto& spec : lsm_edit_specs) {
+    if (spec && spec->merge_incoming_files &&
+        (!spec->snapshot_consistency || spec->merge_existing_files)) {
+      merge_snapshot_context = std::make_shared<JobContext>(0);
+      break;
+    }
+  }
+  std::vector<SuperVersion*> referenced_versions(num_cfs);
+  const std::pair<MutableDBOptions, EnvOptions> preparation_options = [&]() {
+    InstrumentedMutexLock options_lock(&mutex_);
+    if (merge_snapshot_context) {
+      InitSnapshotContext(merge_snapshot_context.get());
+    }
+    for (size_t i = 0; i != num_cfs; ++i) {
+      auto* cfd =
+          static_cast<ColumnFamilyHandleImpl*>(args[i].column_family)->cfd();
+      auto* sv = cfd->GetSuperVersion();
+      sv->Ref();
+      referenced_versions[i] = sv;
+    }
+    return std::make_pair(mutable_db_options_, file_options_);
+  }();
+  for (size_t i = 0; i != num_cfs; ++i) {
+    auto* cfd =
+        static_cast<ColumnFamilyHandleImpl*>(args[i].column_family)->cfd();
+    preparation_versions.emplace_back(
+        referenced_versions[i],
+        [this](SuperVersion* version) { CleanupSuperVersion(version); });
     ingestion_jobs.push_back(std::make_unique<ExternalSstFileIngestionJob>(
-        versions_.get(), cfd, immutable_db_options_, mutable_db_options_,
-        file_options_, &snapshots_, arg.options, &directories_, &event_logger_,
-        io_tracer_));
+        versions_.get(), cfd, immutable_db_options_, preparation_options.first,
+        preparation_options.second, &snapshots_, args[i].options,
+        lsm_edit_specs.empty() ? std::nullopt : lsm_edit_specs[i],
+        &directories_, &event_logger_, io_tracer_, merge_snapshot_context));
   }
 
   // TODO (yanqin) maybe handle the case in which column_families have
@@ -8213,9 +8285,7 @@ Status DBImpl::PrepareFileIngestion(
   for (size_t i = 1; i != num_cfs; ++i) {
     start_file_number += ingestion_jobs[i - 1]->NumFilesToPrepare(
         args[i - 1].external_files.size(), args[i - 1].atomic_replace_range);
-    SuperVersion* super_version =
-        ingestion_jobs[i]->GetColumnFamilyData()->GetReferencedSuperVersion(
-            this);
+    SuperVersion* super_version = preparation_versions[i].get();
     Status es = ingestion_jobs[i]->Prepare(
         args[i].external_files, args[i].files_checksums,
         args[i].files_checksum_func_names, args[i].file_infos,
@@ -8225,14 +8295,12 @@ Status DBImpl::PrepareFileIngestion(
     if (!es.ok() && status.ok()) {
       status = es;
     }
-    CleanupSuperVersion(super_version);
+    preparation_versions[i].reset();
   }
   TEST_SYNC_POINT("DBImpl::IngestExternalFiles:BeforeLastJobPrepare:0");
   TEST_SYNC_POINT("DBImpl::IngestExternalFiles:BeforeLastJobPrepare:1");
   {
-    SuperVersion* super_version =
-        ingestion_jobs[0]->GetColumnFamilyData()->GetReferencedSuperVersion(
-            this);
+    SuperVersion* super_version = preparation_versions[0].get();
     Status es = ingestion_jobs[0]->Prepare(
         args[0].external_files, args[0].files_checksums,
         args[0].files_checksum_func_names, args[0].file_infos,
@@ -8241,7 +8309,7 @@ Status DBImpl::PrepareFileIngestion(
     if (!es.ok()) {
       status = es;
     }
-    CleanupSuperVersion(super_version);
+    preparation_versions[0].reset();
   }
   if (!status.ok()) {
     for (size_t i = 0; i != num_cfs; ++i) {
@@ -8319,6 +8387,12 @@ Status DBImpl::CommitFileIngestionHandles(
     }
   }
   const size_t num_jobs = ingestion_jobs.size();
+  int num_lsm_edit_jobs = 0;
+  for (auto* job : ingestion_jobs) {
+    if (job->BlocksSnapshots()) {
+      ++num_lsm_edit_jobs;
+    }
+  }
 
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const WriteOptions write_options;
@@ -8329,6 +8403,20 @@ Status DBImpl::CommitFileIngestionHandles(
       stats_->get_stats_level() > StatsLevel::kExceptTimers;
   const uint64_t run_start_micros =
       record_ingest_micros ? immutable_db_options_.clock->NowMicros() : 0;
+
+  if (num_lsm_edit_jobs > 0 &&
+      ScopedDeferredFileIOListeners::HasReentrantLeaseDependency(
+          immutable_db_options_.listeners)) {
+    return Status::NotSupported(
+        "LSM edit cannot be committed from a callback sharing its listener "
+        "lease");
+  }
+  std::optional<ScopedDeferredFileIOListeners> deferred_io_callbacks(
+      std::in_place, num_lsm_edit_jobs > 0, immutable_db_options_.listeners,
+      &status);
+  if (!status.ok()) {
+    return status;
+  }
 
   std::vector<SuperVersionContext> sv_ctxs;
   for (size_t i = 0; i != num_jobs; ++i) {
@@ -8426,17 +8514,30 @@ Status DBImpl::CommitFileIngestionHandles(
             ingestion_jobs[i]->SetFlushedBeforeRun();
           }
         }
+        // Wait() releases mutex_. Drain only flush cleanups already started,
+        // without holding the LSM snapshot fence or waiting for later flushes.
+        if (num_lsm_edit_jobs > 0 && (snapshot_checker_ || use_custom_gc_)) {
+          const uint64_t cleanup_limit = next_flush_cleanup_id_;
+          while (!running_flush_cleanup_ids_.empty() &&
+                 *running_flush_cleanup_ids_.begin() < cleanup_limit) {
+            TEST_SYNC_POINT(
+                "DBImpl::IngestExternalFile:WaitForFlushSnapshotCleanup");
+            bg_cv_.Wait();
+          }
+        }
       }
     }
-    // Run() may decide how to assign sequence numbers based on whether any
-    // snapshot exists, and the last sequence number is published before the
-    // new SuperVersion is installed. Snapshot creation does not normally take
-    // mutex_, so make it fall back to mutex_ until the SuperVersion is
-    // installed. A snapshot can still be created while LogAndApply releases
-    // mutex_, matching the old serialization.
+    // BlockNew() redirects lock-free snapshot creators to mutex_. Ordinary
+    // ingestion still permits snapshots while LogAndApply releases mutex_.
+    // Preserved-sequence edits additionally make mutex-held creators wait on
+    // num_running_lsm_edits_ until every new SuperVersion is installed.
+    const bool lsm_edits_started = status.ok() && num_lsm_edit_jobs > 0;
     const bool snapshots_blocked = status.ok();
     if (snapshots_blocked) {
       snapshots_.BlockNew();
+    }
+    if (lsm_edits_started) {
+      num_running_lsm_edits_ += num_lsm_edit_jobs;
     }
     // Run ingestion jobs.
     if (status.ok()) {
@@ -8509,9 +8610,8 @@ Status DBImpl::CommitFileIngestionHandles(
       };
       assert(snapshots_blocked);
       TEST_SYNC_POINT("DBImpl::IngestExternalFiles:BeforeLogAndApply");
-      // LogAndApply releases mutex_ while writing the MANIFEST. GetSnapshot()
-      // can acquire it then even though snapshot creation remains blocked from
-      // the lock-free path.
+      // LogAndApply releases mutex_ while writing the MANIFEST. Snapshot
+      // creators can acquire it then; only LSM edits keep them waiting.
       status = versions_->LogAndApply(
           cfds_to_commit, read_options, write_options, edit_lists, &mutex_,
           directories_.GetDbDir(), false /* new_descriptor_log */,
@@ -8573,8 +8673,15 @@ Status DBImpl::CommitFileIngestionHandles(
       }
       UpdateSnapshotCompactionThresholds();
     }
+    // The snapshot fence covers installation, not synchronous error callbacks.
+    if (lsm_edits_started) {
+      num_running_lsm_edits_ -= num_lsm_edit_jobs;
+    }
     if (snapshots_blocked) {
       snapshots_.UnblockNew();
+    }
+    if (lsm_edits_started && 0 == num_running_lsm_edits_) {
+      bg_cv_.SignalAll();
     }
     if (!status.ok() && versions_->io_status().IsIOError()) {
       // Error while writing to MANIFEST.
@@ -8633,6 +8740,7 @@ Status DBImpl::CommitFileIngestionHandles(
   for (auto& sv_ctx : sv_ctxs) {
     sv_ctx.Clean();
   }
+  deferred_io_callbacks.reset();
   if (!status.ok()) {
     // The atomic commit failed; nothing was made visible. The handles are NOT
     // consumed, so each one's destructor rolls it back
@@ -8664,6 +8772,153 @@ Status DBImpl::IngestExternalFiles(
   PERF_TIMER_GUARD(file_ingestion_nanos);
   std::unique_ptr<FileIngestionHandle> handle;
   Status status = PrepareFileIngestion(args, &handle);
+  if (!status.ok()) {
+    return status;
+  }
+  return CommitFileIngestionHandle(std::move(handle));
+}
+
+Status DBImpl::ApplyLsmEdit(const LsmEditOptions& options,
+                            const std::vector<LsmEdit>& edits) {
+  PERF_TIMER_GUARD(file_ingestion_nanos);
+  if (edits.empty()) {
+    return Status::InvalidArgument("LSM edit list is empty");
+  }
+  if (ScopedDeferredFileIOListeners::HasReentrantLeaseDependency(
+          immutable_db_options_.listeners)) {
+    return Status::NotSupported(
+        "LSM edit cannot be applied from a callback sharing its listener "
+        "lease");
+  }
+  if (options.move_files && options.link_files) {
+    return Status::InvalidArgument(
+        "`move_files` and `link_files` can not both be true.");
+  }
+
+  // An LSM edit installs the files with the sequence numbers they already
+  // carry and takes their placement from the caller, so the ingestion options
+  // that would let RocksDB restamp or relocate them are all pinned off here
+  // rather than exposed through LsmEditOptions.
+  std::vector<IngestExternalFileArg> args;
+  std::vector<std::optional<LsmEditJobSpec>> specs;
+  args.reserve(edits.size());
+  specs.reserve(edits.size());
+  for (const LsmEdit& edit : edits) {
+    if (edit.range.start.has_value() != edit.range.limit.has_value()) {
+      return Status::NotSupported(
+          "LSM edit range must have both endpoints set or neither");
+    }
+    if (edit.deletion_mode == LsmEditDeletionMode::kFilesInRange &&
+        !edit.delete_files.empty()) {
+      return Status::InvalidArgument(
+          "LSM edit delete_files must be empty in kFilesInRange mode");
+    }
+    if (edit.deletion_mode != LsmEditDeletionMode::kFilesInRange &&
+        edit.deletion_mode != LsmEditDeletionMode::kExplicitFiles) {
+      return Status::InvalidArgument("LSM edit has invalid deletion mode");
+    }
+    if (edit.add_files.empty() && edit.delete_files.empty()) {
+      return Status::InvalidArgument("LSM edit has no file operations");
+    }
+    if (options.merge_existing_files &&
+        (!options.merge_incoming_files ||
+         edit.deletion_mode != LsmEditDeletionMode::kExplicitFiles ||
+         !edit.delete_files.empty())) {
+      return Status::InvalidArgument(
+          "LSM edit merge_existing_files requires merge_incoming_files and "
+          "an add-only explicit edit");
+    }
+    std::set<std::pair<int, uint64_t>> unique_deletions;
+    for (const LsmEditFileDeletion& deletion : edit.delete_files) {
+      if (deletion.file_number == 0) {
+        return Status::InvalidArgument(
+            "LSM edit file deletion has file number zero");
+      }
+      if (!unique_deletions.emplace(deletion.level, deletion.file_number)
+               .second) {
+        return Status::InvalidArgument(
+            "LSM edit contains a duplicate file deletion");
+      }
+    }
+
+    IngestExternalFileArg arg;
+    arg.column_family = edit.column_family;
+    arg.atomic_replace_range = edit.range;
+    arg.file_temperature = options.file_temperature;
+    arg.options.move_files = options.move_files;
+    arg.options.link_files = options.link_files;
+    arg.options.verify_file_checksum = options.verify_file_checksum;
+    arg.options.allow_blocking_flush = options.allow_blocking_flush;
+    arg.options.fill_cache = options.fill_cache;
+    arg.options.file_opening_threads = options.file_opening_threads;
+    arg.options.allow_db_generated_files = true;
+    arg.options.allow_global_seqno = false;
+    arg.options.snapshot_consistency = false;
+    arg.options.ingest_behind = false;
+    arg.options.fail_if_not_bottommost_level = false;
+
+    LsmEditJobSpec spec;
+    spec.allow_replacement_file_relocation =
+        options.allow_replacement_file_relocation;
+    spec.merge_incoming_files = options.merge_incoming_files;
+    spec.merge_existing_files = options.merge_existing_files;
+    spec.snapshot_consistency = options.snapshot_consistency;
+    const bool add_only_explicit =
+        edit.deletion_mode == LsmEditDeletionMode::kExplicitFiles &&
+        edit.delete_files.empty();
+    const bool probed_range =
+        edit.deletion_mode == LsmEditDeletionMode::kFilesInRange &&
+        edit.range.start.has_value() && options.merge_incoming_files &&
+        options.probe_straddling_files;
+    if (!options.snapshot_consistency && !add_only_explicit && !probed_range) {
+      return Status::InvalidArgument(
+          "LSM edit snapshot_consistency=false requires an add-only explicit "
+          "edit or a bounded, probed range edit with merge_incoming_files");
+    }
+    spec.probe_straddling_files = options.probe_straddling_files;
+    spec.deletion_mode = edit.deletion_mode;
+    spec.delete_files = edit.delete_files;
+    spec.levels.reserve(edit.add_files.size());
+    arg.external_files.reserve(edit.add_files.size());
+    const bool checksums_supplied =
+        !edit.add_files.empty() &&
+        (!edit.add_files.front().checksum.empty() ||
+         !edit.add_files.front().checksum_func_name.empty());
+    if (checksums_supplied) {
+      arg.files_checksums.reserve(edit.add_files.size());
+      arg.files_checksum_func_names.reserve(edit.add_files.size());
+    }
+    for (const LsmEditFile& file : edit.add_files) {
+      if (file.zero_sequence_numbers && !options.merge_incoming_files) {
+        return Status::InvalidArgument(
+            "LSM edit zero_sequence_numbers requires merge_incoming_files");
+      }
+      const bool has_checksum = !file.checksum.empty();
+      const bool has_checksum_func_name = !file.checksum_func_name.empty();
+      if (has_checksum != has_checksum_func_name) {
+        return Status::InvalidArgument(
+            "LSM edit file checksum and checksum function name must both be "
+            "set or both be empty");
+      }
+      if (has_checksum != checksums_supplied) {
+        return Status::InvalidArgument(
+            "LSM edit must supply checksums for all files or none");
+      }
+      arg.external_files.push_back(file.path);
+      spec.levels.push_back(file.level);
+      spec.zero_sequence_numbers.push_back(file.zero_sequence_numbers);
+      if (checksums_supplied) {
+        arg.files_checksums.push_back(file.checksum);
+        arg.files_checksum_func_names.push_back(file.checksum_func_name);
+      }
+    }
+
+    args.push_back(std::move(arg));
+    specs.emplace_back(std::move(spec));
+  }
+
+  std::unique_ptr<FileIngestionHandle> handle;
+  Status status = PrepareFileIngestionImpl(args, specs, &handle);
   if (!status.ok()) {
     return status;
   }
@@ -9110,6 +9365,7 @@ void DBImpl::NotifyOnExternalFileIngested(
     info.global_seqno = f.assigned_seqno;
     info.table_properties = f.table_properties;
     for (const auto& listener : immutable_db_options_.listeners) {
+      const ScopedEventListenerCallback callback_scope(listener.get());
       listener->OnExternalFileIngested(this, info);
     }
   }

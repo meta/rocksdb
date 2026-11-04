@@ -753,6 +753,9 @@ class DBImpl : public DB
   Status CommitFileIngestionHandles(
       std::vector<std::unique_ptr<FileIngestionHandle>> handles) override;
 
+  Status ApplyLsmEdit(const LsmEditOptions& options,
+                      const std::vector<LsmEdit>& edits) override;
+
   using DB::CreateColumnFamilyWithImport;
   Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& options, const std::string& column_family_name,
@@ -2663,6 +2666,14 @@ class DBImpl : public DB
   // the reserved file numbers)
   void RollbackPreparedFileIngestion(FileIngestionHandleImpl* const h);
 
+  // Shared prepare phase of PrepareFileIngestion() and ApplyLsmEdit().
+  // `lsm_edit_specs` is either empty, for plain file ingestion, or parallel to
+  // `args`, giving each column family's declared LSM placement.
+  Status PrepareFileIngestionImpl(
+      const std::vector<IngestExternalFileArg>& args,
+      const std::vector<std::optional<LsmEditJobSpec>>& lsm_edit_specs,
+      std::unique_ptr<FileIngestionHandle>* handle);
+
   // Similar to pending_outputs, preserve OPTIONS file. Used for remote
   // compaction.
   std::list<uint64_t>::iterator CaptureOptionsFileNumber();
@@ -3760,6 +3771,7 @@ class DBImpl : public DB
   // (i.e. whenever a flush is done, even if it didn't make any progress)
   // * whenever there is an error in background purge, flush or compaction
   // * whenever num_running_ingest_file_ goes to 0.
+  // * whenever num_running_lsm_edits_ goes to 0.
   // * whenever pending_purge_obsolete_files_ goes to 0.
   // * whenever disable_delete_obsolete_files_ goes to 0.
   // * whenever SetOptions successfully updates options.
@@ -4065,6 +4077,10 @@ class DBImpl : public DB
   // stores the number of flushes are currently running
   int num_running_flushes_ = 0;
 
+  // Protected by mutex_. IDs distinguish an existing cleanup from later jobs.
+  uint64_t next_flush_cleanup_id_ = 0;
+  std::set<uint64_t> running_flush_cleanup_ids_;
+
   // number of background obsolete file purge jobs, submitted to the HIGH pool
   int bg_purge_scheduled_ = 0;
 
@@ -4151,6 +4167,11 @@ class DBImpl : public DB
   // calls.
   // REQUIRES: mutex held
   int num_running_ingest_file_ = 0;
+
+  // Number of running DB::ApplyLsmEdit() ingestion jobs. While nonzero, new
+  // snapshots wait so low-sequence LSM edits do not appear inside them.
+  // REQUIRES: mutex held
+  int num_running_lsm_edits_ = 0;
 
   // Number of FileIngestionHandle objects produced by PrepareFileIngestion()
   // that have not been committed or destroyed yet.

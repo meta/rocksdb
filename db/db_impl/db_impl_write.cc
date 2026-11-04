@@ -16,6 +16,7 @@
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "db/wide/wide_columns_helper.h"
+#include "file/file_io_listener.h"
 #include "file/filename.h"
 #include "logging/logging.h"
 #include "memtable/wbwi_memtable.h"
@@ -3242,6 +3243,7 @@ void DBImpl::NotifyOnMemTableSealed(ColumnFamilyData* /*cfd*/,
 
   mutex_.Unlock();
   for (const auto& listener : immutable_db_options_.listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnMemTableSealed(mem_table_info);
   }
   mutex_.Lock();

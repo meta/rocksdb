@@ -5,10 +5,12 @@
 
 #include "util/autovector.h"
 
+#include <algorithm>
 #include <atomic>
 #include <iostream>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "rocksdb/env.h"
 #include "test_util/testharness.h"
@@ -192,6 +194,32 @@ TEST_F(AutoVectorTest, Iterators) {
 
     size_t diff = static_cast<size_t>(pos - vec.begin());
     ASSERT_EQ(i + 2, diff);
+  }
+}
+
+TEST_F(AutoVectorTest, StableSortWithDefaultConstructedIterators) {
+  using Entry = std::pair<size_t, size_t>;
+  for (const size_t size : {kSize / 2, kSize * 4}) {
+    autovector<Entry, kSize> values;
+    std::vector<Entry> expected;
+    for (size_t i = 0; i < size; ++i) {
+      values.emplace_back(i % 3, i);
+      expected.emplace_back(i % 3, i);
+    }
+    const auto& compare = [](const Entry& first, const Entry& second) {
+      return first.first > second.first;
+    };
+    std::stable_sort(values.begin(), values.end(), compare);
+    std::stable_sort(expected.begin(), expected.end(), compare);
+    EXPECT_EQ(expected, std::vector<Entry>(values.begin(), values.end()));
+
+    autovector<Entry, kSize>::iterator iter;
+    iter = values.begin();
+    EXPECT_EQ(expected.front(), *iter);
+    autovector<Entry, kSize>::const_iterator const_iter;
+    const autovector<Entry, kSize>& const_values = values;
+    const_iter = const_values.begin();
+    EXPECT_EQ(expected.back(), *(const_iter + size - 1));
   }
 }
 

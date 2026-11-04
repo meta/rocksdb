@@ -12,15 +12,18 @@ class CompactionMergingIterator : public InternalIterator {
  public:
   CompactionMergingIterator(
       const InternalKeyComparator* comparator, InternalIterator** children,
-      int n, bool is_arena_mode,
+      int n, bool is_arena_mode, bool source_priority_for_equal_sequences,
       std::vector<std::pair<std::unique_ptr<TruncatedRangeDelIterator>,
                             std::unique_ptr<TruncatedRangeDelIterator>**>>&
           range_tombstones,
       InternalStats* internal_stats)
       : is_arena_mode_(is_arena_mode),
         comparator_(comparator),
+        source_priority_for_equal_sequences_(
+            source_priority_for_equal_sequences),
         current_(nullptr),
-        minHeap_(CompactionHeapItemComparator(comparator_)),
+        minHeap_(CompactionHeapItemComparator(
+            comparator_, source_priority_for_equal_sequences_)),
         pinned_iters_mgr_(nullptr),
         internal_stats_(internal_stats),
         num_sorted_runs_recorded_(0) {
@@ -192,29 +195,38 @@ class CompactionMergingIterator : public InternalIterator {
 
   class CompactionHeapItemComparator {
    public:
-    explicit CompactionHeapItemComparator(
-        const InternalKeyComparator* comparator)
-        : comparator_(comparator) {}
+    CompactionHeapItemComparator(const InternalKeyComparator* comparator,
+                                 bool source_priority)
+        : comparator_(comparator), source_priority_(source_priority) {}
 
     bool operator()(HeapItem* a, HeapItem* b) const {
-      int r = comparator_->Compare(a->key(), b->key());
-      // For each file, we assume all range tombstone start keys come before
-      // its file boundary sentinel key (file's meta.largest key).
-      // In the case when meta.smallest = meta.largest and range tombstone start
-      // key is truncated at meta.smallest, the start key will have op_type =
-      // kMaxValid to make it smaller (see TruncatedRangeDelIterator
-      // constructor). The following assertion validates this assumption.
-      assert(a->type == b->type || r != 0);
-      return r > 0;
+      // A truncated range start must remain distinct from a file sentinel.
+      assert(a->type == b->type ||
+             comparator_->Compare(a->key(), b->key()) != 0);
+      if (!source_priority_) {
+        return comparator_->Compare(a->key(), b->key()) > 0;
+      }
+      const int cmp = comparator_->CompareKeySeq(a->key(), b->key());
+      if (cmp != 0) {
+        return cmp > 0;
+      }
+      // Range starts precede equal-key/sequence points and file boundaries,
+      // regardless of point value type. Point ties follow source priority.
+      if (a->type != b->type) {
+        return a->type == HeapItem::ITERATOR;
+      }
+      return a->level > b->level;
     }
 
    private:
     const InternalKeyComparator* comparator_;
+    bool source_priority_;
   };
 
   using CompactionMinHeap = BinaryHeap<HeapItem*, CompactionHeapItemComparator>;
   bool is_arena_mode_;
   const InternalKeyComparator* comparator_;
+  const bool source_priority_for_equal_sequences_;
   // HeapItem for all child point iterators.
   std::vector<HeapItem> children_;
   // HeapItem for range tombstones. pinned_heap_item_[i] corresponds to the
@@ -293,8 +305,11 @@ void CompactionMergingIterator::Seek(const Slice& target) {
       range_tombstone_iters_[i]->Seek(pik.user_key);
       // For compaction, output keys should all be after seek target.
       while (range_tombstone_iters_[i]->Valid() &&
-             comparator_->Compare(range_tombstone_iters_[i]->start_key(), pik) <
-                 0) {
+             (source_priority_for_equal_sequences_
+                  ? comparator_->CompareKeySeq(
+                        range_tombstone_iters_[i]->start_key(), target)
+                  : comparator_->Compare(range_tombstone_iters_[i]->start_key(),
+                                         pik)) < 0) {
         range_tombstone_iters_[i]->Next();
       }
       InsertRangeTombstoneAtLevel(i);
@@ -380,6 +395,7 @@ void CompactionMergingIterator::AddToMinHeapOrCheckStatus(HeapItem* child) {
 
 InternalIterator* NewCompactionMergingIterator(
     const InternalKeyComparator* comparator, InternalIterator** children, int n,
+    bool source_priority_for_equal_sequences,
     std::vector<std::pair<std::unique_ptr<TruncatedRangeDelIterator>,
                           std::unique_ptr<TruncatedRangeDelIterator>**>>&
         range_tombstone_iters,
@@ -389,14 +405,14 @@ InternalIterator* NewCompactionMergingIterator(
     return NewEmptyInternalIterator<Slice>(arena);
   } else {
     if (arena == nullptr) {
-      return new CompactionMergingIterator(comparator, children, n,
-                                           false /* is_arena_mode */,
-                                           range_tombstone_iters, stats);
+      return new CompactionMergingIterator(
+          comparator, children, n, false /* is_arena_mode */,
+          source_priority_for_equal_sequences, range_tombstone_iters, stats);
     } else {
       auto mem = arena->AllocateAligned(sizeof(CompactionMergingIterator));
-      return new (mem) CompactionMergingIterator(comparator, children, n,
-                                                 true /* is_arena_mode */,
-                                                 range_tombstone_iters, stats);
+      return new (mem) CompactionMergingIterator(
+          comparator, children, n, true /* is_arena_mode */,
+          source_priority_for_equal_sequences, range_tombstone_iters, stats);
     }
   }
 }

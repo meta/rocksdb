@@ -333,7 +333,9 @@ class ShardedSnapshotList {
   // ingestion, which can already hold many per-column-family locks. A
   // concurrent release can make a true result conservative; the DB mutex
   // prevents a creator that bypasses the gate from being missed.
-  bool AnySnapshotWhileNewBlocked() const;
+  // An operation-owned pin may be excluded; other snapshots at the same
+  // sequence number still count.
+  bool AnySnapshotWhileNewBlocked(const Snapshot* excluded = nullptr) const;
   uint64_t count() const;
   // Returns 0 when empty. Snapshot timestamps are read before taking a shard
   // lock, so the result is approximate when creations are concurrent or the

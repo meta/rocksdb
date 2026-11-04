@@ -3531,6 +3531,12 @@ class ModelDB : public DB {
     return Status::NotSupported("Not implemented.");
   }
 
+  using DB::ApplyLsmEdit;
+  Status ApplyLsmEdit(const LsmEditOptions& /*options*/,
+                      const std::vector<LsmEdit>& /*edits*/) override {
+    return Status::NotSupported("Not implemented.");
+  }
+
   using DB::CreateColumnFamilyWithImport;
   Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& /*options*/,

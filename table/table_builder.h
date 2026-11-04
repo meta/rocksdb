@@ -200,6 +200,9 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
   // same-file ("embedded") blob records. Currently only honored by
   // BlockBasedTableBuilder.
   const EmbeddedBlobSstBuilderOptions* embedded_blob_options;
+
+  // Reject unresolved duplicate internal keys before they reach the builder.
+  bool require_strict_key_order = false;
 };
 
 enum class TableBuilderAddResult : uint8_t {

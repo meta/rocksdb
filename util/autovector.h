@@ -60,6 +60,7 @@ class autovector {
     using difference_type = typename TAutoVector::difference_type;
     using iterator_category = std::random_access_iterator_tag;
 
+    iterator_impl() = default;
     iterator_impl(TAutoVector* vect, size_t index)
         : vect_(vect), index_(index) {}
     iterator_impl(const iterator_impl&) = default;

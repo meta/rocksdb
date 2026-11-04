@@ -5,6 +5,7 @@
 
 #include "db/event_helpers.h"
 
+#include "file/file_io_listener.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/listener.h"
 #include "rocksdb/utilities/customizable_util.h"
@@ -44,6 +45,7 @@ void EventHelpers::NotifyTableFileCreationStarted(
   info.job_id = job_id;
   info.reason = reason;
   for (auto& listener : listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnTableFileCreationStarted(info);
   }
 }
@@ -59,6 +61,7 @@ void EventHelpers::NotifyOnBackgroundError(
   // release lock while notifying events
   db_mutex->Unlock();
   for (auto& listener : listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnBackgroundError(reason, bg_error);
     bg_error->PermitUncheckedError();
     if (*auto_recovery) {
@@ -193,6 +196,7 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
   info.file_checksum = file_checksum;
   info.file_checksum_func_name = file_checksum_func_name;
   for (auto& listener : listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnTableFileCreated(info);
   }
   info.status.PermitUncheckedError();
@@ -230,6 +234,7 @@ void EventHelpers::LogAndNotifyTableFileDeletion(
   info.file_path = file_path;
   info.status = status;
   for (auto& listener : listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnTableFileDeleted(info);
   }
   info.status.PermitUncheckedError();
@@ -252,6 +257,7 @@ void EventHelpers::NotifyOnErrorRecoveryEnd(
       BackgroundErrorRecoveryInfo info;
       info.old_bg_error = old_bg_error_cp;
       info.new_bg_error = new_bg_error_cp;
+      const ScopedEventListenerCallback callback_scope(listener.get());
       listener->OnErrorRecoveryCompleted(old_bg_error_cp);
       listener->OnErrorRecoveryEnd(info);
       info.old_bg_error.PermitUncheckedError();
@@ -275,6 +281,7 @@ void EventHelpers::NotifyBlobFileCreationStarted(
   BlobFileCreationBriefInfo info(db_name, cf_name, file_path, job_id,
                                  creation_reason);
   for (const auto& listener : listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnBlobFileCreationStarted(info);
   }
 }
@@ -314,6 +321,7 @@ void EventHelpers::LogAndNotifyBlobFileCreationFinished(
                             creation_reason, total_blob_count, total_blob_bytes,
                             s, file_checksum, file_checksum_func_name);
   for (const auto& listener : listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnBlobFileCreated(info);
   }
   info.status.PermitUncheckedError();
@@ -345,6 +353,7 @@ void EventHelpers::LogAndNotifyBlobFileDeletion(
   }
   BlobFileDeletionInfo info(dbname, file_path, job_id, status);
   for (const auto& listener : listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnBlobFileDeleted(info);
   }
   info.status.PermitUncheckedError();

@@ -234,8 +234,13 @@ class CompactionPicker {
                              int output_level, int* parent_index,
                              const FileMetaData* starting_l0_file = nullptr);
 
-  // Register this compaction in the set of running compactions
+  // Register this compaction in the set of running compactions. The
+  // one-argument form preserves placeholder-only handling for external
+  // ingestion; ordinary compactions still register their actual L0 inputs.
   void RegisterCompaction(Compaction* c);
+
+  // External ingestion may reserve real L0 files as well as placeholders.
+  void RegisterCompaction(Compaction* c, bool has_live_l0_inputs);
 
   // Remove this compaction from the set of running compactions
   void UnregisterCompaction(Compaction* c);

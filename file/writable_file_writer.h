@@ -13,6 +13,7 @@
 
 #include "db/version_edit.h"
 #include "env/file_system_tracer.h"
+#include "file/file_io_listener.h"
 #include "monitoring/thread_status_util.h"
 #include "port/port.h"
 #include "rocksdb/file_checksum.h"
@@ -55,9 +56,8 @@ class WritableFileWriter final : public FSWritableFile {
     info.offset = offset;
     info.length = length;
 
-    for (auto& listener : listeners_) {
-      listener->OnFileWriteFinish(info);
-    }
+    ScopedDeferredFileIOListeners::Notify(
+        listeners_, &EventListener::OnFileWriteFinish, info);
     info.status.PermitUncheckedError();
   }
   void NotifyOnFileFlushFinish(
@@ -67,9 +67,8 @@ class WritableFileWriter final : public FSWritableFile {
     FileOperationInfo info(FileOperationType::kFlush, file_name_, start_ts,
                            finish_ts, io_status, temperature_);
 
-    for (auto& listener : listeners_) {
-      listener->OnFileFlushFinish(info);
-    }
+    ScopedDeferredFileIOListeners::Notify(
+        listeners_, &EventListener::OnFileFlushFinish, info);
     info.status.PermitUncheckedError();
   }
   void NotifyOnFileSyncFinish(
@@ -80,9 +79,8 @@ class WritableFileWriter final : public FSWritableFile {
     FileOperationInfo info(type, file_name_, start_ts, finish_ts, io_status,
                            temperature_);
 
-    for (auto& listener : listeners_) {
-      listener->OnFileSyncFinish(info);
-    }
+    ScopedDeferredFileIOListeners::Notify(
+        listeners_, &EventListener::OnFileSyncFinish, info);
     info.status.PermitUncheckedError();
   }
   void NotifyOnFileRangeSyncFinish(
@@ -95,9 +93,8 @@ class WritableFileWriter final : public FSWritableFile {
     info.offset = offset;
     info.length = length;
 
-    for (auto& listener : listeners_) {
-      listener->OnFileRangeSyncFinish(info);
-    }
+    ScopedDeferredFileIOListeners::Notify(
+        listeners_, &EventListener::OnFileRangeSyncFinish, info);
     info.status.PermitUncheckedError();
   }
   void NotifyOnFileTruncateFinish(
@@ -107,9 +104,8 @@ class WritableFileWriter final : public FSWritableFile {
     FileOperationInfo info(FileOperationType::kTruncate, file_name_, start_ts,
                            finish_ts, io_status, temperature_);
 
-    for (auto& listener : listeners_) {
-      listener->OnFileTruncateFinish(info);
-    }
+    ScopedDeferredFileIOListeners::Notify(
+        listeners_, &EventListener::OnFileTruncateFinish, info);
     info.status.PermitUncheckedError();
   }
   void NotifyOnFileCloseFinish(
@@ -119,9 +115,8 @@ class WritableFileWriter final : public FSWritableFile {
     FileOperationInfo info(FileOperationType::kClose, file_name_, start_ts,
                            finish_ts, io_status, temperature_);
 
-    for (auto& listener : listeners_) {
-      listener->OnFileCloseFinish(info);
-    }
+    ScopedDeferredFileIOListeners::Notify(
+        listeners_, &EventListener::OnFileCloseFinish, info);
     info.status.PermitUncheckedError();
   }
 
@@ -132,9 +127,7 @@ class WritableFileWriter final : public FSWritableFile {
       return;
     }
     IOErrorInfo io_error_info(io_status, operation, file_path, length, offset);
-    for (auto& listener : listeners_) {
-      listener->OnIOError(io_error_info);
-    }
+    ScopedDeferredFileIOListeners::NotifyError(listeners_, io_error_info);
     io_error_info.io_status.PermitUncheckedError();
   }
 
