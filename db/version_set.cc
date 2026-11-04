@@ -2248,7 +2248,7 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
       files.back().num_entries = file->num_entries;
       files.back().num_deletions = file->num_deletions;
       files.back().db_ownership_start_time = file->db_ownership_start_time;
-      files.back().db_ownership_info = file->db_ownership_info;
+      files.back().data_file_provenance = file->data_file_provenance;
       files.back().smallest = file->smallest.Encode().ToString();
       files.back().largest = file->largest.Encode().ToString();
       level_size += file->fd.GetFileSize();
@@ -2333,7 +2333,7 @@ void Version::GetColumnFamilyMetaData(
       files.back().num_entries = file->num_entries;
       files.back().num_deletions = file->num_deletions;
       files.back().db_ownership_start_time = file->db_ownership_start_time;
-      files.back().db_ownership_info = file->db_ownership_info;
+      files.back().data_file_provenance = file->data_file_provenance;
       files.back().smallest = file->smallest.Encode().ToString();
       files.back().largest = file->largest.Encode().ToString();
       level_size += file->fd.GetFileSize();
@@ -8027,7 +8027,7 @@ Status VersionSet::WriteCurrentStateToManifest(
           // Preserves all persisted metadata, including file_open_metadata
           // so live SSTs still benefit from fast_sst_open after a MANIFEST
           // rotation.
-          edit.AddExistingFile(level, *f, /*ownership_info_flags_to_set=*/0);
+          edit.AddExistingFile(level, *f, /*provenance_flags_to_set=*/0);
         }
       }
 
@@ -8607,7 +8607,7 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
         filemetadata.oldest_ancestor_time = file->TryGetOldestAncestorTime();
         filemetadata.file_creation_time = file->TryGetFileCreationTime();
         filemetadata.db_ownership_start_time = file->db_ownership_start_time;
-        filemetadata.db_ownership_info = file->db_ownership_info;
+        filemetadata.data_file_provenance = file->data_file_provenance;
         filemetadata.epoch_number = file->epoch_number;
         metadata->push_back(filemetadata);
       }

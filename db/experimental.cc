@@ -160,8 +160,8 @@ Status UpdateManifestForFilesState(
               edit.DeleteFile(level, number);
               FileMetaData updated = *lf;
               updated.temperature = temp;
-              edit.AddExistingFile(
-                  level, updated, kDbOwnershipTemperatureUpdatedFromFileSystem);
+              edit.AddExistingFile(level, updated,
+                                   kProvenanceTemperatureUpdatedFromFileSystem);
             }
           }
         } else {

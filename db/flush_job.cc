@@ -1045,8 +1045,8 @@ Status FlushJob::WriteLevel0Table() {
       meta_.oldest_ancestor_time = oldest_ancestor_time;
       meta_.file_creation_time = current_time;
       meta_.db_ownership_start_time = current_time;
-      meta_.db_ownership_info =
-          DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kFlush);
+      meta_.data_file_provenance =
+          DataFileProvenanceForOrigin(DataFileProvenance::Origin::kFlush);
 
       uint64_t memtable_payload_bytes = 0;
       uint64_t memtable_garbage_bytes = 0;

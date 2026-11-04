@@ -77,9 +77,9 @@ Status ImportColumnFamilyJob::Prepare(uint64_t next_file_number,
             CarriedImportTime(
                 file_metadata.file_creation_time,
                 file_to_import.table_properties.file_creation_time),
-            file_to_import.table_properties.newest_key_time,
-            lossless_cast<uint64_t>(now), cfd_->ioptions().compaction_style,
-            sv->mutable_cf_options, db_options_.info_log.get());
+            file_to_import.table_properties, lossless_cast<uint64_t>(now),
+            cfd_->ioptions().compaction_style, sv->mutable_cf_options,
+            db_options_.info_log.get());
         if (!status.ok()) {
           return status;
         }
@@ -259,8 +259,8 @@ Status ImportColumnFamilyJob::Run() {
           /*_min_timestamp=*/"", /*_max_timestamp=*/"");
       // The export metadata's ownership fields describe the source DB.
       meta.db_ownership_start_time = f.db_ownership_start_time;
-      meta.db_ownership_info =
-          DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kImport);
+      meta.data_file_provenance =
+          DataFileProvenanceForOrigin(DataFileProvenance::Origin::kImport);
       VersionEdit dummy_version_edit;
       dummy_version_edit.AddFile(file_metadata.level, meta);
       s = dummy_version_builder.Apply(&dummy_version_edit);

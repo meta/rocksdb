@@ -834,7 +834,8 @@ Status CheckpointImpl::ExportColumnFamily(
             file_metadata.file_creation_time;
         live_file_metadata.db_ownership_start_time =
             file_metadata.db_ownership_start_time;
-        live_file_metadata.db_ownership_info = file_metadata.db_ownership_info;
+        live_file_metadata.data_file_provenance =
+            file_metadata.data_file_provenance;
         live_file_metadata.epoch_number = file_metadata.epoch_number;
         live_file_metadata.level = level_metadata.level;
         live_file_metadata.smallest = file_metadata.smallest;

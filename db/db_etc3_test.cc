@@ -831,7 +831,7 @@ TEST_F(DBEtc3Test, AutoTuneManifestSize) {
 }
 
 // Tests for the DB ownership metadata recorded for SST files
-// (FileMetaData::db_ownership_start_time and db_ownership_info)
+// (FileMetaData::db_ownership_start_time and data_file_provenance)
 class DBOwnershipTest : public DBEtc3Test {
  protected:
   uint64_t Now() {
@@ -856,24 +856,25 @@ class DBOwnershipTest : public DBEtc3Test {
     return {FileMetaData(), -1};
   }
 
-  static DbOwnershipInfo Decode(const FileMetaData& f) {
-    return DbOwnershipInfo::DecodeFrom(f.db_ownership_info);
+  static DataFileProvenance Decode(const FileMetaData& f) {
+    return DataFileProvenance::DecodeFrom(f.data_file_provenance);
   }
 
-  static DbOwnershipInfo OriginOnly(DbOwnershipInfo::Origin origin) {
-    DbOwnershipInfo info;
+  static DataFileProvenance OriginOnly(DataFileProvenance::Origin origin) {
+    DataFileProvenance info;
     info.origin = origin;
     return info;
   }
 
   // Expects `after` to be the same file as `before`, with the same contents
-  // and DB ownership, plus DbOwnershipInfo flag bits `added_flags`
+  // and DB ownership, plus DataFileProvenance flag bits `added_flags`
   static void ExpectSameFile(const FileMetaData& before,
                              const FileMetaData& after, uint32_t added_flags) {
     EXPECT_EQ(after.fd.GetNumber(), before.fd.GetNumber());
     EXPECT_EQ(after.file_creation_time, before.file_creation_time);
     EXPECT_EQ(after.db_ownership_start_time, before.db_ownership_start_time);
-    EXPECT_EQ(after.db_ownership_info, before.db_ownership_info | added_flags);
+    EXPECT_EQ(after.data_file_provenance,
+              before.data_file_provenance | added_flags);
   }
 };
 
@@ -889,7 +890,7 @@ TEST_F(DBOwnershipTest, FlushAndCompactionOutputs) {
   const FileMetaData flushed = FileStartingWith("a").first;
   EXPECT_GE(flushed.db_ownership_start_time, start);
   EXPECT_EQ(flushed.db_ownership_start_time, flushed.file_creation_time);
-  EXPECT_EQ(Decode(flushed), OriginOnly(DbOwnershipInfo::Origin::kFlush));
+  EXPECT_EQ(Decode(flushed), OriginOnly(DataFileProvenance::Origin::kFlush));
 
   // Reported in public metadata
   std::vector<LiveFileMetaData> live_files;
@@ -897,14 +898,14 @@ TEST_F(DBOwnershipTest, FlushAndCompactionOutputs) {
   ASSERT_EQ(live_files.size(), 1U);
   EXPECT_EQ(live_files[0].db_ownership_start_time,
             flushed.db_ownership_start_time);
-  EXPECT_EQ(live_files[0].db_ownership_info, flushed.db_ownership_info);
+  EXPECT_EQ(live_files[0].data_file_provenance, flushed.data_file_provenance);
   ColumnFamilyMetaData cf_meta;
   db_->GetColumnFamilyMetaData(&cf_meta);
   ASSERT_EQ(cf_meta.levels[0].files.size(), 1U);
   EXPECT_EQ(cf_meta.levels[0].files[0].db_ownership_start_time,
             flushed.db_ownership_start_time);
-  EXPECT_EQ(cf_meta.levels[0].files[0].db_ownership_info,
-            flushed.db_ownership_info);
+  EXPECT_EQ(cf_meta.levels[0].files[0].data_file_provenance,
+            flushed.data_file_provenance);
 
   // Flushed during WAL recovery
   ASSERT_OK(Put("b", "1"));
@@ -912,7 +913,7 @@ TEST_F(DBOwnershipTest, FlushAndCompactionOutputs) {
   const FileMetaData recovered = FileStartingWith("b").first;
   EXPECT_GE(recovered.db_ownership_start_time, start);
   EXPECT_EQ(recovered.db_ownership_start_time, recovered.file_creation_time);
-  EXPECT_EQ(Decode(recovered), OriginOnly(DbOwnershipInfo::Origin::kFlush));
+  EXPECT_EQ(Decode(recovered), OriginOnly(DataFileProvenance::Origin::kFlush));
 
   // Compactions that take a long time to finish after creating their output
   ASSERT_OK(Put("a", "2"));
@@ -931,7 +932,7 @@ TEST_F(DBOwnershipTest, FlushAndCompactionOutputs) {
   EXPECT_EQ(compacted.db_ownership_start_time, compacted.file_creation_time);
   EXPECT_LE(compacted.db_ownership_start_time + 1000, Now());
   EXPECT_EQ(Decode(compacted),
-            OriginOnly(DbOwnershipInfo::Origin::kCompaction));
+            OriginOnly(DataFileProvenance::Origin::kCompaction));
 }
 
 TEST_F(DBOwnershipTest, MovesPreserveOwnership) {
@@ -952,7 +953,7 @@ TEST_F(DBOwnershipTest, MovesPreserveOwnership) {
         experimental::PromoteL0(db_.get(), db_->DefaultColumnFamily(), 2));
     const auto& [after, level] = FileStartingWith("a");
     EXPECT_EQ(level, 2);
-    ExpectSameFile(before, after, kDbOwnershipMovedBetweenLevels);
+    ExpectSameFile(before, after, kProvenanceMovedBetweenLevels);
   }
   {
     SCOPED_TRACE("Trivial move");
@@ -972,7 +973,7 @@ TEST_F(DBOwnershipTest, MovesPreserveOwnership) {
     EXPECT_GT(trivial_moves.load(), 0);
     const auto& [after, level] = FileStartingWith("a");
     EXPECT_GT(level, 0);
-    ExpectSameFile(before, after, kDbOwnershipMovedBetweenLevels);
+    ExpectSameFile(before, after, kProvenanceMovedBetweenLevels);
   }
   {
     SCOPED_TRACE("CompactRange with change_level, and reopen");
@@ -984,7 +985,8 @@ TEST_F(DBOwnershipTest, MovesPreserveOwnership) {
     ASSERT_OK(Flush());
     ASSERT_OK(db_->CompactRange(force_compact, nullptr, nullptr));
     const auto& [before, before_level] = FileStartingWith("a");
-    ASSERT_EQ(Decode(before), OriginOnly(DbOwnershipInfo::Origin::kCompaction));
+    ASSERT_EQ(Decode(before),
+              OriginOnly(DataFileProvenance::Origin::kCompaction));
     ASSERT_GT(before_level, 1);
     env_->MockSleepForSeconds(1000);
     CompactRangeOptions refit;
@@ -993,7 +995,7 @@ TEST_F(DBOwnershipTest, MovesPreserveOwnership) {
     ASSERT_OK(db_->CompactRange(refit, nullptr, nullptr));
     const auto& [after, level] = FileStartingWith("a");
     EXPECT_EQ(level, 1);
-    ExpectSameFile(before, after, kDbOwnershipMovedBetweenLevels);
+    ExpectSameFile(before, after, kProvenanceMovedBetweenLevels);
 
     // Preserved by replaying the MANIFEST and then by the new MANIFEST written
     // on open
@@ -1012,7 +1014,8 @@ TEST_F(DBOwnershipTest, MovesPreserveOwnership) {
     ASSERT_OK(Flush());
     ASSERT_OK(db_->CompactRange(force_compact, nullptr, nullptr));
     const auto& [before, before_level] = FileStartingWith("a");
-    ASSERT_EQ(Decode(before), OriginOnly(DbOwnershipInfo::Origin::kCompaction));
+    ASSERT_EQ(Decode(before),
+              OriginOnly(DataFileProvenance::Origin::kCompaction));
     ASSERT_LT(before_level, options.num_levels - 1);
     env_->MockSleepForSeconds(1000);
     options.level_compaction_dynamic_level_bytes = true;
@@ -1021,7 +1024,7 @@ TEST_F(DBOwnershipTest, MovesPreserveOwnership) {
     Reopen(options);
     const auto& [after, level] = FileStartingWith("a");
     EXPECT_EQ(level, options.num_levels - 1);
-    ExpectSameFile(before, after, kDbOwnershipMovedBetweenLevels);
+    ExpectSameFile(before, after, kProvenanceMovedBetweenLevels);
   }
 }
 
@@ -1060,8 +1063,8 @@ TEST_F(DBOwnershipTest, FIFOTemperatureChangeCopy) {
   // ...in a new file for the DB to hold
   EXPECT_GE(after.db_ownership_start_time,
             before.db_ownership_start_time + 2000);
-  EXPECT_EQ(after.db_ownership_info,
-            before.db_ownership_info | kDbOwnershipTemperatureChangedByCopy);
+  EXPECT_EQ(after.data_file_provenance,
+            before.data_file_provenance | kProvenanceTemperatureChangedByCopy);
 }
 
 TEST_F(DBOwnershipTest, TemperatureUpdatedFromFileSystem) {
@@ -1088,7 +1091,7 @@ TEST_F(DBOwnershipTest, TemperatureUpdatedFromFileSystem) {
   Reopen(options);
   const FileMetaData after = FileStartingWith("a").first;
   EXPECT_EQ(after.temperature, Temperature::kCold);
-  ExpectSameFile(before, after, kDbOwnershipTemperatureUpdatedFromFileSystem);
+  ExpectSameFile(before, after, kProvenanceTemperatureUpdatedFromFileSystem);
   Close();
 }
 
@@ -1111,14 +1114,14 @@ TEST_F(DBOwnershipTest, Repair) {
   // Restored from the table property, recorded when the flush finished
   EXPECT_GE(repaired.file_creation_time, flushed.file_creation_time);
   EXPECT_EQ(repaired.db_ownership_start_time, kUnknownDbOwnershipStartTime);
-  DbOwnershipInfo expected;
+  DataFileProvenance expected;
   expected.recorded_by_repair = true;
   EXPECT_EQ(Decode(repaired), expected);
 
   const FileMetaData from_wal = FileStartingWith("b").first;
   EXPECT_GT(from_wal.file_creation_time, 0U);
   EXPECT_EQ(from_wal.db_ownership_start_time, from_wal.file_creation_time);
-  expected.origin = DbOwnershipInfo::Origin::kFlush;
+  expected.origin = DataFileProvenance::Origin::kFlush;
   EXPECT_EQ(Decode(from_wal), expected);
 }
 

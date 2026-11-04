@@ -542,10 +542,10 @@ class Repairer {
       } else {
         // The MANIFEST being rebuilt held the ownership start time and origin
         // of tables that existed before the repair, so those are unknown.
-        t.meta.db_ownership_info = kDbOwnershipRecordedByRepair;
+        t.meta.data_file_provenance = kProvenanceRecordedByRepair;
         if (tables_built_from_wals) {
-          t.meta.db_ownership_info |=
-              DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kFlush);
+          t.meta.data_file_provenance |=
+              DataFileProvenanceForOrigin(DataFileProvenance::Origin::kFlush);
           t.meta.db_ownership_start_time = t.meta.file_creation_time;
         }
         tables_.push_back(t);

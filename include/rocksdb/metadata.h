@@ -69,12 +69,12 @@ struct LiveFileStorageInfo : public FileStorageInfo {
   bool trim_to_size = false;
 };
 
-// Decoded form of SstFileMetaData::db_ownership_info: how this DB got an SST
+// Decoded form of SstFileMetaData::data_file_provenance: how this DB got an SST
 // file's contents, and what has happened to the file since without its
 // contents being rewritten. Recorded in the MANIFEST (not in the file), since
 // the same file contents can be added to several DBs. Round-trips through
 // Encode() / DecodeFrom().
-struct DbOwnershipInfo {
+struct DataFileProvenance {
   // How this DB got the file's contents. Values may be added in the future;
   // DecodeFrom() reports values it doesn't recognize as kUnknown.
   enum class Origin : uint8_t {
@@ -114,13 +114,13 @@ struct DbOwnershipInfo {
   bool recorded_by_repair = false;
 
   // Serialize to / deserialize from the packed
-  // SstFileMetaData::db_ownership_info representation. DecodeFrom() ignores
+  // SstFileMetaData::data_file_provenance representation. DecodeFrom() ignores
   // unrecognized bits so the encoding can be extended in the future, which
   // means re-encoding a decoded value drops any bits added by newer versions.
   uint32_t Encode() const;
-  static DbOwnershipInfo DecodeFrom(uint32_t encoded);
+  static DataFileProvenance DecodeFrom(uint32_t encoded);
 
-  bool operator==(const DbOwnershipInfo& other) const {
+  bool operator==(const DataFileProvenance& other) const {
     return origin == other.origin &&
            moved_between_levels == other.moved_between_levels &&
            temperature_changed_by_copy == other.temperature_changed_by_copy &&
@@ -222,7 +222,7 @@ struct SstFileMetaData : public FileStorageInfo {
   // writing it (flush or compaction output), when ingestion (in the prepare
   // phase, for two-phase ingestion) or CreateColumnFamilyWithImport() linked
   // or copied it into the DB, or when it was copied as a new file with a
-  // different temperature (see DbOwnershipInfo). Preserved when the file is
+  // different temperature (see DataFileProvenance). Preserved when the file is
   // moved between levels. A DB opened from a checkpoint or backup keeps the
   // values recorded by the DB it was copied from. 0 if the information is not
   // available, e.g. for a file recorded by an older RocksDB version (whose
@@ -230,11 +230,11 @@ struct SstFileMetaData : public FileStorageInfo {
   // arrived that way) or found by RepairDB.
   uint64_t db_ownership_start_time = 0;
   // How this DB got the file's contents and what has happened to the file
-  // since, packed as described by DbOwnershipInfo (decode with
-  // DbOwnershipInfo::DecodeFrom()). 0 if the information is not available.
+  // since, packed as described by DataFileProvenance (decode with
+  // DataFileProvenance::DecodeFrom()). 0 if the information is not available.
   // (CreateColumnFamilyWithImport() ignores this field and
   // db_ownership_start_time in its input metadata, recording its own.)
-  uint32_t db_ownership_info = 0;
+  uint32_t data_file_provenance = 0;
 
   // These bounds define the effective key range for range tombstones
   // in this file.

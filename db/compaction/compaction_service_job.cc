@@ -994,8 +994,8 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     // local compaction output (by the worker's clock, as with its
     // file_creation_time).
     meta.db_ownership_start_time = file.file_creation_time;
-    meta.db_ownership_info =
-        DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kCompaction);
+    meta.data_file_provenance =
+        DataFileProvenanceForOrigin(DataFileProvenance::Origin::kCompaction);
     meta.epoch_number = file.epoch_number;
     meta.file_checksum = file.file_checksum;
     meta.file_checksum_func_name = file.file_checksum_func_name;

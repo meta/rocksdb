@@ -1317,14 +1317,14 @@ void AddTestFile(VersionEdit* edit, uint64_t file_number) {
 TEST_F(VersionEditTest, DbOwnershipEncodeDecode) {
   // Includes a reserved bit, which must be preserved
   const uint32_t kInfo =
-      DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kIngestion) |
-      kDbOwnershipMovedBetweenLevels | (uint32_t{1} << 20);
+      DataFileProvenanceForOrigin(DataFileProvenance::Origin::kIngestion) |
+      kProvenanceMovedBetweenLevels | (uint32_t{1} << 20);
   VersionEdit edit;
   AddTestFile(&edit, 300);
   AddTestFile(&edit, 301);
   auto& new_files = edit.GetMutableNewFiles();
   new_files[0].second.db_ownership_start_time = 1234567;
-  new_files[0].second.db_ownership_info = kInfo;
+  new_files[0].second.data_file_provenance = kInfo;
   TestEncodeDecode(edit);
 
   std::string encoded;
@@ -1334,10 +1334,10 @@ TEST_F(VersionEditTest, DbOwnershipEncodeDecode) {
   const auto& parsed_files = parsed.GetNewFiles();
   ASSERT_EQ(parsed_files.size(), 2u);
   EXPECT_EQ(parsed_files[0].second.db_ownership_start_time, 1234567u);
-  EXPECT_EQ(parsed_files[0].second.db_ownership_info, kInfo);
+  EXPECT_EQ(parsed_files[0].second.data_file_provenance, kInfo);
   EXPECT_EQ(parsed_files[1].second.db_ownership_start_time,
             kUnknownDbOwnershipStartTime);
-  EXPECT_EQ(parsed_files[1].second.db_ownership_info, 0u);
+  EXPECT_EQ(parsed_files[1].second.data_file_provenance, 0u);
 
   // Fields are only written when known. (If written for 0, setting a small
   // value would not change the encoded size.)
@@ -1347,7 +1347,7 @@ TEST_F(VersionEditTest, DbOwnershipEncodeDecode) {
     std::string unknown_encoded;
     unknown_edit.EncodeTo(&unknown_encoded, 0 /* ts_sz */);
     if (set_info) {
-      unknown_edit.GetMutableNewFiles()[0].second.db_ownership_info = 1;
+      unknown_edit.GetMutableNewFiles()[0].second.data_file_provenance = 1;
     } else {
       unknown_edit.GetMutableNewFiles()[0].second.db_ownership_start_time = 1;
     }
@@ -1360,25 +1360,26 @@ TEST_F(VersionEditTest, DbOwnershipEncodeDecode) {
   // Older versions safely ignore the fields
   EXPECT_EQ(0u, NewFileCustomTag::kDbOwnershipStartTime &
                     NewFileCustomTag::kCustomTagNonSafeIgnoreMask);
-  EXPECT_EQ(0u, NewFileCustomTag::kDbOwnershipInfo &
+  EXPECT_EQ(0u, NewFileCustomTag::kDataFileProvenance &
                     NewFileCustomTag::kCustomTagNonSafeIgnoreMask);
 
   const std::string debug = edit.DebugString();
   EXPECT_NE(debug.find(" db_ownership_start_time:1234567 "), std::string::npos)
       << debug;
-  EXPECT_NE(debug.find(" db_ownership_info:ingestion+moved+raw:0x100103 "),
+  EXPECT_NE(debug.find(" data_file_provenance:ingestion+moved+raw:0x100103 "),
             std::string::npos)
       << debug;
   const std::string json = edit.DebugJSON(0 /* edit_num */);
   EXPECT_NE(json.find("\"DbOwnershipStartTime\": 1234567"), std::string::npos)
       << json;
-  EXPECT_NE(json.find("\"DbOwnershipInfo\": \"ingestion+moved+raw:0x100103\""),
-            std::string::npos)
+  EXPECT_NE(
+      json.find("\"DataFileProvenance\": \"ingestion+moved+raw:0x100103\""),
+      std::string::npos)
       << json;
 }
 
-TEST_F(VersionEditTest, DbOwnershipInfoEncoding) {
-  using Origin = DbOwnershipInfo::Origin;
+TEST_F(VersionEditTest, DataFileProvenanceEncoding) {
+  using Origin = DataFileProvenance::Origin;
   // The encoding is persisted, so must not change
   const std::pair<Origin, uint32_t> kOrigins[] = {{Origin::kUnknown, 0},
                                                   {Origin::kFlush, 1},
@@ -1389,7 +1390,7 @@ TEST_F(VersionEditTest, DbOwnershipInfoEncoding) {
     for (uint32_t flags = 0; flags < 16; ++flags) {
       SCOPED_TRACE("origin=" + std::to_string(origin_value) +
                    " flags=" + std::to_string(flags));
-      DbOwnershipInfo info;
+      DataFileProvenance info;
       info.origin = origin;
       info.moved_between_levels = (flags & 1) != 0;
       info.temperature_changed_by_copy = (flags & 2) != 0;
@@ -1397,14 +1398,14 @@ TEST_F(VersionEditTest, DbOwnershipInfoEncoding) {
       info.recorded_by_repair = (flags & 8) != 0;
       const uint32_t encoded = info.Encode();
       EXPECT_EQ(encoded, origin_value | (flags << 8));
-      EXPECT_EQ(DbOwnershipInfo::DecodeFrom(encoded), info);
+      EXPECT_EQ(DataFileProvenance::DecodeFrom(encoded), info);
       // Reserved bits are ignored
-      EXPECT_EQ(DbOwnershipInfo::DecodeFrom(encoded | 0xfffff000U), info);
+      EXPECT_EQ(DataFileProvenance::DecodeFrom(encoded | 0xfffff000U), info);
     }
   }
   // Unrecognized origins decode as unknown, without affecting flags
-  const DbOwnershipInfo decoded =
-      DbOwnershipInfo::DecodeFrom(0x7f | kDbOwnershipRecordedByRepair);
+  const DataFileProvenance decoded =
+      DataFileProvenance::DecodeFrom(0x7f | kProvenanceRecordedByRepair);
   EXPECT_EQ(decoded.origin, Origin::kUnknown);
   EXPECT_TRUE(decoded.recorded_by_repair);
   EXPECT_FALSE(decoded.moved_between_levels);
@@ -1422,14 +1423,14 @@ TEST_F(VersionEditTest, AddExistingFile) {
                  "max_ts");
   f.file_open_metadata = "open_metadata";
   f.db_ownership_start_time = 2500;
-  f.db_ownership_info =
-      DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kIngestion) |
-      kDbOwnershipTemperatureChangedByCopy | (uint32_t{1} << 20);
+  f.data_file_provenance =
+      DataFileProvenanceForOrigin(DataFileProvenance::Origin::kIngestion) |
+      kProvenanceTemperatureChangedByCopy | (uint32_t{1} << 20);
   f.refs = 5;
   f.being_compacted = true;
 
   VersionEdit edit;
-  edit.AddExistingFile(4, f, kDbOwnershipMovedBetweenLevels);
+  edit.AddExistingFile(4, f, kProvenanceMovedBetweenLevels);
   ASSERT_EQ(edit.GetNewFiles().size(), 1u);
   EXPECT_EQ(edit.GetNewFiles()[0].first, 4);
   const FileMetaData& added = edit.GetNewFiles()[0].second;
@@ -1438,16 +1439,16 @@ TEST_F(VersionEditTest, AddExistingFile) {
   // encoded MANIFEST record, once the added flag is accounted for
   VersionEdit expected_edit;
   expected_edit.AddFile(4, f);
-  expected_edit.GetMutableNewFiles()[0].second.db_ownership_info |=
-      kDbOwnershipMovedBetweenLevels;
+  expected_edit.GetMutableNewFiles()[0].second.data_file_provenance |=
+      kProvenanceMovedBetweenLevels;
   std::string expected_encoded;
   expected_edit.EncodeTo(&expected_encoded, 0 /* ts_sz */);
   std::string encoded;
   edit.EncodeTo(&encoded, 0 /* ts_sz */);
   EXPECT_EQ(encoded, expected_encoded);
   EXPECT_EQ(added.db_ownership_start_time, 2500u);
-  EXPECT_EQ(added.db_ownership_info,
-            f.db_ownership_info | kDbOwnershipMovedBetweenLevels);
+  EXPECT_EQ(added.data_file_provenance,
+            f.data_file_provenance | kProvenanceMovedBetweenLevels);
 
   // In-memory-only state starts fresh
   EXPECT_EQ(added.refs, 0);

@@ -2971,8 +2971,8 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
     meta.oldest_ancestor_time = oldest_ancestor_time;
     meta.file_creation_time = current_time;
     meta.db_ownership_start_time = current_time;
-    meta.db_ownership_info =
-        DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kCompaction);
+    meta.data_file_provenance =
+        DataFileProvenanceForOrigin(DataFileProvenance::Origin::kCompaction);
     meta.epoch_number = epoch_number;
     meta.temperature = temperature;
     assert(!db_id_.empty());

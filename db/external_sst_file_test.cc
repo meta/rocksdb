@@ -6034,49 +6034,72 @@ TEST_F(ExternalSSTFileTimeTest, CreationTimeIsWhenFileIsFinished) {
   EXPECT_EQ(reader.GetTableProperties()->file_creation_time, 3000U);
 }
 
-// For FIFO compaction, reject_too_old_file judges a file by its newest key
-// time when known, as FIFO TTL compaction does, even if the file was built
-// recently
+// For FIFO compaction, reject_too_old_file judges a file by its newest data as
+// FIFO TTL compaction estimates it: by its newest key time when known, else
+// its oldest ancestor time, even if the file was built recently
 TEST_F(ExternalSSTFileTimeTest, RejectFIFOFileWithOldNewestKey) {
-  Options options = CurrentOptions();
-  options.disable_auto_compactions = true;
-  options.max_open_files = -1;
-  env_->SetMockSleep();
-  DestroyAndReopen(options);
-  Options fifo_options = options;
-  fifo_options.compaction_style = kCompactionStyleFIFO;
-  fifo_options.num_levels = 1;
-  fifo_options.ttl = 10000;
-  CreateColumnFamilies({"fifo"}, fifo_options);
-  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "fifo"},
-                           std::vector<Options>{options, fifo_options});
+  for (bool newest_key_time_unknown : {false, true}) {
+    SCOPED_TRACE("newest_key_time_unknown=" +
+                 std::to_string(newest_key_time_unknown));
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.max_open_files = -1;
+    env_->SetMockSleep();
+    DestroyAndReopen(options);
+    Options fifo_options = options;
+    fifo_options.compaction_style = kCompactionStyleFIFO;
+    fifo_options.num_levels = 1;
+    fifo_options.ttl = 10000;
+    CreateColumnFamilies({"fifo"}, fifo_options);
+    ReopenWithColumnFamilies({kDefaultColumnFamilyName, "fifo"},
+                             std::vector<Options>{options, fifo_options});
 
-  // Compacting old data builds a new file with the same newest key time
-  ASSERT_OK(Put("a", "val"));
-  ASSERT_OK(Flush());
-  env_->MockSleepForSeconds(20000);
-  CompactRangeOptions cro;
-  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
-  ASSERT_OK(db_->CompactRange(cro, handles_[0], nullptr, nullptr));
-  TablePropertiesCollection props;
-  ASSERT_OK(db_->GetPropertiesOfAllTables(handles_[0], &props));
-  ASSERT_EQ(props.size(), 1U);
-  const TableProperties& file_props = *props.begin()->second;
-  ASSERT_GT(file_props.newest_key_time, 0U);
-  ASSERT_GE(file_props.file_creation_time, file_props.newest_key_time + 20000);
-  const std::string file = props.begin()->first;
+    if (newest_key_time_unknown) {
+      // As in files written by older versions
+      SyncPoint::GetInstance()->SetCallBack(
+          "PropertyBlockBuilder::AddTableProperty:Start", [](void* arg) {
+            static_cast<TableProperties*>(arg)->newest_key_time = 0;
+          });
+      SyncPoint::GetInstance()->EnableProcessing();
+    }
+    // Compacting old data builds a new file with the same newest key time
+    // (when known) and oldest ancestor time
+    ASSERT_OK(Put("a", "val"));
+    ASSERT_OK(Flush());
+    env_->MockSleepForSeconds(20000);
+    CompactRangeOptions cro;
+    cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(cro, handles_[0], nullptr, nullptr));
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    TablePropertiesCollection props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(handles_[0], &props));
+    ASSERT_EQ(props.size(), 1U);
+    const TableProperties& file_props = *props.begin()->second;
+    if (newest_key_time_unknown) {
+      ASSERT_EQ(file_props.newest_key_time, 0U);
+    } else {
+      ASSERT_GT(file_props.newest_key_time, 0U);
+      ASSERT_GE(file_props.file_creation_time,
+                file_props.newest_key_time + 20000);
+    }
+    ASSERT_GT(file_props.oldest_ancestor_time, 0U);
+    ASSERT_GE(file_props.file_creation_time,
+              file_props.oldest_ancestor_time + 20000);
+    const std::string file = props.begin()->first;
 
-  IngestExternalFileOptions ifo;
-  ifo.allow_db_generated_files = true;
-  ifo.snapshot_consistency = false;
-  ifo.reject_too_old_file = true;
-  Status s = db_->IngestExternalFile(handles_[1], {file}, ifo);
-  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
-  ASSERT_EQ(NumTableFilesAtLevel(0, 1), 0);
+    IngestExternalFileOptions ifo;
+    ifo.allow_db_generated_files = true;
+    ifo.snapshot_consistency = false;
+    ifo.reject_too_old_file = true;
+    Status s = db_->IngestExternalFile(handles_[1], {file}, ifo);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_EQ(NumTableFilesAtLevel(0, 1), 0);
 
-  ifo.reject_too_old_file = false;
-  ASSERT_OK(db_->IngestExternalFile(handles_[1], {file}, ifo));
-  ASSERT_EQ(NumTableFilesAtLevel(0, 1), 1);
+    ifo.reject_too_old_file = false;
+    ASSERT_OK(db_->IngestExternalFile(handles_[1], {file}, ifo));
+    ASSERT_EQ(NumTableFilesAtLevel(0, 1), 1);
+  }
 }
 
 // SstFileWriter files carry neither the newest key time nor the oldest
@@ -6113,8 +6136,8 @@ TEST_F(ExternalSSTFileTimeTest, RecordsDbOwnership) {
   options.disable_auto_compactions = true;
   env_->SetMockSleep();
   CreateAndReopenWithCF({"src"}, options);
-  DbOwnershipInfo ingested;
-  ingested.origin = DbOwnershipInfo::Origin::kIngestion;
+  DataFileProvenance ingested;
+  ingested.origin = DataFileProvenance::Origin::kIngestion;
   const uint64_t old_time = Now() - 5000;
 
   // The DB began holding the file when it was ingested, regardless of when
@@ -6127,7 +6150,7 @@ TEST_F(ExternalSSTFileTimeTest, RecordsDbOwnership) {
   EXPECT_EQ(f.file_creation_time, old_time);
   EXPECT_GE(f.db_ownership_start_time, start);
   EXPECT_LE(f.db_ownership_start_time, Now());
-  EXPECT_EQ(DbOwnershipInfo::DecodeFrom(f.db_ownership_info), ingested);
+  EXPECT_EQ(DataFileProvenance::DecodeFrom(f.data_file_provenance), ingested);
 
   // With two-phase ingestion, from the prepare phase
   file = WriteFileAt(options, old_time, "b");
@@ -6142,7 +6165,7 @@ TEST_F(ExternalSSTFileTimeTest, RecordsDbOwnership) {
   EXPECT_EQ(f.file_creation_time, old_time);
   EXPECT_GE(f.db_ownership_start_time, start);
   EXPECT_LE(f.db_ownership_start_time, prepared);
-  EXPECT_EQ(DbOwnershipInfo::DecodeFrom(f.db_ownership_info), ingested);
+  EXPECT_EQ(DataFileProvenance::DecodeFrom(f.data_file_provenance), ingested);
 
   // A file generated by a DB (here, another column family)
   ASSERT_OK(Put(1, "c", "val"));
@@ -6163,7 +6186,7 @@ TEST_F(ExternalSSTFileTimeTest, RecordsDbOwnership) {
   f = ManifestRecord(handles_[0], "c");
   EXPECT_EQ(f.file_creation_time, src.file_creation_time);
   EXPECT_GE(f.db_ownership_start_time, start);
-  EXPECT_EQ(DbOwnershipInfo::DecodeFrom(f.db_ownership_info), ingested);
+  EXPECT_EQ(DataFileProvenance::DecodeFrom(f.data_file_provenance), ingested);
 }
 
 // bottommost_file_compaction_delay counts from when the DB began holding a

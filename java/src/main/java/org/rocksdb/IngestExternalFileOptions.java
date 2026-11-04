@@ -175,9 +175,11 @@ public class IngestExternalFileOptions extends RocksObject {
    * deletion. A file is too old if the age of its contents, from the creation
    * time recorded in the file, exceeds the effective
    * periodic_compaction_seconds (leveled or universal compaction), or if the
-   * age of its newest data, from the newest key time recorded in the file or
-   * else its creation time, exceeds ttl (FIFO compaction). A limit of 0
-   * rejects nothing, and a file without the recorded time is not rejected.
+   * age of its newest data, as estimated by FIFO TTL compaction (from the
+   * newest key time recorded in the file, or else its oldest ancestor time, or
+   * else its creation time), exceeds ttl (FIFO compaction). Nothing is
+   * rejected if the applicable periodic_compaction_seconds or ttl is 0
+   * (disabled), and a file without the recorded time is not rejected.
    * <p>
    * Default: false
    *

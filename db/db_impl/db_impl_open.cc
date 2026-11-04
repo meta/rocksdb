@@ -681,8 +681,7 @@ Status DBImpl::Recover(
               edit.DeleteFile(from_level, f->fd.GetNumber());
               // Keeps f->temperature, which can be different from
               // `last_level_temperature`
-              edit.AddExistingFile(to_level, *f,
-                                   kDbOwnershipMovedBetweenLevels);
+              edit.AddExistingFile(to_level, *f, kProvenanceMovedBetweenLevels);
               ROCKS_LOG_WARN(immutable_db_options_.info_log,
                              "[%s] Moving #%" PRIu64
                              " from from_level-%d to from_level-%d %" PRIu64
@@ -2179,8 +2178,8 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
     meta.oldest_ancestor_time = current_time;
     meta.file_creation_time = current_time;
     meta.db_ownership_start_time = current_time;
-    meta.db_ownership_info =
-        DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kFlush);
+    meta.data_file_provenance =
+        DataFileProvenanceForOrigin(DataFileProvenance::Origin::kFlush);
     meta.epoch_number = cfd->NewEpochNumber();
     {
       auto write_hint = cfd->current()->storage_info()->CalculateSSTWriteHint(

@@ -137,7 +137,7 @@ Status DBImpl::PromoteL0(ColumnFamilyHandle* column_family, int target_level) {
     edit.SetColumnFamily(cfd->GetID());
     for (const auto& f : l0_files) {
       edit.DeleteFile(0, f->fd.GetNumber());
-      edit.AddExistingFile(target_level, *f, kDbOwnershipMovedBetweenLevels);
+      edit.AddExistingFile(target_level, *f, kProvenanceMovedBetweenLevels);
     }
 
     status = versions_->LogAndApply(cfd, read_options, write_options, &edit,

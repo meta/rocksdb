@@ -1713,7 +1713,7 @@ void DBImpl::PrepareTrivialMoveEdit(Compaction& c, LogBuffer* log_buffer,
       FileMetaData* f = c.input(l, i);
       c.edit()->DeleteFile(c.level(l), f->fd.GetNumber());
       c.edit()->AddExistingFile(c.output_level(), *f,
-                                kDbOwnershipMovedBetweenLevels);
+                                kProvenanceMovedBetweenLevels);
       moved_bytes += static_cast<size_t>(c.input(l, i)->fd.GetFileSize());
       ROCKS_LOG_BUFFER(
           log_buffer, "[%s] Moved #%" PRIu64 " to level-%d %" PRIu64 " bytes\n",
@@ -2294,7 +2294,7 @@ Status DBImpl::ReFitLevel(ColumnFamilyData* cfd, int level, int target_level) {
 
     for (const auto& f : vstorage->LevelFiles(level)) {
       edit.DeleteFile(level, f->fd.GetNumber());
-      edit.AddExistingFile(to_level, *f, kDbOwnershipMovedBetweenLevels);
+      edit.AddExistingFile(to_level, *f, kProvenanceMovedBetweenLevels);
     }
     ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
                     "[%s] Apply version edit:\n%s", cfd->GetName().c_str(),
@@ -4180,8 +4180,8 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
                                    in_file->min_timestamp,
                                    in_file->max_timestamp};
     out_file_metadata.db_ownership_start_time = copy_time;
-    out_file_metadata.db_ownership_info =
-        in_file->db_ownership_info | kDbOwnershipTemperatureChangedByCopy;
+    out_file_metadata.data_file_provenance =
+        in_file->data_file_provenance | kProvenanceTemperatureChangedByCopy;
 
     if (out_table_properties) {
       c->SetOutputTableProperties(out_fname, out_table_properties);

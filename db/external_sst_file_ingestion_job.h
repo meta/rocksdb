@@ -233,18 +233,21 @@ void ResolveExternalFileTimes(const std::string& file_path,
                               uint64_t* oldest_ancestor_time);
 
 // Implements `reject_too_old_file` (IngestExternalFileOptions and
-// ImportColumnFamilyOptions) for one file, using the times carried by the file
-// or its import metadata (0 = unknown). Returns InvalidArgument (and logs a
-// warning) if, as of `now`,
+// ImportColumnFamilyOptions) for one file, using the file's creation time
+// carried by the file or its import metadata, and the file's table properties
+// (times of 0 = unknown). Returns InvalidArgument (and logs a warning) if, as
+// of `now`,
 // * for leveled or universal compaction, the file's contents (per
 //   `file_creation_time`) are older than periodic_compaction_seconds, or
-// * for FIFO compaction, its newest data (per `newest_key_time`, or else
-//   `file_creation_time`, which is no earlier) is older than ttl.
+// * for FIFO compaction, its newest data, estimated as FIFO TTL compaction
+//   does (the newest key time table property, else the oldest ancestor time
+//   table property, else `file_creation_time`), is older than ttl.
 // `mutable_cf_options` must be sanitized (as in a SuperVersion), so that these
 // are the effective limits.
 Status CheckExternalFileNotTooOld(const std::string& file_path,
                                   uint64_t file_creation_time,
-                                  uint64_t newest_key_time, uint64_t now,
+                                  const TableProperties& table_properties,
+                                  uint64_t now,
                                   CompactionStyle compaction_style,
                                   const MutableCFOptions& mutable_cf_options,
                                   Logger* info_log);

@@ -1109,10 +1109,10 @@ TEST_F(ImportColumnFamilyTest, ImportKeepsExportedFileTimes) {
   EXPECT_EQ(metadata_ptr_->files[0].oldest_ancestor_time, src_times.second);
   // The source DB's ownership of the file is also exported...
   EXPECT_EQ(metadata_ptr_->files[0].db_ownership_start_time, src_times.first);
-  EXPECT_EQ(
-      DbOwnershipInfo::DecodeFrom(metadata_ptr_->files[0].db_ownership_info)
-          .origin,
-      DbOwnershipInfo::Origin::kCompaction);
+  EXPECT_EQ(DataFileProvenance::DecodeFrom(
+                metadata_ptr_->files[0].data_file_provenance)
+                .origin,
+            DataFileProvenance::Origin::kCompaction);
 
   env_->MockSleepForSeconds(1000);
   int64_t import_start = 0;
@@ -1125,9 +1125,9 @@ TEST_F(ImportColumnFamilyTest, ImportKeepsExportedFileTimes) {
   const FileMetaData imported = ManifestRecord(dbfull(), import_cfh_, "a");
   EXPECT_GE(imported.db_ownership_start_time,
             static_cast<uint64_t>(import_start));
-  DbOwnershipInfo expected_info;
-  expected_info.origin = DbOwnershipInfo::Origin::kImport;
-  EXPECT_EQ(DbOwnershipInfo::DecodeFrom(imported.db_ownership_info),
+  DataFileProvenance expected_info;
+  expected_info.origin = DataFileProvenance::Origin::kImport;
+  EXPECT_EQ(DataFileProvenance::DecodeFrom(imported.data_file_provenance),
             expected_info);
 }
 

@@ -68,7 +68,8 @@ void ResolveExternalFileTimes(const std::string& file_path,
 
 Status CheckExternalFileNotTooOld(const std::string& file_path,
                                   uint64_t file_creation_time,
-                                  uint64_t newest_key_time, uint64_t now,
+                                  const TableProperties& table_properties,
+                                  uint64_t now,
                                   CompactionStyle compaction_style,
                                   const MutableCFOptions& mutable_cf_options,
                                   Logger* info_log) {
@@ -85,10 +86,16 @@ Status CheckExternalFileNotTooOld(const std::string& file_path,
     case kCompactionStyleFIFO:
       limit_name = "ttl";
       max_age = mutable_cf_options.ttl;
-      // As FIFO TTL compaction does, judge by the newest data when known
-      if (newest_key_time != kUnknownNewestKeyTime) {
+      // Estimate when the newest data was written, as FIFO TTL compaction
+      // does (FIFOCompactionPicker::PickTTLCompaction()), so that a file it
+      // would treat as expired is rejected
+      if (table_properties.newest_key_time != kUnknownNewestKeyTime) {
         judged_time_name = "newest_key_time";
-        judged_time = newest_key_time;
+        judged_time = table_properties.newest_key_time;
+      } else if (table_properties.oldest_ancestor_time !=
+                 kUnknownOldestAncestorTime) {
+        judged_time_name = "oldest_ancestor_time";
+        judged_time = table_properties.oldest_ancestor_time;
       }
       break;
     default:
@@ -290,9 +297,9 @@ Status ExternalSstFileIngestionJob::Prepare(
       }
       status = CheckExternalFileNotTooOld(
           file_path, file_to_ingest.table_properties.file_creation_time,
-          file_to_ingest.table_properties.newest_key_time,
-          lossless_cast<uint64_t>(now), cfd_->ioptions().compaction_style,
-          sv->mutable_cf_options, db_options_.info_log.get());
+          file_to_ingest.table_properties, lossless_cast<uint64_t>(now),
+          cfd_->ioptions().compaction_style, sv->mutable_cf_options,
+          db_options_.info_log.get());
       if (!status.ok()) {
         return status;
       }
@@ -1008,8 +1015,8 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
     f_metadata.temperature = file->file_temperature;
     f_metadata.marked_for_compaction = marked_for_compaction;
     f_metadata.db_ownership_start_time = file->db_ownership_start_time;
-    f_metadata.db_ownership_info =
-        DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kIngestion);
+    f_metadata.data_file_provenance =
+        DataFileProvenanceForOrigin(DataFileProvenance::Origin::kIngestion);
     f_metadata.skip_index_and_filter_blocks_prefetch =
         !file->prefetch_lmax_index_and_filter_blocks &&
         file->picked_level == cfd_->NumberLevels() - 1;

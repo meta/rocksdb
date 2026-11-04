@@ -24,23 +24,23 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 // For DebugString() / DebugJSON(), e.g. "ingestion+moved+raw:0x1103" (the raw
 // value shows reserved bits that aren't decoded).
-std::string DbOwnershipInfoToString(uint32_t encoded) {
-  const DbOwnershipInfo info = DbOwnershipInfo::DecodeFrom(encoded);
+std::string DataFileProvenanceToString(uint32_t encoded) {
+  const DataFileProvenance info = DataFileProvenance::DecodeFrom(encoded);
   std::string r;
   switch (info.origin) {
-    case DbOwnershipInfo::Origin::kUnknown:
+    case DataFileProvenance::Origin::kUnknown:
       r = "unknown_origin";
       break;
-    case DbOwnershipInfo::Origin::kFlush:
+    case DataFileProvenance::Origin::kFlush:
       r = "flush";
       break;
-    case DbOwnershipInfo::Origin::kCompaction:
+    case DataFileProvenance::Origin::kCompaction:
       r = "compaction";
       break;
-    case DbOwnershipInfo::Origin::kIngestion:
+    case DataFileProvenance::Origin::kIngestion:
       r = "ingestion";
       break;
-    case DbOwnershipInfo::Origin::kImport:
+    case DataFileProvenance::Origin::kImport:
       r = "import";
       break;
   }
@@ -63,35 +63,35 @@ std::string DbOwnershipInfoToString(uint32_t encoded) {
 }
 }  // anonymous namespace
 
-uint32_t DbOwnershipInfo::Encode() const {
-  uint32_t encoded = DbOwnershipInfoForOrigin(origin);
+uint32_t DataFileProvenance::Encode() const {
+  uint32_t encoded = DataFileProvenanceForOrigin(origin);
   if (moved_between_levels) {
-    encoded |= kDbOwnershipMovedBetweenLevels;
+    encoded |= kProvenanceMovedBetweenLevels;
   }
   if (temperature_changed_by_copy) {
-    encoded |= kDbOwnershipTemperatureChangedByCopy;
+    encoded |= kProvenanceTemperatureChangedByCopy;
   }
   if (temperature_updated_from_file_system) {
-    encoded |= kDbOwnershipTemperatureUpdatedFromFileSystem;
+    encoded |= kProvenanceTemperatureUpdatedFromFileSystem;
   }
   if (recorded_by_repair) {
-    encoded |= kDbOwnershipRecordedByRepair;
+    encoded |= kProvenanceRecordedByRepair;
   }
   return encoded;
 }
 
-DbOwnershipInfo DbOwnershipInfo::DecodeFrom(uint32_t encoded) {
-  DbOwnershipInfo info;
-  const uint32_t origin_value = encoded & kDbOwnershipOriginMask;
-  if (origin_value <= DbOwnershipInfoForOrigin(Origin::kImport)) {
+DataFileProvenance DataFileProvenance::DecodeFrom(uint32_t encoded) {
+  DataFileProvenance info;
+  const uint32_t origin_value = encoded & kProvenanceOriginMask;
+  if (origin_value <= DataFileProvenanceForOrigin(Origin::kImport)) {
     info.origin = static_cast<Origin>(origin_value);
   }
-  info.moved_between_levels = (encoded & kDbOwnershipMovedBetweenLevels) != 0;
+  info.moved_between_levels = (encoded & kProvenanceMovedBetweenLevels) != 0;
   info.temperature_changed_by_copy =
-      (encoded & kDbOwnershipTemperatureChangedByCopy) != 0;
+      (encoded & kProvenanceTemperatureChangedByCopy) != 0;
   info.temperature_updated_from_file_system =
-      (encoded & kDbOwnershipTemperatureUpdatedFromFileSystem) != 0;
-  info.recorded_by_repair = (encoded & kDbOwnershipRecordedByRepair) != 0;
+      (encoded & kProvenanceTemperatureUpdatedFromFileSystem) != 0;
+  info.recorded_by_repair = (encoded & kProvenanceRecordedByRepair) != 0;
   return info;
 }
 
@@ -199,8 +199,8 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
 void VersionEdit::Clear() { *this = VersionEdit(); }
 
 void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
-                                  uint32_t ownership_info_flags_to_set) {
-  assert((ownership_info_flags_to_set & kDbOwnershipOriginMask) == 0);
+                                  uint32_t provenance_flags_to_set) {
+  assert((provenance_flags_to_set & kProvenanceOriginMask) == 0);
   AddFile(level, f.fd.GetNumber(), f.fd.GetPathId(), f.fd.GetFileSize(),
           f.smallest, f.largest, f.fd.smallest_seqno, f.fd.largest_seqno,
           f.marked_for_compaction, f.temperature, f.oldest_blob_file_number,
@@ -211,7 +211,7 @@ void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
           f.file_open_metadata);
   FileMetaData& added = new_files_.back().second;
   added.db_ownership_start_time = f.db_ownership_start_time;
-  added.db_ownership_info = f.db_ownership_info | ownership_info_flags_to_set;
+  added.data_file_provenance = f.data_file_provenance | provenance_flags_to_set;
 }
 
 bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
@@ -501,11 +501,11 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     PutVarint64(&varint_db_ownership_start_time, f.db_ownership_start_time);
     PutLengthPrefixedSlice(dst, Slice(varint_db_ownership_start_time));
   }
-  if (f.db_ownership_info != 0) {
-    PutVarint32(dst, NewFileCustomTag::kDbOwnershipInfo);
-    std::string varint_db_ownership_info;
-    PutVarint32(&varint_db_ownership_info, f.db_ownership_info);
-    PutLengthPrefixedSlice(dst, Slice(varint_db_ownership_info));
+  if (f.data_file_provenance != 0) {
+    PutVarint32(dst, NewFileCustomTag::kDataFileProvenance);
+    std::string varint_data_file_provenance;
+    PutVarint32(&varint_data_file_provenance, f.data_file_provenance);
+    PutLengthPrefixedSlice(dst, Slice(varint_data_file_provenance));
   }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
@@ -660,9 +660,9 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
             return "invalid DB ownership start time";
           }
           break;
-        case kDbOwnershipInfo:
-          if (!GetVarint32(&field, &f.db_ownership_info)) {
-            return "invalid DB ownership info";
+        case kDataFileProvenance:
+          if (!GetVarint32(&field, &f.data_file_provenance)) {
+            return "invalid data file provenance";
           }
           break;
         default:
@@ -1163,9 +1163,9 @@ std::string VersionEdit::DebugString(bool hex_key) const {
       r.append(" db_ownership_start_time:");
       AppendNumberTo(&r, f.db_ownership_start_time);
     }
-    if (f.db_ownership_info != 0) {
-      r.append(" db_ownership_info:");
-      r.append(DbOwnershipInfoToString(f.db_ownership_info));
+    if (f.data_file_provenance != 0) {
+      r.append(" data_file_provenance:");
+      r.append(DataFileProvenanceToString(f.data_file_provenance));
     }
     r.append(" file_checksum:");
     r.append(Slice(f.file_checksum).ToString(true));
@@ -1311,8 +1311,9 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
       if (f.db_ownership_start_time != kUnknownDbOwnershipStartTime) {
         jw << "DbOwnershipStartTime" << f.db_ownership_start_time;
       }
-      if (f.db_ownership_info != 0) {
-        jw << "DbOwnershipInfo" << DbOwnershipInfoToString(f.db_ownership_info);
+      if (f.data_file_provenance != 0) {
+        jw << "DataFileProvenance"
+           << DataFileProvenanceToString(f.data_file_provenance);
       }
       jw << "FileChecksum" << Slice(f.file_checksum).ToString(true);
       jw << "FileChecksumFuncName" << f.file_checksum_func_name;

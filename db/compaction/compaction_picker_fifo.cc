@@ -115,6 +115,8 @@ Compaction* FIFOCompactionPicker::PickTTLCompaction(
           // written no later than the file's contents were built.
           est_newest_key_time = f->TryGetFileCreationTime();
         }
+        // CheckExternalFileNotTooOld() (reject_too_old_file) mirrors this
+        // estimate
         if (est_newest_key_time == kUnknownNewestKeyTime ||
             est_newest_key_time >= (current_time - mutable_cf_options.ttl)) {
           break;

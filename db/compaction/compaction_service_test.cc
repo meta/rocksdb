@@ -1307,12 +1307,12 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
     db_->GetLiveFilesMetaData(&live_files);
     int num_compaction_outputs = 0;
     for (const auto& f : live_files) {
-      const DbOwnershipInfo info =
-          DbOwnershipInfo::DecodeFrom(f.db_ownership_info);
-      if (info.origin == DbOwnershipInfo::Origin::kCompaction) {
+      const DataFileProvenance info =
+          DataFileProvenance::DecodeFrom(f.data_file_provenance);
+      if (info.origin == DataFileProvenance::Origin::kCompaction) {
         ++num_compaction_outputs;
       } else {
-        EXPECT_EQ(info.origin, DbOwnershipInfo::Origin::kFlush);
+        EXPECT_EQ(info.origin, DataFileProvenance::Origin::kFlush);
       }
       EXPECT_GT(f.db_ownership_start_time, 0U);
       EXPECT_EQ(f.db_ownership_start_time, f.file_creation_time);
