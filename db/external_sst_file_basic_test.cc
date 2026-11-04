@@ -15,6 +15,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/sst_file_writer.h"
+#include "rocksdb/table.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/defer.h"
@@ -273,6 +274,43 @@ TEST_F(ExternalSSTFileBasicTest, Basic) {
   ASSERT_NOK(s) << s.ToString();
   s = sst_file_writer.DeleteRange(Key(100), Key(200));
   ASSERT_NOK(s) << s.ToString();
+
+  DestroyAndRecreateExternalSSTFilesDir();
+}
+
+TEST_F(ExternalSSTFileBasicTest, IngestPlainTableFile) {
+  Options options = CurrentOptions();
+
+  PlainTableOptions plain_table_options;
+  plain_table_options.hash_table_ratio = 0;
+  options.table_factory.reset(NewPlainTableFactory(plain_table_options));
+  options.prefix_extractor.reset();
+  options.allow_mmap_reads = true;
+  DestroyAndReopen(options);
+
+  SstFileWriter sst_file_writer(EnvOptions(), options);
+  std::string file = sst_files_dir_ + "plain_table_file.sst";
+  ASSERT_OK(sst_file_writer.Open(file));
+  for (int k = 0; k < 100; k++) {
+    ASSERT_OK(sst_file_writer.Put(Key(k), Key(k) + "_val"));
+  }
+  ExternalSstFileInfo file_info;
+  ASSERT_OK(sst_file_writer.Finish(&file_info));
+  ASSERT_EQ(file_info.num_entries, 100);
+
+  ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+
+  TablePropertiesCollection props;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+  ASSERT_EQ(props.size(), 1);
+  for (const auto& file_and_props : props) {
+    ASSERT_EQ(file_and_props.second->comparator_name,
+              options.comparator->Name());
+  }
+
+  for (int k = 0; k < 100; k++) {
+    ASSERT_EQ(Get(Key(k)), Key(k) + "_val");
+  }
 
   DestroyAndRecreateExternalSSTFilesDir();
 }

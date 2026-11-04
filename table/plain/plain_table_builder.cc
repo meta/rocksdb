@@ -108,7 +108,9 @@ PlainTableBuilder::PlainTableBuilder(
       moptions_.prefix_extractor != nullptr
           ? moptions_.prefix_extractor->AsString()
           : "nullptr";
-
+  properties_.comparator_name = ioptions_.user_comparator != nullptr
+                                    ? ioptions_.user_comparator->Name()
+                                    : "nullptr";
   std::string val;
   PutFixed32(&val, static_cast<uint32_t>(encoder_.GetEncodingType()));
   properties_
