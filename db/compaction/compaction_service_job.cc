@@ -990,6 +990,12 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     meta.oldest_blob_file_number = file.oldest_blob_file_number;
     meta.oldest_ancestor_time = file.oldest_ancestor_time;
     meta.file_creation_time = file.file_creation_time;
+    // The remote worker wrote the file on this DB's behalf; treat it like a
+    // local compaction output (by the worker's clock, as with its
+    // file_creation_time).
+    meta.db_ownership_start_time = file.file_creation_time;
+    meta.db_ownership_info =
+        DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kCompaction);
     meta.epoch_number = file.epoch_number;
     meta.file_checksum = file.file_checksum;
     meta.file_checksum_func_name = file.file_checksum_func_name;

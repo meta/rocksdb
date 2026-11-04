@@ -95,4 +95,13 @@ public class ImportColumnFamilyTest {
       }
     }
   }
+
+  @Test
+  public void rejectTooOldFileOption() {
+    try (final ImportColumnFamilyOptions options = new ImportColumnFamilyOptions()) {
+      assertThat(options.rejectTooOldFile()).isFalse();
+      options.setRejectTooOldFile(true);
+      assertThat(options.rejectTooOldFile()).isTrue();
+    }
+  }
 }

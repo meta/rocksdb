@@ -828,6 +828,13 @@ Status CheckpointImpl::ExportColumnFamily(
         live_file_metadata.largestkey = file_metadata.largestkey;
         live_file_metadata.oldest_blob_file_number =
             file_metadata.oldest_blob_file_number;
+        live_file_metadata.oldest_ancestor_time =
+            file_metadata.oldest_ancestor_time;
+        live_file_metadata.file_creation_time =
+            file_metadata.file_creation_time;
+        live_file_metadata.db_ownership_start_time =
+            file_metadata.db_ownership_start_time;
+        live_file_metadata.db_ownership_info = file_metadata.db_ownership_info;
         live_file_metadata.epoch_number = file_metadata.epoch_number;
         live_file_metadata.level = level_metadata.level;
         live_file_metadata.smallest = file_metadata.smallest;

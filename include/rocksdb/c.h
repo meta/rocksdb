@@ -6008,6 +6008,14 @@ extern ROCKSDB_LIBRARY_API int
 rocksdb_ingestexternalfileoptions_get_file_opening_threads(
     rocksdb_ingestexternalfileoptions_t* opt);
 
+extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfileoptions_set_reject_too_old_file(
+    rocksdb_ingestexternalfileoptions_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_ingestexternalfileoptions_get_reject_too_old_file(
+    rocksdb_ingestexternalfileoptions_t* opt);
+
 /* OpenAndCompactOptions */
 
 extern ROCKSDB_LIBRARY_API void
@@ -6026,6 +6034,14 @@ rocksdb_open_and_compact_options_get_allow_resumption(
 
 extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_import_column_family_options_get_move_files(
+    rocksdb_import_column_family_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_import_column_family_options_set_reject_too_old_file(
+    rocksdb_import_column_family_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_import_column_family_options_get_reject_too_old_file(
     rocksdb_import_column_family_options_t* opt);
 
 /* SizeApproximationOptions */

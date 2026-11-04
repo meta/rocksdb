@@ -13,6 +13,7 @@
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
 #include "db/job_context.h"
+#include "env/composite_env_wrapper.h"
 #include "file/filename.h"
 #include "options/options_helper.h"
 #include "port/port.h"
@@ -21,6 +22,7 @@
 #include "rocksdb/sst_file_writer.h"
 #include "table/format.h"
 #include "table/prepared_file_info.h"
+#include "test_util/mock_time_env.h"
 #include "test_util/testutil.h"
 #include "util/defer.h"
 #include "util/random.h"
@@ -5810,6 +5812,420 @@ TEST_P(IngestDBGeneratedFileTest2, ZeroAndNonZeroSeqno) {
     temp_db.reset();
     ASSERT_OK(DestroyDB(temp_db_name, temp_db_opts));
   } while (ChangeOptions(kSkipPlainTable | kSkipFIFOCompaction));
+}
+
+// Tests for the file times recorded for ingested files and for
+// IngestExternalFileOptions::reject_too_old_file
+class ExternalSSTFileTimeTest : public ExternalSSTFileTestBase {
+ protected:
+  uint64_t Now() {
+    int64_t now = 0;
+    EXPECT_OK(env_->GetCurrentTime(&now));
+    return static_cast<uint64_t>(now);
+  }
+
+  // Writes a single-key SST file with SstFileWriter at `write_time` (0 means
+  // unknown) according to the writer's clock.
+  std::string WriteFileAt(const Options& options, uint64_t write_time,
+                          const std::string& key) {
+    auto clock = std::make_shared<MockSystemClock>(env_->GetSystemClock());
+    clock->SetCurrentTime(write_time);
+    CompositeEnvWrapper writer_env(env_, clock);
+    Options writer_options = options;
+    writer_options.env = &writer_env;
+    std::string file = sst_files_dir_ + key + ".sst";
+    SstFileWriter writer(EnvOptions(), writer_options);
+    EXPECT_OK(writer.Open(file));
+    EXPECT_OK(writer.Put(key, "val"));
+    EXPECT_OK(writer.Finish());
+    return file;
+  }
+
+  // MANIFEST record of the file in `cfh` whose smallest user key is `key`
+  FileMetaData ManifestRecord(ColumnFamilyHandle* cfh, const std::string& key) {
+    std::vector<std::vector<FileMetaData>> metadata;
+    dbfull()->TEST_GetFilesMetaData(cfh, &metadata);
+    for (const auto& level : metadata) {
+      for (const auto& f : level) {
+        if (f.smallest.user_key() == key) {
+          return f;
+        }
+      }
+    }
+    ADD_FAILURE() << "No file starting with " << key;
+    return FileMetaData();
+  }
+
+  // MANIFEST file_creation_time and oldest_ancestor_time of the file in `cfh`
+  // whose smallest user key is `key`
+  std::pair<uint64_t, uint64_t> ManifestTimes(ColumnFamilyHandle* cfh,
+                                              const std::string& key) {
+    const FileMetaData f = ManifestRecord(cfh, key);
+    return {f.file_creation_time, f.oldest_ancestor_time};
+  }
+
+  size_t NumLiveFiles() {
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    return files.size();
+  }
+};
+
+TEST_F(ExternalSSTFileTimeTest, KeepRecordedTimes) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+
+  const uint64_t start = Now();
+  const uint64_t old_time = start - 5000;
+  std::string old_file = WriteFileAt(options, old_time, "a");
+  std::string unknown_time_file = WriteFileAt(options, 0, "b");
+  std::string future_file = WriteFileAt(options, start + 5000, "c");
+  ASSERT_OK(db_->IngestExternalFile({old_file, unknown_time_file, future_file},
+                                    IngestExternalFileOptions()));
+  const uint64_t end = Now();
+
+  // SstFileWriter files record no oldest ancestor time, so it matches the
+  // resolved file_creation_time
+  auto times = ManifestTimes(db_->DefaultColumnFamily(), "a");
+  EXPECT_EQ(times.first, old_time);
+  EXPECT_EQ(times.second, old_time);
+
+  // Unknown or future times are replaced with the ingestion time
+  for (const char* key : {"b", "c"}) {
+    SCOPED_TRACE(key);
+    times = ManifestTimes(db_->DefaultColumnFamily(), key);
+    EXPECT_GE(times.first, start);
+    EXPECT_LE(times.first, end);
+    EXPECT_EQ(times.second, times.first);
+  }
+}
+
+TEST_F(ExternalSSTFileTimeTest, KeepDBGeneratedFileTimes) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  env_->SetMockSleep();
+  CreateAndReopenWithCF({"src"}, options);
+
+  // Flush and then compact in a source CF so that its file has an oldest
+  // ancestor time older than its file creation time
+  ASSERT_OK(Put(1, "a", "val"));
+  ASSERT_OK(Flush(1));
+  env_->MockSleepForSeconds(1000);
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, handles_[1], nullptr, nullptr));
+  std::vector<LiveFileMetaData> live_meta;
+  db_->GetLiveFilesMetaData(&live_meta);
+  ASSERT_EQ(live_meta.size(), 1U);
+  const std::string src_file =
+      live_meta[0].directory + "/" + live_meta[0].relative_filename;
+  TablePropertiesCollection src_props;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(handles_[1], &src_props));
+  ASSERT_EQ(src_props.size(), 1U);
+  const TableProperties& props = *src_props.begin()->second;
+  ASSERT_GT(props.oldest_ancestor_time, 0U);
+  ASSERT_GE(props.file_creation_time, props.oldest_ancestor_time + 1000);
+
+  env_->MockSleepForSeconds(1000);
+  IngestExternalFileOptions ifo;
+  ifo.allow_db_generated_files = true;
+  ifo.snapshot_consistency = false;
+  ASSERT_OK(db_->IngestExternalFile(handles_[0], {src_file}, ifo));
+
+  auto times = ManifestTimes(handles_[0], "a");
+  EXPECT_EQ(times.first, props.file_creation_time);
+  EXPECT_EQ(times.second, props.oldest_ancestor_time);
+}
+
+TEST_F(ExternalSSTFileTimeTest, PeriodicCompactionFromWriteTime) {
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleLevel;
+  options.periodic_compaction_seconds = 10000;
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+
+  std::atomic<int> periodic_compactions{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+        Compaction* c = static_cast<Compaction*>(arg);
+        if (c->compaction_reason() == CompactionReason::kPeriodicCompaction) {
+          ++periodic_compactions;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::string file = WriteFileAt(options, Now(), "a");
+  env_->MockSleepForSeconds(6000);
+  ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  EXPECT_EQ(periodic_compactions.load(), 0);
+
+  // Due for periodic compaction relative to when the file was written, though
+  // not relative to when it was ingested
+  env_->MockSleepForSeconds(5000);
+  // Recompute files marked for compaction
+  ASSERT_OK(Put("b", "val"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  EXPECT_EQ(periodic_compactions.load(), 1);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(ExternalSSTFileTimeTest, RejectTooOldFile) {
+  for (CompactionStyle style :
+       {kCompactionStyleLevel, kCompactionStyleUniversal,
+        kCompactionStyleFIFO}) {
+    SCOPED_TRACE("compaction_style=" + std::to_string(static_cast<int>(style)));
+    Options options = CurrentOptions();
+    options.compaction_style = style;
+    options.disable_auto_compactions = true;
+    if (style == kCompactionStyleFIFO) {
+      options.ttl = 10000;
+      options.max_open_files = -1;
+    } else {
+      options.periodic_compaction_seconds = 10000;
+    }
+    env_->SetMockSleep();
+    DestroyAndReopen(options);
+    DestroyAndRecreateExternalSSTFilesDir();
+
+    const uint64_t now = Now();
+    std::string too_old = WriteFileAt(options, now - 10100, "a");
+    std::string not_too_old = WriteFileAt(options, now - 9900, "b");
+    std::string unknown_time = WriteFileAt(options, 0, "c");
+
+    IngestExternalFileOptions ifo;
+    ifo.reject_too_old_file = true;
+    Status s = db_->IngestExternalFile({not_too_old, too_old}, ifo);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_EQ(NumLiveFiles(), 0U);
+
+    ASSERT_OK(db_->IngestExternalFile({not_too_old, unknown_time}, ifo));
+    ASSERT_EQ(NumLiveFiles(), 2U);
+
+    ASSERT_OK(db_->IngestExternalFile({too_old}, IngestExternalFileOptions()));
+    ASSERT_EQ(NumLiveFiles(), 3U);
+  }
+}
+
+// An SstFileWriter file's creation time is when it was finished, so that it is
+// no earlier than when any entry was added
+TEST_F(ExternalSSTFileTimeTest, CreationTimeIsWhenFileIsFinished) {
+  Options options = CurrentOptions();
+  auto clock = std::make_shared<MockSystemClock>(env_->GetSystemClock());
+  clock->SetCurrentTime(1000);
+  CompositeEnvWrapper writer_env(env_, clock);
+  Options writer_options = options;
+  writer_options.env = &writer_env;
+  const std::string file = sst_files_dir_ + "a.sst";
+  SstFileWriter writer(EnvOptions(), writer_options);
+  ASSERT_OK(writer.Open(file));
+  clock->SetCurrentTime(2000);
+  ASSERT_OK(writer.Put("a", "val"));
+  clock->SetCurrentTime(3000);
+  ASSERT_OK(writer.Finish());
+
+  SstFileReader reader(options);
+  ASSERT_OK(reader.Open(file));
+  EXPECT_EQ(reader.GetTableProperties()->file_creation_time, 3000U);
+}
+
+// For FIFO compaction, reject_too_old_file judges a file by its newest key
+// time when known, as FIFO TTL compaction does, even if the file was built
+// recently
+TEST_F(ExternalSSTFileTimeTest, RejectFIFOFileWithOldNewestKey) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.max_open_files = -1;
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+  Options fifo_options = options;
+  fifo_options.compaction_style = kCompactionStyleFIFO;
+  fifo_options.num_levels = 1;
+  fifo_options.ttl = 10000;
+  CreateColumnFamilies({"fifo"}, fifo_options);
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "fifo"},
+                           std::vector<Options>{options, fifo_options});
+
+  // Compacting old data builds a new file with the same newest key time
+  ASSERT_OK(Put("a", "val"));
+  ASSERT_OK(Flush());
+  env_->MockSleepForSeconds(20000);
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, handles_[0], nullptr, nullptr));
+  TablePropertiesCollection props;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(handles_[0], &props));
+  ASSERT_EQ(props.size(), 1U);
+  const TableProperties& file_props = *props.begin()->second;
+  ASSERT_GT(file_props.newest_key_time, 0U);
+  ASSERT_GE(file_props.file_creation_time, file_props.newest_key_time + 20000);
+  const std::string file = props.begin()->first;
+
+  IngestExternalFileOptions ifo;
+  ifo.allow_db_generated_files = true;
+  ifo.snapshot_consistency = false;
+  ifo.reject_too_old_file = true;
+  Status s = db_->IngestExternalFile(handles_[1], {file}, ifo);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_EQ(NumTableFilesAtLevel(0, 1), 0);
+
+  ifo.reject_too_old_file = false;
+  ASSERT_OK(db_->IngestExternalFile(handles_[1], {file}, ifo));
+  ASSERT_EQ(NumTableFilesAtLevel(0, 1), 1);
+}
+
+// SstFileWriter files carry neither the newest key time nor the oldest
+// ancestor time table property, which FIFO TTL compaction looks at. Such a
+// file, and every newer file, should still expire by TTL.
+TEST_F(ExternalSSTFileTimeTest, FIFOTtlDeletesIngestedFile) {
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleFIFO;
+  options.ttl = 10000;
+  options.max_open_files = -1;
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+
+  std::string file = WriteFileAt(options, Now(), "a");
+  ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+  ASSERT_OK(Put("b", "val"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(NumLiveFiles(), 2U);
+
+  env_->MockSleepForSeconds(11000);
+  // Flush to trigger compaction
+  ASSERT_OK(Put("c", "val"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  EXPECT_EQ(NumLiveFiles(), 1U);
+  EXPECT_EQ(Get("a"), "NOT_FOUND");
+  EXPECT_EQ(Get("b"), "NOT_FOUND");
+  EXPECT_EQ(Get("c"), "val");
+}
+
+TEST_F(ExternalSSTFileTimeTest, RecordsDbOwnership) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  env_->SetMockSleep();
+  CreateAndReopenWithCF({"src"}, options);
+  DbOwnershipInfo ingested;
+  ingested.origin = DbOwnershipInfo::Origin::kIngestion;
+  const uint64_t old_time = Now() - 5000;
+
+  // The DB began holding the file when it was ingested, regardless of when
+  // the file was written
+  std::string file = WriteFileAt(options, old_time, "a");
+  uint64_t start = Now();
+  ASSERT_OK(db_->IngestExternalFile(handles_[0], {file},
+                                    IngestExternalFileOptions()));
+  FileMetaData f = ManifestRecord(handles_[0], "a");
+  EXPECT_EQ(f.file_creation_time, old_time);
+  EXPECT_GE(f.db_ownership_start_time, start);
+  EXPECT_LE(f.db_ownership_start_time, Now());
+  EXPECT_EQ(DbOwnershipInfo::DecodeFrom(f.db_ownership_info), ingested);
+
+  // With two-phase ingestion, from the prepare phase
+  file = WriteFileAt(options, old_time, "b");
+  start = Now();
+  std::unique_ptr<FileIngestionHandle> handle;
+  ASSERT_OK(db_->PrepareFileIngestion(handles_[0], {file},
+                                      IngestExternalFileOptions(), &handle));
+  const uint64_t prepared = Now();
+  env_->MockSleepForSeconds(1000);
+  ASSERT_OK(db_->CommitFileIngestionHandle(std::move(handle)));
+  f = ManifestRecord(handles_[0], "b");
+  EXPECT_EQ(f.file_creation_time, old_time);
+  EXPECT_GE(f.db_ownership_start_time, start);
+  EXPECT_LE(f.db_ownership_start_time, prepared);
+  EXPECT_EQ(DbOwnershipInfo::DecodeFrom(f.db_ownership_info), ingested);
+
+  // A file generated by a DB (here, another column family)
+  ASSERT_OK(Put(1, "c", "val"));
+  ASSERT_OK(Flush(1));
+  const FileMetaData src = ManifestRecord(handles_[1], "c");
+  ColumnFamilyMetaData src_meta;
+  db_->GetColumnFamilyMetaData(handles_[1], &src_meta);
+  ASSERT_EQ(src_meta.levels[0].files.size(), 1U);
+  const SstFileMetaData& src_file = src_meta.levels[0].files[0];
+  env_->MockSleepForSeconds(1000);
+  start = Now();
+  IngestExternalFileOptions ifo;
+  ifo.allow_db_generated_files = true;
+  ifo.snapshot_consistency = false;
+  ASSERT_OK(db_->IngestExternalFile(
+      handles_[0], {src_file.directory + "/" + src_file.relative_filename},
+      ifo));
+  f = ManifestRecord(handles_[0], "c");
+  EXPECT_EQ(f.file_creation_time, src.file_creation_time);
+  EXPECT_GE(f.db_ownership_start_time, start);
+  EXPECT_EQ(DbOwnershipInfo::DecodeFrom(f.db_ownership_info), ingested);
+}
+
+// bottommost_file_compaction_delay counts from when the DB began holding a
+// file, which for an ingested file is when it was ingested, not when its
+// contents were built
+TEST_F(ExternalSSTFileTimeTest, BottommostCompactionDelayFromIngestion) {
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleLevel;
+  options.bottommost_file_compaction_delay = 5000;
+  env_->SetMockSleep();
+  CreateAndReopenWithCF({"src"}, options);
+
+  // A DB-generated file with nonzero sequence numbers, which ingestion keeps
+  ASSERT_OK(Put(1, "a", "val"));
+  ASSERT_OK(Put(1, "b", "val"));
+  ASSERT_OK(Flush(1));
+  // Only compactions of the ingested file are of interest
+  ASSERT_OK(
+      db_->SetOptions(handles_[1], {{"disable_auto_compactions", "true"}}));
+  ColumnFamilyMetaData src_meta;
+  db_->GetColumnFamilyMetaData(handles_[1], &src_meta);
+  ASSERT_EQ(src_meta.levels[0].files.size(), 1U);
+  const SstFileMetaData& src_file = src_meta.levels[0].files[0];
+  ASSERT_GT(src_file.largest_seqno, 0U);
+  // Keeps the file from being eligible for bottommost compaction until
+  // released
+  const Snapshot* snapshot = db_->GetSnapshot();
+
+  env_->MockSleepForSeconds(10000);
+  IngestExternalFileOptions ifo;
+  ifo.allow_db_generated_files = true;
+  ifo.snapshot_consistency = false;
+  ASSERT_OK(db_->IngestExternalFile(
+      handles_[0], {src_file.directory + "/" + src_file.relative_filename},
+      ifo));
+  ASSERT_EQ(NumTableFilesAtLevel(options.num_levels - 1, 0), 1);
+
+  std::atomic<int> bottommost_compactions{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+        Compaction* c = static_cast<Compaction*>(arg);
+        if (c->compaction_reason() == CompactionReason::kBottommostFiles) {
+          ++bottommost_compactions;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Bump the published sequence number so that releasing the snapshot
+  // advances the oldest snapshot past the file's sequence numbers
+  ASSERT_OK(Put("y", "val"));
+  db_->ReleaseSnapshot(snapshot);
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  EXPECT_EQ(bottommost_compactions.load(), 0);
+
+  env_->MockSleepForSeconds(6000);
+  // Recompute files marked for compaction
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  EXPECT_EQ(bottommost_compactions.load(), 1);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 }  // namespace ROCKSDB_NAMESPACE

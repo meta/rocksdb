@@ -140,8 +140,7 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
       const std::string& _column_family_name, int _level,
       const int64_t _newest_key_time, bool _is_bottommost = false,
       TableFileCreationReason _reason = TableFileCreationReason::kMisc,
-      const int64_t _oldest_key_time = 0,
-      const uint64_t _file_creation_time = 0, const std::string& _db_id = "",
+      const int64_t _oldest_key_time = 0, const std::string& _db_id = "",
       const std::string& _db_session_id = "",
       const uint64_t _target_file_size = 0, const uint64_t _cur_file_num = 0,
       const SequenceNumber _last_level_inclusive_max_seqno_threshold =
@@ -163,7 +162,6 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
         oldest_key_time(_oldest_key_time),
         newest_key_time(_newest_key_time),
         target_file_size(_target_file_size),
-        file_creation_time(_file_creation_time),
         db_id(_db_id),
         db_session_id(_db_session_id),
         is_bottommost(_is_bottommost),
@@ -185,7 +183,6 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
   const int64_t oldest_key_time;
   const int64_t newest_key_time;
   const uint64_t target_file_size;
-  const uint64_t file_creation_time;
   const std::string db_id;
   const std::string db_session_id;
   // BEGIN for FilterBuildingContext

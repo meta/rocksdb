@@ -1044,6 +1044,9 @@ Status FlushJob::WriteLevel0Table() {
           &oldest_ancestor_time);
       meta_.oldest_ancestor_time = oldest_ancestor_time;
       meta_.file_creation_time = current_time;
+      meta_.db_ownership_start_time = current_time;
+      meta_.db_ownership_info =
+          DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kFlush);
 
       uint64_t memtable_payload_bytes = 0;
       uint64_t memtable_garbage_bytes = 0;
@@ -1060,9 +1063,8 @@ Status FlushJob::WriteLevel0Table() {
           output_compression_, mutable_cf_options_.compression_opts,
           cfd_->GetID(), cfd_->GetName(), 0 /* level */,
           current_time /* newest_key_time */, false /* is_bottommost */,
-          TableFileCreationReason::kFlush, oldest_key_time, current_time,
-          db_id_, db_session_id_, 0 /* target_file_size */,
-          meta_.fd.GetNumber(),
+          TableFileCreationReason::kFlush, oldest_key_time, db_id_,
+          db_session_id_, 0 /* target_file_size */, meta_.fd.GetNumber(),
           preclude_last_level_min_seqno_ == kMaxSequenceNumber
               ? preclude_last_level_min_seqno_
               : std::min(earliest_snapshot_, preclude_last_level_min_seqno_),

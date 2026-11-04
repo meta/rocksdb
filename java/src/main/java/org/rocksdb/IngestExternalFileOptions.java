@@ -157,6 +157,39 @@ public class IngestExternalFileOptions extends RocksObject {
     return this;
   }
 
+  /**
+   * Returns true if ingestion rejects files that are already too old for
+   * the column family.
+   * <p>
+   * See {@link #setRejectTooOldFile(boolean)}.
+   *
+   * @return true if too-old files are rejected.
+   */
+  public boolean rejectTooOldFile() {
+    return rejectTooOldFile(nativeHandle_);
+  }
+
+  /**
+   * If true, ingestion fails (and no files are ingested) if any file is
+   * already too old for the column family to keep without recompaction or
+   * deletion. A file is too old if the age of its contents, from the creation
+   * time recorded in the file, exceeds the effective
+   * periodic_compaction_seconds (leveled or universal compaction), or if the
+   * age of its newest data, from the newest key time recorded in the file or
+   * else its creation time, exceeds ttl (FIFO compaction). A limit of 0
+   * rejects nothing, and a file without the recorded time is not rejected.
+   * <p>
+   * Default: false
+   *
+   * @param rejectTooOldFile true to reject files that are too old
+   *
+   * @return the reference to the current IngestExternalFileOptions.
+   */
+  public IngestExternalFileOptions setRejectTooOldFile(final boolean rejectTooOldFile) {
+    setRejectTooOldFile(nativeHandle_, rejectTooOldFile);
+    return this;
+  }
+
   private static native long newIngestExternalFileOptions();
   private static native long newIngestExternalFileOptions(final boolean moveFiles,
       final boolean snapshotConsistency, final boolean allowGlobalSeqNo,
@@ -180,4 +213,6 @@ public class IngestExternalFileOptions extends RocksObject {
       final long handle, final boolean allowBlockingFlush);
   private static native boolean ingestBehind(final long handle);
   private static native void setIngestBehind(final long handle, final boolean ingestBehind);
+  private static native boolean rejectTooOldFile(final long handle);
+  private static native void setRejectTooOldFile(final long handle, final boolean rejectTooOldFile);
 }

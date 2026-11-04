@@ -23,10 +23,12 @@
 #include "port/malloc.h"
 #include "rocksdb/advanced_cache.h"
 #include "rocksdb/advanced_options.h"
+#include "rocksdb/metadata.h"
 #include "table/table_reader.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
 #include "util/autovector.h"
+#include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -116,6 +118,8 @@ enum NewFileCustomTag : uint32_t {
   kTailSize = 15,
   kUserDefinedTimestampsPersisted = 16,
   kFileOpenMetadata = 17,
+  kDbOwnershipStartTime = 18,
+  kDbOwnershipInfo = 19,
 
   // If this bit for the custom tag is set, opening DB should fail if
   // we don't know this field.
@@ -131,10 +135,31 @@ constexpr uint64_t kFileNumberMask = 0x3FFFFFFFFFFFFFFF;
 constexpr uint64_t kUnknownOldestAncestorTime = 0;
 constexpr uint64_t kUnknownNewestKeyTime = 0;
 constexpr uint64_t kUnknownFileCreationTime = 0;
+constexpr uint64_t kUnknownDbOwnershipStartTime = 0;
 constexpr uint64_t kUnknownEpochNumber = 0;
 // If `Options::cf_allow_ingest_behind` is true, this epoch number
 // will be dedicated to files ingested behind.
 constexpr uint64_t kReservedEpochNumberForFileIngestedBehind = 1;
+
+// Bit layout of FileMetaData::db_ownership_info (decoded form:
+// DbOwnershipInfo), LSB first:
+//  * bits 0-7: DbOwnershipInfo::Origin (values above kImport reserved)
+//  * bits 8-11: the flags below
+//  * bits 12-31: reserved
+// Readers ignore bits they don't recognize, and code carrying a file's record
+// over (moves, MANIFEST rewrites, copies) preserves them, by updating the
+// packed value rather than re-encoding a decoded one.
+constexpr uint32_t kDbOwnershipOriginMask = 0xff;
+constexpr uint32_t kDbOwnershipMovedBetweenLevels = uint32_t{1} << 8;
+constexpr uint32_t kDbOwnershipTemperatureChangedByCopy = uint32_t{1} << 9;
+constexpr uint32_t kDbOwnershipTemperatureUpdatedFromFileSystem = uint32_t{1}
+                                                                  << 10;
+constexpr uint32_t kDbOwnershipRecordedByRepair = uint32_t{1} << 11;
+
+// Packed db_ownership_info for a file this DB got via `origin`, with no flags.
+inline uint32_t DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin origin) {
+  return lossless_cast<uint32_t>(origin);
+}
 
 uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id);
 
@@ -280,6 +305,11 @@ struct FileMetaData {
                                        // compact this file.
   Temperature temperature = Temperature::kUnknown;
 
+  // How this DB got the file's contents and what has happened to the file
+  // since, packed as described by DbOwnershipInfo (include/rocksdb/metadata.h).
+  // 0 means unknown. Persisted in the MANIFEST only.
+  uint32_t db_ownership_info = 0;
+
   // Used only in BlobDB. The file number of the oldest blob file this SST file
   // refers to. 0 is an invalid value; BlobDB numbers the files starting from 1.
   uint64_t oldest_blob_file_number = kInvalidBlobFileNumber;
@@ -296,8 +326,15 @@ struct FileMetaData {
   // 0 means the information is not available.
   uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
 
-  // Unix time when the SST file is created.
+  // Unix time when the SST file's contents were built (by flush or
+  // compaction, in this DB or another, or by SstFileWriter). Preserved when
+  // the file is moved between levels or copied to another temperature.
   uint64_t file_creation_time = kUnknownFileCreationTime;
+
+  // Unix time when this DB began holding this physical file (this file
+  // number); see SstFileMetaData::db_ownership_start_time. Persisted in the
+  // MANIFEST only. kUnknownDbOwnershipStartTime if unknown.
+  uint64_t db_ownership_start_time = kUnknownDbOwnershipStartTime;
 
   // The order of a file being flushed or ingested/imported.
   // Compaction output file will be assigned with the minimum `epoch_number`
@@ -420,6 +457,18 @@ struct FileMetaData {
       return reader->GetTableProperties()->file_creation_time;
     }
     return kUnknownFileCreationTime;
+  }
+
+  // When this DB began holding this file, if recorded. Otherwise falls back on
+  // TryGetFileCreationTime(): for files recorded by older RocksDB versions,
+  // that was the time of ingestion, import or temperature-change copy for
+  // files that arrived that way, and is the creation time for files built by
+  // this DB.
+  uint64_t TryGetDbOwnershipStartTime() {
+    if (db_ownership_start_time != kUnknownDbOwnershipStartTime) {
+      return db_ownership_start_time;
+    }
+    return TryGetFileCreationTime();
   }
 
   // Tries to get the newest key time from the current file
@@ -867,6 +916,15 @@ class VersionEdit {
       SetLastSequence(f.fd.largest_seqno);
     }
   }
+
+  // Add a file that is already in the LSM under the same file number, such as
+  // a file being moved to another level (paired with DeleteFile()) or recorded
+  // in a new MANIFEST, preserving all of its persisted metadata. In-memory-only
+  // state (refs, being_compacted, sampled stats, pinned table reader) starts
+  // fresh. `ownership_info_flags_to_set` are DbOwnershipInfo flag bits to set
+  // on the added file, recording what is happening to it (0 for none).
+  void AddExistingFile(int level, const FileMetaData& f,
+                       uint32_t ownership_info_flags_to_set);
 
   const NewFiles& GetNewFiles() const { return new_files_; }
 

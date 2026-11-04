@@ -226,14 +226,14 @@ class Repairer {
     if (status.ok()) {
       // Need to scan existing SST files first so the column families are
       // created before we process WAL files
-      ExtractMetaData();
+      ExtractMetaData(/*tables_built_from_wals=*/false);
 
       // ExtractMetaData() uses table_fds_ to know which SST files' metadata to
       // extract -- we need to clear it here since metadata for existing SST
       // files has been extracted already
       table_fds_.clear();
       ConvertLogFilesToTables();
-      ExtractMetaData();
+      ExtractMetaData(/*tables_built_from_wals=*/true);
       status = AddTables();
     }
     if (status.ok()) {
@@ -487,8 +487,8 @@ class Repairer {
           default_compression, cfd->GetID(), cfd->GetName(), -1 /* level */,
           current_time /* newest_key_time */, false /* is_bottommost */,
           TableFileCreationReason::kRecovery, 0 /* oldest_key_time */,
-          0 /* file_creation_time */, "DB Repairer" /* db_id */, db_session_id_,
-          0 /*target_file_size*/, meta.fd.GetNumber(),
+          "DB Repairer" /* db_id */, db_session_id_, 0 /*target_file_size*/,
+          meta.fd.GetNumber(),
           kMaxSequenceNumber /*last_level_inclusive_max_seqno_threshold*/,
           dbname_ /*db_name*/);
 
@@ -523,7 +523,9 @@ class Repairer {
     return status;
   }
 
-  void ExtractMetaData() {
+  // `tables_built_from_wals`: whether table_fds_ are tables this repair built
+  // from WAL files, rather than tables that existed before the repair.
+  void ExtractMetaData(bool tables_built_from_wals) {
     for (size_t i = 0; i < table_fds_.size(); i++) {
       TableInfo t;
       t.meta.fd = table_fds_[i];
@@ -538,6 +540,14 @@ class Repairer {
                        file_num_buf, status.ToString().c_str());
         ArchiveFile(fname);
       } else {
+        // The MANIFEST being rebuilt held the ownership start time and origin
+        // of tables that existed before the repair, so those are unknown.
+        t.meta.db_ownership_info = kDbOwnershipRecordedByRepair;
+        if (tables_built_from_wals) {
+          t.meta.db_ownership_info |=
+              DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kFlush);
+          t.meta.db_ownership_start_time = t.meta.file_creation_time;
+        }
         tables_.push_back(t);
       }
     }
@@ -586,6 +596,7 @@ class Repairer {
             AddColumnFamily(props->column_family_name, t->column_family_id);
       }
       t->meta.oldest_ancestor_time = props->oldest_ancestor_time;
+      t->meta.file_creation_time = props->file_creation_time;
       t->meta.user_defined_timestamps_persisted =
           static_cast<bool>(props->user_defined_timestamps_persisted);
     }
@@ -717,17 +728,7 @@ class Repairer {
       VersionEdit dummy_edit;
       for (const auto* table : cf_id_and_tables.second) {
         // TODO(opt): separate out into multiple levels
-        const auto& meta = table->meta;
-        dummy_edit.AddFile(
-            0, meta.fd.GetNumber(), meta.fd.GetPathId(), meta.fd.GetFileSize(),
-            meta.smallest, meta.largest, meta.fd.smallest_seqno,
-            meta.fd.largest_seqno, meta.marked_for_compaction, meta.temperature,
-            meta.oldest_blob_file_number, meta.oldest_ancestor_time,
-            meta.file_creation_time, meta.epoch_number, meta.file_checksum,
-            meta.file_checksum_func_name, meta.unique_id,
-            meta.compensated_range_deletion_size, meta.tail_size,
-            meta.user_defined_timestamps_persisted, meta.min_timestamp,
-            meta.max_timestamp);
+        dummy_edit.AddFile(0, table->meta);
       }
       s = dummy_version_builder.Apply(&dummy_edit);
       if (s.ok()) {

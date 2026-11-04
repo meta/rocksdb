@@ -2020,7 +2020,6 @@ struct BlockBasedTableBuilder::Rep {
     props.column_family_name = tbo.column_family_name;
     props.oldest_key_time = tbo.oldest_key_time;
     props.newest_key_time = tbo.newest_key_time;
-    props.file_creation_time = tbo.file_creation_time;
     props.orig_file_number = tbo.cur_file_num;
     props.db_id = tbo.db_id;
     props.db_session_id = tbo.db_session_id;
@@ -4049,6 +4048,14 @@ Status BlockBasedTableBuilder::Finish() {
   r->AutoSkipWriteBack();
 
   r->props.tail_start_offset = r->offset.LoadRelaxed();
+
+  // Read the clock when finishing rather than when starting, so that this
+  // time is no earlier than when any entry was added, even for a builder whose
+  // input arrives over a long time (e.g. SstFileWriter).
+  int64_t now = 0;
+  if (r->ioptions.clock->GetCurrentTime(&now).ok()) {
+    r->props.file_creation_time = lossless_cast<uint64_t>(now);
+  }
 
   uint64_t last_estimated_tail_size = EstimatedTailSize();
 

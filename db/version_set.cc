@@ -2247,6 +2247,8 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
           file->file_checksum, file->file_checksum_func_name);
       files.back().num_entries = file->num_entries;
       files.back().num_deletions = file->num_deletions;
+      files.back().db_ownership_start_time = file->db_ownership_start_time;
+      files.back().db_ownership_info = file->db_ownership_info;
       files.back().smallest = file->smallest.Encode().ToString();
       files.back().largest = file->largest.Encode().ToString();
       level_size += file->fd.GetFileSize();
@@ -2330,6 +2332,8 @@ void Version::GetColumnFamilyMetaData(
           file->file_checksum, file->file_checksum_func_name);
       files.back().num_entries = file->num_entries;
       files.back().num_deletions = file->num_deletions;
+      files.back().db_ownership_start_time = file->db_ownership_start_time;
+      files.back().db_ownership_info = file->db_ownership_info;
       files.back().smallest = file->smallest.Encode().ToString();
       files.back().largest = file->largest.Encode().ToString();
       level_size += file->fd.GetFileSize();
@@ -4578,9 +4582,11 @@ void VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction(
   if (allow_ingest_behind) {
     return;
   }
-  // If a file's creation time is larger than creation_time_ub,
-  // it is too new to be marked for compaction.
-  int64_t creation_time_ub = 0;
+  // If this DB began holding a file later than ownership_start_time_ub, it is
+  // too new to be marked for compaction. (Measuring from when the DB took the
+  // file rather than from file creation means a file ingested with old
+  // contents still gets the delay.)
+  int64_t ownership_start_time_ub = 0;
   bool needs_delay = bottommost_file_compaction_delay_ > 0;
   if (needs_delay) {
     int64_t current_time = 0;
@@ -4589,7 +4595,7 @@ void VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction(
     // We will treat it as is and treat all files as too new.
     // The subtraction will not underflow since
     // bottommost_file_compaction_delay_ is of type uint32_t.
-    creation_time_ub =
+    ownership_start_time_ub =
         current_time - static_cast<int64_t>(bottommost_file_compaction_delay_);
   }
 
@@ -4646,11 +4652,11 @@ void VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction(
 
         if (!needs_delay) {
           bottommost_files_marked_for_compaction_.push_back(level_and_file);
-        } else if (creation_time_ub > 0) {
-          int64_t creation_time = static_cast<int64_t>(
-              level_and_file.second->TryGetFileCreationTime());
-          if (creation_time == kUnknownFileCreationTime ||
-              creation_time <= creation_time_ub) {
+        } else if (ownership_start_time_ub > 0) {
+          int64_t ownership_start_time = static_cast<int64_t>(
+              level_and_file.second->TryGetDbOwnershipStartTime());
+          if (ownership_start_time == kUnknownDbOwnershipStartTime ||
+              ownership_start_time <= ownership_start_time_ub) {
             bottommost_files_marked_for_compaction_.push_back(level_and_file);
           } else {
             // Just ignore this file for both
@@ -4662,8 +4668,8 @@ void VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction(
             // bottommost_files_mark_threshold_ is released.
           }
         } else {
-          // creation_time_ub <= 0, all files are too new to be marked for
-          // compaction.
+          // ownership_start_time_ub <= 0, all files are too new to be marked
+          // for compaction.
         }
       } else {
         bottommost_files_mark_threshold_ =
@@ -8018,21 +8024,10 @@ Status VersionSet::WriteCurrentStateToManifest(
 
         for (const auto& f : level_files) {
           assert(f);
-          // Preserve file_open_metadata so live SSTs still benefit from
-          // fast_sst_open after a MANIFEST rotation. Without this, the
-          // rotated MANIFEST snapshot drops kFileOpenMetadata for unchanged
-          // files and their fast-open advantage is lost until they are
-          // rewritten.
-          edit.AddFile(level, f->fd.GetNumber(), f->fd.GetPathId(),
-                       f->fd.GetFileSize(), f->smallest, f->largest,
-                       f->fd.smallest_seqno, f->fd.largest_seqno,
-                       f->marked_for_compaction, f->temperature,
-                       f->oldest_blob_file_number, f->oldest_ancestor_time,
-                       f->file_creation_time, f->epoch_number, f->file_checksum,
-                       f->file_checksum_func_name, f->unique_id,
-                       f->compensated_range_deletion_size, f->tail_size,
-                       f->user_defined_timestamps_persisted, f->min_timestamp,
-                       f->max_timestamp, f->file_open_metadata);
+          // Preserves all persisted metadata, including file_open_metadata
+          // so live SSTs still benefit from fast_sst_open after a MANIFEST
+          // rotation.
+          edit.AddExistingFile(level, *f, /*ownership_info_flags_to_set=*/0);
         }
       }
 
@@ -8611,6 +8606,8 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
         filemetadata.temperature = file->temperature;
         filemetadata.oldest_ancestor_time = file->TryGetOldestAncestorTime();
         filemetadata.file_creation_time = file->TryGetFileCreationTime();
+        filemetadata.db_ownership_start_time = file->db_ownership_start_time;
+        filemetadata.db_ownership_info = file->db_ownership_info;
         filemetadata.epoch_number = file->epoch_number;
         metadata->push_back(filemetadata);
       }

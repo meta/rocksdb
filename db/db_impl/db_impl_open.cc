@@ -679,19 +679,10 @@ Status DBImpl::Recover(
             edit.SetColumnFamily(cfd->GetID());
             for (const FileMetaData* f : level_files) {
               edit.DeleteFile(from_level, f->fd.GetNumber());
-              edit.AddFile(to_level, f->fd.GetNumber(), f->fd.GetPathId(),
-                           f->fd.GetFileSize(), f->smallest, f->largest,
-                           f->fd.smallest_seqno, f->fd.largest_seqno,
-                           f->marked_for_compaction,
-                           f->temperature,  // this can be different from
-                           // `last_level_temperature`
-                           f->oldest_blob_file_number, f->oldest_ancestor_time,
-                           f->file_creation_time, f->epoch_number,
-                           f->file_checksum, f->file_checksum_func_name,
-                           f->unique_id, f->compensated_range_deletion_size,
-                           f->tail_size, f->user_defined_timestamps_persisted,
-                           f->min_timestamp, f->max_timestamp,
-                           f->file_open_metadata);
+              // Keeps f->temperature, which can be different from
+              // `last_level_temperature`
+              edit.AddExistingFile(to_level, *f,
+                                   kDbOwnershipMovedBetweenLevels);
               ROCKS_LOG_WARN(immutable_db_options_.info_log,
                              "[%s] Moving #%" PRIu64
                              " from from_level-%d to from_level-%d %" PRIu64
@@ -2186,6 +2177,10 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
         .PermitUncheckedError();  // ignore error
     const uint64_t current_time = static_cast<uint64_t>(_current_time);
     meta.oldest_ancestor_time = current_time;
+    meta.file_creation_time = current_time;
+    meta.db_ownership_start_time = current_time;
+    meta.db_ownership_info =
+        DbOwnershipInfoForOrigin(DbOwnershipInfo::Origin::kFlush);
     meta.epoch_number = cfd->NewEpochNumber();
     {
       auto write_hint = cfd->current()->storage_info()->CalculateSSTWriteHint(
@@ -2229,9 +2224,9 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           mutable_cf_options_copy.compression_opts, cfd->GetID(),
           cfd->GetName(), 0 /* level */, current_time /* newest_key_time */,
           false /* is_bottommost */, TableFileCreationReason::kRecovery,
-          0 /* oldest_key_time */, 0 /* file_creation_time */, db_id_,
-          db_session_id_, 0 /* target_file_size */, meta.fd.GetNumber(),
-          kMaxSequenceNumber, dbname_ /* db_name */);
+          0 /* oldest_key_time */, db_id_, db_session_id_,
+          0 /* target_file_size */, meta.fd.GetNumber(), kMaxSequenceNumber,
+          dbname_ /* db_name */);
       Version* version = cfd->current();
       version->Ref();
       TableProperties temp_table_proerties;
@@ -2316,15 +2311,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
   }
 
   if (s.ok() && has_output) {
-    edit->AddFile(level, meta.fd.GetNumber(), meta.fd.GetPathId(),
-                  meta.fd.GetFileSize(), meta.smallest, meta.largest,
-                  meta.fd.smallest_seqno, meta.fd.largest_seqno,
-                  meta.marked_for_compaction, meta.temperature,
-                  meta.oldest_blob_file_number, meta.oldest_ancestor_time,
-                  meta.file_creation_time, meta.epoch_number,
-                  meta.file_checksum, meta.file_checksum_func_name,
-                  meta.unique_id, meta.compensated_range_deletion_size,
-                  meta.tail_size, meta.user_defined_timestamps_persisted);
+    edit->AddFile(level, meta);
 
     for (const auto& blob : blob_file_additions) {
       edit->AddBlobFile(blob);

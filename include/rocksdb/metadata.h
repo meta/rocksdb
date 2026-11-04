@@ -69,6 +69,67 @@ struct LiveFileStorageInfo : public FileStorageInfo {
   bool trim_to_size = false;
 };
 
+// Decoded form of SstFileMetaData::db_ownership_info: how this DB got an SST
+// file's contents, and what has happened to the file since without its
+// contents being rewritten. Recorded in the MANIFEST (not in the file), since
+// the same file contents can be added to several DBs. Round-trips through
+// Encode() / DecodeFrom().
+struct DbOwnershipInfo {
+  // How this DB got the file's contents. Values may be added in the future;
+  // DecodeFrom() reports values it doesn't recognize as kUnknown.
+  enum class Origin : uint8_t {
+    // Not recorded, e.g. for a file recorded by an older RocksDB version or
+    // found by RepairDB.
+    kUnknown = 0,
+    // Written by a flush of this DB, including flushes of WAL data during DB
+    // open or RepairDB.
+    kFlush = 1,
+    // Written by a compaction of this DB, local or remote.
+    kCompaction = 2,
+    // Added by external file ingestion (one- or two-phase), whether the file
+    // was written by SstFileWriter or by another DB.
+    kIngestion = 3,
+    // Added by CreateColumnFamilyWithImport().
+    kImport = 4,
+  };
+  Origin origin = Origin::kUnknown;
+
+  // The following flags each record that something has happened to the file
+  // at least once without its contents being rewritten. Once set, a flag stays
+  // set when the file is moved or copied again.
+
+  // Moved to another level without being rewritten (e.g. trivial move, or
+  // CompactRange() with change_level).
+  bool moved_between_levels = false;
+  // Copied as-is to a new file with a different temperature, as FIFO
+  // compaction does with allow_trivial_copy_when_change_temperature. The new
+  // file's db_ownership_start_time is the time of the latest such copy.
+  bool temperature_changed_by_copy = false;
+  // The temperature recorded for the file was updated to match where the
+  // FileSystem reports the file to be (UpdateManifestForFilesState()), so
+  // the file was moved at a time unknown to RocksDB.
+  bool temperature_updated_from_file_system = false;
+  // Recorded by RepairDB, which rebuilds the MANIFEST. For files that existed
+  // before the repair, the origin and db_ownership_start_time are lost.
+  bool recorded_by_repair = false;
+
+  // Serialize to / deserialize from the packed
+  // SstFileMetaData::db_ownership_info representation. DecodeFrom() ignores
+  // unrecognized bits so the encoding can be extended in the future, which
+  // means re-encoding a decoded value drops any bits added by newer versions.
+  uint32_t Encode() const;
+  static DbOwnershipInfo DecodeFrom(uint32_t encoded);
+
+  bool operator==(const DbOwnershipInfo& other) const {
+    return origin == other.origin &&
+           moved_between_levels == other.moved_between_levels &&
+           temperature_changed_by_copy == other.temperature_changed_by_copy &&
+           temperature_updated_from_file_system ==
+               other.temperature_updated_from_file_system &&
+           recorded_by_repair == other.recorded_by_repair;
+  }
+};
+
 // The metadata that describes an SST file. (Does not need to extend
 // LiveFileStorageInfo because SST files are always immutable.)
 struct SstFileMetaData : public FileStorageInfo {
@@ -144,8 +205,11 @@ struct SstFileMetaData : public FileStorageInfo {
     // removed in a future release.
     uint64_t oldest_ancester_time;
   };
-  // Timestamp when the SST file is created, provided by
-  // SystemClock::GetCurrentTime(). 0 if the information is not available.
+  // Timestamp when the SST file's contents were built, provided by
+  // SystemClock::GetCurrentTime(). For an ingested or imported file, this is
+  // when it was built by SstFileWriter or by the DB it came from. Preserved
+  // when the file is moved between levels or copied to another temperature.
+  // 0 if the information is not available.
   uint64_t file_creation_time = 0;
   // The order of a file being flushed or ingested/imported.
   // Compaction output file will be assigned with the minimum `epoch_number`
@@ -153,6 +217,24 @@ struct SstFileMetaData : public FileStorageInfo {
   // For L0, larger `epoch_number` indicates newer L0 file.
   // 0 if the information is not available.
   uint64_t epoch_number = 0;
+  // Timestamp, provided by SystemClock::GetCurrentTime(), when this DB began
+  // holding this physical file (this file number): when the DB started
+  // writing it (flush or compaction output), when ingestion (in the prepare
+  // phase, for two-phase ingestion) or CreateColumnFamilyWithImport() linked
+  // or copied it into the DB, or when it was copied as a new file with a
+  // different temperature (see DbOwnershipInfo). Preserved when the file is
+  // moved between levels. A DB opened from a checkpoint or backup keeps the
+  // values recorded by the DB it was copied from. 0 if the information is not
+  // available, e.g. for a file recorded by an older RocksDB version (whose
+  // file_creation_time was the ingestion, import or copy time for files that
+  // arrived that way) or found by RepairDB.
+  uint64_t db_ownership_start_time = 0;
+  // How this DB got the file's contents and what has happened to the file
+  // since, packed as described by DbOwnershipInfo (decode with
+  // DbOwnershipInfo::DecodeFrom()). 0 if the information is not available.
+  // (CreateColumnFamilyWithImport() ignores this field and
+  // db_ownership_start_time in its input metadata, recording its own.)
+  uint32_t db_ownership_info = 0;
 
   // These bounds define the effective key range for range tombstones
   // in this file.

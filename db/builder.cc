@@ -400,7 +400,7 @@ Status BuildTable(
             std::min(meta->fd.smallest_seqno, smallest_preferred_seqno),
             meta->fd.largest_seqno);
         relevant_mapping.SetCapacity(kMaxSeqnoTimePairsPerSST);
-        relevant_mapping.Enforce(tboptions.file_creation_time);
+        relevant_mapping.Enforce(meta->file_creation_time);
       }
       builder->SetSeqnoTimeTableProperties(
           relevant_mapping,
