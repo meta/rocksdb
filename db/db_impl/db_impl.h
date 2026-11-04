@@ -62,6 +62,7 @@
 #include "rocksdb/attribute_groups.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
+#include "rocksdb/live_tune.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/status.h"
 #include "rocksdb/trace_reader_writer.h"
@@ -92,6 +93,7 @@ class Cleanable;
 class FileIngestionHandleImpl;
 class SameFileBlobReader;
 class InMemoryStatsHistoryIterator;
+class LiveTuner;
 class MemTable;
 class PersistentStatsHistoryIterator;
 class TableCache;
@@ -564,6 +566,12 @@ class DBImpl : public DB
   Status SetDBOptions(
       const std::unordered_map<std::string, std::string>& options_map) override;
 
+  // See rocksdb/live_tune.h.
+  Status StartLiveTuneCycle(const LiveTuneOptions& options);
+  Status GetLiveTuneStatus(LiveTuneStatus* status);
+  Status GetLiveTuneAppliedOptions(std::map<std::string, std::string>* options);
+  Status StopLiveTuneCycle();
+
   using DB::NumberLevels;
   int NumberLevels(ColumnFamilyHandle* column_family) override;
   using DB::Level0StopWriteTrigger;
@@ -787,6 +795,17 @@ class DBImpl : public DB
 
   using DB::EndTrace;
   Status EndTrace() override;
+
+  // Like StartTrace(), but returns Busy rather than replacing a trace that is
+  // already running. `*trace_id` identifies the started trace for
+  // EndTraceIfCurrent().
+  Status StartTraceIfNone(const TraceOptions& options,
+                          std::unique_ptr<TraceWriter>&& trace_writer,
+                          uint64_t* trace_id);
+  // Ends the trace `trace_id` from StartTraceIfNone() if it is still the one
+  // running. Incomplete if a later StartTrace() replaced it or EndTrace()
+  // ended it.
+  Status EndTraceIfCurrent(uint64_t trace_id);
 
   using DB::NewDefaultReplayer;
   Status NewDefaultReplayer(const std::vector<ColumnFamilyHandle*>& handles,
@@ -1722,6 +1741,8 @@ class DBImpl : public DB
   std::shared_ptr<SlowMutexLoggingContext> slow_mutex_logging_;
   RecoveredTransactionMap recovered_transactions_;
   std::unique_ptr<Tracer> tracer_;
+  // Incremented by every trace started; guarded by trace_mutex_.
+  uint64_t trace_id_ = 0;
   InstrumentedMutex trace_mutex_;
   BlockCacheTracer block_cache_tracer_;
 
@@ -3691,6 +3712,17 @@ class DBImpl : public DB
 
   // Guards reads and writes to in-memory stats_history_.
   InstrumentedMutex stats_history_mutex_;
+
+  // Guards live_tuner_ (the running or last live tune cycle) and
+  // live_tune_closed_. Never held while stopping a cycle (which joins its
+  // thread, and the cycle calls into the DB) nor while holding the DB mutex.
+  std::mutex live_tune_mutex_;
+  // The tuner holds a ColumnFamilyHandle, whose destructor locks the DB mutex,
+  // so it must be destroyed while the DB is still open: CloseHelper() takes
+  // it out and destroys it first. Never hand out this pointer, which would
+  // let the tuner outlive the DB.
+  std::shared_ptr<LiveTuner> live_tuner_;
+  bool live_tune_closed_ = false;
 
   // In addition to mutex_, wal_write_mutex_ protects writes to logs_ and
   // cur_wal_number_. With two_write_queues it also protects alive_wal_files_,

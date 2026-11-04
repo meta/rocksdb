@@ -1,0 +1,1 @@
+Add experimental live tuning of a DB's options (`StartLiveTuneCycle()`, `GetLiveTuneStatus()`, `StopLiveTuneCycle()` in `include/rocksdb/live_tune.h`): one call runs a cycle that measures the DB, asks an application-provided `LiveTuneAdvisor` for option changes, applies them, and reverts them when they break the application's constraints or do not prove better.

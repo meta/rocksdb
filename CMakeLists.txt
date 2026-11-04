@@ -1051,6 +1051,8 @@ set(SOURCES
         utilities/cassandra/format.cc
         utilities/cassandra/merge_operator.cc
         utilities/checkpoint/checkpoint_impl.cc
+        utilities/live_tune/live_tune_options_helper.cc
+        utilities/live_tune/live_tuner.cc
         utilities/compaction_filters.cc
         utilities/db_split_merge.cc
         utilities/sorted_run_builder/sorted_run_builder.cc
@@ -1660,6 +1662,7 @@ if(WITH_TESTS)
         utilities/cassandra/cassandra_row_merge_test.cc
         utilities/cassandra/cassandra_serialize_test.cc
         utilities/checkpoint/checkpoint_test.cc
+        utilities/live_tune/live_tuner_test.cc
         utilities/copy_engine/copy_engine_test.cc
         utilities/sorted_run_builder/sorted_run_builder_test.cc
         utilities/env_timed_test.cc
