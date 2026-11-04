@@ -177,6 +177,61 @@ def render_impl(fn: dict) -> list[str]:
         return lines
     raise ValueError(f"Unsupported function kind: {kind}")
 
+"""
+Export JSON for the function description for use by an external tool
+"""
+def render_json(fn: dict) -> list[str]:
+    return [json.dumps(fn)]
+
+class JSONOutputRenderer:
+    def __init__(self, prefix: list[str]):
+        self.prefix = prefix
+        self.lines = []
+ 
+    def render(self, fn: dict):
+        if len(self.lines) > 0:
+            self.lines.append(",")
+        self.lines.extend(render_json(fn))
+
+    def comment(self, s: str):
+        self.render({ "comment" : s})
+
+    def output(self):
+        result = self.prefix.copy()
+        result.append("[");
+        result.extend(self.lines)
+        result.append("]");
+        return result
+
+class CHeaderRenderer:
+    def __init__(self, lines: list[str]):
+        self.lines = lines
+ 
+    def render(self, fn: dict):
+        self.lines.extend(render_decl(fn))
+        self.lines.append("")
+
+    def comment(self, s: str):
+        self.lines.append(f"/* {s} */")
+        self.lines.append("")            
+
+    def output(self):
+        return self.lines.copy()
+
+class CSourceRenderer:
+    def __init__(self, lines: list[str]):
+        self.lines = lines
+ 
+    def render(self, fn: dict):
+        self.lines.extend(render_impl(fn))
+        self.lines.append("")
+
+    def comment(self, s: str):
+        self.lines.append(f"/* {s} */")
+        self.lines.append("")            
+
+    def output(self):
+        return self.lines.copy()
 
 def regen_comment_lines(mode: str) -> list[str]:
     if mode == "header":
@@ -234,14 +289,12 @@ def render_sections(spec: dict, mode: str, cmd_comment: list[str] | None = None)
     lines: list[str] = []
     lines.extend(HEADER_BANNER)
     lines.extend(cmd_comment if cmd_comment is not None else regen_comment_lines(mode))
+    renderer = CHeaderRenderer(lines) if mode == "header" else CSourceRenderer(lines) if mode == "source" else JSONOutputRenderer(lines)        
     for section in spec["sections"]:
-        lines.append(f'/* {section["name"]} */')
-        lines.append("")
+        renderer.comment(section["name"])
         for fn in section["functions"]:
-            render = render_decl if mode == "header" else render_impl
-            lines.extend(render(fn))
-            lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+            renderer.render(fn)
+    return "\n".join(renderer.output()).rstrip() + "\n"
 
 
 def write_if_changed(path: Path, content: str) -> None:
@@ -284,11 +337,13 @@ def main() -> int:
         )
     header = render_sections(spec, "header", cmd_comment=comment)
     source = render_sections(spec, "source", cmd_comment=comment)
+    json = render_sections(spec, "json", cmd_comment=comment)
 
     if args.check:
         expected = {
             args.header_out: header,
             args.source_out: source,
+            args.json_out: json,
         }
         stale: list[str] = []
         for path, content in expected.items():
@@ -302,6 +357,7 @@ def main() -> int:
 
     write_if_changed(args.header_out, header)
     write_if_changed(args.source_out, source)
+    write_if_changed(args.json_out, json)
     return 0
 
 
