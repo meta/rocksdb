@@ -1053,6 +1053,81 @@ TEST_F(ImportColumnFamilyTest, AssignEpochNumberToMultipleCF) {
   ASSERT_OK(db_->WaitForCompact(o));
   delete checkpoint1;
 }
+
+TEST_F(ImportColumnFamilyTest, ImportAndGetSstSize) {
+  Options options = CurrentOptions();
+  std::shared_ptr<SstFileManager> sst_manager;
+  sst_manager.reset(NewSstFileManager(options.env));
+  options.sst_file_manager = sst_manager;
+  CreateAndReopenWithCF({"koko"}, options);
+
+  SstFileWriter sfw_cf1(EnvOptions(), options, handles_[1]);
+  // cf1.sst
+  const std::string cf1_sst_name = "cf1.sst";
+  const std::string cf1_sst = sst_files_dir_ + cf1_sst_name;
+  ASSERT_OK(sfw_cf1.Open(cf1_sst));
+  ASSERT_OK(sfw_cf1.Put("K1", "V1"));
+  ASSERT_OK(sfw_cf1.Put("K2", "V2"));
+  ASSERT_OK(sfw_cf1.Finish());
+  {
+    // Import sst file corresponding to cf1 onto a new cf and verify
+    ExportImportFilesMetaData metadata;
+    metadata.files.push_back(
+        LiveFileMetaDataInit(cf1_sst_name, sst_files_dir_, 0, 10, 19));
+    metadata.db_comparator_name = options.comparator->Name();
+
+    ASSERT_OK(db_->CreateColumnFamilyWithImport(
+        options, "toto", ImportColumnFamilyOptions(), metadata, &import_cfh_));
+    ASSERT_NE(import_cfh_, nullptr);
+
+    // sst size
+    ASSERT_GT(sst_manager->GetTotalSize(), 1 << 10);
+
+    std::string value;
+    ASSERT_OK(db_->Get(ReadOptions(), import_cfh_, "K1", &value));
+    ASSERT_EQ(value, "V1");
+    ASSERT_OK(db_->Get(ReadOptions(), import_cfh_, "K2", &value));
+    ASSERT_EQ(value, "V2");
+    ASSERT_OK(db_->DropColumnFamily(import_cfh_));
+    ASSERT_OK(db_->DestroyColumnFamilyHandle(import_cfh_));
+    import_cfh_ = nullptr;
+  }
+  // Import sst files exported and verify sst size
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put(1, Key(i), Key(i) + "_val"));
+  }
+  ASSERT_OK(Flush(1));
+
+  ASSERT_OK(
+      db_->CompactRange(CompactRangeOptions(), handles_[1], nullptr, nullptr));
+
+  // Overwrite the value in the same set of keys.
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put(1, Key(i), Key(i) + "_overwrite"));
+  }
+
+  // Flush again to create another L0 file. It should have higher sequencer.
+  ASSERT_OK(Flush(1));
+
+  Checkpoint* checkpoint;
+  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(checkpoint->ExportColumnFamily(handles_[1], export_files_dir_,
+                                           &metadata_ptr_));
+  ASSERT_NE(metadata_ptr_, nullptr);
+  delete checkpoint;
+  ASSERT_OK(db_->CreateColumnFamilyWithImport(options, "toto",
+                                              ImportColumnFamilyOptions(),
+                                              *metadata_ptr_, &import_cfh_));
+  ASSERT_NE(import_cfh_, nullptr);
+  delete metadata_ptr_;
+  metadata_ptr_ = nullptr;
+  std::string value1;
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(db_->Get(ReadOptions(), import_cfh_, Key(i), &value1));
+    ASSERT_EQ(Get(1, Key(i)), value1);
+  }
+  ASSERT_GT(sst_manager->GetTotalSize(), 8 << 10);
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

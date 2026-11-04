@@ -8794,6 +8794,12 @@ Status DBImpl::CreateColumnFamilyWithImport(
     sv_context.Clean();
   }
 
+  auto sfm = static_cast<SstFileManagerImpl*>(
+      immutable_db_options_.sst_file_manager.get());
+  if (status.ok() && sfm) {
+    TrackExistingDataFiles({});
+  }
+
   {
     InstrumentedMutexLock l(&mutex_);
     ReleaseFileNumberFromPendingOutputs(pending_output_elem);
