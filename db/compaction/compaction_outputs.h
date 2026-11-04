@@ -179,6 +179,11 @@ class CompactionOutputs {
 
   bool HasBuilder() const { return builder_ != nullptr; }
 
+  // Returns true if the last output file is still open.
+  bool HasUnfinishedOutput() const {
+    return !outputs_.empty() && !outputs_.back().finished;
+  }
+
   FileMetaData* GetMetaData() { return &current_output().meta; }
 
   bool HasOutput() const { return !outputs_.empty(); }

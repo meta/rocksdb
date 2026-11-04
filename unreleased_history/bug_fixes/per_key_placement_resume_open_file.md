@@ -1,0 +1,1 @@
+Fixed `DB::OpenAndCompact()` with `OpenAndCompactOptions::allow_resumption` and per-key placement (`preclude_last_level_data_seconds`) failing to resume with `Corruption`, because its saved progress could list an output file that was still open.

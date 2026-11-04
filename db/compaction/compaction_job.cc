@@ -2595,6 +2595,14 @@ bool CompactionJob::ShouldUpdateSubcompactionProgress(
     return false;
   }
 
+  // LIMITATION: With per-key placement, the file that just closed can belong
+  // to one output level while the other level still has an open file with
+  // keys before this boundary. A resume can restore only finished files, so it
+  // would lose those keys.
+  if (sub_compact->HasUnfinishedOutputFile()) {
+    return false;
+  }
+
   // No need to update for a new empty output
   if (meta == nullptr) {
     return false;
