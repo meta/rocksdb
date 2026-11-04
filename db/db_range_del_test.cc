@@ -1817,6 +1817,148 @@ TEST_F(DBRangeDelTest, CompactionEmitRangeTombstoneToSSTPartitioner) {
   ASSERT_EQ(2, NumTableFilesAtLevel(1));
 }
 
+namespace {
+// Records the compaction output files that were started, and how many of them
+// were empty and not kept.
+class CompactionOutputListener : public EventListener {
+ public:
+  void OnTableFileCreationStarted(
+      const TableFileCreationBriefInfo& info) override {
+    if (info.reason == TableFileCreationReason::kCompaction) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      started_paths_.push_back(info.file_path);
+    }
+  }
+
+  void OnTableFileCreated(const TableFileCreationInfo& info) override {
+    if (info.reason == TableFileCreationReason::kCompaction &&
+        info.status.IsAborted()) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++num_not_kept_;
+    }
+  }
+
+  std::vector<std::string> TakeStartedPaths() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::exchange(started_paths_, {});
+  }
+
+  int TakeNumNotKept() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::exchange(num_not_kept_, 0);
+  }
+
+ private:
+  std::mutex mutex_;
+  std::vector<std::string> started_paths_;
+  int num_not_kept_ = 0;
+};
+}  // namespace
+
+TEST_F(DBRangeDelTest, BottommostCompactionEmitRangeTombstoneToSSTPartitioner) {
+  // A range tombstone after the last point key must reach the SSTPartitioner
+  // at the bottommost level too. Otherwise the tombstone is appended to the
+  // file holding the point key and extends that file across the partition
+  // boundary, so no file starting at the boundary fits in the level.
+  // The fixed-prefix factory exercises the partitioner's prefix fast path,
+  // and SingleKeySstPartitionerFactory its per-key ShouldPartition() path.
+  // Each Key(i) is 9 bytes, so a 9-byte prefix puts every key in its own
+  // partition.
+  for (const auto& factory :
+       std::vector<std::shared_ptr<SstPartitionerFactory>>{
+           NewSstPartitionerFixedPrefixFactory(9),
+           std::make_shared<SingleKeySstPartitionerFactory>()}) {
+    SCOPED_TRACE(factory->Name());
+    Options options = CurrentOptions();
+    options.sst_partitioner_factory = factory;
+    options.disable_auto_compactions = true;
+    options.level_compaction_dynamic_level_bytes = true;
+    auto listener = std::make_shared<CompactionOutputListener>();
+    options.listeners.push_back(listener);
+    DestroyAndReopen(options);
+    const int bottommost_level = options.num_levels - 1;
+
+    ASSERT_OK(Put(Key(1), "val"));
+    // Keeps the tombstone from being dropped at the bottommost level
+    const Snapshot* snapshot = db_->GetSnapshot();
+    ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                               Key(2), Key(5)));
+    ASSERT_OK(Flush());
+
+    CompactRangeOptions cro;
+    cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    const std::vector<SstFileMetaData>& files =
+        cf_meta.levels[bottommost_level].files;
+    ASSERT_EQ(2, files.size());
+    ASSERT_EQ(Key(1), files[0].largestkey);
+    ASSERT_EQ(Key(2), files[1].smallestkey);
+    ASSERT_EQ(0, listener->TakeNumNotKept());
+    listener->TakeStartedPaths();
+
+    // Once nothing pins it, the tombstone is dropped. The file cut for it is
+    // still created, but it is empty, so the compaction deletes it before
+    // installing its outputs: it is never part of the LSM.
+    db_->ReleaseSnapshot(snapshot);
+    ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+    ASSERT_EQ(1, NumTableFilesAtLevel(bottommost_level));
+    ASSERT_EQ(1, listener->TakeNumNotKept());
+    const std::vector<std::string> started = listener->TakeStartedPaths();
+    ASSERT_EQ(2, started.size());
+    int num_on_disk = 0;
+    for (const auto& path : started) {
+      const Status exists = env_->FileExists(path);
+      if (exists.ok()) {
+        ++num_on_disk;
+      } else {
+        ASSERT_TRUE(exists.IsNotFound()) << exists.ToString();
+      }
+    }
+    ASSERT_EQ(1, num_on_disk);
+  }
+}
+
+TEST_F(DBRangeDelTest, BottommostRangeTombstoneAtSameUserKeyAsPointKey) {
+  // At the bottommost level a point key's seqno can be zeroed, so it sorts
+  // after a range tombstone that starts at the same user key. The partitioner
+  // must not cut between them, even one that requires a cut for every key.
+  Options options = CurrentOptions();
+  options.sst_partitioner_factory =
+      std::make_shared<SingleKeySstPartitionerFactory>();
+  options.disable_auto_compactions = true;
+  options.level_compaction_dynamic_level_bytes = true;
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+
+  // The tombstone is dropped.
+  DestroyAndReopen(options);
+  ASSERT_OK(Put(Key(1), "val"));
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), Key(2),
+                             Key(5)));
+  ASSERT_OK(Put(Key(2), "val"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  ASSERT_EQ("val", Get(Key(2)));
+
+  // A newer tombstone covering the same user key is kept by a snapshot, so it
+  // is written to every output file that overlaps it.
+  DestroyAndReopen(options);
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), Key(2),
+                             Key(5)));
+  ASSERT_OK(Put(Key(2), "val"));
+  ASSERT_OK(Flush());
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), Key(1),
+                             Key(4)));
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  ASSERT_EQ("NOT_FOUND", Get(Key(2)));
+  ASSERT_EQ("val", Get(Key(2), snapshot));
+  db_->ReleaseSnapshot(snapshot);
+}
+
 TEST_F(DBRangeDelTest, OversizeCompactionGapBetweenPointKeyAndTombstone) {
   // L2 has 2 files
   // L2_0: 0, 1, 2, 3, 4
