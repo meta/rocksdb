@@ -1,0 +1,1 @@
+`SetOptions()` now runs the table factory option validation that `DB::Open()` runs, so it rejects changes such as clearing `prefix_extractor` under a hash index or enabling compression with `block_align`. It used to apply them, and the next flush could crash or fail with a background error.

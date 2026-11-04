@@ -540,6 +540,82 @@ TEST_F(DBOptionsTest, SetMutableTableOptions) {
   ASSERT_EQ(c_bbto->block_restart_interval, 13);
 }
 
+// SetOptions() used to skip the table factory checks of DB::Open, so it could
+// install options that DB::Open rejects. Clearing the prefix extractor of a
+// hash index made the next flush crash.
+TEST_F(DBOptionsTest, SetOptionsRejectsHashIndexWithoutPrefixExtractor) {
+  Options options;
+  options.create_if_missing = true;
+  options.env = env_;
+  BlockBasedTableOptions bbto;
+  bbto.index_type = BlockBasedTableOptions::kHashSearch;
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+  options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+  Reopen(options);
+  ASSERT_OK(Put("a1", "v1"));
+
+  ASSERT_EQ(dbfull()->SetOptions({{"prefix_extractor", "nullptr"}}).code(),
+            Status::Code::kInvalidArgument);
+  ASSERT_NE(dbfull()->GetOptions().prefix_extractor, nullptr);
+
+  // Dropping both is valid, but then the hash index cannot come back alone.
+  ASSERT_OK(dbfull()->SetOptions({{"table_factory.index_type", "kBinarySearch"},
+                                  {"prefix_extractor", "nullptr"}}));
+  ASSERT_EQ(dbfull()
+                ->SetOptions({{"table_factory.index_type", "kHashSearch"}})
+                .code(),
+            Status::Code::kInvalidArgument);
+  ASSERT_EQ(dbfull()
+                ->GetOptions()
+                .table_factory->GetOptions<BlockBasedTableOptions>()
+                ->index_type,
+            BlockBasedTableOptions::kBinarySearch);
+
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get("a1"), "v1");
+  // The options that SetOptions() kept are ones DB::Open accepts.
+  bbto.index_type = BlockBasedTableOptions::kBinarySearch;
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+  options.prefix_extractor.reset();
+  Reopen(options);
+  ASSERT_EQ(Get("a1"), "v1");
+}
+
+// The table builder fails every compressed build when block_align is set, so a
+// flush after such a SetOptions() used to stop writes with a background error.
+TEST_F(DBOptionsTest, SetOptionsRejectsCompressionWithBlockAlign) {
+  CompressionType compression = kNoCompression;
+  for (CompressionType t : GetSupportedCompressions()) {
+    if (t != kNoCompression) {
+      compression = t;
+      break;
+    }
+  }
+  if (compression == kNoCompression) {
+    ROCKSDB_GTEST_BYPASS("No compression supported");
+    return;
+  }
+  std::string compression_name;
+  ASSERT_OK(GetStringFromCompressionType(&compression_name, compression));
+
+  Options options;
+  options.create_if_missing = true;
+  options.env = env_;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions bbto;
+  bbto.block_align = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+  Reopen(options);
+
+  ASSERT_EQ(dbfull()->SetOptions({{"compression", compression_name}}).code(),
+            Status::Code::kInvalidArgument);
+  ASSERT_EQ(dbfull()->GetOptions().compression, kNoCompression);
+  ASSERT_OK(Put("a1", "v1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("a2", "v2"));
+  ASSERT_EQ(Get("a1"), "v1");
+}
+
 TEST_F(DBOptionsTest, SetWithCustomMemTableFactory) {
   class DummySkipListFactory : public SkipListFactory {
    public:
