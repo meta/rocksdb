@@ -368,6 +368,12 @@ class ColumnFamilyData {
 
   bool is_delete_range_supported() { return is_delete_range_supported_; }
 
+  // False when the table factory cannot write tables, so the column family is
+  // never compacted.
+  bool is_table_builder_supported() const {
+    return is_table_builder_supported_;
+  }
+
   // Validate CF options against DB options
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
@@ -562,12 +568,15 @@ class ColumnFamilyData {
     --num_in_flight_compactions_;
   }
 
+  // L0 files and pending compaction bytes stall writes only when the column
+  // family can be compacted automatically, which requires
+  // 'table_builder_supported' and no disable_auto_compactions.
   static std::pair<WriteStallCondition, WriteStallCause>
-  GetWriteStallConditionAndCause(
-      int num_unflushed_memtables, int num_l0_files,
-      uint64_t num_compaction_needed_bytes,
-      const MutableCFOptions& mutable_cf_options,
-      const ImmutableCFOptions& immutable_cf_options);
+  GetWriteStallConditionAndCause(int num_unflushed_memtables, int num_l0_files,
+                                 uint64_t num_compaction_needed_bytes,
+                                 const MutableCFOptions& mutable_cf_options,
+                                 const ImmutableCFOptions& immutable_cf_options,
+                                 bool table_builder_supported);
 
   // Recalculate some stall conditions, which are changed only during
   // compaction, adding new memtable and/or recalculation of compaction score.
@@ -705,6 +714,7 @@ class ColumnFamilyData {
   MutableCFOptions mutable_cf_options_;
 
   const bool is_delete_range_supported_;
+  const bool is_table_builder_supported_;
 
   // True from a successful SetOptions() until MarkOptionsInstalled(). A
   // DB::SetOptions() call that fails on a later column family leaves it set

@@ -62,6 +62,11 @@ void RecordAtomicFlushRequestReason(Statistics* stats,
   }
 }
 
+Status TableBuilderNotSupported(const ColumnFamilyData& cfd) {
+  return Status::NotSupported(
+      "Column family's table factory cannot build tables", cfd.GetName());
+}
+
 std::vector<uint64_t> MemTableIds(const autovector<ReadOnlyMemTable*>& mems) {
   std::vector<uint64_t> ids;
   ids.reserve(mems.size());
@@ -158,7 +163,7 @@ bool DBImpl::ShouldRescheduleFlushRequestToRetainUDT(
           cfd->GetUnflushedMemTableCountForWriteStallCheck(),
           /*num_l0_files=*/0,
           /*num_compaction_needed_bytes=*/0, mutable_cf_options,
-          cfd->ioptions())
+          cfd->ioptions(), cfd->is_table_builder_supported())
           .first;
   if (write_stall != WriteStallCondition::kNormal) {
     return false;
@@ -1193,6 +1198,10 @@ Status DBImpl::CompactRange(const CompactRangeOptions& options,
       static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
   assert(cfd);
 
+  if (!cfd->is_table_builder_supported()) {
+    return TableBuilderNotSupported(*cfd);
+  }
+
   if (manual_compaction_paused_.load(std::memory_order_acquire) > 0) {
     return Status::Incomplete(Status::SubCode::kManualCompactionPaused);
   }
@@ -1618,6 +1627,10 @@ Status DBImpl::CompactFiles(const CompactionOptions& compact_options,
   auto cfd =
       static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
   assert(cfd);
+
+  if (!cfd->is_table_builder_supported()) {
+    return TableBuilderNotSupported(*cfd);
+  }
 
   {
     InstrumentedMutexLock l(&mutex_);
@@ -3362,7 +3375,7 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
               cfd->GetUnflushedMemTableCountForWriteStallCheck(),
               vstorage->l0_delay_trigger_count() + 1,
               vstorage->estimated_compaction_needed_bytes(), mutable_cf_options,
-              cfd->ioptions())
+              cfd->ioptions(), cfd->is_table_builder_supported())
               .first;
     } while (write_stall_condition != WriteStallCondition::kNormal);
   }

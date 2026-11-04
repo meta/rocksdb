@@ -576,6 +576,11 @@ class ExternalTableFactoryBase : public Customizable {
   // requires the corresponding builder and reader to implement
   // PutRangeDeletionBlock() and GetRangeDeletionBlock(), respectively.
   virtual bool IsDeleteRangeSupported() const { return false; }
+
+  // Returns whether NewTableBuilder() can write tables. A factory that only
+  // reads files written elsewhere returns false; see
+  // TableFactory::IsTableBuilderSupported() for what RocksDB then requires.
+  virtual bool IsTableBuilderSupported() const { return true; }
 };
 
 using ExternalTableFactory =
