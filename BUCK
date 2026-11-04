@@ -324,6 +324,8 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "utilities/fault_injection_fs.cc",
         "utilities/fault_injection_secondary_cache.cc",
         "utilities/leveldb_options/leveldb_options.cc",
+        "utilities/live_tune/live_tune_options_helper.cc",
+        "utilities/live_tune/live_tuner.cc",
         "utilities/memory/memory_util.cc",
         "utilities/merge_operators.cc",
         "utilities/merge_operators/bytesxor.cc",
@@ -5391,6 +5393,12 @@ cpp_unittest_wrapper(name="ldb_cmd_test",
 
 cpp_unittest_wrapper(name="listener_test",
             srcs=["db/listener_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="live_tuner_test",
+            srcs=["utilities/live_tune/live_tuner_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 

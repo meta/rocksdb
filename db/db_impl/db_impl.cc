@@ -125,6 +125,8 @@
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 #include "util/udt_util.h"
+#include "utilities/live_tune/live_tune_options_helper.h"
+#include "utilities/live_tune/live_tuner.h"
 #include "utilities/trace/replayer_impl.h"
 
 #if USE_COROUTINES
@@ -1074,6 +1076,21 @@ void DBImpl::MaybeRegisterFlushInitiator() {
 }
 
 Status DBImpl::CloseHelper() {
+  // End a live tune cycle first: it reverts a change being watched through
+  // SetOptions(), which needs the DB fully working.
+  // The tuner also holds a column family handle, released here.
+  {
+    std::shared_ptr<LiveTuner> live_tuner;
+    {
+      std::lock_guard<std::mutex> lock(live_tune_mutex_);
+      live_tune_closed_ = true;
+      live_tuner = std::move(live_tuner_);
+    }
+    if (live_tuner) {
+      live_tuner->Stop();
+    }
+  }
+
   // Guarantee that there is no background error recovery in progress before
   // continuing with the shutdown
   mutex_.Lock();
@@ -2115,6 +2132,125 @@ Status DBImpl::SetOptions(
   }
   LogFlush(immutable_db_options_.info_log);
   return s;
+}
+
+Status DBImpl::StartLiveTuneCycle(const LiveTuneOptions& options) {
+  if (read_only_) {
+    // Applying changes writes an OPTIONS file into the DB directory.
+    return Status::NotSupported("live_tune: read-only DB");
+  }
+  Status s = ValidateLiveTuneOptions(options);
+  if (!s.ok()) {
+    return s;
+  }
+  std::unique_ptr<ColumnFamilyHandle> cf;
+  {
+    InstrumentedMutexLock l(&mutex_);
+    const std::string& name = options.intent.column_family.empty()
+                                  ? kDefaultColumnFamilyName
+                                  : options.intent.column_family;
+    ColumnFamilyData* cfd =
+        versions_->GetColumnFamilySet()->GetColumnFamily(name);
+    if (cfd == nullptr) {
+      return Status::InvalidArgument("live_tune: no column family " + name);
+    }
+    cf.reset(new ColumnFamilyHandleImpl(cfd, this, &mutex_));
+  }
+  s = live_tune::CheckOptionNames(this, cf.get(),
+                                  options.intent.allowed_options);
+  if (!s.ok()) {
+    return s;
+  }
+  std::shared_ptr<LiveTuner> previous;
+  {
+    std::lock_guard<std::mutex> lock(live_tune_mutex_);
+    if (live_tune_closed_) {
+      return Status::Aborted("DB is closing");
+    }
+    std::vector<std::string> history;
+    std::map<std::string, std::string> kept;
+    if (live_tuner_ != nullptr) {
+      if (live_tuner_->Running()) {
+        return Status::Busy("a live tune cycle is running");
+      }
+      if (live_tuner_->OnCycleThread()) {
+        // The previous cycle's thread can't wait for itself to finish.
+        return Status::Busy(
+            "live_tune: start the next cycle from another thread");
+      }
+      history = live_tuner_->History();
+      kept = live_tuner_->AppliedOptions();
+    }
+    previous = std::move(live_tuner_);
+    live_tuner_ = std::make_shared<LiveTuner>(
+        this, options, std::move(cf), immutable_db_options_.info_log,
+        std::move(history), std::move(kept));
+    live_tuner_->Start();
+  }
+  // The previous cycle is done but its thread may still be delivering the
+  // "done" event, whose listener can call into live tuning; join it without
+  // live_tune_mutex_.
+  if (previous) {
+    previous->Stop();
+  }
+  ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                 "Live tune cycle started with advisor %s",
+                 options.advisor->GetId().c_str());
+  return Status::OK();
+}
+
+Status DBImpl::GetLiveTuneStatus(LiveTuneStatus* status) {
+  std::shared_ptr<LiveTuner> live_tuner;
+  {
+    std::lock_guard<std::mutex> lock(live_tune_mutex_);
+    live_tuner = live_tuner_;
+  }
+  *status = live_tuner ? live_tuner->GetStatus() : LiveTuneStatus();
+  return Status::OK();
+}
+
+Status DBImpl::GetLiveTuneAppliedOptions(
+    std::map<std::string, std::string>* options) {
+  std::shared_ptr<LiveTuner> live_tuner;
+  {
+    std::lock_guard<std::mutex> lock(live_tune_mutex_);
+    live_tuner = live_tuner_;
+  }
+  *options = live_tuner ? live_tuner->AppliedOptions()
+                        : std::map<std::string, std::string>();
+  return Status::OK();
+}
+
+Status DBImpl::StopLiveTuneCycle() {
+  std::shared_ptr<LiveTuner> live_tuner;
+  {
+    std::lock_guard<std::mutex> lock(live_tune_mutex_);
+    live_tuner = live_tuner_;
+  }
+  if (live_tuner) {
+    live_tuner->Stop();
+  }
+  return Status::OK();
+}
+
+Status StartLiveTuneCycle(DB* db, const LiveTuneOptions& options) {
+  return static_cast_with_check<DBImpl>(db->GetRootDB())
+      ->StartLiveTuneCycle(options);
+}
+
+Status GetLiveTuneStatus(DB* db, LiveTuneStatus* status) {
+  return static_cast_with_check<DBImpl>(db->GetRootDB())
+      ->GetLiveTuneStatus(status);
+}
+
+Status StopLiveTuneCycle(DB* db) {
+  return static_cast_with_check<DBImpl>(db->GetRootDB())->StopLiveTuneCycle();
+}
+
+Status GetLiveTuneAppliedOptions(DB* db,
+                                 std::map<std::string, std::string>* options) {
+  return static_cast_with_check<DBImpl>(db->GetRootDB())
+      ->GetLiveTuneAppliedOptions(options);
 }
 
 Status DBImpl::SetDBOptions(
@@ -8984,7 +9120,31 @@ Status DBImpl::StartTrace(const TraceOptions& trace_options,
   InstrumentedMutexLock lock(&trace_mutex_);
   tracer_.reset(new Tracer(immutable_db_options_.clock, trace_options,
                            std::move(trace_writer)));
+  ++trace_id_;
   return Status::OK();
+}
+
+Status DBImpl::StartTraceIfNone(const TraceOptions& trace_options,
+                                std::unique_ptr<TraceWriter>&& trace_writer,
+                                uint64_t* trace_id) {
+  InstrumentedMutexLock lock(&trace_mutex_);
+  if (tracer_ != nullptr) {
+    return Status::Busy("a trace is already running");
+  }
+  tracer_.reset(new Tracer(immutable_db_options_.clock, trace_options,
+                           std::move(trace_writer)));
+  *trace_id = ++trace_id_;
+  return Status::OK();
+}
+
+Status DBImpl::EndTraceIfCurrent(uint64_t trace_id) {
+  InstrumentedMutexLock lock(&trace_mutex_);
+  if (tracer_ == nullptr || trace_id_ != trace_id) {
+    return Status::Incomplete("the trace was ended or replaced");
+  }
+  Status s = tracer_->Close();
+  tracer_.reset();
+  return s;
 }
 
 Status DBImpl::EndTrace() {
