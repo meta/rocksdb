@@ -1532,8 +1532,8 @@ void CompactionJob::NotifyOnSubcompactionBegin(
   SubcompactionJobInfo info{};
   sub_compact->BuildSubcompactionJobInfo(info);
   info.job_id = static_cast<int>(job_id_);
-  info.use_separate_remote_compaction_pool =
-      compact_->compaction->use_separate_remote_compaction_pool();
+  info.separate_remote_compaction_pool_selected =
+      compact_->compaction->separate_remote_compaction_pool_selected();
   info.thread_id = env_->GetThreadID();
 
   for (const auto& listener : db_options_.listeners) {
@@ -1559,8 +1559,8 @@ void CompactionJob::NotifyOnSubcompactionCompleted(
   SubcompactionJobInfo info{};
   sub_compact->BuildSubcompactionJobInfo(info);
   info.job_id = static_cast<int>(job_id_);
-  info.use_separate_remote_compaction_pool =
-      compact_->compaction->use_separate_remote_compaction_pool();
+  info.separate_remote_compaction_pool_selected =
+      compact_->compaction->separate_remote_compaction_pool_selected();
   info.thread_id = env_->GetThreadID();
 
   for (const auto& listener : db_options_.listeners) {

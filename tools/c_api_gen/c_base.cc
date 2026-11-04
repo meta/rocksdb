@@ -4555,6 +4555,16 @@ void rocksdb_options_set_block_based_table_factory(
 #include "c_api_gen/c_generated_jobinfo_metadata_subset.cc.inc"
 #include "c_api_gen/c_generated_metadata_structs_auto.cc.inc"
 
+unsigned char rocksdb_compactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_compactionjobinfo_t* info) {
+  return info->rep.separate_remote_compaction_pool_selected;
+}
+
+unsigned char rocksdb_subcompactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_subcompactionjobinfo_t* info) {
+  return info->rep.separate_remote_compaction_pool_selected;
+}
+
 rocksdb_compactionjobinfo_t* rocksdb_compactionjobinfo_create() {
   return new rocksdb_compactionjobinfo_t;
 }

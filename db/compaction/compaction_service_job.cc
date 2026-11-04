@@ -295,8 +295,8 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       compaction->is_full_compaction(), compaction->is_manual_compaction(),
       compaction->bottommost_level(), compaction->start_level(),
       compaction->output_level());
-  info.use_separate_remote_compaction_pool =
-      compaction->use_separate_remote_compaction_pool();
+  info.separate_remote_compaction_pool_selected =
+      compaction->separate_remote_compaction_pool_selected();
   info.merge_before_filter = compaction_input.merge_before_filter;
   CompactionServiceScheduleResponse response =
       db_options_.compaction_service->Schedule(info, compaction_input_binary);
