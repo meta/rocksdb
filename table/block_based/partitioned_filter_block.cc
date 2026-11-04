@@ -571,10 +571,14 @@ void PartitionedFilterBlockReader::MayMatch(
       range->AddSkipsFrom(subrange);
       start_iter_same_handle = iter;
     }
-    if (UNLIKELY(this_filter_handle.size() == 0)) {  // key is out of range
-      // Not reachable with current behavior of GetFilterPartitionHandle
-      assert(false);
-      range->SkipKey(iter);
+    if (UNLIKELY(this_filter_handle.size() == 0)) {
+      // Empty filter partition. Keys outside the prefix extractor's domain
+      // are never added to a prefix filter, so only other keys can be ruled
+      // out.
+      if (prefix_extractor == nullptr ||
+          prefix_extractor->InDomain(iter->ukey_without_ts)) {
+        range->SkipKey(iter);
+      }
       prev_filter_handle = BlockHandle::NullBlockHandle();
     } else {
       prev_filter_handle = this_filter_handle;

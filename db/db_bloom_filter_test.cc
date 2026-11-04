@@ -928,6 +928,43 @@ INSTANTIATE_TEST_CASE_P(
             BlockBasedTableOptions::kLatestSupportedFormatVersion)));
 #endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 
+TEST_F(DBBloomFilterTest, PartitionedPrefixFilterMultiGetKeysOutOfDomain) {
+  for (bool decouple : {false, true}) {
+    SCOPED_TRACE("decouple_partitioned_filters=" + std::to_string(decouple));
+    Options options = CurrentOptions();
+    options.prefix_extractor.reset(NewFixedPrefixTransform(4));
+    BlockBasedTableOptions bbto;
+    bbto.filter_policy.reset(NewBloomFilterPolicy(10));
+    bbto.whole_key_filtering = false;
+    bbto.partition_filters = true;
+    bbto.decouple_partitioned_filters = decouple;
+    bbto.index_type = BlockBasedTableOptions::kTwoLevelIndexSearch;
+    bbto.metadata_block_size = 1;
+    bbto.block_size = 1;
+    options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+    DestroyAndReopen(options);
+
+    std::vector<std::string> keys;
+    std::vector<std::string> expected;
+    for (char c = 'a'; c <= 'j'; ++c) {
+      keys.emplace_back(1, c);
+      expected.push_back("v_" + keys.back());
+      ASSERT_OK(Put(keys.back(), expected.back()));
+    }
+    ASSERT_OK(Put("kkkk1", "v_kkkk1"));
+    ASSERT_OK(Flush());
+    keys.emplace_back("aaaa");
+    expected.emplace_back("NOT_FOUND");
+    keys.emplace_back("kkkk1");
+    expected.emplace_back("v_kkkk1");
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+      ASSERT_EQ(expected[i], Get(keys[i]));
+    }
+    ASSERT_EQ(expected, MultiGet(keys));
+  }
+}
+
 TEST_F(DBBloomFilterTest, BloomFilterRate) {
   while (ChangeFilterOptions()) {
     Options options = CurrentOptions();
