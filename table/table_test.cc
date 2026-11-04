@@ -8384,6 +8384,12 @@ class ExternalTableTest : public DBTestBase {
       : DBTestBase("external_table_test", /*env_do_fsync=*/false) {}
 
  protected:
+  // Reads the files of SimpleExternalTableFactory but cannot write any.
+  class ReadOnlyExternalTableFactory : public SimpleExternalTableFactory {
+   public:
+    bool IsTableBuilderSupported() const override { return false; }
+  };
+
   // A reader that pins values from its internal buffer, exercising the
   // zero-copy path in ExternalTableReaderAdapter::Get().
   class PinnedSimpleExternalTableReader
@@ -8616,6 +8622,140 @@ TEST_F(ExternalTableTest, WrappedFactoryValidatesColumnFamilyOptions) {
   ingest_only.disallow_memtable_writes = true;
   ASSERT_OK(TryReopenWithColumnFamilies(
       column_families, std::vector<Options>{options, ingest_only}));
+}
+
+TEST_F(ExternalTableTest, FactoryWithoutTableBuilderIsNeverCompacted) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-encrypted environment");
+    return;
+  }
+  Options options = GetDefaultOptions();
+  // FIFO compaction, used below, requires it.
+  options.max_open_files = -1;
+  Reopen(options);
+  Options writable = options;
+  writable.table_factory =
+      NewExternalTableFactory(std::make_shared<SimpleExternalTableFactory>());
+  writable.disallow_memtable_writes = true;
+  // Any ingested file exceeds the FIFO size limit, so the picker always wants
+  // an automatic compaction.
+  writable.compaction_style = kCompactionStyleFIFO;
+  writable.compaction_options_fifo.max_table_files_size = 1;
+  Options read_only = writable;
+  read_only.table_factory =
+      NewExternalTableFactory(std::make_shared<ReadOnlyExternalTableFactory>());
+  ASSERT_TRUE(writable.table_factory->IsTableBuilderSupported());
+  ASSERT_FALSE(read_only.table_factory->IsTableBuilderSupported());
+
+  // Memtable writes would reach the missing builder at the next flush.
+  Options accepts_writes = read_only;
+  accepts_writes.disallow_memtable_writes = false;
+  ColumnFamilyHandle* handle = nullptr;
+  Status s = db_->CreateColumnFamily(accepts_writes, "accepts_writes", &handle);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_EQ(handle, nullptr);
+
+  // handles_[1] can build tables and handles_[2] cannot; both get the same
+  // ingested file.
+  CreateColumnFamilies({"writable", "read_only"}, writable);
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "writable", "read_only"},
+                           {options, writable, read_only});
+  const std::string file = dbname_ + "/external.immutable";
+  SstFileWriter writer(EnvOptions(writable), writable);
+  ASSERT_OK(writer.Open(file));
+  ASSERT_OK(writer.Put("a", "va"));
+  ASSERT_OK(writer.Put("b", "vb"));
+  ASSERT_OK(writer.Finish());
+  IngestExternalFileOptions ingest_options;
+  ingest_options.allow_global_seqno = true;
+  const auto live_files = [&](int cf) {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(handles_[cf], &metadata);
+    std::vector<std::string> names;
+    for (const auto& level : metadata.levels) {
+      for (const auto& file_metadata : level.files) {
+        names.push_back(file_metadata.name);
+      }
+    }
+    return names;
+  };
+  std::vector<std::string> ingested[3];
+  for (int cf : {1, 2}) {
+    ASSERT_OK(db_->IngestExternalFile(handles_[cf], {file}, ingest_options));
+    ingested[cf] = live_files(cf);
+    ASSERT_EQ(ingested[cf].size(), 1);
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_TRUE(live_files(1).empty());
+  ASSERT_EQ(live_files(2), ingested[2]);
+  ASSERT_FALSE(static_cast_with_check<ColumnFamilyHandleImpl>(handles_[2])
+                   ->cfd()
+                   ->NeedsCompaction());
+
+  CompactRangeOptions forced;
+  forced.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  s = db_->CompactRange(CompactRangeOptions(), handles_[2], nullptr, nullptr);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  s = db_->CompactRange(forced, handles_[2], nullptr, nullptr);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  // FIFO compaction keeps every file on level 0.
+  s = db_->CompactFiles(CompactionOptions(), handles_[2], ingested[2],
+                        /*output_level=*/0);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_EQ(live_files(2), ingested[2]);
+
+  // The rejected compactions leave the DB writable and the file readable.
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get(2, "a"), "va");
+  ASSERT_EQ(Get(2, "b"), "vb");
+}
+
+TEST_F(ExternalTableTest, FactoryWithoutTableBuilderDoesNotStallWrites) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-encrypted environment");
+    return;
+  }
+  Options options = GetDefaultOptions();
+  Reopen(options);
+  Options writable = options;
+  writable.table_factory =
+      NewExternalTableFactory(std::make_shared<SimpleExternalTableFactory>());
+  Options read_only = writable;
+  read_only.table_factory =
+      NewExternalTableFactory(std::make_shared<ReadOnlyExternalTableFactory>());
+  read_only.disallow_memtable_writes = true;
+  // A second overlapping file can only go to L0, which alone reaches every L0
+  // trigger.
+  read_only.num_levels = 2;
+  read_only.level0_file_num_compaction_trigger = 1;
+  read_only.level0_slowdown_writes_trigger = 1;
+  read_only.level0_stop_writes_trigger = 1;
+  CreateColumnFamilies({"read_only"}, read_only);
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "read_only"},
+                           std::vector<Options>{options, read_only});
+
+  IngestExternalFileOptions ingest_options;
+  ingest_options.allow_global_seqno = true;
+  for (const std::string value : {"v1", "v2"}) {
+    const std::string file = dbname_ + "/external_" + value + ".immutable";
+    SstFileWriter writer(EnvOptions(writable), writable);
+    ASSERT_OK(writer.Open(file));
+    ASSERT_OK(writer.Put("a", value));
+    ASSERT_OK(writer.Finish());
+    ASSERT_OK(db_->IngestExternalFile(handles_[1], {file}, ingest_options));
+  }
+  ASSERT_EQ(NumTableFilesAtLevel(0, 1), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(1, 1), 1);
+  ASSERT_EQ(Get(1, "a"), "v2");
+
+  // No compaction can clear that L0 file, so it must not stall other column
+  // families.
+  ASSERT_FALSE(dbfull()->TEST_write_controler().IsStopped());
+  ASSERT_FALSE(dbfull()->TEST_write_controler().NeedsDelay());
+  WriteOptions no_slowdown;
+  no_slowdown.no_slowdown = true;
+  ASSERT_OK(db_->Put(no_slowdown, "key", "value"));
 }
 
 TEST_F(ExternalTableTest, GetWrappedExternalTableFactory) {
