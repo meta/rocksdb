@@ -593,6 +593,8 @@ default_params = {
     "advise_random_on_open": lambda: random.choice([0] + [1] * 3),
     "WAL_ttl_seconds": lambda: random.choice([0, 60]),
     "WAL_size_limit_MB": lambda: random.choice([0, 1]),
+    "wal_iterator_tail_rotations": lambda: random.choice([0, 0, 0, 1]),
+    "tail_wal_updates": lambda: int(random.randrange(20) == 0),
     "strict_bytes_per_sync": lambda: random.choice([0, 1]),
     "avoid_flush_during_shutdown": lambda: random.choice([0, 1]),
     "fill_cache": lambda: random.choice([0, 1]),
@@ -1856,6 +1858,15 @@ def finalize_and_sanitize(src_params):
         dest_params["write_fault_one_in"] = 0
         dest_params["reopen"] = 0
         dest_params["manual_wal_flush_one_in"] = 0
+        # With no WAL there is nothing for GetUpdatesSince to tail.
+        dest_params["tail_wal_updates"] = 0
+        dest_params["wal_iterator_tail_rotations"] = 0
+    if dest_params.get("tail_wal_updates", 0) == 1:
+        # The tailer's iterator borrows DB state and does not participate in
+        # the worker threads' reopen barrier.
+        dest_params["reopen"] = 0
+        # Print the rotation ticker so successful in-run tailing is observable.
+        dest_params["statistics"] = 1
     if dest_params.get("open_files", 1) != -1:
         # Compaction TTL and periodic compactions are only compatible
         # with open_files = -1

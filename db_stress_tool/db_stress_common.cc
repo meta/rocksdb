@@ -476,6 +476,25 @@ void DbVerificationThread(void* v) {
   }
 }
 
+void WalTailThread(void* v) {
+  assert(FLAGS_tail_wal_updates);
+  auto* thread = static_cast<ThreadState*>(v);
+  SharedState* shared = thread->shared;
+  StressTest* stress_test = shared->GetStressTest();
+  assert(stress_test != nullptr);
+
+  // Unlike the other background threads, the WAL tailer holds a single
+  // long-lived iterator for the whole run so it can walk across many WAL
+  // rotations; TailWalUpdates returns once ShouldStopBgThread() is observed.
+  stress_test->TailWalUpdates(thread);
+
+  MutexLock l(shared->GetMutex());
+  shared->IncBgThreadsFinished();
+  if (shared->BgThreadsFinished()) {
+    shared->GetCondVar()->SignalAll();
+  }
+}
+
 void CompressedCacheSetCapacityThread(void* v) {
   assert(FLAGS_compressed_secondary_cache_size > 0 ||
          FLAGS_compressed_secondary_cache_ratio > 0.0);

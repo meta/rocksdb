@@ -269,6 +269,57 @@ class DBCrashTestTest(unittest.TestCase):
             any(arg.startswith("--use_coro_db_api=") for arg in command)
         )
 
+    def test_wal_tailing_preserves_rotation_and_retention_choices(self):
+        db_crashtest = self.load_db_crashtest()
+        for tailing, rotations, ttl, size_limit, recycle in (
+            (0, 0, 0, 0, 2),
+            (0, 1, 60, 0, 0),
+            (1, 0, 0, 0, 2),
+            (1, 1, 0, 0, 2),
+            (1, 0, 60, 0, 0),
+            (1, 1, 0, 1, 0),
+        ):
+            with self.subTest(
+                tailing=tailing,
+                rotations=rotations,
+                ttl=ttl,
+                size_limit=size_limit,
+                recycle=recycle,
+            ):
+                params = self.build_params(
+                    db_crashtest.default_params,
+                    {
+                        "tail_wal_updates": tailing,
+                        "wal_iterator_tail_rotations": rotations,
+                        "WAL_ttl_seconds": ttl,
+                        "WAL_size_limit_MB": size_limit,
+                        "recycle_log_file_num": recycle,
+                        "reopen": 10,
+                        "disable_wal": 0,
+                        "sync_fault_injection": 0,
+                        "manual_wal_flush_one_in": 0,
+                        "enable_blob_direct_write": 0,
+                        "ingest_external_file_one_in": 100,
+                        "test_batches_snapshots": 0,
+                        "use_txn": 0,
+                        "user_timestamp_size": 0,
+                    },
+                )
+                command, finalized = db_crashtest.gen_cmd(params, [])
+                expected_reopen = 0 if tailing else 10
+                self.assertEqual(expected_reopen, finalized["reopen"])
+                self.assertIn(f"--reopen={expected_reopen}", command)
+                for name in (
+                    "wal_iterator_tail_rotations",
+                    "WAL_ttl_seconds",
+                    "WAL_size_limit_MB",
+                    "recycle_log_file_num",
+                    "ingest_external_file_one_in",
+                ):
+                    self.assertEqual(params[name], finalized[name], name)
+                if tailing:
+                    self.assertEqual(1, finalized["statistics"])
+
     def test_stress_diagnostics_directory_creation_failure_is_non_fatal(self):
         db_crashtest = self.load_db_crashtest()
         diagnostics_path = os.path.join(
@@ -1005,6 +1056,9 @@ class DBCrashTestTest(unittest.TestCase):
             {
                 "disable_wal": 1,
                 "test_batches_snapshots": 1,
+                "tail_wal_updates": 1,
+                "wal_iterator_tail_rotations": 1,
+                "recycle_log_file_num": 2,
                 # finalize_and_sanitize() intentionally forces disable_wal=0
                 # when inplace_update_support=1.
                 "inplace_update_support": 0,
@@ -1015,6 +1069,9 @@ class DBCrashTestTest(unittest.TestCase):
 
         self.assertEqual(1, finalized["disable_wal"])
         self.assertEqual(0, finalized["test_batches_snapshots"])
+        self.assertEqual(0, finalized["tail_wal_updates"])
+        self.assertEqual(0, finalized["wal_iterator_tail_rotations"])
+        self.assertEqual(2, finalized["recycle_log_file_num"])
 
     def test_finalize_disables_test_batches_snapshots_for_blob_direct_write(self):
         db_crashtest = self.load_db_crashtest()

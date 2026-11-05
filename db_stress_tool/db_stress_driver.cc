@@ -103,6 +103,10 @@ bool RunStressTestImpl(SharedState* shared) {
     shared->IncBgThreads();
   }
 
+  if (FLAGS_tail_wal_updates) {
+    shared->IncBgThreads();
+  }
+
   uint32_t remote_compaction_worker_thread_count =
       FLAGS_remote_compaction_worker_threads;
   if (remote_compaction_worker_thread_count > 0) {
@@ -133,6 +137,13 @@ bool RunStressTestImpl(SharedState* shared) {
   ThreadState continuous_verification_thread(0, shared);
   if (FLAGS_continuous_verification_interval > 0) {
     raw_env->StartThread(DbVerificationThread, &continuous_verification_thread);
+  }
+
+  // The WAL tailer is per-DB (it tails this DB's GetUpdatesSince stream), so it
+  // is spawned once per RunStressTestImpl invocation like DbVerificationThread.
+  ThreadState wal_tail_thread(0, shared);
+  if (FLAGS_tail_wal_updates) {
+    raw_env->StartThread(WalTailThread, &wal_tail_thread);
   }
 
   ThreadState liveness_watchdog_thread(0, shared);
@@ -276,7 +287,7 @@ bool RunStressTestImpl(SharedState* shared) {
   if (FLAGS_compaction_thread_pool_adjust_interval > 0 ||
       FLAGS_continuous_verification_interval > 0 || liveness_watchdog_enabled ||
       FLAGS_compressed_secondary_cache_size > 0 ||
-      FLAGS_compressed_secondary_cache_ratio > 0.0 ||
+      FLAGS_compressed_secondary_cache_ratio > 0.0 || FLAGS_tail_wal_updates ||
       remote_compaction_worker_thread_count > 0) {
     MutexLock l(shared->GetMutex());
     shared->SetShouldStopBgThread();
