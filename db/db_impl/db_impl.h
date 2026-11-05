@@ -36,7 +36,6 @@
 #include "db/flush_scheduler.h"
 #include "db/import_column_family_job.h"
 #include "db/internal_stats.h"
-#include "db/log_writer.h"
 #include "db/logs_with_prep_tracker.h"
 #include "db/memtable_list.h"
 #include "db/periodic_task_scheduler.h"
@@ -50,6 +49,7 @@
 #include "db/trim_history_scheduler.h"
 #include "db/version_edit.h"
 #include "db/wal_manager.h"
+#include "db/wal_writer.h"
 #include "db/write_controller.h"
 #include "db/write_thread.h"
 #include "logging/event_logger.h"
@@ -1358,7 +1358,7 @@ class DBImpl : public DB
     recovered_transactions_.clear();
   }
 
-  void AddToLogsToFreeQueue(log::Writer* log_writer) {
+  void AddToLogsToFreeQueue(WalWriter* log_writer) {
     mutex_.AssertHeld();
     wals_to_free_queue_.push_back(log_writer);
   }
@@ -2373,10 +2373,10 @@ class DBImpl : public DB
 
   struct LogWriterNumber {
     // pass ownership of _writer
-    LogWriterNumber(uint64_t _number, log::Writer* _writer)
+    LogWriterNumber(uint64_t _number, WalWriter* _writer)
         : number(_number), writer(_writer) {}
 
-    log::Writer* ReleaseWriter() {
+    WalWriter* ReleaseWriter() {
       auto* w = writer;
       writer = nullptr;
       return w;
@@ -2433,7 +2433,7 @@ class DBImpl : public DB
     uint64_t number;
     // Visual Studio doesn't support deque's member to be noncopyable because
     // of a std::unique_ptr as a member.
-    log::Writer* writer;  // own
+    WalWriter* writer;  // own
 
    private:
     // true for some prefix of logs_
@@ -2453,7 +2453,7 @@ class DBImpl : public DB
         : need_wal_sync(need_sync), need_wal_dir_sync(need_sync) {}
     bool need_wal_sync = false;
     bool need_wal_dir_sync = false;
-    log::Writer* writer = nullptr;
+    WalWriter* writer = nullptr;
     WalFileNumberSize* wal_file_number_size = nullptr;
     uint64_t prev_size = SIZE_MAX;
   };
@@ -3040,14 +3040,13 @@ class DBImpl : public DB
                     size_t* write_with_wal, WriteBatch** to_be_cached_state);
 
   IOStatus WriteToWAL(const WriteBatch& merged_batch,
-                      const WriteOptions& write_options,
-                      log::Writer* log_writer, uint64_t* wal_used,
-                      uint64_t* log_size,
+                      const WriteOptions& write_options, WalWriter* log_writer,
+                      uint64_t* wal_used, uint64_t* log_size,
                       WalFileNumberSize& wal_file_number_size,
                       SequenceNumber sequence);
 
   IOStatus WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
-                           log::Writer* log_writer, uint64_t* wal_used,
+                           WalWriter* log_writer, uint64_t* wal_used,
                            bool need_wal_sync, bool need_wal_dir_sync,
                            SequenceNumber sequence,
                            WalFileNumberSize& wal_file_number_size);
@@ -3420,7 +3419,7 @@ class DBImpl : public DB
   // (logs_ and alive_wal_files_).
   struct UnpublishedWAL {
     uint64_t log_number = 0;
-    std::unique_ptr<log::Writer> writer;
+    std::unique_ptr<WalWriter> writer;
 
     UnpublishedWAL() = default;
     UnpublishedWAL(const UnpublishedWAL&) = delete;
@@ -3471,12 +3470,12 @@ class DBImpl : public DB
   // can be installed as the current WAL for foreground writes.
   IOStatus StartWALFile(const WriteOptions& write_options,
                         const PredecessorWALInfo& predecessor_wal_info,
-                        log::Writer* new_log);
+                        WalWriter* new_log);
   IOStatus CreateWAL(const DBOptions& db_options,
                      const WriteOptions& write_options, uint64_t log_file_num,
                      uint64_t recycle_log_number, size_t preallocate_block_size,
                      const PredecessorWALInfo& predecessor_wal_info,
-                     log::Writer** new_log);
+                     WalWriter** new_log);
 
   // Validate self-consistency of DB options
   static Status ValidateOptions(const DBOptions& db_options);
@@ -3912,7 +3911,7 @@ class DBImpl : public DB
 
   // If this is non-empty, we need to delete these log files in background
   // threads. Protected by wal_write_mutex_.
-  autovector<log::Writer*> wals_to_free_;
+  autovector<WalWriter*> wals_to_free_;
 
   // Written with mutex_ held. Read without mutex_ when creating a snapshot.
   std::atomic<bool> is_snapshot_supported_{true};
@@ -4023,7 +4022,7 @@ class DBImpl : public DB
   std::unordered_set<uint64_t> files_grabbed_for_purge_;
 
   // A queue to store log writers to close. Protected by db mutex_.
-  std::deque<log::Writer*> wals_to_free_queue_;
+  std::deque<WalWriter*> wals_to_free_queue_;
 
   std::deque<SuperVersion*> superversions_to_free_queue_;
 

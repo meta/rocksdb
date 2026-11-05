@@ -146,6 +146,8 @@ class Writer {
 
   IOStatus EmitPhysicalRecord(const WriteOptions& write_options,
                               RecordType type, const char* ptr, size_t length);
+  IOStatus EmitPhysicalRecord(const IOOptions& io_options, RecordType type,
+                              const char* ptr, size_t length);
 
   IOStatus MaybeHandleSeenFileWriterError();
 
