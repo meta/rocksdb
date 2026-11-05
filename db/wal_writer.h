@@ -63,7 +63,10 @@ class WalWriter {
   virtual IOStatus WriteBuffer(const WriteOptions& write_options) = 0;
   // Finalizes an initialized, healthy file and closes the destination.
   // Direct destination closes can omit format-specific finalization.
+  // Repeated Close() after releasing the file is a no-op returning OK.
   virtual IOStatus Close(const WriteOptions& write_options) = 0;
+  // Releases the file if closed; true once released, so repeated calls are
+  // safe.
   virtual bool PublishIfClosed() = 0;
   virtual bool BufferIsEmpty() = 0;
   virtual SequenceNumber GetLastSeqnoRecorded() const = 0;

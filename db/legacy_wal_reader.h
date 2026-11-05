@@ -33,6 +33,7 @@ class LegacyWalReader final : public WalReader {
   bool IsCompressedAndEmptyFile() override;
   const UnorderedMap<uint32_t, size_t>& GetRecordedTimestampSize()
       const override;
+  uint64_t GetVerificationSize(uint64_t physical_file_size) const override;
   uint64_t LastRecordOffset() override;
   bool IsEOF() override;
   uint64_t GetLogNumber() const override;

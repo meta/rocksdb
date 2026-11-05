@@ -68,6 +68,11 @@ class AutoDetectingWalReader final : public WalReader {
                    : empty_timestamp_sizes_;
   }
 
+  uint64_t GetVerificationSize(uint64_t physical_file_size) const override {
+    return reader_ ? reader_->GetVerificationSize(physical_file_size)
+                   : physical_file_size;
+  }
+
   uint64_t LastRecordOffset() override {
     return reader_ ? reader_->LastRecordOffset() : 0;
   }

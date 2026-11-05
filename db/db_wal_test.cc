@@ -15,6 +15,7 @@
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
 #include "db/legacy_wal_writer.h"
+#include "db/wal_reader.h"
 #include "db/write_batch_internal.h"
 #include "file/sequence_file_reader.h"
 #include "options/options_helper.h"
@@ -3680,6 +3681,31 @@ TEST_F(DBWALTest, BlogWalAsyncPrecreateInitializesOnActivation) {
   ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, prepared_wal_number),
                              &contents));
   ASSERT_TRUE(BlogFileHeader::IsBlogFormat(contents.data(), contents.size()));
+}
+
+TEST_F(DBWALTest, WalObsoleteWalClosedTwice) {
+  // The obsolete WAL closes twice (one setting); repeat Close() must no-op.
+  for (bool background_close_inactive_wals : {false, true}) {
+    SCOPED_TRACE(std::string("background_close_inactive_wals=") +
+                 (background_close_inactive_wals ? "true" : "false"));
+    Options options = CurrentOptions();
+    options.background_close_inactive_wals = background_close_inactive_wals;
+    DestroyAndReopen(options);
+
+    // Flush retires key1's WAL so it is closed and purged while the DB is
+    // open.
+    ASSERT_OK(Put("key1", "value1"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("key2", "value2"));
+    ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+
+    ASSERT_EQ("value1", Get("key1"));
+    ASSERT_EQ("value2", Get("key2"));
+
+    Reopen(options);
+    ASSERT_EQ("value1", Get("key1"));
+    ASSERT_EQ("value2", Get("key2"));
+  }
 }
 
 namespace {

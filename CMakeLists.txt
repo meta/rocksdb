@@ -838,6 +838,7 @@ set(SOURCES
         db/forward_iterator.cc
         db/import_column_family_job.cc
         db/internal_stats.cc
+        db/legacy_wal_reader.cc
         db/legacy_wal_writer.cc
         db/logs_with_prep_tracker.cc
         db/log_reader.cc
@@ -868,6 +869,7 @@ set(SOURCES
         db/wal_edit.cc
         db/wal_iterator_impl.cc
         db/wal_manager.cc
+        db/wal_reader.cc
         db/wide/lazy_wide_columns.cc
         db/wide/read_path_blob_resolver.cc
         db/wide/wide_column_serialization.cc

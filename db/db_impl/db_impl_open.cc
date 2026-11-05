@@ -17,6 +17,7 @@
 #include "db/log_writer.h"
 #include "db/periodic_task_scheduler.h"
 #include "db/version_util.h"
+#include "db/wal_reader.h"
 #include "env/composite_env_wrapper.h"
 #include "file/filename.h"
 #include "file/read_write_util.h"
@@ -1358,7 +1359,7 @@ Status DBImpl::ProcessLogFile(
   bool old_log_record = false;
 
   DBOpenLogRecordReadReporter reporter;
-  std::unique_ptr<log::Reader> reader;
+  std::unique_ptr<WalReader> reader;
 
   std::string fname =
       LogFileName(immutable_db_options_.GetWalDir(), wal_number);
@@ -1401,6 +1402,11 @@ Status DBImpl::ProcessLogFile(
     return status;
   }
 
+  // Fired before the reader is created (not just before the read loop)
+  // because reader creation already performs the first block read for format
+  // detection.
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RecoverLogFiles:BeforeReadWal",
+                           /*cb_arg=*/nullptr);
   Status init_status = InitializeLogReader(
       wal_number, is_retry, fname, *stop_replay_for_corruption, min_wal_number,
       predecessor_wal_info, &old_log_record, &status, &reporter, reader);
@@ -1418,8 +1424,6 @@ Status DBImpl::ProcessLogFile(
     return status;
   }
 
-  TEST_SYNC_POINT_CALLBACK("DBImpl::RecoverLogFiles:BeforeReadWal",
-                           /*cb_arg=*/nullptr);
   while (true) {
     if (*stop_replay_by_wal_filter) {
       break;
@@ -1463,7 +1467,7 @@ Status DBImpl::ProcessLogFile(
 
   if (status.ok()) {
     status = UpdatePredecessorWALInfo(wal_number, last_seqno_observed, fname,
-                                      predecessor_wal_info);
+                                      reader.get(), predecessor_wal_info);
   }
 
   if (!status.ok() || old_log_record) {
@@ -1493,7 +1497,7 @@ Status DBImpl::InitializeLogReader(
     bool stop_replay_for_corruption, uint64_t min_wal_number,
     const PredecessorWALInfo& predecessor_wal_info, bool* const old_log_record,
     Status* const reporter_status, DBOpenLogRecordReadReporter* reporter,
-    std::unique_ptr<log::Reader>& reader) {
+    std::unique_ptr<WalReader>& reader) {
   assert(old_log_record);
   assert(reporter_status);
   assert(reporter);
@@ -1531,16 +1535,16 @@ Status DBImpl::InitializeLogReader(
   // paranoid_checks==false so that corruptions cause entire commits
   // to be skipped instead of propagating bad information (like overly
   // large sequence numbers).
-  reader.reset(new log::Reader(
-      immutable_db_options_.info_log, std::move(file_reader), reporter,
-      true /*checksum*/, wal_number,
-      immutable_db_options_.track_and_verify_wals, stop_replay_for_corruption,
-      min_wal_number, predecessor_wal_info));
+  reader = NewWalReader(immutable_db_options_.info_log, std::move(file_reader),
+                        reporter, true /*checksum*/, wal_number,
+                        immutable_db_options_.track_and_verify_wals,
+                        stop_replay_for_corruption, min_wal_number,
+                        predecessor_wal_info, /*buffered=*/false);
   return status;
 }
 
 Status DBImpl::ProcessLogRecord(
-    Slice record, const std::unique_ptr<log::Reader>& reader,
+    Slice record, const std::unique_ptr<WalReader>& reader,
     const UnorderedMap<uint32_t, size_t>& running_ts_sz, uint64_t wal_number,
     const std::string& fname, bool read_only, int job_id,
     const std::function<void()>& logFileDropped,
@@ -1632,7 +1636,7 @@ Status DBImpl::ProcessLogRecord(
 // We create a new batch and initialize with a valid prot_info_ to store
 // the data checksum
 Status DBImpl::InitializeWriteBatchForLogRecord(
-    Slice record, const std::unique_ptr<log::Reader>& reader,
+    Slice record, const std::unique_ptr<WalReader>& reader,
     const UnorderedMap<uint32_t, size_t>& running_ts_sz, WriteBatch* batch,
     std::unique_ptr<WriteBatch>& new_batch, WriteBatch*& batch_to_use,
     uint64_t* record_checksum) {
@@ -1828,12 +1832,17 @@ Status DBImpl::HandleNonOkStatusOrOldLogRecord(
 
 Status DBImpl::UpdatePredecessorWALInfo(
     uint64_t wal_number, const SequenceNumber last_seqno_observed,
-    const std::string& fname, PredecessorWALInfo& predecessor_wal_info) {
+    const std::string& fname, const WalReader* reader,
+    PredecessorWALInfo& predecessor_wal_info) {
   uint64_t bytes;
 
   Status s = env_->GetFileSize(fname, &bytes);
   if (!s.ok()) {
     return s;
+  }
+
+  if (reader != nullptr) {
+    bytes = reader->GetVerificationSize(bytes);
   }
 
   SequenceNumber mock_seqno = kMaxSequenceNumber;
