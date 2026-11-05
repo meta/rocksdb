@@ -556,6 +556,11 @@ default_params = {
     "adaptive_readahead": lambda: random.choice([0, 1]),
     "async_io": lambda: random.choice([0, 1]),
     "wal_compression": lambda: random.choice(["none", "zstd"]),
+    "use_blog_format_for_blobs": lambda: random.choice([0, 1]),
+    "blog_checksum": lambda: random.choice(
+        ["kNoChecksum", "kCRC32c", "kxxHash", "kxxHash64", "kXXH3"]
+    ),
+    "test_noncanonical_blog": lambda: random.choice([0, 1]),
     "verify_sst_unique_id_in_manifest": 1,  # always do unique_id verification
     "fast_sst_open": lambda: random.choice([0, 1]),
     "secondary_cache_uri": lambda: random.choice(

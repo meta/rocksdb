@@ -952,11 +952,11 @@ using FSAllocationPtr = std::unique_ptr<void, std::function<void(void*)>>;
 // A read IO request structure for use in MultiRead and asynchronous Read APIs.
 struct FSReadRequest {
   // Input parameter that represents the file offset in bytes.
-  uint64_t offset;
+  uint64_t offset = 0;
 
   // Input parameter that represents the length to read in bytes. `result` only
   // returns fewer bytes if end of file is hit (or `status` is not OK).
-  size_t len;
+  size_t len = 0;
 
   // A buffer that MultiRead() can optionally place data in. It can
   // ignore this and allocate its own buffer.
@@ -965,7 +965,7 @@ struct FSReadRequest {
   // In case of asynchronous reads, its an output parameter and it will be
   // maintained until callback has been called. Scratch is allocated by RocksDB
   // and will be passed to underlying FileSystem.
-  char* scratch;
+  char* scratch = nullptr;
 
   // Output parameter set by MultiRead() to point to the start of the data
   // buffer.
