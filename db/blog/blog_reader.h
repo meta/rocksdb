@@ -17,8 +17,16 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// Reads blog-format files sequentially (WAL replay) or at random offsets
-// (blob lookups). Supports footer reading by backward scanning.
+// Maximum number of escape-sequence candidates examined while scanning for
+// the end of one unspecified-size record. Past this many rejections the
+// record is declared torn: embedded escapes are 2^-80 per position in
+// non-adversarial data, so a healthy record never gets here. The bound keeps
+// torn scans from consuming the rest of the file, which would cost a
+// full-payload checksum per later record plus a whole-remainder rewind.
+constexpr size_t kBlogMaxUnspecifiedSizeScanCandidates = 64;
+
+// Reads blog-format files sequentially. Random blob reads and backward footer
+// discovery use the format helpers and their respective file readers.
 class BlogFileReader {
  public:
   // Error reporter, same pattern as log::Reader::Reporter.
@@ -43,7 +51,9 @@ class BlogFileReader {
     reporter_ = owned_reporter_.get();
   }
 
-  // Read and validate the file header. Must be called first.
+  // Read and validate the file header. Must be called first. Stops at the
+  // start of the padding after the header; the next ReadRecord() skips that
+  // padding before reading the first record.
   Status ReadHeader(BlogFileHeader* header);
 
   // Read the next record sequentially. Returns:
@@ -60,24 +70,47 @@ class BlogFileReader {
   // Scan forward from the current position for the next occurrence of
   // the file's escape sequence. Used for WAL recovery and unspecified-
   // size record parsing.
-  // On success, *found_offset is the file offset of the escape sequence.
+  // On success, *found_offset is the file offset of the escape sequence and
+  // the sequence remains logically unconsumed, so the next ReadRecord() starts
+  // at that escape sequence.
   Status ScanForEscapeSequence(uint64_t* found_offset);
 
   bool IsEOF() const { return eof_; }
   uint64_t LastRecordOffset() const { return last_record_offset_; }
-  uint64_t current_offset() const { return offset_; }
+  uint64_t current_offset() const { return offset_ - pending_input_.size(); }
   const BlogFileHeader& header() const { return header_; }
 
  private:
-  // Skip arbitrarily long padding (0x00 or 0xFF bytes) after a record or
-  // header. Aligns to 4-byte boundary first, then scans 4-byte chunks
-  // until finding one whose first byte is not 0x00/0xFF. Stashes that
-  // chunk in pending_input_ for the next ReadRecord call.
-  // Returns OK on success, NotFound on clean EOF (no more records),
-  // or an error Status on I/O failure.
+  // Read one record, including ignorable-properties records that the public
+  // ReadRecord() interface skips.
+  Status ReadOneRecord(BlogRecordType* type, Slice* payload,
+                       std::string* scratch, uint64_t* record_offset,
+                       CompressionType* record_compression_type);
+
+  // Advance past the padding gap (0x00 or 0xFF bytes) to the next record,
+  // stashing the first non-padding bytes in pending_input_ for the record
+  // read that follows. Gap bytes are skipped without validation; record
+  // parsing authenticates whatever follows. Returns OK once positioned at
+  // the next record, NotFound on clean EOF (zero gap bytes are legal at an
+  // aligned offset), Incomplete on a torn gap, Corruption on garbage before
+  // an alignment boundary, or an error Status on I/O failure.
   Status SkipPadding();
 
-  // Read exactly n bytes sequentially. Returns Incomplete on short read.
+  // Require the current logical position to be the exact end of the file.
+  Status RequireExactEOF(uint64_t record_offset);
+
+  // Validate record-level semantics that do not depend on the payload.
+  Status ValidateRecordType(BlogRecordType type, uint64_t length,
+                            size_t varint_len, uint64_t record_offset);
+  Status ValidateCompressionType(uint8_t compression_type,
+                                 BlogRecordType record_type,
+                                 uint64_t record_offset);
+
+  // Validate and advance the body/footer record-order state.
+  Status ValidateRecordSequence(BlogRecordType type, uint64_t record_offset);
+
+  // Read exactly n bytes sequentially. Returns Incomplete on a short read and
+  // makes the partial bytes available through result/scratch.
   Status ReadBytes(size_t n, Slice* result, std::string* scratch);
 
   // Read `remaining` bytes from `file`, appending them to `scratch` in
@@ -90,14 +123,18 @@ class BlogFileReader {
   // Read a prefix varint64 from the sequential stream.
   Status ReadPrefixVarint64(uint64_t* value, std::string* scratch);
 
+  void PrependPendingInput(const Slice& input);
+
   // Read the payload/trailer/padding of a full-format unspecified-size record
   // by scanning forward for aligned candidate escape sequences. For each
   // candidate, derive the only possible padding length (the exact trailing run
   // of 0x00/0xFF immediately before it) and validate the trailer checksum.
-  // After the first checksum mismatch, only a small fixed number of later
-  // escape-sequence candidates are considered before reporting corruption.
+  // Embedded escape sequences are skipped until a candidate is authenticated
+  // by its trailer checksum.
   Status ReadUnspecifiedSizeRecord(Slice* payload, std::string* scratch,
                                    uint64_t record_offset,
+                                   BlogRecordType record_type,
+                                   CompressionType prefix_compression_type,
                                    CompressionType* record_compression_type);
 
   // Report corruption and return a Corruption status. `bytes` is the
@@ -111,9 +148,16 @@ class BlogFileReader {
   bool verify_checksums_;
   BlogFileHeader header_;
   bool header_read_ = false;
+  bool has_compression_compatibility_name_ = false;
+  bool has_streaming_compression_type_ = false;
   bool eof_ = false;
   uint64_t offset_ = 0;
   uint64_t last_record_offset_ = 0;
+
+  bool footer_started_ = false;
+  bool footer_properties_seen_ = false;
+  bool footer_checksum_info_seen_ = false;
+  bool footer_locator_seen_ = false;
 
   // Bytes already read from seq_file_ but not yet logically consumed.
   std::string pending_input_;

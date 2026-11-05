@@ -9,7 +9,6 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
-#include <vector>
 
 #include "table/format.h"
 #include "util/cast_util.h"
@@ -53,24 +52,11 @@ std::string MakeRecordChecksumMismatchMessage(const std::string& kind,
          std::to_string(size);
 }
 
-std::string FormatCandidatePayloadSizes(
-    const std::vector<size_t>& candidate_payload_sizes) {
-  std::string result = "[";
-  for (size_t i = 0; i < candidate_payload_sizes.size(); ++i) {
-    if (i > 0) {
-      result += ",";
-    }
-    result += std::to_string(candidate_payload_sizes[i]);
-  }
-  result += "]";
-  return result;
-}
-
 std::string MakeUnspecifiedSizeChecksumMismatchMessage(
     uint64_t record_offset, uint64_t candidate_escape_sequence_offset,
     size_t candidate_payload_size, uint32_t stored_checksum,
     uint32_t computed_checksum, ChecksumType checksum_type,
-    const std::vector<size_t>& candidate_payload_sizes) {
+    size_t candidate_count) {
   return "unspecified-size record checksum mismatch: stored = " +
          std::to_string(stored_checksum) +
          ", computed = " + std::to_string(computed_checksum) +
@@ -79,25 +65,8 @@ std::string MakeUnspecifiedSizeChecksumMismatchMessage(
          " at candidate escape sequence file offset " +
          std::to_string(candidate_escape_sequence_offset) +
          ", candidate payload size " + std::to_string(candidate_payload_size) +
-         "; candidate payload sizes checked=" +
-         FormatCandidatePayloadSizes(candidate_payload_sizes);
-}
-
-std::string MakeUnspecifiedSizeChecksumMismatchAtEOFMessage(
-    uint64_t record_offset, uint64_t scan_limit_offset,
-    size_t candidate_payload_size, uint32_t stored_checksum,
-    uint32_t computed_checksum, ChecksumType checksum_type,
-    const std::vector<size_t>& candidate_payload_sizes) {
-  return "unspecified-size record checksum mismatch: stored = " +
-         std::to_string(stored_checksum) +
-         ", computed = " + std::to_string(computed_checksum) +
-         ", type = " + std::to_string(static_cast<int>(checksum_type)) +
-         " for record at file offset " + std::to_string(record_offset) +
-         " while scanning up to file offset " +
-         std::to_string(scan_limit_offset) + ", last candidate payload size " +
-         std::to_string(candidate_payload_size) +
-         "; candidate payload sizes checked=" +
-         FormatCandidatePayloadSizes(candidate_payload_sizes);
+         "; escape-sequence candidates checked=" +
+         std::to_string(candidate_count);
 }
 
 }  // namespace
@@ -112,7 +81,7 @@ Status BlogFileReader::ReadHeader(BlogFileHeader* header) {
   assert(!header_read_);
 
   // Read the fixed header to get property_section_size
-  const uint64_t fixed_header_offset = offset_;
+  const uint64_t fixed_header_offset = current_offset();
   std::string fixed_buf;
   Slice fixed_slice;
   Status s = ReadBytes(kBlogFileFixedHeaderSize, &fixed_slice, &fixed_buf);
@@ -120,14 +89,18 @@ Status BlogFileReader::ReadHeader(BlogFileHeader* header) {
     return AppendContext(s, "while reading blog fixed header");
   }
 
-  s = BlogFileHeader::VerifyFixedHeaderChecksum(fixed_slice.data());
-  if (!s.ok()) {
+  // Validate the fields needed to determine the remaining header size before
+  // trusting property_section_size for an allocation. DecodeFromBuffer()
+  // checks the magic, the fixed header checksum, and the property-section
+  // bounds before returning the number of missing bytes.
+  size_t prop_section_size = 0;
+  Slice fixed_input(fixed_slice);
+  s = header->DecodeFromBuffer(&fixed_input, &prop_section_size);
+  if (!s.IsIncomplete()) {
+    assert(!s.ok());
     return AppendContext(AppendFileOffset(s, fixed_header_offset),
-                         "while decoding blog header");
+                         "while validating blog fixed header");
   }
-
-  // Peek at property_section_size from bytes [32-35]
-  uint32_t prop_section_size = DecodeFixed32(fixed_slice.data() + 32);
 
   // Read the property section
   std::string prop_buf;
@@ -151,34 +124,71 @@ Status BlogFileReader::ReadHeader(BlogFileHeader* header) {
 
   header_ = *header;
   header_read_ = true;
-
-  // Skip padding after header to reach the first record's escape sequence.
-  // Padding may be arbitrarily long (for stronger alignment or recycled
-  // files of all zeros). EOF here is fine (header-only file, no records).
-  s = SkipPadding();
-  if (!s.ok() && !s.IsNotFound()) {
-    return AppendContext(s, "while skipping padding after blog header");
-  }
+  has_compression_compatibility_name_ =
+      header_.HasProperty(kBlogPropCompressionCompatibilityName);
+  has_streaming_compression_type_ =
+      header_.HasProperty(kBlogPropWriteBatchStreamingCompressionType);
   return Status::OK();
 }
 
 Status BlogFileReader::ReadRecord(BlogRecordType* type, Slice* payload,
                                   std::string* scratch, uint64_t* record_offset,
                                   CompressionType* record_compression_type) {
+  while (true) {
+    if (eof_ && pending_input_.empty()) {
+      return Status::NotFound("Blog reader: clean EOF at " +
+                              MakeFileOffsetString(current_offset()));
+    }
+    // Skip the padding gap after the previously delivered header or record.
+    // Torn padding reports Incomplete (retry once the file grows) without
+    // withholding the complete record or header already delivered.
+    Status pad_status = SkipPadding();
+    if (!pad_status.ok()) {
+      return pad_status;
+    }
+    Status s = ReadOneRecord(type, payload, scratch, record_offset,
+                             record_compression_type);
+    if (!s.ok() || *type != kBlogIgnorablePropertiesRecord) {
+      return s;
+    }
+
+    BlogPropertyMap properties;
+    Slice property_input(*payload);
+    s = DecodeBlogProperties(&property_input, &properties);
+    if (!s.ok() || !property_input.empty()) {
+      return ReportCorruption(payload->size(),
+                              "invalid ignorable properties record at " +
+                                  MakeFileOffsetString(record_offset == nullptr
+                                                           ? last_record_offset_
+                                                           : *record_offset));
+    }
+    for (const auto& [name, value] : properties) {
+      if (!IsBlogIgnorableProperty(name)) {
+        return ReportCorruption(
+            payload->size(),
+            "required property in ignorable properties record at " +
+                MakeFileOffsetString(record_offset == nullptr
+                                         ? last_record_offset_
+                                         : *record_offset));
+      }
+      header_.SetProperty(name, value);
+    }
+  }
+}
+
+Status BlogFileReader::ReadOneRecord(BlogRecordType* type, Slice* payload,
+                                     std::string* scratch,
+                                     uint64_t* record_offset,
+                                     CompressionType* record_compression_type) {
   if (!header_read_) {
     return Status::Corruption("Blog reader: header not read at " +
-                              MakeFileOffsetString(offset_));
-  }
-  if (eof_) {
-    return Status::NotFound("Blog reader: clean EOF at " +
-                            MakeFileOffsetString(offset_));
+                              MakeFileOffsetString(current_offset()));
   }
 
   Status s;
   scratch->clear();
 
   std::string esc_buf;
-  const bool had_pending_input = !pending_input_.empty();
   const uint64_t escape_sequence_offset =
       offset_ - lossless_cast<uint64_t>(pending_input_.size());
   Slice esc_slice;
@@ -186,7 +196,7 @@ Status BlogFileReader::ReadRecord(BlogRecordType* type, Slice* payload,
   if (!s.ok()) {
     if (s.IsIncomplete()) {
       eof_ = true;
-      if (had_pending_input) {
+      if (!esc_slice.empty()) {
         return Status::Incomplete(
             "Blog reader: incomplete escape sequence at " +
             MakeFileOffsetString(escape_sequence_offset));
@@ -214,6 +224,7 @@ Status BlogFileReader::ReadRecord(BlogRecordType* type, Slice* payload,
   }
 
   const uint64_t rec_offset = escape_sequence_offset;
+  assert(rec_offset % kBlogMinRecordAlignment == 0);
   if (record_offset) {
     *record_offset = rec_offset;
   }
@@ -238,7 +249,11 @@ Status BlogFileReader::ReadRecord(BlogRecordType* type, Slice* payload,
 
   if (length == 0) {
     // Trivial format: [varint(0): 1B] [type: 1B] [checksum: 4B]
-    assert(varint_len == 1);
+    if (varint_len != 1) {
+      return ReportCorruption(
+          varint_len, "zero-length record has nontrivial length encoding at " +
+                          MakeFileOffsetString(rec_offset));
+    }
     Slice trivial_rest_slice;
     s = ReadBytes(5, &trivial_rest_slice,
                   &prefix_rest_buf);  // type(1) + cksum(4)
@@ -271,21 +286,25 @@ Status BlogFileReader::ReadRecord(BlogRecordType* type, Slice* payload,
       }
     }
 
+    s = ValidateRecordType(rec_type, length, varint_len, rec_offset);
+    if (!s.ok()) {
+      return s;
+    }
+
     *type = rec_type;
     payload->clear();
     if (record_compression_type) {
       *record_compression_type = kNoCompression;
     }
-    s = SkipPadding();
-    if (!s.ok() && !s.IsNotFound()) {
-      return AppendContext(s,
-                           "while skipping padding after trivial record at " +
-                               MakeFileOffsetString(rec_offset));
+    s = ValidateRecordSequence(rec_type, rec_offset);
+    if (!s.ok()) {
+      return s;
     }
     return Status::OK();
   }
 
   bool is_full_format = (varint_len > kBlogCompactVarintMaxBytes);
+  CompressionType prefix_compression_type = kNoCompression;
 
   if (is_full_format) {
     // Full format: read type + compression_type + prefix_checksum
@@ -302,6 +321,8 @@ Status BlogFileReader::ReadRecord(BlogRecordType* type, Slice* payload,
 
     rec_type =
         static_cast<BlogRecordType>(static_cast<uint8_t>(prefix_rest_slice[0]));
+    prefix_compression_type = lossless_cast<CompressionType>(
+        lossless_cast<uint8_t>(prefix_rest_slice[1]));
 
     if (verify_checksums_) {
       scratch->push_back(prefix_rest_slice[0]);  // type
@@ -326,19 +347,38 @@ Status BlogFileReader::ReadRecord(BlogRecordType* type, Slice* payload,
     rec_type = header_.compact_record_type;
   }
 
-  *type = rec_type;
+  s = ValidateRecordType(rec_type, length, varint_len, rec_offset);
+  if (!s.ok()) {
+    return s;
+  }
+  if (is_full_format) {
+    s = ValidateCompressionType(lossless_cast<uint8_t>(prefix_compression_type),
+                                rec_type, rec_offset);
+    if (!s.ok()) {
+      return s;
+    }
+  }
 
   if (length == kBlogUnspecifiedSize) {
-    s = ReadUnspecifiedSizeRecord(payload, scratch, rec_offset,
+    s = ReadUnspecifiedSizeRecord(payload, scratch, rec_offset, rec_type,
+                                  prefix_compression_type,
                                   record_compression_type);
     if (!s.ok()) {
       return s;
     }
   } else {
+    const size_t payload_size = lossless_cast<size_t>(length);
+    if (payload_size > scratch->max_size()) {
+      return ReportCorruption(
+          varint_len, "record payload length exceeds string max_size at " +
+                          MakeFileOffsetString(rec_offset));
+    }
+
     // Read payload
     scratch->clear();
     Slice payload_slice;
-    s = ReadBytes(static_cast<size_t>(length), &payload_slice, scratch);
+    const uint64_t payload_file_offset = current_offset();
+    s = ReadBytes(payload_size, &payload_slice, scratch);
     if (!s.ok()) {
       if (s.IsIncomplete()) {
         eof_ = true;
@@ -366,42 +406,161 @@ Status BlogFileReader::ReadRecord(BlogRecordType* type, Slice* payload,
     uint32_t stored_checksum = DecodeFixed32(trailer_slice.data() + 1);
 
     if (verify_checksums_) {
-      const uint64_t payload_file_offset =
-          offset_ - kBlogBlockTrailerSize - length;
       uint32_t computed_checksum = ComputeBlogRecordChecksum(
           header_.checksum_type, scratch->data(), scratch->size(),
           trailer_comp_type, header_.incarnation_id(), payload_file_offset);
       if (stored_checksum != computed_checksum) {
-        return ReportCorruption(
-            static_cast<size_t>(length) + kBlogBlockTrailerSize,
-            MakeRecordChecksumMismatchMessage(
-                "record checksum mismatch", stored_checksum, computed_checksum,
-                header_.checksum_type, rec_offset,
-                lossless_cast<size_t>(length)));
+        return ReportCorruption(payload_size + kBlogBlockTrailerSize,
+                                MakeRecordChecksumMismatchMessage(
+                                    "record checksum mismatch", stored_checksum,
+                                    computed_checksum, header_.checksum_type,
+                                    rec_offset, lossless_cast<size_t>(length)));
       }
+    }
+
+    s = ValidateCompressionType(lossless_cast<uint8_t>(trailer_comp_type),
+                                rec_type, rec_offset);
+    if (!s.ok()) {
+      return s;
+    }
+    const CompressionType trailer_compression_type =
+        lossless_cast<CompressionType>(
+            lossless_cast<uint8_t>(trailer_comp_type));
+    if (is_full_format && trailer_compression_type != prefix_compression_type) {
+      return ReportCorruption(
+          payload_size + kBlogBlockTrailerSize,
+          "full record prefix/trailer compression type mismatch at " +
+              MakeFileOffsetString(rec_offset));
     }
 
     *payload = Slice(*scratch);
     if (record_compression_type) {
-      *record_compression_type = static_cast<CompressionType>(
-          lossless_cast<uint8_t>(trailer_comp_type));
+      *record_compression_type = trailer_compression_type;
     }
 
-    // Skip padding to next record.
-    s = SkipPadding();
-    if (!s.ok() && !s.IsNotFound()) {
-      return AppendContext(s, "while skipping padding after record at " +
-                                  MakeFileOffsetString(rec_offset));
+    if (rec_type == kBlogFooterLocatorRecord) {
+      s = RequireExactEOF(rec_offset);
+      if (!s.ok()) {
+        return s;
+      }
     }
   }
 
-  // Silently skip ignorable properties records -- they carry diagnostic
-  // data that readers don't need for correctness.
-  if (*type == kBlogIgnorablePropertiesRecord) {
-    return ReadRecord(type, payload, scratch, record_offset,
-                      record_compression_type);
+  s = ValidateRecordSequence(rec_type, rec_offset);
+  if (!s.ok()) {
+    return s;
+  }
+  *type = rec_type;
+
+  return Status::OK();
+}
+
+Status BlogFileReader::ValidateRecordType(BlogRecordType type, uint64_t length,
+                                          size_t varint_len,
+                                          uint64_t record_offset) {
+  if (!IsKnownBlogRecordType(type)) {
+    const uint8_t raw_type = lossless_cast<uint8_t>(type);
+    const bool in_record_class_range =
+        raw_type != 0x00 && (raw_type <= 0x7F || raw_type >= 0xF0);
+    if (in_record_class_range) {
+      return Status::NotSupported("Blog reader: reserved record type " +
+                                  std::to_string(raw_type) + " at " +
+                                  MakeFileOffsetString(record_offset));
+    }
+    return ReportCorruption(
+        varint_len, "invalid record type " + std::to_string(raw_type) + " at " +
+                        MakeFileOffsetString(record_offset));
   }
 
+  if (type == kBlogPreambleStartRecord && length != 0) {
+    return ReportCorruption(
+        varint_len, "preamble-start record must use trivial format at " +
+                        MakeFileOffsetString(record_offset));
+  }
+  if (type == kBlogFooterLocatorRecord &&
+      (length == 0 || length == kBlogUnspecifiedSize)) {
+    return ReportCorruption(
+        varint_len,
+        "footer locator must have a specified, non-zero payload at " +
+            MakeFileOffsetString(record_offset));
+  }
+  return Status::OK();
+}
+
+Status BlogFileReader::ValidateCompressionType(uint8_t compression_type,
+                                               BlogRecordType record_type,
+                                               uint64_t record_offset) {
+  if (!IsValidBlogCompressionType(compression_type)) {
+    return ReportCorruption(1, "invalid compression type " +
+                                   std::to_string(compression_type) + " at " +
+                                   MakeFileOffsetString(record_offset));
+  }
+
+  if (compression_type == kStreamingCompressionSentinel &&
+      (record_type != kBlogWriteBatchRecord ||
+       !has_streaming_compression_type_)) {
+    return ReportCorruption(
+        1,
+        "streaming compression is only valid for WriteBatch records with "
+        "WriteBatchStreamingCompressionType at " +
+            MakeFileOffsetString(record_offset));
+  }
+
+  if (compression_type != kNoCompression &&
+      !has_compression_compatibility_name_) {
+    return ReportCorruption(
+        1, "compressed record without CompressionCompatibilityName at " +
+               MakeFileOffsetString(record_offset));
+  }
+  return Status::OK();
+}
+
+Status BlogFileReader::ValidateRecordSequence(BlogRecordType type,
+                                              uint64_t record_offset) {
+  if (!IsBlogFooterRecordType(type)) {
+    if (footer_started_) {
+      return ReportCorruption(0, "non-footer record after footer began at " +
+                                     MakeFileOffsetString(record_offset));
+    }
+    return Status::OK();
+  }
+
+  footer_started_ = true;
+  switch (type) {
+    case kBlogFooterIndexRecord:
+      if (footer_properties_seen_ || footer_checksum_info_seen_ ||
+          footer_locator_seen_) {
+        return ReportCorruption(0, "footer index record out of order at " +
+                                       MakeFileOffsetString(record_offset));
+      }
+      break;
+    case kBlogFooterPropertiesRecord:
+      if (footer_properties_seen_ || footer_checksum_info_seen_ ||
+          footer_locator_seen_) {
+        return ReportCorruption(
+            0, "duplicate or out-of-order footer properties record at " +
+                   MakeFileOffsetString(record_offset));
+      }
+      footer_properties_seen_ = true;
+      break;
+    case kBlogFooterFileChecksumInfo:
+      if (footer_checksum_info_seen_ || footer_locator_seen_) {
+        return ReportCorruption(
+            0, "duplicate or out-of-order footer checksum-info record at " +
+                   MakeFileOffsetString(record_offset));
+      }
+      footer_checksum_info_seen_ = true;
+      break;
+    case kBlogFooterLocatorRecord:
+      if (footer_locator_seen_) {
+        return ReportCorruption(0, "duplicate footer locator record at " +
+                                       MakeFileOffsetString(record_offset));
+      }
+      footer_locator_seen_ = true;
+      break;
+    default:
+      assert(false);
+  }
   return Status::OK();
 }
 
@@ -413,27 +572,31 @@ Status BlogFileReader::ScanForEscapeSequence(uint64_t* found_offset) {
 
   std::string buf;
   // Align to 4-byte boundary first
-  size_t remainder = offset_ % 4;
+  uint64_t logical_offset =
+      offset_ - lossless_cast<uint64_t>(pending_input_.size());
+  size_t remainder = logical_offset % kBlogMinRecordAlignment;
   if (remainder != 0) {
-    size_t skip = 4 - remainder;
+    size_t skip = kBlogMinRecordAlignment - remainder;
     Slice skip_slice;
     Status s = ReadBytes(skip, &skip_slice, &buf);
     if (!s.ok()) {
       if (s.IsIncomplete()) {
         return Status::NotFound("escape sequence not found before EOF at " +
-                                MakeFileOffsetString(offset_));
+                                MakeFileOffsetString(current_offset()));
       }
       return AppendContext(s, "while aligning scan for escape sequence");
     }
   }
 
   while (!eof_) {
+    const uint64_t candidate_offset =
+        offset_ - lossless_cast<uint64_t>(pending_input_.size());
     Slice chunk_slice;
-    Status s = ReadBytes(4, &chunk_slice, &buf);
+    Status s = ReadBytes(kBlogMinRecordAlignment, &chunk_slice, &buf);
     if (!s.ok()) {
       if (s.IsIncomplete()) {
         return Status::NotFound("escape sequence not found before EOF at " +
-                                MakeFileOffsetString(offset_));
+                                MakeFileOffsetString(current_offset()));
       }
       return AppendContext(s, "while scanning for escape sequence");
     }
@@ -442,14 +605,13 @@ Status BlogFileReader::ScanForEscapeSequence(uint64_t* found_offset) {
     memcpy(&candidate, chunk_slice.data(), 4);
     if (candidate == first4) {
       // Potential match - verify remaining 6 bytes
-      uint64_t candidate_offset = offset_ - 4;
       Slice rest_slice;
       std::string rest_buf;
       s = ReadBytes(kBlogEscapeSequenceSize - 4, &rest_slice, &rest_buf);
       if (!s.ok()) {
         if (s.IsIncomplete()) {
           return Status::NotFound("escape sequence not found before EOF at " +
-                                  MakeFileOffsetString(offset_));
+                                  MakeFileOffsetString(current_offset()));
         }
         return AppendContext(s,
                              "while verifying candidate escape sequence at " +
@@ -458,67 +620,126 @@ Status BlogFileReader::ScanForEscapeSequence(uint64_t* found_offset) {
 
       if (memcmp(rest_slice.data(), header_.escape_sequence + 4,
                  kBlogEscapeSequenceSize - 4) == 0) {
+        PrependPendingInput(rest_slice);
+        PrependPendingInput(chunk_slice);
         *found_offset = candidate_offset;
         return Status::OK();
       }
-      // False match, continue scanning. But we consumed 6 extra bytes that
-      // might not be aligned. Re-align.
-      remainder = offset_ % 4;
-      if (remainder != 0) {
-        size_t skip = 4 - remainder;
-        Slice skip_s;
-        s = ReadBytes(skip, &skip_s, &buf);
-        if (!s.ok()) {
-          if (s.IsIncomplete()) {
-            return Status::NotFound("escape sequence not found before EOF at " +
-                                    MakeFileOffsetString(offset_));
-          }
-          return AppendContext(s, "while re-aligning scan after candidate at " +
-                                      MakeFileOffsetString(candidate_offset));
-        }
-      }
+      // Advance only by the four-byte aligned candidate prefix. Put the six
+      // lookahead bytes back so an overlapping aligned escape sequence is not
+      // skipped.
+      PrependPendingInput(rest_slice);
     }
   }
   return Status::NotFound("escape sequence not found before EOF at " +
-                          MakeFileOffsetString(offset_));
+                          MakeFileOffsetString(current_offset()));
 }
 
 Status BlogFileReader::SkipPadding() {
-  // Skip arbitrarily long padding (0x00 or 0xFF bytes). Padding is
-  // 32-bit aligned. Since the escape sequence's first byte is guaranteed
-  // to be neither 0x00 nor 0xFF, we align to 4 bytes then scan 4-byte
-  // chunks until we find one that starts with a non-padding byte.
-  size_t remainder = offset_ % 4;
+  // Advance past the padding gap (0x00 or 0xFF bytes) to the next record.
+  // Padding carries no semantic content and the writer constructs it
+  // correctly, so gap bytes are skipped without validating uniformity or any
+  // first/mandatory byte. Records only start aligned, so a non-padding byte
+  // anywhere else is reported immediately; whatever follows at an aligned
+  // offset is left for record parsing to authenticate.
+  // Torn padding returns Incomplete so the caller retries once the file
+  // grows; only an exact end of file is clean (NotFound).
+  //
+  // Align first with an exact-sized read: record starts are always aligned,
+  // so the bytes to the next boundary are required (a short read is torn),
+  // while at an aligned offset zero gap bytes are legal. A fixed-size chunk
+  // read from an unaligned position cannot make that distinction.
+  const size_t remainder = current_offset() % kBlogMinRecordAlignment;
   if (remainder != 0) {
-    Slice skip_slice;
-    std::string skip_buf;
-    Status s = ReadBytes(4 - remainder, &skip_slice, &skip_buf);
-    if (!s.ok()) {
-      if (s.IsIncomplete()) {
-        return Status::NotFound("padding extends to EOF at " +
-                                MakeFileOffsetString(offset_));
-      }
+    Slice pad_slice;
+    std::string pad_buf;
+    Status s =
+        ReadBytes(kBlogMinRecordAlignment - remainder, &pad_slice, &pad_buf);
+    if (!s.ok() && !s.IsIncomplete()) {
       return AppendContext(s, "while aligning padding scan");
     }
+    size_t i = 0;
+    while (i < pad_slice.size()) {
+      const uint8_t byte = lossless_cast<uint8_t>(pad_slice[i]);
+      if (byte != 0x00 && byte != 0xFF) {
+        break;
+      }
+      ++i;
+    }
+    if (i < pad_slice.size()) {
+      // Garbage before the boundary: records can only start aligned, so no
+      // record the parse could accept begins here. Report immediately.
+      return ReportCorruption(
+          pad_slice.size() - i,
+          "non-padding byte before aligned record boundary at " +
+              MakeFileOffsetString(current_offset() - pad_slice.size() + i));
+    }
+    if (s.IsIncomplete()) {
+      return Status::Incomplete("torn padding at " +
+                                MakeFileOffsetString(current_offset()));
+    }
   }
+
   while (true) {
     Slice chunk_slice;
     std::string chunk_buf;
-    Status s = ReadBytes(4, &chunk_slice, &chunk_buf);
-    if (!s.ok()) {
-      if (s.IsIncomplete()) {
-        return Status::NotFound("padding extends to EOF at " +
-                                MakeFileOffsetString(offset_));
-      }
+    Status s = ReadBytes(kBlogMinRecordAlignment, &chunk_slice, &chunk_buf);
+    if (!s.ok() && !s.IsIncomplete()) {
       return AppendContext(s, "while scanning padding");
     }
-    uint8_t first = static_cast<uint8_t>(chunk_slice[0]);
-    if (first != 0x00 && first != 0xFF) {
-      // Found the start of the next escape sequence.
-      pending_input_.assign(chunk_slice.data(), 4);
+    size_t i = 0;
+    while (i < chunk_slice.size()) {
+      const uint8_t byte = lossless_cast<uint8_t>(chunk_slice[i]);
+      if (byte != 0x00 && byte != 0xFF) {
+        break;
+      }
+      ++i;
+    }
+    if (i < chunk_slice.size()) {
+      if (i > 0) {
+        // The chunk began at an aligned offset, so this byte is unaligned
+        // and no record the parse could accept begins here. Report
+        // immediately, as before the boundary above; growth cannot repair a
+        // byte that is neither padding nor a record start.
+        return ReportCorruption(
+            chunk_slice.size() - i,
+            "non-padding byte inside alignment gap at " +
+                MakeFileOffsetString(current_offset() - chunk_slice.size() +
+                                     i));
+      }
+      // Next record (or aligned garbage for the record parse to reject).
+      // Stashing a torn escape likewise leaves the Incomplete to the record
+      // read.
+      PrependPendingInput(
+          Slice(chunk_slice.data() + i, chunk_slice.size() - i));
       return Status::OK();
     }
+    if (!chunk_slice.empty()) {
+      if (s.IsIncomplete()) {
+        return Status::Incomplete("torn padding at " +
+                                  MakeFileOffsetString(current_offset()));
+      }
+      continue;
+    }
+    return Status::NotFound("padding extends to EOF at " +
+                            MakeFileOffsetString(current_offset()));
   }
+}
+
+Status BlogFileReader::RequireExactEOF(uint64_t record_offset) {
+  Slice extra_slice;
+  std::string extra_buf;
+  Status s = ReadBytes(1, &extra_slice, &extra_buf);
+  if (s.ok()) {
+    return ReportCorruption(
+        1, "footer locator is not the last byte sequence in the file at " +
+               MakeFileOffsetString(record_offset));
+  }
+  if (s.IsIncomplete() && extra_slice.empty()) {
+    return Status::OK();
+  }
+  return AppendContext(s, "while checking for data after footer locator at " +
+                              MakeFileOffsetString(record_offset));
 }
 
 Status BlogFileReader::ReadBytes(size_t n, Slice* result,
@@ -617,22 +838,26 @@ Status BlogFileReader::ReadPrefixVarint64(uint64_t* value,
 
   if (!DecodePrefixVarint64(first_byte, scratch->data() + 1,
                             scratch->size() - 1, value)) {
-    return ReportCorruption(
-        scratch->size(),
-        "invalid prefix varint ending at " + MakeFileOffsetString(offset_));
+    return ReportCorruption(scratch->size(),
+                            "invalid prefix varint ending at " +
+                                MakeFileOffsetString(current_offset()));
   }
   return Status::OK();
 }
 
+void BlogFileReader::PrependPendingInput(const Slice& input) {
+  pending_input_.insert(0, input.data(), input.size());
+}
+
 Status BlogFileReader::ReadUnspecifiedSizeRecord(
     Slice* payload, std::string* scratch, uint64_t record_offset,
+    BlogRecordType record_type, CompressionType prefix_compression_type,
     CompressionType* record_compression_type) {
   assert(payload != nullptr);
   assert(scratch != nullptr);
 
   constexpr size_t kReadChunkSize = 4;
-  constexpr uint32_t kMaxEscapeSequenceLookaheadOnChecksumMismatch = 3;
-  const uint64_t payload_file_offset = offset_;
+  const uint64_t payload_file_offset = current_offset();
   scratch->clear();
 
   // scratch is payload-relative: scratch[i] corresponds to file offset
@@ -643,8 +868,8 @@ Status BlogFileReader::ReadUnspecifiedSizeRecord(
   size_t candidate_offset = lossless_cast<size_t>(
       BitwiseAnd(uint64_t{0} - payload_file_offset, uint64_t{3}));
   bool saw_checksum_mismatch = false;
-  uint32_t remaining_checksum_mismatch_lookahead = 0;
-  std::vector<size_t> candidate_payload_sizes_checked;
+  size_t candidate_count = 0;
+  uint64_t last_candidate_escape_sequence_offset = 0;
   size_t last_candidate_payload_size = 0;
   uint32_t last_stored_checksum = 0;
   uint32_t last_computed_checksum = 0;
@@ -656,11 +881,11 @@ Status BlogFileReader::ReadUnspecifiedSizeRecord(
       if (saw_checksum_mismatch && s.IsIncomplete()) {
         return ReportCorruption(
             scratch->size(),
-            MakeUnspecifiedSizeChecksumMismatchAtEOFMessage(
-                record_offset, payload_file_offset + scratch->size(),
+            MakeUnspecifiedSizeChecksumMismatchMessage(
+                record_offset, last_candidate_escape_sequence_offset,
                 last_candidate_payload_size, last_stored_checksum,
                 last_computed_checksum, header_.checksum_type,
-                candidate_payload_sizes_checked));
+                candidate_count));
       }
       if (s.IsIncomplete()) {
         eof_ = true;
@@ -709,7 +934,9 @@ Status BlogFileReader::ReadUnspecifiedSizeRecord(
     const size_t trailer_pos =
         candidate_offset - pad_len - kBlogBlockTrailerSize;
     const size_t payload_size = trailer_pos;
-    candidate_payload_sizes_checked.push_back(payload_size);
+    ++candidate_count;
+    last_candidate_escape_sequence_offset =
+        payload_file_offset + candidate_offset;
     const char* trailer = scratch->data() + trailer_pos;
     const uint32_t stored_checksum = DecodeFixed32(trailer + 1);
     const uint32_t computed_checksum = ComputeBlogRecordChecksum(
@@ -719,33 +946,45 @@ Status BlogFileReader::ReadUnspecifiedSizeRecord(
     last_stored_checksum = stored_checksum;
     last_computed_checksum = computed_checksum;
     if (stored_checksum != computed_checksum) {
-      if (!saw_checksum_mismatch) {
-        saw_checksum_mismatch = true;
-        remaining_checksum_mismatch_lookahead =
-            kMaxEscapeSequenceLookaheadOnChecksumMismatch;
-      } else if (remaining_checksum_mismatch_lookahead == 0) {
+      saw_checksum_mismatch = true;
+      if (candidate_count > kBlogMaxUnspecifiedSizeScanCandidates) {
         return ReportCorruption(
             candidate_offset + kBlogEscapeSequenceSize,
             MakeUnspecifiedSizeChecksumMismatchMessage(
-                record_offset, payload_file_offset + candidate_offset,
-                payload_size, stored_checksum, computed_checksum,
-                header_.checksum_type, candidate_payload_sizes_checked));
-      } else {
-        --remaining_checksum_mismatch_lookahead;
+                record_offset, last_candidate_escape_sequence_offset,
+                last_candidate_payload_size, last_stored_checksum,
+                last_computed_checksum, header_.checksum_type,
+                candidate_count));
       }
-      // Treat this as a likely false positive inside the payload until the
-      // bounded checksum-mismatch lookahead is exhausted.
+      // An escape sequence can legitimately occur in the payload. Continue
+      // until a candidate is authenticated by the trailer checksum, EOF is
+      // reached, or kBlogMaxUnspecifiedSizeScanCandidates is exceeded.
       candidate_offset += 4;
       continue;
     }
 
-    pending_input_.assign(scratch->data() + candidate_offset,
-                          scratch->size() - candidate_offset);
+    const uint8_t trailer_compression_byte = lossless_cast<uint8_t>(trailer[0]);
+    Status validation = ValidateCompressionType(trailer_compression_byte,
+                                                record_type, record_offset);
+    if (!validation.ok()) {
+      return validation;
+    }
+    const CompressionType trailer_compression_type =
+        lossless_cast<CompressionType>(trailer_compression_byte);
+    if (trailer_compression_type != prefix_compression_type) {
+      return ReportCorruption(
+          candidate_offset + kBlogEscapeSequenceSize,
+          "unspecified-size record prefix/trailer compression type mismatch "
+          "at " +
+              MakeFileOffsetString(record_offset));
+    }
+
+    PrependPendingInput(Slice(scratch->data() + candidate_offset,
+                              scratch->size() - candidate_offset));
     scratch->resize(payload_size);
     *payload = Slice(*scratch);
     if (record_compression_type) {
-      *record_compression_type =
-          static_cast<CompressionType>(lossless_cast<uint8_t>(trailer[0]));
+      *record_compression_type = trailer_compression_type;
     }
     return Status::OK();
   }

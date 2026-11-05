@@ -30,6 +30,7 @@
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_sequential_reader.h"
 #include "db/blog/blog_format.h"
+#include "db/blog/blog_reader.h"
 #include "db/blog/blog_writer.h"
 #include "db/column_family.h"
 #include "db/db_test_util.h"
@@ -52,6 +53,31 @@
 #include "utilities/fault_injection_env.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+class TrackingBlobCompressionManager : public CompressionManagerWrapper {
+ public:
+  TrackingBlobCompressionManager()
+      : CompressionManagerWrapper(GetBuiltinV2CompressionManager()) {}
+
+  const char* Name() const override { return "TrackingBlobCompressionManager"; }
+
+  const char* CompatibilityName() const override {
+    return "TrackingBlobCompressionManagerV1";
+  }
+
+  std::unique_ptr<Compressor> GetCompressor(const CompressionOptions& opts,
+                                            CompressionType type) override {
+    get_compressor_calls_.fetch_add(1, std::memory_order_relaxed);
+    return CompressionManagerWrapper::GetCompressor(opts, type);
+  }
+
+  uint64_t GetCompressorCalls() const {
+    return get_compressor_calls_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<uint64_t> get_compressor_calls_{0};
+};
 
 class FixedBlobDirectWritePartitionStrategy : public BlobFilePartitionStrategy {
  public:
@@ -416,6 +442,29 @@ class DBBlobDirectWriteTest : public DBTestBase {
     BlobLogSequentialReader reader(std::move(file_reader), clock,
                                    /*statistics=*/nullptr);
     return reader.ReadHeader(header);
+  }
+
+  Status OpenBlogFileReader(uint64_t blob_file_number,
+                            std::unique_ptr<BlogFileReader>* reader) {
+    assert(reader != nullptr);
+
+    std::unique_ptr<FSSequentialFile> file;
+    FileOptions file_options;
+    constexpr IODebugContext* dbg = nullptr;
+    const std::string blob_file_path = BlobFileName(dbname_, blob_file_number);
+    FileSystem* fs = env_->GetFileSystem().get();
+
+    Status s = fs->NewSequentialFile(blob_file_path, file_options, &file, dbg);
+    if (!s.ok()) {
+      return s;
+    }
+
+    auto file_reader =
+        std::make_unique<SequentialFileReader>(std::move(file), blob_file_path);
+    *reader = std::make_unique<BlogFileReader>(std::move(file_reader),
+                                               /*reporter=*/nullptr,
+                                               /*verify_checksums=*/true);
+    return Status::OK();
   }
 
   Status ReadBlobFileRecords(uint64_t blob_file_number, size_t num_records,
@@ -1293,6 +1342,99 @@ TEST_F(DBBlobDirectWriteTest, DirectWriteBlogManifestMetadata) {
   ASSERT_EQ(reader->GetBlogSchemaVersion(), blob_meta->GetSchemaVersion());
   ASSERT_EQ(reader->GetBlogFileIdentity().ToString(),
             blob_meta->GetFileIdentity());
+
+  std::unique_ptr<BlogFileReader> sequential_reader;
+  ASSERT_OK(OpenBlogFileReader(blob_file_numbers[0], &sequential_reader));
+  BlogFileHeader header;
+  ASSERT_OK(sequential_reader->ReadHeader(&header));
+  ASSERT_FALSE(header.HasProperty(kBlogPropCompressionCompatibilityName));
+}
+
+TEST_F(DBBlobDirectWriteTest,
+       CompressedDirectWriteBlogDeclaresBuiltinCompressionManager) {
+  const CompressionType compression = GetSupportedCompressedBlobCompression();
+  if (compression == kNoCompression) {
+    ROCKSDB_GTEST_SKIP("This test requires a supported blob compression");
+    return;
+  }
+
+  Options options = GetDirectWriteOptions();
+  options.blob_file_size = 1 << 20;
+  options.blob_compression_type = compression;
+  options.use_blog_format_for_blobs = true;
+
+  Reopen(options);
+
+  const std::string key = "compressed_blog_key";
+  const std::string value(4096, 'v');
+  ASSERT_OK(Put(key, value));
+  ASSERT_OK(Flush());
+
+  const std::vector<uint64_t> blob_file_numbers = GetBlobFileNumbers();
+  ASSERT_EQ(blob_file_numbers.size(), 1U);
+
+  std::unique_ptr<BlogFileReader> reader;
+  ASSERT_OK(OpenBlogFileReader(blob_file_numbers[0], &reader));
+  BlogFileHeader header;
+  ASSERT_OK(reader->ReadHeader(&header));
+  ASSERT_EQ(header.GetProperty(kBlogPropCompressionCompatibilityName),
+            GetBuiltinV2CompressionManager()->CompatibilityName());
+
+  BlogRecordType record_type;
+  Slice payload;
+  std::string scratch;
+  CompressionType record_compression_type = kNoCompression;
+  ASSERT_OK(reader->ReadRecord(&record_type, &payload, &scratch,
+                               /*record_offset=*/nullptr,
+                               &record_compression_type));
+  ASSERT_EQ(record_type, kBlogBlobRecord);
+  ASSERT_EQ(record_compression_type, compression);
+
+  Close();
+  Reopen(options);
+  ASSERT_EQ(Get(key), value);
+}
+
+TEST_F(DBBlobDirectWriteTest,
+       BlogDirectWriteCompressionManagerIsCurrentlyBuiltinV2) {
+  const CompressionType compression = GetSupportedCompressedBlobCompression();
+  if (compression == kNoCompression) {
+    ROCKSDB_GTEST_SKIP("This test requires a supported blob compression");
+    return;
+  }
+
+  auto tracking_manager = std::make_shared<TrackingBlobCompressionManager>();
+  ASSERT_NE(std::string(tracking_manager->CompatibilityName()),
+            GetBuiltinV2CompressionManager()->CompatibilityName());
+
+  Options options = GetDirectWriteOptions();
+  options.blob_file_size = 1 << 20;
+  options.blob_compression_type = compression;
+  options.compression_manager = tracking_manager;
+  options.use_blog_format_for_blobs = true;
+
+  Reopen(options);
+  const uint64_t calls_before_put = tracking_manager->GetCompressorCalls();
+  const std::string key = "custom_manager_key";
+  const std::string value(4096, 'v');
+  ASSERT_OK(Put(key, value));
+
+  // Blob direct write currently hardcodes BuiltinV2. If it starts using the
+  // configured manager, this assertion intentionally fails so the manager's
+  // CompatibilityName is also plumbed into the blog file header.
+  ASSERT_EQ(tracking_manager->GetCompressorCalls(), calls_before_put);
+
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get(key), value);
+
+  const std::vector<uint64_t> blob_file_numbers = GetBlobFileNumbers();
+  ASSERT_EQ(blob_file_numbers.size(), 1U);
+  std::unique_ptr<BlogFileReader> reader;
+  ASSERT_OK(OpenBlogFileReader(blob_file_numbers[0], &reader));
+  BlogFileHeader header;
+  ASSERT_OK(reader->ReadHeader(&header));
+  ASSERT_EQ(header.GetProperty(kBlogPropCompressionCompatibilityName),
+            GetBuiltinV2CompressionManager()->CompatibilityName());
 }
 
 TEST_F(DBBlobDirectWriteTest, DirectWriteNoncanonicalBlogFeatures) {
