@@ -4830,7 +4830,7 @@ class BestEffortsRecoverIncompleteVersionTest
         std::move(file), blob_file_path, FileOptions(), options.clock));
 
     BlobLogWriter blob_log_writer(std::move(file_writer), options.clock,
-                                  /*statistics*/ nullptr, blob_file_number,
+                                  /*statistics*/ nullptr,
                                   /*use_fsync*/ true,
                                   /*do_flush*/ false);
 
@@ -4848,8 +4848,8 @@ class BestEffortsRecoverIncompleteVersionTest
     footer.expiration_range = expiration_range;
     std::string checksum_method;
     std::string checksum_value;
-    ASSERT_OK(blob_log_writer.AppendFooter(WriteOptions(), footer,
-                                           &checksum_method, &checksum_value));
+    ASSERT_OK(blob_log_writer.LegacyAppendFooterAndClose(
+        WriteOptions(), footer, &checksum_method, &checksum_value));
   }
 
   void RecoverFromManifestWithMissingFiles(

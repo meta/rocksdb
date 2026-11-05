@@ -275,7 +275,8 @@ void CompactionIterator::SetBlobFetcher(const Version* version,
 
   blob_fetcher_ = std::make_unique<OwningVersionBlobFetcher>(
       version, std::move(read_options), blob_file_cache,
-      allow_write_path_fallback);
+      allow_write_path_fallback,
+      version->GetMutableCFOptions().compression_manager.get());
   blob_resolver_.Init(blob_fetcher_.get(), prefetch_buffers_.get(),
                       &iter_stats_);
 }
@@ -2414,9 +2415,10 @@ std::unique_ptr<BlobFetcher> CompactionIterator::CreateBlobFetcherIfNeeded(
     }
   }
 
-  return std::unique_ptr<BlobFetcher>(
-      new OwningVersionBlobFetcher(version, std::move(read_options),
-                                   blob_file_cache, allow_write_path_fallback));
+  return std::unique_ptr<BlobFetcher>(new OwningVersionBlobFetcher(
+      version, std::move(read_options), blob_file_cache,
+      allow_write_path_fallback,
+      version->GetMutableCFOptions().compression_manager.get()));
 }
 
 std::unique_ptr<PrefetchBufferCollection>

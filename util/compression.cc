@@ -116,6 +116,30 @@ CompressionType CompressionTypeFromString(std::string compression_type_str) {
   return kDisableCompressionOption;
 }
 
+Status ResolveCompressionManagerByCompatibilityName(
+    Slice compatibility_name,
+    CompressionManager* configured_compression_manager,
+    std::shared_ptr<CompressionManager>* resolved_manager) {
+  assert(resolved_manager != nullptr);
+  resolved_manager->reset();
+
+  if (configured_compression_manager != nullptr) {
+    *resolved_manager =
+        configured_compression_manager->FindCompatibleCompressionManager(
+            compatibility_name);
+  }
+
+  if (*resolved_manager != nullptr) {
+    return Status::OK();
+  }
+
+  ConfigOptions strict;
+  strict.ignore_unknown_options = false;
+  strict.ignore_unsupported_options = false;
+  return CompressionManager::CreateFromString(
+      strict, compatibility_name.ToString(), resolved_manager);
+}
+
 std::string CompressionOptionsToString(
     const CompressionOptions& compression_options) {
   std::string result;

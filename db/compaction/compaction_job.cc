@@ -1788,7 +1788,10 @@ InternalIterator* CompactionJob::CreateInputIterator(
       sub_compact->compaction->skip_missing_blob_files()) {
     BlobGarbageMeter* meter = sub_compact->Current().GetBlobGarbageMeter();
     if (meter == nullptr) {
-      meter = sub_compact->Current().CreateBlobGarbageMeter();
+      meter = sub_compact->Current().CreateBlobGarbageMeter(
+          db_options_.use_blog_format_for_blobs,
+          BlobGarbageMeter::CollectBlobFileSchemaVersions(
+              sub_compact->compaction->input_version()->storage_info()));
     }
     iterators.blob_counter = std::make_unique<BlobCountingIterator>(
         input, meter, compaction_progress_writer_ != nullptr);
@@ -3499,7 +3502,10 @@ Status CompactionJob::RestoreBlobCompactionProgress(
   if (!subcompaction_progress.blob_file_garbages.empty()) {
     BlobGarbageMeter* meter = outputs->GetBlobGarbageMeter();
     if (meter == nullptr) {
-      meter = outputs->CreateBlobGarbageMeter();
+      meter = outputs->CreateBlobGarbageMeter(
+          db_options_.use_blog_format_for_blobs,
+          BlobGarbageMeter::CollectBlobFileSchemaVersions(
+              sub_compact->compaction->input_version()->storage_info()));
     }
     for (const auto& garbage : subcompaction_progress.blob_file_garbages) {
       meter->AddGarbage(garbage.GetBlobFileNumber(),

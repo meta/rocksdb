@@ -703,6 +703,24 @@ int rocksdb_options_get_wal_compression(rocksdb_options_t* opt) {
   return static_cast<int>(opt->rep.wal_compression);
 }
 
+void rocksdb_options_set_use_blog_format_for_blobs(rocksdb_options_t* opt,
+                                                   unsigned char v) {
+  opt->rep.use_blog_format_for_blobs = v;
+}
+
+unsigned char rocksdb_options_get_use_blog_format_for_blobs(
+    rocksdb_options_t* opt) {
+  return opt->rep.use_blog_format_for_blobs;
+}
+
+void rocksdb_options_set_blog_checksum(rocksdb_options_t* opt, int v) {
+  opt->rep.blog_checksum = static_cast<decltype(opt->rep.blog_checksum)>(v);
+}
+
+int rocksdb_options_get_blog_checksum(rocksdb_options_t* opt) {
+  return static_cast<int>(opt->rep.blog_checksum);
+}
+
 void rocksdb_options_set_background_close_inactive_wals(rocksdb_options_t* opt,
                                                         unsigned char v) {
   opt->rep.background_close_inactive_wals = v;
