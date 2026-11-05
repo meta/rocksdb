@@ -4957,6 +4957,7 @@ const char* VersionStorageInfo::LevelSummary(
   }
   len +=
       snprintf(scratch->buffer + len, sizeof(scratch->buffer) - len, "files[");
+  len = std::min(len, static_cast<int>(sizeof(scratch->buffer)));
   for (int i = 0; i < num_levels(); i++) {
     int sz = sizeof(scratch->buffer) - len;
     int ret = snprintf(scratch->buffer + len, sz, "%d ", int(files_[i].size()));
@@ -4973,6 +4974,7 @@ const char* VersionStorageInfo::LevelSummary(
       snprintf(scratch->buffer + len, sizeof(scratch->buffer) - len,
                "] max score %.2f, estimated pending compaction bytes %" PRIu64,
                compaction_score_[0], estimated_compaction_needed_bytes_);
+  len = std::min(len, static_cast<int>(sizeof(scratch->buffer)));
 
   if (!files_marked_for_compaction_.empty()) {
     snprintf(scratch->buffer + len, sizeof(scratch->buffer) - len,

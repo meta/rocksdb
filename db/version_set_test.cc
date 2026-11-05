@@ -771,6 +771,14 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCSingleBatch) {
   }
 }
 
+
+TEST_F(VersionStorageInfoTest, LevelSummaryBufferTruncation) {
+  VersionStorageInfo::LevelSummaryStorage scratch;
+  const char* summary = vstorage_.LevelSummary(&scratch);
+  ASSERT_NE(summary, nullptr);
+  ASSERT_LE(std::strlen(summary), sizeof(scratch.buffer));
+}
+
 TEST_F(VersionStorageInfoTest, ForcedBlobGCMultipleBatches) {
   // Add three L0 SSTs (1, 2, and 3) and four blob files (10, 11, 12, and 13).
   // The first two SSTs have the same oldest blob file, namely, the very oldest
