@@ -1687,9 +1687,6 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
 
     PERF_TIMER_STOP(write_pre_and_post_process_time);
 
-    IOStatus io_s;
-    io_s.PermitUncheckedError();  // Allow io_s to be uninitialized
-
     if (w.status.ok() && !write_options.disableWAL) {
       PERF_TIMER_GUARD(write_wal_time);
       stats->AddDBStats(InternalStats::kIntStatsWriteDoneBySelf, 1);
@@ -1702,16 +1699,17 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       assert(wal_context.wal_file_number_size);
       WalFileNumberSize& wal_file_number_size =
           *(wal_context.wal_file_number_size);
-      io_s = WriteGroupToWAL(wal_write_group, wal_context.writer, wal_used,
-                             wal_context.need_wal_sync,
-                             wal_context.need_wal_dir_sync, current_sequence,
-                             wal_file_number_size);
+      IOStatus io_s = WriteGroupToWAL(wal_write_group, wal_context.writer,
+                                      wal_used, wal_context.need_wal_sync,
+                                      wal_context.need_wal_dir_sync,
+                                      current_sequence, wal_file_number_size);
       w.status = io_s;
-    }
 
-    if (!io_s.ok()) {
-      // Check WriteToWAL status
-      WALIOStatusCheck(io_s);
+      if (!io_s.ok()) {
+        PERF_TIMER_STOP(write_wal_time);
+        // Check WriteToWAL status
+        WALIOStatusCheck(io_s);
+      }
     } else if (!w.CallbackFailed()) {
       WriteStatusCheck(w.status);
     }
@@ -2329,7 +2327,7 @@ Status DBImpl::MergeBatch(const WriteThread::WriteGroup& write_group,
 // write thread. Otherwise this must be called holding wal_write_mutex_.
 IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             const WriteOptions& write_options,
-                            log::Writer* log_writer, uint64_t* wal_used,
+                            WalWriter* log_writer, uint64_t* wal_used,
                             uint64_t* log_size,
                             WalFileNumberSize& wal_file_number_size,
                             SequenceNumber sequence) {
@@ -2353,11 +2351,16 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   if (UNLIKELY(needs_locking)) {
     wal_write_mutex_.Lock();
   }
+  const UnorderedMap<uint32_t, size_t>& cf_to_ts_sz =
+      versions_->GetColumnFamiliesTimestampSizeForRecord();
   IOStatus io_s = log_writer->MaybeAddUserDefinedTimestampSizeRecord(
-      write_options, versions_->GetColumnFamiliesTimestampSizeForRecord());
+      write_options, cf_to_ts_sz);
   TEST_SYNC_POINT_CALLBACK(
       "DBImpl::WriteToWAL:AfterMaybeAddUserDefinedTimestampSizeRecord", &io_s);
   if (!io_s.ok()) {
+    if (UNLIKELY(needs_locking)) {
+      wal_write_mutex_.Unlock();
+    }
     return io_s;
   }
   io_s = log_writer->AddRecord(write_options, log_entry, sequence);
@@ -2378,7 +2381,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
 }
 
 IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
-                                 log::Writer* log_writer, uint64_t* wal_used,
+                                 WalWriter* log_writer, uint64_t* wal_used,
                                  bool need_wal_sync, bool need_wal_dir_sync,
                                  SequenceNumber sequence,
                                  WalFileNumberSize& wal_file_number_size) {
@@ -2527,7 +2530,7 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   auto sequence = *last_sequence + 1;
   WriteBatchInternal::SetSequence(merged_batch, sequence);
 
-  log::Writer* log_writer = logs_.back().writer;
+  WalWriter* log_writer = logs_.back().writer;
   WalFileNumberSize& wal_file_number_size = alive_wal_files_.back();
 
   assert(log_writer->get_log_number() == wal_file_number_size.number);
@@ -3281,7 +3284,7 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const WriteOptions write_options;
 
-  log::Writer* new_log = nullptr;
+  WalWriter* new_log = nullptr;
   UnpublishedWAL prepared_wal;
   MemTable* new_mem = nullptr;
   IOStatus io_s;
@@ -3353,7 +3356,7 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
     PredecessorWALInfo info;
     wal_write_mutex_.Lock();
     if (!logs_.empty()) {
-      log::Writer* cur_log_writer = logs_.back().writer;
+      WalWriter* cur_log_writer = logs_.back().writer;
       info = PredecessorWALInfo(cur_log_writer->get_log_number(),
                                 cur_log_writer->file()->GetFileSize(),
                                 cur_log_writer->GetLastSeqnoRecorded());
@@ -3437,7 +3440,7 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
       // Always flush the buffer of the last log before switching to a new one,
       // except when recovery is replacing a file-scoped failed WAL. Its
       // accepted contents are persisted by the atomic recovery flush.
-      log::Writer* cur_log_writer = logs_.back().writer;
+      WalWriter* cur_log_writer = logs_.back().writer;
       const bool abandon_current_wal =
           recovering_from_wal_write_error_ &&
           cur_log_writer->get_log_number() <= recover_wal_through_number_;
