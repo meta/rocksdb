@@ -397,7 +397,7 @@ Status BlobDumpTool::DumpBlogBlobFile(const std::string& filename,
             "  Note               : Keys are not stored in blog-format blob "
             "files\n");
   }
-  PrintBlogProperties("Properties", header.properties);
+  PrintBlogProperties("Properties", header.required_properties);
 
   const bool should_print_records =
       show_key != DisplayType::kNone || show_blob != DisplayType::kNone ||
@@ -521,6 +521,11 @@ Status BlobDumpTool::DumpBlogBlobFile(const std::string& filename,
       }
     }
   }
+
+  // Ignorable properties accumulate in the reader's header view as body
+  // records are consumed, so they can only be printed after the loop above.
+  PrintBlogProperties("Ignorable Properties",
+                      blog_reader.header().ignorable_properties);
 
   if (!has_footer_properties && !has_footer_locator) {
     fprintf(stdout, "No blog blob footer.\n");

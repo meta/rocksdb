@@ -249,7 +249,7 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
 <h2 id="s6">Context Checksums</h2>
 
 <div class="decision">
-<strong>Decision (adopted from SST format_version=6):</strong> Each record's checksum incorporates a 32-bit <strong>incarnation ID</strong> (first 4 bytes of the escape sequence). Uses <code>ChecksumModifierForContext(incarnation_id, record_offset)</code> -- the same mechanism as block-based SST files.
+<strong>Decision (adopted from SST format_version=6):</strong> Each record checksum incorporates a 32-bit <strong>incarnation ID</strong> (first 4 bytes of the escape sequence). Prefix and trivial-record checksums use <code>ChecksumModifierForContext(incarnation_id, record_offset)</code>. Payload trailer checksums use <code>ChecksumModifierForContext(incarnation_id, payload_offset)</code>, allowing a random-access blob reader to verify <code>[payload][trailer]</code> without reading the record prefix. This is the same mechanism as block-based SST files.
 </div>
 
 <p>Context checksums provide defense-in-depth for recycling detection and general data integrity verification with zero per-record overhead.</p>
@@ -263,7 +263,7 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
 
 <ol>
   <li><strong>Footer index records</strong> (0xF0): Large metadata like sparse indexes for range queries. Zero or more per file.</li>
-  <li><strong>Footer properties record</strong> (0xF8): Named properties (same encoding as header properties, but the full record format's own trailer provides integrity). At most one per file.</li>
+  <li><strong>Footer properties record</strong> (0xF8): Named properties (same encoding as header properties, but the full record format's own trailer provides integrity). At most one per file. The encoded properties plus the record's 5-byte trailer must not exceed <code>kBlogMaxPropertySectionSize</code> (16 MiB), matching the header property-section limit.</li>
   <li><strong>Footer file checksum info</strong> (0xFC): Placeholder for future use. Would contain a dump of the full file checksum state, allowing the file checksum to be inferred from just reading the tail of the file.</li>
   <li><strong>Footer locator record</strong> (0xFF): Must be the <strong>last record</strong>. Contains relative offsets (in 4-byte units) to other footer records, sequential relative to each other in reverse order.</li>
 </ol>

@@ -11,11 +11,13 @@
 #include <utility>
 #include <vector>
 
+#include "rocksdb/compression_type.h"
 #include "rocksdb/data_structure.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
+#include "util/cast_util.h"
 #include "util/prefix_varint.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -100,6 +102,10 @@ static constexpr size_t kBlogCompactVarintMaxBytes = 2;
 
 // Block trailer size: 1 byte compression_type + 4 bytes checksum.
 static constexpr size_t kBlogBlockTrailerSize = 5;
+
+// Named property sections are intentionally bounded to prevent unreasonable
+// allocations while opening a file. Includes the enclosing block trailer.
+static constexpr uint32_t kBlogMaxPropertySectionSize = 16 * 1024 * 1024;
 
 // Writers always keep record starts 4-byte aligned. They may optionally pad
 // farther to stronger alignments for flush/sync friendliness.
@@ -199,7 +205,63 @@ inline bool IsBlogRequiredProperty(const Slice& name) {
   return name.size() > 0 && name[0] >= 'A' && name[0] <= 'Z';
 }
 
-// Known header property names
+// Returns true if a property name starts with a lowercase ASCII letter,
+// meaning the reader may ignore an unrecognized property.
+inline bool IsBlogIgnorableProperty(const Slice& name) {
+  return name.size() > 0 && name[0] >= 'a' && name[0] <= 'z';
+}
+
+// Returns true if the given record type is a known (non-reserved) blog
+// record type per the spec table.
+inline bool IsKnownBlogRecordType(BlogRecordType type) {
+  switch (type) {
+    case kBlogIgnorablePropertiesRecord:
+    case kBlogBlobRecord:
+    case kBlogPreambleStartRecord:
+    case kBlogWriteBatchRecord:
+    case kBlogManifestRecord:
+    case kBlogFooterIndexRecord:
+    case kBlogFooterPropertiesRecord:
+    case kBlogFooterFileChecksumInfo:
+    case kBlogFooterLocatorRecord:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Returns true if the record type is a body record (0x10-0x7F).
+inline bool IsBlogBodyRecordType(BlogRecordType type) {
+  uint8_t v = lossless_cast<uint8_t>(type);
+  return v >= 0x10 && v <= 0x7F;
+}
+
+// Returns true if the record type is a footer record (0xF0-0xFF).
+inline bool IsBlogFooterRecordType(BlogRecordType type) {
+  uint8_t v = lossless_cast<uint8_t>(type);
+  return v >= 0xF0;
+}
+
+// Returns true if the compression type byte is a valid value for a blog
+// record trailer (builtin, custom, sentinel; excludes reserved and
+// kDisableCompressionOption).
+inline bool IsValidBlogCompressionType(uint8_t comp) {
+  if (comp <= kLastBuiltinCompression) {
+    return true;
+  }
+  if (comp == kStreamingCompressionSentinel) {
+    return true;
+  }
+  if (comp >= kFirstCustomCompression && comp <= kLastCustomCompression) {
+    return true;
+  }
+  return false;
+}
+
+// Known property names. Required properties (uppercase first letter) live in
+// the physical header property section; ignorable properties (lowercase
+// first letter) travel in kBlogIgnorablePropertiesRecord body records and
+// are never part of the header section.
 static constexpr const char* kBlogPropCompressionCompatibilityName =
     "CompressionCompatibilityName";
 static constexpr const char* kBlogPropTimestampSize = "TimestampSize";
@@ -251,14 +313,25 @@ struct BlogFileHeader {
   bool is_recycled() const { return flags & kBlogFileRecycled; }
   bool is_wal() const { return compact_record_type == kBlogWriteBatchRecord; }
 
-  BlogPropertyMap properties;
+  // Required (uppercase) properties. These are the only properties encoded
+  // in the physical header property section by EncodeTo().
+  BlogPropertyMap required_properties;
+  // Ignorable (lowercase) properties. These are NOT part of the physical
+  // header: on write, BlogFileWriter::WriteHeader emits them as the initial
+  // kBlogIgnorablePropertiesRecord body record; on read,
+  // BlogFileReader::ReadRecord accumulates them here as ignorable properties
+  // records are consumed.
+  BlogPropertyMap ignorable_properties;
 
   // Incarnation ID = first 4 bytes of escape_sequence (little-endian via
   // DecodeFixed32). Guaranteed nonzero since byte[0] is not 0x00.
   uint32_t incarnation_id() const;
 
   // Encode the full header (fixed prefix + property section + checksums)
-  // into dst.
+  // into dst. Only required_properties are encoded; ignorable_properties
+  // are body-record content and never appear in the header section.
+  // required_properties is encoded as-is: case placement is enforced by
+  // SetProperty, not here.
   void EncodeTo(std::string* dst) const;
 
   // Decode from input. Consumes the bytes read. WAL escape sequence derived
@@ -267,15 +340,17 @@ struct BlogFileHeader {
   Status DecodeFrom(Slice* input);
 
   // Verify the fixed header checksum, which covers bytes [0, 36) including
-  // the property section size. fixed_header must point to at least
-  // kBlogFileFixedHeaderSize bytes. Call this before trusting any fixed
-  // header field, such as the property section size.
+  // the property section size, after checking that the checksum type is
+  // supported. fixed_header must point to at least kBlogFileFixedHeaderSize
+  // bytes. Call this before trusting any fixed header field, such as the
+  // property section size.
   static Status VerifyFixedHeaderChecksum(const char* fixed_header);
 
   // Generate escape_sequence from the file's unique ID (db_id, db_session_id,
   // file_number), using the same scheme as SST internal unique IDs. Falls back
-  // to GenerateRandomFields() if any input is empty/zero. Also sets the
-  // ignorable dbId/dbSessionId header properties.
+  // to GenerateRandomFields() if any input is empty/zero. Also records the
+  // IDs as ignorable dbId/dbSessionId properties (body-record content, not
+  // part of the physical header).
   void GenerateFromUniqueId(const std::string& db_id,
                             const std::string& db_session_id,
                             uint64_t file_number);
@@ -283,8 +358,10 @@ struct BlogFileHeader {
                                const std::string& db_session_id,
                                uint64_t log_number);
 
-  // Set optional diagnostic header properties for debugging. All fields
-  // are ignorable (lowercase). Empty strings and sentinel values are skipped.
+  // Set optional diagnostic properties for debugging. All fields are
+  // ignorable (lowercase) and so are emitted in an ignorable properties
+  // body record, not the header section. Empty strings and sentinel values
+  // are skipped.
   static constexpr uint32_t kNoCfId = UINT32_MAX;
   void SetDiagnosticProperties(const std::string& db_host_id,
                                uint32_t column_family_id = kNoCfId,
@@ -323,13 +400,17 @@ struct BlogFileHeader {
   // This enables single-read header parsing from a ~4 KiB buffer.
   Status DecodeFromBuffer(Slice* buffer, size_t* additional_bytes_needed);
 
-  // Raw property helpers (string values)
+  // Property setters. The name's first letter selects the map: uppercase
+  // names are required properties, lowercase names are ignorable.
   void SetProperty(const std::string& name, const std::string& value);
-  std::string GetProperty(const std::string& name) const;
-
-  // Typed property setters/getters for properties that aren't natively strings.
   void SetUint64Property(const std::string& name, uint64_t value);
   void SetUint32Property(const std::string& name, uint32_t value);
+
+  // Property getters. These search required_properties first, then
+  // ignorable_properties, so callers can look up either kind by name. Since
+  // SetProperty places each name by case, a name lives in at most one map;
+  // for direct-inserted duplicates the map searched first wins.
+  std::string GetProperty(const std::string& name) const;
   bool GetUint64Property(const std::string& name, uint64_t* value) const;
   bool GetUint32Property(const std::string& name, uint32_t* value) const;
   bool HasProperty(const std::string& name) const;
@@ -431,11 +512,12 @@ uint8_t ChooseBlogPaddingByte(uint8_t last_meaningful_byte,
 
 // Compute a context-aware checksum over data + compression_type byte,
 // suitable for a blog record trailer. Uses the same algorithm and context
-// checksum approach as block-based SST files.
+// checksum approach as block-based SST files. The context offset is the file
+// offset of data, i.e. the record payload rather than its escape sequence.
 uint32_t ComputeBlogRecordChecksum(ChecksumType type, const char* data,
                                    size_t data_size, char compression_type_byte,
                                    uint32_t base_context_checksum,
-                                   uint64_t record_offset);
+                                   uint64_t payload_file_offset);
 
 // Verify a blog record's 5-byte trailer (compression_type + checksum).
 // payload points to the record payload of payload_size bytes; the trailer
