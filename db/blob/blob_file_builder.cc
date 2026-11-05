@@ -431,35 +431,7 @@ Status BlobFileBuilder::CloseBlobFile() {
   Status s;
 
   if (use_blog_format_) {
-    // Blog format: write footer properties and locator records.
-    const auto& bs = blog_writer_->blob_stats();
-    BlogFileFooterProperties footer_props;
-    if (bs.count > 0) {
-      footer_props.SetBlobCount(bs.count);
-      footer_props.SetBlobPayloadBytes(bs.payload_bytes);
-      if (bs.compressed_bytes > 0) {
-        footer_props.SetBlobCompressedBytes(bs.compressed_bytes);
-        footer_props.SetBlobUncompressedBytes(bs.uncompressed_bytes);
-      }
-      footer_props.SetBlobOverheadBytes(bs.overhead_bytes);
-    }
-    if (!blog_writer_->compression_type_set().empty()) {
-      footer_props.SetCompressionTypes(blog_writer_->compression_type_set());
-    }
-
-    uint64_t props_offset = blog_writer_->current_offset();
-    assert(props_offset % 4 == 0);
-    s = blog_writer_->AddFooterPropertiesRecord(*write_options_, footer_props);
-
-    if (s.ok()) {
-      BlogFileFooterLocator locator;
-      uint64_t locator_offset = blog_writer_->current_offset();
-      assert(locator_offset % 4 == 0);
-      locator.entries.push_back(
-          {kBlogFooterPropertiesRecord,
-           static_cast<uint32_t>((locator_offset - props_offset) / 4)});
-      s = blog_writer_->AddFooterLocatorRecord(*write_options_, locator);
-    }
+    s = blog_writer_->WriteFooter(*write_options_, BlogFileFooterProperties{});
 
     if (s.ok()) {
       s = blog_writer_->Sync(*write_options_, immutable_options_->use_fsync);
@@ -472,11 +444,11 @@ Status BlobFileBuilder::CloseBlobFile() {
       schema_version = blog_writer_->header().schema_version;
       file_identity.assign(blog_writer_->header().escape_sequence,
                            kBlogEscapeSequenceSize);
-      std::string method = blog_writer_->file()->GetFileChecksumFuncName();
+      std::string method = blog_writer_->GetFileChecksumFuncName();
       if (method != kUnknownFileChecksumFuncName) {
         checksum_method = std::move(method);
       }
-      std::string value = blog_writer_->file()->GetFileChecksum();
+      std::string value = blog_writer_->GetFileChecksum();
       if (value != kUnknownFileChecksum) {
         checksum_value = std::move(value);
       }

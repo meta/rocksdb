@@ -5,6 +5,7 @@
 
 #include "db/blog/blog_writer.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -111,6 +112,106 @@ class BlogWriterTest : public testing::Test {
     }
     return count;
   }
+
+  const std::string* FindFooterProperty(
+      const BlogFileFooterProperties& properties,
+      const std::string& property_name) const {
+    for (const auto& [name, value] : properties.properties) {
+      if (name == property_name) {
+        return &value;
+      }
+    }
+    return nullptr;
+  }
+
+  size_t RecordVarintLength(uint64_t record_offset) const {
+    return PrefixVarint64AddlByteCount(
+               contents_[record_offset + kBlogEscapeSequenceSize]) +
+           1;
+  }
+
+  void RewriteFullPrefixChecksum(const BlogFileHeader& header,
+                                 uint64_t record_offset) {
+    const size_t varint_len = RecordVarintLength(record_offset);
+    const size_t varint_offset = record_offset + kBlogEscapeSequenceSize;
+    const size_t checksum_offset = varint_offset + varint_len + 2;
+    const uint32_t checksum =
+        ComputeBuiltinChecksum(header.checksum_type,
+                               contents_.data() + varint_offset,
+                               varint_len + 2) +
+        ChecksumModifierForContext(header.incarnation_id(), record_offset);
+    EncodeFixed32(contents_.data() + checksum_offset, checksum);
+  }
+
+  void RewriteRecordTrailerChecksum(const BlogFileHeader& header,
+                                    uint64_t payload_offset,
+                                    size_t payload_size) {
+    const size_t trailer_offset = payload_offset + payload_size;
+    const uint32_t checksum = ComputeBlogRecordChecksum(
+        header.checksum_type, contents_.data() + payload_offset, payload_size,
+        contents_[trailer_offset], header.incarnation_id(), payload_offset);
+    EncodeFixed32(contents_.data() + trailer_offset + 1, checksum);
+  }
+
+  void ExpectHeaderInvalid(const BlogFileHeader& header) {
+    std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+    const IOStatus s = writer->WriteHeader(WriteOptions());
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_TRUE(contents_.empty());
+  }
+
+  // Construct malformed input independently of the writer's public API.
+  void AppendTestRecord(const BlogFileHeader& header, BlogRecordType type,
+                        uint64_t declared_length, CompressionType prefix_comp,
+                        CompressionType trailer_comp, const Slice& payload) {
+    const uint64_t record_offset = contents_.size();
+    ASSERT_EQ(record_offset % kBlogMinRecordAlignment, 0u);
+    contents_.append(header.escape_sequence, kBlogEscapeSequenceSize);
+    std::string prefix;
+    if (declared_length == 0) {
+      PutPrefixVarint64(&prefix, 0);
+      prefix.push_back(lossless_cast<char>(type));
+    } else {
+      char varint[kMaxPrefixVarint64Length];
+      const char* end = EncodePrefixVarint64<3>(varint, declared_length);
+      prefix.append(varint, lossless_cast<size_t>(end - varint));
+      prefix.push_back(lossless_cast<char>(type));
+      prefix.push_back(lossless_cast<char>(prefix_comp));
+    }
+    contents_.append(prefix);
+    PutFixed32(
+        &contents_,
+        ComputeBuiltinChecksum(header.checksum_type, prefix.data(),
+                               prefix.size()) +
+            ChecksumModifierForContext(header.incarnation_id(), record_offset));
+    if (declared_length != 0) {
+      const uint64_t payload_offset = contents_.size();
+      contents_.append(payload.data(), payload.size());
+      contents_.push_back(lossless_cast<char>(trailer_comp));
+      PutFixed32(&contents_,
+                 ComputeBlogRecordChecksum(
+                     header.checksum_type, payload.data(), payload.size(),
+                     lossless_cast<char>(trailer_comp), header.incarnation_id(),
+                     payload_offset));
+    }
+    if (type != kBlogFooterLocatorRecord) {
+      BlogPadding padding(lossless_cast<uint8_t>(contents_.back()),
+                          contents_.size());
+      padding.AppendTo(&contents_);
+    }
+  }
+
+  void ExpectRecordCorruption(bool verify_checksums, const char* message) {
+    std::unique_ptr<BlogFileReader> reader = MakeReader(verify_checksums);
+    BlogFileHeader read_header;
+    ASSERT_OK(reader->ReadHeader(&read_header));
+    BlogRecordType type;
+    Slice payload;
+    std::string scratch;
+    const Status s = reader->ReadRecord(&type, &payload, &scratch);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+    ASSERT_NE(s.ToString().find(message), std::string::npos) << s.ToString();
+  }
 };
 
 TEST_F(BlogWriterTest, WriteAndReadHeader) {
@@ -130,6 +231,170 @@ TEST_F(BlogWriterTest, WriteAndReadHeader) {
   ASSERT_EQ(memcmp(read_header.escape_sequence, header.escape_sequence,
                    kBlogEscapeSequenceSize),
             0);
+}
+
+TEST_F(BlogWriterTest, RejectsUnsupportedChecksumTypeBeforeWriting) {
+  BlogFileHeader header = MakeBlobHeader();
+  header.checksum_type = lossless_cast<ChecksumType>(uint8_t{0x7f});
+  ExpectHeaderInvalid(header);
+}
+
+TEST_F(BlogWriterTest, AcceptsEverySupportedChecksumType) {
+  for (uint8_t raw = lossless_cast<uint8_t>(kNoChecksum);
+       raw <= lossless_cast<uint8_t>(kXXH3); ++raw) {
+    BlogFileHeader header = MakeBlobHeader();
+    header.checksum_type = lossless_cast<ChecksumType>(raw);
+    std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+    ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+    std::unique_ptr<BlogFileReader> reader = MakeReader();
+    BlogFileHeader read_header;
+    ASSERT_OK(reader->ReadHeader(&read_header));
+    ASSERT_EQ(read_header.checksum_type, header.checksum_type);
+  }
+}
+
+TEST_F(BlogWriterTest, RejectsEmptyBlobBeforeWriting) {
+  BlogFileHeader header = MakeBlobHeader();
+  std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+  const uint64_t offset = writer->current_offset();
+  uint64_t blob_offset = 123;
+  const IOStatus s = writer->AddBlobRecord(WriteOptions(), Slice(),
+                                           kNoCompression, &blob_offset, 0);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_EQ(writer->current_offset(), offset);
+  ASSERT_EQ(blob_offset, 123);
+  ASSERT_EQ(writer->blob_stats().count, 0);
+}
+
+TEST_F(BlogWriterTest, FooterLocatorReferencesPropertiesRecord) {
+  BlogFileHeader header = MakeBlobHeader();
+  std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  BlogFileFooterProperties props;
+  props.SetSequenceRange(5, 7);
+  ASSERT_OK(writer->WriteFooter(WriteOptions(), props));
+
+  std::unique_ptr<BlogFileReader> reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  uint64_t properties_offset = 0;
+  uint64_t locator_offset = 0;
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch, &properties_offset));
+  ASSERT_EQ(type, kBlogFooterPropertiesRecord);
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch, &locator_offset));
+  ASSERT_EQ(type, kBlogFooterLocatorRecord);
+
+  BlogFileFooterLocator locator;
+  ASSERT_OK(locator.DecodeFrom(payload));
+  ASSERT_EQ(locator.entries.size(), 1u);
+  ASSERT_EQ(locator.entries[0].record_type, kBlogFooterPropertiesRecord);
+  ASSERT_EQ(locator_offset - uint64_t{locator.entries[0].relative_offset_4B} *
+                                 kBlogMinRecordAlignment,
+            properties_offset);
+}
+
+TEST_F(BlogWriterTest, AddsLiveWriterStatsToFooterProperties) {
+  BlogFileHeader header = MakeBlobHeader();
+  std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  const std::string blob(50, 'B');
+  ASSERT_OK(writer->AddBlobRecord(WriteOptions(), blob, kNoCompression, nullptr,
+                                  blob.size()));
+
+  BlogFileFooterProperties props;
+  props.SetSequenceRange(5, 7);
+  ASSERT_OK(writer->WriteFooter(WriteOptions(), props));
+
+  std::unique_ptr<BlogFileReader> reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
+  ASSERT_EQ(type, kBlogBlobRecord);
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
+  ASSERT_EQ(type, kBlogFooterPropertiesRecord);
+
+  BlogFileFooterProperties read_props;
+  ASSERT_OK(read_props.DecodeFrom(payload));
+  ASSERT_EQ(read_props.properties.size(), 5u);
+  const BlogFileWriter::BlobStats& stats = writer->blob_stats();
+  const std::pair<std::string, uint64_t> expected[] = {
+      {"blobCount", stats.count},
+      {"blobPayloadBytes", stats.payload_bytes},
+      {"blobOverheadBytes", stats.overhead_bytes},
+      {"minSequence", 5},
+      {"maxSequence", 7},
+  };
+  for (const auto& [expected_name, expected_value] : expected) {
+    const std::string* encoded_value =
+        FindFooterProperty(read_props, expected_name);
+    ASSERT_NE(encoded_value, nullptr) << expected_name;
+    Slice input(*encoded_value);
+    uint64_t value = 0;
+    ASSERT_TRUE(GetPrefixVarint64(&input, &value));
+    ASSERT_TRUE(input.empty());
+    ASSERT_EQ(value, expected_value);
+  }
+}
+
+TEST_F(BlogWriterTest, AddsLiveCompressedStatsToFooterProperties) {
+  BlogFileHeader header = MakeBlobHeader();
+  header.SetProperty(kBlogPropCompressionCompatibilityName, "BuiltinV2");
+  std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  const std::string compressed_blob = "compressed";
+  constexpr uint64_t kUncompressedSize = 100;
+  ASSERT_OK(writer->AddBlobRecord(WriteOptions(), compressed_blob, kZSTD,
+                                  nullptr, kUncompressedSize));
+  ASSERT_OK(writer->WriteFooter(WriteOptions(), BlogFileFooterProperties{}));
+
+  std::unique_ptr<BlogFileReader> reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
+  ASSERT_EQ(type, kBlogBlobRecord);
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
+  ASSERT_EQ(type, kBlogFooterPropertiesRecord);
+
+  BlogFileFooterProperties read_props;
+  ASSERT_OK(read_props.DecodeFrom(payload));
+  ASSERT_EQ(read_props.properties.size(), 6u);
+  const BlogFileWriter::BlobStats& stats = writer->blob_stats();
+  const std::pair<std::string, uint64_t> expected[] = {
+      {"blobCount", stats.count},
+      {"blobPayloadBytes", stats.payload_bytes},
+      {"blobCompressedBytes", stats.compressed_bytes},
+      {"blobUncompressedBytes", kUncompressedSize},
+      {"blobOverheadBytes", stats.overhead_bytes},
+  };
+  for (const auto& [expected_name, expected_value] : expected) {
+    const std::string* encoded_value =
+        FindFooterProperty(read_props, expected_name);
+    ASSERT_NE(encoded_value, nullptr) << expected_name;
+    Slice input(*encoded_value);
+    uint64_t value = 0;
+    ASSERT_TRUE(GetPrefixVarint64(&input, &value));
+    ASSERT_TRUE(input.empty());
+    ASSERT_EQ(value, expected_value);
+  }
+  const std::string* compression_types =
+      FindFooterProperty(read_props, "compressionTypes");
+  ASSERT_NE(compression_types, nullptr);
+  ASSERT_EQ(*compression_types, std::string(1, char{kZSTD}));
 }
 
 TEST_F(BlogWriterTest, WriteSingleBlobRecord) {
@@ -311,20 +576,7 @@ TEST_F(BlogWriterTest, FooterRecords) {
   ASSERT_OK(writer->AddBlobRecord(wo, blob_data, kNoCompression, &blob_offset,
                                   blob_data.size()));
 
-  // Write footer properties
-  uint64_t props_offset = writer->current_offset();
-  BlogFileFooterProperties props;
-  props.SetBlobCount(1);
-  props.SetBlobPayloadBytes(50);
-  ASSERT_OK(writer->AddFooterPropertiesRecord(wo, props));
-
-  // Write footer locator
-  BlogFileFooterLocator locator;
-  uint64_t locator_offset = writer->current_offset();
-  locator.entries.push_back(
-      {kBlogFooterPropertiesRecord,
-       static_cast<uint32_t>((locator_offset - props_offset) / 4)});
-  ASSERT_OK(writer->AddFooterLocatorRecord(wo, locator));
+  ASSERT_OK(writer->WriteFooter(wo, BlogFileFooterProperties{}));
 
   // Read all records
   auto reader = MakeReader();
@@ -344,7 +596,7 @@ TEST_F(BlogWriterTest, FooterRecords) {
   ASSERT_EQ(type, kBlogFooterPropertiesRecord);
   BlogFileFooterProperties read_props;
   ASSERT_OK(read_props.DecodeFrom(payload));
-  ASSERT_EQ(read_props.properties.size(), 2u);
+  ASSERT_EQ(read_props.properties.size(), 3u);
 
   // Footer locator record
   ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
@@ -461,6 +713,368 @@ TEST_F(BlogWriterTest, CorruptHugeLengthReturnsIncompleteWithoutThrow) {
   ASSERT_TRUE(s.IsIncomplete()) << s.ToString();
 }
 
+TEST_F(BlogWriterTest, HeaderRejectsOversizedPropertySectionBeforeReadingIt) {
+  auto header = MakeBlobHeader();
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  // Keep the fixed header checksum valid so the size bound rejects it.
+  EncodeFixed32(contents_.data() + 32, UINT32_MAX);
+  EncodeFixed32(
+      contents_.data() + 36,
+      ComputeBuiltinChecksum(header.checksum_type, contents_.data(), 36) +
+          ChecksumModifierForContext(header.incarnation_id(), 0));
+
+  auto reader = MakeReader();
+  BlogFileHeader read_header;
+  const Status s = reader->ReadHeader(&read_header);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(s.ToString().find("invalid property section size"),
+            std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(BlogWriterTest, RejectsNontrivialEncodingOfZeroLength) {
+  auto header = MakeBlobHeader();
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  contents_.append(header.escape_sequence, kBlogEscapeSequenceSize);
+  char encoded_length[kMaxPrefixVarint64Length];
+  char* encoded_end = EncodePrefixVarint64<3>(encoded_length, 0);
+  contents_.append(encoded_length,
+                   lossless_cast<size_t>(encoded_end - encoded_length));
+
+  auto reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  const Status s = reader->ReadRecord(&type, &payload, &scratch);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(s.ToString().find("nontrivial length encoding"), std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(BlogWriterTest, RejectsReservedRecordTypeWithoutChecksumVerification) {
+  auto header = MakeBlobHeader();
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  const uint64_t record_offset = writer->current_offset();
+  ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "value"));
+  const size_t type_offset = record_offset + kBlogEscapeSequenceSize +
+                             RecordVarintLength(record_offset);
+  contents_[type_offset] = static_cast<char>(0x14);
+
+  auto reader = MakeReader(/*verify_checksums=*/false);
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  const Status s = reader->ReadRecord(&type, &payload, &scratch);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_NE(s.ToString().find("reserved record type"), std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(BlogWriterTest, RejectsInvalidCompressionWithoutChecksumVerification) {
+  auto header = MakeBlobHeader();
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  uint64_t payload_offset = 0;
+  ASSERT_OK(writer->AddBlobRecord(WriteOptions(), "value", kNoCompression,
+                                  &payload_offset, 5));
+  contents_[payload_offset + 5] = static_cast<char>(0x08);
+
+  auto reader = MakeReader(/*verify_checksums=*/false);
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  const Status s = reader->ReadRecord(&type, &payload, &scratch);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(s.ToString().find("invalid compression type"), std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(BlogWriterTest, FullRecordPrefixCorruptionDetected) {
+  auto header = MakeBlobHeader();
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  const std::string blob(16384, 'B');
+  const uint64_t record_offset = writer->current_offset();
+  ASSERT_OK(writer->AddBlobRecord(WriteOptions(), blob, kNoCompression, nullptr,
+                                  blob.size()));
+  const size_t type_offset = record_offset + kBlogEscapeSequenceSize +
+                             RecordVarintLength(record_offset);
+  contents_[type_offset] = static_cast<char>(kBlogWriteBatchRecord);
+
+  auto reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  const Status s = reader->ReadRecord(&type, &payload, &scratch);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(s.ToString().find("prefix checksum mismatch"), std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(BlogWriterTest, RejectsCompressedRecordWithoutCompatibilityName) {
+  auto header = MakeBlobHeader();
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  uint64_t payload_offset = 0;
+  ASSERT_OK(writer->AddBlobRecord(WriteOptions(), "compressed", kNoCompression,
+                                  &payload_offset, 10));
+  contents_[payload_offset + 10] = lossless_cast<char>(kSnappyCompression);
+  RewriteRecordTrailerChecksum(header, payload_offset, 10);
+
+  auto reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  const Status s = reader->ReadRecord(&type, &payload, &scratch);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(s.ToString().find("without CompressionCompatibilityName"),
+            std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(BlogWriterTest, RejectsStreamingCompressionOnNonWriteBatch) {
+  auto header = MakeBlobHeader();
+  header.SetProperty(kBlogPropCompressionCompatibilityName, "BuiltinV2");
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+  uint64_t payload_offset = 0;
+  ASSERT_OK(writer->AddBlobRecord(WriteOptions(), "stream", kNoCompression,
+                                  &payload_offset, 6));
+  contents_[payload_offset + 6] =
+      lossless_cast<char>(kStreamingCompressionSentinel);
+  RewriteRecordTrailerChecksum(header, payload_offset, 6);
+
+  auto reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  const Status s = reader->ReadRecord(&type, &payload, &scratch);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(s.ToString().find("only valid for WriteBatch"), std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(BlogWriterTest, AcceptsDeclaredWriteBatchStreamingCompression) {
+  auto header = MakeWalHeader();
+  header.SetProperty(kBlogPropCompressionCompatibilityName, "BuiltinV2");
+  header.SetProperty(kBlogPropWriteBatchStreamingCompressionType, "07");
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+  ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "stream",
+                                        kStreamingCompressionSentinel));
+
+  auto reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  CompressionType compression_type = kNoCompression;
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch, nullptr,
+                               &compression_type));
+  ASSERT_EQ(type, kBlogWriteBatchRecord);
+  ASSERT_EQ(compression_type, kStreamingCompressionSentinel);
+}
+
+TEST_F(BlogWriterTest, FooterRecordUsesGeneralCompressionValidation) {
+  auto header = MakeBlobHeader();
+  header.SetProperty(kBlogPropCompressionCompatibilityName, "BuiltinV2");
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  const uint64_t record_offset = writer->current_offset();
+  BlogFileFooterProperties props;
+  props.SetSequenceRange(5, 7);
+  std::string properties_payload;
+  props.EncodeTo(&properties_payload);
+  ASSERT_OK(writer->WriteFooter(WriteOptions(), props));
+  const size_t varint_len = RecordVarintLength(record_offset);
+  const size_t prefix_compression_offset =
+      record_offset + kBlogEscapeSequenceSize + varint_len + 1;
+  const uint64_t payload_offset =
+      record_offset + kBlogEscapeSequenceSize + varint_len + 6;
+  contents_[prefix_compression_offset] = static_cast<char>(kSnappyCompression);
+  contents_[payload_offset + properties_payload.size()] =
+      static_cast<char>(kSnappyCompression);
+  RewriteFullPrefixChecksum(header, record_offset);
+  RewriteRecordTrailerChecksum(header, payload_offset,
+                               properties_payload.size());
+  const size_t padding_offset =
+      payload_offset + properties_payload.size() + kBlogBlockTrailerSize;
+  const uint8_t last_meaningful_byte =
+      lossless_cast<uint8_t>(contents_[padding_offset - 1]);
+  const size_t next_record_offset = contents_.find(
+      std::string(header.escape_sequence, kBlogEscapeSequenceSize),
+      padding_offset);
+  ASSERT_NE(next_record_offset, std::string::npos);
+  std::fill(
+      contents_.begin() + padding_offset,
+      contents_.begin() + next_record_offset,
+      lossless_cast<char>(ChooseBlogPaddingByte(last_meaningful_byte, false)));
+
+  auto reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  CompressionType compression_type = kNoCompression;
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch, nullptr,
+                               &compression_type));
+  ASSERT_EQ(type, kBlogFooterPropertiesRecord);
+  ASSERT_EQ(payload, properties_payload);
+  ASSERT_EQ(compression_type, kSnappyCompression);
+}
+
+// Padding carries no semantic content, so a gap that mixes 0x00 and 0xFF
+// bytes is skipped like any other gap; the flanking records still verify.
+TEST_F(BlogWriterTest, SkipsMixedPaddingBytes) {
+  auto header = MakeBlobHeader();
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  uint64_t first_payload_offset = 0;
+  ASSERT_OK(writer->AddBlobRecord(WriteOptions(), "a", kNoCompression,
+                                  &first_payload_offset, 1));
+  const uint64_t second_record_offset = writer->current_offset();
+  ASSERT_OK(
+      writer->AddBlobRecord(WriteOptions(), "b", kNoCompression, nullptr, 1));
+
+  const uint64_t padding_offset =
+      first_payload_offset + 1 + kBlogBlockTrailerSize;
+  ASSERT_GT(second_record_offset, padding_offset + 1);
+  contents_[padding_offset + 1] =
+      contents_[padding_offset] == '\0' ? '\xFF' : '\0';
+
+  auto reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
+  ASSERT_EQ(payload, "a");
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
+  ASSERT_EQ(payload, "b");
+  ASSERT_TRUE(reader->ReadRecord(&type, &payload, &scratch).IsNotFound());
+}
+
+// A non-pad byte before the next alignment boundary cannot start a record
+// (records only start aligned), so it is reported immediately rather than
+// handed to the record parse.
+TEST_F(BlogWriterTest, RejectsGarbageBeforeAlignmentBoundary) {
+  // Find a payload whose record ends unaligned, leaving pre-boundary gap
+  // bytes to corrupt. Canonical layout keeps this deterministic.
+  std::string payload;
+  size_t record_end = 0;
+  bool found = false;
+  for (size_t len = 1; len <= 8; ++len) {
+    auto header = MakeBlobHeader();
+    auto writer = MakeWriter(header);
+    ASSERT_OK(writer->WriteHeader(WriteOptions()));
+    payload.assign(len, 'a');
+    uint64_t payload_offset = 0;
+    ASSERT_OK(writer->AddBlobRecord(WriteOptions(), payload, kNoCompression,
+                                    &payload_offset, payload.size()));
+    record_end = payload_offset + payload.size() + kBlogBlockTrailerSize;
+    ASSERT_OK(
+        writer->AddBlobRecord(WriteOptions(), "b", kNoCompression, nullptr, 1));
+    ASSERT_OK(writer->Close(WriteOptions()));
+    if (record_end % kBlogMinRecordAlignment != 0) {
+      found = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found) << "no payload length ended unaligned";
+
+  // A bitflip turning the first gap byte into garbage.
+  contents_[record_end] = '\x42';
+
+  auto reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice record;
+  std::string scratch;
+  ASSERT_OK(reader->ReadRecord(&type, &record, &scratch));
+  ASSERT_EQ(record, payload);
+  const Status s = reader->ReadRecord(&type, &record, &scratch);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(s.ToString().find("non-padding byte"), std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(BlogWriterTest, RejectsDataAfterFooterLocator) {
+  auto header = MakeBlobHeader();
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  ASSERT_OK(
+      writer->AddBlobRecord(WriteOptions(), "v", kNoCompression, nullptr, 1));
+
+  ASSERT_OK(writer->WriteFooter(WriteOptions(), BlogFileFooterProperties{}));
+  contents_.push_back('x');
+
+  auto reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
+  ASSERT_EQ(type, kBlogBlobRecord);
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
+  const Status s = reader->ReadRecord(&type, &payload, &scratch);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(s.ToString().find("footer locator is not the last"),
+            std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(BlogWriterTest, EscapeSequenceScanCanResumeRecordReading) {
+  auto header = MakeBlobHeader();
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+  const uint64_t record_offset = writer->current_offset();
+  ASSERT_OK(writer->AddBlobRecord(WriteOptions(), "value", kNoCompression,
+                                  nullptr, 5));
+
+  auto reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  uint64_t found_offset = 0;
+  ASSERT_OK(reader->ScanForEscapeSequence(&found_offset));
+  ASSERT_EQ(found_offset, record_offset);
+
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
+  ASSERT_EQ(type, kBlogBlobRecord);
+  ASSERT_EQ(payload, "value");
+}
+
 TEST_F(BlogWriterTest, MixedRecordTypes) {
   // Use blob compact type but also write WriteBatch records (full format)
   auto header = MakeBlobHeader();
@@ -563,6 +1177,10 @@ TEST_F(BlogWriterTest, HeaderWithProperties) {
   ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
   ASSERT_EQ(type, kBlogBlobRecord);
   ASSERT_EQ(payload, blob_data);
+  // The skipped ignorable properties record was merged into the reader's
+  // header view.
+  ASSERT_EQ(reader->header().GetProperty("role"), "blob");
+  ASSERT_EQ(reader->header().GetProperty("compressionSettings"), "level=3");
 }
 
 TEST_F(BlogWriterTest, NoncanonicalUnspecifiedSizeRecordReadsBack) {
@@ -590,17 +1208,7 @@ TEST_F(BlogWriterTest, NoncanonicalUnspecifiedSizeRecordReadsBack) {
   ASSERT_OK(writer->AddBlobRecord(wo, blob_data, kNoCompression, &blob_offset,
                                   blob_data.size()));
 
-  BlogFileFooterProperties props;
-  props.SetBlobCount(1);
-  const uint64_t props_offset = writer->current_offset();
-  ASSERT_OK(writer->AddFooterPropertiesRecord(wo, props));
-
-  BlogFileFooterLocator locator;
-  const uint64_t locator_offset = writer->current_offset();
-  locator.entries.push_back(
-      {kBlogFooterPropertiesRecord,
-       static_cast<uint32_t>((locator_offset - props_offset) / 4)});
-  ASSERT_OK(writer->AddFooterLocatorRecord(wo, locator));
+  ASSERT_OK(writer->WriteFooter(wo, BlogFileFooterProperties{}));
   ASSERT_OK(writer->Close(wo));
 
   auto reader = MakeReader();
@@ -637,14 +1245,12 @@ TEST_F(BlogWriterTest,
   ASSERT_OK(writer->WriteHeader(wo));
 
   std::string blob_data(128, 'E');
-  // Plant four aligned copies of the file escape sequence inside the payload.
+  // Plant six aligned copies of the file escape sequence inside the payload.
   // The two preceding 0x00/0xFF bytes make each one look like a plausible
   // next-record boundary, so the reader has to reject them by checksum rather
-  // than by obvious shape alone. This stays on the success side of the bounded
-  // lookahead; the corruption test below reuses four embedded candidates but
-  // corrupts the real trailer so the fifth checked candidate reports
-  // corruption.
-  const size_t escape_offsets[] = {7, 27, 47, 67};
+  // than by obvious shape alone. There is intentionally no fixed lookahead
+  // limit because payload bytes are unrestricted.
+  const size_t escape_offsets[] = {7, 27, 47, 67, 87, 107};
   for (size_t i = 0; i < sizeof(escape_offsets) / sizeof(escape_offsets[0]);
        ++i) {
     const size_t offset = escape_offsets[i];
@@ -657,19 +1263,9 @@ TEST_F(BlogWriterTest,
   ASSERT_OK(writer->AddBlobRecord(wo, blob_data, kNoCompression, nullptr,
                                   blob_data.size()));
 
-  BlogFileFooterProperties props;
-  props.SetBlobCount(1);
   // Append real footer records so unspecified-size parsing eventually reaches
   // a valid next-record boundary after skipping the embedded lookalikes.
-  const uint64_t props_offset = writer->current_offset();
-  ASSERT_OK(writer->AddFooterPropertiesRecord(wo, props));
-
-  BlogFileFooterLocator locator;
-  const uint64_t locator_offset = writer->current_offset();
-  locator.entries.push_back(
-      {kBlogFooterPropertiesRecord,
-       static_cast<uint32_t>((locator_offset - props_offset) / 4)});
-  ASSERT_OK(writer->AddFooterLocatorRecord(wo, locator));
+  ASSERT_OK(writer->WriteFooter(wo, BlogFileFooterProperties{}));
   ASSERT_OK(writer->Close(wo));
 
   auto reader = MakeReader();
@@ -684,9 +1280,8 @@ TEST_F(BlogWriterTest,
   ASSERT_EQ(payload, blob_data);
 }
 
-TEST_F(
-    BlogWriterTest,
-    NoncanonicalUnspecifiedSizeRecordReportsChecksumCorruptionAfterLimitedLookahead) {
+TEST_F(BlogWriterTest,
+       NoncanonicalUnspecifiedSizeRecordScansAllCandidatesBeforeCorruption) {
   TEST_BlogNoncanonicalConfig config;
   config.enabled = true;
   config.seed = 29;
@@ -726,17 +1321,12 @@ TEST_F(
   ASSERT_OK(writer->AddBlobRecord(wo, blob_data, kNoCompression, &blob_offset,
                                   blob_data.size()));
 
-  BlogFileFooterProperties props;
-  props.SetBlobCount(1);
   const uint64_t props_offset = writer->current_offset();
-  ASSERT_OK(writer->AddFooterPropertiesRecord(wo, props));
-
-  BlogFileFooterLocator locator;
-  const uint64_t locator_offset = writer->current_offset();
-  locator.entries.push_back(
-      {kBlogFooterPropertiesRecord,
-       static_cast<uint32_t>((locator_offset - props_offset) / 4)});
-  ASSERT_OK(writer->AddFooterLocatorRecord(wo, locator));
+  ASSERT_OK(writer->WriteFooter(wo, BlogFileFooterProperties{}));
+  const size_t locator_offset = contents_.find(
+      std::string(header.escape_sequence, kBlogEscapeSequenceSize),
+      props_offset + kBlogEscapeSequenceSize);
+  ASSERT_NE(locator_offset, std::string::npos);
   ASSERT_OK(writer->Close(wo));
 
   std::string& contents = contents_;
@@ -767,15 +1357,14 @@ TEST_F(
       << corruption_status.ToString();
   ASSERT_NE(corruption_status.ToString().find(
                 "candidate escape sequence file offset " +
-                std::to_string(props_offset)),
+                std::to_string(locator_offset)),
             std::string::npos)
       << corruption_status.ToString();
-  // The embedded false positives use one pad byte, so their candidate payload
-  // sizes are offset - 6 => 1, 21, 41, and 61. The real next-record boundary
-  // contributes the fifth checked payload size, 128.
-  ASSERT_NE(corruption_status.ToString().find(
-                "candidate payload sizes checked=[1,21,41,61,128]"),
-            std::string::npos)
+  // Four embedded false positives, the corrupted real boundary, and the next
+  // footer record boundary were all considered before EOF.
+  ASSERT_NE(
+      corruption_status.ToString().find("escape-sequence candidates checked=6"),
+      std::string::npos)
       << corruption_status.ToString();
 }
 
@@ -848,17 +1437,7 @@ TEST_F(BlogWriterTest, BlobFilesCanInjectAuxiliaryWriteBatchRecords) {
   ASSERT_OK(writer->WriteHeader(wo));
   ASSERT_OK(writer->AddBlobRecord(wo, "blob", kNoCompression, nullptr, 4));
 
-  BlogFileFooterProperties props;
-  props.SetBlobCount(1);
-  const uint64_t props_offset = writer->current_offset();
-  ASSERT_OK(writer->AddFooterPropertiesRecord(wo, props));
-
-  BlogFileFooterLocator locator;
-  const uint64_t locator_offset = writer->current_offset();
-  locator.entries.push_back(
-      {kBlogFooterPropertiesRecord,
-       static_cast<uint32_t>((locator_offset - props_offset) / 4)});
-  ASSERT_OK(writer->AddFooterLocatorRecord(wo, locator));
+  ASSERT_OK(writer->WriteFooter(wo, BlogFileFooterProperties{}));
   ASSERT_OK(writer->Close(wo));
 
   auto reader = MakeReader();
@@ -875,6 +1454,240 @@ TEST_F(BlogWriterTest, BlobFilesCanInjectAuxiliaryWriteBatchRecords) {
   ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
   ASSERT_EQ(type, kBlogWriteBatchRecord);
   ASSERT_FALSE(payload.empty());
+}
+
+TEST_F(BlogWriterTest, RejectsOversizedHeaderPropertiesBeforeWriting) {
+  BlogFileHeader header = MakeBlobHeader();
+  header.SetProperty("PredecessorWalInfo",
+                     std::string(kBlogMaxPropertySectionSize, 'x'));
+  std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+  const IOStatus s = writer->WriteHeader(WriteOptions());
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_TRUE(contents_.empty());
+}
+
+TEST_F(BlogWriterTest, RejectsOversizedFooterPropertiesBeforeWriting) {
+  BlogFileHeader header = MakeBlobHeader();
+  std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+  const uint64_t offset = writer->current_offset();
+
+  BlogFileFooterProperties properties;
+  properties.properties.emplace_back(
+      "oversized", std::string(kBlogMaxPropertySectionSize, 'x'));
+  const IOStatus s = writer->WriteFooter(WriteOptions(), properties);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_EQ(writer->current_offset(), offset);
+}
+
+TEST_F(BlogWriterTest, RejectsFooterPropertiesMadeOversizedByLiveStats) {
+  BlogFileHeader header = MakeBlobHeader();
+  std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+  ASSERT_OK(
+      writer->AddBlobRecord(WriteOptions(), "v", kNoCompression, nullptr, 1));
+  const uint64_t offset = writer->current_offset();
+
+  BlogFileFooterProperties properties;
+  properties.properties.emplace_back(
+      "x", std::string(kBlogMaxPropertySectionSize - 16, 'x'));
+  const IOStatus s = writer->WriteFooter(WriteOptions(), properties);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_EQ(writer->current_offset(), offset);
+}
+
+TEST_F(BlogWriterTest, RejectsNontrivialPreambleStartRecord) {
+  auto header = MakeBlobHeader();
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  const uint64_t record_offset = writer->current_offset();
+  ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "value"));
+  const size_t type_offset = record_offset + kBlogEscapeSequenceSize +
+                             RecordVarintLength(record_offset);
+  contents_[type_offset] = static_cast<char>(kBlogPreambleStartRecord);
+
+  auto reader = MakeReader(/*verify_checksums=*/false);
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  const Status s = reader->ReadRecord(&type, &payload, &scratch);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(s.ToString().find("preamble-start record must use trivial format"),
+            std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(BlogWriterTest, RejectsFullRecordCompressionMismatch) {
+  auto header = MakeBlobHeader();
+  header.SetProperty(kBlogPropCompressionCompatibilityName, "BuiltinV2");
+  auto writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+
+  const std::string blob(16384, 'B');
+  const uint64_t record_offset = writer->current_offset();
+  uint64_t payload_offset = 0;
+  ASSERT_OK(writer->AddBlobRecord(WriteOptions(), blob, kNoCompression,
+                                  &payload_offset, blob.size()));
+  contents_[payload_offset + blob.size()] =
+      static_cast<char>(kSnappyCompression);
+  RewriteRecordTrailerChecksum(header, payload_offset, blob.size());
+
+  auto reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  const Status s = reader->ReadRecord(&type, &payload, &scratch);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_EQ(reader->LastRecordOffset(), record_offset);
+  ASSERT_NE(s.ToString().find("prefix/trailer compression type mismatch"),
+            std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(BlogWriterTest, RejectsInvalidFullRecordPrefixCompression) {
+  for (ChecksumType checksum : {kXXH3, kNoChecksum}) {
+    for (bool verify_checksums : {false, true}) {
+      for (uint64_t length : {uint64_t{1}, kBlogUnspecifiedSize}) {
+        SCOPED_TRACE("checksum=" + std::to_string(checksum) +
+                     " verify=" + std::to_string(verify_checksums) +
+                     " length=" + std::to_string(length));
+        BlogFileHeader header = MakeBlobHeader();
+        header.checksum_type = checksum;
+        std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+        ASSERT_OK(writer->WriteHeader(WriteOptions()));
+        AppendTestRecord(header, kBlogBlobRecord, length,
+                         lossless_cast<CompressionType>(uint8_t{0x08}),
+                         kNoCompression, "v");
+        ExpectRecordCorruption(verify_checksums, "invalid compression type");
+      }
+    }
+  }
+}
+
+TEST_F(BlogWriterTest, RejectsCompressionMismatchWithoutChecksums) {
+  for (ChecksumType checksum : {kXXH3, kNoChecksum}) {
+    for (bool verify_checksums : {false, true}) {
+      for (uint64_t length : {uint64_t{1}, kBlogUnspecifiedSize}) {
+        SCOPED_TRACE("checksum=" + std::to_string(checksum) +
+                     " verify=" + std::to_string(verify_checksums) +
+                     " length=" + std::to_string(length));
+        BlogFileHeader header = MakeBlobHeader();
+        header.checksum_type = checksum;
+        header.SetProperty(kBlogPropCompressionCompatibilityName, "BuiltinV2");
+        std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+        ASSERT_OK(writer->WriteHeader(WriteOptions()));
+        AppendTestRecord(header, kBlogBlobRecord, length, kSnappyCompression,
+                         kNoCompression, "v");
+        if (length == kBlogUnspecifiedSize) {
+          AppendTestRecord(header, kBlogPreambleStartRecord, 0, kNoCompression,
+                           kNoCompression, Slice());
+        }
+        ExpectRecordCorruption(verify_checksums,
+                               "prefix/trailer compression type mismatch");
+      }
+    }
+  }
+}
+
+TEST_F(BlogWriterTest, RejectsUnspecifiedSizePreambleStartRecord) {
+  BlogFileHeader header = MakeBlobHeader();
+  std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+  AppendTestRecord(header, kBlogPreambleStartRecord, kBlogUnspecifiedSize,
+                   kNoCompression, kNoCompression, "v");
+  ExpectRecordCorruption(false,
+                         "preamble-start record must use trivial format");
+}
+
+TEST_F(BlogWriterTest, RejectsTrivialFooterLocator) {
+  BlogFileHeader header = MakeBlobHeader();
+  std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+  AppendTestRecord(header, kBlogFooterLocatorRecord, 0, kNoCompression,
+                   kNoCompression, Slice());
+  ExpectRecordCorruption(false, "footer locator must have a specified");
+}
+
+TEST_F(BlogWriterTest, RejectsUnspecifiedSizeFooterLocator) {
+  BlogFileHeader header = MakeBlobHeader();
+  std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+  AppendTestRecord(header, kBlogFooterLocatorRecord, kBlogUnspecifiedSize,
+                   kNoCompression, kNoCompression, "v");
+  ExpectRecordCorruption(false, "footer locator must have a specified");
+}
+
+TEST_F(BlogWriterTest, RejectsOutOfOrderFooterRecords) {
+  const BlogRecordType sequences[][2] = {
+      {kBlogFooterPropertiesRecord, kBlogFooterIndexRecord},
+      {kBlogFooterFileChecksumInfo, kBlogFooterIndexRecord},
+      {kBlogFooterFileChecksumInfo, kBlogFooterPropertiesRecord},
+      {kBlogFooterPropertiesRecord, kBlogFooterPropertiesRecord},
+      {kBlogFooterFileChecksumInfo, kBlogFooterFileChecksumInfo},
+  };
+  for (const auto& sequence : sequences) {
+    SCOPED_TRACE("first=" + std::to_string(sequence[0]) +
+                 " second=" + std::to_string(sequence[1]));
+    BlogFileHeader header = MakeBlobHeader();
+    header.checksum_type = kNoChecksum;
+    std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+    ASSERT_OK(writer->WriteHeader(WriteOptions()));
+    for (BlogRecordType type : sequence) {
+      AppendTestRecord(header, type, 1, kNoCompression, kNoCompression, "v");
+    }
+    std::unique_ptr<BlogFileReader> reader = MakeReader();
+    BlogFileHeader read_header;
+    ASSERT_OK(reader->ReadHeader(&read_header));
+    BlogRecordType type;
+    Slice payload;
+    std::string scratch;
+    ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
+    const Status s = reader->ReadRecord(&type, &payload, &scratch);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+    ASSERT_NE(s.ToString().find("footer"), std::string::npos) << s.ToString();
+  }
+}
+
+TEST_F(BlogWriterTest, AcceptsMultipleFooterIndexes) {
+  BlogFileHeader header = MakeBlobHeader();
+  std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+  const BlogRecordType sequence[] = {
+      kBlogFooterIndexRecord, kBlogFooterIndexRecord,
+      kBlogFooterPropertiesRecord, kBlogFooterFileChecksumInfo};
+  for (BlogRecordType type : sequence) {
+    AppendTestRecord(header, type, 1, kNoCompression, kNoCompression, "v");
+  }
+  std::unique_ptr<BlogFileReader> reader = MakeReader();
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type;
+  Slice payload;
+  std::string scratch;
+  for (BlogRecordType expected : sequence) {
+    ASSERT_OK(reader->ReadRecord(&type, &payload, &scratch));
+    ASSERT_EQ(type, expected);
+  }
+}
+
+TEST_F(BlogWriterTest, RejectsInvalidStreamingHeader) {
+  for (const std::string& value : {std::string(), std::string("0"),
+                                   std::string("zz"), std::string("7f")}) {
+    SCOPED_TRACE(value);
+    BlogFileHeader header = MakeWalHeader();
+    header.SetProperty(kBlogPropWriteBatchStreamingCompressionType, value);
+    std::unique_ptr<BlogFileWriter> writer = MakeWriter(header);
+    ASSERT_OK(writer->WriteHeader(WriteOptions()));
+    std::unique_ptr<BlogFileReader> reader = MakeReader();
+    BlogFileHeader read_header;
+    const Status s = reader->ReadHeader(&read_header);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
