@@ -69,10 +69,16 @@ static constexpr size_t kBlogEscapeSequenceSize = 10;
 static constexpr size_t kBlogEscapeSeqRandomPartSize = 6;
 
 // Seed for deriving bytes [6-9] of escape sequence via
-// XXH3_64bits_withSeed(random_6_bytes, 6, kBlogEscapeSeqSeed).
-// Chosen arbitrarily; must never change once the format is released.
+// XXH3_64bits_withSeed(random_6_bytes, 6, seed), where seed is
+// kBlogEscapeSeqSeed for non-WAL files and BlogWalEscapeSeqSeed(log_number)
+// for WAL files. Chosen arbitrarily; must never change once the format is
+// released.
 static constexpr uint64_t kBlogEscapeSeqSeed =
     0x52636B73426C6F67ULL;  // "RcksBlg\0"
+
+inline uint64_t BlogWalEscapeSeqSeed(uint64_t log_number) {
+  return kBlogEscapeSeqSeed + log_number;
+}
 
 // Sentinel for unspecified-size records. Encodes to 9 bytes in prefix varint,
 // which always triggers the full record format.
@@ -126,6 +132,42 @@ inline uint64_t ComputeBlogRecordSize(uint64_t payload_size,
   return (size_before_padding + 3) & ~uint64_t{3};
 }
 
+// Returns whether a record payload of `payload_size` bytes starting at file
+// offset `payload_file_offset` fits inside a blog file of `file_size` bytes,
+// accounting for the 5-byte trailer that always follows a payload on disk.
+//
+// Random-access readers call this before issuing a read so that an offset
+// outside the file they opened is reported as corruption rather than reaching
+// the file layer. That distinction matters: a reader holding a stale, shorter
+// view of a file that is still being appended to (direct-write blob files) is
+// recovered by reopening it, and that recovery is keyed on Corruption.
+//
+// This is a bound, not a framing check: it does not know where records
+// actually begin, so it can accept an offset that no record starts at. The
+// record trailer checksum remains the authority on payload validity.
+inline bool IsBlogPayloadWithinFile(uint64_t payload_file_offset,
+                                    uint64_t payload_size, uint64_t file_size) {
+  // A payload cannot begin before the fixed header, the property section that
+  // always follows it (at minimum its own 5-byte trailer), and the shortest
+  // possible record prefix (escape sequence + a one-byte length varint).
+  constexpr uint64_t kMinPayloadOffset = kBlogFileFixedHeaderSize +
+                                         kBlogBlockTrailerSize +
+                                         kBlogEscapeSequenceSize + 1;
+  if (payload_file_offset < kMinPayloadOffset) {
+    return false;
+  }
+  if (file_size < kBlogBlockTrailerSize) {
+    return false;
+  }
+  // The payload and its trailer must both be inside the file. Written without
+  // addition so a hostile payload_size cannot overflow.
+  const uint64_t max_payload_end = file_size - kBlogBlockTrailerSize;
+  if (payload_size > max_payload_end) {
+    return false;
+  }
+  return payload_file_offset <= max_payload_end - payload_size;
+}
+
 // Estimated footer size for file-rolling decisions. A typical footer contains
 // a properties record (~80-100 bytes of varint-encoded stats) and a locator
 // record (~29 bytes), plus framing overhead. This is an approximation; the
@@ -177,7 +219,6 @@ static constexpr const char* kBlogPropCreator = "creator";
 // Ignorable properties for file identity and diagnostics.
 static constexpr const char* kBlogPropDbId = "dbId";
 static constexpr const char* kBlogPropDbSessionId = "dbSessionId";
-static constexpr const char* kBlogPropFileNumber = "fileNumber";
 static constexpr const char* kBlogPropDbHostId = "dbHostId";
 static constexpr const char* kBlogPropColumnFamilyId = "columnFamilyId";
 static constexpr const char* kBlogPropColumnFamilyName = "columnFamilyName";
@@ -203,11 +244,12 @@ struct BlogFileHeader {
   BlogRecordType compact_record_type = kBlogBlobRecord;
   uint8_t flags = 0;  // BlogFileHeaderFlags, byte [15] in fixed header
   // 10-byte escape sequence: bytes [0-5] random (byte[0] not 0x00/0xFF),
-  // bytes [6-9] = lower32(XXH3_64bits_withSeed(bytes[0-5],
-  // kBlogEscapeSeqSeed)).
+  // bytes [6-9] = lower32(XXH3_64bits_withSeed(bytes[0-5], seed)). See
+  // kBlogEscapeSeqSeed.
   char escape_sequence[kBlogEscapeSequenceSize] = {};
 
   bool is_recycled() const { return flags & kBlogFileRecycled; }
+  bool is_wal() const { return compact_record_type == kBlogWriteBatchRecord; }
 
   BlogPropertyMap properties;
 
@@ -219,16 +261,27 @@ struct BlogFileHeader {
   // into dst.
   void EncodeTo(std::string* dst) const;
 
-  // Decode from input. Consumes the bytes read.
+  // Decode from input. Consumes the bytes read. WAL escape sequence derived
+  // bytes are not verified because the log number is not known here; see
+  // VerifyWalEscapeSequence.
   Status DecodeFrom(Slice* input);
+
+  // Verify the fixed header checksum, which covers bytes [0, 36) including
+  // the property section size. fixed_header must point to at least
+  // kBlogFileFixedHeaderSize bytes. Call this before trusting any fixed
+  // header field, such as the property section size.
+  static Status VerifyFixedHeaderChecksum(const char* fixed_header);
 
   // Generate escape_sequence from the file's unique ID (db_id, db_session_id,
   // file_number), using the same scheme as SST internal unique IDs. Falls back
   // to GenerateRandomFields() if any input is empty/zero. Also sets the
-  // ignorable dbId/dbSessionId/fileNumber header properties.
+  // ignorable dbId/dbSessionId header properties.
   void GenerateFromUniqueId(const std::string& db_id,
                             const std::string& db_session_id,
                             uint64_t file_number);
+  void GenerateWalFromUniqueId(const std::string& db_id,
+                               const std::string& db_session_id,
+                               uint64_t log_number);
 
   // Set optional diagnostic header properties for debugging. All fields
   // are ignorable (lowercase). Empty strings and sentinel values are skipped.
@@ -243,12 +296,18 @@ struct BlogFileHeader {
   void GenerateRandomFields();
 
  private:
+  void GenerateFromUniqueIdWithSeed(const std::string& db_id,
+                                    const std::string& db_session_id,
+                                    uint64_t file_number, uint64_t seed);
+  void GenerateRandomFieldsWithSeed(uint64_t seed);
   // Populate escape_sequence from a 64 bits of entropy.
-  void SetEscapeSequenceFromU64(uint64_t v);
+  void SetEscapeSequenceFromU64(uint64_t v, uint64_t seed);
+  static bool VerifyEscapeSequenceWithSeed(const char* seq, uint64_t seed);
 
  public:
   // Verify that the escape sequence's derived bytes match.
   static bool VerifyEscapeSequence(const char* seq);
+  static bool VerifyWalEscapeSequence(const char* seq, uint64_t log_number);
 
   // Check if a buffer starts with the blog file magic number.
   static bool IsBlogFormat(const char* data, size_t size) {
@@ -367,12 +426,6 @@ uint32_t ComputeBlogPaddingLength(uint8_t last_meaningful_byte,
 // default.
 uint8_t ChooseBlogPaddingByte(uint8_t last_meaningful_byte,
                               bool prefer_0xff_when_legal);
-
-// Returns whether the provided padding is legal for a record or header ending
-// at `current_offset`. Test-mode readers accept the standard 4-byte alignment
-// as well as the stronger alignments currently used by test-mode writers.
-bool IsValidBlogPadding(uint8_t last_meaningful_byte, uint64_t current_offset,
-                        uint32_t count, uint8_t pad_byte);
 
 // --- Checksum helpers ---
 

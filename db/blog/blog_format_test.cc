@@ -17,7 +17,35 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-class BlogFormatTest : public testing::Test {};
+class BlogFormatTest : public testing::Test {
+ protected:
+  static std::string MakeFooterLocatorRecord(const BlogFileHeader& header,
+                                             uint64_t file_offset,
+                                             uint32_t incarnation_id,
+                                             uint64_t declared_length,
+                                             const std::string& payload) {
+    std::string record(header.escape_sequence, kBlogEscapeSequenceSize);
+    char varint[kMaxPrefixVarint64Length];
+    const char* varint_end = EncodePrefixVarint64<3>(varint, declared_length);
+    std::string prefix(varint, lossless_cast<size_t>(varint_end - varint));
+    prefix.push_back(lossless_cast<char>(kBlogFooterLocatorRecord));
+    prefix.push_back(lossless_cast<char>(kNoCompression));
+    const uint32_t prefix_checksum =
+        ComputeBuiltinChecksum(header.checksum_type, prefix.data(),
+                               prefix.size()) +
+        ChecksumModifierForContext(incarnation_id, file_offset);
+    record.append(prefix);
+    PutFixed32(&record, prefix_checksum);
+    const uint64_t payload_file_offset = file_offset + record.size();
+    record.append(payload);
+    record.push_back(lossless_cast<char>(kNoCompression));
+    PutFixed32(&record, ComputeBlogRecordChecksum(
+                            header.checksum_type, payload.data(),
+                            payload.size(), lossless_cast<char>(kNoCompression),
+                            incarnation_id, payload_file_offset));
+    return record;
+  }
+};
 
 // --- Property encoding/decoding ---
 
@@ -132,6 +160,44 @@ TEST_F(BlogFormatTest, HeuristicEscapeSequenceDetection) {
   // Might still pass if the corruption happens to produce a valid derived
   // part, but astronomically unlikely
   // (We don't ASSERT_FALSE here because of the tiny probability)
+}
+
+TEST_F(BlogFormatTest, WalEscapeSequenceBindsLogNumber) {
+  // Empty session id exercises the random fallback.
+  for (const std::string& db_session_id :
+       {std::string(), std::string("0123456789ABCDEFGHIJ")}) {
+    BlogFileHeader header;
+    header.compact_record_type = kBlogWriteBatchRecord;
+    header.GenerateWalFromUniqueId("db-id", db_session_id, /*log_number=*/123);
+    ASSERT_TRUE(BlogFileHeader::VerifyWalEscapeSequence(header.escape_sequence,
+                                                        /*log_number=*/123));
+    ASSERT_FALSE(BlogFileHeader::VerifyWalEscapeSequence(header.escape_sequence,
+                                                         /*log_number=*/124));
+    ASSERT_FALSE(BlogFileHeader::VerifyEscapeSequence(header.escape_sequence));
+
+    header.properties.clear();
+    std::string encoded;
+    header.EncodeTo(&encoded);
+    Slice input(encoded);
+    BlogFileHeader decoded;
+    ASSERT_OK(decoded.DecodeFrom(&input));
+  }
+}
+
+TEST_F(BlogFormatTest, NonWalHeaderRejectsWalBoundEscapeSequence) {
+  BlogFileHeader header;
+  header.compact_record_type = kBlogWriteBatchRecord;
+  header.GenerateWalFromUniqueId("db-id", "0123456789ABCDEFGHIJ",
+                                 /*log_number=*/123);
+  header.compact_record_type = kBlogBlobRecord;
+  header.properties.clear();
+  std::string encoded;
+  header.EncodeTo(&encoded);
+  Slice input(encoded);
+  BlogFileHeader decoded;
+  Status s = decoded.DecodeFrom(&input);
+  ASSERT_TRUE(s.IsCorruption());
+  ASSERT_NE(s.ToString().find("invalid escape sequence"), std::string::npos);
 }
 
 // --- BlogFileHeader encode/decode ---
@@ -289,6 +355,30 @@ TEST_F(BlogFormatTest, HeaderChecksumCorruption) {
   ASSERT_TRUE(decoded.DecodeFrom(&input).IsCorruption());
 }
 
+TEST_F(BlogFormatTest, DecodeFromBufferVerifiesChecksumBeforePropertySize) {
+  BlogFileHeader header;
+  header.GenerateRandomFields();
+  header.SetProperty("role", "wal");
+
+  std::string encoded;
+  header.EncodeTo(&encoded);
+
+  // An intact fixed header without its property section needs more data.
+  BlogFileHeader decoded;
+  size_t additional_bytes_needed = 0;
+  Slice fixed_only(encoded.data(), kBlogFileFixedHeaderSize);
+  ASSERT_TRUE(decoded.DecodeFromBuffer(&fixed_only, &additional_bytes_needed)
+                  .IsIncomplete());
+  ASSERT_EQ(additional_bytes_needed, encoded.size() - kBlogFileFixedHeaderSize);
+
+  // A corrupted property section size that points past the buffer fails the
+  // fixed header checksum instead of asking for more data.
+  EncodeFixed32(&encoded[32], 1 << 20);
+  Slice corrupted(encoded);
+  Status s = decoded.DecodeFromBuffer(&corrupted, &additional_bytes_needed);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+}
+
 TEST_F(BlogFormatTest, HeaderPropertyChecksumCorruption) {
   BlogFileHeader header;
   header.GenerateRandomFields();
@@ -338,6 +428,65 @@ TEST_F(BlogFormatTest, HeaderMagicValues) {
 }
 
 // --- Footer locator ---
+
+TEST_F(BlogFormatTest, FooterLocatorRejectsUnboundedLength) {
+  // Zero context and kNoChecksum avoid a huge payload checksum scan if the
+  // bounds check regresses. On wraparound, trailer reads would target the
+  // zero-filled prefix checksum or payload instead of rejecting the length.
+  BlogFileHeader header;
+  header.checksum_type = kNoChecksum;
+  header.escape_sequence[0] = 0x42;
+  const std::string payload(5, '\0');
+  const uint64_t invalid_lengths[] = {6,
+                                      kBlogUnspecifiedSize,
+                                      UINT64_MAX - 4,
+                                      UINT64_MAX - 3,
+                                      UINT64_MAX - 2,
+                                      UINT64_MAX - 1,
+                                      UINT64_MAX};
+  for (const uint64_t length : invalid_lengths) {
+    SCOPED_TRACE("length=" + std::to_string(length));
+    const std::string record =
+        MakeFooterLocatorRecord(header, 0, 0, length, payload);
+    uint64_t locator_offset = 123;
+    ASSERT_FALSE(VerifyBlogFooterLocator(
+        record.data(), record.size(), 0, header.escape_sequence,
+        header.checksum_type, 0, nullptr, &locator_offset));
+    ASSERT_EQ(locator_offset, 123u);
+  }
+
+  std::string short_trailer = MakeFooterLocatorRecord(header, 0, 0, 1, "x");
+  short_trailer.resize(short_trailer.size() - 2);
+  ASSERT_FALSE(VerifyBlogFooterLocator(
+      short_trailer.data(), short_trailer.size(), 0, header.escape_sequence,
+      header.checksum_type, 0, nullptr, nullptr));
+}
+
+TEST_F(BlogFormatTest, FooterLocatorBoundedPayloadRoundTrip) {
+  BlogFileFooterLocator locator;
+  locator.entries.push_back({kBlogFooterPropertiesRecord, 50});
+  std::string payload;
+  locator.EncodeTo(&payload);
+  const uint64_t file_offset = 100;
+  for (const ChecksumType checksum_type : {kNoChecksum, kCRC32c, kXXH3}) {
+    SCOPED_TRACE("checksum=" + std::to_string(checksum_type));
+    BlogFileHeader header;
+    header.GenerateRandomFields();
+    header.checksum_type = checksum_type;
+    const std::string record = MakeFooterLocatorRecord(
+        header, file_offset, header.incarnation_id(), payload.size(), payload);
+    BlogFileFooterLocator decoded;
+    uint64_t locator_offset = 0;
+    ASSERT_TRUE(VerifyBlogFooterLocator(
+        record.data(), record.size(), file_offset, header.escape_sequence,
+        checksum_type, header.incarnation_id(), &decoded, &locator_offset));
+    ASSERT_EQ(locator_offset, file_offset);
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    ASSERT_EQ(decoded.entries[0].record_type, locator.entries[0].record_type);
+    ASSERT_EQ(decoded.entries[0].relative_offset_4B,
+              locator.entries[0].relative_offset_4B);
+  }
+}
 
 TEST_F(BlogFormatTest, FooterLocatorEncodeDecodeEmpty) {
   BlogFileFooterLocator locator;
@@ -450,28 +599,6 @@ TEST_F(BlogFormatTest, PaddingAllowsStrongerAlignment) {
                   /*prefer_0xff_when_legal=*/true);
   ASSERT_EQ((100u + pad.count) % kBlogFlushFriendlyAlignment, 0u);
   ASSERT_EQ(lossless_cast<uint8_t>(pad.byte), 0xFFu);
-}
-
-TEST_F(BlogFormatTest, IsValidPaddingAcceptsSupportedAlignments) {
-  const uint8_t last_meaningful_byte = 0x42;
-  const uint64_t current_offset = 100;
-
-  const uint32_t min_pad = ComputeBlogPaddingLength(
-      last_meaningful_byte, current_offset, kBlogMinRecordAlignment);
-  ASSERT_TRUE(IsValidBlogPadding(last_meaningful_byte, current_offset, min_pad,
-                                 /*pad_byte=*/0x00));
-
-  const uint32_t flush_pad = ComputeBlogPaddingLength(
-      last_meaningful_byte, current_offset, kBlogFlushFriendlyAlignment);
-  ASSERT_TRUE(IsValidBlogPadding(last_meaningful_byte, current_offset,
-                                 flush_pad, /*pad_byte=*/0xFF));
-
-  const uint32_t page_pad = ComputeBlogPaddingLength(
-      last_meaningful_byte, current_offset, kBlogPageFriendlyAlignment);
-  ASSERT_TRUE(IsValidBlogPadding(last_meaningful_byte, current_offset, page_pad,
-                                 /*pad_byte=*/0x00));
-  ASSERT_FALSE(IsValidBlogPadding(last_meaningful_byte, current_offset,
-                                  /*count=*/5, /*pad_byte=*/0x00));
 }
 
 // --- Improper (non-minimal) prefix varint ---

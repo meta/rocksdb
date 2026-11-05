@@ -36,6 +36,15 @@ namespace ROCKSDB_NAMESPACE {
 
 namespace {
 
+Status InvalidBlobOffsetCorruption(uint64_t offset, uint64_t value_size,
+                                   const std::string& file_name,
+                                   uint64_t file_size) {
+  return Status::Corruption("Invalid blob offset " + std::to_string(offset) +
+                            " for value size " + std::to_string(value_size) +
+                            " in " + file_name + " (file size " +
+                            std::to_string(file_size) + ")");
+}
+
 Status ResolveBlogCompressionManager(
     Slice compatibility_name,
     CompressionManager* configured_compression_manager,
@@ -235,6 +244,43 @@ Status BlobFileReader::Create(
       blob_file_reader->reset();
       return s;
     }
+  }
+
+  return Status::OK();
+}
+
+Status BlobFileReader::VerifyAgainstManifestMetadata(
+    uint64_t expected_physical_size, uint8_t expected_schema_version,
+    const Slice& expected_file_identity) const {
+  if (expected_physical_size != 0 && file_size_ != expected_physical_size) {
+    return Status::Corruption(
+        "BlobFileAddition",
+        "Blob file physical size does not match manifest metadata");
+  }
+
+  if (expected_schema_version == kLegacyBlobFileSchemaVersion) {
+    if (is_blog_format_) {
+      return Status::Corruption(
+          "BlobFileAddition",
+          "Blob file format does not match legacy manifest metadata");
+    }
+    return Status::OK();
+  }
+
+  if (!is_blog_format_) {
+    return Status::Corruption("BlobFileAddition",
+                              "Blob file format does not match blog manifest "
+                              "metadata");
+  }
+  if (blog_schema_version_ != expected_schema_version) {
+    return Status::Corruption(
+        "BlobFileAddition",
+        "Blob file schema version does not match manifest metadata");
+  }
+  if (GetBlogFileIdentity() != expected_file_identity) {
+    return Status::Corruption(
+        "BlobFileAddition",
+        "Blob file identity does not match manifest metadata");
   }
 
   return Status::OK();
@@ -647,6 +693,10 @@ Status BlobFileReader::GetBlob(
   uint64_t adjustment_after = 0;   // bytes after the value to include
 
   if (is_blog_format_) {
+    if (!IsBlogPayloadWithinFile(offset, value_size, file_size_)) {
+      return InvalidBlobOffsetCorruption(offset, value_size,
+                                         file_reader_->file_name(), file_size_);
+    }
     if (read_options.verify_checksums) {
       adjustment_after = kBlogBlockTrailerSize;
     }
@@ -654,10 +704,8 @@ Status BlobFileReader::GetBlob(
     const uint64_t key_size = user_key.size();
     if (!IsValidBlobOffset(offset, key_size, value_size, file_size_,
                            has_footer_)) {
-      return Status::Corruption(
-          "Invalid blob offset " + std::to_string(offset) + " for value size " +
-          std::to_string(value_size) + " in " + file_reader_->file_name() +
-          " (file size " + std::to_string(file_size_) + ")");
+      return InvalidBlobOffsetCorruption(offset, value_size,
+                                         file_reader_->file_name(), file_size_);
     }
     if (compression_type != compression_type_) {
       return Status::Corruption("Compression type mismatch when reading blob");
@@ -755,21 +803,31 @@ Status BlobFileReader::GetBlobRange(const ReadOptions& read_options,
 
   // Partial reads are only meaningful for uncompressed blobs: a strict
   // sub-range of a compressed record cannot be decompressed in isolation.
-  // Callers (BlobSource::GetBlobRange) must ensure this; enforce it here too.
+  // Legacy files carry one file-wide compression type, so it can be re-checked
+  // here. Blog files compress per record and a range read deliberately does not
+  // read the trailer that holds the type; they report kNoCompression at the
+  // file level, so this guard never fires for one and the caller
+  // (BlobSource::GetBlobRange, via BlobIndex::compression()) is the only layer
+  // that can enforce it for those.
+  assert(!is_blog_format_ || compression_type_ == kNoCompression);
   if (compression_type_ != kNoCompression) {
     return Status::Corruption("Cannot range-read a compressed blob");
   }
 
-  const uint64_t key_size = user_key.size();
-
   // Validate that the full value region is within the file (same check GetBlob
   // performs); this guards the sub-range read below.
-  if (!IsValidBlobOffset(offset, key_size, value_size, file_size_,
-                         has_footer_)) {
-    return Status::Corruption(
-        "Invalid blob offset " + std::to_string(offset) + " for value size " +
-        std::to_string(value_size) + " in " + file_reader_->file_name() +
-        " (file size " + std::to_string(file_size_) + ")");
+  if (is_blog_format_) {
+    if (!IsBlogPayloadWithinFile(offset, value_size, file_size_)) {
+      return InvalidBlobOffsetCorruption(offset, value_size,
+                                         file_reader_->file_name(), file_size_);
+    }
+  } else {
+    const uint64_t key_size = user_key.size();
+    if (!IsValidBlobOffset(offset, key_size, value_size, file_size_,
+                           has_footer_)) {
+      return InvalidBlobOffsetCorruption(offset, value_size,
+                                         file_reader_->file_name(), file_size_);
+    }
   }
 
   // The requested sub-range must lie within the value.
@@ -855,6 +913,11 @@ void BlobFileReader::MultiGetBlob(
     uint64_t adj_after = 0;
 
     if (is_blog_format_) {
+      if (!IsBlogPayloadWithinFile(offset, value_size, file_size_)) {
+        *req->status = InvalidBlobOffsetCorruption(
+            offset, value_size, file_reader_->file_name(), file_size_);
+        continue;
+      }
       if (read_options.verify_checksums) {
         adj_after = kBlogBlockTrailerSize;
       }
@@ -862,11 +925,8 @@ void BlobFileReader::MultiGetBlob(
       const size_t key_size = req->user_key->size();
       if (!IsValidBlobOffset(offset, key_size, value_size, file_size_,
                              has_footer_)) {
-        *req->status = Status::Corruption(
-            "Invalid blob offset " + std::to_string(offset) +
-            " for value size " + std::to_string(value_size) + " in " +
-            file_reader_->file_name() + " (file size " +
-            std::to_string(file_size_) + ")");
+        *req->status = InvalidBlobOffsetCorruption(
+            offset, value_size, file_reader_->file_name(), file_size_);
         continue;
       }
       if (req->compression != compression_type_) {
@@ -1044,17 +1104,24 @@ void BlobFileReader::MultiGetBlobRange(
     assert(req);
     assert(req->status);
 
-    const size_t key_size = req->user_key.size();
     // Validate that the full value region is within the file (same check
     // GetBlob performs); this guards the sub-range read below.
-    if (!IsValidBlobOffset(req->offset, key_size, req->value_size, file_size_,
-                           has_footer_)) {
-      *req->status = Status::Corruption(
-          "Invalid blob offset " + std::to_string(req->offset) +
-          " for value size " + std::to_string(req->value_size) + " in " +
-          file_reader_->file_name() + " (file size " +
-          std::to_string(file_size_) + ")");
-      continue;
+    if (is_blog_format_) {
+      if (!IsBlogPayloadWithinFile(req->offset, req->value_size, file_size_)) {
+        *req->status =
+            InvalidBlobOffsetCorruption(req->offset, req->value_size,
+                                        file_reader_->file_name(), file_size_);
+        continue;
+      }
+    } else {
+      const size_t key_size = req->user_key.size();
+      if (!IsValidBlobOffset(req->offset, key_size, req->value_size, file_size_,
+                             has_footer_)) {
+        *req->status =
+            InvalidBlobOffsetCorruption(req->offset, req->value_size,
+                                        file_reader_->file_name(), file_size_);
+        continue;
+      }
     }
     // The requested sub-range must lie within the value.
     if (req->range_offset > req->value_size ||

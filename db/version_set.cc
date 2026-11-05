@@ -2836,9 +2836,9 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
                                    blob_file_meta->GetChecksumMethod()};
   const Status s = blob_source_->GetBlob(
       read_options, user_key, mutable_cf_options_.compression_manager.get(),
-      blob_file, blob_index.offset(), blob_file_meta->GetBlobFileSize(),
-      blob_index.size(), blob_index.compression(), prefetch_buffer, value,
-      bytes_read);
+      blob_file, blob_file_meta->GetSharedMeta().get(), blob_index.offset(),
+      blob_file_meta->GetBlobFileSize(), blob_index.size(),
+      blob_index.compression(), prefetch_buffer, value, bytes_read);
 
   return s;
 }
@@ -2875,7 +2875,8 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
                                    blob_file_meta->GetChecksumValue(),
                                    blob_file_meta->GetChecksumMethod()};
   return blob_source_->GetBlobRange(
-      read_options, user_key, blob_file, blob_index.offset(),
+      read_options, user_key, mutable_cf_options_.compression_manager.get(),
+      blob_file, blob_file_meta->GetSharedMeta().get(), blob_index.offset(),
       blob_file_meta->GetBlobFileSize(), blob_index.size(),
       blob_index.compression(), range_offset, range_length, value, bytes_read);
 }
@@ -2898,6 +2899,12 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
   autovector<BlobFileRangeReadRequests> range_reqs;
   std::unordered_map<uint64_t, size_t> whole_idx;
   std::unordered_map<uint64_t, size_t> range_idx;
+  // Owns the metadata borrowed by the whole-value per-file tuples below for
+  // the duration of the MultiGetBlob call.
+  std::vector<std::shared_ptr<BlobFileMetaData>> whole_metadatas;
+  // Owns the metadata borrowed by the range per-file tuples below for the
+  // duration of the MultiGetBlobRange call.
+  std::vector<std::shared_ptr<BlobFileMetaData>> range_metadatas;
 
   for (auto& req : reqs) {
     assert(req.user_key);
@@ -2940,8 +2947,10 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
       } else {
         idx = whole_reqs.size();  // no batch yet for this file, or it is full
         whole_idx[file_number] = idx;
+        whole_metadatas.push_back(blob_file_meta);
         whole_reqs.emplace_back(blob_file, file_size,
-                                autovector<BlobReadRequest>());
+                                autovector<BlobReadRequest>(),
+                                whole_metadatas.back()->GetSharedMeta().get());
       }
       std::get<2>(whole_reqs[idx])
           .emplace_back(*req.user_key, blob_index.offset(), blob_index.size(),
@@ -2963,8 +2972,10 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
       } else {
         idx = range_reqs.size();  // no batch yet for this file, or it is full
         range_idx[file_number] = idx;
+        range_metadatas.push_back(blob_file_meta);
         range_reqs.emplace_back(blob_file, file_size,
-                                autovector<BlobRangeReadRequest>());
+                                autovector<BlobRangeReadRequest>(),
+                                range_metadatas.back()->GetSharedMeta().get());
       }
       std::get<2>(range_reqs[idx])
           .emplace_back(*req.user_key, blob_index.offset(), blob_index.size(),
@@ -2975,12 +2986,14 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
 
   // Resolve every batch; BlobSource issues one coalesced MultiRead per batch.
   if (!whole_reqs.empty()) {
-    blob_source_->MultiGetBlob(read_options, whole_reqs,
-                               /*bytes_read=*/nullptr);
+    blob_source_->MultiGetBlob(
+        read_options, mutable_cf_options_.compression_manager.get(), whole_reqs,
+        /*bytes_read=*/nullptr);
   }
   if (!range_reqs.empty()) {
-    blob_source_->MultiGetBlobRange(read_options, range_reqs,
-                                    /*bytes_read=*/nullptr);
+    blob_source_->MultiGetBlobRange(
+        read_options, mutable_cf_options_.compression_manager.get(), range_reqs,
+        /*bytes_read=*/nullptr);
   }
 }
 
@@ -2990,6 +3003,9 @@ void Version::MultiGetBlob(
   assert(!blob_ctxs.empty());
 
   autovector<BlobFileReadRequests> blob_reqs;
+  // Owns the metadata borrowed by the per-file tuples below for the duration
+  // of the MultiGetBlob call.
+  std::vector<std::shared_ptr<BlobFileMetaData>> blob_metadatas;
 
   for (auto& ctx : blob_ctxs) {
     const auto file_number = ctx.first;
@@ -3031,11 +3047,14 @@ void Version::MultiGetBlob(
           &blob.result, key_context->s);
     }
     if (blob_reqs_in_file.size() > 0) {
+      assert(blob_file_meta);
       const auto file_size = blob_file_meta->GetBlobFileSize();
       const BlobFileOpenInfo blob_file{file_number,
                                        blob_file_meta->GetChecksumValue(),
                                        blob_file_meta->GetChecksumMethod()};
-      blob_reqs.emplace_back(blob_file, file_size, blob_reqs_in_file);
+      blob_metadatas.push_back(blob_file_meta);
+      blob_reqs.emplace_back(blob_file, file_size, blob_reqs_in_file,
+                             blob_metadatas.back()->GetSharedMeta().get());
     }
   }
 

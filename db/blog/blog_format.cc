@@ -5,7 +5,6 @@
 
 #include "db/blog/blog_format.h"
 
-#include <array>
 #include <cassert>
 #include <cstring>
 
@@ -20,6 +19,13 @@
 #include "util/xxhash.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+bool HasValidEscapeSequenceFirstByte(const char* seq) {
+  uint8_t first = static_cast<uint8_t>(seq[0]);
+  return first != 0x00 && first != 0xFF;
+}
+}  // namespace
 
 // --- Property encoding/decoding ---
 
@@ -109,6 +115,25 @@ void BlogFileHeader::EncodeTo(std::string* dst) const {
   dst->append(prop_section);
 }
 
+Status BlogFileHeader::VerifyFixedHeaderChecksum(const char* fixed_header) {
+  const char* p = fixed_header;
+  ChecksumType type = static_cast<ChecksumType>(p[13]);
+  uint32_t incarnation_id = DecodeFixed32(p + 16);
+  uint32_t stored_header_checksum = DecodeFixed32(p + 36);
+  uint32_t computed_header_checksum =
+      ComputeBuiltinChecksum(type, p, 36) +
+      ChecksumModifierForContext(incarnation_id, 0);
+  if (stored_header_checksum != computed_header_checksum) {
+    char computed_buf[4];
+    EncodeFixed32(computed_buf, computed_header_checksum);
+    return Status::Corruption(
+        "Blog header: fixed header checksum mismatch (stored: 0x" +
+        Slice(p + 36, 4).ToString(true) + ", computed: 0x" +
+        Slice(computed_buf, 4).ToString(true) + ")");
+  }
+  return Status::OK();
+}
+
 Status BlogFileHeader::DecodeFrom(Slice* input) {
   if (input->size() < kBlogFileFixedHeaderSize) {
     return Status::Corruption("Blog header too short: have " +
@@ -129,19 +154,11 @@ Status BlogFileHeader::DecodeFrom(Slice* input) {
   memcpy(escape_sequence, p + 16, kBlogEscapeSequenceSize);
 
   // Verify fixed header checksum FIRST, before trusting any other fields.
-  uint32_t prop_section_size = DecodeFixed32(p + 32);
-  uint32_t stored_header_checksum = DecodeFixed32(p + 36);
-  uint32_t computed_header_checksum =
-      ComputeBuiltinChecksum(checksum_type, p, 36) +
-      ChecksumModifierForContext(incarnation_id(), 0);
-  if (stored_header_checksum != computed_header_checksum) {
-    char computed_buf[4];
-    EncodeFixed32(computed_buf, computed_header_checksum);
-    return Status::Corruption(
-        "Blog header: fixed header checksum mismatch (stored: 0x" +
-        Slice(p + 36, 4).ToString(true) + ", computed: 0x" +
-        Slice(computed_buf, 4).ToString(true) + ")");
+  Status checksum_status = VerifyFixedHeaderChecksum(p);
+  if (!checksum_status.ok()) {
+    return checksum_status;
   }
+  uint32_t prop_section_size = DecodeFixed32(p + 32);
 
   // Now that checksum is verified, validate the remaining fields.
   schema_version = static_cast<uint8_t>(p[12]);
@@ -154,9 +171,12 @@ Status BlogFileHeader::DecodeFrom(Slice* input) {
   compact_record_type = static_cast<BlogRecordType>(p[14]);
   flags = static_cast<uint8_t>(p[15]);
 
-  if (!VerifyEscapeSequence(escape_sequence)) {
+  const bool escape_sequence_valid =
+      is_wal() ? HasValidEscapeSequenceFirstByte(escape_sequence)
+               : VerifyEscapeSequence(escape_sequence);
+  if (!escape_sequence_valid) {
     return Status::Corruption(
-        "Blog header: escape sequence derived bytes mismatch (first byte: 0x" +
+        "Blog header: invalid escape sequence (first byte: 0x" +
         Slice(escape_sequence, 1).ToString(true) + ")");
   }
 
@@ -218,7 +238,7 @@ Status BlogFileHeader::DecodeFrom(Slice* input) {
   return Status::OK();
 }
 
-void BlogFileHeader::SetEscapeSequenceFromU64(uint64_t v) {
+void BlogFileHeader::SetEscapeSequenceFromU64(uint64_t v, uint64_t seed) {
   // Byte 0: derived from top 4 bytes via FastRange32 into [1, 254],
   // avoiding 0x00 and 0xFF (which are padding bytes).
   uint32_t top = static_cast<uint32_t>(v >> 32);
@@ -237,8 +257,8 @@ void BlogFileHeader::SetEscapeSequenceFromU64(uint64_t v) {
   // detect escape sequences with high accuracy (expect 1 false positive per
   // ~16GB; further validation/pruning can be done trying to parse records
   // and/or picking the most common candidate escape sequence).
-  uint64_t derived = XXH3_64bits_withSeed(
-      escape_sequence, kBlogEscapeSeqRandomPartSize, kBlogEscapeSeqSeed);
+  uint64_t derived =
+      XXH3_64bits_withSeed(escape_sequence, kBlogEscapeSeqRandomPartSize, seed);
   EncodeFixed32(escape_sequence + kBlogEscapeSeqRandomPartSize,
                 static_cast<uint32_t>(derived));
 }
@@ -246,8 +266,22 @@ void BlogFileHeader::SetEscapeSequenceFromU64(uint64_t v) {
 void BlogFileHeader::GenerateFromUniqueId(const std::string& db_id,
                                           const std::string& db_session_id,
                                           uint64_t file_number) {
+  GenerateFromUniqueIdWithSeed(db_id, db_session_id, file_number,
+                               kBlogEscapeSeqSeed);
+}
+
+void BlogFileHeader::GenerateWalFromUniqueId(const std::string& db_id,
+                                             const std::string& db_session_id,
+                                             uint64_t log_number) {
+  GenerateFromUniqueIdWithSeed(db_id, db_session_id, log_number,
+                               BlogWalEscapeSeqSeed(log_number));
+}
+
+void BlogFileHeader::GenerateFromUniqueIdWithSeed(
+    const std::string& db_id, const std::string& db_session_id,
+    uint64_t file_number, uint64_t seed) {
   if (db_id.empty() || db_session_id.empty() || file_number == 0) {
-    GenerateRandomFields();
+    GenerateRandomFieldsWithSeed(seed);
     return;
   }
 
@@ -256,7 +290,7 @@ void BlogFileHeader::GenerateFromUniqueId(const std::string& db_id,
   Status s =
       GetSstInternalUniqueId(db_id, db_session_id, file_number, &unique_id);
   if (!s.ok()) {
-    GenerateRandomFields();
+    GenerateRandomFieldsWithSeed(seed);
     return;
   }
 
@@ -264,21 +298,24 @@ void BlogFileHeader::GenerateFromUniqueId(const std::string& db_id,
   // so that it is.
   InternalUniqueIdToExternal(&unique_id);
 
-  SetEscapeSequenceFromU64(unique_id[0]);
+  SetEscapeSequenceFromU64(unique_id[0], seed);
 
-  // Store the inputs as ignorable header properties for debugging/tracking.
+  // Store the IDs as ignorable header properties for debugging/tracking.
   SetProperty(kBlogPropDbId, db_id);
   SetProperty(kBlogPropDbSessionId, db_session_id);
-  SetUint64Property(kBlogPropFileNumber, file_number);
 }
 
 void BlogFileHeader::GenerateRandomFields() {
+  GenerateRandomFieldsWithSeed(kBlogEscapeSeqSeed);
+}
+
+void BlogFileHeader::GenerateRandomFieldsWithSeed(uint64_t seed) {
   uint64_t rand_a;
   uint64_t rand_b;
   GenerateRawUniqueId(&rand_a, &rand_b);
   // Use rand_a for escape sequence, rand_b is unused extra entropy.
   (void)rand_b;
-  SetEscapeSequenceFromU64(rand_a);
+  SetEscapeSequenceFromU64(rand_a, seed);
 }
 
 void BlogFileHeader::SetDiagnosticProperties(
@@ -300,13 +337,22 @@ void BlogFileHeader::SetDiagnosticProperties(
 }
 
 bool BlogFileHeader::VerifyEscapeSequence(const char* seq) {
-  uint8_t first = static_cast<uint8_t>(seq[0]);
-  if (first == 0x00 || first == 0xFF) {
+  return VerifyEscapeSequenceWithSeed(seq, kBlogEscapeSeqSeed);
+}
+
+bool BlogFileHeader::VerifyWalEscapeSequence(const char* seq,
+                                             uint64_t log_number) {
+  return VerifyEscapeSequenceWithSeed(seq, BlogWalEscapeSeqSeed(log_number));
+}
+
+bool BlogFileHeader::VerifyEscapeSequenceWithSeed(const char* seq,
+                                                  uint64_t seed) {
+  if (!HasValidEscapeSequenceFirstByte(seq)) {
     return false;
   }
   // Verify derived part
-  uint64_t derived = XXH3_64bits_withSeed(seq, kBlogEscapeSeqRandomPartSize,
-                                          kBlogEscapeSeqSeed);
+  uint64_t derived =
+      XXH3_64bits_withSeed(seq, kBlogEscapeSeqRandomPartSize, seed);
   uint32_t expected = static_cast<uint32_t>(derived);
   uint32_t actual = DecodeFixed32(seq + kBlogEscapeSeqRandomPartSize);
   return expected == actual;
@@ -379,6 +425,10 @@ Status BlogFileHeader::DecodeFromBuffer(Slice* buffer,
                                         size_t* additional_bytes_needed) {
   if (buffer->size() < kBlogFileFixedHeaderSize) {
     return Status::Corruption("Blog header: buffer too small for fixed header");
+  }
+  Status checksum_status = VerifyFixedHeaderChecksum(buffer->data());
+  if (!checksum_status.ok()) {
+    return checksum_status;
   }
 
   // Check if the full header (fixed + property section) fits in the buffer.
@@ -474,7 +524,8 @@ bool VerifyBlogFooterLocator(const char* buffer, size_t buffer_size,
     // If length > 0, verify the payload trailer checksum
     if (length > 0) {
       size_t after_prefix = after_varint - 6;  // after type+comp+prefix_cksum
-      if (after_prefix < length + kBlogBlockTrailerSize) {
+      if (after_prefix < kBlogBlockTrailerSize ||
+          length > after_prefix - kBlogBlockTrailerSize) {
         continue;  // truncated payload or trailer
       }
       const char* payload = varint_end + 6;
@@ -618,35 +669,6 @@ uint8_t ChooseBlogPaddingByte(uint8_t last_meaningful_byte,
     return 0x00;
   }
   return prefer_0xff_when_legal ? 0xFF : 0x00;
-}
-
-bool IsValidBlogPadding(uint8_t last_meaningful_byte, uint64_t current_offset,
-                        uint32_t count, uint8_t pad_byte) {
-  if (count == 0) {
-    return true;
-  }
-
-  if (pad_byte != 0x00 && pad_byte != 0xFF) {
-    return false;
-  }
-
-  if (last_meaningful_byte == 0x00 && pad_byte != 0xFF) {
-    return false;
-  }
-  if (last_meaningful_byte == 0xFF && pad_byte != 0x00) {
-    return false;
-  }
-
-  static constexpr std::array<uint32_t, 3> kAllowedAlignments{
-      kBlogMinRecordAlignment, kBlogFlushFriendlyAlignment,
-      kBlogPageFriendlyAlignment};
-  for (uint32_t alignment : kAllowedAlignments) {
-    if (count == ComputeBlogPaddingLength(last_meaningful_byte, current_offset,
-                                          alignment)) {
-      return true;
-    }
-  }
-  return false;
 }
 
 BlogPadding::BlogPadding(uint8_t last_meaningful_byte, size_t current_offset,

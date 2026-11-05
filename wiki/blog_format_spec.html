@@ -70,7 +70,7 @@
 <tr><td>13</td><td>1</td><td>Checksum type (<code>ChecksumType</code> enum: 0=none, 1=CRC32c, 4=XXH3). Configured via <code>DBOptions::blog_checksum</code>.</td></tr>
 <tr><td>14</td><td>1</td><td>Compact record type (<code>BlogRecordType</code> -- type for all compact-format records)</td></tr>
 <tr><td>15</td><td>1</td><td>Flags: bit 0 = <code>kBlogFileRecycled</code> (file may contain trailing stale data)</td></tr>
-<tr><td>16</td><td>10</td><td>Escape sequence: bytes [0-5] random (byte[0] not 0x00/0xFF), bytes [6-9] = lower32(XXH3_64bits_withSeed(bytes[0-5], kBlogEscapeSeqSeed)). First 4 bytes also serve as incarnation ID (little-endian via DecodeFixed32).</td></tr>
+<tr><td>16</td><td>10</td><td>Escape sequence: bytes [0-5] random (byte[0] not 0x00/0xFF), bytes [6-9] = lower32(XXH3_64bits_withSeed(bytes[0-5], seed)), where seed is <code>kBlogEscapeSeqSeed</code>, plus the log number for WAL files (compact record type WriteBatch). First 4 bytes also serve as incarnation ID (little-endian via DecodeFixed32).</td></tr>
 <tr><td>26</td><td>6</td><td>Reserved (zero)</td></tr>
 <tr><td>32</td><td>4</td><td>Property section size (uint32 LE) -- includes 5-byte trailer</td></tr>
 <tr><td>36</td><td>4</td><td>Fixed header checksum -- covers bytes [0, 36)</td></tr>
@@ -106,7 +106,6 @@
 <tr><td><code>"role"</code></td><td>File purpose hint: <code>"wal"</code>, <code>"blob"</code>, <code>"manifest"</code>, <code>"rlog"</code></td></tr>
 <tr><td><code>"dbId"</code></td><td>Database identity string</td></tr>
 <tr><td><code>"dbSessionId"</code></td><td>Session identity of the writer</td></tr>
-<tr><td><code>"fileNumber"</code></td><td>File number within the DB</td></tr>
 <tr><td><code>"dbHostId"</code></td><td>Hostname of the writing machine</td></tr>
 <tr><td><code>"columnFamilyId"</code></td><td>Column family ID (omitted for DB-wide files)</td></tr>
 <tr><td><code>"columnFamilyName"</code></td><td>Column family name (omitted for DB-wide files)</td></tr>
@@ -119,14 +118,14 @@
 <h2 id="s2">Escape Sequences</h2>
 
 <div class="decision">
-<strong>Decision:</strong> 10-byte escape sequence: 6 random bytes + 4 derived bytes. First byte not 0x00 nor 0xFF (distinguishable from padding). Bytes [6-9] = lower32(XXH3_64bits_withSeed(bytes[0-5], kBlogEscapeSeqSeed)), enabling heuristic detection without knowing the header.
+<strong>Decision:</strong> 10-byte escape sequence: 6 random bytes + 4 derived bytes. First byte not 0x00 nor 0xFF (distinguishable from padding). Bytes [6-9] = lower32(XXH3_64bits_withSeed(bytes[0-5], seed)), enabling heuristic detection without knowing the header. The seed is <code>kBlogEscapeSeqSeed</code>, plus the log number for WAL files, so a WAL header is only valid under its own log number.
 </div>
 
 <p>Escape sequences must be <strong>32-bit aligned</strong> in the file. The first 4 bytes (little-endian) serve as the <strong>incarnation ID</strong> for context checksums.</p>
 
 <h3>Primary Roles</h3>
 <ul>
-  <li><strong>WAL recycling detection:</strong> When recovery encounters undecodable data, scan for our escape sequence. If not found, the data is stale/recycled (different random sequence). The <code>kBlogFileRecycled</code> flag in the header indicates recycling is expected.</li>
+  <li><strong>WAL recycling detection:</strong> When recovery encounters undecodable data, scan for our escape sequence. If not found, the data is stale/recycled (different random sequence). The <code>kBlogFileRecycled</code> flag in the header indicates recycling is expected. A recycled WAL renamed to a new log number, but whose header has not yet been rewritten, fails the log-number-seeded escape sequence check.</li>
   <li><strong>Non-linear recovery:</strong> After corruption, scan forward for the next escape sequence to resume recovery (<code>kSkipAnyCorruptedRecords</code>).</li>
   <li><strong>Record boundary discovery:</strong> Find record boundaries from any file position.</li>
 </ul>
@@ -163,8 +162,23 @@
   <li><strong>Value 0</strong> (1 byte): Trivial format (no payload).</li>
   <li><strong>Values 1&ndash;16383</strong> (1&ndash;2 bytes): Compact format.</li>
   <li><strong>3+ byte prefix varint</strong>: Full format. Includes type, pre-payload compression type, and prefix checksum.</li>
-  <li><strong>length = 2<sup>63</sup> &minus; 1</strong>: Unspecified size (full format). Reader scans forward for next escape sequence.</li>
+  <li><strong>length = 2<sup>63</sup> &minus; 1</strong>: Unspecified size (full format). Reader scans forward for the next escape sequence, or terminates the record at the end of the file. See below.</li>
 </ul>
+
+<h3>Unspecified-Size Records and Their Boundaries</h3>
+
+<p>An unspecified-size record is the one record shape that is not self-delimiting. Its payload ends at whichever comes first: the next 32-bit-aligned escape sequence, or the end of the file. For either boundary the reader derives the padding length as the exact trailing run of 0x00/0xFF bytes immediately before it, places the 5-byte trailer immediately before that run, and accepts the boundary only if the trailer checksum authenticates the payload. Without the end-of-file boundary, a record that nothing follows -- the last record of a file abandoned by a crashed process -- could never be read back at all.</p>
+
+<div class="note"><strong>Writer restriction.</strong> A writer must not use the unspecified-size encoding in a file whose trailing bytes, at the moment a reader may see it, are neither absent nor padding. There is no reader-side remedy for such a file: nothing in it records where the last record stopped, and brute-force scanning for a boundary whose trailer happens to checksum is unsafe -- over a large tail the per-candidate false-accept probability accumulates, and under <code>kNoChecksum</code> the stored trailer value does not depend on the payload at all, so it authenticates nothing.</div>
+
+<p>In RocksDB today exactly one file shape violates that condition: a <strong>recycled WAL</strong> (<code>kBlogFileRecycled</code>). It is reused without being truncated or zeroed first, so the previous incarnation's bytes remain past the logical end, and they carry a different escape sequence, so neither boundary is reachable. Writers of recycled WALs must therefore keep every record self-delimiting. Every other file is safe:</p>
+<ul>
+  <li><strong>Blob files</strong>: records are only ever read by random access at an offset the blob index supplies, never by scanning for boundaries -- including a direct-write file read while it is still open and unsealed.</li>
+  <li><strong>Non-recycled WAL and MANIFEST</strong>: written buffered, and preallocated with <code>FALLOC_FL_KEEP_SIZE</code>, so the physical end of the file is exactly its last written byte.</li>
+</ul>
+
+<p>Note that this is a constraint on the <em>length encoding</em>, not on any particular feature. Anything that cannot know a record's payload size before emitting its prefix -- for instance a future writer that streams compressed bytes to the file rather than buffering and measuring them first -- inherits the same restriction, whether or not it uses streaming compression.</p>
+
 
 <h3>Trivial Record Format (prefix varint value 0)</h3>
 <div class="diagram">
@@ -178,7 +192,12 @@
   [payload: length bytes]
   [compression_type: 1B] [checksum: 4B]
   [padding: 0+ B]</div>
-<p>No type byte &mdash; type comes from the header's <code>compact_record_type</code> field. Used for payloads &lt; 16 KiB. The compact format has no separate length checksum; the <code>checksum</code> in the trailer covers the payload and <code>compression_type</code> byte with a context modifier derived from the record's file offset and incarnation ID. An incorrect length field will cause the checksum to fail because the payload bytes fed to the checksum will be wrong. Adding a type byte to the compact format would require including it in the checksum computation (or modifying the escape sequence) to maintain integrity.</p>
+<p>No type byte &mdash; type comes from the header's <code>compact_record_type</code> field. Used for payloads &lt; 16 KiB. The compact format has no separate length checksum; the <code>checksum</code> in the trailer covers the payload and <code>compression_type</code> byte with a context modifier derived from the payload's file offset and incarnation ID. An incorrect length field will cause the checksum to fail because the payload bytes fed to the checksum will be wrong. Furthermore, an incorrect length field fails to locate its own checksum trailer without scanning and must be reported as Corruption. Adding a type byte to the compact format would require including it in the checksum computation (or modifying the escape sequence) to maintain integrity.</p>
+
+<p>Unlike the full format, which may encode its length with an irregular (overlong) prefix varint, a compact record's length must use the minimal prefix varint encoding for its value. A non-minimal 1&ndash;2 byte encoding is rejected as corruption before any payload is read. This keeps the unauthenticated compact length structurally checkable even when <code>blog_checksum</code> is <code>kNoChecksum</code>.</p>
+
+<p>Unlike the full format, which may encode its length with an irregular (overlong) prefix varint, a compact record's length must use the minimal prefix varint encoding for its value. A non-minimal 1&ndash;2 byte encoding is rejected as corruption before any payload is read. This keeps the unauthenticated compact length structurally checkable even when <code>blog_checksum</code> is <code>kNoChecksum</code>.</p>
+
 
 <h3>Full Record Format (prefix varint &ge; 3 bytes)</h3>
 <div class="diagram">
@@ -202,7 +221,9 @@
 <h3>Streaming Compression (WriteBatch records only)</h3>
 <p>When the header property <code>WriteBatchStreamingCompressionType</code> is set, WriteBatch record payloads may use streaming compression across records. Such records use <code>kStreamingCompressionSentinel</code> (0x7F) as their trailer's compression_type byte, indicating "compressed using the streaming algorithm declared in the header."</p>
 
-<p>A record with <code>kNoCompression</code> (0x00) in the trailer remains individually uncompressed even when streaming is active, enabling dynamic on/off switching based on compression effectiveness.</p>
+<p>All streaming-compressed records in a file form a single stream, in file order. For ZSTD this is one frame that is continued, never restarted, by each record; the writer flushes after each record's payload, so a record decodes once all earlier streaming-compressed records in the file have been decoded. The frame need not be ended. Because later records may reference earlier ones, a reader that cannot decode a streaming-compressed record cannot decode any later one in the file.</p>
+
+<p>A record with <code>kNoCompression</code> (0x00) in the trailer is stored uncompressed and is not part of the stream, even when streaming is active, so readers must accept it anywhere among streaming-compressed records. This is a writer-internal escape hatch, not a tunable: a writer must decide to leave a record out of the stream before compressing it, because compressing advances the stream state that later records depend on, so a record cannot be compressed, judged ineffective, and then stored raw. <code>BlogWalWriter</code> writes empty WriteBatch records uncompressed, and writes all later records uncompressed after a write error that may have lost part of the stream.</p>
 
 <p>Non-WriteBatch records (blob records, footer records) are always outside the streaming context and use per-record compression, keeping blob data randomly readable.</p>
 
@@ -302,6 +323,8 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
 
 <p>The escape sequence is the <strong>primary mechanism</strong> for detecting WAL recycling and for non-linear data recovery. The <code>kBlogFileRecycled</code> flag in the header indicates the file may contain trailing stale data from a previous incarnation.</p>
 
+<p>In every mode, a WAL header whose escape sequence does not match the file's log number ends reading of that file. If the header is flagged <code>kBlogFileRecycled</code>, it is a previous incarnation and the file is treated as empty (reported as an old log record); otherwise it is reported as corruption.</p>
+
 <table>
 <tr>
   <th style="width:22%">Mode</th>
@@ -315,7 +338,7 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
 </tr>
 <tr>
   <td><code>kTolerateCorruptedTailRecords</code></td>
-  <td>Incomplete trailing record (Incomplete status): tolerate, stop at last complete record. Corruption: scan for escape sequence. Not found = clean end (recycled or preallocated). Found with valid record beyond = mid-file corruption (error).</td>
+  <td>Incomplete trailing record (Incomplete status): tolerate, stop at last complete record. A record whose length runs past the end of the file but covers a later record boundary is corruption, not an incomplete tail. Corruption: scan for escape sequence.Found with valid record beyond = mid-file corruption (error). If not found, it is clean end for recycled or preallocated files; otherwise damaged tail bytes represent tolerable data loss from this incarnation, emit warning log and open DB succeeds. </td>
   <td>Distinguishes tail damage from mid-file corruption.</td>
 </tr>
 <tr>
@@ -325,7 +348,7 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
 </tr>
 <tr>
   <td><code>kSkipAnyCorruptedRecords</code></td>
-  <td>On corruption, scan forward for next escape sequence. If found, try to decode and verify; resume if valid. If not found, stop.</td>
+  <td>On corruption, scan forward for next escape sequence. If found, try to decode and verify; resume if valid. If not found, stop. Ignores IOError and Corruption, matching existing WAL <code>kSkipAnyCorruptedRecords</code> behavior. Once a record is skipped or a streaming-compressed record cannot be decoded, later streaming-compressed records are dropped without decoding, while other records are still recovered.</td>
   <td>Essential for record discovery after corruption.</td>
 </tr>
 </table>
@@ -378,6 +401,7 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
 <h3>DB Options</h3>
 <ul>
   <li><code>use_blog_format_for_wals</code> (bool, default false): New WAL files use blog format.</li>
+  <li><code>blog_wal_streaming_compression</code> (bool, default false): New blog WAL files compress WriteBatch records with cross-record streaming compression of type <code>wal_compression</code> (ZSTD only) instead of per-record compression.</li>
   <li><code>use_blog_format_for_blobs</code> (bool, default false): New blob files use blog format.</li>
   <li><code>blog_checksum</code> (<code>ChecksumType</code>, default <code>kXXH3</code>): Checksum algorithm for blog format files. <code>ChecksumType</code> enum moved to <code>include/rocksdb/checksum_type.h</code> (from <code>table.h</code>) for use by both table and DB options.</li>
 </ul>
@@ -387,7 +411,7 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
 <ul>
   <li><strong>Blog blob files</strong> use the CF's configured compression manager (via <code>MutableCFOptions::compression_manager</code>). Legacy blob files continue to use the builtin manager for backward compatibility.</li>
   <li><strong>Blog WAL files</strong> use per-record compression via <code>Compressor::CompressBlock</code>. The actual <code>CompressionType</code> from <code>CompressBlock</code> output is stored in the record trailer.</li>
-  <li>Streaming compression infrastructure exists (<code>WriteBatchStreamingCompressionType</code> property, <code>kStreamingCompressionSentinel</code> 0x7F trailer value) but is not yet enabled by default.</li>
+  <li>With <code>blog_wal_streaming_compression</code>, <code>BlogWalWriter</code> instead writes ZSTD cross-record streaming compression, declaring <code>WriteBatchStreamingCompressionType</code> and marking records with <code>kStreamingCompressionSentinel</code> (0x7F). <code>BlogWalReader</code> decodes the stream in file order and accepts <code>kNoCompression</code> records among streamed ones.</li>
 </ul>
 
 </body>

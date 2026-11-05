@@ -99,6 +99,7 @@ BlobFileBuilder::BlobFileBuilder(
       blob_output_path_(std::move(blob_output_path)),
       output_file_paths_(output_file_paths),
       blob_file_additions_(blob_file_additions),
+      use_blog_format_(immutable_options->use_blog_format_for_blobs),
       blob_count_(0),
       blob_bytes_(0) {
   assert(file_number_generator_);
@@ -138,7 +139,7 @@ Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
   Slice blob = value;
   GrowableBuffer compressed_blob;
 
-  if (!blog_writer_) {
+  if (!use_blog_format_) {
     // Legacy format: compress before writing (compression type is implicit
     // from the configured blob_compression_type_).
     const Status s = LegacyCompressBlob(&blob, &compressed_blob);
@@ -193,7 +194,7 @@ Status BlobFileBuilder::Finish() {
 }
 
 bool BlobFileBuilder::IsBlobFileOpen() const {
-  return !!writer_ || !!blog_writer_;
+  return use_blog_format_ ? !!blog_writer_ : !!writer_;
 }
 
 Status BlobFileBuilder::OpenBlobFileIfNeeded() {
@@ -261,7 +262,7 @@ Status BlobFileBuilder::OpenBlobFileIfNeeded() {
 
   blob_file_number_ = blob_file_number;
 
-  if (immutable_options_->use_blog_format_for_blobs) {
+  if (use_blog_format_) {
     // Blog format path
     BlogFileHeader blog_header;
     blog_header.checksum_type = immutable_options_->blog_checksum;
@@ -279,8 +280,10 @@ Status BlobFileBuilder::OpenBlobFileIfNeeded() {
                               blob_compression_manager_->CompatibilityName());
     }
 
-    blog_writer_ =
-        std::make_unique<BlogFileWriter>(std::move(file_writer), blog_header);
+    // Bulk-built files are read after sealing. Buffer records until the
+    // buffer fills or CloseBlobFile syncs, as on the legacy path.
+    blog_writer_ = std::make_unique<BlogFileWriter>(
+        std::move(file_writer), blog_header, /*manual_flush=*/true);
 
     Status s = blog_writer_->WriteHeader(*write_options_);
 
@@ -364,9 +367,10 @@ Status BlobFileBuilder::WriteBlobToFile(
 
   Status s;
 
-  if (blog_writer_) {
+  if (use_blog_format_) {
     // Blog format: compress here using CompressBlock (like SST) so we
     // capture the actual compression type used in the record trailer.
+    assert(blog_writer_ != nullptr);
     CompressionType actual_type = kNoCompression;
     GrowableBuffer compressed;
     if (blob_compressor_) {
@@ -388,6 +392,7 @@ Status BlobFileBuilder::WriteBlobToFile(
     *blob_on_disk_size = write_data.size();
     *actual_compression_type = actual_type;
   } else {
+    assert(writer_ != nullptr);
     uint64_t key_offset = 0;
     s = writer_->AddRecord(*write_options_, key, blob, &key_offset,
                            blob_offset);
@@ -404,7 +409,7 @@ Status BlobFileBuilder::WriteBlobToFile(
   *blob_file_number = blob_file_number_;
 
   ++blob_count_;
-  if (blog_writer_) {
+  if (use_blog_format_) {
     blob_bytes_ += blog_writer_->last_blob_record_size();
   } else {
     // Legacy format: blob is already compressed by the caller, so blob.size()
@@ -425,7 +430,7 @@ Status BlobFileBuilder::CloseBlobFile() {
   std::string file_identity;
   Status s;
 
-  if (blog_writer_) {
+  if (use_blog_format_) {
     // Blog format: write footer properties and locator records.
     const auto& bs = blog_writer_->blob_stats();
     BlogFileFooterProperties footer_props;
@@ -457,7 +462,7 @@ Status BlobFileBuilder::CloseBlobFile() {
     }
 
     if (s.ok()) {
-      s = blog_writer_->Sync(*write_options_);
+      s = blog_writer_->Sync(*write_options_, immutable_options_->use_fsync);
     }
     if (s.ok()) {
       s = blog_writer_->Close(*write_options_);
@@ -528,7 +533,7 @@ Status BlobFileBuilder::CloseBlobFileIfNeeded() {
   assert(IsBlobFileOpen());
 
   const WritableFileWriter* const file_writer =
-      blog_writer_ ? blog_writer_->file() : writer_->file();
+      use_blog_format_ ? blog_writer_->file() : writer_->file();
   assert(file_writer);
 
   if (file_writer->GetFileSize() < blob_file_size_) {
