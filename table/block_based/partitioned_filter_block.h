@@ -178,6 +178,11 @@ class PartitionedFilterBlockReader
                         BlockCacheLookupContext* lookup_context,
                         const ReadOptions& read_options) override;
 
+  bool KeyMayMatchInMemory(const Slice& key,
+                           const Slice* const const_ikey_ptr) override;
+  bool PrefixMayMatchInMemory(const Slice& prefix,
+                              const Slice* const const_ikey_ptr) override;
+
   size_t ApproximateMemoryUsage() const override;
 
  private:
@@ -213,6 +218,10 @@ class PartitionedFilterBlockReader
                 BlockCacheLookupContext* lookup_context,
                 const ReadOptions& read_options,
                 FilterManyFunction filter_function) const;
+  using InMemoryFilterFunction = bool (FullFilterBlockReader::*)(
+      const Slice& slice, const Slice* const const_ikey_ptr);
+  bool MayMatchInMemory(const Slice& slice, const Slice* const_ikey_ptr,
+                        InMemoryFilterFunction filter_function) const;
   void MayMatchPartition(MultiGetRange* range,
                          const SliceTransform* prefix_extractor,
                          BlockHandle filter_handle,

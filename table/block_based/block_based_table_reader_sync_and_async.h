@@ -95,7 +95,8 @@ DEFINE_SYNC_AND_ASYNC(BlocklikeStatus<TBlocklike>,
     if (!contents) {
       if (use_block_cache_for_lookup) {
         s = GetDataBlockFromCache(key, block_cache, out_parsed_block,
-                                  get_context, decomp);
+                                  get_context, decomp,
+                                  rep_->ioptions.lowest_used_cache_tier);
         // Value could still be null at this point, so check the cache handle
         // and update the read pattern for prefetching
         if (out_parsed_block->GetValue() ||

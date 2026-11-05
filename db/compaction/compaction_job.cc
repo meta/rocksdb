@@ -1857,10 +1857,10 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
       sub_compact->compaction->DoesInputReferenceBlobFiles() ||
           sub_compact->compaction
               ->skip_missing_blob_files() /* must_count_input_entries */,
-      sub_compact->compaction, compaction_filter, shutting_down_,
-      db_options_.info_log, full_history_ts_low, preserve_seqno_after_,
-      nullptr /* input_version */, Env::IOActivity::kCompaction,
-      GetBlobGarbageCollectionCutoffFileNumber());
+      /*absence_prover=*/nullptr, sub_compact->compaction, compaction_filter,
+      shutting_down_, db_options_.info_log, full_history_ts_low,
+      preserve_seqno_after_, nullptr /* input_version */,
+      Env::IOActivity::kCompaction, GetBlobGarbageCollectionCutoffFileNumber());
 }
 
 std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc>

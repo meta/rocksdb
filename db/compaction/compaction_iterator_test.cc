@@ -6,6 +6,7 @@
 #include "db/compaction/compaction_iterator.h"
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -220,6 +221,20 @@ class FakeCompaction : public CompactionIterator::CompactionProxy {
   bool supports_per_key_placement = false;
 };
 
+// Proves absence for a fixed set of user keys.
+class FakeAbsenceProver : public AbsenceProver {
+ public:
+  explicit FakeAbsenceProver(std::set<std::string> absent_user_keys)
+      : absent_user_keys_(std::move(absent_user_keys)) {}
+
+  bool ProveAbsent(const Slice& user_key) override {
+    return absent_user_keys_.count(user_key.ToString()) > 0;
+  }
+
+ private:
+  std::set<std::string> absent_user_keys_;
+};
+
 // A simplified snapshot checker which assumes each snapshot has a global
 // last visible sequence.
 class TestSnapshotChecker : public SnapshotChecker {
@@ -332,8 +347,9 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
         nullptr /* blob_file_builder */, true /*allow_data_in_errors*/,
         true /*enforce_single_del_contracts*/,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse_,
-        std::move(compaction), /*must_count_input_entries=*/false, filter,
-        &shutting_down_, /*info_log=*/nullptr, full_history_ts_low));
+        std::move(compaction), /*must_count_input_entries=*/false,
+        absence_prover_.get(), filter, &shutting_down_, /*info_log=*/nullptr,
+        full_history_ts_low));
     c_iter_->SetMissingBlobRepairIterator(repair_iter_.get());
   }
 
@@ -398,6 +414,13 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
     snapshot_map_.clear();
   }
 
+  // Makes InitIterators() give the iterator an absence prover that proves
+  // absence for exactly `absent_user_keys` (with timestamps, if any).
+  void UseAbsenceProver(std::set<std::string> absent_user_keys) {
+    absence_prover_ =
+        std::make_unique<FakeAbsenceProver>(std::move(absent_user_keys));
+  }
+
   const Comparator* cmp_;
   const InternalKeyComparator icmp_;
   std::vector<SequenceNumber> snapshots_;
@@ -413,6 +436,8 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
   std::atomic<bool> shutting_down_{false};
   const std::atomic<bool> kManualCompactionCanceledFalse_{false};
   FakeCompaction* compaction_proxy_;
+  // Passed to the iterator by InitIterators() if set by UseAbsenceProver().
+  std::unique_ptr<FakeAbsenceProver> absence_prover_;
   bool repair_enabled_ = false;
 };
 
@@ -1726,6 +1751,33 @@ TEST_P(CompactionIteratorTest, ZeroSeqOfKeyAndSnapshot) {
   RunTest(input_keys, input_values, input_keys, input_values);
 }
 
+// An absence prover lets the iterator drop plain point tombstones (and, by
+// rule (A), the versions they hide). Other entries are unaffected.
+TEST_P(CompactionIteratorTest, AbsenceProverDropsPointTombstones) {
+  UseAbsenceProver({"a", "b", "d"});
+  RunTest(
+      {test::KeyStr("a", 5, kTypeDeletion), test::KeyStr("a", 3, kTypeValue),
+       test::KeyStr("b", 4, kTypeDeletion), test::KeyStr("c", 2, kTypeDeletion),
+       test::KeyStr("d", 1, kTypeValue)},
+      {"", "va", "", "", "vd"},
+      {test::KeyStr("c", 2, kTypeDeletion), test::KeyStr("d", 1, kTypeValue)},
+      {"", "vd"});
+}
+
+TEST_P(CompactionIteratorTest, AbsenceProverKeepsTombstonesNewerThanSnapshot) {
+  UseAbsenceProver({"a", "b"});
+  AddSnapshot(3);
+  RunTest({test::KeyStr("a", 5, kTypeDeletion),
+           test::KeyStr("b", 2, kTypeDeletion)},
+          {"", ""}, {test::KeyStr("a", 5, kTypeDeletion)}, {""});
+}
+
+TEST_P(CompactionIteratorTest, AbsenceProverIgnoresSingleDelete) {
+  UseAbsenceProver({"a"});
+  RunTest({test::KeyStr("a", 5, kTypeSingleDeletion)}, {""},
+          {test::KeyStr("a", 5, kTypeSingleDeletion)}, {""});
+}
+
 INSTANTIATE_TEST_CASE_P(CompactionIteratorTestInstance, CompactionIteratorTest,
                         testing::Values(true, false));
 
@@ -2311,6 +2363,14 @@ class CompactionIteratorTsGcTest : public CompactionIteratorTest {
  public:
   CompactionIteratorTsGcTest()
       : CompactionIteratorTest(test::BytewiseComparatorWithU64TsWrapper()) {}
+
+ protected:
+  // UseAbsenceProver() for user key "a" at timestamp 103.
+  void UseAbsenceProverForKeyAAtTs103() {
+    std::string user_key_with_ts = "a";
+    PutFixed64(&user_key_with_ts, 103);
+    UseAbsenceProver({user_key_with_ts});
+  }
 };
 
 TEST_P(CompactionIteratorTsGcTest,
@@ -2400,6 +2460,28 @@ TEST_P(CompactionIteratorTsGcTest, MissingBlobRepairRespectsHistoryGcFloor) {
            test::KeyStr(0, "a", 0, kTypeValue)},
           {"", "", "older"}, kMaxSequenceNumber, nullptr, nullptr, true,
           kMaxSequenceNumber, false, &history_low);
+}
+
+TEST_P(CompactionIteratorTsGcTest, AbsenceProverIgnoresTimestampedDelete) {
+  UseAbsenceProverForKeyAAtTs103();
+  std::string history_low;
+  PutFixed64(&history_low, 104);
+  RunTest({test::KeyStr(103, "a", 5, kTypeDeletionWithTimestamp)}, {""},
+          {test::KeyStr(103, "a", 5, kTypeDeletionWithTimestamp)}, {""},
+          kMaxSequenceNumber, nullptr, nullptr, false, kMaxSequenceNumber,
+          false, &history_low);
+}
+
+// With timestamps, a plain point tombstone (as a compaction filter's removal of
+// a timestamped value produces) hides the older timestamps of its key, which
+// the iterator keeps as separate keys, so it is never dropped.
+TEST_P(CompactionIteratorTsGcTest, AbsenceProverIgnoresPlainDeleteWithTs) {
+  UseAbsenceProverForKeyAAtTs103();
+  const std::vector<std::string> keys = {
+      test::KeyStr(103, "a", 5, kTypeDeletion),
+      test::KeyStr(101, "a", 3, kTypeValue)};
+  const std::vector<std::string> values = {"", "older"};
+  RunTest(keys, values, keys, values);
 }
 
 TEST_P(CompactionIteratorTsGcTest, HistoryGcKeepsScalarBlobTimestamp) {
@@ -2988,7 +3070,8 @@ class WideColumnEntityBlobExtractionTest : public testing::Test {
         &blob_file_builder, true /*allow_data_in_errors*/,
         true /*enforce_single_del_contracts*/, manual_compaction_canceled,
         nullptr /*compaction*/, false /*must_count_input_entries*/,
-        nullptr /*compaction_filter*/, &shutting_down);
+        nullptr /*absence_prover*/, nullptr /*compaction_filter*/,
+        &shutting_down);
 
     c_iter.SeekToFirst();
     while (c_iter.Valid()) {
@@ -3438,7 +3521,7 @@ class WideColumnEntityBlobGCTest : public testing::Test {
         blob_file_builder.get(), true /*allow_data_in_errors*/,
         true /*enforce_single_del_contracts*/, manual_compaction_canceled,
         std::move(fake_compaction), false /*must_count_input_entries*/,
-        compaction_filter, &shutting_down);
+        nullptr /*absence_prover*/, compaction_filter, &shutting_down);
 
     c_iter.SeekToFirst();
     while (c_iter.Valid()) {
@@ -3875,7 +3958,7 @@ TEST_F(WideColumnEntityBlobGCTest,
       kMaxSequenceNumber, kMaxSequenceNumber, kMaxSequenceNumber, nullptr,
       Env::Default(), false, range_del_agg.get(), nullptr /*blob_file_builder*/,
       true, true, manual_compaction_canceled, std::move(fake_compaction), false,
-      &keep_filter, &shutting_down);
+      nullptr /*absence_prover*/, &keep_filter, &shutting_down);
 
   c_iter.SeekToFirst();
   ASSERT_TRUE(c_iter.Valid());

@@ -223,6 +223,11 @@
           "field": "hard_pending_compaction_bytes_limit",
           "policy": "manual",
           "reason": "ABI type mismatch: legacy C API uses size_t but C++ field is uint64_t. Hand-written binding preserved for ABI compatibility."
+        },
+        {
+          "field": "flush_drop_obsolete_point_tombstones",
+          "policy": "deferred",
+          "reason": "Experimental option whose name and semantics may still change; configure it through the option string API until it stabilizes."
         }
       ]
     },

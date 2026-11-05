@@ -1501,6 +1501,42 @@ struct AdvancedColumnFamilyOptions {
   // Immutable.
   bool memtable_batch_lookup_optimization = false;
 
+  // EXPERIMENTAL
+  //
+  // If true, a flush leaves out a point tombstone (from Delete()) that is
+  // older than the earliest snapshot when it can cheaply show that no older
+  // version of the key exists in the column family. Such a tombstone hides
+  // nothing, so leaving it out changes no read result. Typical cases are keys
+  // written and deleted before their memtable is flushed, and deletes of keys
+  // that never existed.
+  //
+  // The check never performs I/O, so a tombstone that cannot be cheaply shown
+  // to be obsolete is kept. A key counts as absent from an SST file if it is
+  // outside the file's key range or, for block-based tables, if the file's
+  // filter is in memory (held by the table reader, or in the block cache but
+  // not only in a secondary cache) and reports the key absent. Other table
+  // formats, and files without a usable filter, fall back to key ranges. The
+  // CPU cost per point tombstone grows with the number of SST files whose key
+  // range includes its key. When deletes mostly target keys already present
+  // in SST files, the option costs flush CPU and drops little.
+  //
+  // This option trusts filters to have no false negatives: an in-memory
+  // corruption that made a filter report a present key as absent could make a
+  // deleted value visible again. Consider enabling
+  // BlockBasedTableOptions::detect_filter_construct_corruption.
+  //
+  // SingleDelete() and range deletions are not affected. The option has no
+  // effect in a column family with user-defined timestamps, or while
+  // ingest-behind is enabled for the column family (cf_allow_ingest_behind or
+  // DBOptions::allow_ingest_behind).
+  //
+  // See statistics FLUSH_OBSOLETE_POINT_TOMBSTONES_DROPPED and
+  // FLUSH_OBSOLETE_POINT_TOMBSTONE_DROP_SKIPPED.
+  //
+  // Default: false
+  // Dynamically changeable through the SetOptions() API.
+  bool flush_drop_obsolete_point_tombstones = false;
+
   // Create ColumnFamilyOptions with default values for all fields
   AdvancedColumnFamilyOptions();
   // Create ColumnFamilyOptions from Options

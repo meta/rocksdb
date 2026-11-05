@@ -548,6 +548,25 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
   }
 }
 
+bool MemTableList::UnpickedMemtablesAreNewer(
+    const autovector<ReadOnlyMemTable*>& picked) const {
+  SequenceNumber newest_picked_earliest_seqno = 0;
+  for (ReadOnlyMemTable* m : picked) {
+    newest_picked_earliest_seqno =
+        std::max(newest_picked_earliest_seqno, m->GetEarliestSequenceNumber());
+  }
+  for (ReadOnlyMemTable* m : current_->memlist_) {
+    if (m->IsEmpty() ||
+        std::find(picked.begin(), picked.end(), m) != picked.end()) {
+      continue;
+    }
+    if (m->GetEarliestSequenceNumber() <= newest_picked_earliest_seqno) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void MemTableList::RollbackMemtableFlush(
     const autovector<ReadOnlyMemTable*>& mems,
     bool rollback_succeeding_memtables) {

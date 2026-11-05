@@ -78,6 +78,7 @@
 #include "table/sst_file_writer_collectors.h"
 #include "table/two_level_iterator.h"
 #include "test_util/sync_point.h"
+#include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
 #include "util/stop_watch.h"
@@ -2144,7 +2145,7 @@ template <typename TBlocklike>
 WithBlocklikeCheck<Status, TBlocklike> BlockBasedTable::GetDataBlockFromCache(
     const Slice& cache_key, BlockCacheInterface<TBlocklike> block_cache,
     CachableEntry<TBlocklike>* out_parsed_block, GetContext* get_context,
-    UnownedPtr<Decompressor> decomp) const {
+    UnownedPtr<Decompressor> decomp, CacheTier lowest_used_cache_tier) const {
   assert(out_parsed_block);
   assert(out_parsed_block->IsEmpty());
 
@@ -2163,13 +2164,13 @@ WithBlocklikeCheck<Status, TBlocklike> BlockBasedTable::GetDataBlockFromCache(
       // (see TODO in block_cache.h)
       BlockCreateContext create_ctx = rep_->create_context;
       create_ctx.decompressor = decomp.get();
-      cache_handle = block_cache.LookupFull(
-          cache_key, &create_ctx, GetCachePriority<TBlocklike>(), statistics,
-          rep_->ioptions.lowest_used_cache_tier);
+      cache_handle = block_cache.LookupFull(cache_key, &create_ctx,
+                                            GetCachePriority<TBlocklike>(),
+                                            statistics, lowest_used_cache_tier);
     } else {
-      cache_handle = block_cache.LookupFull(
-          cache_key, &rep_->create_context, GetCachePriority<TBlocklike>(),
-          statistics, rep_->ioptions.lowest_used_cache_tier);
+      cache_handle = block_cache.LookupFull(cache_key, &rep_->create_context,
+                                            GetCachePriority<TBlocklike>(),
+                                            statistics, lowest_used_cache_tier);
     }
 
     // Avoid updating metrics here if the handle is not complete yet. This
@@ -2393,6 +2394,25 @@ Status BlockBasedTable::LookupAndPinBlocksInCache(
 }
 
 template <typename TBlocklike>
+Status BlockBasedTable::LookupBlockInPrimaryCache(
+    const BlockHandle& handle,
+    CachableEntry<TBlocklike>* out_parsed_block) const {
+  assert(out_parsed_block);
+  assert(out_parsed_block->IsEmpty());
+  BlockCacheInterface<TBlocklike> block_cache{
+      rep_->table_options.block_cache.get()};
+  if (!block_cache) {
+    return Status::OK();
+  }
+  const CacheKey key_data = GetCacheKey(rep_->base_cache_key, handle);
+  // A lookup in CacheTier::kVolatileTier passes the cache no secondary cache
+  // helper, so the cache cannot consult a secondary cache.
+  return GetDataBlockFromCache(key_data.AsSlice(), block_cache,
+                               out_parsed_block, /*get_context=*/nullptr,
+                               /*decomp=*/nullptr, CacheTier::kVolatileTier);
+}
+
+template <typename TBlocklike>
 Status BlockBasedTable::CreateAndPinBlockInCache(
     const ReadOptions& ro, const BlockHandle& handle,
     UnownedPtr<Decompressor> decomp, BlockContents* contents,
@@ -2537,6 +2557,8 @@ BlockBasedTable::SaveLookupContextOrTraceRecord(
   template Status BlockBasedTable::LookupAndPinBlocksInCache<T>(               \
       const ReadOptions& ro, const BlockHandle& handle,                        \
       CachableEntry<T>* out_parsed_block) const;                               \
+  template Status BlockBasedTable::LookupBlockInPrimaryCache<T>(               \
+      const BlockHandle& handle, CachableEntry<T>* out_parsed_block) const;    \
   template Status BlockBasedTable::CreateAndPinBlockInCache<T>(                \
       const ReadOptions& ro, const BlockHandle& handle,                        \
       UnownedPtr<Decompressor> decomp, BlockContents* block_contents,          \
@@ -3031,6 +3053,124 @@ Status BlockBasedTable::MultiGetFilter(const ReadOptions& read_options,
                          read_options);
 
   return Status::OK();
+}
+
+namespace {
+// Checks the full filter of a table whose reader holds the filter bits for its
+// whole life: one filter probe per key, with nothing to look up.
+class HeldFullFilterAbsenceChecker : public PointKeyAbsenceChecker {
+ public:
+  // `prefix_extractor` is null for a filter of whole keys.
+  HeldFullFilterAbsenceChecker(FilterBitsReader* filter_bits_reader,
+                               const SliceTransform* prefix_extractor)
+      : filter_bits_reader_(filter_bits_reader),
+        prefix_extractor_(prefix_extractor) {}
+
+  bool DefinitelyAbsent(const Slice& user_key) override {
+    if (prefix_extractor_ == nullptr) {
+      return !filter_bits_reader_->MayMatch(user_key);
+    }
+    return prefix_extractor_->InDomain(user_key) &&
+           !filter_bits_reader_->MayMatch(
+               prefix_extractor_->Transform(user_key));
+  }
+
+ private:
+  FilterBitsReader* const filter_bits_reader_;
+  const SliceTransform* const prefix_extractor_;
+};
+
+// Checks a table's filter through FilterBlockReader::*MayMatchInMemory(),
+// which use only filter data that the reader holds or that is in the primary
+// block cache tier at the time of each check. Their block cache lookups record
+// BLOCK_CACHE_* statistics (including BLOCK_CACHE_FILTER_HIT and
+// BLOCK_CACHE_FILTER_MISS) and block cache perf counters, and a hit counts as
+// a use of the cached block (for example, for LRU order). Unlike
+// FullFilterKeyMayMatch(), they record no BLOOM_FILTER_* statistics or
+// bloom_sst_* perf counters: those describe reads. Nothing is traced.
+class InMemoryFilterAbsenceChecker : public PointKeyAbsenceChecker {
+ public:
+  // `prefix_extractor` is null for a filter of whole keys.
+  InMemoryFilterAbsenceChecker(FilterBlockReader* filter,
+                               const SliceTransform* prefix_extractor,
+                               size_t ts_sz, bool partitioned)
+      : filter_(filter),
+        prefix_extractor_(prefix_extractor),
+        ts_sz_(ts_sz),
+        partitioned_(partitioned) {}
+
+  bool DefinitelyAbsent(const Slice& user_key) override {
+    const Slice key = StripTimestampFromUserKey(user_key, ts_sz_);
+    if (prefix_extractor_ != nullptr && !prefix_extractor_->InDomain(key)) {
+      // A filter of prefixes says nothing about keys outside the prefix
+      // extractor's domain.
+      return false;
+    }
+    if (!partitioned_) {
+      return !MayMatch(key, /*ikey=*/nullptr);
+    }
+    // A partitioned filter picks its partition by internal key. Look for the
+    // first possible entry of the user key, as a Get() at the latest sequence
+    // number would.
+    std::string max_ts;
+    Slice max_ts_slice;
+    if (ts_sz_ > 0) {
+      max_ts.assign(ts_sz_, '\xff');
+      max_ts_slice = max_ts;
+    }
+    IterKey seek_key;
+    seek_key.SetInternalKey(key, kMaxSequenceNumber, kValueTypeForSeek,
+                            ts_sz_ > 0 ? &max_ts_slice : nullptr);
+    const Slice ikey = seek_key.GetInternalKey();
+    return !MayMatch(key, &ikey);
+  }
+
+ private:
+  bool MayMatch(const Slice& key, const Slice* ikey) {
+    return prefix_extractor_ == nullptr
+               ? filter_->KeyMayMatchInMemory(key, ikey)
+               : filter_->PrefixMayMatchInMemory(
+                     prefix_extractor_->Transform(key), ikey);
+  }
+
+  FilterBlockReader* const filter_;
+  const SliceTransform* const prefix_extractor_;
+  const size_t ts_sz_;
+  const bool partitioned_;
+};
+}  // namespace
+
+std::unique_ptr<PointKeyAbsenceChecker>
+BlockBasedTable::NewPointKeyAbsenceChecker(
+    const SliceTransform* prefix_extractor) {
+  FilterBlockReader* const filter = rep_->filter.get();
+  if (filter == nullptr) {
+    return nullptr;
+  }
+  // Same filter choice as FullFilterKeyMayMatch(). A filter of prefixes is
+  // usable only with the prefix extractor it was built with.
+  const bool use_prefix = !rep_->whole_key_filtering;
+  if (use_prefix &&
+      (!rep_->prefix_filtering || PrefixExtractorChanged(prefix_extractor))) {
+    return nullptr;
+  }
+  const SliceTransform* const key_prefix_extractor =
+      use_prefix ? prefix_extractor : nullptr;
+  const size_t ts_sz =
+      rep_->internal_comparator.user_comparator()->timestamp_size();
+  const bool partitioned =
+      rep_->filter_type == Rep::FilterType::kPartitionedFilter;
+  if (!partitioned && ts_sz == 0) {
+    FilterBitsReader* const filter_bits_reader =
+        static_cast_with_check<FullFilterBlockReader>(filter)
+            ->HeldFilterBitsReader();
+    if (filter_bits_reader != nullptr) {
+      return std::make_unique<HeldFullFilterAbsenceChecker>(
+          filter_bits_reader, key_prefix_extractor);
+    }
+  }
+  return std::make_unique<InMemoryFilterAbsenceChecker>(
+      filter, key_prefix_extractor, ts_sz, partitioned);
 }
 
 Status BlockBasedTable::Prefetch(const ReadOptions& read_options,

@@ -33,6 +33,19 @@ struct TableProperties;
 class GetContext;
 class MultiGetContext;
 
+// Shows, without I/O, that a table contains no entry for some user keys. See
+// TableReader::NewPointKeyAbsenceChecker().
+class PointKeyAbsenceChecker {
+ public:
+  virtual ~PointKeyAbsenceChecker() = default;
+
+  // Returns true only if the table certainly contains no entry for
+  // `user_key`, at any sequence number (and at any timestamp, if the
+  // comparator has timestamps; `user_key` then includes one). Returning false
+  // is always correct.
+  virtual bool DefinitelyAbsent(const Slice& user_key) = 0;
+};
+
 // A Table (also referred to as SST) is a sorted map from strings to strings.
 // Tables are immutable and persistent.  A Table may be safely accessed from
 // multiple threads without external synchronization. Table readers are used
@@ -154,6 +167,34 @@ class TableReader {
                                 const SliceTransform* /*prefix_extractor*/,
                                 MultiGetContext::Range* /*mget_range*/) {
     return Status::NotSupported();
+  }
+
+  // Returns a checker that shows, for one user key at a time, that this
+  // table certainly contains no entry for it, or nullptr if this table can
+  // never show that (the default), for example because it has no usable
+  // filter. The checker is for checking many keys: what does not depend on
+  // the key is worked out once, here.
+  //
+  // Neither this call nor the checker performs I/O. The checker answers false
+  // whenever absence cannot be shown from data already in memory, for example
+  // when filter data is neither held by this table reader nor, at the time of
+  // the check, in the primary tier of the block cache. Neither consults a
+  // secondary cache or inserts into the block cache.
+  //
+  // The checker records no statistics of its own (such as BLOOM_FILTER_*
+  // tickers), but block cache lookups it makes record the usual block cache
+  // statistics and perf counters, and a hit counts as a use of the cached
+  // block (for example, for LRU order).
+  //
+  // `prefix_extractor` is the column family's current prefix extractor, and
+  // must outlive the checker. A filter of prefixes only is used just when the
+  // table was built with a prefix extractor of the same name.
+  //
+  // The checker must not outlive this table reader, and must be used by one
+  // thread at a time.
+  virtual std::unique_ptr<PointKeyAbsenceChecker> NewPointKeyAbsenceChecker(
+      const SliceTransform* /*prefix_extractor*/) {
+    return nullptr;
   }
 
   virtual void MultiGet(const ReadOptions& readOptions,

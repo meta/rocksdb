@@ -24,7 +24,7 @@ Step 2 - **WAL**: Tombstone is persisted as a regular WAL record.
 
 Step 3 - **MemTable**: Point tombstones (`kTypeDeletion`, `kTypeSingleDeletion`) are inserted into `table_` (the main memtable skiplist). Range tombstones (`kTypeRangeDeletion`) are inserted into `range_del_table_` (a separate skiplist).
 
-Step 4 - **Flush**: During flush to L0 SST, point tombstones are written to data blocks. Range tombstones are written to a dedicated meta-block as a `FragmentedRangeTombstoneList`.
+Step 4 - **Flush**: During flush to L0 SST, point tombstones are written to data blocks (except as described in "Point Tombstone Drop at Flush" below). Range tombstones are written to a dedicated meta-block as a `FragmentedRangeTombstoneList`.
 
 ## Tombstone Visibility During Reads
 
@@ -46,6 +46,10 @@ Step 4 - If a point tombstone (`kTypeDeletion`) is found, return not-found immed
 
 - Point tombstones (`kTypeDeletion`): The iterator skips past the current key's older versions.
 - Range tombstones: Integrated via `RangeDelAggregator::ShouldDelete()`, which checks whether the current key falls within a range tombstone and has a lower sequence number.
+
+## Point Tombstone Drop at Flush
+
+With the experimental option `flush_drop_obsolete_point_tombstones` (off by default), flush leaves out a `kTypeDeletion` that is below the earliest snapshot when an `AbsenceProver` (see `db/compaction/absence_prover.h`) shows that no older version of the key exists outside the memtables being flushed. `FlushJob::PickMemTable()` enables it only when the column family has no user-defined timestamps, ingest-behind is off, and every unflushed memtable it did not pick is newer than the picked ones. `VersionAbsenceProver` (see `db/version_set.h`) then checks each SST file of the Version captured at pick time: the key must be outside the file's key range or reported absent by the file's `PointKeyAbsenceChecker` (see `TableReader::NewPointKeyAbsenceChecker()`), which consults only filter data that the table reader holds or that is in the primary block cache tier (never a secondary cache). It checks the levels below L0 from the bottommost one up, then L0, and stops at the first file that may hold the key. Each file's table reader and checker are looked up once per flush, on first use, and kept until the flush's keys are past the file's key range (below L0) or until the flush has built its output (L0). Compaction, MemPurge, WAL recovery flushes, and repair never use it. Tickers `FLUSH_OBSOLETE_POINT_TOMBSTONES_DROPPED` and `FLUSH_OBSOLETE_POINT_TOMBSTONE_DROP_SKIPPED`, recorded when the flush result is installed, count dropped tombstones and flushes that skipped the check.
 
 ## Tombstone Cleanup During Compaction
 

@@ -347,6 +347,8 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
   cf_opts->paranoid_memory_checks = moptions.paranoid_memory_checks;
   cf_opts->memtable_verify_per_key_checksum_on_seek =
       moptions.memtable_verify_per_key_checksum_on_seek;
+  cf_opts->flush_drop_obsolete_point_tombstones =
+      moptions.flush_drop_obsolete_point_tombstones;
   cf_opts->bottommost_file_compaction_delay =
       moptions.bottommost_file_compaction_delay;
 

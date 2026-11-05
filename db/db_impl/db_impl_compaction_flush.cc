@@ -913,6 +913,7 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
     autovector<FileMetaData*> tmp_file_meta;
     autovector<std::list<std::unique_ptr<FlushJobInfo>>*>
         committed_flush_jobs_info;
+    autovector<FlushJob*> installed_jobs;
     for (int i = 0; i != num_cfs; ++i) {
       const auto& mems = jobs[i]->GetMemTables();
       if (!cfds[i]->IsDropped() && !mems.empty()) {
@@ -921,6 +922,7 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
         tmp_file_meta.emplace_back(&file_meta[i]);
         committed_flush_jobs_info.emplace_back(
             jobs[i]->GetCommittedFlushJobsInfo());
+        installed_jobs.emplace_back(jobs[i].get());
       }
     }
 
@@ -929,6 +931,11 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
         &logs_with_prep_tracker_, &mutex_, tmp_file_meta,
         committed_flush_jobs_info, &job_context->memtables_to_free,
         directories_.GetDbDir(), log_buffer);
+    if (s.ok()) {
+      for (FlushJob* job : installed_jobs) {
+        job->RecordPointTombstoneDropStats();
+      }
+    }
   }
 
   // Reserve a pending flush-completion notification for every CF that the
