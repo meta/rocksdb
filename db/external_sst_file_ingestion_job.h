@@ -297,6 +297,10 @@ class ExternalSstFileIngestionJob {
 
   ColumnFamilyData* GetColumnFamilyData() const { return cfd_; }
 
+  const IngestExternalFileOptions& GetIngestionOptions() const {
+    return ingestion_options_;
+  }
+
   // Prepare the job by copying external files into the DB.
   Status Prepare(const std::vector<std::string>& external_files_paths,
                  const std::vector<std::string>& files_checksums,

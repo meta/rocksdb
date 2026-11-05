@@ -192,6 +192,37 @@ class FileIngestionHandle {
   // returns a Status.
   virtual Status Abort() = 0;
 
+  // Metadata of the ingested files this handle will make visible on commit.
+  // The files exist from prepare until commit or abort and keep their path,
+  // number, size and checksum when committed, so a caller can read them
+  // before they go live. Empty once the handle is spent.
+  //
+  // Set fields:
+  //   directory
+  //   relative_filename
+  //   name
+  //   db_path
+  //   file_number
+  //   size
+  //   temperature
+  //   file_checksum
+  //   file_checksum_func_name
+  //   smallestkey
+  //   largestkey
+  //   num_entries
+  //   num_deletions
+  //   smallest_seqno, largest_seqno: only with allow_db_generated_files;
+  //     otherwise commit assigns them
+  //
+  // Left at defaults (commit decides them):
+  //   epoch_number
+  //   file_creation_time
+  //   oldest_ancestor_time
+  //
+  // Does not include the range-tombstone file that an atomic_replace_range
+  // ingestion may add at commit.
+  virtual std::vector<SstFileMetaData> GetPreparedFiles() const = 0;
+
   FileIngestionHandle(const FileIngestionHandle&) = delete;
   FileIngestionHandle& operator=(const FileIngestionHandle&) = delete;
   FileIngestionHandle(FileIngestionHandle&&) = delete;

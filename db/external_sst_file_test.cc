@@ -8,6 +8,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <set>
 #include <sstream>
 
 #include "db/db_test_util.h"
@@ -844,6 +845,189 @@ TEST_F(ExternalSSTFileTest, AbortPreparedIngestion) {
   ASSERT_OK(db_->PrepareFileIngestion({arg}, &handle2));
   ASSERT_OK(db_->CommitFileIngestionHandle(std::move(handle2)));
   ASSERT_EQ("1", Get("x"));
+}
+
+static std::string DescribeFile(const SstFileMetaData& meta) {
+  return meta.directory + "/" + meta.relative_filename + " #" +
+         std::to_string(meta.file_number) + " " + std::to_string(meta.size) +
+         "B " + meta.file_checksum_func_name + ":" +
+         Slice(meta.file_checksum).ToString(/*hex=*/true) + " [" +
+         meta.smallestkey + ", " + meta.largestkey + "] temperature " +
+         std::to_string(static_cast<int>(meta.temperature));
+}
+
+static std::set<std::string> DescribeFiles(
+    const std::vector<SstFileMetaData>& files) {
+  std::set<std::string> described;
+  for (const auto& meta : files) {
+    described.insert(DescribeFile(meta));
+  }
+  return described;
+}
+
+static std::set<std::string> DescribeLiveFiles(DB* db) {
+  std::vector<LiveFileMetaData> live;
+  db->GetLiveFilesMetaData(&live);
+  return DescribeFiles({live.begin(), live.end()});
+}
+
+TEST_F(ExternalSSTFileTest, PreparedFilesAreTheFilesThatGoLive) {
+  Options options = CurrentOptions();
+  options.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
+  DestroyAndReopen(options);
+
+  std::string file_a;
+  ASSERT_OK(
+      GenerateExternalFileOnly(options, {{"a1", "1"}, {"a2", "2"}}, &file_a));
+  const std::string file_b = sst_files_dir_ + "put_and_delete.sst";
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(file_b));
+  ASSERT_OK(writer.Put("b", "2"));
+  ASSERT_OK(writer.Delete("c"));
+  ASSERT_OK(writer.Finish());
+  IngestExternalFileArg arg;
+  arg.column_family = db_->DefaultColumnFamily();
+  arg.external_files = {file_a, file_b};
+
+  std::unique_ptr<FileIngestionHandle> handle;
+  ASSERT_OK(db_->PrepareFileIngestion({arg}, &handle));
+  const std::vector<SstFileMetaData> prepared = handle->GetPreparedFiles();
+
+  ASSERT_EQ(2, prepared.size());
+  for (const auto& meta : prepared) {
+    const std::string path = meta.directory + "/" + meta.relative_filename;
+    uint64_t size_on_disk = 0;
+    ASSERT_OK(env_->GetFileSize(path, &size_on_disk));
+    ASSERT_EQ(size_on_disk, meta.size);
+    ASSERT_EQ("FileChecksumCrc32c", meta.file_checksum_func_name);
+    ASSERT_FALSE(meta.file_checksum.empty());
+  }
+  std::set<std::string> key_ranges;
+  for (const auto& meta : prepared) {
+    key_ranges.insert(meta.smallestkey + ".." + meta.largestkey + " " +
+                      std::to_string(meta.num_entries) + " entries " +
+                      std::to_string(meta.num_deletions) + " deletions");
+  }
+  ASSERT_EQ((std::set<std::string>{"a1..a2 2 entries 0 deletions",
+                                   "b..c 2 entries 1 deletions"}),
+            key_ranges);
+  ASSERT_EQ("NOT_FOUND", Get("a1"));
+
+  ASSERT_OK(db_->CommitFileIngestionHandle(std::move(handle)));
+
+  ASSERT_EQ(DescribeFiles(prepared), DescribeLiveFiles(db_.get()));
+}
+
+TEST_F(ExternalSSTFileTest, PreparedDbGeneratedFilesCarryTheirSeqnos) {
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  const std::string source_dbname = dbname_ + "_source";
+  ASSERT_OK(DestroyDB(source_dbname, options));
+  std::unique_ptr<DB> source_db;
+  ASSERT_OK(DB::Open(options, source_dbname, &source_db));
+  ASSERT_OK(source_db->Put(WriteOptions(), Key(1), "v1"));
+  ASSERT_OK(source_db->Put(WriteOptions(), Key(2), "v2"));
+  ASSERT_OK(source_db->Flush(FlushOptions()));
+  std::vector<LiveFileMetaData> source_meta;
+  source_db->GetLiveFilesMetaData(&source_meta);
+  ASSERT_EQ(1, source_meta.size());
+  ASSERT_LT(source_meta[0].smallest_seqno, source_meta[0].largest_seqno);
+
+  IngestExternalFileArg arg;
+  arg.column_family = db_->DefaultColumnFamily();
+  arg.external_files = {source_meta[0].directory + "/" +
+                        source_meta[0].relative_filename};
+  arg.options.allow_db_generated_files = true;
+  arg.options.snapshot_consistency = false;
+
+  std::unique_ptr<FileIngestionHandle> handle;
+  ASSERT_OK(db_->PrepareFileIngestion({arg}, &handle));
+  const std::vector<SstFileMetaData> prepared = handle->GetPreparedFiles();
+  ASSERT_EQ(1, prepared.size());
+  ASSERT_EQ(source_meta[0].smallest_seqno, prepared[0].smallest_seqno);
+  ASSERT_EQ(source_meta[0].largest_seqno, prepared[0].largest_seqno);
+
+  ASSERT_OK(db_->CommitFileIngestionHandle(std::move(handle)));
+
+  std::vector<LiveFileMetaData> live;
+  db_->GetLiveFilesMetaData(&live);
+  ASSERT_EQ(1, live.size());
+  ASSERT_EQ(live[0].smallest_seqno, prepared[0].smallest_seqno);
+  ASSERT_EQ(live[0].largest_seqno, prepared[0].largest_seqno);
+  ASSERT_EQ(live[0].name, prepared[0].name);
+  ASSERT_EQ(live[0].db_path, prepared[0].db_path);
+
+  ASSERT_OK(source_db->Close());
+  source_db.reset();
+  ASSERT_OK(DestroyDB(source_dbname, options));
+}
+
+TEST_F(ExternalSSTFileTest, PreparedFilesAreGoneAfterAbort) {
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  std::string file_path;
+  ASSERT_OK(GenerateExternalFileOnly(options, {{"x", "1"}}, &file_path));
+  IngestExternalFileArg arg;
+  arg.column_family = db_->DefaultColumnFamily();
+  arg.external_files = {file_path};
+
+  std::unique_ptr<FileIngestionHandle> handle;
+  ASSERT_OK(db_->PrepareFileIngestion({arg}, &handle));
+  const std::vector<SstFileMetaData> prepared = handle->GetPreparedFiles();
+  ASSERT_EQ(1, prepared.size());
+  const std::string path =
+      prepared[0].directory + "/" + prepared[0].relative_filename;
+  ASSERT_OK(env_->FileExists(path));
+
+  ASSERT_OK(handle->Abort());
+
+  ASSERT_TRUE(handle->GetPreparedFiles().empty());
+  ASSERT_TRUE(env_->FileExists(path).IsNotFound());
+}
+
+TEST_F(ExternalSSTFileTest, PreparedFilesOfMergedHandlesGoLive) {
+  Options options = CurrentOptions();
+  CreateAndReopenWithCF({"cf1", "cf2", "cf3"}, options);
+
+  std::string f_cf1;
+  std::string f_cf2_h1;
+  std::string f_cf2_h2;
+  std::string f_cf3;
+  ASSERT_OK(GenerateExternalFileOnly(options, {{"a", "1"}}, &f_cf1));
+  ASSERT_OK(GenerateExternalFileOnly(options, {{"b", "h1"}}, &f_cf2_h1));
+  ASSERT_OK(GenerateExternalFileOnly(options, {{"b", "h2"}}, &f_cf2_h2));
+  ASSERT_OK(GenerateExternalFileOnly(options, {{"c", "3"}}, &f_cf3));
+
+  // Each handle spans two column families, and both write cf2, so commit
+  // merges the two cf2 jobs.
+  std::vector<IngestExternalFileArg> args1(2);
+  args1[0].column_family = handles_[1];
+  args1[0].external_files = {f_cf1};
+  args1[1].column_family = handles_[2];
+  args1[1].external_files = {f_cf2_h1};
+  std::vector<IngestExternalFileArg> args2(2);
+  args2[0].column_family = handles_[2];
+  args2[0].external_files = {f_cf2_h2};
+  args2[1].column_family = handles_[3];
+  args2[1].external_files = {f_cf3};
+
+  std::unique_ptr<FileIngestionHandle> h1;
+  std::unique_ptr<FileIngestionHandle> h2;
+  ASSERT_OK(db_->PrepareFileIngestion(args1, &h1));
+  ASSERT_OK(db_->PrepareFileIngestion(args2, &h2));
+  std::set<std::string> prepared = DescribeFiles(h1->GetPreparedFiles());
+  prepared.merge(DescribeFiles(h2->GetPreparedFiles()));
+  ASSERT_EQ(4, prepared.size());
+
+  std::vector<std::unique_ptr<FileIngestionHandle>> batch;
+  batch.push_back(std::move(h1));
+  batch.push_back(std::move(h2));
+  ASSERT_OK(db_->CommitFileIngestionHandles(std::move(batch)));
+
+  ASSERT_EQ("h2", Get(2, "b"));
+  ASSERT_EQ(prepared, DescribeLiveFiles(db_.get()));
 }
 
 TEST_F(ExternalSSTFileTest, MultiHandleAtomicCommit) {
