@@ -15,6 +15,7 @@
 #include "table/unique_id_impl.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
+#include "util/crc32c.h"
 #include "util/fastrange.h"
 #include "util/prefix_varint.h"
 #include "util/xxhash.h"
@@ -177,7 +178,8 @@ Status BlogFileHeader::DecodeFrom(Slice* input) {
   if (!checksum_status.ok()) {
     return checksum_status;
   }
-  uint32_t prop_section_size = DecodeFixed32(p + 32);
+  uint32_t prop_section_size =
+      DecodeFixed32(p + kBlogFilePropertySectionSizeOffset);
 
   // Now that checksum is verified, validate the remaining fields.
   schema_version = static_cast<uint8_t>(p[12]);
@@ -554,7 +556,8 @@ Status BlogFileHeader::DecodeFromBuffer(Slice* buffer,
     return checksum_status;
   }
   // Check if the full header (fixed + property section) fits in the buffer.
-  uint32_t prop_section_size = DecodeFixed32(buffer->data() + 32);
+  uint32_t prop_section_size =
+      DecodeFixed32(buffer->data() + kBlogFilePropertySectionSizeOffset);
   // Sanity cap: property section should be reasonably small (properties are
   // diagnostic/required metadata). Reject absurd sizes to avoid OOM.
   if (prop_section_size < kBlogBlockTrailerSize ||
@@ -924,6 +927,110 @@ uint32_t ComputeBlogRecordChecksum(ChecksumType type, const char* data,
   checksum +=
       ChecksumModifierForContext(base_context_checksum, payload_file_offset);
   return checksum;
+}
+
+struct BlogRecordChecksumWriter::State {
+  // Only the member matching the checksum type passed to Init() is used.
+  // Init() always (re)initializes the active member before any Update().
+  union {
+    uint32_t crc32c;
+    XXH32_state_t xxh32;
+    XXH64_state_t xxh64;
+    XXH3_state_t xxh3;
+  };
+};
+
+BlogRecordChecksumWriter::BlogRecordChecksumWriter(ChecksumType type,
+                                                   uint32_t incarnation_id)
+    : type_(type), incarnation_id_(incarnation_id) {}
+BlogRecordChecksumWriter::~BlogRecordChecksumWriter() = default;
+BlogRecordChecksumWriter::BlogRecordChecksumWriter(BlogRecordChecksumWriter&&) =
+    default;
+BlogRecordChecksumWriter& BlogRecordChecksumWriter::operator=(
+    BlogRecordChecksumWriter&&) = default;
+
+void BlogRecordChecksumWriter::Init(uint64_t payload_file_offset) {
+  payload_file_offset_ = payload_file_offset;
+  if (state_ == nullptr) {
+    state_ = std::make_unique<State>();
+  }
+  switch (type_) {
+    case kCRC32c:
+      state_->crc32c = 0;
+      break;
+    case kxxHash:
+      XXH32_reset(&state_->xxh32, 0);
+      break;
+    case kxxHash64:
+      XXH64_reset(&state_->xxh64, 0);
+      break;
+    case kXXH3:
+      XXH3_64bits_reset(&state_->xxh3);
+      break;
+    default:  // including kNoChecksum
+      break;
+  }
+}
+
+void BlogRecordChecksumWriter::Update(const char* data, size_t size) {
+  assert(state_ != nullptr);
+  switch (type_) {
+    case kCRC32c:
+      state_->crc32c = crc32c::Extend(state_->crc32c, data, size);
+      break;
+    case kxxHash:
+      XXH32_update(&state_->xxh32, data, size);
+      break;
+    case kxxHash64:
+      XXH64_update(&state_->xxh64, data, size);
+      break;
+    case kXXH3: {
+      // Update outside assert(): an NDEBUG build must still hash the input.
+      const XXH_errorcode rc = XXH3_64bits_update(&state_->xxh3, data, size);
+      assert(rc == XXH_OK);
+      (void)rc;
+      break;
+    }
+    default:  // including kNoChecksum
+      break;
+  }
+}
+
+uint32_t BlogRecordChecksumWriter::Finalize(char compression_type_byte) {
+  assert(state_ != nullptr);
+  uint32_t checksum = 0;
+  switch (type_) {
+    case kCRC32c: {
+      const uint32_t crc =
+          crc32c::Extend(state_->crc32c, &compression_type_byte, 1);
+      checksum = crc32c::Mask(crc);
+      break;
+    }
+    case kxxHash: {
+      XXH32_update(&state_->xxh32, &compression_type_byte, 1);
+      checksum = XXH32_digest(&state_->xxh32);
+      break;
+    }
+    case kxxHash64: {
+      XXH64_update(&state_->xxh64, &compression_type_byte, 1);
+      checksum = Lower32of64(XXH64_digest(&state_->xxh64));
+      break;
+    }
+    case kXXH3: {
+      // Same custom last-byte handling as
+      // ComputeBuiltinChecksumWithLastByte: digest the payload, then mix in
+      // the trailing byte. The prime must match table/format.cc; the
+      // blog_format_test equivalence test guards it.
+      constexpr uint32_t kRandomPrime = 0x6b9083d9;
+      checksum = Lower32of64(XXH3_64bits_digest(&state_->xxh3)) ^
+                 lossless_cast<uint8_t>(compression_type_byte) * kRandomPrime;
+      break;
+    }
+    default:  // including kNoChecksum
+      break;
+  }
+  return checksum +
+         ChecksumModifierForContext(incarnation_id_, payload_file_offset_);
 }
 
 // --- Record trailer verification ---

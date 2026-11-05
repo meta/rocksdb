@@ -451,6 +451,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, wal_compression),
           OptionType::kCompressionType, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"use_blog_format_for_wals",
+         {offsetof(struct ImmutableDBOptions, use_blog_format_for_wals),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"use_blog_format_for_blobs",
          {offsetof(struct ImmutableDBOptions, use_blog_format_for_blobs),
           OptionType::kBoolean, OptionVerificationType::kNormal,
@@ -458,6 +462,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
         {"blog_checksum",
          {offsetof(struct ImmutableDBOptions, blog_checksum),
           OptionType::kChecksumType, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"blog_timestamp_size",
+         {offsetof(struct ImmutableDBOptions, blog_timestamp_size),
+          OptionType::kSizeT, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"background_close_inactive_wals",
          {offsetof(struct ImmutableDBOptions, background_close_inactive_wals),
@@ -864,8 +872,10 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       two_write_queues(options.two_write_queues),
       manual_wal_flush(options.manual_wal_flush),
       wal_compression(options.wal_compression),
+      use_blog_format_for_wals(options.use_blog_format_for_wals),
       use_blog_format_for_blobs(options.use_blog_format_for_blobs),
       blog_checksum(options.blog_checksum),
+      blog_timestamp_size(options.blog_timestamp_size),
       background_close_inactive_wals(options.background_close_inactive_wals),
       atomic_flush(options.atomic_flush),
       avoid_unnecessary_blocking_io(options.avoid_unnecessary_blocking_io),
@@ -1050,9 +1060,13 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    manual_wal_flush);
   ROCKS_LOG_HEADER(log, "            Options.wal_compression: %d",
                    wal_compression);
+  ROCKS_LOG_HEADER(log, "      Options.use_blog_format_for_wals: %d",
+                   use_blog_format_for_wals);
   ROCKS_LOG_HEADER(log, "    Options.use_blog_format_for_blobs: %d",
                    use_blog_format_for_blobs);
   ROCKS_LOG_HEADER(log, "            Options.blog_checksum: %d", blog_checksum);
+  ROCKS_LOG_HEADER(log, "      Options.blog_timestamp_size: %" ROCKSDB_PRIszt,
+                   blog_timestamp_size);
   ROCKS_LOG_HEADER(log,
                    "            Options.background_close_inactive_wals: %d",
                    background_close_inactive_wals);

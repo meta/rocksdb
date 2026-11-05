@@ -103,7 +103,8 @@ void WriteBlogBlobFile(const ImmutableOptions& immutable_options,
   blog_header.compact_record_type = kBlogBlobRecord;
   blog_header.GenerateRandomFields();
 
-  BlogFileWriter blog_writer(std::move(file_writer), blog_header);
+  BlogFileWriter blog_writer(std::move(file_writer), blog_header,
+                             BlogUnspecifiedSizeRecords::kAllowed);
   ASSERT_OK(blog_writer.WriteHeader(WriteOptions()));
 
   uint64_t blob_offset = 0;

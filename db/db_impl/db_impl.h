@@ -2381,17 +2381,46 @@ class DBImpl : public DB
       writer = nullptr;
       return w;
     }
-    Status ClearWriter() {
+    Status ClearWriter(FileSystem* fs) {
       Status s;
       if (writer->file()) {
-        // TODO: plumb Env::IOActivity, Env::IOPriority
-        s = writer->WriteBuffer(WriteOptions());
+        const WriteOptions write_options;
         if (attempt_truncate_size < SIZE_MAX &&
             attempt_truncate_size < writer->file()->GetFileSize()) {
-          Status s2 = writer->file()->writable_file()->Truncate(
-              attempt_truncate_size, IOOptions{}, nullptr);
-          // This is just a best effort attempt
-          s2.PermitUncheckedError();
+          TEST_SYNC_POINT("DBImpl::ClearWriter:SkippedSealForTruncate");
+          const std::string fname = writer->file()->file_name();
+          const bool use_direct_io = writer->file()->use_direct_io();
+          s = writer->WriteBuffer(write_options);
+          // Removing the failed batch remains best effort.
+          Status truncate_s;
+          if (!use_direct_io) {
+            // Buffered writes are all issued by now, so truncate the open
+            // handle; this needs no FileSystem::ReopenWritableFile support.
+            truncate_s = writer->file()->writable_file()->Truncate(
+                attempt_truncate_size, IOOptions{}, nullptr);
+          }
+          Status close_s = writer->file()->Close(IOOptions{}, nullptr);
+          if (s.ok()) {
+            s = close_s;
+          }
+          close_s.PermitUncheckedError();
+          writer->PublishIfClosed();
+          if (use_direct_io) {
+            // Direct I/O Close rewrites the aligned tail and trims to its own
+            // logical size, so truncate only after it can issue no more
+            // writes.
+            std::unique_ptr<FSWritableFile> truncate_file;
+            truncate_s = fs->ReopenWritableFile(fname, FileOptions(),
+                                                &truncate_file, nullptr);
+            if (truncate_s.ok()) {
+              truncate_s = truncate_file->Truncate(attempt_truncate_size,
+                                                   IOOptions{}, nullptr);
+              truncate_file->Close(IOOptions{}, nullptr).PermitUncheckedError();
+            }
+          }
+          truncate_s.PermitUncheckedError();
+        } else {
+          s = writer->Close(write_options);
         }
       }
       delete writer;
@@ -3043,12 +3072,12 @@ class DBImpl : public DB
                       const WriteOptions& write_options, WalWriter* log_writer,
                       uint64_t* wal_used, uint64_t* log_size,
                       WalFileNumberSize& wal_file_number_size,
-                      SequenceNumber sequence);
+                      SequenceNumber sequence, size_t seq_inc);
 
   IOStatus WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                            WalWriter* log_writer, uint64_t* wal_used,
                            bool need_wal_sync, bool need_wal_dir_sync,
-                           SequenceNumber sequence,
+                           SequenceNumber sequence, size_t seq_inc,
                            WalFileNumberSize& wal_file_number_size);
 
   IOStatus ConcurrentWriteGroupToWAL(const WriteThread::WriteGroup& write_group,
