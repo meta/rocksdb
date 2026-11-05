@@ -101,6 +101,7 @@ class TaskLimiterToken;
 class Version;
 class VersionEdit;
 class VersionSet;
+class WalReader;
 class WriteCallback;
 struct JobContext;
 struct ExternalSstFileInfo;
@@ -2762,9 +2763,9 @@ class DBImpl : public DB
                              bool* const old_log_record,
                              Status* const reporter_status,
                              DBOpenLogRecordReadReporter* reporter,
-                             std::unique_ptr<log::Reader>& reader);
+                             std::unique_ptr<WalReader>& reader);
   Status ProcessLogRecord(
-      Slice record, const std::unique_ptr<log::Reader>& reader,
+      Slice record, const std::unique_ptr<WalReader>& reader,
       const UnorderedMap<uint32_t, size_t>& running_ts_sz, uint64_t wal_number,
       const std::string& fname, bool read_only, int job_id,
       const std::function<void()>& logFileDropped,
@@ -2775,7 +2776,7 @@ class DBImpl : public DB
       std::unordered_map<int, VersionEdit>* version_edits, bool* flushed);
 
   Status InitializeWriteBatchForLogRecord(
-      Slice record, const std::unique_ptr<log::Reader>& reader,
+      Slice record, const std::unique_ptr<WalReader>& reader,
       const UnorderedMap<uint32_t, size_t>& running_ts_sz, WriteBatch* batch,
       std::unique_ptr<WriteBatch>& new_batch, WriteBatch*& batch_to_use,
       uint64_t* record_checksum);
@@ -2803,6 +2804,7 @@ class DBImpl : public DB
   Status UpdatePredecessorWALInfo(uint64_t wal_number,
                                   const SequenceNumber last_seqno_observed,
                                   const std::string& fname,
+                                  const WalReader* reader,
                                   PredecessorWALInfo& predecessor_wal_info);
 
   void FinishLogFileProcessing(const Status& status,

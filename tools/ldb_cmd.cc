@@ -29,6 +29,7 @@
 #include "db/manifest_ops.h"
 #include "db/version_set.h"
 #include "db/version_util.h"
+#include "db/wal_reader.h"
 #include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_columns_helper.h"
 #include "db/write_batch_internal.h"
@@ -3229,8 +3230,12 @@ void DumpWalFile(Options options, const std::string& wal_file,
       // bogus input, carry on as best we can
       log_number = 0;
     }
-    log::Reader reader(options.info_log, std::move(wal_file_reader), &reporter,
-                       true /* checksum */, log_number);
+    std::unique_ptr<WalReader> reader = NewWalReader(
+        options.info_log, std::move(wal_file_reader), &reporter,
+        true /* checksum */, log_number, /*track_and_verify_wals=*/false,
+        /*stop_replay_for_corruption=*/false,
+        std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
+        /*buffered=*/false);
     std::unordered_set<uint32_t> encountered_cf_ids;
     std::string scratch;
     WriteBatch batch;
@@ -3243,7 +3248,7 @@ void DumpWalFile(Options options, const std::string& wal_file,
       }
       std::cout << "\n";
     }
-    while (status.ok() && reader.ReadRecord(&record, &scratch)) {
+    while (status.ok() && reader->ReadRecord(&record, &scratch)) {
       row.str("");
       if (record.size() < WriteBatchInternal::kHeader) {
         reporter.Corruption(record.size(),
@@ -3261,7 +3266,7 @@ void DumpWalFile(Options options, const std::string& wal_file,
           break;
         }
         const UnorderedMap<uint32_t, size_t> recorded_ts_sz =
-            reader.GetRecordedTimestampSize();
+            reader->GetRecordedTimestampSize();
         if (!running_ts_sz.empty()) {
           status = HandleWriteBatchTimestampSizeDifference(
               &batch, running_ts_sz, recorded_ts_sz,
@@ -3324,7 +3329,7 @@ void DumpWalFile(Options options, const std::string& wal_file,
         *prev_batch_seqno = sequence_number;
         *prev_batch_count = batch_count;
         row << WriteBatchInternal::ByteSize(&batch) << ",";
-        row << reader.LastRecordOffset() << ",";
+        row << reader->LastRecordOffset() << ",";
         ColumnFamilyCollector cf_collector;
         status = batch.Iterate(&cf_collector);
         auto cf_ids = cf_collector.column_families();

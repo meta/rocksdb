@@ -53,6 +53,9 @@ class WalReader {
   virtual bool IsCompressedAndEmptyFile() = 0;
   virtual const UnorderedMap<uint32_t, size_t>& GetRecordedTimestampSize()
       const = 0;
+  // After replay, returns the size used to verify this WAL as a predecessor.
+  // `physical_file_size` is the caller's file-size observation.
+  virtual uint64_t GetVerificationSize(uint64_t physical_file_size) const = 0;
   virtual uint64_t LastRecordOffset() = 0;
   virtual bool IsEOF() = 0;
   virtual uint64_t GetLogNumber() const = 0;

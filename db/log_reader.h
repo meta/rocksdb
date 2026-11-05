@@ -12,7 +12,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "db/log_format.h"
@@ -119,6 +121,19 @@ class Reader {
   // block that was partially read.
   virtual void UnmarkEOF();
 
+  // Reads or extends the first block through the normal read path, as if the
+  // first ReadRecord had been called: sync points fire and read errors are
+  // reported via the reporter. Repeated calls after a temporary EOF retain the
+  // bytes already read and look for newly appended bytes. Must only be called
+  // before any ReadRecord.
+  virtual Slice PrimeFirstBlock();
+
+  // Releases ownership of the underlying file. The reader must not be used
+  // afterwards. Used with PrimeFirstBlock when the primed bytes reveal a
+  // non-legacy format: the file is handed to the format-specific reader
+  // together with a copy of the primed bytes.
+  std::unique_ptr<SequentialFileReader> ReleaseFile();
+
   SequentialFileReader* file() { return file_.get(); }
 
   Reporter* GetReporter() const { return reporter_; }
@@ -135,7 +150,9 @@ class Reader {
 
  protected:
   std::shared_ptr<Logger> info_log_;
-  const std::unique_ptr<SequentialFileReader> file_;
+  // Non-const: ReleaseFile() moves it out when handing the file to a
+  // format-specific reader.
+  std::unique_ptr<SequentialFileReader> file_;
   Reporter* const reporter_;
   bool const checksum_;
   char* const backing_store_;
@@ -252,6 +269,7 @@ class FragmentBufferedReader : public Reader {
         fragments_(),
         in_fragmented_record_(false) {}
   ~FragmentBufferedReader() override {}
+  Slice PrimeFirstBlock() override;
   bool ReadRecord(Slice* record, std::string* scratch,
                   WALRecoveryMode wal_recovery_mode =
                       WALRecoveryMode::kTolerateCorruptedTailRecords,

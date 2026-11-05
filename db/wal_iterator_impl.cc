@@ -6,6 +6,7 @@
 #include "db/wal_iterator_impl.h"
 
 #include <cinttypes>
+#include <limits>
 
 #include "db/write_batch_internal.h"
 #include "file/sequence_file_reader.h"
@@ -364,9 +365,12 @@ Status WalIteratorImpl::OpenLogReader(const WalFile* log_file) {
     return s;
   }
   assert(file);
-  current_log_reader_.reset(
-      new log::Reader(options_->info_log, std::move(file), &reporter_,
-                      read_options_.verify_checksums_, log_file->LogNumber()));
+  current_log_reader_ = NewWalReader(
+      options_->info_log, std::move(file), &reporter_,
+      read_options_.verify_checksums_, log_file->LogNumber(),
+      /*track_and_verify_wals=*/false, /*stop_replay_for_corruption=*/false,
+      std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
+      /*buffered=*/false);
   return Status::OK();
 }
 }  // namespace ROCKSDB_NAMESPACE

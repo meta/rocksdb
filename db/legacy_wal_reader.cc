@@ -30,6 +30,11 @@ LegacyWalReader::GetRecordedTimestampSize() const {
   return reader_->GetRecordedTimestampSize();
 }
 
+uint64_t LegacyWalReader::GetVerificationSize(
+    uint64_t physical_file_size) const {
+  return physical_file_size;
+}
+
 uint64_t LegacyWalReader::LastRecordOffset() {
   return reader_->LastRecordOffset();
 }

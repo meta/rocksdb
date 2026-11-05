@@ -362,8 +362,8 @@ Status DBImplSecondary::FindNewLogNumbers(std::vector<uint64_t>* logs) {
   return s;
 }
 
-Status DBImplSecondary::MaybeInitLogReader(
-    uint64_t log_number, log::FragmentBufferedReader** log_reader) {
+Status DBImplSecondary::MaybeInitLogReader(uint64_t log_number,
+                                           WalReader** log_reader) {
   auto iter = log_readers_.find(log_number);
   // make sure the log file is still present
   if (iter == log_readers_.end() ||
@@ -419,7 +419,7 @@ Status DBImplSecondary::RecoverLogFiles(
   mutex_.AssertHeld();
   Status status;
   for (auto log_number : log_numbers) {
-    log::FragmentBufferedReader* reader = nullptr;
+    WalReader* reader = nullptr;
     status = MaybeInitLogReader(log_number, &reader);
     if (!status.ok()) {
       return status;
@@ -434,7 +434,7 @@ Status DBImplSecondary::RecoverLogFiles(
   for (auto log_number : log_numbers) {
     auto it = log_readers_.find(log_number);
     assert(it != log_readers_.end());
-    log::FragmentBufferedReader* reader = it->second->reader_;
+    WalReader* reader = it->second->reader_;
     Status* wal_read_status = it->second->status_;
     assert(wal_read_status);
     // Manually update the file number allocation counter in VersionSet.

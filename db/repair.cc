@@ -70,6 +70,7 @@
 #include "db/table_cache.h"
 #include "db/version_builder.h"
 #include "db/version_edit.h"
+#include "db/wal_reader.h"
 #include "db/write_batch_internal.h"
 #include "file/filename.h"
 #include "file/writable_file_writer.h"
@@ -393,8 +394,12 @@ class Repairer {
     // corruptions cause entire commits to be skipped instead of
     // propagating bad information (like overly large sequence
     // numbers).
-    log::Reader reader(db_options_.info_log, std::move(lfile_reader), &reporter,
-                       true /*enable checksum*/, log);
+    std::unique_ptr<WalReader> reader = NewWalReader(
+        db_options_.info_log, std::move(lfile_reader), &reporter,
+        true /*enable checksum*/, log, /*track_and_verify_wals=*/false,
+        /*stop_replay_for_corruption=*/false,
+        std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
+        /*buffered=*/false);
 
     // Initialize per-column family memtables
     for (auto* cfd : *vset_.GetColumnFamilySet()) {
@@ -410,7 +415,7 @@ class Repairer {
     WriteBatch batch;
 
     int counter = 0;
-    while (reader.ReadRecord(&record, &scratch)) {
+    while (reader->ReadRecord(&record, &scratch)) {
       if (record.size() < WriteBatchInternal::kHeader) {
         reporter.Corruption(record.size(),
                             Status::Corruption("log record too small"));
@@ -419,7 +424,7 @@ class Repairer {
       Status record_status = WriteBatchInternal::SetContents(&batch, record);
       if (record_status.ok()) {
         const UnorderedMap<uint32_t, size_t>& record_ts_sz =
-            reader.GetRecordedTimestampSize();
+            reader->GetRecordedTimestampSize();
         // Use same value for `seq_per_batch` and `batch_per_txn` as
         // WriteBatchInternal::InsertInto does below.
         record_status = HandleWriteBatchTimestampSizeDifference(

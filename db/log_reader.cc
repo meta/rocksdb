@@ -62,6 +62,29 @@ Reader::~Reader() {
   }
 }
 
+Slice Reader::PrimeFirstBlock() {
+  if (read_error_) {
+    return buffer_;
+  }
+
+  assert(end_of_buffer_offset_ == buffer_.size());
+
+  if (eof_) {
+    UnmarkEOF();
+  }
+  if (end_of_buffer_offset_ != 0) {
+    return buffer_;
+  }
+  size_t drop_size = 0;
+  uint8_t error = kEof;
+  ReadMore(&drop_size, &error);
+  return buffer_;
+}
+
+std::unique_ptr<SequentialFileReader> Reader::ReleaseFile() {
+  return std::move(file_);
+}
+
 // For kAbsoluteConsistency, on clean shutdown we don't expect any error
 // in the log files.  For other modes, we can ignore only incomplete records
 // in the last log file, which are presumably due to a write in progress
@@ -911,6 +934,23 @@ void FragmentBufferedReader::UnmarkEOF() {
   }
   eof_ = false;
   UnmarkEOFInternal();
+}
+
+Slice FragmentBufferedReader::PrimeFirstBlock() {
+  assert(end_of_buffer_offset_ == buffer_.size());
+  if (read_error_) {
+    return buffer_;
+  }
+  if (eof_) {
+    UnmarkEOF();
+  }
+  if (end_of_buffer_offset_ != 0) {
+    return buffer_;
+  }
+  size_t drop_size = 0;
+  uint8_t error = kEof;
+  TryReadMore(&drop_size, &error);
+  return buffer_;
 }
 
 bool FragmentBufferedReader::TryReadMore(size_t* drop_size, uint8_t* error) {
