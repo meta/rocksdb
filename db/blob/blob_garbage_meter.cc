@@ -5,12 +5,73 @@
 
 #include "db/blob/blob_garbage_meter.h"
 
+#include <string>
+
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blog/blog_format.h"
 #include "db/dbformat.h"
+#include "db/version_set.h"
 #include "db/wide/wide_column_serialization.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+Status GetBlobReferenceBytes(uint64_t blob_file_number, uint8_t schema_version,
+                             uint64_t key_size, const BlobIndex& blob_index,
+                             uint64_t* bytes) {
+  assert(bytes != nullptr);
+
+  switch (schema_version) {
+    case kLegacyBlobFileSchemaVersion:
+      *bytes = blob_index.size() +
+               BlobLogRecord::CalculateAdjustmentForRecordHeader(key_size);
+      return Status::OK();
+    case kBlogCurrentSchemaVersion:
+      // BlobIndex does not persist test-only noncanonical framing choices, so
+      // mixed-size blog references fall back to canonical sizing here.
+      *bytes = ComputeBlogRecordSize(blob_index.size(),
+                                     /*compact_eligible=*/true);
+      return Status::OK();
+    default:
+      return Status::Corruption(
+          "Unsupported blob file schema version " +
+          std::to_string(schema_version) + " for blob file #" +
+          std::to_string(blob_file_number) +
+          " while accounting blob reference bytes; supported schema versions "
+          "are 0 (legacy) and 1.." +
+          std::to_string(kBlogCurrentSchemaVersion) + " (blog)");
+  }
+}
+
+}  // namespace
+
+BlobGarbageMeter::BlobGarbageMeter(
+    bool use_blog_format, BlobFileSchemaVersions blob_file_schema_versions)
+    : default_blob_file_schema_version_(use_blog_format
+                                            ? kBlogCurrentSchemaVersion
+                                            : kLegacyBlobFileSchemaVersion),
+      blob_file_schema_versions_(std::move(blob_file_schema_versions)) {}
+
+BlobGarbageMeter::BlobFileSchemaVersions
+BlobGarbageMeter::CollectBlobFileSchemaVersions(
+    const VersionStorageInfo* version_storage_info) {
+  BlobFileSchemaVersions blob_file_schema_versions;
+  if (version_storage_info == nullptr) {
+    return blob_file_schema_versions;
+  }
+
+  const auto& blob_files = version_storage_info->GetBlobFiles();
+  blob_file_schema_versions.reserve(blob_files.size());
+  for (const auto& meta : blob_files) {
+    assert(meta);
+    blob_file_schema_versions.emplace(meta->GetBlobFileNumber(),
+                                      meta->GetSchemaVersion());
+  }
+
+  return blob_file_schema_versions;
+}
 
 Status BlobGarbageMeter::ProcessInFlow(const Slice& key, const Slice& value) {
   return ProcessFlow(key, value, /*is_inflow=*/true);
@@ -37,11 +98,13 @@ Status BlobGarbageMeter::GetBlobReferenceDetails(const ParsedInternalKey& ikey,
   }
 
   *blob_file_number = blob_index.file_number();
-  *bytes =
-      blob_index.size() +
-      BlobLogRecord::CalculateAdjustmentForRecordHeader(ikey.user_key.size());
+  const auto it = blob_file_schema_versions_.find(*blob_file_number);
+  const uint8_t schema_version = it != blob_file_schema_versions_.end()
+                                     ? it->second
+                                     : default_blob_file_schema_version_;
 
-  return Status::OK();
+  return GetBlobReferenceBytes(*blob_file_number, schema_version,
+                               ikey.user_key.size(), blob_index, bytes);
 }
 
 Status BlobGarbageMeter::ParseBlobIndexReference(const ParsedInternalKey& ikey,

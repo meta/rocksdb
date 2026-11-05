@@ -1029,7 +1029,10 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
 
   if (!compaction_result.blob_file_garbages.empty()) {
     BlobGarbageMeter* const garbage_meter =
-        current_outputs->CreateBlobGarbageMeter();
+        current_outputs->CreateBlobGarbageMeter(
+            db_options_.use_blog_format_for_blobs,
+            BlobGarbageMeter::CollectBlobFileSchemaVersions(
+                compaction->input_version()->storage_info()));
     for (const auto& garbage : compaction_result.blob_file_garbages) {
       garbage_meter->AddGarbage(garbage.GetBlobFileNumber(),
                                 garbage.GetGarbageBlobCount(),

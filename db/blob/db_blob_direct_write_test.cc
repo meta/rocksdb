@@ -25,9 +25,12 @@
 
 #include "cache/compressed_secondary_cache.h"
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_sequential_reader.h"
+#include "db/blog/blog_format.h"
+#include "db/blog/blog_writer.h"
 #include "db/column_family.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
@@ -539,6 +542,75 @@ class DBBlobDirectWriteTest : public DBTestBase {
     ASSERT_FALSE(inspector.saw_put_blob_index);
     ASSERT_EQ(inspector.key_, key);
     ASSERT_EQ(inspector.value_, value);
+  }
+
+  void AssertFailedBatchTrackedAsInitialGarbage(bool use_blog_format) {
+    Options options = GetDirectWriteOptions();
+    options.blob_file_size = 1 << 20;
+    options.blob_compression_type = kNoCompression;
+    options.use_blog_format_for_blobs = use_blog_format;
+
+    Reopen(options);
+
+    const std::string failed_key = "failed_key";
+    const std::string failed_value(128, 'f');
+    const uint64_t failed_record_bytes =
+        use_blog_format ? ComputeBlogRecordSize(failed_value.size(),
+                                                /*compact_eligible=*/true)
+                        : BlobLogRecord::kHeaderSize + failed_key.size() +
+                              failed_value.size();
+
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteImpl:AfterBlobDirectWrite", [](void* arg) {
+          auto* status = static_cast<Status*>(arg);
+          assert(status != nullptr);
+          *status = Status::IOError("Injected post-BDW failure");
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    ASSERT_TRUE(Put(failed_key, failed_value).IsIOError());
+
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    const std::string good_key = "good_key";
+    const std::string good_value(96, 'g');
+    const uint64_t good_record_bytes =
+        use_blog_format
+            ? ComputeBlogRecordSize(good_value.size(),
+                                    /*compact_eligible=*/true)
+            : BlobLogRecord::kHeaderSize + good_key.size() + good_value.size();
+
+    ASSERT_OK(Put(good_key, good_value));
+    ASSERT_EQ(Get(failed_key), "NOT_FOUND");
+    ASSERT_EQ(Get(good_key), good_value);
+
+    ASSERT_OK(Flush());
+
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    ASSERT_EQ(cf_meta.blob_file_count, 1U);
+    ASSERT_EQ(cf_meta.blob_files.size(), 1U);
+
+    const BlobMetaData& blob_meta = cf_meta.blob_files[0];
+    ASSERT_EQ(blob_meta.total_blob_count, 2U);
+    ASSERT_EQ(blob_meta.total_blob_bytes,
+              failed_record_bytes + good_record_bytes);
+    ASSERT_EQ(blob_meta.garbage_blob_count, 1U);
+    ASSERT_EQ(blob_meta.garbage_blob_bytes, failed_record_bytes);
+
+    Close();
+    Reopen(options);
+
+    ASSERT_EQ(Get(failed_key), "NOT_FOUND");
+    ASSERT_EQ(Get(good_key), good_value);
+
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    ASSERT_EQ(cf_meta.blob_file_count, 1U);
+    ASSERT_EQ(cf_meta.blob_files.size(), 1U);
+    ASSERT_EQ(cf_meta.blob_files[0].total_blob_count, 2U);
+    ASSERT_EQ(cf_meta.blob_files[0].garbage_blob_count, 1U);
+    ASSERT_EQ(cf_meta.blob_files[0].garbage_blob_bytes, failed_record_bytes);
   }
 };
 
@@ -1143,6 +1215,94 @@ TEST_F(DBBlobDirectWriteTest, DirectWriteRefreshesReaderAfterFlush) {
   }
 }
 
+TEST_F(DBBlobDirectWriteTest, DirectWriteBlogManifestMetadata) {
+  Options options = GetDirectWriteOptions();
+  options.blob_direct_write_partitions = 1;
+  options.blob_file_size = 1 << 20;
+  options.use_blog_format_for_blobs = true;
+
+  Reopen(options);
+
+  ASSERT_OK(Put("blog_key", std::string(128, 'v')));
+  ASSERT_OK(Flush());
+
+  const std::vector<uint64_t> blob_file_numbers = GetBlobFileNumbers();
+  ASSERT_EQ(blob_file_numbers.size(), 1U);
+
+  VersionSet* const versions = dbfull()->GetVersionSet();
+  ASSERT_NE(versions, nullptr);
+  ASSERT_NE(versions->GetColumnFamilySet(), nullptr);
+
+  ColumnFamilyData* const cfd = versions->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(cfd, nullptr);
+  ASSERT_NE(cfd->current(), nullptr);
+
+  const auto& blob_files = cfd->current()->storage_info()->GetBlobFiles();
+  ASSERT_EQ(blob_files.size(), 1U);
+  const auto& blob_meta = blob_files.front();
+  ASSERT_NE(blob_meta, nullptr);
+  ASSERT_EQ(blob_meta->GetBlobFileNumber(), blob_file_numbers[0]);
+  ASSERT_GT(blob_meta->GetPhysicalBlobFileSize(),
+            blob_meta->GetTotalBlobBytes());
+  ASSERT_EQ(blob_meta->GetSchemaVersion(), kBlogCurrentSchemaVersion);
+  ASSERT_EQ(blob_meta->GetFileIdentity().size(), kBlogEscapeSequenceSize);
+
+  constexpr HistogramImpl* blob_file_read_hist = nullptr;
+  FileOptions file_options;
+  ReadOptions read_options;
+  std::unique_ptr<BlobFileReader> reader;
+  ASSERT_OK(BlobFileReader::Create(
+      cfd->ioptions(), read_options, file_options, cfd->GetID(),
+      blob_file_read_hist, blob_meta->GetBlobFileNumber(),
+      std::shared_ptr<IOTracer>() /*io_tracer*/, &reader));
+  ASSERT_TRUE(reader->IsBlogFormat());
+  ASSERT_EQ(reader->GetFileSize(), blob_meta->GetPhysicalBlobFileSize());
+  ASSERT_EQ(reader->GetBlogSchemaVersion(), blob_meta->GetSchemaVersion());
+  ASSERT_EQ(reader->GetBlogFileIdentity().ToString(),
+            blob_meta->GetFileIdentity());
+}
+
+TEST_F(DBBlobDirectWriteTest, DirectWriteNoncanonicalBlogFeatures) {
+  TEST_BlogNoncanonicalConfig config;
+  config.enabled = true;
+  config.seed = 43;
+  config.force_full_record_one_in = 1;
+  config.overlong_full_varint_one_in = 1;
+  config.unspecified_size_record_one_in = 1;
+  config.inject_auxiliary_record_one_in = 1;
+  config.max_auxiliary_payload_bytes = 8;
+  config.extra_padding_512b_one_in = 1;
+  config.extra_padding_4k_one_in = 0;
+  config.prefer_padding_with_0xff_one_in = 1;
+  TEST_BlogNoncanonicalConfigScope config_scope(config);
+
+  Options options = GetDirectWriteOptions();
+  options.blob_direct_write_partitions = 1;
+  options.blob_file_size = 1 << 20;
+  options.use_blog_format_for_blobs = true;
+
+  Reopen(options);
+
+  const std::array<std::string, 2> keys{"nk0", "nk1"};
+  const std::array<std::string, 2> values{std::string(256, 'a'),
+                                          std::string(384, 'b')};
+  for (size_t i = 0; i < keys.size(); ++i) {
+    ASSERT_OK(Put(keys[i], values[i]));
+    ASSERT_EQ(Get(keys[i]), values[i]);
+  }
+  ASSERT_OK(Flush());
+
+  const std::array<Slice, 2> key_slices{Slice(keys[0]), Slice(keys[1])};
+  std::array<PinnableSlice, 2> results;
+  std::array<Status, 2> statuses;
+  db_->MultiGet(ReadOptions(), db_->DefaultColumnFamily(), key_slices.size(),
+                key_slices.data(), results.data(), statuses.data());
+  for (size_t i = 0; i < key_slices.size(); ++i) {
+    ASSERT_OK(statuses[i]);
+    ASSERT_EQ(results[i], values[i]);
+  }
+}
+
 TEST_F(DBBlobDirectWriteTest, DirectWriteRefreshesReaderWhileFileIsGrowing) {
   Options options = GetDirectWriteOptions();
   options.blob_direct_write_partitions = 1;
@@ -1339,65 +1499,12 @@ TEST_F(DBBlobDirectWriteTest,
 }
 
 TEST_F(DBBlobDirectWriteTest, DirectWriteFailedBatchTrackedAsInitialGarbage) {
-  Options options = GetDirectWriteOptions();
-  options.blob_file_size = 1 << 20;
-  options.blob_compression_type = kNoCompression;
+  AssertFailedBatchTrackedAsInitialGarbage(/*use_blog_format=*/false);
+}
 
-  Reopen(options);
-
-  const std::string failed_key = "failed_key";
-  const std::string failed_value(128, 'f');
-  const uint64_t failed_record_bytes =
-      BlobLogRecord::kHeaderSize + failed_key.size() + failed_value.size();
-
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::WriteImpl:AfterBlobDirectWrite", [](void* arg) {
-        auto* status = static_cast<Status*>(arg);
-        assert(status != nullptr);
-        *status = Status::IOError("Injected post-BDW failure");
-      });
-  SyncPoint::GetInstance()->EnableProcessing();
-
-  ASSERT_TRUE(Put(failed_key, failed_value).IsIOError());
-
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
-
-  const std::string good_key = "good_key";
-  const std::string good_value(96, 'g');
-  const uint64_t good_record_bytes =
-      BlobLogRecord::kHeaderSize + good_key.size() + good_value.size();
-
-  ASSERT_OK(Put(good_key, good_value));
-  ASSERT_EQ(Get(failed_key), "NOT_FOUND");
-  ASSERT_EQ(Get(good_key), good_value);
-
-  ASSERT_OK(Flush());
-
-  ColumnFamilyMetaData cf_meta;
-  db_->GetColumnFamilyMetaData(&cf_meta);
-  ASSERT_EQ(cf_meta.blob_file_count, 1U);
-  ASSERT_EQ(cf_meta.blob_files.size(), 1U);
-
-  const BlobMetaData& blob_meta = cf_meta.blob_files[0];
-  ASSERT_EQ(blob_meta.total_blob_count, 2U);
-  ASSERT_EQ(blob_meta.total_blob_bytes,
-            failed_record_bytes + good_record_bytes);
-  ASSERT_EQ(blob_meta.garbage_blob_count, 1U);
-  ASSERT_EQ(blob_meta.garbage_blob_bytes, failed_record_bytes);
-
-  Close();
-  Reopen(options);
-
-  ASSERT_EQ(Get(failed_key), "NOT_FOUND");
-  ASSERT_EQ(Get(good_key), good_value);
-
-  db_->GetColumnFamilyMetaData(&cf_meta);
-  ASSERT_EQ(cf_meta.blob_file_count, 1U);
-  ASSERT_EQ(cf_meta.blob_files.size(), 1U);
-  ASSERT_EQ(cf_meta.blob_files[0].total_blob_count, 2U);
-  ASSERT_EQ(cf_meta.blob_files[0].garbage_blob_count, 1U);
-  ASSERT_EQ(cf_meta.blob_files[0].garbage_blob_bytes, failed_record_bytes);
+TEST_F(DBBlobDirectWriteTest,
+       DirectWriteFailedBlogBatchTrackedAsInitialGarbage) {
+  AssertFailedBatchTrackedAsInitialGarbage(/*use_blog_format=*/true);
 }
 
 TEST_F(DBBlobDirectWriteTest, DirectWriteRollbackMismatchReturnsCorruption) {

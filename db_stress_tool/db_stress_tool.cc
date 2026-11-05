@@ -24,6 +24,7 @@
 #include <iostream>
 #include <thread>
 
+#include "db/blog/blog_writer.h"
 #include "db_stress_tool/db_stress_common.h"
 #include "db_stress_tool/db_stress_driver.h"
 #include "db_stress_tool/db_stress_shared_state.h"
@@ -241,6 +242,13 @@ int db_stress_tool(int argc, char** argv) {
               WriteBufferFlushPolicy::kFlushLargestAcrossDBs)) {
     return ReturnValidationError("--wbm_flush_policy must be 0, 1, or 2");
   }
+
+  TEST_BlogNoncanonicalConfig noncanonical_blog_config;
+  if (FLAGS_test_noncanonical_blog) {
+    noncanonical_blog_config.enabled = true;
+    noncanonical_blog_config.seed = FLAGS_seed;
+  }
+  TEST_SetBlogNoncanonicalConfig(noncanonical_blog_config);
 
   SanitizeDoubleParam(&FLAGS_bloom_bits);
   SanitizeDoubleParam(&FLAGS_memtable_prefix_bloom_size_ratio);

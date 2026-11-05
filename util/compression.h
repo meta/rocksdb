@@ -44,6 +44,17 @@
 #endif  // ZSTD
 
 namespace ROCKSDB_NAMESPACE {
+// Internal helper for readers decoding persisted compression metadata.
+// Resolves `compatibility_name` to a CompressionManager by first checking
+// whether `configured_compression_manager` can read that compatibility name,
+// then falling back to constructing a standalone manager from the serialized
+// name. Callers that want special handling for an empty compatibility name
+// should do so before calling this helper.
+Status ResolveCompressionManagerByCompatibilityName(
+    Slice compatibility_name,
+    CompressionManager* configured_compression_manager,
+    std::shared_ptr<CompressionManager>* resolved_manager);
+
 // Need this for the context allocation override
 // On windows we need to do this explicitly
 #if defined(ZSTD) && defined(ROCKSDB_JEMALLOC) && defined(OS_WIN) && \
