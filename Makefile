@@ -1767,6 +1767,12 @@ db_logical_block_size_cache_test: $(OBJ_DIR)/db/db_logical_block_size_cache_test
 db_blob_index_test: $(OBJ_DIR)/db/blob/db_blob_index_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+blog_format_test: $(OBJ_DIR)/db/blog/blog_format_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+blog_writer_test: $(OBJ_DIR)/db/blog/blog_writer_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 db_block_cache_test: $(OBJ_DIR)/db/db_block_cache_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 

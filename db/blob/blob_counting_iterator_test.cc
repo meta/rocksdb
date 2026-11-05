@@ -69,7 +69,7 @@ TEST(BlobCountingIteratorTest, CountBlobs) {
   assert(keys.size() == values.size());
 
   VectorIterator input(keys, values);
-  BlobGarbageMeter blob_garbage_meter;
+  BlobGarbageMeter blob_garbage_meter(/*use_blog_format=*/false);
 
   BlobCountingIterator blob_counter(&input, &blob_garbage_meter,
                                     /*track_current_key_inflow=*/false);
@@ -317,7 +317,7 @@ TEST(BlobCountingIteratorTest, TracksCurrentKeyOnlyForResumableCompaction) {
 
   for (const bool track_current_key : {false, true}) {
     VectorIterator input(keys, values);
-    BlobGarbageMeter blob_garbage_meter;
+    BlobGarbageMeter blob_garbage_meter(/*use_blog_format=*/false);
     size_t aggregate_parse_count = 0;
     size_t current_key_parse_count = 0;
     SyncPoint::GetInstance()->SetCallBack(
@@ -362,7 +362,7 @@ TEST(BlobCountingIteratorTest, CorruptBlobIndex) {
   assert(keys.size() == values.size());
 
   VectorIterator input(keys, values);
-  BlobGarbageMeter blob_garbage_meter;
+  BlobGarbageMeter blob_garbage_meter(/*use_blog_format=*/false);
 
   BlobCountingIterator blob_counter(&input, &blob_garbage_meter,
                                     /*track_current_key_inflow=*/false);
