@@ -11,8 +11,10 @@
 #include <string>
 
 #include "db/log_reader.h"
+#include "rocksdb/file_system.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "util/hash_containers.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -48,8 +50,9 @@ class WalReader {
                           uint64_t* record_checksum) = 0;
 
   virtual void UnmarkEOF() = 0;
-  // True when the file declares compression but no data record has been
-  // read yet (a compression preamble with an otherwise empty file).
+  // True when no data record has been read yet but the file is not
+  // physically empty: a legacy compression preamble, or a blog file header
+  // (compressed or not).
   virtual bool IsCompressedAndEmptyFile() = 0;
   virtual const UnorderedMap<uint32_t, size_t>& GetRecordedTimestampSize()
       const = 0;
@@ -65,15 +68,61 @@ class WalReader {
   WalReader() = default;
 };
 
-// Creates the WalReader implementation matching the WAL file's format.
-// `buffered` selects the fragment-buffering legacy reader used when tailing
-// a WAL that is still being written.
+// Retains the open file and unconsumed prefix until its format is known.
+// This is opening state, not a record reader. Retry after the file grows;
+// once ready, discard this state and use the returned WalReader directly.
+class WalReaderOpenState {
+ public:
+  enum class Result { kReady, kPending, kReadError };
+
+  WalReaderOpenState(std::shared_ptr<Logger> info_log,
+                     std::unique_ptr<SequentialFileReader>&& file,
+                     log::Reader::Reporter* reporter, bool checksum,
+                     uint64_t log_number, bool track_and_verify_wals,
+                     bool stop_replay_for_corruption,
+                     uint64_t min_wal_number_to_keep,
+                     const PredecessorWALInfo& observed_predecessor_wal_info,
+                     bool buffered);
+
+  // Reads through the normal file-read path, including reporter callbacks.
+  // `reader` must be empty. A read error is terminal for this open file and
+  // is reported through the reporter; retries do not repeat the failed I/O.
+  Result TryOpen(std::unique_ptr<WalReader>* reader);
+
+ private:
+  std::unique_ptr<WalReader> candidate_reader_;
+  // Borrows the candidate's embedded decoder only while opening.
+  log::Reader* probe_reader_ = nullptr;
+  log::Reader::Reporter* const reporter_;
+  const bool checksum_;
+  const uint64_t log_number_;
+  const bool track_and_verify_wals_;
+  const bool stop_replay_for_corruption_;
+  const uint64_t min_wal_number_to_keep_;
+  const PredecessorWALInfo observed_predecessor_wal_info_;
+  const bool buffered_;
+};
+
+// Attempts to open a format-specific reader. If the file is empty, or has
+// a partial magic prefix in buffered mode, returns null and retains the open
+// state in `pending_open`. Read errors also return null with retained state;
+// existing reporter policy determines how the caller handles the error.
+// On success `pending_open` is empty. `buffered` selects fragment buffering,
+// not whether the caller may subsequently tail a growing file.
 std::unique_ptr<WalReader> NewWalReader(
     std::shared_ptr<Logger> info_log,
     std::unique_ptr<SequentialFileReader>&& file,
     log::Reader::Reporter* reporter, bool checksum, uint64_t log_number,
     bool track_and_verify_wals, bool stop_replay_for_corruption,
     uint64_t min_wal_number_to_keep,
-    const PredecessorWALInfo& observed_predecessor_wal_info, bool buffered);
+    const PredecessorWALInfo& observed_predecessor_wal_info, bool buffered,
+    std::unique_ptr<WalReaderOpenState>* pending_open);
+
+// Sets *is_blog to whether the WAL file `fname` is in the blog format. Reads
+// the file separately, for callers that must choose a read mode before the
+// first WalReader::ReadRecord detects the format.
+Status IsBlogFormatWalFile(const std::shared_ptr<FileSystem>& fs,
+                           const std::string& fname,
+                           const FileOptions& file_options, bool* is_blog);
 
 }  // namespace ROCKSDB_NAMESPACE

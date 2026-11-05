@@ -1043,6 +1043,10 @@ static enum ROCKSDB_NAMESPACE::CompressionType FLAGS_wal_compression_e =
 DEFINE_bool(use_blog_format_for_wals, false,
             "Use blog file format for new WAL files.");
 
+DEFINE_bool(blog_wal_streaming_compression,
+            ROCKSDB_NAMESPACE::Options().blog_wal_streaming_compression,
+            "Sets DB option blog_wal_streaming_compression.");
+
 DEFINE_bool(use_blog_format_for_blobs, false,
             "Use blog file format for new blob files.");
 
@@ -5991,6 +5995,8 @@ class Benchmark {
     options.manual_wal_flush = FLAGS_manual_wal_flush;
     options.wal_compression = FLAGS_wal_compression_e;
     options.use_blog_format_for_wals = FLAGS_use_blog_format_for_wals;
+    options.blog_wal_streaming_compression =
+        FLAGS_blog_wal_streaming_compression;
     options.use_blog_format_for_blobs = FLAGS_use_blog_format_for_blobs;
     // Parse blog_checksum via the options string system.
     {

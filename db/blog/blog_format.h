@@ -109,6 +109,13 @@ static constexpr size_t kBlogCompactVarintMaxBytes = 2;
 // Block trailer size: 1 byte compression_type + 4 bytes checksum.
 static constexpr size_t kBlogBlockTrailerSize = 5;
 
+// Full-format prefix bytes after the length varint: type + compression +
+// prefix checksum.
+static constexpr size_t kBlogFullFormatPrefixRestSize = 6;
+
+// Trivial record trailer size: 1 byte type + 4 bytes checksum.
+static constexpr size_t kBlogTrivialRecordTrailerSize = 5;
+
 // Named property sections are intentionally bounded to prevent unreasonable
 // allocations while opening a file. Includes the enclosing block trailer.
 static constexpr uint32_t kBlogMaxPropertySectionSize = 16 * 1024 * 1024;

@@ -109,6 +109,11 @@ Status WalIteratorImpl::OpenLogFile(
     file_reader->reset(new SequentialFileReader(std::move(file), fname,
                                                 io_tracer_, options_->listeners,
                                                 options_->rate_limiter.get()));
+    if (log_file->Type() != kArchivedLogFile) {
+      (*file_reader)
+          ->SetReopenOptions(options_->fs, optimized_env_options,
+                             /*readahead_size=*/0, io_tracer_);
+    }
   }
   return s;
 }
@@ -133,6 +138,20 @@ bool WalIteratorImpl::RestrictedRead(Slice* record) {
   return current_log_reader_->ReadRecord(record, &scratch_);
 }
 
+bool WalIteratorImpl::TryOpenLogReader() {
+  if (pending_log_reader_) {
+    const WalReaderOpenState::Result result =
+        pending_log_reader_->TryOpen(&current_log_reader_);
+    if (result != WalReaderOpenState::Result::kReady) {
+      pending_log_reader_read_error_ =
+          result == WalReaderOpenState::Result::kReadError;
+      return false;
+    }
+    pending_log_reader_.reset();
+  }
+  return current_log_reader_ != nullptr;
+}
+
 void WalIteratorImpl::SeekToStartSequence(uint64_t start_file_index,
                                           bool strict) {
   Slice record;
@@ -155,40 +174,46 @@ void WalIteratorImpl::SeekToStartSequence(uint64_t start_file_index,
     // Already spent; see the comment on current_status_.
     return;
   }
-  Status s =
-      OpenLogReader(files_->at(static_cast<size_t>(start_file_index)).get());
+  Status s;
+  if (!pending_log_reader_ || pending_log_reader_read_error_ ||
+      current_file_index_ != start_file_index) {
+    s = OpenLogReader(files_->at(static_cast<size_t>(start_file_index)).get());
+  }
   if (!s.ok()) {
     current_status_ = s;
     reporter_.Info(current_status_.ToString().c_str());
     return;
   }
-  while (RestrictedRead(&record)) {
-    if (record.size() < WriteBatchInternal::kHeader) {
-      reporter_.Corruption(record.size(),
-                           Status::Corruption("very small log record"));
-      continue;
-    }
-    UpdateCurrentWriteBatch(record);
-    if (!current_status_.ok()) {
-      return;
-    }
-    if (current_last_seq_ >= starting_sequence_number_) {
-      if (strict && current_batch_seq_ != starting_sequence_number_) {
-        current_status_ = Status::Corruption(
-            "Gap in sequence number. Could not "
-            "seek to required sequence number");
-        reporter_.Info(current_status_.ToString().c_str());
-        return;
-      } else if (strict) {
-        reporter_.Info(
-            "Could seek required sequence number. Iterator will "
-            "continue.");
+  if (TryOpenLogReader()) {
+    while (RestrictedRead(&record)) {
+      if (record.size() < WriteBatchInternal::kHeader) {
+        reporter_.Corruption(record.size(),
+                             Status::Corruption("very small log record"));
+        continue;
       }
-      is_valid_ = true;
-      started_ = true;  // set started_ as we could seek till starting sequence
-      return;
-    } else {
-      is_valid_ = false;
+      UpdateCurrentWriteBatch(record);
+      if (!current_status_.ok()) {
+        return;
+      }
+      if (current_last_seq_ >= starting_sequence_number_) {
+        if (strict && current_batch_seq_ != starting_sequence_number_) {
+          current_status_ = Status::Corruption(
+              "Gap in sequence number. Could not "
+              "seek to required sequence number");
+          reporter_.Info(current_status_.ToString().c_str());
+          return;
+        } else if (strict) {
+          reporter_.Info(
+              "Could seek required sequence number. Iterator will "
+              "continue.");
+        }
+        is_valid_ = true;
+        started_ =
+            true;  // set started_ as we could seek till starting sequence
+        return;
+      } else {
+        is_valid_ = false;
+      }
     }
   }
 
@@ -230,25 +255,27 @@ void WalIteratorImpl::NextImpl(bool internal) {
     SeekToStartSequence();
   }
   while (true) {
-    assert(current_log_reader_);
-    if (current_log_reader_->IsEOF()) {
+    assert(current_log_reader_ || pending_log_reader_);
+    if (current_log_reader_ && current_log_reader_->IsEOF()) {
       current_log_reader_->UnmarkEOF();
     }
-    while (RestrictedRead(&record)) {
-      if (record.size() < WriteBatchInternal::kHeader) {
-        reporter_.Corruption(record.size(),
-                             Status::Corruption("very small log record"));
-        continue;
-      } else {
-        // started_ should be true if called by application
-        assert(internal || started_);
-        // started_ should be false if called internally
-        assert(!internal || !started_);
-        UpdateCurrentWriteBatch(record);
-        if (internal && !started_) {
-          started_ = true;
+    if (current_log_reader_ || TryOpenLogReader()) {
+      while (RestrictedRead(&record)) {
+        if (record.size() < WriteBatchInternal::kHeader) {
+          reporter_.Corruption(record.size(),
+                               Status::Corruption("very small log record"));
+          continue;
+        } else {
+          // started_ should be true if called by application
+          assert(internal || started_);
+          // started_ should be false if called internally
+          assert(!internal || !started_);
+          UpdateCurrentWriteBatch(record);
+          if (internal && !started_) {
+            started_ = true;
+          }
+          return;
         }
-        return;
       }
     }
 
@@ -365,12 +392,13 @@ Status WalIteratorImpl::OpenLogReader(const WalFile* log_file) {
     return s;
   }
   assert(file);
+  pending_log_reader_read_error_ = false;
   current_log_reader_ = NewWalReader(
       options_->info_log, std::move(file), &reporter_,
       read_options_.verify_checksums_, log_file->LogNumber(),
       /*track_and_verify_wals=*/false, /*stop_replay_for_corruption=*/false,
       std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
-      /*buffered=*/false);
+      /*buffered=*/false, &pending_log_reader_);
   return Status::OK();
 }
 }  // namespace ROCKSDB_NAMESPACE

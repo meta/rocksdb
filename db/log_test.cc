@@ -1275,7 +1275,7 @@ TEST_P(StreamingCompressionTest, Basic) {
     allocator->Deallocate((void*)output_buffer);
   } while (remaining > 0);
   std::string uncompressed_buffer;
-  int ret_val = 0;
+  int64_t ret_val = 0;
   size_t output_pos;
   char* uncompressed_output_buffer = (char*)allocator->Allocate(kBlockSize);
   // Uncompress the fragments and concatenate them.

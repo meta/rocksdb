@@ -455,6 +455,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, use_blog_format_for_wals),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"blog_wal_streaming_compression",
+         {offsetof(struct ImmutableDBOptions, blog_wal_streaming_compression),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"use_blog_format_for_blobs",
          {offsetof(struct ImmutableDBOptions, use_blog_format_for_blobs),
           OptionType::kBoolean, OptionVerificationType::kNormal,
@@ -873,6 +877,7 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       manual_wal_flush(options.manual_wal_flush),
       wal_compression(options.wal_compression),
       use_blog_format_for_wals(options.use_blog_format_for_wals),
+      blog_wal_streaming_compression(options.blog_wal_streaming_compression),
       use_blog_format_for_blobs(options.use_blog_format_for_blobs),
       blog_checksum(options.blog_checksum),
       blog_timestamp_size(options.blog_timestamp_size),
@@ -1062,6 +1067,8 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    wal_compression);
   ROCKS_LOG_HEADER(log, "      Options.use_blog_format_for_wals: %d",
                    use_blog_format_for_wals);
+  ROCKS_LOG_HEADER(log, "Options.blog_wal_streaming_compression: %d",
+                   blog_wal_streaming_compression);
   ROCKS_LOG_HEADER(log, "    Options.use_blog_format_for_blobs: %d",
                    use_blog_format_for_blobs);
   ROCKS_LOG_HEADER(log, "            Options.blog_checksum: %d", blog_checksum);

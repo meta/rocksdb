@@ -430,11 +430,20 @@ enum class WALRecoveryMode : char {
   // detected during recovery, this mode will refuse to open the DB. Whereas,
   // `kPointInTimeRecovery` will stop recovery just before the corruption since
   // that is a valid point-in-time to which to recover.
+  //
+  // In blog-format WALs, record boundaries are self-identifying, so this mode
+  // distinguishes tail damage from mid-file damage: unreadable data with no
+  // later record boundary is truncated as a tolerable tail and logged, while a
+  // record boundary beyond the damage refuses to open the DB.
   kTolerateCorruptedTailRecords = 0x00,
   // Recover from clean shutdown
   // We don't expect to find any corruption in the WAL
   // Use case : This is ideal for unit tests and rare applications that
   // can require high consistency guarantee
+  // In recycled blog-format WALs, trailing bytes holding no escape sequence of
+  // the current incarnation are stale data from a previous one, so corruption
+  // confined there truncates the log silently even in this mode. Damage to a
+  // record whose escape sequence still identifies this incarnation is reported.
   kAbsoluteConsistency = 0x01,
   // Recover to point-in-time consistency (default)
   // We stop the WAL playback on discovering WAL inconsistency
@@ -446,6 +455,10 @@ enum class WALRecoveryMode : char {
   // possible
   // Use case : Ideal for last ditch effort to recover data or systems that
   // operate with low grade unrelated data
+  // Corruption and I/O errors are ignored: an unreadable device truncates
+  // replay like a torn tail rather than failing the open, matching legacy
+  // WALs. A WAL written in a format this build does not support still fails
+  // the open rather than being treated as the end of the log.
   kSkipAnyCorruptedRecords = 0x03,
 };
 
@@ -1618,17 +1631,36 @@ struct DBOptions {
   // legacy WALs, only ZSTD (= kZSTD) is supported (until streaming support
   // is adapted for other compression types); other types are silently
   // disabled. Blog-format WALs (`use_blog_format_for_wals`) use per-record
-  // block compression instead and support any type accepted by the
-  // compression manager. Compressed WAL records will be read in supported
-  // versions (>= RocksDB 7.4.0 for ZSTD) regardless of this setting when
-  // the WAL is read.
+  // block compression by default and support any type accepted by the
+  // compression manager; see `blog_wal_streaming_compression` for streaming.
+  // Compressed WAL records will be read in supported versions (>= RocksDB
+  // 7.4.0 for ZSTD) regardless of this setting when the WAL is read.
   CompressionType wal_compression = kNoCompression;
 
   // If true, new WAL files use the blog file format instead of the legacy
   // log format. Existing WAL files are readable regardless of this setting.
   //
+  // Not downgrade-safe: a release without blog WAL support reads a blog-format
+  // WAL as a corrupted legacy WAL and, depending on `wal_recovery_mode`, can
+  // open the DB without the writes it holds. Before downgrading to such a
+  // release, set this option to false, flush all column families, and wait
+  // until no blog-format WAL remains in the WAL directory.
+  //
   // Default: false
   bool use_blog_format_for_wals = false;
+
+  // If true, new blog-format WAL files compress WriteBatch records as one
+  // stream per file, so each record can reference data in earlier records,
+  // instead of compressing each record on its own. This usually compresses
+  // small records much better. Requires `use_blog_format_for_wals` to be true
+  // and `wal_compression` to be kZSTD; otherwise DB::Open returns NotSupported.
+  // A record that cannot be decompressed makes the streaming-compressed
+  // records after it in the same file unreadable. Existing WAL files are
+  // readable regardless of this setting, but releases that predate it cannot
+  // read the files it produces.
+  //
+  // Default: false
+  bool blog_wal_streaming_compression = false;
 
   // If true, new blob files use the blog file format instead of the legacy
   // blob log format. The blog format provides context checksums and a
@@ -1641,6 +1673,11 @@ struct DBOptions {
   // Checksum type used for integrity checks within blog format files
   // (both WAL and blob). Uses the same ChecksumType enum as
   // BlockBasedTableOptions::checksum.
+  //
+  // With kNoChecksum, WAL header corruption can be mistaken for a stale
+  // recycled WAL. Recovery can silently skip the entire file and lose its
+  // unflushed writes. This ambiguity is accepted when checksums are disabled
+  // so genuinely stale WALs do not cause an open failure.
   //
   // Default: kXXH3
   ChecksumType blog_checksum = kXXH3;

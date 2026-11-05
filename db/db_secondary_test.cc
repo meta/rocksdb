@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "db/blob/blob_index.h"
+#include "db/blog/blog_format.h"
 #include "db/db_impl/db_impl_secondary.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
@@ -25,10 +26,12 @@
 #include "file/filename.h"
 #include "file/sequence_file_reader.h"
 #include "port/stack_trace.h"
+#include "rocksdb/iostats_context.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "test_util/sync_point.h"
 #include "test_util/testutil.h"
 #include "util/defer.h"
+#include "util/prefix_varint.h"
 #include "utilities/fault_injection_fs.h"
 #include "utilities/merge_operators/string_append/stringappend2.h"
 
@@ -1716,6 +1719,36 @@ TEST_F(DBSecondaryTest, OpenAsSecondaryWALTailing) {
   verify_db_func("new_foo_value_1", "new_bar_value");
 }
 
+TEST_F(DBSecondaryTest, CatchUpDetectsInitiallyEmptyWal) {
+  Options options;
+  options.env = env_;
+  options.wal_compression = kNoCompression;
+  options.use_blog_format_for_wals = false;
+  Reopen(options);
+  std::unique_ptr<WalFile> wal;
+  ASSERT_OK(db_->GetCurrentWalFile(&wal));
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, wal->LogNumber()),
+                             &contents));
+  ASSERT_TRUE(contents.empty());
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(db_->FlushWAL(true));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  std::string value;
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ("value", value);
+  ASSERT_OK(Put("key", "value2"));
+  ASSERT_OK(db_->FlushWAL(true));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ("value2", value);
+}
+
 TEST_F(DBSecondaryTest, CatchUpTailsCurrentWalWhenFutureWalExists) {
   // Goal: secondary catch-up must keep tailing the current WAL even when a
   // higher-number empty WAL is present. This reproduces the async WAL
@@ -1814,6 +1847,161 @@ class DBSecondaryCatchUpFaultTest : public DBSecondaryTestBase {
   std::shared_ptr<FaultInjectionTestFS> fault_fs_;
   std::unique_ptr<Env> fault_env_;
 };
+
+TEST_F(DBSecondaryTest, RecycledWalCatchUpPreservesRecordsAndMergeHistory) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.recycle_log_file_num = 1;
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  options.disable_auto_compactions = true;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator("|");
+  DestroyAndReopen(options);
+  Random rnd(301);
+  ASSERT_OK(Put("big", rnd.RandomString(256 * 1024)));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("seed", "s"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("events", "start"));
+  ASSERT_OK(db_->FlushWAL(true));
+  const uint64_t log_number = dbfull()->TEST_LogfileNumber();
+  uint64_t physical_size = 0;
+  ASSERT_OK(
+      env_->GetFileSize(LogFileName(dbname_, log_number), &physical_size));
+  ASSERT_GT(physical_size, 128 * 1024u);
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  secondary_options.log_readahead_size = 65536;
+  OpenSecondary(secondary_options);
+  VerifySecondaryValue("events", "start");
+  std::string expected = "start";
+  for (int round = 0; round < 4; ++round) {
+    SCOPED_TRACE(round);
+    ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+    const std::string value = rnd.RandomString(40000);
+    ASSERT_OK(Put(Key(round), value));
+    ASSERT_OK(Merge("events", std::to_string(round)));
+    ASSERT_OK(db_->FlushWAL(true));
+    ASSERT_EQ(log_number, dbfull()->TEST_LogfileNumber());
+    ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+    VerifySecondaryValue(Key(round), value);
+    expected += "|" + std::to_string(round);
+    VerifySecondaryValue("events", expected);
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("rotated", "new-wal"));
+  ASSERT_OK(db_->FlushWAL(true));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  VerifySecondaryValue("events", expected);
+  VerifySecondaryValue("rotated", "new-wal");
+  CloseSecondary();
+}
+
+TEST_F(DBSecondaryTest, IdleCatchUpBoundsReadsForLargeIncompleteRecycledWal) {
+  constexpr size_t kPayloadSize = 2 * 1024 * 1024;
+  constexpr size_t kStaleTailSize = 8 * 1024 * 1024;
+  for (bool plausible_trailer : {false, true}) {
+    SCOPED_TRACE(plausible_trailer);
+    Options options = CurrentOptions();
+    options.use_blog_format_for_wals = true;
+    options.wal_compression = kNoCompression;
+    options.recycle_log_file_num = 1;
+    options.write_buffer_size = 64 * 1024 * 1024;
+    options.disable_auto_compactions = true;
+    options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("old", std::string(12 * 1024 * 1024, 's')));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("seed", "s"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("ready", "first"));
+    ASSERT_OK(db_->FlushWAL(true));
+    Options secondary_options = options;
+    secondary_options.max_open_files = -1;
+    secondary_options.log_readahead_size = 65536;
+    OpenSecondary(secondary_options);
+    VerifySecondaryValue("ready", "first");
+
+    const uint64_t log_number = dbfull()->TEST_LogfileNumber();
+    const std::string fname = LogFileName(dbname_, log_number);
+    const std::string value(kPayloadSize, 'b');
+    ASSERT_OK(Put("pending", value));
+    ASSERT_OK(db_->FlushWAL(true));
+    ASSERT_EQ(dbfull()->TEST_LogfileNumber(), log_number);
+    std::string complete;
+    ASSERT_OK(ReadFileToString(env_, fname, &complete));
+    BlogFileHeader header;
+    Slice header_input(complete);
+    ASSERT_OK(header.DecodeFrom(&header_input));
+    ASSERT_TRUE(header.is_recycled());
+    ASSERT_NE(header.checksum_type, kNoChecksum);
+    const size_t value_offset = complete.find(value);
+    ASSERT_NE(value_offset, std::string::npos);
+    const size_t record_offset = complete.rfind(
+        Slice(header.escape_sequence, kBlogEscapeSequenceSize).ToString(),
+        value_offset);
+    ASSERT_NE(record_offset, std::string::npos);
+    const char* length_start =
+        complete.data() + record_offset + kBlogEscapeSequenceSize;
+    uint64_t payload_length = 0;
+    const char* length_end = GetPrefixVarint64Ptr(
+        length_start, complete.data() + complete.size(), &payload_length);
+    ASSERT_NE(length_end, nullptr);
+    ASSERT_GT(length_end - length_start, kBlogCompactVarintMaxBytes);
+    ASSERT_GT(payload_length, kPayloadSize);
+
+    // Keep the authenticated prefix and optionally the current trailer,
+    // while the value still contains bytes from the previous incarnation.
+    const size_t record_end =
+        value_offset + value.size() + kBlogBlockTrailerSize;
+    ASSERT_GE(complete.size(), record_end + kStaleTailSize);
+    std::string incomplete = complete.substr(0, record_end + kStaleTailSize);
+    const size_t stale_bytes =
+        value.size() + (plausible_trailer ? 0 : kBlogBlockTrailerSize);
+    incomplete.replace(value_offset, stale_bytes, stale_bytes, 's');
+    Defer restore_wal(
+        [&] { EXPECT_OK(WriteStringToFile(env_, complete, fname)); });
+    ASSERT_OK(WriteStringToFile(env_, incomplete, fname));
+    ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+    for (int poll = 0; poll < 40; ++poll) {
+      SCOPED_TRACE(poll);
+      const uint64_t bytes_before = get_iostats_context()->bytes_read;
+      ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+      const uint64_t bytes_read =
+          get_iostats_context()->bytes_read - bytes_before;
+      // Each poll re-reads the record and the scan bound, rounded up to the
+      // input window's 32 KiB refill boundary.
+      EXPECT_LT(bytes_read, payload_length + 40 * 1024u);
+      std::string pending;
+      ASSERT_TRUE(
+          db_secondary_->Get(ReadOptions(), "pending", &pending).IsNotFound());
+    }
+    ASSERT_OK(WriteStringToFile(env_, complete, fname));
+    bool caught_up = false;
+    for (int poll = 0; poll < 80 && !caught_up; ++poll) {
+      ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+      std::string pending;
+      Status s = db_secondary_->Get(ReadOptions(), "pending", &pending);
+      ASSERT_TRUE(s.ok() || s.IsNotFound());
+      caught_up = s.ok();
+    }
+    ASSERT_TRUE(caught_up);
+    VerifySecondaryValue("pending", value);
+    CloseSecondary();
+  }
+}
+
+TEST_F(DBSecondaryTest, BlogWalCatchUpAfterOpeningCurrentWal) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.disable_auto_compactions = true;
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+
+  // OpenSecondaryOnWalOnlyPut opens the secondary after a flush has created a
+  // new current WAL, but before that WAL has a write batch to replay.
+  OpenSecondaryOnWalOnlyPut(options, secondary_options);
+  VerifySecondaryValue("foo", "v1");
+}
 
 // A catch-up round can fail after ReadAndApply() has already advanced the
 // column family's log number, here because WAL discovery fails. Later rounds

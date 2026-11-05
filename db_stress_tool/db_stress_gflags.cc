@@ -1563,10 +1563,19 @@ DEFINE_string(wal_compression, "none",
 DEFINE_bool(use_blog_format_for_wals, false,
             "Use blog file format for new WAL files.");
 
+DEFINE_bool(blog_wal_streaming_compression,
+            ROCKSDB_NAMESPACE::Options().blog_wal_streaming_compression,
+            "Sets DB option blog_wal_streaming_compression.");
+
 DEFINE_bool(use_blog_format_for_blobs, false,
             "Use blog file format for new blob files.");
 
 DEFINE_string(blog_checksum, "kXXH3", "Checksum type for blog format files.");
+
+DEFINE_string(wal_recovery_mode, "kPointInTimeRecovery",
+              "WAL recovery mode: kTolerateCorruptedTailRecords, "
+              "kAbsoluteConsistency, kPointInTimeRecovery, or "
+              "kSkipAnyCorruptedRecords.");
 
 DEFINE_uint64(blog_timestamp_size,
               ROCKSDB_NAMESPACE::Options().blog_timestamp_size,

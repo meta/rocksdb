@@ -21,6 +21,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/random.h"
+#include "util/string_util.h"
 #include "utilities/fault_injection_env.h"
 #include "utilities/fault_injection_fs.h"
 
@@ -3816,6 +3817,77 @@ TEST_F(DBErrorHandlingFSTest, BlogWALFileScopedAppendErrorSkipsFailedSeal) {
   verify_recovered_data();
   ASSERT_EQ("default-after", Get(0, "after"));
   ASSERT_EQ("one-after", Get(1, "after"));
+}
+
+namespace {
+// Fails Close() of WAL files while armed, after the wrapped file has closed,
+// so only the close status differs from a clean shutdown.
+class WalCloseErrorFS : public FileSystemWrapper {
+ public:
+  explicit WalCloseErrorFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+  const char* Name() const override { return "WalCloseErrorFS"; }
+
+  IOStatus NewWritableFile(const std::string& fname,
+                           const FileOptions& file_opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override {
+    IOStatus s = target()->NewWritableFile(fname, file_opts, result, dbg);
+    if (s.ok() && EndsWith(fname, ".log")) {
+      result->reset(new WalFile(std::move(*result), this));
+    }
+    return s;
+  }
+
+  std::atomic<bool> fail_close{false};
+  std::atomic<int> failed_closes{0};
+
+ private:
+  class WalFile : public FSWritableFileOwnerWrapper {
+   public:
+    WalFile(std::unique_ptr<FSWritableFile>&& file, WalCloseErrorFS* fs)
+        : FSWritableFileOwnerWrapper(std::move(file)), fs_(fs) {}
+
+    IOStatus Close(const IOOptions& options, IODebugContext* dbg) override {
+      IOStatus s = FSWritableFileOwnerWrapper::Close(options, dbg);
+      if (s.ok() && fs_->fail_close.load()) {
+        fs_->failed_closes.fetch_add(1);
+        return IOStatus::IOError("injected WAL close error");
+      }
+      return s;
+    }
+
+   private:
+    WalCloseErrorFS* const fs_;
+  };
+};
+}  // namespace
+
+// DB::Close() returns the error from closing a legacy WAL file even when
+// flushing its buffer succeeded, as it does for the MANIFEST.
+TEST_F(DBErrorHandlingFSTest, LegacyWALCloseErrorFailsDBClose) {
+  std::shared_ptr<WalCloseErrorFS> fs =
+      std::make_shared<WalCloseErrorFS>(Env::Default()->GetFileSystem());
+  std::unique_ptr<Env> wal_env = NewCompositeEnv(fs);
+  Defer close_db([&] { Close(); });
+  Options options = GetDefaultOptions();
+  options.env = wal_env.get();
+  options.create_if_missing = true;
+  options.avoid_flush_during_shutdown = true;
+  options.use_blog_format_for_wals = false;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+
+  fs->fail_close.store(true);
+  Status close_s = db_->Close();
+  fs->fail_close.store(false);
+  ASSERT_GE(fs->failed_closes.load(), 1);
+  ASSERT_TRUE(close_s.IsIOError()) << close_s.ToString();
+  Close();
+
+  // The write was flushed before the failed close, so it is recovered.
+  Reopen(options);
+  ASSERT_EQ("value", Get("key"));
 }
 
 TEST_F(DBErrorHandlingFSTest, BlogWALCloseFinalizationError) {

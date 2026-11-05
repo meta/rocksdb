@@ -10,6 +10,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 
 #include "memory/memory_allocator_impl.h"
 #include "rocksdb/advanced_compression.h"
@@ -734,8 +735,8 @@ class StreamingUncompress {
   // max_output_len
   // output_size - size of the output buffer
   // Returns -1 for errors, remaining input to be processed otherwise.
-  virtual int Uncompress(const char* input, size_t input_size, char* output,
-                         size_t* output_pos) = 0;
+  virtual int64_t Uncompress(const char* input, size_t input_size, char* output,
+                             size_t* output_pos) = 0;
   static std::unique_ptr<StreamingUncompress> Create(
       CompressionType compression_type, uint32_t compress_format_version,
       size_t max_output_len);
@@ -808,8 +809,8 @@ class ZSTDStreamingUncompress final : public StreamingUncompress {
   ZSTDStreamingUncompress& operator=(const ZSTDStreamingUncompress&) = delete;
   ZSTDStreamingUncompress(ZSTDStreamingUncompress&&) = delete;
   ZSTDStreamingUncompress& operator=(ZSTDStreamingUncompress&&) = delete;
-  int Uncompress(const char* input, size_t input_size, char* output,
-                 size_t* output_size) override;
+  int64_t Uncompress(const char* input, size_t input_size, char* output,
+                     size_t* output_size) override;
   void Reset() override;
 
  private:

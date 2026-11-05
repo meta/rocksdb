@@ -220,6 +220,8 @@
   [padding: 0+ B]</div>
 <p>The <code>prefix_checksum</code> covers (prefix_varint + type + compression_type), with a context checksum modifier for defense-in-depth. Validates the length before attempting a potentially large read. The pre-payload <code>compression_type</code> enables streaming decompression without seeking to the trailer.</p>
 
+<div class="note"><strong>Known risk: unverified full-format lengths.</strong> A full-format length is trusted only when its <code>prefix_checksum</code> is verified, which needs both a checksummed file (<code>blog_checksum</code> other than <code>kNoChecksum</code>) and a reader that verifies checksums. WAL recovery, <code>RepairDB</code>, and <code>ldb</code> always verify; a <code>GetUpdatesSince</code> iterator verifies only when <code>WalIterator::ReadOptions::verify_checksums_</code> is true (the default). Otherwise a corrupted length is taken as written: the sequential reader keeps reading and retaining file data until it has the claimed number of bytes or reaches the end of the file, and only then reports the record as incomplete or corrupt. One such record can therefore hold up to about twice the remaining size of the file in memory, rather than one record's worth, and on a very large file the allocation can fail. Choosing <code>kNoChecksum</code> for WALs accepts this risk.</div>
+
 <p>Records that don't match the compact_record_type (e.g. footer records) always use full format by encoding the prefix varint with &ge; 3 bytes (irregular encoding), but length 0 is disallowed and must use the trivial record format.</p>
 
 <p>All checksums in blog files (fixed header, property section trailer, record prefix, record trailer) use context checksum modifiers incorporating the incarnation ID, providing defense-in-depth for misplaced data detection even with <code>kNoChecksum</code>.</p>
@@ -259,6 +261,12 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
 
 <p>Padding may be arbitrarily long for stronger alignment requirements (for example, rounding up to 512-byte or 4 KiB flush/sync-friendly boundaries) or for recycling a file of all zeros. The reader skips padding by scanning forward over 0x00/0xFF bytes in 4-byte-aligned chunks until finding a byte that is neither, which is the first byte of the next escape sequence (guaranteed to be neither 0x00 nor 0xFF).</p>
 
+<div class="decision" id="padding-scan-deferral">
+<strong>Decision deferred: bounding WAL padding scans.</strong>
+<p>The unbounded scan and buffering cost of long padding runs, including zero-filled recycled WAL tails, follows directly from the decision to permit arbitrary padding. Supporting arbitrary amounts of padding while bounding reader resource use would require a more complex reader implementation.</p>
+<p>A future solution should constrain the quantity of padding bytes the writer is permitted to emit. Selection of that limit and changes to the reader are deferred. No padding bound is currently specified or enforced; arbitrarily long padding remains legal.</p>
+</div>
+
 <!-- ======================================================================= -->
 <h2 id="s6">Context Checksums</h2>
 
@@ -274,7 +282,7 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
 <h2 id="s7">Footer</h2>
 
 <p>The footer is composed of <strong>regular records</strong> using the full record format, maintaining simple forward parsability. A file is cleanly sealed when a valid footer locator record is the last record. Footer records appear in the order listed below.</p>
-<p>On the happy path, format-aware close of an initialized WAL appends the footer, flushes it, trims any stale recycled tail, and closes the file. Closing does not request an additional sync. Crashes, failed finalization, and direct underlying-file closure may leave the WAL unsealed. A WAL truncated after a failed memtable insertion is closed without a footer.</p>
+<p>On the happy path, format-aware close of an initialized WAL appends the footer, flushes it, trims any stale recycled tail, and closes the file. Closing does not request an additional sync. Crashes, failed finalization, and direct underlying-file closure may leave the WAL unsealed. A WAL truncated after a failed memtable insertion is closed without a footer. Because nothing follows the footer, WAL readers treat damage confined to footer records as an unsealed clean end in every recovery mode, once they can tell that the damaged bytes belong to the footer (see the known gap below).</p>
 
 <ol>
   <li><strong>Footer index records</strong> (0xF0): Large metadata like sparse indexes for range queries. Zero or more per file.</li>
@@ -282,6 +290,8 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
   <li><strong>Footer file checksum info</strong> (0xFC): Placeholder for future use. Would contain a dump of the full file checksum state, allowing the file checksum to be inferred from just reading the tail of the file.</li>
   <li><strong>Footer locator record</strong> (0xFF): Must be the <strong>last record</strong>. Contains relative offsets (in 4-byte units) to other footer records, sequential relative to each other in reverse order.</li>
 </ol>
+
+<div class="note"><strong>Known gap: torn footer prefix.</strong> Because close does not sync the footer, a crash after a clean close can keep any prefix of it, even when every record before it was synced. A reader can recognize footer bytes only after the first footer record's full-format prefix (escape sequence, length varint, record type, compression type) is verified by its prefix checksum; with <code>blog_checksum=kNoChecksum</code> it cannot recognize them at all. A tear before that point is indistinguishable from a torn data record, so it is reported as an incomplete tail. <code>kTolerateCorruptedTailRecords</code> and <code>kSkipAnyCorruptedRecords</code> ignore it, and <code>kPointInTimeRecovery</code> reports it and stops replay at the last complete record before it. <code>kAbsoluteConsistency</code> fails <code>DB::Open</code>, which a legacy WAL closed in the same state would not, because a legacy WAL writes nothing at close. Syncing the footer at close would close this gap at the cost of an extra sync per WAL close; whether to do so is a pending decision.</div>
 
 <h3>Footer Locator Payload</h3>
 <pre>[record_type: 1B] [relative_offset_in_4B_units: uint32 LE] ...</pre>
@@ -355,7 +365,7 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
 </tr>
 <tr>
   <td><code>kAbsoluteConsistency</code></td>
-  <td>Error on any failure, including incomplete trailing records. If recycled and no escape sequence found in trailing data, accept as clean end.</td>
+  <td>Error on any failure, including incomplete trailing records. If recycled and no escape sequence found in trailing data, accept as clean end. Trailing bytes too few to hold an escape sequence count as none found, even when they match a prefix of this file's own escape sequence: in a recycled file they cannot be told apart from stale data.</td>
   <td>Distinguishes stale recycled data from corruption.</td>
 </tr>
 <tr>
@@ -365,7 +375,7 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
 </tr>
 <tr>
   <td><code>kPointInTimeRecovery</code> (default)</td>
-  <td>Stop at first inconsistency. Incomplete trailing records tolerated. Recycled trailing data accepted.</td>
+  <td>Stop at first inconsistency. Incomplete trailing records tolerated. Recycled trailing data accepted, but reported as an old record, as in legacy WALs: it can stand where unsynced records were lost, so the next WAL is replayed only if its sequence numbers are contiguous.</td>
   <td>Diagnostic improvement.</td>
 </tr>
 <tr>
@@ -374,6 +384,10 @@ Currently only ZSTD is supported for streaming compression. The <code>WriteBatch
   <td>Essential for record discovery after corruption.</td>
 </tr>
 </table>
+
+<p><code>ldb dump_wal</code> and <code>RepairDB</code> read blog and legacy WALs in different modes so that both get every readable record. The legacy reader in <code>kTolerateCorruptedTailRecords</code> reports a corrupted record and keeps reading to the end of the file, and it stops quietly at a recycled WAL's stale tail. The blog reader in that mode stops at mid-file corruption (see above); only <code>kSkipAnyCorruptedRecords</code> makes it continue past corruption. So these tools keep <code>kTolerateCorruptedTailRecords</code> for legacy WALs, leaving their behavior unchanged, and use <code>kSkipAnyCorruptedRecords</code> for blog WALs. Because a blog WAL header is verified against the log number, <code>ldb dump_wal</code> requires a blog WAL to keep its original <code>NNNNNN.log</code> file name.</p>
+
+<div class="note"><strong>Tailing a live recycled WAL.</strong> A failed record with no later boundary may be a write still in progress over stale bytes, so a tailing reader waits for a later poll instead of reporting corruption. The scan for that boundary stops at the failed record's maximum extent plus 4 KiB of padding: exact for trivial records, the compact maximum for compact records, and the authenticated length for full-format records; otherwise it is unbounded. <strong>Known gap:</strong> trivial and compact lengths are not checksummed, so corruption that makes a larger record's length decode as trivial or compact hides the next boundary, and the tailing reader waits on every poll rather than reporting corruption. This is accepted because the alternative, an unbounded scan after every failed compact record, costs time proportional to the recycled file size on each poll.</div>
 
 <!-- ======================================================================= -->
 <h2 id="s9">WriteBatch Blob Preamble</h2>

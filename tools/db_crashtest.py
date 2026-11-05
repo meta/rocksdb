@@ -557,12 +557,18 @@ default_params = {
     "async_io": lambda: random.choice([0, 1]),
     "wal_compression": lambda: random.choice(["none", "zstd"]),
     "use_blog_format_for_wals": lambda: random.choice([0, 1]),
+    "blog_wal_streaming_compression": lambda: random.choice([0, 1]),
     "use_blog_format_for_blobs": lambda: random.choice([0, 1]),
     "blog_checksum": lambda: random.choice(
         ["kNoChecksum", "kCRC32c", "kxxHash", "kxxHash64", "kXXH3"]
     ),
     "blog_timestamp_size": 0,
     "test_noncanonical_blog": lambda: random.choice([0, 1]),
+    # wal_recovery_mode stays at its default: the expected-state verifier
+    # assumes a kill loses nothing unless sync_fault_injection is on, so it
+    # reports the truncation the other modes are allowed to perform as lost
+    # keys. db_stress accepts --wal_recovery_mode for targeted runs, and
+    # DBWALTest.BlogWal* covers the modes.
     "verify_sst_unique_id_in_manifest": 1,  # always do unique_id verification
     "fast_sst_open": lambda: random.choice([0, 1]),
     "secondary_cache_uri": lambda: random.choice(
@@ -1448,6 +1454,11 @@ def finalize_and_sanitize(src_params):
         dest_params["compression_max_dict_buffer_bytes"] = 0
     if dest_params.get("compression_type") != "zstd":
         dest_params["compression_zstd_max_train_bytes"] = 0
+    if dest_params.get("blog_wal_streaming_compression") and (
+        not dest_params.get("use_blog_format_for_wals")
+        or dest_params.get("wal_compression") != "zstd"
+    ):
+        dest_params["blog_wal_streaming_compression"] = 0
     if dest_params["mmap_read"] == 1:
         dest_params["use_direct_io_for_flush_and_compaction"] = 0
         dest_params["use_direct_reads"] = 0

@@ -73,6 +73,7 @@
 #include "db/wal_reader.h"
 #include "db/write_batch_internal.h"
 #include "file/filename.h"
+#include "file/sequence_file_reader.h"
 #include "file/writable_file_writer.h"
 #include "logging/logging.h"
 #include "options/cf_options.h"
@@ -372,15 +373,30 @@ class Repairer {
                         log_number == kMaxSequenceNumber ? lognum : log_number,
                         static_cast<int>(bytes), s.ToString().c_str());
       }
+      void ToleratedCorruption(
+          size_t bytes, const Status& s,
+          uint64_t log_number = kMaxSequenceNumber) override {
+        ROCKS_LOG_WARN(info_log,
+                       "Log #%" PRIu64 ": dropping %d bytes (tolerated); %s",
+                       log_number == kMaxSequenceNumber ? lognum : log_number,
+                       static_cast<int>(bytes), s.ToString().c_str());
+      }
     };
 
     // Open the log file
     std::string logname = LogFileName(wal_dir, log);
     const auto& fs = env_->GetFileSystem();
+    const FileOptions log_file_options = fs->OptimizeForLogRead(file_options_);
+    bool is_blog_wal = false;
+    Status status =
+        IsBlogFormatWalFile(fs, logname, log_file_options, &is_blog_wal);
+    if (!status.ok()) {
+      return status;
+    }
     std::unique_ptr<SequentialFileReader> lfile_reader;
-    Status status = SequentialFileReader::Create(
-        fs, logname, fs->OptimizeForLogRead(file_options_), &lfile_reader,
-        nullptr /* dbg */, nullptr /* rate limiter */);
+    status = SequentialFileReader::Create(fs, logname, log_file_options,
+                                          &lfile_reader, nullptr /* dbg */,
+                                          nullptr /* rate limiter */);
     if (!status.ok()) {
       return status;
     }
@@ -394,12 +410,13 @@ class Repairer {
     // corruptions cause entire commits to be skipped instead of
     // propagating bad information (like overly large sequence
     // numbers).
+    std::unique_ptr<WalReaderOpenState> pending_open;
     std::unique_ptr<WalReader> reader = NewWalReader(
         db_options_.info_log, std::move(lfile_reader), &reporter,
         true /*enable checksum*/, log, /*track_and_verify_wals=*/false,
         /*stop_replay_for_corruption=*/false,
         std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
-        /*buffered=*/false);
+        /*buffered=*/false, &pending_open);
 
     // Initialize per-column family memtables
     for (auto* cfd : *vset_.GetColumnFamilySet()) {
@@ -414,8 +431,13 @@ class Repairer {
     Slice record;
     WriteBatch batch;
 
+    // See "WAL Recovery Modes" in wiki/blog_format_spec.html for why the
+    // formats need different modes to recover past corrupted records.
+    const WALRecoveryMode read_mode =
+        is_blog_wal ? WALRecoveryMode::kSkipAnyCorruptedRecords
+                    : WALRecoveryMode::kTolerateCorruptedTailRecords;
     int counter = 0;
-    while (reader->ReadRecord(&record, &scratch)) {
+    while (reader && reader->ReadRecord(&record, &scratch, read_mode)) {
       if (record.size() < WriteBatchInternal::kHeader) {
         reporter.Corruption(record.size(),
                             Status::Corruption("log record too small"));

@@ -7,13 +7,16 @@
 
 #include <cinttypes>
 #include <iomanip>
+#include <limits>
 #include <memory>
 
 #include "db/blog/blog_writer.h"
 #include "db/db_test_util.h"
+#include "db/log_format.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
 #include "env/composite_env_wrapper.h"
+#include "file/file_util.h"
 #include "file/filename.h"
 #include "port/stack_trace.h"
 #include "rocksdb/advanced_options.h"
@@ -23,6 +26,7 @@
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/utilities/options_util.h"
+#include "rocksdb/wal_iterator.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -58,6 +62,30 @@ Status GetBlobFiles(Env* env, const std::string& dbname,
   return Status::OK();
 }
 
+struct DumpWalResult {
+  int rc = 0;
+  std::string out;
+  std::string err;
+};
+
+DumpWalResult RunDumpWal(const Options& options, const std::string& wal_path) {
+  const std::string wal_arg = "--walfile=" + wal_path;
+  const char* argv[] = {"./ldb", "dump_wal", wal_arg.c_str()};
+  DumpWalResult result;
+  ::testing::internal::CaptureStdout();
+  ::testing::internal::CaptureStderr();
+  result.rc =
+      LDBCommandRunner::RunCommand(3, argv, options, LDBOptions(), nullptr);
+  result.err = ::testing::internal::GetCapturedStderr();
+  result.out = ::testing::internal::GetCapturedStdout();
+  return result;
+}
+
+bool DumpHasKey(const DumpWalResult& result, const std::string& key) {
+  return result.out.find(Slice(key).ToString(/*hex=*/true)) !=
+         std::string::npos;
+}
+
 }  // namespace
 
 class LdbCmdTest : public testing::Test {
@@ -86,6 +114,133 @@ TEST_F(LdbCmdTest, HelpAndVersion) {
   ASSERT_NE(0, LDBCommandRunner::RunCommand(2, bad, o, lo, nullptr));
 }
 
+TEST_F(LdbCmdTest, DumpPastCorruptedWalRecord) {
+  Options options;
+  options.env = TryLoadCustomOrDefaultEnv();
+  options.create_if_missing = true;
+  options.wal_compression = kNoCompression;
+  const std::string dbname =
+      test::PerThreadDBPath(options.env, "ldb_corrupted_wal_test");
+  for (bool blog : {false, true}) {
+    SCOPED_TRACE(blog ? "blog WAL" : "legacy WAL");
+    options.use_blog_format_for_wals = blog;
+    ASSERT_OK(DestroyDB(dbname, options));
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(options, dbname, &db));
+    ASSERT_OK(db->Put(WriteOptions(), "key1", std::string(1000, 'a')));
+    ASSERT_OK(db->Put(WriteOptions(), "key2", std::string(1000, 'b')));
+    // Put the final record beyond the legacy reader's damaged block.
+    ASSERT_OK(db->Put(WriteOptions(), "filler", std::string(40000, 'f')));
+    ASSERT_OK(db->Put(WriteOptions(), "key3", std::string(1000, 'c')));
+    VectorLogPtr wal_files;
+    ASSERT_OK(db->GetSortedWalFiles(wal_files));
+    ASSERT_EQ(wal_files.size(), 1U);
+    const std::string wal_path = LogFileName(dbname, wal_files[0]->LogNumber());
+    ASSERT_OK(db->Close());
+    db.reset();
+
+    std::string contents;
+    ASSERT_OK(ReadFileToString(options.env, wal_path, &contents));
+    const size_t pos = contents.find(std::string(1000, 'b'));
+    ASSERT_NE(pos, std::string::npos);
+    contents[pos + 500] = 'Z';
+    ASSERT_OK(
+        WriteStringToFile(options.env, contents, wal_path, /*sync=*/true));
+    const DumpWalResult result = RunDumpWal(options, wal_path);
+    EXPECT_EQ(result.rc, 0);
+    EXPECT_TRUE(DumpHasKey(result, "key1"));
+    EXPECT_FALSE(DumpHasKey(result, "key2"));
+    EXPECT_TRUE(DumpHasKey(result, "key3"));
+    ASSERT_OK(DestroyDB(dbname, options));
+  }
+}
+
+TEST_F(LdbCmdTest, DumpRecycledLegacyWalReportsNoCorruption) {
+  Options options;
+  options.env = TryLoadCustomOrDefaultEnv();
+  options.create_if_missing = true;
+  options.recycle_log_file_num = 1;
+  options.wal_compression = kNoCompression;
+  const std::string dbname =
+      test::PerThreadDBPath(options.env, "ldb_recycled_wal_test");
+  ASSERT_OK(DestroyDB(dbname, options));
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname, &db));
+  // Retire WALs holding large records so the current WAL reuses one of them.
+  // The stale tail must extend past the first block, or the legacy reader
+  // reaches EOF and stops quietly in every mode.
+  constexpr size_t kLargeValueSize = 3 * log::kBlockSize;
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(db->Put(WriteOptions(), "large" + std::to_string(i),
+                      std::string(kLargeValueSize, 'x')));
+    ASSERT_OK(db->Flush(FlushOptions()));
+  }
+  ASSERT_OK(db->Put(WriteOptions(), "small", "value"));
+  std::unique_ptr<LogFile> wal;
+  ASSERT_OK(db->GetCurrentWalFile(&wal));
+  const uint64_t wal_number = wal->LogNumber();
+  // Copy before Close, which trims the previous incarnation's stale tail.
+  std::string contents;
+  ASSERT_OK(ReadFileToString(options.env, LogFileName(dbname, wal_number),
+                             &contents));
+  ASSERT_OK(db->Close());
+  db.reset();
+  ASSERT_GT(contents.size(), kLargeValueSize);
+
+  const std::string copy_dir = dbname + "_copy";
+  ASSERT_OK(options.env->CreateDirIfMissing(copy_dir));
+  const std::string copy_path = LogFileName(copy_dir, wal_number);
+  ASSERT_OK(WriteStringToFile(options.env, contents, copy_path));
+  const DumpWalResult result = RunDumpWal(options, copy_path);
+  EXPECT_EQ(result.rc, 0);
+  EXPECT_TRUE(DumpHasKey(result, "small"));
+  EXPECT_EQ(result.err.find("Corruption"), std::string::npos) << result.err;
+
+  ASSERT_OK(options.env->DeleteFile(copy_path));
+  ASSERT_OK(options.env->DeleteDir(copy_dir));
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
+TEST_F(LdbCmdTest, DumpWalWithUnparsableFileName) {
+  Options options;
+  options.env = TryLoadCustomOrDefaultEnv();
+  options.create_if_missing = true;
+  const std::string dbname =
+      test::PerThreadDBPath(options.env, "ldb_unparsable_wal_name_test");
+  // dump_wal accepts any *.log name, but only NNNNNN.log yields a log number.
+  const std::string copy_path =
+      test::PerThreadDBPath(options.env, "ldb_wal_copy") + ".log";
+  for (bool blog : {false, true}) {
+    SCOPED_TRACE(blog ? "blog WAL" : "legacy WAL");
+    options.use_blog_format_for_wals = blog;
+    ASSERT_OK(DestroyDB(dbname, options));
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(options, dbname, &db));
+    ASSERT_OK(db->Put(WriteOptions(), "key1", "value1"));
+    std::unique_ptr<LogFile> wal;
+    ASSERT_OK(db->GetCurrentWalFile(&wal));
+    std::string contents;
+    ASSERT_OK(ReadFileToString(
+        options.env, LogFileName(dbname, wal->LogNumber()), &contents));
+    ASSERT_OK(db->Close());
+    db.reset();
+    ASSERT_OK(WriteStringToFile(options.env, contents, copy_path));
+
+    const DumpWalResult result = RunDumpWal(options, copy_path);
+    if (blog) {
+      EXPECT_NE(result.rc, 0);
+      EXPECT_NE(result.err.find("Cannot determine the log number"),
+                std::string::npos)
+          << result.err;
+    } else {
+      EXPECT_EQ(result.rc, 0);
+      EXPECT_TRUE(DumpHasKey(result, "key1"));
+    }
+    ASSERT_OK(options.env->DeleteFile(copy_path));
+    ASSERT_OK(DestroyDB(dbname, options));
+  }
+}
+
 TEST_F(LdbCmdTest, HexToString) {
   // map input to expected outputs.
   // odd number of "hex" half bytes doesn't make sense
@@ -103,6 +258,95 @@ TEST_F(LdbCmdTest, HexToString) {
     auto reverse = ROCKSDB_NAMESPACE::LDBCommand::StringToHex(actual);
     EXPECT_STRCASEEQ(inPair.first.c_str(), reverse.c_str());
   }
+}
+
+TEST_F(LdbCmdTest, RebindOptionsFileWithWals) {
+  Options opts;
+  opts.env = TryLoadCustomOrDefaultEnv();
+  opts.create_if_missing = true;
+  opts.track_options_file_number_in_manifest = true;
+  opts.WAL_ttl_seconds = 86400;
+  const std::string dbname = test::PerThreadDBPath(opts.env, "ldb_rebind_test");
+  for (bool blog : {false, true}) {
+    for (bool archive : {false, true}) {
+      SCOPED_TRACE(blog ? "blog WAL" : "legacy WAL");
+      SCOPED_TRACE(archive ? "archived WAL" : "live WAL");
+      opts.use_blog_format_for_wals = blog;
+      ASSERT_OK(DestroyDB(dbname, opts));
+      std::unique_ptr<DB> db;
+      ASSERT_OK(DB::Open(opts, dbname, &db));
+      WriteBatch batch;
+      ASSERT_OK(batch.Put("key1", "value1"));
+      ASSERT_OK(batch.Put("key2", "value2"));
+      ASSERT_OK(batch.Put("key3", "value3"));
+      ASSERT_OK(db->Write(WriteOptions(), &batch));
+      // Keep corruption before an intact record, including unsealed WALs.
+      ASSERT_OK(db->Put(WriteOptions(), "tail", "tail-value"));
+      VectorLogPtr wals;
+      ASSERT_OK(db->GetSortedWalFiles(wals));
+      ASSERT_EQ(1U, wals.size());
+      const uint64_t wal_number = wals.front()->LogNumber();
+      if (archive) {
+        FlushOptions flush_options;
+        flush_options.wait = true;
+        ASSERT_OK(db->Flush(flush_options));
+      }
+      ASSERT_OK(db->Close());
+      db.reset();
+      const std::string wal_path = archive
+                                       ? ArchivedLogFileName(dbname, wal_number)
+                                       : LogFileName(dbname, wal_number);
+      ASSERT_OK(opts.env->FileExists(wal_path));
+      ASSERT_OK(WriteStringToFile(opts.env, "",
+                                  LogFileName(dbname, wal_number + 1000)));
+      std::string selected_options;
+      ASSERT_OK(GetLatestOptionsFileName(dbname, opts.env, &selected_options));
+      const std::string db_arg = "--db=" + dbname;
+      const std::string options_arg = "--options_file=" + selected_options;
+      const char* argv[] = {"./ldb", "update_manifest", db_arg.c_str(),
+                            "--rebind_options_file", options_arg.c_str()};
+
+      // Leave room for only two WAL entries; this WAL contains four.
+      constexpr uint64_t kWritableOpenHeadroom =
+          3 * uint64_t{std::numeric_limits<uint32_t>::max()} + 16;
+      const std::string boundary_file =
+          OptionsFileName(dbname, kFileNumberMask - kWritableOpenHeadroom - 6);
+      ASSERT_OK(WriteStringToFile(opts.env, "", boundary_file));
+      ::testing::internal::CaptureStderr();
+      const int boundary_rc =
+          LDBCommandRunner::RunCommand(5, argv, opts, LDBOptions(), nullptr);
+      const std::string error = ::testing::internal::GetCapturedStderr();
+      ASSERT_NE(0, boundary_rc);
+      ASSERT_NE(std::string::npos, error.find("File number space exhausted"))
+          << error;
+      ASSERT_OK(opts.env->DeleteFile(boundary_file));
+
+      ASSERT_EQ(0, LDBCommandRunner::RunCommand(5, argv, opts, LDBOptions(),
+                                                nullptr));
+      std::string wal_contents;
+      ASSERT_OK(ReadFileToString(opts.env, wal_path, &wal_contents));
+      std::string corrupted_wal = wal_contents;
+      const size_t value_offset = corrupted_wal.find("value3");
+      ASSERT_NE(std::string::npos, value_offset);
+      corrupted_wal[value_offset] ^= 1;
+      ASSERT_OK(WriteStringToFile(opts.env, corrupted_wal, wal_path));
+      ::testing::internal::CaptureStderr();
+      const int corrupt_rc =
+          LDBCommandRunner::RunCommand(5, argv, opts, LDBOptions(), nullptr);
+      const std::string corrupt_error =
+          ::testing::internal::GetCapturedStderr();
+      ASSERT_NE(0, corrupt_rc);
+      ASSERT_NE(std::string::npos, corrupt_error.find("Corruption"))
+          << corrupt_error;
+      ASSERT_OK(WriteStringToFile(opts.env, wal_contents, wal_path));
+      ASSERT_OK(DB::Open(opts, dbname, &db));
+      std::string value;
+      ASSERT_OK(db->Get(ReadOptions(), "key3", &value));
+      ASSERT_EQ("value3", value);
+      ASSERT_OK(db->Close());
+    }
+  }
+  ASSERT_OK(DestroyDB(dbname, opts));
 }
 
 TEST_F(LdbCmdTest, HexToStringBadInputs) {

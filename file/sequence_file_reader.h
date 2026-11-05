@@ -57,6 +57,13 @@ class SequentialFileReader {
   std::vector<std::shared_ptr<EventListener>> listeners_{};
   RateLimiter* rate_limiter_;
   bool verify_and_reconstruct_read_;
+  struct ReopenOptions {
+    std::shared_ptr<FileSystem> fs;
+    FileOptions file_options;
+    size_t readahead_size;
+    std::shared_ptr<IOTracer> io_tracer;
+  };
+  std::unique_ptr<ReopenOptions> reopen_options_;
 
  public:
   explicit SequentialFileReader(
@@ -115,6 +122,17 @@ class SequentialFileReader {
                 Env::IOPriority rate_limiter_priority);
 
   IOStatus Skip(uint64_t n);
+
+  // Enables repositioning through a fresh file handle, including fresh
+  // read-ahead buffers. The supplied options must match the original open.
+  // Whether and when to reposition is decided by the reader using this file,
+  // not here.
+  void SetReopenOptions(const std::shared_ptr<FileSystem>& fs,
+                        const FileOptions& file_options, size_t readahead_size,
+                        const std::shared_ptr<IOTracer>& io_tracer);
+  bool CanReopen() const { return reopen_options_ != nullptr; }
+  IOStatus ReopenAt(uint64_t offset,
+                    std::unique_ptr<SequentialFileReader>* reader) const;
 
   FSSequentialFile* file() { return file_.get(); }
 

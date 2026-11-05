@@ -87,6 +87,7 @@ struct ImmutableDBOptions {
   bool manual_wal_flush;
   CompressionType wal_compression;
   bool use_blog_format_for_wals;
+  bool blog_wal_streaming_compression;
   bool use_blog_format_for_blobs;
   ChecksumType blog_checksum;
   size_t blog_timestamp_size;

@@ -515,6 +515,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "manual_wal_flush=false;"
       "wal_compression=kZSTD;"
       "use_blog_format_for_wals=false;"
+      "blog_wal_streaming_compression=true;"
       "use_blog_format_for_blobs=false;"
       "blog_checksum=kXXH3;"
       "blog_timestamp_size=8;"

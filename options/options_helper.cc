@@ -260,6 +260,8 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
   options.wal_compression = immutable_db_options.wal_compression;
   options.use_blog_format_for_wals =
       immutable_db_options.use_blog_format_for_wals;
+  options.blog_wal_streaming_compression =
+      immutable_db_options.blog_wal_streaming_compression;
   options.use_blog_format_for_blobs =
       immutable_db_options.use_blog_format_for_blobs;
   options.blog_checksum = immutable_db_options.blog_checksum;

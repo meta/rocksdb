@@ -7279,6 +7279,7 @@ void InitializeOptionsFromFlags(
   options.wal_compression =
       StringToCompressionType(FLAGS_wal_compression.c_str());
   options.use_blog_format_for_wals = FLAGS_use_blog_format_for_wals;
+  options.blog_wal_streaming_compression = FLAGS_blog_wal_streaming_compression;
   options.use_blog_format_for_blobs = FLAGS_use_blog_format_for_blobs;
   // Parse blog_checksum from string. Use the options system for correct
   // handling of all ChecksumType values.
@@ -7290,6 +7291,16 @@ void InitializeOptionsFromFlags(
                            "blog_checksum=" + FLAGS_blog_checksum, &tmp_opts)
         .PermitUncheckedError();
     options.blog_checksum = tmp_opts.blog_checksum;
+  }
+  {
+    ConfigOptions config_options;
+    config_options.ignore_unknown_options = true;
+    DBOptions tmp_opts;
+    GetDBOptionsFromString(config_options, tmp_opts,
+                           "wal_recovery_mode=" + FLAGS_wal_recovery_mode,
+                           &tmp_opts)
+        .PermitUncheckedError();
+    options.wal_recovery_mode = tmp_opts.wal_recovery_mode;
   }
   options.blog_timestamp_size =
       lossless_cast<size_t>(FLAGS_blog_timestamp_size);

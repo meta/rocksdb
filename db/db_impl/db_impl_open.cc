@@ -255,6 +255,19 @@ Status DBImpl::ValidateOptions(
 }
 
 Status DBImpl::ValidateOptions(const DBOptions& db_options) {
+  if (db_options.blog_wal_streaming_compression &&
+      !db_options.use_blog_format_for_wals) {
+    return Status::NotSupported(
+        "blog_wal_streaming_compression requires "
+        "use_blog_format_for_wals=true");
+  }
+
+  if (db_options.blog_wal_streaming_compression &&
+      db_options.wal_compression != kZSTD) {
+    return Status::NotSupported(
+        "blog_wal_streaming_compression requires wal_compression=kZSTD");
+  }
+
   if (db_options.read_io_executor_threads <= 0) {
     return Status::InvalidArgument(
         "read_io_executor_threads must be greater than zero");
@@ -1233,6 +1246,25 @@ void DBOpenLogRecordReadReporter::Corruption(size_t bytes, const Status& s,
   }
 }
 
+void DBOpenLogRecordReadReporter::UnrecoverableError(size_t bytes,
+                                                     const Status& s,
+                                                     uint64_t log_number) {
+  ROCKS_LOG_ERROR(info_log, "%s: cannot read %d bytes; %s", fname,
+                  static_cast<int>(bytes), s.ToString().c_str());
+  if (unrecoverable_status != nullptr && unrecoverable_status->ok()) {
+    *unrecoverable_status = s;
+    corrupted_wal_number_ = log_number;
+    has_unrecoverable_error_ = true;
+  }
+}
+
+void DBOpenLogRecordReadReporter::ToleratedCorruption(size_t bytes,
+                                                      const Status& s,
+                                                      uint64_t /*log_number*/) {
+  ROCKS_LOG_WARN(info_log, "%s: dropping %d bytes (tolerated); %s", fname,
+                 static_cast<int>(bytes), s.ToString().c_str());
+}
+
 void DBOpenLogRecordReadReporter::OldLogRecord(size_t bytes) {
   if (old_log_record != nullptr) {
     *old_log_record = true;
@@ -1407,16 +1439,18 @@ Status DBImpl::ProcessLogFile(
   // detection.
   TEST_SYNC_POINT_CALLBACK("DBImpl::RecoverLogFiles:BeforeReadWal",
                            /*cb_arg=*/nullptr);
+  bool open_error_ignored = false;
   Status init_status = InitializeLogReader(
       wal_number, is_retry, fname, *stop_replay_for_corruption, min_wal_number,
-      predecessor_wal_info, &old_log_record, &status, &reporter, reader);
+      predecessor_wal_info, &old_log_record, &status, &reporter,
+      &open_error_ignored, reader);
 
   // FIXME(hx235): Consolidate `!init_status.ok()` and `reader == nullptr` cases
   if (!init_status.ok()) {
     assert(status.ok());
     status.PermitUncheckedError();
     return init_status;
-  } else if (reader == nullptr) {
+  } else if (open_error_ignored) {
     // TODO(hx235): remove this case since it's confusing
     assert(status.ok());
     // Fail initializing log reader for one log file with an ok status.
@@ -1424,7 +1458,7 @@ Status DBImpl::ProcessLogFile(
     return status;
   }
 
-  while (true) {
+  while (reader) {
     if (*stop_replay_by_wal_filter) {
       break;
     }
@@ -1497,10 +1531,12 @@ Status DBImpl::InitializeLogReader(
     bool stop_replay_for_corruption, uint64_t min_wal_number,
     const PredecessorWALInfo& predecessor_wal_info, bool* const old_log_record,
     Status* const reporter_status, DBOpenLogRecordReadReporter* reporter,
-    std::unique_ptr<WalReader>& reader) {
+    bool* const open_error_ignored, std::unique_ptr<WalReader>& reader) {
   assert(old_log_record);
   assert(reporter_status);
   assert(reporter);
+  assert(open_error_ignored);
+  *open_error_ignored = false;
 
   Status status;
 
@@ -1511,6 +1547,7 @@ Status DBImpl::InitializeLogReader(
         fname, fs_->OptimizeForLogRead(file_options_), &file, nullptr);
     if (!status.ok()) {
       MaybeIgnoreError(&status);
+      *open_error_ignored = status.ok();
       return status;
     }
     file_reader.reset(new SequentialFileReader(
@@ -1524,6 +1561,9 @@ Status DBImpl::InitializeLogReader(
   reporter->info_log = immutable_db_options_.info_log.get();
   reporter->fname = fname.c_str();
   reporter->old_log_record = old_log_record;
+  // Unsupported formats and I/O errors are surfaced regardless of the
+  // corruption-tolerance settings applied to `status` below.
+  reporter->unrecoverable_status = reporter_status;
   if (!immutable_db_options_.paranoid_checks ||
       immutable_db_options_.wal_recovery_mode ==
           WALRecoveryMode::kSkipAnyCorruptedRecords) {
@@ -1535,11 +1575,12 @@ Status DBImpl::InitializeLogReader(
   // paranoid_checks==false so that corruptions cause entire commits
   // to be skipped instead of propagating bad information (like overly
   // large sequence numbers).
-  reader = NewWalReader(immutable_db_options_.info_log, std::move(file_reader),
-                        reporter, true /*checksum*/, wal_number,
-                        immutable_db_options_.track_and_verify_wals,
-                        stop_replay_for_corruption, min_wal_number,
-                        predecessor_wal_info, /*buffered=*/false);
+  std::unique_ptr<WalReaderOpenState> pending_open;
+  reader = NewWalReader(
+      immutable_db_options_.info_log, std::move(file_reader), reporter,
+      true /*checksum*/, wal_number,
+      immutable_db_options_.track_and_verify_wals, stop_replay_for_corruption,
+      min_wal_number, predecessor_wal_info, /*buffered=*/false, &pending_open);
   return status;
 }
 
@@ -1797,17 +1838,27 @@ Status DBImpl::HandleNonOkStatusOrOldLogRecord(
       WALRecoveryMode::kSkipAnyCorruptedRecords) {
     // We should ignore all errors unconditionally
     return Status::OK();
-  } else if (immutable_db_options_.wal_recovery_mode ==
-             WALRecoveryMode::kPointInTimeRecovery) {
-    if (status.IsIOError()) {
+  }
+
+  if (status.IsIOError()) {
+    if (!immutable_db_options_.paranoid_checks &&
+        reporter.HasUnrecoverableError()) {
+      return Status::OK();
+    }
+    if (immutable_db_options_.wal_recovery_mode ==
+        WALRecoveryMode::kPointInTimeRecovery) {
       ROCKS_LOG_ERROR(immutable_db_options_.info_log,
                       "IOError during point-in-time reading log #%" PRIu64
                       " seq #%" PRIu64
                       ". %s. This likely mean loss of synced WAL, "
                       "thus recovery fails.",
                       wal_number, *next_sequence, status.ToString().c_str());
-      return status;
     }
+    return status;
+  }
+
+  if (immutable_db_options_.wal_recovery_mode ==
+      WALRecoveryMode::kPointInTimeRecovery) {
     // We should ignore the error but not continue replaying
     *old_log_record = false;
     *stop_replay_for_corruption = true;
@@ -2551,10 +2602,10 @@ IOStatus DBImpl::CreateWALWriter(const DBOptions& db_options,
       new_wal->writer = std::make_unique<BlogWalWriter>(
           std::move(file_writer), log_file_num, is_recycled,
           db_options.manual_wal_flush, db_options.wal_compression,
-          /*use_streaming_compression=*/false, db_options.track_and_verify_wals,
-          db_options.blog_checksum, db_options.blog_timestamp_size, db_id_,
-          db_session_id_, db_options.db_host_id,
-          lossless_cast<uint64_t>(current_time));
+          db_options.blog_wal_streaming_compression,
+          db_options.track_and_verify_wals, db_options.blog_checksum,
+          db_options.blog_timestamp_size, db_id_, db_session_id_,
+          db_options.db_host_id, lossless_cast<uint64_t>(current_time));
     } else {
       // Deliberately still DB-wide: log::Writer needs recyclable record types
       // in every WAL (even fresh ones) so a later reuse stays detectable.

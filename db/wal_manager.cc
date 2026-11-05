@@ -343,8 +343,10 @@ Status WalManager::GetSortedWalsOfType(const std::string& path,
     FileType type;
     if (ParseFileName(f, &number, &type) && type == kWalFile) {
       SequenceNumber sequence;
+      bool start_sequence_is_placeholder = false;
       if (need_seqnos) {
-        Status s = ReadFirstRecord(log_type, number, &sequence);
+        Status s = ReadFirstRecord(log_type, number, &sequence,
+                                   &start_sequence_is_placeholder);
         if (!s.ok()) {
           return s;
         }
@@ -380,8 +382,9 @@ Status WalManager::GetSortedWalsOfType(const std::string& path,
         return s;
       }
 
-      log_files.emplace_back(
-          new WalFileImpl(number, log_type, sequence, size_bytes));
+      log_files.emplace_back(new WalFileImpl(number, log_type, sequence,
+                                             start_sequence_is_placeholder,
+                                             size_bytes));
     }
   }
   std::sort(
@@ -396,13 +399,26 @@ Status WalManager::GetSortedWalsOfType(const std::string& path,
 
 Status WalManager::RetainProbableWalFiles(VectorWalPtr& all_logs,
                                           const SequenceNumber target) {
+  // A placeholder start sequence is not ordered with the real ones around it,
+  // so search only files with a real start sequence.
+  std::vector<size_t> searchable;
+  searchable.reserve(all_logs.size());
+  for (size_t i = 0; i < all_logs.size(); ++i) {
+    if (!static_cast_with_check<WalFileImpl>(all_logs[i].get())
+             ->StartSequenceIsPlaceholder()) {
+      searchable.push_back(i);
+    }
+  }
+  if (searchable.empty()) {
+    return Status::OK();
+  }
   int64_t start = 0;  // signed to avoid overflow when target is < first file.
-  int64_t end = static_cast<int64_t>(all_logs.size()) - 1;
+  int64_t end = static_cast<int64_t>(searchable.size()) - 1;
   // Binary Search. avoid opening all files.
   while (end >= start) {
     int64_t mid = start + (end - start) / 2;  // Avoid overflow.
     SequenceNumber current_seq_num =
-        all_logs.at(static_cast<size_t>(mid))->StartSequence();
+        all_logs.at(searchable.at(static_cast<size_t>(mid)))->StartSequence();
     if (current_seq_num == target) {
       end = mid;
       break;
@@ -413,8 +429,8 @@ Status WalManager::RetainProbableWalFiles(VectorWalPtr& all_logs,
     }
   }
   // end could be -ve.
-  size_t start_index =
-      static_cast<size_t>(std::max(static_cast<int64_t>(0), end));
+  size_t start_index = searchable.at(
+      static_cast<size_t>(std::max(static_cast<int64_t>(0), end)));
   // The last wal file is always included
   all_logs.erase(all_logs.begin(), all_logs.begin() + start_index);
   return Status::OK();
@@ -422,8 +438,10 @@ Status WalManager::RetainProbableWalFiles(VectorWalPtr& all_logs,
 
 Status WalManager::ReadFirstRecord(const WalFileType type,
                                    const uint64_t number,
-                                   SequenceNumber* sequence) {
+                                   SequenceNumber* sequence,
+                                   bool* start_sequence_is_placeholder) {
   *sequence = 0;
+  *start_sequence_is_placeholder = false;
   if (type != kAliveLogFile && type != kArchivedLogFile) {
     ROCKS_LOG_ERROR(db_options_.info_log, "[WalManger] Unknown file type %s",
                     std::to_string(type).c_str());
@@ -440,7 +458,7 @@ Status WalManager::ReadFirstRecord(const WalFileType type,
   Status s;
   if (type == kAliveLogFile) {
     std::string fname = LogFileName(wal_dir_, number);
-    s = ReadFirstLine(fname, number, sequence);
+    s = ReadFirstLine(fname, number, sequence, start_sequence_is_placeholder);
     if (!s.ok() && env_->FileExists(fname).ok()) {
       // return any error that is not caused by non-existing file
       return s;
@@ -450,7 +468,8 @@ Status WalManager::ReadFirstRecord(const WalFileType type,
   if (type == kArchivedLogFile || !s.ok()) {
     //  check if the file got moved to archive.
     std::string archived_file = ArchivedLogFileName(wal_dir_, number);
-    s = ReadFirstLine(archived_file, number, sequence);
+    s = ReadFirstLine(archived_file, number, sequence,
+                      start_sequence_is_placeholder);
     // maybe the file was deleted from archive dir. If that's the case, return
     // Status::OK(). The caller with identify this as empty file because
     // *sequence == 0
@@ -459,7 +478,7 @@ Status WalManager::ReadFirstRecord(const WalFileType type,
     }
   }
 
-  if (s.ok() && *sequence != 0) {
+  if (s.ok() && *sequence != 0 && !*start_sequence_is_placeholder) {
     MutexLock l(&read_first_record_cache_mutex_);
     read_first_record_cache_.insert({number, *sequence});
   }
@@ -487,7 +506,7 @@ Status WalManager::GetLiveWalFile(uint64_t number,
 
   log_file->reset(new WalFileImpl(number, kAliveLogFile,
                                   0,  // SequenceNumber
-                                  size_bytes));
+                                  /*startSeqIsPlaceholder=*/false, size_bytes));
 
   return Status::OK();
 }
@@ -496,7 +515,9 @@ Status WalManager::GetLiveWalFile(uint64_t number,
 // empty
 Status WalManager::ReadFirstLine(const std::string& fname,
                                  const uint64_t number,
-                                 SequenceNumber* sequence) {
+                                 SequenceNumber* sequence,
+                                 bool* start_sequence_is_placeholder) {
+  *start_sequence_is_placeholder = false;
   struct LogReporter : public log::Reader::Reporter {
     Env* env;
     Logger* info_log;
@@ -513,6 +534,13 @@ Status WalManager::ReadFirstLine(const std::string& fname,
         // only keep the first error
         *this->status = s;
       }
+    }
+    void ToleratedCorruption(
+        size_t bytes, const Status& s,
+        uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+      ROCKS_LOG_WARN(info_log,
+                     "[WalManager] %s: dropping %d bytes (tolerated); %s",
+                     fname, static_cast<int>(bytes), s.ToString().c_str());
     }
   };
 
@@ -532,16 +560,17 @@ Status WalManager::ReadFirstLine(const std::string& fname,
   reporter.fname = fname.c_str();
   reporter.status = &status;
   reporter.ignore_error = !db_options_.paranoid_checks;
+  std::unique_ptr<WalReaderOpenState> pending_open;
   std::unique_ptr<WalReader> reader =
       NewWalReader(db_options_.info_log, std::move(file_reader), &reporter,
                    true /*checksum*/, number, /*track_and_verify_wals=*/false,
                    /*stop_replay_for_corruption=*/false,
                    std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
-                   /*buffered=*/false);
+                   /*buffered=*/false, &pending_open);
   std::string scratch;
   Slice record;
 
-  if (reader->ReadRecord(&record, &scratch) &&
+  if (reader && reader->ReadRecord(&record, &scratch) &&
       (status.ok() || !db_options_.paranoid_checks)) {
     if (record.size() < WriteBatchInternal::kHeader) {
       reporter.Corruption(record.size(),
@@ -559,14 +588,16 @@ Status WalManager::ReadFirstLine(const std::string& fname,
     }
   }
 
-  if (status.ok() && reader->IsCompressedAndEmptyFile()) {
+  if (status.ok() && reader && reader->IsCompressedAndEmptyFile()) {
     // In case of wal_compression, it writes a `kSetCompressionType` record
-    // which is not associated with any sequence number. As result for an empty
+    // which is not associated with any sequence number; a blog-format WAL
+    // starts with a header. As result for an otherwise empty
     // file, GetSortedWalsOfType() will skip these WALs causing the operations
     // to fail.
     // Therefore, in order to avoid that failure, it sets sequence_number to 1
     // indicating those WALs should be included.
     *sequence = 1;
+    *start_sequence_is_placeholder = true;
   } else {
     // ReadRecord might have returned false on EOF, which means that the log
     // file is empty. Or, a failure may have occurred while processing the first

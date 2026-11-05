@@ -348,8 +348,9 @@ void ZSTDStreamingCompress::Reset() {
 #endif
 }
 
-int ZSTDStreamingUncompress::Uncompress(const char* input, size_t input_size,
-                                        char* output, size_t* output_pos) {
+int64_t ZSTDStreamingUncompress::Uncompress(const char* input,
+                                            size_t input_size, char* output,
+                                            size_t* output_pos) {
   assert(output != nullptr && output_pos != nullptr);
   *output_pos = 0;
   // Don't need to uncompress an empty input
@@ -368,7 +369,10 @@ int ZSTDStreamingUncompress::Uncompress(const char* input, size_t input_size,
     return -1;
   }
   *output_pos = output_buffer.pos;
-  return (int)(input_buffer_.size - input_buffer_.pos);
+  size_t remaining_input = input_buffer_.size - input_buffer_.pos;
+  TEST_SYNC_POINT_CALLBACK("ZSTDStreamingUncompress::Uncompress:RemainingInput",
+                           &remaining_input);
+  return lossless_cast<int64_t>(remaining_input);
 #else
   (void)input;
   (void)input_size;

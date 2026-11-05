@@ -367,7 +367,8 @@ Status DBImplSecondary::MaybeInitLogReader(uint64_t log_number,
   auto iter = log_readers_.find(log_number);
   // make sure the log file is still present
   if (iter == log_readers_.end() ||
-      iter->second->reader_->GetLogNumber() != log_number) {
+      (iter->second->reader_ &&
+       iter->second->reader_->GetLogNumber() != log_number)) {
     // delete the obsolete log reader if log number mismatch
     if (iter != log_readers_.end()) {
       log_readers_.erase(iter);
@@ -393,6 +394,9 @@ Status DBImplSecondary::MaybeInitLogReader(uint64_t log_number,
       file_reader.reset(new SequentialFileReader(
           std::move(file), fname, immutable_db_options_.log_readahead_size,
           io_tracer_));
+      file_reader->SetReopenOptions(
+          immutable_db_options_.fs, fs_->OptimizeForLogRead(file_options_),
+          immutable_db_options_.log_readahead_size, io_tracer_);
     }
 
     // Create the log reader.
@@ -401,10 +405,15 @@ Status DBImplSecondary::MaybeInitLogReader(uint64_t log_number,
         std::move(file_reader), log_number);
     log_readers_.insert(std::make_pair(
         log_number, std::unique_ptr<LogReaderContainer>(log_reader_container)));
+  } else if (iter->second->pending_open_) {
+    if (iter->second->pending_open_->TryOpen(&iter->second->reader_) ==
+        WalReaderOpenState::Result::kReady) {
+      iter->second->pending_open_.reset();
+    }
   }
   iter = log_readers_.find(log_number);
   assert(iter != log_readers_.end());
-  *log_reader = iter->second->reader_;
+  *log_reader = iter->second->reader_.get();
   return Status::OK();
 }
 
@@ -424,7 +433,6 @@ Status DBImplSecondary::RecoverLogFiles(
     if (!status.ok()) {
       return status;
     }
-    assert(reader != nullptr);
   }
 
   DeleteResolvedRecoveredTransactions();
@@ -434,7 +442,7 @@ Status DBImplSecondary::RecoverLogFiles(
   for (auto log_number : log_numbers) {
     auto it = log_readers_.find(log_number);
     assert(it != log_readers_.end());
-    WalReader* reader = it->second->reader_;
+    WalReader* reader = it->second->reader_.get();
     Status* wal_read_status = it->second->status_;
     assert(wal_read_status);
     // Manually update the file number allocation counter in VersionSet.
@@ -450,7 +458,8 @@ Status DBImplSecondary::RecoverLogFiles(
     // set constructed there would allocate again for every record.
     std::unordered_set<uint32_t> selected_cf_ids;
 
-    while (reader->ReadRecord(&record, &scratch,
+    while (reader &&
+           reader->ReadRecord(&record, &scratch,
                               immutable_db_options_.wal_recovery_mode) &&
            wal_read_status->ok() && status.ok()) {
       if (record.size() < WriteBatchInternal::kHeader) {

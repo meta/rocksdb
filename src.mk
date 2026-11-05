@@ -33,8 +33,10 @@ LIB_SOURCES =                                                   \
   db/blob/blob_write_batch_transformer.cc                       \
   db/blob/prefetch_buffer_collection.cc                         \
   db/blog/blog_format.cc                                        \
+  db/blog/blog_input_window.cc                                  \
   db/blog/blog_reader.cc                                        \
   db/blog/blog_writer.cc                                        \
+  db/blog_wal_reader.cc                                         \
   db/blog_wal_writer.cc                                         \
   db/builder.cc                                                 \
   db/c.cc                                                       \
@@ -483,6 +485,7 @@ TOOLS_MAIN_SOURCES =                                                    \
 BENCH_MAIN_SOURCES =                                                    \
   cache/cache_bench.cc                                                  \
   db/range_del_aggregator_bench.cc                                      \
+  db/wal_reader_bench.cc                                                \
   memtable/memtablerep_bench.cc                                         \
   table/table_reader_bench.cc                                           \
   tools/db_bench.cc                                                     \

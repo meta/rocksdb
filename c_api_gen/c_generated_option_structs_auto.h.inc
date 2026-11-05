@@ -203,6 +203,13 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_use_blog_format_for_wals(
 extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_options_get_use_blog_format_for_wals(rocksdb_options_t* opt);
 
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_blog_wal_streaming_compression(rocksdb_options_t* opt,
+                                                   unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_options_get_blog_wal_streaming_compression(rocksdb_options_t* opt);
+
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_use_blog_format_for_blobs(
     rocksdb_options_t* opt, unsigned char v);
 

@@ -713,6 +713,16 @@ unsigned char rocksdb_options_get_use_blog_format_for_wals(
   return opt->rep.use_blog_format_for_wals;
 }
 
+void rocksdb_options_set_blog_wal_streaming_compression(rocksdb_options_t* opt,
+                                                        unsigned char v) {
+  opt->rep.blog_wal_streaming_compression = v;
+}
+
+unsigned char rocksdb_options_get_blog_wal_streaming_compression(
+    rocksdb_options_t* opt) {
+  return opt->rep.blog_wal_streaming_compression;
+}
+
 void rocksdb_options_set_use_blog_format_for_blobs(rocksdb_options_t* opt,
                                                    unsigned char v) {
   opt->rep.use_blog_format_for_blobs = v;

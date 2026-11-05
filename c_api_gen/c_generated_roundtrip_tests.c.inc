@@ -689,6 +689,10 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_blog_timestamp_size(obj) == 1);
   rocksdb_options_set_blog_timestamp_size(obj, 0);
   CheckCondition(rocksdb_options_get_blog_timestamp_size(obj) == 0);
+  rocksdb_options_set_blog_wal_streaming_compression(obj, 1);
+  CheckCondition(rocksdb_options_get_blog_wal_streaming_compression(obj) == 1);
+  rocksdb_options_set_blog_wal_streaming_compression(obj, 0);
+  CheckCondition(rocksdb_options_get_blog_wal_streaming_compression(obj) == 0);
   rocksdb_options_set_bottommost_file_compaction_delay(obj, 1);
   CheckCondition(rocksdb_options_get_bottommost_file_compaction_delay(obj) ==
                  1);

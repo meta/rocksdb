@@ -197,17 +197,28 @@ struct DBOpenLogRecordReadReporter : public log::Reader::Reporter {
   Env* env;
   Logger* info_log;
   const char* fname;
-  Status* status;  // nullptr if immutable_db_options_.paranoid_checks==false
+  // nullptr when corruption should not fail the open.
+  Status* status;
+  // Set even when `status` is nullptr.
+  Status* unrecoverable_status = nullptr;
   bool* old_log_record;
   void Corruption(size_t bytes, const Status& s,
                   uint64_t log_number = kMaxSequenceNumber) override;
+  void UnrecoverableError(size_t bytes, const Status& s,
+                          uint64_t log_number = kMaxSequenceNumber) override;
+  void ToleratedCorruption(size_t bytes, const Status& s,
+                           uint64_t log_number = kMaxSequenceNumber) override;
 
   void OldLogRecord(size_t bytes) override;
 
   uint64_t GetCorruptedLogNumber() const { return corrupted_wal_number_; }
 
+  // True when the WAL reader stored an error into `unrecoverable_status`.
+  bool HasUnrecoverableError() const { return has_unrecoverable_error_; }
+
  private:
   uint64_t corrupted_wal_number_ = kMaxSequenceNumber;
+  bool has_unrecoverable_error_ = false;
 };
 
 // While DB is the public interface of RocksDB, and DBImpl is the actual
@@ -2754,16 +2765,14 @@ class DBImpl : public DB
 
   void SetupLogFileProcessing(uint64_t wal_number);
 
-  Status InitializeLogReader(uint64_t wal_number, bool is_retry,
-                             std::string& fname,
+  Status InitializeLogReader(
+      uint64_t wal_number, bool is_retry, std::string& fname,
 
-                             bool stop_replay_for_corruption,
-                             uint64_t min_wal_number,
-                             const PredecessorWALInfo& predecessor_wal_info,
-                             bool* const old_log_record,
-                             Status* const reporter_status,
-                             DBOpenLogRecordReadReporter* reporter,
-                             std::unique_ptr<WalReader>& reader);
+      bool stop_replay_for_corruption, uint64_t min_wal_number,
+      const PredecessorWALInfo& predecessor_wal_info,
+      bool* const old_log_record, Status* const reporter_status,
+      DBOpenLogRecordReadReporter* reporter, bool* const open_error_ignored,
+      std::unique_ptr<WalReader>& reader);
   Status ProcessLogRecord(
       Slice record, const std::unique_ptr<WalReader>& reader,
       const UnorderedMap<uint32_t, size_t>& running_ts_sz, uint64_t wal_number,

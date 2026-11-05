@@ -792,8 +792,10 @@ set(SOURCES
         db/blob/blob_write_batch_transformer.cc
         db/blob/prefetch_buffer_collection.cc
         db/blog/blog_format.cc
+        db/blog/blog_input_window.cc
         db/blog/blog_reader.cc
         db/blog/blog_writer.cc
+        db/blog_wal_reader.cc
         db/blog_wal_writer.cc
         db/builder.cc
         db/c.cc
@@ -1803,6 +1805,11 @@ if(WITH_BENCHMARK_TOOLS)
   add_executable(range_del_aggregator_bench${ARTIFACT_SUFFIX}
     db/range_del_aggregator_bench.cc)
   target_link_libraries(range_del_aggregator_bench${ARTIFACT_SUFFIX}
+    ${ROCKSDB_LIB} ${GFLAGS_LIB} ${FOLLY_LIBS})
+
+  add_executable(wal_reader_bench${ARTIFACT_SUFFIX}
+    db/wal_reader_bench.cc)
+  target_link_libraries(wal_reader_bench${ARTIFACT_SUFFIX}
     ${ROCKSDB_LIB} ${GFLAGS_LIB} ${FOLLY_LIBS})
 
   add_executable(table_reader_bench${ARTIFACT_SUFFIX}
