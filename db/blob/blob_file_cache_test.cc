@@ -111,18 +111,8 @@ void WriteBlogBlobFile(const ImmutableOptions& immutable_options,
                                       &blob_offset,
                                       /*uncompressed_size=*/4));
 
-  // Write footer
-  BlogFileFooterProperties footer_props;
-  footer_props.SetBlobCount(1);
-  uint64_t props_offset = blog_writer.current_offset();
   ASSERT_OK(
-      blog_writer.AddFooterPropertiesRecord(WriteOptions(), footer_props));
-  BlogFileFooterLocator locator;
-  uint64_t locator_offset = blog_writer.current_offset();
-  locator.entries.push_back(
-      {kBlogFooterPropertiesRecord,
-       static_cast<uint32_t>((locator_offset - props_offset) / 4)});
-  ASSERT_OK(blog_writer.AddFooterLocatorRecord(WriteOptions(), locator));
+      blog_writer.WriteFooter(WriteOptions(), BlogFileFooterProperties{}));
   ASSERT_OK(blog_writer.Sync(WriteOptions()));
   ASSERT_OK(blog_writer.Close(WriteOptions()));
 }

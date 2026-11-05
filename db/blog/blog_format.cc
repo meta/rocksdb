@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "env/unique_id_gen.h"
+#include "options/options_helper.h"
 #include "rocksdb/version.h"
 #include "table/format.h"
 #include "table/unique_id_impl.h"
@@ -44,6 +45,9 @@ Status DecodeBlogProperties(Slice* input, BlogPropertyMap* props) {
     if (!GetPrefixVarint32(input, &name_len) || input->size() < name_len) {
       return Status::Corruption("Blog properties: truncated property name");
     }
+    if (name_len == 0) {
+      return Status::Corruption("Blog properties: empty property name");
+    }
     std::string name(input->data(), name_len);
     input->remove_prefix(name_len);
 
@@ -53,6 +57,14 @@ Status DecodeBlogProperties(Slice* input, BlogPropertyMap* props) {
     }
     std::string value(input->data(), value_len);
     input->remove_prefix(value_len);
+
+    // Reject duplicate property names within a single section.
+    for (const auto& [existing_name, _] : *props) {
+      if (existing_name == name) {
+        return Status::Corruption(
+            "Blog properties: duplicate property name \"" + name + "\"");
+      }
+    }
 
     props->emplace_back(std::move(name), std::move(value));
   }
@@ -84,9 +96,10 @@ void BlogFileHeader::EncodeTo(std::string* dst) const {
     dst->push_back(0);
   }
 
-  // Encode properties into a temporary buffer to measure size.
+  // Encode required properties into a temporary buffer to measure size.
+  // Ignorable properties are body-record content and are never encoded here.
   std::string prop_buf;
-  EncodeBlogProperties(properties, &prop_buf);
+  EncodeBlogProperties(required_properties, &prop_buf);
   char prop_comp_type = static_cast<char>(kNoCompression);
 
   // Build property section: [properties][compression_type][checksum]
@@ -118,6 +131,12 @@ void BlogFileHeader::EncodeTo(std::string* dst) const {
 Status BlogFileHeader::VerifyFixedHeaderChecksum(const char* fixed_header) {
   const char* p = fixed_header;
   ChecksumType type = static_cast<ChecksumType>(p[13]);
+  if (!IsSupportedChecksumType(type)) {
+    return Status::Corruption("Blog header: unsupported checksum type: " +
+                              std::to_string(lossless_cast<int>(p[13])));
+  }
+  // Blog spec lists only kNoChecksum, kCRC32c, kXXH3 as expected, but we
+  // accept any supported checksum type for forward compatibility.
   uint32_t incarnation_id = DecodeFixed32(p + 16);
   uint32_t stored_header_checksum = DecodeFixed32(p + 36);
   uint32_t computed_header_checksum =
@@ -162,6 +181,10 @@ Status BlogFileHeader::DecodeFrom(Slice* input) {
 
   // Now that checksum is verified, validate the remaining fields.
   schema_version = static_cast<uint8_t>(p[12]);
+  if (schema_version == 0) {
+    return Status::Corruption(
+        "Blog header: schema version 0 is reserved for legacy blob files");
+  }
   if (schema_version > kBlogCurrentSchemaVersion) {
     return Status::NotSupported("Blog header: schema version " +
                                 std::to_string(schema_version) +
@@ -169,7 +192,27 @@ Status BlogFileHeader::DecodeFrom(Slice* input) {
                                 std::to_string(kBlogCurrentSchemaVersion));
   }
   compact_record_type = static_cast<BlogRecordType>(p[14]);
+  if (!IsBlogBodyRecordType(compact_record_type)) {
+    return Status::Corruption("Blog header: compact_record_type 0x" +
+                              Slice(p + 14, 1).ToString(true) +
+                              " is not a body record type");
+  }
+  if (!IsKnownBlogRecordType(compact_record_type)) {
+    return Status::NotSupported("Blog header: unknown compact_record_type 0x" +
+                                Slice(p + 14, 1).ToString(true));
+  }
   flags = static_cast<uint8_t>(p[15]);
+  if ((flags & ~lossless_cast<uint8_t>(kBlogFileRecycled)) != 0) {
+    return Status::NotSupported("Blog header: unknown flags 0x" +
+                                Slice(p + 15, 1).ToString(true));
+  }
+  // Reserved bytes [26-31] must be zero.
+  for (int i = 26; i < 32; ++i) {
+    if (p[i] != 0) {
+      return Status::NotSupported(
+          "Blog header: non-zero reserved byte at offset " + std::to_string(i));
+    }
+  }
 
   const bool escape_sequence_valid =
       is_wal() ? HasValidEscapeSequenceFirstByte(escape_sequence)
@@ -201,6 +244,14 @@ Status BlogFileHeader::DecodeFrom(Slice* input) {
   const char* prop_data = input->data();
   size_t prop_data_size = prop_section_size - kBlogBlockTrailerSize;
   char prop_comp_type = prop_data[prop_data_size];
+  if (lossless_cast<uint8_t>(prop_comp_type) !=
+      lossless_cast<uint8_t>(kNoCompression)) {
+    return Status::Corruption(
+        "Blog header: property section compression type must be "
+        "kNoCompression, "
+        "got 0x" +
+        Slice(&prop_comp_type, 1).ToString(true));
+  }
   uint32_t stored_prop_checksum = DecodeFixed32(prop_data + prop_data_size + 1);
   uint32_t computed_prop_checksum = ComputeBuiltinChecksumWithLastByte(
       checksum_type, prop_data, prop_data_size, prop_comp_type);
@@ -215,21 +266,68 @@ Status BlogFileHeader::DecodeFrom(Slice* input) {
 
   // Decode properties
   Slice prop_slice(prop_data, prop_data_size);
-  properties.clear();
-  Status s = DecodeBlogProperties(&prop_slice, &properties);
+  required_properties.clear();
+  // The header section carries no ignorable properties; reset those too so
+  // a reused object cannot leak a previous file's merged lookup state.
+  ignorable_properties.clear();
+  Status s = DecodeBlogProperties(&prop_slice, &required_properties);
   if (!s.ok()) {
     return s;
   }
 
-  // Check for unrecognized required properties
-  for (const auto& [name, value] : properties) {
-    if (IsBlogRequiredProperty(name)) {
-      if (name != kBlogPropCompressionCompatibilityName &&
-          name != kBlogPropTimestampSize &&
-          name != kBlogPropPredecessorWalInfo &&
-          name != kBlogPropWriteBatchStreamingCompressionType) {
+  for (const auto& [name, value] : required_properties) {
+    // Header must contain only required (uppercase) properties; ignorable
+    // (lowercase) properties belong in kBlogIgnorablePropertiesRecord.
+    // Our own writer can no longer produce such a file (see EncodeTo), so
+    // this guards against corrupt or foreign files.
+    if (!IsBlogRequiredProperty(name)) {
+      return Status::Corruption(
+          "Blog header: ignorable property in header: \"" + name + "\"");
+    }
+    // Check for unrecognized required properties
+    if (name != kBlogPropCompressionCompatibilityName &&
+        name != kBlogPropTimestampSize && name != kBlogPropPredecessorWalInfo &&
+        name != kBlogPropWriteBatchStreamingCompressionType) {
+      return Status::NotSupported(
+          "Blog header: unrecognized required property: \"" + name + "\"");
+    }
+    // Validate known required property values.
+    if (name == kBlogPropWriteBatchStreamingCompressionType) {
+      // Must be exactly 2-digit hex of CompressionType (e.g. "07" for ZSTD).
+      if (value.size() != 2) {
+        return Status::Corruption(
+            "Blog header: WriteBatchStreamingCompressionType must be 2-digit "
+            "hex, got size " +
+            std::to_string(value.size()));
+      }
+      std::string decoded_type;
+      if (!Slice(value).DecodeHex(&decoded_type)) {
+        return Status::Corruption(
+            "Blog header: WriteBatchStreamingCompressionType not hex: \"" +
+            value + "\"");
+      }
+      const uint8_t comp = lossless_cast<uint8_t>(decoded_type[0]);
+      if (!IsValidBlogCompressionType(comp) ||
+          comp == kStreamingCompressionSentinel) {
+        return Status::Corruption(
+            "Blog header: WriteBatchStreamingCompressionType invalid "
+            "compression type 0x" +
+            value);
+      }
+      // Currently only ZSTD is supported for streaming compression.
+      if (comp != kZSTD) {
         return Status::NotSupported(
-            "Blog header: unrecognized required property: \"" + name + "\"");
+            "Blog header: WriteBatchStreamingCompressionType only ZSTD "
+            "(0x07) currently supported, got 0x" +
+            value);
+      }
+    } else if (name == kBlogPropTimestampSize) {
+      // Must be a valid prefix-varint64.
+      Slice ts_slice(value);
+      uint64_t ts_val = 0;
+      if (!GetPrefixVarint64(&ts_slice, &ts_val) || !ts_slice.empty()) {
+        return Status::Corruption(
+            "Blog header: TimestampSize not a valid prefix varint");
       }
     }
   }
@@ -300,7 +398,7 @@ void BlogFileHeader::GenerateFromUniqueIdWithSeed(
 
   SetEscapeSequenceFromU64(unique_id[0], seed);
 
-  // Store the IDs as ignorable header properties for debugging/tracking.
+  // Record the IDs as ignorable properties for debugging/tracking.
   SetProperty(kBlogPropDbId, db_id);
   SetProperty(kBlogPropDbSessionId, db_session_id);
 }
@@ -358,33 +456,54 @@ bool BlogFileHeader::VerifyEscapeSequenceWithSeed(const char* seq,
   return expected == actual;
 }
 
-void BlogFileHeader::SetProperty(const std::string& name,
-                                 const std::string& value) {
-  for (auto& [k, v] : properties) {
+namespace {
+void SetPropertyInMap(BlogPropertyMap* map, const std::string& name,
+                      const std::string& value) {
+  for (auto& [k, v] : *map) {
     if (k == name) {
       v = value;
       return;
     }
   }
-  properties.emplace_back(name, value);
+  map->emplace_back(name, value);
+}
+
+const std::string* FindPropertyInMaps(const BlogPropertyMap& required,
+                                      const BlogPropertyMap& ignorable,
+                                      const std::string& name) {
+  for (const auto& [k, v] : required) {
+    if (k == name) {
+      return &v;
+    }
+  }
+  for (const auto& [k, v] : ignorable) {
+    if (k == name) {
+      return &v;
+    }
+  }
+  return nullptr;
+}
+}  // namespace
+
+void BlogFileHeader::SetProperty(const std::string& name,
+                                 const std::string& value) {
+  if (IsBlogRequiredProperty(name)) {
+    SetPropertyInMap(&required_properties, name, value);
+  } else {
+    assert(IsBlogIgnorableProperty(name));
+    SetPropertyInMap(&ignorable_properties, name, value);
+  }
 }
 
 std::string BlogFileHeader::GetProperty(const std::string& name) const {
-  for (const auto& [k, v] : properties) {
-    if (k == name) {
-      return v;
-    }
-  }
-  return "";
+  const std::string* v =
+      FindPropertyInMaps(required_properties, ignorable_properties, name);
+  return v != nullptr ? *v : "";
 }
 
 bool BlogFileHeader::HasProperty(const std::string& name) const {
-  for (const auto& [k, v] : properties) {
-    if (k == name) {
-      return true;
-    }
-  }
-  return false;
+  return FindPropertyInMaps(required_properties, ignorable_properties, name) !=
+         nullptr;
 }
 
 void BlogFileHeader::SetUint64Property(const std::string& name,
@@ -408,7 +527,7 @@ bool BlogFileHeader::GetUint64Property(const std::string& name,
     return false;
   }
   Slice s(raw);
-  return GetPrefixVarint64(&s, value);
+  return GetPrefixVarint64(&s, value) && s.empty();
 }
 
 bool BlogFileHeader::GetUint32Property(const std::string& name,
@@ -418,7 +537,7 @@ bool BlogFileHeader::GetUint32Property(const std::string& name,
     return false;
   }
   Slice s(raw);
-  return GetPrefixVarint32(&s, value);
+  return GetPrefixVarint32(&s, value) && s.empty();
 }
 
 Status BlogFileHeader::DecodeFromBuffer(Slice* buffer,
@@ -426,13 +545,23 @@ Status BlogFileHeader::DecodeFromBuffer(Slice* buffer,
   if (buffer->size() < kBlogFileFixedHeaderSize) {
     return Status::Corruption("Blog header: buffer too small for fixed header");
   }
+  // Early magic check before trusting prop_section_size.
+  if (!IsBlogFormat(buffer->data(), buffer->size())) {
+    return Status::Corruption("Blog header: bad magic in DecodeFromBuffer");
+  }
   Status checksum_status = VerifyFixedHeaderChecksum(buffer->data());
   if (!checksum_status.ok()) {
     return checksum_status;
   }
-
   // Check if the full header (fixed + property section) fits in the buffer.
   uint32_t prop_section_size = DecodeFixed32(buffer->data() + 32);
+  // Sanity cap: property section should be reasonably small (properties are
+  // diagnostic/required metadata). Reject absurd sizes to avoid OOM.
+  if (prop_section_size < kBlogBlockTrailerSize ||
+      prop_section_size > kBlogMaxPropertySectionSize) {
+    return Status::Corruption("Blog header: invalid property section size " +
+                              std::to_string(prop_section_size));
+  }
   size_t total_header_size = kBlogFileFixedHeaderSize + prop_section_size;
 
   if (buffer->size() < total_header_size) {
@@ -509,6 +638,18 @@ bool VerifyBlogFooterLocator(const char* buffer, size_t buffer_size,
     if (type != kBlogFooterLocatorRecord) {
       continue;  // not a footer locator
     }
+    // Validate compression type in prefix (must be valid and typically
+    // kNoCompression for locator).
+    uint8_t prefix_comp = lossless_cast<uint8_t>(varint_end[1]);
+    if (!IsValidBlogCompressionType(prefix_comp)) {
+      continue;  // invalid compression type
+    }
+    if (length == 0) {
+      continue;  // locator must have payload (empty is invalid)
+    }
+    if (length == kBlogUnspecifiedSize) {
+      continue;  // locator cannot be unspecified-size
+    }
 
     // Verify prefix checksum over (varint + type + compression_type)
     size_t prefix_data_size = varint_len + 2;  // varint + type + comp
@@ -521,12 +662,17 @@ bool VerifyBlogFooterLocator(const char* buffer, size_t buffer_size,
       continue;  // prefix checksum mismatch
     }
 
-    // If length > 0, verify the payload trailer checksum
-    if (length > 0) {
+    // Verify the payload trailer checksum and ensure record ends at EOF.
+    {
       size_t after_prefix = after_varint - 6;  // after type+comp+prefix_cksum
       if (after_prefix < kBlogBlockTrailerSize ||
           length > after_prefix - kBlogBlockTrailerSize) {
         continue;  // truncated payload or trailer
+      }
+      // Locator must be the last record: trailer must end exactly at buffer
+      // end.
+      if (after_prefix != length + kBlogBlockTrailerSize) {
+        continue;  // trailing bytes after locator
       }
       const char* payload = varint_end + 6;
       uint64_t payload_file_offset = buffer_file_offset + esc_start +
@@ -538,15 +684,26 @@ bool VerifyBlogFooterLocator(const char* buffer, size_t buffer_size,
       if (!s.ok()) {
         continue;  // trailer checksum mismatch
       }
+      if (lossless_cast<uint8_t>(actual_comp) != prefix_comp) {
+        continue;  // pre-payload and trailer compression mismatch
+      }
+      // Payload must be multiple of 5 (entry size).
+      if (length % 5 != 0) {
+        continue;  // malformed locator payload size
+      }
+    }
+
+    BlogFileFooterLocator decoded_locator;
+    const char* payload = varint_end + 6;
+    Status decode_status = decoded_locator.DecodeFrom(
+        Slice(payload, lossless_cast<size_t>(length)));
+    if (!decode_status.ok()) {
+      continue;
     }
 
     // Valid footer locator record found.
-    if (locator_out && length > 0) {
-      const char* payload = varint_end + 6;
-      if (!locator_out->DecodeFrom(Slice(payload, static_cast<size_t>(length)))
-               .ok()) {
-        continue;  // malformed locator payload
-      }
+    if (locator_out) {
+      *locator_out = std::move(decoded_locator);
     }
     if (locator_file_offset_out) {
       *locator_file_offset_out = buffer_file_offset + esc_start;
@@ -569,9 +726,28 @@ Status BlogFileFooterLocator::DecodeFrom(const Slice& input) {
   Slice s = input;
   entries.clear();
   while (s.size() >= 5) {  // 1 byte type + 4 bytes offset
-    entries.push_back(
-        {.record_type = static_cast<BlogRecordType>(static_cast<uint8_t>(s[0])),
-         .relative_offset_4B = DecodeFixed32(s.data() + 1)});
+    BlogRecordType rt =
+        lossless_cast<BlogRecordType>(lossless_cast<uint8_t>(s[0]));
+    uint32_t rel = DecodeFixed32(s.data() + 1);
+    if (!IsBlogFooterRecordType(rt)) {
+      return Status::Corruption("Blog footer locator: entry record_type 0x" +
+                                Slice(s.data(), 1).ToString(true) +
+                                " is not a footer type");
+    }
+    if (!IsKnownBlogRecordType(rt)) {
+      return Status::NotSupported(
+          "Blog footer locator: unknown footer record_type 0x" +
+          Slice(s.data(), 1).ToString(true));
+    }
+    if (rt == kBlogFooterLocatorRecord) {
+      return Status::Corruption(
+          "Blog footer locator: entry must not reference locator itself");
+    }
+    if (rel == 0) {
+      return Status::Corruption(
+          "Blog footer locator: relative_offset must be non-zero");
+    }
+    entries.push_back({.record_type = rt, .relative_offset_4B = rel});
     s.remove_prefix(5);
   }
   if (s.size() != 0) {
@@ -639,7 +815,63 @@ void BlogFileFooterProperties::EncodeTo(std::string* dst) const {
 Status BlogFileFooterProperties::DecodeFrom(const Slice& input) {
   Slice s = input;
   properties.clear();
-  return DecodeBlogProperties(&s, &properties);
+  Status st = DecodeBlogProperties(&s, &properties);
+  if (!st.ok()) {
+    return st;
+  }
+  // Validate known footer properties.
+  for (const auto& [name, value] : properties) {
+    if (name == "compressionTypes") {
+      // Must be sorted raw bytes, unique, excluding kNoCompression and
+      // kStreamingCompressionSentinel, and each must be a valid type.
+      for (size_t i = 0; i < value.size(); ++i) {
+        uint8_t comp = lossless_cast<uint8_t>(value[i]);
+        if (!IsValidBlogCompressionType(comp) || comp == kNoCompression ||
+            comp == kStreamingCompressionSentinel) {
+          return Status::Corruption(
+              "Blog footer properties: compressionTypes contains invalid "
+              "type 0x" +
+              Slice(value.data() + i, 1).ToString(true));
+        }
+        if (i > 0 && lossless_cast<uint8_t>(value[i]) <=
+                         lossless_cast<uint8_t>(value[i - 1])) {
+          return Status::Corruption(
+              "Blog footer properties: compressionTypes not sorted/unique");
+        }
+      }
+    } else if (name == "blobCount" || name == "blobPayloadBytes" ||
+               name == "blobCompressedBytes" ||
+               name == "blobUncompressedBytes" || name == "blobOverheadBytes" ||
+               name == "minSequence" || name == "maxSequence") {
+      Slice vs(value);
+      uint64_t v = 0;
+      if (!GetPrefixVarint64(&vs, &v) || !vs.empty()) {
+        return Status::Corruption("Blog footer properties: property \"" + name +
+                                  "\" not a valid prefix varint");
+      }
+    } else if (IsBlogRequiredProperty(name)) {
+      return Status::NotSupported(
+          "Blog footer properties: unrecognized required property \"" + name +
+          "\"");
+    }
+  }
+  // Cross-field: minSequence <= maxSequence if both present.
+  bool has_min = false, has_max = false;
+  uint64_t min_seq = 0, max_seq = 0;
+  for (const auto& [name, value] : properties) {
+    if (name == "minSequence") {
+      Slice vs(value);
+      has_min = GetPrefixVarint64(&vs, &min_seq) && vs.empty();
+    } else if (name == "maxSequence") {
+      Slice vs(value);
+      has_max = GetPrefixVarint64(&vs, &max_seq) && vs.empty();
+    }
+  }
+  if (has_min && has_max && min_seq > max_seq) {
+    return Status::Corruption(
+        "Blog footer properties: minSequence > maxSequence");
+  }
+  return Status::OK();
 }
 
 // --- Padding ---
@@ -686,10 +918,11 @@ BlogPadding::BlogPadding(uint8_t last_meaningful_byte, size_t current_offset,
 uint32_t ComputeBlogRecordChecksum(ChecksumType type, const char* data,
                                    size_t data_size, char compression_type_byte,
                                    uint32_t base_context_checksum,
-                                   uint64_t record_offset) {
+                                   uint64_t payload_file_offset) {
   uint32_t checksum = ComputeBuiltinChecksumWithLastByte(type, data, data_size,
                                                          compression_type_byte);
-  checksum += ChecksumModifierForContext(base_context_checksum, record_offset);
+  checksum +=
+      ChecksumModifierForContext(base_context_checksum, payload_file_offset);
   return checksum;
 }
 
@@ -703,6 +936,11 @@ Status VerifyBlogRecordTrailer(ChecksumType checksum_type, const char* payload,
   // [compression_type: 1B][checksum: 4B]
   const char* trailer = payload + payload_size;
   char comp_byte = trailer[0];
+  if (!IsValidBlogCompressionType(lossless_cast<uint8_t>(comp_byte))) {
+    return Status::Corruption(
+        "Blog record trailer: invalid compression type 0x" +
+        Slice(&comp_byte, 1).ToString(true));
+  }
   uint32_t stored_checksum = DecodeFixed32(trailer + 1);
   uint32_t computed_checksum =
       ComputeBlogRecordChecksum(checksum_type, payload, payload_size, comp_byte,
@@ -712,7 +950,7 @@ Status VerifyBlogRecordTrailer(ChecksumType checksum_type, const char* payload,
   }
   if (actual_compression_type) {
     *actual_compression_type =
-        static_cast<CompressionType>(static_cast<uint8_t>(comp_byte));
+        lossless_cast<CompressionType>(lossless_cast<uint8_t>(comp_byte));
   }
   return Status::OK();
 }

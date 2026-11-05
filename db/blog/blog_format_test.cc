@@ -24,12 +24,22 @@ class BlogFormatTest : public testing::Test {
                                              uint32_t incarnation_id,
                                              uint64_t declared_length,
                                              const std::string& payload) {
+    return MakeFooterLocatorRecordWithCompression(
+        header, file_offset, incarnation_id, declared_length, payload,
+        kNoCompression, kNoCompression);
+  }
+
+  static std::string MakeFooterLocatorRecordWithCompression(
+      const BlogFileHeader& header, uint64_t file_offset,
+      uint32_t incarnation_id, uint64_t declared_length,
+      const std::string& payload, CompressionType prefix_comp,
+      CompressionType trailer_comp) {
     std::string record(header.escape_sequence, kBlogEscapeSequenceSize);
     char varint[kMaxPrefixVarint64Length];
     const char* varint_end = EncodePrefixVarint64<3>(varint, declared_length);
     std::string prefix(varint, lossless_cast<size_t>(varint_end - varint));
     prefix.push_back(lossless_cast<char>(kBlogFooterLocatorRecord));
-    prefix.push_back(lossless_cast<char>(kNoCompression));
+    prefix.push_back(lossless_cast<char>(prefix_comp));
     const uint32_t prefix_checksum =
         ComputeBuiltinChecksum(header.checksum_type, prefix.data(),
                                prefix.size()) +
@@ -38,10 +48,10 @@ class BlogFormatTest : public testing::Test {
     PutFixed32(&record, prefix_checksum);
     const uint64_t payload_file_offset = file_offset + record.size();
     record.append(payload);
-    record.push_back(lossless_cast<char>(kNoCompression));
+    record.push_back(lossless_cast<char>(trailer_comp));
     PutFixed32(&record, ComputeBlogRecordChecksum(
                             header.checksum_type, payload.data(),
-                            payload.size(), lossless_cast<char>(kNoCompression),
+                            payload.size(), lossless_cast<char>(trailer_comp),
                             incarnation_id, payload_file_offset));
     return record;
   }
@@ -103,6 +113,12 @@ TEST_F(BlogFormatTest, IsBlogRequiredProperty) {
   ASSERT_FALSE(IsBlogRequiredProperty("compressionSettings"));
   ASSERT_FALSE(IsBlogRequiredProperty("a"));
   ASSERT_FALSE(IsBlogRequiredProperty(""));
+
+  ASSERT_TRUE(IsBlogIgnorableProperty("role"));
+  ASSERT_TRUE(IsBlogIgnorableProperty("a"));
+  ASSERT_FALSE(IsBlogIgnorableProperty("TimestampSize"));
+  ASSERT_FALSE(IsBlogIgnorableProperty("1invalid"));
+  ASSERT_FALSE(IsBlogIgnorableProperty(""));
 }
 
 // --- Escape sequence generation ---
@@ -175,7 +191,8 @@ TEST_F(BlogFormatTest, WalEscapeSequenceBindsLogNumber) {
                                                          /*log_number=*/124));
     ASSERT_FALSE(BlogFileHeader::VerifyEscapeSequence(header.escape_sequence));
 
-    header.properties.clear();
+    // GenerateWalFromUniqueId records dbId/dbSessionId as ignorable
+    // properties, which EncodeTo leaves out of the header section.
     std::string encoded;
     header.EncodeTo(&encoded);
     Slice input(encoded);
@@ -190,7 +207,6 @@ TEST_F(BlogFormatTest, NonWalHeaderRejectsWalBoundEscapeSequence) {
   header.GenerateWalFromUniqueId("db-id", "0123456789ABCDEFGHIJ",
                                  /*log_number=*/123);
   header.compact_record_type = kBlogBlobRecord;
-  header.properties.clear();
   std::string encoded;
   header.EncodeTo(&encoded);
   Slice input(encoded);
@@ -222,7 +238,8 @@ TEST_F(BlogFormatTest, HeaderEncodeDecodeMinimal) {
   ASSERT_EQ(memcmp(decoded.escape_sequence, header.escape_sequence,
                    kBlogEscapeSequenceSize),
             0);
-  ASSERT_TRUE(decoded.properties.empty());
+  ASSERT_TRUE(decoded.required_properties.empty());
+  ASSERT_TRUE(decoded.ignorable_properties.empty());
   ASSERT_EQ(input.size(), 0u);  // all bytes consumed
 }
 
@@ -232,8 +249,8 @@ TEST_F(BlogFormatTest, HeaderEncodeDecodeWithProperties) {
   header.compact_record_type = kBlogBlobRecord;
   header.GenerateRandomFields();
   header.SetProperty("CompressionCompatibilityName", "lz4");
-  header.SetProperty("role", "blob");
-  header.SetProperty("compressionSettings", "level=1");
+  header.SetProperty("PredecessorWalInfo", "some-info");
+  header.SetUint32Property("TimestampSize", 8);
 
   std::string encoded;
   header.EncodeTo(&encoded);
@@ -243,8 +260,31 @@ TEST_F(BlogFormatTest, HeaderEncodeDecodeWithProperties) {
   ASSERT_OK(decoded.DecodeFrom(&input));
 
   ASSERT_EQ(decoded.GetProperty("CompressionCompatibilityName"), "lz4");
-  ASSERT_EQ(decoded.GetProperty("role"), "blob");
-  ASSERT_EQ(decoded.GetProperty("compressionSettings"), "level=1");
+  ASSERT_EQ(decoded.GetProperty("PredecessorWalInfo"), "some-info");
+  uint32_t ts = 0;
+  ASSERT_TRUE(decoded.GetUint32Property("TimestampSize", &ts));
+  ASSERT_EQ(ts, 8u);
+  ASSERT_EQ(input.size(), 0u);
+}
+
+TEST_F(BlogFormatTest, HeaderEncodeDecodeWithIgnorableProperties) {
+  BlogFileHeader header;
+  header.checksum_type = kXXH3;
+  header.compact_record_type = kBlogBlobRecord;
+  header.GenerateRandomFields();
+  header.SetProperty("CompressionCompatibilityName", "BuiltinV2");
+  // Ignorable properties must not break header decode; they travel in body
+  // records, not the header property section.
+  header.SetProperty("role", "blob");
+  std::string encoded;
+  header.EncodeTo(&encoded);
+  BlogFileHeader decoded;
+  Slice input(encoded);
+  ASSERT_OK(decoded.DecodeFrom(&input));
+  // Only required properties survive the header round-trip; ignorable ones
+  // are body-record content decoded separately by the reader.
+  ASSERT_EQ(decoded.GetProperty("CompressionCompatibilityName"), "BuiltinV2");
+  ASSERT_TRUE(decoded.ignorable_properties.empty());
   ASSERT_EQ(input.size(), 0u);
 }
 
@@ -301,43 +341,57 @@ TEST_F(BlogFormatTest, HeaderCurrentSchemaVersionAccepted) {
 }
 
 TEST_F(BlogFormatTest, TypedPropertyRoundTrip) {
+  // In-memory round-trip for ignorable typed properties (not via header
+  // encoding, since the header section holds only required uppercase props).
   BlogFileHeader header;
   header.GenerateRandomFields();
   header.SetUint64Property("fileNumber", 12345678ULL);
   header.SetUint32Property("columnFamilyId", 42);
 
-  std::string encoded;
-  header.EncodeTo(&encoded);
-
-  BlogFileHeader decoded;
-  Slice input(encoded);
-  ASSERT_OK(decoded.DecodeFrom(&input));
-
   uint64_t fn = 0;
-  ASSERT_TRUE(decoded.GetUint64Property("fileNumber", &fn));
+  ASSERT_TRUE(header.GetUint64Property("fileNumber", &fn));
   ASSERT_EQ(fn, 12345678ULL);
 
   uint32_t cf_id = 0;
-  ASSERT_TRUE(decoded.GetUint32Property("columnFamilyId", &cf_id));
+  ASSERT_TRUE(header.GetUint32Property("columnFamilyId", &cf_id));
   ASSERT_EQ(cf_id, 42u);
 
   // Missing property returns false
   uint64_t missing = 0;
-  ASSERT_FALSE(decoded.GetUint64Property("nonexistent", &missing));
+  ASSERT_FALSE(header.GetUint64Property("nonexistent", &missing));
+
+  // Header encoding round-trip for required typed property.
+  BlogFileHeader header2;
+  header2.GenerateRandomFields();
+  header2.SetUint32Property("TimestampSize", 8);
+  std::string encoded;
+  header2.EncodeTo(&encoded);
+  BlogFileHeader decoded;
+  Slice input(encoded);
+  ASSERT_OK(decoded.DecodeFrom(&input));
+  uint32_t ts = 0;
+  ASSERT_TRUE(decoded.GetUint32Property("TimestampSize", &ts));
+  ASSERT_EQ(ts, 8u);
 }
 
-TEST_F(BlogFormatTest, HeaderAcceptsUnknownIgnorableProperty) {
+TEST_F(BlogFormatTest, HeaderRejectsIgnorableProperty) {
   BlogFileHeader header;
   header.GenerateRandomFields();
-  header.SetProperty("futureIgnorable", "something");
+  // Bypass the setters to simulate a corrupt/foreign file whose header
+  // section contains a lowercase property. Our own writer can no longer
+  // produce this: EncodeTo only encodes required_properties.
+  header.required_properties.emplace_back("futureIgnorable", "something");
 
   std::string encoded;
   header.EncodeTo(&encoded);
 
   BlogFileHeader decoded;
   Slice input(encoded);
-  ASSERT_OK(decoded.DecodeFrom(&input));
-  ASSERT_EQ(decoded.GetProperty("futureIgnorable"), "something");
+  Status s = decoded.DecodeFrom(&input);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(s.ToString().find("ignorable property in header"),
+            std::string::npos)
+      << s.ToString();
 }
 
 TEST_F(BlogFormatTest, HeaderChecksumCorruption) {
@@ -382,7 +436,7 @@ TEST_F(BlogFormatTest, DecodeFromBufferVerifiesChecksumBeforePropertySize) {
 TEST_F(BlogFormatTest, HeaderPropertyChecksumCorruption) {
   BlogFileHeader header;
   header.GenerateRandomFields();
-  header.SetProperty("role", "wal");
+  header.SetProperty("CompressionCompatibilityName", "wal");
 
   std::string encoded;
   header.EncodeTo(&encoded);
@@ -398,7 +452,7 @@ TEST_F(BlogFormatTest, HeaderPropertyChecksumCorruption) {
   ASSERT_TRUE(s.IsCorruption()) << s.ToString();
 }
 
-TEST_F(BlogFormatTest, HeaderSetPropertyOverwrites) {
+TEST_F(BlogFormatTest, HeaderPropertySettersOverwrite) {
   BlogFileHeader header;
   header.SetProperty("role", "wal");
   ASSERT_EQ(header.GetProperty("role"), "wal");
@@ -407,12 +461,29 @@ TEST_F(BlogFormatTest, HeaderSetPropertyOverwrites) {
   ASSERT_EQ(header.GetProperty("role"), "blob");
   // Should not have duplicate entries
   int count = 0;
-  for (const auto& [k, v] : header.properties) {
+  for (const auto& [k, v] : header.ignorable_properties) {
     if (k == "role") {
       ++count;
     }
   }
   ASSERT_EQ(count, 1);
+
+  header.SetProperty("PredecessorWalInfo", "a");
+  header.SetProperty("PredecessorWalInfo", "b");
+  ASSERT_EQ(header.GetProperty("PredecessorWalInfo"), "b");
+  count = 0;
+  for (const auto& [k, v] : header.required_properties) {
+    if (k == "PredecessorWalInfo") {
+      ++count;
+    }
+  }
+  ASSERT_EQ(count, 1);
+
+  // Uppercase names land in required_properties, lowercase in ignorable.
+  ASSERT_EQ(header.required_properties.size(), 1u);
+  ASSERT_EQ(header.required_properties[0].first, "PredecessorWalInfo");
+  ASSERT_EQ(header.ignorable_properties.size(), 1u);
+  ASSERT_EQ(header.ignorable_properties[0].first, "role");
 }
 
 TEST_F(BlogFormatTest, HeaderMagicValues) {
@@ -691,6 +762,462 @@ TEST_F(BlogFormatTest, ComputeBlogRecordChecksumWithContext) {
   uint32_t cksum3 = ComputeBlogRecordChecksum(
       kXXH3, data, size, static_cast<char>(kNoCompression), 0xABCDEF01, 100);
   ASSERT_NE(cksum1, cksum3);
+}
+
+// --- Header validation (spec: Fixed Header) ---
+
+TEST_F(BlogFormatTest, HeaderRejectsZeroSchemaVersion) {
+  BlogFileHeader header;
+  header.GenerateRandomFields();
+  std::string encoded;
+  header.EncodeTo(&encoded);
+  encoded[12] = 0;
+  uint32_t new_checksum =
+      ComputeBuiltinChecksum(header.checksum_type, encoded.data(), 36) +
+      ChecksumModifierForContext(header.incarnation_id(), 0);
+  EncodeFixed32(&encoded[36], new_checksum);
+  BlogFileHeader decoded;
+  Slice input(encoded);
+  ASSERT_TRUE(decoded.DecodeFrom(&input).IsCorruption());
+}
+
+TEST_F(BlogFormatTest, HeaderRejectsUnsupportedChecksumType) {
+  BlogFileHeader header;
+  header.GenerateRandomFields();
+  std::string encoded;
+  header.EncodeTo(&encoded);
+  encoded[13] = static_cast<char>(0x7F);
+  // Checksum will be computed with invalid type, but our code rejects
+  // before checksum verification, so no need to fix checksum.
+  BlogFileHeader decoded;
+  Slice input(encoded);
+  ASSERT_TRUE(decoded.DecodeFrom(&input).IsCorruption());
+}
+
+TEST_F(BlogFormatTest, HeaderRejectsInvalidCompactRecordType) {
+  // Meta type (0x01) not allowed as compact
+  {
+    BlogFileHeader header;
+    header.GenerateRandomFields();
+    header.compact_record_type = kBlogIgnorablePropertiesRecord;
+    std::string encoded;
+    header.EncodeTo(&encoded);
+    // Fix header checksum after tampering? EncodeTo already used invalid
+    // type, so checksum is correct for that value. We just decode.
+    BlogFileHeader decoded;
+    Slice input(encoded);
+    ASSERT_TRUE(decoded.DecodeFrom(&input).IsCorruption());
+  }
+  // Footer type not allowed
+  {
+    BlogFileHeader header;
+    header.GenerateRandomFields();
+    header.compact_record_type = kBlogFooterLocatorRecord;
+    std::string encoded;
+    header.EncodeTo(&encoded);
+    BlogFileHeader decoded;
+    Slice input(encoded);
+    ASSERT_TRUE(decoded.DecodeFrom(&input).IsCorruption());
+  }
+  // Reserved body type (0x14)
+  {
+    BlogFileHeader header;
+    header.GenerateRandomFields();
+    header.compact_record_type = static_cast<BlogRecordType>(0x14);
+    std::string encoded;
+    header.EncodeTo(&encoded);
+    BlogFileHeader decoded;
+    Slice input(encoded);
+    ASSERT_TRUE(decoded.DecodeFrom(&input).IsNotSupported());
+  }
+}
+
+TEST_F(BlogFormatTest, HeaderRejectsUnknownFlags) {
+  BlogFileHeader header;
+  header.GenerateRandomFields();
+  header.flags = 0x02;
+  std::string encoded;
+  header.EncodeTo(&encoded);
+  BlogFileHeader decoded;
+  Slice input(encoded);
+  ASSERT_TRUE(decoded.DecodeFrom(&input).IsNotSupported());
+}
+
+TEST_F(BlogFormatTest, HeaderRejectsNonZeroReserved) {
+  BlogFileHeader header;
+  header.GenerateRandomFields();
+  std::string encoded;
+  header.EncodeTo(&encoded);
+  encoded[26] = 0x42;
+  uint32_t new_checksum =
+      ComputeBuiltinChecksum(header.checksum_type, encoded.data(), 36) +
+      ChecksumModifierForContext(header.incarnation_id(), 0);
+  EncodeFixed32(&encoded[36], new_checksum);
+  BlogFileHeader decoded;
+  Slice input(encoded);
+  ASSERT_TRUE(decoded.DecodeFrom(&input).IsNotSupported());
+}
+
+TEST_F(BlogFormatTest, HeaderRejectsNonZeroPropCompType) {
+  BlogFileHeader header;
+  header.GenerateRandomFields();
+  std::string encoded;
+  header.EncodeTo(&encoded);
+  // Property section trailer compression_type is at offset 40+prop_data_size
+  uint32_t prop_size = DecodeFixed32(encoded.data() + 32);
+  size_t comp_offset = kBlogFileFixedHeaderSize + prop_size - 5;
+  encoded[comp_offset] = lossless_cast<char>(kLZ4Compression);
+  // Recompute property section checksum with new comp type
+  const char* prop_data = encoded.data() + kBlogFileFixedHeaderSize;
+  size_t prop_data_size = prop_size - 5;
+  uint32_t new_prop_cksum = ComputeBuiltinChecksumWithLastByte(
+      header.checksum_type, prop_data, prop_data_size, encoded[comp_offset]);
+  new_prop_cksum += ChecksumModifierForContext(header.incarnation_id(),
+                                               kBlogFileFixedHeaderSize);
+  EncodeFixed32(&encoded[comp_offset + 1], new_prop_cksum);
+  BlogFileHeader decoded;
+  Slice input(encoded);
+  ASSERT_TRUE(decoded.DecodeFrom(&input).IsCorruption());
+}
+
+// --- Property decoding validation ---
+
+TEST_F(BlogFormatTest, DecodePropertiesRejectsEmptyName) {
+  std::string encoded;
+  PutPrefixVarint32(&encoded, 0);
+  PutPrefixVarint32(&encoded, 3);
+  encoded.append("val");
+  Slice input(encoded);
+  BlogPropertyMap props;
+  ASSERT_TRUE(DecodeBlogProperties(&input, &props).IsCorruption());
+}
+
+TEST_F(BlogFormatTest, DecodePropertiesRejectsDuplicate) {
+  BlogPropertyMap props = {{"role", "wal"}, {"role", "blob"}};
+  std::string encoded;
+  EncodeBlogProperties(props, &encoded);
+  Slice input(encoded);
+  BlogPropertyMap decoded;
+  ASSERT_TRUE(DecodeBlogProperties(&input, &decoded).IsCorruption());
+}
+
+TEST_F(BlogFormatTest, TypedPropertyRejectsTrailingBytes) {
+  BlogFileHeader header;
+  header.GenerateRandomFields();
+  std::string bad;
+  PutPrefixVarint64(&bad, 42);
+  bad.push_back(0xFF);  // trailing garbage
+  header.SetProperty("fileNumber", bad);
+  // Get helper should reject trailing bytes
+  uint64_t v = 0;
+  ASSERT_FALSE(header.GetUint64Property("fileNumber", &v));
+}
+
+// --- Footer properties validation ---
+
+TEST_F(BlogFormatTest, FooterPropertiesRejectsRequiredUppercase) {
+  BlogFileFooterProperties props;
+  props.properties.emplace_back("FutureRequired", "x");
+  std::string encoded;
+  props.EncodeTo(&encoded);
+  BlogFileFooterProperties decoded;
+  ASSERT_TRUE(decoded.DecodeFrom(Slice(encoded)).IsNotSupported());
+}
+
+// --- Record trailer validation ---
+
+TEST_F(BlogFormatTest, VerifyRecordTrailerRejectsInvalidCompType) {
+  const char* payload = "hello";
+  size_t payload_size = 5;
+  char trailer[5];
+  trailer[0] = static_cast<char>(0x08);  // reserved compression type
+  uint32_t checksum = ComputeBlogRecordChecksum(kXXH3, payload, payload_size,
+                                                trailer[0], 0x1234, 100);
+  EncodeFixed32(trailer + 1, checksum);
+  // Build a buffer where VerifyBlogRecordTrailer expects payload+trailer
+  std::string buf(payload, payload_size);
+  buf.append(trailer, 5);
+  CompressionType ct;
+  Status s = VerifyBlogRecordTrailer(kXXH3, buf.data(), payload_size, 0x1234,
+                                     100, &ct);
+  ASSERT_TRUE(s.IsCorruption());
+}
+
+TEST_F(BlogFormatTest, HeaderRejectsInvalidStreamingCompressionType) {
+  const struct {
+    const char* value;
+    bool corruption;
+    bool not_supported;
+  } cases[] = {
+      {"", true, false},    {"0", true, false},  {"07x", true, false},
+      {"zz", true, false},  {"08", true, false}, {"7f", true, false},
+      {"00", false, true},  {"01", false, true}, {"80", false, true},
+      {"07", false, false},
+  };
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.value);
+    BlogFileHeader header;
+    header.GenerateRandomFields();
+    header.SetProperty(kBlogPropWriteBatchStreamingCompressionType,
+                       test_case.value);
+    std::string encoded;
+    header.EncodeTo(&encoded);
+    BlogFileHeader decoded;
+    Slice input(encoded);
+    const Status s = decoded.DecodeFrom(&input);
+    if (test_case.corruption) {
+      ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+    } else if (test_case.not_supported) {
+      ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    } else {
+      ASSERT_OK(s);
+    }
+  }
+}
+
+TEST_F(BlogFormatTest, HeaderRejectsInvalidTimestampSize) {
+  BlogFileHeader header;
+  header.GenerateRandomFields();
+  header.SetProperty(kBlogPropTimestampSize, "not-a-varint\xff\xff");
+  std::string encoded;
+  header.EncodeTo(&encoded);
+  BlogFileHeader decoded;
+  Slice input(encoded);
+  ASSERT_TRUE(decoded.DecodeFrom(&input).IsCorruption());
+}
+
+TEST_F(BlogFormatTest, FooterLocatorRejectsInvalidEntryType) {
+  BlogFileFooterLocator locator;
+  locator.entries.push_back(
+      {lossless_cast<BlogRecordType>(uint8_t{0x10}), 10});  // body, not footer
+  std::string encoded;
+  locator.EncodeTo(&encoded);
+  BlogFileFooterLocator decoded;
+  ASSERT_TRUE(decoded.DecodeFrom(Slice(encoded)).IsCorruption());
+}
+
+TEST_F(BlogFormatTest, FooterLocatorRejectsUnknownFooterType) {
+  BlogFileFooterLocator locator;
+  locator.entries.push_back({lossless_cast<BlogRecordType>(uint8_t{0xF1}), 10});
+  std::string encoded;
+  locator.EncodeTo(&encoded);
+  BlogFileFooterLocator decoded;
+  ASSERT_TRUE(decoded.DecodeFrom(Slice(encoded)).IsNotSupported());
+}
+
+TEST_F(BlogFormatTest, FooterLocatorRejectsZeroOffset) {
+  BlogFileFooterLocator locator;
+  locator.entries.push_back({kBlogFooterPropertiesRecord, 0});
+  std::string encoded;
+  locator.EncodeTo(&encoded);
+  BlogFileFooterLocator decoded;
+  ASSERT_TRUE(decoded.DecodeFrom(Slice(encoded)).IsCorruption());
+}
+
+TEST_F(BlogFormatTest, FooterLocatorRejectsSelfReference) {
+  BlogFileFooterLocator locator;
+  locator.entries.push_back({kBlogFooterLocatorRecord, 10});
+  std::string encoded;
+  locator.EncodeTo(&encoded);
+  BlogFileFooterLocator decoded;
+  ASSERT_TRUE(decoded.DecodeFrom(Slice(encoded)).IsCorruption());
+}
+
+TEST_F(BlogFormatTest, FooterPropertiesRejectsInvalidCompressionTypes) {
+  // Unsorted
+  {
+    BlogFileFooterProperties props;
+    std::string unsorted;
+    unsorted.push_back(lossless_cast<char>(kZSTD));
+    unsorted.push_back(lossless_cast<char>(kLZ4Compression));
+    props.properties.emplace_back("compressionTypes", unsorted);
+    std::string encoded;
+    props.EncodeTo(&encoded);
+    BlogFileFooterProperties decoded;
+    ASSERT_TRUE(decoded.DecodeFrom(Slice(encoded)).IsCorruption());
+  }
+  // Includes kNoCompression
+  {
+    BlogFileFooterProperties props;
+    std::string bad;
+    bad.push_back(lossless_cast<char>(kNoCompression));
+    props.properties.emplace_back("compressionTypes", bad);
+    std::string encoded;
+    props.EncodeTo(&encoded);
+    BlogFileFooterProperties decoded;
+    ASSERT_TRUE(decoded.DecodeFrom(Slice(encoded)).IsCorruption());
+  }
+  // Invalid type 0x08
+  {
+    BlogFileFooterProperties props;
+    std::string bad;
+    bad.push_back(static_cast<char>(0x08));
+    props.properties.emplace_back("compressionTypes", bad);
+    std::string encoded;
+    props.EncodeTo(&encoded);
+    BlogFileFooterProperties decoded;
+    ASSERT_TRUE(decoded.DecodeFrom(Slice(encoded)).IsCorruption());
+  }
+}
+
+TEST_F(BlogFormatTest, FooterPropertiesRejectsInvalidBlobCount) {
+  BlogFileFooterProperties props;
+  props.properties.emplace_back("blobCount", "not-varint\xff");
+  std::string encoded;
+  props.EncodeTo(&encoded);
+  BlogFileFooterProperties decoded;
+  ASSERT_TRUE(decoded.DecodeFrom(Slice(encoded)).IsCorruption());
+}
+
+TEST_F(BlogFormatTest, FooterPropertiesRejectsMinGreaterMax) {
+  BlogFileFooterProperties props;
+  props.SetSequenceRange(200, 100);
+  std::string encoded;
+  props.EncodeTo(&encoded);
+  BlogFileFooterProperties decoded;
+  ASSERT_TRUE(decoded.DecodeFrom(Slice(encoded)).IsCorruption());
+}
+
+TEST_F(BlogFormatTest, HeaderRejectsCaseFlippedRequiredProperty) {
+  for (ChecksumType checksum : {kXXH3, kNoChecksum}) {
+    BlogFileHeader header;
+    header.GenerateRandomFields();
+    header.checksum_type = checksum;
+    header.SetProperty(kBlogPropPredecessorWalInfo, "predecessor");
+    std::string encoded;
+    header.EncodeTo(&encoded);
+    const size_t property_offset = encoded.find(kBlogPropPredecessorWalInfo);
+    ASSERT_NE(property_offset, std::string::npos);
+    encoded[property_offset] ^= 0x20;  // Uppercase P becomes lowercase p.
+    BlogFileHeader decoded;
+    Slice input(encoded);
+    const Status s = decoded.DecodeFrom(&input);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+    if (checksum == kNoChecksum) {
+      ASSERT_NE(s.ToString().find("ignorable property in header"),
+                std::string::npos)
+          << s.ToString();
+    }
+  }
+}
+
+TEST_F(BlogFormatTest, HeaderTimestampSizeValueBoundaries) {
+  std::string trailing;
+  PutPrefixVarint64(&trailing, 8);
+  trailing.push_back('x');
+  const std::string invalid[] = {std::string(), std::string(1, '\0'), trailing};
+  for (const std::string& value : invalid) {
+    BlogFileHeader header;
+    header.GenerateRandomFields();
+    header.SetProperty(kBlogPropTimestampSize, value);
+    std::string encoded;
+    header.EncodeTo(&encoded);
+    BlogFileHeader decoded;
+    Slice input(encoded);
+    const Status s = decoded.DecodeFrom(&input);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  }
+  BlogFileHeader header;
+  header.GenerateRandomFields();
+  header.SetUint64Property(kBlogPropTimestampSize, 0);
+  std::string encoded;
+  header.EncodeTo(&encoded);
+  BlogFileHeader decoded;
+  Slice input(encoded);
+  ASSERT_OK(decoded.DecodeFrom(&input));
+}
+
+TEST_F(BlogFormatTest, FooterLocatorRejectsMalformedRecordWithoutOutput) {
+  const struct {
+    uint64_t declared_length;
+    std::string payload;
+    CompressionType prefix_comp;
+    CompressionType trailer_comp;
+  } cases[] = {
+      {0, "", kNoCompression, kNoCompression},
+      {1, "x", kNoCompression, kNoCompression},
+      {5, std::string(5, '\0'), kNoCompression, kNoCompression},
+      {5, std::string("\xf9\x01\x00\x00\x00", 5), kNoCompression,
+       kNoCompression},
+      {5, std::string("\xf8\x01\x00\x00\x00", 5),
+       lossless_cast<CompressionType>(uint8_t{0x08}), kNoCompression},
+      {5, std::string("\xf8\x01\x00\x00\x00", 5), kSnappyCompression,
+       kNoCompression},
+  };
+  for (ChecksumType checksum : {kXXH3, kNoChecksum}) {
+    BlogFileHeader header;
+    header.GenerateRandomFields();
+    header.checksum_type = checksum;
+    for (const auto& test_case : cases) {
+      const std::string record = MakeFooterLocatorRecordWithCompression(
+          header, 0, header.incarnation_id(), test_case.declared_length,
+          test_case.payload, test_case.prefix_comp, test_case.trailer_comp);
+      for (bool decode_output : {false, true}) {
+        BlogFileFooterLocator decoded;
+        uint64_t offset = 123;
+        ASSERT_FALSE(VerifyBlogFooterLocator(
+            record.data(), record.size(), 0, header.escape_sequence, checksum,
+            header.incarnation_id(), decode_output ? &decoded : nullptr,
+            &offset));
+        ASSERT_EQ(offset, 123u);
+      }
+    }
+  }
+}
+
+TEST_F(BlogFormatTest, FooterPropertiesCompressionTypeBoundaries) {
+  const std::string invalid[] = {
+      std::string(1, lossless_cast<char>(kStreamingCompressionSentinel)),
+      std::string(2, lossless_cast<char>(kZSTD)),
+  };
+  for (const std::string& value : invalid) {
+    BlogFileFooterProperties props;
+    props.properties.emplace_back("compressionTypes", value);
+    std::string encoded;
+    props.EncodeTo(&encoded);
+    BlogFileFooterProperties decoded;
+    const Status s = decoded.DecodeFrom(encoded);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  }
+  BlogFileFooterProperties props;
+  props.properties.emplace_back(
+      "compressionTypes",
+      std::string(1, lossless_cast<char>(kFirstCustomCompression)));
+  std::string encoded;
+  props.EncodeTo(&encoded);
+  BlogFileFooterProperties decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+}
+
+TEST_F(BlogFormatTest, FooterPropertiesNumericValueBoundaries) {
+  const char* names[] = {"blobCount",           "blobPayloadBytes",
+                         "blobCompressedBytes", "blobUncompressedBytes",
+                         "blobOverheadBytes",   "minSequence",
+                         "maxSequence"};
+  std::string trailing;
+  PutPrefixVarint64(&trailing, 42);
+  trailing.push_back('x');
+  const std::string invalid[] = {std::string(), std::string(1, '\0'), trailing};
+  for (const char* name : names) {
+    SCOPED_TRACE(name);
+    for (const std::string& value : invalid) {
+      BlogFileFooterProperties props;
+      props.properties.emplace_back(name, value);
+      std::string encoded;
+      props.EncodeTo(&encoded);
+      BlogFileFooterProperties decoded;
+      const Status s = decoded.DecodeFrom(encoded);
+      ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+    }
+    std::string value;
+    PutPrefixVarint64(&value, UINT64_MAX);
+    BlogFileFooterProperties props;
+    props.properties.emplace_back(name, value);
+    std::string encoded;
+    props.EncodeTo(&encoded);
+    BlogFileFooterProperties decoded;
+    ASSERT_OK(decoded.DecodeFrom(encoded));
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
