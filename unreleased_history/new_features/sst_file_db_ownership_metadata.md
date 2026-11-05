@@ -1,1 +1,0 @@
-Added `db_ownership_start_time` and `data_file_provenance` (decoded by `DataFileProvenance`) to `SstFileMetaData`, recording when the DB began holding each SST file and how it got the file (e.g. flush, compaction, ingestion, or import).
