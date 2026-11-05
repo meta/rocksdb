@@ -8680,11 +8680,15 @@ TEST_F(ExternalTableTest, FactoryWithoutTableBuilderIsNeverCompacted) {
     return names;
   };
   std::vector<std::string> ingested[3];
+  // Otherwise the FIFO compaction of handles_[1] can delete its file before
+  // the check below sees it.
+  ASSERT_OK(db_->PauseBackgroundWork());
   for (int cf : {1, 2}) {
     ASSERT_OK(db_->IngestExternalFile(handles_[cf], {file}, ingest_options));
     ingested[cf] = live_files(cf);
     ASSERT_EQ(ingested[cf].size(), 1);
   }
+  ASSERT_OK(db_->ContinueBackgroundWork());
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   ASSERT_TRUE(live_files(1).empty());
   ASSERT_EQ(live_files(2), ingested[2]);
