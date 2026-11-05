@@ -12,6 +12,7 @@
 
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
+#include "db/legacy_wal_writer.h"
 #include "options/options_helper.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
@@ -1916,7 +1917,7 @@ class RecoveryTestHelper {
     wal_manager.reset(
         new WalManager(db_options, file_options, /*io_tracer=*/nullptr));
 
-    std::unique_ptr<log::Writer> current_log_writer;
+    std::unique_ptr<WalWriter> current_log_writer;
 
     for (size_t j = kWALFileOffset; j < wal_count + kWALFileOffset; j++) {
       uint64_t current_log_number = j;
@@ -1925,10 +1926,11 @@ class RecoveryTestHelper {
       ASSERT_OK(WritableFileWriter::Create(db_options.env->GetFileSystem(),
                                            fname, file_options, &file_writer,
                                            nullptr));
-      log::Writer* log_writer =
-          new log::Writer(std::move(file_writer), current_log_number,
-                          db_options.recycle_log_file_num > 0, false,
-                          db_options.wal_compression);
+      WalWriter* log_writer = new LegacyWalWriter(
+          std::move(file_writer), current_log_number,
+          db_options.recycle_log_file_num > 0, /*manual_flush=*/false,
+          db_options.wal_compression, /*track_and_verify_wals=*/false,
+          /*initial_block_offset=*/0);
       ASSERT_OK(log_writer->AddCompressionTypeRecord(WriteOptions()));
       current_log_writer.reset(log_writer);
 

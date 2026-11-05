@@ -48,7 +48,6 @@
 #include "db/import_column_family_job.h"
 #include "db/job_context.h"
 #include "db/log_reader.h"
-#include "db/log_writer.h"
 #include "db/malloc_stats.h"
 #include "db/memtable.h"
 #include "db/memtable_list.h"
@@ -1157,7 +1156,7 @@ Status DBImpl::CloseHelper() {
   // Release any opened-but-unpublished WAL writer after the in-flight worker
   // has published its result. Clear the DB-owned async slot while holding
   // mutex_, but destroy the detached writer after dropping mutex_ because
-  // log::Writer / WritableFileWriter destruction can flush and close the file.
+  // WalWriter / WritableFileWriter destruction can flush and close the file.
   // The file itself can be left behind as an empty future WAL; recovery already
   // tolerates it and marks its file number used if observed.
   UnpublishedWAL unused_async_wal = std::move(async_wal_precreate_wal_);
@@ -2491,7 +2490,7 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
     {
       // We need to lock wal_write_mutex_ since logs_ might change concurrently
       InstrumentedMutexLock wl(&wal_write_mutex_);
-      log::Writer* cur_log_writer = logs_.back().writer;
+      WalWriter* cur_log_writer = logs_.back().writer;
       io_s = cur_log_writer->WriteBuffer(write_options);
     }
     if (!io_s.ok()) {
@@ -2518,7 +2517,7 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
 
 bool DBImpl::WALBufferIsEmpty() {
   InstrumentedMutexLock l(&wal_write_mutex_);
-  log::Writer* cur_log_writer = logs_.back().writer;
+  WalWriter* cur_log_writer = logs_.back().writer;
   auto res = cur_log_writer->BufferIsEmpty();
   return res;
 }
@@ -2566,7 +2565,7 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
                              const WriteOptions& write_options,
                              JobContext* job_context, VersionEdit* synced_wals,
                              bool error_recovery_in_prog) {
-  autovector<log::Writer*, 1> wals_to_sync;
+  autovector<WalWriter*, 1> wals_to_sync;
   bool need_wal_dir_sync;
   // Number of a WAL that was active at the start of call and maybe is by
   // the end of the call.
@@ -2627,11 +2626,11 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
   RecordTick(stats_, WAL_FILE_SYNCED);
   IOOptions opts;
   IOStatus io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
-  std::list<log::Writer*> wals_internally_closed;
+  std::list<WalWriter*> wals_internally_closed;
   uint64_t failed_wal_number = 0;
   bool failed_with_previous_error = false;
   if (io_s.ok()) {
-    for (log::Writer* log : wals_to_sync) {
+    for (WalWriter* log : wals_to_sync) {
       if (log->get_log_number() <=
           wal_recovery_cutoff_.load(std::memory_order_acquire)) {
         continue;
@@ -2653,7 +2652,7 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
         io_s = log->file()->Sync(opts, immutable_db_options_.use_fsync,
                                  &failed_with_previous_error);
       }
-      std::pair<log::Writer*, IOStatus*> wal_and_status(log, &io_s);
+      std::pair<WalWriter*, IOStatus*> wal_and_status(log, &io_s);
       TEST_SYNC_POINT_CALLBACK("DBImpl::SyncWalImpl:AfterSyncWAL",
                                &wal_and_status);
       if (!io_s.ok()) {
@@ -2715,7 +2714,7 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
   {
     InstrumentedMutexLock l(&wal_write_mutex_);
     for (auto* wal : wals_internally_closed) {
-      // We can only modify the state of log::Writer under the mutex
+      // We can only modify the state of WalWriter under the mutex
       bool was_closed = wal->PublishIfClosed();
       assert(was_closed);
       (void)was_closed;
@@ -3025,7 +3024,7 @@ void DBImpl::BackgroundCallPurge() {
 
   while (!wals_to_free_queue_.empty()) {
     assert(!wals_to_free_queue_.empty());
-    log::Writer* log_writer = *(wals_to_free_queue_.begin());
+    WalWriter* log_writer = *(wals_to_free_queue_.begin());
     wals_to_free_queue_.pop_front();
     mutex_.Unlock();
     delete log_writer;
