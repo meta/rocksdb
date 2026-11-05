@@ -2510,6 +2510,7 @@ class DB {
   // WalIterator for details.
   //
   // Returns Status::OK if the iterator is valid.
+  // The returned iterator must be destroyed before the DB is closed.
   virtual Status GetUpdatesSince(SequenceNumber seq_number,
                                  std::unique_ptr<WalIterator>* iter,
                                  const WalIterator::ReadOptions& read_options =

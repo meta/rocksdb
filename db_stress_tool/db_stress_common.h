@@ -489,6 +489,8 @@ DECLARE_string(file_temperature_age_thresholds);
 DECLARE_bool(allow_trivial_copy_when_change_temperature);
 DECLARE_uint32(commit_bypass_memtable_one_in);
 DECLARE_bool(track_and_verify_wals);
+DECLARE_bool(wal_iterator_tail_rotations);
+DECLARE_bool(tail_wal_updates);
 DECLARE_int32(remote_compaction_worker_threads);
 DECLARE_int32(remote_compaction_worker_interval);
 DECLARE_bool(remote_compaction_failure_fall_back_to_local);
@@ -848,6 +850,8 @@ inline void SanitizeDoubleParam(double* param) {
 void PoolSizeChangeThread(void* v);
 
 void DbVerificationThread(void* v);
+
+void WalTailThread(void* v);
 
 void LivenessWatchdogThread(void* v);
 

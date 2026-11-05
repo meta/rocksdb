@@ -3294,6 +3294,11 @@ class DBImpl : public DB
   // WALs with log number up to up_to are not synced successfully.
   void MarkLogsNotSynced(uint64_t up_to);
 
+  // A NextWalForTailFn that looks for the successor among the live WALs only.
+  // Bound into the WAL iterator by GetUpdatesSince() when
+  // DBOptions::wal_iterator_tail_rotations is enabled.
+  uint64_t FindNextLiveWalForTail(uint64_t last_wal_number);
+
   enum class SnapshotLockMode {
     kTryWithoutDBMutex,
     kDBMutexHeld,
@@ -3806,6 +3811,7 @@ class DBImpl : public DB
   //    of two-write-queues. Only wal_write_mutex_ is held. This suffices to
   //    protect the data structure from concurrent push_back() by current
   //    write group leader as well as pop_front() by FindObsoleteFiles().
+  // 10. read by FindNextLiveWalForTail() with only mutex_ held.
   std::deque<WalFileNumberSize> alive_wal_files_;
 
   // Total size of all "alive" WALs (for easy access without synchronization)

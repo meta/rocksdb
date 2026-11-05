@@ -108,7 +108,7 @@ class WalManagerTest : public testing::Test {
   std::unique_ptr<WalIterator> OpenWalIter(const SequenceNumber seq) {
     std::unique_ptr<WalIterator> iter;
     Status status = wal_manager_->GetUpdatesSince(
-        seq, &iter, WalIterator::ReadOptions(), versions_.get());
+        seq, &iter, WalIterator::ReadOptions(), versions_.get(), nullptr);
     EXPECT_OK(status);
     return iter;
   }

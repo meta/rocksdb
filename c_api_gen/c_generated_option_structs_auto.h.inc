@@ -204,6 +204,12 @@ rocksdb_options_set_background_close_inactive_wals(rocksdb_options_t* opt,
 extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_options_get_background_close_inactive_wals(rocksdb_options_t* opt);
 
+extern ROCKSDB_LIBRARY_API void rocksdb_options_set_wal_iterator_tail_rotations(
+    rocksdb_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_options_get_wal_iterator_tail_rotations(rocksdb_options_t* opt);
+
 extern ROCKSDB_LIBRARY_API void
 rocksdb_options_set_track_options_file_number_in_manifest(
     rocksdb_options_t* opt, unsigned char v);

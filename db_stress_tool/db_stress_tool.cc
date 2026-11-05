@@ -409,6 +409,11 @@ int db_stress_tool(int argc, char** argv) {
     return ReturnValidationError(
         "Db cannot reopen safely with disable_wal set!");
   }
+  if (FLAGS_tail_wal_updates && FLAGS_reopen > 0) {
+    return ReturnValidationError(
+        "tail_wal_updates requires reopen=0: its iterator must not outlive "
+        "the DB");
+  }
   if ((unsigned)FLAGS_reopen >= FLAGS_ops_per_thread) {
     return ReturnValidationError(
         "#DB-reopens should be < ops_per_thread\nProvided reopens = ",
