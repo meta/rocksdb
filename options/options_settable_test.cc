@@ -514,6 +514,8 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "two_write_queues=false;"
       "manual_wal_flush=false;"
       "wal_compression=kZSTD;"
+      "use_blog_format_for_blobs=false;"
+      "blog_checksum=kXXH3;"
       "background_close_inactive_wals=true;"
       "seq_per_batch=false;"
       "atomic_flush=false;"

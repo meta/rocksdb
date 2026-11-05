@@ -109,14 +109,17 @@ class VersionBlobFetcherBase : public BlobFetcher {
 
  protected:
   VersionBlobFetcherBase(const Version* version, BlobFileCache* blob_file_cache,
-                         bool allow_write_path_fallback)
+                         bool allow_write_path_fallback,
+                         CompressionManager* configured_compression_manager)
       : version_(version),
         blob_file_cache_(blob_file_cache),
-        allow_write_path_fallback_(allow_write_path_fallback) {}
+        allow_write_path_fallback_(allow_write_path_fallback),
+        configured_compression_manager_(configured_compression_manager) {}
 
   const Version* version_;
   BlobFileCache* blob_file_cache_;
   bool allow_write_path_fallback_;
+  CompressionManager* configured_compression_manager_;
 };
 
 // The default BlobFetcher for transient/stack use: holds a reference to a
@@ -127,19 +130,24 @@ class VersionBlobFetcherBase : public BlobFetcher {
 // Use OwningVersionBlobFetcher for lifetime-independent fetchers.
 class VersionBlobFetcher : public VersionBlobFetcherBase {
  public:
-  VersionBlobFetcher(const Version* version, const ReadOptions& read_options,
-                     BlobFileCache* blob_file_cache = nullptr,
-                     bool allow_write_path_fallback = false)
+  VersionBlobFetcher(
+      const Version* version, const ReadOptions& read_options,
+      BlobFileCache* blob_file_cache = nullptr,
+      bool allow_write_path_fallback = false,
+      CompressionManager* configured_compression_manager = nullptr)
       : VersionBlobFetcherBase(version, blob_file_cache,
-                               allow_write_path_fallback),
+                               allow_write_path_fallback,
+                               configured_compression_manager),
         read_options_(read_options) {}
 
   // Reject binding to a temporary ReadOptions, which would leave a dangling
   // reference. Callers that cannot guarantee the ReadOptions outlives the
   // fetcher must use OwningVersionBlobFetcher instead.
-  VersionBlobFetcher(const Version* version, ReadOptions&& read_options,
-                     BlobFileCache* blob_file_cache = nullptr,
-                     bool allow_write_path_fallback = false) = delete;
+  VersionBlobFetcher(
+      const Version* version, ReadOptions&& read_options,
+      BlobFileCache* blob_file_cache = nullptr,
+      bool allow_write_path_fallback = false,
+      CompressionManager* configured_compression_manager = nullptr) = delete;
 
   const ReadOptions& read_options() const override { return read_options_; }
 
@@ -155,11 +163,14 @@ class VersionBlobFetcher : public VersionBlobFetcherBase {
 // move must make the copy explicit (e.g. ReadOptions(read_options)).
 class OwningVersionBlobFetcher : public VersionBlobFetcherBase {
  public:
-  OwningVersionBlobFetcher(const Version* version, ReadOptions&& read_options,
-                           BlobFileCache* blob_file_cache = nullptr,
-                           bool allow_write_path_fallback = false)
+  OwningVersionBlobFetcher(
+      const Version* version, ReadOptions&& read_options,
+      BlobFileCache* blob_file_cache = nullptr,
+      bool allow_write_path_fallback = false,
+      CompressionManager* configured_compression_manager = nullptr)
       : VersionBlobFetcherBase(version, blob_file_cache,
-                               allow_write_path_fallback),
+                               allow_write_path_fallback,
+                               configured_compression_manager),
         read_options_(std::move(read_options)) {}
 
   const ReadOptions& read_options() const override { return read_options_; }
