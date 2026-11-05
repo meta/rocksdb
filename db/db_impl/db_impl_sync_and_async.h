@@ -354,9 +354,10 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImpl::GetImpl)
       partition_mgr != nullptr && (is_blob_ptr == &is_blob_index);
   std::optional<VersionBlobFetcher> memtable_blob_fetcher;
   if (partition_mgr != nullptr) {
-    memtable_blob_fetcher.emplace(sv->current, read_options,
-                                  cfd->blob_file_cache(),
-                                  /*allow_write_path_fallback=*/true);
+    memtable_blob_fetcher.emplace(
+        sv->current, read_options, cfd->blob_file_cache(),
+        /*allow_write_path_fallback=*/true,
+        sv->current->GetMutableCFOptions().compression_manager.get());
   }
   const BlobFetcher* memtable_blob_fetcher_ptr =
       memtable_blob_fetcher ? &*memtable_blob_fetcher : nullptr;
@@ -533,7 +534,9 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImpl::MultiGetImpl)
   if (partition_mgr != nullptr) {
     memtable_blob_fetcher.emplace(super_version->current, read_options,
                                   cfd->blob_file_cache(),
-                                  /*allow_write_path_fallback=*/true);
+                                  /*allow_write_path_fallback=*/true,
+                                  super_version->current->GetMutableCFOptions()
+                                      .compression_manager.get());
   }
   const BlobFetcher* memtable_blob_fetcher_ptr =
       memtable_blob_fetcher ? &*memtable_blob_fetcher : nullptr;

@@ -14,12 +14,13 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-ReadPathBlobResolver::ReadPathBlobResolver(const Version* version,
-                                           const ReadOptions& read_options,
-                                           BlobFileCache* blob_file_cache,
-                                           bool allow_write_path_fallback)
+ReadPathBlobResolver::ReadPathBlobResolver(
+    const Version* version, const ReadOptions& read_options,
+    BlobFileCache* blob_file_cache, bool allow_write_path_fallback,
+    CompressionManager* configured_compression_manager)
     : blob_fetcher_(version, ReadOptions(read_options), blob_file_cache,
-                    allow_write_path_fallback) {}
+                    allow_write_path_fallback, configured_compression_manager) {
+}
 
 void ReadPathBlobResolver::Reset(
     const Slice& user_key, const std::vector<WideColumn>* columns,

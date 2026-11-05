@@ -86,6 +86,19 @@ class BlobSource {
                  uint64_t file_size, uint64_t value_size,
                  CompressionType compression_type,
                  FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
+                 uint64_t* bytes_read) {
+    return GetBlob(read_options, user_key,
+                   /*configured_compression_manager=*/nullptr, blob_file,
+                   offset, file_size, value_size, compression_type,
+                   prefetch_buffer, value, bytes_read);
+  }
+
+  Status GetBlob(const ReadOptions& read_options, const Slice& user_key,
+                 CompressionManager* configured_compression_manager,
+                 const BlobFileOpenInfo& blob_file, uint64_t offset,
+                 uint64_t file_size, uint64_t value_size,
+                 CompressionType compression_type,
+                 FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
                  uint64_t* bytes_read);
 
   // Reads a byte sub-range [range_offset, range_offset + range_length) of an
@@ -217,6 +230,14 @@ class BlobSource {
   //  records.
   void MultiGetBlob(const ReadOptions& read_options,
                     autovector<BlobFileReadRequests>& blob_reqs,
+                    uint64_t* bytes_read) {
+    MultiGetBlob(read_options, /*configured_compression_manager=*/nullptr,
+                 blob_reqs, bytes_read);
+  }
+
+  void MultiGetBlob(const ReadOptions& read_options,
+                    CompressionManager* configured_compression_manager,
+                    autovector<BlobFileReadRequests>& blob_reqs,
                     uint64_t* bytes_read);
 
   // Read multiple blobs from the underlying cache or one blob file.
@@ -239,7 +260,25 @@ class BlobSource {
                                const BlobFileOpenInfo& blob_file,
                                uint64_t file_size,
                                autovector<BlobReadRequest>& blob_reqs,
-                               uint64_t* bytes_read);
+                               uint64_t* bytes_read) {
+    MultiGetBlobFromOneFile(read_options,
+                            /*configured_compression_manager=*/nullptr,
+                            blob_file, file_size, blob_reqs, bytes_read);
+  }
+
+  void MultiGetBlobFromOneFile(
+      const ReadOptions& read_options,
+      CompressionManager* configured_compression_manager,
+      const BlobFileOpenInfo& blob_file, uint64_t file_size,
+      autovector<BlobReadRequest>& blob_reqs, uint64_t* bytes_read);
+
+  inline Status GetBlobFileReader(
+      const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
+      CacheHandleGuard<BlobFileReader>* blob_file_reader) {
+    return GetBlobFileReader(read_options, blob_file,
+                             /*configured_compression_manager=*/nullptr,
+                             blob_file_reader);
+  }
 
   // Byte-range (partial) multi-read counterpart of MultiGetBlob: for each
   // request reads only its sub-range of an *uncompressed* blob value, from the
@@ -262,8 +301,10 @@ class BlobSource {
 
   inline Status GetBlobFileReader(
       const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
+      CompressionManager* configured_compression_manager,
       CacheHandleGuard<BlobFileReader>* blob_file_reader) {
     return blob_file_cache_->GetBlobFileReader(read_options, blob_file,
+                                               configured_compression_manager,
                                                blob_file_reader);
   }
 
@@ -310,6 +351,7 @@ class BlobSource {
   const std::string& db_session_id_;
 
   Statistics* statistics_;
+  bool use_blog_format_;
 
   // A cache to store blob file reader.
   BlobFileCache* blob_file_cache_;

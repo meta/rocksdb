@@ -34,6 +34,8 @@ class BlobLogWriter;
 class IOTracer;
 class BlobFileCompletionCallback;
 
+class BlogFileWriter;
+
 class BlobFileBuilder {
  public:
   BlobFileBuilder(VersionSet* versions, FileSystem* fs,
@@ -83,10 +85,11 @@ class BlobFileBuilder {
   std::string GetBlobFilePath(uint64_t blob_file_number) const;
   bool IsBlobFileOpen() const;
   Status OpenBlobFileIfNeeded();
-  Status CompressBlobIfNeeded(Slice* blob,
-                              GrowableBuffer* compressed_blob) const;
+  Status LegacyCompressBlob(Slice* blob, GrowableBuffer* compressed_blob) const;
   Status WriteBlobToFile(const Slice& key, const Slice& blob,
-                         uint64_t* blob_file_number, uint64_t* blob_offset);
+                         uint64_t* blob_file_number, uint64_t* blob_offset,
+                         uint64_t* blob_on_disk_size,
+                         CompressionType* actual_compression_type);
   Status CloseBlobFile();
   Status CloseBlobFileIfNeeded();
 
@@ -100,6 +103,7 @@ class BlobFileBuilder {
   uint64_t blob_file_size_;
   uint64_t blob_file_writable_file_max_buffer_size_;
   CompressionType blob_compression_type_;
+  std::shared_ptr<CompressionManager> blob_compression_manager_;
   std::unique_ptr<Compressor> blob_compressor_;
   mutable Compressor::ManagedWorkingArea blob_compressor_wa_;
   PrepopulateBlobCache prepopulate_blob_cache_;
@@ -118,6 +122,8 @@ class BlobFileBuilder {
   std::vector<std::string>* output_file_paths_;
   std::vector<BlobFileAddition>* blob_file_additions_;
   std::unique_ptr<BlobLogWriter> writer_;
+  std::unique_ptr<BlogFileWriter> blog_writer_;
+  uint64_t blob_file_number_ = 0;
   uint64_t blob_count_;
   uint64_t blob_bytes_;
 };

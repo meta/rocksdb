@@ -10807,10 +10807,11 @@ class DBCompactionTestBlobError
   std::string sync_point_;
 };
 
-INSTANTIATE_TEST_CASE_P(DBCompactionTestBlobError, DBCompactionTestBlobError,
-                        ::testing::ValuesIn(std::vector<std::string>{
-                            "BlobFileBuilder::WriteBlobToFile:AddRecord",
-                            "BlobFileBuilder::WriteBlobToFile:AppendFooter"}));
+INSTANTIATE_TEST_CASE_P(
+    DBCompactionTestBlobError, DBCompactionTestBlobError,
+    ::testing::ValuesIn(std::vector<std::string>{
+        "BlobFileBuilder::WriteBlobToFile:AddRecord",
+        "BlobFileBuilder::WriteBlobToFile:LegacyAppendFooterAndClose"}));
 
 TEST_P(DBCompactionTestBlobError, CompactionError) {
   Options options = CurrentOptions();

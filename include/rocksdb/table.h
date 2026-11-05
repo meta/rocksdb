@@ -23,6 +23,7 @@
 #include <unordered_map>
 
 #include "rocksdb/cache.h"
+#include "rocksdb/checksum_type.h"
 #include "rocksdb/cleanable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/env.h"
@@ -108,20 +109,6 @@ class ReadScopedBlockBufferProvider {
   virtual ~ReadScopedBlockBufferProvider() = default;
 
   virtual Status Allocate(size_t size, size_t alignment, Lease* out) = 0;
-};
-
-// Types of checksums to use for checking integrity of logical blocks within
-// files. All checksums currently use 32 bits of checking power (1 in 4B
-// chance of failing to detect random corruption). Traditionally, the actual
-// checking power can be far from ideal if the corruption is due to misplaced
-// data (e.g. physical blocks out of order in a file, or from another file),
-// which is fixed in format_version=6 (see below).
-enum ChecksumType : char {
-  kNoChecksum = 0x0,
-  kCRC32c = 0x1,
-  kxxHash = 0x2,
-  kxxHash64 = 0x3,
-  kXXH3 = 0x4,  // Supported since RocksDB 6.27
 };
 
 // `PinningTier` is used to specify which tier of block-based tables should

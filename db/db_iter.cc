@@ -82,7 +82,8 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       // write-path partition manager; otherwise the fetcher stays on the
       // version-backed path.
       blob_state_(version, read_options, cfd ? cfd->blob_file_cache() : nullptr,
-                  cfd != nullptr && cfd->blob_partition_manager() != nullptr),
+                  cfd != nullptr && cfd->blob_partition_manager() != nullptr,
+                  mutable_cf_options.compression_manager.get()),
       read_callback_(read_callback),
       sequence_(s),
       value_columns_state_(version, read_options, cfd),

@@ -13,6 +13,7 @@
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blog/blog_format.h"
 #include "db/wide/wide_column_serialization.h"
 #include "db/write_batch_internal.h"
 #include "port/likely.h"
@@ -115,7 +116,9 @@ Status BlobWriteBatchTransformer::MaybePreprocessWideColumns(
 
     if (rollback_infos != nullptr) {
       const uint64_t record_bytes =
-          BlobLogRecord::kHeaderSize + key.size() + blob_size;
+          partition_mgr->is_blog_format()
+              ? ComputeBlogRecordSize(blob_size, /*compact_eligible=*/true)
+              : BlobLogRecord::kHeaderSize + key.size() + blob_size;
       rollback_infos->push_back(
           {partition_mgr, blob_file_number, /*count=*/1, record_bytes});
     }
@@ -179,7 +182,9 @@ Status BlobWriteBatchTransformer::PutCF(uint32_t column_family_id,
   // Track the exact file so stale transformed attempts can rollback
   // per-file rather than smearing bytes across all partitions at seal time.
   const uint64_t record_bytes =
-      BlobLogRecord::kHeaderSize + key.size() + blob_size;
+      cached_partition_mgr_->is_blog_format()
+          ? ComputeBlogRecordSize(blob_size, /*compact_eligible=*/true)
+          : BlobLogRecord::kHeaderSize + key.size() + blob_size;
   rollback_infos_.push_back(
       {cached_partition_mgr_, blob_file_number, /*count=*/1, record_bytes});
 
