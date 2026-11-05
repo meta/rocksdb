@@ -12,6 +12,7 @@
 
 #include "port/port.h"
 #include "test_util/testharness.h"
+#include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -402,6 +403,273 @@ TEST_F(FaultInjectionTestFSTest,
   // forward another raw Close().
   file.reset();
   ASSERT_EQ(0, inner_close_calls);
+}
+
+namespace {
+
+// Opens a file for write through a FaultInjectionTestFS that holds unsynced
+// appends in memory.
+std::shared_ptr<FaultInjectionTestFS> NewUnsyncedDataLossFsAndFile(
+    Env* env, const std::string& test_name, std::string* file_name,
+    std::unique_ptr<FSWritableFile>* file) {
+  const std::string dbname = test::PerThreadDBPath(test_name);
+  *file_name = dbname + "/test-file";
+  EXPECT_OK(env->CreateDirIfMissing(dbname));
+
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(env->GetFileSystem());
+  fault_fs->SetFilesystemDirectWritable(false);
+  fault_fs->SetInjectUnsyncedDataLoss(true);
+  EXPECT_OK(fault_fs->NewWritableFile(*file_name, FileOptions(), file,
+                                      nullptr /* dbg */));
+  return fault_fs;
+}
+
+class FailTruncateWritableFile : public FSWritableFileOwnerWrapper {
+ public:
+  explicit FailTruncateWritableFile(std::unique_ptr<FSWritableFile>&& target)
+      : FSWritableFileOwnerWrapper(std::move(target)) {}
+
+  IOStatus Truncate(uint64_t /*size*/, const IOOptions& /*options*/,
+                    IODebugContext* /*dbg*/) override {
+    return IOStatus::IOError("injected truncate failure");
+  }
+};
+
+class FailTruncateFS : public FileSystemWrapper {
+ public:
+  explicit FailTruncateFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+  const char* Name() const override { return "FailTruncateFS"; }
+
+  IOStatus NewWritableFile(const std::string& fname, const FileOptions& opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override {
+    IOStatus s = target()->NewWritableFile(fname, opts, result, dbg);
+    if (s.ok()) {
+      result->reset(new FailTruncateWritableFile(std::move(*result)));
+    }
+    return s;
+  }
+};
+
+}  // namespace
+
+TEST_F(FaultInjectionTestFSTest, TruncatePreservesAndShrinksUnsyncedData) {
+  Env* env = Env::Default();
+  std::string file_name;
+  std::unique_ptr<FSWritableFile> file;
+  std::shared_ptr<FaultInjectionTestFS> fault_fs = NewUnsyncedDataLossFsAndFile(
+      env, "fault_injection_fs_test_truncate_unsynced", &file_name, &file);
+  ASSERT_NE(nullptr, file);
+
+  ASSERT_OK(file->Append("synced", IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Sync(IOOptions(), nullptr /* dbg */));
+
+  ASSERT_OK(file->Append("unsynced", IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Truncate(/*size=*/14, IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Sync(IOOptions(), nullptr /* dbg */));
+
+  ASSERT_OK(file->Append("keepdiscard", IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Truncate(/*size=*/18, IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Sync(IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Close(IOOptions(), nullptr /* dbg */));
+
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env, file_name, &contents));
+  ASSERT_EQ("syncedunsyncedkeep", contents);
+  ASSERT_OK(env->DeleteFile(file_name));
+}
+
+// Truncating below the last sync point discards everything still buffered.
+TEST_F(FaultInjectionTestFSTest, TruncateBelowSyncPointDropsUnsyncedData) {
+  Env* env = Env::Default();
+  std::string file_name;
+  std::unique_ptr<FSWritableFile> file;
+  std::shared_ptr<FaultInjectionTestFS> fault_fs = NewUnsyncedDataLossFsAndFile(
+      env, "fault_injection_fs_test_truncate_below_sync", &file_name, &file);
+  ASSERT_NE(nullptr, file);
+
+  ASSERT_OK(file->Append("synced", IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Sync(IOOptions(), nullptr /* dbg */));
+
+  ASSERT_OK(file->Append("unsynced", IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Truncate(/*size=*/3, IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Sync(IOOptions(), nullptr /* dbg */));
+
+  // Writing again after the truncation must resume from the new end of file.
+  ASSERT_OK(file->Append("tail", IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Sync(IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Close(IOOptions(), nullptr /* dbg */));
+
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env, file_name, &contents));
+  ASSERT_EQ("syntail", contents);
+  ASSERT_OK(env->DeleteFile(file_name));
+}
+
+// A reopened handle models offsets from zero while the file already holds
+// data, so its truncation must still reach the file.
+TEST_F(FaultInjectionTestFSTest, TruncateReopenedFileReachesTarget) {
+  Env* env = Env::Default();
+  std::string file_name;
+  std::unique_ptr<FSWritableFile> file;
+  std::shared_ptr<FaultInjectionTestFS> fault_fs = NewUnsyncedDataLossFsAndFile(
+      env, "fault_injection_fs_test_truncate_reopened", &file_name, &file);
+  ASSERT_NE(nullptr, file);
+  ASSERT_OK(file->Append("synced", IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Sync(IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Close(IOOptions(), nullptr /* dbg */));
+
+  ASSERT_OK(fault_fs->ReopenWritableFile(file_name, FileOptions(), &file,
+                                         nullptr /* dbg */));
+  ASSERT_OK(file->Truncate(/*size=*/0, IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Close(IOOptions(), nullptr /* dbg */));
+
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env, file_name, &contents));
+  ASSERT_EQ("", contents);
+  ASSERT_OK(env->DeleteFile(file_name));
+}
+
+// A failed below-sync truncation must not discard buffered data: the file
+// must still hold everything the caller wrote.
+TEST_F(FaultInjectionTestFSTest, TruncateBelowSyncPointFailureKeepsBuffer) {
+  Env* env = Env::Default();
+  const std::string dbname =
+      test::PerThreadDBPath("fault_injection_fs_test_truncate_fail");
+  const std::string file_name = dbname + "/test-file";
+  ASSERT_OK(env->CreateDirIfMissing(dbname));
+  env->DeleteFile(file_name).PermitUncheckedError();
+
+  auto base_fs = std::make_shared<FailTruncateFS>(env->GetFileSystem());
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(base_fs);
+  fault_fs->SetFilesystemDirectWritable(false);
+  fault_fs->SetInjectUnsyncedDataLoss(true);
+
+  std::unique_ptr<FSWritableFile> file;
+  ASSERT_OK(
+      fault_fs->NewWritableFile(file_name, FileOptions(), &file, nullptr));
+  ASSERT_NE(nullptr, file);
+
+  ASSERT_OK(file->Append("synced", IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Sync(IOOptions(), nullptr /* dbg */));
+
+  ASSERT_OK(file->Append("unsynced", IOOptions(), nullptr /* dbg */));
+  ASSERT_NOK(file->Truncate(/*size=*/3, IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Sync(IOOptions(), nullptr /* dbg */));
+  ASSERT_OK(file->Close(IOOptions(), nullptr /* dbg */));
+
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env, file_name, &contents));
+  ASSERT_EQ("syncedunsynced", contents);
+  ASSERT_OK(env->DeleteFile(file_name));
+}
+
+// Absent a crash, FaultInjectionTestFS must produce byte-for-byte what the
+// real filesystem would. Unsynced-data-loss injection defers appends into
+// buffer_ instead of making them non-durable, so every operation that depends
+// on the file's length needs a matching compensation; this replays randomized
+// Append/Truncate/Sync sequences against both and compares the result. It is
+// the guard that the injection machinery models POSIX rather than diverging
+// from it.
+TEST_F(FaultInjectionTestFSTest, UnsyncedInjectionMatchesRealFsWithoutCrash) {
+  Env* env = Env::Default();
+  const std::string dbname =
+      test::PerThreadDBPath("fault_injection_fs_test_differential");
+  ASSERT_OK(env->CreateDirIfMissing(dbname));
+  const std::string real_name = dbname + "/real";
+  const std::string fault_name = dbname + "/fault";
+
+  const uint32_t seed = static_cast<uint32_t>(env->NowMicros());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+
+  for (int trial = 0; trial < 200; ++trial) {
+    env->DeleteFile(real_name).PermitUncheckedError();
+    env->DeleteFile(fault_name).PermitUncheckedError();
+
+    std::shared_ptr<FaultInjectionTestFS> fault_fs =
+        std::make_shared<FaultInjectionTestFS>(env->GetFileSystem());
+    fault_fs->SetFilesystemDirectWritable(false);
+    fault_fs->SetInjectUnsyncedDataLoss(true);
+
+    std::unique_ptr<FSWritableFile> real_file;
+    std::unique_ptr<FSWritableFile> fault_file;
+    ASSERT_OK(env->GetFileSystem()->NewWritableFile(real_name, FileOptions(),
+                                                    &real_file, nullptr));
+    ASSERT_OK(fault_fs->NewWritableFile(fault_name, FileOptions(), &fault_file,
+                                        nullptr));
+
+    uint64_t logical_size = 0;
+    const int num_ops = 1 + static_cast<int>(rnd.Uniform(12));
+    for (int op = 0; op < num_ops; ++op) {
+      switch (rnd.Uniform(3)) {
+        case 0: {  // Append
+          const std::string data =
+              rnd.RandomString(1 + static_cast<int>(rnd.Uniform(64)));
+          ASSERT_OK(real_file->Append(data, IOOptions(), nullptr));
+          ASSERT_OK(fault_file->Append(data, IOOptions(), nullptr));
+          logical_size += data.size();
+          break;
+        }
+        case 1: {  // Truncate somewhere at or below the logical end
+          const uint64_t size =
+              logical_size == 0
+                  ? 0
+                  : rnd.Uniform(static_cast<int>(logical_size + 1));
+          ASSERT_OK(real_file->Truncate(size, IOOptions(), nullptr));
+          ASSERT_OK(fault_file->Truncate(size, IOOptions(), nullptr));
+          logical_size = size;
+          break;
+        }
+        default: {  // Sync
+          ASSERT_OK(real_file->Sync(IOOptions(), nullptr));
+          ASSERT_OK(fault_file->Sync(IOOptions(), nullptr));
+          break;
+        }
+      }
+    }
+    // A final Sync is what makes the two comparable: it is the point at which
+    // the injected filesystem has promised the same durability as the real one.
+    ASSERT_OK(real_file->Sync(IOOptions(), nullptr));
+    ASSERT_OK(fault_file->Sync(IOOptions(), nullptr));
+    ASSERT_OK(real_file->Close(IOOptions(), nullptr));
+    ASSERT_OK(fault_file->Close(IOOptions(), nullptr));
+
+    std::string real_contents;
+    std::string fault_contents;
+    ASSERT_OK(ReadFileToString(env, real_name, &real_contents));
+    ASSERT_OK(ReadFileToString(env, fault_name, &fault_contents));
+    ASSERT_EQ(real_contents.size(), logical_size) << "trial=" << trial;
+    ASSERT_EQ(real_contents, fault_contents) << "trial=" << trial;
+  }
+  ASSERT_OK(env->DeleteFile(real_name));
+  ASSERT_OK(env->DeleteFile(fault_name));
+}
+
+// Truncate must stay a fault injection point: the logical fast path above
+// runs only after error injection has had its chance.
+TEST_F(FaultInjectionTestFSTest, TruncateStillHonorsInjectedWriteError) {
+  Env* env = Env::Default();
+  std::string file_name;
+  std::unique_ptr<FSWritableFile> file;
+  std::shared_ptr<FaultInjectionTestFS> fault_fs = NewUnsyncedDataLossFsAndFile(
+      env, "fault_injection_fs_test_truncate_injection", &file_name, &file);
+  ASSERT_NE(nullptr, file);
+
+  ASSERT_OK(file->Append("0123456789", IOOptions(), nullptr));
+  fault_fs->SetThreadLocalErrorContext(FaultInjectionIOType::kWrite, /*seed=*/0,
+                                       /*one_in=*/1, /*retryable=*/false,
+                                       /*has_data_loss=*/false);
+  fault_fs->EnableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+  // Size 10 is the logical no-op that the fast path would otherwise short
+  // circuit; injection still has to win.
+  ASSERT_NOK(file->Truncate(/*size=*/10, IOOptions(), nullptr));
+  fault_fs->DisableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+
+  ASSERT_OK(file->Close(IOOptions(), nullptr));
+  ASSERT_OK(env->DeleteFile(file_name));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,7 +32,8 @@ enum BlogRecordType : uint8_t {
   // --- Blog meta records (0x01-0x0F) ---
   kBlogIgnorablePropertiesRecord = 0x01,  // ignorable named properties
                                           // (diagnostic/debugging data)
-  // 0x02-0x0F: reserved for future blog meta record types
+  kBlogUserDefinedTimestampSizeRecord = 0x02,
+  // 0x03-0x0F: reserved for future blog meta record types
 
   // --- Body records (0x10-0x7F) ---
   kBlogBlobRecord = 0x10,
@@ -65,6 +67,10 @@ static constexpr size_t kBlogFileMagicSize = 12;
 
 // Fixed header size in bytes (before property section).
 static constexpr size_t kBlogFileFixedHeaderSize = 40;
+
+// Byte offset of the property-section-size field (bytes [32-35]) within the
+// fixed header.
+static constexpr size_t kBlogFilePropertySectionSizeOffset = 32;
 
 // Escape sequence: 6 random bytes + 4 derived bytes.
 static constexpr size_t kBlogEscapeSequenceSize = 10;
@@ -182,8 +188,8 @@ static constexpr size_t kBlogEstimatedFooterSize = 128;
 
 // kStreamingCompressionSentinel (0x7F) is defined in compression_type.h
 // and used in blog record trailers to indicate streaming compression.
-// A record with kNoCompression in the trailer remains individually
-// uncompressed even when streaming is active (dynamic on/off).
+// A record with kNoCompression in the trailer is stored uncompressed and is
+// not part of the stream, even when streaming is active.
 
 // --- Named Properties ---
 
@@ -216,6 +222,7 @@ inline bool IsBlogIgnorableProperty(const Slice& name) {
 inline bool IsKnownBlogRecordType(BlogRecordType type) {
   switch (type) {
     case kBlogIgnorablePropertiesRecord:
+    case kBlogUserDefinedTimestampSizeRecord:
     case kBlogBlobRecord:
     case kBlogPreambleStartRecord:
     case kBlogWriteBatchRecord:
@@ -518,6 +525,36 @@ uint32_t ComputeBlogRecordChecksum(ChecksumType type, const char* data,
                                    size_t data_size, char compression_type_byte,
                                    uint32_t base_context_checksum,
                                    uint64_t payload_file_offset);
+
+// Incrementally computes the same value as ComputeBlogRecordChecksum, for
+// writers that emit a record payload in chunks without buffering it first.
+// The checksum type and incarnation ID are fixed for the file and set at
+// construction; Init() starts each record's checksum with its payload file
+// offset, Update() folds in payload bytes in file order, and Finalize()
+// covers the trailing compression_type byte and returns the value the record
+// trailer stores. The hash state is allocated once and reused across records.
+class BlogRecordChecksumWriter {
+ public:
+  BlogRecordChecksumWriter(ChecksumType type, uint32_t incarnation_id);
+  ~BlogRecordChecksumWriter();
+
+  BlogRecordChecksumWriter(BlogRecordChecksumWriter&&);
+  BlogRecordChecksumWriter& operator=(BlogRecordChecksumWriter&&);
+
+  BlogRecordChecksumWriter(const BlogRecordChecksumWriter&) = delete;
+  BlogRecordChecksumWriter& operator=(const BlogRecordChecksumWriter&) = delete;
+
+  void Init(uint64_t payload_file_offset);
+  void Update(const char* data, size_t size);
+  uint32_t Finalize(char compression_type_byte);
+
+ private:
+  struct State;
+  std::unique_ptr<State> state_;
+  ChecksumType type_;
+  uint32_t incarnation_id_;
+  uint64_t payload_file_offset_ = 0;
+};
 
 // Verify a blog record's 5-byte trailer (compression_type + checksum).
 // payload points to the record payload of payload_size bytes; the trailer

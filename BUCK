@@ -45,6 +45,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/blog/blog_format.cc",
         "db/blog/blog_reader.cc",
         "db/blog/blog_writer.cc",
+        "db/blog_wal_writer.cc",
         "db/builder.cc",
         "db/c.cc",
         "db/coalescing_iterator.cc",

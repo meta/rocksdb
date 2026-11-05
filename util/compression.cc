@@ -263,6 +263,84 @@ int ZSTDStreamingCompress::Compress(const char* input, size_t input_size,
 #endif
 }
 
+Status ZSTDStreamingCompress::CompressAndFlush(const Slice& input,
+                                               std::string* output) {
+  assert(output != nullptr);
+  if (input.empty()) {
+    return Status::OK();
+  }
+#ifndef ZSTD
+  (void)output;
+  return Status::NotSupported("ZSTD streaming compression not supported");
+#else
+  // No Compress() input may be pending within this frame.
+  assert(input_buffer_.pos == input_buffer_.size);
+  ZSTD_inBuffer input_buffer = {input.data(), input.size(), /*pos=*/0};
+  size_t output_size = output->size();
+  // The bound normally fits the whole flush; the loop covers the rest.
+  size_t available = ZSTD_compressBound(input.size());
+  while (true) {
+    output->resize(output_size + available);
+    ZSTD_outBuffer output_buffer = {&(*output)[output_size], available,
+                                    /*pos=*/0};
+    const size_t remaining = ZSTD_compressStream2(cctx_, &output_buffer,
+                                                  &input_buffer, ZSTD_e_flush);
+    output_size += output_buffer.pos;
+    if (ZSTD_isError(remaining)) {
+      output->resize(output_size);
+      Reset();
+      return Status::Corruption(std::string("ZSTD_compressStream2 failed: ") +
+                                ZSTD_getErrorName(remaining));
+    }
+    if (remaining == 0) {
+      break;
+    }
+    available = std::max(remaining, ZSTD_CStreamOutSize());
+  }
+  output->resize(output_size);
+  return Status::OK();
+#endif
+}
+
+Status ZSTDStreamingCompress::CompressAndFlushToSink(
+    const Slice& input, StreamingCompressOutput* output) {
+  assert(output != nullptr);
+  if (input.empty()) {
+    return Status::OK();
+  }
+#ifndef ZSTD
+  (void)output;
+  return Status::NotSupported("ZSTD streaming compression not supported");
+#else
+  // No Compress() input may be pending within this frame.
+  assert(input_buffer_.pos == input_buffer_.size);
+  if (chunk_.empty()) {
+    chunk_.resize(ZSTD_CStreamOutSize());
+  }
+  ZSTD_inBuffer input_buffer = {input.data(), input.size(), /*pos=*/0};
+  size_t remaining = 0;
+  do {
+    ZSTD_outBuffer output_buffer = {chunk_.data(), chunk_.size(), /*pos=*/0};
+    remaining = ZSTD_compressStream2(cctx_, &output_buffer, &input_buffer,
+                                     ZSTD_e_flush);
+    if (ZSTD_isError(remaining)) {
+      Reset();
+      return Status::Corruption(std::string("ZSTD_compressStream2 failed: ") +
+                                ZSTD_getErrorName(remaining));
+    }
+    if (output_buffer.pos > 0) {
+      Status s = output->Append(chunk_.data(), output_buffer.pos);
+      if (!s.ok()) {
+        return s;
+      }
+    }
+    // Unlike CompressAndFlush(), whose first buffer fits compressBound(input),
+    // a fixed chunk may not consume the whole input at once.
+  } while (input_buffer.pos < input_buffer.size || remaining != 0);
+  return Status::OK();
+#endif
+}
+
 void ZSTDStreamingCompress::Reset() {
 #ifdef ZSTD
   ZSTD_CCtx_reset(cctx_, ZSTD_ResetDirective::ZSTD_reset_session_only);

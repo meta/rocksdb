@@ -640,6 +640,15 @@ class CompressionTypeRecord {
   CompressionType compression_type_;
 };
 
+// Sink for StreamingCompress::CompressAndFlushToSink. Chunks arrive in
+// compression order; returning non-OK aborts the flush and the error is
+// relayed to the CompressAndFlushToSink caller.
+class StreamingCompressOutput {
+ public:
+  virtual ~StreamingCompressOutput() = default;
+  virtual Status Append(const char* data, size_t len) = 0;
+};
+
 // Base class to implement compression for a stream of buffers.
 // Instantiate an implementation of the class using Create() with the
 // compression type and use Compress() repeatedly.
@@ -673,6 +682,23 @@ class StreamingCompress {
   static std::unique_ptr<StreamingCompress> Create(
       CompressionType compression_type, const CompressionOptions& opts,
       uint32_t compress_format_version, size_t max_output_len);
+  // Unlike Compress(), which ends a frame per input, compresses all of
+  // `input` as a continuation of the current frame and appends the output to
+  // `*output`, flushed so that the output since the last Reset() decodes to
+  // all input since then. Later input may reference earlier input, so the
+  // output is only decodable in order. Not limited by max_output_len. Must
+  // not be mixed with Compress() within a frame. On error, the frame is
+  // Reset() and earlier output can no longer be continued.
+  virtual Status CompressAndFlush(const Slice& input, std::string* output) = 0;
+  // Same continuation-and-flush semantics as CompressAndFlush(), but the
+  // output is delivered to `*output` in chunks instead of being accumulated.
+  // Not limited by max_output_len. Must not be mixed with Compress() within
+  // a frame. A compression error Reset()s the frame like CompressAndFlush();
+  // a sink error is relayed as-is without touching the frame, but the caller
+  // must still abandon the stream: the input was consumed and later output
+  // would reference bytes the sink never received.
+  virtual Status CompressAndFlushToSink(const Slice& input,
+                                        StreamingCompressOutput* output) = 0;
   virtual void Reset() = 0;
 
  protected:
@@ -748,10 +774,16 @@ class ZSTDStreamingCompress final : public StreamingCompress {
   ZSTDStreamingCompress& operator=(ZSTDStreamingCompress&&) = delete;
   int Compress(const char* input, size_t input_size, char* output,
                size_t* output_pos) override;
+  Status CompressAndFlush(const Slice& input, std::string* output) override;
+  Status CompressAndFlushToSink(const Slice& input,
+                                StreamingCompressOutput* output) override;
   void Reset() override;
 #ifdef ZSTD
   ZSTD_CCtx* cctx_;
   ZSTD_inBuffer input_buffer_;
+  // Fixed-size output chunk for CompressAndFlushToSink, sized once from
+  // ZSTD_CStreamOutSize() and reused across calls.
+  std::string chunk_;
 #endif
 };
 

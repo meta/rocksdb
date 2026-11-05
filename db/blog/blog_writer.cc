@@ -12,6 +12,7 @@
 #include <limits>
 
 #include "options/options_helper.h"
+#include "port/likely.h"
 #include "table/format.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
@@ -197,9 +198,14 @@ TEST_BlogNoncanonicalConfigScope::~TEST_BlogNoncanonicalConfigScope() {
   TEST_SetBlogNoncanonicalConfig(prev_);
 }
 
-BlogFileWriter::BlogFileWriter(std::unique_ptr<WritableFileWriter>&& dest,
-                               const BlogFileHeader& header, bool manual_flush)
-    : dest_(std::move(dest)), header_(header), manual_flush_(manual_flush) {}
+BlogFileWriter::BlogFileWriter(
+    std::unique_ptr<WritableFileWriter>&& dest, const BlogFileHeader& header,
+    BlogUnspecifiedSizeRecords unspecified_size_records, bool manual_flush)
+    : dest_(std::move(dest)),
+      header_(header),
+      unspecified_size_records_(unspecified_size_records),
+      streaming_record_checksum_(header.checksum_type, header.incarnation_id()),
+      manual_flush_(manual_flush) {}
 
 BlogFileWriter::~BlogFileWriter() = default;
 
@@ -239,6 +245,7 @@ IOStatus BlogFileWriter::WriteHeader(const WriteOptions& wo) {
 
   std::string buf;
   header_copy.EncodeTo(&buf);
+  const uint64_t header_body_end = buf.size();
   BlogPadding header_pad(
       lossless_cast<uint8_t>(buf.back()), buf.size(),
       ChoosePaddingAlignment(config, header_, /*record_ordinal=*/0,
@@ -248,9 +255,15 @@ IOStatus BlogFileWriter::WriteHeader(const WriteOptions& wo) {
                         kBlogDecisionHeaderPreferPadFF));
   header_pad.AppendTo(&buf);
 
-  IOStatus s = EmitBytes(wo, buf);
+  IOOptions opts;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
+  if (s.ok()) {
+    s = EmitBytes(opts, buf.data(), buf.size());
+  }
   if (s.ok()) {
     header_written_ = true;
+    header_end_offset_ = offset_;
+    body_end_offset_ = header_body_end;
   }
 
   if (s.ok() && !ignorable_props.empty()) {
@@ -263,7 +276,7 @@ IOStatus BlogFileWriter::WriteHeader(const WriteOptions& wo) {
       for (const auto& prop : ignorable_props) {
         std::string payload;
         EncodeBlogProperties(BlogPropertyMap{prop}, &payload);
-        s = AddRecordInternal(wo, kBlogIgnorablePropertiesRecord, payload,
+        s = AddRecordInternal(opts, kBlogIgnorablePropertiesRecord, payload,
                               kNoCompression, nullptr, /*force_full=*/true,
                               /*allow_unspecified_size=*/false,
                               /*record_size=*/nullptr);
@@ -274,7 +287,7 @@ IOStatus BlogFileWriter::WriteHeader(const WriteOptions& wo) {
     } else {
       std::string payload;
       EncodeBlogProperties(ignorable_props, &payload);
-      s = AddRecordInternal(wo, kBlogIgnorablePropertiesRecord, payload,
+      s = AddRecordInternal(opts, kBlogIgnorablePropertiesRecord, payload,
                             kNoCompression, nullptr, /*force_full=*/true,
                             /*allow_unspecified_size=*/false,
                             /*record_size=*/nullptr);
@@ -282,7 +295,7 @@ IOStatus BlogFileWriter::WriteHeader(const WriteOptions& wo) {
   }
 
   if (s.ok()) {
-    s = MaybeFlush(wo);
+    s = MaybeFlush(opts);
   }
   return s;
 }
@@ -301,9 +314,13 @@ IOStatus BlogFileWriter::AddBlobRecord(const WriteOptions& wo,
         "Blog blob record payload must not be empty");
   }
 
+  IOOptions opts;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
+  if (!s.ok()) {
+    return s;
+  }
   uint64_t blob_record_size = 0;
-  IOStatus s =
-      AddRecordInternal(wo, kBlogBlobRecord, payload, comp_type, blob_offset,
+  s = AddRecordInternal(opts, kBlogBlobRecord, payload, comp_type, blob_offset,
                         /*force_full=*/false,
                         /*allow_unspecified_size=*/true, &blob_record_size);
   if (s.ok()) {
@@ -316,11 +333,11 @@ IOStatus BlogFileWriter::AddBlobRecord(const WriteOptions& wo,
       blob_stats_.uncompressed_bytes += uncompressed_size;
     }
 
-    s = MaybeEmitAuxiliaryRecord(wo);
+    s = MaybeEmitAuxiliaryRecord(opts);
   }
 
   if (s.ok()) {
-    s = MaybeFlush(wo);
+    s = MaybeFlush(opts);
   }
   return s;
 }
@@ -328,15 +345,152 @@ IOStatus BlogFileWriter::AddBlobRecord(const WriteOptions& wo,
 IOStatus BlogFileWriter::AddWriteBatchRecord(const WriteOptions& wo,
                                              const Slice& wb_data,
                                              CompressionType comp_type) {
-  IOStatus s =
-      AddRecordInternal(wo, kBlogWriteBatchRecord, wb_data, comp_type, nullptr,
+  IOOptions opts;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
+  if (!s.ok()) {
+    return s;
+  }
+  s = AddRecordInternal(opts, kBlogWriteBatchRecord, wb_data, comp_type,
+                        nullptr,
                         /*force_full=*/false,
                         /*allow_unspecified_size=*/true,
                         /*record_size=*/nullptr);
   if (s.ok()) {
-    s = MaybeFlush(wo);
+    s = MaybeFlush(opts);
   }
   return s;
+}
+
+IOStatus BlogFileWriter::BeginUnspecifiedSizeRecord(const WriteOptions& wo,
+                                                    BlogRecordType type,
+                                                    CompressionType comp_type) {
+  // A torn session is abandoned by starting the next record; an unbroken one
+  // must always be finished first.
+  assert(!streaming_record_active_ || streaming_record_broken_);
+  streaming_record_active_ = false;
+  streaming_record_broken_ = false;
+
+  if (unspecified_size_records_ != BlogUnspecifiedSizeRecords::kAllowed) {
+    return IOStatus::InvalidArgument(
+        "Blog writer: unspecified-size records are disallowed for this file");
+  }
+  assert(header_written_);
+  assert(!sealed_);
+  assert(IsValidBlogCompressionType(lossless_cast<uint8_t>(comp_type)));
+  assert(type == kBlogBlobRecord || type == kBlogWriteBatchRecord ||
+         type == kBlogManifestRecord);
+  assert(comp_type == kNoCompression ||
+         header_.HasProperty(kBlogPropCompressionCompatibilityName));
+  assert(comp_type != kStreamingCompressionSentinel ||
+         (type == kBlogWriteBatchRecord &&
+          header_.HasProperty(kBlogPropWriteBatchStreamingCompressionType)));
+
+  IOOptions opts;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
+  if (!s.ok()) {
+    return s;
+  }
+  s = ResyncOffsetAfterLostWrites(opts);
+  if (!s.ok()) {
+    return s;
+  }
+
+  RecordPlan plan;
+  plan.use_unspecified_size = true;
+  char prefix[kMaxFullRecordPrefixSize];
+  const size_t prefix_size =
+      BuildFullRecordPrefix(prefix, type, comp_type, plan, /*payload_size=*/0);
+  s = EmitBytes(opts, prefix, prefix_size);
+  if (!s.ok()) {
+    return s;
+  }
+
+  streaming_record_checksum_.Init(offset_);
+  streaming_record_active_ = true;
+  streaming_record_comp_type_ = comp_type;
+  streaming_record_payload_size_ = 0;
+  return IOStatus::OK();
+}
+
+IOStatus BlogFileWriter::AppendUnspecifiedSizeChunk(const WriteOptions& wo,
+                                                    const Slice& chunk) {
+  if (!streaming_record_active_ || streaming_record_broken_) {
+    return IOStatus::InvalidArgument(
+        "Blog writer: no active unspecified-size record to append to");
+  }
+  if (chunk.empty()) {
+    return IOStatus::OK();
+  }
+  streaming_record_checksum_.Update(chunk.data(), chunk.size());
+  IOOptions opts;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
+  if (s.ok()) {
+    s = EmitBytes(opts, chunk.data(), chunk.size());
+  }
+  if (s.ok()) {
+    streaming_record_payload_size_ += chunk.size();
+  } else {
+    streaming_record_broken_ = true;
+  }
+  return s;
+}
+
+IOStatus BlogFileWriter::FinishUnspecifiedSizeRecord(const WriteOptions& wo) {
+  if (!streaming_record_active_ || streaming_record_broken_) {
+    return IOStatus::InvalidArgument(
+        "Blog writer: no complete unspecified-size record to finish");
+  }
+  // A zero-length payload must use the trivial encoding. Streaming callers
+  // never produce one: an empty WriteBatch bypasses streaming, and flushing
+  // a stream always emits bytes.
+  if (streaming_record_payload_size_ == 0) {
+    streaming_record_broken_ = true;
+    return IOStatus::InvalidArgument(
+        "Blog writer: unspecified-size record has no payload");
+  }
+
+  IOOptions opts;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
+  if (!s.ok()) {
+    streaming_record_broken_ = true;
+    return s;
+  }
+
+  const CompressionType comp_type = streaming_record_comp_type_;
+  char trailer[kBlogBlockTrailerSize];
+  trailer[0] = lossless_cast<char>(comp_type);
+  const uint32_t checksum = streaming_record_checksum_.Finalize(trailer[0]);
+  EncodeFixed32(trailer + 1, checksum);
+  s = EmitBytes(opts, trailer, kBlogBlockTrailerSize);
+  if (!s.ok()) {
+    streaming_record_broken_ = true;
+    return s;
+  }
+
+  body_end_offset_ = offset_;
+  // Minimum alignment, like PlanRecord() for unspecified-size records. The
+  // pad byte is locally determined by the trailer's last byte (canonical).
+  const BlogPadding pad(
+      lossless_cast<uint8_t>(trailer[kBlogBlockTrailerSize - 1]), offset_,
+      kBlogMinRecordAlignment);
+  s = EmitPadding(opts, pad);
+  if (!s.ok()) {
+    streaming_record_broken_ = true;
+    return s;
+  }
+  s = MaybeFlush(opts);
+  if (!s.ok()) {
+    streaming_record_broken_ = true;
+    return s;
+  }
+
+  streaming_record_active_ = false;
+  ++record_ordinal_;
+  if (comp_type != kNoCompression &&
+      comp_type != kStreamingCompressionSentinel) {
+    compression_type_set_.Add(comp_type);
+  }
+  return IOStatus::OK();
 }
 
 IOStatus BlogFileWriter::AddIgnorablePropertiesRecord(
@@ -353,12 +507,16 @@ IOStatus BlogFileWriter::AddIgnorablePropertiesRecord(
                          kBlogDecisionShuffleDynamicIgnorableProps,
                          config.shuffle_properties_one_in);
 
-  IOStatus s;
+  IOOptions opts;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
+  if (!s.ok()) {
+    return s;
+  }
   if (ignorable_props.size() > 1 && ShouldSplitIgnorableProperties()) {
     for (const auto& prop : ignorable_props) {
       std::string payload;
       EncodeBlogProperties(BlogPropertyMap{prop}, &payload);
-      s = AddRecordInternal(wo, kBlogIgnorablePropertiesRecord, payload,
+      s = AddRecordInternal(opts, kBlogIgnorablePropertiesRecord, payload,
                             kNoCompression, nullptr, /*force_full=*/true,
                             /*allow_unspecified_size=*/false,
                             /*record_size=*/nullptr);
@@ -369,26 +527,49 @@ IOStatus BlogFileWriter::AddIgnorablePropertiesRecord(
   } else {
     std::string payload;
     EncodeBlogProperties(ignorable_props, &payload);
-    s = AddRecordInternal(wo, kBlogIgnorablePropertiesRecord, payload,
+    s = AddRecordInternal(opts, kBlogIgnorablePropertiesRecord, payload,
                           kNoCompression, nullptr, /*force_full=*/true,
                           /*allow_unspecified_size=*/false,
                           /*record_size=*/nullptr);
   }
 
   if (s.ok()) {
-    s = MaybeFlush(wo);
+    s = MaybeFlush(opts);
+  }
+  return s;
+}
+
+IOStatus BlogFileWriter::AddUserDefinedTimestampSizeRecord(
+    const WriteOptions& wo, const Slice& payload) {
+  IOOptions opts;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
+  if (!s.ok()) {
+    return s;
+  }
+  s = AddRecordInternal(opts, kBlogUserDefinedTimestampSizeRecord, payload,
+                        kNoCompression, nullptr,
+                        /*force_full=*/true,
+                        /*allow_unspecified_size=*/false,
+                        /*record_size=*/nullptr);
+  if (s.ok()) {
+    s = MaybeFlush(opts);
   }
   return s;
 }
 
 IOStatus BlogFileWriter::AddPreambleStartRecord(const WriteOptions& wo) {
-  IOStatus s = AddRecordInternal(wo, kBlogPreambleStartRecord, Slice(),
-                                 kNoCompression, nullptr,
-                                 /*force_full=*/false,
-                                 /*allow_unspecified_size=*/false,
-                                 /*record_size=*/nullptr);
+  IOOptions opts;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
+  if (!s.ok()) {
+    return s;
+  }
+  s = AddRecordInternal(opts, kBlogPreambleStartRecord, Slice(), kNoCompression,
+                        nullptr,
+                        /*force_full=*/false,
+                        /*allow_unspecified_size=*/false,
+                        /*record_size=*/nullptr);
   if (s.ok()) {
-    s = MaybeFlush(wo);
+    s = MaybeFlush(opts);
   }
   return s;
 }
@@ -397,6 +578,16 @@ IOStatus BlogFileWriter::WriteFooter(
     const WriteOptions& wo, const BlogFileFooterProperties& properties) {
   assert(header_written_);
   assert(!sealed_);
+  // Before recording footer record offsets.
+  IOOptions opts;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
+  if (!s.ok()) {
+    return s;
+  }
+  s = ResyncOffsetAfterLostWrites(opts);
+  if (!s.ok()) {
+    return s;
+  }
   assert(std::none_of(
       properties.properties.begin(), properties.properties.end(),
       [](const BlogPropertyMap::value_type& prop) {
@@ -437,10 +628,10 @@ IOStatus BlogFileWriter::WriteFooter(
   footer_properties.EncodeTo(&properties_payload);
   sealed_ = true;
   const uint64_t properties_offset = offset_;
-  IOStatus s = AddRecordInternal(
-      wo, kBlogFooterPropertiesRecord, properties_payload, kNoCompression,
-      nullptr, /*force_full=*/true, /*allow_unspecified_size=*/false,
-      /*record_size=*/nullptr);
+  s = AddRecordInternal(opts, kBlogFooterPropertiesRecord, properties_payload,
+                        kNoCompression, nullptr, /*force_full=*/true,
+                        /*allow_unspecified_size=*/false,
+                        /*record_size=*/nullptr);
   if (!s.ok()) {
     return s;
   }
@@ -456,12 +647,12 @@ IOStatus BlogFileWriter::WriteFooter(
       {kBlogFooterPropertiesRecord, static_cast<uint32_t>(relative_offset_4b)});
   std::string locator_payload;
   locator.EncodeTo(&locator_payload);
-  s = AddRecordInternal(wo, kBlogFooterLocatorRecord, locator_payload,
+  s = AddRecordInternal(opts, kBlogFooterLocatorRecord, locator_payload,
                         kNoCompression, nullptr, /*force_full=*/true,
                         /*allow_unspecified_size=*/false,
                         /*record_size=*/nullptr);
   if (s.ok()) {
-    s = MaybeFlush(wo);
+    s = MaybeFlush(opts);
   }
   return s;
 }
@@ -487,10 +678,27 @@ IOStatus BlogFileWriter::Sync(const WriteOptions& wo, bool use_fsync) {
 IOStatus BlogFileWriter::Close(const WriteOptions& wo) {
   IOOptions opts;
   IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
-  if (s.ok()) {
+  if (s.ok() && dest_) {
     s = dest_->Close(opts);
   }
   return s;
+}
+
+bool BlogFileWriter::PublishIfClosed() {
+  // Like log::Writer: already-published counts as closed, so repeat calls
+  // are safe.
+  if (!dest_) {
+    return true;
+  }
+  if (dest_->IsClosed()) {
+    dest_.reset();
+    return true;
+  }
+  return false;
+}
+
+bool BlogFileWriter::BufferIsEmpty() const {
+  return !dest_ || dest_->BufferIsEmpty();
 }
 
 uint64_t BlogFileWriter::EstimateNextBlobWritePhysicalGrowth(
@@ -524,11 +732,13 @@ BlogFileWriter::RecordPlan BlogFileWriter::PlanRecord(
   RecordPlan plan;
 
   const TEST_BlogNoncanonicalConfig& config = TEST_GetBlogNoncanonicalConfig();
-  plan.padding_alignment = ChoosePaddingAlignment(
-      config, header_, record_ordinal, kBlogDecisionRecordPad512,
-      kBlogDecisionRecordPad4K);
-  plan.prefer_padding_with_0xff = PreferPadWith0xFF(
-      config, header_, record_ordinal, kBlogDecisionPreferPadFF);
+  if (config.enabled) {
+    plan.padding_alignment = ChoosePaddingAlignment(
+        config, header_, record_ordinal, kBlogDecisionRecordPad512,
+        kBlogDecisionRecordPad4K);
+    plan.prefer_padding_with_0xff = PreferPadWith0xFF(
+        config, header_, record_ordinal, kBlogDecisionPreferPadFF);
+  }
 
   if (payload.empty()) {
     return plan;
@@ -539,7 +749,7 @@ BlogFileWriter::RecordPlan BlogFileWriter::PlanRecord(
                      natural_varint_len <= kBlogCompactVarintMaxBytes &&
                      type == header_.compact_record_type;
 
-  if (plan.use_compact &&
+  if (plan.use_compact && config.enabled &&
       ShouldApplyDecision(config, header_, record_ordinal,
                           kBlogDecisionForceFull,
                           config.force_full_record_one_in)) {
@@ -556,7 +766,8 @@ BlogFileWriter::RecordPlan BlogFileWriter::PlanRecord(
   const bool body_record = type == kBlogBlobRecord ||
                            type == kBlogWriteBatchRecord ||
                            type == kBlogManifestRecord;
-  if (allow_unspecified_size && body_record &&
+  if (unspecified_size_records_ == BlogUnspecifiedSizeRecords::kAllowed &&
+      allow_unspecified_size && body_record &&
       ShouldApplyDecision(config, header_, record_ordinal,
                           kBlogDecisionUnspecifiedSize,
                           config.unspecified_size_record_one_in)) {
@@ -666,7 +877,7 @@ std::string BlogFileWriter::BuildAuxiliaryPayload(
 }
 
 IOStatus BlogFileWriter::AddRecordInternal(
-    const WriteOptions& wo, BlogRecordType type, const Slice& payload,
+    const IOOptions& opts, BlogRecordType type, const Slice& payload,
     CompressionType comp_type, uint64_t* payload_offset, bool force_full,
     bool allow_unspecified_size, uint64_t* record_size) {
   assert(header_written_);
@@ -686,11 +897,14 @@ IOStatus BlogFileWriter::AddRecordInternal(
   assert(type != kBlogFooterLocatorRecord || !payload.empty());
   assert(payload.size() < kBlogUnspecifiedSize);
 
+  IOStatus s = ResyncOffsetAfterLostWrites(opts);
+  if (!s.ok()) {
+    return s;
+  }
   const uint64_t offset_before = offset_;
   const RecordPlan plan = PlanRecord(type, payload, force_full,
                                      allow_unspecified_size, record_ordinal_);
-  IOStatus s =
-      EmitRecordWithPlan(wo, type, payload, comp_type, plan, payload_offset);
+  s = EmitRecordWithPlan(opts, type, payload, comp_type, plan, payload_offset);
   if (s.ok()) {
     ++record_ordinal_;
     if (comp_type != kNoCompression &&
@@ -704,22 +918,22 @@ IOStatus BlogFileWriter::AddRecordInternal(
   return s;
 }
 
-IOStatus BlogFileWriter::EmitRecordWithPlan(const WriteOptions& wo,
+IOStatus BlogFileWriter::EmitRecordWithPlan(const IOOptions& opts,
                                             BlogRecordType type,
                                             const Slice& payload,
                                             CompressionType comp_type,
                                             const RecordPlan& plan,
                                             uint64_t* payload_offset) {
   if (payload.empty()) {
-    return EmitTrivialRecord(wo, type, plan);
+    return EmitTrivialRecord(opts, type, plan);
   }
   if (plan.use_compact) {
-    return EmitCompactRecord(wo, payload, comp_type, plan, payload_offset);
+    return EmitCompactRecord(opts, payload, comp_type, plan, payload_offset);
   }
-  return EmitFullRecord(wo, type, payload, comp_type, plan, payload_offset);
+  return EmitFullRecord(opts, type, payload, comp_type, plan, payload_offset);
 }
 
-IOStatus BlogFileWriter::EmitTrivialRecord(const WriteOptions& wo,
+IOStatus BlogFileWriter::EmitTrivialRecord(const IOOptions& opts,
                                            BlogRecordType type,
                                            const RecordPlan& plan) {
   std::string buf;
@@ -735,37 +949,70 @@ IOStatus BlogFileWriter::EmitTrivialRecord(const WriteOptions& wo,
       ChecksumModifierForContext(header_.incarnation_id(), offset_);
   PutFixed32(&buf, checksum);
 
-  IOStatus s = EmitBytes(wo, buf);
+  IOStatus s = EmitBytes(opts, buf.data(), buf.size());
   if (!s.ok()) {
     return s;
   }
 
+  if (!sealed_) {
+    body_end_offset_ = offset_;
+  }
   const BlogPadding pad(static_cast<uint8_t>(checksum >> 24), offset_,
                         plan.padding_alignment, plan.prefer_padding_with_0xff);
-  return EmitPadding(wo, pad);
+  return EmitPadding(opts, pad);
 }
 
-IOStatus BlogFileWriter::EmitCompactRecord(const WriteOptions& wo,
+IOStatus BlogFileWriter::EmitCompactRecord(const IOOptions& opts,
                                            const Slice& payload,
                                            CompressionType comp_type,
                                            const RecordPlan& plan,
                                            uint64_t* payload_offset) {
   assert(!payload.empty());
 
-  std::string prefix;
-  prefix.append(header_.escape_sequence, kBlogEscapeSequenceSize);
-  PutPrefixVarint64(&prefix, payload.size());
+  char prefix[kBlogEscapeSequenceSize + kMaxPrefixVarint64Length];
+  memcpy(prefix, header_.escape_sequence, kBlogEscapeSequenceSize);
+  const char* prefix_end =
+      EncodePrefixVarint64(prefix + kBlogEscapeSequenceSize, payload.size());
 
-  IOStatus s = EmitBytes(wo, prefix);
-  if (!s.ok()) {
-    return s;
-  }
-
-  return EmitPayloadTrailerPadding(wo, payload, comp_type, plan, payload_offset,
-                                   /*skip_padding=*/false);
+  return EmitPrefixPayloadTrailerPadding(
+      opts, prefix, static_cast<size_t>(prefix_end - prefix), payload,
+      comp_type, plan, payload_offset, /*skip_padding=*/false);
 }
 
-IOStatus BlogFileWriter::EmitFullRecord(const WriteOptions& wo,
+size_t BlogFileWriter::BuildFullRecordPrefix(char* dst, BlogRecordType type,
+                                             CompressionType comp_type,
+                                             const RecordPlan& plan,
+                                             uint64_t payload_size) const {
+  assert(dst != nullptr);
+  memcpy(dst, header_.escape_sequence, kBlogEscapeSequenceSize);
+
+  char* const varint_start = dst + kBlogEscapeSequenceSize;
+  char* p;
+  if (plan.use_unspecified_size) {
+    p = EncodePrefixVarint64(varint_start, kBlogUnspecifiedSize);
+  } else if (plan.full_varint_min_bytes == kMaxPrefixVarint64Length) {
+    p = EncodePrefixVarint64(varint_start, payload_size);
+  } else {
+    p = EncodePrefixVarint64WithMinBytes(varint_start, payload_size,
+                                         plan.full_varint_min_bytes);
+  }
+
+  *p++ = lossless_cast<char>(type);
+  *p++ = lossless_cast<char>(comp_type);
+
+  const uint32_t prefix_checksum =
+      ComputeBuiltinChecksum(header_.checksum_type, varint_start,
+                             static_cast<size_t>(p - varint_start)) +
+      ChecksumModifierForContext(header_.incarnation_id(), offset_);
+  EncodeFixed32(p, prefix_checksum);
+  p += sizeof(uint32_t);
+
+  const size_t prefix_size = static_cast<size_t>(p - dst);
+  assert(prefix_size <= kMaxFullRecordPrefixSize);
+  return prefix_size;
+}
+
+IOStatus BlogFileWriter::EmitFullRecord(const IOOptions& opts,
                                         BlogRecordType type,
                                         const Slice& payload,
                                         CompressionType comp_type,
@@ -773,75 +1020,84 @@ IOStatus BlogFileWriter::EmitFullRecord(const WriteOptions& wo,
                                         uint64_t* payload_offset) {
   assert(!payload.empty());
 
-  std::string prefix;
-  prefix.append(header_.escape_sequence, kBlogEscapeSequenceSize);
+  char prefix[kMaxFullRecordPrefixSize];
+  const size_t prefix_size =
+      BuildFullRecordPrefix(prefix, type, comp_type, plan, payload.size());
 
-  const size_t varint_start = prefix.size();
-  if (plan.use_unspecified_size) {
-    PutPrefixVarint64(&prefix, kBlogUnspecifiedSize);
-  } else if (plan.full_varint_min_bytes == kMaxPrefixVarint64Length) {
-    PutPrefixVarint64(&prefix, payload.size());
-  } else {
-    char buf[kMaxPrefixVarint64Length];
-    char* end = EncodePrefixVarint64WithMinBytes(buf, payload.size(),
-                                                 plan.full_varint_min_bytes);
-    prefix.append(buf, static_cast<size_t>(end - buf));
-  }
-
-  prefix.push_back(lossless_cast<char>(type));
-  prefix.push_back(lossless_cast<char>(comp_type));
-
-  const char* prefix_data = prefix.data() + varint_start;
-  const size_t prefix_data_size = prefix.size() - varint_start;
-  const uint32_t prefix_checksum =
-      ComputeBuiltinChecksum(header_.checksum_type, prefix_data,
-                             prefix_data_size) +
-      ChecksumModifierForContext(header_.incarnation_id(), offset_);
-  PutFixed32(&prefix, prefix_checksum);
-
-  IOStatus s = EmitBytes(wo, prefix);
-  if (!s.ok()) {
-    return s;
-  }
-
-  return EmitPayloadTrailerPadding(wo, payload, comp_type, plan, payload_offset,
-                                   type == kBlogFooterLocatorRecord);
+  return EmitPrefixPayloadTrailerPadding(opts, prefix, prefix_size, payload,
+                                         comp_type, plan, payload_offset,
+                                         type == kBlogFooterLocatorRecord);
 }
 
-IOStatus BlogFileWriter::EmitPayloadTrailerPadding(
-    const WriteOptions& wo, const Slice& payload, CompressionType comp_type,
-    const RecordPlan& plan, uint64_t* payload_offset, bool skip_padding) {
+IOStatus BlogFileWriter::EmitPrefixPayloadTrailerPadding(
+    const IOOptions& opts, const char* prefix, size_t prefix_size,
+    const Slice& payload, CompressionType comp_type, const RecordPlan& plan,
+    uint64_t* payload_offset, bool skip_padding) {
+  assert(prefix_size <= kMaxFullRecordPrefixSize);
+  const uint64_t payload_start = offset_ + prefix_size;
   if (payload_offset != nullptr) {
-    *payload_offset = offset_;
-  }
-
-  IOStatus s = EmitBytes(wo, payload);
-  if (!s.ok()) {
-    return s;
+    *payload_offset = payload_start;
   }
 
   char trailer[kBlogBlockTrailerSize];
   trailer[0] = lossless_cast<char>(comp_type);
   const uint32_t checksum = ComputeBlogRecordChecksum(
       header_.checksum_type, payload.data(), payload.size(), trailer[0],
-      header_.incarnation_id(), offset_ - payload.size());
+      header_.incarnation_id(), payload_start);
   EncodeFixed32(trailer + 1, checksum);
-  s = EmitBytes(wo, trailer, kBlogBlockTrailerSize);
+
+  const uint64_t trailer_end =
+      payload_start + payload.size() + kBlogBlockTrailerSize;
+  BlogPadding pad(lossless_cast<uint8_t>(trailer[kBlogBlockTrailerSize - 1]),
+                  trailer_end, plan.padding_alignment,
+                  plan.prefer_padding_with_0xff);
+  if (skip_padding) {
+    pad.count = 0;
+  }
+
+  // Padding up to the minimum alignment goes out with the trailer; longer
+  // (noncanonical) padding follows separately.
+  const uint32_t inline_pad_count =
+      pad.count <= kBlogMinRecordAlignment ? pad.count : 0;
+  char buf[kMaxFullRecordPrefixSize + kMaxInlinePayloadSize +
+           kBlogBlockTrailerSize + kBlogMinRecordAlignment];
+  char* p = buf;
+  IOStatus s;
+  if (payload.size() <= kMaxInlinePayloadSize) {
+    memcpy(p, prefix, prefix_size);
+    p += prefix_size;
+    memcpy(p, payload.data(), payload.size());
+    p += payload.size();
+  } else {
+    s = EmitBytes(opts, prefix, prefix_size);
+    if (!s.ok()) {
+      return s;
+    }
+    s = EmitBytes(opts, payload.data(), payload.size());
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  memcpy(p, trailer, kBlogBlockTrailerSize);
+  p += kBlogBlockTrailerSize;
+  memset(p, pad.byte, inline_pad_count);
+  p += inline_pad_count;
+
+  s = EmitBytes(opts, buf, static_cast<size_t>(p - buf));
   if (!s.ok()) {
     return s;
   }
 
-  if (skip_padding) {
+  if (!sealed_) {
+    body_end_offset_ = trailer_end;
+  }
+  if (inline_pad_count == pad.count) {
     return IOStatus::OK();
   }
-
-  const BlogPadding pad(
-      lossless_cast<uint8_t>(trailer[kBlogBlockTrailerSize - 1]), offset_,
-      plan.padding_alignment, plan.prefer_padding_with_0xff);
-  return EmitPadding(wo, pad);
+  return EmitPadding(opts, pad);
 }
 
-IOStatus BlogFileWriter::EmitPadding(const WriteOptions& wo,
+IOStatus BlogFileWriter::EmitPadding(const IOOptions& opts,
                                      const BlogPadding& pad) {
   if (pad.count == 0) {
     return IOStatus::OK();
@@ -853,7 +1109,7 @@ IOStatus BlogFileWriter::EmitPadding(const WriteOptions& wo,
   uint32_t remaining = pad.count;
   while (remaining > 0) {
     const size_t to_write = std::min<size_t>(remaining, scratch.size());
-    IOStatus s = EmitBytes(wo, scratch.data(), to_write);
+    IOStatus s = EmitBytes(opts, scratch.data(), to_write);
     if (!s.ok()) {
       return s;
     }
@@ -862,44 +1118,68 @@ IOStatus BlogFileWriter::EmitPadding(const WriteOptions& wo,
   return IOStatus::OK();
 }
 
-IOStatus BlogFileWriter::MaybeFlush(const WriteOptions& wo) {
+IOStatus BlogFileWriter::MaybeFlush(const IOOptions& opts) {
   if (manual_flush_) {
     return IOStatus::OK();
   }
-
-  IOOptions opts;
-  IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
-  if (s.ok()) {
-    s = dest_->Flush(opts);
-  }
-  return s;
+  return dest_->Flush(opts);
 }
 
-IOStatus BlogFileWriter::MaybeEmitAuxiliaryRecord(const WriteOptions& wo) {
+IOStatus BlogFileWriter::MaybeEmitAuxiliaryRecord(const IOOptions& opts) {
   if (!ShouldEmitAuxiliaryRecord(record_ordinal_)) {
     return IOStatus::OK();
   }
 
   const std::string payload = BuildAuxiliaryPayload(record_ordinal_);
-  return AddRecordInternal(wo, kBlogWriteBatchRecord, payload, kNoCompression,
+  return AddRecordInternal(opts, kBlogWriteBatchRecord, payload, kNoCompression,
                            nullptr, /*force_full=*/false,
                            /*allow_unspecified_size=*/true,
                            &last_auxiliary_record_size_);
 }
 
-IOStatus BlogFileWriter::EmitBytes(const WriteOptions& wo, const Slice& data) {
-  return EmitBytes(wo, data.data(), data.size());
-}
-
-IOStatus BlogFileWriter::EmitBytes(const WriteOptions& wo, const char* data,
-                                   size_t len) {
-  IOOptions opts;
-  IOStatus s = WritableFileWriter::PrepareIOOptions(wo, opts);
-  if (!s.ok()) {
-    return s;
+IOStatus BlogFileWriter::ResyncOffsetAfterLostWrites(const IOOptions& opts) {
+  // A failed write empties the buffer and this runs before every record, so
+  // after a loss the buffer is still empty here.
+  if (LIKELY(!dest_->BufferIsEmpty() || dest_->GetFlushedSize() == offset_)) {
+    if (LIKELY(offset_ % kBlogMinRecordAlignment == 0)) {
+      return IOStatus::OK();
+    }
+    // A record failed after some of its bytes were appended, none lost.
+    const char zeros[kBlogMinRecordAlignment] = {};
+    return EmitBytes(
+        opts, zeros,
+        kBlogMinRecordAlignment - offset_ % kBlogMinRecordAlignment);
+  }
+  if (dest_->use_direct_io()) {
+    // Flushed size counts rewrites of the unaligned tail, so it does not say
+    // where the file ends.
+    return IOStatus::OK();
+  }
+  lost_writes_ = true;
+  const uint64_t flushed = dest_->GetFlushedSize();
+  if (flushed < header_end_offset_) {
+    return IOStatus::IOError("Blog writer: file header lost to a write error");
   }
 
-  s = dest_->Append(Slice(data, len), opts);
+  const uint64_t pad =
+      (kBlogMinRecordAlignment - flushed % kBlogMinRecordAlignment) %
+      kBlogMinRecordAlignment;
+  if (pad > 0) {
+    // Not EmitBytes(): on failure offset_ must stay out of step with the
+    // flushed size so the next record retries this.
+    const char zeros[kBlogMinRecordAlignment] = {};
+    IOStatus s = dest_->Append(Slice(zeros, pad), opts);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  offset_ = flushed + pad;
+  return IOStatus::OK();
+}
+
+IOStatus BlogFileWriter::EmitBytes(const IOOptions& opts, const char* data,
+                                   size_t len) {
+  IOStatus s = dest_->Append(Slice(data, len), opts);
   if (s.ok()) {
     offset_ += len;
   }

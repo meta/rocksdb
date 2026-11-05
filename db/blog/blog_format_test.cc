@@ -5,6 +5,7 @@
 
 #include "db/blog/blog_format.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -14,6 +15,7 @@
 #include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/prefix_varint.h"
+#include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -762,6 +764,50 @@ TEST_F(BlogFormatTest, ComputeBlogRecordChecksumWithContext) {
   uint32_t cksum3 = ComputeBlogRecordChecksum(
       kXXH3, data, size, static_cast<char>(kNoCompression), 0xABCDEF01, 100);
   ASSERT_NE(cksum1, cksum3);
+}
+
+TEST_F(BlogFormatTest, RecordChecksumWriterMatchesOneShot) {
+  const ChecksumType types[] = {kNoChecksum, kCRC32c, kxxHash, kxxHash64,
+                                kXXH3};
+  const char comp_bytes[] = {static_cast<char>(kNoCompression),
+                             static_cast<char>(kZSTD),
+                             static_cast<char>(kStreamingCompressionSentinel)};
+  Random rnd(301);
+  for (ChecksumType type : types) {
+    for (char comp_byte : comp_bytes) {
+      for (size_t size : {0u, 1u, 2u, 7u, 64u, 4096u, 65536u + 3u}) {
+        SCOPED_TRACE("type=" + std::to_string(static_cast<int>(type)) +
+                     " size=" + std::to_string(size));
+        std::string data(size, '\0');
+        for (size_t i = 0; i < size; ++i) {
+          data[i] = static_cast<char>(rnd.Next());
+        }
+        const uint32_t incarnation_id = rnd.Next();
+        const uint64_t payload_offset = rnd.Next64();
+        const uint32_t expected =
+            ComputeBlogRecordChecksum(type, data.data(), data.size(), comp_byte,
+                                      incarnation_id, payload_offset);
+        // One Update for the whole payload, then adversarial chunkings.
+        for (int chunking = 0; chunking < 3; ++chunking) {
+          BlogRecordChecksumWriter writer(type, incarnation_id);
+          writer.Init(payload_offset);
+          size_t pos = 0;
+          while (pos < data.size()) {
+            size_t step = data.size() - pos;
+            if (chunking == 1) {
+              step = 1 + rnd.Uniform(7);
+            } else if (chunking == 2) {
+              step = 1 + rnd.Uniform(5000);
+            }
+            step = std::min(step, data.size() - pos);
+            writer.Update(data.data() + pos, step);
+            pos += step;
+          }
+          ASSERT_EQ(writer.Finalize(comp_byte), expected);
+        }
+      }
+    }
+  }
 }
 
 // --- Header validation (spec: Fixed Header) ---

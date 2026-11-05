@@ -10,9 +10,13 @@
 #include <algorithm>
 #include <future>
 
+#include "db/blog/blog_format.h"
+#include "db/blog/blog_reader.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
 #include "db/legacy_wal_writer.h"
+#include "db/write_batch_internal.h"
+#include "file/sequence_file_reader.h"
 #include "options/options_helper.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
@@ -77,6 +81,106 @@ class DBWALTestBase : public DBTestBase {
                                     EnvOptions()));
     ASSERT_OK(file->Append(contents));
     ASSERT_OK(file->Close());
+  }
+
+  // Reads the min/maxSequence footer properties of a sealed blog WAL file.
+  // Returns NotFound if the file has no footer properties record or no
+  // sequence range (e.g. it holds no sequence-consuming records).
+  Status ReadBlogWalFooterSequenceRange(const std::string& fname,
+                                        uint64_t* min_sequence,
+                                        uint64_t* max_sequence) {
+    assert(min_sequence != nullptr);
+    assert(max_sequence != nullptr);
+    std::unique_ptr<FSSequentialFile> file;
+    FileOptions file_options;
+    Status s = env_->GetFileSystem()->NewSequentialFile(fname, file_options,
+                                                        &file, /*dbg=*/nullptr);
+    if (!s.ok()) {
+      return s;
+    }
+    auto file_reader =
+        std::make_unique<SequentialFileReader>(std::move(file), fname);
+    BlogFileReader reader(std::move(file_reader), /*reporter=*/nullptr,
+                          /*verify_checksums=*/true);
+    BlogFileHeader header;
+    s = reader.ReadHeader(&header);
+    if (!s.ok()) {
+      return s;
+    }
+    BlogRecordType type;
+    Slice record;
+    std::string scratch;
+    while ((s = reader.ReadRecord(&type, &record, &scratch)).ok()) {
+      if (type != kBlogFooterPropertiesRecord) {
+        continue;
+      }
+      BlogFileFooterProperties properties;
+      s = properties.DecodeFrom(record);
+      if (!s.ok()) {
+        return s;
+      }
+      bool found_min = false;
+      bool found_max = false;
+      for (const auto& [name, value] : properties.properties) {
+        Slice encoded(value);
+        if (name == "minSequence") {
+          if (!GetPrefixVarint64(&encoded, min_sequence) || !encoded.empty()) {
+            return Status::Corruption("bad minSequence encoding");
+          }
+          found_min = true;
+        } else if (name == "maxSequence") {
+          if (!GetPrefixVarint64(&encoded, max_sequence) || !encoded.empty()) {
+            return Status::Corruption("bad maxSequence encoding");
+          }
+          found_max = true;
+        }
+      }
+      if (!found_min || !found_max) {
+        return Status::NotFound("sequence range absent from footer");
+      }
+      return Status::OK();
+    }
+    if (s.IsNotFound()) {
+      return Status::NotFound("no footer properties record");
+    }
+    return s;
+  }
+
+  // Creates a live blog WAL reusing a retired larger WAL file, so the
+  // recycled file starts with a stale tail. Requires recycle_log_file_num > 0
+  // in options. Uses TEST_SwitchMemtable (not TEST_SwitchWAL) so rotation is
+  // deterministic and schedules no background flushes.
+  void CreateRecycledBlogWal(const Options& options, std::string* fname,
+                             uint64_t* log_number) {
+    Options setup_options = options;
+    // Recycling is sanitized away under Tolerate/Absolute; PIT keeps it.
+    setup_options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+    DestroyAndReopen(setup_options);
+    for (int i = 0; i < 200; ++i) {
+      ASSERT_OK(Put("bulk" + std::to_string(i), std::string(500, 'x')));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+    JobContext job_context(0);
+    dbfull()->TEST_LockMutex();
+    dbfull()->FindObsoleteFiles(&job_context, true /* force */);
+    dbfull()->TEST_UnlockMutex();
+    dbfull()->PurgeObsoleteFiles(job_context);
+    job_context.Clean();
+    ASSERT_OK(Put("key2", "value2"));
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    ASSERT_OK(Put("key3", "value3"));
+    ASSERT_OK(Put("key3b", "value3b"));
+    // GetSortedWalFiles reads WAL contents, which requires blog WAL read
+    // support. ListWalNumbers parses file names only and yields the same log
+    // numbers.
+    const std::vector<uint64_t> wal_numbers = ListWalNumbers();
+    ASSERT_EQ(wal_numbers.size(), 2);
+    *log_number = wal_numbers.back();
+    *fname = LogFileName(dbname_, *log_number);
+    uint64_t size = 0;
+    ASSERT_OK(env_->GetFileSize(*fname, &size));
+    ASSERT_GT(size, 50 * 1024);
   }
 
 #if defined(ROCKSDB_PLATFORM_POSIX)
@@ -418,6 +522,8 @@ class DBWALTestWithTimestamp
                                     bool avoid_flush_during_recovery = false) {
     Options default_options = CurrentOptions();
     default_options.create_if_missing = false;
+    default_options.use_blog_format_for_wals =
+        ts_options.use_blog_format_for_wals;
     default_options.allow_concurrent_memtable_write =
         persist_udt ? true : false;
     default_options.avoid_flush_during_recovery = avoid_flush_during_recovery;
@@ -1429,6 +1535,42 @@ TEST_F(DBWALTest, GetCurrentWalFile) {
   } while (ChangeWalOptions());
 }
 
+TEST_F(DBWALTest, BlogWalHeaderTimestampSizeFromOption) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.blog_timestamp_size = 8;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+
+  std::unique_ptr<LogFile> wal_file;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, wal_file->LogNumber()),
+                             &contents));
+  Slice input(contents);
+  BlogFileHeader header;
+  ASSERT_OK(header.DecodeFrom(&input));
+  uint64_t timestamp_size = 0;
+  ASSERT_TRUE(
+      header.GetUint64Property(kBlogPropTimestampSize, &timestamp_size));
+  ASSERT_EQ(timestamp_size, 8);
+
+  // Default zero omits the property on the next WAL.
+  options.blog_timestamp_size = 0;
+  Reopen(options);
+  ASSERT_OK(Put("key2", "value2"));
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+  ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, wal_file->LogNumber()),
+                             &contents));
+  Slice input2(contents);
+  ASSERT_OK(header.DecodeFrom(&input2));
+  ASSERT_FALSE(header.HasProperty(kBlogPropTimestampSize));
+
+  options.blog_timestamp_size =
+      size_t{std::numeric_limits<uint16_t>::max()} + 1;
+  ASSERT_TRUE(TryReopen(options).IsInvalidArgument());
+}
+
 TEST_F(DBWALTest, RecoveryWithLogDataForSomeCFs) {
   // Test for regression of WAL cleanup missing files that don't contain data
   // for every column family.
@@ -1931,7 +2073,8 @@ class RecoveryTestHelper {
           db_options.recycle_log_file_num > 0, /*manual_flush=*/false,
           db_options.wal_compression, /*track_and_verify_wals=*/false,
           /*initial_block_offset=*/0);
-      ASSERT_OK(log_writer->AddCompressionTypeRecord(WriteOptions()));
+      ASSERT_OK(
+          log_writer->WriteFileStart(WriteOptions(), PredecessorWALInfo()));
       current_log_writer.reset(log_writer);
 
       WriteBatch batch;
@@ -3497,6 +3640,264 @@ TEST_F(DBWALTest, AsyncWalPrecreateConsumesReadyFile) {
   ASSERT_EQ(0, options.statistics->getTickerCount(WAL_PRECREATE_WAITED));
 }
 
+TEST_F(DBWALTest, BlogWalAsyncPrecreateInitializesOnActivation) {
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.async_wal_precreate = true;
+  options.recycle_log_file_num = 0;
+  options.use_blog_format_for_wals = true;
+  options.write_buffer_size = 1024;
+  options.max_write_buffer_number = 4;
+
+  SyncPoint::GetInstance()->LoadDependency({
+      {"DBImpl::BGWorkAsyncWALPrecreate:Done",
+       "DBWALTest::BlogWalAsyncPrecreateInitializesOnActivation:PrecreateDone"},
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Defer cleanup_sync_point([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  Reopen(options);
+  TEST_SYNC_POINT(
+      "DBWALTest::BlogWalAsyncPrecreateInitializesOnActivation:PrecreateDone");
+
+  const std::vector<uint64_t> wal_numbers = ListWalNumbers();
+  ASSERT_GE(wal_numbers.size(), 2);
+  const uint64_t prepared_wal_number = wal_numbers.back();
+  ASSERT_NE(prepared_wal_number, dbfull()->TEST_GetCurrentLogNumber());
+  uint64_t prepared_size = 1;
+  ASSERT_OK(env_->GetFileSize(LogFileName(dbname_, prepared_wal_number),
+                              &prepared_size));
+  ASSERT_EQ(0, prepared_size);
+
+  ASSERT_OK(Put("fill", "value"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_EQ(prepared_wal_number, dbfull()->TEST_GetCurrentLogNumber());
+
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, prepared_wal_number),
+                             &contents));
+  ASSERT_TRUE(BlogFileHeader::IsBlogFormat(contents.data(), contents.size()));
+}
+
+namespace {
+// Controls WAL direct writes, and whether ReopenWritableFile is supported.
+class WalIOTestFS : public FileSystemWrapper {
+ public:
+  explicit WalIOTestFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+  const char* Name() const override { return "WalIOTestFS"; }
+  FileOptions OptimizeForLogWrite(const FileOptions& options,
+                                  const DBOptions& db_options) const override {
+    FileOptions result =
+        FileSystemWrapper::OptimizeForLogWrite(options, db_options);
+    result.use_direct_writes = direct_io;
+    return result;
+  }
+  IOStatus ReopenWritableFile(const std::string& fname,
+                              const FileOptions& file_opts,
+                              std::unique_ptr<FSWritableFile>* result,
+                              IODebugContext* dbg) override {
+    if (!reopen_supported) {
+      return IOStatus::NotSupported("ReopenWritableFile");
+    }
+    return target()->ReopenWritableFile(fname, file_opts, result, dbg);
+  }
+  bool direct_io = false;
+  bool reopen_supported = true;
+};
+}  // namespace
+
+TEST_F(DBWALTest, BlogWalCloseAfterMemtableFailureSkipsSeal) {
+  std::shared_ptr<WalIOTestFS> fs =
+      std::make_shared<WalIOTestFS>(Env::Default()->GetFileSystem());
+  std::unique_ptr<Env> wal_env = NewCompositeEnv(fs);
+  Defer close_db([&] { Close(); });
+  for (int config = 0; config < 8; ++config) {
+    SCOPED_TRACE(config);
+    fs->direct_io = (config & 2) != 0;
+    fs->reopen_supported = (config & 4) == 0;
+    if (fs->direct_io && (!fs->reopen_supported ||
+                          !test::IsDirectIOSupported(wal_env.get(), dbname_))) {
+      // Direct I/O truncation after Close requires ReopenWritableFile.
+      continue;
+    }
+    Options options = CurrentOptions();
+    options.env = wal_env.get();
+    options.manual_wal_flush = (config & 1) != 0;
+    options.use_blog_format_for_wals = true;
+    options.avoid_flush_during_shutdown = true;
+    DestroyAndReopen(options);
+
+    ASSERT_OK(Put("good", "value"));
+    ASSERT_OK(db_->FlushWAL(false));
+    std::unique_ptr<LogFile> wal;
+    ASSERT_OK(dbfull()->GetCurrentWalFile(&wal));
+    const std::string wal_name = LogFileName(dbname_, wal->LogNumber());
+    std::string good_prefix;
+    ASSERT_OK(ReadFileToString(wal_env.get(), wal_name, &good_prefix));
+    std::unique_ptr<FSSequentialFile> file;
+    ASSERT_OK(fs->NewSequentialFile(wal_name, FileOptions(), &file, nullptr));
+    BlogFileReader reader(
+        std::make_unique<SequentialFileReader>(std::move(file), wal_name),
+        nullptr, true);
+    BlogFileHeader prefix_header;
+    ASSERT_OK(reader.ReadHeader(&prefix_header));
+    BlogRecordType type;
+    Slice record;
+    std::string scratch;
+    ASSERT_OK(reader.ReadRecord(&type, &record, &scratch));
+    ASSERT_EQ(type, kBlogWriteBatchRecord);
+    const size_t body_end = lossless_cast<size_t>(reader.current_offset());
+    const BlogPadding padding(lossless_cast<uint8_t>(good_prefix[body_end - 1]),
+                              body_end);
+    good_prefix.resize(body_end + padding.count);
+
+    // A batch for an unknown column family appends to the WAL, then fails
+    // memtable insert, recording a truncate back to the pre-write size.
+    // (The raw-ID Put bypasses the handle validation in WriteBatch::Put.)
+    WriteBatch bad;
+    ASSERT_OK(WriteBatchInternal::Put(&bad, /*column_family_id=*/100, "bad",
+                                      "value"));
+    ASSERT_TRUE(db_->Write(WriteOptions(), &bad).IsInvalidArgument());
+
+    std::atomic<int> skipped_seal_count{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ClearWriter:SkippedSealForTruncate",
+        [&](void*) { ++skipped_seal_count; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    Defer cleanup_sync_point([] {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+    });
+
+    Close();
+    ASSERT_EQ(skipped_seal_count.load(), 1);
+
+    // The truncated WAL is left unsealed: no footer locator at its tail.
+    std::string contents;
+    ASSERT_OK(ReadFileToString(wal_env.get(), wal_name, &contents));
+    ASSERT_EQ(contents, good_prefix);
+    Slice input(contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&input));
+    ASSERT_FALSE(VerifyBlogFooterLocator(
+        contents.data(), contents.size(),
+        /*buffer_file_offset=*/0, header.escape_sequence, header.checksum_type,
+        header.incarnation_id()));
+  }
+}
+
+TEST_F(DBWALTest, LegacyWalCloseAfterMemtableFailureTruncatesWithoutReopen) {
+  std::shared_ptr<WalIOTestFS> fs =
+      std::make_shared<WalIOTestFS>(Env::Default()->GetFileSystem());
+  fs->reopen_supported = false;
+  std::unique_ptr<Env> wal_env = NewCompositeEnv(fs);
+  Defer close_db([&] { Close(); });
+  Options options = CurrentOptions();
+  options.env = wal_env.get();
+  options.avoid_flush_during_shutdown = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("good", "value"));
+  std::unique_ptr<LogFile> wal;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal));
+  const std::string wal_name = LogFileName(dbname_, wal->LogNumber());
+  std::string good_prefix;
+  ASSERT_OK(ReadFileToString(wal_env.get(), wal_name, &good_prefix));
+
+  // A batch for an unknown column family appends to the WAL, then fails
+  // memtable insert, recording a truncate back to the pre-write size.
+  WriteBatch bad;
+  ASSERT_OK(
+      WriteBatchInternal::Put(&bad, /*column_family_id=*/100, "bad", "value"));
+  ASSERT_TRUE(db_->Write(WriteOptions(), &bad).IsInvalidArgument());
+  std::string with_bad;
+  ASSERT_OK(ReadFileToString(wal_env.get(), wal_name, &with_bad));
+  ASSERT_GT(with_bad.size(), good_prefix.size());
+
+  Close();
+  std::string contents;
+  ASSERT_OK(ReadFileToString(wal_env.get(), wal_name, &contents));
+  ASSERT_EQ(contents, good_prefix);
+}
+
+TEST_F(DBWALTest, BlogWalFooterSequenceRangeCoversMultiKeyBatches) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.avoid_flush_during_shutdown = true;
+  DestroyAndReopen(options);
+
+  // Sequences 1-3 and 4-5. The footer maxSequence must be the last sequence
+  // consumed (5), not the largest batch-start sequence (4).
+  WriteBatch batch1;
+  ASSERT_OK(batch1.Put("k1", "v1"));
+  ASSERT_OK(batch1.Put("k2", "v2"));
+  ASSERT_OK(batch1.Put("k3", "v3"));
+  ASSERT_OK(db_->Write(WriteOptions(), &batch1));
+  WriteBatch batch2;
+  ASSERT_OK(batch2.Put("k4", "v4"));
+  ASSERT_OK(batch2.Put("k5", "v5"));
+  ASSERT_OK(db_->Write(WriteOptions(), &batch2));
+  ASSERT_EQ(dbfull()->GetLatestSequenceNumber(), 5);
+
+  std::unique_ptr<LogFile> old_wal;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&old_wal));
+  const std::string old_wal_name = LogFileName(dbname_, old_wal->LogNumber());
+  Close();
+
+  uint64_t min_sequence = 0;
+  uint64_t max_sequence = 0;
+  ASSERT_OK(ReadBlogWalFooterSequenceRange(old_wal_name, &min_sequence,
+                                           &max_sequence));
+  ASSERT_EQ(min_sequence, 1);
+  ASSERT_EQ(max_sequence, 5);
+}
+
+TEST_F(DBWALTest, BlogWalRecycledFlagOnlyForReusedFile) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.recycle_log_file_num = 1;
+  options.avoid_flush_during_shutdown = true;
+  options.write_buffer_size = 10 * 1024 * 1024;
+  options.max_write_buffer_number = 10;
+  options.compression = kNoCompression;
+  options.track_and_verify_wals = false;
+
+  // Fresh WAL: no recyclable file exists yet, so the flag must be clear even
+  // though recycling is enabled.
+  {
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key1", "value1"));
+    std::unique_ptr<LogFile> wal_file;
+    ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+    const std::string fname = LogFileName(dbname_, wal_file->LogNumber());
+    Close();
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env_, fname, &contents));
+    Slice header_input(contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&header_input));
+    ASSERT_FALSE(header.is_recycled());
+  }
+
+  // Recycled WAL: reuses a retired larger file, so the flag must be set.
+  {
+    std::string recycled_fname;
+    uint64_t recycled_number = 0;
+    CreateRecycledBlogWal(options, &recycled_fname, &recycled_number);
+    Close();
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env_, recycled_fname, &contents));
+    Slice header_input(contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&header_input));
+    ASSERT_TRUE(header.is_recycled());
+  }
+}
+
 TEST_F(DBWALTest, AsyncWalPrecreateRecoveryToleratesActualFutureWal) {
   Options options = CurrentOptions();
   options.env = env_;
@@ -3571,7 +3972,7 @@ TEST_F(DBWALTest, AsyncWalPrecreateDeletesFileOnStartFailure) {
   TEST_SYNC_POINT(
       "DBWALTest::AsyncWalPrecreateDeletesFileOnStartFailure:PrecreateDone");
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::StartWALFile:AfterCompressionTypeRecord", [](void* arg) {
+      "DBImpl::StartWALFile:AfterWriteFileStart", [](void* arg) {
         *static_cast<IOStatus*>(arg) =
             IOStatus::IOError("injected async WAL start failure");
       });

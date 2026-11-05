@@ -1256,7 +1256,7 @@ Status DBImpl::CloseHelper() {
     }
     for (auto& log : logs_) {
       uint64_t log_number = log.writer->get_log_number();
-      Status s = log.ClearWriter();
+      Status s = log.ClearWriter(fs_.get());
       if (!s.ok()) {
         ROCKS_LOG_WARN(
             immutable_db_options_.info_log,
