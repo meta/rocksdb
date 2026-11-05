@@ -24,12 +24,21 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   // true
   // @param read_options Must outlive this iterator.
  public:
+  // Outcome of the prefix check for the iterator's first Seek(), when
+  // BlockBasedTable::NewIteratorForSeek() ran it before building the iterator.
+  enum class FirstSeekPrefixCheck : uint8_t {
+    kNotRun,
+    kPassedWithoutFilter,
+    kPassedFilter,
+  };
+
   BlockBasedTableIterator(
       const BlockBasedTable* table, const ReadOptions& read_options,
       const InternalKeyComparator& icomp,
       std::unique_ptr<InternalIteratorBase<IndexValue>>&& index_iter,
       bool check_filter, bool need_upper_bound_check,
       const SliceTransform* prefix_extractor, TableReaderCaller caller,
+      FirstSeekPrefixCheck first_seek_prefix_check,
       size_t compaction_readahead_size = 0, bool allow_unprepared_value = false)
       : index_iter_(std::move(index_iter)),
         table_(table),
@@ -45,6 +54,7 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
         allow_unprepared_value_(allow_unprepared_value),
         check_filter_(check_filter),
         need_upper_bound_check_(need_upper_bound_check),
+        first_seek_prefix_check_(first_seek_prefix_check),
         async_read_in_progress_(false),
         is_last_level_(table->IsLastLevel()),
         block_iter_points_to_real_block_(false) {
@@ -384,6 +394,8 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   bool check_filter_;
   // TODO(Zhongyi): pick a better name
   bool need_upper_bound_check_;
+  // Consumed by the first Seek(); later seeks run their own prefix check.
+  FirstSeekPrefixCheck first_seek_prefix_check_;
 
   bool async_read_in_progress_;
 

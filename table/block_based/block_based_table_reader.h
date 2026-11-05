@@ -198,6 +198,18 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
                                 size_t compaction_readahead_size = 0,
                                 bool allow_unprepared_value = false) override;
 
+  // Checks the prefix filter for seek_target before building the iterator,
+  // so that a filtered seek costs neither an index iterator nor a table
+  // iterator. Tables with range tombstones are not checked here, which leaves
+  // seeks over them, and their interplay with range tombstones, unchanged.
+  InternalIterator* NewIteratorForSeek(const ReadOptions&,
+                                       const SliceTransform* prefix_extractor,
+                                       Arena* arena, bool skip_filters,
+                                       TableReaderCaller caller,
+                                       size_t compaction_readahead_size,
+                                       bool allow_unprepared_value,
+                                       const Slice& seek_target) override;
+
   FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
       const ReadOptions& read_options) override;
 
@@ -533,6 +545,17 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   friend class MockedBlockBasedTable;
   friend class BlockBasedTableReaderTestVerifyChecksum_ChecksumMismatch_Test;
   BlockCacheTracer* const block_cache_tracer_;
+
+  // NewIterator(), or NewIteratorForSeek() when seek_target is non-null.
+  // seek_target comes last so that both callers pass their arguments through
+  // in place.
+  InternalIterator* NewIteratorImpl(const ReadOptions& read_options,
+                                    const SliceTransform* prefix_extractor,
+                                    Arena* arena, bool skip_filters,
+                                    TableReaderCaller caller,
+                                    size_t compaction_readahead_size,
+                                    bool allow_unprepared_value,
+                                    const Slice* seek_target);
 
   void UpdateCacheHitMetrics(BlockType block_type, GetContext* get_context,
                              size_t usage) const;
