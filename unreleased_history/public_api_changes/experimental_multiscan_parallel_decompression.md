@@ -1,1 +1,0 @@
-Added experimental `MultiScanArgs::use_parallel_async_io_block_decompression` for materializing asynchronously prefetched data blocks, including decompression, in parallel on the `Env::Priority::READ` thread pool. A zero-sized pool preserves inline materialization.

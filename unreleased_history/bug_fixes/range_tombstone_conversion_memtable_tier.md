@@ -1,1 +1,0 @@
-Fixed a data loss bug where an iterator with `ReadOptions::read_tier = kMemtableTier` could, with `min_tombstones_for_range_conversion` enabled, insert a range tombstone that deleted live keys stored only in SST files. Read-path range tombstone conversion now runs only for iterators with `read_tier = kReadAllTier`.
