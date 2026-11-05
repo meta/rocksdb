@@ -843,19 +843,20 @@ TEST_F(TieredCompactionTest, LevelOutofBoundaryRangeDelete) {
   ASSERT_OK(Flush());
 
   ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
-  ASSERT_EQ("0,2,10",
-            FilesPerLevel());  // one file is at the proximal level
-                               // which only contains a range delete
+  ASSERT_EQ("0,3,10",
+            FilesPerLevel());  // the partitioner cuts before and after the
+                               // range delete, so it has a file of its own
+                               // at the proximal level
   std::vector<LiveFileMetaData> live_file_meta;
   db_->GetLiveFilesMetaData(&live_file_meta);
   bool found_sst_with_del = false;
   uint64_t sst_with_del_num = 0;
   for (const auto& meta : live_file_meta) {
     if (meta.num_deletions > 0) {
-      // found SST with del, which has 2 entries, one for data one for range del
+      // found SST with del, which only contains the range del
       ASSERT_EQ(meta.level,
                 kNumLevels - 2);  // output to proximal level
-      ASSERT_EQ(meta.num_entries, 2);
+      ASSERT_EQ(meta.num_entries, 1);
       ASSERT_EQ(meta.num_deletions, 1);
       found_sst_with_del = true;
       sst_with_del_num = meta.file_number;
@@ -974,7 +975,9 @@ TEST_F(TieredCompactionTest, UniversalRangeDelete) {
   ASSERT_OK(Flush());
 
   ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
-  ASSERT_EQ("0,0,0,0,0,2,8", FilesPerLevel());
+  // the partitioner cuts before and after the range del, so it has a file of
+  // its own at the proximal level
+  ASSERT_EQ("0,0,0,0,0,3,8", FilesPerLevel());
   // find the SST with range del
   std::vector<LiveFileMetaData> live_file_meta;
   db_->GetLiveFilesMetaData(&live_file_meta);
@@ -982,10 +985,10 @@ TEST_F(TieredCompactionTest, UniversalRangeDelete) {
   uint64_t sst_with_del_num = 0;
   for (const auto& meta : live_file_meta) {
     if (meta.num_deletions > 0) {
-      // found SST with del, which has 2 entries, one for data one for range del
+      // found SST with del, which only contains the range del
       ASSERT_EQ(meta.level,
                 kNumLevels - 2);  // output_to_proximal_level level
-      ASSERT_EQ(meta.num_entries, 2);
+      ASSERT_EQ(meta.num_entries, 1);
       ASSERT_EQ(meta.num_deletions, 1);
       found_sst_with_del = true;
       sst_with_del_num = meta.file_number;

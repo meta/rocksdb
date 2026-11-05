@@ -235,6 +235,32 @@ uint64_t CompactionOutputs::GetCurrentKeyGrandparentOverlappedBytes(
   return overlapped_bytes;
 }
 
+bool CompactionOutputs::PartitionerRequiresCut(
+    const CompactionIterator& c_iter) const {
+  assert(HasBuilder());
+  if (!partitioner_) {
+    return false;
+  }
+  if (partitioner_prefix_valid_) {
+    // Fast path: no per-key copy or virtual call. A partition is requested at
+    // the first key that no longer shares the established prefix. An empty
+    // prefix means no further partitions (every key "starts with" it).
+    return UNLIKELY(!c_iter.user_key().starts_with(partitioner_prefix_));
+  }
+  // Slow path: per-key callback (and copy elsewhere)
+  return UNLIKELY(partitioner_->ShouldPartition(PartitionerRequest(
+                      last_key_for_partitioner_, c_iter.user_key(),
+                      current_output_file_size_)) == kRequired);
+}
+
+bool CompactionOutputs::LargestUserKeyEquals(const Slice& user_key) {
+  const InternalKey& largest = current_output().meta.largest;
+  return largest.size() > 0 &&
+         compaction_->column_family_data()
+             ->user_comparator()
+             ->EqualWithoutTimestamp(largest.user_key(), user_key);
+}
+
 bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
   assert(c_iter.Valid());
   const Slice& internal_key = c_iter.key();
@@ -270,22 +296,8 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
     return true;
   }
 
-  if (partitioner_) {
-    if (partitioner_prefix_valid_) {
-      // Fast path: no per-key copy or virtual call. A partition is requested at
-      // the first key that no longer shares the established prefix. An empty
-      // prefix means no further partitions (every key "starts with" it).
-      if (UNLIKELY(!c_iter.user_key().starts_with(partitioner_prefix_))) {
-        return true;
-      }
-    } else {
-      // Slow path: per-key callback (and copy elsewhere)
-      if (UNLIKELY(partitioner_->ShouldPartition(PartitionerRequest(
-                       last_key_for_partitioner_, c_iter.user_key(),
-                       current_output_file_size_)) == kRequired)) {
-        return true;
-      }
-    }
+  if (PartitionerRequiresCut(c_iter)) {
+    return true;
   }
 
   // files output to Level 0 won't be split
@@ -400,13 +412,24 @@ Status CompactionOutputs::AddToOutput(
     const ParsedInternalKey& prev_iter_output_internal_key) {
   Status s;
   bool is_range_del = c_iter.IsDeleteRangeSentinelKey();
+  bool cut_before;
   if (is_range_del && compaction_->bottommost_level()) {
-    // We don't consider range tombstone for bottommost level since:
-    // 1. there is no grandparent and hence no overlap to consider
-    // 2. range tombstone may be dropped at bottommost level.
-    return s;
+    // At the bottommost level, a range tombstone is not by itself a reason to
+    // cut: there are no grandparents to limit overlap with, and the tombstone
+    // might be dropped. However, a boundary required by the SstPartitioner
+    // must still be honored; otherwise AddRangeDels() would extend the
+    // current file across it. No boundary can fall inside one user key, and
+    // a point key there may have its seqno zeroed, so that it sorts after a
+    // tombstone starting at the same user key.
+    if (!HasBuilder() || LargestUserKeyEquals(c_iter.user_key()) ||
+        !PartitionerRequiresCut(c_iter)) {
+      return s;
+    }
+    cut_before = true;
+  } else {
+    cut_before = ShouldStopBefore(c_iter) && HasBuilder();
   }
-  if (ShouldStopBefore(c_iter) && HasBuilder()) {
+  if (cut_before) {
     const Slice next_table_min_key = c_iter.key();
     s = close_file_func(c_iter.InputStatus(), prev_iter_output_internal_key,
                         next_table_min_key, &c_iter,

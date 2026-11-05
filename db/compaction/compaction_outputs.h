@@ -245,6 +245,15 @@ class CompactionOutputs {
   // before processing the current key in compaction iterator.
   bool ShouldStopBefore(const CompactionIterator& c_iter);
 
+  // Returns true iff the SST partitioner requires a new output file to start
+  // at the current key. Only meaningful while an output file is open: the
+  // partitioner state describes the current file.
+  bool PartitionerRequiresCut(const CompactionIterator& c_iter) const;
+
+  // Returns true iff the current output file has a largest key and its user
+  // key equals `user_key`, ignoring timestamps.
+  bool LargestUserKeyEquals(const Slice& user_key);
+
   // Re-establishes per-file state that depends on the first key accepted by a
   // freshly opened builder. This keeps caller-requested file cuts equivalent to
   // RocksDB's built-in file-boundary decisions for partition tracking.
