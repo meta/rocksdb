@@ -1,1 +1,0 @@
-`CompactRangeOptions::skip_missing_blob_files` enables offline repair that deletes values referencing integrated external blob files absent from Version metadata, preserves available wide entity columns, and rewrites selected SSTs locally, bypassing `DBOptions::compaction_service`. It defaults to false; FIFO compaction and legacy BlobDB are unsupported.
