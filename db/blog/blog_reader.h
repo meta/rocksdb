@@ -42,6 +42,10 @@ class BlogFileReader {
   // Construct for sequential reading (WAL replay, forward scan).
   BlogFileReader(std::unique_ptr<SequentialFileReader>&& file,
                  Reporter* reporter, bool verify_checksums);
+  // Construct after `initial_data` has already been read from `file`.
+  BlogFileReader(std::unique_ptr<SequentialFileReader>&& file,
+                 Reporter* reporter, bool verify_checksums,
+                 std::string&& initial_data);
 
   ~BlogFileReader() = default;
 
@@ -76,8 +80,10 @@ class BlogFileReader {
   Status ScanForEscapeSequence(uint64_t* found_offset);
 
   bool IsEOF() const { return eof_; }
+  void UnmarkEOF() { eof_ = false; }
   uint64_t LastRecordOffset() const { return last_record_offset_; }
   uint64_t current_offset() const { return offset_ - pending_input_.size(); }
+  SequentialFileReader* file() { return seq_file_.get(); }
   const BlogFileHeader& header() const { return header_; }
 
  private:

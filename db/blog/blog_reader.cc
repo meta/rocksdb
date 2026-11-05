@@ -73,9 +73,17 @@ std::string MakeUnspecifiedSizeChecksumMismatchMessage(
 
 BlogFileReader::BlogFileReader(std::unique_ptr<SequentialFileReader>&& file,
                                Reporter* reporter, bool verify_checksums)
+    : BlogFileReader(std::move(file), reporter, verify_checksums,
+                     std::string()) {}
+
+BlogFileReader::BlogFileReader(std::unique_ptr<SequentialFileReader>&& file,
+                               Reporter* reporter, bool verify_checksums,
+                               std::string&& initial_data)
     : seq_file_(std::move(file)),
       reporter_(reporter),
-      verify_checksums_(verify_checksums) {}
+      verify_checksums_(verify_checksums),
+      offset_(initial_data.size()),
+      pending_input_(std::move(initial_data)) {}
 
 Status BlogFileReader::ReadHeader(BlogFileHeader* header) {
   assert(!header_read_);

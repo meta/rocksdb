@@ -47,6 +47,8 @@ const char* GetBlogRecordTypeName(BlogRecordType type) {
   switch (type) {
     case kBlogIgnorablePropertiesRecord:
       return "IgnorableProperties";
+    case kBlogUserDefinedTimestampSizeRecord:
+      return "UserDefinedTimestampSize";
     case kBlogBlobRecord:
       return "Blob";
     case kBlogPreambleStartRecord:

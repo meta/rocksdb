@@ -9,6 +9,7 @@
 #include <cinttypes>
 
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blog_wal_writer.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
@@ -30,6 +31,7 @@
 #include "rocksdb/table.h"
 #include "rocksdb/wal_filter.h"
 #include "test_util/sync_point.h"
+#include "util/cast_util.h"
 #include "util/rate_limiter_impl.h"
 #include "util/string_util.h"
 #include "util/udt_util.h"
@@ -106,7 +108,7 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
     result.recycle_log_file_num = false;
   }
 
-  if (result.recycle_log_file_num &&
+  if (result.recycle_log_file_num && !result.use_blog_format_for_wals &&
       (result.wal_recovery_mode ==
            WALRecoveryMode::kTolerateCorruptedTailRecords ||
        result.wal_recovery_mode == WALRecoveryMode::kAbsoluteConsistency)) {
@@ -122,6 +124,9 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
     //   hole in the recovered data
     //   (https://github.com/meta/rocksdb/pull/7252#issuecomment-673766236).
     //   Besides this bug, we believe the features are fundamentally compatible.
+    // Blog-format WALs are exempt from the above: the per-incarnation escape
+    // sequence lets the reader distinguish stale recycled tail data from real
+    // corruption, so both modes stay compatible with recycling.
     result.recycle_log_file_num = 0;
   }
 
@@ -199,8 +204,12 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
     result.sst_file_manager = sst_file_manager;
   }
 
-  // Supported wal compression types
-  if (!StreamingCompressionTypeSupported(result.wal_compression)) {
+  // Legacy WALs use streaming compression, which supports only ZSTD.
+  // Blog-format WALs use per-record block compression instead and accept any
+  // type the compression manager supports (validated when the WAL is created),
+  // so they are exempt from the streaming-only override below.
+  if (!result.use_blog_format_for_wals &&
+      !StreamingCompressionTypeSupported(result.wal_compression)) {
     result.wal_compression = kNoCompression;
     ROCKS_LOG_WARN(result.info_log,
                    "wal_compression is disabled since only zstd is supported");
@@ -325,6 +334,12 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
   if (!db_options.write_dbid_to_manifest && !db_options.write_identity_file) {
     return Status::InvalidArgument(
         "write_dbid_to_manifest and write_identity_file cannot both be false");
+  }
+
+  if (db_options.blog_timestamp_size > std::numeric_limits<uint16_t>::max()) {
+    return Status::InvalidArgument(
+        "blog_timestamp_size must not exceed " +
+        std::to_string(std::numeric_limits<uint16_t>::max()));
   }
   return Status::OK();
 }
@@ -2516,13 +2531,30 @@ IOStatus DBImpl::CreateWALWriter(const DBOptions& db_options,
         tmp_set.Contains(FileType::kWalFile),
         tmp_set.Contains(FileType::kWalFile)));
     new_wal->log_number = log_file_num;
-    new_wal->writer = std::make_unique<LegacyWalWriter>(
-        std::move(file_writer), log_file_num,
-        immutable_db_options_.recycle_log_file_num > 0,
-        immutable_db_options_.manual_wal_flush,
-        immutable_db_options_.wal_compression,
-        immutable_db_options_.track_and_verify_wals,
-        /*initial_block_offset=*/0);
+    if (db_options.use_blog_format_for_wals) {
+      int64_t current_time = 0;
+      immutable_db_options_.clock->GetCurrentTime(&current_time)
+          .PermitUncheckedError();
+      // kBlogFileRecycled marks whether this file itself was recycled, not
+      // whether the DB has recycling enabled. A fresh file must not carry the
+      // flag even when recycle_log_file_num > 0.
+      const bool is_recycled = recycle_log_number != 0;
+      new_wal->writer = std::make_unique<BlogWalWriter>(
+          std::move(file_writer), log_file_num, is_recycled,
+          db_options.manual_wal_flush, db_options.wal_compression,
+          /*use_streaming_compression=*/false, db_options.track_and_verify_wals,
+          db_options.blog_checksum, db_options.blog_timestamp_size, db_id_,
+          db_session_id_, db_options.db_host_id,
+          lossless_cast<uint64_t>(current_time));
+    } else {
+      // Deliberately still DB-wide: log::Writer needs recyclable record types
+      // in every WAL (even fresh ones) so a later reuse stays detectable.
+      new_wal->writer = std::make_unique<LegacyWalWriter>(
+          std::move(file_writer), log_file_num,
+          db_options.recycle_log_file_num > 0, db_options.manual_wal_flush,
+          db_options.wal_compression, db_options.track_and_verify_wals,
+          /*initial_block_offset=*/0);
+    }
   }
 
   return io_s;
@@ -2532,13 +2564,8 @@ IOStatus DBImpl::StartWALFile(const WriteOptions& write_options,
                               const PredecessorWALInfo& predecessor_wal_info,
                               WalWriter* new_log) {
   assert(new_log);
-  IOStatus io_s = new_log->AddCompressionTypeRecord(write_options);
-  TEST_SYNC_POINT_CALLBACK("DBImpl::StartWALFile:AfterCompressionTypeRecord",
-                           &io_s);
-  if (io_s.ok()) {
-    io_s = new_log->MaybeAddPredecessorWALInfo(write_options,
-                                               predecessor_wal_info);
-  }
+  IOStatus io_s = new_log->WriteFileStart(write_options, predecessor_wal_info);
+  TEST_SYNC_POINT_CALLBACK("DBImpl::StartWALFile:AfterWriteFileStart", &io_s);
   return io_s;
 }
 
@@ -2826,8 +2853,11 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
 
         assert(log_writer->get_log_number() == wal_file_number_size.number);
         impl->mutex_.AssertHeld();
+        // The dummy batch is empty and consumes no sequences; its header
+        // sequence is only a hint for corruption classification.
         s = impl->WriteToWAL(empty_batch, write_options, log_writer, &wal_used,
-                             &log_size, wal_file_number_size, recovered_seq);
+                             &log_size, wal_file_number_size, recovered_seq,
+                             /*seq_inc=*/0);
         if (s.ok()) {
           // Need to fsync, otherwise it might get lost after a power reset.
           s = impl->FlushWAL(write_options, false);

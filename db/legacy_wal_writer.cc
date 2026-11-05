@@ -7,6 +7,8 @@
 
 #include <utility>
 
+#include "file/writable_file_writer.h"
+
 namespace ROCKSDB_NAMESPACE {
 
 LegacyWalWriter::LegacyWalWriter(std::unique_ptr<WritableFileWriter>&& dest,
@@ -20,20 +22,23 @@ LegacyWalWriter::LegacyWalWriter(std::unique_ptr<WritableFileWriter>&& dest,
 
 IOStatus LegacyWalWriter::AddRecord(const WriteOptions& write_options,
                                     const Slice& record,
-                                    SequenceNumber sequence) {
-  return writer_.AddRecord(write_options, record, sequence);
+                                    SequenceNumber first_sequence,
+                                    size_t /*num_sequences*/) {
+  // The legacy format persists no sequence range; only the first sequence
+  // feeds GetLastSeqnoRecorded(), matching what recovery observes (the batch
+  // header sequence) for predecessor verification.
+  return writer_.AddRecord(write_options, record, first_sequence);
 }
 
-IOStatus LegacyWalWriter::AddCompressionTypeRecord(
-    const WriteOptions& write_options) {
-  return writer_.AddCompressionTypeRecord(write_options);
-}
-
-IOStatus LegacyWalWriter::MaybeAddPredecessorWALInfo(
+IOStatus LegacyWalWriter::WriteFileStart(
     const WriteOptions& write_options,
     const PredecessorWALInfo& predecessor_wal_info) {
-  return writer_.MaybeAddPredecessorWALInfo(write_options,
-                                            predecessor_wal_info);
+  IOStatus io_s = writer_.AddCompressionTypeRecord(write_options);
+  if (io_s.ok()) {
+    io_s =
+        writer_.MaybeAddPredecessorWALInfo(write_options, predecessor_wal_info);
+  }
+  return io_s;
 }
 
 IOStatus LegacyWalWriter::MaybeAddUserDefinedTimestampSizeRecord(
@@ -68,6 +73,10 @@ bool LegacyWalWriter::BufferIsEmpty() { return writer_.BufferIsEmpty(); }
 
 SequenceNumber LegacyWalWriter::GetLastSeqnoRecorded() const {
   return writer_.GetLastSeqnoRecorded();
+}
+
+uint64_t LegacyWalWriter::GetVerificationSize() const {
+  return writer_.file()->GetFileSize();
 }
 
 }  // namespace ROCKSDB_NAMESPACE

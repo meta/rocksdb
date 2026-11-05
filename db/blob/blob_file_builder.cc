@@ -280,10 +280,16 @@ Status BlobFileBuilder::OpenBlobFileIfNeeded() {
                               blob_compression_manager_->CompatibilityName());
     }
 
+    // Blob records are only ever read by random access at an offset the blob
+    // index supplies, never by scanning forward for record boundaries, so no
+    // reader ever has to find the end of the last record. See
+    // BlogUnspecifiedSizeRecords.
     // Bulk-built files are read after sealing. Buffer records until the
     // buffer fills or CloseBlobFile syncs, as on the legacy path.
-    blog_writer_ = std::make_unique<BlogFileWriter>(
-        std::move(file_writer), blog_header, /*manual_flush=*/true);
+    blog_writer_ =
+        std::make_unique<BlogFileWriter>(std::move(file_writer), blog_header,
+                                         BlogUnspecifiedSizeRecords::kAllowed,
+                                         /*manual_flush=*/true);
 
     Status s = blog_writer_->WriteHeader(*write_options_);
 

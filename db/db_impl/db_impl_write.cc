@@ -1396,7 +1396,7 @@ Status DBImpl::WriteImpl(
         io_s = WriteGroupToWAL(write_group, wal_context.writer, wal_used,
                                wal_context.need_wal_sync,
                                wal_context.need_wal_dir_sync, last_sequence + 1,
-                               *wal_context.wal_file_number_size);
+                               seq_inc, *wal_context.wal_file_number_size);
       }
     } else {
       if (status.ok() && !write_options.disableWAL) {
@@ -1699,10 +1699,12 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       assert(wal_context.wal_file_number_size);
       WalFileNumberSize& wal_file_number_size =
           *(wal_context.wal_file_number_size);
-      IOStatus io_s = WriteGroupToWAL(wal_write_group, wal_context.writer,
-                                      wal_used, wal_context.need_wal_sync,
-                                      wal_context.need_wal_dir_sync,
-                                      current_sequence, wal_file_number_size);
+      // Pipelined writes are incompatible with seq_per_batch_, so the key
+      // count is the sequence consumption.
+      IOStatus io_s = WriteGroupToWAL(
+          wal_write_group, wal_context.writer, wal_used,
+          wal_context.need_wal_sync, wal_context.need_wal_dir_sync,
+          current_sequence, total_count, wal_file_number_size);
       w.status = io_s;
 
       if (!io_s.ok()) {
@@ -2330,7 +2332,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             WalWriter* log_writer, uint64_t* wal_used,
                             uint64_t* log_size,
                             WalFileNumberSize& wal_file_number_size,
-                            SequenceNumber sequence) {
+                            SequenceNumber sequence, size_t seq_inc) {
   assert(log_size != nullptr);
 
   Slice log_entry = WriteBatchInternal::Contents(&merged_batch);
@@ -2363,7 +2365,10 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
     }
     return io_s;
   }
-  io_s = log_writer->AddRecord(write_options, log_entry, sequence);
+  // `seq_inc` is the number of sequence numbers consumed by this record,
+  // so the writer can track the record's last sequence
+  // (`sequence + seq_inc - 1`) for the footer, rather than just its first.
+  io_s = log_writer->AddRecord(write_options, log_entry, sequence, seq_inc);
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:AfterAddRecord", &io_s);
 
   if (UNLIKELY(needs_locking)) {
@@ -2383,7 +2388,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
 IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                                  WalWriter* log_writer, uint64_t* wal_used,
                                  bool need_wal_sync, bool need_wal_dir_sync,
-                                 SequenceNumber sequence,
+                                 SequenceNumber sequence, size_t seq_inc,
                                  WalFileNumberSize& wal_file_number_size) {
   IOStatus io_s;
   assert(!two_write_queues_);
@@ -2415,7 +2420,7 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, wal_used,
-                    &log_size, wal_file_number_size, sequence);
+                    &log_size, wal_file_number_size, sequence, seq_inc);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
@@ -2542,7 +2547,7 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, wal_used,
-                    &log_size, wal_file_number_size, sequence);
+                    &log_size, wal_file_number_size, sequence, seq_inc);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
@@ -3358,7 +3363,7 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
     if (!logs_.empty()) {
       WalWriter* cur_log_writer = logs_.back().writer;
       info = PredecessorWALInfo(cur_log_writer->get_log_number(),
-                                cur_log_writer->file()->GetFileSize(),
+                                cur_log_writer->GetVerificationSize(),
                                 cur_log_writer->GetLastSeqnoRecorded());
     }
     wal_write_mutex_.Unlock();

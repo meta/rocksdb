@@ -1040,10 +1040,17 @@ DEFINE_string(wal_compression, "none",
 static enum ROCKSDB_NAMESPACE::CompressionType FLAGS_wal_compression_e =
     ROCKSDB_NAMESPACE::kNoCompression;
 
+DEFINE_bool(use_blog_format_for_wals, false,
+            "Use blog file format for new WAL files.");
+
 DEFINE_bool(use_blog_format_for_blobs, false,
             "Use blog file format for new blob files.");
 
 DEFINE_string(blog_checksum, "kXXH3", "Checksum type for blog format files.");
+
+DEFINE_uint64(blog_timestamp_size,
+              ROCKSDB_NAMESPACE::Options().blog_timestamp_size,
+              "DB-wide default timestamp size for blog format WAL headers.");
 
 DEFINE_string(wal_dir, "", "If not empty, use the given dir for WAL");
 
@@ -5983,6 +5990,7 @@ class Benchmark {
         FLAGS_use_direct_io_for_flush_and_compaction;
     options.manual_wal_flush = FLAGS_manual_wal_flush;
     options.wal_compression = FLAGS_wal_compression_e;
+    options.use_blog_format_for_wals = FLAGS_use_blog_format_for_wals;
     options.use_blog_format_for_blobs = FLAGS_use_blog_format_for_blobs;
     // Parse blog_checksum via the options string system.
     {
@@ -5994,6 +6002,8 @@ class Benchmark {
           .PermitUncheckedError();
       options.blog_checksum = tmp_opts.blog_checksum;
     }
+    options.blog_timestamp_size =
+        lossless_cast<size_t>(FLAGS_blog_timestamp_size);
     options.ttl = FLAGS_fifo_compaction_ttl;
     options.compaction_options_fifo = CompactionOptionsFIFO(
         FLAGS_fifo_compaction_max_table_files_size_mb * 1024 * 1024,

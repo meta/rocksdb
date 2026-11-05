@@ -703,6 +703,16 @@ int rocksdb_options_get_wal_compression(rocksdb_options_t* opt) {
   return static_cast<int>(opt->rep.wal_compression);
 }
 
+void rocksdb_options_set_use_blog_format_for_wals(rocksdb_options_t* opt,
+                                                  unsigned char v) {
+  opt->rep.use_blog_format_for_wals = v;
+}
+
+unsigned char rocksdb_options_get_use_blog_format_for_wals(
+    rocksdb_options_t* opt) {
+  return opt->rep.use_blog_format_for_wals;
+}
+
 void rocksdb_options_set_use_blog_format_for_blobs(rocksdb_options_t* opt,
                                                    unsigned char v) {
   opt->rep.use_blog_format_for_blobs = v;
@@ -719,6 +729,14 @@ void rocksdb_options_set_blog_checksum(rocksdb_options_t* opt, int v) {
 
 int rocksdb_options_get_blog_checksum(rocksdb_options_t* opt) {
   return static_cast<int>(opt->rep.blog_checksum);
+}
+
+void rocksdb_options_set_blog_timestamp_size(rocksdb_options_t* opt, size_t v) {
+  opt->rep.blog_timestamp_size = v;
+}
+
+size_t rocksdb_options_get_blog_timestamp_size(rocksdb_options_t* opt) {
+  return opt->rep.blog_timestamp_size;
 }
 
 void rocksdb_options_set_background_close_inactive_wals(rocksdb_options_t* opt,

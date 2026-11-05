@@ -337,6 +337,45 @@ TEST_F(DBOptionsTest, SanitizeAsyncWalPrecreateWithWalRecycle) {
   ASSERT_TRUE(sanitized_options.async_wal_precreate);
 }
 
+TEST_F(DBOptionsTest, SanitizeWalRecycleWithRecoveryMode) {
+  // Legacy WALs cannot distinguish stale recycled tail data from corruption,
+  // so recycling is sanitized away for kTolerateCorruptedTailRecords and
+  // kAbsoluteConsistency. Blog-format WALs identify their incarnation via the
+  // escape sequence, so all recovery modes keep recycling.
+  struct TestCase {
+    WALRecoveryMode wal_recovery_mode;
+    bool use_blog_format_for_wals;
+    size_t expected_recycle_log_file_num;
+  };
+  const TestCase test_cases[] = {
+      {WALRecoveryMode::kTolerateCorruptedTailRecords, false, 0},
+      {WALRecoveryMode::kAbsoluteConsistency, false, 0},
+      {WALRecoveryMode::kPointInTimeRecovery, false, 1},
+      {WALRecoveryMode::kSkipAnyCorruptedRecords, false, 1},
+      {WALRecoveryMode::kTolerateCorruptedTailRecords, true, 1},
+      {WALRecoveryMode::kAbsoluteConsistency, true, 1},
+      {WALRecoveryMode::kPointInTimeRecovery, true, 1},
+      {WALRecoveryMode::kSkipAnyCorruptedRecords, true, 1},
+  };
+  for (const auto& test_case : test_cases) {
+    SCOPED_TRACE("wal_recovery_mode=" +
+                 std::to_string(static_cast<int>(test_case.wal_recovery_mode)) +
+                 " use_blog_format_for_wals=" +
+                 std::to_string(test_case.use_blog_format_for_wals));
+    Options options;
+    options.env = env_;
+    options.recycle_log_file_num = 1;
+    options.wal_recovery_mode = test_case.wal_recovery_mode;
+    options.use_blog_format_for_wals = test_case.use_blog_format_for_wals;
+    Options sanitized_options = SanitizeOptions(dbname_, options);
+    ASSERT_EQ(test_case.expected_recycle_log_file_num,
+              sanitized_options.recycle_log_file_num);
+    ASSERT_EQ(test_case.wal_recovery_mode, sanitized_options.wal_recovery_mode);
+    ASSERT_EQ(test_case.use_blog_format_for_wals,
+              sanitized_options.use_blog_format_for_wals);
+  }
+}
+
 TEST_F(DBOptionsTest, ImmutableVerifySstUniqueIdInManifest) {
   Options options;
   options.env = env_;

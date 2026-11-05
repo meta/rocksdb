@@ -556,10 +556,12 @@ default_params = {
     "adaptive_readahead": lambda: random.choice([0, 1]),
     "async_io": lambda: random.choice([0, 1]),
     "wal_compression": lambda: random.choice(["none", "zstd"]),
+    "use_blog_format_for_wals": lambda: random.choice([0, 1]),
     "use_blog_format_for_blobs": lambda: random.choice([0, 1]),
     "blog_checksum": lambda: random.choice(
         ["kNoChecksum", "kCRC32c", "kxxHash", "kxxHash64", "kXXH3"]
     ),
+    "blog_timestamp_size": 0,
     "test_noncanonical_blog": lambda: random.choice([0, 1]),
     "verify_sst_unique_id_in_manifest": 1,  # always do unique_id verification
     "fast_sst_open": lambda: random.choice([0, 1]),
@@ -1316,6 +1318,7 @@ ts_params = {
     "test_cf_consistency": 0,
     "test_batches_snapshots": 0,
     "user_timestamp_size": 8,
+    "blog_timestamp_size": lambda: random.choice([0, 8]),
     # Below flag is randomly picked once and kept consistent in following runs.
     "persist_user_defined_timestamps": random.choice([0, 1, 1]),
     "use_merge": 0,
@@ -1912,6 +1915,8 @@ def finalize_and_sanitize(src_params):
         dest_params["index_block_search_type"] = 0
         # TrieIndexFactory requires BytewiseComparator.
         dest_params["use_trie_index"] = 0
+    else:
+        dest_params["blog_timestamp_size"] = 0
     # Select the new-order stress filter only with a compatible active filter;
     # other profiles keep their existing filter policy and
     # unsupported-configuration coverage.

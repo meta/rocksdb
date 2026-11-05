@@ -27,9 +27,9 @@ class LegacyWalWriter final : public WalWriter {
 
   using WalWriter::AddRecord;
   IOStatus AddRecord(const WriteOptions& write_options, const Slice& record,
-                     SequenceNumber sequence) override;
-  IOStatus AddCompressionTypeRecord(const WriteOptions& write_options) override;
-  IOStatus MaybeAddPredecessorWALInfo(
+                     SequenceNumber first_sequence,
+                     size_t num_sequences) override;
+  IOStatus WriteFileStart(
       const WriteOptions& write_options,
       const PredecessorWALInfo& predecessor_wal_info) override;
   IOStatus MaybeAddUserDefinedTimestampSizeRecord(
@@ -45,6 +45,7 @@ class LegacyWalWriter final : public WalWriter {
   bool PublishIfClosed() override;
   bool BufferIsEmpty() override;
   SequenceNumber GetLastSeqnoRecorded() const override;
+  uint64_t GetVerificationSize() const override;
 
  private:
   log::Writer writer_;

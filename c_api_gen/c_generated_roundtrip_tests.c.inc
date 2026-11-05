@@ -685,6 +685,10 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_blog_checksum(obj) == 1);
   rocksdb_options_set_blog_checksum(obj, 0);
   CheckCondition(rocksdb_options_get_blog_checksum(obj) == 0);
+  rocksdb_options_set_blog_timestamp_size(obj, 1);
+  CheckCondition(rocksdb_options_get_blog_timestamp_size(obj) == 1);
+  rocksdb_options_set_blog_timestamp_size(obj, 0);
+  CheckCondition(rocksdb_options_get_blog_timestamp_size(obj) == 0);
   rocksdb_options_set_bottommost_file_compaction_delay(obj, 1);
   CheckCondition(rocksdb_options_get_bottommost_file_compaction_delay(obj) ==
                  1);
@@ -945,6 +949,10 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_use_blog_format_for_blobs(obj) == 1);
   rocksdb_options_set_use_blog_format_for_blobs(obj, 0);
   CheckCondition(rocksdb_options_get_use_blog_format_for_blobs(obj) == 0);
+  rocksdb_options_set_use_blog_format_for_wals(obj, 1);
+  CheckCondition(rocksdb_options_get_use_blog_format_for_wals(obj) == 1);
+  rocksdb_options_set_use_blog_format_for_wals(obj, 0);
+  CheckCondition(rocksdb_options_get_use_blog_format_for_wals(obj) == 0);
   rocksdb_options_set_use_direct_io_for_compaction_reads(obj, 1);
   CheckCondition(rocksdb_options_get_use_direct_io_for_compaction_reads(obj) ==
                  1);

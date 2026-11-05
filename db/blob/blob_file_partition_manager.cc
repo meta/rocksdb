@@ -268,8 +268,15 @@ Status BlobFilePartitionManager::OpenNewBlobFile(Partition* partition,
     blog_header.SetDiagnosticProperties(db_host_id_, column_family_id,
                                         column_family_name_, creation_time);
 
+    // Blob records are only ever read by random access at an offset the blob
+    // index supplies, never by scanning forward for record boundaries. That
+    // holds even for a direct-write file being read while it is still open and
+    // unsealed (see ResolveBlobDirectWriteIndex), so no reader ever has to
+    // find the end of the last record and the unspecified-size encoding is
+    // safe here.
     auto blog_writer =
-        std::make_unique<BlogFileWriter>(std::move(file_writer), blog_header);
+        std::make_unique<BlogFileWriter>(std::move(file_writer), blog_header,
+                                         BlogUnspecifiedSizeRecords::kAllowed);
     IOStatus ios = blog_writer->WriteHeader(WriteOptions());
     if (!ios.ok()) {
       RemoveFilePartitionMapping(blob_file_number);

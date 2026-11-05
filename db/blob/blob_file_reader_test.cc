@@ -256,7 +256,8 @@ void WriteBlogBlobFile(
                             manager_to_use->CompatibilityName());
   }
 
-  BlogFileWriter blog_writer(std::move(file_writer), blog_header);
+  BlogFileWriter blog_writer(std::move(file_writer), blog_header,
+                             BlogUnspecifiedSizeRecords::kAllowed);
   ASSERT_OK(blog_writer.WriteHeader(WriteOptions()));
 
   std::vector<GrowableBuffer> compressed_blobs(num);

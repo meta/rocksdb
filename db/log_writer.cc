@@ -76,6 +76,9 @@ IOStatus Writer::Close(const WriteOptions& write_options) {
 }
 
 bool Writer::PublishIfClosed() {
+  if (!dest_) {
+    return true;
+  }
   if (dest_->IsClosed()) {
     dest_.reset();
     return true;
@@ -303,7 +306,7 @@ IOStatus Writer::MaybeAddUserDefinedTimestampSizeRecord(
                             encoded.size());
 }
 
-bool Writer::BufferIsEmpty() { return dest_->BufferIsEmpty(); }
+bool Writer::BufferIsEmpty() { return !dest_ || dest_->BufferIsEmpty(); }
 
 IOStatus Writer::EmitPhysicalRecord(const WriteOptions& write_options,
                                     RecordType t, const char* ptr, size_t n) {
