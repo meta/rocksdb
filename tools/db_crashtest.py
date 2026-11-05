@@ -1082,7 +1082,7 @@ cf_consistency_params = {
     "ingest_external_file_one_in": 0,
     # `CfConsistencyStressTest::TestIterateAgainstExpected()` is not implemented.
     "verify_iterator_with_expected_state_one_in": 0,
-    "memtablerep": random.choice(["skip_list"] * 9 + ["vector"]),
+    "memtablerep": random.choice(["skip_list"] * 8 + ["vector", "sorted_hash"]),
 }
 
 cf_lifecycle_params = {
@@ -1582,6 +1582,10 @@ def finalize_and_sanitize(src_params):
 
     if dest_params.get("memtablerep") == "vector":
         dest_params["inplace_update_support"] = 0
+
+    if dest_params.get("memtablerep") == "sorted_hash":
+        dest_params["inplace_update_support"] = 0
+        dest_params["user_timestamp_size"] = 0
 
     # only skip list memtable representation supports paranoid memory checks
     if dest_params.get("memtablerep") != "skip_list":

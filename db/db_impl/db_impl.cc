@@ -185,6 +185,15 @@ void DumpSupportInfo(Logger* logger) {
 #endif
   ROCKS_LOG_HEADER(logger, "Jemalloc supported: %d", jemalloc_supported);
 }
+
+Status FailIfTailingIteratorUnsupported(const ColumnFamilyData& cfd) {
+  if (!cfd.ioptions().memtable_factory->IsTailingIteratorSupported()) {
+    return Status::NotSupported(
+        "Tailing iterators are not supported by memtable factory " +
+        std::string(cfd.ioptions().memtable_factory->Name()));
+  }
+  return Status::OK();
+}
 }  // namespace
 
 DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
@@ -5684,6 +5693,12 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
   assert(cfh != nullptr);
   ColumnFamilyData* cfd = cfh->cfd();
   assert(cfd != nullptr);
+  if (read_options.tailing) {
+    const Status s = FailIfTailingIteratorUnsupported(*cfd);
+    if (!s.ok()) {
+      return NewErrorIterator(s);
+    }
+  }
   SuperVersion* sv = cfd->GetReferencedSuperVersion(this);
   {
     const Status s = FailIfTableFilterWithRangeConversion(
@@ -5988,6 +6003,13 @@ Status DBImpl::NewIterators(
     if (!s.ok()) {
       cleanup_super_versions();
       return s;
+    }
+    if (tailing) {
+      s = FailIfTailingIteratorUnsupported(*cf_sv_pair.cfd);
+      if (!s.ok()) {
+        cleanup_super_versions();
+        return s;
+      }
     }
   }
 

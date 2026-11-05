@@ -1543,6 +1543,9 @@ Status ColumnFamilyData::ValidateOptions(
   if (s.ok()) {
     s = CheckCFPathsSupported(db_options, cf_options);
   }
+  if (s.ok() && cf_options.memtable_factory != nullptr) {
+    s = cf_options.memtable_factory->ValidateOptions(db_options, cf_options);
+  }
   if (!s.ok()) {
     return s;
   }

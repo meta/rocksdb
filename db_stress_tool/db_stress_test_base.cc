@@ -5746,6 +5746,9 @@ void StressTest::PrintEnv() const {
     case kVectorRep:
       memtablerep = "vector";
       break;
+    case kSortedHash:
+      memtablerep = "sorted_hash";
+      break;
   }
 
   fprintf(stdout, "Memtablerep               : %s\n", memtablerep);
@@ -7312,6 +7315,11 @@ void InitializeOptionsFromFlags(
       break;
     case kVectorRep:
       options.memtable_factory.reset(new VectorRepFactory());
+      break;
+    case kSortedHash:
+      // About one bucket per KiB of write buffer.
+      options.memtable_factory.reset(NewSortedHashRepFactory(
+          std::max<size_t>(1, FLAGS_write_buffer_size / 1024)));
       break;
   }
 

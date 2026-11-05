@@ -538,7 +538,7 @@ extern enum ROCKSDB_NAMESPACE::CompressionType compression_type_e;
 extern enum ROCKSDB_NAMESPACE::CompressionType bottommost_compression_type_e;
 extern enum ROCKSDB_NAMESPACE::ChecksumType checksum_type_e;
 
-enum RepFactory { kSkipList, kHashSkipList, kVectorRep };
+enum RepFactory { kSkipList, kHashSkipList, kVectorRep, kSortedHash };
 
 inline enum RepFactory StringToRepFactory(const char* ctype) {
   assert(ctype);
@@ -549,6 +549,8 @@ inline enum RepFactory StringToRepFactory(const char* ctype) {
     return kHashSkipList;
   } else if (!strcasecmp(ctype, "vector")) {
     return kVectorRep;
+  } else if (!strcasecmp(ctype, "sorted_hash")) {
+    return kSortedHash;
   }
 
   fprintf(stdout, "Cannot parse memreptable %s\n", ctype);

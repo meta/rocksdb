@@ -1062,6 +1062,7 @@ class DBTestBase : public testing::Test {
     kUniversalSubcompactions,
     kUnorderedWrite,
     kBlockBasedTableWithBinarySearchWithFirstKeyIndex,
+    kSortedHash,
     // This must be the last line
     kEnd,
   };
@@ -1094,6 +1095,7 @@ class DBTestBase : public testing::Test {
     kSkipFIFOCompaction = 128,
     kSkipMmapReads = 256,
     kSkipRowCache = 512,
+    kSkipSortedHash = 1024,
   };
 
   const int kRangeDelSkipConfigs =
