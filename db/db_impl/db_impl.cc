@@ -8037,6 +8037,7 @@ class FileIngestionHandleImpl : public FileIngestionHandle {
   FileIngestionHandleImpl& operator=(FileIngestionHandleImpl&&) = delete;
 
   Status Abort() override;
+  std::vector<SstFileMetaData> GetPreparedFiles() const override;
 
   DBImpl* const db_;
   const uint64_t first_file_number_;
@@ -8081,6 +8082,44 @@ Status FileIngestionHandleImpl::Abort() {
   }
   db_->RollbackPreparedFileIngestion(this);
   return Status::OK();
+}
+
+std::vector<SstFileMetaData> FileIngestionHandleImpl::GetPreparedFiles() const {
+  std::vector<SstFileMetaData> files;
+  if (consumed_) {
+    return files;
+  }
+  for (const auto& job : jobs_) {
+    const auto& cf_paths = job->GetColumnFamilyData()->ioptions().cf_paths;
+    // Without allow_db_generated_files, commit assigns each file its sequence
+    // numbers, so they are unknown here.
+    const bool seqnos_known =
+        job->GetIngestionOptions().allow_db_generated_files;
+    for (const auto& file : job->files_to_ingest()) {
+      SstFileMetaData meta;
+      meta.directory = file.fd.GetPathId() < cf_paths.size()
+                           ? cf_paths[file.fd.GetPathId()].path
+                           : cf_paths.back().path;
+      meta.db_path = meta.directory;
+      meta.name = MakeTableFileName("", file.fd.GetNumber());
+      meta.relative_filename = meta.name.substr(1);
+      if (seqnos_known) {
+        meta.smallest_seqno = file.smallest_seqno;
+        meta.largest_seqno = file.largest_seqno;
+      }
+      meta.file_number = file.fd.GetNumber();
+      meta.size = file.fd.GetFileSize();
+      meta.temperature = file.file_temperature;
+      meta.file_checksum = file.file_checksum;
+      meta.file_checksum_func_name = file.file_checksum_func_name;
+      meta.smallestkey = file.smallest_internal_key.user_key().ToString();
+      meta.largestkey = file.largest_internal_key.user_key().ToString();
+      meta.num_entries = file.num_entries;
+      meta.num_deletions = file.table_properties.num_deletions;
+      files.push_back(std::move(meta));
+    }
+  }
+  return files;
 }
 
 Status DBImpl::PrepareFileIngestion(
