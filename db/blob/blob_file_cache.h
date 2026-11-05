@@ -24,6 +24,7 @@ class HistogramImpl;
 class Status;
 class Slice;
 class IOTracer;
+class SharedBlobFileMetaData;
 
 class BlobFileCache {
  public:
@@ -42,18 +43,31 @@ class BlobFileCache {
   // Returns a cached reader for `blob_file`, opening and caching it on miss.
   // Checksum metadata is forwarded to the FileSystem through FileOptions when
   // the file is opened. If `allow_footer_skip_retry` is true, a
-  // footer-validation corruption retries once without requiring a footer.
+  // footer-validation corruption retries once without requiring a footer; the
+  // retry only applies when `expected_meta` is null, since a file with MANIFEST
+  // metadata is expected to be sealed.
+  //
+  // When `expected_meta` is non-null, a freshly opened reader is verified
+  // against it (physical size, format, schema version, file identity) before
+  // caching; a mismatch returns Corruption and the reader is not cached.
+  // Readers served from the cache were verified when opened and are not
+  // re-verified. Pass null for files without MANIFEST metadata (e.g.
+  // in-flight direct-write files) to skip verification.
   Status GetBlobFileReader(const ReadOptions& read_options,
                            const BlobFileOpenInfo& blob_file,
                            CompressionManager* configured_compression_manager,
                            CacheHandleGuard<BlobFileReader>* blob_file_reader,
+                           const SharedBlobFileMetaData* expected_meta,
                            bool allow_footer_skip_retry = false);
 
-  // Opens a blob file reader without inserting it into the cache.
+  // Opens a blob file reader without inserting it into the cache. When
+  // `expected_meta` is non-null, the reader is verified against it the same
+  // way as in GetBlobFileReader.
   Status OpenBlobFileReaderUncached(
       const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
       CompressionManager* configured_compression_manager,
       std::unique_ptr<BlobFileReader>* blob_file_reader,
+      const SharedBlobFileMetaData* expected_meta,
       bool allow_footer_skip_retry = false);
 
   // Makes finalized checksum metadata available to direct-write fallback reads
@@ -94,6 +108,7 @@ class BlobFileCache {
   Status OpenBlobFileReader(const ReadOptions& read_options,
                             const BlobFileOpenInfo& blob_file,
                             CompressionManager* configured_compression_manager,
+                            const SharedBlobFileMetaData* expected_meta,
                             bool allow_footer_skip_retry,
                             std::unique_ptr<BlobFileReader>* blob_file_reader);
 

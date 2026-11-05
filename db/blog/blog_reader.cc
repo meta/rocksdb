@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 
@@ -117,6 +118,12 @@ Status BlogFileReader::ReadHeader(BlogFileHeader* header) {
   Status s = ReadBytes(kBlogFileFixedHeaderSize, &fixed_slice, &fixed_buf);
   if (!s.ok()) {
     return AppendContext(s, "while reading blog fixed header");
+  }
+
+  s = BlogFileHeader::VerifyFixedHeaderChecksum(fixed_slice.data());
+  if (!s.ok()) {
+    return AppendContext(AppendFileOffset(s, fixed_header_offset),
+                         "while decoding blog header");
   }
 
   // Peek at property_section_size from bytes [32-35]
@@ -516,10 +523,11 @@ Status BlogFileReader::SkipPadding() {
 
 Status BlogFileReader::ReadBytes(size_t n, Slice* result,
                                  std::string* scratch) {
-  scratch->resize(n);
+  scratch->clear();
   size_t copied = 0;
   if (!pending_input_.empty()) {
     copied = std::min(n, pending_input_.size());
+    scratch->resize(copied);
     memcpy(scratch->data(), pending_input_.data(), copied);
     pending_input_.erase(0, copied);
   }
@@ -528,29 +536,56 @@ Status BlogFileReader::ReadBytes(size_t n, Slice* result,
     return Status::OK();
   }
 
-  Slice read_result;
-  IOStatus ios = seq_file_->Read(n - copied, &read_result,
-                                 scratch->data() + copied, Env::IO_TOTAL);
-  if (!ios.ok()) {
-    return AppendContext(
-        AppendFileOffset(static_cast<Status>(ios), offset_),
-        "while reading " + std::to_string(n - copied) + " bytes");
+  Status s =
+      ReadInChunks(seq_file_.get(), scratch, n - copied, &offset_, &eof_);
+  if (!s.ok()) {
+    return s;
   }
-  if (read_result.size() < n - copied) {
-    eof_ = true;
-    // Return Incomplete -- the caller (ReadRecord) determines whether
-    // this is an acceptable incomplete tail vs. genuine corruption.
-    return Status::Incomplete(
-        "Blog reader: unexpected EOF at " +
-        MakeFileOffsetString(offset_ +
-                             lossless_cast<uint64_t>(read_result.size())) +
-        " while reading " + std::to_string(n) + " bytes");
-  }
-  if (read_result.data() != scratch->data() + copied) {
-    memcpy(scratch->data() + copied, read_result.data(), read_result.size());
-  }
-  offset_ += n - copied;
   *result = Slice(scratch->data(), n);
+  return Status::OK();
+}
+
+Status BlogFileReader::ReadInChunks(SequentialFileReader* file,
+                                    std::string* scratch, size_t remaining,
+                                    uint64_t* offset, bool* eof) {
+  // Initial file-read chunk size. Reads smaller than this complete in a
+  // single iteration, exactly like a direct read, so multi-megabyte sized
+  // payloads cost one underlying read; the chunk doubles per round so larger
+  // reads copy linearly. Chunking (instead of pre-sizing the full request)
+  // bounds a corrupt huge length to what is actually present: allocation
+  // grows with bytes read and stops at the first short read.
+  constexpr size_t kInitialChunkSize = 8 << 20;
+  size_t chunk = kInitialChunkSize;
+  while (remaining > 0) {
+    const size_t want = std::min(remaining, chunk);
+    const size_t have = scratch->size();
+    scratch->resize(have + want);
+    Slice read_result;
+    IOStatus ios =
+        file->Read(want, &read_result, scratch->data() + have, Env::IO_TOTAL);
+    if (!ios.ok()) {
+      return AppendContext(AppendFileOffset(static_cast<Status>(ios), *offset),
+                           "while reading " + std::to_string(want) + " bytes");
+    }
+    if (read_result.size() < want) {
+      *eof = true;
+      *offset += lossless_cast<uint64_t>(read_result.size());
+      scratch->resize(have + read_result.size());
+      // Return Incomplete -- the caller (ReadRecord) determines whether
+      // this is an acceptable incomplete tail vs. genuine corruption.
+      return Status::Incomplete(
+          "Blog reader: unexpected EOF at " + MakeFileOffsetString(*offset) +
+          " while reading " + std::to_string(remaining) + " bytes");
+    }
+    if (read_result.data() != scratch->data() + have) {
+      memcpy(scratch->data() + have, read_result.data(), read_result.size());
+    }
+    *offset += want;
+    remaining -= want;
+    if (chunk < remaining && chunk <= SIZE_MAX / 2) {
+      chunk *= 2;
+    }
+  }
   return Status::OK();
 }
 

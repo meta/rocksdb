@@ -77,8 +77,15 @@ class BlogFileReader {
   // or an error Status on I/O failure.
   Status SkipPadding();
 
-  // Read exactly n bytes sequentially. Returns Corruption on short read.
+  // Read exactly n bytes sequentially. Returns Incomplete on short read.
   Status ReadBytes(size_t n, Slice* result, std::string* scratch);
+
+  // Read `remaining` bytes from `file`, appending them to `scratch` in
+  // progressively larger chunks. Advances *offset by the bytes read and
+  // sets *eof if EOF is hit first. Returns Incomplete on short read; the
+  // caller decides whether that is an acceptable tail or corruption.
+  static Status ReadInChunks(SequentialFileReader* file, std::string* scratch,
+                             size_t remaining, uint64_t* offset, bool* eof);
 
   // Read a prefix varint64 from the sequential stream.
   Status ReadPrefixVarint64(uint64_t* value, std::string* scratch);
