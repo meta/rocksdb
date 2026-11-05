@@ -13,6 +13,7 @@
 #include <memory>
 
 #include "db/db_test_util.h"
+#include "db/wal_writer.h"
 #include "file/sst_file_manager_impl.h"
 #include "port/stack_trace.h"
 #include "rocksdb/io_status.h"
@@ -2827,7 +2828,7 @@ TEST_F(DBErrorHandlingFSTest, FileScopedWALWriteErrorReplacesFailedWAL) {
       });
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::SyncWalImpl:BeforeSyncWAL", [&](void* arg) {
-        auto* writer = static_cast<log::Writer*>(arg);
+        auto* writer = static_cast<WalWriter*>(arg);
         if (writer->get_log_number() == failed_wal) {
           synced_failed_wal.store(true);
         }
@@ -3460,7 +3461,7 @@ TEST_F(DBErrorHandlingFSTest,
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::SyncWalImpl:AfterSyncWAL", [&](void* arg) {
         auto* wal_and_status =
-            static_cast<std::pair<log::Writer*, IOStatus*>*>(arg);
+            static_cast<std::pair<WalWriter*, IOStatus*>*>(arg);
         if (wal_and_status->first->get_log_number() == failed_wal &&
             !injected_sync_error.exchange(true)) {
           IOStatus error =
@@ -3758,7 +3759,7 @@ TEST_F(DBErrorHandlingFSTest, FileScopedErrorOnOlderWALSkipsExactWriter) {
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::SyncWalImpl:AfterSyncWAL", [&](void* arg) {
         auto* wal_and_status =
-            static_cast<std::pair<log::Writer*, IOStatus*>*>(arg);
+            static_cast<std::pair<WalWriter*, IOStatus*>*>(arg);
         auto* writer = wal_and_status->first;
         if (failed_wal_sync_attempts.fetch_add(1) == 0) {
           first_synced_wal.store(writer->get_log_number());
@@ -3819,7 +3820,7 @@ TEST_F(DBErrorHandlingFSTest,
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::SyncWalImpl:AfterSyncWAL", [&](void* arg) {
         auto* wal_and_status =
-            static_cast<std::pair<log::Writer*, IOStatus*>*>(arg);
+            static_cast<std::pair<WalWriter*, IOStatus*>*>(arg);
         if (wal_and_status->first->get_log_number() == failed_wal &&
             !injected.exchange(true)) {
           IOStatus error =

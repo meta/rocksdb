@@ -54,7 +54,7 @@ Types 10 and above use bit 0 to distinguish recyclable (odd) from non-recyclable
 
 ## Write Path
 
-`log::Writer::AddRecord()` (see `db/log_writer.cc`) writes a logical record to the WAL:
+`WalWriter::AddRecord()` (see `db/wal_writer.h`) writes a logical record to the WAL. The legacy implementation delegates record framing to `log::Writer`:
 
 Step 1 - If WAL compression is enabled, compress the payload via the streaming compressor.
 
