@@ -3,6 +3,7 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -522,7 +523,34 @@ TEST_F(CompactFilesTest, GetCompactionJobInfo) {
   ASSERT_EQ(compaction_job_info.compression, CompressionType::kLZ4Compression);
   ASSERT_EQ(compaction_job_info.output_level, 0);
   ASSERT_OK(compaction_job_info.status);
-  // no assertion failure
+
+  int input_level = 0;
+  for (int output_level : {1, 3, 5}) {
+    SCOPED_TRACE(input_level);
+    ColumnFamilyMetaData metadata;
+    db->GetColumnFamilyMetaData(&metadata);
+    std::vector<std::string> inputs;
+    std::vector<uint64_t> expected_file_numbers;
+    for (const auto& file : metadata.levels[input_level].files) {
+      inputs.push_back(file.relative_filename);
+      expected_file_numbers.push_back(file.file_number);
+    }
+    ASSERT_FALSE(inputs.empty());
+    CompactionJobInfo info;
+    ASSERT_OK(db->CompactFiles(co, inputs, output_level, -1, nullptr, &info));
+    ASSERT_OK(info.status);
+    EXPECT_EQ(input_level, info.base_input_level);
+    EXPECT_EQ(output_level, info.output_level);
+    std::vector<uint64_t> actual_file_numbers;
+    for (const auto& file : info.input_file_infos) {
+      EXPECT_EQ(input_level, file.level);
+      actual_file_numbers.push_back(file.file_number);
+    }
+    std::sort(expected_file_numbers.begin(), expected_file_numbers.end());
+    std::sort(actual_file_numbers.begin(), actual_file_numbers.end());
+    EXPECT_EQ(expected_file_numbers, actual_file_numbers);
+    input_level = output_level;
+  }
 }
 
 // Helper function to generate zero-padded keys
