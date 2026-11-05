@@ -253,6 +253,13 @@ Status BlobFilePartitionManager::OpenNewBlobFile(Partition* partition,
     blog_header.compact_record_type = kBlogBlobRecord;
     blog_header.GenerateFromUniqueId(db_id_, db_session_id_, blob_file_number);
     blog_header.SetProperty(kBlogPropRole, "blob");
+    if (compression != kNoCompression) {
+      // GetDirectWriteCompressionState() currently obtains compressors from
+      // BuiltinV2. Keep this property in sync if that ownership changes.
+      blog_header.SetProperty(
+          kBlogPropCompressionCompatibilityName,
+          GetBuiltinV2CompressionManager()->CompatibilityName());
+    }
     int64_t cur_time = 0;
     if (clock_) {
       clock_->GetCurrentTime(&cur_time).PermitUncheckedError();
@@ -364,34 +371,8 @@ Status BlobFilePartitionManager::FinalizeBlobFile(
   std::string file_identity;
 
   if (blog_writer) {
-    const auto& bs = blog_writer->blob_stats();
-    BlogFileFooterProperties footer_props;
-    if (bs.count > 0) {
-      footer_props.SetBlobCount(bs.count);
-      footer_props.SetBlobPayloadBytes(bs.payload_bytes);
-      if (bs.compressed_bytes > 0) {
-        footer_props.SetBlobCompressedBytes(bs.compressed_bytes);
-        footer_props.SetBlobUncompressedBytes(bs.uncompressed_bytes);
-      }
-      footer_props.SetBlobOverheadBytes(bs.overhead_bytes);
-    }
-    if (!blog_writer->compression_type_set().empty()) {
-      footer_props.SetCompressionTypes(blog_writer->compression_type_set());
-    }
-
-    uint64_t props_offset = blog_writer->current_offset();
     IOStatus ios =
-        blog_writer->AddFooterPropertiesRecord(write_options, footer_props);
-    if (!ios.ok()) {
-      return static_cast<Status>(ios);
-    }
-
-    BlogFileFooterLocator locator;
-    uint64_t locator_offset = blog_writer->current_offset();
-    locator.entries.push_back(
-        {kBlogFooterPropertiesRecord,
-         static_cast<uint32_t>((locator_offset - props_offset) / 4)});
-    ios = blog_writer->AddFooterLocatorRecord(write_options, locator);
+        blog_writer->WriteFooter(write_options, BlogFileFooterProperties{});
     if (!ios.ok()) {
       return static_cast<Status>(ios);
     }

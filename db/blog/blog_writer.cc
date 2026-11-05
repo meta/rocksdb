@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 
+#include "options/options_helper.h"
 #include "table/format.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
@@ -23,6 +24,27 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 
 TEST_BlogNoncanonicalConfig g_blog_noncanonical_config;
+
+IOStatus ValidatePropertySectionSize(const BlogPropertyMap& properties,
+                                     const char* section_name) {
+  uint64_t property_section_size = kBlogBlockTrailerSize;
+  for (const auto& [name, value] : properties) {
+    const uint64_t name_size = name.size();
+    const uint64_t value_size = value.size();
+    const uint64_t encoded_property_size =
+        PrefixVarint64Length(name_size) + name_size +
+        PrefixVarint64Length(value_size) + value_size;
+    if (encoded_property_size >
+        kBlogMaxPropertySectionSize - property_section_size) {
+      return IOStatus::InvalidArgument(
+          std::string(section_name) +
+          ": property section exceeds maximum size " +
+          std::to_string(kBlogMaxPropertySectionSize));
+    }
+    property_section_size += encoded_property_size;
+  }
+  return IOStatus::OK();
+}
 
 enum BlogDecisionTag : uint64_t {
   kBlogDecisionForceFull = 1,
@@ -183,20 +205,23 @@ BlogFileWriter::~BlogFileWriter() = default;
 
 IOStatus BlogFileWriter::WriteHeader(const WriteOptions& wo) {
   assert(!header_written_);
+  if (!IsSupportedChecksumType(header_.checksum_type)) {
+    return IOStatus::InvalidArgument(
+        "Blog header: unsupported checksum type " +
+        std::to_string(lossless_cast<int>(header_.checksum_type)));
+  }
+
+  IOStatus size_status =
+      ValidatePropertySectionSize(header_.required_properties, "Blog header");
+  if (!size_status.ok()) {
+    return size_status;
+  }
 
   const TEST_BlogNoncanonicalConfig& config = TEST_GetBlogNoncanonicalConfig();
 
-  BlogPropertyMap required_props;
-  BlogPropertyMap ignorable_props;
-  required_props.reserve(header_.properties.size());
-  ignorable_props.reserve(header_.properties.size());
-  for (const auto& [name, value] : header_.properties) {
-    if (IsBlogRequiredProperty(name)) {
-      required_props.emplace_back(name, value);
-    } else {
-      ignorable_props.emplace_back(name, value);
-    }
-  }
+  // Copies: test shuffling below must not mutate the writer's header.
+  BlogPropertyMap required_props = header_.required_properties;
+  BlogPropertyMap ignorable_props = header_.ignorable_properties;
   MaybeShuffleProperties(&required_props, config, header_,
                          /*record_ordinal=*/0,
                          kBlogDecisionShuffleHeaderRequiredProps,
@@ -207,7 +232,10 @@ IOStatus BlogFileWriter::WriteHeader(const WriteOptions& wo) {
                          config.shuffle_properties_one_in);
 
   BlogFileHeader header_copy = header_;
-  header_copy.properties = std::move(required_props);
+  header_copy.required_properties = std::move(required_props);
+  // EncodeTo ignores the ignorable map, but don't carry body-record content
+  // in a struct about to be encoded as a header.
+  header_copy.ignorable_properties.clear();
 
   std::string buf;
   header_copy.EncodeTo(&buf);
@@ -264,8 +292,14 @@ IOStatus BlogFileWriter::AddBlobRecord(const WriteOptions& wo,
                                        CompressionType comp_type,
                                        uint64_t* blob_offset,
                                        uint64_t uncompressed_size) {
+  // Reset first so a rejected call reports no sizes rather than stale ones.
   last_blob_record_size_ = 0;
   last_auxiliary_record_size_ = 0;
+
+  if (payload.empty()) {
+    return IOStatus::InvalidArgument(
+        "Blog blob record payload must not be empty");
+  }
 
   uint64_t blob_record_size = 0;
   IOStatus s =
@@ -294,10 +328,11 @@ IOStatus BlogFileWriter::AddBlobRecord(const WriteOptions& wo,
 IOStatus BlogFileWriter::AddWriteBatchRecord(const WriteOptions& wo,
                                              const Slice& wb_data,
                                              CompressionType comp_type) {
-  IOStatus s = AddRecordInternal(wo, kBlogWriteBatchRecord, wb_data, comp_type,
-                                 nullptr, /*force_full=*/false,
-                                 /*allow_unspecified_size=*/true,
-                                 /*record_size=*/nullptr);
+  IOStatus s =
+      AddRecordInternal(wo, kBlogWriteBatchRecord, wb_data, comp_type, nullptr,
+                        /*force_full=*/false,
+                        /*allow_unspecified_size=*/true,
+                        /*record_size=*/nullptr);
   if (s.ok()) {
     s = MaybeFlush(wo);
   }
@@ -306,13 +341,11 @@ IOStatus BlogFileWriter::AddWriteBatchRecord(const WriteOptions& wo,
 
 IOStatus BlogFileWriter::AddIgnorablePropertiesRecord(
     const WriteOptions& wo, const BlogPropertyMap& props) {
-  for (const auto& [name, value] : props) {
-    if (IsBlogRequiredProperty(name)) {
-      return IOStatus::InvalidArgument(
-          "Required properties not allowed in ignorable properties record: " +
-          name);
-    }
-  }
+  assert(header_written_);
+  assert(std::all_of(props.begin(), props.end(),
+                     [](const BlogPropertyMap::value_type& prop) {
+                       return IsBlogIgnorableProperty(prop.first);
+                     }));
 
   const TEST_BlogNoncanonicalConfig& config = TEST_GetBlogNoncanonicalConfig();
   BlogPropertyMap ignorable_props = props;
@@ -360,49 +393,73 @@ IOStatus BlogFileWriter::AddPreambleStartRecord(const WriteOptions& wo) {
   return s;
 }
 
-IOStatus BlogFileWriter::AddFooterIndexRecord(const WriteOptions& wo,
-                                              const Slice& index_data) {
-  IOStatus s = AddRecordInternal(wo, kBlogFooterIndexRecord, index_data,
-                                 kNoCompression, nullptr,
-                                 /*force_full=*/true,
-                                 /*allow_unspecified_size=*/false,
-                                 /*record_size=*/nullptr);
-  if (s.ok()) {
-    s = MaybeFlush(wo);
-  }
-  return s;
-}
+IOStatus BlogFileWriter::WriteFooter(
+    const WriteOptions& wo, const BlogFileFooterProperties& properties) {
+  assert(header_written_);
+  assert(!sealed_);
+  assert(std::none_of(
+      properties.properties.begin(), properties.properties.end(),
+      [](const BlogPropertyMap::value_type& prop) {
+        const std::string& name = prop.first;
+        return name == "blobCount" || name == "blobPayloadBytes" ||
+               name == "blobCompressedBytes" ||
+               name == "blobUncompressedBytes" || name == "blobOverheadBytes" ||
+               name == "compressionTypes";
+      }));
 
-IOStatus BlogFileWriter::AddFooterPropertiesRecord(
-    const WriteOptions& wo, const BlogFileFooterProperties& props) {
+  BlogFileFooterProperties footer_properties = properties;
+  if (blob_stats_.count > 0) {
+    footer_properties.SetBlobCount(blob_stats_.count);
+    footer_properties.SetBlobPayloadBytes(blob_stats_.payload_bytes);
+    if (blob_stats_.compressed_bytes > 0) {
+      footer_properties.SetBlobCompressedBytes(blob_stats_.compressed_bytes);
+      footer_properties.SetBlobUncompressedBytes(
+          blob_stats_.uncompressed_bytes);
+    }
+    footer_properties.SetBlobOverheadBytes(blob_stats_.overhead_bytes);
+  }
+  if (!compression_type_set_.empty()) {
+    footer_properties.SetCompressionTypes(compression_type_set_);
+  }
+
+  IOStatus size_status = ValidatePropertySectionSize(
+      footer_properties.properties, "Blog footer properties");
+  if (!size_status.ok()) {
+    return size_status;
+  }
+
   const TEST_BlogNoncanonicalConfig& config = TEST_GetBlogNoncanonicalConfig();
-  BlogFileFooterProperties footer_props = props;
-  MaybeShuffleProperties(&footer_props.properties, config, header_,
+  MaybeShuffleProperties(&footer_properties.properties, config, header_,
                          record_ordinal_, kBlogDecisionShuffleFooterProps,
                          config.shuffle_properties_one_in);
 
-  std::string payload;
-  footer_props.EncodeTo(&payload);
-  IOStatus s = AddRecordInternal(wo, kBlogFooterPropertiesRecord, payload,
-                                 kNoCompression, nullptr,
-                                 /*force_full=*/true,
-                                 /*allow_unspecified_size=*/false,
-                                 /*record_size=*/nullptr);
-  if (s.ok()) {
-    s = MaybeFlush(wo);
+  std::string properties_payload;
+  footer_properties.EncodeTo(&properties_payload);
+  sealed_ = true;
+  const uint64_t properties_offset = offset_;
+  IOStatus s = AddRecordInternal(
+      wo, kBlogFooterPropertiesRecord, properties_payload, kNoCompression,
+      nullptr, /*force_full=*/true, /*allow_unspecified_size=*/false,
+      /*record_size=*/nullptr);
+  if (!s.ok()) {
+    return s;
   }
-  return s;
-}
 
-IOStatus BlogFileWriter::AddFooterLocatorRecord(
-    const WriteOptions& wo, const BlogFileFooterLocator& locator) {
-  std::string payload;
-  locator.EncodeTo(&payload);
-  IOStatus s = AddRecordInternal(wo, kBlogFooterLocatorRecord, payload,
-                                 kNoCompression, nullptr,
-                                 /*force_full=*/true,
-                                 /*allow_unspecified_size=*/false,
-                                 /*record_size=*/nullptr);
+  assert(offset_ > properties_offset);
+  const uint64_t relative_bytes = offset_ - properties_offset;
+  assert(relative_bytes % kBlogMinRecordAlignment == 0);
+  const uint64_t relative_offset_4b = relative_bytes / kBlogMinRecordAlignment;
+  assert(relative_offset_4b <= UINT32_MAX);
+
+  BlogFileFooterLocator locator;
+  locator.entries.push_back(
+      {kBlogFooterPropertiesRecord, static_cast<uint32_t>(relative_offset_4b)});
+  std::string locator_payload;
+  locator.EncodeTo(&locator_payload);
+  s = AddRecordInternal(wo, kBlogFooterLocatorRecord, locator_payload,
+                        kNoCompression, nullptr, /*force_full=*/true,
+                        /*allow_unspecified_size=*/false,
+                        /*record_size=*/nullptr);
   if (s.ok()) {
     s = MaybeFlush(wo);
   }
@@ -613,11 +670,21 @@ IOStatus BlogFileWriter::AddRecordInternal(
     CompressionType comp_type, uint64_t* payload_offset, bool force_full,
     bool allow_unspecified_size, uint64_t* record_size) {
   assert(header_written_);
-
-  if (comp_type != kNoCompression &&
-      comp_type != kStreamingCompressionSentinel) {
-    compression_type_set_.Add(comp_type);
-  }
+  assert(IsKnownBlogRecordType(type));
+  assert(sealed_ == IsBlogFooterRecordType(type));
+  assert(IsValidBlogCompressionType(lossless_cast<uint8_t>(comp_type)));
+  assert(!payload.empty() || comp_type == kNoCompression);
+  assert(comp_type == kNoCompression ||
+         header_.HasProperty(kBlogPropCompressionCompatibilityName));
+  assert(comp_type != kStreamingCompressionSentinel ||
+         (type == kBlogWriteBatchRecord &&
+          header_.HasProperty(kBlogPropWriteBatchStreamingCompressionType)));
+  assert(!allow_unspecified_size || type == kBlogBlobRecord ||
+         type == kBlogWriteBatchRecord || type == kBlogManifestRecord);
+  assert(!IsBlogFooterRecordType(type) || force_full);
+  assert(type != kBlogPreambleStartRecord || payload.empty());
+  assert(type != kBlogFooterLocatorRecord || !payload.empty());
+  assert(payload.size() < kBlogUnspecifiedSize);
 
   const uint64_t offset_before = offset_;
   const RecordPlan plan = PlanRecord(type, payload, force_full,
@@ -626,6 +693,10 @@ IOStatus BlogFileWriter::AddRecordInternal(
       EmitRecordWithPlan(wo, type, payload, comp_type, plan, payload_offset);
   if (s.ok()) {
     ++record_ordinal_;
+    if (comp_type != kNoCompression &&
+        comp_type != kStreamingCompressionSentinel) {
+      compression_type_set_.Add(comp_type);
+    }
     if (record_size != nullptr) {
       *record_size = offset_ - offset_before;
     }

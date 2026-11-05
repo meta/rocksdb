@@ -57,8 +57,8 @@ class TEST_BlogNoncanonicalConfigScope {
 
 // Writes blog-format files (WAL or blob). The caller constructs a
 // BlogFileHeader, calls WriteHeader(), then adds records via
-// AddBlobRecord/AddWriteBatchRecord, and optionally appends footer records
-// before closing.
+// AddBlobRecord/AddWriteBatchRecord, and optionally calls WriteFooter() before
+// closing.
 //
 // Format selection (compact vs full) is automatic based on payload size and
 // record type. See blog_format.h for the wire format details.
@@ -72,6 +72,7 @@ class BlogFileWriter {
   IOStatus WriteHeader(const WriteOptions& wo);
 
   // Write a blob record. Selects compact or full format automatically.
+  // The payload must not be empty.
   // On success, *blob_offset is the file offset of the payload start.
   // uncompressed_size: original size before compression (for footer stats).
   // Pass payload.size() when comp_type == kNoCompression.
@@ -89,21 +90,16 @@ class BlogFileWriter {
   // Write an ignorable properties record. Can appear anywhere in the file
   // body, including when re-opening an existing file (e.g. manifest reuse)
   // to record updated diagnostic properties. Only ignorable (lowercase)
-  // properties are allowed; required (uppercase) properties are rejected.
+  // properties may be passed.
   IOStatus AddIgnorablePropertiesRecord(const WriteOptions& wo,
                                         const BlogPropertyMap& props);
 
-  // Write a footer index record (full format).
-  IOStatus AddFooterIndexRecord(const WriteOptions& wo,
-                                const Slice& index_data);
-
-  // Write a footer properties record (full format).
-  IOStatus AddFooterPropertiesRecord(const WriteOptions& wo,
-                                     const BlogFileFooterProperties& props);
-
-  // Write a footer locator record (full format). Must be the last record.
-  IOStatus AddFooterLocatorRecord(const WriteOptions& wo,
-                                  const BlogFileFooterLocator& locator);
+  // Seal the file: write a footer properties record holding `properties` plus
+  // the statistics this writer tracked, then a footer locator that references
+  // it. `properties` must not contain the writer-tracked statistics. No
+  // records can be added afterwards.
+  IOStatus WriteFooter(const WriteOptions& wo,
+                       const BlogFileFooterProperties& properties);
 
   IOStatus WriteBuffer(const WriteOptions& wo);
   IOStatus Sync(const WriteOptions& wo, bool use_fsync = false);
@@ -111,6 +107,13 @@ class BlogFileWriter {
 
   uint64_t current_offset() const { return offset_; }
   WritableFileWriter* file() { return dest_.get(); }
+  const WritableFileWriter* file() const { return dest_.get(); }
+  std::string GetFileChecksum() { return dest_->GetFileChecksum(); }
+  const char* GetFileChecksumFuncName() const {
+    return dest_->GetFileChecksumFuncName();
+  }
+  // Test-only escape hatch for constructing malformed files.
+  WritableFileWriter* TEST_file() { return file(); }
   const BlogFileHeader& header() const { return header_; }
   uint64_t last_blob_record_size() const { return last_blob_record_size_; }
   uint64_t last_auxiliary_record_size() const {
@@ -209,6 +212,9 @@ class BlogFileWriter {
   uint64_t offset_ = 0;
   bool manual_flush_;
   bool header_written_ = false;
+  // Set once WriteFooter() starts. Footer records are only written while
+  // sealed; all other records only before.
+  bool sealed_ = false;
   uint64_t record_ordinal_ = 0;
   BlobStats blob_stats_;
   CompressionTypeSet compression_type_set_;
