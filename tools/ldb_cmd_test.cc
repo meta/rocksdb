@@ -28,6 +28,7 @@
 #include "test_util/testutil.h"
 #include "util/file_checksum_helper.h"
 #include "util/random.h"
+#include "utilities/blob_db/blob_dump_tool.h"
 
 using std::map;
 using std::string;
@@ -721,6 +722,60 @@ TEST_F(LdbCmdTest, DumpBlogBlobFile) {
   ASSERT_NE(output.find("total blob records: 2"), std::string::npos);
   ASSERT_NE(output.find("total auxiliary body records: 2"), std::string::npos);
   ASSERT_EQ(output.find("total key size"), std::string::npos);
+}
+
+TEST_F(LdbCmdTest, DumpCompressedLegacyBlobSummary) {
+  CompressionType compression = kNoCompression;
+  for (CompressionType candidate : {kSnappyCompression, kLZ4Compression, kZSTD,
+                                    kZlibCompression, kBZip2Compression}) {
+    if (CompressionTypeSupported(candidate)) {
+      compression = candidate;
+      break;
+    }
+  }
+  if (compression == kNoCompression) {
+    ROCKSDB_GTEST_SKIP("This test requires a supported blob compression");
+    return;
+  }
+
+  Options opts;
+  opts.env = Env::Default();
+  opts.create_if_missing = true;
+  opts.enable_blob_files = true;
+  opts.min_blob_size = 0;
+  opts.use_blog_format_for_blobs = false;
+  opts.blob_compression_type = compression;
+  opts.disable_auto_compactions = true;
+  const std::string dbname =
+      test::PerThreadDBPath(opts.env, "ldb_legacy_blob_summary");
+  ASSERT_OK(DestroyDB(dbname, opts));
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(opts, dbname, &db));
+  const std::string value(1000, 'v');
+  ASSERT_OK(db->Put(WriteOptions(), "key", value));
+  FlushOptions flush_opts;
+  flush_opts.wait = true;
+  ASSERT_OK(db->Flush(flush_opts));
+  ColumnFamilyMetaData metadata;
+  db->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.blob_files.size(), 1U);
+  ASSERT_LT(metadata.blob_files.front().total_blob_bytes, value.size());
+  db.reset();
+
+  std::vector<std::string> blob_files;
+  ASSERT_OK(GetBlobFiles(opts.env, dbname, &blob_files));
+  ASSERT_EQ(blob_files.size(), 1U);
+  blob_db::BlobDumpTool tool;
+  using DisplayType = blob_db::BlobDumpTool::DisplayType;
+  ::testing::internal::CaptureStdout();
+  const Status status =
+      tool.Run(dbname + "/" + blob_files.front(), DisplayType::kNone,
+               DisplayType::kNone, DisplayType::kNone, /*show_summary=*/true);
+  const std::string output = ::testing::internal::GetCapturedStdout();
+  ASSERT_OK(status);
+  ASSERT_NE(output.find("total raw blob size: " + std::to_string(value.size())),
+            std::string::npos);
+  ASSERT_EQ(output.find(value), std::string::npos);
 }
 
 TEST_F(LdbCmdTest, OptionParsing) {

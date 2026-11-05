@@ -702,6 +702,39 @@ TEST_F(
   }
 }
 
+TEST_F(DBBlobDirectWriteTest, EmptyValueNotStoredAsBlob) {
+  for (bool blog : {false, true}) {
+    SCOPED_TRACE(blog ? "blog blobs" : "legacy blobs");
+    Options options = GetDirectWriteOptions();
+    options.min_blob_size = 0;
+    options.blob_compression_type = kNoCompression;
+    options.use_blog_format_for_blobs = blog;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+
+    EXPECT_OK(Put("empty", ""));
+    EXPECT_EQ(CountBlobFiles(), 0U);
+    const std::string value(100, 'v');
+    ASSERT_OK(Put("nonempty", value));
+    auto verify = [&]() {
+      EXPECT_EQ(Get("empty"), "");
+      EXPECT_EQ(Get("nonempty"), value);
+    };
+    verify();
+    ASSERT_OK(Flush());
+    verify();
+
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    ASSERT_EQ(metadata.blob_files.size(), 1U);
+    EXPECT_EQ(metadata.blob_files[0].total_blob_count, 1U);
+    Close();
+    Reopen(options);
+    verify();
+    Close();
+  }
+}
+
 TEST_F(DBBlobDirectWriteTest,
        DirectWriteCustomPartitionStrategyRoutesWritesToOneBlobFile) {
   Options options = GetDirectWriteOptions();
@@ -1969,6 +2002,71 @@ TEST_F(DBBlobDirectWriteTest, DirectWriteDelayedReadUsesFinalizedFileChecksum) {
   const int capture_count = capturing_fs->GetCaptureCount();
   ASSERT_EQ(Get(key), value);
   ASSERT_EQ(capturing_fs->GetCaptureCount(), capture_count);
+}
+
+TEST_F(DBBlobDirectWriteTest, DirectWriteWholeFileChecksum) {
+  std::shared_ptr<BlobFileChecksumCapturingFileSystem> capturing_fs =
+      std::make_shared<BlobFileChecksumCapturingFileSystem>(
+          env_->GetFileSystem());
+  std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, capturing_fs));
+  Defer close_db([this]() { Close(); });
+
+  for (bool use_blog_format : {false, true}) {
+    SCOPED_TRACE(use_blog_format);
+    Options options = GetDirectWriteOptions();
+    options.env = env.get();
+    options.blob_direct_write_partitions = 1;
+    options.blob_file_size = 1 << 20;
+    options.use_blog_format_for_blobs = use_blog_format;
+    options.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
+    DestroyAndReopen(options);
+
+    const std::string key = "checksum-key";
+    const std::string value(128, 'v');
+    ASSERT_OK(Put(key, value));
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->VerifyFileChecksums(ReadOptions()));
+
+    // Reopening exercises the checksum persisted in the MANIFEST as well as
+    // registration of that checksum for subsequent blob reads.
+    Reopen(options);
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    ASSERT_EQ(metadata.blob_files.size(), 1U);
+    const BlobMetaData& blob_metadata = metadata.blob_files.front();
+    ASSERT_FALSE(blob_metadata.checksum_value.empty());
+    ASSERT_EQ(blob_metadata.checksum_method, "FileChecksumCrc32c");
+
+    capturing_fs->Reset();
+    ASSERT_EQ(Get(key), value);
+    ASSERT_GT(capturing_fs->GetCaptureCount(), 0);
+    ASSERT_EQ(capturing_fs->GetFileChecksum(), blob_metadata.checksum_value);
+    ASSERT_EQ(capturing_fs->GetFileChecksumFuncName(),
+              blob_metadata.checksum_method);
+
+    PinnableSlice encoded_index;
+    bool is_blob_index = false;
+    DBImpl::GetImplOptions get_impl_options;
+    get_impl_options.column_family = db_->DefaultColumnFamily();
+    get_impl_options.value = &encoded_index;
+    get_impl_options.is_blob_index = &is_blob_index;
+    ASSERT_OK(dbfull()->GetImpl(ReadOptions(), key, get_impl_options));
+    ASSERT_TRUE(is_blob_index);
+    BlobIndex blob_index;
+    ASSERT_OK(blob_index.DecodeFrom(encoded_index));
+    ASSERT_LE(blob_index.offset(), std::numeric_limits<int>::max());
+    const int blob_offset = static_cast<int>(blob_index.offset());
+
+    const std::string blob_path =
+        BlobFileName(dbname_, blob_metadata.blob_file_number);
+    Close();
+    ASSERT_OK(test::CorruptFile(env_, blob_path, blob_offset,
+                                /*bytes_to_corrupt=*/2,
+                                /*verify_checksum=*/false));
+    ASSERT_OK(TryReopen(options));
+    ASSERT_TRUE(db_->VerifyFileChecksums(ReadOptions()).IsCorruption());
+    Close();
+  }
 }
 
 TEST_F(DBBlobDirectWriteTest, OrderedTraceUsesLogicalBatchForBlobDirectWrite) {
