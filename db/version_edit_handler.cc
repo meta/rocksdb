@@ -1022,40 +1022,9 @@ Status VersionEditHandlerPointInTime::VerifyBlobFile(
   const BlobFileReader* reader = blob_file_reader.GetValue();
   assert(reader != nullptr);
 
-  if (blob_addition.GetPhysicalBlobFileSize() != 0 &&
-      reader->GetFileSize() != blob_addition.GetPhysicalBlobFileSize()) {
-    return Status::Corruption(
-        "BlobFileAddition",
-        "Blob file physical size does not match manifest metadata");
-  }
-
-  if (blob_addition.GetSchemaVersion() == kLegacyBlobFileSchemaVersion) {
-    if (reader->IsBlogFormat()) {
-      return Status::Corruption(
-          "BlobFileAddition",
-          "Blob file format does not match legacy manifest metadata");
-    }
-    return s;
-  }
-
-  if (!reader->IsBlogFormat()) {
-    return Status::Corruption("BlobFileAddition",
-                              "Blob file format does not match blog manifest "
-                              "metadata");
-  }
-  if (reader->GetBlogSchemaVersion() != blob_addition.GetSchemaVersion()) {
-    return Status::Corruption(
-        "BlobFileAddition",
-        "Blob file schema version does not match manifest metadata");
-  }
-  if (reader->GetBlogFileIdentity().compare(
-          Slice(blob_addition.GetFileIdentity())) != 0) {
-    return Status::Corruption(
-        "BlobFileAddition",
-        "Blob file identity does not match manifest metadata");
-  }
-
-  return s;
+  return reader->VerifyAgainstManifestMetadata(
+      blob_addition.GetPhysicalBlobFileSize(), blob_addition.GetSchemaVersion(),
+      blob_addition.GetFileIdentity());
 }
 
 Status VersionEditHandlerPointInTime::LoadTables(

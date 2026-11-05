@@ -405,6 +405,15 @@ Status BlobFilePartitionManager::FinalizeBlobFile(
       return static_cast<Status>(ios);
     }
 
+    std::string method = blog_writer->file()->GetFileChecksumFuncName();
+    if (method != kUnknownFileChecksumFuncName) {
+      checksum_method = std::move(method);
+    }
+    std::string value = blog_writer->file()->GetFileChecksum();
+    if (value != kUnknownFileChecksum) {
+      checksum_value = std::move(value);
+    }
+
     physical_blob_file_size = blog_writer->current_offset();
     schema_version = blog_writer->header().schema_version;
     file_identity.assign(blog_writer->header().escape_sequence,
@@ -999,9 +1008,11 @@ Status BlobFilePartitionManager::ResolveBlobDirectWriteIndex(
   Status s;
   const BlobFileOpenInfo blob_file{blob_idx.file_number(), Slice(), Slice()};
   CacheHandleGuard<BlobFileReader> reader;
+  // No MANIFEST metadata: this fallback only handles files still owned
+  // exclusively by the write path (see the Version check above).
   s = blob_file_cache->GetBlobFileReader(
       read_options, blob_file, configured_compression_manager, &reader,
-      /*allow_footer_skip_retry=*/true);
+      /*expected_meta=*/nullptr, /*allow_footer_skip_retry=*/true);
   if (!s.ok()) {
     return s;
   }
@@ -1026,6 +1037,7 @@ Status BlobFilePartitionManager::ResolveBlobDirectWriteIndex(
   std::unique_ptr<BlobFileReader> fresh_reader;
   s = blob_file_cache->OpenBlobFileReaderUncached(
       read_options, blob_file, configured_compression_manager, &fresh_reader,
+      /*expected_meta=*/nullptr,
       /*allow_footer_skip_retry=*/true);
   if (!s.ok()) {
     return s;

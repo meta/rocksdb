@@ -447,6 +447,63 @@ class NotSupportedOpenFileSizeFileSystem : public OpenFileSizeFileSystem {
   }
 };
 
+// Emulates an mmap-backed handle on a file that is still being appended to:
+// the mapping is established once, so the handle reports the length it was
+// opened with, and a read past that length fails outright instead of returning
+// a short read. PosixMmapReadableFile behaves exactly this way (its
+// GetFileSize() returns the mapped length), which makes it the only reader that
+// turns a reference outside the opened view into an I/O error rather than a
+// Corruption.
+class FrozenLengthRandomAccessFile : public FSRandomAccessFileOwnerWrapper {
+ public:
+  FrozenLengthRandomAccessFile(std::unique_ptr<FSRandomAccessFile>&& target,
+                               uint64_t length)
+      : FSRandomAccessFileOwnerWrapper(std::move(target)), length_(length) {}
+
+  IOStatus GetFileSize(uint64_t* result) override {
+    *result = length_;
+    return IOStatus::OK();
+  }
+
+  IOStatus Read(uint64_t offset, size_t n, const IOOptions& options,
+                Slice* result, char* scratch,
+                IODebugContext* dbg) const override {
+    if (offset > length_ || n > length_ - offset) {
+      return IOStatus::IOError(
+          "While mmap read offset " + std::to_string(offset) +
+          " larger than file length " + std::to_string(length_));
+    }
+    return FSRandomAccessFileOwnerWrapper::Read(offset, n, options, result,
+                                                scratch, dbg);
+  }
+
+ private:
+  const uint64_t length_;
+};
+
+// Wraps the target blob file in FrozenLengthRandomAccessFile while leaving all
+// other files alone.
+class FrozenLengthFileSystem : public OpenFileSizeFileSystem {
+ public:
+  static const char* kClassName() { return "FrozenLengthFileSystem"; }
+
+  FrozenLengthFileSystem(const std::shared_ptr<FileSystem>& target,
+                         std::string target_path, uint64_t length)
+      : OpenFileSizeFileSystem(target, std::move(target_path)),
+        length_(length) {}
+
+  const char* Name() const override { return kClassName(); }
+
+ private:
+  std::unique_ptr<FSRandomAccessFile> WrapTargetFile(
+      std::unique_ptr<FSRandomAccessFile>&& file) override {
+    return std::unique_ptr<FSRandomAccessFile>(
+        new FrozenLengthRandomAccessFile(std::move(file), length_));
+  }
+
+  const uint64_t length_;
+};
+
 // Forces the target blob file onto the NotSupported open-handle-size branch and
 // then fails the fallback path-level GetFileSize() call.
 class FailingFallbackPathSizeFileSystem
@@ -1895,6 +1952,76 @@ TEST_F(BlobFileReaderTest, BlogFormatCustomCompressionManager) {
   ASSERT_EQ(value->data(), blobs[0]);
 }
 
+TEST_F(BlobFileReaderTest, BlogFormatGetBlobRange) {
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(), "BlogFormatGetBlobRange"), 0);
+  options.enable_blob_files = true;
+  options.use_blog_format_for_blobs = true;
+
+  ImmutableOptions immutable_options(options);
+
+  constexpr uint64_t blob_file_number = 1;
+  const std::vector<std::string> blob_strs = {"0123456789abcdef",
+                                              "ghijklmnopqrstuv"};
+  const std::vector<Slice> blobs = {blob_strs[0], blob_strs[1]};
+
+  std::vector<uint64_t> blob_offsets(blobs.size());
+  std::vector<uint64_t> blob_sizes(blobs.size());
+
+  WriteBlogBlobFile(immutable_options, blob_file_number, blobs, kNoCompression,
+                    blob_offsets, blob_sizes);
+
+  constexpr HistogramImpl* blob_file_read_hist = nullptr;
+  constexpr uint32_t column_family_id = 1;
+  std::unique_ptr<BlobFileReader> reader;
+
+  ReadOptions read_options;
+  ASSERT_OK(BlobFileReader::Create(
+      immutable_options, read_options, FileOptions(), column_family_id,
+      blob_file_read_hist, blob_file_number, nullptr, &reader));
+
+  constexpr MemoryAllocator* allocator = nullptr;
+  // Keys longer than the blob payload offset minus the legacy header prefix
+  // must not trip the legacy offset bounds check on blog files.
+  const std::string key_str(200, 'k');
+  Slice key(key_str);
+  ASSERT_LT(blob_offsets[0],
+            BlobLogHeader::kSize + BlobLogRecord::kHeaderSize + key.size());
+
+  for (size_t i = 0; i < blobs.size(); ++i) {
+    std::unique_ptr<BlobContents> value;
+    uint64_t bytes_read = 0;
+    ASSERT_OK(reader->GetBlobRange(
+        read_options, key, blob_offsets[i], blob_sizes[i],
+        /*range_offset=*/4, /*range_length=*/6, allocator, &value, &bytes_read))
+        << "blob " << i << " at offset " << blob_offsets[i];
+    ASSERT_NE(value, nullptr);
+    ASSERT_EQ(value->data(), blobs[i].ToString().substr(4, 6));
+    ASSERT_EQ(bytes_read, 6);
+  }
+
+  std::vector<Status> statuses(blobs.size());
+  std::vector<BlobRangeReadRequest> requests(blobs.size());
+  autovector<std::pair<BlobRangeReadRequest*, std::unique_ptr<BlobContents>>>
+      blob_reqs;
+  for (size_t i = 0; i < blobs.size(); ++i) {
+    requests[i] = BlobRangeReadRequest(
+        key, blob_offsets[i], blob_sizes[i], /*range_offset=*/4,
+        /*range_length=*/6, /*result=*/nullptr, &statuses[i]);
+    blob_reqs.emplace_back(&requests[i], std::unique_ptr<BlobContents>());
+  }
+  uint64_t bytes_read = 0;
+  reader->MultiGetBlobRange(read_options, blob_reqs, &bytes_read);
+  for (size_t i = 0; i < blobs.size(); ++i) {
+    ASSERT_OK(statuses[i]) << "blob " << i << " at offset " << blob_offsets[i];
+    ASSERT_NE(blob_reqs[i].second, nullptr);
+    ASSERT_EQ(blob_reqs[i].second->data(), blobs[i].ToString().substr(4, 6));
+  }
+  ASSERT_EQ(bytes_read, 6 * blobs.size());
+}
+
 TEST_F(BlobFileReaderTest, BlogFormatMalformedFooterLocatorRejected) {
   Options options;
   options.env = mock_env_.get();
@@ -1927,6 +2054,306 @@ TEST_F(BlobFileReaderTest, BlogFormatMalformedFooterLocatorRejected) {
   Status s = BlobFileReader::Create(
       immutable_options, read_options, FileOptions(), column_family_id,
       blob_file_read_hist, blob_file_number, nullptr, &reader);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+}
+
+TEST_F(BlobFileReaderTest, VerifyAgainstManifestMetadata) {
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(), "VerifyAgainstManifestMetadata"),
+      0);
+  options.enable_blob_files = true;
+
+  ImmutableOptions immutable_options(options);
+
+  constexpr uint32_t column_family_id = 1;
+  constexpr uint64_t legacy_file_number = 1;
+  constexpr uint64_t blog_file_number = 2;
+
+  const std::vector<std::string> key_strs = {"key1", "key2"};
+  const std::vector<std::string> blob_strs = {"blob1", "blob2"};
+  const std::vector<Slice> keys = {key_strs[0], key_strs[1]};
+  const std::vector<Slice> blobs = {blob_strs[0], blob_strs[1]};
+
+  constexpr ExpirationRange expiration_range;
+  std::vector<uint64_t> legacy_offsets(keys.size());
+  std::vector<uint64_t> legacy_sizes(keys.size());
+  WriteBlobFile(immutable_options, column_family_id, /*has_ttl=*/false,
+                expiration_range, expiration_range, legacy_file_number, keys,
+                blobs, kNoCompression, legacy_offsets, legacy_sizes);
+
+  std::vector<uint64_t> blog_offsets(blobs.size());
+  std::vector<uint64_t> blog_sizes(blobs.size());
+  WriteBlogBlobFile(immutable_options, blog_file_number, blobs, kNoCompression,
+                    blog_offsets, blog_sizes);
+
+  constexpr HistogramImpl* blob_file_read_hist = nullptr;
+  ReadOptions read_options;
+
+  std::unique_ptr<BlobFileReader> legacy_reader;
+  ASSERT_OK(BlobFileReader::Create(immutable_options, read_options,
+                                   FileOptions(), column_family_id,
+                                   blob_file_read_hist, legacy_file_number,
+                                   nullptr /*IOTracer*/, &legacy_reader));
+  ASSERT_FALSE(legacy_reader->IsBlogFormat());
+
+  std::unique_ptr<BlobFileReader> blog_reader;
+  ASSERT_OK(BlobFileReader::Create(immutable_options, read_options,
+                                   FileOptions(), column_family_id,
+                                   blob_file_read_hist, blog_file_number,
+                                   nullptr /*IOTracer*/, &blog_reader));
+  ASSERT_TRUE(blog_reader->IsBlogFormat());
+
+  const uint64_t legacy_size = legacy_reader->GetFileSize();
+  const uint64_t blog_size = blog_reader->GetFileSize();
+  const uint8_t blog_schema = blog_reader->GetBlogSchemaVersion();
+  const std::string blog_identity =
+      blog_reader->GetBlogFileIdentity().ToString();
+  ASSERT_EQ(blog_schema, kBlogCurrentSchemaVersion);
+  ASSERT_EQ(blog_identity.size(), kBlobFileIdentitySize);
+
+  std::string wrong_identity = blog_identity;
+  wrong_identity[0] = static_cast<char>(wrong_identity[0] ^ 0xFF);
+  ASSERT_NE(wrong_identity, blog_identity);
+
+  // Exact matches pass.
+  ASSERT_OK(legacy_reader->VerifyAgainstManifestMetadata(
+      legacy_size, kLegacyBlobFileSchemaVersion, Slice()));
+  ASSERT_OK(blog_reader->VerifyAgainstManifestMetadata(blog_size, blog_schema,
+                                                       blog_identity));
+
+  // An unknown physical size (zero) skips only the size check; other
+  // mismatches still fail. A legacy file ignores the expected identity.
+  ASSERT_OK(legacy_reader->VerifyAgainstManifestMetadata(
+      0, kLegacyBlobFileSchemaVersion, Slice()));
+  ASSERT_OK(legacy_reader->VerifyAgainstManifestMetadata(
+      legacy_size, kLegacyBlobFileSchemaVersion, "ignored"));
+  ASSERT_OK(blog_reader->VerifyAgainstManifestMetadata(0, blog_schema,
+                                                       blog_identity));
+  ASSERT_TRUE(
+      blog_reader->VerifyAgainstManifestMetadata(0, blog_schema, wrong_identity)
+          .IsCorruption());
+  ASSERT_TRUE(blog_reader
+                  ->VerifyAgainstManifestMetadata(
+                      0, kLegacyBlobFileSchemaVersion, Slice())
+                  .IsCorruption());
+
+  // Size mismatch.
+  ASSERT_TRUE(legacy_reader
+                  ->VerifyAgainstManifestMetadata(
+                      legacy_size + 1, kLegacyBlobFileSchemaVersion, Slice())
+                  .IsCorruption());
+  {
+    const Status s = blog_reader->VerifyAgainstManifestMetadata(
+        blog_size + 1, blog_schema, blog_identity);
+    ASSERT_TRUE(s.IsCorruption());
+    ASSERT_NE(s.ToString().find("BlobFileAddition"), std::string::npos);
+  }
+
+  // Format mismatch in both directions.
+  ASSERT_TRUE(legacy_reader
+                  ->VerifyAgainstManifestMetadata(legacy_size, blog_schema,
+                                                  blog_identity)
+                  .IsCorruption());
+  ASSERT_TRUE(blog_reader
+                  ->VerifyAgainstManifestMetadata(
+                      blog_size, kLegacyBlobFileSchemaVersion, Slice())
+                  .IsCorruption());
+
+  // Blog schema version mismatch.
+  ASSERT_TRUE(blog_reader
+                  ->VerifyAgainstManifestMetadata(
+                      blog_size,
+                      static_cast<uint8_t>(kBlogCurrentSchemaVersion + 1),
+                      blog_identity)
+                  .IsCorruption());
+
+  // File identity mismatch (wrong contents and empty).
+  ASSERT_TRUE(blog_reader
+                  ->VerifyAgainstManifestMetadata(blog_size, blog_schema,
+                                                  wrong_identity)
+                  .IsCorruption());
+  ASSERT_TRUE(
+      blog_reader
+          ->VerifyAgainstManifestMetadata(blog_size, blog_schema, Slice())
+          .IsCorruption());
+}
+
+// A blob reference that falls outside the file the reader opened must be
+// reported as corruption rather than reaching the file layer. The stale-reader
+// recovery in BlobSource (ReadBlobWithReaderRetry) and the direct-write
+// fallback in BlobFilePartitionManager::ResolveBlobDirectWriteIndex both key on
+// Status::IsCorruption(), so any other classification silently disables the
+// reopen-and-retry that recovers a reader holding a short view of a blob file
+// that is still being appended to. Without the bound, an mmap-backed reader
+// turns this into a hard IOError instead.
+TEST_F(BlobFileReaderTest, BlogFormatReferenceOutsideFileIsCorruption) {
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlogFormatReferenceOutsideFileIsCorruption"),
+      0);
+  options.enable_blob_files = true;
+  options.use_blog_format_for_blobs = true;
+
+  ImmutableOptions immutable_options(options);
+
+  constexpr uint64_t blob_file_number = 1;
+  const std::vector<std::string> blob_strs = {"blob1"};
+  const std::vector<Slice> blobs = {blob_strs[0]};
+
+  std::vector<uint64_t> blob_offsets(1);
+  std::vector<uint64_t> blob_sizes(1);
+
+  WriteBlogBlobFile(immutable_options, blob_file_number, blobs, kNoCompression,
+                    blob_offsets, blob_sizes);
+
+  const std::string blob_file_path =
+      BlobFileName(immutable_options.cf_paths.front().path, blob_file_number);
+  uint64_t file_size = 0;
+  ASSERT_OK(immutable_options.fs->GetFileSize(blob_file_path, IOOptions(),
+                                              &file_size, /*dbg=*/nullptr));
+
+  std::unique_ptr<BlobFileReader> reader;
+  ReadOptions read_options;
+  ASSERT_OK(BlobFileReader::Create(
+      immutable_options, read_options, FileOptions(), /*column_family_id=*/1,
+      /*blob_file_read_hist=*/nullptr, blob_file_number, nullptr /*IOTracer*/,
+      &reader));
+
+  struct OutOfRangeCase {
+    const char* name;
+    uint64_t offset;
+    uint64_t size;
+  };
+  // Each case names a reference no valid record could produce in a file of
+  // `file_size` bytes, since a payload is always followed by a 5-byte trailer.
+  const OutOfRangeCase cases[] = {
+      {"offset past end of file", file_size + 16, blob_sizes[0]},
+      {"offset exactly at end of file", file_size, blob_sizes[0]},
+      {"value overruns end of file", blob_offsets[0], file_size},
+      {"trailer overruns end of file by one byte",
+       file_size - kBlogBlockTrailerSize - blob_sizes[0] + 1, blob_sizes[0]},
+      {"offset inside the fixed header", 0, blob_sizes[0]},
+  };
+
+  for (bool verify : {false, true}) {
+    read_options.verify_checksums = verify;
+    for (const OutOfRangeCase& c : cases) {
+      SCOPED_TRACE(std::string(c.name) +
+                   ", verify_checksums=" + std::to_string(verify));
+
+      std::unique_ptr<BlobContents> value;
+      Status s = reader->GetBlob(read_options, blobs[0], c.offset, c.size,
+                                 kNoCompression, /*prefetch_buffer=*/nullptr,
+                                 /*allocator=*/nullptr, &value,
+                                 /*bytes_read=*/nullptr);
+      ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+
+      value.reset();
+      s = reader->GetBlobRange(read_options, blobs[0], c.offset, c.size,
+                               /*range_offset=*/0, /*range_length=*/1,
+                               /*allocator=*/nullptr, &value,
+                               /*bytes_read=*/nullptr);
+      ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+
+      Status multiget_status;
+      BlobReadRequest request(blobs[0], c.offset, c.size, kNoCompression,
+                              nullptr, &multiget_status);
+      autovector<std::pair<BlobReadRequest*, std::unique_ptr<BlobContents>>>
+          blob_reqs;
+      blob_reqs.emplace_back(&request, std::unique_ptr<BlobContents>());
+      reader->MultiGetBlob(read_options, /*allocator=*/nullptr, blob_reqs,
+                           /*bytes_read=*/nullptr);
+      ASSERT_TRUE(multiget_status.IsCorruption()) << multiget_status.ToString();
+
+      Status range_status;
+      BlobRangeReadRequest range_request(blobs[0], c.offset, c.size,
+                                         /*range_offset=*/0, /*range_length=*/1,
+                                         /*result=*/nullptr, &range_status);
+      autovector<
+          std::pair<BlobRangeReadRequest*, std::unique_ptr<BlobContents>>>
+          range_reqs;
+      range_reqs.emplace_back(&range_request, std::unique_ptr<BlobContents>());
+      uint64_t bytes_read = 1;
+      reader->MultiGetBlobRange(read_options, range_reqs, &bytes_read);
+      ASSERT_TRUE(range_status.IsCorruption()) << range_status.ToString();
+      ASSERT_EQ(range_reqs[0].second, nullptr);
+      ASSERT_EQ(bytes_read, 0);
+    }
+  }
+}
+
+// The situation the crash test hit: an mmap-backed reader opened a direct-write
+// blob file while it was still short, and a later blob was then read through
+// it. The record is perfectly valid in the finished file, so the reader must
+// report corruption -- which makes BlobSource reopen it and retry -- rather
+// than the I/O error mmap produces for a read beyond the mapped length.
+TEST_F(BlobFileReaderTest, BlogFormatStaleShortFileViewIsCorruption) {
+  const std::string db_path = test::PerThreadDBPath(
+      mock_env_.get(), "BlogFormatStaleShortFileViewIsCorruption");
+
+  constexpr uint64_t blob_file_number = 1;
+  const std::string blob_file_path = BlobFileName(db_path, blob_file_number);
+
+  Options write_options;
+  write_options.env = mock_env_.get();
+  write_options.cf_paths.emplace_back(db_path, 0);
+  write_options.enable_blob_files = true;
+  write_options.use_blog_format_for_blobs = true;
+
+  ImmutableOptions write_immutable_options(write_options);
+
+  const std::vector<std::string> blob_strs = {"blob1", "blob2"};
+  const std::vector<Slice> blobs = {blob_strs[0], blob_strs[1]};
+
+  std::vector<uint64_t> blob_offsets(2);
+  std::vector<uint64_t> blob_sizes(2);
+
+  WriteBlogBlobFile(write_immutable_options, blob_file_number, blobs,
+                    kNoCompression, blob_offsets, blob_sizes);
+
+  // Freeze the reader's view just before the second blob's payload, the same
+  // view an mmap-backed reader gets when it maps a file that is still growing.
+  auto frozen_length_fs = std::make_shared<FrozenLengthFileSystem>(
+      mock_env_->GetFileSystem(), blob_file_path, blob_offsets[1]);
+  CompositeEnvWrapper frozen_length_env(mock_env_.get(), frozen_length_fs);
+
+  Options read_env_options;
+  read_env_options.env = &frozen_length_env;
+  read_env_options.cf_paths.emplace_back(db_path, 0);
+  read_env_options.enable_blob_files = true;
+  read_env_options.use_blog_format_for_blobs = true;
+
+  ImmutableOptions read_immutable_options(read_env_options);
+
+  std::unique_ptr<BlobFileReader> reader;
+  ReadOptions read_options;
+  // The footer sits past the frozen length, so open the way an in-flight
+  // direct-write read does.
+  ASSERT_OK(BlobFileReader::Create(
+      read_immutable_options, read_options, FileOptions(),
+      /*column_family_id=*/1, /*blob_file_read_hist=*/nullptr, blob_file_number,
+      nullptr /*IOTracer*/, /*skip_footer_validation=*/true, &reader));
+
+  // The first blob is fully inside the frozen view and still reads back.
+  std::unique_ptr<BlobContents> value;
+  ASSERT_OK(reader->GetBlob(read_options, blobs[0], blob_offsets[0],
+                            blob_sizes[0], kNoCompression,
+                            /*prefetch_buffer=*/nullptr, /*allocator=*/nullptr,
+                            &value, /*bytes_read=*/nullptr));
+  ASSERT_NE(value, nullptr);
+  ASSERT_EQ(value->data(), blobs[0]);
+
+  // The second one is not, and must be rejected as corruption so that the
+  // stale-reader recovery keyed on Status::IsCorruption() can run.
+  value.reset();
+  const Status s = reader->GetBlob(
+      read_options, blobs[1], blob_offsets[1], blob_sizes[1], kNoCompression,
+      /*prefetch_buffer=*/nullptr, /*allocator=*/nullptr, &value,
+      /*bytes_read=*/nullptr);
   ASSERT_TRUE(s.IsCorruption()) << s.ToString();
 }
 

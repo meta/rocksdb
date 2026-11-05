@@ -94,7 +94,7 @@ Status BlobWriteBatchTransformer::MaybePreprocessWideColumns(
 
   for (size_t column_idx = 0; column_idx < columns.size(); ++column_idx) {
     const Slice& column_value = columns[column_idx].value();
-    if (column_value.size() < settings.min_blob_size) {
+    if (column_value.empty() || column_value.size() < settings.min_blob_size) {
       continue;
     }
     if (!has_entity_partition) {
@@ -162,7 +162,7 @@ Status BlobWriteBatchTransformer::PutCF(uint32_t column_family_id,
   const auto& settings = cached_settings_;
 
   if (!cached_partition_mgr_ || !settings.enable_blob_direct_write ||
-      value.size() < settings.min_blob_size) {
+      value.empty() || value.size() < settings.min_blob_size) {
     return WriteBatchInternal::Put(output_batch_, column_family_id, key, value);
   }
 

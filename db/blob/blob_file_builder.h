@@ -123,6 +123,7 @@ class BlobFileBuilder {
   std::vector<BlobFileAddition>* blob_file_additions_;
   std::unique_ptr<BlobLogWriter> writer_;
   std::unique_ptr<BlogFileWriter> blog_writer_;
+  const bool use_blog_format_;
   uint64_t blob_file_number_ = 0;
   uint64_t blob_count_;
   uint64_t blob_bytes_;
