@@ -485,6 +485,18 @@ static void rocksdb_roundtrip_test_rocksdb_flushwaloptions(void) {
   rocksdb_flushwaloptions_destroy(obj);
 }
 
+static void rocksdb_roundtrip_test_rocksdb_import_column_family_options(void) {
+  rocksdb_import_column_family_options_t* obj =
+      rocksdb_import_column_family_options_create();
+  rocksdb_import_column_family_options_set_reject_too_old_file(obj, 1);
+  CheckCondition(
+      rocksdb_import_column_family_options_get_reject_too_old_file(obj) == 1);
+  rocksdb_import_column_family_options_set_reject_too_old_file(obj, 0);
+  CheckCondition(
+      rocksdb_import_column_family_options_get_reject_too_old_file(obj) == 0);
+  rocksdb_import_column_family_options_destroy(obj);
+}
+
 static void rocksdb_roundtrip_test_rocksdb_ingestexternalfileoptions(void) {
   rocksdb_ingestexternalfileoptions_t* obj =
       rocksdb_ingestexternalfileoptions_create();
@@ -526,6 +538,12 @@ static void rocksdb_roundtrip_test_rocksdb_ingestexternalfileoptions(void) {
   CheckCondition(
       rocksdb_ingestexternalfileoptions_get_prefetch_lmax_index_and_filter_blocks(
           obj) == 0);
+  rocksdb_ingestexternalfileoptions_set_reject_too_old_file(obj, 1);
+  CheckCondition(
+      rocksdb_ingestexternalfileoptions_get_reject_too_old_file(obj) == 1);
+  rocksdb_ingestexternalfileoptions_set_reject_too_old_file(obj, 0);
+  CheckCondition(
+      rocksdb_ingestexternalfileoptions_get_reject_too_old_file(obj) == 0);
   rocksdb_ingestexternalfileoptions_set_verify_checksums_before_ingest(obj, 1);
   CheckCondition(
       rocksdb_ingestexternalfileoptions_get_verify_checksums_before_ingest(
@@ -1403,6 +1421,7 @@ static void rocksdb_run_generated_roundtrip_tests(void) {
   rocksdb_roundtrip_test_rocksdb_fifo_compaction_options();
   rocksdb_roundtrip_test_rocksdb_flushoptions();
   rocksdb_roundtrip_test_rocksdb_flushwaloptions();
+  rocksdb_roundtrip_test_rocksdb_import_column_family_options();
   rocksdb_roundtrip_test_rocksdb_ingestexternalfileoptions();
   rocksdb_roundtrip_test_rocksdb_livefiles_storage_info_options();
   rocksdb_roundtrip_test_rocksdb_open_and_compact_options();

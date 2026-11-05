@@ -3294,6 +3294,28 @@ struct IngestExternalFileOptions {
   // multiple files at once.
   int file_opening_threads = 1;
 
+  // If true, ingestion fails with Status::InvalidArgument (and no files are
+  // ingested) if any file is already too old for the column family to keep
+  // without recompaction or deletion. This avoids publishing data that, for
+  // example, should already have been processed by a compaction filter. A
+  // file is too old if
+  // * for leveled or universal compaction, the age of its contents, from the
+  //   creation time recorded in the file (see `periodic_compaction_seconds` on
+  //   how ingested files are aged), exceeds the effective
+  //   `periodic_compaction_seconds` (including any RocksDB-picked default and,
+  //   for universal compaction, the effect of `ttl`), or
+  // * for FIFO compaction, the age of its newest data, as estimated by FIFO
+  //   TTL compaction (from the newest key time recorded in the file, or else
+  //   its oldest ancestor time, or else its creation time), exceeds `ttl`, so
+  //   that FIFO compaction would already treat the file as expired.
+  // Nothing is rejected if the applicable `periodic_compaction_seconds` or
+  // `ttl` is 0 (disabled), and a file without the recorded time (e.g. from an
+  // older SstFileWriter) is not rejected. Leveled `ttl` is not considered
+  // because it does not limit how long data can be kept: it only moves data
+  // out of the levels above the last level, where an ingested file is then
+  // compacted down soon after ingestion.
+  bool reject_too_old_file = false;
+
   bool operator==(const IngestExternalFileOptions& rhs) const = default;
 };
 
@@ -3408,6 +3430,11 @@ struct TraceOptions {
 struct ImportColumnFamilyOptions {
   // Can be set to true to move the files instead of copying them.
   bool move_files = false;
+  // Like IngestExternalFileOptions::reject_too_old_file, using the
+  // `file_creation_time` from the import metadata, or from the file itself if
+  // the metadata does not have one. If any file is rejected, the import fails
+  // with Status::InvalidArgument.
+  bool reject_too_old_file = false;
 };
 
 // Options used with DB::GetApproximateSizes()

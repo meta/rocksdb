@@ -15,6 +15,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/sst_file_writer.h"
+#include "test_util/mock_time_env.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/defer.h"
@@ -2614,7 +2615,14 @@ TEST_F(ExternalSSTFileBasicTest,
       SyncPoint::GetInstance()->ClearAllCallBacks();
     });
 
-    SstFileWriter sst_file_writer(EnvOptions(), options);
+    // Files written while the clock reads 0 record no creation time, like
+    // SstFileWriter files from older versions
+    auto zero_clock =
+        std::make_shared<MockSystemClock>(counting_env.GetSystemClock());
+    CompositeEnvWrapper legacy_writer_env(&counting_env, zero_clock);
+    Options legacy_writer_options = options;
+    legacy_writer_options.env = &legacy_writer_env;
+    SstFileWriter sst_file_writer(EnvOptions(), legacy_writer_options);
     std::vector<std::string> old_files;
     for (const auto& contents :
          std::vector<std::vector<std::pair<std::string, std::string>>>{

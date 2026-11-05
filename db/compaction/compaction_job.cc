@@ -2970,6 +2970,9 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
                              sub_compact->compaction->output_path_id(), 0);
     meta.oldest_ancestor_time = oldest_ancestor_time;
     meta.file_creation_time = current_time;
+    meta.db_ownership_start_time = current_time;
+    meta.data_file_provenance =
+        DataFileProvenanceForOrigin(DataFileProvenance::Origin::kCompaction);
     meta.epoch_number = epoch_number;
     meta.temperature = temperature;
     assert(!db_id_.empty());
@@ -3024,7 +3027,7 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
       sub_compact->compaction->output_compression_opts(), cfd->GetID(),
       cfd->GetName(), sub_compact->compaction->output_level(), newest_key_time,
       bottommost_level_, TableFileCreationReason::kCompaction,
-      0 /* oldest_key_time */, current_time, db_id_, db_session_id_,
+      0 /* oldest_key_time */, db_id_, db_session_id_,
       sub_compact->compaction->max_output_file_size(), file_number,
       proximal_after_seqno_ /*last_level_inclusive_max_seqno_threshold*/,
       dbname_ /*db_name*/, IsRemoteCompaction() /*is_remote_compaction*/);

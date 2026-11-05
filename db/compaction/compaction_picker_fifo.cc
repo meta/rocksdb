@@ -110,6 +110,13 @@ Compaction* FIFOCompactionPicker::PickTTLCompaction(
         uint64_t est_newest_key_time = newest_key_time == kUnknownNewestKeyTime
                                            ? oldest_ancestor_time
                                            : newest_key_time;
+        if (est_newest_key_time == kUnknownNewestKeyTime) {
+          // E.g. a file written by SstFileWriter. Every key in the file was
+          // written no later than the file's contents were built.
+          est_newest_key_time = f->TryGetFileCreationTime();
+        }
+        // CheckExternalFileNotTooOld() (reject_too_old_file) mirrors this
+        // estimate
         if (est_newest_key_time == kUnknownNewestKeyTime ||
             est_newest_key_time >= (current_time - mutable_cf_options.ttl)) {
           break;

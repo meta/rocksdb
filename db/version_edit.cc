@@ -21,7 +21,79 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-namespace {}  // anonymous namespace
+namespace {
+// For DebugString() / DebugJSON(), e.g. "ingestion+moved+raw:0x1103" (the raw
+// value shows reserved bits that aren't decoded).
+std::string DataFileProvenanceToString(uint32_t encoded) {
+  const DataFileProvenance info = DataFileProvenance::DecodeFrom(encoded);
+  std::string r;
+  switch (info.origin) {
+    case DataFileProvenance::Origin::kUnknown:
+      r = "unknown_origin";
+      break;
+    case DataFileProvenance::Origin::kFlush:
+      r = "flush";
+      break;
+    case DataFileProvenance::Origin::kCompaction:
+      r = "compaction";
+      break;
+    case DataFileProvenance::Origin::kIngestion:
+      r = "ingestion";
+      break;
+    case DataFileProvenance::Origin::kImport:
+      r = "import";
+      break;
+  }
+  if (info.moved_between_levels) {
+    r += "+moved";
+  }
+  if (info.temperature_changed_by_copy) {
+    r += "+temperature_copied";
+  }
+  if (info.temperature_updated_from_file_system) {
+    r += "+temperature_updated";
+  }
+  if (info.recorded_by_repair) {
+    r += "+repaired";
+  }
+  char raw[24];
+  snprintf(raw, sizeof(raw), "+raw:0x%x", encoded);
+  r += raw;
+  return r;
+}
+}  // anonymous namespace
+
+uint32_t DataFileProvenance::Encode() const {
+  uint32_t encoded = DataFileProvenanceForOrigin(origin);
+  if (moved_between_levels) {
+    encoded |= kProvenanceMovedBetweenLevels;
+  }
+  if (temperature_changed_by_copy) {
+    encoded |= kProvenanceTemperatureChangedByCopy;
+  }
+  if (temperature_updated_from_file_system) {
+    encoded |= kProvenanceTemperatureUpdatedFromFileSystem;
+  }
+  if (recorded_by_repair) {
+    encoded |= kProvenanceRecordedByRepair;
+  }
+  return encoded;
+}
+
+DataFileProvenance DataFileProvenance::DecodeFrom(uint32_t encoded) {
+  DataFileProvenance info;
+  const uint32_t origin_value = encoded & kProvenanceOriginMask;
+  if (origin_value <= DataFileProvenanceForOrigin(Origin::kImport)) {
+    info.origin = static_cast<Origin>(origin_value);
+  }
+  info.moved_between_levels = (encoded & kProvenanceMovedBetweenLevels) != 0;
+  info.temperature_changed_by_copy =
+      (encoded & kProvenanceTemperatureChangedByCopy) != 0;
+  info.temperature_updated_from_file_system =
+      (encoded & kProvenanceTemperatureUpdatedFromFileSystem) != 0;
+  info.recorded_by_repair = (encoded & kProvenanceRecordedByRepair) != 0;
+  return info;
+}
 
 // After copying, we rely on the caller to ensure no double releases. Fragile,
 // but keeps copying cheap.
@@ -125,6 +197,22 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
 }
 
 void VersionEdit::Clear() { *this = VersionEdit(); }
+
+void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
+                                  uint32_t provenance_flags_to_set) {
+  assert((provenance_flags_to_set & kProvenanceOriginMask) == 0);
+  AddFile(level, f.fd.GetNumber(), f.fd.GetPathId(), f.fd.GetFileSize(),
+          f.smallest, f.largest, f.fd.smallest_seqno, f.fd.largest_seqno,
+          f.marked_for_compaction, f.temperature, f.oldest_blob_file_number,
+          f.oldest_ancestor_time, f.file_creation_time, f.epoch_number,
+          f.file_checksum, f.file_checksum_func_name, f.unique_id,
+          f.compensated_range_deletion_size, f.tail_size,
+          f.user_defined_timestamps_persisted, f.min_timestamp, f.max_timestamp,
+          f.file_open_metadata);
+  FileMetaData& added = new_files_.back().second;
+  added.db_ownership_start_time = f.db_ownership_start_time;
+  added.data_file_provenance = f.data_file_provenance | provenance_flags_to_set;
+}
 
 bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
     uint64_t current_log_number) const {
@@ -407,6 +495,18 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     PutVarint32(dst, NewFileCustomTag::kFileOpenMetadata);
     PutLengthPrefixedSlice(dst, Slice(f.file_open_metadata));
   }
+  if (f.db_ownership_start_time != kUnknownDbOwnershipStartTime) {
+    PutVarint32(dst, NewFileCustomTag::kDbOwnershipStartTime);
+    std::string varint_db_ownership_start_time;
+    PutVarint64(&varint_db_ownership_start_time, f.db_ownership_start_time);
+    PutLengthPrefixedSlice(dst, Slice(varint_db_ownership_start_time));
+  }
+  if (f.data_file_provenance != 0) {
+    PutVarint32(dst, NewFileCustomTag::kDataFileProvenance);
+    std::string varint_data_file_provenance;
+    PutVarint32(&varint_data_file_provenance, f.data_file_provenance);
+    PutLengthPrefixedSlice(dst, Slice(varint_data_file_provenance));
+  }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
 
@@ -554,6 +654,16 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
           break;
         case kFileOpenMetadata:
           f.file_open_metadata = field.ToString();
+          break;
+        case kDbOwnershipStartTime:
+          if (!GetVarint64(&field, &f.db_ownership_start_time)) {
+            return "invalid DB ownership start time";
+          }
+          break;
+        case kDataFileProvenance:
+          if (!GetVarint32(&field, &f.data_file_provenance)) {
+            return "invalid data file provenance";
+          }
           break;
         default:
           if ((custom_tag & kCustomTagNonSafeIgnoreMask) != 0) {
@@ -1049,6 +1159,14 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     AppendNumberTo(&r, f.file_creation_time);
     r.append(" epoch_number:");
     AppendNumberTo(&r, f.epoch_number);
+    if (f.db_ownership_start_time != kUnknownDbOwnershipStartTime) {
+      r.append(" db_ownership_start_time:");
+      AppendNumberTo(&r, f.db_ownership_start_time);
+    }
+    if (f.data_file_provenance != 0) {
+      r.append(" data_file_provenance:");
+      r.append(DataFileProvenanceToString(f.data_file_provenance));
+    }
     r.append(" file_checksum:");
     r.append(Slice(f.file_checksum).ToString(true));
     r.append(" file_checksum_func_name: ");
@@ -1190,6 +1308,13 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
       jw << "OldestAncesterTime" << f.oldest_ancestor_time;
       jw << "FileCreationTime" << f.file_creation_time;
       jw << "EpochNumber" << f.epoch_number;
+      if (f.db_ownership_start_time != kUnknownDbOwnershipStartTime) {
+        jw << "DbOwnershipStartTime" << f.db_ownership_start_time;
+      }
+      if (f.data_file_provenance != 0) {
+        jw << "DataFileProvenance"
+           << DataFileProvenanceToString(f.data_file_provenance);
+      }
       jw << "FileChecksum" << Slice(f.file_checksum).ToString(true);
       jw << "FileChecksumFuncName" << f.file_checksum_func_name;
       if (f.temperature != Temperature::kUnknown) {

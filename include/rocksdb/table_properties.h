@@ -360,7 +360,9 @@ struct TableProperties {
   uint64_t oldest_key_time = 0;
   // Timestamp of the newest key. 0 means unknown.
   uint64_t newest_key_time = 0;
-  // Actual SST file creation time. 0 means unknown.
+  // When the SST file was built (for block-based tables, when the builder
+  // finished, which is no earlier than when any entry was added to it). 0
+  // means unknown.
   uint64_t file_creation_time = 0;
   // Estimated size of data blocks if compressed using a relatively slower
   // compression algorithm (see `ColumnFamilyOptions::sample_for_compression`).

@@ -20,9 +20,20 @@
 #include "table/sst_file_writer_collectors.h"
 #include "table/table_builder.h"
 #include "table/unique_id_impl.h"
+#include "util/cast_util.h"
 #include "util/stop_watch.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+// A time carried by an imported file: from its import metadata (e.g. the
+// exporting DB's MANIFEST) when known, else from the file's table properties
+// (0 if unknown in both).
+uint64_t CarriedImportTime(uint64_t from_metadata,
+                           uint64_t from_table_properties) {
+  return from_metadata != 0 ? from_metadata : from_table_properties;
+}
+}  // namespace
 
 Status ImportColumnFamilyJob::Prepare(uint64_t next_file_number,
                                       SuperVersion* sv) {
@@ -54,6 +65,24 @@ Status ImportColumnFamilyJob::Prepare(uint64_t next_file_number,
           !file_to_import.largest_internal_key.Valid()) {
         status = Status::Corruption("File has corrupted keys");
         return status;
+      }
+
+      if (import_options_.reject_too_old_file) {
+        int64_t now = 0;
+        if (!clock_->GetCurrentTime(&now).ok()) {
+          now = 0;
+        }
+        status = CheckExternalFileNotTooOld(
+            file_path,
+            CarriedImportTime(
+                file_metadata.file_creation_time,
+                file_to_import.table_properties.file_creation_time),
+            file_to_import.table_properties, lossless_cast<uint64_t>(now),
+            cfd_->ioptions().compaction_style, sv->mutable_cf_options,
+            db_options_.info_log.get());
+        if (!status.ok()) {
+          return status;
+        }
       }
 
       files_to_import_per_cf.push_back(file_to_import);
@@ -135,6 +164,10 @@ Status ImportColumnFamilyJob::Prepare(uint64_t next_file_number,
       }
       f.copy_file = !hardlink_files;
       f.internal_file_path = path_inside_db;
+      int64_t now = 0;
+      if (clock_->GetCurrentTime(&now).ok()) {
+        f.db_ownership_start_time = lossless_cast<uint64_t>(now);
+      }
     }
     if (!status.ok()) {
       break;
@@ -165,14 +198,10 @@ Status ImportColumnFamilyJob::Prepare(uint64_t next_file_number,
 // REQUIRES: we have become the only writer by entering both write_thread_ and
 // nonmem_write_thread_
 Status ImportColumnFamilyJob::Run() {
-  // We use the import time as the ancestor time. This is the time the data
-  // is written to the database.
   int64_t temp_current_time = 0;
-  uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
-  uint64_t current_time = kUnknownOldestAncestorTime;
+  uint64_t current_time = 0;
   if (clock_->GetCurrentTime(&temp_current_time).ok()) {
-    current_time = oldest_ancestor_time =
-        static_cast<uint64_t>(temp_current_time);
+    current_time = static_cast<uint64_t>(temp_current_time);
   }
 
   Status s;
@@ -206,17 +235,34 @@ Status ImportColumnFamilyJob::Run() {
       uint64_t tail_size = FileMetaData::CalculateTailSize(f.fd.GetFileSize(),
                                                            f.table_properties);
 
-      VersionEdit dummy_version_edit;
-      dummy_version_edit.AddFile(
-          file_metadata.level, f.fd.GetNumber(), f.fd.GetPathId(),
-          f.fd.GetFileSize(), f.smallest_internal_key, f.largest_internal_key,
+      uint64_t file_creation_time = kUnknownFileCreationTime;
+      uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
+      ResolveExternalFileTimes(
+          f.external_file_path,
+          CarriedImportTime(file_metadata.file_creation_time,
+                            f.table_properties.file_creation_time),
+          CarriedImportTime(file_metadata.oldest_ancestor_time,
+                            f.table_properties.oldest_ancestor_time),
+          current_time, db_options_.info_log.get(), &file_creation_time,
+          &oldest_ancestor_time);
+
+      FileMetaData meta(
+          f.fd.GetNumber(), f.fd.GetPathId(), f.fd.GetFileSize(),
+          f.smallest_internal_key, f.largest_internal_key,
           file_metadata.smallest_seqno, file_metadata.largest_seqno, false,
           file_metadata.temperature, kInvalidBlobFileNumber,
-          oldest_ancestor_time, current_time, file_metadata.epoch_number,
+          oldest_ancestor_time, file_creation_time, file_metadata.epoch_number,
           kUnknownFileChecksum, kUnknownFileChecksumFuncName, f.unique_id, 0,
           tail_size,
           static_cast<bool>(
-              f.table_properties.user_defined_timestamps_persisted));
+              f.table_properties.user_defined_timestamps_persisted),
+          /*_min_timestamp=*/"", /*_max_timestamp=*/"");
+      // The export metadata's ownership fields describe the source DB.
+      meta.db_ownership_start_time = f.db_ownership_start_time;
+      meta.data_file_provenance =
+          DataFileProvenanceForOrigin(DataFileProvenance::Origin::kImport);
+      VersionEdit dummy_version_edit;
+      dummy_version_edit.AddFile(file_metadata.level, meta);
       s = dummy_version_builder.Apply(&dummy_version_edit);
     }
     if (s.ok()) {

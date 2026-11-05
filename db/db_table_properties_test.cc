@@ -996,6 +996,70 @@ TEST_F(DBTablePropertiesTest, LsmInfoNotApplicableForSstFileWriter) {
   EXPECT_GT(table_props->uncompressed_data_size, 0U);
 }
 
+TEST_F(DBTablePropertiesTest, FileCreationTimeAlwaysSet) {
+  // file_creation_time is recorded in both table properties and the MANIFEST
+  // for SstFileWriter files, WAL recovery flushes, and after DB repair.
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  int64_t start_time = 0;
+  ASSERT_OK(env_->GetCurrentTime(&start_time));
+
+  std::string file = dbname_ + "/for_ingestion.sst";
+  {
+    // With a column family, so that repair keeps the file
+    SstFileWriter writer(EnvOptions(), options, db_->DefaultColumnFamily());
+    ASSERT_OK(writer.Open(file));
+    ASSERT_OK(writer.Put("a", "1"));
+    ASSERT_OK(writer.Finish());
+  }
+  IngestExternalFileOptions ifo;
+  ifo.move_files = true;
+  ASSERT_OK(db_->IngestExternalFile({file}, ifo));
+
+  // Left in the WAL to be flushed during recovery
+  ASSERT_OK(Put("b", "2"));
+  Reopen(options);
+
+  auto verify = [&]() {
+    int64_t end_time = 0;
+    ASSERT_OK(env_->GetCurrentTime(&end_time));
+    const uint64_t lo = static_cast<uint64_t>(start_time);
+    const uint64_t hi = static_cast<uint64_t>(end_time);
+
+    TablePropertiesCollection props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+    ASSERT_EQ(props.size(), 2U);
+    for (const auto& p : props) {
+      EXPECT_GE(p.second->file_creation_time, lo) << p.first;
+      EXPECT_LE(p.second->file_creation_time, hi) << p.first;
+    }
+
+    std::vector<std::vector<FileMetaData>> metadata;
+    dbfull()->TEST_GetFilesMetaData(db_->DefaultColumnFamily(), &metadata);
+    size_t num_files = 0;
+    for (const auto& level : metadata) {
+      for (const auto& f : level) {
+        ++num_files;
+        EXPECT_GE(f.file_creation_time, lo) << f.fd.GetNumber();
+        EXPECT_LE(f.file_creation_time, hi) << f.fd.GetNumber();
+      }
+    }
+    ASSERT_EQ(num_files, 2U);
+  };
+  {
+    SCOPED_TRACE("before repair");
+    verify();
+  }
+
+  Close();
+  ASSERT_OK(RepairDB(dbname_, options));
+  Reopen(options);
+  {
+    SCOPED_TRACE("after repair");
+    verify();
+  }
+}
+
 TEST_F(DBTablePropertiesTest, CompressionManagerFullDetailsPersisted) {
   // With an explicit CompressionManager, compression_options records the
   // manager's full details via ToString() (id plus any configured options),

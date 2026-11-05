@@ -1301,6 +1301,25 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
   SyncPoint::GetInstance()->DisableProcessing();
   VerifyTestData();
 
+  // Remote compaction outputs record DB ownership as local ones would
+  {
+    std::vector<LiveFileMetaData> live_files;
+    db_->GetLiveFilesMetaData(&live_files);
+    int num_compaction_outputs = 0;
+    for (const auto& f : live_files) {
+      const DataFileProvenance info =
+          DataFileProvenance::DecodeFrom(f.data_file_provenance);
+      if (info.origin == DataFileProvenance::Origin::kCompaction) {
+        ++num_compaction_outputs;
+      } else {
+        EXPECT_EQ(info.origin, DataFileProvenance::Origin::kFlush);
+      }
+      EXPECT_GT(f.db_ownership_start_time, 0U);
+      EXPECT_EQ(f.db_ownership_start_time, f.file_creation_time);
+    }
+    EXPECT_GT(num_compaction_outputs, 0);
+  }
+
   auto my_cs = GetCompactionService();
   ASSERT_GE(my_cs->GetCompactionNum(), 1);
   ASSERT_EQ(CompactionServiceJobStatus::kSuccess,

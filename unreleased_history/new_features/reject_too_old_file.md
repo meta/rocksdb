@@ -1,0 +1,1 @@
+Added option `reject_too_old_file` to `IngestExternalFileOptions` and `ImportColumnFamilyOptions` to reject files whose data is already older than the column family's `periodic_compaction_seconds` (or `ttl` for FIFO compaction).

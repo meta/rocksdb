@@ -161,6 +161,30 @@ void Java_org_rocksdb_IngestExternalFileOptions_setIngestBehind(
 
 /*
  * Class:     org_rocksdb_IngestExternalFileOptions
+ * Method:    rejectTooOldFile
+ * Signature: (J)Z
+ */
+jboolean Java_org_rocksdb_IngestExternalFileOptions_rejectTooOldFile(
+    JNIEnv*, jclass, jlong jhandle) {
+  auto* options =
+      reinterpret_cast<ROCKSDB_NAMESPACE::IngestExternalFileOptions*>(jhandle);
+  return static_cast<jboolean>(options->reject_too_old_file);
+}
+
+/*
+ * Class:     org_rocksdb_IngestExternalFileOptions
+ * Method:    setRejectTooOldFile
+ * Signature: (JZ)V
+ */
+void Java_org_rocksdb_IngestExternalFileOptions_setRejectTooOldFile(
+    JNIEnv*, jclass, jlong jhandle, jboolean jreject_too_old_file) {
+  auto* options =
+      reinterpret_cast<ROCKSDB_NAMESPACE::IngestExternalFileOptions*>(jhandle);
+  options->reject_too_old_file = static_cast<bool>(jreject_too_old_file);
+}
+
+/*
+ * Class:     org_rocksdb_IngestExternalFileOptions
  * Method:    disposeInternal
  * Signature: (J)V
  */

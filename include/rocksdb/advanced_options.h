@@ -924,6 +924,12 @@ struct AdvancedColumnFamilyOptions {
   // non-zero values; if not, the age is based on the file's last modified time
   // (given by the underlying Env).
   //
+  // For a file added by IngestExternalFile() or CreateColumnFamilyWithImport(),
+  // the age is based on the creation time recorded in the file or import
+  // metadata (when known and not in the future), not on when it was added, so
+  // such a file can be compacted soon after it is added. See also
+  // IngestExternalFileOptions::reject_too_old_file.
+  //
   // This option only supports block based table format for any compaction
   // style.
   //
@@ -1362,7 +1368,10 @@ struct AdvancedColumnFamilyOptions {
   // "BottommostFiles". Usually such compaction can happen as soon as a
   // relevant snapshot is released. This option allows user to delay
   // such compactions. A file is qualified for "BottommostFiles" compaction
-  // if it is at least "bottommost_file_compaction_delay" seconds old.
+  // if this DB has held it for at least "bottommost_file_compaction_delay"
+  // seconds, i.e. since the DB started writing it or, for an ingested or
+  // imported file, since the file was added to the DB (see
+  // SstFileMetaData::db_ownership_start_time).
   //
   // Default: 0 (no delay)
   // Dynamically changeable through the SetOptions() API.

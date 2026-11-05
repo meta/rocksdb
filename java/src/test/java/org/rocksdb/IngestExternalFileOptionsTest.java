@@ -94,4 +94,13 @@ public class IngestExternalFileOptionsTest {
       assertThat(options.ingestBehind()).isTrue();
     }
   }
+
+  @Test
+  public void rejectTooOldFile() {
+    try (final IngestExternalFileOptions options = new IngestExternalFileOptions()) {
+      assertThat(options.rejectTooOldFile()).isFalse();
+      options.setRejectTooOldFile(true);
+      assertThat(options.rejectTooOldFile()).isTrue();
+    }
+  }
 }

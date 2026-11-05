@@ -5,6 +5,7 @@
 
 #include "db/db_test_util.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/experimental.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/sst_file_writer.h"
 #include "util/defer.h"
@@ -827,6 +828,301 @@ TEST_F(DBEtc3Test, AutoTuneManifestSize) {
   while (!handles.empty()) {
     DropCfFn(/*include_background_manifest_write=*/false);
   }
+}
+
+// Tests for the DB ownership metadata recorded for SST files
+// (FileMetaData::db_ownership_start_time and data_file_provenance)
+class DBOwnershipTest : public DBEtc3Test {
+ protected:
+  uint64_t Now() {
+    int64_t now = 0;
+    EXPECT_OK(env_->GetCurrentTime(&now));
+    return static_cast<uint64_t>(now);
+  }
+
+  // The MANIFEST record and level of the file in the default column family
+  // whose smallest user key is `key`
+  std::pair<FileMetaData, int> FileStartingWith(const std::string& key) {
+    std::vector<std::vector<FileMetaData>> metadata;
+    dbfull()->TEST_GetFilesMetaData(db_->DefaultColumnFamily(), &metadata);
+    for (size_t level = 0; level < metadata.size(); ++level) {
+      for (const auto& f : metadata[level]) {
+        if (f.smallest.user_key() == key) {
+          return {f, static_cast<int>(level)};
+        }
+      }
+    }
+    ADD_FAILURE() << "No file starting with " << key;
+    return {FileMetaData(), -1};
+  }
+
+  static DataFileProvenance Decode(const FileMetaData& f) {
+    return DataFileProvenance::DecodeFrom(f.data_file_provenance);
+  }
+
+  static DataFileProvenance OriginOnly(DataFileProvenance::Origin origin) {
+    DataFileProvenance info;
+    info.origin = origin;
+    return info;
+  }
+
+  // Expects `after` to be the same file as `before`, with the same contents
+  // and DB ownership, plus DataFileProvenance flag bits `added_flags`
+  static void ExpectSameFile(const FileMetaData& before,
+                             const FileMetaData& after, uint32_t added_flags) {
+    EXPECT_EQ(after.fd.GetNumber(), before.fd.GetNumber());
+    EXPECT_EQ(after.file_creation_time, before.file_creation_time);
+    EXPECT_EQ(after.db_ownership_start_time, before.db_ownership_start_time);
+    EXPECT_EQ(after.data_file_provenance,
+              before.data_file_provenance | added_flags);
+  }
+};
+
+TEST_F(DBOwnershipTest, FlushAndCompactionOutputs) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+
+  const uint64_t start = Now();
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  const FileMetaData flushed = FileStartingWith("a").first;
+  EXPECT_GE(flushed.db_ownership_start_time, start);
+  EXPECT_EQ(flushed.db_ownership_start_time, flushed.file_creation_time);
+  EXPECT_EQ(Decode(flushed), OriginOnly(DataFileProvenance::Origin::kFlush));
+
+  // Reported in public metadata
+  std::vector<LiveFileMetaData> live_files;
+  db_->GetLiveFilesMetaData(&live_files);
+  ASSERT_EQ(live_files.size(), 1U);
+  EXPECT_EQ(live_files[0].db_ownership_start_time,
+            flushed.db_ownership_start_time);
+  EXPECT_EQ(live_files[0].data_file_provenance, flushed.data_file_provenance);
+  ColumnFamilyMetaData cf_meta;
+  db_->GetColumnFamilyMetaData(&cf_meta);
+  ASSERT_EQ(cf_meta.levels[0].files.size(), 1U);
+  EXPECT_EQ(cf_meta.levels[0].files[0].db_ownership_start_time,
+            flushed.db_ownership_start_time);
+  EXPECT_EQ(cf_meta.levels[0].files[0].data_file_provenance,
+            flushed.data_file_provenance);
+
+  // Flushed during WAL recovery
+  ASSERT_OK(Put("b", "1"));
+  Reopen(options);
+  const FileMetaData recovered = FileStartingWith("b").first;
+  EXPECT_GE(recovered.db_ownership_start_time, start);
+  EXPECT_EQ(recovered.db_ownership_start_time, recovered.file_creation_time);
+  EXPECT_EQ(Decode(recovered), OriginOnly(DataFileProvenance::Origin::kFlush));
+
+  // Compactions that take a long time to finish after creating their output
+  ASSERT_OK(Put("a", "2"));
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCompaction:NonTrivial:AfterRun",
+      [&](void*) { env_->MockSleepForSeconds(1000); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  // The DB has held the output since creating it
+  const FileMetaData compacted = FileStartingWith("a").first;
+  EXPECT_EQ(compacted.db_ownership_start_time, compacted.file_creation_time);
+  EXPECT_LE(compacted.db_ownership_start_time + 1000, Now());
+  EXPECT_EQ(Decode(compacted),
+            OriginOnly(DataFileProvenance::Origin::kCompaction));
+}
+
+TEST_F(DBOwnershipTest, MovesPreserveOwnership) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.level_compaction_dynamic_level_bytes = true;
+  env_->SetMockSleep();
+  CompactRangeOptions force_compact;
+  force_compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  {
+    SCOPED_TRACE("PromoteL0");
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("a", "1"));
+    ASSERT_OK(Flush());
+    const FileMetaData before = FileStartingWith("a").first;
+    env_->MockSleepForSeconds(1000);
+    ASSERT_OK(
+        experimental::PromoteL0(db_.get(), db_->DefaultColumnFamily(), 2));
+    const auto& [after, level] = FileStartingWith("a");
+    EXPECT_EQ(level, 2);
+    ExpectSameFile(before, after, kProvenanceMovedBetweenLevels);
+  }
+  {
+    SCOPED_TRACE("Trivial move");
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("a", "1"));
+    ASSERT_OK(Flush());
+    const FileMetaData before = FileStartingWith("a").first;
+    env_->MockSleepForSeconds(1000);
+    std::atomic<int> trivial_moves{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::BackgroundCompaction:TrivialMove",
+        [&](void*) { ++trivial_moves; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    EXPECT_GT(trivial_moves.load(), 0);
+    const auto& [after, level] = FileStartingWith("a");
+    EXPECT_GT(level, 0);
+    ExpectSameFile(before, after, kProvenanceMovedBetweenLevels);
+  }
+  {
+    SCOPED_TRACE("CompactRange with change_level, and reopen");
+    DestroyAndReopen(options);
+    // A compaction output that has not been moved
+    ASSERT_OK(Put("a", "1"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("a", "2"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->CompactRange(force_compact, nullptr, nullptr));
+    const auto& [before, before_level] = FileStartingWith("a");
+    ASSERT_EQ(Decode(before),
+              OriginOnly(DataFileProvenance::Origin::kCompaction));
+    ASSERT_GT(before_level, 1);
+    env_->MockSleepForSeconds(1000);
+    CompactRangeOptions refit;
+    refit.change_level = true;
+    refit.target_level = 1;
+    ASSERT_OK(db_->CompactRange(refit, nullptr, nullptr));
+    const auto& [after, level] = FileStartingWith("a");
+    EXPECT_EQ(level, 1);
+    ExpectSameFile(before, after, kProvenanceMovedBetweenLevels);
+
+    // Preserved by replaying the MANIFEST and then by the new MANIFEST written
+    // on open
+    for (int i = 0; i < 2; ++i) {
+      Reopen(options);
+      ExpectSameFile(after, FileStartingWith("a").first, 0);
+    }
+  }
+  {
+    SCOPED_TRACE("Level migration on open");
+    options.level_compaction_dynamic_level_bytes = false;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("a", "1"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("a", "2"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->CompactRange(force_compact, nullptr, nullptr));
+    const auto& [before, before_level] = FileStartingWith("a");
+    ASSERT_EQ(Decode(before),
+              OriginOnly(DataFileProvenance::Origin::kCompaction));
+    ASSERT_LT(before_level, options.num_levels - 1);
+    env_->MockSleepForSeconds(1000);
+    options.level_compaction_dynamic_level_bytes = true;
+    // Required for the migration
+    options.disable_auto_compactions = false;
+    Reopen(options);
+    const auto& [after, level] = FileStartingWith("a");
+    EXPECT_EQ(level, options.num_levels - 1);
+    ExpectSameFile(before, after, kProvenanceMovedBetweenLevels);
+  }
+}
+
+TEST_F(DBOwnershipTest, FIFOTemperatureChangeCopy) {
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleFIFO;
+  options.num_levels = 1;
+  options.max_open_files = -1;
+  options.level0_file_num_compaction_trigger = 2;
+  CompactionOptionsFIFO fifo_options;
+  fifo_options.file_temperature_age_thresholds = {{Temperature::kCold, 1000}};
+  fifo_options.max_table_files_size = 100000000;
+  fifo_options.allow_trivial_copy_when_change_temperature = true;
+  options.compaction_options_fifo = fifo_options;
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("b", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  const FileMetaData before = FileStartingWith("a").first;
+  ASSERT_NE(before.temperature, Temperature::kCold);
+
+  env_->MockSleepForSeconds(2000);
+  ASSERT_OK(Put("c", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  const FileMetaData after = FileStartingWith("a").first;
+  ASSERT_EQ(after.temperature, Temperature::kCold);
+  EXPECT_NE(after.fd.GetNumber(), before.fd.GetNumber());
+  // Same contents...
+  EXPECT_EQ(after.file_creation_time, before.file_creation_time);
+  // ...in a new file for the DB to hold
+  EXPECT_GE(after.db_ownership_start_time,
+            before.db_ownership_start_time + 2000);
+  EXPECT_EQ(after.data_file_provenance,
+            before.data_file_provenance | kProvenanceTemperatureChangedByCopy);
+}
+
+TEST_F(DBOwnershipTest, TemperatureUpdatedFromFileSystem) {
+  auto test_fs = std::make_shared<FileTemperatureTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, test_fs));
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.env = env.get();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  const FileMetaData before = FileStartingWith("a").first;
+  ASSERT_NE(before.temperature, Temperature::kCold);
+
+  test_fs->OverrideSstFileTemperature(before.fd.GetNumber(),
+                                      Temperature::kCold);
+  Close();
+  experimental::UpdateManifestForFilesStateOptions update_opts;
+  update_opts.update_temperatures = true;
+  ASSERT_OK(experimental::UpdateManifestForFilesState(
+      options, dbname_,
+      {ColumnFamilyDescriptor(kDefaultColumnFamilyName, options)},
+      update_opts));
+  Reopen(options);
+  const FileMetaData after = FileStartingWith("a").first;
+  EXPECT_EQ(after.temperature, Temperature::kCold);
+  ExpectSameFile(before, after, kProvenanceTemperatureUpdatedFromFileSystem);
+  Close();
+}
+
+TEST_F(DBOwnershipTest, Repair) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  const FileMetaData flushed = FileStartingWith("a").first;
+  // Left in the WAL, for repair to write to a table
+  ASSERT_OK(Put("b", "1"));
+  Close();
+  ASSERT_OK(RepairDB(dbname_, options));
+  Reopen(options);
+
+  // Ownership of tables from before the repair was recorded in the lost
+  // MANIFEST
+  const FileMetaData repaired = FileStartingWith("a").first;
+  // Restored from the table property, recorded when the flush finished
+  EXPECT_GE(repaired.file_creation_time, flushed.file_creation_time);
+  EXPECT_EQ(repaired.db_ownership_start_time, kUnknownDbOwnershipStartTime);
+  DataFileProvenance expected;
+  expected.recorded_by_repair = true;
+  EXPECT_EQ(Decode(repaired), expected);
+
+  const FileMetaData from_wal = FileStartingWith("b").first;
+  EXPECT_GT(from_wal.file_creation_time, 0U);
+  EXPECT_EQ(from_wal.db_ownership_start_time, from_wal.file_creation_time);
+  expected.origin = DataFileProvenance::Origin::kFlush;
+  EXPECT_EQ(Decode(from_wal), expected);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

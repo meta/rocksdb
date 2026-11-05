@@ -150,6 +150,9 @@ struct IngestedFileInfo : public KeyRangeInfo {
   FileDescriptor fd;
   // file path that we picked for file inside the DB
   std::string internal_file_path;
+  // When the file was linked, copied or written into the DB directory, i.e.
+  // when this DB began holding it (FileMetaData::db_ownership_start_time)
+  uint64_t db_ownership_start_time = kUnknownDbOwnershipStartTime;
   // Global sequence number that we picked for the file inside the DB
   SequenceNumber assigned_seqno = 0;
   // Level inside the DB we picked for the external file.
@@ -213,6 +216,41 @@ struct FileBatchInfo : public KeyRangeInfo {
   explicit FileBatchInfo(bool _track_batch_range)
       : track_batch_range(_track_batch_range) {}
 };
+
+// Determines the file_creation_time and oldest_ancestor_time to record in the
+// MANIFEST for an ingested or imported file, from the times carried by the
+// file or its import metadata (0 = unknown) and the current time `now`
+// (0 = unknown). A known carried time is kept unless it is later than `now`,
+// which suggests an unreliable clock, so it is logged as a warning and
+// replaced by `now`. An unknown file_creation_time becomes `now`, and an
+// unknown oldest ancestor time becomes the resolved file_creation_time, an
+// upper bound on when the data was written.
+void ResolveExternalFileTimes(const std::string& file_path,
+                              uint64_t carried_file_creation_time,
+                              uint64_t carried_oldest_ancestor_time,
+                              uint64_t now, Logger* info_log,
+                              uint64_t* file_creation_time,
+                              uint64_t* oldest_ancestor_time);
+
+// Implements `reject_too_old_file` (IngestExternalFileOptions and
+// ImportColumnFamilyOptions) for one file, using the file's creation time
+// carried by the file or its import metadata, and the file's table properties
+// (times of 0 = unknown). Returns InvalidArgument (and logs a warning) if, as
+// of `now`,
+// * for leveled or universal compaction, the file's contents (per
+//   `file_creation_time`) are older than periodic_compaction_seconds, or
+// * for FIFO compaction, its newest data, estimated as FIFO TTL compaction
+//   does (the newest key time table property, else the oldest ancestor time
+//   table property, else `file_creation_time`), is older than ttl.
+// `mutable_cf_options` must be sanitized (as in a SuperVersion), so that these
+// are the effective limits.
+Status CheckExternalFileNotTooOld(const std::string& file_path,
+                                  uint64_t file_creation_time,
+                                  const TableProperties& table_properties,
+                                  uint64_t now,
+                                  CompactionStyle compaction_style,
+                                  const MutableCFOptions& mutable_cf_options,
+                                  Logger* info_log);
 
 class ExternalSstFileIngestionJob {
  public:

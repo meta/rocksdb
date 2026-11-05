@@ -1725,16 +1725,8 @@ void DBImpl::PrepareTrivialMoveEdit(Compaction& c, LogBuffer* log_buffer,
     for (size_t i = 0; i < c.num_input_files(l); i++) {
       FileMetaData* f = c.input(l, i);
       c.edit()->DeleteFile(c.level(l), f->fd.GetNumber());
-      c.edit()->AddFile(
-          c.output_level(), f->fd.GetNumber(), f->fd.GetPathId(),
-          f->fd.GetFileSize(), f->smallest, f->largest, f->fd.smallest_seqno,
-          f->fd.largest_seqno, f->marked_for_compaction, f->temperature,
-          f->oldest_blob_file_number, f->oldest_ancestor_time,
-          f->file_creation_time, f->epoch_number, f->file_checksum,
-          f->file_checksum_func_name, f->unique_id,
-          f->compensated_range_deletion_size, f->tail_size,
-          f->user_defined_timestamps_persisted, f->min_timestamp,
-          f->max_timestamp, f->file_open_metadata);
+      c.edit()->AddExistingFile(c.output_level(), *f,
+                                kProvenanceMovedBetweenLevels);
       moved_bytes += static_cast<size_t>(c.input(l, i)->fd.GetFileSize());
       ROCKS_LOG_BUFFER(
           log_buffer, "[%s] Moved #%" PRIu64 " to level-%d %" PRIu64 " bytes\n",
@@ -2315,15 +2307,7 @@ Status DBImpl::ReFitLevel(ColumnFamilyData* cfd, int level, int target_level) {
 
     for (const auto& f : vstorage->LevelFiles(level)) {
       edit.DeleteFile(level, f->fd.GetNumber());
-      edit.AddFile(
-          to_level, f->fd.GetNumber(), f->fd.GetPathId(), f->fd.GetFileSize(),
-          f->smallest, f->largest, f->fd.smallest_seqno, f->fd.largest_seqno,
-          f->marked_for_compaction, f->temperature, f->oldest_blob_file_number,
-          f->oldest_ancestor_time, f->file_creation_time, f->epoch_number,
-          f->file_checksum, f->file_checksum_func_name, f->unique_id,
-          f->compensated_range_deletion_size, f->tail_size,
-          f->user_defined_timestamps_persisted, f->min_timestamp,
-          f->max_timestamp, f->file_open_metadata);
+      edit.AddExistingFile(to_level, *f, kProvenanceMovedBetweenLevels);
     }
     ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
                     "[%s] Apply version edit:\n%s", cfd->GetName().c_str(),
@@ -4075,7 +4059,9 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
                        c->column_family_data()->GetName().c_str(),
                        get_time_status.ToString().c_str());
     }
-    uint64_t out_file_creation_time = static_cast<uint64_t>(tmp_current_time);
+    // The copy is a new file for this DB to hold, but has the same contents
+    // (and file_creation_time) as the input
+    uint64_t copy_time = static_cast<uint64_t>(tmp_current_time);
 
     FileOptions copied_file_options = file_options_;
     copied_file_options.temperature = c->GetOutputTemperature();
@@ -4196,7 +4182,7 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
                                    c->GetOutputTemperature() /* temperature */,
                                    in_file->oldest_blob_file_number,
                                    in_file->oldest_ancestor_time,
-                                   out_file_creation_time,
+                                   in_file->file_creation_time,
                                    c->MinInputFileEpochNumber(),
                                    dest_writer->GetFileChecksum(),
                                    dest_writer->GetFileChecksumFuncName(),
@@ -4206,6 +4192,9 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
                                    in_file->user_defined_timestamps_persisted,
                                    in_file->min_timestamp,
                                    in_file->max_timestamp};
+    out_file_metadata.db_ownership_start_time = copy_time;
+    out_file_metadata.data_file_provenance =
+        in_file->data_file_provenance | kProvenanceTemperatureChangedByCopy;
 
     if (out_table_properties) {
       c->SetOutputTableProperties(out_fname, out_table_properties);

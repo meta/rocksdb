@@ -11629,6 +11629,16 @@ int rocksdb_ingestexternalfileoptions_get_file_opening_threads(
   return opt->rep.file_opening_threads;
 }
 
+void rocksdb_ingestexternalfileoptions_set_reject_too_old_file(
+    rocksdb_ingestexternalfileoptions_t* opt, unsigned char v) {
+  opt->rep.reject_too_old_file = v;
+}
+
+unsigned char rocksdb_ingestexternalfileoptions_get_reject_too_old_file(
+    rocksdb_ingestexternalfileoptions_t* opt) {
+  return opt->rep.reject_too_old_file;
+}
+
 /* OpenAndCompactOptions */
 
 void rocksdb_open_and_compact_options_set_max_secondary_open_retries(
@@ -11651,6 +11661,16 @@ unsigned char rocksdb_open_and_compact_options_get_allow_resumption(
 unsigned char rocksdb_import_column_family_options_get_move_files(
     rocksdb_import_column_family_options_t* opt) {
   return opt->rep.move_files;
+}
+
+void rocksdb_import_column_family_options_set_reject_too_old_file(
+    rocksdb_import_column_family_options_t* opt, unsigned char v) {
+  opt->rep.reject_too_old_file = v;
+}
+
+unsigned char rocksdb_import_column_family_options_get_reject_too_old_file(
+    rocksdb_import_column_family_options_t* opt) {
+  return opt->rep.reject_too_old_file;
 }
 
 /* SizeApproximationOptions */

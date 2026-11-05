@@ -25,9 +25,96 @@
 #include "table/table_builder.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
+#include "util/cast_util.h"
 #include "util/udt_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+uint64_t ResolveExternalFileTime(const std::string& file_path,
+                                 const char* time_name, uint64_t carried_time,
+                                 uint64_t now, Logger* info_log) {
+  if (carried_time == 0) {
+    return now;
+  }
+  if (now != 0 && carried_time > now) {
+    ROCKS_LOG_WARN(info_log,
+                   "External file %s has %s %" PRIu64
+                   " later than current time %" PRIu64 "; using current time",
+                   file_path.c_str(), time_name, carried_time, now);
+    return now;
+  }
+  return carried_time;
+}
+}  // namespace
+
+void ResolveExternalFileTimes(const std::string& file_path,
+                              uint64_t carried_file_creation_time,
+                              uint64_t carried_oldest_ancestor_time,
+                              uint64_t now, Logger* info_log,
+                              uint64_t* file_creation_time,
+                              uint64_t* oldest_ancestor_time) {
+  *file_creation_time =
+      ResolveExternalFileTime(file_path, "file_creation_time",
+                              carried_file_creation_time, now, info_log);
+  if (carried_oldest_ancestor_time == kUnknownOldestAncestorTime) {
+    *oldest_ancestor_time = *file_creation_time;
+  } else {
+    *oldest_ancestor_time =
+        ResolveExternalFileTime(file_path, "oldest ancestor time",
+                                carried_oldest_ancestor_time, now, info_log);
+  }
+}
+
+Status CheckExternalFileNotTooOld(const std::string& file_path,
+                                  uint64_t file_creation_time,
+                                  const TableProperties& table_properties,
+                                  uint64_t now,
+                                  CompactionStyle compaction_style,
+                                  const MutableCFOptions& mutable_cf_options,
+                                  Logger* info_log) {
+  const char* limit_name;
+  uint64_t max_age;
+  const char* judged_time_name = "file_creation_time";
+  uint64_t judged_time = file_creation_time;
+  switch (compaction_style) {
+    case kCompactionStyleLevel:
+    case kCompactionStyleUniversal:
+      limit_name = "periodic_compaction_seconds";
+      max_age = mutable_cf_options.periodic_compaction_seconds;
+      break;
+    case kCompactionStyleFIFO:
+      limit_name = "ttl";
+      max_age = mutable_cf_options.ttl;
+      // Estimate when the newest data was written, as FIFO TTL compaction
+      // does (FIFOCompactionPicker::PickTTLCompaction()), so that a file it
+      // would treat as expired is rejected
+      if (table_properties.newest_key_time != kUnknownNewestKeyTime) {
+        judged_time_name = "newest_key_time";
+        judged_time = table_properties.newest_key_time;
+      } else if (table_properties.oldest_ancestor_time !=
+                 kUnknownOldestAncestorTime) {
+        judged_time_name = "oldest_ancestor_time";
+        judged_time = table_properties.oldest_ancestor_time;
+      }
+      break;
+    default:
+      return Status::OK();
+  }
+  if (judged_time == 0 || judged_time >= now) {
+    return Status::OK();
+  }
+  const uint64_t age = now - judged_time;
+  if (max_age == 0 || age <= max_age) {
+    return Status::OK();
+  }
+  std::string msg =
+      "External file " + file_path + " is too old: " + judged_time_name +
+      " is " + std::to_string(age) + " seconds ago, exceeding " + limit_name +
+      "=" + std::to_string(max_age) + " (reject_too_old_file)";
+  ROCKS_LOG_WARN(info_log, "%s", msg.c_str());
+  return Status::InvalidArgument(msg);
+}
 
 bool ExternalSstFileIngestionJob::SupportsAtomicReplaceRangeTombstone() const {
   return cfd_->is_delete_range_supported() &&
@@ -123,6 +210,11 @@ Status ExternalSstFileIngestionJob::PrepareAtomicReplaceRangeTombstone(
   }
 
   tombstone.internal_file_path = file_path;
+  // Written by this job directly into the DB directory
+  int64_t now = 0;
+  if (clock_->GetCurrentTime(&now).ok()) {
+    tombstone.db_ownership_start_time = lossless_cast<uint64_t>(now);
+  }
   tombstone.copy_file = true;
   tombstone.generated_for_ingestion = true;
   tombstone.file_checksum = external_file_info.file_checksum;
@@ -196,6 +288,21 @@ Status ExternalSstFileIngestionJob::Prepare(
     if (!file_to_ingest.smallest_internal_key.Valid() ||
         !file_to_ingest.largest_internal_key.Valid()) {
       return Status::Corruption("Generated table have corrupted keys");
+    }
+
+    if (ingestion_options_.reject_too_old_file) {
+      int64_t now = 0;
+      if (!clock_->GetCurrentTime(&now).ok()) {
+        now = 0;
+      }
+      status = CheckExternalFileNotTooOld(
+          file_path, file_to_ingest.table_properties.file_creation_time,
+          file_to_ingest.table_properties, lossless_cast<uint64_t>(now),
+          cfd_->ioptions().compaction_style, sv->mutable_cf_options,
+          db_options_.info_log.get());
+      if (!status.ok()) {
+        return status;
+      }
     }
 
     files_to_ingest_.emplace_back(std::move(file_to_ingest));
@@ -353,6 +460,10 @@ Status ExternalSstFileIngestionJob::Prepare(
       break;
     }
     f.internal_file_path = path_inside_db;
+    int64_t now = 0;
+    if (clock_->GetCurrentTime(&now).ok()) {
+      f.db_ownership_start_time = lossless_cast<uint64_t>(now);
+    }
     // Initialize the checksum information of ingested files.
     f.file_checksum = kUnknownFileChecksum;
     f.file_checksum_func_name = kUnknownFileChecksumFuncName;
@@ -863,15 +974,17 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
     }
     max_assigned_seqno_ = std::max(max_assigned_seqno_, assigned_seqno);
 
-    // We use the import time as the ancestor time. This is the time the data
-    // is written to the database.
     int64_t temp_current_time = 0;
-    uint64_t current_time = kUnknownFileCreationTime;
-    uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
+    uint64_t current_time = 0;
     if (clock_->GetCurrentTime(&temp_current_time).ok()) {
-      current_time = oldest_ancestor_time =
-          static_cast<uint64_t>(temp_current_time);
+      current_time = static_cast<uint64_t>(temp_current_time);
     }
+    uint64_t file_creation_time = kUnknownFileCreationTime;
+    uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
+    ResolveExternalFileTimes(
+        file->external_file_path, file->table_properties.file_creation_time,
+        file->table_properties.oldest_ancestor_time, current_time,
+        db_options_.info_log.get(), &file_creation_time, &oldest_ancestor_time);
     uint64_t tail_size = FileMetaData::CalculateTailSize(
         file->fd.GetFileSize(), file->table_properties);
 
@@ -893,7 +1006,7 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
         file->fd.GetNumber(), file->fd.GetPathId(), file->fd.GetFileSize(),
         file->smallest_internal_key, file->largest_internal_key, smallest_seqno,
         largest_seqno, false, file->file_temperature, kInvalidBlobFileNumber,
-        oldest_ancestor_time, current_time,
+        oldest_ancestor_time, file_creation_time,
         ingestion_options_.ingest_behind
             ? kReservedEpochNumberForFileIngestedBehind
             : cfd_->NewEpochNumber(),  // orders files ingested to L0
@@ -901,6 +1014,9 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
         tail_size, file->user_defined_timestamps_persisted, "", "");
     f_metadata.temperature = file->file_temperature;
     f_metadata.marked_for_compaction = marked_for_compaction;
+    f_metadata.db_ownership_start_time = file->db_ownership_start_time;
+    f_metadata.data_file_provenance =
+        DataFileProvenanceForOrigin(DataFileProvenance::Origin::kIngestion);
     f_metadata.skip_index_and_filter_blocks_prefetch =
         !file->prefetch_lmax_index_and_filter_blocks &&
         file->picked_level == cfd_->NumberLevels() - 1;
