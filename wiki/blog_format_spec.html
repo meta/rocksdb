@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Blog File Format Specification - RocksDB</title>
+<style>
+  body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 960px; margin: 40px auto; padding: 0 20px; color: #222; line-height: 1.6; }
+  h1 { border-bottom: 3px solid #333; padding-bottom: 8px; }
+  h2 { border-bottom: 2px solid #999; padding-bottom: 4px; margin-top: 40px; }
+  h3 { margin-top: 30px; }
+  pre { background: #f4f4f4; border: 1px solid #ddd; border-radius: 4px; padding: 12px 16px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+  code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #bbb; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #e8e8e8; font-weight: 600; }
+  .diagram { background: #fafafa; border: 1px solid #ccc; border-radius: 4px; padding: 16px; margin: 16px 0; font-family: 'Courier New', monospace; font-size: 13px; white-space: pre; overflow-x: auto; line-height: 1.4; }
+  .note { background: #fff8e1; border-left: 4px solid #ffc107; padding: 10px 14px; margin: 14px 0; }
+  .decision { background: #e8f5e9; border-left: 4px solid #4caf50; padding: 10px 14px; margin: 14px 0; }
+</style>
+</head>
+<body>
+
+<h1>"Blog" File Format Specification</h1>
+<p><em>A unified file format for WAL, Blob, and related data in RocksDB</em></p>
+<p>Status: Implementation in progress &nbsp;|&nbsp; Format name: "blog" (portmanteau of "blob" + "log")</p>
+
+<!-- ======================================================================= -->
+<h2>Vocabulary</h2>
+
+<table>
+<tr><th>Term</th><th>Scope</th><th>Definition</th></tr>
+<tr><td><strong>Record</strong></td><td>Blog file</td><td>A top-level unit in the blog file body: blob record, WriteBatch record, preamble-start record, footer record.</td></tr>
+<tr><td><strong>Operation (op)</strong></td><td>WriteBatch</td><td>An entry within a WriteBatch: Put op, Delete op, Merge op, etc.</td></tr>
+<tr><td><strong>Prefix varint</strong></td><td>Encoding</td><td>Little-endian, low-bit-prefix varint (same as LLVM/MLIR PrefixVarInt). Length determined from first byte's trailing zero count. See <code>util/prefix_varint.h</code>.</td></tr>
+<tr><td><strong>Trivial format</strong></td><td>Record</td><td>A record with prefix varint length value 0. No payload; includes type byte and checksum.</td></tr>
+<tr><td><strong>Compact format</strong></td><td>Record</td><td>A record with prefix varint length value 1&ndash;16383 (1&ndash;2 bytes). Omits the type byte (type from header).</td></tr>
+<tr><td><strong>Full format</strong></td><td>Record</td><td>A record with prefix varint length &ge; 3 bytes. Includes explicit type, pre-payload compression type, and prefix checksum.</td></tr>
+</table>
+
+<!-- ======================================================================= -->
+<h2 id="s1">File-Level Structure</h2>
+
+<p>A blog file consists of three regions: a <strong>fixed header</strong> with a <strong>property section</strong>, a <strong>body</strong> of records, and an optional <strong>footer</strong> composed of footer records.</p>
+
+<div class="diagram">
++---------------------------------------------------------------------+
+|                         FILE HEADER (40 bytes fixed)                 |
+|  96-bit magic, schema version, checksum type, compact record type,  |
+|  flags, escape sequence, reserved, property section size, checksum  |
++---------------------------------------------------------------------+
+|                    HEADER PROPERTY SECTION                           |
+|  Named key-value pairs + 5-byte trailer (compression + checksum)    |
+|  Followed by arbitrarily long padding (0x00 or 0xFF)                |
++---------------------------------------------------------------------+
+|                         FILE BODY                                    |
+|  Sequence of records, each starting with the escape sequence.       |
+|  Record types: blob, WriteBatch, preamble-start, footer records.    |
++---------------------------------------------------------------------+
+|                    FILE FOOTER (optional)                            |
+|  Footer index records (0xF0), footer properties record (0xF8),      |
+|  file checksum info (0xFC, placeholder), locator (0xFF) last.       |
++---------------------------------------------------------------------+</div>
+
+<h3>Fixed Header (40 bytes)</h3>
+
+<table>
+<tr><th>Offset</th><th>Size</th><th>Field</th></tr>
+<tr><td>0</td><td>12</td><td>File magic: <code>kBlogFileMagic</code> -- opaque 12 bytes ("Blog" ASCII + XXH3_64bits("Blog"))</td></tr>
+<tr><td>12</td><td>1</td><td>Schema version (currently 1). Newer versions are rejected by older readers. Value 0 is reserved outside the file format to denote legacy blob files in MANIFEST metadata.</td></tr>
+<tr><td>13</td><td>1</td><td>Checksum type (<code>ChecksumType</code> enum: 0=none, 1=CRC32c, 4=XXH3). Configured via <code>DBOptions::blog_checksum</code>.</td></tr>
+<tr><td>14</td><td>1</td><td>Compact record type (<code>BlogRecordType</code> -- type for all compact-format records)</td></tr>
+<tr><td>15</td><td>1</td><td>Flags: bit 0 = <code>kBlogFileRecycled</code> (file may contain trailing stale data)</td></tr>
+<tr><td>16</td><td>10</td><td>Escape sequence: bytes [0-5] random (byte[0] not 0x00/0xFF), bytes [6-9] = lower32(XXH3_64bits_withSeed(bytes[0-5], kBlogEscapeSeqSeed)). First 4 bytes also serve as incarnation ID (little-endian via DecodeFixed32).</td></tr>
+<tr><td>26</td><td>6</td><td>Reserved (zero)</td></tr>
+<tr><td>32</td><td>4</td><td>Property section size (uint32 LE) -- includes 5-byte trailer</td></tr>
+<tr><td>36</td><td>4</td><td>Fixed header checksum -- covers bytes [0, 36)</td></tr>
+</table>
+
+<h3>Header Property Section</h3>
+
+<p>Immediately follows the fixed header. Contains only <strong>required (uppercase) named properties</strong> that the reader must recognize or reject the file. Ignorable (lowercase) properties are stored in separate <a href="#s-ign-props">ignorable properties records</a> in the body. Encoded as:</p>
+<pre>[name_len: prefix_varint32] [name: name_len bytes] [value_len: prefix_varint32] [value: value_len bytes] ...</pre>
+<p>Followed by a 5-byte trailer: <code>[compression_type: 1B][checksum: 4B]</code> (same as block-based table). The checksum covers the property data + compression_type, with a context checksum modifier using the incarnation ID at offset <code>kBlogFileFixedHeaderSize</code>. The section may be empty (trailer only) when no required properties are set.</p>
+
+<p>After the property section, arbitrarily long padding (0x00 or 0xFF, differing from the last meaningful byte) aligns the first record's escape sequence. This supports stronger alignment requirements (flush/sync boundaries) or recycling files of all zeros.</p>
+
+<h3>Property Name Convention</h3>
+<table>
+<tr><th>First letter</th><th>Meaning</th></tr>
+<tr><td>Uppercase (e.g. <code>"CompressionCompatibilityName"</code>)</td><td><strong>Required</strong> -- reader must recognize or reject the file</td></tr>
+<tr><td>Lowercase (e.g. <code>"role"</code>)</td><td><strong>Ignorable</strong> -- reader may skip unrecognized properties</td></tr>
+</table>
+
+<h3>Known Required Header Properties (uppercase, in header property section)</h3>
+<table>
+<tr><th>Name</th><th>When present</th><th>Description</th></tr>
+<tr><td><code>"CompressionCompatibilityName"</code></td><td>If any compression</td><td>Compression manager compatibility name (e.g. <code>"BuiltinV2"</code>)</td></tr>
+<tr><td><code>"WriteBatchStreamingCompressionType"</code></td><td>If streaming active</td><td>2-digit hex of CompressionType for streaming WriteBatch compression (e.g. "07" for ZSTD). Presence means WriteBatch records with <code>kStreamingCompressionSentinel</code> (0x7F) trailer are part of a cross-record streaming context.</td></tr>
+<tr><td><code>"TimestampSize"</code></td><td>If &gt;0</td><td>Size of user timestamps</td></tr>
+<tr><td><code>"PredecessorWalInfo"</code></td><td>If tracking</td><td>Predecessor WAL metadata for verification</td></tr>
+</table>
+
+<h3>Known Ignorable Properties (lowercase, in <code>kBlogIgnorablePropertiesRecord</code>)</h3>
+<table>
+<tr><th>Name</th><th>Description</th></tr>
+<tr><td><code>"role"</code></td><td>File purpose hint: <code>"wal"</code>, <code>"blob"</code>, <code>"manifest"</code>, <code>"rlog"</code></td></tr>
+<tr><td><code>"dbId"</code></td><td>Database identity string</td></tr>
+<tr><td><code>"dbSessionId"</code></td><td>Session identity of the writer</td></tr>
+<tr><td><code>"fileNumber"</code></td><td>File number within the DB</td></tr>
+<tr><td><code>"dbHostId"</code></td><td>Hostname of the writing machine</td></tr>
+<tr><td><code>"columnFamilyId"</code></td><td>Column family ID (omitted for DB-wide files)</td></tr>
+<tr><td><code>"columnFamilyName"</code></td><td>Column family name (omitted for DB-wide files)</td></tr>
+<tr><td><code>"creationTime"</code></td><td>Unix timestamp of file creation (or re-open)</td></tr>
+<tr><td><code>"creator"</code></td><td>RocksDB version string of the writer</td></tr>
+<tr><td><code>"compressionSettings"</code></td><td>Human-readable compression settings for debugging</td></tr>
+</table>
+
+<!-- ======================================================================= -->
+<h2 id="s2">Escape Sequences</h2>
+
+<div class="decision">
+<strong>Decision:</strong> 10-byte escape sequence: 6 random bytes + 4 derived bytes. First byte not 0x00 nor 0xFF (distinguishable from padding). Bytes [6-9] = lower32(XXH3_64bits_withSeed(bytes[0-5], kBlogEscapeSeqSeed)), enabling heuristic detection without knowing the header.
+</div>
+
+<p>Escape sequences must be <strong>32-bit aligned</strong> in the file. The first 4 bytes (little-endian) serve as the <strong>incarnation ID</strong> for context checksums.</p>
+
+<h3>Primary Roles</h3>
+<ul>
+  <li><strong>WAL recycling detection:</strong> When recovery encounters undecodable data, scan for our escape sequence. If not found, the data is stale/recycled (different random sequence). The <code>kBlogFileRecycled</code> flag in the header indicates recycling is expected.</li>
+  <li><strong>Non-linear recovery:</strong> After corruption, scan forward for the next escape sequence to resume recovery (<code>kSkipAnyCorruptedRecords</code>).</li>
+  <li><strong>Record boundary discovery:</strong> Find record boundaries from any file position.</li>
+</ul>
+
+<!-- ======================================================================= -->
+<h2 id="s3">Record Types and Formats</h2>
+
+<h3>Record Type Values</h3>
+<table>
+<tr><th>Value</th><th>Name</th><th>Usage</th></tr>
+<tr><td colspan="3"><em>Blog meta records (0x01-0x0F)</em></td></tr>
+<tr><td>0x01</td><td><code>kBlogIgnorablePropertiesRecord</code></td><td>Ignorable named properties (diagnostic/debugging data). May appear multiple times.</td></tr>
+<tr><td>0x02-0x0F</td><td></td><td><em>Reserved for future blog meta record types</em></td></tr>
+<tr><td colspan="3"><em>Body record types (0x10-0x7F)</em></td></tr>
+<tr><td>0x10</td><td><code>kBlogBlobRecord</code></td><td>Blob data (typically a separated value)</td></tr>
+<tr><td>0x11</td><td><code>kBlogPreambleStartRecord</code></td><td>Preamble marker (stub)</td></tr>
+<tr><td>0x12</td><td><code>kBlogWriteBatchRecord</code></td><td>Serialized WriteBatch</td></tr>
+<tr><td>0x13</td><td><code>kBlogManifestRecord</code></td><td>Manifest (version edit) record (placeholder)</td></tr>
+<tr><td>0x14-0x7F</td><td></td><td><em>Reserved for future body record types</em></td></tr>
+<tr><td colspan="3"><em>Footer record types (0xF0-0xFF, in expected order of occurrence with gaps)</em></td></tr>
+<tr><td>0xF0</td><td><code>kBlogFooterIndexRecord</code></td><td>Large footer metadata (sparse index)</td></tr>
+<tr><td>0xF1-0xF3</td><td></td><td><em>Reserved for future footer data records</em></td></tr>
+<tr><td>0xF4-0xF7</td><td></td><td><em>Reserved for future footer data records</em></td></tr>
+<tr><td>0xF8</td><td><code>kBlogFooterPropertiesRecord</code></td><td>Small footer metadata (named properties)</td></tr>
+<tr><td>0xF9-0xFB</td><td></td><td><em>Reserved</em></td></tr>
+<tr><td>0xFC</td><td><code>kBlogFooterFileChecksumInfo</code></td><td>Full file checksum state dump. Allows inferring the file checksum from just reading the tail. Placeholder for future use.</td></tr>
+<tr><td>0xFD-0xFE</td><td></td><td><em>Reserved</em></td></tr>
+<tr><td>0xFF</td><td><code>kBlogFooterLocatorRecord</code></td><td>Footer locator with relative offsets. Must be the last record in the file.</td></tr>
+</table>
+
+<h3>Format Selection</h3>
+<p>The record format is determined by the prefix-varint-encoded length field:</p>
+<ul>
+  <li><strong>Value 0</strong> (1 byte): Trivial format (no payload).</li>
+  <li><strong>Values 1&ndash;16383</strong> (1&ndash;2 bytes): Compact format.</li>
+  <li><strong>3+ byte prefix varint</strong>: Full format. Includes type, pre-payload compression type, and prefix checksum.</li>
+  <li><strong>length = 2<sup>63</sup> &minus; 1</strong>: Unspecified size (full format). Reader scans forward for next escape sequence.</li>
+</ul>
+
+<h3>Trivial Record Format (prefix varint value 0)</h3>
+<div class="diagram">
+[escape_seq: 10B] [prefix_varint(0): 1B] [type: 1B] [checksum: 4B]
+  [padding: 0+ B]</div>
+<p>For records with no payload (e.g. preamble-start). The <code>checksum</code> covers (prefix_varint + type), with a context checksum modifier. No compression type byte since there is no payload to compress.</p>
+
+<h3>Compact Record Format (prefix varint 1&ndash;2 bytes, values 1&ndash;16383)</h3>
+<div class="diagram">
+[escape_seq: 10B] [prefix_varint length: 1-2B]
+  [payload: length bytes]
+  [compression_type: 1B] [checksum: 4B]
+  [padding: 0+ B]</div>
+<p>No type byte &mdash; type comes from the header's <code>compact_record_type</code> field. Used for payloads &lt; 16 KiB. The compact format has no separate length checksum; the <code>checksum</code> in the trailer covers the payload and <code>compression_type</code> byte with a context modifier derived from the record's file offset and incarnation ID. An incorrect length field will cause the checksum to fail because the payload bytes fed to the checksum will be wrong. Adding a type byte to the compact format would require including it in the checksum computation (or modifying the escape sequence) to maintain integrity.</p>
+
+<h3>Full Record Format (prefix varint &ge; 3 bytes)</h3>
+<div class="diagram">
+[escape_seq: 10B] [prefix_varint length: 3+B] [type: 1B] [compression_type: 1B]
+  [prefix_checksum: 4B]
+  [payload: length bytes]
+  [compression_type: 1B] [checksum: 4B]
+  [padding: 0+ B]</div>
+<p>The <code>prefix_checksum</code> covers (prefix_varint + type + compression_type), with a context checksum modifier for defense-in-depth. Validates the length before attempting a potentially large read. The pre-payload <code>compression_type</code> enables streaming decompression without seeking to the trailer.</p>
+
+<p>Records that don't match the compact_record_type (e.g. footer records) always use full format by encoding the prefix varint with &ge; 3 bytes (irregular encoding), but length 0 is disallowed and must use the trivial record format.</p>
+
+<p>All checksums in blog files (fixed header, property section trailer, record prefix, record trailer) use context checksum modifiers incorporating the incarnation ID, providing defense-in-depth for misplaced data detection even with <code>kNoChecksum</code>.</p>
+
+<!-- ======================================================================= -->
+<h2 id="s4">Compression</h2>
+
+<h3>Per-Record Compression</h3>
+<p>Each record's trailer <code>compression_type</code> byte indicates the compression algorithm used for that record's payload. The actual type comes from <code>Compressor::CompressBlock</code> output, not the configured type. This is the same approach used by SST block-based table builders.</p>
+
+<h3>Streaming Compression (WriteBatch records only)</h3>
+<p>When the header property <code>WriteBatchStreamingCompressionType</code> is set, WriteBatch record payloads may use streaming compression across records. Such records use <code>kStreamingCompressionSentinel</code> (0x7F) as their trailer's compression_type byte, indicating "compressed using the streaming algorithm declared in the header."</p>
+
+<p>A record with <code>kNoCompression</code> (0x00) in the trailer remains individually uncompressed even when streaming is active, enabling dynamic on/off switching based on compression effectiveness.</p>
+
+<p>Non-WriteBatch records (blob records, footer records) are always outside the streaming context and use per-record compression, keeping blob data randomly readable.</p>
+
+<div class="note">
+Currently only ZSTD is supported for streaming compression. The <code>WriteBatchStreamingCompressionType</code> property is required (uppercase first letter), so older readers that don't understand it will reject the file rather than misinterpret streaming-compressed payloads.
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="s5">Padding Scheme</h2>
+
+<p>Padding fills the gap between a record's trailer (or the header property section) and the next escape sequence. The padding byte value is chosen to <strong>differ from the last meaningful byte</strong>, enabling unambiguous scanning.</p>
+
+<table>
+<tr><th>Last meaningful byte</th><th>Pad with</th><th>Mandatory?</th></tr>
+<tr><td><code>0x00</code></td><td><code>0xFF</code></td><td>Yes -- at least 1 byte required</td></tr>
+<tr><td><code>0xFF</code></td><td><code>0x00</code></td><td>Yes -- at least 1 byte required</td></tr>
+<tr><td>Anything else</td><td><code>0x00</code> preferred; <code>0xFF</code> also legal</td><td>Only if needed for alignment</td></tr>
+</table>
+
+<p>Padding may be arbitrarily long for stronger alignment requirements (for example, rounding up to 512-byte or 4 KiB flush/sync-friendly boundaries) or for recycling a file of all zeros. The reader skips padding by scanning forward over 0x00/0xFF bytes in 4-byte-aligned chunks until finding a byte that is neither, which is the first byte of the next escape sequence (guaranteed to be neither 0x00 nor 0xFF).</p>
+
+<!-- ======================================================================= -->
+<h2 id="s6">Context Checksums</h2>
+
+<div class="decision">
+<strong>Decision (adopted from SST format_version=6):</strong> Each record's checksum incorporates a 32-bit <strong>incarnation ID</strong> (first 4 bytes of the escape sequence). Uses <code>ChecksumModifierForContext(incarnation_id, record_offset)</code> -- the same mechanism as block-based SST files.
+</div>
+
+<p>Context checksums provide defense-in-depth for recycling detection and general data integrity verification with zero per-record overhead.</p>
+
+<p>The checksum type is configured via <code>DBOptions::blog_checksum</code>. The same option is intended to govern blog-format internal checksums across file roles.</p>
+
+<!-- ======================================================================= -->
+<h2 id="s7">Footer</h2>
+
+<p>The footer is composed of <strong>regular records</strong> using the full record format, maintaining simple forward parsability. A file is cleanly sealed when a valid footer locator record is the last record. Footer records appear in the order listed below.</p>
+
+<ol>
+  <li><strong>Footer index records</strong> (0xF0): Large metadata like sparse indexes for range queries. Zero or more per file.</li>
+  <li><strong>Footer properties record</strong> (0xF8): Named properties (same encoding as header properties, but the full record format's own trailer provides integrity). At most one per file.</li>
+  <li><strong>Footer file checksum info</strong> (0xFC): Placeholder for future use. Would contain a dump of the full file checksum state, allowing the file checksum to be inferred from just reading the tail of the file.</li>
+  <li><strong>Footer locator record</strong> (0xFF): Must be the <strong>last record</strong>. Contains relative offsets (in 4-byte units) to other footer records, sequential relative to each other in reverse order.</li>
+</ol>
+
+<h3>Footer Locator Payload</h3>
+<pre>[record_type: 1B] [relative_offset_in_4B_units: uint32 LE] ...</pre>
+<p>First entry: distance from locator's escape_seq backward to the preceding footer record. Subsequent: from the previous entry backward to the next.</p>
+
+<h3>Known Footer Properties</h3>
+
+<p>All blob-related footer properties start with <code>"blob"</code> and are only emitted when the file contains blob records. The <code>"compressionTypes"</code> property is file-level (not blob-specific).</p>
+
+<table>
+<tr><th>Name</th><th>When emitted</th><th>Description</th></tr>
+<tr><td><code>"blobCount"</code></td><td>blob count &gt; 0</td><td>Number of blob records in the file</td></tr>
+<tr><td><code>"blobPayloadBytes"</code></td><td>blob count &gt; 0</td><td>Total on-disk payload bytes across all blob records (compressed where applicable). Blobs not compressed contribute their uncompressed size here.</td></tr>
+<tr><td><code>"blobCompressedBytes"</code></td><td>any blob compressed</td><td>Total compressed payload bytes for blobs that were actually compressed (compression_type &ne; kNoCompression). Together with <code>"blobUncompressedBytes"</code>, enables computing the compression ratio for compressed blobs only.</td></tr>
+<tr><td><code>"blobUncompressedBytes"</code></td><td>any blob compressed</td><td>Total original (pre-compression) payload bytes for the same blobs counted by <code>"blobCompressedBytes"</code>.</td></tr>
+<tr><td><code>"blobOverheadBytes"</code></td><td>blob count &gt; 0</td><td>Total record framing bytes across all blob records (escape sequence, prefix varint, trailer, padding). Excludes payload bytes.</td></tr>
+<tr><td><code>"compressionTypes"</code></td><td>any record compressed</td><td>Set of CompressionType values used across all records in the file (excluding kNoCompression and kStreamingCompressionSentinel). Encoded as sorted raw bytes. Used on the read side to create an optimized decompressor.</td></tr>
+<tr><td><code>"minSequence"</code></td><td>WAL files</td><td>Minimum sequence number in the file</td></tr>
+<tr><td><code>"maxSequence"</code></td><td>WAL files</td><td>Maximum sequence number in the file</td></tr>
+</table>
+
+<p>Derivable stats:</p>
+<ul>
+  <li>Compression ratio (compressed blobs): <code>blobCompressedBytes / blobUncompressedBytes</code></li>
+  <li>Uncompressed blob payload bytes: <code>blobPayloadBytes &minus; blobCompressedBytes</code></li>
+  <li>Total blob file bytes (approximate): <code>blobPayloadBytes + blobOverheadBytes + header + footer</code></li>
+</ul>
+<p>Exact physical file size, when known, is tracked separately in blob MANIFEST metadata.</p>
+
+<!-- ======================================================================= -->
+<h2 id="s7a">Blob MANIFEST Metadata</h2>
+
+<p>Blob files are tracked in MANIFEST via <code>BlobFileAddition</code> records. In addition to the long-standing blob count/byte totals and file checksum fields, the current blob implementation persists the following per-file metadata for format-aware accounting and verification.</p>
+
+<table>
+<tr><th>Field</th><th>Encoding / When Present</th><th>Purpose</th></tr>
+<tr><td><code>physical_blob_file_size</code></td><td>Forward-compatible custom field. Varint64 actual file size. Emitted when known for both legacy and blog blob files.</td><td>Provides an exact physical size for verification and accounting. This avoids relying on format-specific estimates from <code>total_blob_bytes</code> plus hard-coded header/footer constants.</td></tr>
+<tr><td><code>format descriptor</code></td><td>Forward-incompatible custom field. Emitted only for non-legacy blog blob files. Payload: <code>[schema_version: 1B][file_identity: 10B]</code>.</td><td>Makes the blob file format explicit on a per-file basis and ensures older readers fail fast rather than silently misinterpreting a blog blob file.</td></tr>
+<tr><td><code>schema_version</code></td><td>Stored inside the format descriptor. Manifest value <code>0</code> is reserved to mean legacy blob log format by omission of the descriptor. Current blog blob files use schema version <code>1</code>.</td><td>Determines how blob bytes are interpreted for mixed legacy/blog deployments and future schema evolution.</td></tr>
+<tr><td><code>file_identity</code></td><td>Stored inside the format descriptor. Exactly the blog file header's 10-byte escape sequence.</td><td>Provides a cheap but precise check that the MANIFEST entry refers to the same physical blob file that is being opened.</td></tr>
+</table>
+
+<p>On open, RocksDB verifies this metadata against the actual blob file: physical size, legacy-vs-blog format, blog schema version, and file identity must all match.</p>
+
+<p>Motivation:</p>
+<ul>
+  <li>Mixed legacy/blog blob files can coexist in one DB across option flips or upgrades, so format interpretation must be per-file rather than inferred from a DB-wide setting.</li>
+  <li><code>total_blob_bytes</code> intentionally tracks blob payload plus record framing, not an exact file length. Persisting the physical file size removes avoidable approximation error from header/footer differences.</li>
+  <li>Using the escape sequence as MANIFEST-side file identity catches stale or mismatched files early during recovery and verification without inventing a second file-identity mechanism.</li>
+</ul>
+
+<!-- ======================================================================= -->
+<h2 id="s8">WAL Recovery Modes</h2>
+
+<p>The escape sequence is the <strong>primary mechanism</strong> for detecting WAL recycling and for non-linear data recovery. The <code>kBlogFileRecycled</code> flag in the header indicates the file may contain trailing stale data from a previous incarnation.</p>
+
+<table>
+<tr>
+  <th style="width:22%">Mode</th>
+  <th style="width:48%">Behavior on Undecodable Data</th>
+  <th style="width:30%">Escape Sequence Role</th>
+</tr>
+<tr>
+  <td><code>kAbsoluteConsistency</code></td>
+  <td>Error on any failure, including incomplete trailing records. If recycled and no escape sequence found in trailing data, accept as clean end.</td>
+  <td>Distinguishes stale recycled data from corruption.</td>
+</tr>
+<tr>
+  <td><code>kTolerateCorruptedTailRecords</code></td>
+  <td>Incomplete trailing record (Incomplete status): tolerate, stop at last complete record. Corruption: scan for escape sequence. Not found = clean end (recycled or preallocated). Found with valid record beyond = mid-file corruption (error).</td>
+  <td>Distinguishes tail damage from mid-file corruption.</td>
+</tr>
+<tr>
+  <td><code>kPointInTimeRecovery</code> (default)</td>
+  <td>Stop at first inconsistency. Incomplete trailing records tolerated. Recycled trailing data accepted.</td>
+  <td>Diagnostic improvement.</td>
+</tr>
+<tr>
+  <td><code>kSkipAnyCorruptedRecords</code></td>
+  <td>On corruption, scan forward for next escape sequence. If found, try to decode and verify; resume if valid. If not found, stop.</td>
+  <td>Essential for record discovery after corruption.</td>
+</tr>
+</table>
+
+<!-- ======================================================================= -->
+<h2 id="s9">WriteBatch Blob Preamble</h2>
+
+<p>A <strong>blob preamble</strong> is a sequence of blob records preceded by a preamble-start record (type 0x11, trivial format, length=0) and followed by the associated WriteBatch record. The blob records contain separated values referenced by <code>file_number = 0</code> blob references in the WriteBatch.</p>
+
+<p>This functionality is stubbed in the current implementation: the preamble-start record type is defined and can be written/read, but the full preamble flow (in-memory serialization, blob reference encoding) is deferred.</p>
+
+<!-- ======================================================================= -->
+<h2 id="s-ign-props">Ignorable Properties Records</h2>
+
+<p>Ignorable properties records (<code>kBlogIgnorablePropertiesRecord</code>, type 0x01) carry diagnostic/debugging named properties using the same encoding as the header property section. They may appear anywhere in the file body:</p>
+<ul>
+  <li><strong>Initial writer:</strong> immediately after the header, the writer emits an ignorable properties record for its diagnostic properties (<code>dbSessionId</code>, <code>dbHostId</code>, <code>creator</code>, <code>creationTime</code>, <code>role</code>, etc.). The header property section itself contains only required/uppercase properties.</li>
+  <li><strong>File reuse (e.g. manifest reuse):</strong> when an existing file is re-opened for appending by a new writer (potentially on a different host or RocksDB version), the new writer emits another ignorable properties record with its own identity and diagnostics. This is why multiple ignorable properties records may appear in a single file.</li>
+</ul>
+
+<p>Restrictions:</p>
+<ul>
+  <li><strong>Only ignorable (lowercase) properties</strong> are allowed in these records. Required (uppercase) properties are set once in the header property section and cannot appear here.</li>
+  <li>Readers may skip these records entirely without affecting correctness.</li>
+</ul>
+
+<p>The upper/lowercase naming convention remains useful for distinguishing required vs. ignorable properties when they are combined into a single map or dictionary for inspection.</p>
+
+<!-- ======================================================================= -->
+<h2 id="s10">Replication Log Column Family</h2>
+
+<p>Deferred. The blog format supports an "rlog" role hint for replication log storage, with sparse indexes in footer records and in-memory index maintenance. See design notes in the original proposal.</p>
+
+<!-- ======================================================================= -->
+<h2 id="s11">Implementation Status</h2>
+
+<h3>Resolved (from original Open Questions)</h3>
+<table>
+<tr><th>Question</th><th>Resolution</th></tr>
+<tr><td>Escape sequence size</td><td>10 bytes: 6 random + 4 derived. First byte not 0x00/0xFF.</td></tr>
+<tr><td>Header/footer encoding</td><td>40-byte fixed header + required-only property section with 5-byte trailer. Ignorable properties in separate body records (0x01). Footer uses regular full-format records: index (0xF0), properties (0xF8), file checksum info (0xFC, placeholder), locator (0xFF). Record types: 0x01-0x0F blog meta, 0x10-0x7F body, 0xF0-0xFF footer.</td></tr>
+<tr><td>Preamble-start record format</td><td>Trivial format, length=0, type 0x11. Minimal -- just the type tag.</td></tr>
+<tr><td>WriteBatch record framing</td><td>Same compact/full format as blob records, type 0x12.</td></tr>
+<tr><td>Record format selection</td><td>Trivial: length=0, type + checksum, no payload. Compact: length 1&ndash;16383 (1&ndash;2 byte prefix varint), matches compact_record_type, no type byte. Full: prefix varint &ge; 3B (possibly irregular), includes type + pre-payload compression_type + prefix_checksum with context modifier.</td></tr>
+<tr><td>Checksum context</td><td>All checksums (fixed header, property section, record prefix, record trailer) use context checksum modifiers with the incarnation ID, ensuring nonzero stored values even with <code>kNoChecksum</code>.</td></tr>
+<tr><td>Schema version</td><td>Blog file schema versions start at 1. Value 0 is reserved outside the file format for legacy blob-file manifest metadata. Newer versions are rejected by older readers (returns <code>NotSupported</code>). Checksum is verified before schema version is checked.</td></tr>
+<tr><td>Streaming compression sentinel</td><td><code>kStreamingCompressionSentinel = 0x7F</code> defined in <code>CompressionType</code> enum (compression_type.h). Used in blog record trailers for streaming-compressed WriteBatch payloads.</td></tr>
+</table>
+
+<h3>DB Options</h3>
+<ul>
+  <li><code>use_blog_format_for_wals</code> (bool, default false): New WAL files use blog format.</li>
+  <li><code>use_blog_format_for_blobs</code> (bool, default false): New blob files use blog format.</li>
+  <li><code>blog_checksum</code> (<code>ChecksumType</code>, default <code>kXXH3</code>): Checksum algorithm for blog format files. <code>ChecksumType</code> enum moved to <code>include/rocksdb/checksum_type.h</code> (from <code>table.h</code>) for use by both table and DB options.</li>
+</ul>
+<p>All are immutable <code>DBOptions</code>. Existing legacy WAL and blob files are always readable regardless of these settings.</p>
+
+<h3>Compression Manager Integration</h3>
+<ul>
+  <li><strong>Blog blob files</strong> use the CF's configured compression manager (via <code>MutableCFOptions::compression_manager</code>). Legacy blob files continue to use the builtin manager for backward compatibility.</li>
+  <li><strong>Blog WAL files</strong> use per-record compression via <code>Compressor::CompressBlock</code>. The actual <code>CompressionType</code> from <code>CompressBlock</code> output is stored in the record trailer.</li>
+  <li>Streaming compression infrastructure exists (<code>WriteBatchStreamingCompressionType</code> property, <code>kStreamingCompressionSentinel</code> 0x7F trailer value) but is not yet enabled by default.</li>
+</ul>
+
+</body>
+</html>

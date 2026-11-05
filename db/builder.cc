@@ -114,7 +114,10 @@ Status BuildTable(
     // Flush can drop blob-backed records via overwrite elision and flush-time
     // compaction filters. Track input and surviving output refs just like the
     // compaction path so the manifest learns about the new garbage.
-    blob_garbage_meter.reset(new BlobGarbageMeter());
+    blob_garbage_meter.reset(new BlobGarbageMeter(
+        db_options.use_blog_format_for_blobs,
+        BlobGarbageMeter::CollectBlobFileSchemaVersions(
+            version != nullptr ? version->storage_info() : nullptr)));
     blob_counting_iter.reset(
         new BlobCountingIterator(iter, blob_garbage_meter.get(),
                                  /*track_current_key_inflow=*/false));

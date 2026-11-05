@@ -12,9 +12,11 @@
 #include <vector>
 
 #include "db/blob/blob_file_addition.h"
+#include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_sequential_reader.h"
+#include "db/blog/blog_format.h"
 #include "env/mock_env.h"
 #include "file/filename.h"
 #include "file/random_access_file_reader.h"
@@ -581,6 +583,62 @@ TEST_F(BlobFileBuilderTest, Checksum) {
                  kNoCompression, expected_key_value_pairs, blob_indexes);
 }
 
+TEST_F(BlobFileBuilderTest, BlogFormatManifestMetadata) {
+  Options options;
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlobFileBuilderTest_BlogFormatManifestMetadata"),
+      0);
+  options.enable_blob_files = true;
+  options.use_blog_format_for_blobs = true;
+  options.env = mock_env_.get();
+
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_cf_options(options);
+
+  constexpr int job_id = 1;
+  constexpr uint32_t column_family_id = 123;
+  constexpr char column_family_name[] = "blog_cf";
+  constexpr Env::WriteLifeTimeHint write_hint = Env::WLTH_MEDIUM;
+
+  std::vector<std::string> blob_file_paths;
+  std::vector<BlobFileAddition> blob_file_additions;
+
+  BlobFileBuilder builder(
+      TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
+      &file_options_, &write_options_, "dbid", "session", job_id,
+      column_family_id, column_family_name, write_hint, nullptr /*IOTracer*/,
+      nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
+      immutable_options.cf_paths.front().path, &blob_file_paths,
+      &blob_file_additions);
+
+  std::string blob_index;
+  ASSERT_OK(builder.Add("key", std::string(64, 'v'), &blob_index));
+  ASSERT_OK(builder.Finish());
+
+  ASSERT_EQ(blob_file_additions.size(), 1U);
+  const auto& blob_file_addition = blob_file_additions[0];
+  ASSERT_GT(blob_file_addition.GetPhysicalBlobFileSize(),
+            blob_file_addition.GetTotalBlobBytes());
+  ASSERT_EQ(blob_file_addition.GetSchemaVersion(), kBlogCurrentSchemaVersion);
+  ASSERT_EQ(blob_file_addition.GetFileIdentity().size(), kBlobFileIdentitySize);
+
+  constexpr HistogramImpl* blob_file_read_hist = nullptr;
+  std::unique_ptr<BlobFileReader> reader;
+  ReadOptions read_options;
+  ASSERT_OK(BlobFileReader::Create(
+      immutable_options, read_options, file_options_, column_family_id,
+      blob_file_read_hist, blob_file_addition.GetBlobFileNumber(),
+      std::shared_ptr<IOTracer>() /*io_tracer*/, &reader));
+  ASSERT_TRUE(reader->IsBlogFormat());
+  ASSERT_EQ(reader->GetFileSize(),
+            blob_file_addition.GetPhysicalBlobFileSize());
+  ASSERT_EQ(reader->GetBlogSchemaVersion(),
+            blob_file_addition.GetSchemaVersion());
+  ASSERT_EQ(reader->GetBlogFileIdentity().ToString(),
+            blob_file_addition.GetFileIdentity());
+}
+
 class BlobFileBuilderIOErrorTest
     : public testing::Test,
       public testing::WithParamInterface<std::string> {
@@ -604,7 +662,7 @@ INSTANTIATE_TEST_CASE_P(
         "BlobFileBuilder::OpenBlobFileIfNeeded:NewWritableFile",
         "BlobFileBuilder::OpenBlobFileIfNeeded:WriteHeader",
         "BlobFileBuilder::WriteBlobToFile:AddRecord",
-        "BlobFileBuilder::WriteBlobToFile:AppendFooter"}));
+        "BlobFileBuilder::WriteBlobToFile:LegacyAppendFooterAndClose"}));
 
 TEST_P(BlobFileBuilderIOErrorTest, IOError) {
   // Simulate an I/O error during the specified step of Add()

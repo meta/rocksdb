@@ -59,8 +59,7 @@ void WriteBlobFile(const ImmutableOptions& immutable_options,
   constexpr bool do_flush = false;
 
   BlobLogWriter blob_log_writer(std::move(file_writer), immutable_options.clock,
-                                statistics, blob_file_number, use_fsync,
-                                do_flush);
+                                statistics, use_fsync, do_flush);
 
   BlobLogHeader header(column_family_id, compression, has_ttl,
                        expiration_range_header);
@@ -100,8 +99,8 @@ void WriteBlobFile(const ImmutableOptions& immutable_options,
 
   std::string checksum_method;
   std::string checksum_value;
-  ASSERT_OK(blob_log_writer.AppendFooter(WriteOptions(), footer,
-                                         &checksum_method, &checksum_value));
+  ASSERT_OK(blob_log_writer.LegacyAppendFooterAndClose(
+      WriteOptions(), footer, &checksum_method, &checksum_value));
 }
 
 BlobFileOpenInfo OpenInfoWithoutChecksum(uint64_t file_number) {
@@ -529,11 +528,13 @@ TEST_F(BlobSourceTest, GetCompressedBlobs) {
 
     CacheHandleGuard<BlobFileReader> blob_file_reader;
     ASSERT_OK(blob_source.GetBlobFileReader(
-        read_options, OpenInfoWithoutChecksum(file_number), &blob_file_reader));
+        read_options, OpenInfoWithoutChecksum(file_number),
+        options_.compression_manager.get(), &blob_file_reader));
     ASSERT_NE(blob_file_reader.GetValue(), nullptr);
 
     const uint64_t file_size = blob_file_reader.GetValue()->GetFileSize();
-    ASSERT_EQ(blob_file_reader.GetValue()->GetCompressionType(), compression);
+    ASSERT_EQ(blob_file_reader.GetValue()->GetLegacyCompressionType(),
+              compression);
 
     for (size_t i = 0; i < num_blobs; ++i) {
       ASSERT_NE(blobs[i].size() /*uncompressed size*/,
@@ -1319,10 +1320,11 @@ TEST_F(BlobSecondaryCacheTest, GetBlobsFromSecondaryCache) {
   CacheHandleGuard<BlobFileReader> file_reader;
   ReadOptions read_options;
   ASSERT_OK(blob_source.GetBlobFileReader(
-      read_options, OpenInfoWithoutChecksum(file_number), &file_reader));
+      read_options, OpenInfoWithoutChecksum(file_number),
+      options_.compression_manager.get(), &file_reader));
   ASSERT_NE(file_reader.GetValue(), nullptr);
   const uint64_t file_size = file_reader.GetValue()->GetFileSize();
-  ASSERT_EQ(file_reader.GetValue()->GetCompressionType(), kNoCompression);
+  ASSERT_EQ(file_reader.GetValue()->GetLegacyCompressionType(), kNoCompression);
 
   read_options.verify_checksums = true;
 

@@ -1040,6 +1040,11 @@ DEFINE_string(wal_compression, "none",
 static enum ROCKSDB_NAMESPACE::CompressionType FLAGS_wal_compression_e =
     ROCKSDB_NAMESPACE::kNoCompression;
 
+DEFINE_bool(use_blog_format_for_blobs, false,
+            "Use blog file format for new blob files.");
+
+DEFINE_string(blog_checksum, "kXXH3", "Checksum type for blog format files.");
+
 DEFINE_string(wal_dir, "", "If not empty, use the given dir for WAL");
 
 DEFINE_string(truth_db, "/dev/shm/truth_db/dbbench",
@@ -5978,6 +5983,17 @@ class Benchmark {
         FLAGS_use_direct_io_for_flush_and_compaction;
     options.manual_wal_flush = FLAGS_manual_wal_flush;
     options.wal_compression = FLAGS_wal_compression_e;
+    options.use_blog_format_for_blobs = FLAGS_use_blog_format_for_blobs;
+    // Parse blog_checksum via the options string system.
+    {
+      ConfigOptions blog_config_options;
+      blog_config_options.ignore_unknown_options = true;
+      DBOptions tmp_opts;
+      GetDBOptionsFromString(blog_config_options, tmp_opts,
+                             "blog_checksum=" + FLAGS_blog_checksum, &tmp_opts)
+          .PermitUncheckedError();
+      options.blog_checksum = tmp_opts.blog_checksum;
+    }
     options.ttl = FLAGS_fifo_compaction_ttl;
     options.compaction_options_fifo = CompactionOptionsFIFO(
         FLAGS_fifo_compaction_max_table_files_size_mb * 1024 * 1024,

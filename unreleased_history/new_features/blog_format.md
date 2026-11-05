@@ -1,0 +1,1 @@
+Added new DB options `use_blog_format_for_blobs` and `blog_checksum` to enable the new "blog" file format for blob files. The blog format uses escape-sequence record framing with context checksums. Existing legacy format files remain readable regardless of these settings.

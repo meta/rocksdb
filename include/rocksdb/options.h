@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "rocksdb/advanced_options.h"
+#include "rocksdb/checksum_type.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/compression_type.h"
 #include "rocksdb/customizable.h"
@@ -1619,6 +1620,21 @@ struct DBOptions {
   // versions (>= RocksDB 7.4.0 for ZSTD) regardless of this setting when
   // the WAL is read.
   CompressionType wal_compression = kNoCompression;
+
+  // If true, new blob files use the blog file format instead of the legacy
+  // blob log format. The blog format provides context checksums and a
+  // unified file structure shared with WAL. Existing legacy blob files are
+  // still readable regardless of this setting.
+  //
+  // Default: false
+  bool use_blog_format_for_blobs = false;
+
+  // Checksum type used for integrity checks within blog format files
+  // (both WAL and blob). Uses the same ChecksumType enum as
+  // BlockBasedTableOptions::checksum.
+  //
+  // Default: kXXH3
+  ChecksumType blog_checksum = kXXH3;
 
   // Set to true to re-instate an old behavior of keeping complete, synced WAL
   // files open for write until they are collected for deletion by a

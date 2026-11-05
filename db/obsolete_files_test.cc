@@ -52,8 +52,7 @@ void WriteFooterlessBlobFile(const ImmutableOptions& immutable_options,
   constexpr bool use_fsync = false;
   constexpr bool do_flush = false;
   BlobLogWriter blob_log_writer(std::move(file_writer), immutable_options.clock,
-                                statistics, blob_file_number, use_fsync,
-                                do_flush);
+                                statistics, use_fsync, do_flush);
 
   constexpr bool has_ttl = false;
   constexpr ExpirationRange expiration_range;
