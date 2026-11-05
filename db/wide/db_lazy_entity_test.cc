@@ -34,6 +34,43 @@
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
+// Deliberately unregistered: opening a blog file must use the CF's manager,
+// including when a record fell back to storing its payload uncompressed.
+class LazyBlogCompressionManager : public CompressionManager {
+ public:
+  const char* Name() const override { return "LazyBlogCompressionManager"; }
+  const char* CompatibilityName() const override {
+    return "LazyEntityTestCustom";
+  }
+
+  bool SupportsCompressionType(CompressionType type) const override {
+    return type == kCustomCompression8A ||
+           GetBuiltinV2CompressionManager()->SupportsCompressionType(type);
+  }
+
+  std::unique_ptr<Compressor> GetCompressor(const CompressionOptions& opts,
+                                            CompressionType type) override {
+    if (type == kLZ4Compression || type == kCustomCompression8A) {
+      return std::make_unique<
+          test::CompressorCustomAlg<kCustomCompression8A>>();
+    }
+    return GetBuiltinV2CompressionManager()->GetCompressor(opts, type);
+  }
+
+  std::shared_ptr<Decompressor> GetDecompressor() override {
+    return std::make_shared<test::DecompressorCustomAlg>();
+  }
+
+  std::shared_ptr<Decompressor> GetDecompressorForTypes(
+      const CompressionType* types_begin,
+      const CompressionType* types_end) override {
+    std::shared_ptr<test::DecompressorCustomAlg> decompressor =
+        std::make_shared<test::DecompressorCustomAlg>();
+    decompressor->SetAllowedTypes(types_begin, types_end);
+    return decompressor;
+  }
+};
+
 // FileSystem wrapper that records the ReadOptions::io_activity of the most
 // recent read to a blob file (*.blob), so tests can assert how deferred lazy
 // resolve reads are attributed. Separate-file blob payloads live in .blob
@@ -159,6 +196,89 @@ class DBLazyEntityTest : public DBTestBase {
     return options;
   }
 
+  enum class CustomManagerRead { kSingleRange, kGroupedRange, kGroupedWhole };
+
+  void CheckColdCustomManagerRead(CustomManagerRead read_kind) {
+    if (!test::CompressorCustomAlg<kCustomCompression8A>::Supported()) {
+      ROCKSDB_GTEST_SKIP("LZ4 compression not supported");
+      return;
+    }
+    Options options = GetLazyTestOptions();
+    options.use_blog_format_for_blobs = true;
+    // DB option validation accepts built-in codecs; the configured manager
+    // chooses its custom codec as the compressor's preferred type.
+    options.blob_compression_type = kLZ4Compression;
+    options.compression_manager =
+        std::make_shared<LazyBlogCompressionManager>();
+
+    for (const bool compressed : {false, true}) {
+      SCOPED_TRACE(compressed ? "custom compressed" : "raw fallback");
+      Destroy(options);
+      ASSERT_OK(TryReopen(options));
+      std::array<std::string, 2> values;
+      const uint32_t seed = env_->NowMicros() % 0x7fffffff;
+      SCOPED_TRACE("seed=" + std::to_string(seed));
+      Random random(seed);
+      constexpr char alphabet[] =
+          " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+          "[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+      for (size_t i = 0; i < values.size(); ++i) {
+        values[i].assign(8192, 'a');
+        if (!compressed) {
+          for (char& byte : values[i]) {
+            byte = alphabet[random.Uniform(sizeof(alphabet) - 1)];
+          }
+        }
+      }
+      const std::array<Slice, 2> keys{Slice("k0"), Slice("k1")};
+      for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_OK(db_->PutEntity(
+            WriteOptions(), db_->DefaultColumnFamily(), keys[i],
+            {{kDefaultWideColumnName, "i"}, {"data", values[i]}}));
+      }
+      ASSERT_OK(Flush());
+      // No blob reader or blob value may be warmed by another read path.
+      Close();
+      ASSERT_OK(TryReopen(options));
+
+      if (read_kind == CustomManagerRead::kSingleRange) {
+        LazyWideColumns lazy;
+        ASSERT_OK(db_->GetEntityLazy(ReadOptions(), db_->DefaultColumnFamily(),
+                                     keys[0], &lazy));
+        ASSERT_TRUE(lazy[1].is_reference());
+        ASSERT_EQ(lazy[1].logical_size().has_value(), !compressed);
+        PinnableSlice result;
+        ASSERT_OK(lazy.ResolveColumnRange(lazy[1], 100, 50, &result));
+        ASSERT_EQ(result, values[0].substr(100, 50));
+      } else {
+        LazyWideColumnsBatch batch;
+        std::array<Status, 2> get_statuses;
+        db_->MultiGetEntityLazy(ReadOptions(), db_->DefaultColumnFamily(),
+                                keys.size(), keys.data(), &batch,
+                                get_statuses.data());
+        std::array<PinnableSlice, 2> results;
+        std::array<Status, 2> statuses;
+        std::array<LazyColumnReadRequest, 2> reads;
+        const bool whole = read_kind == CustomManagerRead::kGroupedWhole;
+        for (size_t i = 0; i < keys.size(); ++i) {
+          ASSERT_OK(get_statuses[i]);
+          ASSERT_TRUE(batch[i][1].is_reference());
+          ASSERT_EQ(batch[i][1].logical_size().has_value(), !compressed);
+          reads[i].column = &batch[i][1];
+          reads[i].offset = whole ? 0 : 100;
+          reads[i].length = whole ? kLazyWholeColumn : 50;
+          reads[i].result = &results[i];
+          reads[i].status = &statuses[i];
+        }
+        ASSERT_OK(batch.MultiResolve(reads.size(), reads.data()));
+        for (size_t i = 0; i < keys.size(); ++i) {
+          ASSERT_OK(statuses[i]);
+          ASSERT_EQ(results[i], whole ? values[i] : values[i].substr(100, 50));
+        }
+      }
+    }
+  }
+
   // Like GetLazyTestOptions but with a blob cache configured, so tests can
   // observe blob-cache hits / (non-)insertions on the partial-read path.
   Options GetLazyTestOptionsWithBlobCache() {
@@ -237,6 +357,18 @@ class DBLazyEntityTest : public DBTestBase {
     ASSERT_OK(db_->IngestExternalFile({sst_path}, IngestExternalFileOptions()));
   }
 };
+
+TEST_F(DBLazyEntityTest, ColdBlogCustomManagerSingleRange) {
+  CheckColdCustomManagerRead(CustomManagerRead::kSingleRange);
+}
+
+TEST_F(DBLazyEntityTest, ColdBlogCustomManagerGroupedRange) {
+  CheckColdCustomManagerRead(CustomManagerRead::kGroupedRange);
+}
+
+TEST_F(DBLazyEntityTest, ColdBlogCustomManagerGroupedWhole) {
+  CheckColdCustomManagerRead(CustomManagerRead::kGroupedWhole);
+}
 
 // Enumerate a lazily-read entity without triggering any blob I/O: inline
 // columns expose their bytes immediately, blob columns show up as unresolved

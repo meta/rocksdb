@@ -12,6 +12,7 @@
 #include "cache/cache_reservation_manager.h"
 #include "cache/charged_cache.h"
 #include "db/blob/blob_contents.h"
+#include "db/blob/blob_file_meta.h"
 #include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_gen2_format.h"
 #include "db/blob/blob_log_format.h"
@@ -52,11 +53,12 @@ template <typename ReadFn>
 Status ReadBlobWithReaderRetry(
     BlobFileCache* blob_file_cache, const ReadOptions& read_options,
     const BlobFileOpenInfo& blob_file,
-    CompressionManager* configured_compression_manager, const ReadFn& read) {
+    CompressionManager* configured_compression_manager,
+    const SharedBlobFileMetaData* expected_meta, const ReadFn& read) {
   CacheHandleGuard<BlobFileReader> blob_file_reader;
-  Status s = blob_file_cache->GetBlobFileReader(read_options, blob_file,
-                                                configured_compression_manager,
-                                                &blob_file_reader);
+  Status s = blob_file_cache->GetBlobFileReader(
+      read_options, blob_file, configured_compression_manager,
+      &blob_file_reader, expected_meta);
   if (!s.ok()) {
     return s;
   }
@@ -74,6 +76,7 @@ Status ReadBlobWithReaderRetry(
   std::unique_ptr<BlobFileReader> fresh_reader;
   s = blob_file_cache->OpenBlobFileReaderUncached(
       read_options, blob_file, configured_compression_manager, &fresh_reader,
+      expected_meta,
       /*allow_footer_skip_retry=*/false);
   if (!s.ok()) {
     return AppendBlobRefreshRetryFailure(stale_status, s);
@@ -278,8 +281,10 @@ Status BlobSource::InsertEntryIntoCache(const Slice& key, BlobContents* value,
 Status BlobSource::GetBlob(const ReadOptions& read_options,
                            const Slice& user_key,
                            CompressionManager* configured_compression_manager,
-                           const BlobFileOpenInfo& blob_file, uint64_t offset,
-                           uint64_t file_size, uint64_t value_size,
+                           const BlobFileOpenInfo& blob_file,
+                           const SharedBlobFileMetaData* expected_meta,
+                           uint64_t offset, uint64_t file_size,
+                           uint64_t value_size,
                            CompressionType compression_type,
                            FilePrefetchBuffer* prefetch_buffer,
                            PinnableSlice* value, uint64_t* bytes_read) {
@@ -305,9 +310,16 @@ Status BlobSource::GetBlob(const ReadOptions& read_options,
       // is assigned to bytes_read. Legacy format includes the 32-byte record
       // header + key when verifying checksums. Blog format includes the
       // 5-byte trailer (compression_type + checksum).
+      // MANIFEST metadata identifies this file even if the writer option
+      // changed after it was created. In-flight direct-write files have no
+      // metadata yet and use this BlobSource's immutable writer format.
+      const bool is_blog_format = expected_meta
+                                      ? expected_meta->GetSchemaVersion() !=
+                                            kLegacyBlobFileSchemaVersion
+                                      : use_blog_format_;
       uint64_t adjustment =
           read_options.verify_checksums
-              ? (use_blog_format_
+              ? (is_blog_format
                      ? kBlogBlockTrailerSize
                      : BlobLogRecord::CalculateAdjustmentForRecordHeader(
                            user_key.size()))
@@ -315,7 +327,7 @@ Status BlobSource::GetBlob(const ReadOptions& read_options,
       // Legacy: adjustment is header+key bytes before the value offset.
       // Blog: adjustment is trailer bytes after the value, so offset
       // relationship is different.
-      assert(use_blog_format_ || offset >= adjustment);
+      assert(is_blog_format || offset >= adjustment);
 
       uint64_t record_size = value_size + adjustment;
       if (bytes_read) {
@@ -346,7 +358,8 @@ Status BlobSource::GetBlob(const ReadOptions& read_options,
     uint64_t read_size = 0;
     s = ReadBlobWithReaderRetry(
         blob_file_cache_, read_options, blob_file,
-        configured_compression_manager, [&](BlobFileReader* reader) {
+        configured_compression_manager, expected_meta,
+        [&](BlobFileReader* reader) {
           if (!reader->IsBlogFormat() &&
               compression_type != reader->GetLegacyCompressionType()) {
             return Status::Corruption(
@@ -390,14 +403,14 @@ Status BlobSource::GetBlob(const ReadOptions& read_options,
   return s;
 }
 
-Status BlobSource::GetBlobRange(const ReadOptions& read_options,
-                                const Slice& user_key,
-                                const BlobFileOpenInfo& blob_file,
-                                uint64_t offset, uint64_t file_size,
-                                uint64_t value_size,
-                                CompressionType compression_type,
-                                uint64_t range_offset, size_t range_length,
-                                PinnableSlice* value, uint64_t* bytes_read) {
+Status BlobSource::GetBlobRange(
+    const ReadOptions& read_options, const Slice& user_key,
+    CompressionManager* configured_compression_manager,
+    const BlobFileOpenInfo& blob_file,
+    const SharedBlobFileMetaData* expected_meta, uint64_t offset,
+    uint64_t file_size, uint64_t value_size, CompressionType compression_type,
+    uint64_t range_offset, size_t range_length, PinnableSlice* value,
+    uint64_t* bytes_read) {
   assert(value);
   // Partial reads are for uncompressed blobs only; the caller decides this (a
   // compressed column takes the whole-value GetBlob path and slices).
@@ -452,7 +465,7 @@ Status BlobSource::GetBlobRange(const ReadOptions& read_options,
     // checksum failure.
     s = ReadBlobWithReaderRetry(
         blob_file_cache_, read_options, blob_file,
-        /*configured_compression_manager=*/nullptr,
+        configured_compression_manager, expected_meta,
         [&](BlobFileReader* reader) {
           if (!reader->IsBlogFormat() &&
               compression_type != reader->GetLegacyCompressionType()) {
@@ -846,7 +859,8 @@ void BlobSource::MultiGetBlob(
   uint64_t total_bytes_read = 0;
   uint64_t bytes_read_in_file = 0;
 
-  for (auto& [blob_file, file_size, blob_reqs_in_file] : blob_reqs) {
+  for (auto& [blob_file, file_size, blob_reqs_in_file, expected_meta] :
+       blob_reqs) {
     // sort blob_reqs_in_file by file offset.
     std::sort(
         blob_reqs_in_file.begin(), blob_reqs_in_file.end(),
@@ -855,8 +869,8 @@ void BlobSource::MultiGetBlob(
         });
 
     MultiGetBlobFromOneFile(read_options, configured_compression_manager,
-                            blob_file, file_size, blob_reqs_in_file,
-                            &bytes_read_in_file);
+                            blob_file, expected_meta, file_size,
+                            blob_reqs_in_file, &bytes_read_in_file);
 
     total_bytes_read += bytes_read_in_file;
   }
@@ -869,7 +883,8 @@ void BlobSource::MultiGetBlob(
 void BlobSource::MultiGetBlobFromOneFile(
     const ReadOptions& read_options,
     CompressionManager* configured_compression_manager,
-    const BlobFileOpenInfo& blob_file, uint64_t /*file_size*/,
+    const BlobFileOpenInfo& blob_file,
+    const SharedBlobFileMetaData* expected_meta, uint64_t /*file_size*/,
     autovector<BlobReadRequest>& blob_reqs, uint64_t* bytes_read) {
   const size_t num_blobs = blob_reqs.size();
   assert(num_blobs > 0);
@@ -889,6 +904,12 @@ void BlobSource::MultiGetBlobFromOneFile(
   const OffsetableCacheKey base_cache_key(db_id_, db_session_id_, file_number);
 
   if (blob_cache_) {
+    // See GetBlob: metadata describes existing files; the writer option is
+    // only a fallback for files without MANIFEST metadata.
+    const bool is_blog_format =
+        expected_meta
+            ? expected_meta->GetSchemaVersion() != kLegacyBlobFileSchemaVersion
+            : use_blog_format_;
     size_t cached_blob_count = 0;
     for (size_t i = 0; i < num_blobs; ++i) {
       auto& req = blob_reqs[i];
@@ -912,12 +933,12 @@ void BlobSource::MultiGetBlobFromOneFile(
         // record is accumulated to total_bytes.
         uint64_t adjustment =
             read_options.verify_checksums
-                ? (use_blog_format_
+                ? (is_blog_format
                        ? kBlogBlockTrailerSize
                        : BlobLogRecord::CalculateAdjustmentForRecordHeader(
                              req.user_key->size()))
                 : 0;
-        assert(use_blog_format_ || req.offset >= adjustment);
+        assert(is_blog_format || req.offset >= adjustment);
         total_bytes += req.len + adjustment;
         cache_hit_mask |= (Mask{1} << i);  // cache hit
       }
@@ -961,7 +982,7 @@ void BlobSource::MultiGetBlobFromOneFile(
     CacheHandleGuard<BlobFileReader> blob_file_reader;
     Status s = blob_file_cache_->GetBlobFileReader(
         read_options, blob_file, configured_compression_manager,
-        &blob_file_reader);
+        &blob_file_reader, expected_meta);
     if (!s.ok()) {
       for (size_t i = 0; i < _blob_reqs.size(); ++i) {
         BlobReadRequest* const req = _blob_reqs[i].first;
@@ -1001,7 +1022,7 @@ void BlobSource::MultiGetBlobFromOneFile(
       std::unique_ptr<BlobFileReader> fresh_reader;
       s = blob_file_cache_->OpenBlobFileReaderUncached(
           read_options, blob_file, configured_compression_manager,
-          &fresh_reader,
+          &fresh_reader, expected_meta,
           /*allow_footer_skip_retry=*/false);
       if (!s.ok()) {
         for (const auto& blob_req : _blob_reqs) {
@@ -1122,13 +1143,15 @@ void BlobSource::MultiGetBlobFromOneFile(
 
 void BlobSource::MultiGetBlobRange(
     const ReadOptions& read_options,
+    CompressionManager* configured_compression_manager,
     autovector<BlobFileRangeReadRequests>& blob_reqs, uint64_t* bytes_read) {
   assert(blob_reqs.size() > 0);
 
   uint64_t total_bytes_read = 0;
   uint64_t bytes_read_in_file = 0;
 
-  for (auto& [blob_file, file_size, blob_reqs_in_file] : blob_reqs) {
+  for (auto& [blob_file, file_size, blob_reqs_in_file, expected_meta] :
+       blob_reqs) {
     // Sort by effective read offset so the file system layer can coalesce
     // adjacent sub-range reads within one MultiRead.
     std::sort(blob_reqs_in_file.begin(), blob_reqs_in_file.end(),
@@ -1138,7 +1161,8 @@ void BlobSource::MultiGetBlobRange(
                        rhs.offset + rhs.range_offset;
               });
 
-    MultiGetBlobRangeFromOneFile(read_options, blob_file, file_size,
+    MultiGetBlobRangeFromOneFile(read_options, configured_compression_manager,
+                                 blob_file, expected_meta, file_size,
                                  blob_reqs_in_file, &bytes_read_in_file);
 
     total_bytes_read += bytes_read_in_file;
@@ -1151,9 +1175,11 @@ void BlobSource::MultiGetBlobRange(
 }
 
 void BlobSource::MultiGetBlobRangeFromOneFile(
-    const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
-    uint64_t /*file_size*/, autovector<BlobRangeReadRequest>& blob_reqs,
-    uint64_t* bytes_read) {
+    const ReadOptions& read_options,
+    CompressionManager* configured_compression_manager,
+    const BlobFileOpenInfo& blob_file,
+    const SharedBlobFileMetaData* expected_meta, uint64_t /*file_size*/,
+    autovector<BlobRangeReadRequest>& blob_reqs, uint64_t* bytes_read) {
   const size_t num_blobs = blob_reqs.size();
   assert(num_blobs > 0);
   assert(num_blobs <= MultiGetContext::MAX_BATCH_SIZE);
@@ -1223,8 +1249,8 @@ void BlobSource::MultiGetBlobRangeFromOneFile(
   // cache-fill (a partial value cannot represent the whole-record cache entry).
   CacheHandleGuard<BlobFileReader> blob_file_reader;
   Status s = blob_file_cache_->GetBlobFileReader(
-      read_options, blob_file,
-      /*configured_compression_manager=*/nullptr, &blob_file_reader);
+      read_options, blob_file, configured_compression_manager,
+      &blob_file_reader, expected_meta);
   if (!s.ok()) {
     for (auto& blob_req : _blob_reqs) {
       assert(blob_req.first);

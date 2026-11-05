@@ -15,6 +15,8 @@
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/cast_util.h"
+#include "util/coding.h"
+#include "util/prefix_varint.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -40,12 +42,12 @@ class BlogWriterTest : public testing::Test {
   }
 
   // Create a reader over the data written so far.
-  std::unique_ptr<BlogFileReader> MakeReader() {
-    return MakeReaderImpl(nullptr);
+  std::unique_ptr<BlogFileReader> MakeReader(bool verify_checksums = true) {
+    return MakeReaderImpl(nullptr, verify_checksums);
   }
 
   std::unique_ptr<BlogFileReader> MakeReaderImpl(
-      BlogFileReader::Reporter* reporter) {
+      BlogFileReader::Reporter* reporter, bool verify_checksums = true) {
     // Create an FSSequentialFile that reads from contents_
     class MemSequentialFile : public FSSequentialFile {
      public:
@@ -77,7 +79,7 @@ class BlogWriterTest : public testing::Test {
     std::unique_ptr<SequentialFileReader> file_reader(
         new SequentialFileReader(std::move(source_holder), "" /* file name */));
     return std::make_unique<BlogFileReader>(std::move(file_reader), reporter,
-                                            true /* verify_checksums */);
+                                            verify_checksums);
   }
 
   // Helper to create a default header for blob files.
@@ -397,6 +399,66 @@ TEST_F(BlogWriterTest, ChecksumCorruptionDetected) {
       << corruption_status.ToString();
   ASSERT_NE(corruption_status.ToString().find("size 100"), std::string::npos)
       << corruption_status.ToString();
+}
+
+TEST_F(BlogWriterTest, ReadHeaderVerifiesChecksumBeforePropertySize) {
+  auto header = MakeBlobHeader();
+  auto writer = MakeWriter(header);
+
+  WriteOptions wo;
+  ASSERT_OK(writer->WriteHeader(wo));
+  std::string blob_data(100, 'H');
+  uint64_t blob_offset;
+  ASSERT_OK(writer->AddBlobRecord(wo, blob_data, kNoCompression, &blob_offset,
+                                  blob_data.size()));
+
+  // Claim a property section far larger than the file, without updating the
+  // fixed header checksum.
+  ASSERT_LT(contents_.size(), kBlogFileFixedHeaderSize + (1 << 20));
+  EncodeFixed32(&contents_[32], 1 << 20);
+
+  auto reader = MakeReader();
+  BlogFileHeader rh;
+  Status s = reader->ReadHeader(&rh);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(s.ToString().find("fixed header checksum mismatch"),
+            std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(BlogWriterTest, CorruptHugeLengthReturnsIncompleteWithoutThrow) {
+  // A full-format record whose length prefix claims far more bytes than the
+  // file holds must fail cleanly instead of throwing from an upfront
+  // allocation. Length 2^60 clears kMaxBlogRecordLength but can never be
+  // allocated; only a few body bytes are actually present.
+  auto header = MakeWalHeader();
+  auto writer = MakeWriter(header);
+  WriteOptions wo;
+  ASSERT_OK(writer->WriteHeader(wo));
+
+  constexpr uint64_t kHugeLength = 1ULL << 60;
+  ASSERT_EQ(PrefixVarint64Length(kHugeLength), 9);
+  contents_.append(header.escape_sequence, kBlogEscapeSequenceSize);
+  PutPrefixVarint64(&contents_, kHugeLength);
+  contents_.push_back(static_cast<char>(kBlogWriteBatchRecord));
+  contents_.push_back(static_cast<char>(kNoCompression));
+  contents_.append("\x00\x00\x00\x00", 4);
+  contents_.append("short");
+
+  auto reader = MakeReader(/*verify_checksums=*/false);
+  BlogFileHeader read_header;
+  ASSERT_OK(reader->ReadHeader(&read_header));
+  BlogRecordType type = kBlogBlobRecord;
+  Slice payload;
+  std::string scratch;
+  Status s;
+  try {
+    s = reader->ReadRecord(&type, &payload, &scratch);
+  } catch (const std::exception& e) {
+    FAIL() << "ReadRecord threw " << e.what() << " instead of returning "
+           << "Incomplete";
+  }
+  ASSERT_TRUE(s.IsIncomplete()) << s.ToString();
 }
 
 TEST_F(BlogWriterTest, MixedRecordTypes) {

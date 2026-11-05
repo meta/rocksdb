@@ -625,9 +625,8 @@ Status BlobDumpTool::DumpBlobLogFooter(uint64_t file_size,
 
 Status BlobDumpTool::DumpRecord(DisplayType show_key, DisplayType show_blob,
                                 DisplayType show_uncompressed_blob,
-                                bool /*show_summary*/,
-                                CompressionType compression, uint64_t* offset,
-                                uint64_t* total_records,
+                                bool show_summary, CompressionType compression,
+                                uint64_t* offset, uint64_t* total_records,
                                 uint64_t* total_key_size,
                                 uint64_t* total_blob_size,
                                 uint64_t* total_uncompressed_blob_size) {
@@ -662,7 +661,7 @@ Status BlobDumpTool::DumpRecord(DisplayType show_key, DisplayType show_blob,
   if (compression == kNoCompression) {
     uncompressed_value.assign(slice.data() + static_cast<size_t>(key_size),
                               static_cast<size_t>(value_size));
-  } else if (show_uncompressed_blob != DisplayType::kNone) {
+  } else if (show_uncompressed_blob != DisplayType::kNone || show_summary) {
     auto decompressor =
         GetBuiltinV2CompressionManager()->GetDecompressorOptimizeFor(
             compression);

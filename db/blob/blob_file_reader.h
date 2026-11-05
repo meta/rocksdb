@@ -152,6 +152,21 @@ class BlobFileReader {
                : Slice();
   }
 
+  // Verifies the file facts observed when this reader was opened against
+  // MANIFEST metadata for the same blob file: the physical file size, the
+  // legacy-vs-blog format, the blog schema version, and the file identity.
+  // Returns Corruption describing the first mismatch, or OK when everything
+  // matches.
+  //
+  // An expected physical size of zero means "unknown" (MANIFESTs written
+  // before the size was tracked) and skips the size check. A legacy expected
+  // schema version (kLegacyBlobFileSchemaVersion) requires a legacy file and
+  // ignores the expected identity; otherwise a blog file with the same
+  // schema version and file identity is required.
+  Status VerifyAgainstManifestMetadata(
+      uint64_t expected_physical_size, uint8_t expected_schema_version,
+      const Slice& expected_file_identity) const;
+
  private:
   // `has_footer` tracks whether offset validation should reserve footer space.
   BlobFileReader(std::unique_ptr<RandomAccessFileReader>&& file_reader,
