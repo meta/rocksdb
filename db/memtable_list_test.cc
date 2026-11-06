@@ -144,6 +144,28 @@ class MemTableListTest : public testing::Test {
     return s;
   }
 
+  // Wrappers giving TEST_F bodies access to state/methods that require
+  // friend access this fixture class has (via `friend class
+  // MemTableListTest` in ReadOnlyMemTable and MemTableList) but a TEST_F
+  // body -- a separate, gtest-generated class deriving from this one --
+  // does not have directly. See MempurgeLeaderDoesNotDropSiblingEdit below.
+  static void SetMockFlushCompleted(ReadOnlyMemTable* m, uint64_t file_num,
+                                    bool should_write_edit) {
+    m->flush_completed_ = true;
+    m->file_number_ = file_num;
+    m->edit_should_be_written_ = should_write_edit;
+  }
+
+  static void CallCollectEditsToWrite(
+      const std::list<ReadOnlyMemTable*>& memlist, const std::string& cfd_name,
+      LogBuffer* log_buffer, autovector<VersionEdit*>* edit_list,
+      autovector<ReadOnlyMemTable*>* memtables_to_flush, bool* any_write_edits,
+      std::list<std::unique_ptr<FlushJobInfo>>* committed_flush_jobs_info) {
+    MemTableList::CollectEditsToWrite(memlist, cfd_name, log_buffer, edit_list,
+                                      memtables_to_flush, any_write_edits,
+                                      committed_flush_jobs_info);
+  }
+
   // Calls MemTableList::InstallMemtableFlushResults() and sets up all
   // structures needed to call this function.
   Status Mock_InstallMemtableAtomicFlushResults(
@@ -925,6 +947,87 @@ TEST_F(MemTableListTest, FlushPendingTest) {
     delete m;
   }
   to_delete.clear();
+}
+
+// Regression test for https://github.com/facebook/rocksdb/issues/9022.
+//
+// `MemTableList::TryInstallMemtableFlushResults()` can batch multiple
+// concurrently-completed flush jobs' VersionEdits into a single MANIFEST
+// write. Each flush job passes its OWN write_edits bool (stashed per
+// memtable as `edit_should_be_written_`), which is false only for a
+// successful mempurge (that job has no new SST file and its own log
+// number is stale, so its own edit must not be written). Before the fix,
+// that bool was applied to the WHOLE batch, so a mempurge-successful job
+// sharing a batch with a sibling (normal) flush job would cause the
+// sibling's real edit to be silently dropped along with the mempurge job's
+// (correctly-skipped) edit.
+//
+// `CollectEditsToWrite()` is the extracted, pure in-memory bookkeeping that
+// decides which edits go into the batch's edit_list -- it never touches
+// VersionSet/LogAndApply or any real file, so it can be tested directly
+// and fast, without a real MANIFEST or SST files.
+TEST_F(MemTableListTest, MempurgeLeaderDoesNotDropSiblingEdit) {
+  auto factory = std::make_shared<SkipListFactory>();
+  options.memtable_factory = factory;
+  ImmutableOptions ioptions(options);
+  InternalKeyComparator cmp(BytewiseComparator());
+  WriteBufferManager wb(options.db_write_buffer_size);
+  MutableCFOptions mutable_cf_options(options);
+
+  // The older memtable: as if its flush "succeeded" via mempurge, so it
+  // needs no edit written (edit_should_be_written_ == false).
+  MemTable* mempurge_mem = new MemTable(cmp, ioptions, mutable_cf_options, &wb,
+                                        kMaxSequenceNumber,
+                                        0 /* column_family_id */);
+  mempurge_mem->Ref();
+  SetMockFlushCompleted(mempurge_mem, /*file_num=*/100,
+                        /*should_write_edit=*/false);
+
+  // The newer memtable: as if a normal (non-mempurge) flush completed, so
+  // its edit needs to be written (edit_should_be_written_ == true).
+  MemTable* normal_mem = new MemTable(cmp, ioptions, mutable_cf_options, &wb,
+                                      kMaxSequenceNumber,
+                                      0 /* column_family_id */);
+  normal_mem->Ref();
+  SetMockFlushCompleted(normal_mem, /*file_num=*/200,
+                        /*should_write_edit=*/true);
+  normal_mem->GetEdits()->SetLogNumber(42);
+
+  // New memtables are inserted at the front of the list, so the list is
+  // {newest, ..., oldest}: `normal_mem` (newer) then `mempurge_mem`
+  // (older), matching how `MemTableList::Add()` orders `memlist_`.
+  std::list<ReadOnlyMemTable*> memlist{normal_mem, mempurge_mem};
+
+  test::NullLogger logger;
+  LogBuffer log_buffer(DEBUG_LEVEL, &logger);
+  autovector<VersionEdit*> edit_list;
+  autovector<ReadOnlyMemTable*> memtables_to_flush;
+  bool any_write_edits = false;
+  std::list<std::unique_ptr<FlushJobInfo>> committed_flush_jobs_info;
+
+  CallCollectEditsToWrite(memlist, "default", &log_buffer, &edit_list,
+                          &memtables_to_flush, &any_write_edits,
+                          &committed_flush_jobs_info);
+
+  // Both memtables (mempurge and normal) are gathered for retirement from
+  // the immutable list...
+  ASSERT_EQ(2u, memtables_to_flush.size());
+
+  // ...but, crucially, only the sibling normal flush's own edit is
+  // collected for the MANIFEST write: the mempurge job's (correctly
+  // skipped) edit must not suppress it. Before the fix for #9022, this
+  // whole batch would have been treated as write_edits=false (since the
+  // OLDEST/leading memtable, mempurge_mem, opted out), and `edit_list`
+  // would have ended up empty here.
+  ASSERT_TRUE(any_write_edits);
+  ASSERT_EQ(1u, edit_list.size());
+  ASSERT_EQ(normal_mem->GetEdits(), edit_list[0]);
+  ASSERT_EQ(42u, edit_list[0]->GetLogNumber());
+
+  ASSERT_EQ(mempurge_mem, mempurge_mem->Unref());
+  delete mempurge_mem;
+  ASSERT_EQ(normal_mem, normal_mem->Unref());
+  delete normal_mem;
 }
 
 TEST_F(MemTableListTest, FlushRequestPersistsAfterPartialPick) {

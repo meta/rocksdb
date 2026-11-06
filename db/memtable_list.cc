@@ -603,6 +603,58 @@ void MemTableList::RollbackMemtableFlush(
   }
 }
 
+// static
+void MemTableList::CollectEditsToWrite(
+    const std::list<ReadOnlyMemTable*>& memlist, const std::string& cfd_name,
+    LogBuffer* log_buffer, autovector<VersionEdit*>* edit_list,
+    autovector<ReadOnlyMemTable*>* memtables_to_flush, bool* any_write_edits,
+    std::list<std::unique_ptr<FlushJobInfo>>* committed_flush_jobs_info) {
+  uint64_t batch_file_number = 0;
+  // Whether the sub-batch currently being scanned (i.e. the one that
+  // produced `batch_file_number`) wants its own edit written.
+  bool sub_batch_write_edits = true;
+  *any_write_edits = false;
+  // enumerate from the last (earliest) element to see how many batch finished
+  for (auto it = memlist.rbegin(); it != memlist.rend(); ++it) {
+    ReadOnlyMemTable* m = *it;
+    if (!m->flush_completed_) {
+      break;
+    }
+    if (it == memlist.rbegin() || batch_file_number != m->file_number_) {
+      // Oldest memtable in a new batch.
+      batch_file_number = m->file_number_;
+      sub_batch_write_edits = m->edit_should_be_written_;
+      if (m->edit_.GetBlobFileAdditions().empty()) {
+        ROCKS_LOG_BUFFER(log_buffer,
+                         "[%s] Level-0 commit flush result of table #%" PRIu64
+                         " started",
+                         cfd_name.c_str(), m->file_number_);
+      } else {
+        ROCKS_LOG_BUFFER(log_buffer,
+                         "[%s] Level-0 commit flush result of table #%" PRIu64
+                         " (+%zu blob files) started",
+                         cfd_name.c_str(), m->file_number_,
+                         m->edit_.GetBlobFileAdditions().size());
+      }
+
+      if (sub_batch_write_edits) {
+        // Only this sub-batch's own edit is added to `edit_list`. A
+        // sub-batch that opted out (e.g. a successful mempurge) must not
+        // contribute its (stale) edit -- in particular its log number --
+        // to the MANIFEST write, but that must not prevent sibling
+        // sub-batches from writing theirs.
+        edit_list->push_back(&m->edit_);
+        *any_write_edits = true;
+      }
+      std::unique_ptr<FlushJobInfo> info = m->ReleaseFlushJobInfo();
+      if (info != nullptr) {
+        committed_flush_jobs_info->push_back(std::move(info));
+      }
+    }
+    memtables_to_flush->push_back(m);
+  }
+}
+
 // Try record a successful flush in the manifest file. It might just return
 // Status::OK letting a concurrent flush to do actual the recording..
 Status MemTableList::TryInstallMemtableFlushResults(
@@ -628,6 +680,12 @@ Status MemTableList::TryInstallMemtableFlushResults(
 
     mems[i]->flush_completed_ = true;
     mems[i]->file_number_ = file_number;
+    // `write_edits` reflects the outcome of THIS flush job only (e.g. false
+    // for a successful mempurge). It must not be applied to any other,
+    // concurrently-completing flush job's memtable(s): stash it on this
+    // job's own memtable(s) so the commit loop below can decide, edit by
+    // edit, which ones to write.
+    mems[i]->edit_should_be_written_ = write_edits;
   }
 
   // if some other thread is already committing, then return
@@ -655,81 +713,65 @@ Status MemTableList::TryInstallMemtableFlushResults(
     // scan all memtables from the earliest, and commit those
     // (in that order) that have finished flushing. Memtables
     // are always committed in the order that they were created.
-    uint64_t batch_file_number = 0;
     autovector<VersionEdit*> edit_list;
     autovector<ReadOnlyMemTable*> memtables_to_flush;
-    // enumerate from the last (earliest) element to see how many batch finished
-    for (auto it = memlist.rbegin(); it != memlist.rend(); ++it) {
-      ReadOnlyMemTable* m = *it;
-      if (!m->flush_completed_) {
-        break;
-      }
-      if (it == memlist.rbegin() || batch_file_number != m->file_number_) {
-        // Oldest memtable in a new batch.
-        batch_file_number = m->file_number_;
-        if (m->edit_.GetBlobFileAdditions().empty()) {
-          ROCKS_LOG_BUFFER(log_buffer,
-                           "[%s] Level-0 commit flush result of table #%" PRIu64
-                           " started",
-                           cfd->GetName().c_str(), m->file_number_);
-        } else {
-          ROCKS_LOG_BUFFER(log_buffer,
-                           "[%s] Level-0 commit flush result of table #%" PRIu64
-                           " (+%zu blob files) started",
-                           cfd->GetName().c_str(), m->file_number_,
-                           m->edit_.GetBlobFileAdditions().size());
-        }
-
-        edit_list.push_back(&m->edit_);
-        std::unique_ptr<FlushJobInfo> info = m->ReleaseFlushJobInfo();
-        if (info != nullptr) {
-          committed_flush_jobs_info->push_back(std::move(info));
-        }
-      }
-      memtables_to_flush.push_back(m);
-    }
+    // Whether at least one of the (possibly several, concurrently-completed)
+    // sub-batches being installed here actually wants its edit written to
+    // the MANIFEST. A single commit can cover multiple flush jobs' results;
+    // each job's own `edit_should_be_written_` must only gate ITS OWN edit,
+    // never the whole commit -- otherwise one flush job (e.g. a successful
+    // mempurge, which legitimately needs no edit written) could cause
+    // other, unrelated flush jobs' edits to be silently dropped from the
+    // MANIFEST. See https://github.com/facebook/rocksdb/issues/9022.
+    bool any_write_edits = false;
+    CollectEditsToWrite(memlist, cfd->GetName(), log_buffer, &edit_list,
+                        &memtables_to_flush, &any_write_edits,
+                        committed_flush_jobs_info);
 
     size_t num_mem_to_flush = memtables_to_flush.size();
     // TODO(myabandeh): Not sure how batch_count could be 0 here.
     if (num_mem_to_flush > 0) {
-      VersionEdit edit;
+      if (any_write_edits) {
+        VersionEdit edit;
 #ifdef ROCKSDB_ASSERT_STATUS_CHECKED
-      if (memtables_to_flush.size() == memlist.size()) {
-        // TODO(yuzhangyu): remove this testing code once the
-        // `GetEditForDroppingCurrentVersion` API is used by the atomic data
-        // replacement. This function can get the same edits for wal related
-        // fields, and some duplicated fields as contained already in edit_list
-        // for column family's recovery.
-        edit = GetEditForDroppingCurrentVersion(cfd, vset, prep_tracker);
-      } else {
+        if (memtables_to_flush.size() == memlist.size()) {
+          // TODO(yuzhangyu): remove this testing code once the
+          // `GetEditForDroppingCurrentVersion` API is used by the atomic
+          // data replacement. This function can get the same edits for wal
+          // related fields, and some duplicated fields as contained already
+          // in edit_list for column family's recovery.
+          edit = GetEditForDroppingCurrentVersion(cfd, vset, prep_tracker);
+        } else {
+          edit = GetDBRecoveryEditForObsoletingMemTables(
+              vset, *cfd, edit_list, memtables_to_flush, prep_tracker);
+        }
+#else
         edit = GetDBRecoveryEditForObsoletingMemTables(
             vset, *cfd, edit_list, memtables_to_flush, prep_tracker);
-      }
-#else
-      edit = GetDBRecoveryEditForObsoletingMemTables(
-          vset, *cfd, edit_list, memtables_to_flush, prep_tracker);
 #endif  // ROCKSDB_ASSERT_STATUS_CHECKED
-      TEST_SYNC_POINT_CALLBACK(
-          "MemTableList::TryInstallMemtableFlushResults:"
-          "AfterComputeMinWalToKeep",
-          nullptr);
-      edit_list.push_back(&edit);
+        TEST_SYNC_POINT_CALLBACK(
+            "MemTableList::TryInstallMemtableFlushResults:"
+            "AfterComputeMinWalToKeep",
+            nullptr);
+        edit_list.push_back(&edit);
 
-      const auto manifest_write_cb = [this, cfd, num_mem_to_flush, log_buffer,
-                                      to_delete, mu](const Status& status) {
-        RemoveMemTablesOrRestoreFlags(status, cfd, num_mem_to_flush, log_buffer,
-                                      to_delete, mu);
-      };
-      if (write_edits) {
+        const auto manifest_write_cb = [this, cfd, num_mem_to_flush,
+                                        log_buffer, to_delete,
+                                        mu](const Status& status) {
+          RemoveMemTablesOrRestoreFlags(status, cfd, num_mem_to_flush,
+                                        log_buffer, to_delete, mu);
+        };
         // this can release and reacquire the mutex.
         s = vset->LogAndApply(cfd, read_options, write_options, edit_list, mu,
                               db_directory, /*new_descriptor_log=*/false,
                               /*column_family_options=*/nullptr,
                               manifest_write_cb);
       } else {
-        // If write_edit is false (e.g: successful mempurge),
-        // then remove old memtables, wake up manifest write queue threads,
-        // and don't commit anything to the manifest file.
+        // None of the flush jobs being installed in this commit wants its
+        // edit written (e.g. this commit covers only a successful
+        // mempurge, or several of them). Remove the old memtables, wake up
+        // manifest write queue threads, and don't commit anything to the
+        // manifest file.
         RemoveMemTablesOrRestoreFlags(s, cfd, num_mem_to_flush, log_buffer,
                                       to_delete, mu);
         // Note: cfd->SetLogNumber is only called when a VersionEdit
