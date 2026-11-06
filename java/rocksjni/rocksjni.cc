@@ -2144,7 +2144,6 @@ jboolean key_exists_helper(JNIEnv* env, jlong jdb_handle, jlong jcf_handle,
 
   const bool may_exist =
       db->KeyMayExist(read_opts, cf_handle, key_slice, &value, &value_found);
-
   if (may_exist) {
     ROCKSDB_NAMESPACE::Status s;
     {

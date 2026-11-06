@@ -87,6 +87,7 @@
 #ifdef ROCKSDB_JEMALLOC
 #include "port/jemalloc_helper.h"
 #endif
+
 #include "port/port.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/compaction_filter.h"
@@ -5668,6 +5669,9 @@ bool DBImpl::KeyMayExist(const ReadOptions& read_options,
   // If block_cache is enabled and the index block of the table didn't
   // not present in block_cache, the return value will be Status::Incomplete.
   // In this case, key may still exist in the table.
+  if (value_found != nullptr && s.IsIncomplete()) {
+    *value_found = false;
+  }
   return s.ok() || s.IsIncomplete();
 }
 
