@@ -11792,6 +11792,7 @@ TEST_F(DBCompactionTest, FIFOMultiTierTemperatureAging) {
           case Temperature::kUnknown:
             total_unknown++;
             break;
+          case Temperature::kLastTemperature:
           default:
             break;
         }

@@ -968,6 +968,9 @@ class TableFileCreationListener : public EventListener {
       case TableFileCreationReason::kCompaction:
         idx = 1;
         break;
+      case TableFileCreationReason::kRecovery:
+      case TableFileCreationReason::kMisc:
+      case TableFileCreationReason::kSstFileWriter:
       default:
         idx = -1;
     }

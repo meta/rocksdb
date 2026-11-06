@@ -83,6 +83,18 @@ const std::string& ThreadStatus::GetOperationPropertyName(
         return empty_str;
       }
       return flush_operation_properties[i].name;
+    case ThreadStatus::OP_UNKNOWN:
+    case ThreadStatus::OP_DBOPEN:
+    case ThreadStatus::OP_GET:
+    case ThreadStatus::OP_MULTIGET:
+    case ThreadStatus::OP_DBITERATOR:
+    case ThreadStatus::OP_VERIFY_DB_CHECKSUM:
+    case ThreadStatus::OP_VERIFY_FILE_CHECKSUMS:
+    case ThreadStatus::OP_GETENTITY:
+    case ThreadStatus::OP_MULTIGETENTITY:
+    case ThreadStatus::OP_GET_FILE_CHECKSUMS_FROM_CURRENT_MANIFEST:
+    case ThreadStatus::OP_LAZY_RESOLVE:
+    case ThreadStatus::NUM_OP_TYPES:
     default:
       return empty_str;
   }
@@ -98,6 +110,18 @@ std::map<std::string, uint64_t> ThreadStatus::InterpretOperationProperties(
     case OP_FLUSH:
       num_properties = NUM_FLUSH_PROPERTIES;
       break;
+    case OP_UNKNOWN:
+    case OP_DBOPEN:
+    case OP_GET:
+    case OP_MULTIGET:
+    case OP_DBITERATOR:
+    case OP_VERIFY_DB_CHECKSUM:
+    case OP_VERIFY_FILE_CHECKSUMS:
+    case OP_GETENTITY:
+    case OP_MULTIGETENTITY:
+    case OP_GET_FILE_CHECKSUMS_FROM_CURRENT_MANIFEST:
+    case OP_LAZY_RESOLVE:
+    case NUM_OP_TYPES:
     default:
       num_properties = 0;
   }

@@ -295,8 +295,17 @@ class CorruptionTest : public testing::Test {
       case FileType::kWalFile:
         path = LogFileName(dbname_, number);
         break;
-      // TODO: Add other file types as this method is being used for those file
-      // types.
+      case FileType::kDBLockFile:
+      case FileType::kTableFile:
+      case FileType::kDescriptorFile:
+      case FileType::kCurrentFile:
+      case FileType::kTempFile:
+      case FileType::kInfoLogFile:
+      case FileType::kMetaDatabase:
+      case FileType::kIdentityFile:
+      case FileType::kOptionsFile:
+      case FileType::kBlobFile:
+      case FileType::kCompactionProgressFile:
       default:
         return;
     }

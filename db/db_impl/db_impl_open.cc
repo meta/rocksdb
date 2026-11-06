@@ -1155,6 +1155,7 @@ bool DBImpl::InvokeWalFilterIfNeededOnWalRecord(uint64_t wal_number,
       }
       break;
     }
+    case WalFilter::WalProcessingOption::kWalProcessingOptionMax:
     default: {
       // logical error which should not happen. If RocksDB throws, we would
       // just do `throw std::logic_error`.

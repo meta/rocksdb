@@ -3450,6 +3450,13 @@ TEST_F(BackupEngineTest, FileDetailsHaveCorrectFileType) {
       case kOptionsFile:
         found_options = true;
         break;
+      case kDBLockFile:
+      case kTempFile:
+      case kInfoLogFile:
+      case kMetaDatabase:
+      case kIdentityFile:
+      case kBlobFile:
+      case kCompactionProgressFile:
       default:
         break;
     }

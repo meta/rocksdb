@@ -765,6 +765,15 @@ static bool ParseOptionHelper(void* opt_address, const OptionType& opt_type,
       return ParseEnum<Temperature>(temperature_string_map, value,
                                     static_cast<Temperature*>(opt_address));
     }
+    case OptionType::kEnv:
+    case OptionType::kEnum:
+    case OptionType::kStruct:
+    case OptionType::kVector:
+    case OptionType::kConfigurable:
+    case OptionType::kCustomizable:
+    case OptionType::kArray:
+    case OptionType::kStringMap:
+    case OptionType::kUnknown:
     default:
       return false;
   }
@@ -854,6 +863,15 @@ bool SerializeSingleOptionHelper(const void* opt_address,
           temperature_string_map, *static_cast<const Temperature*>(opt_address),
           value);
     }
+    case OptionType::kEnv:
+    case OptionType::kEnum:
+    case OptionType::kStruct:
+    case OptionType::kVector:
+    case OptionType::kConfigurable:
+    case OptionType::kCustomizable:
+    case OptionType::kArray:
+    case OptionType::kStringMap:
+    case OptionType::kUnknown:
     default:
       return false;
   }
@@ -1578,6 +1596,15 @@ static bool AreOptionsEqual(OptionType type, const void* this_offset,
       return IsOptionEqual<std::string>(this_offset, that_offset);
     case OptionType::kTemperature:
       return IsOptionEqual<Temperature>(this_offset, that_offset);
+    case OptionType::kEnv:
+    case OptionType::kEnum:
+    case OptionType::kStruct:
+    case OptionType::kVector:
+    case OptionType::kConfigurable:
+    case OptionType::kCustomizable:
+    case OptionType::kArray:
+    case OptionType::kStringMap:
+    case OptionType::kUnknown:
     default:
       return false;
   }  // End switch

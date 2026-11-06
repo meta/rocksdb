@@ -736,7 +736,8 @@ uint32_t ComputeBuiltinChecksum(ChecksumType type, const char* data,
         return ModifyChecksumForLastByte(v, data[data_size - 1]);
       }
     }
-    default:  // including kNoChecksum
+    case kNoChecksum:
+    default:
       return 0;
   }
 }
@@ -779,7 +780,8 @@ uint32_t ComputeBuiltinChecksumWithLastByte(ChecksumType type, const char* data,
       uint32_t v = Lower32of64(XXH3_64bits(data, data_size));
       return ModifyChecksumForLastByte(v, last_byte);
     }
-    default:  // including kNoChecksum
+    case kNoChecksum:
+    default:
       return 0;
   }
 }

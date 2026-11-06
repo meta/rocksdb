@@ -873,6 +873,7 @@ TEST_F(DBTest2, WalFilterTest) {
         }
         break;
       }
+      case WalFilter::WalProcessingOption::kWalProcessingOptionMax:
       default:
         FAIL();  // unhandled case
     }

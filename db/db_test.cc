@@ -7958,6 +7958,7 @@ class OpenFilesAsyncTest
         return "TableCache::MultiGet::BeforeFindTable";
       case ReadType::kIterator:
         return "TableCache::NewIterator::BeforeFindTable";
+      case ReadType::kNumReadTypes:
       default:
         assert(false);
         return "";
@@ -8043,6 +8044,7 @@ class OpenFilesAsyncTest
         ASSERT_OK(iter->status());
         break;
       }
+      case ReadType::kNumReadTypes:
       default:
         assert(false);
     }
@@ -8088,6 +8090,7 @@ class OpenFilesAsyncTest
         ASSERT_TRUE(iter->status().IsCorruption()) << iter->status().ToString();
         break;
       }
+      case ReadType::kNumReadTypes:
       default:
         assert(false);
     }

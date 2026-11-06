@@ -361,6 +361,7 @@ class DBCompactionAbortStyleTest
         options.compaction_options_fifo.allow_compaction = true;
         options.max_open_files = -1;  // Required for FIFO compaction
         break;
+      case kCompactionStyleNone:
       default:
         break;
     }

@@ -116,6 +116,7 @@ inline void RecordIOStats(Statistics* stats, Temperature file_temperature,
             file_io_stats_by_temperature.unknown_non_last_level_read_count, 1);
       }
       break;
+    case Temperature::kLastTemperature:
     default:
       break;
   }

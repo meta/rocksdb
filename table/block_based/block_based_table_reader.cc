@@ -374,6 +374,13 @@ void BlockBasedTable::UpdateCacheHitMetrics(BlockType block_type,
       }
       break;
 
+    case BlockType::kData:
+    case BlockType::kProperties:
+    case BlockType::kRangeDeletion:
+    case BlockType::kHashIndexPrefixes:
+    case BlockType::kHashIndexMetadata:
+    case BlockType::kMetaIndex:
+    case BlockType::kInvalid:
     default:
       // TODO: introduce dedicated tickers/statistics/counters
       // for range tombstones
@@ -428,6 +435,13 @@ void BlockBasedTable::UpdateCacheMissMetrics(BlockType block_type,
       }
       break;
 
+    case BlockType::kData:
+    case BlockType::kProperties:
+    case BlockType::kRangeDeletion:
+    case BlockType::kHashIndexPrefixes:
+    case BlockType::kHashIndexMetadata:
+    case BlockType::kMetaIndex:
+    case BlockType::kInvalid:
     default:
       // TODO: introduce dedicated tickers/statistics/counters
       // for range tombstones
@@ -512,6 +526,13 @@ void BlockBasedTable::UpdateCacheInsertionMetrics(
       }
       break;
 
+    case BlockType::kData:
+    case BlockType::kProperties:
+    case BlockType::kRangeDeletion:
+    case BlockType::kHashIndexPrefixes:
+    case BlockType::kHashIndexMetadata:
+    case BlockType::kMetaIndex:
+    case BlockType::kInvalid:
     default:
       // TODO: introduce dedicated tickers/statistics/counters
       // for range tombstones
@@ -2271,6 +2292,7 @@ std::unique_ptr<FilterBlockReader> BlockBasedTable::CreateFilterBlockReader(
       return FullFilterBlockReader::Create(this, ro, prefetch_buffer, use_cache,
                                            prefetch, pin, lookup_context);
 
+    case Rep::FilterType::kNoFilter:
     default:
       // filter_type is either kNoFilter (exited the function at the first if),
       // or it must be covered in this switch block
@@ -2486,6 +2508,11 @@ BlockBasedTable::SaveLookupContextOrTraceRecord(
     case BlockType::kUserDefinedIndex:
       trace_block_type = TraceType::kBlockTraceIndexBlock;
       break;
+    case BlockType::kProperties:
+    case BlockType::kHashIndexPrefixes:
+    case BlockType::kHashIndexMetadata:
+    case BlockType::kMetaIndex:
+    case BlockType::kInvalid:
     default:
       // This cannot happen.
       assert(false);

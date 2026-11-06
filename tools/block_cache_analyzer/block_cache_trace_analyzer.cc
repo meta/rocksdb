@@ -205,6 +205,16 @@ std::string block_type_to_string(TraceType type) {
       return "RangeDeletion";
     case kBlockTraceUncompressionDictBlock:
       return "UncompressionDict";
+    case kTraceNone:
+    case kTraceBegin:
+    case kTraceEnd:
+    case kTraceWrite:
+    case kTraceGet:
+    case kTraceIteratorSeek:
+    case kTraceIteratorSeekForPrev:
+    case kIOTracer:
+    case kTraceMultiGet:
+    case kTraceMax:
     default:
       break;
   }
@@ -242,6 +252,7 @@ std::string caller_to_string(TableReaderCaller caller) {
       return "SSTFileReader";
     case kUncategorized:
       return "Uncategorized";
+    case kMaxBlockCacheLookupCaller:
     default:
       break;
   }
@@ -290,6 +301,16 @@ bool is_user_access(TableReaderCaller caller) {
     case kUserApproximateSize:
     case kUserVerifyChecksum:
       return true;
+    case kSSTDumpTool:
+    case kExternalSSTIngestion:
+    case kRepair:
+    case kPrefetch:
+    case kCompaction:
+    case kCompactionRefill:
+    case kFlush:
+    case kSSTFileReader:
+    case kUncategorized:
+    case kMaxBlockCacheLookupCaller:
     default:
       break;
   }

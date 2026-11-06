@@ -50,6 +50,12 @@ inline void RecordBlockReadBytePerfCounter(BlockType block_type,
     case BlockType::kUserDefinedIndex:
       PERF_COUNTER_ADD(index_block_read_byte, block_size_with_trailer);
       break;
+    case BlockType::kProperties:
+    case BlockType::kRangeDeletion:
+    case BlockType::kHashIndexPrefixes:
+    case BlockType::kHashIndexMetadata:
+    case BlockType::kMetaIndex:
+    case BlockType::kInvalid:
     default:
       PERF_COUNTER_ADD(metadata_block_read_byte, block_size_with_trailer);
       break;
