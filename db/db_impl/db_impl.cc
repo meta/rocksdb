@@ -970,10 +970,13 @@ void DBImpl::MaybeInitBlobDirectWriteColumnFamily(
       column_family_name, cf_options.blob_file_size,
       immutable_db_options_.use_fsync,
       cf_options.blob_file_writable_file_max_buffer_size,
-      cfd->blob_file_cache(), &blob_callback_, immutable_db_options_.listeners,
+      immutable_db_options_.use_blog_format_for_blobs,
+      immutable_db_options_.blog_checksum, cfd->blob_file_cache(),
+      &blob_callback_, immutable_db_options_.listeners,
       immutable_db_options_.file_checksum_gen_factory.get(),
       immutable_db_options_.checksum_handoff_file_types, io_tracer_, db_id_,
-      db_session_id_, immutable_db_options_.info_log.get());
+      db_session_id_, immutable_db_options_.db_host_id,
+      immutable_db_options_.info_log.get());
 
   cfd->SetBlobPartitionManager(std::move(mgr));
   RegisterBlobDirectWriteColumnFamily();
@@ -7918,9 +7921,10 @@ Status DBImpl::GetLatestSequenceForKey(
   *found_record_for_key = false;
   std::optional<VersionBlobFetcher> memtable_blob_fetcher;
   if (cfd->blob_partition_manager() != nullptr) {
-    memtable_blob_fetcher.emplace(sv->current, read_options,
-                                  cfd->blob_file_cache(),
-                                  /*allow_write_path_fallback=*/true);
+    memtable_blob_fetcher.emplace(
+        sv->current, read_options, cfd->blob_file_cache(),
+        /*allow_write_path_fallback=*/true,
+        sv->current->GetMutableCFOptions().compression_manager.get());
   }
   const BlobFetcher* memtable_blob_fetcher_ptr =
       memtable_blob_fetcher ? &*memtable_blob_fetcher : nullptr;

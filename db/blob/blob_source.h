@@ -26,6 +26,7 @@ class Status;
 class FilePrefetchBuffer;
 class Slice;
 class RandomAccessFileReader;
+class SharedBlobFileMetaData;
 enum ChecksumType : char;
 
 // One whole-record request for BlobSource::MultiGetSimpleGen2Blob (the batched
@@ -81,8 +82,27 @@ class BlobSource {
   // Note: For consistency, whether the blob is found in the cache or on disk,
   // sets "*bytes_read" to the size of on-disk (possibly compressed) blob
   // record.
+  //
+  // `expected_meta` carries the MANIFEST metadata a freshly opened blob file
+  // reader is verified against (physical size, format, schema version, file
+  // identity); null skips verification. The convenience overload below passes
+  // null.
   Status GetBlob(const ReadOptions& read_options, const Slice& user_key,
                  const BlobFileOpenInfo& blob_file, uint64_t offset,
+                 uint64_t file_size, uint64_t value_size,
+                 CompressionType compression_type,
+                 FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
+                 uint64_t* bytes_read) {
+    return GetBlob(read_options, user_key,
+                   /*configured_compression_manager=*/nullptr, blob_file,
+                   /*expected_meta=*/nullptr, offset, file_size, value_size,
+                   compression_type, prefetch_buffer, value, bytes_read);
+  }
+
+  Status GetBlob(const ReadOptions& read_options, const Slice& user_key,
+                 CompressionManager* configured_compression_manager,
+                 const BlobFileOpenInfo& blob_file,
+                 const SharedBlobFileMetaData* expected_meta, uint64_t offset,
                  uint64_t file_size, uint64_t value_size,
                  CompressionType compression_type,
                  FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
@@ -107,9 +127,14 @@ class BlobSource {
   // The caller must ensure range_offset + range_length <= value_size. On a miss
   // *bytes_read (when non-null) is the number of bytes read from the file; on a
   // hit it is 0.
+  //
+  // `expected_meta` carries the MANIFEST metadata a freshly opened blob file
+  // reader is verified against; null skips verification (see GetBlob).
   Status GetBlobRange(const ReadOptions& read_options, const Slice& user_key,
-                      const BlobFileOpenInfo& blob_file, uint64_t offset,
-                      uint64_t file_size, uint64_t value_size,
+                      CompressionManager* configured_compression_manager,
+                      const BlobFileOpenInfo& blob_file,
+                      const SharedBlobFileMetaData* expected_meta,
+                      uint64_t offset, uint64_t file_size, uint64_t value_size,
                       CompressionType compression_type, uint64_t range_offset,
                       size_t range_length, PinnableSlice* value,
                       uint64_t* bytes_read);
@@ -217,6 +242,14 @@ class BlobSource {
   //  records.
   void MultiGetBlob(const ReadOptions& read_options,
                     autovector<BlobFileReadRequests>& blob_reqs,
+                    uint64_t* bytes_read) {
+    MultiGetBlob(read_options, /*configured_compression_manager=*/nullptr,
+                 blob_reqs, bytes_read);
+  }
+
+  void MultiGetBlob(const ReadOptions& read_options,
+                    CompressionManager* configured_compression_manager,
+                    autovector<BlobFileReadRequests>& blob_reqs,
                     uint64_t* bytes_read);
 
   // Read multiple blobs from the underlying cache or one blob file.
@@ -239,7 +272,27 @@ class BlobSource {
                                const BlobFileOpenInfo& blob_file,
                                uint64_t file_size,
                                autovector<BlobReadRequest>& blob_reqs,
-                               uint64_t* bytes_read);
+                               uint64_t* bytes_read) {
+    MultiGetBlobFromOneFile(read_options,
+                            /*configured_compression_manager=*/nullptr,
+                            blob_file, /*expected_meta=*/nullptr, file_size,
+                            blob_reqs, bytes_read);
+  }
+
+  void MultiGetBlobFromOneFile(
+      const ReadOptions& read_options,
+      CompressionManager* configured_compression_manager,
+      const BlobFileOpenInfo& blob_file,
+      const SharedBlobFileMetaData* expected_meta, uint64_t file_size,
+      autovector<BlobReadRequest>& blob_reqs, uint64_t* bytes_read);
+
+  inline Status GetBlobFileReader(
+      const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
+      CacheHandleGuard<BlobFileReader>* blob_file_reader) {
+    return GetBlobFileReader(read_options, blob_file,
+                             /*configured_compression_manager=*/nullptr,
+                             blob_file_reader);
+  }
 
   // Byte-range (partial) multi-read counterpart of MultiGetBlob: for each
   // request reads only its sub-range of an *uncompressed* blob value, from the
@@ -249,22 +302,28 @@ class BlobSource {
   // MultiGetBlobRangeFromOneFile. Per-request outcome is in
   // *blob_reqs[..].status.
   void MultiGetBlobRange(const ReadOptions& read_options,
+                         CompressionManager* configured_compression_manager,
                          autovector<BlobFileRangeReadRequests>& blob_reqs,
                          uint64_t* bytes_read);
 
   // Byte-range (partial) multi-read counterpart of MultiGetBlobFromOneFile for
-  // a single blob file. See MultiGetBlobRange.
-  void MultiGetBlobRangeFromOneFile(const ReadOptions& read_options,
-                                    const BlobFileOpenInfo& blob_file,
-                                    uint64_t file_size,
-                                    autovector<BlobRangeReadRequest>& blob_reqs,
-                                    uint64_t* bytes_read);
+  // a single blob file. See MultiGetBlobRange. `expected_meta` carries the
+  // MANIFEST metadata a freshly opened reader is verified against (null
+  // skips verification).
+  void MultiGetBlobRangeFromOneFile(
+      const ReadOptions& read_options,
+      CompressionManager* configured_compression_manager,
+      const BlobFileOpenInfo& blob_file,
+      const SharedBlobFileMetaData* expected_meta, uint64_t file_size,
+      autovector<BlobRangeReadRequest>& blob_reqs, uint64_t* bytes_read);
 
   inline Status GetBlobFileReader(
       const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
+      CompressionManager* configured_compression_manager,
       CacheHandleGuard<BlobFileReader>* blob_file_reader) {
-    return blob_file_cache_->GetBlobFileReader(read_options, blob_file,
-                                               blob_file_reader);
+    return blob_file_cache_->GetBlobFileReader(
+        read_options, blob_file, configured_compression_manager,
+        blob_file_reader, /*expected_meta=*/nullptr);
   }
 
   inline Cache* GetBlobCache() const { return blob_cache_.get(); }
@@ -310,6 +369,7 @@ class BlobSource {
   const std::string& db_session_id_;
 
   Statistics* statistics_;
+  bool use_blog_format_;
 
   // A cache to store blob file reader.
   BlobFileCache* blob_file_cache_;

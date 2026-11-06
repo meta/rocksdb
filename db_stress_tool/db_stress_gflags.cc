@@ -1560,6 +1560,15 @@ DEFINE_bool(
 DEFINE_string(wal_compression, "none",
               "Algorithm to use for WAL compression. none to disable.");
 
+DEFINE_bool(use_blog_format_for_blobs, false,
+            "Use blog file format for new blob files.");
+
+DEFINE_string(blog_checksum, "kXXH3", "Checksum type for blog format files.");
+
+DEFINE_bool(test_noncanonical_blog, false,
+            "Enable testing-only noncanonical blog writer features for the "
+            "entire invocation.");
+
 DEFINE_bool(
     verify_sst_unique_id_in_manifest, false,
     "Enable DB options `verify_sst_unique_id_in_manifest`, if true, during "

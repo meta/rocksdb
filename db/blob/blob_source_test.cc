@@ -15,9 +15,13 @@
 #include "cache/compressed_secondary_cache.h"
 #include "db/blob/blob_contents.h"
 #include "db/blob/blob_file_cache.h"
+#include "db/blob/blob_file_meta.h"
 #include "db/blob/blob_file_reader.h"
+#include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_writer.h"
+#include "db/blog/blog_format.h"
+#include "db/column_family.h"
 #include "db/db_test_util.h"
 #include "file/filename.h"
 #include "file/read_write_util.h"
@@ -59,8 +63,7 @@ void WriteBlobFile(const ImmutableOptions& immutable_options,
   constexpr bool do_flush = false;
 
   BlobLogWriter blob_log_writer(std::move(file_writer), immutable_options.clock,
-                                statistics, blob_file_number, use_fsync,
-                                do_flush);
+                                statistics, use_fsync, do_flush);
 
   BlobLogHeader header(column_family_id, compression, has_ttl,
                        expiration_range_header);
@@ -100,8 +103,8 @@ void WriteBlobFile(const ImmutableOptions& immutable_options,
 
   std::string checksum_method;
   std::string checksum_value;
-  ASSERT_OK(blob_log_writer.AppendFooter(WriteOptions(), footer,
-                                         &checksum_method, &checksum_value));
+  ASSERT_OK(blob_log_writer.LegacyAppendFooterAndClose(
+      WriteOptions(), footer, &checksum_method, &checksum_value));
 }
 
 BlobFileOpenInfo OpenInfoWithoutChecksum(uint64_t file_number) {
@@ -136,6 +139,234 @@ class BlobSourceTest : public DBTestBase {
   std::string db_id_;
   std::string db_session_id_;
 };
+
+// Exercise both reopen directions with old and newly written files in the
+// same DB. Cache hits must describe each file rather than the current writer.
+TEST_F(BlobSourceTest, CachedRecordSizesAfterWriterFormatChange) {
+  options_.min_blob_size = 0;
+  options_.blob_compression_type = kNoCompression;
+  options_.disable_auto_compactions = true;
+  options_.statistics = CreateDBStatistics();
+  for (bool original_blog_format : {false, true}) {
+    SCOPED_TRACE(original_blog_format);
+    options_.use_blog_format_for_blobs = original_blog_format;
+    DestroyAndReopen(options_);
+
+    const std::vector<std::string> key_strings{
+        std::string(4096, 'a'), std::string(4096, 'b'), std::string(4096, 'c'),
+        std::string(4096, 'd')};
+    const std::vector<std::string> blobs{"first", "second", "third", "fourth"};
+    const std::vector<Slice> keys{key_strings[0], key_strings[1],
+                                  key_strings[2], key_strings[3]};
+    for (size_t i = 0; i < 2; ++i) {
+      ASSERT_OK(Put(keys[i], blobs[i]));
+    }
+    ASSERT_OK(Flush());
+    options_.use_blog_format_for_blobs = !original_blog_format;
+    Reopen(options_);
+    for (size_t i = 2; i < keys.size(); ++i) {
+      ASSERT_OK(Put(keys[i], blobs[i]));
+    }
+    ASSERT_OK(Flush());
+
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    Version* const version = cfd->current();
+    ASSERT_EQ(version->storage_info()->GetBlobFiles().size(), 2U);
+    std::vector<BlobIndex> indexes(keys.size());
+    // GetImpl's is_blob_index output requests the raw index rather than
+    // resolving the value, leaving the blob cache cold.
+    for (size_t i = 0; i < keys.size(); ++i) {
+      bool is_blob_index = false;
+      PinnableSlice encoded;
+      DBImpl::GetImplOptions get_options;
+      get_options.column_family = db_->DefaultColumnFamily();
+      get_options.value = &encoded;
+      get_options.is_blob_index = &is_blob_index;
+      ASSERT_OK(dbfull()->GetImpl(ReadOptions(), keys[i], get_options));
+      ASSERT_TRUE(is_blob_index);
+      ASSERT_OK(indexes[i].DecodeFrom(encoded));
+    }
+
+    ReadOptions read_options;
+    read_options.verify_checksums = true;
+    std::vector<uint64_t> verified_sizes(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const bool file_is_blog =
+          i < 2 ? original_blog_format : !original_blog_format;
+      const uint64_t overhead =
+          file_is_blog ? kBlogBlockTrailerSize
+                       : BlobLogRecord::kHeaderSize + keys[i].size();
+      verified_sizes[i] = blobs[i].size() + overhead;
+      PinnableSlice value;
+      uint64_t bytes_read = 0;
+      ASSERT_OK(version->GetBlob(read_options, keys[i], indexes[i],
+                                 /*prefetch_buffer=*/nullptr, &value,
+                                 &bytes_read));
+      ASSERT_EQ(value, blobs[i]);
+      ASSERT_EQ(bytes_read, verified_sizes[i]);
+      if (file_is_blog) {
+        // The legacy cache-hit assertion would reject these long keys.
+        ASSERT_LT(indexes[i].offset(),
+                  BlobLogRecord::kHeaderSize + keys[i].size());
+      }
+    }
+
+    // Drop file readers so an attempted cache-hit open is observable.
+    for (const auto& meta : version->storage_info()->GetBlobFiles()) {
+      cfd->blob_file_cache()->Evict(meta->GetBlobFileNumber());
+    }
+    read_options.read_tier = kBlockCacheTier;
+    const uint64_t file_opens =
+        options_.statistics->getTickerCount(NO_FILE_OPENS);
+    const uint64_t file_bytes =
+        options_.statistics->getTickerCount(BLOB_DB_BLOB_FILE_BYTES_READ);
+    for (bool verify_checksums : {true, false}) {
+      SCOPED_TRACE(verify_checksums);
+      read_options.verify_checksums = verify_checksums;
+      uint64_t expected_total = 0;
+      for (size_t i = 0; i < keys.size(); ++i) {
+        PinnableSlice value;
+        uint64_t bytes_read = 0;
+        ASSERT_OK(version->GetBlob(read_options, keys[i], indexes[i],
+                                   /*prefetch_buffer=*/nullptr, &value,
+                                   &bytes_read));
+        ASSERT_EQ(value, blobs[i]);
+        const uint64_t expected_size =
+            verify_checksums ? verified_sizes[i] : blobs[i].size();
+        ASSERT_EQ(bytes_read, expected_size);
+        expected_total += expected_size;
+      }
+
+      std::vector<PinnableSlice> values(keys.size());
+      std::vector<Status> statuses(keys.size());
+      autovector<BlobFileReadRequests> file_requests;
+      for (size_t begin : {size_t{0}, size_t{2}}) {
+        const auto& meta = version->storage_info()->GetBlobFileMetaData(
+            indexes[begin].file_number());
+        ASSERT_NE(meta, nullptr);
+        const BlobFileOpenInfo file{meta->GetBlobFileNumber(),
+                                    meta->GetChecksumValue(),
+                                    meta->GetChecksumMethod()};
+        autovector<BlobReadRequest> requests;
+        for (size_t i = begin; i < begin + 2; ++i) {
+          requests.emplace_back(keys[i], indexes[i].offset(), indexes[i].size(),
+                                indexes[i].compression(), &values[i],
+                                &statuses[i]);
+        }
+        file_requests.emplace_back(file, meta->GetBlobFileSize(),
+                                   std::move(requests),
+                                   meta->GetSharedMeta().get());
+      }
+      uint64_t bytes_read = 0;
+      cfd->blob_source()->MultiGetBlob(read_options,
+                                       options_.compression_manager.get(),
+                                       file_requests, &bytes_read);
+      ASSERT_EQ(bytes_read, expected_total);
+      for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_OK(statuses[i]);
+        ASSERT_EQ(values[i], blobs[i]);
+      }
+    }
+    ASSERT_EQ(options_.statistics->getTickerCount(NO_FILE_OPENS), file_opens);
+    ASSERT_EQ(options_.statistics->getTickerCount(BLOB_DB_BLOB_FILE_BYTES_READ),
+              file_bytes);
+  }
+}
+
+// A range read verifies the opened blob file against the MANIFEST metadata
+// carried by its batch, like whole-value reads: a first-touch range open
+// with mismatched metadata fails instead of caching an unverified reader.
+TEST_F(BlobSourceTest, MultiGetBlobRangeVerifiesManifestMetadata) {
+  options_.min_blob_size = 0;
+  options_.blob_compression_type = kNoCompression;
+  options_.disable_auto_compactions = true;
+  DestroyAndReopen(options_);
+
+  ASSERT_OK(Put("key-small", "small"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key-big", std::string(512, 'b')));
+  ASSERT_OK(Flush());
+
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  Version* const version = cfd->current();
+  ASSERT_EQ(version->storage_info()->GetBlobFiles().size(), 2U);
+
+  // Resolve raw indexes without populating the blob cache.
+  const std::vector<std::string> key_strings{"key-small", "key-big"};
+  const std::vector<Slice> keys{key_strings[0], key_strings[1]};
+  std::vector<BlobIndex> indexes(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    bool is_blob_index = false;
+    PinnableSlice encoded;
+    DBImpl::GetImplOptions get_options;
+    get_options.column_family = db_->DefaultColumnFamily();
+    get_options.value = &encoded;
+    get_options.is_blob_index = &is_blob_index;
+    ASSERT_OK(dbfull()->GetImpl(ReadOptions(), keys[i], get_options));
+    ASSERT_TRUE(is_blob_index);
+    ASSERT_OK(indexes[i].DecodeFrom(encoded));
+  }
+
+  const auto meta_small =
+      version->storage_info()->GetBlobFileMetaData(indexes[0].file_number());
+  const auto meta_big =
+      version->storage_info()->GetBlobFileMetaData(indexes[1].file_number());
+  ASSERT_NE(meta_small, nullptr);
+  ASSERT_NE(meta_big, nullptr);
+  ASSERT_NE(meta_small->GetBlobFileNumber(), meta_big->GetBlobFileNumber());
+  const auto* shared_small = meta_small->GetSharedMeta().get();
+  const auto* shared_big = meta_big->GetSharedMeta().get();
+  ASSERT_NE(shared_small->GetPhysicalBlobFileSize(), 0U);
+  ASSERT_NE(shared_small->GetPhysicalBlobFileSize(),
+            shared_big->GetPhysicalBlobFileSize());
+
+  ReadOptions read_options;
+  read_options.io_activity = Env::IOActivity::kLazyResolve;
+
+  // Range-read `range_length` bytes at offset 1 of one blob, presenting
+  // `meta` for open-time verification.
+  auto range_read = [&](const Slice& user_key, const BlobIndex& index,
+                        uint64_t file_size, const SharedBlobFileMetaData* meta,
+                        size_t range_length, PinnableSlice* result,
+                        Status* status) {
+    const BlobFileOpenInfo file{index.file_number(), Slice(), Slice()};
+    autovector<BlobRangeReadRequest> reqs_in_file;
+    reqs_in_file.emplace_back(user_key, index.offset(), index.size(),
+                              /*range_offset=*/1, range_length, result, status);
+    autovector<BlobFileRangeReadRequests> file_reqs;
+    file_reqs.emplace_back(file, file_size, std::move(reqs_in_file), meta);
+    cfd->blob_source()->MultiGetBlobRange(
+        read_options, options_.compression_manager.get(), file_reqs,
+        /*bytes_read=*/nullptr);
+  };
+
+  // Drop readers so each open below is observable.
+  cfd->blob_file_cache()->Evict(meta_small->GetBlobFileNumber());
+  cfd->blob_file_cache()->Evict(meta_big->GetBlobFileNumber());
+
+  // Control: matching metadata serves the sub-range.
+  {
+    PinnableSlice result;
+    Status status;
+    range_read(keys[0], indexes[0], meta_small->GetBlobFileSize(), shared_small,
+               2, &result, &status);
+    ASSERT_OK(status);
+    ASSERT_EQ(result, std::string("ma"));
+  }
+
+  // A first-touch range open with mismatched metadata fails instead of
+  // caching an unverified reader.
+  cfd->blob_file_cache()->Evict(meta_small->GetBlobFileNumber());
+  {
+    PinnableSlice result;
+    Status status;
+    range_read(keys[0], indexes[0], meta_small->GetBlobFileSize(), shared_big,
+               2, &result, &status);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  }
+}
 
 TEST_F(BlobSourceTest, GetBlobsFromCache) {
   options_.cf_paths.emplace_back(
@@ -529,11 +760,13 @@ TEST_F(BlobSourceTest, GetCompressedBlobs) {
 
     CacheHandleGuard<BlobFileReader> blob_file_reader;
     ASSERT_OK(blob_source.GetBlobFileReader(
-        read_options, OpenInfoWithoutChecksum(file_number), &blob_file_reader));
+        read_options, OpenInfoWithoutChecksum(file_number),
+        options_.compression_manager.get(), &blob_file_reader));
     ASSERT_NE(blob_file_reader.GetValue(), nullptr);
 
     const uint64_t file_size = blob_file_reader.GetValue()->GetFileSize();
-    ASSERT_EQ(blob_file_reader.GetValue()->GetCompressionType(), compression);
+    ASSERT_EQ(blob_file_reader.GetValue()->GetLegacyCompressionType(),
+              compression);
 
     for (size_t i = 0; i < num_blobs; ++i) {
       ASSERT_NE(blobs[i].size() /*uncompressed size*/,
@@ -681,7 +914,8 @@ TEST_F(BlobSourceTest, MultiGetBlobsFromMultiFiles) {
             &value_buf[i * num_blobs + j], &statuses_buf[i * num_blobs + j]);
       }
       blob_reqs.emplace_back(OpenInfoWithoutChecksum(file_number), file_size,
-                             blob_reqs_in_file[i]);
+                             blob_reqs_in_file[i],
+                             /*expected_meta=*/nullptr);
     }
 
     get_perf_context()->Reset();
@@ -739,7 +973,8 @@ TEST_F(BlobSourceTest, MultiGetBlobsFromMultiFiles) {
 
     // Add a fake multi-get blob request.
     blob_reqs.emplace_back(OpenInfoWithoutChecksum(fake_file_number), file_size,
-                           fake_blob_reqs_in_file);
+                           fake_blob_reqs_in_file,
+                           /*expected_meta=*/nullptr);
 
     blob_source.MultiGetBlob(read_options, blob_reqs, &bytes_read);
 
@@ -1140,6 +1375,116 @@ TEST_F(BlobSourceTest, GetBlobPreservesCorruptionDetailsWhenRefreshOpenFails) {
   ASSERT_NE(status_str.find("IO error"), std::string::npos);
 }
 
+TEST_F(BlobSourceTest, ReadsVerifyManifestMetadata) {
+  options_.cf_paths.emplace_back(
+      test::PerThreadDBPath(env_, "BlobSourceTest_ReadsVerifyManifestMetadata"),
+      0);
+
+  DestroyAndReopen(options_);
+
+  ImmutableOptions immutable_options(options_);
+  MutableCFOptions mutable_cf_options(options_);
+
+  constexpr uint32_t column_family_id = 1;
+  constexpr bool has_ttl = false;
+  constexpr ExpirationRange expiration_range;
+  constexpr uint64_t blob_file_number = 1;
+
+  const std::string key_str = "key0";
+  const std::string blob_str = "blob0";
+  std::vector<Slice> keys{Slice(key_str)};
+  std::vector<Slice> blobs{Slice(blob_str)};
+  std::vector<uint64_t> blob_offsets(1);
+  std::vector<uint64_t> blob_sizes(1);
+
+  const uint64_t file_size = BlobLogHeader::kSize + BlobLogRecord::kHeaderSize +
+                             key_str.size() + blob_str.size() +
+                             BlobLogFooter::kSize;
+
+  WriteBlobFile(immutable_options, column_family_id, has_ttl, expiration_range,
+                expiration_range, blob_file_number, keys, blobs, kNoCompression,
+                blob_offsets, blob_sizes);
+
+  constexpr size_t capacity = 1024;
+  std::shared_ptr<Cache> backing_cache = NewLRUCache(capacity);
+
+  FileOptions file_options;
+  std::unique_ptr<BlobFileCache> blob_file_cache =
+      std::make_unique<BlobFileCache>(
+          backing_cache.get(), &immutable_options, &file_options,
+          column_family_id, nullptr /*HistogramImpl*/, nullptr /*IOTracer*/);
+
+  BlobSource blob_source(immutable_options, mutable_cf_options, db_id_,
+                         db_session_id_, blob_file_cache.get());
+
+  ReadOptions read_options;
+  read_options.verify_checksums = true;
+  read_options.fill_cache = false;
+  constexpr FilePrefetchBuffer* prefetch_buffer = nullptr;
+
+  const std::shared_ptr<SharedBlobFileMetaData> matching_meta =
+      SharedBlobFileMetaData::Create(
+          blob_file_number, /*total_blob_count=*/1,
+          key_str.size() + blob_str.size(), /*checksum_method=*/"",
+          /*checksum_value=*/"", file_size, kLegacyBlobFileSchemaVersion,
+          /*file_identity=*/{});
+  const std::shared_ptr<SharedBlobFileMetaData> mismatched_meta =
+      SharedBlobFileMetaData::Create(
+          blob_file_number, /*total_blob_count=*/1,
+          key_str.size() + blob_str.size(), /*checksum_method=*/"",
+          /*checksum_value=*/"", file_size + 1, kLegacyBlobFileSchemaVersion,
+          /*file_identity=*/{});
+  const BlobFileOpenInfo blob_file = OpenInfoWithoutChecksum(blob_file_number);
+  CompressionManager* compression_manager =
+      mutable_cf_options.compression_manager.get();
+
+  // GetBlob threads the expected metadata through to the open.
+  PinnableSlice value;
+  uint64_t bytes_read = 0;
+  ASSERT_OK(blob_source.GetBlob(read_options, keys[0], compression_manager,
+                                blob_file, matching_meta.get(), blob_offsets[0],
+                                file_size, blob_sizes[0], kNoCompression,
+                                prefetch_buffer, &value, &bytes_read));
+  ASSERT_EQ(value, blobs[0]);
+
+  blob_file_cache->Evict(blob_file_number);
+  ASSERT_TRUE(blob_source
+                  .GetBlob(read_options, keys[0], compression_manager,
+                           blob_file, mismatched_meta.get(), blob_offsets[0],
+                           file_size, blob_sizes[0], kNoCompression,
+                           prefetch_buffer, &value, &bytes_read)
+                  .IsCorruption());
+
+  // MultiGetBlob threads the per-file metadata from the request tuple.
+  auto multiget_with_meta = [&](const SharedBlobFileMetaData* meta,
+                                PinnableSlice* result, Status* status) {
+    std::array<Status, 1> statuses;
+    std::array<PinnableSlice, 1> values;
+    autovector<BlobReadRequest> reqs_in_file;
+    reqs_in_file.emplace_back(keys[0], blob_offsets[0], blob_sizes[0],
+                              kNoCompression, &values[0], &statuses[0]);
+    autovector<BlobFileReadRequests> file_reqs;
+    file_reqs.emplace_back(blob_file, file_size, reqs_in_file, meta);
+    uint64_t multiget_bytes_read = 0;
+    blob_source.MultiGetBlob(read_options, compression_manager, file_reqs,
+                             &multiget_bytes_read);
+    result->Reset();
+    *result = std::move(values[0]);
+    *status = statuses[0];
+  };
+
+  PinnableSlice multiget_value;
+  Status status;
+  blob_file_cache->Evict(blob_file_number);
+  multiget_with_meta(matching_meta.get(), &multiget_value, &status);
+  ASSERT_OK(status);
+  ASSERT_EQ(multiget_value, blobs[0]);
+
+  blob_file_cache->Evict(blob_file_number);
+  multiget_with_meta(mismatched_meta.get(), &multiget_value, &status);
+  ASSERT_TRUE(status.IsCorruption());
+}
+
 TEST_F(BlobSourceTest,
        MultiGetBlobPreservesCorruptionDetailsWhenRefreshOpenFails) {
   options_.cf_paths.emplace_back(
@@ -1319,10 +1664,11 @@ TEST_F(BlobSecondaryCacheTest, GetBlobsFromSecondaryCache) {
   CacheHandleGuard<BlobFileReader> file_reader;
   ReadOptions read_options;
   ASSERT_OK(blob_source.GetBlobFileReader(
-      read_options, OpenInfoWithoutChecksum(file_number), &file_reader));
+      read_options, OpenInfoWithoutChecksum(file_number),
+      options_.compression_manager.get(), &file_reader));
   ASSERT_NE(file_reader.GetValue(), nullptr);
   const uint64_t file_size = file_reader.GetValue()->GetFileSize();
-  ASSERT_EQ(file_reader.GetValue()->GetCompressionType(), kNoCompression);
+  ASSERT_EQ(file_reader.GetValue()->GetLegacyCompressionType(), kNoCompression);
 
   read_options.verify_checksums = true;
 

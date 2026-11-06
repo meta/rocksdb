@@ -7,20 +7,25 @@
 
 #include <cassert>
 #include <cinttypes>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "db/blob/blob_contents.h"
 #include "db/blob/blob_file_addition.h"
+#include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_sequential_reader.h"
+#include "db/blog/blog_format.h"
 #include "env/mock_env.h"
 #include "file/filename.h"
 #include "file/random_access_file_reader.h"
 #include "options/cf_options.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_checksum.h"
+#include "rocksdb/file_system.h"
 #include "rocksdb/options.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
@@ -581,6 +586,209 @@ TEST_F(BlobFileBuilderTest, Checksum) {
                  kNoCompression, expected_key_value_pairs, blob_indexes);
 }
 
+TEST_F(BlobFileBuilderTest, SyncUsesConfiguredFsync) {
+  struct SyncCounts {
+    size_t sync = 0;
+    size_t fsync = 0;
+  };
+  class SyncCountingFile : public FSWritableFileOwnerWrapper {
+   public:
+    SyncCountingFile(std::unique_ptr<FSWritableFile>&& file, SyncCounts* counts)
+        : FSWritableFileOwnerWrapper(std::move(file)), counts_(counts) {}
+    IOStatus Sync(const IOOptions& options, IODebugContext* dbg) override {
+      ++counts_->sync;
+      return target()->Sync(options, dbg);
+    }
+    IOStatus Fsync(const IOOptions& options, IODebugContext* dbg) override {
+      ++counts_->fsync;
+      return target()->Fsync(options, dbg);
+    }
+
+   private:
+    SyncCounts* counts_;
+  };
+  class SyncCountingFileSystem : public FileSystemWrapper {
+   public:
+    SyncCountingFileSystem(const std::shared_ptr<FileSystem>& fs,
+                           SyncCounts* counts)
+        : FileSystemWrapper(fs), counts_(counts) {}
+    const char* Name() const override { return "SyncCountingFileSystem"; }
+    IOStatus NewWritableFile(const std::string& path,
+                             const FileOptions& options,
+                             std::unique_ptr<FSWritableFile>* file,
+                             IODebugContext* dbg) override {
+      IOStatus s = target()->NewWritableFile(path, options, file, dbg);
+      if (s.ok()) {
+        *file = std::make_unique<SyncCountingFile>(std::move(*file), counts_);
+      }
+      return s;
+    }
+
+   private:
+    SyncCounts* counts_;
+  };
+
+  for (bool blog_format : {false, true}) {
+    for (bool use_fsync : {false, true}) {
+      SCOPED_TRACE(blog_format);
+      SCOPED_TRACE(use_fsync);
+      SyncCounts counts;
+      SyncCountingFileSystem fs(mock_env_->GetFileSystem(), &counts);
+      Options options;
+      options.cf_paths.emplace_back(
+          test::PerThreadDBPath(mock_env_.get(), "SyncUsesConfiguredFsync"), 0);
+      options.enable_blob_files = true;
+      options.use_blog_format_for_blobs = blog_format;
+      options.use_fsync = use_fsync;
+      options.env = mock_env_.get();
+
+      ImmutableOptions immutable_options(options);
+      MutableCFOptions mutable_cf_options(options);
+      std::vector<std::string> blob_file_paths;
+      std::vector<BlobFileAddition> blob_file_additions;
+      BlobFileBuilder builder(
+          TestFileNumberGenerator(), &fs, &immutable_options,
+          &mutable_cf_options, &file_options_, &write_options_, "dbid",
+          "session", /*job_id=*/1,
+          /*column_family_id=*/123, "blob_cf", Env::WLTH_MEDIUM,
+          nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
+          BlobFileCreationReason::kFlush,
+          immutable_options.cf_paths.front().path, &blob_file_paths,
+          &blob_file_additions);
+      std::string blob_index;
+      ASSERT_OK(builder.Add("key", "value", &blob_index));
+      ASSERT_EQ(counts.sync, 0U);
+      ASSERT_EQ(counts.fsync, 0U);
+      ASSERT_OK(builder.Finish());
+      ASSERT_EQ(counts.sync, use_fsync ? 0U : 1U);
+      ASSERT_EQ(counts.fsync, use_fsync ? 1U : 0U);
+    }
+  }
+}
+
+TEST_F(BlobFileBuilderTest, BufferedSmallBlobWrites) {
+  for (bool blog_format : {false, true}) {
+    SCOPED_TRACE(blog_format);
+    Options options;
+    options.cf_paths.emplace_back(
+        test::PerThreadDBPath(mock_env_.get(), "BufferedSmallBlobWrites"), 0);
+    options.enable_blob_files = true;
+    options.use_blog_format_for_blobs = blog_format;
+    options.env = mock_env_.get();
+
+    ImmutableOptions immutable_options(options);
+    MutableCFOptions mutable_cf_options(options);
+    std::vector<std::string> blob_file_paths;
+    std::vector<BlobFileAddition> blob_file_additions;
+    BlobFileBuilder builder(
+        TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
+        &file_options_, &write_options_, "dbid", "session", /*job_id=*/1,
+        /*column_family_id=*/123, "blob_cf", Env::WLTH_MEDIUM,
+        nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
+        BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+        &blob_file_paths, &blob_file_additions);
+
+    size_t append_count = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "WritableFileWriter::Flush:BeforeAppend",
+        [&append_count](void*) { ++append_count; });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    constexpr size_t number_of_blobs = 100;
+    const std::string value(64, 'v');
+    std::vector<std::string> blob_indexes(number_of_blobs);
+    for (size_t i = 0; i < number_of_blobs; ++i) {
+      ASSERT_OK(builder.Add("key", value, &blob_indexes[i]));
+    }
+    const size_t appends_before_finish = append_count;
+    const Status finish_status = builder.Finish();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    ASSERT_OK(finish_status);
+    ASSERT_EQ(appends_before_finish, 0U);
+    ASSERT_EQ(append_count, 1U);
+    ASSERT_EQ(blob_file_additions.size(), 1U);
+    ASSERT_EQ(blob_file_additions[0].GetTotalBlobCount(), number_of_blobs);
+
+    std::unique_ptr<BlobFileReader> reader;
+    ReadOptions read_options;
+    ASSERT_OK(BlobFileReader::Create(immutable_options, read_options,
+                                     file_options_, /*column_family_id=*/123,
+                                     /*blob_file_read_hist=*/nullptr,
+                                     blob_file_additions[0].GetBlobFileNumber(),
+                                     nullptr /*IOTracer*/, &reader));
+    for (const std::string& encoded_index : blob_indexes) {
+      BlobIndex index;
+      ASSERT_OK(index.DecodeFrom(encoded_index));
+      std::unique_ptr<BlobContents> contents;
+      ASSERT_OK(reader->GetBlob(read_options, "key", index.offset(),
+                                index.size(), index.compression(),
+                                /*prefetch_buffer=*/nullptr,
+                                /*allocator=*/nullptr, &contents,
+                                /*bytes_read=*/nullptr));
+      ASSERT_NE(contents, nullptr);
+      ASSERT_EQ(contents->data(), value);
+    }
+  }
+}
+
+TEST_F(BlobFileBuilderTest, BlogFormatManifestMetadata) {
+  Options options;
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlobFileBuilderTest_BlogFormatManifestMetadata"),
+      0);
+  options.enable_blob_files = true;
+  options.use_blog_format_for_blobs = true;
+  options.env = mock_env_.get();
+
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_cf_options(options);
+
+  constexpr int job_id = 1;
+  constexpr uint32_t column_family_id = 123;
+  constexpr char column_family_name[] = "blog_cf";
+  constexpr Env::WriteLifeTimeHint write_hint = Env::WLTH_MEDIUM;
+
+  std::vector<std::string> blob_file_paths;
+  std::vector<BlobFileAddition> blob_file_additions;
+
+  BlobFileBuilder builder(
+      TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
+      &file_options_, &write_options_, "dbid", "session", job_id,
+      column_family_id, column_family_name, write_hint, nullptr /*IOTracer*/,
+      nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
+      immutable_options.cf_paths.front().path, &blob_file_paths,
+      &blob_file_additions);
+
+  std::string blob_index;
+  ASSERT_OK(builder.Add("key", std::string(64, 'v'), &blob_index));
+  ASSERT_OK(builder.Finish());
+
+  ASSERT_EQ(blob_file_additions.size(), 1U);
+  const auto& blob_file_addition = blob_file_additions[0];
+  ASSERT_GT(blob_file_addition.GetPhysicalBlobFileSize(),
+            blob_file_addition.GetTotalBlobBytes());
+  ASSERT_EQ(blob_file_addition.GetSchemaVersion(), kBlogCurrentSchemaVersion);
+  ASSERT_EQ(blob_file_addition.GetFileIdentity().size(), kBlobFileIdentitySize);
+
+  constexpr HistogramImpl* blob_file_read_hist = nullptr;
+  std::unique_ptr<BlobFileReader> reader;
+  ReadOptions read_options;
+  ASSERT_OK(BlobFileReader::Create(
+      immutable_options, read_options, file_options_, column_family_id,
+      blob_file_read_hist, blob_file_addition.GetBlobFileNumber(),
+      std::shared_ptr<IOTracer>() /*io_tracer*/, &reader));
+  ASSERT_TRUE(reader->IsBlogFormat());
+  ASSERT_EQ(reader->GetFileSize(),
+            blob_file_addition.GetPhysicalBlobFileSize());
+  ASSERT_EQ(reader->GetBlogSchemaVersion(),
+            blob_file_addition.GetSchemaVersion());
+  ASSERT_EQ(reader->GetBlogFileIdentity().ToString(),
+            blob_file_addition.GetFileIdentity());
+}
+
 class BlobFileBuilderIOErrorTest
     : public testing::Test,
       public testing::WithParamInterface<std::string> {
@@ -604,7 +812,7 @@ INSTANTIATE_TEST_CASE_P(
         "BlobFileBuilder::OpenBlobFileIfNeeded:NewWritableFile",
         "BlobFileBuilder::OpenBlobFileIfNeeded:WriteHeader",
         "BlobFileBuilder::WriteBlobToFile:AddRecord",
-        "BlobFileBuilder::WriteBlobToFile:AppendFooter"}));
+        "BlobFileBuilder::WriteBlobToFile:LegacyAppendFooterAndClose"}));
 
 TEST_P(BlobFileBuilderIOErrorTest, IOError) {
   // Simulate an I/O error during the specified step of Add()

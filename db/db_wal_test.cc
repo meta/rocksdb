@@ -980,10 +980,11 @@ class DBRecoveryTestBlobError
   std::string sync_point_;
 };
 
-INSTANTIATE_TEST_CASE_P(DBRecoveryTestBlobError, DBRecoveryTestBlobError,
-                        ::testing::ValuesIn(std::vector<std::string>{
-                            "BlobFileBuilder::WriteBlobToFile:AddRecord",
-                            "BlobFileBuilder::WriteBlobToFile:AppendFooter"}));
+INSTANTIATE_TEST_CASE_P(
+    DBRecoveryTestBlobError, DBRecoveryTestBlobError,
+    ::testing::ValuesIn(std::vector<std::string>{
+        "BlobFileBuilder::WriteBlobToFile:AddRecord",
+        "BlobFileBuilder::WriteBlobToFile:LegacyAppendFooterAndClose"}));
 
 TEST_P(DBRecoveryTestBlobError, RecoverWithBlobError) {
   // Write a value. Note that blob files are not actually enabled at this point.
