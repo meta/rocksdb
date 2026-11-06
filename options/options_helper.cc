@@ -352,6 +352,7 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
 
   // Compaction related options
   cf_opts->disable_auto_compactions = moptions.disable_auto_compactions;
+  cf_opts->disable_intra_l0_compaction = moptions.disable_intra_l0_compaction;
   cf_opts->table_factory = moptions.table_factory;
   cf_opts->soft_pending_compaction_bytes_limit =
       moptions.soft_pending_compaction_bytes_limit;

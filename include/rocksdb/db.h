@@ -2237,6 +2237,8 @@ class DB {
   virtual Status EnableAutoCompaction(
       const std::vector<ColumnFamilyHandle*>& column_family_handles) = 0;
 
+  virtual Status EnableIntraL0Compaction(
+      const std::vector<ColumnFamilyHandle*>& column_family_handles) = 0;
   // After this function call, CompactRange() or CompactFiles() will not
   // run compactions and fail. Calling this function will tell outstanding
   // manual compactions to abort and will wait for them to finish or abort

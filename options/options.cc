@@ -320,6 +320,8 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    hard_pending_compaction_bytes_limit);
   ROCKS_LOG_HEADER(log, "               Options.disable_auto_compactions: %d",
                    disable_auto_compactions);
+  ROCKS_LOG_HEADER(log, "  Options.disable_intra_l0_compaction: %d",
+                   disable_intra_l0_compaction);
 
   const auto& it_compaction_style =
       compaction_style_to_string.find(compaction_style);

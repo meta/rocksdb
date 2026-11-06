@@ -3218,6 +3218,21 @@ void Java_org_rocksdb_RocksDB_enableAutoCompaction(JNIEnv* env, jclass,
   db->EnableAutoCompaction(cf_handles);
 }
 
+void Java_org_rocksdb_RocksDB_enableIntraL0Compaction(JNIEnv* env, jclass,
+                                                      jlong jdb_handle,
+                                                      jlongArray jcf_handles) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  jboolean has_exception = JNI_FALSE;
+  const std::vector<ROCKSDB_NAMESPACE::ColumnFamilyHandle*> cf_handles =
+      ROCKSDB_NAMESPACE::JniUtil::fromJPointers<
+          ROCKSDB_NAMESPACE::ColumnFamilyHandle>(env, jcf_handles,
+                                                 &has_exception);
+  if (has_exception == JNI_TRUE) {
+    // exception occurred
+    return;
+  }
+  db->EnableIntraL0Compaction(cf_handles);
+}
 /*
  * Class:     org_rocksdb_RocksDB
  * Method:    numberLevels
