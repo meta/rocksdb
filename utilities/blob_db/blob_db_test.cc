@@ -1936,6 +1936,72 @@ TEST_F(BlobDBTest, MaintainBlobFileToSstMapping) {
   }
 }
 
+TEST_F(BlobDBTest, ProcessFlushJobInfoBeforeUpdateLiveSSTSize) {
+  BlobDBOptions bdb_options;
+  bdb_options.enable_garbage_collection = true;
+  bdb_options.disable_background_tasks = true;
+
+  Options options;
+  options.disable_auto_compactions = true;
+  Open(bdb_options, options);
+
+  ASSERT_OK(Put("key", "value"));
+
+  std::atomic<bool> checked{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlobDBImpl::UpdateLiveSSTSize:Begin", [&](void* /* arg */) {
+        if (checked.exchange(true)) {
+          return;
+        }
+        auto blob_files = blob_db_impl()->TEST_GetBlobFiles();
+        EXPECT_EQ(blob_files.size(), 1);
+        if (blob_files.size() == 1) {
+          EXPECT_EQ(blob_files[0]->GetLinkedSstFiles().size(), 1);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(blob_db_->Flush(FlushOptions()));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+
+  ASSERT_TRUE(checked.load());
+}
+
+TEST_F(BlobDBTest, UnlinkSstBeforeFlushLink) {
+  BlobDBOptions bdb_options;
+  bdb_options.enable_garbage_collection = true;
+  bdb_options.disable_background_tasks = true;
+
+  Options options;
+  options.disable_auto_compactions = true;
+  Open(bdb_options, options);
+
+  ASSERT_OK(Put("key", "value"));
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlobDBListenerGC::OnFlushCompleted:BeforeProcess", [&](void* arg) {
+        auto* info = static_cast<FlushJobInfo*>(arg);
+        if (info->oldest_blob_file_number == kInvalidBlobFileNumber) {
+          return;
+        }
+        // Simulate a compaction that consumed this SST before the flush
+        // listener had a chance to link it. This is the race window that
+        // exists between version install and listener notification.
+        CompactionJobInfo cinfo{};
+        cinfo.input_file_infos.emplace_back(CompactionFileInfo{
+            0, info->file_number, info->oldest_blob_file_number});
+        cinfo.output_file_infos.emplace_back(CompactionFileInfo{
+            1, info->file_number + 1, info->oldest_blob_file_number});
+        blob_db_impl()->TEST_ProcessCompactionJobInfo(cinfo);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(blob_db_->Flush(FlushOptions()));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+}
+
 TEST_F(BlobDBTest, ShutdownWait) {
   BlobDBOptions bdb_options;
   bdb_options.ttl_range_secs = 100;
