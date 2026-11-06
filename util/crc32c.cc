@@ -52,7 +52,7 @@ ASSERT_FEATURE_COMPAT_HEADER();
 #include <wmmintrin.h>
 #endif
 
-#if defined(HAVE_ARM64_CRC)
+#if defined(__ARM_FEATURE_CRC32)
 bool pmull_runtime_flag = false;
 #endif
 
@@ -353,7 +353,7 @@ static bool isAltiVec() {
 }
 #endif
 
-#if defined(HAVE_ARM64_CRC)
+#if defined(__ARM_FEATURE_CRC32)
 uint32_t ExtendARMImpl(uint32_t crc, const char* buf, size_t size) {
   return crc32c_arm64(crc, (const unsigned char*)buf, size);
 }
@@ -362,30 +362,30 @@ uint32_t ExtendARMImpl(uint32_t crc, const char* buf, size_t size) {
 std::string IsFastCrc32Supported() {
   bool has_fast_crc = false;
   std::string fast_zero_msg;
-  std::string arch;
+  std::string arch = "unknown_architecture";
 #ifdef HAVE_POWER8
+  arch = "PPC";
 #ifdef HAS_ALTIVEC
   if (arch_ppc_probe()) {
     has_fast_crc = true;
-    arch = "PPC";
   }
 #else
   has_fast_crc = false;
-  arch = "PPC";
 #endif
-#elif defined(HAVE_ARM64_CRC)
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  arch = "Arm64";
+#if defined(__ARM_FEATURE_CRC32)
   if (crc32c_runtime_check()) {
     has_fast_crc = true;
-    arch = "Arm64";
     pmull_runtime_flag = crc32c_pmull_runtime_check();
   } else {
     has_fast_crc = false;
-    arch = "Arm64";
   }
-#else
-#ifdef __SSE4_2__
+#endif
+#elif defined(__SSE4_2__)
   has_fast_crc = true;
-#endif  // __SSE4_2__
+  arch = "x86";
+#elif defined(__x86_64__) || defined(_M_X64)
   arch = "x86";
 #endif
   if (has_fast_crc) {
@@ -1108,7 +1108,7 @@ uint32_t crc32c_3way(uint32_t crc, const char* buf, size_t len) {
 static inline Function Choose_Extend() {
 #ifdef HAVE_POWER8
   return isAltiVec() ? ExtendPPCImpl : ExtendImpl<DefaultCRC32>;
-#elif defined(HAVE_ARM64_CRC)
+#elif defined(__ARM_FEATURE_CRC32)
   if(crc32c_runtime_check()) {
     pmull_runtime_flag = crc32c_pmull_runtime_check();
     return ExtendARMImpl;

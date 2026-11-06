@@ -289,11 +289,11 @@ endif
 
 CXXFLAGS += $(ARCHFLAG)
 
-ifeq (,$(shell $(CXX) -fsyntax-only -march=armv8-a+crc+crypto -xc /dev/null 2>&1))
+# compile aarch64 CRC and pmull (in the aes set) instructions: Linux aarch64 default excludes them
+ifeq (,$(shell $(CXX) -fsyntax-only -march=armv8-a+crc+aes -xc /dev/null 2>&1))
 ifneq ($(PLATFORM),OS_MACOSX)
-CXXFLAGS += -march=armv8-a+crc+crypto
-CFLAGS += -march=armv8-a+crc+crypto
-ARMCRC_SOURCE=1
+CXXFLAGS += -march=armv8-a+crc+aes
+CFLAGS += -march=armv8-a+crc+aes
 endif
 endif
 
