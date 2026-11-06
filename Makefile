@@ -536,6 +536,9 @@ ifeq ($(HAVE_POWER8),1)
 LIB_OBJECTS += $(patsubst %.c, $(OBJ_DIR)/%.o, $(LIB_SOURCES_C))
 LIB_OBJECTS += $(patsubst %.S, $(OBJ_DIR)/%.o, $(LIB_SOURCES_ASM))
 endif
+ifeq ($(ARMCRC_SOURCE),1)
+LIB_OBJECTS += $(patsubst %.S, $(OBJ_DIR)/%.o, $(LIB_SOURCES_ARM64_ASM))
+endif
 
 ifeq ($(USE_FOLLY_LITE),1)
   LIB_OBJECTS += $(patsubst %.cpp, $(OBJ_DIR)/%.o, $(FOLLY_SOURCES))
@@ -2936,6 +2939,13 @@ $(OBJ_DIR)/util/crc32c_ppc.o: util/crc32c_ppc.c
 
 $(OBJ_DIR)/util/crc32c_ppc_asm.o: util/crc32c_ppc_asm.S
 	$(AM_V_CC)$(CC) $(CFLAGS) -c $< -o $@
+endif
+ifeq ($(ARMCRC_SOURCE),1)
+$(OBJ_DIR)/util/crc32_iscsi_sve2.o: util/crc32_iscsi_sve2.S
+	$(AM_V_CC)mkdir -p $(@D) && $(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/util/crc32_iscsi_crc_ext.o: util/crc32_iscsi_crc_ext.S
+	$(AM_V_CC)mkdir -p $(@D) && $(CC) $(CFLAGS) -c $< -o $@
 endif
 $(OBJ_DIR)/%.o: %.cc
 	$(AM_V_CC)mkdir -p $(@D) && $(CXX) $(CXXFLAGS) -c $< -o $@ $(COVERAGEFLAGS)

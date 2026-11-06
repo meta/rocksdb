@@ -20,6 +20,19 @@
 #include "util/crc32c_arm64.h"
 #include "util/math.h"
 
+#if defined(HAVE_ARM64_CRC) && defined(__linux__) && \
+    defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#include "util/crc32c_asm.h"
+#ifndef AT_HWCAP2
+#define AT_HWCAP2 26
+#endif
+#ifndef HWCAP2_SVE2
+#define HWCAP2_SVE2 (1 << 1)
+#endif
+#endif
+
 #ifdef __powerpc64__
 #include "util/crc32c_ppc.h"
 #include "util/crc32c_ppc_constants.h"
@@ -356,6 +369,15 @@ static bool isAltiVec() {
 #if defined(HAVE_ARM64_CRC)
 uint32_t ExtendARMImpl(uint32_t crc, const char* buf, size_t size) {
   return crc32c_arm64(crc, (const unsigned char*)buf, size);
+}
+#endif
+
+#if defined(HAVE_ARM64_CRC) && defined(__linux__) && \
+    defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT)
+// SVE2 path: crc32_iscsi_sve2 uses uninverted CRC convention.
+// Extend() uses inverted CRC, so we invert before/after.
+uint32_t ExtendSVE2ARMImpl(uint32_t crc, const char* buf, size_t size) {
+  return ~crc32_iscsi_sve2(buf, (uint64_t)size, ~crc);
 }
 #endif
 
@@ -1109,7 +1131,15 @@ static inline Function Choose_Extend() {
 #ifdef HAVE_POWER8
   return isAltiVec() ? ExtendPPCImpl : ExtendImpl<DefaultCRC32>;
 #elif defined(HAVE_ARM64_CRC)
-  if(crc32c_runtime_check()) {
+#if defined(__linux__) && defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT)
+  {
+    unsigned long auxval2 = getauxval(AT_HWCAP2);
+    if (auxval2 & HWCAP2_SVE2) {
+      return ExtendSVE2ARMImpl;
+    }
+  }
+#endif
+  if (crc32c_runtime_check()) {
     pmull_runtime_flag = crc32c_pmull_runtime_check();
     return ExtendARMImpl;
   } else {
