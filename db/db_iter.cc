@@ -1606,6 +1606,12 @@ bool DBIter::MergeWithNoBaseValue(const Slice& user_key) {
 
 bool DBIter::MergeWithPlainBaseValue(const Slice& value,
                                      const Slice& user_key) {
+  return MergeWithPlainBaseValueImpl(value, user_key, &pinned_value_);
+}
+
+bool DBIter::MergeWithPlainBaseValueImpl(const Slice& value,
+                                         const Slice& user_key,
+                                         Slice* result_operand) {
   // `op_failure_scope` (an output parameter) is not provided (set to nullptr)
   // since a failure must be propagated regardless of its value.
   ValueType result_type;
@@ -1613,7 +1619,7 @@ bool DBIter::MergeWithPlainBaseValue(const Slice& value,
       merge_operator_, user_key, MergeHelper::kPlainBaseValue, value,
       merge_context_.GetOperands(), logger_, statistics_, clock_,
       /* update_num_ops_stats */ true, /* op_failure_scope */ nullptr,
-      &value_columns_state_.mut()->saved_value(), &pinned_value_, &result_type);
+      &value_columns_state_.mut()->saved_value(), result_operand, &result_type);
   return SetValueAndColumnsFromMergeResult(s, result_type);
 }
 
@@ -1638,7 +1644,18 @@ bool DBIter::MergeWithBlobBaseValue(const Slice& blob_index,
 
   valid_ = true;
 
-  if (!MergeWithPlainBaseValue(blob_state_->reader.GetBlobValue(), user_key)) {
+  // The merge operator may return the base value by reference (by pointing
+  // MergeOperationOutput::existing_operand at existing_value, as e.g.
+  // MaxOperator does), which would leave the iterator's value pointing into
+  // the blob buffer that is released below. Materialize the result in
+  // saved_value() instead of pinning it, like the Get path does. pinned_value_
+  // has to be null so that SetValueAndColumnsFromMergeResult publishes
+  // saved_value(). (In the reverse iteration path, `blob_index` aliases
+  // pinned_value_, but it has already been consumed above.)
+  pinned_value_ = Slice(nullptr, 0);
+
+  if (!MergeWithPlainBaseValueImpl(blob_state_->reader.GetBlobValue(), user_key,
+                                   /* result_operand */ nullptr)) {
     return false;
   }
 
@@ -1662,6 +1679,20 @@ bool DBIter::MergeWithWideColumnBaseValue(const Slice& entity,
     return false;
   }
 
+  // If the entity had blob columns, `effective_entity` points into the local
+  // `resolved_entity` buffer, which goes away when this function returns. A
+  // FullMergeV3 implementation may return (a column of) the base value by
+  // reference, so the result has to be materialized in saved_value() in that
+  // case, like in MergeWithBlobBaseValue. (The built-in V2-to-V3 adapter always
+  // produces new columns for a wide-column base, so this only matters for
+  // custom FullMergeV3 implementations.) Note that `entity` may alias
+  // pinned_value_ in the reverse iteration path; it is not used below.
+  Slice* result_operand = &pinned_value_;
+  if (effective_entity.data() != entity.data()) {
+    pinned_value_ = Slice(nullptr, 0);
+    result_operand = nullptr;
+  }
+
   // `op_failure_scope` (an output parameter) is not provided (set to nullptr)
   // since a failure must be propagated regardless of its value.
   ValueType result_type;
@@ -1669,7 +1700,7 @@ bool DBIter::MergeWithWideColumnBaseValue(const Slice& entity,
       merge_operator_, user_key, MergeHelper::kWideBaseValue, effective_entity,
       merge_context_.GetOperands(), logger_, statistics_, clock_,
       /* update_num_ops_stats */ true, /* op_failure_scope */ nullptr,
-      &value_columns_state_.mut()->saved_value(), &pinned_value_, &result_type);
+      &value_columns_state_.mut()->saved_value(), result_operand, &result_type);
   return SetValueAndColumnsFromMergeResult(s, result_type);
 }
 

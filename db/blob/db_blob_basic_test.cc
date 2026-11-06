@@ -11,6 +11,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <variant>
 
 #include "cache/compressed_secondary_cache.h"
 #include "db/blob/blob_file_partition_manager.h"
@@ -20,6 +21,7 @@
 #include "db/column_family.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
+#include "db/wide/wide_columns_helper.h"
 #include "env/composite_env_wrapper.h"
 #include "file/filename.h"
 #include "file/random_access_file_reader.h"
@@ -1958,6 +1960,368 @@ TEST_F(DBBlobBasicTest, MultiGetMergeBlobWithPut) {
 
   ASSERT_OK(statuses[2]);
   ASSERT_EQ(values[2], "v2_0");
+}
+
+// Regression tests for https://github.com/facebook/rocksdb/issues/15336
+// (reported by GitHub user ronag). When a merge operator returns the base
+// value by reference (MergeOperationOutput::existing_operand pointing at
+// existing_value, as the built-in MaxOperator does) and that base value is
+// stored in a blob file, DBIter used to release the blob storage right after
+// the merge while value() still pointed into it. The non-blob configuration
+// is a control: plain base values are kept pinned by the iterator, so it
+// passes with and without the fix.
+class DBBlobBasicMergeByReferenceTest
+    : public DBBlobBasicTest,
+      public testing::WithParamInterface<bool> {
+ protected:
+  static constexpr int kNumKeys = 6;
+
+  bool enable_blob_files() const { return GetParam(); }
+
+  // Even keys: the base value is the maximum, so MaxOperator returns a slice
+  // into the base value (a blob value when blob files are enabled).
+  // Odd keys: a merge operand is the maximum, so the result points at an
+  // operand instead (pinned by the iterator); this path was never broken.
+  static std::string Base(int i) {
+    return (i % 2 == 0 ? "z-base-" : "a-base-") + std::to_string(i);
+  }
+  static std::string Operand(int i, int round) {
+    return (i % 2 == 0 ? "a-op-" : "z-op-") + std::to_string(i) + "-" +
+           std::to_string(round);
+  }
+  static std::string Expected(int i) {
+    return i % 2 == 0 ? Base(i) : Operand(i, 1);
+  }
+
+  Options MergeOptions(std::shared_ptr<MergeOperator> merge_operator) {
+    Options options = GetDefaultOptions();
+    options.merge_operator = std::move(merge_operator);
+    options.enable_blob_files = enable_blob_files();
+    options.min_blob_size = 0;
+    return options;
+  }
+
+  // Base values go to an SST plus a blob file. Round-0 operands end up in an
+  // SST and round-1 operands stay in the memtable, so both inner-iterator
+  // pinning paths feed the merge.
+  void SetUpMaxDb(bool force_seek_fallback) {
+    Options options = MergeOptions(MergeOperators::CreateMaxOperator());
+    if (force_seek_fallback) {
+      // Reverse iteration then resolves the merge chain through
+      // FindValueForCurrentKeyUsingSeek.
+      options.max_sequential_skip_in_iterations = 1;
+    }
+    Reopen(options);
+
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_OK(Put(Key(i), Base(i)));
+    }
+    ASSERT_OK(Flush());
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_OK(Merge(Key(i), Operand(i, 0)));
+    }
+    ASSERT_OK(Flush());
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_OK(Merge(Key(i), Operand(i, 1)));
+    }
+
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_EQ(Get(Key(i)), Expected(i));
+    }
+  }
+
+  void ExpectAt(Iterator* iter, int k, const std::string& expected) {
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(iter->key().ToString(), Key(k));
+    // value() has to stay stable while the iterator is positioned.
+    ASSERT_EQ(iter->value().ToString(), expected);
+    ASSERT_EQ(iter->value().ToString(), expected);
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(DBBlobBasicMergeByReferenceTest,
+                        DBBlobBasicMergeByReferenceTest, ::testing::Bool());
+
+TEST_P(DBBlobBasicMergeByReferenceTest, Forward) {
+  ASSERT_NO_FATAL_FAILURE(SetUpMaxDb(/* force_seek_fallback */ false));
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  int i = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++i) {
+    ASSERT_LT(i, kNumKeys);
+    ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), i, Expected(i)));
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(i, kNumKeys);
+}
+
+TEST_P(DBBlobBasicMergeByReferenceTest, Reverse) {
+  ASSERT_NO_FATAL_FAILURE(SetUpMaxDb(/* force_seek_fallback */ false));
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  int i = kNumKeys - 1;
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev(), --i) {
+    ASSERT_GE(i, 0);
+    ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), i, Expected(i)));
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(i, -1);
+}
+
+TEST_P(DBBlobBasicMergeByReferenceTest, Reposition) {
+  ASSERT_NO_FATAL_FAILURE(SetUpMaxDb(/* force_seek_fallback */ false));
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+
+  iter->Seek(Key(2));
+  ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), 2, Expected(2)));
+  iter->Next();
+  ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), 3, Expected(3)));
+  iter->Prev();  // forward -> reverse
+  ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), 2, Expected(2)));
+  iter->Prev();
+  ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), 1, Expected(1)));
+  iter->Next();  // reverse -> forward
+  ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), 2, Expected(2)));
+
+  iter->SeekForPrev(Key(4));
+  ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), 4, Expected(4)));
+  iter->Prev();
+  ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), 3, Expected(3)));
+
+  iter->Seek(Key(kNumKeys - 1));
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectAt(iter.get(), kNumKeys - 1, Expected(kNumKeys - 1)));
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  iter->SeekForPrev(Key(0));
+  ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), 0, Expected(0)));
+  iter->Prev();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+}
+
+// With max_sequential_skip_in_iterations == 1, reverse iteration resolves the
+// merge chain through FindValueForCurrentKeyUsingSeek, which merges the blob
+// base value on a separate code path.
+TEST_P(DBBlobBasicMergeByReferenceTest, ReverseUsingSeek) {
+  ASSERT_NO_FATAL_FAILURE(SetUpMaxDb(/* force_seek_fallback */ true));
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  int i = kNumKeys - 1;
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev(), --i) {
+    ASSERT_GE(i, 0);
+    ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), i, Expected(i)));
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(i, -1);
+
+  iter->SeekForPrev(Key(2));
+  ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), 2, Expected(2)));
+  iter->Prev();
+  ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), 1, Expected(1)));
+}
+
+// ReadOptions::pin_data keeps keys and values of the inner iterator pinned for
+// the lifetime of the iterator; the blob buffer is owned by DBIter either way.
+TEST_P(DBBlobBasicMergeByReferenceTest, PinData) {
+  ASSERT_NO_FATAL_FAILURE(SetUpMaxDb(/* force_seek_fallback */ false));
+
+  ReadOptions read_options;
+  read_options.pin_data = true;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+
+  int i = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++i) {
+    ASSERT_LT(i, kNumKeys);
+    ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), i, Expected(i)));
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(i, kNumKeys);
+
+  i = kNumKeys - 1;
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev(), --i) {
+    ASSERT_GE(i, 0);
+    ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), i, Expected(i)));
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(i, -1);
+}
+
+// The merge operator produces a new value (StringAppendOperator), so the
+// result is materialized in saved_value() both before and after the fix. This
+// checks correct publication of materialized results.
+TEST_P(DBBlobBasicMergeByReferenceTest, NewValueResult) {
+  Reopen(MergeOptions(MergeOperators::CreateStringAppendOperator()));
+
+  auto expected = [](int i) {
+    const std::string n = std::to_string(i);
+    return "base-" + n + ",op0-" + n + ",op1-" + n;
+  };
+
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), "base-" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Merge(Key(i), "op0-" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Merge(Key(i), "op1-" + std::to_string(i)));
+  }
+
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_EQ(Get(Key(i)), expected(i));
+  }
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  int i = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++i) {
+    ASSERT_LT(i, kNumKeys);
+    ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), i, expected(i)));
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(i, kNumKeys);
+
+  i = kNumKeys - 1;
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev(), --i) {
+    ASSERT_GE(i, 0);
+    ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), i, expected(i)));
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(i, -1);
+}
+
+namespace {
+
+// A FullMergeV3 operator that returns the base value (or, for a wide-column
+// base, its default column) by reference, and the last operand otherwise.
+class DefaultColumnByReferenceOperator : public MergeOperator {
+ public:
+  static const char* kClassName() { return "DefaultColumnByReferenceOperator"; }
+  const char* Name() const override { return kClassName(); }
+
+  bool FullMergeV3(const MergeOperationInputV3& merge_in,
+                   MergeOperationOutputV3* merge_out) const override {
+    if (const auto* columns =
+            std::get_if<WideColumns>(&merge_in.existing_value);
+        columns && WideColumnsHelper::HasDefaultColumn(*columns)) {
+      merge_out->new_value = WideColumnsHelper::GetDefaultColumn(*columns);
+      return true;
+    }
+    if (const auto* value = std::get_if<Slice>(&merge_in.existing_value)) {
+      merge_out->new_value = *value;
+      return true;
+    }
+    merge_out->new_value = merge_in.operand_list.back();
+    return true;
+  }
+};
+
+}  // namespace
+
+// Wide-column base value whose columns are stored in blob files: the merge
+// path resolves the entity into a temporary buffer before merging, so a
+// by-reference result must not be exposed through value() either.
+class DBBlobBasicWideColumnMergeByReferenceTest
+    : public DBBlobBasicMergeByReferenceTest {
+ protected:
+  // Owned by the fixture: WideColumn holds slices into it.
+  const std::string default_value_ = "default-column-value";
+
+  void SetUpWideColumnDb() {
+    Options options =
+        MergeOptions(std::make_shared<DefaultColumnByReferenceOperator>());
+    options.min_blob_size = 10;
+    options.disable_auto_compactions = true;
+    Reopen(options);
+
+    const std::string large_value(100, 'v');
+    const WideColumns columns{{kDefaultWideColumnName, default_value_},
+                              {"large", large_value},
+                              {"small", "s"}};
+
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                               Key(i), columns));
+    }
+    ASSERT_OK(Flush());
+    // Compaction stores the large columns in blob files when they are enabled.
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_OK(Merge(Key(i), "operand"));
+    }
+
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_EQ(Get(Key(i)), default_value_);
+    }
+  }
+
+  // The merge result is a plain value, so columns() has to be exactly the
+  // default column.
+  void ExpectDefaultColumnAt(Iterator* iter, int k) {
+    ASSERT_NO_FATAL_FAILURE(ExpectAt(iter, k, default_value_));
+    const WideColumns expected_columns{
+        {kDefaultWideColumnName, default_value_}};
+    ASSERT_EQ(iter->columns(), expected_columns);
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(DBBlobBasicWideColumnMergeByReferenceTest,
+                        DBBlobBasicWideColumnMergeByReferenceTest,
+                        ::testing::Bool());
+
+TEST_P(DBBlobBasicWideColumnMergeByReferenceTest,
+       WideColumnBaseWithBlobColumns) {
+  ASSERT_NO_FATAL_FAILURE(SetUpWideColumnDb());
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  int i = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++i) {
+    ASSERT_LT(i, kNumKeys);
+    ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), i, default_value_));
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(i, kNumKeys);
+
+  i = kNumKeys - 1;
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev(), --i) {
+    ASSERT_GE(i, 0);
+    ASSERT_NO_FATAL_FAILURE(ExpectAt(iter.get(), i, default_value_));
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(i, -1);
+}
+
+TEST_P(DBBlobBasicWideColumnMergeByReferenceTest,
+       WideColumnBaseWithBlobColumnsReposition) {
+  ASSERT_NO_FATAL_FAILURE(SetUpWideColumnDb());
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+
+  iter->Seek(Key(2));
+  ASSERT_NO_FATAL_FAILURE(ExpectDefaultColumnAt(iter.get(), 2));
+  iter->Next();
+  ASSERT_NO_FATAL_FAILURE(ExpectDefaultColumnAt(iter.get(), 3));
+  iter->Prev();  // forward -> reverse
+  ASSERT_NO_FATAL_FAILURE(ExpectDefaultColumnAt(iter.get(), 2));
+  iter->Next();  // reverse -> forward
+  ASSERT_NO_FATAL_FAILURE(ExpectDefaultColumnAt(iter.get(), 3));
+
+  iter->SeekForPrev(Key(4));
+  ASSERT_NO_FATAL_FAILURE(ExpectDefaultColumnAt(iter.get(), 4));
+  iter->Prev();
+  ASSERT_NO_FATAL_FAILURE(ExpectDefaultColumnAt(iter.get(), 3));
+
+  iter->Seek(Key(kNumKeys - 1));
+  ASSERT_NO_FATAL_FAILURE(ExpectDefaultColumnAt(iter.get(), kNumKeys - 1));
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
 }
 
 TEST_F(DBBlobBasicTest, Properties) {
