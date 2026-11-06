@@ -114,6 +114,12 @@ inline void TsanAnnotateMappedMemory(const volatile void* mem, size_t size) {
 
 class PosixHelper {
  public:
+  struct StatxDioAlignInfo {
+    long statx_result;
+    bool has_dio_offset_align;
+    size_t dio_offset_align;
+  };
+
   static const std::string& GetLogicalBlockSizeFileName() {
     static const std::string kLogicalBlockSizeFileName = "logical_block_size";
     return kLogicalBlockSizeFileName;
