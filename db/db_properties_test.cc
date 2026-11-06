@@ -448,9 +448,6 @@ TEST_F(DBPropertiesTest, ReadLatencyHistogramByLevel) {
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
-  BlockBasedTableOptions table_options;
-  table_options.no_block_cache = true;
-
   CreateAndReopenWithCF({"pikachu"}, options);
   int key_index = 0;
   Random rnd(301);
