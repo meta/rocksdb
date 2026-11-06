@@ -64,7 +64,7 @@ constexpr TxnTimestamp kMaxTxnTimestamp =
   where -infinity will compare less than any possible suffix, and +infinity
   will compare as greater than any possible suffix.
 
-  class Endpoint allows to define these kind of rangtes.
+  class Endpoint allows to define these kind of ranges.
 
   == Notes ==
   BytewiseComparator and ReverseBytewiseComparator produce lexicographic
@@ -616,13 +616,13 @@ class Transaction {
 
   virtual Status SingleDeleteUntracked(const Slice& key) = 0;
 
-  // Collpase the merge chain for the given key. This is can be used by the
-  // application to trigger an on-demand collpase to a key that has a long
+  // Collapse the merge chain for the given key. This is can be used by the
+  // application to trigger an on-demand collapse to a key that has a long
   // merge chain to reduce read amplification, without waiting for compaction
   // to kick in.
   virtual Status CollapseKey(const ReadOptions&, const Slice&,
                              ColumnFamilyHandle* = nullptr) {
-    return Status::NotSupported("collpase not supported");
+    return Status::NotSupported("collapse not supported");
   }
 
   // Similar to WriteBatch::PutLogData
