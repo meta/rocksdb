@@ -94,7 +94,7 @@ DBTestBase::DBTestBase(const std::string path, bool env_do_fsync)
   env_->SetBackgroundThreads(1, Env::LOW);
   env_->SetBackgroundThreads(1, Env::HIGH);
   env_->skip_fsync_ = !env_do_fsync;
-  dbname_ = test::PerThreadDBPath(env_, path);
+  dbname_ = test::PerThreadDBPath(env_, test::GetTestNameForDB(path));
   alternative_wal_dir_ = dbname_ + "/wal";
   alternative_db_log_dir_ = dbname_ + "/db_log_dir";
   EXPECT_OK(DestroyDir(env_, alternative_wal_dir_));
