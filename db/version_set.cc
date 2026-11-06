@@ -1223,7 +1223,7 @@ class LevelIterator final : public InternalIterator {
     delete file_iter_.Set(nullptr);
     // Clean up any prepared iterators that weren't used
     for (auto& entry : prepared_iters_) {
-      delete entry.second;
+      delete entry.second.iter;
     }
     prepared_iters_.clear();
     assert(prepared_iters_.size() == 0);
@@ -1377,6 +1377,12 @@ class LevelIterator final : public InternalIterator {
     if (so->use_async_io &&
         (!range_tombstone_iter_required_ || range_tombstone_iter_ != nullptr)) {
       auto before = file_index_;
+      // NewFileIterator() replaces *range_tombstone_iter_ with the new file's
+      // range tombstones, so set aside the current file's.
+      std::unique_ptr<TruncatedRangeDelIterator> current_range_tombstone_iter;
+      if (range_tombstone_iter_) {
+        current_range_tombstone_iter = std::move(*range_tombstone_iter_);
+      }
       // Pre-create and prepare only relevant file iterators
       for (auto& file_to_arg : *file_to_scan_opts_) {
         size_t file_index = file_to_arg.first;
@@ -1387,11 +1393,18 @@ class LevelIterator final : public InternalIterator {
         if (iter != nullptr) {
           // If we have async enabled, lets prepare all our iterators.
           iter->Prepare(&file_to_arg.second);
-          // Store the prepared iterator
-          prepared_iters_[file_index] = iter;
+          // Store the prepared iterator with its file's range tombstones
+          PreparedFileIterator& prepared = prepared_iters_[file_index];
+          prepared.iter = iter;
+          if (range_tombstone_iter_) {
+            prepared.range_tombstone_iter = std::move(*range_tombstone_iter_);
+          }
         }
       }
       file_index_ = before;
+      if (range_tombstone_iter_) {
+        *range_tombstone_iter_ = std::move(current_range_tombstone_iter);
+      }
     }
   }
 
@@ -1553,8 +1566,13 @@ class LevelIterator final : public InternalIterator {
   // Our stored scan_opts for each prefix
   std::unique_ptr<ScanOptionsMap> file_to_scan_opts_ = nullptr;
 
+  // A pre-created file iterator and the range tombstones of its file.
+  struct PreparedFileIterator {
+    InternalIterator* iter = nullptr;
+    std::unique_ptr<TruncatedRangeDelIterator> range_tombstone_iter;
+  };
   // Map to store pre-created iterators by file index
-  std::unordered_map<size_t, InternalIterator*> prepared_iters_;
+  std::unordered_map<size_t, PreparedFileIterator> prepared_iters_;
 
   // Sets flags for if we should return the sentinel key next.
   // The condition for returning sentinel is reaching the end of current
@@ -1946,8 +1964,13 @@ void LevelIterator::InitFileIterator(size_t new_file_index) {
       if (!prepared_iters_.empty()) {
         auto prepared_it = prepared_iters_.find(file_index_);
         if (prepared_it != prepared_iters_.end()) {
-          InternalIterator* iter = prepared_it->second;
+          InternalIterator* iter = prepared_it->second.iter;
+          if (range_tombstone_iter_) {
+            *range_tombstone_iter_ =
+                std::move(prepared_it->second.range_tombstone_iter);
+          }
           prepared_iters_.erase(prepared_it);
+          CheckMayBeOutOfLowerBound();
           SetFileIterator(iter);
           return;
         }

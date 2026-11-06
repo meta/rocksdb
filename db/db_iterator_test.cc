@@ -6182,6 +6182,55 @@ TEST_P(DBMultiScanIteratorTest, RangeBetweenFiles) {
   iter.reset();
 }
 
+TEST_P(DBMultiScanIteratorTest, AsyncPreparedFileAppliesItsRangeTombstones) {
+  auto options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  // One level ends up with a standalone range tombstone file, which multiscan
+  // does not prepare, followed by a file holding "k032" and a range tombstone
+  // that deletes it. The snapshot keeps both in the compaction output.
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "k000",
+                             "k002"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("k032", "v"));
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "k030",
+                             "k033"));
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  std::vector<LiveFileMetaData> files;
+  db_->GetLiveFilesMetaData(&files);
+  ASSERT_EQ(2, files.size());
+  ASSERT_EQ(files[0].level, files[1].level);
+  ASSERT_EQ("NOT_FOUND", Get("k032"));
+
+  for (bool use_async_io : {false, true}) {
+    SCOPED_TRACE("use_async_io=" + std::to_string(use_async_io));
+    MultiScanArgs scan_options(BytewiseComparator());
+    scan_options.insert("k001", "k010");
+    scan_options.insert("k013", "k022");
+    scan_options.insert("k032", "k033");
+    scan_options.use_async_io = use_async_io;
+    ReadOptions ro;
+    ro.fill_cache = GetParam();
+    std::unique_ptr<MultiScan> iter =
+        dbfull()->NewMultiScan(ro, db_->DefaultColumnFamily(), scan_options);
+    std::vector<std::string> keys;
+    try {
+      for (auto range : *iter) {
+        for (auto it : range) {
+          keys.push_back(it.first.ToString());
+        }
+      }
+    } catch (MultiScanException& ex) {
+      FAIL() << ex.status().ToString();
+    }
+    ASSERT_EQ(std::vector<std::string>(), keys);
+  }
+  db_->ReleaseSnapshot(snapshot);
+}
+
 // This test case tests multiscan in the presence of fragmented range
 // tombstones in the LSM.
 TEST_P(DBMultiScanIteratorTest, FragmentedRangeTombstones) {
