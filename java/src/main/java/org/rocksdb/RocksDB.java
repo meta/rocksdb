@@ -44,6 +44,13 @@ public class RocksDB extends RocksObject {
   final List<ColumnFamilyHandle> ownedColumnFamilyHandles = new ArrayList<>();
 
   /**
+   * Package-private accessor for {@link #defaultReadOptions_}, for testing only.
+   */
+  ReadOptions getDefaultReadOptions() {
+    return defaultReadOptions_;
+  }
+
+  /**
    * Loads the necessary library files.
    * Calling this method twice will have no effect.
    * By default the method extracts the shared library for loading at
@@ -696,6 +703,7 @@ public class RocksDB extends RocksObject {
       } catch (final RocksDBException e) {
         // silently ignore the error report
       } finally {
+        defaultReadOptions_.close();
         disposeInternal();
       }
     }
