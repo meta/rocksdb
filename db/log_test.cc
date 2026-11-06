@@ -7,10 +7,16 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <algorithm>
+#include <atomic>
+#include <memory>
+#include <vector>
+
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "file/sequence_file_reader.h"
 #include "file/writable_file_writer.h"
+#include "port/port.h"
 #include "rocksdb/env.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -148,6 +154,7 @@ class LogTest
   ReportCollector report_;
 
  protected:
+  uint64_t next_wal_index_ = kWALIndexStartNumber;
   std::unique_ptr<Writer> writer_;
   std::unique_ptr<Reader> reader_;
   bool allow_retry_read_;
@@ -188,7 +195,10 @@ class LogTest
       ASSERT_OK(writer_->MaybeAddUserDefinedTimestampSizeRecord(WriteOptions(),
                                                                 *cf_to_ts_sz));
     }
-    ASSERT_OK(writer_->AddRecord(WriteOptions(), Slice(msg)));
+    const uint64_t wal_index =
+        writer_->WALIndexEnabled() ? next_wal_index_++ : 0;
+    ASSERT_OK(
+        writer_->AddRecord(WriteOptions(), Slice(msg), /*seqno=*/0, wal_index));
   }
 
   size_t WrittenBytes() const { return dest_contents().size(); }
@@ -211,7 +221,7 @@ class LogTest
         // support record checksum yet.
         uint64_t actual_record_checksum =
             XXH3_64bits(record.data(), record.size());
-        assert(actual_record_checksum == record_checksum);
+        EXPECT_EQ(actual_record_checksum, record_checksum);
       }
       return record.ToString();
     } else {
@@ -276,6 +286,42 @@ class LogTest
                        kTolerateCorruptedTailRecords /* wal_recovery_mode */,
                    &recorded_ts_sz));
     EXPECT_EQ(expected_ts_sz, recorded_ts_sz);
+  }
+
+  // Turns on wal_index on the writer and emits the identifying marker record.
+  // For compressed logs, call this after AddCompressionTypeRecord.
+  void EnableWALIndex(bool write_marker = true) {
+    writer_->SetPartitionWALUsage(PartitionWALUsage::kPartitionByColumnFamily);
+    if (write_marker) {
+      ASSERT_OK(writer_->MaybeAddWALIndexMarkerRecord(WriteOptions()));
+    }
+  }
+
+  // Returns the wal_index the writer prefixed to each data record of an
+  // indexed WAL image. Reader-side decoding lands later in the stack, so tests
+  // that need to see what actually reached the file read it back from here.
+  // `payload_sizes` are the logical record sizes in write order; knowing them
+  // is what lets the walk skip from record to record without parsing headers,
+  // and the trailing size check catches any drift in the layout.
+  std::vector<uint64_t> DecodeWALIndices(
+      const std::string& contents, const std::vector<size_t>& payload_sizes) {
+    const size_t header_size = static_cast<size_t>(
+        std::get<0>(GetParam()) != 0 ? kRecyclableHeaderSize : kHeaderSize);
+    std::vector<uint64_t> indices;
+    indices.reserve(payload_sizes.size());
+    // The marker record leads the file and carries no payload.
+    size_t offset = header_size;
+    for (size_t payload_size : payload_sizes) {
+      const size_t record_size = header_size + kWALIndexSize + payload_size;
+      if (contents.size() < offset + record_size) {
+        ADD_FAILURE() << "WAL image ends before record " << indices.size();
+        return indices;
+      }
+      indices.push_back(DecodeFixed64(contents.data() + offset + header_size));
+      offset += record_size;
+    }
+    EXPECT_EQ(contents.size(), offset);
+    return indices;
   }
 };
 
@@ -810,6 +856,609 @@ TEST_P(LogTest, TimestampSizeRecordPadding) {
 
   ASSERT_EQ(first_str, Read());
   CheckRecordAndTimestampSize(second_str, ts_sz);
+}
+
+// EmitPhysicalRecord used to pick the legacy 7-byte header from a whitelist of
+// record types; it now asks IsRecyclableRecordType instead. With WAL index
+// disabled the output must be byte-identical to before, which requires the two
+// to agree on every record type that predates WAL index.
+static constexpr bool HeaderSelectionUnchangedForPreWALIndexTypes() {
+  constexpr uint8_t kPreWALIndexTypes[] = {
+      kZeroType,
+      kFullType,
+      kFirstType,
+      kMiddleType,
+      kLastType,
+      kRecyclableFullType,
+      kRecyclableFirstType,
+      kRecyclableMiddleType,
+      kRecyclableLastType,
+      kSetCompressionType,
+      kUserDefinedTimestampSizeType,
+      kRecyclableUserDefinedTimestampSizeType,
+      kPredecessorWALInfoType,
+      kRecyclePredecessorWALInfoType};
+  for (uint8_t type : kPreWALIndexTypes) {
+    const bool used_legacy_header_before =
+        type < kRecyclableFullType || type == kSetCompressionType ||
+        type == kPredecessorWALInfoType ||
+        type == kUserDefinedTimestampSizeType;
+    if (used_legacy_header_before == IsRecyclableRecordType(type)) {
+      return false;
+    }
+  }
+  return true;
+}
+static_assert(HeaderSelectionUnchangedForPreWALIndexTypes(),
+              "adding the WAL index record types changed header selection for "
+              "a record type that predates WAL index");
+
+// Basic round-trip: with wal_index enabled, each logical record carries a
+// monotonically increasing index starting at 1, and the reader strips it so
+// upper layers observe the original payload.
+TEST_P(LogTest, WALIndexReadWrite) {
+  EnableWALIndex();
+  Write("foo");
+  Write("bar");
+  Write("");
+  Write("xxxx");
+
+  ASSERT_EQ(5U, next_wal_index_);
+
+  ASSERT_EQ("foo", Read());
+  ASSERT_EQ(1U, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("bar", Read());
+  ASSERT_EQ(2U, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("", Read());
+  ASSERT_EQ(3U, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("xxxx", Read());
+  ASSERT_EQ(4U, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+// When wal_index is disabled the WAL is bit-for-bit vanilla: no marker record,
+// no indexed record types, and the reader reports no wal_index.
+TEST_P(LogTest, WALIndexDisabledStaysVanilla) {
+  Write("foo");
+  Write("bar");
+
+  const std::string contents = get_reader_contents()->ToString();
+  ASSERT_GE(contents.size(), static_cast<size_t>(kHeaderSize));
+  const uint8_t first_type = static_cast<uint8_t>(contents[6]);
+  ASSERT_FALSE(IsWALIndexRecordType(first_type) ||
+               first_type == kWALIndexMarkerType ||
+               first_type == kRecyclableWALIndexMarkerType);
+
+  ASSERT_EQ("foo", Read());
+  ASSERT_EQ("bar", Read());
+  ASSERT_EQ(0U, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+// The marker record identifies the file as carrying wal_index. The record type
+// alone is the signal, so the marker is written with an empty payload.
+TEST_P(LogTest, WALIndexMarkerRecordIsEmpty) {
+  EnableWALIndex();
+  Write("foo");
+
+  const std::string contents = get_reader_contents()->ToString();
+  ASSERT_GE(contents.size(), static_cast<size_t>(kHeaderSize));
+
+  const uint8_t type = static_cast<uint8_t>(contents[6]);
+  ASSERT_TRUE(type == kWALIndexMarkerType ||
+              type == kRecyclableWALIndexMarkerType);
+
+  const uint32_t length = (static_cast<uint32_t>(contents[4]) & 0xff) |
+                          ((static_cast<uint32_t>(contents[5]) & 0xff) << 8);
+  ASSERT_EQ(0U, length);
+}
+
+// The marker is written when the file is started, so one appearing after a
+// data record is reported, the same way kSetCompressionType is.
+TEST_P(LogTest, WALIndexMarkerAfterDataRecordReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  EnableWALIndex();
+  Write("foo");
+  Write("bar");
+
+  // Relabel the second data record as a marker, so a marker appears after a
+  // data record has been returned. Both marker types share the recyclability
+  // of the indexed full type they replace, so the header size is unchanged.
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  const int payload_size = static_cast<int>(kWALIndexSize) + 3;
+  const int third_header = 2 * header_size + payload_size;
+  SetByte(third_header + 6,
+          static_cast<char>(recyclable ? kRecyclableWALIndexMarkerType
+                                       : kWALIndexMarkerType));
+  FixChecksum(third_header, payload_size, recyclable);
+
+  ASSERT_EQ("foo", Read());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ("OK", MatchError("not the first record"));
+}
+
+// A marker landing inside a fragmented record is reported the same way a
+// user-defined timestamp record is. The "not the first record" check above
+// stays quiet here because nothing has been returned yet, so without a
+// separate report the buffered first fragment would vanish silently.
+//
+// The interrupted record is then abandoned rather than completed: the fragment
+// after the marker must not be handed back as a whole record assembled from a
+// tail alone.
+TEST_P(LogTest, WALIndexMarkerInsidePartialRecordReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+
+  // Size the payload so the record spans three physical records: First fills
+  // the rest of block 0, Middle fills block 1, and Last carries kTailSize
+  // bytes into block 2.
+  constexpr int kTailSize = 100;
+  const int first_fragment = static_cast<int>(kBlockSize) - 2 * header_size;
+  const int middle_fragment = static_cast<int>(kBlockSize) - header_size;
+  Write(BigString("abcd", static_cast<size_t>(first_fragment) +
+                              middle_fragment - kWALIndexSize + kTailSize));
+
+  // Relabel the middle fragment as a marker: it arrives while the first
+  // fragment is buffered and before any record has been returned, and a Last
+  // fragment still follows it.
+  const int middle_header = static_cast<int>(kBlockSize);
+  SetByte(middle_header + 6,
+          static_cast<char>(recyclable ? kRecyclableWALIndexMarkerType
+                                       : kWALIndexMarkerType));
+  FixChecksum(middle_header, middle_fragment, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ("OK", MatchError("interspersed partial record"));
+  ASSERT_EQ("OK", MatchError("missing start of fragmented record(2)"));
+}
+
+// The same interruption once a record has already been returned. Both the
+// "not the first record" and the dropped-fragment reports have to fire: they
+// describe independent problems, and only the second one clears the streaming
+// digest of the bytes being abandoned.
+TEST_P(LogTest, WALIndexMarkerInsidePartialRecordAfterFirstRecord) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+
+  Write("foo");
+
+  // As above, but the leading Full record leaves less of block 0 for the
+  // First fragment.
+  constexpr int kTailSize = 100;
+  const int first_fragment = static_cast<int>(kBlockSize) - 3 * header_size -
+                             static_cast<int>(kWALIndexSize) - 3;
+  const int middle_fragment = static_cast<int>(kBlockSize) - header_size;
+  Write(BigString("abcd", static_cast<size_t>(first_fragment) +
+                              middle_fragment - kWALIndexSize + kTailSize));
+
+  const int middle_header = static_cast<int>(kBlockSize);
+  SetByte(middle_header + 6,
+          static_cast<char>(recyclable ? kRecyclableWALIndexMarkerType
+                                       : kWALIndexMarkerType));
+  FixChecksum(middle_header, middle_fragment, recyclable);
+
+  ASSERT_EQ("foo", Read());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ("OK", MatchError("not the first record"));
+  ASSERT_EQ("OK", MatchError("interspersed partial record"));
+}
+
+// The separate index prefix must produce the same bytes as a contiguous
+// fixed64(index) + record payload, including the combined checksum.
+TEST_P(LogTest, WALIndexFirstFragmentByteLayout) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  Write("foo");
+
+  const std::string contents = get_reader_contents()->ToString();
+  const size_t data_header = static_cast<size_t>(header_size);
+  ASSERT_GE(contents.size(), data_header + header_size + kWALIndexSize + 3);
+
+  const uint8_t type = static_cast<uint8_t>(contents[data_header + 6]);
+  ASSERT_TRUE(type == kWALIndexFullType || type == kRecyclableWALIndexFullType);
+  const uint32_t length =
+      (static_cast<uint32_t>(contents[data_header + 4]) & 0xff) |
+      ((static_cast<uint32_t>(contents[data_header + 5]) & 0xff) << 8);
+  ASSERT_EQ(static_cast<uint32_t>(kWALIndexSize) + 3, length);
+
+  const char* payload = contents.data() + data_header + header_size;
+  ASSERT_EQ(kWALIndexStartNumber, DecodeFixed64(payload));
+  ASSERT_EQ("foo", std::string(payload + kWALIndexSize, 3));
+
+  const uint32_t stored_crc = DecodeFixed32(contents.data() + data_header);
+  const uint32_t expected_crc = crc32c::Mask(crc32c::Value(
+      contents.data() + data_header + 6, header_size - 6 + length));
+  ASSERT_EQ(expected_crc, stored_crc);
+
+  ASSERT_EQ("foo", Read());
+  ASSERT_EQ(kWALIndexStartNumber, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+// An indexed empty record contains only the fixed64 index in one Full record.
+TEST_P(LogTest, WALIndexEmptyRecordByteLayout) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  Write("");
+
+  const std::string contents = get_reader_contents()->ToString();
+  const size_t data_header = static_cast<size_t>(header_size);
+  ASSERT_GE(contents.size(), data_header + header_size + kWALIndexSize);
+
+  const uint8_t type = static_cast<uint8_t>(contents[data_header + 6]);
+  ASSERT_TRUE(type == kWALIndexFullType || type == kRecyclableWALIndexFullType);
+  const uint32_t length =
+      (static_cast<uint32_t>(contents[data_header + 4]) & 0xff) |
+      ((static_cast<uint32_t>(contents[data_header + 5]) & 0xff) << 8);
+  ASSERT_EQ(static_cast<uint32_t>(kWALIndexSize), length);
+  ASSERT_EQ(kWALIndexStartNumber,
+            DecodeFixed64(contents.data() + data_header + header_size));
+
+  ASSERT_EQ("", Read());
+  ASSERT_EQ(kWALIndexStartNumber, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+// AddRecord persists the wal_index supplied by its DB-level caller.
+TEST_P(LogTest, WALIndexAssignedConsecutively) {
+  EnableWALIndex();
+
+  const std::vector<std::string> payloads = {"a", "b", "c", "d"};
+  std::vector<uint64_t> expected;
+  std::vector<size_t> payload_sizes;
+  for (const std::string& payload : payloads) {
+    expected.push_back(next_wal_index_++);
+    payload_sizes.push_back(payload.size());
+    ASSERT_OK(writer_->AddRecord(WriteOptions(), Slice(payload), /*seqno=*/0,
+                                 expected.back()));
+  }
+
+  // Compare against the bytes on disk: the counter that produced the values
+  // says nothing about what the writer persisted.
+  ASSERT_EQ(expected,
+            DecodeWALIndices(get_reader_contents()->ToString(), payload_sizes));
+}
+
+// With WAL index disabled AddRecord does not persist its wal_index argument.
+TEST_P(LogTest, WALIndexNotAssignedWhenDisabled) {
+  ASSERT_OK(writer_->AddRecord(WriteOptions(), Slice("a"), /*seqno=*/0,
+                               /*wal_index=*/12345));
+  ASSERT_EQ("a", Read());
+  ASSERT_EQ(0U, reader_->GetLastReadWALIndex());
+}
+
+// Indexed data record types remain self-describing if the optional marker is
+// lost during file creation.
+TEST_P(LogTest, WALIndexRecordsDoNotRequireMarker) {
+  EnableWALIndex(/*write_marker=*/false);
+  Write("foo");
+  Write("bar");
+
+  ASSERT_EQ("foo", Read());
+  ASSERT_EQ(1U, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("bar", Read());
+  ASSERT_EQ(2U, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+TEST_P(LogTest, WALIndexValuesCanSpanWriters) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  EnableWALIndex();
+
+  Slice second_writer_contents;
+  std::unique_ptr<FSWritableFile> second_sink(
+      new test::StringSink(&second_writer_contents));
+  std::unique_ptr<WritableFileWriter> second_file_writer(
+      new WritableFileWriter(std::move(second_sink), "", FileOptions()));
+  Writer second_writer(std::move(second_file_writer), 124, recyclable);
+  second_writer.SetPartitionWALUsage(
+      PartitionWALUsage::kPartitionByColumnFamily);
+  ASSERT_OK(second_writer.MaybeAddWALIndexMarkerRecord(WriteOptions()));
+
+  // The DB-level allocator can hand interleaved values to different writers;
+  // each writer persists the values it receives.
+  const uint64_t first = next_wal_index_++;
+  const uint64_t second = next_wal_index_++;
+  const uint64_t third = next_wal_index_++;
+  ASSERT_OK(
+      writer_->AddRecord(WriteOptions(), Slice("first"), /*seqno=*/0, first));
+  ASSERT_OK(second_writer.AddRecord(WriteOptions(), Slice("second"),
+                                    /*seqno=*/0, second));
+  ASSERT_OK(
+      writer_->AddRecord(WriteOptions(), Slice("third"), /*seqno=*/0, third));
+
+  // Each file holds exactly the values its writer was handed. The value that
+  // went to the other writer leaves a gap rather than being renumbered away.
+  const std::vector<uint64_t> mine = {first, third};
+  ASSERT_EQ(mine, DecodeWALIndices(get_reader_contents()->ToString(),
+                                   {sizeof("first") - 1, sizeof("third") - 1}));
+  const std::vector<uint64_t> theirs = {second};
+  ASSERT_EQ(theirs, DecodeWALIndices(second_writer_contents.ToString(),
+                                     {sizeof("second") - 1}));
+}
+
+// wal_index is consecutive across the WAL partition as a whole, not within any
+// single file, so a jump between successive records in one file is normal and
+// must not be reported as corruption.
+TEST_P(LogTest, WALIndexNonConsecutiveWithinFileIsAccepted) {
+  EnableWALIndex();
+  Write("a");
+  next_wal_index_ = 3;
+  Write("b");
+
+  ASSERT_EQ("a", Read());
+  ASSERT_EQ(1U, reader_->GetLastReadWALIndex());
+
+  ASSERT_EQ("b", Read());
+  ASSERT_EQ(3U, reader_->GetLastReadWALIndex());
+
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+  ASSERT_EQ("", ReportMessage());
+}
+
+TEST_P(LogTest, WALIndexMissingAssignmentFailsWrite) {
+  EnableWALIndex();
+  ASSERT_TRUE(
+      writer_->AddRecord(WriteOptions(), Slice("record")).IsCorruption());
+}
+
+// A caller that repeats or rewinds a wal_index is rejected rather than
+// asserted on: the values must strictly increase for downstream gap detection,
+// and an optimized build has no assert left to catch the violation.
+TEST_P(LogTest, WALIndexNonIncreasingFailsWrite) {
+  EnableWALIndex();
+  // Start well above kWALIndexStartNumber so the rewind below stays non-zero
+  // and is rejected for going backwards, not for being unassigned.
+  next_wal_index_ = kWALIndexStartNumber + 4;
+  const uint64_t recorded = next_wal_index_++;
+  ASSERT_OK(writer_->AddRecord(WriteOptions(), Slice("first"), /*seqno=*/0,
+                               recorded));
+  const IOStatus repeated = writer_->AddRecord(WriteOptions(), Slice("second"),
+                                               /*seqno=*/0, recorded);
+  ASSERT_TRUE(repeated.IsCorruption());
+  const IOStatus rewound = writer_->AddRecord(
+      WriteOptions(), Slice("third"), /*seqno=*/0, kWALIndexStartNumber);
+  ASSERT_TRUE(rewound.IsCorruption());
+}
+
+// The index survives records that span multiple 32KiB blocks (fragmented into
+// first/middle/last physical records).
+TEST_P(LogTest, WALIndexLargeRecord) {
+  EnableWALIndex();
+  const std::string big = BigString("abcd", 100 * 1000);
+  Write("small");
+  Write(big);
+
+  ASSERT_EQ("small", Read());
+  ASSERT_EQ(1U, reader_->GetLastReadWALIndex());
+  ASSERT_EQ(big, Read());
+  ASSERT_EQ(2U, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+// A record starting with fewer than 8 bytes left in the block splits the index
+// across a First fragment and a Last fragment that also contains the payload.
+TEST_P(LogTest, WALIndexStraddlesBlockBoundary) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+
+  const size_t filler_len =
+      kBlockSize - header_size - 3 - header_size - header_size - kWALIndexSize;
+  const std::string filler = BigString("f", filler_len);
+  Write(filler);
+  Write("xyz");
+
+  const std::string contents = get_reader_contents()->ToString();
+  const size_t first_header = kBlockSize - header_size - 3;
+  ASSERT_GE(contents.size(), first_header + header_size + 3);
+  const uint8_t first_type = static_cast<uint8_t>(contents[first_header + 6]);
+  ASSERT_TRUE(first_type == kWALIndexFirstType ||
+              first_type == kRecyclableWALIndexFirstType);
+  const uint32_t first_len =
+      (static_cast<uint32_t>(contents[first_header + 4]) & 0xff) |
+      ((static_cast<uint32_t>(contents[first_header + 5]) & 0xff) << 8);
+  ASSERT_EQ(3U, first_len);
+
+  char expected_index[kWALIndexSize];
+  EncodeFixed64(expected_index, kWALIndexStartNumber + 1);
+  ASSERT_EQ(std::string(expected_index, 3),
+            std::string(contents.data() + first_header + header_size, 3));
+  ASSERT_EQ(crc32c::Mask(crc32c::Value(contents.data() + first_header + 6,
+                                       header_size - 6 + first_len)),
+            DecodeFixed32(contents.data() + first_header));
+
+  const size_t last_header = kBlockSize;
+  ASSERT_GE(contents.size(), last_header + header_size + 8);
+  const uint8_t last_type = static_cast<uint8_t>(contents[last_header + 6]);
+  ASSERT_TRUE(last_type == kWALIndexLastType ||
+              last_type == kRecyclableWALIndexLastType);
+  const uint32_t last_len =
+      (static_cast<uint32_t>(contents[last_header + 4]) & 0xff) |
+      ((static_cast<uint32_t>(contents[last_header + 5]) & 0xff) << 8);
+  ASSERT_EQ(8U, last_len);
+  const char* last_payload = contents.data() + last_header + header_size;
+  ASSERT_EQ(std::string(expected_index + 3, 5), std::string(last_payload, 5));
+  ASSERT_EQ("xyz", std::string(last_payload + 5, 3));
+  ASSERT_EQ(crc32c::Mask(crc32c::Value(contents.data() + last_header + 6,
+                                       header_size - 6 + last_len)),
+            DecodeFixed32(contents.data() + last_header));
+
+  ASSERT_EQ(filler, Read());
+  ASSERT_EQ(kWALIndexStartNumber, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("xyz", Read());
+  ASSERT_EQ(kWALIndexStartNumber + 1, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+// The wal_index is stored as a fixed64, so a value using the high bits round
+// trips intact rather than being truncated.
+TEST_P(LogTest, WALIndexLargeValueRoundTrips) {
+  EnableWALIndex();
+  constexpr uint64_t kBigIndex = 0xFEDCBA9876543210ULL;
+  next_wal_index_ = kBigIndex;
+
+  Write("foo");
+
+  ASSERT_EQ("foo", Read());
+  ASSERT_EQ(kBigIndex, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+// The reader classifies each record by its own type, so a file holding both
+// indexed and plain records decodes correctly and only the indexed one is
+// stripped. The writer contract does not produce such a file, but nothing in
+// the format prevents one and the reader must not assume otherwise.
+TEST_P(LogTest, WALIndexMixedWithPlainRecords) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  EnableWALIndex(/*write_marker=*/false);
+  Write("first");
+  Write("second");
+
+  // Relabel the second record as a plain type so a non-indexed record follows
+  // an indexed one. Written in this order on purpose: it is the direction that
+  // catches GetLastReadWALIndex() reporting the previous record's index.
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  const int second_header =
+      header_size + static_cast<int>(kWALIndexSize) + 5 /* "first" */;
+  SetByte(second_header + 6,
+          static_cast<char>(recyclable ? kRecyclableFullType : kFullType));
+  FixChecksum(second_header, static_cast<int>(kWALIndexSize) + 6 /* "second" */,
+              recyclable);
+
+  ASSERT_EQ("first", Read());
+  ASSERT_EQ(kWALIndexStartNumber, reader_->GetLastReadWALIndex());
+
+  // The plain record keeps its whole payload, index bytes included, and must
+  // report no index of its own.
+  const std::string second = Read();
+  ASSERT_EQ(static_cast<size_t>(kWALIndexSize) + 6, second.size());
+  ASSERT_EQ("second", second.substr(kWALIndexSize));
+  ASSERT_EQ(0U, reader_->GetLastReadWALIndex());
+
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+// A record whose type claims a wal_index but whose payload is too short to
+// hold one is reported as corruption instead of being over-read.
+TEST_P(LogTest, WALIndexTooShortRecordReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+
+  // Write a 3-byte record with indexing off, then relabel it as indexed. The
+  // type byte is at offset 6 for both header layouts, and both the plain and
+  // the indexed full types have the same recyclability, so the header size is
+  // unchanged.
+  Write("abc");
+  SetByte(6, static_cast<char>(recyclable ? kRecyclableWALIndexFullType
+                                          : kWALIndexFullType));
+  FixChecksum(0, 3 /* len */, recyclable);
+
+  ASSERT_EQ("abc", Read());
+  ASSERT_EQ("OK", MatchError("too small"));
+}
+
+// Fragments of one logical record must agree about carrying a wal_index.
+TEST_P(LogTest, WALIndexInconsistentFragmentTypesReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  EnableWALIndex(/*write_marker=*/false);
+  Write(BigString("x", 2 * kBlockSize));
+
+  // The record spans three fragments; the second one starts at the beginning
+  // of the next block. Relabel it as a plain middle fragment so it disagrees
+  // with the indexed first fragment.
+  const int second_header = kBlockSize;
+  const std::string contents = get_reader_contents()->ToString();
+  const uint32_t len =
+      (static_cast<uint32_t>(contents[second_header + 4]) & 0xff) |
+      ((static_cast<uint32_t>(contents[second_header + 5]) & 0xff) << 8);
+  SetByte(second_header + 6,
+          static_cast<char>(recyclable ? kRecyclableMiddleType : kMiddleType));
+  FixChecksum(second_header, static_cast<int>(len), recyclable);
+
+  Read();
+  ASSERT_EQ("OK", MatchError("inconsistent WAL index fragment types"));
+}
+
+// wal_index is consecutive across the WAL partition as a whole. With two
+// writers sharing one counter neither file is internally consecutive, but the
+// union of the indices that actually landed on disk is exactly the run the
+// counter handed out.
+TEST_P(LogTest, WALIndexConsecutiveAcrossFilesInPartition) {
+  EnableWALIndex();
+
+  Slice second_contents;
+  std::unique_ptr<FSWritableFile> second_sink(
+      new test::StringSink(&second_contents));
+  std::unique_ptr<WritableFileWriter> second_file_writer(
+      new WritableFileWriter(std::move(second_sink), "", FileOptions()));
+  Writer second_writer(std::move(second_file_writer), 124,
+                       std::get<0>(GetParam()) != 0);
+  second_writer.SetPartitionWALUsage(
+      PartitionWALUsage::kPartitionByColumnFamily);
+  ASSERT_OK(second_writer.MaybeAddWALIndexMarkerRecord(WriteOptions()));
+
+  // Interleave so this file takes 1, 3, 5 and the other takes 2, 4, 6.
+  Write("a1");
+  ASSERT_OK(second_writer.AddRecord(WriteOptions(), Slice("b1"), /*seqno=*/0,
+                                    next_wal_index_++));
+  Write("a2");
+  ASSERT_OK(second_writer.AddRecord(WriteOptions(), Slice("b2"), /*seqno=*/0,
+                                    next_wal_index_++));
+  Write("a3");
+  ASSERT_OK(second_writer.AddRecord(WriteOptions(), Slice("b3"), /*seqno=*/0,
+                                    next_wal_index_++));
+
+  std::vector<uint64_t> indices;
+  ASSERT_EQ("a1", Read());
+  indices.push_back(reader_->GetLastReadWALIndex());
+  ASSERT_EQ("a2", Read());
+  indices.push_back(reader_->GetLastReadWALIndex());
+  ASSERT_EQ("a3", Read());
+  indices.push_back(reader_->GetLastReadWALIndex());
+
+  // This file alone skips values.
+  ASSERT_EQ(kWALIndexStartNumber, indices[0]);
+  ASSERT_EQ(kWALIndexStartNumber + 2, indices[1]);
+  ASSERT_EQ(kWALIndexStartNumber + 4, indices[2]);
+
+  // Read the other file back through its own reader. Read exactly as many
+  // records as were written so we never hit SeqStringSource's EOF error.
+  const std::string second_data = second_contents.ToString();
+  std::atomic<int> read_count{0};
+  std::unique_ptr<FSSequentialFile> second_source(
+      new test::SeqStringSource(second_data, &read_count));
+  std::unique_ptr<SequentialFileReader> second_file_reader(
+      new SequentialFileReader(std::move(second_source), "" /* file name */));
+  Reader second_reader(nullptr, std::move(second_file_reader),
+                       nullptr /* reporter */, true /* checksum */,
+                       124 /* log_number */);
+  std::string scratch;
+  Slice record;
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(second_reader.ReadRecord(&record, &scratch));
+    indices.push_back(second_reader.GetLastReadWALIndex());
+  }
+
+  // Neither file is consecutive on its own; together they are.
+  std::sort(indices.begin(), indices.end());
+  ASSERT_EQ(6U, indices.size());
+  for (size_t i = 0; i < indices.size(); ++i) {
+    ASSERT_EQ(kWALIndexStartNumber + i, indices[i]);
+  }
 }
 
 // Do NOT enable compression for this instantiation.
