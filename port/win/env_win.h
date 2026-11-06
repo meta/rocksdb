@@ -227,7 +227,10 @@ class WinFileSystem : public FileSystem {
       const FileOptions& file_options) const override;
   FileOptions OptimizeForManifestWrite(
       const FileOptions& file_options) const override;
-  void SupportedOps(int64_t& supported_ops) override { supported_ops = 0; }
+  virtual void SupportedOps(int64_t& supported_ops) override;
+  virtual IOStatus Poll(std::vector<void*>& io_handles,
+                        size_t min_completions) override;
+  virtual IOStatus AbortIO(std::vector<void*>& io_handles) override;
 
  protected:
   static uint64_t FileTimeToUnixTime(const FILETIME& ftTime);

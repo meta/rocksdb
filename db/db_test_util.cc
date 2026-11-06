@@ -367,6 +367,11 @@ Options DBTestBase::GetOptions(
       "NewRandomAccessFile:O_DIRECT");
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
       "NewWritableFile:O_DIRECT");
+#elif defined(OS_WIN)
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
+      "NewRandomAccessFile:FILE_FLAG_NO_BUFFERING");
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
+      "NewWritableFile:FILE_FLAG_NO_BUFFERING");
 #endif
   // kMustFreeHeapAllocations -> indicates ASAN build
   if (kMustFreeHeapAllocations && !options_override.full_block_cache) {
