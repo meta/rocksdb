@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <unordered_set>
+#include <cstdint>
 
 #include "rocksdb/rocksdb_namespace.h"
 
