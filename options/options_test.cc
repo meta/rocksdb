@@ -816,10 +816,14 @@ TEST_F(OptionsTest, CompressionOptionsFromString) {
   ASSERT_OK(GetColumnFamilyOptionsFromString(
       config_options, base_cf_opt,
       "compression_opts.enabled=false; "
-      "bottommost_compression_opts.enabled=true; ",
+      "bottommost_compression_opts.enabled=true; "
+      "compression_opts.parallel_threads=8; "
+      "bottommost_compression_opts.parallel_threads=3; ",
       &new_cf_opt));
   ASSERT_EQ(new_cf_opt.compression_opts.enabled, false);
   ASSERT_EQ(new_cf_opt.bottommost_compression_opts.enabled, true);
+  ASSERT_EQ(new_cf_opt.compression_opts.parallel_threads, 8);
+  ASSERT_EQ(new_cf_opt.bottommost_compression_opts.parallel_threads, 3);
 
   // Now test some illegal values
   ConfigOptions ignore;
