@@ -58,6 +58,7 @@ NATIVE_JAVA_CLASSES = \
 	org.rocksdb.ReadOptions\
 	org.rocksdb.RemoveEmptyValueCompactionFilter\
 	org.rocksdb.RestoreOptions\
+	org.rocksdb.RibbonFilter\
 	org.rocksdb.RocksCallbackObject\
 	org.rocksdb.RocksDB\
 	org.rocksdb.RocksEnv\
