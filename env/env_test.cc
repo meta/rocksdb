@@ -5089,6 +5089,23 @@ TEST_F(EnvTest, WriteStringToFileCloseFailureDeletesFile) {
   ASSERT_TRUE(exists.IsNotFound()) << exists.ToString();
 }
 
+TEST_F(EnvPosixTest, PhysicalCoreID) {
+  // PhysicalCoreID must be > -1 on supported platforms
+  // TODO: support PPC?
+  int core1 = port::PhysicalCoreID();
+  int core2 = port::PhysicalCoreID();
+  ASSERT_GE(core1, -1);
+  ASSERT_GE(core2, -1);
+
+  // this SHOULD be equal, but this can theoretically flake
+  ASSERT_EQ(core1, core2);
+
+#if defined(ROCKSDB_SCHED_GETCPU_PRESENT)
+  ASSERT_NE(core1, -1) << "platform support may be missing";
+  ASSERT_NE(core2, -1);
+#endif
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
