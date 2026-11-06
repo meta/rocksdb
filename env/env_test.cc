@@ -2750,7 +2750,7 @@ TEST_P(EnvPosixTestWithParam, PosixRandomRWFileRandomized) {
   Random rnd(301);
   std::string buf;
   for (int i = 0; i < 10000; i++) {
-    // Genrate random data
+    // Generate random data
     buf = rnd.RandomString(10);
 
     // Pick random offset for write

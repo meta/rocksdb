@@ -1085,7 +1085,7 @@ Status MockEnv::CorruptBuffer(const std::string& fname) {
   return mock->CorruptBuffer(fname);
 }
 
-// This is to maintain the behavior before swithcing from InMemoryEnv to MockEnv
+// This is to maintain the behavior before switching from InMemoryEnv to MockEnv
 Env* NewMemEnv(Env* base_env) { return MockEnv::Create(base_env); }
 
 }  // namespace ROCKSDB_NAMESPACE
