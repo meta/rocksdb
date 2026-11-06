@@ -20,6 +20,10 @@
 #include "util/crc32c_arm64.h"
 #include "util/math.h"
 
+#if defined(__riscv) && defined(__riscv_zbc)
+#include "util/crc32c_riscv.h"
+#endif
+
 #ifdef __powerpc64__
 #include "util/crc32c_ppc.h"
 #include "util/crc32c_ppc_constants.h"
@@ -359,6 +363,12 @@ uint32_t ExtendARMImpl(uint32_t crc, const char* buf, size_t size) {
 }
 #endif
 
+#if defined(__riscv) && defined(__riscv_zbc)
+uint32_t ExtendRISCVImpl(uint32_t crc, const char* buf, size_t size) {
+  return crc32c_riscv(crc, (const unsigned char*)buf, size);
+}
+#endif
+
 std::string IsFastCrc32Supported() {
   bool has_fast_crc = false;
   std::string fast_zero_msg;
@@ -381,6 +391,14 @@ std::string IsFastCrc32Supported() {
   } else {
     has_fast_crc = false;
     arch = "Arm64";
+  }
+#elif defined(__riscv) && defined(__riscv_zbc)
+  if (crc32c_runtime_check()) {
+    has_fast_crc = true;
+    arch = "RISC-V";
+  } else {
+    has_fast_crc = false;
+    arch = "RISC-V";
   }
 #else
 #ifdef __SSE4_2__
@@ -1112,6 +1130,12 @@ static inline Function Choose_Extend() {
   if(crc32c_runtime_check()) {
     pmull_runtime_flag = crc32c_pmull_runtime_check();
     return ExtendARMImpl;
+  } else {
+    return ExtendImpl<DefaultCRC32>;
+  }
+#elif defined(__riscv) && defined(__riscv_zbc)
+  if (crc32c_runtime_check()) {
+    return ExtendRISCVImpl;
   } else {
     return ExtendImpl<DefaultCRC32>;
   }

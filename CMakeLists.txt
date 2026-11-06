@@ -279,6 +279,23 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|AARCH64")
   endif(HAS_ARMV8_CRC)
 endif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|AARCH64")
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64|riscv")
+  CHECK_C_COMPILER_FLAG("-march=rv64gc_zbc_zicbop" HAS_RISCV_ZBC)
+  # Prefer zvbc (vector carry-less multiply) when the toolchain supports it;
+  # it enables the vector fold path in util/crc32c_riscv.cc. zvbc depends on
+  # the V extension, so the march must include v.
+  CHECK_C_COMPILER_FLAG("-march=rv64gcv_zbc_zvbc_zicbop" HAS_RISCV_ZVBC)
+  if(HAS_RISCV_ZVBC)
+    message(STATUS " HAS_RISCV_ZVBC yes")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=rv64gcv_zbc_zvbc_zicbop")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gcv_zbc_zvbc_zicbop")
+  elseif(HAS_RISCV_ZBC)
+    message(STATUS " HAS_RISCV_ZBC yes")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=rv64gc_zbc_zicbop")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gc_zbc_zicbop")
+  endif()
+endif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64|riscv")
+
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "s390x")
   CHECK_C_COMPILER_FLAG("-march=native" HAS_S390X_MARCH_NATIVE)
   if(HAS_S390X_MARCH_NATIVE)
@@ -1171,6 +1188,11 @@ if(HAS_ARMV8_CRC)
   list(APPEND SOURCES
     util/crc32c_arm64.cc)
 endif(HAS_ARMV8_CRC)
+
+if(HAS_RISCV_ZBC)
+  list(APPEND SOURCES
+    util/crc32c_riscv.cc)
+endif(HAS_RISCV_ZBC)
 
 if(WIN32)
   list(APPEND SOURCES
