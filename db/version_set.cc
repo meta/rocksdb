@@ -3959,6 +3959,9 @@ void VersionStorageInfo::ComputeExpiredTtlFiles(
     return;
   }
   const uint64_t current_time = static_cast<uint64_t>(_current_time);
+  if (ttl > current_time) {
+    return;
+  }
 
   for (int level = 0; level < num_levels() - 1; level++) {
     for (FileMetaData* f : files_[level]) {

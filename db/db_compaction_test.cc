@@ -6666,6 +6666,28 @@ TEST_F(DBCompactionTest, LevelPeriodicCompactionWithOldDB) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
+TEST_F(DBCompactionTest, LevelTtlLargerThanCurrentTime) {
+  Options options = CurrentOptions();
+  options.ttl = std::numeric_limits<uint64_t>::max();
+  options.periodic_compaction_seconds = 0;
+  options.max_open_files = -1;
+  options.write_buffer_size = 256 << 10;
+  std::shared_ptr<CompactionStatsCollector> collector =
+      std::make_shared<CompactionStatsCollector>();
+  options.listeners.push_back(collector);
+  DestroyAndReopen(options);
+
+  const std::string value(1000, 'x');
+  for (int i = 0; i < 40; ++i) {
+    for (int j = 0; j < 400; ++j) {
+      ASSERT_OK(Put(Key(i * 400 + j), value));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(0, collector->NumberOfCompactions(CompactionReason::kTtl));
+}
+
 TEST_F(DBCompactionTest, LevelPeriodicAndTtlCompaction) {
   const int kNumKeysPerFile = 32;
   const int kNumLevelFiles = 2;
