@@ -6,6 +6,7 @@
 #include "db/db_test_util.h"
 #include "db/version_set.h"
 #include "port/stack_trace.h"
+#include "rocksdb/sst_file_reader.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
 #include "test_util/testutil.h"
 #include "util/random.h"
@@ -569,6 +570,120 @@ TEST_F(DBRangeDelTest, CompactionRemovesCoveredMergeOperands) {
   GetFixed64(&tmp2, &tmp);
   PutFixed64(&expected, 30);  // 6+7+8+9 (earlier operands covered by tombstone)
   ASSERT_EQ(expected, actual);
+}
+
+// Entry types stored for `user_key` in the SST file at `file_path`.
+std::vector<EntryType> EntryTypesForKey(const Options& options,
+                                        const std::string& file_path,
+                                        const Slice& user_key) {
+  std::vector<EntryType> types;
+  SstFileReader reader(options);
+  EXPECT_OK(reader.Open(file_path));
+  std::unique_ptr<Iterator> iter = reader.NewTableIterator();
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    ParsedEntryInfo entry;
+    EXPECT_OK(reader.ParseTableIteratorKey(iter->key(), &entry));
+    if (entry.user_key == user_key) {
+      types.push_back(entry.type);
+    }
+  }
+  EXPECT_OK(iter->status());
+  return types;
+}
+
+TEST_F(DBRangeDelTest, GetMergeBaseValueAcrossFileBoundaryWithOlderTombstone) {
+  // Regression test for #15419. When compaction cuts an output file between
+  // the versions of one user key, the first file holds the newest versions
+  // (here the merge operand) and a range tombstone that is older than all of
+  // them, while the next file of the same level holds the base value. Get()
+  // used to stop after the first file because a covering tombstone had been
+  // seen, and merged the operand without the base value.
+  Options opts = CurrentOptions();
+  opts.merge_operator = MergeOperators::CreateStringAppendOperator();
+  opts.disable_auto_compactions = true;
+  // Small uncompressed files so that some output file boundary falls inside
+  // the versions of one key, independently of the available compression
+  // libraries.
+  opts.target_file_size_base = 1024;
+  opts.compression = kNoCompression;
+  DestroyAndReopen(opts);
+
+  const int kNumKeys = 400;
+  for (int i = 0; i < kNumKeys; i++) {
+    ASSERT_OK(Put(Key(i), "old" + std::to_string(i)));
+  }
+  const Snapshot* snap_old = db_->GetSnapshot();
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), Key(0),
+                             Key(kNumKeys)));
+  const Snapshot* snap_tombstone = db_->GetSnapshot();
+  for (int i = 0; i < kNumKeys; i++) {
+    ASSERT_OK(Put(Key(i), "v" + std::to_string(i)));
+  }
+  // Keeps the base value and the merge operand as separate versions.
+  const Snapshot* snap_value = db_->GetSnapshot();
+  for (int i = 0; i < kNumKeys; i++) {
+    ASSERT_OK(Merge(Key(i), "m"));
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+
+  // The layout must contain a user key whose merge operand is in one file and
+  // whose base value is in the next file of the same level, otherwise this
+  // test does not exercise the bug. Equal file boundaries alone are not
+  // enough: compaction also extends a range tombstone's end point to the next
+  // file's first key, so look at the point entries of the two files.
+  std::vector<LiveFileMetaData> files;
+  db_->GetLiveFilesMetaData(&files);
+  std::sort(files.begin(), files.end(),
+            [](const LiveFileMetaData& a, const LiveFileMetaData& b) {
+              return a.level != b.level ? a.level < b.level
+                                        : a.smallestkey < b.smallestkey;
+            });
+  bool key_spans_files = false;
+  for (size_t i = 0; i + 1 < files.size(); i++) {
+    if (files[i].level == 0 || files[i].level != files[i + 1].level ||
+        files[i].largestkey != files[i + 1].smallestkey) {
+      continue;
+    }
+    const std::string& boundary_key = files[i].largestkey;
+    std::vector<EntryType> first = EntryTypesForKey(
+        opts, files[i].db_path + files[i].name, boundary_key);
+    std::vector<EntryType> second = EntryTypesForKey(
+        opts, files[i + 1].db_path + files[i + 1].name, boundary_key);
+    if (std::find(first.begin(), first.end(), kEntryMerge) != first.end() &&
+        std::find(second.begin(), second.end(), kEntryPut) != second.end()) {
+      key_spans_files = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(key_spans_files);
+
+  std::vector<std::string> keys;
+  std::vector<std::string> expected;
+  for (int i = 0; i < kNumKeys; i++) {
+    keys.push_back(Key(i));
+    expected.push_back("v" + std::to_string(i) + ",m");
+  }
+  for (int i = 0; i < kNumKeys; i++) {
+    ASSERT_EQ(Get(keys[i]), expected[i]);
+  }
+  ASSERT_EQ(MultiGet(keys), expected);
+  std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+  int num_seen = 0;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    ASSERT_LT(num_seen, kNumKeys);
+    ASSERT_EQ(it->key().ToString(), keys[num_seen]);
+    ASSERT_EQ(it->value().ToString(), expected[num_seen]);
+    num_seen++;
+  }
+  ASSERT_OK(it->status());
+  ASSERT_EQ(num_seen, kNumKeys);
+
+  db_->ReleaseSnapshot(snap_old);
+  db_->ReleaseSnapshot(snap_tombstone);
+  db_->ReleaseSnapshot(snap_value);
 }
 
 TEST_F(DBRangeDelTest, PutDeleteRangeMergeFlush) {
