@@ -2783,19 +2783,60 @@ InternalIterator* BlockBasedTable::NewIterator(
     const ReadOptions& read_options, const SliceTransform* prefix_extractor,
     Arena* arena, bool skip_filters, TableReaderCaller caller,
     size_t compaction_readahead_size, bool allow_unprepared_value) {
+  return NewIteratorImpl(read_options, prefix_extractor, arena, skip_filters,
+                         caller, compaction_readahead_size,
+                         allow_unprepared_value, /*seek_target=*/nullptr);
+}
+
+InternalIterator* BlockBasedTable::NewIteratorForSeek(
+    const ReadOptions& read_options, const SliceTransform* prefix_extractor,
+    Arena* arena, bool skip_filters, TableReaderCaller caller,
+    size_t compaction_readahead_size, bool allow_unprepared_value,
+    const Slice& seek_target) {
+  return NewIteratorImpl(read_options, prefix_extractor, arena, skip_filters,
+                         caller, compaction_readahead_size,
+                         allow_unprepared_value, &seek_target);
+}
+
+InternalIterator* BlockBasedTable::NewIteratorImpl(
+    const ReadOptions& read_options, const SliceTransform* prefix_extractor,
+    Arena* arena, bool skip_filters, TableReaderCaller caller,
+    size_t compaction_readahead_size, bool allow_unprepared_value,
+    const Slice* seek_target) {
   BlockCacheLookupContext lookup_context{caller};
   bool need_upper_bound_check =
       read_options.auto_prefix_mode || PrefixExtractorChanged(prefix_extractor);
-  std::unique_ptr<InternalIteratorBase<IndexValue>> index_iter(NewIndexIterator(
-      read_options,
-      /*disable_prefix_seek=*/need_upper_bound_check &&
-          rep_->index_type == BlockBasedTableOptions::kHashSearch,
-      /*input_iter=*/nullptr, /*get_context=*/nullptr, &lookup_context));
   bool check_filter =
       !skip_filters &&
       (!read_options.total_order_seek || read_options.auto_prefix_mode ||
        read_options.prefix_same_as_start) &&
       prefix_extractor != nullptr;
+  // Runs the check that the iterator's first Seek() would run, with the same
+  // arguments.
+  auto first_seek_prefix_check =
+      BlockBasedTableIterator::FirstSeekPrefixCheck::kNotRun;
+  if (seek_target != nullptr && check_filter &&
+      rep_->fragmented_range_dels == nullptr) {
+    bool filter_checked = false;
+    if (!PrefixRangeMayMatch(*seek_target, read_options, prefix_extractor,
+                             need_upper_bound_check, &lookup_context,
+                             &filter_checked)) {
+      RecordTick(rep_->ioptions.stats, IsLastLevel()
+                                           ? LAST_LEVEL_SEEK_FILTERED
+                                           : NON_LAST_LEVEL_SEEK_FILTERED);
+      return nullptr;
+    }
+    first_seek_prefix_check =
+        filter_checked
+            ? BlockBasedTableIterator::FirstSeekPrefixCheck::kPassedFilter
+            : BlockBasedTableIterator::FirstSeekPrefixCheck::
+                  kPassedWithoutFilter;
+  }
+  std::unique_ptr<InternalIteratorBase<IndexValue>> index_iter(NewIndexIterator(
+      read_options,
+      /*disable_prefix_seek=*/need_upper_bound_check &&
+          rep_->index_type == BlockBasedTableOptions::kHashSearch,
+      /*input_iter=*/nullptr, /*get_context=*/nullptr, &lookup_context));
   // Same-file ("embedded") blob references are resolved by a wrapper iterator
   // so the block-based iterator never exposes an unresolved BlobIndex. The SST
   // dump tool must keep seeing raw BlobIndex values, so it is excluded.
@@ -2811,7 +2852,8 @@ InternalIterator* BlockBasedTable::NewIterator(
     auto* iter = new BlockBasedTableIterator(
         this, read_options, rep_->internal_comparator, std::move(index_iter),
         check_filter, need_upper_bound_check, prefix_extractor, caller,
-        compaction_readahead_size, inner_allow_unprepared_value);
+        first_seek_prefix_check, compaction_readahead_size,
+        inner_allow_unprepared_value);
     if (!resolve_embedded_values) {
       return iter;
     }
@@ -2826,7 +2868,8 @@ InternalIterator* BlockBasedTable::NewIterator(
     auto* iter = new (mem) BlockBasedTableIterator(
         this, read_options, rep_->internal_comparator, std::move(index_iter),
         check_filter, need_upper_bound_check, prefix_extractor, caller,
-        compaction_readahead_size, inner_allow_unprepared_value);
+        first_seek_prefix_check, compaction_readahead_size,
+        inner_allow_unprepared_value);
     if (!resolve_embedded_values) {
       return iter;
     }
