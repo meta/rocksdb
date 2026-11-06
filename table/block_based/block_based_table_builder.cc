@@ -2276,6 +2276,24 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
       }
     }
 
+    // The block format cannot address a data block of 2^32 bytes or more
+    // (restart_offset_ is uint32_t). Never emit one: cut the block first,
+    // or fail if the single entry does not fit.
+    if (r->data_block.EstimateSizeAfterKV(entry_ikey, entry_value) >
+        std::numeric_limits<uint32_t>::max()) {
+      if (!r->data_block.empty()) {
+        Flush(/*first_key_in_next_block=*/&entry_ikey);
+      }
+
+      if (r->data_block.EstimateSizeAfterKV(entry_ikey, entry_value) >
+          std::numeric_limits<uint32_t>::max()) {
+        r->SetStatus(Status::InvalidArgument(
+            "BlockBasedTableBuilder::Add() entry would exceed 4GB data block "
+            "limit"));
+        return;
+      }
+    }
+
     // NOTE: WriteBatch guarantees keys < 4GB; value size checked above
     r->data_block.AddWithLastKey(entry_ikey, entry_value, r->last_ikey);
     r->last_ikey.assign(entry_ikey.data(), entry_ikey.size());
