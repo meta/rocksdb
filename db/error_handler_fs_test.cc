@@ -283,6 +283,64 @@ TEST_F(DBErrorHandlingFSTest, FlushWriteNoSpaceError) {
   Destroy(options);
 }
 
+// A write attempted while the DB is stopped due to an SstFileManager space
+// limit error is fed back to the error handler as kWriteCallback (in the
+// pipelined and unordered write paths). That must not escalate the error to
+// fatal, or the DB can never be resumed.
+TEST_F(DBErrorHandlingFSTest, WriteAfterSpaceLimitErrorIsRecoverable) {
+  for (bool pipelined : {true, false}) {
+    SCOPED_TRACE(pipelined ? "enable_pipelined_write" : "unordered_write");
+    std::shared_ptr<ErrorHandlerFSListener> listener =
+        std::make_shared<ErrorHandlerFSListener>();
+    std::shared_ptr<SstFileManager> sfm(NewSstFileManager(env_));
+    Options options = GetDefaultOptions();
+    options.env = fault_env_.get();
+    options.create_if_missing = true;
+    options.listeners.emplace_back(listener);
+    options.sst_file_manager = sfm;
+    options.enable_pipelined_write = pipelined;
+    options.unordered_write = !pipelined;
+
+    listener->EnableAutoRecovery(false);
+    DestroyAndReopen(options);
+
+    // Any SST file will exceed this limit
+    sfm->SetMaxAllowedSpaceUsage(1);
+    ASSERT_OK(Put(Key(0), "val0"));
+    // Flush() may return before the flush job sets the space limit error
+    SyncPoint::GetInstance()->LoadDependency(
+        {{"DBImpl::FlushMemTableToOutputFile:Finish",
+          "WriteAfterSpaceLimitErrorIsRecoverable:FlushDone"}});
+    SyncPoint::GetInstance()->EnableProcessing();
+    Flush().PermitUncheckedError();
+    TEST_SYNC_POINT("WriteAfterSpaceLimitErrorIsRecoverable:FlushDone");
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    Status bg_error = dbfull()->TEST_GetBGError();
+    ASSERT_EQ(bg_error.subcode(), Status::SubCode::kSpaceLimit);
+    ASSERT_EQ(bg_error.severity(), Status::Severity::kHardError);
+
+    // The write fails with the existing background error, which is then
+    // reported back to the error handler
+    Status s = Put(Key(1), "val1");
+    ASSERT_EQ(s.subcode(), Status::SubCode::kSpaceLimit);
+    bg_error = dbfull()->TEST_GetBGError();
+    ASSERT_EQ(bg_error.subcode(), Status::SubCode::kSpaceLimit);
+    ASSERT_EQ(bg_error.severity(), Status::Severity::kHardError);
+
+    // After freeing up space, the DB should be resumable
+    sfm->SetMaxAllowedSpaceUsage(0);
+    ASSERT_OK(dbfull()->Resume());
+    ASSERT_OK(Put(Key(1), "val1"));
+    ASSERT_OK(Flush());
+
+    Reopen(options);
+    ASSERT_EQ("val0", Get(Key(0)));
+    ASSERT_EQ("val1", Get(Key(1)));
+    Destroy(options);
+  }
+}
+
 TEST_F(DBErrorHandlingFSTest, FlushWriteRetryableError) {
   std::shared_ptr<ErrorHandlerFSListener> listener =
       std::make_shared<ErrorHandlerFSListener>();
