@@ -3,6 +3,7 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -122,6 +123,32 @@ class TestPrefixExtractor : public SliceTransform {
     return static_cast<const char*>(memchr(key.data(), '_', key.size()));
   }
 };
+
+TEST_F(DBMemTableTest, RejectsOversizedEncodedEntry) {
+  Options options;
+  InternalKeyComparator cmp(options.comparator);
+  ImmutableOptions ioptions(options);
+  WriteBufferManager wb(options.db_write_buffer_size);
+  std::unique_ptr<MemTable> mem =
+      std::make_unique<MemTable>(cmp, ioptions, MutableCFOptions(options), &wb,
+                                 kMaxSequenceNumber, 0 /* column_family_id */);
+
+  constexpr size_t kMaxUint32 = std::numeric_limits<uint32_t>::max();
+  const char dummy = 'x';
+
+  // Slice does not own or access the described storage. These artificial
+  // lengths exercise validation without allocating or copying gigabytes.
+  Status s = mem->Add(1, kTypeValue, Slice(&dummy, 1),
+                      Slice(&dummy, kMaxUint32), nullptr /* kv_prot_info */);
+  ASSERT_TRUE(s.IsInvalidArgument());
+
+  s = mem->Add(2, kTypeValue, Slice(&dummy, kMaxUint32 - kNumInternalBytes + 1),
+               Slice(), nullptr /* kv_prot_info */);
+  ASSERT_TRUE(s.IsInvalidArgument());
+
+  ASSERT_EQ(0U, mem->NumEntries());
+  ASSERT_EQ(0U, mem->GetDataSize());
+}
 
 // Test that ::Add properly returns false when inserting duplicate keys
 TEST_F(DBMemTableTest, DuplicateSeq) {
