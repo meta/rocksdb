@@ -1178,7 +1178,7 @@ bool DBImpl::InvokeWalFilterIfNeededOnWalRecord(uint64_t wal_number,
 
   if (batch_changed) {
     // Make sure that the count in the new batch is
-    // within the orignal count.
+    // within the original count.
     int new_count = WriteBatchInternal::Count(&new_batch);
     int original_count = WriteBatchInternal::Count(&batch);
     if (new_count > original_count) {

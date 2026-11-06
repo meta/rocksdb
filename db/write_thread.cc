@@ -131,7 +131,7 @@ uint8_t WriteThread::AwaitState(Writer* w, uint8_t goal_mask,
   const size_t kMaxSlowYieldsWhileSpinning = 3;
 
   // Whether the yield approach has any credit in this context. The credit is
-  // added by yield being succesfull before timing out, and decreased otherwise.
+  // added by yield being successful before timing out, and decreased otherwise.
   auto& yield_credit = ctx->value;
   // Update the yield_credit based on sample runs or right after a hard failure
   bool update_ctx = false;

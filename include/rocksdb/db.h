@@ -1146,7 +1146,7 @@ class DB {
 
   // NOTE: Pure virtual => was virtual (optional). If the concrete
   // implementation
-  //       doesn't support returning timestamps, and the timestamps paramater is
+  //       doesn't support returning timestamps, and the timestamps parameter is
   //       non-null, it should return Status::NotSupported() for all the keys.
   virtual void MultiGet(const ReadOptions& options, const size_t num_keys,
                         ColumnFamilyHandle** column_families, const Slice* keys,

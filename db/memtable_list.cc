@@ -733,7 +733,7 @@ Status MemTableList::TryInstallMemtableFlushResults(
         RemoveMemTablesOrRestoreFlags(s, cfd, num_mem_to_flush, log_buffer,
                                       to_delete, mu);
         // Note: cfd->SetLogNumber is only called when a VersionEdit
-        // is written to MANIFEST. When mempurge is succesful, we skip
+        // is written to MANIFEST. When mempurge is successful, we skip
         // this step, therefore cfd->GetLogNumber is always is
         // earliest log with data unflushed.
         // Notify new head of manifest write queue.
