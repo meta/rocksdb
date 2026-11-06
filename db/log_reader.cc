@@ -86,6 +86,19 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
   if (uncompress_) {
     uncompress_->Reset();
   }
+  // A bad physical record can make us abandon a fragmented logical record and
+  // keep scanning in this same call:
+  //
+  //   FIRST(A) -> MIDDLE(A) -> BAD -> MIDDLE(A) -> LAST(A) -> FIRST(B)
+  //      hash += A fragments     abandon A, skip rest        hash must start B
+  //
+  // Reset the streamed logical-record checksum before hashing fragments from
+  // the next candidate record.
+  auto ResetRecordChecksum = [&]() {
+    if (record_checksum != nullptr) {
+      XXH3_64bits_reset(hash_state_);
+    }
+  };
   bool in_fragmented_record = false;
   // Record offset of the logical record that we're reading
   // 0 is a dummy value to make compilers happy
@@ -129,7 +142,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
           // of a block followed by a kFullType or kFirstType record
           // at the beginning of the next block.
           ReportCorruption(scratch->size(), "partial record without end(2)");
-          XXH3_64bits_reset(hash_state_);
+          ResetRecordChecksum();
         }
         if (record_checksum != nullptr) {
           XXH3_64bits_update(hash_state_, fragment.data(), fragment.size());
@@ -298,6 +311,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
       case kBadRecord:
         if (in_fragmented_record) {
           ReportCorruption(scratch->size(), "error in middle of record");
+          ResetRecordChecksum();
           in_fragmented_record = false;
           scratch->clear();
         }
@@ -331,6 +345,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
         }
         if (in_fragmented_record) {
           ReportCorruption(scratch->size(), "error in middle of record");
+          ResetRecordChecksum();
           in_fragmented_record = false;
           scratch->clear();
         }
@@ -344,7 +359,10 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
               (fragment.size() + (in_fragmented_record ? scratch->size() : 0)),
               reason.c_str());
         }
-        in_fragmented_record = false;
+        if (in_fragmented_record) {
+          ResetRecordChecksum();
+          in_fragmented_record = false;
+        }
         scratch->clear();
         break;  // switch
       }
@@ -609,11 +627,12 @@ uint8_t Reader::ReadPhysicalRecord(Slice* result, size_t* drop_size,
     }
 
     if (type == kZeroType && length == 0) {
-      // Skip zero length record without reporting any drops since
-      // such records are produced by the mmap based writing code in
-      // env_posix.cc that preallocates file regions.
-      // NOTE: this should never happen in DB written by new RocksDB versions,
-      // since we turn off mmap writes to manifest and log files
+      // Skip zero-length records without reporting any drops.
+      //
+      // Historically these could come from mmap-based preallocation. Newer WAL
+      // writers can also produce all-zero block trailers when there is not
+      // enough room left in the block for the next physical record header. See
+      // Writer::AddRecord().
       buffer_.clear();
       return kBadRecord;
     }
@@ -1015,6 +1034,7 @@ bool FragmentBufferedReader::TryReadFragment(Slice* fragment, size_t* drop_size,
   }
 
   if (type == kZeroType && length == 0) {
+    // See ReadPhysicalRecord().
     buffer_.clear();
     *fragment_type_or_err = kBadRecord;
     return true;

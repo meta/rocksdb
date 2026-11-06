@@ -211,7 +211,7 @@ class LogTest
         // support record checksum yet.
         uint64_t actual_record_checksum =
             XXH3_64bits(record.data(), record.size());
-        assert(actual_record_checksum == record_checksum);
+        EXPECT_EQ(actual_record_checksum, record_checksum);
       }
       return record.ToString();
     } else {
@@ -582,6 +582,33 @@ TEST_P(LogTest, UnexpectedFirstType) {
   ASSERT_EQ("EOF", Read());
   ASSERT_EQ(3U, DroppedBytes());
   ASSERT_EQ("OK", MatchError("partial record without end"));
+}
+
+// Regression test derived from a physical WAL observed during recovery: a
+// fragmented record is abandoned after a zero-length kZeroType padding record,
+// and the next fragmented record must start with a fresh logical checksum.
+TEST_P(LogTest, BadRecordInFragmentedRecordResetsRecordChecksum) {
+  if (allow_retry_read_) {
+    return;
+  }
+
+  bool recyclable_log = (std::get<0>(GetParam()) != 0);
+  int header_size = recyclable_log ? kRecyclableHeaderSize : kHeaderSize;
+  int payload_size = kBlockSize - header_size;
+  Write(BigString("foo", 3 * payload_size));
+  std::string second = BigString("bar", 3 * payload_size);
+  Write(second);
+
+  // Make the middle physical record look like the zero-length padding record
+  // that ReadPhysicalRecord() maps to kBadRecord.
+  int middle_header = kBlockSize;
+  SetByte(middle_header + 4, 0);
+  SetByte(middle_header + 5, 0);
+  SetByte(middle_header + 6, static_cast<char>(kZeroType));
+
+  ASSERT_EQ(second, Read());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ("OK", MatchError("error in middle of record"));
 }
 
 TEST_P(LogTest, MissingLastIsIgnored) {
