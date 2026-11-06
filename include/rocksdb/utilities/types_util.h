@@ -38,6 +38,12 @@ Status GetInternalKeyForSeekForPrev(const Slice& user_key,
 // Such an internal key usually comes from a table iterator.
 // `comparator`: see doc for `GetInternalKeyForSeek`.
 Status ParseEntry(const Slice& internal_key, const Comparator* comparator,
+                  ParsedEntryInfo* parsed_entry, bool copied_user_key);
+
+// Util method that takes an internal key and parse it to get `ParsedEntryInfo`.
+// Such an internal key usually comes from a table iterator.
+// `comparator`: see doc for `GetInternalKeyForSeek`.
+Status ParseEntry(const Slice& internal_key, const Comparator* comparator,
                   ParsedEntryInfo* parsed_entry);
 
 // Returns the buffer size required to encode entry.

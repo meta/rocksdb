@@ -72,6 +72,46 @@ jlong Java_org_rocksdb_SstFileReader_newIterator(JNIEnv* /*env*/,
 
 /*
  * Class:     org_rocksdb_SstFileReader
+ * Method:    newTableIterator
+ * Signature: (JJ)J
+ */
+jlong Java_org_rocksdb_SstFileReader_newTableIterator0(JNIEnv * /*env*/,
+                                                      jclass /*jcls*/,
+                                                      jlong jhandle,
+                                                      jboolean jhas_from,
+                                                      jlong from_slice_handle,
+                                                      jboolean jhas_to,
+                                                      jlong to_slice_handle) {
+  auto *sst_file_reader =
+          reinterpret_cast<ROCKSDB_NAMESPACE::SstFileReader *>(jhandle);
+  ROCKSDB_NAMESPACE::Slice* from_slice = nullptr;
+  ROCKSDB_NAMESPACE::Slice* to_slice = nullptr;
+  bool has_from = static_cast<bool>(jhas_from);
+  bool has_to = static_cast<bool>(jhas_to);
+  if (has_from) {
+      from_slice = reinterpret_cast<ROCKSDB_NAMESPACE::Slice*>(from_slice_handle);
+  }
+  if (has_to) {
+      to_slice = reinterpret_cast<ROCKSDB_NAMESPACE::Slice*>(to_slice_handle);
+  }
+  return GET_CPLUSPLUS_POINTER(sst_file_reader->NewTableIterator(from_slice, to_slice).release());
+}
+
+/*
+ * Class:     org_rocksdb_SstFileReader
+ * Method:    newTableIterator
+ * Signature: (JJ)J
+ */
+jlong Java_org_rocksdb_SstFileReader_newTableIterator1(JNIEnv * /*env*/,
+                                                      jclass /*jcls*/,
+                                                      jlong jhandle) {
+  auto *sst_file_reader =
+      reinterpret_cast<ROCKSDB_NAMESPACE::SstFileReader *>(jhandle);
+  return GET_CPLUSPLUS_POINTER(sst_file_reader->NewTableIterator().release());
+}
+
+/*
+ * Class:     org_rocksdb_SstFileReader
  * Method:    disposeInternal
  * Signature: (J)V
  */

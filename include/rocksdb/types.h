@@ -82,6 +82,7 @@ struct ParsedEntryInfo {
   Slice timestamp;
   SequenceNumber sequence;
   EntryType type;
+  bool copied_user_key;
 };
 
 enum class WriteStallCause {
