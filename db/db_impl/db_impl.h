@@ -3050,7 +3050,7 @@ class DBImpl : public DB
                       log::Writer* log_writer, uint64_t* wal_used,
                       uint64_t* log_size,
                       WalFileNumberSize& wal_file_number_size,
-                      SequenceNumber sequence);
+                      SequenceNumber sequence, bool wal_write_mutex_held);
 
   IOStatus WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                            log::Writer* log_writer, uint64_t* wal_used,
