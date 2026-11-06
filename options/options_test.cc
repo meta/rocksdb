@@ -198,6 +198,9 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"daily_offpeak_time_utc", ""},
   };
 
+  std::unordered_map<std::string, std::string> options_map = cf_options_map;
+  options_map.insert(db_options_map.begin(), db_options_map.end());
+
   ColumnFamilyOptions base_cf_opt;
   ColumnFamilyOptions new_cf_opt;
   ConfigOptions exact;
@@ -319,7 +322,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_OK(GetColumnFamilyOptionsFromMap(exact, base_cf_opt, cf_options_map,
                                           &new_cf_opt));
 
-  cf_options_map["unknown_option"] = "1";
+  cf_options_map["unknown_cf_option"] = "1";
   ASSERT_NOK(GetColumnFamilyOptionsFromMap(exact, base_cf_opt, cf_options_map,
                                            &new_cf_opt));
   ASSERT_OK(
@@ -395,6 +398,11 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_OK(
       RocksDBOptionsParser::VerifyDBOptions(loose, base_db_opt, new_db_opt));
 
+  db_options_map["max_open_files"] = "32";
+  s = GetDBOptionsFromMap(exact, base_db_opt, db_options_map, &new_db_opt);
+  ASSERT_OK(s);
+  ASSERT_FALSE(s.IsInvalidArgument());
+
   // unknow options should fail parsing without ignore_unknown_options = true
   db_options_map["unknown_db_option"] = "1";
   s = GetDBOptionsFromMap(exact, base_db_opt, db_options_map, &new_db_opt);
@@ -409,6 +417,37 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       RocksDBOptionsParser::VerifyDBOptions(loose, base_db_opt, new_db_opt));
   ASSERT_NOK(
       RocksDBOptionsParser::VerifyDBOptions(exact, base_db_opt, new_db_opt));
+
+  Options base_opt;
+  Options new_opt;
+  ASSERT_OK(GetOptionsFromMap(exact, base_opt, options_map, &new_opt));
+  ASSERT_EQ(new_opt.write_buffer_size, 1U);
+  ASSERT_EQ(new_opt.create_if_missing, false);
+
+  options_map["max_open_files"] = "hello";
+  s = GetOptionsFromMap(exact, base_opt, options_map, &new_opt);
+  ASSERT_NOK(s);
+  ASSERT_TRUE(s.IsInvalidArgument());
+  ASSERT_OK(RocksDBOptionsParser::VerifyCFOptions(exact, base_opt, new_opt));
+  ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(exact, base_opt, new_opt));
+
+  options_map["max_open_files"] = "32";
+  s = GetOptionsFromMap(exact, base_opt, options_map, &new_opt);
+  ASSERT_FALSE(s.IsInvalidArgument());
+
+  // ignore_unknown_options=true;input_strings_escaped=false
+  options_map["unknown_option"] = "1";
+  s = GetOptionsFromMap(exact, base_opt, options_map, &new_opt);
+  ASSERT_NOK(s);
+  ASSERT_TRUE(s.IsInvalidArgument());
+  ASSERT_OK(RocksDBOptionsParser::VerifyCFOptions(exact, base_opt, new_opt));
+  ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(exact, base_opt, new_opt));
+
+  ASSERT_OK(GetOptionsFromMap(loose, base_opt, options_map, &new_opt));
+  ASSERT_OK(RocksDBOptionsParser::VerifyCFOptions(loose, base_opt, new_opt));
+  ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(loose, base_opt, new_opt));
+  ASSERT_NOK(RocksDBOptionsParser::VerifyCFOptions(exact, base_opt, new_opt));
+  ASSERT_NOK(RocksDBOptionsParser::VerifyDBOptions(exact, base_opt, new_opt));
 }
 
 TEST_F(OptionsTest, GetColumnFamilyOptionsFromStringTest) {
