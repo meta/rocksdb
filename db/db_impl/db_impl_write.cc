@@ -2945,9 +2945,12 @@ Status DBImpl::DelayWrite(uint64_t num_bytes, WriteThread& write_thread,
     }
 
     // Don't wait if there's a background error that is not pending recovery
-    // since recovery might never be attempted.
+    // since recovery might never be attempted. Don't wait once the DB is
+    // stopped either: its recovery flush needs the write queue this writer
+    // holds.
     while ((error_handler_.GetBGError().ok() ||
-            error_handler_.IsRecoveryInProgress()) &&
+            (error_handler_.IsRecoveryInProgress() &&
+             !error_handler_.IsDBStopped())) &&
            write_controller_.IsStopped() &&
            !shutting_down_.load(std::memory_order_relaxed)) {
       if (write_options.no_slowdown) {
