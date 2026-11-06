@@ -38,6 +38,7 @@
 #include "rocksdb/rate_limiter.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/sst_file_manager.h"
+#include "rocksdb/sst_file_reader.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
@@ -110,6 +111,7 @@ using ROCKSDB_NAMESPACE::EventListener;
 using ROCKSDB_NAMESPACE::ExportImportFilesMetaData;
 using ROCKSDB_NAMESPACE::ExternalFileIngestionInfo;
 using ROCKSDB_NAMESPACE::FileChecksumGenFactory;
+using ROCKSDB_NAMESPACE::FileIngestionHandle;
 using ROCKSDB_NAMESPACE::FileLock;
 using ROCKSDB_NAMESPACE::FileType;
 using ROCKSDB_NAMESPACE::FilterPolicy;
@@ -122,6 +124,7 @@ using ROCKSDB_NAMESPACE::HistogramData;
 using ROCKSDB_NAMESPACE::HyperClockCacheOptions;
 using ROCKSDB_NAMESPACE::ImportColumnFamilyOptions;
 using ROCKSDB_NAMESPACE::InfoLogLevel;
+using ROCKSDB_NAMESPACE::IngestExternalFileArg;
 using ROCKSDB_NAMESPACE::IngestExternalFileOptions;
 using ROCKSDB_NAMESPACE::Iterator;
 using ROCKSDB_NAMESPACE::LevelMetaData;
@@ -170,6 +173,7 @@ using ROCKSDB_NAMESPACE::SliceTransform;
 using ROCKSDB_NAMESPACE::Snapshot;
 using ROCKSDB_NAMESPACE::SstFileManager;
 using ROCKSDB_NAMESPACE::SstFileMetaData;
+using ROCKSDB_NAMESPACE::SstFileReader;
 using ROCKSDB_NAMESPACE::SstFileWriter;
 using ROCKSDB_NAMESPACE::SstPartitionerFactory;
 using ROCKSDB_NAMESPACE::Status;
@@ -593,6 +597,12 @@ struct rocksdb_envoptions_t {
 struct rocksdb_ingestexternalfileoptions_t {
   IngestExternalFileOptions rep;
 };
+struct rocksdb_ingestexternalfilearg_t {
+  IngestExternalFileArg rep;
+};
+struct rocksdb_fileingestionhandle_t {
+  std::unique_ptr<FileIngestionHandle> rep;
+};
 struct rocksdb_trace_options_t {
   TraceOptions rep;
 };
@@ -616,6 +626,9 @@ struct rocksdb_livefiles_storage_info_t {
 };
 struct rocksdb_sstfilewriter_t {
   SstFileWriter* rep;
+};
+struct rocksdb_sstfilereader_t {
+  SstFileReader* rep;
 };
 struct rocksdb_ratelimiter_t {
   std::shared_ptr<RateLimiter> rep;
@@ -8587,6 +8600,36 @@ void rocksdb_sstfilewriter_destroy(rocksdb_sstfilewriter_t* writer) {
   delete writer;
 }
 
+rocksdb_sstfilereader_t* rocksdb_sstfilereader_create(
+    const rocksdb_options_t* io_options) {
+  rocksdb_sstfilereader_t* reader = new rocksdb_sstfilereader_t;
+  reader->rep = new SstFileReader(io_options->rep);
+  return reader;
+}
+
+void rocksdb_sstfilereader_open(rocksdb_sstfilereader_t* reader,
+                                const char* name, char** errptr) {
+  SaveError(errptr, reader->rep->Open(std::string(name)));
+}
+
+rocksdb_iterator_t* rocksdb_sstfilereader_new_iterator(
+    rocksdb_sstfilereader_t* reader, const rocksdb_readoptions_t* options) {
+  rocksdb_iterator_t* result = new rocksdb_iterator_t;
+  result->rep = reader->rep->NewIterator(options->rep);
+  return result;
+}
+
+void rocksdb_sstfilereader_verify_checksum(rocksdb_sstfilereader_t* reader,
+                                           const rocksdb_readoptions_t* options,
+                                           char** errptr) {
+  SaveError(errptr, reader->rep->VerifyChecksum(options->rep));
+}
+
+void rocksdb_sstfilereader_destroy(rocksdb_sstfilereader_t* reader) {
+  delete reader->rep;
+  delete reader;
+}
+
 rocksdb_ingestexternalfileoptions_t*
 rocksdb_ingestexternalfileoptions_create() {
   rocksdb_ingestexternalfileoptions_t* opt =
@@ -8652,6 +8695,100 @@ void rocksdb_ingest_external_file_cf(
     files[i] = std::string(file_list[i]);
   }
   SaveError(errptr, db->rep->IngestExternalFile(handle->rep, files, opt->rep));
+}
+
+rocksdb_ingestexternalfilearg_t* rocksdb_ingestexternalfilearg_create() {
+  return new rocksdb_ingestexternalfilearg_t;
+}
+
+void rocksdb_ingestexternalfilearg_destroy(
+    rocksdb_ingestexternalfilearg_t* arg) {
+  delete arg;
+}
+
+void rocksdb_ingestexternalfilearg_set_column_family(
+    rocksdb_ingestexternalfilearg_t* arg,
+    rocksdb_column_family_handle_t* column_family) {
+  arg->rep.column_family = column_family->rep;
+}
+
+void rocksdb_ingestexternalfilearg_set_external_files(
+    rocksdb_ingestexternalfilearg_t* arg, const char* const* file_list,
+    size_t list_len) {
+  arg->rep.external_files.assign(file_list, file_list + list_len);
+}
+
+void rocksdb_ingestexternalfilearg_set_options(
+    rocksdb_ingestexternalfilearg_t* arg,
+    const rocksdb_ingestexternalfileoptions_t* opt) {
+  arg->rep.options = opt->rep;
+}
+
+void rocksdb_ingestexternalfilearg_set_files_checksums(
+    rocksdb_ingestexternalfilearg_t* arg, const char* const* checksums,
+    const size_t* checksums_lens, size_t num_checksums) {
+  arg->rep.files_checksums.clear();
+  arg->rep.files_checksums.reserve(num_checksums);
+  for (size_t i = 0; i < num_checksums; ++i) {
+    arg->rep.files_checksums.emplace_back(checksums[i], checksums_lens[i]);
+  }
+}
+
+void rocksdb_ingestexternalfilearg_set_files_checksum_func_names(
+    rocksdb_ingestexternalfilearg_t* arg, const char* const* func_names,
+    size_t num_func_names) {
+  arg->rep.files_checksum_func_names.assign(func_names,
+                                            func_names + num_func_names);
+}
+
+static std::vector<IngestExternalFileArg> ToIngestExternalFileArgs(
+    const rocksdb_ingestexternalfilearg_t* const* args, size_t num_args) {
+  std::vector<IngestExternalFileArg> ingest_args;
+  ingest_args.reserve(num_args);
+  for (size_t i = 0; i < num_args; ++i) {
+    ingest_args.push_back(args[i]->rep);
+  }
+  return ingest_args;
+}
+
+void rocksdb_ingest_external_files(
+    rocksdb_t* db, const rocksdb_ingestexternalfilearg_t* const* args,
+    size_t num_args, char** errptr) {
+  SaveError(errptr, db->rep->IngestExternalFiles(
+                        ToIngestExternalFileArgs(args, num_args)));
+}
+
+rocksdb_fileingestionhandle_t* rocksdb_prepare_file_ingestion(
+    rocksdb_t* db, const rocksdb_ingestexternalfilearg_t* const* args,
+    size_t num_args, char** errptr) {
+  std::unique_ptr<FileIngestionHandle> handle;
+  if (SaveError(errptr,
+                db->rep->PrepareFileIngestion(
+                    ToIngestExternalFileArgs(args, num_args), &handle))) {
+    return nullptr;
+  }
+  rocksdb_fileingestionhandle_t* result = new rocksdb_fileingestionhandle_t;
+  result->rep = std::move(handle);
+  return result;
+}
+
+void rocksdb_commit_file_ingestion_handles(
+    rocksdb_t* db, rocksdb_fileingestionhandle_t** handles, size_t num_handles,
+    char** errptr) {
+  std::vector<std::unique_ptr<FileIngestionHandle>> ingestion_handles;
+  ingestion_handles.reserve(num_handles);
+  for (size_t i = 0; i < num_handles; ++i) {
+    ingestion_handles.push_back(std::move(handles[i]->rep));
+    delete handles[i];
+    handles[i] = nullptr;
+  }
+  SaveError(errptr,
+            db->rep->CommitFileIngestionHandles(std::move(ingestion_handles)));
+}
+
+void rocksdb_fileingestionhandle_destroy(
+    rocksdb_fileingestionhandle_t* handle) {
+  delete handle;
 }
 
 void rocksdb_try_catch_up_with_primary(rocksdb_t* db, char** errptr) {
