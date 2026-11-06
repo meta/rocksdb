@@ -3481,6 +3481,15 @@ struct CompactionServiceOptionsOverride {
   const CompactionFilter* compaction_filter = nullptr;
   std::shared_ptr<CompactionFilterFactory> compaction_filter_factory = nullptr;
   std::shared_ptr<const SliceTransform> prefix_extractor = nullptr;
+  // If null, the column family uses the table factory loaded from the OPTIONS
+  // file the primary referenced when it scheduled the compaction, which
+  // reflects table options changed with DB::SetOptions(). OpenAndCompact()
+  // returns NotSupported if the worker's RocksDB does not know an option in
+  // those table options, or cannot create the table factory or a component of
+  // it, such as a filter_policy, because it is not registered with the
+  // worker's object registry. Built-in components are always registered. A
+  // component the table factory replaces with its default instead, such as a
+  // BlockBasedTable flush_block_policy_factory, is not detected.
   std::shared_ptr<TableFactory> table_factory;
   std::shared_ptr<SstPartitionerFactory> sst_partitioner_factory = nullptr;
 

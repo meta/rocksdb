@@ -165,6 +165,7 @@ void RocksDBOptionsParser::Reset() {
   cf_names_.clear();
   cf_opts_.clear();
   cf_opt_maps_.clear();
+  cf_table_options_sections_.clear();
   has_version_section_ = false;
   has_db_options_ = false;
   has_default_cf_options_ = false;
@@ -485,13 +486,13 @@ Status RocksDBOptionsParser::EndSection(
           "TableOptions section:",
           section_arg);
     }
+    const std::string table_factory_id = section_title.substr(
+        opt_section_titles[kOptionSectionTableOptions].size());
+    cf_table_options_sections_[section_arg] = {table_factory_id, opt_map};
     // Ignore error as table factory deserialization is optional
     cf_opt->table_factory.reset();
-    s = TableFactory::CreateFromString(
-        config_options,
-        section_title.substr(
-            opt_section_titles[kOptionSectionTableOptions].size()),
-        &(cf_opt->table_factory));
+    s = TableFactory::CreateFromString(config_options, table_factory_id,
+                                       &(cf_opt->table_factory));
     if (s.ok() && cf_opt->table_factory != nullptr) {
       s = cf_opt->table_factory->ConfigureFromMap(config_options, opt_map);
       // Translate any errors (NotFound, NotSupported, to InvalidArgument
