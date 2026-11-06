@@ -1245,6 +1245,9 @@ void CompactionPicker::RegisterCompaction(Compaction* c) {
       ioptions_.compaction_style == kCompactionStyleUniversal) {
     level0_compactions_in_progress_.insert(c);
   }
+  if(c->start_level() == 0 && c->output_level() != 0 && ioptions_.compaction_style == kCompactionStyleLevel) {
+    level0_to_lbase_compactions_in_progress_.insert(c);
+  }
   compactions_in_progress_.insert(c);
   TEST_SYNC_POINT_CALLBACK("CompactionPicker::RegisterCompaction:Registered",
                            c);
@@ -1257,6 +1260,9 @@ void CompactionPicker::UnregisterCompaction(Compaction* c) {
   if (c->start_level() == 0 ||
       ioptions_.compaction_style == kCompactionStyleUniversal) {
     level0_compactions_in_progress_.erase(c);
+  }
+  if(c->start_level() == 0 && c->output_level() != 0 && ioptions_.compaction_style == kCompactionStyleLevel) {
+    level0_to_lbase_compactions_in_progress_.erase(c);
   }
   compactions_in_progress_.erase(c);
 }
