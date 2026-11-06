@@ -3118,7 +3118,7 @@ bool CompactionJob::UpdateInternalStatsFromInputFiles(
         std::string fn = TableFileName(compaction->immutable_options().cf_paths,
                                        file_number, file_meta->fd.GetPathId());
         const auto& tp = input_table_properties.find(fn);
-        if (tp != input_table_properties.end()) {
+        if (tp != input_table_properties.end() && tp->second != nullptr) {
           file_input_entries = tp->second->num_entries;
           file_num_range_del = tp->second->num_range_deletions;
         } else {

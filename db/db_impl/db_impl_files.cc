@@ -781,6 +781,13 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
     std::string dir_to_sync;
     if (type == kTableFile) {
       fname = MakeTableFileName(candidate_file.file_path, number);
+      if (!env_->FileExists(fname).ok()) {
+        // Table files inherited from LevelDB keep their ".ldb" name.
+        std::string ldb_fname = Rocks2LevelTableFileName(fname);
+        if (!ldb_fname.empty() && env_->FileExists(ldb_fname).ok()) {
+          fname = ldb_fname;
+        }
+      }
       dir_to_sync = candidate_file.file_path;
     } else if (type == kBlobFile) {
       fname = BlobFileName(candidate_file.file_path, number);

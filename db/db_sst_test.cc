@@ -135,6 +135,57 @@ TEST_F(DBSSTTest, SSTsWithLdbSuffixHandling) {
   Destroy(options);
 }
 
+// 1 Create some SST files by inserting K-V pairs into DB
+// 2 Close DB and change suffix from ".sst" to ".ldb" for every other SST file
+// 3 Open DB and compact everything so that all those files become obsolete
+// 4 Check that the obsolete ".ldb" files are deleted like the ".sst" ones
+TEST_F(DBSSTTest, ObsoleteLdbFilesAreDeleted) {
+  Options options = CurrentOptions();
+  options.write_buffer_size = 110 << 10;  // 110KB
+  options.num_levels = 4;
+  DestroyAndReopen(options);
+
+  Random rnd(301);
+  int key_id = 0;
+  for (int i = 0; i < 10; ++i) {
+    GenerateNewFile(&rnd, &key_id, false);
+  }
+  ASSERT_OK(Flush());
+  std::vector<std::string> values;
+  values.reserve(key_id);
+  for (int k = 0; k < key_id; ++k) {
+    values.push_back(Get(Key(k)));
+  }
+  Close();
+
+  std::vector<std::string> filenames;
+  GetSstFiles(env_, dbname_, &filenames);
+  std::vector<std::string> ldb_files;
+  for (size_t i = 0; i < filenames.size(); i += 2) {
+    std::string const rdb_name = dbname_ + "/" + filenames[i];
+    std::string const ldb_name = Rocks2LevelTableFileName(rdb_name);
+    ASSERT_OK(env_->RenameFile(rdb_name, ldb_name));
+    ldb_files.push_back(ldb_name);
+  }
+  ASSERT_GT(ldb_files.size(), 0u);
+
+  Reopen(options);
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  for (int k = 0; k < key_id; ++k) {
+    ASSERT_EQ(values[k], Get(Key(k)));
+  }
+
+  // Every renamed file was an input of the compaction, so none may remain.
+  for (const std::string& ldb_name : ldb_files) {
+    ASSERT_TRUE(env_->FileExists(ldb_name).IsNotFound())
+        << "obsolete file not deleted: " << ldb_name;
+  }
+  Destroy(options);
+}
+
 TEST_F(DBSSTTest, DontDeleteMovedFile) {
   // This test triggers move compaction and verifies that the file is not
   // deleted when it's part of move compaction
