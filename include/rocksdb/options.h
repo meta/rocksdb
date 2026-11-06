@@ -936,6 +936,21 @@ struct DBOptions {
 
   // Maximum number of concurrent background jobs (compactions and flushes).
   //
+  // This option limits the number of jobs running at the same time; it does
+  // not directly determine the number of threads in the background thread
+  // pools (see Env::SetBackgroundThreads). Unless max_background_flushes or
+  // max_background_compactions (both deprecated) is set, this limit is split
+  // between flushes and compactions as
+  // max(1, max_background_jobs / 4) concurrent flushes and
+  // max(1, max_background_jobs - flushes) concurrent compactions.
+  // At DB open, the thread pools are grown if necessary to accommodate
+  // that many concurrent jobs (by default, flushes are submitted to the
+  // HIGH priority pool and compactions to the LOW priority pool). If the
+  // pools are larger than these limits, the extra threads simply stay
+  // idle, so there is generally no benefit in calling
+  // Env::SetBackgroundThreads with the same value for the HIGH and LOW
+  // pools and for max_background_jobs.
+  //
   // Default: 2
   //
   // Dynamically changeable through SetDBOptions() API.
@@ -1611,6 +1626,13 @@ struct DBOptions {
   // If true WAL is not flushed automatically after each write. Instead it
   // relies on manual invocation of FlushWAL to write the WAL buffer to its
   // file.
+  //
+  // Writes with WriteOptions::sync=true are an exception: such a write
+  // flushes the WAL buffer to the file and syncs it before returning
+  // (as in FlushWAL(true)), so WAL data written with sync=true is durable
+  // even when manual_wal_flush is enabled. DB::SyncWAL(), on the other
+  // hand, does not flush the buffer, so FlushWAL(true) is recommended for
+  // syncing all buffered WAL data (see DB::SyncWAL).
   bool manual_wal_flush = false;
 
   // If enabled WAL records will be compressed before they are written. Only
@@ -2806,6 +2828,9 @@ struct WriteOptions {
   // crash semantics as the "write()" system call.  A DB write
   // with sync==true has similar crash semantics to a "write()"
   // system call followed by "fdatasync()".
+  //
+  // Note that sync==true also flushes the WAL buffer to the WAL file when
+  // DBOptions::manual_wal_flush is enabled, as in FlushWAL(true).
   //
   // Default: false
   bool sync = false;
