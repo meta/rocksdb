@@ -29,9 +29,8 @@ InternalIterator* WBWIMemTable::NewIterator(
   assert(assigned_seqno_.lower_bound != kMaxSequenceNumber);
   assert(arena);
   auto mem = arena->AllocateAligned(sizeof(WBWIMemTableIterator));
-  return new (mem) WBWIMemTableIterator(
-      std::unique_ptr<WBWIIterator>(wbwi_->NewIterator(cf_id_)),
-      assigned_seqno_, comparator_, for_flush);
+  auto iter = std::make_unique<WBWIIterator>(wbwi_->NewIterator(cf_id_));
+  return new (mem) WBWIMemTableIterator(std::move(iter), assigned_seqno_, comparator_, for_flush);
 }
 
 inline InternalIterator* WBWIMemTable::NewIterator() const {
