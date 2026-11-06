@@ -1123,6 +1123,12 @@ void Java_org_rocksdb_Options_setLogger(JNIEnv* env, jclass, jlong jhandle,
           *(reinterpret_cast<std::shared_ptr<ROCKSDB_NAMESPACE::StderrLogger>*>(
               jlogger_handle));
       break;
+    case 0x3:
+      // LOGGER_FROM_OPTIONS_IMPLEMENTATION is a logger created by RocksDB
+      options->info_log =
+          *(reinterpret_cast<std::shared_ptr<ROCKSDB_NAMESPACE::Logger>*>(
+              jlogger_handle));
+      break;
     default:
       ROCKSDB_NAMESPACE::IllegalArgumentExceptionJni::ThrowNew(
           env, ROCKSDB_NAMESPACE::Status::InvalidArgument(

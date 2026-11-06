@@ -90,6 +90,7 @@ NATIVE_JAVA_CLASSES = \
 	org.rocksdb.WriteBatchWithIndex\
 	org.rocksdb.WriteBufferManager\
 	org.rocksdb.WBWIRocksIterator\
+	org.rocksdb.util.LoggerFromOptions \
 	org.rocksdb.util.StdErrLogger
 
 NATIVE_JAVA_TEST_CLASSES = \

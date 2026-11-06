@@ -1,0 +1,1 @@
+* New Java API `LoggerFromOptions` Logger implementation. 
