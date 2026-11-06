@@ -4120,8 +4120,9 @@ void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
     sum_garbage_blob_bytes += meta->GetGarbageBlobBytes();
   }
 
-  if (sum_garbage_blob_bytes <
-      blob_garbage_collection_force_threshold * sum_total_blob_bytes) {
+  if (sum_garbage_blob_bytes == 0 ||
+      sum_garbage_blob_bytes <
+          blob_garbage_collection_force_threshold * sum_total_blob_bytes) {
     return;
   }
 

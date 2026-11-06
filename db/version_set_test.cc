@@ -657,6 +657,43 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCEmpty) {
   ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
 }
 
+TEST_F(VersionStorageInfoTest, ForcedBlobGCZeroThreshold) {
+  constexpr uint64_t first_blob = 10;
+  constexpr uint64_t second_blob = 11;
+  Add(/*level=*/0, /*file_number=*/1, "a", "b", /*file_size=*/1000, first_blob);
+  Add(/*level=*/0, /*file_number=*/2, "c", "d", /*file_size=*/1000,
+      second_blob);
+  AddBlob(first_blob, /*total_blob_count=*/10, /*total_blob_bytes=*/1000,
+          BlobFileMetaData::LinkedSsts{1}, /*garbage_blob_count=*/0,
+          /*garbage_blob_bytes=*/0);
+  AddBlob(second_blob, /*total_blob_count=*/10, /*total_blob_bytes=*/1000,
+          BlobFileMetaData::LinkedSsts{2}, /*garbage_blob_count=*/1,
+          /*garbage_blob_bytes=*/100);
+  UpdateVersionStorageInfo();
+
+  // Only the clean oldest blob file is eligible, so there is nothing to
+  // reclaim.
+  vstorage_.ComputeFilesMarkedForForcedBlobGC(
+      /*age_cutoff=*/0.5, /*force_threshold=*/0.0,
+      /*enable_blob_garbage_collection=*/true);
+  ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
+
+  // Including the newer file introduces garbage into the eligible batch.
+  vstorage_.ComputeFilesMarkedForForcedBlobGC(
+      /*age_cutoff=*/1.0, /*force_threshold=*/0.0,
+      /*enable_blob_garbage_collection=*/true);
+  const auto& marked_files = vstorage_.FilesMarkedForForcedBlobGC();
+  ASSERT_EQ(1U, marked_files.size());
+  ASSERT_EQ(0, marked_files[0].first);
+  ASSERT_EQ(1U, marked_files[0].second->fd.GetNumber());
+
+  // Recomputing for a clean eligible batch clears the previous selection.
+  vstorage_.ComputeFilesMarkedForForcedBlobGC(
+      /*age_cutoff=*/0.5, /*force_threshold=*/0.0,
+      /*enable_blob_garbage_collection=*/true);
+  ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
+}
+
 TEST_F(VersionStorageInfoTest, ForcedBlobGCSingleBatch) {
   // Test the edge case when all blob files are part of the oldest batch.
   // We have one L0 SST file #1, and four blob files #10, #11, #12, and #13.
