@@ -5,8 +5,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include "db/blob/blob_index.h"
 #include "db/db_impl/db_impl.h"
@@ -95,14 +98,43 @@ class TestCompactionListener : public EventListener {
  public:
   explicit TestCompactionListener(EventListenerTest* test) : test_(test) {}
 
-  void OnCompactionCompleted(DB* db, const CompactionJobInfo& ci) override {
+  void OnCompactionBegin(DB* db, const CompactionJobInfo& ci) override {
+    SCOPED_TRACE("OnCompactionBegin");
     std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<LiveFileMetaData> live_files;
+    db->GetLiveFilesMetaData(&live_files);
+    auto& input_levels = input_levels_by_job_[ci.job_id];
+    for (const auto& input : ci.input_file_infos) {
+      const auto file =
+          std::find_if(live_files.begin(), live_files.end(),
+                       [&](const LiveFileMetaData& meta) {
+                         return meta.file_number == input.file_number;
+                       });
+      ASSERT_NE(live_files.end(), file);
+      ASSERT_TRUE(input_levels.emplace(input.file_number, file->level).second);
+      if (file->level > 0) {
+        ++nonzero_input_files_;
+      }
+    }
+    CheckInputLevels(ci);
+  }
+
+  void OnCompactionPreCommit(DB*, const CompactionJobInfo& ci) override {
+    SCOPED_TRACE("OnCompactionPreCommit");
+    std::lock_guard<std::mutex> lock(mutex_);
+    CheckInputLevels(ci);
+  }
+
+  void OnCompactionCompleted(DB* db, const CompactionJobInfo& ci) override {
+    SCOPED_TRACE("OnCompactionCompleted");
+    std::lock_guard<std::mutex> lock(mutex_);
+    CheckInputLevels(ci);
+    input_levels_by_job_.erase(ci.job_id);
     compacted_dbs_.push_back(db);
     ASSERT_GT(ci.input_files.size(), 0U);
     ASSERT_EQ(ci.input_files.size(), ci.input_file_infos.size());
 
     for (size_t i = 0; i < ci.input_file_infos.size(); ++i) {
-      ASSERT_EQ(ci.input_file_infos[i].level, ci.base_input_level);
       ASSERT_EQ(ci.input_file_infos[i].file_number,
                 TableFileNameToNumber(ci.input_files[i]));
     }
@@ -151,6 +183,22 @@ class TestCompactionListener : public EventListener {
   EventListenerTest* test_;
   std::vector<DB*> compacted_dbs_;
   std::mutex mutex_;
+  size_t nonzero_input_files_ = 0;
+
+ private:
+  void CheckInputLevels(const CompactionJobInfo& ci) {
+    ASSERT_OK(ci.status);
+    const auto job = input_levels_by_job_.find(ci.job_id);
+    ASSERT_NE(input_levels_by_job_.end(), job);
+    ASSERT_EQ(job->second.size(), ci.input_file_infos.size());
+    for (const auto& input : ci.input_file_infos) {
+      const auto expected = job->second.find(input.file_number);
+      ASSERT_NE(job->second.end(), expected);
+      EXPECT_EQ(expected->second, input.level) << input.file_number;
+    }
+  }
+
+  std::map<int, std::map<uint64_t, int>> input_levels_by_job_;
 };
 
 TEST_F(EventListenerTest, OnSingleDBCompactionTest) {
@@ -204,6 +252,42 @@ TEST_F(EventListenerTest, OnSingleDBCompactionTest) {
   ASSERT_EQ(listener->compacted_dbs_.size(), cf_names.size());
   for (size_t i = 0; i < cf_names.size(); ++i) {
     ASSERT_EQ(listener->compacted_dbs_[i], db_.get());
+  }
+}
+
+TEST_F(EventListenerTest, CompactionInputLevelsMatchFileMetadata) {
+  for (bool dynamic_level_bytes : {false, true}) {
+    SCOPED_TRACE(dynamic_level_bytes);
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.num_levels = 5;
+    options.compression = kNoCompression;
+    options.level_compaction_dynamic_level_bytes = dynamic_level_bytes;
+    options.table_properties_collector_factories.push_back(
+        std::make_shared<TestPropertiesCollectorFactory>());
+    auto listener = std::make_shared<TestCompactionListener>(this);
+    options.listeners.push_back(listener);
+    DestroyAndReopen(options);
+    CreateAndReopenWithCF({"metadata"}, options);
+
+    ASSERT_OK(Put(1, "key", "old"));
+    ASSERT_OK(Flush(1));
+    CompactRangeOptions placement;
+    placement.change_level = true;
+    placement.target_level = 4;
+    ASSERT_OK(db_->CompactRange(placement, handles_[1], nullptr, nullptr));
+    ASSERT_EQ(1, NumTableFilesAtLevel(4, 1));
+
+    ASSERT_OK(Put(1, "key", "updated"));
+    ASSERT_OK(Flush(1));
+    ASSERT_OK(Put(1, "other", "inserted"));
+    ASSERT_OK(Flush(1));
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), handles_[1], nullptr,
+                                nullptr));
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    EXPECT_GT(listener->nonzero_input_files_, 0U);
+    EXPECT_EQ("updated", Get(1, "key"));
+    EXPECT_EQ("inserted", Get(1, "other"));
   }
 }
 

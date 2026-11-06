@@ -6231,7 +6231,7 @@ void DBImpl::BuildCompactionJobInfo(
                               desc.GetPathId());
       compaction_job_info->input_files.push_back(fn);
       compaction_job_info->input_file_infos.push_back(CompactionFileInfo{
-          static_cast<int>(i), file_number, fmd->oldest_blob_file_number});
+          c->level(i), file_number, fmd->oldest_blob_file_number});
     }
   }
 
