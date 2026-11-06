@@ -85,7 +85,10 @@ class TimeSeriesData(DataSource):
                 last_val = self.keys_ts[entity][statistic][last_ts]
                 diff = last_val - first_val
                 if percent:
-                    diff = diff * 100 / first_val
+                    if first_val == 0:
+                        diff = float('inf')
+                    else:
+                        diff = diff * 100 / first_val
                 rate = (diff * self.duration_sec) / (last_ts - first_ts)
                 # if the rate change is greater than the provided threshold,
                 # then the condition is triggered for entity at time 'last_ts'
