@@ -1709,6 +1709,9 @@ bool CompactionIterator::ExtractLargeValueIfNeededImpl() {
     return false;
   }
 
+  iter_stats_.total_value_bytes_before_blob_extraction += value_.size();
+  iter_stats_.total_value_bytes_after_blob_extraction += blob_index_.size();
+
   value_ = blob_index_;
 
   return true;
@@ -1934,6 +1937,10 @@ void CompactionIterator::ExtractLargeColumnValuesIfNeeded() {
     validity_info_.Invalidate();
     return;
   }
+
+  iter_stats_.total_value_bytes_before_blob_extraction += value_.size();
+  iter_stats_.total_value_bytes_after_blob_extraction +=
+      rewritten_entity_.size();
 
   // Update value_ to point to the rewritten entity
   value_ = rewritten_entity_;
