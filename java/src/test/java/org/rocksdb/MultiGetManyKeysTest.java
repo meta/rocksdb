@@ -103,28 +103,33 @@ public class MultiGetManyKeysTest {
   public void multiGetAsListLargeTransactionalCF() throws RocksDBException {
     final List<byte[]> keys = generateRandomKeys(numKeys);
     final Map<Key, byte[]> keyValues = generateRandomKeyValues(keys, 10);
-    final ColumnFamilyDescriptor columnFamilyDescriptor =
-        new ColumnFamilyDescriptor("cfTest".getBytes());
-    putKeysAndValues(columnFamilyDescriptor, keyValues);
 
-    final List<ColumnFamilyDescriptor> columnFamilyDescriptors = new ArrayList<>();
-    columnFamilyDescriptors.add(columnFamilyDescriptor);
-    columnFamilyDescriptors.add(new ColumnFamilyDescriptor("default".getBytes()));
-    final List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>();
-    try (final Options options = new Options().setCreateIfMissing(true);
-         final TransactionDBOptions txnDbOptions = new TransactionDBOptions();
-         final TransactionDB txnDB = TransactionDB.open(new DBOptions(options), txnDbOptions,
-             dbFolder.getRoot().getAbsolutePath(), columnFamilyDescriptors, columnFamilyHandles)) {
-      final List<ColumnFamilyHandle> columnFamilyHandlesForMultiGet = new ArrayList<>(numKeys);
-      for (int i = 0; i < numKeys; i++)
-        columnFamilyHandlesForMultiGet.add(columnFamilyHandles.get(0));
-      try (final Transaction transaction = txnDB.beginTransaction(new WriteOptions())) {
-        final List<byte[]> values =
-            transaction.multiGetAsList(new ReadOptions(), columnFamilyHandlesForMultiGet, keys);
-        assertKeysAndValues(keys, keyValues, values);
-      }
-      for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles) {
-        columnFamilyHandle.close();
+    try (final ColumnFamilyDescriptor columnFamilyDescriptor =
+             new ColumnFamilyDescriptor("cfTest".getBytes());
+        final ColumnFamilyDescriptor defaultCf =
+            new ColumnFamilyDescriptor("default".getBytes())) {
+      putKeysAndValues(columnFamilyDescriptor, keyValues);
+
+      final List<ColumnFamilyDescriptor> columnFamilyDescriptors = new ArrayList<>();
+      columnFamilyDescriptors.add(columnFamilyDescriptor);
+
+      columnFamilyDescriptors.add(defaultCf);
+      final List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>();
+      try (final Options options = new Options().setCreateIfMissing(true);
+          final TransactionDBOptions txnDbOptions = new TransactionDBOptions();
+          final TransactionDB txnDB = TransactionDB.open(new DBOptions(options), txnDbOptions,
+              dbFolder.getRoot().getAbsolutePath(), columnFamilyDescriptors, columnFamilyHandles)) {
+        final List<ColumnFamilyHandle> columnFamilyHandlesForMultiGet = new ArrayList<>(numKeys);
+        for (int i = 0; i < numKeys; i++)
+          columnFamilyHandlesForMultiGet.add(columnFamilyHandles.get(0));
+        try (final Transaction transaction = txnDB.beginTransaction(new WriteOptions())) {
+          final List<byte[]> values =
+              transaction.multiGetAsList(new ReadOptions(), columnFamilyHandlesForMultiGet, keys);
+          assertKeysAndValues(keys, keyValues, values);
+        }
+        for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles) {
+          columnFamilyHandle.close();
+        }
       }
     }
   }
@@ -137,28 +142,32 @@ public class MultiGetManyKeysTest {
   public void multiGetForUpdateAsListLargeTransactionalCF() throws RocksDBException {
     final List<byte[]> keys = generateRandomKeys(numKeys);
     final Map<Key, byte[]> keyValues = generateRandomKeyValues(keys, 10);
-    final ColumnFamilyDescriptor columnFamilyDescriptor =
-        new ColumnFamilyDescriptor("cfTest".getBytes());
-    putKeysAndValues(columnFamilyDescriptor, keyValues);
+    try (final ColumnFamilyDescriptor columnFamilyDescriptor =
+             new ColumnFamilyDescriptor("cfTest".getBytes());
+        final ColumnFamilyDescriptor defaultCf =
+            new ColumnFamilyDescriptor("default".getBytes())) {
+      putKeysAndValues(columnFamilyDescriptor, keyValues);
 
-    final List<ColumnFamilyDescriptor> columnFamilyDescriptors = new ArrayList<>();
-    columnFamilyDescriptors.add(columnFamilyDescriptor);
-    columnFamilyDescriptors.add(new ColumnFamilyDescriptor("default".getBytes()));
-    final List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>();
-    try (final Options options = new Options().setCreateIfMissing(true);
-         final TransactionDBOptions txnDbOptions = new TransactionDBOptions();
-         final TransactionDB txnDB = TransactionDB.open(new DBOptions(options), txnDbOptions,
-             dbFolder.getRoot().getAbsolutePath(), columnFamilyDescriptors, columnFamilyHandles)) {
-      final List<ColumnFamilyHandle> columnFamilyHandlesForMultiGet = new ArrayList<>(numKeys);
-      for (int i = 0; i < numKeys; i++)
-        columnFamilyHandlesForMultiGet.add(columnFamilyHandles.get(0));
-      try (final Transaction transaction = txnDB.beginTransaction(new WriteOptions())) {
-        final List<byte[]> values = transaction.multiGetForUpdateAsList(
-            new ReadOptions(), columnFamilyHandlesForMultiGet, keys);
-        assertKeysAndValues(keys, keyValues, values);
-      }
-      for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles) {
-        columnFamilyHandle.close();
+      final List<ColumnFamilyDescriptor> columnFamilyDescriptors = new ArrayList<>();
+      columnFamilyDescriptors.add(columnFamilyDescriptor);
+
+      columnFamilyDescriptors.add(defaultCf);
+      final List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>();
+      try (final Options options = new Options().setCreateIfMissing(true);
+          final TransactionDBOptions txnDbOptions = new TransactionDBOptions();
+          final TransactionDB txnDB = TransactionDB.open(new DBOptions(options), txnDbOptions,
+              dbFolder.getRoot().getAbsolutePath(), columnFamilyDescriptors, columnFamilyHandles)) {
+        final List<ColumnFamilyHandle> columnFamilyHandlesForMultiGet = new ArrayList<>(numKeys);
+        for (int i = 0; i < numKeys; i++)
+          columnFamilyHandlesForMultiGet.add(columnFamilyHandles.get(0));
+        try (final Transaction transaction = txnDB.beginTransaction(new WriteOptions())) {
+          final List<byte[]> values = transaction.multiGetForUpdateAsList(
+              new ReadOptions(), columnFamilyHandlesForMultiGet, keys);
+          assertKeysAndValues(keys, keyValues, values);
+        }
+        for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles) {
+          columnFamilyHandle.close();
+        }
       }
     }
   }

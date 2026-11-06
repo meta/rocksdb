@@ -262,6 +262,7 @@ public class ReverseBytewiseComparatorIntTest {
           cfHandles.clear();
           for (final ColumnFamilyDescriptor cfDescriptor : cfDescriptors) {
             cfDescriptor.getOptions().close();
+            cfDescriptor.close();
           }
         }
       }
