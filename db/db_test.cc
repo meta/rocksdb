@@ -6327,7 +6327,7 @@ TEST_F(DBTest, MergeTestTime) {
   SetPerfLevel(kEnableTime);
   Options options = CurrentOptions();
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
-  options.merge_operator.reset(new DelayedMergeOperator(this));
+  options.merge_operator = std::make_shared<DelayedMergeOperator>(this);
   SetTimeElapseOnlySleepOnReopen(&options);
   DestroyAndReopen(options);
 
@@ -6370,7 +6370,7 @@ TEST_P(DBTestWithParam, MergeCompactionTimeTest) {
   Options options = CurrentOptions();
   options.compaction_filter_factory = std::make_shared<KeepFilterFactory>();
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
-  options.merge_operator.reset(new DelayedMergeOperator(this));
+  options.merge_operator = std::make_shared<DelayedMergeOperator>(this);
   options.disable_auto_compactions = true;
   options.max_subcompactions = max_subcompactions_;
   SetTimeElapseOnlySleepOnReopen(&options);

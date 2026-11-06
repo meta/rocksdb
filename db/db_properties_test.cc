@@ -372,7 +372,7 @@ TEST_F(DBPropertiesTest, AggregatedTableProperties) {
     options.level0_file_num_compaction_trigger = 8;
     options.compression = kNoCompression;
     options.create_if_missing = true;
-    options.merge_operator.reset(new TestPutOperator());
+    options.merge_operator = std::make_shared<TestPutOperator>();
 
     BlockBasedTableOptions table_options;
     table_options.filter_policy.reset(
@@ -573,7 +573,7 @@ TEST_F(DBPropertiesTest, AggregatedTablePropertiesAtLevel) {
   options.max_bytes_for_level_multiplier = 2;
   // The checks assume kTableCount number of files
   options.disable_auto_compactions = true;
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
 
   BlockBasedTableOptions table_options;
   table_options.filter_policy.reset(

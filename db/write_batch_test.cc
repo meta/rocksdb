@@ -38,7 +38,7 @@ static std::string PrintContents(WriteBatch* b,
   Options options;
   options.memtable_factory = factory;
   if (merge_operator_supported) {
-    options.merge_operator.reset(new TestPutOperator());
+    options.merge_operator = std::make_shared<TestPutOperator>();
   }
   ImmutableOptions ioptions(options);
   WriteBufferManager wb(options.db_write_buffer_size);

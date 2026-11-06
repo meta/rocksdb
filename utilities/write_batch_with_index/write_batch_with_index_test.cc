@@ -2939,7 +2939,7 @@ TEST_P(WriteBatchWithIndexTest, TestBadMergeOperator) {
 
     const char* Name() const override { return "Failing"; }
   };
-  options_.merge_operator.reset(new FailingMergeOperator());
+  options_.merge_operator = std::make_shared<FailingMergeOperator>();
   ASSERT_OK(OpenDB());
 
   ColumnFamilyHandle* column_family = db_->DefaultColumnFamily();
