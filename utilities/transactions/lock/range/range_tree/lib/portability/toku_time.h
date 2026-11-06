@@ -58,9 +58,6 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include <stdint.h>
 #include <sys/time.h>
 #include <time.h>
-#if defined(__powerpc__)
-#include <sys/platform/ppc.h>
-#endif
 
 #if 0
 static inline float toku_tdiff (struct timeval *a, struct timeval *b) {
@@ -132,7 +129,7 @@ static inline tokutime_t toku_time_now(void) {
   __asm __volatile__("mrs %[rt], cntvct_el0" : [rt] "=r"(result));
   return result;
 #elif defined(__powerpc__)
-  return __ppc_get_timebase();
+  return __builtin_ppc_get_timebase();
 #elif defined(__s390x__)
   uint64_t result;
   asm volatile("stckf %0" : "=Q"(result) : : "cc");
