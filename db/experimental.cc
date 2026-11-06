@@ -248,6 +248,7 @@ class DynamicCappedKeySegmentsExtractor : public KeySegmentsExtractor {
  public:
   DynamicCappedKeySegmentsExtractor(const std::vector<uint32_t>& byte_widths) {
     id_ = kName();
+    ideal_ends_.resize(byte_widths.size());
     uint32_t prev_end = 0;
     for (size_t i = 0; i < byte_widths.size(); ++i) {
       prev_end = prev_end + byte_widths[i];
