@@ -47,19 +47,10 @@ std::shared_ptr<CompressionManager> ResolveCompressionManagerForDisplay(
     Slice compatibility_name,
     const std::shared_ptr<CompressionManager>& compression_manager) {
   std::shared_ptr<CompressionManager> mgr_to_use;
-  if (compression_manager) {
-    mgr_to_use = compression_manager->FindCompatibleCompressionManager(
-        compatibility_name);
-  }
-  if (mgr_to_use == nullptr) {
-    ConfigOptions strict;
-    strict.ignore_unknown_options = false;
-    strict.ignore_unsupported_options = false;
-    Status s = CompressionManager::CreateFromString(
-        strict, compatibility_name.ToString(), &mgr_to_use);
-    if (!s.ok()) {
-      mgr_to_use.reset();
-    }
+  if (!ResolveCompressionManagerByCompatibilityName(
+           compatibility_name, compression_manager.get(), &mgr_to_use)
+           .ok()) {
+    mgr_to_use.reset();
   }
   return mgr_to_use;
 }

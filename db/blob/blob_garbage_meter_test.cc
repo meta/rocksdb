@@ -8,8 +8,10 @@
 #include <string>
 #include <vector>
 
+#include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blog/blog_format.h"
 #include "db/dbformat.h"
 #include "db/wide/wide_column_serialization.h"
 #include "test_util/testharness.h"
@@ -29,7 +31,7 @@ BlobIndex MakeBlobIndex(uint64_t file_number, uint64_t offset, uint64_t size) {
 }  // namespace
 
 TEST(BlobGarbageMeterTest, MeasureGarbage) {
-  BlobGarbageMeter blob_garbage_meter;
+  BlobGarbageMeter blob_garbage_meter(/*use_blog_format=*/false);
 
   struct BlobDescriptor {
     std::string user_key;
@@ -144,7 +146,7 @@ TEST(BlobGarbageMeterTest, PlainValue) {
   constexpr char value[] = "value";
   const Slice value_slice(value);
 
-  BlobGarbageMeter blob_garbage_meter;
+  BlobGarbageMeter blob_garbage_meter(/*use_blog_format=*/false);
 
   ASSERT_OK(blob_garbage_meter.ProcessInFlow(key_slice, value_slice));
   ASSERT_OK(blob_garbage_meter.ProcessOutFlow(key_slice, value_slice));
@@ -162,11 +164,86 @@ TEST(BlobGarbageMeterTest, SameFileBlobIndex) {
   BlobIndex::EncodeBlob(&value, kCurrentFileBlobIndexFileNumber,
                         /*offset=*/123, /*size=*/456, kNoCompression);
 
-  BlobGarbageMeter blob_garbage_meter;
+  BlobGarbageMeter blob_garbage_meter(/*use_blog_format=*/false);
 
   ASSERT_OK(blob_garbage_meter.ProcessInFlow(key_slice, value));
   ASSERT_OK(blob_garbage_meter.ProcessOutFlow(key_slice, value));
   ASSERT_TRUE(blob_garbage_meter.flows().empty());
+}
+
+TEST(BlobGarbageMeterTest, PerFileSchemaVersionOverridesFallback) {
+  BlobGarbageMeter::BlobFileSchemaVersions schema_versions{
+      {4, kLegacyBlobFileSchemaVersion},
+      {5, kBlogCurrentSchemaVersion},
+  };
+  BlobGarbageMeter blob_garbage_meter(/*use_blog_format=*/true,
+                                      schema_versions);
+
+  struct BlobDescriptor {
+    std::string user_key;
+    uint64_t blob_file_number;
+    uint64_t offset;
+    uint64_t size;
+    uint64_t expected_bytes;
+  };
+
+  const BlobDescriptor descriptors[] = {
+      {"legacy_key", 4, 123, 555,
+       555 + BlobLogRecord::CalculateAdjustmentForRecordHeader(
+                 sizeof("legacy_key") - 1)},
+      {"blog_key", 5, 456, 777, ComputeBlogRecordSize(777, true)},
+      {"fallback_key", 6, 789, 999, ComputeBlogRecordSize(999, true)},
+  };
+
+  for (const auto& descriptor : descriptors) {
+    constexpr SequenceNumber seq = 321;
+    const InternalKey key(descriptor.user_key, seq, kTypeBlobIndex);
+    const Slice key_slice = key.Encode();
+
+    std::string value;
+    BlobIndex::EncodeBlob(&value, descriptor.blob_file_number,
+                          descriptor.offset, descriptor.size, kNoCompression);
+    ASSERT_OK(blob_garbage_meter.ProcessInFlow(key_slice, value));
+  }
+
+  const auto& flows = blob_garbage_meter.flows();
+  ASSERT_EQ(flows.size(), 3);
+  for (const auto& descriptor : descriptors) {
+    const auto it = flows.find(descriptor.blob_file_number);
+    ASSERT_NE(it, flows.end());
+    ASSERT_EQ(it->second.GetInFlow().GetCount(), 1);
+    ASSERT_EQ(it->second.GetInFlow().GetBytes(), descriptor.expected_bytes);
+  }
+}
+
+TEST(BlobGarbageMeterTest, UnsupportedSchemaVersionDiagnostic) {
+  const uint8_t future_schema_version = kBlogCurrentSchemaVersion + 1;
+  BlobGarbageMeter::BlobFileSchemaVersions schema_versions{
+      {7, future_schema_version},
+  };
+  BlobGarbageMeter blob_garbage_meter(/*use_blog_format=*/false,
+                                      schema_versions);
+
+  constexpr SequenceNumber seq = 123;
+  const InternalKey key("future_schema_key", seq, kTypeBlobIndex);
+  const Slice key_slice = key.Encode();
+
+  std::string value;
+  BlobIndex::EncodeBlob(&value, /*file_number=*/7, /*offset=*/100,
+                        /*size=*/200, kNoCompression);
+
+  const Status s = blob_garbage_meter.ProcessInFlow(key_slice, value);
+  ASSERT_TRUE(s.IsCorruption());
+
+  const std::string diagnostic = s.ToString();
+  ASSERT_NE(diagnostic.find("schema version " +
+                            std::to_string(future_schema_version)),
+            std::string::npos);
+  ASSERT_NE(diagnostic.find("blob file #7"), std::string::npos);
+  ASSERT_NE(
+      diagnostic.find("supported schema versions are 0 (legacy) and 1.." +
+                      std::to_string(kBlogCurrentSchemaVersion) + " (blog)"),
+      std::string::npos);
 }
 
 TEST(BlobGarbageMeterTest, CorruptInternalKey) {
@@ -176,7 +253,7 @@ TEST(BlobGarbageMeterTest, CorruptInternalKey) {
   constexpr char value[] = "value";
   const Slice value_slice(value);
 
-  BlobGarbageMeter blob_garbage_meter;
+  BlobGarbageMeter blob_garbage_meter(/*use_blog_format=*/false);
 
   ASSERT_NOK(blob_garbage_meter.ProcessInFlow(key_slice, value_slice));
   ASSERT_NOK(blob_garbage_meter.ProcessOutFlow(key_slice, value_slice));
@@ -192,7 +269,7 @@ TEST(BlobGarbageMeterTest, CorruptBlobIndex) {
   constexpr char value[] = "i_am_not_a_blob_index";
   const Slice value_slice(value);
 
-  BlobGarbageMeter blob_garbage_meter;
+  BlobGarbageMeter blob_garbage_meter(/*use_blog_format=*/false);
 
   ASSERT_NOK(blob_garbage_meter.ProcessInFlow(key_slice, value_slice));
   ASSERT_NOK(blob_garbage_meter.ProcessOutFlow(key_slice, value_slice));
@@ -213,7 +290,7 @@ TEST(BlobGarbageMeterTest, InlinedTTLBlobIndex) {
 
   const Slice value_slice(value);
 
-  BlobGarbageMeter blob_garbage_meter;
+  BlobGarbageMeter blob_garbage_meter(/*use_blog_format=*/false);
 
   ASSERT_NOK(blob_garbage_meter.ProcessInFlow(key_slice, value_slice));
   ASSERT_NOK(blob_garbage_meter.ProcessOutFlow(key_slice, value_slice));
@@ -242,7 +319,7 @@ TEST(BlobGarbageMeterTest, WideColumnEntity) {
   ASSERT_OK(WideColumnSerialization::SerializeV2(columns, {{0, default_blob}},
                                                  outflow_value));
 
-  BlobGarbageMeter blob_garbage_meter;
+  BlobGarbageMeter blob_garbage_meter(/*use_blog_format=*/false);
   ASSERT_OK(blob_garbage_meter.ProcessInFlow(key_slice, inflow_value));
   ASSERT_OK(blob_garbage_meter.ProcessOutFlow(key_slice, outflow_value));
 

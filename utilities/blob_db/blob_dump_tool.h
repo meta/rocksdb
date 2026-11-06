@@ -37,6 +37,10 @@ class BlobDumpTool {
   size_t buffer_size_;
 
   Status Read(uint64_t offset, size_t size, Slice* result);
+  Status DumpBlogBlobFile(const std::string& filename, DisplayType show_key,
+                          DisplayType show_blob,
+                          DisplayType show_uncompressed_blob,
+                          bool show_summary);
   Status DumpBlobLogHeader(uint64_t* offset, CompressionType* compression);
   Status DumpBlobLogFooter(uint64_t file_size, uint64_t* footer_offset);
   Status DumpRecord(DisplayType show_key, DisplayType show_blob,
