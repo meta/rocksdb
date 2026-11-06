@@ -14,6 +14,10 @@ find_library(ZSTD_LIBRARIES
   HINTS ${zstd_ROOT_DIR}/lib)
 
 include(FindPackageHandleStandardArgs)
+find_package(PkgConfig QUIET)
+if(PKG_CONFIG_FOUND)
+  pkg_check_modules(ZSTD QUIET libzstd)
+endif()
 find_package_handle_standard_args(zstd DEFAULT_MSG ZSTD_LIBRARIES ZSTD_INCLUDE_DIRS)
 
 mark_as_advanced(
