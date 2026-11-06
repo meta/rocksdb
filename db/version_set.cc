@@ -1591,6 +1591,11 @@ void LevelIterator::Seek(const Slice& target) {
   if (need_to_reseek) {
     TEST_SYNC_POINT("LevelIterator::Seek:BeforeFindFile");
     size_t new_file_index = FindFile(icomparator_, *flevel_, target);
+    // If this file is out of upper bound, we should skip the whole level
+    if (new_file_index < flevel_->num_files &&
+        KeyReachedUpperBound(file_smallest_key(new_file_index))) {
+      new_file_index = flevel_->num_files;
+    }
     InitFileIterator(new_file_index);
   }
 
