@@ -46,6 +46,7 @@
 #include <chrono>
 #endif
 #include <deque>
+#include <fstream>
 #include <set>
 #include <vector>
 
@@ -804,11 +805,19 @@ class PosixFileSystem : public FileSystem {
   IOStatus LinkFile(const std::string& src, const std::string& target,
                     const IOOptions& /*opts*/,
                     IODebugContext* /*dbg*/) override {
+    const auto IsProtectedHardLinksEnabled = []() -> bool {
+      std::ifstream file("/proc/sys/fs/protected_hardlinks");
+      return file.is_open() && file.get() == '1';
+    };
     if (link(src.c_str(), target.c_str()) != 0) {
       if (errno == EXDEV || errno == ENOTSUP) {
         return IOStatus::NotSupported(errno == EXDEV
                                           ? "No cross FS links allowed"
                                           : "Links not supported by FS");
+      }
+      if (errno == EPERM && IsProtectedHardLinksEnabled()) {
+        return IOStatus::NotSupported(
+          "Cannot hard-link non-owned file: protected_hardlinks enabled");
       }
       return IOError("while link file to " + target, src, errno);
     }
