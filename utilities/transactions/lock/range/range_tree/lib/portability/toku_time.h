@@ -133,6 +133,11 @@ static inline tokutime_t toku_time_now(void) {
   return result;
 #elif defined(__powerpc__)
   return __ppc_get_timebase();
+#elif defined(__arm__)
+  uint32_t lo, hi;
+  __asm __volatile__("mrrc p15, 1, %[lo], %[hi], c14"
+                     : [lo] "=r"(lo), [hi] "=r"(hi));
+  return (uint64_t)hi << 32 | lo;
 #elif defined(__s390x__)
   uint64_t result;
   asm volatile("stckf %0" : "=Q"(result) : : "cc");
