@@ -202,7 +202,8 @@ class VersionStorageInfo {
   void AddBlobFile(std::shared_ptr<BlobFileMetaData> blob_file_meta);
 
   void PrepareForVersionAppend(const ImmutableOptions& immutable_options,
-                               const MutableCFOptions& mutable_cf_options);
+                               const MutableCFOptions& mutable_cf_options,
+                               uint32_t max_compation_job = 0);
 
   // REQUIRES: PrepareForVersionAppend has been called
   void SetFinalized();
@@ -724,7 +725,8 @@ class VersionStorageInfo {
   void CalculateBaseBytes(const ImmutableOptions& ioptions,
                           const MutableCFOptions& options);
   void UpdateFilesByCompactionPri(const ImmutableOptions& immutable_options,
-                                  const MutableCFOptions& mutable_cf_options);
+                                  const MutableCFOptions& mutable_cf_options,
+                                  uint32_t max_compaction_job);
 
   void GenerateFileIndexer() {
     file_indexer_.UpdateIndex(&arena_, num_non_empty_levels_, files_);
