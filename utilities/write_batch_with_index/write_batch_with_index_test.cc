@@ -331,6 +331,7 @@ void AssertIterEqual(WBWIIteratorImpl* wbwii,
   for (const auto& k : keys) {
     ASSERT_TRUE(wbwii->Valid());
     ASSERT_EQ(wbwii->Entry().key, k);
+    ASSERT_EQ(wbwii->Entry().timestamp, Slice());
     wbwii->NextKey();
   }
   ASSERT_FALSE(wbwii->Valid());
@@ -338,6 +339,7 @@ void AssertIterEqual(WBWIIteratorImpl* wbwii,
   for (auto kit = keys.rbegin(); kit != keys.rend(); ++kit) {
     ASSERT_TRUE(wbwii->Valid());
     ASSERT_EQ(wbwii->Entry().key, *kit);
+    ASSERT_EQ(wbwii->Entry().timestamp, Slice());
     wbwii->PrevKey();
   }
   ASSERT_FALSE(wbwii->Valid());
@@ -457,6 +459,182 @@ class WriteBatchWithIndexTest : public testing::WithParamInterface<bool>,
  public:
   WriteBatchWithIndexTest() : WBWIBaseTest(GetParam()) {}
 };
+
+class WriteBatchWithIndexRequireTimestampsTest
+    : public WBWIBaseTest,
+      public testing::WithParamInterface<bool> {
+ public:
+  WriteBatchWithIndexRequireTimestampsTest() : WBWIBaseTest(GetParam()) {
+    batch_.reset(new WriteBatchWithIndex{
+        /*backup_index_comparator=*/BytewiseComparator(),
+        /*reserved_bytes=*/0, /*overwrite_key=*/GetParam(),
+        /*max_bytes=*/0, /*protection_bytes_per_key=*/0,
+        /*require_timestamps=*/true});
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(WBWIRequireTimestamps,
+                        WriteBatchWithIndexRequireTimestampsTest,
+                        testing::Bool());
+
+namespace {
+std::string Pack64(uint64_t v) {
+  std::string ret;
+  PutFixed64(&ret, v);
+  return ret;
+}
+}  // namespace
+
+TEST_P(WriteBatchWithIndexRequireTimestampsTest,
+       MultipleVersionsWithTimestamps) {
+  // MultipleVersionsWithTimestamps tests that timestamps are preserved with
+  // require_timestamps and the batch can be written out without
+  // UpdateTimestamps. Additionally it validates iteration order and timestamp
+  // visibility rules within the write batch.
+  std::string scope_name{"OverwriteKey="};
+  scope_name += (GetParam() ? "true" : "false");
+  SCOPED_TRACE(scope_name);
+
+  ASSERT_OK(OpenDB());
+  ColumnFamilyHandle* cf;
+  {
+    ColumnFamilyOptions opts;
+    opts.comparator = test::BytewiseComparatorWithU64TsWrapper();
+    Status s = db_->CreateColumnFamily(opts, "test_cf", &cf);
+    ASSERT_OK(s);
+    ASSERT_TRUE(cf);
+  }
+  struct Guard {
+    DB* db;
+    ColumnFamilyHandle* cf;
+    ~Guard() { db->DestroyColumnFamilyHandle(cf); }
+  } g{db_, cf};
+
+  using Record =
+      std::tuple<std::string /*Key*/, std::string /*Ts*/, std::string /*Val*/>;
+  const std::vector<Record> recs{
+      {"k1", Pack64(1), "v1"},   // 0
+      {"k1", Pack64(3), "v10"},  // 1
+      {"k1", Pack64(3), "v2"},   // 2
+      {"k1", Pack64(4), "v3"},   // 3
+      {"k2", Pack64(2), "v5"},   // 4
+  };
+  for (size_t i = 0; i < recs.size(); i++) {
+    Slice key, ts, value;
+    std::tie(key, ts, value) = recs[i];
+    ASSERT_OK(batch_->Put(cf, key, ts, value));
+    if (i == 1) {
+      batch_->SetSavePoint();
+    }
+  }
+  {
+    SCOPED_TRACE("rebuild index");
+    ASSERT_OK(batch_->RollbackToSavePoint());
+    for (size_t i = 2; i < recs.size(); i++) {
+      Slice key, ts, value;
+      std::tie(key, ts, value) = recs[i];
+      ASSERT_OK(batch_->Put(cf, key, ts, value));
+    }
+  }
+
+  {
+    SCOPED_TRACE("batch iteration order");
+    std::vector<Record> iterate_recs{
+        recs[3],
+        recs[2],
+    };
+    if (!GetParam()) {
+      // overwrite_key = false
+      iterate_recs.push_back(recs[1]);
+    }
+    iterate_recs.push_back(recs[0]);
+    iterate_recs.push_back(recs[4]);
+
+    std::unique_ptr<WBWIIterator> wbwi_iter(batch_->NewIterator(cf));
+    wbwi_iter->SeekToFirst();
+    for (size_t i = 0; i < iterate_recs.size(); i++) {
+      Slice key, ts, value;
+      std::tie(key, ts, value) = iterate_recs.at(i);
+      ASSERT_TRUE(wbwi_iter->Valid());
+      WriteEntry entry = wbwi_iter->Entry();
+      ASSERT_OK(wbwi_iter->status()) << i;
+      EXPECT_EQ(entry.key.ToStringView(), key.ToStringView()) << i;
+      EXPECT_EQ(entry.timestamp.ToString(/*hex=*/true), ts.ToString(true)) << i;
+      EXPECT_EQ(entry.value.ToStringView(), value.ToStringView()) << i;
+      EXPECT_EQ(entry.type, WriteType::kPutRecord) << i;
+      wbwi_iter->Next();
+    }
+    ASSERT_FALSE(wbwi_iter->Valid());
+  }
+  {
+    // timestamp is implicitly the last written timestamp in RYOW
+    // with require_timestamps set (same as without it set)
+    // read_timestamp only affects what rows are visible in the DB (not the
+    // batch)
+    SCOPED_TRACE("batch read-your-own-write");
+    ReadOptions opts;
+    const std::string read_timestamp = Pack64(0);
+    const Slice read_ts_slice = read_timestamp;
+    opts.timestamp = &read_ts_slice;
+    const std::vector<Record> iterate_recs{
+        recs[3],
+        recs[4],
+    };
+
+    Iterator* base_iter = db_->NewIterator(opts, cf);
+    std::unique_ptr<Iterator> iter(
+        batch_->NewIteratorWithBase(cf, base_iter, &opts));
+    iter->SeekToFirst();
+    for (size_t i = 0; i < iterate_recs.size(); i++) {
+      Slice key, ts, value;
+      std::tie(key, ts, value) = iterate_recs.at(i);
+      ASSERT_TRUE(iter->Valid()) << i;
+      ASSERT_OK(iter->status()) << i;
+      EXPECT_EQ(iter->key().ToStringView(), key.ToStringView()) << i;
+      EXPECT_EQ(iter->timestamp().ToString(/*hex=*/true), ts.ToString(true))
+          << i;
+      EXPECT_EQ(iter->value().ToStringView(), value.ToStringView()) << i;
+
+      PinnableSlice actual_value;
+      ASSERT_OK(batch_->GetFromBatchAndDB(db_, opts, cf, key, &actual_value))
+          << i;
+      EXPECT_EQ(actual_value.ToStringView(), value.ToStringView()) << i;
+      iter->Next();
+    }
+    ASSERT_FALSE(iter->Valid());
+  }
+
+  {
+    WriteOptions opts;
+    ASSERT_OK(db_->Write(opts, batch_->GetWriteBatch()));
+  }
+
+  {
+    SCOPED_TRACE("batch flushed to memtable reads back");
+    ReadOptions opts;
+    const std::string read_timestamp = Pack64(3);
+    const Slice read_ts_slice = read_timestamp;
+    opts.timestamp = &read_ts_slice;
+    const std::vector<Record> iterate_recs{
+        recs[2],
+        recs[4],
+    };
+    std::unique_ptr<Iterator> iter(db_->NewIterator(opts, cf));
+    iter->SeekToFirst();
+    for (size_t i = 0; i < iterate_recs.size(); i++) {
+      Slice key, ts, value;
+      std::tie(key, ts, value) = iterate_recs.at(i);
+      ASSERT_TRUE(iter->Valid()) << i;
+      ASSERT_OK(iter->status()) << i;
+      EXPECT_EQ(iter->key().ToStringView(), key.ToStringView()) << i;
+      EXPECT_EQ(iter->timestamp().ToString(/*hex=*/true), ts.ToString(true))
+          << i;
+      EXPECT_EQ(iter->value().ToStringView(), value.ToStringView()) << i;
+      iter->Next();
+    }
+    ASSERT_FALSE(iter->Valid());
+  }
+}
 
 void TestValueAsSecondaryIndexHelper(std::vector<Entry> entries,
                                      WriteBatchWithIndex* batch,
@@ -2955,6 +3133,37 @@ TEST_P(WriteBatchWithIndexTest, TestBadMergeOperator) {
   ASSERT_OK(batch_->GetFromBatch(column_family, options_, "b", &value));
 }
 
+TEST_P(WriteBatchWithIndexTest, UDTRollback) {
+  ASSERT_OK(OpenDB());
+  const std::string dummy_ts = Pack64(0);
+  ColumnFamilyHandleImplDummy cf2(2,
+                                  test::BytewiseComparatorWithU64TsWrapper());
+  ASSERT_OK(batch_->Put(&cf2, "k1", "v1"));
+  ASSERT_OK(batch_->Put(&cf2, "k1", "v2"));
+  batch_->SetSavePoint();
+  ASSERT_OK(batch_->RollbackToSavePoint());
+  std::string value;
+  Status s = batch_->GetFromBatch(&cf2, db_->GetDBOptions(), "k1", &value);
+  EXPECT_OK(s);
+  EXPECT_EQ(value, "v2");
+  std::unique_ptr<WBWIIterator> iter(batch_->NewIterator(&cf2));
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  EXPECT_EQ(iter->Entry().key.ToString(), "k1");
+  EXPECT_EQ(iter->Entry().timestamp.ToString(), dummy_ts);
+  EXPECT_EQ(iter->Entry().value.ToString(), "v2");
+  iter->Next();
+  const bool overwrite = GetParam();
+  ASSERT_EQ(iter->Valid(), !overwrite);
+  if (!overwrite) {
+    ASSERT_OK(iter->status());
+    EXPECT_EQ(iter->Entry().key.ToString(), "k1");
+    EXPECT_EQ(iter->Entry().timestamp.ToString(), dummy_ts);
+    EXPECT_EQ(iter->Entry().value.ToString(), "v1");
+  }
+}
+
 TEST_P(WriteBatchWithIndexTest, ColumnFamilyWithTimestamp) {
   ASSERT_OK(OpenDB());
 
@@ -2962,13 +3171,13 @@ TEST_P(WriteBatchWithIndexTest, ColumnFamilyWithTimestamp) {
                                   test::BytewiseComparatorWithU64TsWrapper());
 
   // Sanity checks
-  ASSERT_TRUE(batch_->Put(&cf2, "key", "ts", "value").IsNotSupported());
+  ASSERT_TRUE(batch_->Put(&cf2, "key", "ts", "value").IsInvalidArgument());
   ASSERT_TRUE(batch_->Put(/*column_family=*/nullptr, "key", "ts", "value")
                   .IsInvalidArgument());
-  ASSERT_TRUE(batch_->Delete(&cf2, "key", "ts").IsNotSupported());
+  ASSERT_TRUE(batch_->Delete(&cf2, "key", "ts").IsInvalidArgument());
   ASSERT_TRUE(batch_->Delete(/*column_family=*/nullptr, "key", "ts")
                   .IsInvalidArgument());
-  ASSERT_TRUE(batch_->SingleDelete(&cf2, "key", "ts").IsNotSupported());
+  ASSERT_TRUE(batch_->SingleDelete(&cf2, "key2", "ts").IsInvalidArgument());
   ASSERT_TRUE(batch_->SingleDelete(/*column_family=*/nullptr, "key", "ts")
                   .IsInvalidArgument());
   {

@@ -25,7 +25,8 @@ namespace ROCKSDB_NAMESPACE {
 struct WriteBatchWithIndex::Rep {
   explicit Rep(const Comparator* index_comparator, size_t reserved_bytes = 0,
                size_t max_bytes = 0, bool _overwrite_key = false,
-               size_t protection_bytes_per_key = 0)
+               size_t protection_bytes_per_key = 0,
+               bool _require_timestamps = false)
       : write_batch(reserved_bytes, max_bytes, protection_bytes_per_key,
                     index_comparator ? index_comparator->timestamp_size() : 0),
         comparator(index_comparator, &write_batch),
@@ -33,6 +34,7 @@ struct WriteBatchWithIndex::Rep {
         last_sub_batch_offset(0),
         sub_batch_cnt(1),
         overwrite_key(_overwrite_key),
+        require_timestamps(_require_timestamps),
         op_count(0) {}
   ReadableWriteBatch write_batch;
   WriteBatchEntryComparator comparator;
@@ -46,6 +48,7 @@ struct WriteBatchWithIndex::Rep {
   size_t sub_batch_cnt;
 
   const bool overwrite_key;
+  const bool require_timestamps;
   // Tracks ids of CFs that have updates in this WBWI, number of updates and
   // number of overwritten single deletions per cf. Useful for WBWIMemTable
   // when this WBWI is ingested into a DB.
@@ -57,9 +60,10 @@ struct WriteBatchWithIndex::Rep {
   // Return true if the key is found and updated.
   // most_recent_entry_update_count will be set to the update count of the
   // most recent index entry for `key` if exists.
-  bool UpdateExistingEntryWithCfId(uint32_t column_family_id, const Slice& key,
-                                   WriteType type, size_t last_entry_offset,
-                                   uint32_t* most_recent_entry_update_count);
+  std::pair<Status, bool> UpdateExistingEntryWithCfId(
+      uint32_t column_family_id, const Slice& key, const Slice& ts,
+      WriteType type, size_t last_entry_offset,
+      uint32_t* most_recent_entry_update_count, const Comparator* cf_cmp);
 
   // Add or update the index for the given `key` of `type`
   // at `last_entry_offset` in the write batch.
@@ -69,20 +73,51 @@ struct WriteBatchWithIndex::Rep {
   //
   // If `cf_cmp` is provided and there is no compartor stored
   // for this cf, it will be stored as the comparator to use for this cf.
-  void AddOrUpdateIndexWithCfId(uint32_t cf_id, const Slice& key,
-                                WriteType type, size_t last_entry_offset,
-                                const Comparator* cf_cmp = nullptr);
+  Status AddOrUpdateIndexWithCfId(uint32_t cf_id, const Slice& key,
+                                  const Slice& ts, WriteType type,
+                                  size_t last_entry_offset,
+                                  const Comparator* cf_cmp);
 
-  void AddOrUpdateIndex(ColumnFamilyHandle* cfh, const Slice& key,
-                        WriteType type, size_t last_entry_offset) {
-    AddOrUpdateIndexWithCfId(GetColumnFamilyID(cfh), key, type,
-                             last_entry_offset,
-                             GetColumnFamilyUserComparator(cfh));
+  Status AddOrUpdateIndex(ColumnFamilyHandle* cfh, const Slice& key,
+                          const Slice& ts, WriteType type,
+                          size_t last_entry_offset) {
+    return AddOrUpdateIndexWithCfId(GetColumnFamilyID(cfh), key, ts, type,
+                                    last_entry_offset,
+                                    GetColumnFamilyUserComparator(cfh));
   }
 
-  void AddOrUpdateIndex(const Slice& key, WriteType type,
-                        size_t last_entry_offset) {
-    AddOrUpdateIndexWithCfId(0, key, type, last_entry_offset);
+  Status CheckTsArg(ColumnFamilyHandle* cfh, const Slice* ts) {
+    if (!require_timestamps) {
+      return ts ? Status::InvalidArgument("ts must not be specified")
+                : Status::OK();
+    }
+    Status s;
+    size_t ts_sz;
+    std::tie(s, std::ignore, ts_sz) =
+        WriteBatchInternal::GetColumnFamilyIdAndTimestampSize(&write_batch,
+                                                              cfh);
+    if (!s.ok()) {
+      return s;
+    }
+    if (ts) {
+      if (ts_sz == ts->size()) {
+        return Status::OK();
+      } else if (ts_sz == 0) {
+        return Status::InvalidArgument("ts must not be specified");
+      } else {
+        return Status::InvalidArgument(
+            "ts does not match the timestamp size of the column family");
+      }
+    } else {
+      return ts_sz > 0 ? Status::InvalidArgument("ts must be specified")
+                       : Status::OK();
+    }
+  }
+
+  Status AddOrUpdateIndex(const Slice& key, const Slice& ts, WriteType type,
+                          size_t last_entry_offset) {
+    return AddOrUpdateIndexWithCfId(0, key, ts, type, last_entry_offset,
+                                    comparator.GetComparator(0u));
   }
 
   // Add a new index entry pointing to the the entry at `last_entry_offset`
@@ -101,22 +136,39 @@ struct WriteBatchWithIndex::Rep {
   Status ReBuildIndex();
 };
 
-bool WriteBatchWithIndex::Rep::UpdateExistingEntryWithCfId(
-    uint32_t column_family_id, const Slice& key, WriteType type,
-    size_t last_entry_offset, uint32_t* most_recent_entry_update_count) {
+std::pair<Status, bool> WriteBatchWithIndex::Rep::UpdateExistingEntryWithCfId(
+    uint32_t column_family_id, const Slice& key, const Slice& ts,
+    WriteType type, size_t last_entry_offset,
+    uint32_t* most_recent_entry_update_count, const Comparator* cf_cmp) {
   assert(most_recent_entry_update_count);
   if (!overwrite_key) {
-    return false;
+    return {Status::OK(), false};
   }
 
   WBWIIteratorImpl iter(column_family_id, &skip_list, &write_batch,
                         &comparator);
   iter.Seek(key);
   if (!iter.Valid()) {
-    return false;
+    return {Status::OK(), false};
   } else if (!iter.MatchesKey(column_family_id, key)) {
-    return false;
+    return {Status::OK(), false};
   }
+
+  if (require_timestamps) {
+    size_t ts_sz = cf_cmp ? cf_cmp->timestamp_size() : 0;
+    if (ts_sz > 0) {
+      Slice last_ts_for_key = iter.Entry().timestamp;
+      int compare_result = cf_cmp->CompareTimestamp(last_ts_for_key, ts);
+      if (compare_result != 0) {
+        if (compare_result < 0) {
+          return {Status::OK(), false};
+        }
+        return {Status::InvalidArgument("cannot write below max ts for key"),
+                false};
+      }
+    }
+  }
+
   // Seek() and MatchesKey() guarantees that we are at the first entry with
   // key == `key`, which is the most recently update to `key`.
   WriteBatchIndexEntry* most_recent_entry =
@@ -141,7 +193,7 @@ bool WriteBatchWithIndex::Rep::UpdateExistingEntryWithCfId(
   }
   if (type == kMergeRecord) {
     assert(iter.Entry().type != kSingleDeleteRecord);
-    return false;
+    return {Status::OK(), false};
   } else {
     // We still increment the update count when updating in-place. This is
     // useful for WBWIMemTable when it needs to emit overwritten SingleDeletes.
@@ -149,22 +201,29 @@ bool WriteBatchWithIndex::Rep::UpdateExistingEntryWithCfId(
     // update_count is 0. So any later update should have update_count > 0.
     most_recent_entry->update_count++;
     most_recent_entry->offset = last_entry_offset;
-    return true;
+    return {Status::OK(), true};
   }
 }
 
-void WriteBatchWithIndex::Rep::AddOrUpdateIndexWithCfId(
-    uint32_t cf_id, const Slice& key, WriteType type, size_t last_entry_offset,
-    const Comparator* cf_cmp) {
+Status WriteBatchWithIndex::Rep::AddOrUpdateIndexWithCfId(
+    uint32_t cf_id, const Slice& key, const Slice& ts, WriteType type,
+    size_t last_entry_offset, const Comparator* cf_cmp) {
   op_count++;
   uint32_t update_count = 0;
-  if (!UpdateExistingEntryWithCfId(cf_id, key, type, last_entry_offset,
-                                   &update_count)) {
+  Status s;
+  bool overwritten;
+  std::tie(s, overwritten) = UpdateExistingEntryWithCfId(
+      cf_id, key, ts, type, last_entry_offset, &update_count, cf_cmp);
+  if (!s.ok()) {
+    return s;
+  }
+  if (!overwritten) {
     if (cf_cmp) {
       comparator.SetComparatorForCF(cf_id, cf_cmp);
     }
     AddNewEntry(cf_id, type, last_entry_offset, update_count + 1);
   }
+  return s;
 }
 
 void WriteBatchWithIndex::Rep::AddNewEntry(uint32_t column_family_id,
@@ -249,6 +308,15 @@ Status WriteBatchWithIndex::Rep::ReBuildIndex() {
 
     s = ReadRecordFromWriteBatch(&input, &tag, &column_family_id, &key, &value,
                                  &blob, &xid, &unix_write_time);
+    auto* ucmp = comparator.GetComparator(column_family_id);
+    size_t ts_sz = ucmp ? ucmp->timestamp_size() : 0;
+    Slice ts;
+    if (ts_sz > 0) {
+      assert(key.size() >= ts_sz);
+      ts = key;
+      key.remove_suffix(ts_sz);
+      ts.remove_prefix(key.size());
+    }
     if (!s.ok()) {
       break;
     }
@@ -257,26 +325,27 @@ Status WriteBatchWithIndex::Rep::ReBuildIndex() {
       case kTypeColumnFamilyValue:
       case kTypeValue:
         found++;
-        AddOrUpdateIndexWithCfId(column_family_id, key, kPutRecord,
-                                 last_entry_offset);
+        s = AddOrUpdateIndexWithCfId(column_family_id, key, ts, kPutRecord,
+                                     last_entry_offset, ucmp);
         break;
       case kTypeColumnFamilyDeletion:
       case kTypeDeletion:
         found++;
-        AddOrUpdateIndexWithCfId(column_family_id, key, kDeleteRecord,
-                                 last_entry_offset);
+        s = AddOrUpdateIndexWithCfId(column_family_id, key, ts, kDeleteRecord,
+                                     last_entry_offset, ucmp);
         break;
       case kTypeColumnFamilySingleDeletion:
       case kTypeSingleDeletion:
         found++;
-        AddOrUpdateIndexWithCfId(column_family_id, key, kSingleDeleteRecord,
-                                 last_entry_offset);
+        s = AddOrUpdateIndexWithCfId(column_family_id, key, ts,
+                                     kSingleDeleteRecord, last_entry_offset,
+                                     ucmp);
         break;
       case kTypeColumnFamilyMerge:
       case kTypeMerge:
         found++;
-        AddOrUpdateIndexWithCfId(column_family_id, key, kMergeRecord,
-                                 last_entry_offset);
+        s = AddOrUpdateIndexWithCfId(column_family_id, key, ts, kMergeRecord,
+                                     last_entry_offset, ucmp);
         break;
       case kTypeLogData:
       case kTypeBeginPrepareXID:
@@ -291,8 +360,8 @@ Status WriteBatchWithIndex::Rep::ReBuildIndex() {
       case kTypeColumnFamilyWideColumnEntity:
       case kTypeWideColumnEntity:
         found++;
-        AddOrUpdateIndexWithCfId(column_family_id, key, kPutEntityRecord,
-                                 last_entry_offset);
+        s = AddOrUpdateIndexWithCfId(column_family_id, key, ts,
+                                     kPutEntityRecord, last_entry_offset, ucmp);
         break;
       case kTypeColumnFamilyValuePreferredSeqno:
       case kTypeValuePreferredSeqno:
@@ -316,9 +385,11 @@ Status WriteBatchWithIndex::Rep::ReBuildIndex() {
 
 WriteBatchWithIndex::WriteBatchWithIndex(
     const Comparator* default_index_comparator, size_t reserved_bytes,
-    bool overwrite_key, size_t max_bytes, size_t protection_bytes_per_key)
+    bool overwrite_key, size_t max_bytes, size_t protection_bytes_per_key,
+    bool require_timestamps)
     : rep(new Rep(default_index_comparator, reserved_bytes, max_bytes,
-                  overwrite_key, protection_bytes_per_key)) {}
+                  overwrite_key, protection_bytes_per_key,
+                  require_timestamps)) {}
 
 WriteBatchWithIndex::~WriteBatchWithIndex() = default;
 
@@ -365,7 +436,8 @@ Iterator* WriteBatchWithIndex::NewIteratorWithBase(
 
   return new BaseDeltaIterator(column_family, base_iterator, wbwiii,
                                GetColumnFamilyUserComparator(column_family),
-                               read_options);
+                               read_options,
+                               /*fill_timestamps=*/rep->require_timestamps);
 }
 
 Iterator* WriteBatchWithIndex::NewIteratorWithBase(
@@ -383,124 +455,185 @@ Iterator* WriteBatchWithIndex::NewIteratorWithBase(
 
   return new BaseDeltaIterator(nullptr, base_iterator, wbwiii,
                                rep->comparator.default_comparator(),
-                               /* read_options */ nullptr);
+                               /* read_options */ nullptr,
+                               /*fill_timestamps=*/rep->require_timestamps);
 }
 
 Status WriteBatchWithIndex::Put(ColumnFamilyHandle* column_family,
                                 const Slice& key, const Slice& value) {
+  Status s = rep->CheckTsArg(column_family, /*ts=*/nullptr);
+  if (!s.ok()) {
+    return s;
+  }
   size_t last_entry_offset = rep->write_batch.GetDataSize();
-  auto s = rep->write_batch.Put(column_family, key, value);
+  s = rep->write_batch.Put(column_family, key, value);
   if (s.ok()) {
-    rep->AddOrUpdateIndex(column_family, key, kPutRecord, last_entry_offset);
+    s = rep->AddOrUpdateIndex(column_family, key, /*ts=*/Slice(), kPutRecord,
+                              last_entry_offset);
   }
   return s;
 }
 
 Status WriteBatchWithIndex::Put(const Slice& key, const Slice& value) {
+  Status s = rep->CheckTsArg(nullptr, /*ts=*/nullptr);
+  if (!s.ok()) {
+    return s;
+  }
   size_t last_entry_offset = rep->write_batch.GetDataSize();
-  auto s = rep->write_batch.Put(key, value);
+  s = rep->write_batch.Put(key, value);
   if (s.ok()) {
-    rep->AddOrUpdateIndex(key, kPutRecord, last_entry_offset);
+    s = rep->AddOrUpdateIndex(key, /*ts=*/Slice(), kPutRecord,
+                              last_entry_offset);
   }
   return s;
 }
 
 Status WriteBatchWithIndex::Put(ColumnFamilyHandle* column_family,
-                                const Slice& /*key*/, const Slice& /*ts*/,
-                                const Slice& /*value*/) {
-  if (!column_family) {
-    return Status::InvalidArgument("column family handle cannot be nullptr");
+                                const Slice& key, const Slice& ts,
+                                const Slice& value) {
+  Status s = rep->CheckTsArg(column_family, &ts);
+  if (!s.ok()) {
+    return s;
   }
-  // TODO: support WBWI::Put() with timestamp.
-  return Status::NotSupported();
+  size_t last_entry_offset = rep->write_batch.GetDataSize();
+  s = rep->write_batch.Put(column_family, key, ts, value);
+  if (s.ok()) {
+    s = rep->AddOrUpdateIndex(column_family, key, ts, kPutRecord,
+                              last_entry_offset);
+  }
+  return s;
 }
 
 Status WriteBatchWithIndex::PutEntity(ColumnFamilyHandle* column_family,
                                       const Slice& key,
                                       const WideColumns& columns) {
-  assert(rep);
+  Status s = rep->CheckTsArg(column_family, /*ts=*/nullptr);
+  if (!s.ok()) {
+    return s;
+  }
   size_t last_entry_offset = rep->write_batch.GetDataSize();
-  const Status s = rep->write_batch.PutEntity(column_family, key, columns);
+  s = rep->write_batch.PutEntity(column_family, key, columns);
   if (s.ok()) {
-    rep->AddOrUpdateIndex(column_family, key, kPutEntityRecord,
-                          last_entry_offset);
+    s = rep->AddOrUpdateIndex(column_family, key, /*ts=*/Slice(),
+                              kPutEntityRecord, last_entry_offset);
   }
   return s;
 }
 
 Status WriteBatchWithIndex::Delete(ColumnFamilyHandle* column_family,
                                    const Slice& key) {
+  Status s = rep->CheckTsArg(column_family, /*ts=*/nullptr);
+  if (!s.ok()) {
+    return s;
+  }
   size_t last_entry_offset = rep->write_batch.GetDataSize();
-  auto s = rep->write_batch.Delete(column_family, key);
+  s = rep->write_batch.Delete(column_family, key);
   if (s.ok()) {
-    rep->AddOrUpdateIndex(column_family, key, kDeleteRecord, last_entry_offset);
+    s = rep->AddOrUpdateIndex(column_family, key, /*ts=*/Slice(), kDeleteRecord,
+                              last_entry_offset);
   }
   return s;
 }
 
 Status WriteBatchWithIndex::Delete(const Slice& key) {
+  Status s = rep->CheckTsArg(nullptr, /*ts=*/nullptr);
+  if (!s.ok()) {
+    return s;
+  }
   size_t last_entry_offset = rep->write_batch.GetDataSize();
-  auto s = rep->write_batch.Delete(key);
+  s = rep->write_batch.Delete(key);
   if (s.ok()) {
-    rep->AddOrUpdateIndex(key, kDeleteRecord, last_entry_offset);
+    s = rep->AddOrUpdateIndex(key, /*ts=*/Slice(), kDeleteRecord,
+                              last_entry_offset);
   }
   return s;
 }
 
 Status WriteBatchWithIndex::Delete(ColumnFamilyHandle* column_family,
-                                   const Slice& /*key*/, const Slice& /*ts*/) {
-  if (!column_family) {
-    return Status::InvalidArgument("column family handle cannot be nullptr");
+                                   const Slice& key, const Slice& ts) {
+  Status s = rep->CheckTsArg(column_family, &ts);
+  if (!s.ok()) {
+    return s;
   }
-  // TODO: support WBWI::Delete() with timestamp.
-  return Status::NotSupported();
+  size_t last_entry_offset = rep->write_batch.GetDataSize();
+  s = rep->write_batch.Delete(column_family, key, ts);
+  if (s.ok()) {
+    s = rep->AddOrUpdateIndex(column_family, key, ts, kDeleteRecord,
+                              last_entry_offset);
+  }
+  return s;
 }
 
 Status WriteBatchWithIndex::SingleDelete(ColumnFamilyHandle* column_family,
                                          const Slice& key) {
+  Status s = rep->CheckTsArg(column_family, /*ts=*/nullptr);
+  if (!s.ok()) {
+    return s;
+  }
   size_t last_entry_offset = rep->write_batch.GetDataSize();
-  auto s = rep->write_batch.SingleDelete(column_family, key);
+  s = rep->write_batch.SingleDelete(column_family, key);
   if (s.ok()) {
-    rep->AddOrUpdateIndex(column_family, key, kSingleDeleteRecord,
-                          last_entry_offset);
+    s = rep->AddOrUpdateIndex(column_family, key, /*ts=*/Slice(),
+                              kSingleDeleteRecord, last_entry_offset);
   }
   return s;
 }
 
 Status WriteBatchWithIndex::SingleDelete(const Slice& key) {
+  Status s = rep->CheckTsArg(nullptr, /*ts=*/nullptr);
+  if (!s.ok()) {
+    return s;
+  }
   size_t last_entry_offset = rep->write_batch.GetDataSize();
-  auto s = rep->write_batch.SingleDelete(key);
+  s = rep->write_batch.SingleDelete(key);
   if (s.ok()) {
-    rep->AddOrUpdateIndex(key, kSingleDeleteRecord, last_entry_offset);
+    s = rep->AddOrUpdateIndex(key, /*ts=*/Slice(), kSingleDeleteRecord,
+                              last_entry_offset);
   }
   return s;
 }
 
 Status WriteBatchWithIndex::SingleDelete(ColumnFamilyHandle* column_family,
-                                         const Slice& /*key*/,
-                                         const Slice& /*ts*/) {
-  if (!column_family) {
-    return Status::InvalidArgument("column family handle cannot be nullptr");
+                                         const Slice& key, const Slice& ts) {
+  Status s = rep->CheckTsArg(column_family, /*ts=*/&ts);
+  if (!s.ok()) {
+    return s;
   }
-  // TODO: support WBWI::SingleDelete() with timestamp.
-  return Status::NotSupported();
+
+  size_t last_entry_offset = rep->write_batch.GetDataSize();
+  s = rep->write_batch.SingleDelete(column_family, key, ts);
+  if (s.ok()) {
+    s = rep->AddOrUpdateIndex(column_family, key, ts, kSingleDeleteRecord,
+                              last_entry_offset);
+  }
+  return s;
 }
 
 Status WriteBatchWithIndex::Merge(ColumnFamilyHandle* column_family,
                                   const Slice& key, const Slice& value) {
+  Status s = rep->CheckTsArg(column_family, /*ts=*/nullptr);
+  if (!s.ok()) {
+    return s;
+  }
   size_t last_entry_offset = rep->write_batch.GetDataSize();
-  auto s = rep->write_batch.Merge(column_family, key, value);
+  s = rep->write_batch.Merge(column_family, key, value);
   if (s.ok()) {
-    rep->AddOrUpdateIndex(column_family, key, kMergeRecord, last_entry_offset);
+    s = rep->AddOrUpdateIndex(column_family, key, /*ts=*/Slice(), kMergeRecord,
+                              last_entry_offset);
   }
   return s;
 }
 
 Status WriteBatchWithIndex::Merge(const Slice& key, const Slice& value) {
+  Status s = rep->CheckTsArg(nullptr, /*ts=*/nullptr);
+  if (!s.ok()) {
+    return s;
+  }
   size_t last_entry_offset = rep->write_batch.GetDataSize();
-  auto s = rep->write_batch.Merge(key, value);
+  s = rep->write_batch.Merge(key, value);
   if (s.ok()) {
-    rep->AddOrUpdateIndex(key, kMergeRecord, last_entry_offset);
+    s = rep->AddOrUpdateIndex(key, /*ts=*/Slice(), kMergeRecord,
+                              last_entry_offset);
   }
   return s;
 }
