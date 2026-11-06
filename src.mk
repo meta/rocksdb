@@ -746,6 +746,7 @@ JNI_NATIVE_SOURCES =                                          \
   java/rocksjni/import_column_family_options.cc               \
   java/rocksjni/ingest_external_file_options.cc               \
   java/rocksjni/filter.cc                                     \
+  java/rocksjni/ribbon_filter.cc                              \
   java/rocksjni/hyper_clock_cache.cc                          \
   java/rocksjni/iterator.cc                                   \
   java/rocksjni/jni_perf_context.cc                           \
