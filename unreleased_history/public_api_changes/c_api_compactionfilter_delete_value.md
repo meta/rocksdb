@@ -1,0 +1,1 @@
+Added `rocksdb_compactionfilter_create_with_delete_value()` to the C API. Like `rocksdb_mergeoperator_create()`, it releases any value returned by the filter callback using the given `delete_value` callback or `free()` if it is NULL. `rocksdb_compactionfilter_create()` still does not release values.

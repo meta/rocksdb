@@ -3118,6 +3118,16 @@ rocksdb_compactionfilter_create(
                             size_t* new_value_length,
                             unsigned char* value_changed),
     const char* (*name)(void*));
+extern ROCKSDB_LIBRARY_API rocksdb_compactionfilter_t*
+rocksdb_compactionfilter_create_with_delete_value(
+    void* state, void (*destructor)(void*),
+    unsigned char (*filter)(void*, int level, const char* key,
+                            size_t key_length, const char* existing_value,
+                            size_t value_length, char** new_value,
+                            size_t* new_value_length,
+                            unsigned char* value_changed),
+    void (*delete_value)(void*, const char* value, size_t value_length),
+    const char* (*name)(void*));
 extern ROCKSDB_LIBRARY_API void rocksdb_compactionfilter_set_ignore_snapshots(
     rocksdb_compactionfilter_t*, unsigned char);
 extern ROCKSDB_LIBRARY_API void rocksdb_compactionfilter_destroy(
