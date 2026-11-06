@@ -27,6 +27,9 @@ struct Compare : private Base {
   inline bool operator()(const char* a, const char* b) const {
     return compare_(a, b) < 0;
   }
+  inline bool operator()(const char* a, const Slice& b) const {
+    return compare_(a, b) < 0;
+  }
 };
 
 }  // namespace stl_wrappers
