@@ -5,7 +5,10 @@
 
 package org.rocksdb;
 
+import static org.rocksdb.util.BufferUtil.CheckBounds;
+
 import java.nio.ByteBuffer;
+import java.util.List;
 
 /**
  * Similar to {@link org.rocksdb.WriteBatch} but with a binary searchable
@@ -292,6 +295,68 @@ public class WriteBatchWithIndex extends AbstractWriteBatch {
         options.nativeHandle_, key, key.length);
   }
 
+  public Status getEntityFromBatch(final ColumnFamilyHandle columnFamily, final ByteBuffer key,
+      final List<WideColumn.ByteBufferWideColumn> columns) throws RocksDBException {
+    ByteBuffer[] names = new ByteBuffer[columns.size()];
+    ByteBuffer[] values = new ByteBuffer[columns.size()];
+    int[] namesRequiredSize = new int[columns.size()];
+    int[] valuesRequiredSize = new int[columns.size()];
+
+    int[] namesOffset = new int[columns.size()];
+    int[] namesRemaining = new int[columns.size()];
+    int[] valuesOffset = new int[columns.size()];
+    int[] valuesRemaining = new int[columns.size()];
+
+    for (int i = 0; i < names.length; i++) {
+      names[i] = columns.get(i).getName();
+      namesOffset[i] = names[i].position();
+      namesRemaining[i] = names[i].remaining();
+
+      values[i] = columns.get(i).getValue();
+      valuesOffset[i] = values[i].position();
+      valuesRemaining[i] = values[i].remaining();
+    }
+
+    Status status = getEntityFromBatchDirect(nativeHandle_, key, key.position(), key.remaining(),
+        names, namesOffset, namesRemaining, namesRequiredSize, values, valuesOffset,
+        valuesRemaining, valuesRequiredSize, columnFamily.nativeHandle_);
+
+    if (status != null && status.getCode() == Status.Code.Ok) {
+      for (int i = 0; i < namesRequiredSize.length; i++) {
+        columns.get(i).setNameRequiredSize(namesRequiredSize[i]);
+
+        if (namesRequiredSize[i] > names[i].remaining()) {
+          names[i].position(names[i].position() + names[i].remaining()); // Fully filled buffer
+        } else {
+          names[i].position(names[i].position() + namesRequiredSize[i]);
+        }
+
+        columns.get(i).setValueRequiredSize(valuesRequiredSize[i]);
+        if (valuesRequiredSize[i] > values[i].remaining()) {
+          values[i].position(values[i].position() + values[i].remaining());
+        } else {
+          values[i].position(values[i].position() + valuesRequiredSize[i]);
+        }
+      }
+    }
+    return status;
+  }
+  public Status getEntityFromBatch(final ColumnFamilyHandle columnFamily, final byte[] key,
+      int keyOffset, int keyLength, final List<WideColumn<byte[]>> values) throws RocksDBException {
+    CheckBounds(keyOffset, keyLength, key.length);
+
+    RocksDB.GetEntityResult result = new RocksDB.GetEntityResult();
+    getEntityFromBatch(nativeHandle_, key, keyOffset, keyLength, result,
+        columnFamily == null ? 0 : columnFamily.nativeHandle_);
+
+    if (result.status.getCode() == Status.Code.Ok) {
+      for (int i = 0; i < result.names.length; i++) {
+        values.add(new WideColumn<>(result.names[i], result.values[i]));
+      }
+    }
+    return result.status;
+  }
+
   @Override
   protected final void disposeInternal(final long handle) {
     disposeInternalJni(handle);
@@ -318,6 +383,14 @@ public class WriteBatchWithIndex extends AbstractWriteBatch {
     putJni(handle, key, keyLen, value, valueLen, cfHandle);
   }
 
+  @Override
+  void putEntity(long nativeHandle, byte[] key, int keyOffset, int keyLength, byte[][] names,
+      byte[][] values, long cfHandle) throws RocksDBException {
+    putEntityJni(nativeHandle, key, keyOffset, keyLength, names, values, cfHandle);
+  }
+  private static native void putEntityJni(long nativeHandle, byte[] key, int keyOffset,
+      int keyLength, byte[][] names, byte[][] values, long cfHandle) throws RocksDBException;
+
   private static native void putJni(final long handle, final byte[] key, final int keyLen,
       final byte[] value, final int valueLen, final long cfHandle);
 
@@ -327,6 +400,18 @@ public class WriteBatchWithIndex extends AbstractWriteBatch {
       final long cfHandle) {
     putDirectJni(handle, key, keyOffset, keyLength, value, valueOffset, valueLength, cfHandle);
   }
+
+  @Override
+  void putEntityDirect(long nativeHandle, ByteBuffer key, int keyOffset, int keyLength,
+      ByteBuffer[] names, int[] namesOffset, int[] namesLength, ByteBuffer[] values,
+      int[] valuesOffset, int[] valuesLength, long cfHandle) throws RocksDBException {
+    putEntityDirectJni(nativeHandle, key, keyOffset, keyLength, names, namesOffset, namesLength,
+        values, valuesOffset, valuesLength, cfHandle);
+  }
+
+  private static native void putEntityDirectJni(long nativeHandle, ByteBuffer key, int keyOffset,
+      int keyLength, ByteBuffer[] names, int[] namesOffset, int[] namesLength, ByteBuffer[] values,
+      int[] valuesOffset, int[] valuesLength, long cfHandle) throws RocksDBException;
 
   private static native void putDirectJni(final long handle, final ByteBuffer key,
       final int keyOffset, final int keyLength, final ByteBuffer value, final int valueOffset,
@@ -476,4 +561,13 @@ public class WriteBatchWithIndex extends AbstractWriteBatch {
       final long readOptHandle, final byte[] key, final int keyLen);
   private static native byte[] getFromBatchAndDB(final long handle, final long dbHandle,
       final long readOptHandle, final byte[] key, final int keyLen, final long cfHandle);
+
+  private static native void getEntityFromBatch(final long handle, final byte[] key, int keyOffset,
+      int keyLength, final RocksDB.GetEntityResult result, final long cfHandle)
+      throws RocksDBException;
+
+  private static native Status getEntityFromBatchDirect(long nativeHandle, ByteBuffer key,
+      int position, int remaining, ByteBuffer[] names, int[] namesOffset, int[] namesRemaining,
+      int[] namesRequiredSize, ByteBuffer[] values, int[] valuesOffset, int[] valuesRemaining,
+      int[] valuesRequiredSize, long columnFamilyHandle) throws RocksDBException;
 }

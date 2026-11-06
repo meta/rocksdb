@@ -290,6 +290,7 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/WalFilter.java
   src/main/java/org/rocksdb/WalIterator.java
   src/main/java/org/rocksdb/WalProcessingOption.java
+  src/main/java/org/rocksdb/WideColumn.java
   src/main/java/org/rocksdb/WriteBatch.java
   src/main/java/org/rocksdb/WriteBatchInterface.java
   src/main/java/org/rocksdb/WriteBatchWithIndex.java
@@ -430,6 +431,7 @@ set(JAVA_TEST_CLASSES
   src/test/java/org/rocksdb/util/JNIComparatorTest.java
   src/test/java/org/rocksdb/util/ReverseBytewiseComparatorIntTest.java
   src/test/java/org/rocksdb/util/SizeUnitTest.java
+  src/test/java/org/rocksdb/WideColumnTest.java
   src/test/java/org/rocksdb/util/StdErrLoggerTest.java
   src/test/java/org/rocksdb/util/TestUtil.java
 )
@@ -527,6 +529,7 @@ set(JAVA_TEST_RUNNING_CLASSES
   org.rocksdb.WALRecoveryModeTest
   org.rocksdb.WalFilterTest
   org.rocksdb.WalIteratorTest
+  org.rocksdb.WideColumnTest
   org.rocksdb.WriteBatchHandlerTest
   org.rocksdb.WriteBatchTest
   org.rocksdb.WriteBatchThreadedTest
