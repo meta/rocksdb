@@ -172,6 +172,9 @@ bool DBTestBase::ShouldSkipOptions(int option_config, int skip_mask) {
   if ((skip_mask & kSkipRowCache) && option_config == kRowCache) {
     return true;
   }
+  if ((skip_mask & kSkipSortedHash) && option_config == kSortedHash) {
+    return true;
+  }
   return false;
 }
 
@@ -415,6 +418,9 @@ Options DBTestBase::GetOptions(
       options.allow_mmap_reads = can_allow_mmap;
       options.max_sequential_skip_in_iterations = 999999;
       set_block_based_table_factory = false;
+      break;
+    case kSortedHash:
+      options.memtable_factory.reset(NewSortedHashRepFactory(16));
       break;
     case kVectorRep:
       options.memtable_factory.reset(new VectorRepFactory(100));

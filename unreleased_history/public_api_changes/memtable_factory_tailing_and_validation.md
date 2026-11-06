@@ -1,0 +1,1 @@
+Added `MemTableRepFactory::IsTailingIteratorSupported()`; tailing iterators now fail with `NotSupported` on column families whose memtable factory returns false. `MemTableRepFactory::ValidateOptions()` is now also checked by `CreateColumnFamily()` and `SetOptions()`, not only `DB::Open()`.

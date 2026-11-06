@@ -1,0 +1,1 @@
+Added `NewSortedHashRepFactory()` (`sorted_hash:<bucket_count>`), a concurrent memtable for point-lookup-heavy workloads that hashes whole user keys into sorted per-bucket lists. It trades O(n log n) iterator creation after writes for faster point reads and inserts; see `rocksdb/memtablerep.h` for sizing guidance and unsupported options.
