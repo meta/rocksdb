@@ -1677,6 +1677,23 @@
           "expr": "opt->rep.compression_opts.max_dict_buffer_bytes"
         },
         {
+          "kind": "field_setter",
+          "name": "rocksdb_options_set_compression_options_max_compressed_bytes_per_kb",
+          "receiver_type": "rocksdb_options_t*",
+          "receiver_name": "opt",
+          "value_type": "int",
+          "value_name": "max_compressed_bytes_per_kb",
+          "field": "opt->rep.compression_opts.max_compressed_bytes_per_kb"
+        },
+        {
+          "kind": "field_getter",
+          "name": "rocksdb_options_get_compression_options_max_compressed_bytes_per_kb",
+          "receiver_type": "rocksdb_options_t*",
+          "receiver_name": "opt",
+          "return_type": "int",
+          "expr": "opt->rep.compression_opts.max_compressed_bytes_per_kb"
+        },
+        {
           "kind": "field_getter",
           "name": "rocksdb_options_get_bottommost_compression_options_use_zstd_dict_trainer",
           "receiver_type": "rocksdb_options_t*",
