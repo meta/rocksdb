@@ -844,6 +844,56 @@ TEST_F(DBErrorHandlingFSTest, ManifestWriteRetryableError) {
   Close();
 }
 
+// A manual Resume() whose recovery flush hits another retryable IO error must
+// fail with that retryable (non-Busy) error and leave the DB recoverable, so a
+// later Resume() succeeds without losing data.
+TEST_F(DBErrorHandlingFSTest, ManualResumeRetryableFlushErrorThenResume) {
+  std::shared_ptr<ErrorHandlerFSListener> listener =
+      std::make_shared<ErrorHandlerFSListener>();
+  Options options = GetDefaultOptions();
+  options.env = fault_env_.get();
+  options.create_if_missing = true;
+  options.listeners.emplace_back(listener);
+  options.max_bgerror_resume_count = 0;
+
+  listener->EnableAutoRecovery(false);
+  DestroyAndReopen(options);
+
+  IOStatus error_msg = IOStatus::IOError("Retryable IO Error");
+  error_msg.SetRetryable(true);
+
+  ASSERT_OK(Put(Key(0), "val0"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put(Key(1), "val1"));
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WriteManifest",
+      [&](void*) { fault_fs_->SetFilesystemActive(false, error_msg); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status s = Flush();
+  ASSERT_EQ(s.severity(), ROCKSDB_NAMESPACE::Status::Severity::kHardError);
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->DisableProcessing();
+
+  // The filesystem is still failing, so the recovery flush run by this manual
+  // Resume() fails with a retryable IO error.
+  s = dbfull()->Resume();
+  ASSERT_NOK(s);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  ASSERT_FALSE(s.IsBusy()) << s.ToString();
+  ASSERT_TRUE(status_to_io_status(Status(s)).GetRetryable()) << s.ToString();
+  ASSERT_NOK(Put(Key(2), "val2"));
+
+  fault_fs_->SetFilesystemActive(true);
+  ASSERT_OK(dbfull()->Resume());
+  ASSERT_OK(Put(Key(2), "val2"));
+
+  Reopen(options);
+  ASSERT_EQ("val0", Get(Key(0)));
+  ASSERT_EQ("val1", Get(Key(1)));
+  ASSERT_EQ("val2", Get(Key(2)));
+  Close();
+}
+
 // Without auto resume, the error stops writes until a manual Resume(). With
 // auto resume, it is a soft error cleared by automatic recovery.
 TEST_F(DBErrorHandlingFSTest, ManifestWriteFileScopeError) {

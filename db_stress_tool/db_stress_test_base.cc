@@ -2369,10 +2369,11 @@ Status StressTest::CommitTxn(Transaction& txn, ThreadState* thread) {
       std::string last_resume_status;
       if (!rollback_s.ok() && IsErrorInjectedAndRetryable(rollback_s) &&
           db_ != nullptr) {
-        // Retry budget: count only actual rollback attempts (after Resume
-        // succeeds), not time spent waiting for recovery to finish on another
-        // thread. With many concurrent threads hitting write errors, recovery
-        // can take much longer than individual threads' retry budgets.
+        // Retry budget: count rollback attempts (after Resume succeeds) and
+        // Resume calls failed by injected retryable errors, not time spent
+        // waiting for recovery to finish on another thread. With many
+        // concurrent threads hitting write errors, recovery can take much
+        // longer than individual threads' retry budgets.
         constexpr int kMaxRollbackRetries = 100;
         constexpr int kMaxResumeBusyWaits = 3000;
         constexpr int kRetryIntervalMicros = 10 * 1000;
@@ -2386,6 +2387,13 @@ Status StressTest::CommitTxn(Transaction& txn, ThreadState* thread) {
             if (rollback_s.ok() || !IsErrorInjectedAndRetryable(rollback_s)) {
               break;
             }
+          } else if (IsErrorInjectedAndRetryable(resume_s)) {
+            // Manual Resume() does not invoke OnErrorRecoveryBegin(), so
+            // --error_recovery_with_no_fault_injection does not shield its
+            // recovery flush, which can hit another injected write fault. The
+            // DB stays recoverable, so retry instead of giving up.
+            ++rollback_recovery_retries;
+            last_resume_status = resume_s.ToString();
           } else if (!resume_s.IsBusy()) {
             last_resume_status = resume_s.ToString();
             break;
