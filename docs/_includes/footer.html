@@ -18,7 +18,7 @@
         <a class="footerLink" href="https://opensource.fb.com/legal/privacy" target="_blank">Privacy Policy</a>
       </div>
       <div class="footerSection rightAlign">
-       Copyright © 2022 Meta Platforms, Inc.
+       Copyright © <span id="footer-copyright"></span> Meta Platforms, Inc.
       </div>
     </div>
   </div>
@@ -31,4 +31,5 @@
 
   ga('create', '{{ site.gacode }}', 'auto');
   ga('send', 'pageview');
+  document.getElementById('footer-copyright').innerText = new Date().getFullYear();
 </script>
