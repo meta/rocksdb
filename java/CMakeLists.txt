@@ -66,6 +66,7 @@ set(JNI_NATIVE_SOURCES
         rocksjni/rocks_callback_object.cc
         rocksjni/rocksdb_exception_test.cc
         rocksjni/rocksjni.cc
+        rocksjni/sim_cache.cc
         rocksjni/slice.cc
         rocksjni/snapshot.cc
         rocksjni/sst_file_manager.cc
@@ -240,6 +241,7 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/RocksMutableObject.java
   src/main/java/org/rocksdb/RocksObject.java
   src/main/java/org/rocksdb/SanityLevel.java
+  src/main/java/org/rocksdb/SimCache.java
   src/main/java/org/rocksdb/SizeApproximationFlag.java
   src/main/java/org/rocksdb/SkipListMemTableConfig.java
   src/main/java/org/rocksdb/Slice.java
@@ -746,6 +748,7 @@ if(${CMAKE_VERSION} VERSION_LESS "3.11.4")
           org.rocksdb.RocksMemEnv
           org.rocksdb.RocksMutableObject
           org.rocksdb.RocksObject
+          org.rocksdb.SimCache
           org.rocksdb.SkipListMemTableConfig
           org.rocksdb.Slice
           org.rocksdb.Snapshot
