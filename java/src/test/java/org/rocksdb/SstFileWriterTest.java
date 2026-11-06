@@ -30,7 +30,7 @@ public class SstFileWriterTest {
 
   @Rule public TemporaryFolder parentFolder = new TemporaryFolder();
 
-  enum OpType { PUT, PUT_BYTES, PUT_DIRECT, MERGE, MERGE_BYTES, DELETE, DELETE_BYTES }
+  enum OpType { PUT, PUT_BYTES, PUT_DIRECT, MERGE, MERGE_BYTES, DELETE, DELETE_BYTES, DELETE_DIRECT }
 
   static class KeyValueWithOp {
     KeyValueWithOp(final String key, final String value, final OpType opType) {
@@ -114,6 +114,9 @@ public class SstFileWriterTest {
           case DELETE_BYTES:
             sstFileWriter.delete(keyBytes);
             break;
+          case DELETE_DIRECT:
+            sstFileWriter.delete(keyDirect);
+            break;
           default:
             fail("Unsupported op type");
         }
@@ -146,6 +149,7 @@ public class SstFileWriterTest {
     keyValues.add(new KeyValueWithOp("key3", "value3", OpType.MERGE));
     keyValues.add(new KeyValueWithOp("key4", "value4", OpType.MERGE));
     keyValues.add(new KeyValueWithOp("key5", "", OpType.DELETE));
+    keyValues.add(new KeyValueWithOp("key6", "", OpType.DELETE_DIRECT));
 
     newSstFile(keyValues, true);
   }
@@ -159,6 +163,7 @@ public class SstFileWriterTest {
     keyValues.add(new KeyValueWithOp("key3", "value3", OpType.MERGE));
     keyValues.add(new KeyValueWithOp("key4", "value4", OpType.MERGE));
     keyValues.add(new KeyValueWithOp("key5", "", OpType.DELETE));
+    keyValues.add(new KeyValueWithOp("key6", "", OpType.DELETE_DIRECT));
 
     newSstFile(keyValues, false);
   }
@@ -173,6 +178,7 @@ public class SstFileWriterTest {
     keyValues.add(new KeyValueWithOp("key5", "value5", OpType.MERGE_BYTES));
     keyValues.add(new KeyValueWithOp("key6", "", OpType.DELETE));
     keyValues.add(new KeyValueWithOp("key7", "", OpType.DELETE));
+    keyValues.add(new KeyValueWithOp("key8", "", OpType.DELETE_DIRECT));
 
 
     final File sstFile = newSstFile(keyValues, false);
@@ -185,6 +191,8 @@ public class SstFileWriterTest {
         final RocksDB db = RocksDB.open(options, dbFolder.getAbsolutePath());
         final IngestExternalFileOptions ingestExternalFileOptions =
             new IngestExternalFileOptions()) {
+      db.put("key8".getBytes(), "value8".getBytes());
+      assertThat(db.get("key8".getBytes())).isEqualTo("value8".getBytes());
       db.ingestExternalFile(
           Collections.singletonList(sstFile.getAbsolutePath()), ingestExternalFileOptions);
 
@@ -195,6 +203,7 @@ public class SstFileWriterTest {
       assertThat(db.get("key5".getBytes())).isEqualTo("value5".getBytes());
       assertThat(db.get("key6".getBytes())).isEqualTo(null);
       assertThat(db.get("key7".getBytes())).isEqualTo(null);
+      assertThat(db.get("key8".getBytes())).isEqualTo(null);
     }
   }
 
@@ -205,6 +214,7 @@ public class SstFileWriterTest {
     keyValues.add(new KeyValueWithOp("key2", "value2", OpType.PUT));
     keyValues.add(new KeyValueWithOp("key3", "value3", OpType.MERGE));
     keyValues.add(new KeyValueWithOp("key4", "", OpType.DELETE));
+    keyValues.add(new KeyValueWithOp("key5", "", OpType.DELETE_DIRECT));
 
     final File sstFile = newSstFile(keyValues, false);
     final File dbFolder = parentFolder.newFolder(DB_DIRECTORY_NAME);
@@ -222,6 +232,8 @@ public class SstFileWriterTest {
               .setMergeOperator(stringAppendOperator);
           final ColumnFamilyHandle cf_handle = db.createColumnFamily(
               new ColumnFamilyDescriptor("new_cf".getBytes(), cf_opts))) {
+        db.put(cf_handle, "key5".getBytes(), "value5".getBytes());
+        assertThat(db.get(cf_handle, "key5".getBytes())).isEqualTo("value5".getBytes());
         db.ingestExternalFile(cf_handle, Collections.singletonList(sstFile.getAbsolutePath()),
             ingestExternalFileOptions);
 
@@ -233,6 +245,8 @@ public class SstFileWriterTest {
             "key3".getBytes())).isEqualTo("value3".getBytes());
         assertThat(db.get(cf_handle,
             "key4".getBytes())).isEqualTo(null);
+        assertThat(db.get(cf_handle,
+            "key5".getBytes())).isEqualTo(null);
       }
     }
   }
