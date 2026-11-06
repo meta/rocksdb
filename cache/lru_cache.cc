@@ -219,6 +219,19 @@ size_t LRUCacheShard::TEST_GetLRUSize() {
   return lru_size;
 }
 
+void LRUCacheShard::TEST_SimulateCorruptLowPriPoolUsage(size_t bogus_usage) {
+  DMutexLock l(mutex_);
+  low_pri_pool_usage_ = bogus_usage;
+  MaintainPoolSize();
+}
+
+void LRUCacheShard::TEST_GetPoolUsage(size_t* high_pri_pool_usage,
+                                      size_t* low_pri_pool_usage) {
+  DMutexLock l(mutex_);
+  *high_pri_pool_usage = high_pri_pool_usage_;
+  *low_pri_pool_usage = low_pri_pool_usage_;
+}
+
 double LRUCacheShard::GetHighPriPoolRatio() {
   DMutexLock l(mutex_);
   return high_pri_pool_ratio_;
@@ -296,10 +309,17 @@ void LRUCacheShard::LRU_Insert(LRUHandle* e) {
 }
 
 void LRUCacheShard::MaintainPoolSize() {
-  while (high_pri_pool_usage_ > high_pri_pool_capacity_) {
+  // Both loops are bounded by the LRU list, not just by the usage counters.
+  // The counters are size_t and the invariant tying them to the list is only
+  // checked by asserts, which are compiled out in release builds. Were a loop
+  // to trust its counter alone, a counter that disagreed with the list would
+  // send the walk around the circular list subtracting charges that were never
+  // counted, underflowing the counter and spinning forever while holding
+  // mutex_, which wedges every DB sharing this cache. See #15128.
+  while (high_pri_pool_usage_ > high_pri_pool_capacity_ &&
+         lru_low_pri_->next != &lru_) {
     // Overflow last entry in high-pri pool to low-pri pool.
     lru_low_pri_ = lru_low_pri_->next;
-    assert(lru_low_pri_ != &lru_);
     assert(lru_low_pri_->InHighPriPool());
     lru_low_pri_->SetInHighPriPool(false);
     lru_low_pri_->SetInLowPriPool(true);
@@ -308,16 +328,46 @@ void LRUCacheShard::MaintainPoolSize() {
     low_pri_pool_usage_ += lru_low_pri_->total_charge;
   }
 
-  while (low_pri_pool_usage_ > low_pri_pool_capacity_) {
+  // The second condition is the normal bound: the low-pri pool is the entries
+  // in (lru_bottom_pri_, lru_low_pri_]. The third only matters once the markers
+  // are already out of order, which is the state reported in #15128; without it
+  // the walk runs off the end of the list and reads the sentinel's charge.
+  while (low_pri_pool_usage_ > low_pri_pool_capacity_ &&
+         lru_bottom_pri_ != lru_low_pri_ && lru_bottom_pri_->next != &lru_) {
     // Overflow last entry in low-pri pool to bottom-pri pool.
     lru_bottom_pri_ = lru_bottom_pri_->next;
-    assert(lru_bottom_pri_ != &lru_);
     assert(lru_bottom_pri_->InLowPriPool());
     lru_bottom_pri_->SetInHighPriPool(false);
     lru_bottom_pri_->SetInLowPriPool(false);
     assert(low_pri_pool_usage_ >= lru_bottom_pri_->total_charge);
     low_pri_pool_usage_ -= lru_bottom_pri_->total_charge;
   }
+
+  // A loop only exits with its counter still over capacity by hitting one of
+  // the list bounds above, which means the counter no longer describes the
+  // list. Report it and dump core rather than spinning with mutex_ held or
+  // running on with a shard whose accounting cannot be trusted.
+  if (UNLIKELY(high_pri_pool_usage_ > high_pri_pool_capacity_)) {
+    CrashOnCorruptPoolUsage("high-pri");
+  }
+  if (UNLIKELY(low_pri_pool_usage_ > low_pri_pool_capacity_)) {
+    CrashOnCorruptPoolUsage("low-pri");
+  }
+}
+
+void LRUCacheShard::CrashOnCorruptPoolUsage(const char* pool_name) const {
+  // Printed rather than logged because the shard has no Logger, and these
+  // numbers are worth having even if the core dump is lost.
+  fprintf(stderr,
+          "rocksdb: corrupt %s pool accounting in LRUCacheShard %p; aborting. "
+          "capacity=%zu usage=%zu lru_usage=%zu high_pri_pool_usage=%zu "
+          "high_pri_pool_capacity=%g low_pri_pool_usage=%zu "
+          "low_pri_pool_capacity=%g\n",
+          pool_name, static_cast<const void*>(this), capacity_, usage_,
+          lru_usage_, high_pri_pool_usage_, high_pri_pool_capacity_,
+          low_pri_pool_usage_, low_pri_pool_capacity_);
+  fflush(stderr);
+  std::abort();
 }
 
 void LRUCacheShard::EvictFromLRU(size_t charge,
