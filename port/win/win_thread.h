@@ -20,10 +20,10 @@
 namespace ROCKSDB_NAMESPACE {
 namespace port {
 
-// This class is a replacement for std::thread
-// 2 reasons we do not like std::thread:
+// This class is a replacement for std::jthread
+// 2 reasons we do not like std::jthread:
 //  -- is that it dynamically allocates its internals that are automatically
-//     freed when  the thread terminates and not on the destruction of the
+//     freed when the thread terminates and not necessarily on the destruction of the
 //     object. This makes it difficult to control the source of memory
 //     allocation
 //  -  This implements Pimpl so we can easily replace the guts of the

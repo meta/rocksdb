@@ -195,7 +195,7 @@ class CondVar {
 };
 
 #ifdef _POSIX_THREADS
-using Thread = std::thread;
+using Thread = std::jthread;
 #else
 // Wrapper around the platform efficient
 // or otherwise preferrable implementation
