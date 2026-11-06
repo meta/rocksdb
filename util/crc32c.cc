@@ -18,6 +18,7 @@
 #include "port/lang.h"
 #include "util/coding.h"
 #include "util/crc32c_arm64.h"
+#include "util/crc32c_riscv.h"
 #include "util/math.h"
 
 #ifdef __powerpc64__
@@ -359,6 +360,12 @@ uint32_t ExtendARMImpl(uint32_t crc, const char* buf, size_t size) {
 }
 #endif
 
+#if defined(HAVE_RISCV_ZBC)
+uint32_t ExtendRiscVImpl(uint32_t crc, const char* buf, size_t size) {
+  return crc32c_riscv(crc, (const unsigned char*)buf, size);
+}
+#endif
+
 std::string IsFastCrc32Supported() {
   bool has_fast_crc = false;
   std::string fast_zero_msg;
@@ -381,6 +388,15 @@ std::string IsFastCrc32Supported() {
   } else {
     has_fast_crc = false;
     arch = "Arm64";
+  }
+#elif defined(HAVE_RISCV_ZBC)
+  // RISC-V platform detection
+  if (crc32c_riscv_zbc_runtime_check()) {
+    has_fast_crc = true;
+    arch = "RISC-V (Zbc)";
+  } else {
+    has_fast_crc = false;
+    arch = "RISC-V";
   }
 #else
 #ifdef __SSE4_2__
@@ -1112,6 +1128,13 @@ static inline Function Choose_Extend() {
   if(crc32c_runtime_check()) {
     pmull_runtime_flag = crc32c_pmull_runtime_check();
     return ExtendARMImpl;
+  } else {
+    return ExtendImpl<DefaultCRC32>;
+  }
+#elif defined(HAVE_RISCV_ZBC)
+  // RISC-V Zbc extension detection
+  if (crc32c_riscv_zbc_runtime_check()) {
+    return ExtendRiscVImpl;
   } else {
     return ExtendImpl<DefaultCRC32>;
   }
