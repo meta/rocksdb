@@ -2060,7 +2060,7 @@ class DB {
                                      uint64_t* sizes) = 0;
 
   // Simpler versions of the GetApproximateSizes() method above.
-  // The include_flags argument must of type DB::SizeApproximationFlags
+  // The include_flags argument must be of type DB::SizeApproximationFlags
   // and can not be NONE.
   virtual Status GetApproximateSizes(ColumnFamilyHandle* column_family,
                                      const Range* ranges, int n,
