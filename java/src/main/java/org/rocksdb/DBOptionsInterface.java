@@ -622,7 +622,7 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
   /**
    * Number of shards used for table cache.
    *
-   * @param tableCacheNumshardbits the number of chards
+   * @param tableCacheNumshardbits the number of shards
    * @return the instance of the current object.
    */
   T setTableCacheNumshardbits(int tableCacheNumshardbits);
