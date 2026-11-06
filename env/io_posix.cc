@@ -56,6 +56,26 @@
 #define F_SET_RW_HINT (F_LINUX_SPECIFIC_BASE + 12)
 #endif
 
+// Suppress known TSAN false positives in third-party liburing code.
+// liburing's io_uring_mmap() uses __sys_mmap (raw syscall) which bypasses
+// TSAN's mmap interceptor, then immediately reads from the mapped memory in
+// io_uring_setup_ring_pointers().  When the kernel reuses a virtual address
+// that was previously mmap'd through libc (and thus tracked by TSAN), TSAN
+// flags a data race between the old mapping's write and the new io_uring
+// read.  The TsanAnnotateIOUringMemory() call in CreateIOUring() resets
+// shadow state, but only AFTER io_uring_queue_init() returns — too late for
+// reads that happen inside io_uring_mmap() during init.
+//
+// The suppression is safe because io_uring_setup_ring_pointers() is pure
+// pointer arithmetic + reads from kernel-managed shared memory; there are
+// no real data races in that code path.
+#if defined(__SANITIZE_THREAD__) && defined(ROCKSDB_IOURING_PRESENT)
+extern "C" const char* __tsan_default_suppressions() {
+  return "race:io_uring_mmap\n"
+         "race:io_uring_setup_ring_pointers\n";
+}
+#endif  // __SANITIZE_THREAD__ && ROCKSDB_IOURING_PRESENT
+
 namespace ROCKSDB_NAMESPACE {
 
 std::string IOErrorMsg(const std::string& context,
