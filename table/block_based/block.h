@@ -1107,6 +1107,16 @@ class IndexBlockIter final : public BlockIter<IndexValue> {
     return value_;
   }
 
+  // Seeks without the prefix (hash) index. Binary search is valid for any
+  // index block, as used by total order iterators.
+  bool TotalOrderSeek(const Slice& target) override {
+    BlockPrefixIndex* const prefix_index = prefix_index_;
+    prefix_index_ = nullptr;
+    Seek(target);
+    prefix_index_ = prefix_index;
+    return true;
+  }
+
   bool IsValuePinned() const override {
     return global_seqno_state_ != nullptr ? false : BlockIter::IsValuePinned();
   }

@@ -71,6 +71,13 @@ class InternalIteratorBase : public Cleanable {
   // an entry that comes at or before target.
   virtual void SeekForPrev(const Slice& target) = 0;
 
+  // Same as Seek() and SeekForPrev(), but the result must match a total order
+  // seek even when this iterator was created for prefix seek: prefix filters
+  // and prefix-based indexes must not hide keys outside the target's prefix.
+  // Returns false, without changing the position, if this is not supported.
+  virtual bool TotalOrderSeek(const Slice& /*target*/) { return false; }
+  virtual bool TotalOrderSeekForPrev(const Slice& /*target*/) { return false; }
+
   // Moves to the next entry in the source.  After this call, Valid() is
   // true iff the iterator was not positioned at the last entry in the source.
   // REQUIRES: Valid()

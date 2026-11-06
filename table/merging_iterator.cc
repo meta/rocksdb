@@ -59,6 +59,7 @@ class MergingIterator : public InternalIterator {
                   const Slice* iterate_upper_bound = nullptr)
       : is_arena_mode_(is_arena_mode),
         prefix_seek_mode_(prefix_seek_mode),
+        unbounded_prefix_scan_(false),
         direction_(kForward),
         comparator_(comparator),
         current_(nullptr),
@@ -263,6 +264,7 @@ class MergingIterator : public InternalIterator {
   void SeekToFirst() override {
     ClearHeaps();
     status_ = Status::OK();
+    unbounded_prefix_scan_ = prefix_seek_mode_;
     for (auto& child : children_) {
       child.iter.SeekToFirst();
       AddToMinHeapOrCheckStatus(&child);
@@ -286,6 +288,7 @@ class MergingIterator : public InternalIterator {
     ClearHeaps();
     InitMaxHeap();
     status_ = Status::OK();
+    unbounded_prefix_scan_ = prefix_seek_mode_;
     for (auto& child : children_) {
       child.iter.SeekToLast();
       AddToMaxHeapOrCheckStatus(&child);
@@ -328,6 +331,7 @@ class MergingIterator : public InternalIterator {
     // first key >= target among children_ that is not covered by any range
     // tombstone.
     status_ = Status::OK();
+    unbounded_prefix_scan_ = false;
     SeekImpl(target);
     FindNextVisibleKey();
 
@@ -342,6 +346,7 @@ class MergingIterator : public InternalIterator {
     assert(range_tombstone_iters_.empty() ||
            range_tombstone_iters_.size() == children_.size());
     status_ = Status::OK();
+    unbounded_prefix_scan_ = false;
     SeekForPrevImpl(target);
     FindPrevVisibleKey();
 
@@ -607,8 +612,27 @@ class MergingIterator : public InternalIterator {
   void SeekForPrevImpl(const Slice& target, size_t starting_level = 0,
                        bool range_tombstone_reseek = false);
 
+  // Positions `child` like child->iter.Seek(target) (or SeekForPrev()) in a
+  // total order. Used only for cascading seeks while unbounded_prefix_scan_.
+  // If the child does not support InternalIterator::TotalOrderSeek(), it is
+  // stepped instead. This is correct because during such a scan children only
+  // move forward (or backward), so any key skipped is covered by the range
+  // tombstone that triggered the reseek.
+  void ChildTotalOrderSeek(HeapItem* child, const Slice& target);
+  void ChildTotalOrderSeekForPrev(HeapItem* child, const Slice& target);
+
   bool is_arena_mode_;
   bool prefix_seek_mode_;
+  // True iff prefix_seek_mode_ and the last positioning call was SeekToFirst()
+  // or SeekToLast(). In prefix seek mode, a child Seek() or SeekForPrev() is
+  // only accurate within the target's prefix: the child can stop at the end of
+  // that prefix or become invalid (e.g., when its prefix filter excludes the
+  // prefix) and lose all of its remaining keys. After Seek() or SeekForPrev(),
+  // the upper layer stops at the end of the target's prefix, so this is safe.
+  // A scan started by SeekToFirst() or SeekToLast() has no such bound, so
+  // reseeks to a range tombstone boundary ("cascading seek") use
+  // ChildTotalOrderSeek() and ChildTotalOrderSeekForPrev() instead.
+  bool unbounded_prefix_scan_;
   // Which direction is the iterator moving?
   enum Direction : uint8_t { kForward, kReverse };
   Direction direction_;
@@ -840,7 +864,12 @@ void MergingIterator::SeekImpl(const Slice& target, size_t starting_level,
   for (auto level = starting_level; level < children_.size(); ++level) {
     {
       PERF_TIMER_GUARD(seek_child_seek_time);
-      children_[level].iter.Seek(current_search_key.GetInternalKey());
+      if (unbounded_prefix_scan_) {
+        ChildTotalOrderSeek(&children_[level],
+                            current_search_key.GetInternalKey());
+      } else {
+        children_[level].iter.Seek(current_search_key.GetInternalKey());
+      }
     }
 
     PERF_COUNTER_ADD(seek_child_seek_count, 1);
@@ -922,7 +951,11 @@ void MergingIterator::SeekImpl(const Slice& target, size_t starting_level,
   } else {
     for (auto& prefetch : prefetched_target) {
       // (level, target) pairs
-      children_[prefetch.first].iter.Seek(prefetch.second);
+      if (unbounded_prefix_scan_) {
+        ChildTotalOrderSeek(&children_[prefetch.first], prefetch.second);
+      } else {
+        children_[prefetch.first].iter.Seek(prefetch.second);
+      }
       {
         PERF_TIMER_GUARD(seek_min_heap_time);
         AddToMinHeapOrCheckStatus(&children_[prefetch.first]);
@@ -1125,7 +1158,12 @@ void MergingIterator::SeekForPrevImpl(const Slice& target,
   for (auto level = starting_level; level < children_.size(); ++level) {
     {
       PERF_TIMER_GUARD(seek_child_seek_time);
-      children_[level].iter.SeekForPrev(current_search_key.GetInternalKey());
+      if (unbounded_prefix_scan_) {
+        ChildTotalOrderSeekForPrev(&children_[level],
+                                   current_search_key.GetInternalKey());
+      } else {
+        children_[level].iter.SeekForPrev(current_search_key.GetInternalKey());
+      }
     }
 
     PERF_COUNTER_ADD(seek_child_seek_count, 1);
@@ -1191,7 +1229,11 @@ void MergingIterator::SeekForPrevImpl(const Slice& target,
   } else {
     for (auto& prefetch : prefetched_target) {
       // (level, target) pairs
-      children_[prefetch.first].iter.SeekForPrev(prefetch.second);
+      if (unbounded_prefix_scan_) {
+        ChildTotalOrderSeekForPrev(&children_[prefetch.first], prefetch.second);
+      } else {
+        children_[prefetch.first].iter.SeekForPrev(prefetch.second);
+      }
       {
         PERF_TIMER_GUARD(seek_max_heap_time);
         AddToMaxHeapOrCheckStatus(&children_[prefetch.first]);
@@ -1324,6 +1366,28 @@ void MergingIterator::AddToMaxHeapOrCheckStatus(HeapItem* child) {
 // current_, to the first tombstone with end_key > current_.key().
 // TODO: potentially do cascading seek here too
 // TODO: show that invariants hold
+void MergingIterator::ChildTotalOrderSeek(HeapItem* child,
+                                          const Slice& target) {
+  if (child->iter.TotalOrderSeek(target)) {
+    return;
+  }
+  while (child->iter.Valid() &&
+         comparator_->Compare(child->iter.key(), target) < 0) {
+    child->iter.Next();
+  }
+}
+
+void MergingIterator::ChildTotalOrderSeekForPrev(HeapItem* child,
+                                                 const Slice& target) {
+  if (child->iter.TotalOrderSeekForPrev(target)) {
+    return;
+  }
+  while (child->iter.Valid() &&
+         comparator_->Compare(child->iter.key(), target) > 0) {
+    child->iter.Prev();
+  }
+}
+
 void MergingIterator::SwitchToForward() {
   ClearHeaps();
   Slice target = key();

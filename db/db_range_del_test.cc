@@ -3163,6 +3163,235 @@ TEST_F(DBRangeDelTest, PrefixSentinelKey) {
   delete iter;
 }
 
+namespace {
+Options PrefixFilterOptions(const Options& base,
+                            BlockBasedTableOptions::IndexType index_type =
+                                BlockBasedTableOptions::kBinarySearch) {
+  Options options = base;
+  options.disable_auto_compactions = true;
+  options.prefix_extractor.reset(NewFixedPrefixTransform(4));
+  BlockBasedTableOptions table_options;
+  table_options.index_type = index_type;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+  table_options.whole_key_filtering = false;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  return options;
+}
+
+// Scans the whole DB from SeekToFirst() (or SeekToLast() if !forward).
+std::vector<std::string> ScanAllKeys(DB* db, const ReadOptions& ro,
+                                     bool forward) {
+  std::vector<std::string> keys;
+  std::unique_ptr<Iterator> iter(db->NewIterator(ro));
+  if (forward) {
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      keys.push_back(iter->key().ToString());
+    }
+  } else {
+    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+      keys.push_back(iter->key().ToString());
+    }
+  }
+  EXPECT_OK(iter->status());
+  return keys;
+}
+
+// Checks that prefix-mode SeekToFirst()/SeekToLast() scans return the same
+// keys as total order scans, and that prefix_same_as_start returns the same
+// first key.
+void VerifyPrefixModeFullScans(DB* db, const std::vector<std::string>& keys) {
+  ReadOptions total_order;
+  total_order.total_order_seek = true;
+  ReadOptions legacy_prefix;
+  ReadOptions same_prefix;
+  same_prefix.prefix_same_as_start = true;
+  for (bool forward : {true, false}) {
+    SCOPED_TRACE(forward ? "forward" : "reverse");
+    std::vector<std::string> expected = keys;
+    if (!forward) {
+      std::reverse(expected.begin(), expected.end());
+    }
+    ASSERT_EQ(expected, ScanAllKeys(db, total_order, forward));
+    ASSERT_EQ(expected, ScanAllKeys(db, legacy_prefix, forward));
+    std::unique_ptr<Iterator> iter(db->NewIterator(same_prefix));
+    if (forward) {
+      iter->SeekToFirst();
+    } else {
+      iter->SeekToLast();
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(expected.front(), iter->key().ToString());
+  }
+}
+}  // namespace
+
+TEST_F(DBRangeDelTest, PrefixModeFullScanCrossPrefixTombstone) {
+  // A newer range tombstone covers a key in an older file, and the tombstone's
+  // end key (forward) or start key (reverse) has a prefix that the older file
+  // does not have. Prefix-mode SeekToFirst()/SeekToLast() scans used to reseek
+  // the older file to that boundary key. The prefix filter then made the file
+  // iterator invalid, and the scan lost all later keys of the file.
+  for (auto index_type : {BlockBasedTableOptions::kBinarySearch,
+                          BlockBasedTableOptions::kHashSearch}) {
+    for (int older_level : {0, 1}) {
+      SCOPED_TRACE("index_type=" + std::to_string(index_type) +
+                   " older_level=" + std::to_string(older_level));
+      DestroyAndReopen(PrefixFilterOptions(CurrentOptions(), index_type));
+      // Older file has prefixes aaaa, kkkk and xxxx only.
+      ASSERT_OK(Put("aaaa1", "v"));
+      ASSERT_OK(Put("kkkk1", "v"));
+      ASSERT_OK(Put("kkkk5", "v"));
+      ASSERT_OK(Put("xxxx1", "v"));
+      ASSERT_OK(Flush());
+      if (older_level > 0) {
+        MoveFilesToLevel(older_level);
+        ASSERT_EQ(1, NumTableFilesAtLevel(older_level));
+      }
+      // Forward: covers aaaa1 and ends in absent prefix cccc.
+      ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                                 "aaaa", "cccc2"));
+      // Reverse: covers xxxx1 and starts in absent prefix pppp.
+      ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                                 "pppp", "zzzz"));
+      VerifyPrefixModeFullScans(db_.get(), {"kkkk1", "kkkk5"});
+      // Same result when the tombstones are in an L0 file instead of the
+      // memtable.
+      ASSERT_OK(Flush());
+      VerifyPrefixModeFullScans(db_.get(), {"kkkk1", "kkkk5"});
+    }
+  }
+}
+
+TEST_F(DBRangeDelTest, PrefixModeFullScanHashIndexKeepsIndexedSeek) {
+  // Many small tombstones, all in one prefix, each cover a key of an older L1
+  // file with a hash index. Each covered key triggers a reseek of that file.
+  // The reseek must use the index, not walk the file from its first key.
+  constexpr int kNumRanges = 128;
+  DestroyAndReopen(PrefixFilterOptions(CurrentOptions(),
+                                       BlockBasedTableOptions::kHashSearch));
+  auto key = [](int i) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "kkkk%07d", i);
+    return std::string(buf);
+  };
+  std::vector<std::string> live_keys;
+  for (int i = 0; i < 2 * kNumRanges; ++i) {
+    ASSERT_OK(Put(key(i), "v"));
+    if (i % 2 == 1) {
+      live_keys.push_back(key(i));
+    }
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  for (int i = 0; i < kNumRanges; ++i) {
+    ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                               key(2 * i), key(2 * i + 1)));
+  }
+  std::atomic<int> num_data_block_next{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DataBlockIter::NextImpl",
+      [&](void* /*corrupt*/) { num_data_block_next.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ReadOptions legacy_prefix;
+  ASSERT_EQ(live_keys, ScanAllKeys(db_.get(), legacy_prefix, /*forward=*/true));
+  // An indexed reseek steps through at most one restart interval (16 keys), so
+  // the scan takes about 18 * kNumRanges steps. A walk from the first key of
+  // the file on every reseek would take about kNumRanges^2 steps.
+  ASSERT_LT(num_data_block_next.load(), kNumRanges * kNumRanges / 4);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  VerifyPrefixModeFullScans(db_.get(), live_keys);
+}
+
+TEST_F(DBRangeDelTest, PrefixModeFullScanReadPathConvertedTombstone) {
+  // Read-path tombstone conversion creates a range tombstone that crosses
+  // prefixes. Same failure as PrefixModeFullScanCrossPrefixTombstone.
+  Options options = PrefixFilterOptions(CurrentOptions());
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("aaaa", "v"));
+  ASSERT_OK(Put("kkkk1", "v"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Delete("aaaa"));
+  ASSERT_OK(Delete("bbbb"));
+  ASSERT_OK(Put("cccc", "v"));
+  ReadOptions total_order;
+  total_order.total_order_seek = true;
+  ASSERT_EQ(std::vector<std::string>({"cccc", "kkkk1"}),
+            ScanAllKeys(db_.get(), total_order, /*forward=*/true));
+  // Inserted [aaaa, cccc).
+  ASSERT_EQ(1, options.statistics->getTickerCount(
+                   READ_PATH_RANGE_TOMBSTONES_INSERTED));
+  ASSERT_OK(Delete("cccc"));
+  VerifyPrefixModeFullScans(db_.get(), {"kkkk1"});
+}
+
+TEST_F(DBRangeDelTest, PrefixModeFullScanImmutableMemtable) {
+  // The older child is an immutable memtable with a prefix bloom filter. It
+  // does not support a total order seek, so it is stepped instead.
+  Options options = PrefixFilterOptions(CurrentOptions());
+  options.memtable_prefix_bloom_size_ratio = 0.1;
+  options.max_write_buffer_number = 4;
+  DestroyAndReopen(options);
+  // Keep the immutable memtable from being flushed.
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"PrefixModeFullScanImmutableMemtable:Done", "DBImpl::BGWorkFlush"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(Put("aaaa1", "v"));
+  ASSERT_OK(Put("kkkk1", "v"));
+  ASSERT_OK(Put("xxxx1", "v"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "aaaa",
+                             "cccc2"));
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "pppp",
+                             "zzzz"));
+  VerifyPrefixModeFullScans(db_.get(), {"kkkk1"});
+  TEST_SYNC_POINT("PrefixModeFullScanImmutableMemtable:Done");
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBRangeDelTest, PrefixModeKeepsCascadingSeek) {
+  // Prefix-mode Seek(), SeekToFirst() and SeekToLast() still reseek older
+  // levels to the range tombstone boundary instead of stepping over covered
+  // keys.
+  struct Case {
+    const char* begin;
+    const char* end;
+    std::function<void(Iterator*)> position;
+    const char* expected;
+  };
+  const std::vector<Case> cases = {
+      {"kkkk0", "kkkk8", [](Iterator* it) { it->Seek("kkkk"); }, "kkkk8"},
+      {"kkkk0", "kkkk8", [](Iterator* it) { it->SeekToFirst(); }, "kkkk8"},
+      {"kkkk2", "kkkkz", [](Iterator* it) { it->SeekToLast(); }, "kkkk1"},
+  };
+  ReadOptions ro;
+  ro.prefix_same_as_start = true;
+  SetPerfLevel(PerfLevel::kEnableCount);
+  for (size_t i = 0; i < cases.size(); ++i) {
+    SCOPED_TRACE("case=" + std::to_string(i));
+    const Case& c = cases[i];
+    DestroyAndReopen(PrefixFilterOptions(CurrentOptions()));
+    for (int k = 0; k < 10; ++k) {
+      ASSERT_OK(Put("kkkk" + std::to_string(k), "v"));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                               c.begin, c.end));
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    get_perf_context()->Reset();
+    c.position(iter.get());
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(c.expected, iter->key().ToString());
+    ASSERT_GT(get_perf_context()->internal_range_del_reseek_count, 0);
+  }
+  SetPerfLevel(PerfLevel::kDisable);
+}
+
 TEST_F(DBRangeDelTest, RefreshMemtableIter) {
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;

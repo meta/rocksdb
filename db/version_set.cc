@@ -1236,6 +1236,10 @@ class LevelIterator final : public InternalIterator {
   // These sentinel keys will be skipped in merging iterator.
   void Seek(const Slice& target) override;
   void SeekForPrev(const Slice& target) override;
+  // Always supported. A file iterator that does not support it falls back to
+  // positioning from the start (or end) of the file.
+  bool TotalOrderSeek(const Slice& target) override;
+  bool TotalOrderSeekForPrev(const Slice& target) override;
   void SeekToFirst() override;
   void SeekToLast() override;
   void Next() final;
@@ -1396,6 +1400,11 @@ class LevelIterator final : public InternalIterator {
   }
 
  private:
+  // total_order: see InternalIterator::TotalOrderSeek().
+  void SeekImpl(const Slice& target, bool total_order);
+  void SeekForPrevImpl(const Slice& target, bool total_order);
+  void FileTotalOrderSeek(const Slice& target);
+  void FileTotalOrderSeekForPrev(const Slice& target);
   // Return true if at least one invalid file is seen and skipped.
   bool SkipEmptyFileForward();
   void SkipEmptyFileBackward();
@@ -1573,6 +1582,26 @@ void LevelIterator::TrySetDeleteRangeSentinel(const Slice& boundary_key) {
 }
 
 void LevelIterator::Seek(const Slice& target) {
+  SeekImpl(target, /*total_order=*/false);
+}
+
+bool LevelIterator::TotalOrderSeek(const Slice& target) {
+  SeekImpl(target, /*total_order=*/true);
+  return true;
+}
+
+void LevelIterator::FileTotalOrderSeek(const Slice& target) {
+  if (file_iter_.TotalOrderSeek(target)) {
+    return;
+  }
+  file_iter_.SeekToFirst();
+  while (file_iter_.Valid() &&
+         icomparator_.Compare(file_iter_.key(), target) < 0) {
+    file_iter_.Next();
+  }
+}
+
+void LevelIterator::SeekImpl(const Slice& target, bool total_order) {
   prefix_exhausted_ = false;
   ClearSentinel();
   // Check whether the seek key fall under the same file
@@ -1603,7 +1632,11 @@ void LevelIterator::Seek(const Slice& target) {
         return;
       }
     }
-    file_iter_.Seek(target);
+    if (total_order) {
+      FileTotalOrderSeek(target);
+    } else {
+      file_iter_.Seek(target);
+    }
     // Status::TryAgain indicates asynchronous request for retrieval of data
     // blocks has been submitted. So it should return at this point and Seek
     // should be called again to retrieve the requested block and execute the
@@ -1611,7 +1644,7 @@ void LevelIterator::Seek(const Slice& target) {
     if (file_iter_.status() == Status::TryAgain()) {
       return;
     }
-    if (!file_iter_.Valid() && file_iter_.status().ok() &&
+    if (!total_order && !file_iter_.Valid() && file_iter_.status().ok() &&
         prefix_extractor_ != nullptr && !read_options_.total_order_seek &&
         !read_options_.auto_prefix_mode &&
         file_index_ < flevel_->num_files - 1) {
@@ -1675,6 +1708,26 @@ void LevelIterator::Seek(const Slice& target) {
 }
 
 void LevelIterator::SeekForPrev(const Slice& target) {
+  SeekForPrevImpl(target, /*total_order=*/false);
+}
+
+bool LevelIterator::TotalOrderSeekForPrev(const Slice& target) {
+  SeekForPrevImpl(target, /*total_order=*/true);
+  return true;
+}
+
+void LevelIterator::FileTotalOrderSeekForPrev(const Slice& target) {
+  if (file_iter_.TotalOrderSeekForPrev(target)) {
+    return;
+  }
+  file_iter_.SeekToLast();
+  while (file_iter_.Valid() &&
+         icomparator_.Compare(file_iter_.key(), target) > 0) {
+    file_iter_.Prev();
+  }
+}
+
+void LevelIterator::SeekForPrevImpl(const Slice& target, bool total_order) {
   prefix_exhausted_ = false;
   ClearSentinel();
   size_t new_file_index = FindFile(icomparator_, *flevel_, target);
@@ -1692,7 +1745,11 @@ void LevelIterator::SeekForPrev(const Slice& target) {
 
   InitFileIterator(new_file_index);
   if (file_iter_.iter() != nullptr) {
-    file_iter_.SeekForPrev(target);
+    if (total_order) {
+      FileTotalOrderSeekForPrev(target);
+    } else {
+      file_iter_.SeekForPrev(target);
+    }
     if (range_tombstone_iter_ &&
         icomparator_.Compare(target, file_smallest_key(file_index_)) >= 0) {
       // In SeekForPrev() case, it is possible that the target is less than

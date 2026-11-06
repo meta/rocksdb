@@ -60,6 +60,8 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
 
   void Seek(const Slice& target) override;
   void SeekForPrev(const Slice& target) override;
+  bool TotalOrderSeek(const Slice& target) override;
+  bool TotalOrderSeekForPrev(const Slice& target) override;
   void SeekToFirst() override;
   void SeekToLast() override;
   void Next() final;
@@ -382,6 +384,9 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   // that block yet. A call to PrepareValue() will trigger loading the block.
   bool is_at_first_key_from_index_ = false;
   bool check_filter_;
+  // True only inside TotalOrderSeek*(): skip the prefix filter and prefix-based
+  // readahead trimming.
+  bool total_order_seek_ = false;
   // TODO(Zhongyi): pick a better name
   bool need_upper_bound_check_;
 
@@ -465,6 +470,9 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   // we need to check and update data_block_within_upper_bound_ accordingly.
   void CheckDataBlockWithinUpperBound();
 
+  bool SupportsTotalOrderSeek() const;
+  void SeekIndex(const Slice& target);
+
   bool CheckPrefixMayMatch(const Slice& ikey, IterDirection direction,
                            bool* filter_checked) {
     if (need_upper_bound_check_ && direction == IterDirection::kBackward) {
@@ -473,7 +481,7 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
       // check.
       return true;
     }
-    if (check_filter_ &&
+    if (check_filter_ && !total_order_seek_ &&
         !table_->PrefixRangeMayMatch(ikey, read_options_, prefix_extractor_,
                                      need_upper_bound_check_, &lookup_context_,
                                      filter_checked)) {
