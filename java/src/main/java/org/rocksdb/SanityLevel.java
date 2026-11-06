@@ -37,7 +37,7 @@ public enum SanityLevel {
    *     SanityLevel
    */
   static SanityLevel fromValue(final byte value) throws IllegalArgumentException {
-    for (final SanityLevel level : SanityLevel.values()) {
+    for (final SanityLevel level : values()) {
       if (level.value == value) {
         return level;
       }

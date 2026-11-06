@@ -28,6 +28,7 @@ public abstract class AbstractTransactionNotifier
    * This is intentionally private as it is the callback hook
    * from JNI
    */
+  @SuppressWarnings("PMD.UnusedPrivateMethod")
   private void snapshotCreated(final long snapshotHandle) {
     snapshotCreated(new Snapshot(snapshotHandle));
   }

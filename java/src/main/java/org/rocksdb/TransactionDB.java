@@ -86,7 +86,7 @@ public class TransactionDB extends RocksDB
           .get(i);
       cfNames[i] = cfDescriptor.getName();
       cfOptionHandles[i] = cfDescriptor.getOptions().nativeHandle_;
-      if (Arrays.equals(cfDescriptor.getName(), RocksDB.DEFAULT_COLUMN_FAMILY)) {
+      if (Arrays.equals(cfDescriptor.getName(), DEFAULT_COLUMN_FAMILY)) {
         defaultColumnFamilyIndex = i;
       }
     }

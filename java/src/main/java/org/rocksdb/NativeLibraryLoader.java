@@ -63,7 +63,7 @@ public class NativeLibraryLoader {
    *
    * @throws java.io.IOException if a filesystem operation fails.
    */
-  @SuppressWarnings({"PMD.EmptyCatchBlock", "PMD.SystemPrintln"})
+  @SuppressWarnings("PMD.SystemPrintln")
   public synchronized void loadLibrary(final String tmpDir) throws IOException {
     try {
       // try dynamic library
@@ -155,7 +155,7 @@ public class NativeLibraryLoader {
     }
   }
 
-  @SuppressWarnings({"PMD.UseProperClassLoader", "PMD.UseTryWithResources", "PMD.SystemPrintln"})
+  @SuppressWarnings({"PMD.UseProperClassLoader", "PMD.SystemPrintln"})
   File loadLibraryFromJarToTemp(final String tmpDir) throws IOException {
     try (InputStream is = getClass().getClassLoader().getResourceAsStream(jniLibraryFileName)) {
       if (is != null) {

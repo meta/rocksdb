@@ -53,8 +53,7 @@ public enum ReusedSynchronisationType {
    */
   public static ReusedSynchronisationType getReusedSynchronisationType(
       final byte value) {
-    for (final ReusedSynchronisationType reusedSynchronisationType
-        : ReusedSynchronisationType.values()) {
+    for (final ReusedSynchronisationType reusedSynchronisationType : values()) {
       if (reusedSynchronisationType.getValue() == value) {
         return reusedSynchronisationType;
       }

@@ -43,7 +43,7 @@ public enum WalProcessingOption {
   }
 
   public static WalProcessingOption fromValue(final byte value) {
-    for (final WalProcessingOption walProcessingOption : WalProcessingOption.values()) {
+    for (final WalProcessingOption walProcessingOption : values()) {
       if (walProcessingOption.value == value) {
         return walProcessingOption;
       }

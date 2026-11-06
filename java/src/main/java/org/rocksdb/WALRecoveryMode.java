@@ -70,7 +70,7 @@ public enum WALRecoveryMode {
    *   provided byteIdentifier
    */
   public static WALRecoveryMode getWALRecoveryMode(final byte byteIdentifier) {
-    for (final WALRecoveryMode walRecoveryMode : WALRecoveryMode.values()) {
+    for (final WALRecoveryMode walRecoveryMode : values()) {
       if (walRecoveryMode.getValue() == byteIdentifier) {
         return walRecoveryMode;
       }

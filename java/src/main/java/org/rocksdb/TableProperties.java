@@ -115,7 +115,6 @@ public class TableProperties {
    *
    * @return the total number of index partitions.
    */
-  @SuppressWarnings("PMD.MethodReturnsInternalArray")
   public long getIndexPartitions() {
     return indexPartitions;
   }

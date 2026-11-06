@@ -42,7 +42,7 @@ public enum StateType {
    */
   static StateType fromValue(final byte value)
       throws IllegalArgumentException {
-    for (final StateType threadType : StateType.values()) {
+    for (final StateType threadType : values()) {
       if (threadType.value == value) {
         return threadType;
       }

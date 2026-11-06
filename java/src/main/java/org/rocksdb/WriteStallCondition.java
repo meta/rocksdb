@@ -33,7 +33,7 @@ public enum WriteStallCondition {
    * @throws IllegalArgumentException if the value is unknown.
    */
   static WriteStallCondition fromValue(final byte value) {
-    for (final WriteStallCondition writeStallCondition : WriteStallCondition.values()) {
+    for (final WriteStallCondition writeStallCondition : values()) {
       if (writeStallCondition.value == value) {
         return writeStallCondition;
       }

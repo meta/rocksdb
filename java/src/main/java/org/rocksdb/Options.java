@@ -25,7 +25,7 @@ public class Options extends RocksObject
    * @return The Options-style representation of those properties.
    */
   public static String getOptionStringFromProps(final Properties properties) {
-    if (properties == null || properties.size() == 0) {
+    if (properties == null || properties.isEmpty()) {
       throw new IllegalArgumentException("Properties value must contain at least one value.");
     }
     final StringBuilder stringBuilder = new StringBuilder();
@@ -2156,7 +2156,7 @@ public class Options extends RocksObject
     long[] factoryHandlers = tablePropertiesCollectorFactory(nativeHandle_);
 
     return Arrays.stream(factoryHandlers)
-        .mapToObj(factoryHandle -> TablePropertiesCollectorFactory.newWrapper(factoryHandle))
+        .mapToObj(TablePropertiesCollectorFactory::newWrapper)
         .collect(Collectors.toList());
   }
 

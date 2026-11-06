@@ -69,8 +69,7 @@ public enum CompactionPriority {
    *     value is provided.
    */
   public static CompactionPriority getCompactionPriority(final byte value) {
-    for (final CompactionPriority compactionPriority :
-        CompactionPriority.values()) {
+    for (final CompactionPriority compactionPriority : values()) {
       if (compactionPriority.getValue() == value){
         return compactionPriority;
       }

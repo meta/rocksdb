@@ -2824,7 +2824,7 @@ public class Transaction extends RocksObject {
      *     value is provided.
      */
     public static TransactionState getTransactionState(final byte value) {
-      for (final TransactionState transactionState : TransactionState.values()) {
+      for (final TransactionState transactionState : values()) {
         if (transactionState.value == value){
           return transactionState;
         }

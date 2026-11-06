@@ -46,7 +46,7 @@ public enum FlushReason {
    * @throws IllegalArgumentException if the value is unknown.
    */
   static FlushReason fromValue(final byte value) {
-    for (final FlushReason flushReason : FlushReason.values()) {
+    for (final FlushReason flushReason : values()) {
       if (flushReason.value == value) {
         return flushReason;
       }

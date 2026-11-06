@@ -83,7 +83,7 @@ public class Status implements Serializable {
     }
 
     public static Code getCode(final byte value) {
-      for (final Code code : Code.values()) {
+      for (final Code code : values()) {
         if (code.value == value){
           return code;
         }
@@ -121,7 +121,7 @@ public class Status implements Serializable {
     }
 
     public static SubCode getSubCode(final byte value) {
-      for (final SubCode subCode : SubCode.values()) {
+      for (final SubCode subCode : values()) {
         if (subCode.value == value){
           return subCode;
         }

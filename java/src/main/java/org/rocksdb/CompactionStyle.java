@@ -68,7 +68,7 @@ public enum CompactionStyle {
    */
   static CompactionStyle fromValue(final byte value)
       throws IllegalArgumentException {
-    for (final CompactionStyle compactionStyle : CompactionStyle.values()) {
+    for (final CompactionStyle compactionStyle : values()) {
       if (compactionStyle.value == value) {
         return compactionStyle;
       }

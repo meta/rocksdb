@@ -42,7 +42,6 @@ public class ByteBufferGetStatus {
    *
    * @param status the status of the request to fetch into the buffer
    */
-  @SuppressWarnings("PMD.NullAssignment")
   ByteBufferGetStatus(final Status status) {
     this.status = status;
     this.requiredSize = 0;
