@@ -2327,6 +2327,12 @@ char** rocksdb_list_column_families(const rocksdb_options_t* options,
   *lencfs = fams.size();
   char** column_families =
       static_cast<char**>(malloc(sizeof(char*) * fams.size()));
+  if (!column_families) {
+    *lencfs = 0;
+    SaveError(errptr,
+              Status::MemoryLimit("Failed to allocate column family list"));
+    return nullptr;
+  }
   for (size_t i = 0; i < fams.size(); i++) {
     column_families[i] = strdup(fams[i].c_str());
   }
@@ -2372,6 +2378,16 @@ rocksdb_column_family_handle_t** rocksdb_create_column_families(
   rocksdb_column_family_handle_t** c_handles =
       static_cast<rocksdb_column_family_handle_t**>(
           malloc(sizeof(rocksdb_column_family_handle_t*) * handles.size()));
+  if (!c_handles) {
+    // Avoid leaking the column family handles that were just created.
+    for (size_t i = 0; i != handles.size(); ++i) {
+      delete handles[i];
+    }
+    *lencfs = 0;
+    SaveError(errptr,
+              Status::MemoryLimit("Failed to allocate column family handles"));
+    return nullptr;
+  }
   for (size_t i = 0; i != handles.size(); ++i) {
     c_handles[i] = new rocksdb_column_family_handle_t;
     c_handles[i]->rep = handles[i];
@@ -4644,6 +4660,17 @@ void rocksdb_load_latest_options(
     char** cf_names = (char**)malloc(cf_descs.size() * sizeof(char*));
     rocksdb_options_t** cf_options = (rocksdb_options_t**)malloc(
         cf_descs.size() * sizeof(rocksdb_options_t*));
+    if (!cf_names || !cf_options) {
+      free(cf_names);
+      free(cf_options);
+      *num_column_families = 0;
+      *db_options = nullptr;
+      *list_column_family_names = nullptr;
+      *list_column_family_options = nullptr;
+      SaveError(errptr, Status::MemoryLimit(
+                            "Failed to allocate column family options"));
+      return;
+    }
     for (size_t i = 0; i < cf_descs.size(); ++i) {
       cf_names[i] = strdup(cf_descs[i].name.c_str());
       cf_options[i] = new rocksdb_options_t{
