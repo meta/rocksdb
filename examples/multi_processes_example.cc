@@ -51,8 +51,6 @@ using ROCKSDB_NAMESPACE::Status;
 using ROCKSDB_NAMESPACE::WriteOptions;
 
 const std::string kDBPath = "/tmp/rocksdb_multi_processes_example";
-const std::string kPrimaryStatusFile =
-    "/tmp/rocksdb_multi_processes_example_primary_status";
 const uint64_t kMaxKey = 600000;
 const size_t kMaxValueLength = 256;
 const size_t kNumKeysPerFlush = 1000;
@@ -65,7 +63,7 @@ const std::vector<std::string>& GetColumnFamilyNames() {
 
 inline bool IsLittleEndian() {
   uint32_t x = 1;
-  return *static_cast<char*>(&x) != 0;
+  return *reinterpret_cast<char*>(&x) != 0;
 }
 
 static std::atomic<int>& ShouldSecondaryWait() {
@@ -76,7 +74,7 @@ static std::atomic<int>& ShouldSecondaryWait() {
 static std::string Key(uint64_t k) {
   std::string ret;
   if (IsLittleEndian()) {
-    ret.append(static_cast<char*>(&k), sizeof(k));
+    ret.append(reinterpret_cast<char*>(&k), sizeof(k));
   } else {
     char buf[sizeof(k)];
     buf[0] = k & 0xff;
@@ -241,7 +239,7 @@ void RunPrimary() {
   fprintf(stdout, "[process %ld] Finished adding keys\n", my_pid);
 }
 
-void secondary_instance_sigint_handler(int signal) {
+void secondary_instance_sigint_handler(int /*signal*/) {
   ShouldSecondaryWait().store(0, std::memory_order_relaxed);
   fprintf(stdout, "\n");
   fflush(stdout);
