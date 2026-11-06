@@ -2447,6 +2447,7 @@ ROCKSDB_JAR_ALL = rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar
 ROCKSDB_JAVADOCS_JAR = rocksdbjni-$(ROCKSDB_JAVA_VERSION)-javadoc.jar
 ROCKSDB_SOURCES_JAR = rocksdbjni-$(ROCKSDB_JAVA_VERSION)-sources.jar
 SHA256_CMD = sha256sum
+JAR_SHA ?= sha1
 
 # The *_DOWNLOAD_PREFIX defaults below point at the upstream projects; CI
 # overrides them to a mirror on the "third-party-deps" GitHub release (see
@@ -2702,14 +2703,14 @@ rocksdbjavastaticosx: rocksdbjavastaticosx_archs
 	cd java; $(JAR_CMD)  -cf target/$(ROCKSDB_JAR) HISTORY*.md
 	cd java/target; $(JAR_CMD) -uf $(ROCKSDB_JAR) librocksdbjni-osx-x86_64.jnilib librocksdbjni-osx-arm64.jnilib
 	cd java/target/classes; $(JAR_CMD) -uf ../$(ROCKSDB_JAR) org/rocksdb/*.class org/rocksdb/util/*.class
-	openssl sha1 java/target/$(ROCKSDB_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR).sha1
+	openssl $(JAR_SHA) java/target/$(ROCKSDB_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR).$(JAR_SHA)
 
 rocksdbjavastaticosx_ub: rocksdbjavastaticosx_archs
 	cd java/target; lipo -create -output librocksdbjni-osx.jnilib librocksdbjni-osx-x86_64.jnilib librocksdbjni-osx-arm64.jnilib
 	cd java; $(JAR_CMD)  -cf target/$(ROCKSDB_JAR) HISTORY*.md
 	cd java/target; $(JAR_CMD) -uf $(ROCKSDB_JAR) librocksdbjni-osx.jnilib
 	cd java/target/classes; $(JAR_CMD) -uf ../$(ROCKSDB_JAR) org/rocksdb/*.class org/rocksdb/util/*.class
-	openssl sha1 java/target/$(ROCKSDB_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR).sha1
+	openssl $(JAR_SHA) java/target/$(ROCKSDB_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR).$(JAR_SHA)
 
 rocksdbjavastaticosx_archs:
 	$(MAKE) rocksdbjavastaticosx_arch_x86_64
@@ -2747,15 +2748,15 @@ rocksdbjava_jar:
 	cd java; $(JAR_CMD)  -cf target/$(ROCKSDB_JAR) HISTORY*.md
 	cd java/target; $(JAR_CMD) -uf $(ROCKSDB_JAR) $(ROCKSDBJNILIB)
 	cd java/target/classes; $(JAR_CMD) -uf ../$(ROCKSDB_JAR) org/rocksdb/*.class org/rocksdb/util/*.class
-	openssl sha1 java/target/$(ROCKSDB_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR).sha1
+	openssl $(JAR_SHA) java/target/$(ROCKSDB_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR).$(JAR_SHA)
 
 rocksdbjava_javadocs_jar:
 	cd java/target/apidocs; $(JAR_CMD) -cf ../$(ROCKSDB_JAVADOCS_JAR) *
-	openssl sha1 java/target/$(ROCKSDB_JAVADOCS_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAVADOCS_JAR).sha1
+	openssl $(JAR_SHA) java/target/$(ROCKSDB_JAVADOCS_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAVADOCS_JAR).$(JAR_SHA)
 
 rocksdbjava_sources_jar:
 	cd java/src/main/java; $(JAR_CMD) -cf ../../../target/$(ROCKSDB_SOURCES_JAR) org
-	openssl sha1 java/target/$(ROCKSDB_SOURCES_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_SOURCES_JAR).sha1
+	openssl $(JAR_SHA) java/target/$(ROCKSDB_SOURCES_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_SOURCES_JAR).$(JAR_SHA)
 
 rocksdbjavastatic_deps: $(JAVA_COMPRESSIONS)
 
@@ -2766,13 +2767,13 @@ rocksdbjavastaticrelease: rocksdbjavastaticosx rocksdbjava_javadocs_jar rocksdbj
 	cd java; $(JAR_CMD) -cf target/$(ROCKSDB_JAR_ALL) HISTORY*.md
 	cd java/target; $(JAR_CMD) -uf $(ROCKSDB_JAR_ALL) librocksdbjni-*.so librocksdbjni-*.jnilib
 	cd java/target/classes; $(JAR_CMD) -uf ../$(ROCKSDB_JAR_ALL) org/rocksdb/*.class org/rocksdb/util/*.class
-	openssl sha1 java/target/$(ROCKSDB_JAR_ALL) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR_ALL).sha1
+	openssl $(JAR_SHA) java/target/$(ROCKSDB_JAR_ALL) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR_ALL).$(JAR_SHA)
 
 rocksdbjavastaticreleasedocker: rocksdbjavastaticosx rocksdbjavastaticdockerx86 rocksdbjavastaticdockerx86_64 rocksdbjavastaticdockerx86musl rocksdbjavastaticdockerx86_64musl rocksdbjava_javadocs_jar rocksdbjava_sources_jar
 	cd java; $(JAR_CMD) -cf target/$(ROCKSDB_JAR_ALL) HISTORY*.md
 	cd java/target; $(JAR_CMD) -uf $(ROCKSDB_JAR_ALL) librocksdbjni-*.so librocksdbjni-*.jnilib
 	cd java/target/classes; $(JAR_CMD) -uf ../$(ROCKSDB_JAR_ALL) org/rocksdb/*.class org/rocksdb/util/*.class
-	openssl sha1 java/target/$(ROCKSDB_JAR_ALL) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR_ALL).sha1
+	openssl $(JAR_SHA) java/target/$(ROCKSDB_JAR_ALL) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR_ALL).$(JAR_SHA)
 
 rocksdbjavastaticdockerx86:
 	mkdir -p java/target
@@ -2832,14 +2833,14 @@ rocksdbjavageneratepom:
 	cd java;cat pom.xml.template | sed 's/\$${ROCKSDB_JAVA_VERSION}/$(ROCKSDB_JAVA_VERSION)/' > pom.xml
 
 rocksdbjavastaticnexusbundlejar: rocksdbjavageneratepom
-	openssl sha1 -r java/pom.xml | awk '{  print $$1 }' > java/target/pom.xml.sha1
-	openssl sha1 -r java/target/rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar | awk '{  print $$1 }' > java/target/rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar.sha1
-	$(foreach classifier, $(ROCKSDB_JAVA_RELEASE_CLASSIFIERS), openssl sha1 -r java/target/rocksdbjni-$(ROCKSDB_JAVA_VERSION)-$(classifier).jar | awk '{  print $$1 }' > java/target/rocksdbjni-$(ROCKSDB_JAVA_VERSION)-$(classifier).jar.sha1;)
+	openssl $(JAR_SHA) -r java/pom.xml | awk '{  print $$1 }' > java/target/pom.xml.$(JAR_SHA)
+	openssl $(JAR_SHA) -r java/target/rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar | awk '{  print $$1 }' > java/target/rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar.$(JAR_SHA)
+	$(foreach classifier, $(ROCKSDB_JAVA_RELEASE_CLASSIFIERS), openssl $(JAR_SHA) -r java/target/rocksdbjni-$(ROCKSDB_JAVA_VERSION)-$(classifier).jar | awk '{  print $$1 }' > java/target/rocksdbjni-$(ROCKSDB_JAVA_VERSION)-$(classifier).jar.$(JAR_SHA);)
 	gpg --yes --output java/target/pom.xml.asc -ab java/pom.xml
 	gpg --yes -ab java/target/rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar
 	$(foreach classifier, $(ROCKSDB_JAVA_RELEASE_CLASSIFIERS), gpg --yes -ab java/target/rocksdbjni-$(ROCKSDB_JAVA_VERSION)-$(classifier).jar;)
-	$(JAR_CMD) cvf java/target/nexus-bundle-rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar -C java pom.xml -C java/target pom.xml.sha1 -C java/target pom.xml.asc -C java/target rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar -C java/target rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar.sha1 -C java/target rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar.asc
-	$(foreach classifier, $(ROCKSDB_JAVA_RELEASE_CLASSIFIERS), $(JAR_CMD) uf java/target/nexus-bundle-rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar -C java/target rocksdbjni-$(ROCKSDB_JAVA_VERSION)-$(classifier).jar -C java/target rocksdbjni-$(ROCKSDB_JAVA_VERSION)-$(classifier).jar.sha1 -C java/target rocksdbjni-$(ROCKSDB_JAVA_VERSION)-$(classifier).jar.asc;)
+	$(JAR_CMD) cvf java/target/nexus-bundle-rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar -C java pom.xml -C java/target pom.xml.$(JAR_SHA) -C java/target pom.xml.asc -C java/target rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar -C java/target rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar.$(JAR_SHA) -C java/target rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar.asc
+	$(foreach classifier, $(ROCKSDB_JAVA_RELEASE_CLASSIFIERS), $(JAR_CMD) uf java/target/nexus-bundle-rocksdbjni-$(ROCKSDB_JAVA_VERSION).jar -C java/target rocksdbjni-$(ROCKSDB_JAVA_VERSION)-$(classifier).jar -C java/target rocksdbjni-$(ROCKSDB_JAVA_VERSION)-$(classifier).jar.$(JAR_SHA) -C java/target rocksdbjni-$(ROCKSDB_JAVA_VERSION)-$(classifier).jar.asc;)
 
 
 # A version of each $(LIBOBJECTS) compiled with -fPIC
@@ -2857,7 +2858,7 @@ endif
 	$(AM_V_at)cd java; $(JAR_CMD) -cf target/$(ROCKSDB_JAR) HISTORY*.md
 	$(AM_V_at)cd java/target; $(JAR_CMD) -uf $(ROCKSDB_JAR) $(ROCKSDBJNILIB)
 	$(AM_V_at)cd java/target/classes; $(JAR_CMD) -uf ../$(ROCKSDB_JAR) org/rocksdb/*.class org/rocksdb/util/*.class
-	$(AM_V_at)openssl sha1 java/target/$(ROCKSDB_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR).sha1
+	$(AM_V_at)openssl $(JAR_SHA) java/target/$(ROCKSDB_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR).$(JAR_SHA)
 
 jclean:
 	cd java;$(MAKE) clean;
