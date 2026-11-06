@@ -4627,6 +4627,51 @@ void rocksdb_write_writebatch_wi(rocksdb_t* db,
   SaveError(errptr, db->rep->Write(options->rep, wb));
 }
 
+void rocksdb_load_options_from_file(const rocksdb_options_t* config_options,
+                                    const char* file_path,
+                                    rocksdb_options_t** db_options,
+                                    size_t* num_column_families,
+                                    char*** list_column_family_names,
+                                    rocksdb_options_t*** list_column_family_options,
+                                    rocksdb_cache_t* cache,
+                                    char** errptr) {
+    ConfigOptions cfg_options(config_options->rep);
+    const std::string fpath(file_path);
+    DBOptions db_opt;
+    std::vector<ColumnFamilyDescriptor> cf_descs;
+    const Status s = LoadOptionsFromFile(cfg_options, fpath, &db_opt,
+                                         &cf_descs, &cache->rep);
+    if (!s.ok()) {
+        SaveError(errptr, s);
+        *db_options = nullptr;
+        *num_column_families = 0;
+        *list_column_family_names = nullptr;
+        *list_column_family_options = nullptr;
+        return;
+    }
+    *errptr = nullptr;
+    char** cf_names = (char**)malloc(cf_descs.size() * sizeof(char*));
+    rocksdb_options_t** cf_options = (rocksdb_options_t**)malloc(
+        cf_descs.size() * sizeof(rocksdb_options_t*));
+    for (size_t i = 0; i < cf_descs.size(); ++i) {
+      cf_names[i] = strdup(cf_descs[i].name.c_str());
+      cf_options[i] = new rocksdb_options_t{
+          Options(DBOptions(), std::move(cf_descs[i].options))};
+    }
+    *num_column_families = cf_descs.size();
+    *db_options = new rocksdb_options_t{
+        Options(std::move(db_opt), ColumnFamilyOptions())};
+    *list_column_family_names = cf_names;
+    *list_column_family_options = cf_options;
+}
+
+void rocksdb_load_options_from_file_destroy(rocksdb_options_t* db_options,
+                                            char** list_column_family_names,
+                                            rocksdb_options_t** list_column_family_options,
+                                            size_t len) {
+    rocksdb_load_latest_options_destroy(db_options, list_column_family_names, list_column_family_options, len);
+}
+
 void rocksdb_load_latest_options(
     const char* db_path, rocksdb_env_t* env, bool ignore_unknown_options,
     rocksdb_cache_t* cache, rocksdb_options_t** db_options,
