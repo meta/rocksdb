@@ -333,6 +333,15 @@ public class WriteBatchWithIndex extends AbstractWriteBatch {
       final int valueLength, final long cfHandle);
 
   @Override
+  final void putAddr(final long handle, final long keyAddr, final int keyLength,
+      final long valueAddr, final int valueLength, final long cfHandle) throws RocksDBException {
+    putAddrJni(handle, keyAddr, keyLength, valueAddr, valueLength, cfHandle);
+  }
+
+  private static native void putAddrJni(final long handle, final long keyAddr, final int keyLength,
+      final long valueAddr, final int valueLength, final long cfHandle) throws RocksDBException;
+
+  @Override
   final void merge(final long handle, final byte[] key, final int keyLen, final byte[] value,
       final int valueLen) {
     mergeJni(handle, key, keyLen, value, valueLen);
@@ -391,6 +400,15 @@ public class WriteBatchWithIndex extends AbstractWriteBatch {
 
   private static native void deleteDirectJni(final long handle, final ByteBuffer key,
       final int keyOffset, final int keyLength, final long cfHandle) throws RocksDBException;
+
+  @Override
+  final void deleteAddr(final long handle, final long keyAddr, final int keyLength,
+      final long cfHandle) throws RocksDBException {
+    deleteAddrJni(handle, keyAddr, keyLength, cfHandle);
+  }
+
+  private static native void deleteAddrJni(final long handle, final long keyAddr,
+      final int keyLength, final long cfHandle) throws RocksDBException;
 
   // DO NOT USE - `WriteBatchWithIndex::deleteRange` is not yet supported
   @Override

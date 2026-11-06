@@ -8,6 +8,8 @@ package org.rocksdb.jmh;
 
 import static org.rocksdb.util.KVUtils.ba;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
@@ -49,6 +51,10 @@ public class GetBenchmarks {
   private ByteBuffer valueBuf;
   private byte[] keyArr;
   private byte[] valueArr;
+
+  private RocksDBBuf dbBuf;
+  private ByteBuf keyByteBuf;
+  private ByteBuf valueByteBuf;
 
   @Setup(Level.Trial)
   public void setup() throws IOException, RocksDBException {
@@ -110,6 +116,14 @@ public class GetBenchmarks {
     keyBuf.flip();
     valueBuf.put(valueArr);
     valueBuf.flip();
+
+    dbBuf = new RocksDBBuf(db);
+    keyByteBuf = PooledByteBufAllocator.DEFAULT.directBuffer(keySize);
+    keyByteBuf.writeBytes(keyArr);
+    valueByteBuf = PooledByteBufAllocator.DEFAULT.directBuffer(valueSize);
+    if (dbBuf.get(cfHandles[0], readOptions, getKeyByteBuf(), valueByteBuf) != valueSize) {
+      throw new IllegalStateException("preallocatedMemoryAddr would not read the stored keys");
+    }
   }
 
   @TearDown(Level.Trial)
@@ -121,6 +135,9 @@ public class GetBenchmarks {
     options.close();
     readOptions.close();
     FileUtils.delete(dbDir);
+
+    keyByteBuf.release();
+    valueByteBuf.release();
   }
 
   private ColumnFamilyHandle getColumnFamily() {
@@ -184,6 +201,20 @@ public class GetBenchmarks {
     return keyBuf;
   }
 
+  // String -> ByteBuf
+  private ByteBuf getKeyByteBuf() {
+    final int MAX_LEN = 9; // key100000
+    final int keyIdx = next();
+    final String keyStr = "key" + keyIdx;
+    for (int i = 0; i < keyStr.length(); ++i) {
+      keyByteBuf.setByte(i, (byte) keyStr.charAt(i));
+    }
+    for (int i = keyStr.length(); i < MAX_LEN; ++i) {
+      keyByteBuf.setByte(i, (byte) 0x30);
+    }
+    return keyByteBuf;
+  }
+
   private byte[] getValueArr() {
     return valueArr;
   }
@@ -211,5 +242,10 @@ public class GetBenchmarks {
     //    valueBuf.get(ret);
     //    System.out.println(str(ret));
     //    valueBuf.flip();
+  }
+
+  @Benchmark
+  public int preallocatedMemoryAddr() throws RocksDBException {
+    return dbBuf.get(getColumnFamily(), readOptions, getKeyByteBuf(), valueByteBuf);
   }
 }

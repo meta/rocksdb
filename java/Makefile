@@ -287,9 +287,15 @@ endif
 # Test whether the version we see meets our minimum
 MIN_JAVAC_MAJOR_VERSION := 8
 JAVAC_VERSION_GE_MIN := $(shell [ $(JAVAC_MAJOR_VERSION) -ge $(MIN_JAVAC_MAJOR_VERSION) ] > /dev/null 2>&1 && echo true)
+JAVAC_VERSION_GT_MIN := $(shell [ $(JAVAC_MAJOR_VERSION) -gt $(MIN_JAVAC_MAJOR_VERSION) ] > /dev/null 2>&1 && echo true)
 
 # Set the default JAVA_ARGS to "" for DEBUG_LEVEL=0
 JAVA_ARGS ?=
+
+# The DirectByteBufferAddress test utility reads the private java.nio.Buffer.address field
+ifeq ($(JAVAC_VERSION_GT_MIN),true)
+	JAVA_ARGS += --add-opens java.base/java.nio=ALL-UNNAMED
+endif
 
 JAVAC_ARGS ?=
 

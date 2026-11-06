@@ -1,0 +1,1 @@
+Java: added `RocksDBAddr` and `WriteBatchAddr`, opt-in base classes for passing keys and values held in native memory (for example Netty `ByteBuf`s) by raw address and length, which avoids the per-call JNI overhead of the `byte[]` and `ByteBuffer` methods.
