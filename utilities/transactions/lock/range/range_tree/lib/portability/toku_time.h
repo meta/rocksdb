@@ -61,6 +61,9 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #if defined(__powerpc__)
 #include <sys/platform/ppc.h>
 #endif
+#if defined(__e2k__)
+#include <x86intrin.h> // get __rdtsc
+#endif
 
 #if 0
 static inline float toku_tdiff (struct timeval *a, struct timeval *b) {
@@ -158,6 +161,8 @@ static inline tokutime_t toku_time_now(void) {
   unsigned long result;
   asm volatile("rdtime.d\t%0,$r0" : "=r"(result));
   return result;
+#elif defined(__e2k__)
+  return (uint64_t)__rdtsc();
 #else
 #error No timer implementation for this platform
 #endif
