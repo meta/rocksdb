@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <iterator>
 #include <limits>
 #include <queue>
 #include <string>
@@ -109,6 +110,19 @@ void MemTableListVersion::AddMemTable(ReadOnlyMemTable* m) {
     assert(m->GetID() >= memlist_.front()->GetID());
   }
   memlist_.push_front(m);
+  *parent_memtable_list_memory_usage_ += m->ApproximateMemoryUsage();
+}
+
+void MemTableListVersion::AddMemTableBefore(ReadOnlyMemTable* m,
+                                            ReadOnlyMemTable* before) {
+  std::list<ReadOnlyMemTable*>::iterator before_it =
+      std::find(memlist_.begin(), memlist_.end(), before);
+  assert(before_it != memlist_.end());
+  assert(m->GetID() >= before->GetID());
+  if (before_it != memlist_.begin()) {
+    assert((*std::prev(before_it))->GetID() >= m->GetID());
+  }
+  memlist_.insert(before_it, m);
   *parent_memtable_list_memory_usage_ += m->ApproximateMemoryUsage();
 }
 
@@ -382,7 +396,6 @@ SequenceNumber MemTableListVersion::GetEarliestSequenceNumber(
 
 SequenceNumber MemTableListVersion::GetFirstSequenceNumber() const {
   SequenceNumber min_first_seqno = kMaxSequenceNumber;
-  // The first memtable in the list might not be the oldest one with mempurge
   for (const auto& m : memlist_) {
     min_first_seqno = std::min(m->GetFirstSequenceNumber(), min_first_seqno);
   }
@@ -394,6 +407,16 @@ void MemTableListVersion::Add(ReadOnlyMemTable* m,
                               autovector<ReadOnlyMemTable*>* to_delete) {
   assert(refs_ == 1);  // only when refs_ == 1 is MemTableListVersion mutable
   AddMemTable(m);
+  // m->MemoryAllocatedBytes() is added in MemoryAllocatedBytesExcludingLast
+  TrimHistory(to_delete, 0);
+}
+
+// caller is responsible for referencing m
+void MemTableListVersion::AddBefore(ReadOnlyMemTable* m,
+                                    ReadOnlyMemTable* before,
+                                    autovector<ReadOnlyMemTable*>* to_delete) {
+  assert(refs_ == 1);  // only when refs_ == 1 is MemTableListVersion mutable
+  AddMemTableBefore(m, before);
   // m->MemoryAllocatedBytes() is added in MemoryAllocatedBytesExcludingLast
   TrimHistory(to_delete, 0);
 }
@@ -503,8 +526,6 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
   // at the FRONT of the memlist (memlist.push_front(mem)). Therefore, by
   // iterating through the memlist starting at the end, the vector<MemTable*>
   // ret is filled with memtables already sorted in increasing MemTable ID.
-  // However, when the mempurge feature is activated, new memtables with older
-  // IDs will be added to the memlist.
   auto it = memlist.rbegin();
   for (; it != memlist.rend(); ++it) {
     ReadOnlyMemTable* m = *it;
@@ -751,14 +772,26 @@ Status MemTableList::TryInstallMemtableFlushResults(
 // New memtables are inserted at the front of the list.
 void MemTableList::Add(ReadOnlyMemTable* m,
                        autovector<ReadOnlyMemTable*>* to_delete) {
+  AddImpl(m, nullptr, to_delete);
+}
+
+void MemTableList::AddBefore(ReadOnlyMemTable* m, ReadOnlyMemTable* before,
+                             autovector<ReadOnlyMemTable*>* to_delete) {
+  assert(before != nullptr);
+  AddImpl(m, before, to_delete);
+}
+
+void MemTableList::AddImpl(ReadOnlyMemTable* m, ReadOnlyMemTable* before,
+                           autovector<ReadOnlyMemTable*>* to_delete) {
   assert(static_cast<int>(current_->memlist_.size()) >= num_flush_not_started_);
   InstallNewVersion();
-  // this method is used to move mutable memtable into an immutable list.
-  // since mutable memtable is already refcounted by the DBImpl,
-  // and when moving to the immutable list we don't unref it,
-  // we don't have to ref the memtable here. we just take over the
-  // reference from the DBImpl.
-  current_->Add(m, to_delete);
+  // The caller transfers its reference on m to the immutable list, so this
+  // method does not acquire another reference.
+  if (before == nullptr) {
+    current_->Add(m, to_delete);
+  } else {
+    current_->AddBefore(m, before, to_delete);
+  }
   num_flush_not_started_++;
   if (num_flush_not_started_ == 1) {
     imm_flush_needed.store(true, std::memory_order_release);

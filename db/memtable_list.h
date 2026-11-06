@@ -198,6 +198,9 @@ class MemTableListVersion {
 
   // REQUIRE: m is an immutable memtable
   void Add(ReadOnlyMemTable* m, autovector<ReadOnlyMemTable*>* to_delete);
+  // REQUIRE: m and before are immutable memtables, and before is in memlist_.
+  void AddBefore(ReadOnlyMemTable* m, ReadOnlyMemTable* before,
+                 autovector<ReadOnlyMemTable*>* to_delete);
   // REQUIRE: m is an immutable memtable
   void Remove(ReadOnlyMemTable* m, autovector<ReadOnlyMemTable*>* to_delete);
 
@@ -219,6 +222,7 @@ class MemTableListVersion {
                    const BlobFetcher* blob_fetcher = nullptr);
 
   void AddMemTable(ReadOnlyMemTable* m);
+  void AddMemTableBefore(ReadOnlyMemTable* m, ReadOnlyMemTable* before);
 
   void UnrefMemTable(autovector<ReadOnlyMemTable*>* to_delete,
                      ReadOnlyMemTable* m);
@@ -378,6 +382,12 @@ class MemTableList {
   // flushed, but in certain situations, like after a mempurge, we may want to
   // avoid flushing the memtable list upon addition of a memtable.
   void Add(ReadOnlyMemTable* m, autovector<ReadOnlyMemTable*>* to_delete);
+
+  // Inserts m immediately before `before` in the newest-to-oldest list order.
+  // Takes ownership of the reference held on m by the caller. `before` must
+  // already be in the immutable memtable list.
+  void AddBefore(ReadOnlyMemTable* m, ReadOnlyMemTable* before,
+                 autovector<ReadOnlyMemTable*>* to_delete);
 
   // Returns an estimate of the number of bytes of data in use.
   size_t ApproximateMemoryUsage();
@@ -560,6 +570,10 @@ class MemTableList {
 
   // DB mutex held
   void InstallNewVersion();
+
+  // DB mutex held. A null `before` inserts m at the front.
+  void AddImpl(ReadOnlyMemTable* m, ReadOnlyMemTable* before,
+               autovector<ReadOnlyMemTable*>* to_delete);
 
   // DB mutex held
   // Called after writing to MANIFEST

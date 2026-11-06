@@ -10,6 +10,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <limits>
+#include <memory>
 #include <mutex>
 
 #include "db/db_impl/db_impl.h"
@@ -18,6 +19,7 @@
 #include "file/filename.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
+#include "rocksdb/memtablerep.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "table/block_based/block_based_table_builder.h"
 #include "table/format.h"
@@ -1991,18 +1993,17 @@ TEST_F(DBFlushTest, MemPurgeCorrectLogNumberAndSSTFileCreation) {
   Close();
 }
 
-// Reproduction for MemPurge memtable ID ordering bug.
-// When MemPurge runs, it releases db_mutex_. During that window, new
-// memtables can be switched to the immutable list with higher IDs. When
-// MemPurge re-acquires the mutex and adds its output memtable using the
-// stale ID from mems_.back(), the ordering assertion fires.
-TEST_F(DBFlushTest, MemPurgeIdOrdering) {
+// MemPurge releases db_mutex_ while building its output memtable. Verify that
+// a newer memtable switched to the immutable list during that window remains
+// ahead of the MemPurge output for reads.
+TEST_F(DBFlushTest, MemPurgeImmutableMemtableOrdering) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
   options.compression = kNoCompression;
   options.inplace_update_support = false;
   options.allow_concurrent_memtable_write = true;
   options.write_buffer_size = 1 << 20;  // 1MB
+  options.max_background_flushes = 1;
   // Allow enough immutable memtables so writes don't stall while the
   // flush thread is paused in the sync point.
   options.max_write_buffer_number = 8;
@@ -2010,17 +2011,27 @@ TEST_F(DBFlushTest, MemPurgeIdOrdering) {
   options.experimental_mempurge_threshold = 1.0;
   ASSERT_OK(TryReopen(options));
 
-  // Coordinate via LoadDependency:
-  //   1. Flush thread hits BeforeReacquireMutex -> foreground unblocks
-  //   2. Foreground writes data, triggers memtable switch
-  //   3. Foreground hits SwitchDone -> flush thread unblocks at
-  //   AfterWaitForTest
-  //   4. Flush thread re-acquires mutex, tries AddMemTable with stale ID
+  std::atomic<int> background_flush_count{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCallFlush:start", [&](void* /*arg*/) {
+        if (background_flush_count.fetch_add(1) == 1) {
+          TEST_SYNC_POINT(
+              "DBFlushTest::MemPurgeImmutableMemtableOrdering:"
+              "SecondFlushStarted");
+          TEST_SYNC_POINT(
+              "DBFlushTest::MemPurgeImmutableMemtableOrdering:"
+              "AllowSecondFlush");
+        }
+      });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency(
       {{"FlushJob::MemPurge:BeforeReacquireMutex",
-        "DBFlushTest::MemPurgeIdOrdering:StartWriting"},
-       {"DBFlushTest::MemPurgeIdOrdering:SwitchDone",
-        "FlushJob::MemPurge:AfterWaitForTest"}});
+        "DBFlushTest::MemPurgeImmutableMemtableOrdering:StartWriting"},
+       {"DBFlushTest::MemPurgeImmutableMemtableOrdering:SwitchDone",
+        "FlushJob::MemPurge:AfterWaitForTest"},
+       {"DBFlushTest::MemPurgeImmutableMemtableOrdering:SecondFlushStarted",
+        "DBFlushTest::MemPurgeImmutableMemtableOrdering:BeforeRead"},
+       {"DBFlushTest::MemPurgeImmutableMemtableOrdering:AfterRead",
+        "DBFlushTest::MemPurgeImmutableMemtableOrdering:AllowSecondFlush"}});
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
   const int kValueSize = 10240;  // 10KB values like MemPurgeBasic
@@ -2042,27 +2053,79 @@ TEST_F(DBFlushTest, MemPurgeIdOrdering) {
   }
 
   // Block until MemPurge reaches the sync point (db_mutex_ released).
-  TEST_SYNC_POINT("DBFlushTest::MemPurgeIdOrdering:StartWriting");
+  TEST_SYNC_POINT(
+      "DBFlushTest::MemPurgeImmutableMemtableOrdering:StartWriting");
 
-  // Now MemPurge is paused with db_mutex_ released. Write enough data
-  // to fill another memtable and trigger a switch. This creates an
-  // immutable memtable with a higher ID than the one being mempurged.
+  // Write newer values for the same keys into the next memtable, then fill it
+  // with unrelated keys until it is switched to the immutable list.
+  std::vector<std::string> new_values;
+  new_values.reserve(kNumKeys);
+  for (int i = 0; i < kNumKeys; i++) {
+    new_values.push_back(rnd.RandomString(kValueSize));
+    ASSERT_OK(Put("key" + std::to_string(i), new_values.back()));
+  }
   for (int i = 0; i < kNumKeys * 4; i++) {
     ASSERT_OK(Put("newkey" + std::to_string(i), rnd.RandomString(kValueSize)));
   }
 
-  // Let MemPurge continue -- it will re-acquire the mutex and try to
-  // add the output memtable with the stale ID.
-  TEST_SYNC_POINT("DBFlushTest::MemPurgeIdOrdering:SwitchDone");
+  TEST_SYNC_POINT("DBFlushTest::MemPurgeImmutableMemtableOrdering:SwitchDone");
 
-  // Allow background work to finish.
-  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
-
-  // If the bug is present, the assertion in AddMemTable fires before
-  // we reach here.
+  // Wait until the first flush has finished and the next flush is blocked
+  // before it can consume the two immutable memtables.
+  TEST_SYNC_POINT("DBFlushTest::MemPurgeImmutableMemtableOrdering:BeforeRead");
+  auto* cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(db_->DefaultColumnFamily())
+          ->cfd();
+  const int num_immutable_memtables = cfd->imm()->NumNotFlushed();
+  std::vector<std::string> values;
+  values.reserve(kNumKeys);
   for (int i = 0; i < kNumKeys; i++) {
-    ASSERT_NE(Get("key" + std::to_string(i)), "NOT_FOUND");
+    values.push_back(Get("key" + std::to_string(i)));
   }
+  TEST_SYNC_POINT("DBFlushTest::MemPurgeImmutableMemtableOrdering:AfterRead");
+
+  ASSERT_OK(WaitForFlushCallbacks());
+
+  ASSERT_EQ(num_immutable_memtables, 2);
+  for (int i = 0; i < kNumKeys; i++) {
+    ASSERT_TRUE(values[i] == new_values[i]) << "key" << i;
+  }
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  Close();
+}
+
+TEST_F(DBFlushTest, MemPurgeSkipsMemtableRepWithoutSampling) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.compression = kNoCompression;
+  options.memtable_factory = std::make_shared<VectorRepFactory>();
+  options.write_buffer_size = 64 << 10;
+  options.max_write_buffer_number = 4;
+  options.max_background_flushes = 1;
+  options.experimental_mempurge_threshold = 1.0;
+  ASSERT_OK(TryReopen(options));
+
+  std::atomic<int> mempurge_count{0};
+  std::atomic<int> sst_count{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::FlushJob:MemPurgeSuccessful",
+      [&](void* /*arg*/) { mempurge_count.fetch_add(1); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::FlushJob:SSTFileCreated",
+      [&](void* /*arg*/) { sst_count.fetch_add(1); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  Random rnd(302);
+  for (int i = 0; i < 16; i++) {
+    ASSERT_OK(Put("key" + std::to_string(i), rnd.RandomString(8192)));
+  }
+  ASSERT_OK(WaitForFlushCallbacks());
+
+  ASSERT_EQ(mempurge_count.load(), 0);
+  ASSERT_GE(sst_count.load(), 1);
 
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
