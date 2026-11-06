@@ -20,12 +20,10 @@ namespace ROCKSDB_NAMESPACE {
 
 BlobLogWriter::BlobLogWriter(std::unique_ptr<WritableFileWriter>&& dest,
                              SystemClock* clock, Statistics* statistics,
-                             uint64_t log_number, bool use_fs, bool do_flush,
-                             uint64_t boffset)
+                             bool use_fs, bool do_flush, uint64_t boffset)
     : dest_(std::move(dest)),
       clock_(clock),
       statistics_(statistics),
-      log_number_(log_number),
       block_offset_(boffset),
       use_fsync_(use_fs),
       do_flush_(do_flush),
@@ -74,10 +72,9 @@ Status BlobLogWriter::WriteHeader(const WriteOptions& write_options,
   return s;
 }
 
-Status BlobLogWriter::AppendFooter(const WriteOptions& write_options,
-                                   BlobLogFooter& footer,
-                                   std::string* checksum_method,
-                                   std::string* checksum_value) {
+Status BlobLogWriter::LegacyAppendFooterAndClose(
+    const WriteOptions& write_options, BlobLogFooter& footer,
+    std::string* checksum_method, std::string* checksum_value) {
   assert(block_offset_ != 0);
   assert(last_elem_type_ == kEtFileHdr || last_elem_type_ == kEtRecord);
 

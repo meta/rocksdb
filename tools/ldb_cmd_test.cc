@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <memory>
 
+#include "db/blog/blog_writer.h"
 #include "db/db_test_util.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
@@ -33,6 +34,30 @@ using std::string;
 using std::vector;
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+Status GetBlobFiles(Env* env, const std::string& dbname,
+                    std::vector<std::string>* blob_files) {
+  assert(env != nullptr);
+  assert(blob_files != nullptr);
+
+  blob_files->clear();
+  std::vector<std::string> files;
+  Status s = env->GetChildren(dbname, &files);
+  if (!s.ok()) {
+    return s;
+  }
+
+  for (const auto& file : files) {
+    if (file.size() > 5 && file.substr(file.size() - 5) == ".blob") {
+      blob_files->push_back(file);
+    }
+  }
+  return Status::OK();
+}
+
+}  // namespace
 
 class LdbCmdTest : public testing::Test {
  public:
@@ -631,6 +656,71 @@ TEST_F(LdbCmdTest, BlobDBDumpFileChecksumCRC32) {
 
   ASSERT_EQ(0,
             LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), nullptr));
+}
+
+TEST_F(LdbCmdTest, DumpBlogBlobFile) {
+  Options opts;
+  opts.env = Env::Default();
+  opts.create_if_missing = true;
+  opts.enable_blob_files = true;
+  opts.min_blob_size = 0;
+  opts.use_blog_format_for_blobs = true;
+  opts.disable_auto_compactions = true;
+
+  const std::string dbname = test::PerThreadDBPath(opts.env, "ldb_cmd_test");
+  ASSERT_OK(DestroyDB(dbname, opts));
+
+  TEST_BlogNoncanonicalConfig noncanonical_config;
+  noncanonical_config.enabled = true;
+  noncanonical_config.seed = 17;
+  noncanonical_config.inject_auxiliary_record_one_in = 1;
+  noncanonical_config.max_auxiliary_payload_bytes = 8;
+  TEST_BlogNoncanonicalConfigScope config_scope(noncanonical_config);
+
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(opts, dbname, &db));
+
+  const std::string value0 = "blog-blob-value-zero";
+  const std::string value1 = "blog-blob-value-one";
+  ASSERT_OK(db->Put(WriteOptions(), "key0", value0));
+  ASSERT_OK(db->Put(WriteOptions(), "key1", value1));
+
+  FlushOptions flush_opts;
+  flush_opts.wait = true;
+  ASSERT_OK(db->Flush(flush_opts));
+  db.reset();
+
+  std::vector<std::string> blob_files;
+  ASSERT_OK(GetBlobFiles(opts.env, dbname, &blob_files));
+  ASSERT_EQ(blob_files.size(), 1U);
+  const std::string blob_path = dbname + "/" + blob_files.front();
+
+  char arg0[] = "./ldb";
+  char arg1[] = "dump";
+  std::string arg2 = "--path=" + blob_path;
+  char arg3[] = "--dump_uncompressed_blobs";
+  char* argv[] = {arg0, arg1, const_cast<char*>(arg2.c_str()), arg3};
+
+  ::testing::internal::CaptureStdout();
+  const int rc =
+      LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), nullptr);
+  const std::string output = ::testing::internal::GetCapturedStdout();
+
+  ASSERT_EQ(rc, 0);
+  ASSERT_NE(output.find("Blog blob file header"), std::string::npos);
+  ASSERT_NE(output.find("Keys are not stored in blog-format blob files"),
+            std::string::npos);
+  ASSERT_NE(output.find("Read blob record with offset"), std::string::npos);
+  ASSERT_NE(output.find("Read auxiliary body record with offset"),
+            std::string::npos);
+  ASSERT_NE(output.find(value0), std::string::npos);
+  ASSERT_NE(output.find(value1), std::string::npos);
+  ASSERT_NE(output.find("Blog blob file footer"), std::string::npos);
+  ASSERT_NE(output.find("blobCount : 2"), std::string::npos);
+  ASSERT_NE(output.find("Summary:"), std::string::npos);
+  ASSERT_NE(output.find("total blob records: 2"), std::string::npos);
+  ASSERT_NE(output.find("total auxiliary body records: 2"), std::string::npos);
+  ASSERT_EQ(output.find("total key size"), std::string::npos);
 }
 
 TEST_F(LdbCmdTest, OptionParsing) {

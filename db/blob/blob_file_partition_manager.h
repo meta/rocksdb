@@ -17,6 +17,7 @@
 #include "db/blob/blob_file_garbage.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_write_batch_transformer.h"
+#include "db/blog/blog_format.h"
 #include "port/port.h"
 #include "rocksdb/compression_type.h"
 #include "rocksdb/env.h"
@@ -30,6 +31,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class BlobFileCache;
 class BlobFileCompletionCallback;
+class BlogFileWriter;
 class BlobIndex;
 class BlobLogWriter;
 class FilePrefetchBuffer;
@@ -62,16 +64,19 @@ class BlobFilePartitionManager {
       SystemClock* clock, Statistics* statistics,
       const FileOptions& file_options, std::string db_path,
       std::string column_family_name, uint64_t blob_file_size, bool use_fsync,
-      uint64_t blob_writer_max_buffer_size, BlobFileCache* blob_file_cache,
+      uint64_t blob_writer_max_buffer_size, bool use_blog_format,
+      ChecksumType blog_checksum, BlobFileCache* blob_file_cache,
       BlobFileCompletionCallback* blob_callback,
       const std::vector<std::shared_ptr<EventListener>>& listeners,
       FileChecksumGenFactory* file_checksum_gen_factory,
       const FileTypeSet& checksum_handoff_file_types,
       const std::shared_ptr<IOTracer>& io_tracer, std::string db_id,
-      std::string db_session_id, Logger* info_log);
+      std::string db_session_id, std::string db_host_id, Logger* info_log);
 
   // Evicts cached readers for manager-owned files during shutdown.
   ~BlobFilePartitionManager();
+
+  bool is_blog_format() const { return use_blog_format_; }
 
   // Appends one blob record to a partition file and returns the resulting
   // BlobIndex location metadata.
@@ -162,13 +167,17 @@ class BlobFilePartitionManager {
   static Status ResolveBlobDirectWriteIndex(
       const ReadOptions& read_options, const Slice& user_key,
       const BlobIndex& blob_idx, const Version* version,
-      BlobFileCache* blob_file_cache, FilePrefetchBuffer* prefetch_buffer,
-      PinnableSlice* blob_value, uint64_t* bytes_read);
+      BlobFileCache* blob_file_cache,
+      CompressionManager* configured_compression_manager,
+      FilePrefetchBuffer* prefetch_buffer, PinnableSlice* blob_value,
+      uint64_t* bytes_read);
 
  private:
   struct Partition {
     // Active writer for this partition, or null when the partition is idle.
+    // Exactly one of writer / blog_writer is non-null when active.
     std::unique_ptr<BlobLogWriter> writer;
+    std::unique_ptr<BlogFileWriter> blog_writer;
     // Metadata tracked while the active file remains open.
     uint64_t file_number = 0;
     uint64_t file_size = 0;
@@ -180,6 +189,8 @@ class BlobFilePartitionManager {
     uint32_t column_family_id = 0;
     CompressionType compression = kNoCompression;
     bool sync_required = false;
+
+    bool is_open() const { return writer || blog_writer; }
   };
 
   struct DeferredFile {
@@ -190,6 +201,7 @@ class BlobFilePartitionManager {
 
     // Blob writer moved out of an active partition at memtable rotation.
     std::unique_ptr<BlobLogWriter> writer;
+    std::unique_ptr<BlogFileWriter> blog_writer;
     // Metadata preserved until flush preparation seals the file.
     uint64_t file_number = 0;
     uint64_t blob_count = 0;
@@ -247,9 +259,9 @@ class BlobFilePartitionManager {
   // Appends the footer, reports file completion, and builds the resulting
   // BlobFileAddition for one sealed blob file.
   Status FinalizeBlobFile(const WriteOptions& write_options,
-                          BlobLogWriter* writer, uint64_t file_number,
-                          uint64_t blob_count, uint64_t total_blob_bytes,
-                          BlobFileAddition* addition,
+                          BlobLogWriter* writer, BlogFileWriter* blog_writer,
+                          uint64_t file_number, uint64_t blob_count,
+                          uint64_t total_blob_bytes, BlobFileAddition* addition,
                           bool* space_limit_reached);
   // Appends one initial-garbage record to the flush output if any failed
   // transformed writes targeted the sealed blob file.
@@ -291,6 +303,8 @@ class BlobFilePartitionManager {
   uint64_t blob_file_size_;
   bool use_fsync_;
   std::atomic<uint64_t> blob_writer_max_buffer_size_;
+  bool use_blog_format_;
+  ChecksumType blog_checksum_;
   BlobFileCache* blob_file_cache_;
   BlobFileCompletionCallback* blob_callback_;
   std::vector<std::shared_ptr<EventListener>> listeners_;
@@ -300,6 +314,7 @@ class BlobFilePartitionManager {
   // DB identity used when constructing cache keys.
   std::string db_id_;
   std::string db_session_id_;
+  std::string db_host_id_;
   Logger* info_log_;
 
   // One active writer slot per configured partition.

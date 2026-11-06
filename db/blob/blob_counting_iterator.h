@@ -28,7 +28,7 @@ class BlobCountingIterator : public InternalIterator {
     assert(iter_);
     assert(blob_garbage_meter_);
     if (track_current_key_inflow) {
-      current_key_inflow_.emplace();
+      current_key_inflow_.emplace(blob_garbage_meter_->EmptyWithSameSizing());
     }
 
     UpdateAndCountBlobIfNeeded();

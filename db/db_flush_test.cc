@@ -2735,10 +2735,11 @@ class DBFlushTestBlobError : public DBFlushTest,
   std::string sync_point_;
 };
 
-INSTANTIATE_TEST_CASE_P(DBFlushTestBlobError, DBFlushTestBlobError,
-                        ::testing::ValuesIn(std::vector<std::string>{
-                            "BlobFileBuilder::WriteBlobToFile:AddRecord",
-                            "BlobFileBuilder::WriteBlobToFile:AppendFooter"}));
+INSTANTIATE_TEST_CASE_P(
+    DBFlushTestBlobError, DBFlushTestBlobError,
+    ::testing::ValuesIn(std::vector<std::string>{
+        "BlobFileBuilder::WriteBlobToFile:AddRecord",
+        "BlobFileBuilder::WriteBlobToFile:LegacyAppendFooterAndClose"}));
 
 TEST_P(DBFlushTestBlobError, FlushError) {
   Options options;

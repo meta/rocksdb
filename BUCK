@@ -42,6 +42,9 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/blob/blob_source.cc",
         "db/blob/blob_write_batch_transformer.cc",
         "db/blob/prefetch_buffer_collection.cc",
+        "db/blog/blog_format.cc",
+        "db/blog/blog_reader.cc",
+        "db/blog/blog_writer.cc",
         "db/builder.cc",
         "db/c.cc",
         "db/coalescing_iterator.cc",
@@ -4664,6 +4667,18 @@ cpp_unittest_wrapper(name="block_fetcher_test",
 
 cpp_unittest_wrapper(name="block_test",
             srcs=["table/block_based/block_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="blog_format_test",
+            srcs=["db/blog/blog_format_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="blog_writer_test",
+            srcs=["db/blog/blog_writer_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 

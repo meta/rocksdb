@@ -112,7 +112,9 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImplReadOnly::GetImpl)
     // whenever either blob knob indicates it may be needed.
     memtable_blob_fetcher.emplace(super_version->current, read_options,
                                   cfd->blob_file_cache(),
-                                  /*allow_write_path_fallback=*/true);
+                                  /*allow_write_path_fallback=*/true,
+                                  super_version->current->GetMutableCFOptions()
+                                      .compression_manager.get());
   }
   const BlobFetcher* memtable_blob_fetcher_ptr =
       memtable_blob_fetcher ? &*memtable_blob_fetcher : nullptr;
