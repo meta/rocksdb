@@ -748,15 +748,20 @@ Status Trie::Init(const Slice& data) {
 }
 
 Status Trie::Parse(const Slice& data) {
-  if (data.size() < kTrieHeaderSize) {
-    return Corrupt("too short");
-  }
   const char* p = data.data();
-  if (DecodeFixed32(p + kMagicPos) != kMagic) {
+  // Checked before the header size, which other versions need not share.
+  if (data.size() < kVersionPos + 4 || DecodeFixed32(p + kMagicPos) != kMagic) {
     return Corrupt("bad magic number");
   }
-  if (DecodeFixed32(p + kVersionPos) != kVersion) {
-    return Corrupt("unsupported format version");
+  const uint32_t version = DecodeFixed32(p + kVersionPos);
+  if (version != kVersion) {
+    return Status::NotSupported(
+        "Trie index: format version " + std::to_string(version) +
+        " is not readable by this release; open with "
+        "index_mode=kStandardDefault and compact to rewrite the trie");
+  }
+  if (data.size() < kTrieHeaderSize) {
+    return Corrupt("too short");
   }
   if (DecodeFixed32(p + kFlagsPos) != 0) {
     return Corrupt("unknown flags");
@@ -825,15 +830,7 @@ Status Trie::Parse(const Slice& data) {
   if (max_key_len_ - prefix_len_ > trie_size + bucket_data_size) {
     return Corrupt("max key length exceeds index contents");
   }
-  uint64_t prev_pos = 0;
-  for (uint64_t b = 0; b <= num_buckets_; b++) {
-    const uint64_t pos = bucket_table_.Get(b);
-    if ((b == 0 && pos != 0) || pos < prev_pos ||
-        (b == num_buckets_ && pos != bucket_data_size)) {
-      return Corrupt("bad bucket table");
-    }
-    prev_pos = pos;
-  }
+  bucket_data_size_ = bucket_data_size;
   const uint64_t offset_table_end = explicit_sizes_
                                         ? sections[kSizeTableSection]
                                         : sections[kRunTableSection];
@@ -841,17 +838,6 @@ Status Trie::Parse(const Slice& data) {
                          p + offset_table_end, num_blocks_ + 1);
   if (!s.ok()) {
     return s;
-  }
-  // Offsets never decrease and, when sizes are derived, leave room for the
-  // gap after each block, so a block size cannot wrap around.
-  const uint64_t min_step = explicit_sizes_ ? 0 : size_gap_;
-  uint64_t prev_offset = offset_table_.Get(0);
-  for (uint64_t i = 1; i <= num_blocks_; i++) {
-    const uint64_t offset = offset_table_.Get(i);
-    if (offset < prev_offset || offset - prev_offset < min_step) {
-      return Corrupt("bad offset table");
-    }
-    prev_offset = offset;
   }
   if (explicit_sizes_) {
     s = size_table_.Init(p + sections[kSizeTableSection],
@@ -1061,13 +1047,25 @@ TrieIterator::TrieIterator(const Trie* index)
 
 void TrieIterator::Invalidate() { block_ = index_->num_blocks_; }
 
-TrieBlockHandle TrieIterator::value() const {
-  const uint64_t offset = index_->offset_table_.Get(block_);
-  const uint64_t size =
-      index_->explicit_sizes_
-          ? index_->size_table_.Get(block_)
-          : index_->offset_table_.Get(block_ + 1) - offset - index_->size_gap_;
-  return TrieBlockHandle{offset, size};
+Status TrieIterator::EnterBlock(uint64_t block) {
+  const Trie& index = *index_;
+  const uint64_t offset = index.offset_table_.Get(block);
+  uint64_t size;
+  if (index.explicit_sizes_) {
+    size = index.size_table_.Get(block);
+  } else {
+    // Init() does not check the offsets, so a corrupt column could make the
+    // size wrap around.
+    const uint64_t next = index.offset_table_.Get(block + 1);
+    if (next < offset || next - offset < index.size_gap_) {
+      Invalidate();
+      return Corrupt("bad offset table");
+    }
+    size = next - offset - index.size_gap_;
+  }
+  block_ = block;
+  handle_ = TrieBlockHandle{offset, size};
+  return Status::OK();
 }
 
 void TrieIterator::Descend(const char* target, size_t target_len,
@@ -1223,8 +1221,13 @@ uint64_t TrieIterator::SpellHead(const Candidate& candidate,
 void TrieIterator::EnterBucket(uint64_t bucket) {
   bucket_ = bucket;
   key_index_ = bucket * index_->bucket_size_;
-  bucket_pos_ = index_->bucket_data_ + index_->bucket_table_.Get(bucket);
-  bucket_end_ = index_->bucket_data_ + index_->bucket_table_.Get(bucket + 1);
+  // Init() does not check bucket positions. Clamping keeps a corrupt one
+  // inside the bucket data, where DecodeNext() bounds-checks every separator.
+  const uint64_t size = index_->bucket_data_size_;
+  bucket_pos_ =
+      index_->bucket_data_ + std::min(index_->bucket_table_.Get(bucket), size);
+  bucket_end_ = index_->bucket_data_ +
+                std::min(index_->bucket_table_.Get(bucket + 1), size);
 }
 
 bool TrieIterator::EnterBucketAt(const Candidate& candidate, const char* target,
@@ -1255,19 +1258,18 @@ void TrieIterator::EnterKey() {
   }
   run_begin_ = key_index_ + extra_before;
   run_end_ = run_begin_ + 1 + extra;
-  block_ = run_begin_;
 }
 
 Status TrieIterator::ApplyTag(uint64_t tag) {
   const uint64_t num_tags = index_->num_tags_;
   if (num_tags == 0) {
-    return Status::OK();
+    return EnterBlock(run_begin_);
   }
   // First tagged block at or after the current one.
   uint64_t lo = Trie::SideTableLowerBound(index_->tags_, num_tags, run_begin_);
   // A block without a tag sorts after every tag of its key.
   if (lo == num_tags || index_->TagBlock(lo) != run_begin_) {
-    return Status::OK();
+    return EnterBlock(run_begin_);
   }
   for (uint64_t b = run_begin_; b < run_end_; b++) {
     uint64_t block_tag = 0;
@@ -1276,8 +1278,7 @@ Status TrieIterator::ApplyTag(uint64_t tag) {
       lo++;
     }
     if (block_tag == 0 || tag >= block_tag) {
-      block_ = b;
-      return Status::OK();
+      return EnterBlock(b);
     }
   }
   // Every block of this key precedes the target.
@@ -1387,7 +1388,7 @@ Status TrieIterator::SeekToFirst() {
   }
   EnterBucket(0);
   EnterKey();
-  return Status::OK();
+  return EnterBlock(run_begin_);
 }
 
 Status TrieIterator::Seek(const Slice& key, uint64_t tag) {
@@ -1444,7 +1445,7 @@ Status TrieIterator::Seek(const Slice& key, uint64_t tag) {
     }
   }
   EnterKey();
-  return equal ? ApplyTag(tag) : Status::OK();
+  return equal ? ApplyTag(tag) : EnterBlock(run_begin_);
 }
 
 Status TrieIterator::NextKey() {
@@ -1473,7 +1474,7 @@ Status TrieIterator::NextKey() {
     }
   }
   EnterKey();
-  return Status::OK();
+  return EnterBlock(run_begin_);
 }
 
 Status TrieIterator::AdvanceTo(uint64_t key_index) {
@@ -1487,9 +1488,9 @@ Status TrieIterator::AdvanceTo(uint64_t key_index) {
   return Status::OK();
 }
 
-void TrieIterator::EnterKeyFromEnd() {
+Status TrieIterator::EnterKeyFromEnd() {
   EnterKey();
-  block_ = run_end_ - 1;
+  return EnterBlock(run_end_ - 1);
 }
 
 Status TrieIterator::SeekToLast() {
@@ -1505,10 +1506,7 @@ Status TrieIterator::SeekToLast() {
   }
   EnterBucket(last_bucket);
   Status s = AdvanceTo(index_->num_keys_ - 1);
-  if (s.ok()) {
-    EnterKeyFromEnd();
-  }
-  return s;
+  return s.ok() ? EnterKeyFromEnd() : s;
 }
 
 Status TrieIterator::Prev() {
@@ -1516,8 +1514,7 @@ Status TrieIterator::Prev() {
     return Status::OK();
   }
   if (block_ > run_begin_) {
-    block_--;
-    return Status::OK();
+    return EnterBlock(block_ - 1);
   }
   if (key_index_ == 0) {
     Invalidate();
@@ -1535,10 +1532,7 @@ Status TrieIterator::Prev() {
     return Corrupt("bucket head out of order");
   }
   Status s = AdvanceTo(prev_key);
-  if (s.ok()) {
-    EnterKeyFromEnd();
-  }
-  return s;
+  return s.ok() ? EnterKeyFromEnd() : s;
 }
 
 Status TrieIterator::Next() {
@@ -1546,8 +1540,7 @@ Status TrieIterator::Next() {
     return Status::OK();
   }
   if (block_ + 1 < run_end_) {
-    block_++;
-    return Status::OK();
+    return EnterBlock(block_ + 1);
   }
   return NextKey();
 }

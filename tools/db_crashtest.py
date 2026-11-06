@@ -1643,12 +1643,7 @@ def finalize_and_sanitize(src_params):
         dest_params["open_read_fault_one_in"] = 0
         dest_params["sync_fault_injection"] = 0
 
-    # UDI is compatible with all operation types and iteration directions
-    # except mmap_read.
     if dest_params.get("use_trie_index") == 1:
-        # Trie UDI uses zero-copy pointers into block data, which is
-        # incompatible with mmap_read.
-        dest_params["mmap_read"] = 0
         index_mode = dest_params.get("index_mode")
         if index_mode in (2, 3):
             # kCustomDefault/kCustomOnly reject partitioned index
