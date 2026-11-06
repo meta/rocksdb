@@ -331,6 +331,17 @@ class TransactionBaseImpl : public Transaction {
   Status GetImpl(const ReadOptions& options, ColumnFamilyHandle* column_family,
                  const Slice& key, PinnableSlice* value) override;
 
+  // Single-CF batched read used by MultiGet() and MultiGetForUpdate().
+  // Transaction policies with custom visibility rules override this hook to
+  // supply their ReadCallback while reusing the public read plumbing.
+  virtual void MultiGetImpl(const ReadOptions& options,
+                            ColumnFamilyHandle* column_family, size_t num_keys,
+                            const Slice* keys, PinnableSlice* values,
+                            Status* statuses, bool sorted_input) {
+    write_batch_.MultiGetFromBatchAndDB(db_, options, column_family, num_keys,
+                                        keys, values, statuses, sorted_input);
+  }
+
   // Transaction policies with custom visibility rules override these hooks to
   // supply their ReadCallback while reusing the public entity-read plumbing.
   virtual Status GetEntityImpl(const ReadOptions& options,

@@ -952,28 +952,10 @@ Status WriteUnpreparedTxn::PopSavePoint() {
   return Status::NotFound();
 }
 
-void WriteUnpreparedTxn::MultiGet(const ReadOptions& _read_options,
-                                  ColumnFamilyHandle* column_family,
-                                  const size_t num_keys, const Slice* keys,
-                                  PinnableSlice* values, Status* statuses,
-                                  const bool sorted_input) {
-  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
-      _read_options.io_activity != Env::IOActivity::kMultiGet) {
-    Status s = Status::InvalidArgument(
-        "Can only call MultiGet with `ReadOptions::io_activity` is "
-        "`Env::IOActivity::kUnknown` or `Env::IOActivity::kMultiGet`");
-
-    for (size_t i = 0; i < num_keys; ++i) {
-      if (statuses[i].ok()) {
-        statuses[i] = s;
-      }
-    }
-    return;
-  }
-  ReadOptions read_options(_read_options);
-  if (read_options.io_activity == Env::IOActivity::kUnknown) {
-    read_options.io_activity = Env::IOActivity::kMultiGet;
-  }
+void WriteUnpreparedTxn::MultiGetImpl(
+    const ReadOptions& read_options, ColumnFamilyHandle* column_family,
+    size_t num_keys, const Slice* keys, PinnableSlice* values, Status* statuses,
+    bool sorted_input) {
   SequenceNumber min_uncommitted;
   SequenceNumber snap_seq;
   const SnapshotBackup backed_by_snapshot = wupt_db_->AssignMinMaxSeqs(
