@@ -322,10 +322,10 @@ bool RangeDelAggregator::StripeRep::IsRangeOverlapped(const Slice& start,
     }
 
     if (!checked_candidate_tombstones) {
-      // Do an additional check for when the end of the range is the begin
-      // key of a tombstone, which we missed earlier since SeekForPrev'ing
-      // to the start was invalid.
-      iter->SeekForPrev(end);
+      // SeekForPrev(start) may be invalid when the query starts before the
+      // first tombstone. Check the first candidate, not the last one before
+      // end, which may start at an exclusive end and hide an earlier overlap.
+      iter->Seek(start);
       if (iter->Valid() && icmp_->Compare(start_ikey, iter->end_key()) < 0 &&
           icmp_->Compare(iter->start_key(), end_ikey) <= 0) {
         return true;
