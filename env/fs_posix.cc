@@ -695,13 +695,12 @@ class PosixFileSystem : public FileSystem {
       // filter out '.' and '..' directory entries
       // which appear only on some platforms
       const bool ignore =
-          entry->d_type == DT_DIR &&
           (strcmp(entry->d_name, ".") == 0 ||
            strcmp(entry->d_name, "..") == 0
 #ifndef ASSERT_STATUS_CHECKED
            // In case of ASSERT_STATUS_CHECKED, GetChildren support older
            // version of API for debugging purpose.
-           || opts.do_not_recurse
+           || (entry->d_type == DT_DIR && opts.do_not_recurse)
 #endif
           );
       if (!ignore) {
