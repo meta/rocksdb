@@ -204,6 +204,24 @@ TEST_F(WriteBatchTest, Corruption) {
       PrintContents(&batch));
 }
 
+TEST_F(WriteBatchTest, TimedPutCorruption) {
+  WriteBatch batch;
+  ASSERT_OK(batch.Put(Slice("foo"), Slice("bar")));
+  WriteBatchInternal::SetSequence(&batch, 200);
+  // Append a TimedPut record whose packed value is shorter than the fixed
+  // size write time trailer.
+  std::string contents = WriteBatchInternal::Contents(&batch).ToString();
+  contents.push_back(static_cast<char>(kTypeValuePreferredSeqno));
+  PutLengthPrefixedSlice(&contents, "box");
+  PutLengthPrefixedSlice(&contents, "short");
+  ASSERT_OK(WriteBatchInternal::SetContents(&batch, contents));
+  WriteBatchInternal::SetCount(&batch, 2);
+  ASSERT_EQ(
+      "Put(foo, bar)@200"
+      "Corruption: bad WriteBatch TimedPut",
+      PrintContents(&batch));
+}
+
 TEST_F(WriteBatchTest, Append) {
   WriteBatch b1;
   WriteBatch b2;
