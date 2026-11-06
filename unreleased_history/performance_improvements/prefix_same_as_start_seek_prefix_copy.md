@@ -1,0 +1,1 @@
+A `prefix_same_as_start` seek on a block-based table no longer copies the seek key's prefix when the prefix filter rules the seek out, and reuses the copy's buffer across seeks instead of allocating one for every prefix longer than the small-string buffer.

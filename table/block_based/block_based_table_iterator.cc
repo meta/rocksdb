@@ -50,24 +50,6 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
     return;
   }
 
-  if (target == nullptr) {
-    // `SeekToFirst()` has no seek key, so no prefix to trim readahead against.
-    // An earlier `Seek()` on this iterator can have left one behind, and
-    // `ResetBlockCacheLookupVar()` below does not clear it. Without this clear,
-    // `IsNextBlockOutOfReadaheadBound()` would trim against a key range that
-    // this positioning does not scan.
-    //
-    // TODO(hx235): set `seek_key_prefix_for_readahead_trimming_`
-    // even when `target == nullptr` that is when `SeekToFirst()` is called
-    seek_key_prefix_for_readahead_trimming_.clear();
-  } else if (prefix_extractor_ && read_options_.prefix_same_as_start) {
-    const Slice& seek_user_key = ExtractUserKey(*target);
-    seek_key_prefix_for_readahead_trimming_ =
-        prefix_extractor_->InDomain(seek_user_key)
-            ? prefix_extractor_->Transform(seek_user_key).ToString()
-            : "";
-  }
-
   bool is_first_pass = !async_read_in_progress_;
 
   if (!is_first_pass) {
@@ -104,6 +86,31 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
     RecordTick(table_->GetStatistics(), is_last_level_
                                             ? LAST_LEVEL_SEEK_FILTER_MATCH
                                             : NON_LAST_LEVEL_SEEK_FILTER_MATCH);
+  }
+
+  // Set only after the prefix filter has passed the seek: a filtered seek
+  // reads no data blocks, and the next positioning call replaces or ignores
+  // this prefix. The second pass of an async seek reuses the first pass's.
+  if (target == nullptr) {
+    // `SeekToFirst()` has no seek key, so no prefix to trim readahead against.
+    // An earlier `Seek()` on this iterator can have left one behind, and
+    // `ResetBlockCacheLookupVar()` above does not clear it. Without this clear,
+    // `IsNextBlockOutOfReadaheadBound()` would trim against a key range that
+    // this positioning does not scan.
+    //
+    // TODO(hx235): set `seek_key_prefix_for_readahead_trimming_`
+    // even when `target == nullptr` that is when `SeekToFirst()` is called
+    seek_key_prefix_for_readahead_trimming_.clear();
+  } else if (prefix_extractor_ && read_options_.prefix_same_as_start) {
+    const Slice& seek_user_key = ExtractUserKey(*target);
+    if (prefix_extractor_->InDomain(seek_user_key)) {
+      const Slice prefix = prefix_extractor_->Transform(seek_user_key);
+      // assign() reuses the buffer kept from earlier seeks.
+      seek_key_prefix_for_readahead_trimming_.assign(prefix.data(),
+                                                     prefix.size());
+    } else {
+      seek_key_prefix_for_readahead_trimming_.clear();
+    }
   }
 
   bool need_seek_index = true;
