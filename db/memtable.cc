@@ -1138,6 +1138,7 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
   // Format of an entry is concatenation of:
   //  key_size     : varint32 of internal_key.size()
   //  key bytes    : char[internal_key.size()]
+  //  seq | type   : Fixed64[56bit(seq) | 8bit(type)]
   //  value_size   : varint32 of value.size()
   //  value bytes  : char[value.size()]
   //  checksum     : char[moptions_.protection_bytes_per_key]
