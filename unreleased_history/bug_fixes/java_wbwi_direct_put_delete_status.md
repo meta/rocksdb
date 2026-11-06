@@ -1,0 +1,1 @@
+Fixed Java `WriteBatchWithIndex.put()` and `delete()` with direct `ByteBuffer`s silently discarding a write that failed (for example because `setMaxBytes()` was exceeded). They now throw `RocksDBException`, like the `byte[]` overloads.
