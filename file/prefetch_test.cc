@@ -3333,11 +3333,7 @@ TEST_P(PrefetchTest, SeekParallelizationTestWithPosix) {
     if (read_async_called) {
       ASSERT_GT(async_read_bytes.count, 0);
       ASSERT_GT(get_perf_context()->number_async_seek, 0);
-      if (std::get<1>(GetParam())) {
-        ASSERT_EQ(buff_prefetch_count, 1);
-      } else {
-        ASSERT_EQ(buff_prefetch_count, 2);
-      }
+      ASSERT_EQ(buff_prefetch_count, 2);
     } else {
       // Not all platforms support iouring. In that case, ReadAsync in posix
       // won't submit async requests.
