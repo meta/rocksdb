@@ -707,6 +707,10 @@ bool ForwardIterator::IsValuePinned() const {
          current_->IsValuePinned();
 }
 
+const Version* ForwardIterator::current_version() const {
+  return sv_ != nullptr ? sv_->current : nullptr;
+}
+
 void ForwardIterator::RebuildIterators(bool refresh_sv) {
   // Clean up
   Cleanup(refresh_sv);

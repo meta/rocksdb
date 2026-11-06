@@ -143,6 +143,7 @@ class ReadPathBlobResolver {
 
   // Accessors used by the batch coalescing path to group and dispatch reads.
   const Version* version() const { return blob_fetcher_.version(); }
+  void SetVersion(const Version* version) { blob_fetcher_.SetVersion(version); }
   const SameFileBlobReader* same_file_reader() const {
     return same_file_reader_;
   }

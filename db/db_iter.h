@@ -290,6 +290,9 @@ class DBIter final : public Iterator {
     // The blob fetcher backing this reader, for resolving wide-column entity
     // blob references (the merge path). Valid for this BlobReader's lifetime.
     const BlobFetcher& blob_fetcher() const { return blob_fetcher_; }
+    void SetVersion(const Version* version) {
+      blob_fetcher_.SetVersion(version);
+    }
 
    private:
     PinnableSlice blob_value_;
@@ -350,6 +353,9 @@ class DBIter final : public Iterator {
     }
     const ReadPathBlobResolver& entity_blob_resolver() const {
       return entity_blob_resolver_;
+    }
+    void SetVersion(const Version* version) {
+      entity_blob_resolver_.SetVersion(version);
     }
 
     std::mutex& lazy_entity_columns_mutex() const {
@@ -621,6 +627,8 @@ class DBIter final : public Iterator {
     prefix_.reset();
   }
 
+  void UpdateVersionIfNecessary();
+
   void MarkMemtableForFlushForAvgTrigger() {
     if (avg_op_scan_flush_trigger_ &&
         mem_hidden_op_scanned_since_seek_ >= memtable_op_scan_flush_trigger_ &&
@@ -717,6 +725,7 @@ class DBIter final : public Iterator {
   port::RWMutex* ingest_sst_lock_;
   // Number of the Version this iterator reads, or 0 if unknown.
   const uint64_t version_number_;
+  const Version* current_version_;
   const Slice* const timestamp_ub_;
   const Slice* const timestamp_lb_;
   const size_t timestamp_size_;
