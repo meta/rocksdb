@@ -7,6 +7,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <unistd.h>
 
 #include "proto/gen/db_operation.pb.h"
 #include "rocksdb/db.h"
@@ -41,7 +42,7 @@ DEFINE_PROTO_FUZZER(DBOperations& input) {
     return;
   }
 
-  const std::string kDbPath = "/tmp/db_map_fuzzer_test";
+  const std::string kDbPath = "/tmp/db_map_fuzzer_test_" + std::to_string(getpid());
   auto fs = ROCKSDB_NAMESPACE::FileSystem::Default();
   if (fs->FileExists(kDbPath, ROCKSDB_NAMESPACE::IOOptions(), /*dbg=*/nullptr)
           .ok()) {
