@@ -3537,6 +3537,9 @@ extern ROCKSDB_LIBRARY_API void rocksdb_lru_cache_options_set_num_shard_bits(
     rocksdb_lru_cache_options_t*, int);
 extern ROCKSDB_LIBRARY_API void rocksdb_lru_cache_options_set_memory_allocator(
     rocksdb_lru_cache_options_t*, rocksdb_memory_allocator_t*);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_lru_cache_options_set_high_pri_pool_ratio(rocksdb_lru_cache_options_t*,
+                                                  double);
 
 extern ROCKSDB_LIBRARY_API rocksdb_cache_t* rocksdb_cache_create_lru(
     size_t capacity);
