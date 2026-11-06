@@ -1732,6 +1732,19 @@ Status ColumnFamilyData::ValidateOptions(
   return s;
 }
 
+namespace {
+// Runs both checks DB::Open() runs on a column family's options: its own, and
+// those of the configurable objects in them, such as the table factory.
+Status ValidateOptionsLikeOpen(const DBOptions& db_opts,
+                               const ColumnFamilyOptions& cf_opts) {
+  Status s = ColumnFamilyData::ValidateOptions(db_opts, cf_opts);
+  if (s.ok()) {
+    s = ROCKSDB_NAMESPACE::ValidateOptions(db_opts, cf_opts);
+  }
+  return s;
+}
+}  // namespace
+
 Status ColumnFamilyData::SetOptions(
     const DBOptions& db_opts,
     const std::unordered_map<std::string, std::string>& options_map) {
@@ -1749,7 +1762,7 @@ Status ColumnFamilyData::SetOptions(
   if (s.ok()) {
     // FIXME: we should call SanitizeOptions() too or consolidate it with
     // ValidateOptions().
-    s = ValidateOptions(db_opts, cf_opts);
+    s = ValidateOptionsLikeOpen(db_opts, cf_opts);
   }
   if (s.ok()) {
     mutable_cf_options_ = MutableCFOptions(cf_opts);
@@ -1766,7 +1779,7 @@ bool ColumnFamilyData::SetOptionsIsNoOp(
   // nothing must pass the same check to return the same status.
   return !IsDropped() && !options_install_pending_ &&
          MutableCFOptionsUnchangedByMap(mutable_cf_options_, options_map) &&
-         ValidateOptions(db_opts, GetLatestCFOptions()).ok();
+         ValidateOptionsLikeOpen(db_opts, GetLatestCFOptions()).ok();
 }
 
 Status ColumnFamilyData::AddDirectories(

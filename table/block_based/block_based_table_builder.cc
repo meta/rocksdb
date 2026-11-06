@@ -1866,8 +1866,8 @@ struct BlockBasedTableBuilder::Rep {
     if (builds_custom_index &&
         table_options.user_defined_index_factory != nullptr) {
       // See IndexFactoryOptions for why the two can't be combined. Repeated
-      // from BlockBasedTableFactory::ValidateOptions because SstFileWriter and
-      // SetOptions never reach it. Reopening this needs ts_sz and
+      // from BlockBasedTableFactory::ValidateOptions because SstFileWriter
+      // never reaches it. Reopening this needs ts_sz and
       // persist_user_defined_timestamps plumbed into IndexFactoryOptions.
       if (ts_sz > 0) {
         SetStatus(Status::InvalidArgument(
