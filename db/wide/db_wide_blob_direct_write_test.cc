@@ -622,6 +622,62 @@ TEST_F(DBWideBlobDirectWriteTest, PutEntityRejectsEmptyAttributeGroups) {
   ASSERT_EQ("NOT_FOUND", Get("empty_attribute_groups"));
 }
 
+TEST_F(DBWideBlobDirectWriteTest, EmptyColumnNotStoredAsBlob) {
+  for (bool blog : {false, true}) {
+    SCOPED_TRACE(blog ? "blog blobs" : "legacy blobs");
+    for (bool use_batch : {false, true}) {
+      SCOPED_TRACE(use_batch ? "WriteBatch::PutEntity" : "DB::PutEntity");
+      Options options = GetDirectWriteOptions();
+      options.min_blob_size = 0;
+      options.blob_compression_type = kNoCompression;
+      options.use_blog_format_for_blobs = blog;
+      options.disable_auto_compactions = true;
+      DestroyAndReopen(options);
+
+      auto put_entity = [&](const Slice& key, const WideColumns& columns) {
+        if (!use_batch) {
+          return db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), key,
+                                columns);
+        }
+        WriteBatch batch;
+        Status s = batch.PutEntity(db_->DefaultColumnFamily(), key, columns);
+        return s.ok() ? db_->Write(WriteOptions(), &batch) : s;
+      };
+      const WideColumns empty_columns{{kDefaultWideColumnName, ""},
+                                      {"empty", ""}};
+      EXPECT_OK(put_entity("empty", empty_columns));
+      ASSERT_OK(Flush());
+      EXPECT_EQ(CountBlobFiles(), 0U);
+      const std::string value(100, 'v');
+      const WideColumns mixed_columns{
+          {kDefaultWideColumnName, ""}, {"data", value}, {"empty", ""}};
+      EXPECT_OK(put_entity("mixed", mixed_columns));
+
+      auto verify = [&]() {
+        PinnableWideColumns result;
+        ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(),
+                                 "empty", &result));
+        EXPECT_EQ(result.columns(), empty_columns);
+        result.Reset();
+        ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(),
+                                 "mixed", &result));
+        EXPECT_EQ(result.columns(), mixed_columns);
+      };
+      verify();
+      ASSERT_OK(Flush());
+      verify();
+      ColumnFamilyMetaData metadata;
+      db_->GetColumnFamilyMetaData(&metadata);
+      ASSERT_EQ(metadata.blob_files.size(), 1U);
+      EXPECT_EQ(metadata.blob_files[0].total_blob_count, 1U);
+      Close();
+      Reopen(options);
+      verify();
+      Close();
+    }
+  }
+}
+
 TEST_F(DBWideBlobDirectWriteTest,
        PutEntitySerializedRejectsExistingBlobReferencesWhenDirectWriteEnabled) {
   Options options = GetDirectWriteOptions();

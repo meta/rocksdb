@@ -11,12 +11,14 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <limits>
 #include <memory>
 #include <vector>
 
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/wal_iterator_impl.h"
+#include "db/wal_reader.h"
 #include "db/write_batch_internal.h"
 #include "file/file_util.h"
 #include "file/filename.h"
@@ -530,12 +532,16 @@ Status WalManager::ReadFirstLine(const std::string& fname,
   reporter.fname = fname.c_str();
   reporter.status = &status;
   reporter.ignore_error = !db_options_.paranoid_checks;
-  log::Reader reader(db_options_.info_log, std::move(file_reader), &reporter,
-                     true /*checksum*/, number);
+  std::unique_ptr<WalReader> reader =
+      NewWalReader(db_options_.info_log, std::move(file_reader), &reporter,
+                   true /*checksum*/, number, /*track_and_verify_wals=*/false,
+                   /*stop_replay_for_corruption=*/false,
+                   std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
+                   /*buffered=*/false);
   std::string scratch;
   Slice record;
 
-  if (reader.ReadRecord(&record, &scratch) &&
+  if (reader->ReadRecord(&record, &scratch) &&
       (status.ok() || !db_options_.paranoid_checks)) {
     if (record.size() < WriteBatchInternal::kHeader) {
       reporter.Corruption(record.size(),
@@ -553,7 +559,7 @@ Status WalManager::ReadFirstLine(const std::string& fname,
     }
   }
 
-  if (status.ok() && reader.IsCompressedAndEmptyFile()) {
+  if (status.ok() && reader->IsCompressedAndEmptyFile()) {
     // In case of wal_compression, it writes a `kSetCompressionType` record
     // which is not associated with any sequence number. As result for an empty
     // file, GetSortedWalsOfType() will skip these WALs causing the operations

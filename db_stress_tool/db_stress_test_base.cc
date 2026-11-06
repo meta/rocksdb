@@ -7278,6 +7278,21 @@ void InitializeOptionsFromFlags(
 
   options.wal_compression =
       StringToCompressionType(FLAGS_wal_compression.c_str());
+  options.use_blog_format_for_wals = FLAGS_use_blog_format_for_wals;
+  options.use_blog_format_for_blobs = FLAGS_use_blog_format_for_blobs;
+  // Parse blog_checksum from string. Use the options system for correct
+  // handling of all ChecksumType values.
+  {
+    ConfigOptions config_options;
+    config_options.ignore_unknown_options = true;
+    DBOptions tmp_opts;
+    GetDBOptionsFromString(config_options, tmp_opts,
+                           "blog_checksum=" + FLAGS_blog_checksum, &tmp_opts)
+        .PermitUncheckedError();
+    options.blog_checksum = tmp_opts.blog_checksum;
+  }
+  options.blog_timestamp_size =
+      lossless_cast<size_t>(FLAGS_blog_timestamp_size);
 
   options.last_level_temperature =
       StringToTemperature(FLAGS_last_level_temperature.c_str());

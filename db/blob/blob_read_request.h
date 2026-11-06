@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cinttypes>
+#include <tuple>
 
 #include "rocksdb/compression_type.h"
 #include "rocksdb/slice.h"
@@ -13,6 +14,8 @@
 #include "util/autovector.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+class SharedBlobFileMetaData;
 
 // Non-owning metadata needed when opening a blob file for reading. The
 // checksum slices must remain valid while this object is in use. A file without
@@ -65,9 +68,15 @@ struct BlobReadRequest {
   ~BlobReadRequest() = default;
 };
 
+// Per-file batch for BlobSource::MultiGetBlob. `expected_meta` carries the
+// MANIFEST metadata the opened blob file is verified against (null for files
+// without MANIFEST metadata, e.g. in-flight direct-write files); like
+// BlobReadRequest::user_key, it is a borrowed pointer that must outlive the
+// MultiGetBlob call.
 using BlobFileReadRequests =
     std::tuple<BlobFileOpenInfo, uint64_t /* file_size */,
-               autovector<BlobReadRequest>>;
+               autovector<BlobReadRequest>,
+               const SharedBlobFileMetaData* /* expected_meta */>;
 
 // A byte-range (partial) blob read request for the lazy blob-read multi
 // primitives (BlobFileReader::MultiGetBlobRange /
@@ -109,8 +118,14 @@ struct BlobRangeReadRequest {
   BlobRangeReadRequest() = default;
 };
 
+// Per-file batch for BlobSource::MultiGetBlobRange. `expected_meta` carries
+// the MANIFEST metadata the opened blob file is verified against (null for
+// files without MANIFEST metadata, e.g. in-flight direct-write files); like
+// the whole-value batch above, it is a borrowed pointer that must outlive the
+// MultiGetBlobRange call.
 using BlobFileRangeReadRequests =
     std::tuple<BlobFileOpenInfo, uint64_t /* file_size */,
-               autovector<BlobRangeReadRequest>>;
+               autovector<BlobRangeReadRequest>,
+               const SharedBlobFileMetaData* /* expected_meta */>;
 
 }  // namespace ROCKSDB_NAMESPACE

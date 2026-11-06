@@ -423,6 +423,42 @@ IOStatus TestFSWritableFile::Truncate(uint64_t size, const IOOptions& options,
     return s;
   }
 
+  // With unsynced data loss injection, bytes appended since the last Sync()
+  // live only in buffer_; target_ still ends at pos_at_last_sync_. Truncate()
+  // is against the logical file, so shorten buffer_ for a truncation landing
+  // inside it and leave target_ alone -- forwarding would extend target_ with
+  // zeros and (on POSIX) reseek past them, stranding buffer_ behind that gap
+  // on the next Sync(). Only below pos_at_last_sync_ does target_ need it.
+  // Not for reopened handles: their offsets start at zero although target_
+  // already holds the file's earlier bytes.
+  if (unsync_data_loss_ && !reopened_for_write_ && !target_->use_direct_io() &&
+      state_.pos_at_last_sync_ <= state_.pos_at_last_append_ &&
+      state_.pos_at_last_append_ - state_.pos_at_last_sync_ ==
+          lossless_cast<uint64_t>(state_.buffer_.size())) {
+    if (size >= state_.pos_at_last_sync_ &&
+        size <= state_.pos_at_last_append_) {
+      if (size < state_.pos_at_last_append_) {
+        state_.buffer_.resize(
+            lossless_cast<size_t>(size - state_.pos_at_last_sync_));
+        state_.pos_at_last_append_ = size;
+        fs_->WritableFileAppended(state_);
+      }
+      return IOStatus::OK();
+    }
+    if (size < state_.pos_at_last_sync_) {
+      s = target_->Truncate(size, options, dbg);
+      if (s.ok()) {
+        state_.buffer_.clear();
+        state_.pos_at_last_sync_ = size;
+        state_.pos_at_last_append_ = size;
+        fs_->WritableFileAppended(state_);
+      }
+      return s;
+    }
+    // size > pos_at_last_append_ extends past the logical end; fall through so
+    // behavior is unchanged for any caller that does that.
+  }
+
   s = target_->Truncate(size, options, dbg);
   if (s.ok()) {
     state_.pos_at_last_append_ = size;

@@ -17,6 +17,7 @@
 #include "db/version_edit.h"
 #include "logging/logging.h"
 #include "monitoring/persistent_stats_history.h"
+#include "rocksdb/slice.h"
 #include "util/udt_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -1010,13 +1011,20 @@ Status VersionEditHandlerPointInTime::VerifyBlobFile(
   const BlobFileOpenInfo blob_file{blob_file_num,
                                    blob_addition.GetChecksumValue(),
                                    blob_addition.GetChecksumMethod()};
-  Status s = blob_source->GetBlobFileReader(read_options_, blob_file,
-                                            &blob_file_reader);
+  Status s = blob_source->GetBlobFileReader(
+      read_options_, blob_file,
+      cfd->GetLatestMutableCFOptions().compression_manager.get(),
+      &blob_file_reader);
   if (!s.ok()) {
     return s;
   }
-  // TODO: verify checksum
-  return s;
+
+  const BlobFileReader* reader = blob_file_reader.GetValue();
+  assert(reader != nullptr);
+
+  return reader->VerifyAgainstManifestMetadata(
+      blob_addition.GetPhysicalBlobFileSize(), blob_addition.GetSchemaVersion(),
+      blob_addition.GetFileIdentity());
 }
 
 Status VersionEditHandlerPointInTime::LoadTables(

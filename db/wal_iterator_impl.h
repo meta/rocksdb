@@ -8,8 +8,8 @@
 #include <memory>
 #include <vector>
 
-#include "db/log_reader.h"
 #include "db/version_set.h"
+#include "db/wal_reader.h"
 #include "file/filename.h"
 #include "logging/logging.h"
 #include "options/db_options.h"
@@ -125,7 +125,7 @@ class WalIteratorImpl : public WalIterator {
   Status current_status_;
   size_t current_file_index_;
   std::unique_ptr<WriteBatch> current_batch_;
-  std::unique_ptr<log::Reader> current_log_reader_;
+  std::unique_ptr<WalReader> current_log_reader_;
   std::string scratch_;
   Status OpenLogFile(const WalFile* log_file,
                      std::unique_ptr<SequentialFileReader>* file);
