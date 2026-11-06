@@ -329,6 +329,9 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
                         const SliceTransform* prefix_extractor,
                         MultiGetRange* mget_range) override;
 
+  std::unique_ptr<PointKeyAbsenceChecker> NewPointKeyAbsenceChecker(
+      const SliceTransform* prefix_extractor) override;
+
   DECLARE_SYNC_AND_ASYNC_OVERRIDE(void, MultiGet,
                                   const ReadOptions& readOptions,
                                   const MultiGetContext::Range* mget_range,
@@ -483,6 +486,17 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
       const ReadOptions& ro, const BlockHandle& handle,
       CachableEntry<TBlocklike>* out_parsed_block) const;
 
+  // Looks up the block at `handle` in the primary tier of the block cache
+  // only: performs no I/O, does not look up or promote entries of a secondary
+  // cache, and does not insert into the block cache. Like other block cache
+  // lookups, records BLOCK_CACHE_* statistics and block cache perf counters,
+  // and a hit counts as a use of the cached block (for example, for LRU
+  // order). Leaves `out_parsed_block` empty if the block is not found.
+  template <typename TBlocklike>
+  Status LookupBlockInPrimaryCache(
+      const BlockHandle& handle,
+      CachableEntry<TBlocklike>* out_parsed_block) const;
+
   // Create the block given in `block_contents` and insert it into block cache.
   // `out_parsed_block` points to the inserted block if successful.
   template <typename TBlocklike>
@@ -619,11 +633,13 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   // pointer to the block as well as its block handle.
   // @param uncompression_dict Data for presetting the compression library's
   //    dictionary.
+  // @param lowest_used_cache_tier CacheTier::kVolatileTier to look only in the
+  //    primary cache tier, else rep_->ioptions.lowest_used_cache_tier.
   template <typename TBlocklike>
   WithBlocklikeCheck<Status, TBlocklike> GetDataBlockFromCache(
       const Slice& cache_key, BlockCacheInterface<TBlocklike> block_cache,
       CachableEntry<TBlocklike>* block, GetContext* get_context,
-      UnownedPtr<Decompressor> decomp) const;
+      UnownedPtr<Decompressor> decomp, CacheTier lowest_used_cache_tier) const;
 
   // Put a maybe compressed block to the corresponding block caches.
   // This method will perform decompression against block_contents if needed

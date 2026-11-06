@@ -17,7 +17,7 @@ RocksDB's write path takes application writes through validation, group commit c
 | 5. Sequence Number Assignment | [05_sequence_numbers.md](05_sequence_numbers.md) | Monotonic sequence allocation, per-key vs per-batch modes, visibility publishing, and two-queue semantics. |
 | 6. Write Modes | [06_write_modes.md](06_write_modes.md) | Normal batched, pipelined, two-queue, and unordered write paths with their tradeoffs and implementation details. |
 | 7. Flow Control and Write Stalls | [07_flow_control.md](07_flow_control.md) | WriteController token-based rate limiting, WriteBufferManager memory tracking, write stall conditions, and the delay algorithm. |
-| 8. Tombstone Lifecycle | [08_tombstone_lifecycle.md](08_tombstone_lifecycle.md) | Delete, SingleDelete, and DeleteRange tombstone types, their write path, read-time visibility, and compaction cleanup rules. |
+| 8. Tombstone Lifecycle | [08_tombstone_lifecycle.md](08_tombstone_lifecycle.md) | Delete, SingleDelete, and DeleteRange tombstone types, their write path, read-time visibility, optional flush-time drop of point tombstones, and compaction cleanup rules. |
 | 9. Crash Recovery | [09_crash_recovery.md](09_crash_recovery.md) | WAL replay during DB::Open, fragment reassembly, recyclable header verification, and WAL truncation on memtable failure. |
 | 10. Performance | [10_performance.md](10_performance.md) | Hot path optimizations, write amplification analysis, tuning guidelines, and db_bench examples. |
 

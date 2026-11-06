@@ -195,6 +195,19 @@ class FilterBlockReader {
     }
   }
 
+  // Like KeyMayMatch() and PrefixMayMatch(), but uses only filter data that
+  // this reader holds or that is in the primary tier of the block cache: they
+  // never perform I/O, never look up or promote entries of a secondary cache,
+  // and never insert into the block cache. They return true ("may match")
+  // whenever other filter data would be needed. They record no BLOOM_FILTER_*
+  // statistics and no bloom_sst_* perf counters; block cache lookups record
+  // the usual block cache statistics. Only a partitioned filter uses
+  // `const_ikey_ptr` (to choose a partition); others accept nullptr.
+  virtual bool KeyMayMatchInMemory(const Slice& key,
+                                   const Slice* const const_ikey_ptr) = 0;
+  virtual bool PrefixMayMatchInMemory(const Slice& prefix,
+                                      const Slice* const const_ikey_ptr) = 0;
+
   virtual size_t ApproximateMemoryUsage() const = 0;
 
   // convert this object to a human readable form

@@ -1875,6 +1875,10 @@ DEFINE_bool(memtable_batch_lookup_optimization,
             ROCKSDB_NAMESPACE::Options().memtable_batch_lookup_optimization,
             "Sets CF option memtable_batch_lookup_optimization.");
 
+DEFINE_bool(flush_drop_obsolete_point_tombstones,
+            ROCKSDB_NAMESPACE::Options().flush_drop_obsolete_point_tombstones,
+            "Sets CF option flush_drop_obsolete_point_tombstones.");
+
 DEFINE_uint32(commit_bypass_memtable_one_in, 0,
               "If greater than zero, transaction option will set "
               "commit_bypass_memtable to per every N transactions on average.");

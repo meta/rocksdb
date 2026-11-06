@@ -127,6 +127,13 @@ class FlushJob {
     return &committed_flush_jobs_info_;
   }
 
+  // Records the FLUSH_OBSOLETE_POINT_TOMBSTONE* statistics of a job that wrote
+  // an L0 table. Run() calls it once the result is installed (or, for a flush
+  // that is not the oldest, handed to the flush that commits it). With atomic
+  // flush, Run() does not install the result, so the caller must call it after
+  // installing.
+  void RecordPointTombstoneDropStats() const;
+
  private:
   friend class FlushJobTest_GetRateLimiterPriorityForWrite_Test;
 
@@ -237,7 +244,19 @@ class FlushJob {
   autovector<ReadOnlyMemTable*> mems_;
   VersionEdit* edit_;
   Version* base_;
+  // Point tombstones that WriteLevel0Table() left out of the L0 table.
+  uint64_t num_point_tombstones_dropped_ = 0;
   bool pick_memtable_called;
+  // Whether this flush leaves obsolete point tombstones out of its output
+  // (flush_drop_obsolete_point_tombstones).
+  enum class PointTombstoneDrop : uint8_t {
+    kOptionOff,
+    // The option is on, but the column family has user-defined timestamps or
+    // an absence proof over base_ would not cover all data older than mems_.
+    kSkipped,
+    kEnabled,
+  };
+  PointTombstoneDrop point_tombstone_drop_ = PointTombstoneDrop::kOptionOff;
   Env::Priority thread_pri_;
 
   const std::shared_ptr<IOTracer> io_tracer_;

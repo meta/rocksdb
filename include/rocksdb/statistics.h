@@ -684,6 +684,15 @@ enum Tickers : uint32_t {
   // metadata, files, or capabilities failed validation before installation.
   REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT,
 
+  // Number of point tombstones that flushes left out of their output because
+  // they were obsolete (see flush_drop_obsolete_point_tombstones).
+  FLUSH_OBSOLETE_POINT_TOMBSTONES_DROPPED,
+  // Number of flushes that kept all of their point tombstones although
+  // flush_drop_obsolete_point_tombstones was enabled, because an older
+  // memtable of the column family was not part of the flush, ingest-behind
+  // was enabled, or the column family has user-defined timestamps.
+  FLUSH_OBSOLETE_POINT_TOMBSTONE_DROP_SKIPPED,
+
   TICKER_ENUM_MAX
 };
 

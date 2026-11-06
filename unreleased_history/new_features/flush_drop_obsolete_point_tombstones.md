@@ -1,0 +1,1 @@
+Added experimental column family option `flush_drop_obsolete_point_tombstones` (off by default, changeable with `SetOptions()`). When it is on, flush leaves out a `Delete()` tombstone if SST key ranges and in-memory filters show that no older version of the key exists, such as for a key written and deleted before its memtable is flushed.

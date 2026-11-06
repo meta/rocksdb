@@ -501,8 +501,9 @@ class Repairer {
           snapshot_checker, false /* paranoid_file_checks*/,
           nullptr /* internal_stats */, &io_s, nullptr /*IOTracer*/,
           BlobFileCreationReason::kRecovery,
-          nullptr /* seqno_to_time_mapping */, nullptr /* event_logger */,
-          0 /* job_id */, nullptr /* table_properties */, write_hint);
+          nullptr /* seqno_to_time_mapping */, nullptr /* absence_prover */,
+          nullptr /* event_logger */, 0 /* job_id */,
+          nullptr /* table_properties */, write_hint);
       // BuildTable() folds I/O failures into its Status, but it can return
       // early (for example, on an invalid compaction filter declaration)
       // before reading `io_s`.

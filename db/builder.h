@@ -37,6 +37,7 @@ class TableCache;
 class TableBuilder;
 class WritableFileWriter;
 class BlobFileCompletionCallback;
+class AbsenceProver;
 
 // Convenience function for NewTableBuilder on the embedded table_factory.
 TableBuilder* NewTableBuilder(const TableBuilderOptions& tboptions,
@@ -57,6 +58,8 @@ void ExtractTimestampFromTableProperties(const TableProperties& tp,
 //
 // @param column_family_name Name of the column family that is also identified
 //    by column_family_id, or empty string if unknown.
+// @param absence_prover Passed to the CompactionIterator over `iter`; may be
+//    null. See CompactionIterator.
 // @param flush_stats treat flush as level 0 compaction in internal stats
 Status BuildTable(
     const std::string& dbname, VersionSet* versions,
@@ -73,8 +76,8 @@ Status BuildTable(
     IOStatus* io_status, const std::shared_ptr<IOTracer>& io_tracer,
     BlobFileCreationReason blob_creation_reason,
     UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping,
-    EventLogger* event_logger = nullptr, int job_id = 0,
-    TableProperties* table_properties = nullptr,
+    AbsenceProver* absence_prover, EventLogger* event_logger = nullptr,
+    int job_id = 0, TableProperties* table_properties = nullptr,
     Env::WriteLifeTimeHint write_hint = Env::WLTH_NOT_SET,
     const std::string* full_history_ts_low = nullptr,
     BlobFileCompletionCallback* blob_callback = nullptr,
