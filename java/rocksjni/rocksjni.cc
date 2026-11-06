@@ -3347,6 +3347,24 @@ void Java_org_rocksdb_RocksDB_syncWal(JNIEnv* env, jclass, jlong jdb_handle) {
 
 /*
  * Class:     org_rocksdb_RocksDB
+ * Method:    waitForCompact
+ * Signature: (JJ)V
+ */
+void Java_org_rocksdb_RocksDB_waitForCompact(
+    JNIEnv* env, jclass, jlong jdb_handle,
+    jlong jwait_for_compact_options_handle) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  auto* wait_for_compact_options =
+      reinterpret_cast<ROCKSDB_NAMESPACE::WaitForCompactOptions*>(
+          jwait_for_compact_options_handle);
+  auto s = db->WaitForCompact(*wait_for_compact_options);
+  if (!s.ok()) {
+    ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
+  }
+}
+
+/*
+ * Class:     org_rocksdb_RocksDB
  * Method:    getLatestSequenceNumber
  * Signature: (J)V
  */

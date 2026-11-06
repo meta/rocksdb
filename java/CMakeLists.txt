@@ -91,6 +91,7 @@ set(JNI_NATIVE_SOURCES
         rocksjni/transaction_notifier_jnicallback.cc
         rocksjni/transaction_options.cc
         rocksjni/ttl.cc
+        rocksjni/wait_for_compact_options.cc
         rocksjni/wal_filter.cc
         rocksjni/wal_filter_jnicallback.cc
         rocksjni/wal_iterator.cc
@@ -285,6 +286,7 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/UInt64AddOperator.java
   src/main/java/org/rocksdb/VectorMemTableConfig.java
   src/main/java/org/rocksdb/WALRecoveryMode.java
+  src/main/java/org/rocksdb/WaitForCompactOptions.java
   src/main/java/org/rocksdb/WBWIRocksIterator.java
   src/main/java/org/rocksdb/WalFileType.java
   src/main/java/org/rocksdb/WalFilter.java
@@ -408,6 +410,7 @@ set(JAVA_TEST_CLASSES
   src/test/java/org/rocksdb/Types.java
   src/test/java/org/rocksdb/VerifyChecksumsTest.java
   src/test/java/org/rocksdb/WALRecoveryModeTest.java
+  src/test/java/org/rocksdb/WaitForCompactOptionsTest.java
   src/test/java/org/rocksdb/WalFilterTest.java
   src/test/java/org/rocksdb/WalIteratorTest.java
   src/test/java/org/rocksdb/WriteBatchHandlerTest.java

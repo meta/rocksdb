@@ -795,6 +795,7 @@ JNI_NATIVE_SOURCES =                                          \
   java/rocksjni/transaction_notifier_jnicallback.cc           \
   java/rocksjni/ttl.cc                                        \
   java/rocksjni/testable_event_listener.cc                    \
+  java/rocksjni/wait_for_compact_options.cc                   \
   java/rocksjni/wal_filter.cc                                 \
   java/rocksjni/wal_filter_jnicallback.cc                     \
   java/rocksjni/wal_iterator.cc                               \
