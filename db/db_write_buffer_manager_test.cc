@@ -12,10 +12,12 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 #include "db/db_test_util.h"
 #include "db/write_thread.h"
 #include "port/stack_trace.h"
+#include "rocksdb/utilities/transaction_db.h"
 #include "util/defer.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -2673,6 +2675,65 @@ TEST_F(DBWriteBufferManagerTest, ReadOnlyRecoveryWithEnforceWBMDoesNotAssert) {
   for (int i = 0; i < 50; i++) {
     ASSERT_EQ(DummyString(50 * 1024), Get(Key(i)));
   }
+}
+
+// A TransactionDB keeps flushed memtables as history (its default
+// max_write_buffer_size_to_maintain is max_write_buffer_number *
+// write_buffer_size). Here that history alone can fill the whole budget of a
+// stalling WriteBufferManager. The writer stalls, no flush is scheduled because
+// the mutable memtable is below half the budget, and history is trimmed only by
+// writes or flushes, so the stall must not depend on history being freed.
+TEST_F(DBWriteBufferManagerTest, StallEndsWithTransactionDBMemtableHistory) {
+  Options options = CurrentOptions();
+  options.write_buffer_size = 4 << 20;
+  options.max_write_buffer_number = 2;
+  options.write_buffer_manager.reset(new WriteBufferManager(
+      8 << 20, nullptr /* cache */, true /* allow_stall */));
+  Close();
+  Destroy(options);
+  options.create_if_missing = true;
+  TransactionDB* txn_db = nullptr;
+  ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname_,
+                                &txn_db));
+  db_.reset(txn_db);
+
+  // 64 MB of 1 KB values: eight times the budget.
+  constexpr int kNumPuts = 64 * 1024;
+  std::atomic<int> puts{0};
+  std::atomic<bool> done{false};
+  port::Thread writer([&] {
+    WriteOptions wo;
+    wo.disableWAL = true;
+    for (int i = 0; i < kNumPuts; i++) {
+      ASSERT_OK(txn_db->Put(wo, Key(i), DummyString(1000)));
+      puts.fetch_add(1);
+    }
+    done = true;
+  });
+
+  // Stuck means no put completed for 10 seconds. Then lift the stall so that
+  // the writer and the test can finish.
+  int last = -1;
+  auto last_change = std::chrono::steady_clock::now();
+  while (!done) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const int now = puts.load();
+    if (now != last) {
+      last = now;
+      last_change = std::chrono::steady_clock::now();
+    } else if (std::chrono::steady_clock::now() - last_change >
+               std::chrono::seconds(10)) {
+      break;
+    }
+  }
+  const bool finished = done.load();
+  if (!finished) {
+    options.write_buffer_manager->SetAllowStall(false);
+  }
+  writer.join();
+  ASSERT_TRUE(finished) << "writes stalled for good after " << last
+                        << " of " << kNumPuts << " puts";
+  Close();
 }
 
 INSTANTIATE_TEST_CASE_P(DBWriteBufferManagerTest, DBWriteBufferManagerTest,
