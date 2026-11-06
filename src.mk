@@ -370,6 +370,23 @@ LIB_SOURCES_ASM =
 LIB_SOURCES_C =
 endif
 
+ifeq (,$(shell $(CXX) -fsyntax-only -march=rv64gc_zbc -xc /dev/null 2>&1))
+RISCV_SOURCES_ASM =\
+  util/crc32c_riscv_asm.S
+RISCV_SOURCES_CC = \
+  util/crc32c_riscv.cc
+ifeq (,$(shell $(CXX) -fsyntax-only -march=rv64gc_zbc_zvbc_zbb -xc /dev/null 2>&1))
+RISCV_ZVBC_SOURCES_ASM =\
+  util/crc32c_riscv_zvbc_asm.S
+else
+RISCV_ZVBC_SOURCES_ASM =
+endif
+else
+RISCV_SOURCES_ASM =
+RISCV_SOURCES_CC =
+RISCV_ZVBC_SOURCES_ASM =
+endif
+
 WITH_FAISS_LIB_SOURCES = \
   utilities/secondary_index/faiss_ivf_index.cc                  \
 
