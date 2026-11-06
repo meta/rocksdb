@@ -1467,6 +1467,7 @@ For Leveled Compaction users, `CompactRange()` with `bottommost_level_compaction
   * Either sharing the backend cache with the block cache or using a completely separate cache is supported.
   * A new abstraction interface called `BlobSource` for blob read logic gives all users access to blobs, whether they are in the blob cache, secondary cache, or (remote) storage. Blobs can be potentially read both while handling user reads (`Get`, `MultiGet`, or iterator) and during compaction (while dealing with compaction filters, Merges, or garbage collection) but eventually all blob reads go through `Version::GetBlob` or, for MultiGet, `Version::MultiGetBlob` (and then get dispatched to the interface -- `BlobSource`).
 * Add experimental tiered compaction feature `AdvancedColumnFamilyOptions::preclude_last_level_data_seconds`, which makes sure the new data inserted within preclude_last_level_data_seconds won't be placed on cold tier (the feature is not complete).
+* Add new env parameter `MULTIREAD_BATCHED` for regression.sh
 
 ### Public API changes
 * Add metadata related structs and functions in C API, including
