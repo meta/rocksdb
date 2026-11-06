@@ -2610,6 +2610,10 @@ void rocksdb_flush_wal(rocksdb_t* db, unsigned char sync, char** errptr) {
   SaveError(errptr, db->rep->FlushWAL(sync));
 }
 
+void rocksdb_resume(rocksdb_t* db, char** errptr) {
+  SaveError(errptr, db->rep->Resume());
+}
+
 void rocksdb_pause_background_work(rocksdb_t* db, char** errptr) {
   SaveError(errptr, db->rep->PauseBackgroundWork());
 }
