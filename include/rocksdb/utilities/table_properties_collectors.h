@@ -209,7 +209,7 @@ struct DataCollectionUnixWriteTimeInfo {
     }
     uint64_t num_entries_write_time_tracked =
         num_entries_infinitely_old + num_entries_write_time_aggregated;
-    return num_entries_write_time_tracked /
+    return static_cast<double>(num_entries_write_time_tracked) /
            static_cast<double>(num_entries_write_time_tracked +
                                num_entries_write_time_untracked);
   }
