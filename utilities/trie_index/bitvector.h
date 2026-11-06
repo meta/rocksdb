@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -272,9 +273,8 @@ class Bitvector {
   // Bitvector contains raw pointers (words_, rank_lut_, select hints) that
   // may point into owned_data_ or into external memory (InitFromData).
   // Copying would create dangling pointers, so copy is deleted. Move is safe
-  // only when the pointers point into owned_data_ (BuildFrom case) because
-  // std::string's move constructor preserves the buffer address for
-  // SSO-exceeding strings. For the InitFromData case, the pointers reference
+  // for owned_data_ (BuildFrom case), whose heap allocation remains aligned
+  // and stable across moves. For the InitFromData case, the pointers reference
   // external memory and are unaffected by moving owned_data_ (which is empty).
   ~Bitvector() = default;
 
@@ -299,9 +299,8 @@ class Bitvector {
       num_select0_hints_ = other.num_select0_hints_;
       owned_data_ = std::move(other.owned_data_);
       // If this bitvector owns its data, the pointers must be re-seated into
-      // our owned_data_ buffer. std::string move may or may not preserve the
-      // buffer address (SSO optimization), so always re-seat.
-      if (!owned_data_.empty()) {
+      // our owned_data_ buffer.
+      if (owned_data_ != nullptr) {
         RecomputePointers();
       }
       other.words_ = nullptr;
@@ -497,7 +496,7 @@ class Bitvector {
   // Re-seats pointers into owned_data_ buffer.
   // Layout: [words][rank_lut][select1_hints][select0_hints]
   void RecomputePointers() {
-    const char* base = owned_data_.data();
+    const char* base = owned_data_.get();
     size_t words_bytes = num_words_ * sizeof(uint64_t);
     size_t rank_bytes = num_rank_samples_ * sizeof(uint32_t);
     size_t select1_bytes = num_select1_hints_ * sizeof(uint32_t);
@@ -532,7 +531,9 @@ class Bitvector {
   uint64_t num_select0_hints_;
 
   // Owned storage when built from BitvectorBuilder (not from serialized data).
-  std::string owned_data_;
+  // A char array allocation is aligned for the uint64_t words and uint32_t
+  // lookup tables. std::string's inline storage need not be aligned on libc++.
+  std::unique_ptr<char[]> owned_data_;
 };
 
 // ============================================================================
