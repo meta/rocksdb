@@ -2285,6 +2285,8 @@ TEST_F(ExternalSSTFileTest, MultiThreaded) {
   }
 
   do {
+    fprintf(stderr, "=== Testing with DBTestBase option config=%d (%s) ===\n",
+            option_config_, DBTestBase::GetOptionConfigName(option_config_));
     Options options = CurrentOptions();
     options.disable_auto_compactions = true;
     std::atomic<int> thread_num(0);

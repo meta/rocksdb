@@ -175,6 +175,93 @@ bool DBTestBase::ShouldSkipOptions(int option_config, int skip_mask) {
   return false;
 }
 
+const char* DBTestBase::GetOptionConfigName(int option_config) {
+  switch (option_config) {
+    case kDefault:
+      return "kDefault";
+    case kBlockBasedTableWithPrefixHashIndex:
+      return "kBlockBasedTableWithPrefixHashIndex";
+    case kBlockBasedTableWithWholeKeyHashIndex:
+      return "kBlockBasedTableWithWholeKeyHashIndex";
+    case kPlainTableFirstBytePrefix:
+      return "kPlainTableFirstBytePrefix";
+    case kPlainTableCappedPrefix:
+      return "kPlainTableCappedPrefix";
+    case kPlainTableCappedPrefixNonMmap:
+      return "kPlainTableCappedPrefixNonMmap";
+    case kPlainTableAllBytesPrefix:
+      return "kPlainTableAllBytesPrefix";
+    case kVectorRep:
+      return "kVectorRep";
+    case kHashLinkList:
+      return "kHashLinkList";
+    case kMergePut:
+      return "kMergePut";
+    case kFilter:
+      return "kFilter";
+    case kFullFilterWithNewTableReaderForCompactions:
+      return "kFullFilterWithNewTableReaderForCompactions";
+    case kUncompressed:
+      return "kUncompressed";
+    case kNumLevel_3:
+      return "kNumLevel_3";
+    case kDBLogDir:
+      return "kDBLogDir";
+    case kWalDirAndMmapReads:
+      return "kWalDirAndMmapReads";
+    case kManifestFileSize:
+      return "kManifestFileSize";
+    case kPerfOptions:
+      return "kPerfOptions";
+    case kHashSkipList:
+      return "kHashSkipList";
+    case kUniversalCompaction:
+      return "kUniversalCompaction";
+    case kUniversalCompactionMultiLevel:
+      return "kUniversalCompactionMultiLevel";
+    case kInfiniteMaxOpenFiles:
+      return "kInfiniteMaxOpenFiles";
+    case kCRC32cChecksum:
+      return "kCRC32cChecksum";
+    case kFIFOCompaction:
+      return "kFIFOCompaction";
+    case kOptimizeFiltersForHits:
+      return "kOptimizeFiltersForHits";
+    case kRowCache:
+      return "kRowCache";
+    case kRecycleLogFiles:
+      return "kRecycleLogFiles";
+    case kConcurrentSkipList:
+      return "kConcurrentSkipList";
+    case kPipelinedWrite:
+      return "kPipelinedWrite";
+    case kConcurrentWALWrites:
+      return "kConcurrentWALWrites";
+    case kDirectIO:
+      return "kDirectIO";
+    case kLevelSubcompactions:
+      return "kLevelSubcompactions";
+    case kBlockBasedTableWithIndexRestartInterval:
+      return "kBlockBasedTableWithIndexRestartInterval";
+    case kBlockBasedTableWithPartitionedIndex:
+      return "kBlockBasedTableWithPartitionedIndex";
+    case kBlockBasedTableWithPartitionedIndexFormat4:
+      return "kBlockBasedTableWithPartitionedIndexFormat4";
+    case kBlockBasedTableWithLatestFormat:
+      return "kBlockBasedTableWithLatestFormat";
+    case kPartitionedFilterWithNewTableReaderForCompactions:
+      return "kPartitionedFilterWithNewTableReaderForCompactions";
+    case kUniversalSubcompactions:
+      return "kUniversalSubcompactions";
+    case kUnorderedWrite:
+      return "kUnorderedWrite";
+    case kBlockBasedTableWithBinarySearchWithFirstKeyIndex:
+      return "kBlockBasedTableWithBinarySearchWithFirstKeyIndex";
+    default:
+      return "Unknown";
+  }
+}
+
 // Switch to a fresh database with the next option configuration to
 // test.  Return false if there are no more configurations to test.
 bool DBTestBase::ChangeOptions(int skip_mask) {
