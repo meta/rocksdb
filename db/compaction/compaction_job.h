@@ -626,6 +626,11 @@ class CompactionJob {
       const FileMetaData* file_meta, const ReadOptions& read_options,
       std::shared_ptr<const TableProperties>* tp);
 
+  bool HasTableFragmentedRangeDels(const ImmutableOptions& ioptions,
+                                   const MutableCFOptions& moptions,
+                                   const FileMetaData* file_meta,
+                                   const ReadOptions& read_options);
+
   void RestoreCompactionOutputs(
       const ColumnFamilyData* cfd,
       const std::vector<std::shared_ptr<const TableProperties>>&
