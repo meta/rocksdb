@@ -7,10 +7,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <memory>
+#include <vector>
+
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "file/sequence_file_reader.h"
 #include "file/writable_file_writer.h"
+#include "port/port.h"
 #include "rocksdb/env.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -148,6 +152,7 @@ class LogTest
   ReportCollector report_;
 
  protected:
+  uint64_t next_wal_index_ = kWALIndexStartNumber;
   std::unique_ptr<Writer> writer_;
   std::unique_ptr<Reader> reader_;
   bool allow_retry_read_;
@@ -188,7 +193,10 @@ class LogTest
       ASSERT_OK(writer_->MaybeAddUserDefinedTimestampSizeRecord(WriteOptions(),
                                                                 *cf_to_ts_sz));
     }
-    ASSERT_OK(writer_->AddRecord(WriteOptions(), Slice(msg)));
+    const uint64_t wal_index =
+        writer_->WALIndexEnabled() ? next_wal_index_++ : 0;
+    ASSERT_OK(
+        writer_->AddRecord(WriteOptions(), Slice(msg), /*seqno=*/0, wal_index));
   }
 
   size_t WrittenBytes() const { return dest_contents().size(); }
@@ -211,7 +219,7 @@ class LogTest
         // support record checksum yet.
         uint64_t actual_record_checksum =
             XXH3_64bits(record.data(), record.size());
-        assert(actual_record_checksum == record_checksum);
+        EXPECT_EQ(actual_record_checksum, record_checksum);
       }
       return record.ToString();
     } else {
@@ -276,6 +284,42 @@ class LogTest
                        kTolerateCorruptedTailRecords /* wal_recovery_mode */,
                    &recorded_ts_sz));
     EXPECT_EQ(expected_ts_sz, recorded_ts_sz);
+  }
+
+  // Turns on wal_index on the writer and emits the identifying marker record.
+  // For compressed logs, call this after AddCompressionTypeRecord.
+  void EnableWALIndex(bool write_marker = true) {
+    writer_->SetPartitionWALUsage(PartitionWALUsage::kPartitionByColumnFamily);
+    if (write_marker) {
+      ASSERT_OK(writer_->MaybeAddWALIndexMarkerRecord(WriteOptions()));
+    }
+  }
+
+  // Returns the wal_index the writer prefixed to each data record of an
+  // indexed WAL image. Reader-side decoding lands later in the stack, so tests
+  // that need to see what actually reached the file read it back from here.
+  // `payload_sizes` are the logical record sizes in write order; knowing them
+  // is what lets the walk skip from record to record without parsing headers,
+  // and the trailing size check catches any drift in the layout.
+  std::vector<uint64_t> DecodeWALIndices(
+      const std::string& contents, const std::vector<size_t>& payload_sizes) {
+    const size_t header_size = static_cast<size_t>(
+        std::get<0>(GetParam()) != 0 ? kRecyclableHeaderSize : kHeaderSize);
+    std::vector<uint64_t> indices;
+    indices.reserve(payload_sizes.size());
+    // The marker record leads the file and carries no payload.
+    size_t offset = header_size;
+    for (size_t payload_size : payload_sizes) {
+      const size_t record_size = header_size + kWALIndexSize + payload_size;
+      if (contents.size() < offset + record_size) {
+        ADD_FAILURE() << "WAL image ends before record " << indices.size();
+        return indices;
+      }
+      indices.push_back(DecodeFixed64(contents.data() + offset + header_size));
+      offset += record_size;
+    }
+    EXPECT_EQ(contents.size(), offset);
+    return indices;
   }
 };
 
@@ -810,6 +854,140 @@ TEST_P(LogTest, TimestampSizeRecordPadding) {
 
   ASSERT_EQ(first_str, Read());
   CheckRecordAndTimestampSize(second_str, ts_sz);
+}
+
+// EmitPhysicalRecord used to pick the legacy 7-byte header from a whitelist of
+// record types; it now asks IsRecyclableRecordType instead. With WAL index
+// disabled the output must be byte-identical to before, which requires the two
+// to agree on every record type that predates WAL index.
+static constexpr bool HeaderSelectionUnchangedForPreWALIndexTypes() {
+  constexpr uint8_t kPreWALIndexTypes[] = {
+      kZeroType,
+      kFullType,
+      kFirstType,
+      kMiddleType,
+      kLastType,
+      kRecyclableFullType,
+      kRecyclableFirstType,
+      kRecyclableMiddleType,
+      kRecyclableLastType,
+      kSetCompressionType,
+      kUserDefinedTimestampSizeType,
+      kRecyclableUserDefinedTimestampSizeType,
+      kPredecessorWALInfoType,
+      kRecyclePredecessorWALInfoType};
+  for (uint8_t type : kPreWALIndexTypes) {
+    const bool used_legacy_header_before =
+        type < kRecyclableFullType || type == kSetCompressionType ||
+        type == kPredecessorWALInfoType ||
+        type == kUserDefinedTimestampSizeType;
+    if (used_legacy_header_before == IsRecyclableRecordType(type)) {
+      return false;
+    }
+  }
+  return true;
+}
+static_assert(HeaderSelectionUnchangedForPreWALIndexTypes(),
+              "adding the WAL index record types changed header selection for "
+              "a record type that predates WAL index");
+
+// The marker record identifies the file as carrying wal_index. The record type
+// alone is the signal, so the marker is written with an empty payload.
+TEST_P(LogTest, WALIndexMarkerRecordIsEmpty) {
+  EnableWALIndex();
+  Write("foo");
+
+  const std::string contents = get_reader_contents()->ToString();
+  ASSERT_GE(contents.size(), static_cast<size_t>(kHeaderSize));
+
+  const uint8_t type = static_cast<uint8_t>(contents[6]);
+  ASSERT_TRUE(type == kWALIndexMarkerType ||
+              type == kRecyclableWALIndexMarkerType);
+
+  const uint32_t length = (static_cast<uint32_t>(contents[4]) & 0xff) |
+                          ((static_cast<uint32_t>(contents[5]) & 0xff) << 8);
+  ASSERT_EQ(0U, length);
+}
+
+// AddRecord persists the wal_index supplied by its DB-level caller.
+TEST_P(LogTest, WALIndexAssignedConsecutively) {
+  EnableWALIndex();
+
+  const std::vector<std::string> payloads = {"a", "b", "c", "d"};
+  std::vector<uint64_t> expected;
+  std::vector<size_t> payload_sizes;
+  for (const std::string& payload : payloads) {
+    expected.push_back(next_wal_index_++);
+    payload_sizes.push_back(payload.size());
+    ASSERT_OK(writer_->AddRecord(WriteOptions(), Slice(payload), /*seqno=*/0,
+                                 expected.back()));
+  }
+
+  // Compare against the bytes on disk: the counter that produced the values
+  // says nothing about what the writer persisted.
+  ASSERT_EQ(expected,
+            DecodeWALIndices(get_reader_contents()->ToString(), payload_sizes));
+}
+
+TEST_P(LogTest, WALIndexValuesCanSpanWriters) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  EnableWALIndex();
+
+  Slice second_writer_contents;
+  std::unique_ptr<FSWritableFile> second_sink(
+      new test::StringSink(&second_writer_contents));
+  std::unique_ptr<WritableFileWriter> second_file_writer(
+      new WritableFileWriter(std::move(second_sink), "", FileOptions()));
+  Writer second_writer(std::move(second_file_writer), 124, recyclable);
+  second_writer.SetPartitionWALUsage(
+      PartitionWALUsage::kPartitionByColumnFamily);
+  ASSERT_OK(second_writer.MaybeAddWALIndexMarkerRecord(WriteOptions()));
+
+  // The DB-level allocator can hand interleaved values to different writers;
+  // each writer persists the values it receives.
+  const uint64_t first = next_wal_index_++;
+  const uint64_t second = next_wal_index_++;
+  const uint64_t third = next_wal_index_++;
+  ASSERT_OK(
+      writer_->AddRecord(WriteOptions(), Slice("first"), /*seqno=*/0, first));
+  ASSERT_OK(second_writer.AddRecord(WriteOptions(), Slice("second"),
+                                    /*seqno=*/0, second));
+  ASSERT_OK(
+      writer_->AddRecord(WriteOptions(), Slice("third"), /*seqno=*/0, third));
+
+  // Each file holds exactly the values its writer was handed. The value that
+  // went to the other writer leaves a gap rather than being renumbered away.
+  const std::vector<uint64_t> mine = {first, third};
+  ASSERT_EQ(mine, DecodeWALIndices(get_reader_contents()->ToString(),
+                                   {sizeof("first") - 1, sizeof("third") - 1}));
+  const std::vector<uint64_t> theirs = {second};
+  ASSERT_EQ(theirs, DecodeWALIndices(second_writer_contents.ToString(),
+                                     {sizeof("second") - 1}));
+}
+
+TEST_P(LogTest, WALIndexMissingAssignmentFailsWrite) {
+  EnableWALIndex();
+  ASSERT_TRUE(
+      writer_->AddRecord(WriteOptions(), Slice("record")).IsCorruption());
+}
+
+// A caller that repeats or rewinds a wal_index is rejected rather than
+// asserted on: the values must strictly increase for downstream gap detection,
+// and an optimized build has no assert left to catch the violation.
+TEST_P(LogTest, WALIndexNonIncreasingFailsWrite) {
+  EnableWALIndex();
+  // Start well above kWALIndexStartNumber so the rewind below stays non-zero
+  // and is rejected for going backwards, not for being unassigned.
+  next_wal_index_ = kWALIndexStartNumber + 4;
+  const uint64_t recorded = next_wal_index_++;
+  ASSERT_OK(writer_->AddRecord(WriteOptions(), Slice("first"), /*seqno=*/0,
+                               recorded));
+  const IOStatus repeated = writer_->AddRecord(WriteOptions(), Slice("second"),
+                                               /*seqno=*/0, recorded);
+  ASSERT_TRUE(repeated.IsCorruption());
+  const IOStatus rewound = writer_->AddRecord(
+      WriteOptions(), Slice("third"), /*seqno=*/0, kWALIndexStartNumber);
+  ASSERT_TRUE(rewound.IsCorruption());
 }
 
 // Do NOT enable compression for this instantiation.
