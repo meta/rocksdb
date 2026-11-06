@@ -846,7 +846,7 @@ struct BlockBasedTableOptions {
   //
   // NOTE: Currently only supports index blocks. May update to include data
   // blocks in the future.
-  double uniform_cv_threshold = -1;
+  double uniform_cv_threshold = 0.2;
 
   // Controls the conditions under which the format_version >= 8 "common
   // user-key prefix" data-block optimization is enabled: the common prefix
