@@ -141,6 +141,20 @@ class IteratorWrapperBase {
     iter_->SeekForPrev(k);
     Update();
   }
+  // Update() even if unsupported: a wrapper iterator may rebuild its current
+  // key at the same position.
+  bool TotalOrderSeek(const Slice& k) {
+    assert(iter_);
+    const bool supported = iter_->TotalOrderSeek(k);
+    Update();
+    return supported;
+  }
+  bool TotalOrderSeekForPrev(const Slice& k) {
+    assert(iter_);
+    const bool supported = iter_->TotalOrderSeekForPrev(k);
+    Update();
+    return supported;
+  }
   void SeekToFirst() {
     assert(iter_);
     iter_->SeekToFirst();

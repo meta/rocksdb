@@ -20,6 +20,42 @@ void BlockBasedTableIterator::Seek(const Slice& target) {
   SeekImpl(&target, true);
 }
 
+bool BlockBasedTableIterator::SupportsTotalOrderSeek() const {
+  // MultiScan positions within its own scan ranges.
+  return multi_scan_read_set_ == nullptr;
+}
+
+void BlockBasedTableIterator::SeekIndex(const Slice& target) {
+  // Inside TotalOrderSeek*(), a hash index must not use its prefix index. Other
+  // index iterators already seek in total order.
+  if (total_order_seek_ && index_iter_->TotalOrderSeek(target)) {
+    return;
+  }
+  assert(!total_order_seek_ ||
+         table_->get_rep()->index_type != BlockBasedTableOptions::kHashSearch);
+  index_iter_->Seek(target);
+}
+
+bool BlockBasedTableIterator::TotalOrderSeek(const Slice& target) {
+  if (!SupportsTotalOrderSeek()) {
+    return false;
+  }
+  total_order_seek_ = true;
+  Seek(target);
+  total_order_seek_ = false;
+  return true;
+}
+
+bool BlockBasedTableIterator::TotalOrderSeekForPrev(const Slice& target) {
+  if (!SupportsTotalOrderSeek()) {
+    return false;
+  }
+  total_order_seek_ = true;
+  SeekForPrev(target);
+  total_order_seek_ = false;
+  return true;
+}
+
 void BlockBasedTableIterator::SeekSecondPass(const Slice* target) {
   AsyncInitDataBlock(/*is_first_pass=*/false);
 
@@ -50,8 +86,9 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
     return;
   }
 
-  if (target == nullptr) {
+  if (target == nullptr || total_order_seek_) {
     // `SeekToFirst()` has no seek key, so no prefix to trim readahead against.
+    // `TotalOrderSeek()` must not stop at the end of the target's prefix.
     // An earlier `Seek()` on this iterator can have left one behind, and
     // `ResetBlockCacheLookupVar()` below does not clear it. Without this clear,
     // `IsNextBlockOutOfReadaheadBound()` would trim against a key range that
@@ -138,7 +175,7 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
 
   if (need_seek_index) {
     if (target) {
-      index_iter_->Seek(*target);
+      SeekIndex(*target);
     } else {
       index_iter_->SeekToFirst();
     }
@@ -259,7 +296,7 @@ void BlockBasedTableIterator::SeekForPrev(const Slice& target) {
   if (IsReverseMultiScan()) {
     index_iter_->SeekForPrev(target);
   } else {
-    index_iter_->Seek(target);
+    SeekIndex(target);
   }
   is_index_at_curr_block_ = true;
 

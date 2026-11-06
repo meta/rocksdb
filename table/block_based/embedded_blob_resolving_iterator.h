@@ -112,6 +112,19 @@ class EmbeddedBlobResolvingIterator : public InternalIterator {
     iter_->SeekForPrev(target);
     MaybeEagerlyMaterialize();
   }
+  // If unsupported, `iter_` keeps its position and the state is rebuilt there.
+  bool TotalOrderSeek(const Slice& target) override {
+    ResetState();
+    const bool supported = iter_->TotalOrderSeek(target);
+    MaybeEagerlyMaterialize();
+    return supported;
+  }
+  bool TotalOrderSeekForPrev(const Slice& target) override {
+    ResetState();
+    const bool supported = iter_->TotalOrderSeekForPrev(target);
+    MaybeEagerlyMaterialize();
+    return supported;
+  }
   void Next() override {
     ResetState();
     iter_->Next();
