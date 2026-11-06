@@ -34,6 +34,18 @@ namespace ROCKSDB_NAMESPACE {
 struct IOOptions;
 class RandomAccessFileReader;
 
+enum class FilePrefetchBufferUsage {
+  kTableOpenPrefetchTail,
+  kUserScanPrefetch,
+  kCompactionPrefetch,
+  kUnknown,
+};
+
+enum class PrefetchDirection {
+  kForward,
+  kBackward,
+};
+
 struct ReadaheadParams {
   ReadaheadParams() {}
 
@@ -58,6 +70,10 @@ struct ReadaheadParams {
   // Number of buffers to maintain that contains prefetched data. If num_buffers
   // > 1 then buffers will be filled asynchronously whenever they get emptied.
   size_t num_buffers = 1;
+
+  // Direction of prefetch for sequential scans. Forward is default for backward
+  // compatibility. Backward is used for reverse iteration.
+  PrefetchDirection direction = PrefetchDirection::kForward;
 };
 
 struct BufferInfo {
@@ -118,9 +134,20 @@ struct BufferInfo {
             offset >= offset_ + buffer_.CurrentSize());
   }
 
+  bool IsBufferOutdatedBackward(uint64_t offset, size_t length) {
+    return (!async_read_in_progress_ && DoesBufferContainData() &&
+            offset + length <= offset_);
+  }
+
   bool IsBufferOutdatedWithAsyncProgress(uint64_t offset) {
     return (async_read_in_progress_ && io_handle_ != nullptr &&
             offset >= offset_ + async_req_len_);
+  }
+
+  bool IsBufferOutdatedBackwardWithAsyncProgress(uint64_t offset,
+                                                 size_t length) {
+    return (async_read_in_progress_ && io_handle_ != nullptr &&
+            offset + length <= offset_);
   }
 
   bool IsOffsetInBufferWithAsyncProgress(uint64_t offset) {
@@ -129,13 +156,6 @@ struct BufferInfo {
   }
 
   size_t CurrentSize() { return buffer_.CurrentSize(); }
-};
-
-enum class FilePrefetchBufferUsage {
-  kTableOpenPrefetchTail,
-  kUserScanPrefetch,
-  kCompactionPrefetch,
-  kUnknown,
 };
 
 // Implementation:
@@ -208,7 +228,8 @@ class FilePrefetchBuffer {
         stats_(stats),
         usage_(usage),
         readaheadsize_cb_(cb),
-        num_buffers_(readahead_params.num_buffers) {
+        num_buffers_(readahead_params.num_buffers),
+        direction_(readahead_params.direction) {
     assert((num_file_reads_ >= num_file_reads_for_auto_readahead_ + 1) ||
            (num_file_reads_ == 0));
 
@@ -430,7 +451,7 @@ class FilePrefetchBuffer {
                             size_t roundup_len, bool refit_tail,
                             bool use_fs_buffer, uint64_t& aligned_useful_len);
 
-  void AbortOutdatedIO(uint64_t offset);
+  void AbortOutdatedIO(uint64_t offset, size_t length);
 
   void AbortAllIOs();
 
@@ -717,5 +738,8 @@ class FilePrefetchBuffer {
   // num_buffers_ is the number of buffers maintained by FilePrefetchBuffer to
   // prefetch the data at a time.
   size_t num_buffers_;
+
+  // Direction of prefetch for sequential scans.
+  PrefetchDirection direction_;
 };
 }  // namespace ROCKSDB_NAMESPACE

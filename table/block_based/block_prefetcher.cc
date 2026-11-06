@@ -17,7 +17,7 @@ void BlockPrefetcher::PrefetchIfNeeded(
     const size_t readahead_size, bool is_for_compaction,
     const bool no_sequential_checking, const ReadOptions& read_options,
     const std::function<void(bool, uint64_t&, uint64_t&)>& readaheadsize_cb,
-    bool is_async_io_prefetch) {
+    bool is_async_io_prefetch, PrefetchDirection direction) {
   if (read_options.read_tier == ReadTier::kBlockCacheTier) {
     // Disable prefetching when IO disallowed. (Note that we haven't allocated
     // any buffers yet despite the various tracked settings.)
@@ -28,6 +28,7 @@ void BlockPrefetcher::PrefetchIfNeeded(
   readahead_params.initial_readahead_size = readahead_size;
   readahead_params.max_readahead_size = readahead_size;
   readahead_params.num_buffers = is_async_io_prefetch ? 2 : 1;
+  readahead_params.direction = direction;
 
   const size_t len = BlockBasedTable::BlockSizeWithTrailer(handle);
   const size_t offset = handle.offset();
@@ -35,6 +36,7 @@ void BlockPrefetcher::PrefetchIfNeeded(
     if (!rep->file->use_direct_io() && compaction_readahead_size_ > 0) {
       // If FS supports prefetching (readahead_limit_ will be non zero in that
       // case) and current block exists in prefetch buffer then return.
+      // Compaction is always forward.
       if (offset + len <= readahead_limit_) {
         return;
       }
@@ -108,12 +110,29 @@ void BlockPrefetcher::PrefetchIfNeeded(
 
   // If FS supports prefetching (readahead_limit_ will be non zero in that case)
   // and current block exists in prefetch buffer then return.
-  if (offset + len <= readahead_limit_) {
+  bool in_prefetch_range = false;
+  if (direction == PrefetchDirection::kForward) {
+    in_prefetch_range = (offset + len <= readahead_limit_);
+  } else {
+    // For backward, prefetch_start_ tracks lower bound of prefetched range.
+    // If prefetch_start_ is 0 it means not set yet, treat as miss.
+    in_prefetch_range = (prefetch_start_ != 0 && offset >= prefetch_start_ &&
+                         offset + len <= readahead_limit_);
+    // Alternative simple check for backward: offset >= prefetch_start_
+    // We'll use offset >= prefetch_start_ as indicator current block is within
+    // prefetched window.
+    if (prefetch_start_ != 0) {
+      in_prefetch_range = (offset >= prefetch_start_);
+    } else {
+      in_prefetch_range = false;
+    }
+  }
+  if (in_prefetch_range) {
     UpdateReadPattern(offset, len);
     return;
   }
 
-  if (!IsBlockSequential(offset)) {
+  if (!IsBlockSequential(offset, len, direction)) {
     UpdateReadPattern(offset, len);
     ResetValues(rep->table_options.initial_auto_readahead_size);
     return;
@@ -148,11 +167,31 @@ void BlockPrefetcher::PrefetchIfNeeded(
   }
 
   if (rep->fs_prefetch_support) {
-    s = rep->file->Prefetch(
-        opts, handle.offset(),
-        BlockBasedTable::BlockSizeWithTrailer(handle) + readahead_size_);
+    uint64_t prefetch_offset;
+    size_t prefetch_len;
+    if (direction == PrefetchDirection::kForward) {
+      prefetch_offset = handle.offset();
+      prefetch_len =
+          BlockBasedTable::BlockSizeWithTrailer(handle) + readahead_size_;
+    } else {
+      // Backward: prefetch from offset - readahead_size_ to offset + len
+      uint64_t curr_offset = handle.offset();
+      uint64_t start =
+          curr_offset > readahead_size_ ? curr_offset - readahead_size_ : 0;
+      prefetch_offset = start;
+      prefetch_len =
+          curr_offset - start + BlockBasedTable::BlockSizeWithTrailer(handle);
+    }
+    s = rep->file->Prefetch(opts, prefetch_offset, prefetch_len);
     if (s.ok()) {
-      readahead_limit_ = offset + len + readahead_size_;
+      if (direction == PrefetchDirection::kForward) {
+        readahead_limit_ = offset + len + readahead_size_;
+        prefetch_start_ =
+            offset;  // not really used for forward but for completeness
+      } else {
+        prefetch_start_ = prefetch_offset;
+        readahead_limit_ = offset + len;
+      }
       // Keep exponentially increasing readahead size until
       // max_auto_readahead_size.
       readahead_size_ = std::min(max_auto_readahead_size, readahead_size_ * 2);

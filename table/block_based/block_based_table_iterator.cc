@@ -286,7 +286,7 @@ void BlockBasedTableIterator::SeekForPrev(const Slice& target) {
     }
   }
 
-  InitDataBlock();
+  InitDataBlock(PrefetchDirection::kBackward);
 
   block_iter_.SeekForPrev(target);
 
@@ -316,7 +316,7 @@ void BlockBasedTableIterator::SeekToLast() {
     return;
   }
 
-  InitDataBlock();
+  InitDataBlock(PrefetchDirection::kBackward);
   block_iter_.SeekToLast();
   FindKeyBackward();
   CheckDataBlockWithinUpperBound();
@@ -382,7 +382,7 @@ void BlockBasedTableIterator::Prev() {
       return;
     }
 
-    InitDataBlock();
+    InitDataBlock(PrefetchDirection::kBackward);
     block_iter_.SeekToLast();
   } else {
     assert(block_iter_points_to_real_block_);
@@ -392,7 +392,7 @@ void BlockBasedTableIterator::Prev() {
   FindKeyBackward();
 }
 
-void BlockBasedTableIterator::InitDataBlock() {
+void BlockBasedTableIterator::InitDataBlock(PrefetchDirection direction) {
   // MultiScan path: load block from ReadSet
   if (multi_scan_read_set_) {
     BlockHandle data_block_handle = index_iter_->value().handle;
@@ -480,7 +480,7 @@ void BlockBasedTableIterator::InitDataBlock() {
           rep, data_block_handle, read_options_.readahead_size,
           is_for_compaction,
           /*no_sequential_checking=*/false, read_options_, readaheadsize_cb,
-          read_options_.async_io);
+          read_options_.async_io, direction);
 
       Status s;
       table_->NewDataBlockIterator<DataBlockIter>(
@@ -504,7 +504,8 @@ void BlockBasedTableIterator::InitDataBlock() {
   }
 }
 
-void BlockBasedTableIterator::AsyncInitDataBlock(bool is_first_pass) {
+void BlockBasedTableIterator::AsyncInitDataBlock(bool is_first_pass,
+                                                 PrefetchDirection direction) {
   BlockHandle data_block_handle;
   bool is_for_compaction =
       lookup_context_.caller == TableReaderCaller::kCompaction;
@@ -540,7 +541,7 @@ void BlockBasedTableIterator::AsyncInitDataBlock(bool is_first_pass) {
       block_prefetcher_.PrefetchIfNeeded(
           rep, data_block_handle, read_options_.readahead_size,
           is_for_compaction, /*no_sequential_checking=*/read_options_.async_io,
-          read_options_, readaheadsize_cb, read_options_.async_io);
+          read_options_, readaheadsize_cb, read_options_.async_io, direction);
 
       Status s;
       table_->NewDataBlockIterator<DataBlockIter>(
@@ -760,7 +761,7 @@ void BlockBasedTableIterator::FindKeyBackward() {
     index_iter_->Prev();
 
     if (index_iter_->Valid()) {
-      InitDataBlock();
+      InitDataBlock(PrefetchDirection::kBackward);
       block_iter_.SeekToLast();
     } else {
       return;
@@ -819,9 +820,22 @@ void BlockBasedTableIterator::InitializeStartAndEndOffsets(
 
       end_updated_offset = block_handle_info.handle_.offset() + footer +
                            block_handle_info.handle_.size();
-      block_handles_->emplace_back(std::move(block_handle_info));
-
-      index_iter_->Next();
+      // For backward direction, start should initially be set to current block
+      // offset as well (not low end yet), and will be decreased as we walk
+      // backward adding previous blocks. For forward, start is already at
+      // current block offset from caller passed start_offset.
+      start_updated_offset = block_handle_info.handle_.offset();
+      if (direction_ == IterDirection::kForward) {
+        block_handles_->emplace_back(std::move(block_handle_info));
+        index_iter_->Next();
+      } else {
+        // For backward, maintain deque in increasing file offset order by
+        // inserting current block at back (since it's highest offset seen so
+        // far in backward walk which starts at high end). Subsequent previous
+        // blocks will be inserted at front to keep increasing order.
+        block_handles_->emplace_back(std::move(block_handle_info));
+        index_iter_->Prev();
+      }
       is_index_at_curr_block_ = false;
       found_first_miss_block = true;
     } else {
@@ -844,9 +858,17 @@ void BlockBasedTableIterator::InitializeStartAndEndOffsets(
     //              prefetching in buffers) and the queue already has some
     //              handles from first buffer.
     if (DoesContainBlockHandles()) {
-      start_updated_offset = block_handles_->back().handle_.offset() + footer +
-                             block_handles_->back().handle_.size();
-      end_updated_offset = start_updated_offset;
+      if (direction_ == IterDirection::kForward) {
+        start_updated_offset = block_handles_->back().handle_.offset() +
+                               footer + block_handles_->back().handle_.size();
+        end_updated_offset = start_updated_offset;
+      } else {
+        // For backward, continue prefetching backward from front of queue
+        // (lowest offset). Set end to front offset (high end of new backward
+        // range) and start same initially, then walk backward decreasing start.
+        end_updated_offset = block_handles_->front().handle_.offset();
+        start_updated_offset = end_updated_offset;
+      }
     } else {
       // Scenario 4 : read_curr_block is false (callback made to do additional
       //              prefetching in buffers) but the queue has no handle
@@ -861,6 +883,10 @@ void BlockBasedTableIterator::InitializeStartAndEndOffsets(
       assert(index_iter_->Valid());
       start_updated_offset = index_iter_->value().handle.offset();
       end_updated_offset = start_updated_offset;
+      // For backward direction, index_iter_ should already be positioned at
+      // appropriate block for walking Prev() in BlockCacheLookup loop.
+      // No extra adjustment needed here as start/end initialization is same
+      // for both directions; direction-specific walking happens in main loop.
     }
   }
 }
@@ -903,9 +929,15 @@ void BlockBasedTableIterator::BlockCacheLookupForReadAheadSize(
 
   size_t footer = table_->get_rep()->footer.GetBlockTrailerSize();
   if (read_curr_block && !DoesContainBlockHandles() &&
-      IsNextBlockOutOfReadaheadBound()) {
-    end_offset = index_iter_->value().handle.offset() + footer +
-                 index_iter_->value().handle.size();
+      IsBlockOutOfReadaheadBound()) {
+    if (direction_ == IterDirection::kBackward) {
+      // For backward, trim start to current block start when out of lower bound
+      start_offset = index_iter_->value().handle.offset();
+      end_offset = start_offset + footer + index_iter_->value().handle.size();
+    } else {
+      end_offset = index_iter_->value().handle.offset() + footer +
+                   index_iter_->value().handle.size();
+    }
     return;
   }
 
@@ -925,15 +957,24 @@ void BlockBasedTableIterator::BlockCacheLookupForReadAheadSize(
   while (index_iter_->Valid() && !is_index_out_of_bound_) {
     BlockHandle block_handle = index_iter_->value().handle;
 
-    // Adding this data block exceeds end offset. So this data
-    // block won't be added.
+    // Adding this data block exceeds end offset for forward, or goes below
+    // start offset for backward. So this data block won't be added.
     // There can be a case where passed end offset is smaller than
     // block_handle.size() + footer because of readahead_size truncated to
-    // upper_bound. So we prefer to read the block rather than skip it to avoid
-    // sync read calls in case of async_io.
-    if (start_updated_offset != end_updated_offset &&
-        (end_updated_offset + block_handle.size() + footer > end_offset)) {
-      break;
+    // upper_bound/lower_bound. So we prefer to read the block rather than skip
+    // it to avoid sync read calls in case of async_io.
+    if (direction_ == IterDirection::kForward) {
+      if (start_updated_offset != end_updated_offset &&
+          (end_updated_offset + block_handle.size() + footer > end_offset)) {
+        break;
+      }
+    } else {  // backward
+      if (start_updated_offset != end_updated_offset &&
+          (start_updated_offset < block_handle.size() + footer ||
+           start_updated_offset - block_handle.size() - footer <
+               start_offset)) {
+        break;
+      }
     }
 
     // For current data block, do the lookup in the cache. Lookup should pin the
@@ -942,7 +983,12 @@ void BlockBasedTableIterator::BlockCacheLookupForReadAheadSize(
     block_handle_info.handle_ = index_iter_->value().handle;
     block_handle_info.SetFirstInternalKey(
         index_iter_->value().first_internal_key);
-    end_updated_offset += footer + block_handle_info.handle_.size();
+    if (direction_ == IterDirection::kForward) {
+      end_updated_offset += footer + block_handle_info.handle_.size();
+    } else {
+      // For backward, expand start offset downward
+      start_updated_offset -= footer + block_handle_info.handle_.size();
+    }
 
     Status s = table_->LookupAndPinBlocksInCache<Block_kData>(
         read_options_, block_handle,
@@ -961,25 +1007,44 @@ void BlockBasedTableIterator::BlockCacheLookupForReadAheadSize(
         (block_handle_info.cachable_entry_.GetValue() ||
          block_handle_info.cachable_entry_.GetCacheHandle());
 
-    // If this is the first miss block, update start offset to this block.
+    // If this is the first miss block, update start offset to this block for
+    // forward, or end offset to this block for backward to trim correctly.
     if (!found_first_miss_block && !block_handle_info.is_cache_hit_) {
       found_first_miss_block = true;
-      start_updated_offset = block_handle_info.handle_.offset();
+      if (direction_ == IterDirection::kForward) {
+        start_updated_offset = block_handle_info.handle_.offset();
+      } else {
+        // For backward, first miss sets end to current block end to trim
+        // trailing hits from high end
+        end_updated_offset = block_handle_info.handle_.offset() + footer +
+                             block_handle_info.handle_.size();
+      }
     }
 
-    // Add the handle to the queue.
-    block_handles_->emplace_back(std::move(block_handle_info));
+    // Add the handle to the queue in increasing file offset order to maintain
+    // existing trimming logic assumptions.
+    if (direction_ == IterDirection::kForward) {
+      block_handles_->emplace_back(std::move(block_handle_info));
+    } else {
+      // For backward walk, prepend to maintain increasing order (smallest
+      // offset at front)
+      block_handles_->emplace_front(std::move(block_handle_info));
+    }
 
     // Can't figure out for current block if current block
     // is out of bound. But for next block we can find that.
     // If curr block's index key >= iterate_upper_bound, it
     // means all the keys in next block or above are out of
     // bound.
-    if (IsNextBlockOutOfReadaheadBound()) {
+    if (IsBlockOutOfReadaheadBound()) {
       is_index_out_of_bound_ = true;
       break;
     }
-    index_iter_->Next();
+    if (direction_ == IterDirection::kBackward) {
+      index_iter_->Prev();
+    } else {
+      index_iter_->Next();
+    }
     is_index_at_curr_block_ = false;
   }
 

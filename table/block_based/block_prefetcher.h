@@ -23,7 +23,8 @@ class BlockPrefetcher {
       size_t readahead_size, bool is_for_compaction,
       const bool no_sequential_checking, const ReadOptions& read_options,
       const std::function<void(bool, uint64_t&, uint64_t&)>& readaheadsize_cb,
-      bool is_async_io_prefetch);
+      bool is_async_io_prefetch,
+      PrefetchDirection direction = PrefetchDirection::kForward);
   FilePrefetchBuffer* prefetch_buffer() { return prefetch_buffer_.get(); }
 
   void UpdateReadPattern(const uint64_t& offset, const size_t& len) {
@@ -31,7 +32,21 @@ class BlockPrefetcher {
     prev_len_ = len;
   }
 
+  bool IsBlockSequential(const uint64_t& offset, const size_t& len,
+                         PrefetchDirection direction) {
+    if (prev_len_ == 0) {
+      return true;
+    }
+    if (direction == PrefetchDirection::kForward) {
+      return (prev_offset_ + prev_len_ == offset);
+    } else if (direction == PrefetchDirection::kBackward) {
+      return (offset + len == prev_offset_);
+    }
+    return false;
+  }
+
   bool IsBlockSequential(const uint64_t& offset) {
+    // Backward compatibility for forward-only callers
     return (prev_len_ == 0 || (prev_offset_ + prev_len_ == offset));
   }
 
@@ -44,6 +59,7 @@ class BlockPrefetcher {
     initial_auto_readahead_size_ = initial_auto_readahead_size;
     readahead_size_ = initial_auto_readahead_size_;
     readahead_limit_ = 0;
+    prefetch_start_ = 0;
     return;
   }
 
@@ -63,6 +79,7 @@ class BlockPrefetcher {
   // prefetching.
   size_t readahead_size_;
   size_t readahead_limit_ = 0;
+  uint64_t prefetch_start_ = 0;
   // initial_auto_readahead_size_ is used in non-compaction read if RocksDB uses
   // internal prefetch buffer.
   uint64_t initial_auto_readahead_size_;
