@@ -193,10 +193,12 @@ class TrieBuilder {
   bool out_of_order_ = false;
 };
 
-// Read-only view of a serialized trie index. Init() validates everything
-// except the separators inside buckets. The iterator bounds-checks each one as
-// it decodes it; a separator whose bytes are wrong but in bounds decodes to a
-// wrong key, as the index has no checksum of its own.
+// Read-only view of a serialized trie index. Init() validates the header,
+// section and column layouts, side tables and trie. It does not visit every
+// bucket position, block offset or separator; the iterator keeps reads of
+// them inside the index and returns Corruption for a separator out of bounds
+// or a block size that would wrap around. Other wrong bytes give a wrong key
+// or handle, as the index has no checksum of its own.
 class Trie {
  public:
   Trie() = default;
@@ -246,6 +248,7 @@ class Trie {
   const char* tags_ = nullptr;
   uint64_t num_runs_ = 0;
   uint64_t num_tags_ = 0;
+  uint64_t bucket_data_size_ = 0;
   Column bucket_table_;
   Column offset_table_;
   Column size_table_;
@@ -258,8 +261,8 @@ class Trie {
 };
 
 // Iterates the blocks of a Trie in order. Positioning methods return
-// Corruption if a separator they decode is out of bounds, and leave the
-// iterator invalid.
+// Corruption if a separator or block handle they read is malformed, and leave
+// the iterator invalid.
 class TrieIterator {
  public:
   explicit TrieIterator(const Trie* index);
@@ -276,7 +279,7 @@ class TrieIterator {
   bool Valid() const { return block_ < index_->num_blocks_; }
   // The current block's separator. Valid until the next positioning call.
   Slice key() const { return Slice(key_); }
-  TrieBlockHandle value() const;
+  TrieBlockHandle value() const { return handle_; }
 
  private:
   // A trie position from which a bucket head can be spelled out: the
@@ -320,9 +323,10 @@ class TrieIterator {
   // whether the separator found equals target.
   Status ScanBucket(const char* target, size_t target_len, bool* found,
                     bool* equal);
-  // Sets the block range of the current key index and positions on its
-  // first block.
+  // Sets the block range of the current key index.
   void EnterKey();
+  // Positions on block and reads its handle.
+  Status EnterBlock(uint64_t block);
   // After positioning on a separator equal to the Seek target, moves past its
   // blocks whose tags are greater than tag.
   Status ApplyTag(uint64_t tag);
@@ -331,7 +335,7 @@ class TrieIterator {
   // key_index.
   Status AdvanceTo(uint64_t key_index);
   // Positions on the last block of the current key.
-  void EnterKeyFromEnd();
+  Status EnterKeyFromEnd();
 
   const Trie* index_;
   std::string key_;
@@ -344,6 +348,7 @@ class TrieIterator {
   uint64_t run_begin_ = 0;
   uint64_t run_end_ = 0;
   uint64_t block_;
+  TrieBlockHandle handle_;
 };
 
 }  // namespace trie_index

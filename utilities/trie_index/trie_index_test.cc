@@ -84,6 +84,12 @@ bool OkOrCorruption(const Status& s) {
   return s.ok();
 }
 
+// The same for opening an index, which also reports NotSupported when the
+// version field changed.
+bool OpenedOrRejected(const Status& s) {
+  return s.IsNotSupported() ? false : OkOrCorruption(s);
+}
+
 // ============================================================================
 // TrieIndexFactory integration tests
 // ============================================================================
@@ -1005,7 +1011,7 @@ TEST_F(TrieIndexFactoryTest, MalformedIndexIsRejectedOrReadable) {
   auto exercise = [&](const std::string& mutated) {
     Slice contents(mutated);
     std::unique_ptr<IndexFactoryReader> reader;
-    if (!OkOrCorruption(
+    if (!OpenedOrRejected(
             factory_->NewReader(IndexFactoryOptions(), contents, reader))) {
       return;
     }
@@ -4182,14 +4188,19 @@ TEST_F(TrieTest, NoBlocks) {
   ASSERT_FALSE(it.Valid());
 }
 
-// Version 1 was an earlier layout, so its indexes are rejected too.
+// Version 1 was an earlier layout, so its indexes are rejected too. The
+// version is checked before the header size, as other versions may have a
+// shorter header.
 TEST_F(TrieTest, RejectsOtherVersions) {
   std::string data = Build({{"a", {0, 10}, 0}}, 8);
   for (uint32_t version : {0u, 1u, 3u}) {
     SCOPED_TRACE(version);
     EncodeFixed32(&data[4], version);
-    Trie index;
-    ASSERT_EQ(index.Init(data).code(), Status::Code::kCorruption);
+    for (size_t len : {data.size(), size_t{8}}) {
+      Trie index;
+      ASSERT_EQ(index.Init(Slice(data.data(), len)).code(),
+                Status::Code::kNotSupported);
+    }
   }
 }
 
@@ -4276,8 +4287,9 @@ TEST_F(TrieTest, OutlierBlockWidensOnlyItsGroup) {
   ASSERT_LE(Build(blocks, 8).size(), uniform_size + 64 * 56 / 8);
 }
 
-// Decreasing offsets would wrap a derived block size around: the writer
-// refuses them and the reader rejects them.
+// Decreasing offsets would wrap a derived block size around. The writer
+// refuses them. Init() does not read every offset, so the iterator reports
+// Corruption when it reaches such a block.
 TEST_F(TrieTest, DecreasingOffsets) {
   TrieBuilder builder(8);
   builder.AddBlock("a", {100, 10}, 0);
@@ -4294,13 +4306,27 @@ TEST_F(TrieTest, DecreasingOffsets) {
     keys.push_back("key" + std::to_string(1000 + i));
   }
   data = Build(ContiguousBlocks(keys, &rnd), 8);
-  Trie index;
-  ASSERT_OK(index.Init(data));
   // Zero the base of the second group of offsets, the header's fourth
-  // section offset locating the offset table.
+  // section offset locating the offset table. Block 64 now starts before
+  // block 63.
   const uint64_t offset_table = DecodeFixed64(&data[56 + 8 * 3]);
   EncodeFixed64(&data[offset_table + 8 + 16], 0);
-  ASSERT_EQ(index.Init(data).code(), Status::Code::kCorruption);
+  Trie index;
+  ASSERT_OK(index.Init(data));
+  TrieIterator it(&index);
+  ASSERT_OK(it.SeekToFirst());
+  for (int i = 0; i < 62; i++) {
+    ASSERT_OK(it.Next());
+  }
+  ASSERT_EQ(it.key(), keys[62]);
+  ASSERT_EQ(it.Next().code(), Status::Code::kCorruption);
+  ASSERT_FALSE(it.Valid());
+  ASSERT_EQ(it.Seek(keys[63], kSeekTag).code(), Status::Code::kCorruption);
+  ASSERT_FALSE(it.Valid());
+  ASSERT_OK(it.Seek(keys[64], kSeekTag));
+  ASSERT_EQ(it.key(), keys[64]);
+  ASSERT_EQ(it.Prev().code(), Status::Code::kCorruption);
+  ASSERT_FALSE(it.Valid());
 }
 
 // The serialized bytes of a small index, written out by hand from the format
@@ -4370,9 +4396,9 @@ TEST_F(TrieTest, GoldenBytes) {
   ASSERT_EQ(Slice(data).ToString(true), Slice(expected).ToString(true));
 }
 
-// Init() validates everything except the separators inside buckets. The
-// iterator bounds-checks each one as it decodes it and reports one that is out
-// of bounds as Corruption, leaving itself invalid.
+// Init() does not check the separators inside buckets. The iterator
+// bounds-checks each one as it decodes it and reports one that is out of
+// bounds as Corruption, leaving itself invalid.
 TEST_F(TrieTest, MalformedBucketEntryFailsOnRead) {
   std::vector<Block> blocks;
   blocks.reserve(4);
@@ -4394,6 +4420,31 @@ TEST_F(TrieTest, MalformedBucketEntryFailsOnRead) {
   ASSERT_EQ(it.Seek("k2", kSeekTag).code(), Status::Code::kCorruption);
   ASSERT_FALSE(it.Valid());
   ASSERT_EQ(it.SeekToLast().code(), Status::Code::kCorruption);
+  ASSERT_FALSE(it.Valid());
+}
+
+// Init() does not check bucket positions either. A position past the bucket
+// data is clamped to its end, so the bucket reads as truncated.
+TEST_F(TrieTest, BadBucketPositionFailsOnRead) {
+  std::vector<Block> blocks;
+  blocks.reserve(4);
+  for (uint64_t i = 0; i < 4; i++) {
+    blocks.push_back({"k" + std::to_string(i), {i * 105, 100}, 0});
+  }
+  std::string data = Build(blocks, 8);
+  // The base of the only group of the bucket table, located by the header's
+  // second section offset.
+  const uint64_t bucket_table = DecodeFixed64(&data[56 + 8]);
+  EncodeFixed64(&data[bucket_table + 8], uint64_t{1} << 40);
+  Trie index;
+  ASSERT_OK(index.Init(data));
+  TrieIterator it(&index);
+  // The bucket head comes from the trie, so only the entries after it fail.
+  ASSERT_OK(it.SeekToFirst());
+  ASSERT_EQ(it.key(), "k0");
+  ASSERT_EQ(it.Next().code(), Status::Code::kCorruption);
+  ASSERT_FALSE(it.Valid());
+  ASSERT_EQ(it.Seek("k2", kSeekTag).code(), Status::Code::kCorruption);
   ASSERT_FALSE(it.Valid());
 }
 
@@ -4428,7 +4479,7 @@ TEST_F(TrieTest, MalformedData) {
 
   auto exercise = [&](const std::string& data) {
     Trie index;
-    if (!OkOrCorruption(index.Init(data))) {
+    if (!OpenedOrRejected(index.Init(data))) {
       return;
     }
     TrieIterator it(&index);

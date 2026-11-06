@@ -567,15 +567,6 @@ int db_stress_tool(int argc, char** argv) {
     FLAGS_atomic_flush = true;
   }
 
-  // Trie UDI uses zero-copy pointers into block data, which is
-  // incompatible with mmap_read.
-  if (FLAGS_use_trie_index && FLAGS_mmap_read) {
-    return ReturnValidationError(
-        "use_trie_index is incompatible with mmap_read. The trie index uses "
-        "zero-copy pointers into block data which is unsafe with mmap'd "
-        "reads.");
-  }
-
   // TrieIndexFactory requires plain BytewiseComparator, but timestamps use
   // BytewiseComparator.u64ts.
   if (FLAGS_use_trie_index && FLAGS_user_timestamp_size > 0) {

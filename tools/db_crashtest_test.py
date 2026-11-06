@@ -1322,7 +1322,7 @@ class DBCrashTestTest(unittest.TestCase):
                 finalized = db_crashtest.finalize_and_sanitize(params)
 
                 self.assertEqual(index_mode, finalized["index_mode"])
-                self.assertEqual(0, finalized["mmap_read"])
+                self.assertEqual(1, finalized["mmap_read"])
                 if index_mode in (2, 3):
                     self.assertIn(finalized["index_type"], [0, 3])
                     self.assertEqual(0, finalized["partition_filters"])
