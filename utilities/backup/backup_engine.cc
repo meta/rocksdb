@@ -1290,6 +1290,14 @@ IOStatus BackupEngineImpl::CreateNewBackupWithMetadata(
               src_env_options = db_env_->OptimizeForBlobFileRead(
                   src_raw_env_options, ImmutableDBOptions(db_options));
               break;
+            case kDBLockFile:
+            case kCurrentFile:
+            case kTempFile:
+            case kInfoLogFile:
+            case kMetaDatabase:
+            case kIdentityFile:
+            case kOptionsFile:
+            case kCompactionProgressFile:
             default:
               // Other backed up files (like options file) are not read by live
               // DB, so don't need to worry about avoiding mixing buffered and

@@ -3897,6 +3897,7 @@ class NonBatchedOpsStressTest : public StressTest {
           s = txn->Delete(cfh, k);
           break;
         }
+        case Op::NumberOfOps:
         default:
           assert(false);
       }

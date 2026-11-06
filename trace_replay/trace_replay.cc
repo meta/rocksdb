@@ -522,6 +522,16 @@ Status TracerHelper::DecodeTraceRecord(Trace* trace, int trace_file_version,
 
       return Status::OK();
     }
+    case kTraceNone:
+    case kTraceBegin:
+    case kTraceEnd:
+    case kBlockTraceIndexBlock:
+    case kBlockTraceFilterBlock:
+    case kBlockTraceDataBlock:
+    case kBlockTraceUncompressionDictBlock:
+    case kBlockTraceRangeDeletionBlock:
+    case kIOTracer:
+    case kTraceMax:
     default:
       return Status::NotSupported("Unsupported trace type.");
   }

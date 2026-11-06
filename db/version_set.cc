@@ -5354,6 +5354,8 @@ Env::WriteLifeTimeHint VersionStorageInfo::CalculateSSTWriteHint(
         return Env::WLTH_MEDIUM;
       }
       return Env::WLTH_LONG;
+    case kCompactionStyleFIFO:
+    case kCompactionStyleNone:
     default:
       return Env::WLTH_NOT_SET;
   }

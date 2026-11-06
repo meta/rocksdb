@@ -195,6 +195,17 @@ Cache::Handle* CacheWithSecondaryAdapter::Promote(
     case CacheEntryRole::kDataBlock:
       RecordTick(stats, SECONDARY_CACHE_DATA_HITS);
       break;
+    case CacheEntryRole::kFilterMetaBlock:
+    case CacheEntryRole::kDeprecatedFilterBlock:
+    case CacheEntryRole::kOtherBlock:
+    case CacheEntryRole::kWriteBuffer:
+    case CacheEntryRole::kCompressionDictionaryBuildingBuffer:
+    case CacheEntryRole::kFilterConstruction:
+    case CacheEntryRole::kBlockBasedTableReader:
+    case CacheEntryRole::kFileMetadata:
+    case CacheEntryRole::kBlobValue:
+    case CacheEntryRole::kBlobCache:
+    case CacheEntryRole::kMisc:
     default:
       break;
   }
@@ -680,6 +691,7 @@ std::shared_ptr<Cache> NewTieredCache(const TieredCacheOptions& _opts) {
           valid_adm_policy = false;
         }
         break;
+      case TieredAdmissionPolicy::kAdmPolicyMax:
       default:
         valid_adm_policy = false;
     }

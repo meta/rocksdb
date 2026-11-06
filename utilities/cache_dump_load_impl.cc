@@ -151,6 +151,16 @@ CacheDumperImpl::DumpOneBlockCallBack(std::string& buf) {
       case CacheEntryRole::kIndexBlock:
         type = CacheDumpUnitType::kIndex;
         break;
+      case CacheEntryRole::kDeprecatedFilterBlock:
+      case CacheEntryRole::kOtherBlock:
+      case CacheEntryRole::kWriteBuffer:
+      case CacheEntryRole::kCompressionDictionaryBuildingBuffer:
+      case CacheEntryRole::kFilterConstruction:
+      case CacheEntryRole::kBlockBasedTableReader:
+      case CacheEntryRole::kFileMetadata:
+      case CacheEntryRole::kBlobValue:
+      case CacheEntryRole::kBlobCache:
+      case CacheEntryRole::kMisc:
       default:
         // Filter out other entries
         // FIXME? Do we need the CacheDumpUnitTypes? UncompressionDict?

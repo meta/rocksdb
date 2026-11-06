@@ -381,6 +381,7 @@ class CompactionFilter : public Customizable {
       case ValueType::kBlobIndex:
         return Decision::kKeep;
 
+      case ValueType::kWideColumnEntity:
       default:
         assert(false);
         return Decision::kKeep;

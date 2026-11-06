@@ -90,6 +90,13 @@ void DumpDBFileSummary(const ImmutableDBOptions& options,
           file_info.append(file).append(" ");
         }
         break;
+      case kDBLockFile:
+      case kTempFile:
+      case kInfoLogFile:
+      case kMetaDatabase:
+      case kOptionsFile:
+      case kBlobFile:
+      case kCompactionProgressFile:
       default:
         break;
     }

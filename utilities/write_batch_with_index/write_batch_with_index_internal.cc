@@ -569,6 +569,8 @@ WBWIIteratorImpl::Result WBWIIteratorImpl::FindLatestUpdate(
           break;  // ignore
         case kPutEntityRecord:
           return WBWIIteratorImpl::kFound;
+        case kDeleteRangeRecord:
+        case kUnknownRecord:
         default:
           assert(false);
           return WBWIIteratorImpl::kError;

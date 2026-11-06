@@ -2504,6 +2504,14 @@ void DBDumperCommand::DoCommand() {
         DumpBlobFile(path_, is_key_hex_, is_value_hex_,
                      dump_uncompressed_blobs_);
         break;
+      case kDBLockFile:
+      case kCurrentFile:
+      case kTempFile:
+      case kInfoLogFile:
+      case kMetaDatabase:
+      case kIdentityFile:
+      case kOptionsFile:
+      case kCompactionProgressFile:
       default:
         exec_state_ = LDBCommandExecuteResult::Failed(
             "File type not supported: " + path_);
