@@ -7,6 +7,7 @@
 #include "string_util.h"
 
 #include <gtest/gtest.h>
+#include <stdexcept>
 #include <port/stack_trace.h>
 
 #include "test_util/testutil.h"
@@ -50,6 +51,21 @@ TEST(StringUtilTest, Trim) {
   EXPECT_EQ("", trim("\t"));
   EXPECT_EQ("", trim("\n"));
   EXPECT_EQ("", trim(" \t\n\r"));
+}
+
+
+TEST(StringUtilTest, ParseUnitSuffixOverflow) {
+  // Unit suffixes that fit.
+  EXPECT_EQ(1024, ParseInt("1k"));
+  EXPECT_EQ(1 << 30, ParseInt("1g"));
+  EXPECT_EQ(1ULL << 40, ParseUint64("1t"));
+  EXPECT_EQ(-(1LL << 30), ParseInt64("-1g"));
+
+  // A shift that would leave the destination type overflows like ParseUint32.
+  EXPECT_THROW(ParseInt("2g"), std::out_of_range);
+  EXPECT_THROW(ParseInt("2048m"), std::out_of_range);
+  EXPECT_THROW(ParseUint64(std::to_string(1ULL << 54) + "k"), std::out_of_range);
+  EXPECT_THROW(ParseInt64(std::to_string(-(1LL << 53) - 1) + "k"), std::out_of_range);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
