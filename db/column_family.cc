@@ -798,10 +798,16 @@ ColumnFamilyData::~ColumnFamilyData() {
     // EnvWrapper, that's the main reason why we use env here.
     Status s = ioptions_.env->UnregisterDbPaths(GetDbPaths());
     if (!s.ok()) {
-      ROCKS_LOG_ERROR(
-          ioptions_.logger,
-          "Failed to unregister data paths of column family (id: %d, name: %s)",
-          id_, name_.c_str());
+      // Null-guard before logging: CloseHelper may already have released the
+      // Logger behind raw ioptions_.logger when CFD destructs during
+      // versions_.reset(). SstFileManagerImpl is Closed before info_log for the
+      // same reason. See rocksdb#14939.
+      if (ioptions_.logger != nullptr) {
+        ROCKS_LOG_ERROR(
+            ioptions_.logger,
+            "Failed to unregister data paths of column family (id: %d, name: %s)",
+            id_, name_.c_str());
+      }
     }
   }
 }
