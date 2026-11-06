@@ -115,7 +115,7 @@ int Fadvise(int fd, off_t offset, size_t len, int advice) {
 #endif
 }
 
-// A wrapper for fadvise, if the platform doesn't support fadvise,
+// A wrapper for madvise, if the platform doesn't support madvise,
 // it will simply return 0.
 int Madvise(void* addr, size_t len, int advice) {
 #ifdef OS_LINUX
