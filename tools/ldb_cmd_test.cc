@@ -1249,6 +1249,66 @@ TEST_F(LdbCmdTest, CustomComparator) {
             LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), &cfds));
 }
 
+TEST_F(LdbCmdTest, DumpWal) {
+  Env* base_env = TryLoadCustomOrDefaultEnv();
+  std::unique_ptr<Env> env(NewMemEnv(base_env));
+  Options opts;
+  opts.env = env.get();
+  opts.create_if_missing = true;
+
+  std::string dbname = test::PerThreadDBPath(env.get(), "ldb_cmd_test");
+
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(opts, dbname, &db));
+
+  // PutLogData record
+  WriteBatch batch;
+  ASSERT_OK(batch.PutLogData("xxx"));
+  WriteOptions wopts;
+  ASSERT_OK(db->Write(wopts, &batch));
+  batch.Clear();
+
+  // PutBlobIndex record copied from db_blob_basic_test.cc
+  std::string blob_index;
+  constexpr uint64_t blob_file_number = 1000;
+  constexpr uint64_t offset = 1234;
+  constexpr uint64_t size = 5678;
+  BlobIndex::EncodeBlob(&blob_index, blob_file_number, offset, size,
+                        kNoCompression);
+  constexpr uint64_t column_family_id = 0;
+  ASSERT_OK(WriteBatchInternal::PutBlobIndex(&batch, column_family_id,
+                                             "blob_index_key", blob_index));
+  ASSERT_OK(db->Write(wopts, &batch));
+  batch.Clear();
+
+  // TimedPut record
+  constexpr uint64_t write_unix_time = 1767123301;  // 2025-12-30T19:35:01Z
+  ASSERT_OK(batch.TimedPut(nullptr, "timed_put_key", "v", write_unix_time));
+  ASSERT_OK(db->Write(wopts, &batch));
+  batch.Clear();
+
+  ASSERT_OK(db->Close());
+  db.reset();
+
+  string walfile_arg = string("--walfile=") + dbname;
+  const char* const argv[] = {"./ldb", "dump_wal", walfile_arg.c_str()};
+  static const size_t argc = sizeof(argv) / sizeof(*argv);
+
+  // capture cout while running the command
+  std::stringstream captured_cout;
+  std::streambuf* original_cout_buffer = std::cout.rdbuf(captured_cout.rdbuf());
+  int result =
+      LDBCommandRunner::RunCommand(argc, argv, opts, LDBOptions(), nullptr);
+  std::cout.rdbuf(original_cout_buffer);
+
+  // check the results of running dump_wal: log data must be included
+  string captured_output = captured_cout.str();
+  ASSERT_EQ(0, result) << "ldb output:\n\n" << captured_output;
+  ASSERT_NE(std::string::npos, captured_output.find("LOG_DATA : 0x787878"))
+      << "ldb output:\n\n"
+      << captured_output;
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
