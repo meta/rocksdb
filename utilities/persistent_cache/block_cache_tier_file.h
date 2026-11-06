@@ -192,7 +192,7 @@ class WriteableCacheFile : public RandomAccessCacheFile {
     const bool closed = eof_ && bufs_.empty();
     if (closed) {
       // the file is closed, read from disk
-      return RandomAccessCacheFile::Read(lba, key, block, scratch);
+      return RandomAccessCacheFile::ReadNoLock(lba, key, block, scratch);
     }
     // file is still being written, read from buffers
     return ReadBuffer(lba, key, block, scratch);
