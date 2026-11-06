@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <limits>
 #include <memory>
 #include <unordered_map>
 
@@ -1464,6 +1465,42 @@ TEST_F(WriteBatchTest, CommitWithTimestamp) {
   ASSERT_EQ("MarkCommitWithTimestamp(" + txn_name + ", " +
                 Slice(ts).ToString(true) + ")",
             handler.seen);
+}
+
+TEST_F(WriteBatchTest, EntryCountOverflowIsRejected) {
+  // Each entry-adding op must reject the entry that would push the count past
+  // UINT32_MAX, instead of letting Count() wrap to a small value and the batch
+  // later fail DB::Write with "Corruption: WriteBatch has wrong count"
+  // (issue #15314). The count is driven to its maximum cheaply via SetCount.
+  WriteBatch batch;
+  ASSERT_OK(batch.Put("k", "v"));
+  WriteBatchInternal::SetCount(&batch, std::numeric_limits<uint32_t>::max());
+  ASSERT_EQ(std::numeric_limits<uint32_t>::max(),
+            WriteBatchInternal::Count(&batch));
+
+  ASSERT_TRUE(batch.Put("k2", "v2").IsInvalidArgument());
+  ASSERT_TRUE(batch.Delete("k2").IsInvalidArgument());
+  ASSERT_TRUE(batch.SingleDelete("k2").IsInvalidArgument());
+  ASSERT_TRUE(batch.Merge("k2", "v2").IsInvalidArgument());
+  ASSERT_TRUE(batch.DeleteRange("a", "z").IsInvalidArgument());
+
+  // The count never wrapped: the rejected ops left the batch unchanged.
+  ASSERT_EQ(std::numeric_limits<uint32_t>::max(),
+            WriteBatchInternal::Count(&batch));
+}
+
+TEST_F(WriteBatchTest, AppendEntryCountOverflowIsRejected) {
+  WriteBatch dst;
+  ASSERT_OK(dst.Put("k", "v"));
+  WriteBatchInternal::SetCount(&dst, std::numeric_limits<uint32_t>::max() - 1);
+
+  WriteBatch src;
+  ASSERT_OK(src.Put("a", "1"));
+  ASSERT_OK(src.Put("b", "2"));  // dst(max-1) + 2 would overflow
+
+  ASSERT_TRUE(WriteBatchInternal::Append(&dst, &src).IsInvalidArgument());
+  ASSERT_EQ(std::numeric_limits<uint32_t>::max() - 1,
+            WriteBatchInternal::Count(&dst));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

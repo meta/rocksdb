@@ -882,6 +882,10 @@ Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
     return Status::InvalidArgument("value is too large");
   }
 
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
+  }
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
   if (column_family_id == 0) {
@@ -920,6 +924,10 @@ Status WriteBatchInternal::TimedPut(WriteBatch* b, uint32_t column_family_id,
   }
   if (std::numeric_limits<uint64_t>::max() == write_unix_time) {
     return WriteBatchInternal::Put(b, column_family_id, key, value);
+  }
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
   }
   LocalSavePoint save(b);
 
@@ -1046,6 +1054,10 @@ Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
     return s;
   }
 
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
+  }
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
   if (column_family_id == 0) {
@@ -1134,6 +1146,10 @@ Status WriteBatchInternal::PutEntitySerialized(WriteBatch* b,
     return Status::InvalidArgument("wide column entity is too large");
   }
 
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
+  }
   LocalSavePoint save(b);
 
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
@@ -1301,6 +1317,10 @@ Status WriteBatchInternal::Delete(WriteBatch* b, uint32_t column_family_id,
   if (key.size() > kMaxWriteBatchKeySize) {
     return Status::InvalidArgument("key is too large");
   }
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
+  }
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
   if (column_family_id == 0) {
@@ -1377,6 +1397,10 @@ Status WriteBatchInternal::Delete(WriteBatch* b, uint32_t column_family_id,
   if (!s.ok()) {
     return s;
   }
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
+  }
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
   if (column_family_id == 0) {
@@ -1433,6 +1457,10 @@ Status WriteBatchInternal::SingleDelete(WriteBatch* b,
                                         const Slice& key) {
   if (key.size() > kMaxWriteBatchKeySize) {
     return Status::InvalidArgument("key is too large");
+  }
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
   }
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
@@ -1512,6 +1540,10 @@ Status WriteBatchInternal::SingleDelete(WriteBatch* b,
   if (!s.ok()) {
     return s;
   }
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
+  }
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
   if (column_family_id == 0) {
@@ -1572,6 +1604,10 @@ Status WriteBatchInternal::DeleteRange(WriteBatch* b, uint32_t column_family_id,
   }
   if (end_key.size() > kMaxWriteBatchKeySize) {
     return Status::InvalidArgument("end key is too large");
+  }
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
   }
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
@@ -1658,6 +1694,10 @@ Status WriteBatchInternal::DeleteRange(WriteBatch* b, uint32_t column_family_id,
   if (!s.ok()) {
     return s;
   }
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
+  }
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
   if (column_family_id == 0) {
@@ -1719,6 +1759,10 @@ Status WriteBatchInternal::Merge(WriteBatch* b, uint32_t column_family_id,
     return Status::InvalidArgument("value is too large");
   }
 
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
+  }
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
   if (column_family_id == 0) {
@@ -1799,6 +1843,10 @@ Status WriteBatchInternal::Merge(WriteBatch* b, uint32_t column_family_id,
     return s;
   }
 
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
+  }
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
   if (column_family_id == 0) {
@@ -1851,6 +1899,10 @@ Status WriteBatch::Merge(ColumnFamilyHandle* column_family,
 Status WriteBatchInternal::PutBlobIndex(WriteBatch* b,
                                         uint32_t column_family_id,
                                         const Slice& key, const Slice& value) {
+  if (WriteBatchInternal::Count(b) == std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "WriteBatch would exceed the 2^32 - 1 entry limit");
+  }
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
   if (column_family_id == 0) {
@@ -3516,6 +3568,13 @@ Status WriteBatchInternal::Append(WriteBatch* dst, const WriteBatch* src,
     src_len = src->rep_.size() - WriteBatchInternal::kHeader;
     src_count = Count(src);
     src_flags = src->content_flags_.load(std::memory_order_relaxed);
+  }
+
+  if (src_count < 0 ||
+      Count(dst) > std::numeric_limits<uint32_t>::max() -
+                       static_cast<uint32_t>(src_count)) {
+    return Status::InvalidArgument(
+        "Appending the batch would exceed the 2^32 - 1 entry limit");
   }
 
   if (src->prot_info_ != nullptr) {
