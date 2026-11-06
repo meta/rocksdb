@@ -4120,8 +4120,12 @@ void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
     sum_garbage_blob_bytes += meta->GetGarbageBlobBytes();
   }
 
-  if (sum_garbage_blob_bytes <
-      blob_garbage_collection_force_threshold * sum_total_blob_bytes) {
+  // A batch without garbage has nothing to collect. Checking this explicitly
+  // matters when the threshold is 0.0: the ratio check below is then never
+  // true, and forced GC would rewrite clean blob files over and over.
+  if (sum_garbage_blob_bytes == 0 ||
+      sum_garbage_blob_bytes <
+          blob_garbage_collection_force_threshold * sum_total_blob_bytes) {
     return;
   }
 
