@@ -733,6 +733,7 @@ JNI_NATIVE_SOURCES =                                          \
   java/rocksjni/compaction_options.cc                         \
   java/rocksjni/compaction_options_fifo.cc                    \
   java/rocksjni/compaction_options_universal.cc               \
+  java/rocksjni/flush_wal_options.cc                          \
   java/rocksjni/comparator.cc                                 \
   java/rocksjni/comparatorjnicallback.cc                      \
   java/rocksjni/compression_options.cc                        \

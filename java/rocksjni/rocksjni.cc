@@ -3323,10 +3323,28 @@ void Java_org_rocksdb_RocksDB_flush(JNIEnv* env, jclass, jlong jdb_handle,
  * Method:    flushWal
  * Signature: (JZ)V
  */
-void Java_org_rocksdb_RocksDB_flushWal(JNIEnv* env, jclass, jlong jdb_handle,
-                                       jboolean jsync) {
+void Java_org_rocksdb_RocksDB_flushWal__JZ(JNIEnv* env, jclass,
+                                           jlong jdb_handle, jboolean jsync) {
   auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
   auto s = db->FlushWAL(jsync == JNI_TRUE);
+  if (!s.ok()) {
+    ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
+  }
+}
+
+/*
+ * Class:     org_rocksdb_RocksDB
+ * Method:    flushWal
+ * Signature: (JJ)V
+ */
+void Java_org_rocksdb_RocksDB_flushWal__JJ(JNIEnv* env, jclass,
+                                           jlong jdb_handle,
+                                           jlong jflush_wal_options_handle) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  auto* flush_wal_options =
+      reinterpret_cast<ROCKSDB_NAMESPACE::FlushWALOptions*>(
+          jflush_wal_options_handle);
+  auto s = db->FlushWAL(*flush_wal_options);
   if (!s.ok()) {
     ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
   }
