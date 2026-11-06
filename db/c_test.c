@@ -2841,6 +2841,79 @@ int main(int argc, char** argv) {
     CheckGet(db, roptions, "bar", "fake");
   }
 
+  StartPhase("CF with option");
+  {
+    rocksdb_close(db);
+    rocksdb_destroy_db(options, dbname, &err);
+    CheckNoError(err);
+
+    rocksdb_options_t* db_options = rocksdb_options_create();
+    rocksdb_options_set_create_if_missing(db_options, 1);
+    db = rocksdb_open(db_options, dbname, &err);
+    CheckNoError(err);
+
+    char** cf_names = (char**)malloc(2 * sizeof(char*));
+    cf_names[0] = "cf1";
+    cf_names[1] = "cf2";
+    size_t cflen;
+
+    rocksdb_options_t* cf1_options = rocksdb_options_create();
+    rocksdb_options_set_paranoid_checks(cf1_options, true);
+    rocksdb_options_set_create_if_missing(cf1_options, true);
+
+    rocksdb_options_t* cf2_options = rocksdb_options_create();
+    rocksdb_options_set_max_bytes_for_level_base(cf2_options, 4 * 1024);
+    rocksdb_options_set_create_if_missing(cf2_options, true);
+
+    const rocksdb_options_t* cf_options[2] = {cf1_options, cf2_options};
+    rocksdb_column_family_handle_t** column_family_handle =
+        rocksdb_create_column_families_with_options(
+            db, 2, (const char* const*)cf_names, cf_options, &cflen, &err);
+    free(cf_names);
+    CheckNoError(err);
+    assert(cflen == 2);
+
+    rocksdb_writeoptions_t* write_options = rocksdb_writeoptions_create();
+
+    rocksdb_put_cf(db, write_options, column_family_handle[0], "cf1", 3, "val1",
+                   4, &err);
+    CheckNoError(err);
+
+    rocksdb_put_cf(db, write_options, column_family_handle[1], "cf2", 3, "val2",
+                   4, &err);
+    CheckNoError(err);
+
+    rocksdb_writeoptions_destroy(write_options);
+
+    size_t val_len;
+
+    rocksdb_readoptions_t* read_options = rocksdb_readoptions_create();
+
+    char* value1 = rocksdb_get_cf(db, read_options, column_family_handle[0],
+                                  "cf1", 3, &val_len, &err);
+    CheckNoError(err);
+    CheckEqual("val1", value1, val_len);
+    Free(&value1);
+
+    char* value2 = rocksdb_get_cf(db, read_options, column_family_handle[1],
+                                  "cf2", 3, &val_len, &err);
+    CheckNoError(err);
+    CheckEqual("val2", value2, val_len);
+    Free(&value2);
+
+    rocksdb_readoptions_destroy(read_options);
+
+    rocksdb_column_family_handle_destroy(column_family_handle[0]);
+    rocksdb_column_family_handle_destroy(column_family_handle[1]);
+
+    rocksdb_create_column_families_destroy(column_family_handle);
+
+    rocksdb_options_destroy(cf1_options);
+    rocksdb_options_destroy(cf2_options);
+
+    rocksdb_options_destroy(db_options);
+  }
+
   StartPhase("columnfamilies");
   {
     rocksdb_close(db);
@@ -6322,6 +6395,7 @@ int main(int argc, char** argv) {
     cfh1 = list_cfh[0];
     cfh2 = list_cfh[1];
     rocksdb_create_column_families_destroy(list_cfh);
+
     txn = rocksdb_optimistictransaction_begin(otxn_db, woptions, otxn_options,
                                               NULL);
     rocksdb_transaction_put_cf(txn, cfh1, "key_cf1", 7, "val_cf1", 7, &err);

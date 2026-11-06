@@ -2377,6 +2377,34 @@ rocksdb_column_family_handle_t** rocksdb_create_column_families(
   return c_handles;
 }
 
+rocksdb_column_family_handle_t** rocksdb_create_column_families_with_options(
+    rocksdb_t* db, int num_column_families,
+    const char* const* column_family_names,
+    const rocksdb_options_t* const* column_family_options, size_t* lencfs,
+    char** errptr) {
+  std::vector<ColumnFamilyHandle*> handles;
+
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(num_column_families);
+  for (int i = 0; i < num_column_families; i++) {
+    column_families.emplace_back(
+        std::string(column_family_names[i]),
+        ColumnFamilyOptions(column_family_options[i]->rep));
+  }
+  SaveError(errptr, db->rep->CreateColumnFamilies(column_families, &handles));
+
+  *lencfs = handles.size();
+  rocksdb_column_family_handle_t** c_handles =
+      static_cast<rocksdb_column_family_handle_t**>(
+          malloc(sizeof(rocksdb_column_family_handle_t*) * handles.size()));
+  for (size_t i = 0; i != handles.size(); ++i) {
+    c_handles[i] = new rocksdb_column_family_handle_t;
+    c_handles[i]->rep = handles[i];
+    c_handles[i]->immortal = false;
+  }
+  return c_handles;
+}
+
 rocksdb_column_family_handle_t* rocksdb_create_column_family_with_import(
     rocksdb_t* db, rocksdb_options_t* column_family_options,
     const char* column_family_name,
