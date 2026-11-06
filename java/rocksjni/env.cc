@@ -19,6 +19,13 @@
 #include "portal.h"
 #include "rocksjni/cplusplus_to_java_convert.h"
 
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
+  // Use the standard 'C' locale to handle option conversions correctly
+  assert(setlocale(LC_ALL, "C") != nullptr);
+
+  return JNI_VERSION_1_6;
+}
+
 /*
  * Class:     org_rocksdb_Env
  * Method:    getDefaultEnvInternal
