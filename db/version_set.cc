@@ -6583,7 +6583,7 @@ Status VersionSet::ProcessManifestWrites(
     // successfully, a subsequent recovery attempt will likely see the CURRENT
     // pointing to the new MANIFEST, thus fail. We will not be able to open
     // the DB again. Therefore, if manifest operations succeed, we should keep
-    // the the new MANIFEST. If the process proceeds, any future LogAndApply()
+    // the new MANIFEST. If the process proceeds, any future LogAndApply()
     // call will switch to a new MANIFEST and update CURRENT. If user tries to
     // re-open the DB,
     // a) CURRENT points to the new MANIFEST, and the new MANIFEST is present.
