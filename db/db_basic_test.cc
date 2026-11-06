@@ -1459,6 +1459,7 @@ TEST_F(DBBasicTest, CompactedDB) {
   options.target_file_size_base = kFileSize;
   options.max_bytes_for_level_base = 1 << 30;
   options.compression = kNoCompression;
+  options.statistics = CreateDBStatistics();
   Reopen(options);
   // 1 L0 file, use CompactedDB if max_open_files = -1
   ASSERT_OK(Put("aaa", DummyString(kFileSize / 2, '1')));
@@ -1475,7 +1476,14 @@ TEST_F(DBBasicTest, CompactedDB) {
   s = Put("new", "value");
   ASSERT_EQ(s.ToString(),
             "Not implemented: Not supported in compacted db mode.");
+  const uint64_t prev_cache_miss =
+      options.statistics->getTickerCount(BLOCK_CACHE_DATA_MISS);
+  const uint64_t prev_cache_hit =
+      options.statistics->getTickerCount(BLOCK_CACHE_DATA_HIT);
   ASSERT_EQ(DummyString(kFileSize / 2, '1'), Get("aaa"));
+  ASSERT_GT(options.statistics->getTickerCount(BLOCK_CACHE_DATA_HIT) +
+                options.statistics->getTickerCount(BLOCK_CACHE_DATA_MISS),
+            prev_cache_hit + prev_cache_miss);
   Close();
   Reopen(options);
   // Add more L0 files
@@ -1613,6 +1621,9 @@ TEST_F(DBBasicTest, CompactedDB) {
   ASSERT_OK(db_->GetLiveFilesStorageInfo(lfsi_opts, &files2));
 
   // MultiGet
+  const uint64_t prev_multiget_cache_reads =
+      options.statistics->getTickerCount(BLOCK_CACHE_DATA_HIT) +
+      options.statistics->getTickerCount(BLOCK_CACHE_DATA_MISS);
   std::vector<std::string> values;
   std::vector<Status> status_list = dbfull()->MultiGet(
       ReadOptions(),
@@ -1630,6 +1641,9 @@ TEST_F(DBBasicTest, CompactedDB) {
   ASSERT_OK(status_list[4]);
   ASSERT_EQ(DummyString(kFileSize / 2, 'i'), values[4]);
   ASSERT_TRUE(status_list[5].IsNotFound());
+  ASSERT_GT(options.statistics->getTickerCount(BLOCK_CACHE_DATA_HIT) +
+                options.statistics->getTickerCount(BLOCK_CACHE_DATA_MISS),
+            prev_multiget_cache_reads);
 
   Reopen(options);
   // Add a key
