@@ -626,6 +626,29 @@ public class RocksDBTest {
   }
 
   @Test
+  public void deleteRangeWithByteBuffer() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath())) {
+      db.put("key1".getBytes(), "value".getBytes());
+      db.put("key2".getBytes(), "12345678".getBytes());
+      db.put("key3".getBytes(), "abcdefg".getBytes());
+      db.put("key4".getBytes(), "xyz".getBytes());
+      assertThat(db.get("key1".getBytes())).isEqualTo("value".getBytes());
+      assertThat(db.get("key2".getBytes())).isEqualTo("12345678".getBytes());
+      assertThat(db.get("key3".getBytes())).isEqualTo("abcdefg".getBytes());
+      assertThat(db.get("key4".getBytes())).isEqualTo("xyz".getBytes());
+      ByteBuffer startKey = ByteBuffer.allocateDirect(128);
+      startKey.put("key2".getBytes()).flip();
+      ByteBuffer endKey = ByteBuffer.allocateDirect(128);
+      endKey.put("key4".getBytes()).flip();
+      db.deleteRange(new WriteOptions(), startKey, endKey);
+      assertThat(db.get("key1".getBytes())).isEqualTo("value".getBytes());
+      assertThat(db.get("key2".getBytes())).isNull();
+      assertThat(db.get("key3".getBytes())).isNull();
+      assertThat(db.get("key4".getBytes())).isEqualTo("xyz".getBytes());
+    }
+  }
+
+  @Test
   public void clipColumnFamily() throws RocksDBException {
     try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath())) {
       db.put("key1".getBytes(), "value".getBytes());
