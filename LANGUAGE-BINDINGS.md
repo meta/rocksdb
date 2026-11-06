@@ -16,6 +16,7 @@ This is the list of all known third-party language bindings for RocksDB. If some
 * C#
     * https://github.com/warrenfalk/rocksdb-sharp
     * https://github.com/curiosity-ai/rocksdb-sharp
+    * https://github.com/zcsizmadia/RocksDb.Net
 * Rust
     * https://github.com/pingcap/rust-rocksdb (used in production fork of https://github.com/spacejam/rust-rocksdb)
     * https://github.com/spacejam/rust-rocksdb
