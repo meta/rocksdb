@@ -187,7 +187,10 @@ PLATFORM_SHARED_VERSIONED=true
 # Set ROCKSDB_NO_FAST_LINKER=1 to disable this auto-detection.
 if [ -z "$ROCKSDB_NO_FAST_LINKER" ] && [ "$TARGET_OS" = "Linux" ]; then
     if $CXX -fuse-ld=lld -L/usr/local/lib -x c++ - -o /dev/null 2>/dev/null <<EOF
-int main() { return 0; }
+int main() {
+    try { throw 1; } catch (...) { return 1; }
+    return 0;
+}
 EOF
     then
         PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -fuse-ld=lld"
@@ -698,10 +701,27 @@ if [ "$PORTABLE" == "" ] || [ "$PORTABLE" == 0 ]; then
       COMMON_FLAGS="$COMMON_FLAGS -march=z196 "
     fi
     COMMON_FLAGS="$COMMON_FLAGS"
-  elif test -n "`echo $TARGET_ARCHITECTURE | grep ^riscv64`"; then
-    RISC_ISA=$(cat /proc/cpuinfo | grep -E '^isa\s*:' | head -1 | cut --delimiter=: -f 2 | cut -b 2-)
-    if [ -n "${RISCV_ISA}" ]; then
-      COMMON_FLAGS="$COMMON_FLAGS -march=${RISC_ISA}"
+  elif echo "$TARGET_ARCHITECTURE" | grep -q "^riscv64"; then
+    # Read the ISA string from /proc/cpuinfo (e.g., "rv64imafdcv_zicbom_zicboz_zihintpause")
+    RAW_RISCV_ISA=$(grep -E '^isa\s*:' /proc/cpuinfo 2>/dev/null | head -1 | awk -F: '{print $2}' | xargs)
+    if [ -n "$RAW_RISCV_ISA" ]; then
+      # 1. Extract base ISA (e.g., rv64imafdcv)
+      BASE_ISA=$(echo "$RAW_RISCV_ISA" | grep -o -E '^rv64[a-z]*')
+      # 2. Whitelist safe and useful extensions for RocksDB:
+      #    Keep only Bitmanip (zb*), Crypto (zk*), Vector (zv*)
+      #    Intentionally filter out zi* extensions (e.g., zicntr, zihpm) and zfa
+      #    that may crash older versions of Binutils
+      SAFE_EXTS=$(echo "$RAW_RISCV_ISA" | grep -o -E '_z[bkv][a-z0-9]*' | tr -d '\n')
+      # Assemble the safe ISA string
+      RISCV_ISA="${BASE_ISA}${SAFE_EXTS}"
+      # 3. Compiler probe: test if the current compiler and assembler actually
+      #    support this ISA string. If supported, use it; otherwise (e.g., old
+      #    toolchain), fall back to the generic rv64gc
+      if echo "int main() { return 0; }" | ${CXX:-g++} -x c++ -march="${RISCV_ISA}" - -o /dev/null 2>/dev/null; then
+        COMMON_FLAGS="$COMMON_FLAGS -march=${RISCV_ISA}"
+      else
+        COMMON_FLAGS="$COMMON_FLAGS -march=rv64gc"
+      fi
     fi
   elif [ "$TARGET_OS" == "IOS" ]; then
     COMMON_FLAGS="$COMMON_FLAGS"
