@@ -89,6 +89,7 @@ void TransactionBaseImpl::Clear() {
   save_points_.reset(nullptr);
   write_batch_.Clear();
   commit_time_batch_.Clear();
+  dropped_cfs_in_rebuilt_batch_.clear();
   tracked_locks_->Clear();
   num_puts_ = 0;
   num_put_entities_ = 0;
@@ -893,21 +894,26 @@ void TransactionBaseImpl::UndoGetForUpdate(ColumnFamilyHandle* column_family,
 
 Status TransactionBaseImpl::RebuildFromWriteBatch(WriteBatch* src_batch) {
   struct IndexedWriteBatchBuilder : public WriteBatch::Handler {
-    Transaction* txn_;
+    TransactionBaseImpl* txn_;
     DBImpl* db_;
-    IndexedWriteBatchBuilder(Transaction* txn, DBImpl* db)
-        : txn_(txn), db_(db) {
-      assert(dynamic_cast<TransactionBaseImpl*>(txn_) != nullptr);
-    }
+    IndexedWriteBatchBuilder(TransactionBaseImpl* txn, DBImpl* db)
+        : txn_(txn), db_(db) {}
 
     Status PutCF(uint32_t cf, const Slice& key, const Slice& val) override {
-      Slice user_key = GetUserKey(cf, key);
-      return txn_->Put(db_->GetColumnFamilyHandle(cf), user_key, val);
+      ColumnFamilyHandle* cfh = LookupColumnFamily(cf);
+      if (cfh == nullptr) {
+        return WriteBatchInternal::Put(RawBatch(), cf, key, val);
+      }
+      return txn_->Put(cfh, GetUserKey(cfh, key), val);
     }
 
     Status PutEntityCF(uint32_t cf, const Slice& key,
                        const Slice& entity) override {
-      Slice user_key = GetUserKey(cf, key);
+      ColumnFamilyHandle* cfh = LookupColumnFamily(cf);
+      if (cfh == nullptr) {
+        return WriteBatchInternal::PutEntitySerialized(RawBatch(), cf, key,
+                                                       entity);
+      }
       Slice entity_copy = entity;
       WideColumns columns;
       const Status s =
@@ -916,22 +922,31 @@ Status TransactionBaseImpl::RebuildFromWriteBatch(WriteBatch* src_batch) {
         return s;
       }
 
-      return txn_->PutEntity(db_->GetColumnFamilyHandle(cf), user_key, columns);
+      return txn_->PutEntity(cfh, GetUserKey(cfh, key), columns);
     }
 
     Status DeleteCF(uint32_t cf, const Slice& key) override {
-      Slice user_key = GetUserKey(cf, key);
-      return txn_->Delete(db_->GetColumnFamilyHandle(cf), user_key);
+      ColumnFamilyHandle* cfh = LookupColumnFamily(cf);
+      if (cfh == nullptr) {
+        return WriteBatchInternal::Delete(RawBatch(), cf, key);
+      }
+      return txn_->Delete(cfh, GetUserKey(cfh, key));
     }
 
     Status SingleDeleteCF(uint32_t cf, const Slice& key) override {
-      Slice user_key = GetUserKey(cf, key);
-      return txn_->SingleDelete(db_->GetColumnFamilyHandle(cf), user_key);
+      ColumnFamilyHandle* cfh = LookupColumnFamily(cf);
+      if (cfh == nullptr) {
+        return WriteBatchInternal::SingleDelete(RawBatch(), cf, key);
+      }
+      return txn_->SingleDelete(cfh, GetUserKey(cfh, key));
     }
 
     Status MergeCF(uint32_t cf, const Slice& key, const Slice& val) override {
-      Slice user_key = GetUserKey(cf, key);
-      return txn_->Merge(db_->GetColumnFamilyHandle(cf), user_key, val);
+      ColumnFamilyHandle* cfh = LookupColumnFamily(cf);
+      if (cfh == nullptr) {
+        return WriteBatchInternal::Merge(RawBatch(), cf, key, val);
+      }
+      return txn_->Merge(cfh, GetUserKey(cfh, key), val);
     }
 
     // this is used for reconstructing prepared transactions upon
@@ -954,15 +969,39 @@ Status TransactionBaseImpl::RebuildFromWriteBatch(WriteBatch* src_batch) {
     Status MarkRollback(const Slice&) override {
       return Status::InvalidArgument();
     }
-    size_t GetTimestampSize(uint32_t cf_id) {
-      auto cfd = db_->versions_->GetColumnFamilySet()->GetColumnFamily(cf_id);
-      const Comparator* ucmp = cfd->user_comparator();
-      assert(ucmp);
-      return ucmp->timestamp_size();
+
+    // Returns nullptr if column family `cf_id` no longer exists, i.e. it was
+    // dropped after the transaction was prepared. Such writes are appended to
+    // the transaction's write batch with their original column family id but
+    // are not indexed: the rebuilt transaction must contain the same entries
+    // as its prepared section in the WAL, because committing it consumes one
+    // sequence number per entry and replaying its commit marker on a later
+    // recovery does the same for every entry of the prepared section. At
+    // commit time they are treated like any write to a missing column family:
+    // ignored if WriteOptions::ignore_missing_column_families is set, rejected
+    // otherwise. The column family is recorded on the transaction so that the
+    // commit does not look up a comparator for it.
+    ColumnFamilyHandle* LookupColumnFamily(uint32_t cf_id) {
+      ColumnFamilyHandle* cfh = db_->GetColumnFamilyHandle(cf_id);
+      if (cfh == nullptr &&
+          txn_->dropped_cfs_in_rebuilt_batch_.insert(cf_id).second) {
+        ROCKS_LOG_WARN(
+            db_->immutable_db_options().info_log,
+            "Prepared transaction %s has writes to column family %" PRIu32
+            ", which has been dropped; they are ignored at commit only if "
+            "ignore_missing_column_families is set",
+            txn_->GetName().c_str(), cf_id);
+      }
+      return cfh;
     }
 
-    Slice GetUserKey(uint32_t cf_id, const Slice& key) {
-      size_t ts_sz = GetTimestampSize(cf_id);
+    WriteBatch* RawBatch() { return txn_->GetWriteBatch()->GetWriteBatch(); }
+
+    Slice GetUserKey(ColumnFamilyHandle* cfh, const Slice& key) {
+      assert(cfh);
+      const Comparator* ucmp = cfh->GetComparator();
+      assert(ucmp);
+      size_t ts_sz = ucmp->timestamp_size();
       if (ts_sz == 0) {
         return key;
       }

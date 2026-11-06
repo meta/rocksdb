@@ -871,6 +871,14 @@ Status WriteCommittedTxn::CommitInternal() {
     if (s.ok()) {
       s = wb->UpdateTimestamps(
           commit_ts, [wb, wbwi, this](uint32_t cf) -> size_t {
+            // Writes to a column family that had been dropped when this
+            // transaction was rebuilt from the WAL are skipped: the memtable
+            // insert ignores or rejects them, and the comparator lookup below
+            // would fall back to the default column family's comparator.
+            if (dropped_cfs_in_rebuilt_batch_.find(cf) !=
+                dropped_cfs_in_rebuilt_batch_.end()) {
+              return 0;
+            }
             // first search through timestamp info kept inside the WriteBatch
             // in case some writes bypassed the Transaction's write APIs.
             auto cf_id_to_ts_sz = wb->GetColumnFamilyToTimestampSize();

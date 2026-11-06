@@ -1871,6 +1871,172 @@ TEST_P(TransactionStressTest, TwoPhaseLongPrepareTest) {
   delete txn;
 }
 
+// Regression test for https://github.com/facebook/rocksdb/issues/15473: a
+// prepared transaction wrote to a column family that was then dropped, and the
+// DB was reopened while the transaction was still prepared. Rebuilding the
+// prepared transaction from the WAL used to dereference a null
+// ColumnFamilyData for the dropped column family. The rebuilt transaction
+// keeps those writes (unindexed, with their original column family id, never
+// re-targeted to the default column family) so that it matches its prepared
+// section in the WAL, and committing it with ignore_missing_column_families
+// ignores them like a commit before the restart would have.
+TEST_P(TransactionTest, TwoPhasePreparedWriteToDroppedColumnFamily) {
+  if (txn_db_options.write_policy != WRITE_COMMITTED) {
+    // WritePrepared and WriteUnprepared recovery still rejects any WAL entry
+    // of a dropped column family (DuplicateDetector::InitWithComp), before
+    // the prepared transaction is rebuilt.
+    ROCKSDB_GTEST_BYPASS("Test applies to write-committed only");
+    return;
+  }
+
+  WriteOptions write_options;
+  write_options.sync = true;
+  ReadOptions read_options;
+  TransactionOptions txn_options;
+  std::string value;
+
+  // Keep the WAL across the second reopen so that the commit and rollback
+  // markers written for the recovered transactions are replayed as well.
+  options.avoid_flush_during_shutdown = true;
+  ASSERT_OK(ReOpenNoDelete());
+
+  ColumnFamilyHandle* cfh = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(ColumnFamilyOptions(), "to_drop", &cfh));
+
+  // txn_a, txn_c and txn_d write to both column families, txn_b only to the
+  // column family that is dropped below. All four stay prepared across the
+  // reopen.
+  Transaction* txn_a = db->BeginTransaction(write_options, txn_options);
+  ASSERT_OK(txn_a->SetName("txn_a"));
+  ASSERT_OK(txn_a->Put(cfh, "dropped_key_a", "dropped_value_a"));
+  ASSERT_OK(txn_a->Put("kept_key_a", "kept_value_a"));
+  ASSERT_OK(txn_a->Prepare());
+
+  Transaction* txn_b = db->BeginTransaction(write_options, txn_options);
+  ASSERT_OK(txn_b->SetName("txn_b"));
+  ASSERT_OK(txn_b->Put(cfh, "dropped_key_b", "dropped_value_b"));
+  ASSERT_OK(txn_b->Prepare());
+
+  Transaction* txn_c = db->BeginTransaction(write_options, txn_options);
+  ASSERT_OK(txn_c->SetName("txn_c"));
+  ASSERT_OK(txn_c->Put(cfh, "dropped_key_c", "dropped_value_c"));
+  ASSERT_OK(txn_c->Put("kept_key_c", "kept_value_c"));
+  ASSERT_OK(txn_c->Prepare());
+
+  Transaction* txn_d = db->BeginTransaction(write_options, txn_options);
+  ASSERT_OK(txn_d->SetName("txn_d"));
+  ASSERT_OK(txn_d->Put(cfh, "dropped_key_d", "dropped_value_d"));
+  ASSERT_OK(txn_d->Put("kept_key_d", "kept_value_d"));
+  ASSERT_OK(txn_d->Prepare());
+
+  ASSERT_OK(db->DropColumnFamily(cfh));
+  ASSERT_OK(db->DestroyColumnFamilyHandle(cfh));
+  ASSERT_OK(db->FlushWAL(true));
+
+  delete txn_a;
+  delete txn_b;
+  delete txn_c;
+  delete txn_d;
+
+  // The prepared sections pin the WAL, so the transactions are recovered.
+  static_cast<PessimisticTransactionDB*>(db)->TEST_Crash();
+  ASSERT_OK(ReOpenNoDelete());
+
+  std::vector<Transaction*> prepared_trans;
+  db->GetAllPreparedTransactions(&prepared_trans);
+  ASSERT_EQ(4u, prepared_trans.size());
+
+  txn_a = db->GetTransactionByName("txn_a");
+  ASSERT_NE(nullptr, txn_a);
+  txn_b = db->GetTransactionByName("txn_b");
+  ASSERT_NE(nullptr, txn_b);
+  txn_c = db->GetTransactionByName("txn_c");
+  ASSERT_NE(nullptr, txn_c);
+
+  // The rebuilt write batches contain all writes of the prepared sections,
+  // but the writes to the dropped column family are not indexed and were not
+  // moved to the default column family.
+  ASSERT_EQ(2u, txn_a->GetWriteBatch()->GetWriteBatch()->Count());
+  ASSERT_EQ(1u, txn_b->GetWriteBatch()->GetWriteBatch()->Count());
+  ASSERT_EQ(2u, txn_c->GetWriteBatch()->GetWriteBatch()->Count());
+  ASSERT_OK(txn_a->Get(read_options, "kept_key_a", &value));
+  ASSERT_EQ("kept_value_a", value);
+  ASSERT_TRUE(txn_a->Get(read_options, "dropped_key_a", &value).IsNotFound());
+  ASSERT_TRUE(txn_b->Get(read_options, "dropped_key_b", &value).IsNotFound());
+
+  // As before the restart, the writes to the dropped column family are
+  // ignored at commit with ignore_missing_column_families.
+  txn_a->GetWriteOptions()->ignore_missing_column_families = true;
+  ASSERT_OK(txn_a->Commit());
+  delete txn_a;
+  // A recovered transaction whose writes all went to the dropped column
+  // family commits as a no-op.
+  txn_b->GetWriteOptions()->ignore_missing_column_families = true;
+  ASSERT_OK(txn_b->Commit());
+  delete txn_b;
+  ASSERT_OK(txn_c->Rollback());
+  delete txn_c;
+
+  prepared_trans.clear();
+  db->GetAllPreparedTransactions(&prepared_trans);
+  ASSERT_EQ(1u, prepared_trans.size());
+
+  ASSERT_OK(db->Get(read_options, "kept_key_a", &value));
+  ASSERT_EQ("kept_value_a", value);
+  ASSERT_TRUE(db->Get(read_options, "kept_key_c", &value).IsNotFound());
+  for (const auto& key : {"dropped_key_a", "dropped_key_b", "dropped_key_c"}) {
+    ASSERT_TRUE(db->Get(read_options, key, &value).IsNotFound());
+  }
+
+  // Replay the prepared sections together with their commit/rollback markers.
+  ASSERT_OK(ReOpenNoDelete());
+
+  prepared_trans.clear();
+  db->GetAllPreparedTransactions(&prepared_trans);
+  ASSERT_EQ(1u, prepared_trans.size());
+  ASSERT_OK(db->Get(read_options, "kept_key_a", &value));
+  ASSERT_EQ("kept_value_a", value);
+  ASSERT_TRUE(db->Get(read_options, "kept_key_c", &value).IsNotFound());
+  for (const auto& key : {"dropped_key_a", "dropped_key_b", "dropped_key_c"}) {
+    ASSERT_TRUE(db->Get(read_options, key, &value).IsNotFound());
+  }
+
+  // Without ignore_missing_column_families the commit is rejected exactly as
+  // it would have been before the restart, and, as for any write to a missing
+  // column family, the DB is in the background error state afterwards.
+  txn_d = db->GetTransactionByName("txn_d");
+  ASSERT_NE(nullptr, txn_d);
+  ASSERT_EQ(2u, txn_d->GetWriteBatch()->GetWriteBatch()->Count());
+  Status s = txn_d->Commit();
+  ASSERT_TRUE(s.IsInvalidArgument());
+  ASSERT_EQ("Invalid argument: Invalid column family specified in write batch",
+            s.ToString());
+  delete txn_d;
+
+  // The DB can still be reopened. Whether the rejected commit left its commit
+  // marker in the WAL depends on the write path (it does with
+  // two_write_queues), so txn_d is either committed by the replay of that
+  // marker or still prepared; either way the write to the dropped column
+  // family is gone.
+  ASSERT_OK(ReOpenNoDelete());
+
+  ASSERT_TRUE(db->Get(read_options, "dropped_key_d", &value).IsNotFound());
+  ASSERT_OK(db->Get(read_options, "kept_key_a", &value));
+  ASSERT_EQ("kept_value_a", value);
+  txn_d = db->GetTransactionByName("txn_d");
+  if (txn_d != nullptr) {
+    ASSERT_TRUE(db->Get(read_options, "kept_key_d", &value).IsNotFound());
+    ASSERT_OK(txn_d->Rollback());
+    delete txn_d;
+  } else {
+    ASSERT_OK(db->Get(read_options, "kept_key_d", &value));
+    ASSERT_EQ("kept_value_d", value);
+  }
+  prepared_trans.clear();
+  db->GetAllPreparedTransactions(&prepared_trans);
+  ASSERT_EQ(0u, prepared_trans.size());
+}
+
 TEST_P(TransactionTest, TwoPhaseSequenceTest) {
   WriteOptions write_options;
   write_options.sync = true;
