@@ -8,7 +8,7 @@ At Facebook, we use RocksDB as storage engines in multiple data management servi
 3. ZippyDB --  Facebook's distributed key-value store with Paxos-style replication, built on top of RocksDB.[1] https://www.youtube.com/watch?v=DfiN7pG0D0khtt
 4. Laser -- Laser is a high query throughput, low (millisecond) latency, key-value storage service built on top of RocksDB.[1]
 4. Dragon -- a distributed graph query engine. https://code.facebook.com/posts/1737605303120405/dragon-a-distributed-graph-query-engine/
-5. Stylus -- a low-level stream processing framework writtenin C++.[1]
+5. Stylus -- a low-level stream processing framework written in C++.[1]
 6. LogDevice -- a distributed data store for logs [2]
 
 [1] https://research.facebook.com/publications/realtime-data-processing-at-facebook/
