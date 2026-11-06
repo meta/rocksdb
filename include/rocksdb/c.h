@@ -3854,6 +3854,13 @@ extern ROCKSDB_LIBRARY_API void
 rocksdb_ingestexternalfileoptions_set_move_files(
     rocksdb_ingestexternalfileoptions_t* opt, unsigned char move_files);
 extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfileoptions_set_link_files(
+    rocksdb_ingestexternalfileoptions_t* opt, unsigned char link_files);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfileoptions_set_failed_move_fall_back_to_copy(
+    rocksdb_ingestexternalfileoptions_t* opt,
+    unsigned char failed_move_fall_back_to_copy);
+extern ROCKSDB_LIBRARY_API void
 rocksdb_ingestexternalfileoptions_set_snapshot_consistency(
     rocksdb_ingestexternalfileoptions_t* opt,
     unsigned char snapshot_consistency);
@@ -3868,9 +3875,31 @@ extern ROCKSDB_LIBRARY_API void
 rocksdb_ingestexternalfileoptions_set_ingest_behind(
     rocksdb_ingestexternalfileoptions_t* opt, unsigned char ingest_behind);
 extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfileoptions_set_write_global_seqno(
+    rocksdb_ingestexternalfileoptions_t* opt, unsigned char write_global_seqno);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfileoptions_set_verify_checksums_before_ingest(
+    rocksdb_ingestexternalfileoptions_t* opt,
+    unsigned char verify_checksums_before_ingest);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfileoptions_set_verify_checksums_readahead_size(
+    rocksdb_ingestexternalfileoptions_t* opt,
+    size_t verify_checksums_readahead_size);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfileoptions_set_verify_file_checksum(
+    rocksdb_ingestexternalfileoptions_t* opt,
+    unsigned char verify_file_checksum);
+extern ROCKSDB_LIBRARY_API void
 rocksdb_ingestexternalfileoptions_set_fail_if_not_bottommost_level(
     rocksdb_ingestexternalfileoptions_t* opt,
     unsigned char fail_if_not_bottommost_level);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfileoptions_set_allow_db_generated_files(
+    rocksdb_ingestexternalfileoptions_t* opt,
+    unsigned char allow_db_generated_files);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfileoptions_set_fill_cache(
+    rocksdb_ingestexternalfileoptions_t* opt, unsigned char fill_cache);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_ingestexternalfileoptions_destroy(
     rocksdb_ingestexternalfileoptions_t* opt);

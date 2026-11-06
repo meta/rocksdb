@@ -8599,6 +8599,17 @@ void rocksdb_ingestexternalfileoptions_set_move_files(
   opt->rep.move_files = move_files;
 }
 
+void rocksdb_ingestexternalfileoptions_set_link_files(
+    rocksdb_ingestexternalfileoptions_t* opt, unsigned char link_files) {
+  opt->rep.link_files = link_files;
+}
+
+void rocksdb_ingestexternalfileoptions_set_failed_move_fall_back_to_copy(
+    rocksdb_ingestexternalfileoptions_t* opt,
+    unsigned char failed_move_fall_back_to_copy) {
+  opt->rep.failed_move_fall_back_to_copy = failed_move_fall_back_to_copy;
+}
+
 void rocksdb_ingestexternalfileoptions_set_snapshot_consistency(
     rocksdb_ingestexternalfileoptions_t* opt,
     unsigned char snapshot_consistency) {
@@ -8622,10 +8633,45 @@ void rocksdb_ingestexternalfileoptions_set_ingest_behind(
   opt->rep.ingest_behind = ingest_behind;
 }
 
+void rocksdb_ingestexternalfileoptions_set_write_global_seqno(
+    rocksdb_ingestexternalfileoptions_t* opt,
+    unsigned char write_global_seqno) {
+  opt->rep.write_global_seqno = write_global_seqno;
+}
+
+void rocksdb_ingestexternalfileoptions_set_verify_checksums_before_ingest(
+    rocksdb_ingestexternalfileoptions_t* opt,
+    unsigned char verify_checksums_before_ingest) {
+  opt->rep.verify_checksums_before_ingest = verify_checksums_before_ingest;
+}
+
+void rocksdb_ingestexternalfileoptions_set_verify_checksums_readahead_size(
+    rocksdb_ingestexternalfileoptions_t* opt,
+    size_t verify_checksums_readahead_size) {
+  opt->rep.verify_checksums_readahead_size = verify_checksums_readahead_size;
+}
+
+void rocksdb_ingestexternalfileoptions_set_verify_file_checksum(
+    rocksdb_ingestexternalfileoptions_t* opt,
+    unsigned char verify_file_checksum) {
+  opt->rep.verify_file_checksum = verify_file_checksum;
+}
+
 void rocksdb_ingestexternalfileoptions_set_fail_if_not_bottommost_level(
     rocksdb_ingestexternalfileoptions_t* opt,
     unsigned char fail_if_not_bottommost_level) {
   opt->rep.fail_if_not_bottommost_level = fail_if_not_bottommost_level;
+}
+
+void rocksdb_ingestexternalfileoptions_set_allow_db_generated_files(
+    rocksdb_ingestexternalfileoptions_t* opt,
+    unsigned char allow_db_generated_files) {
+  opt->rep.allow_db_generated_files = allow_db_generated_files;
+}
+
+void rocksdb_ingestexternalfileoptions_set_fill_cache(
+    rocksdb_ingestexternalfileoptions_t* opt, unsigned char fill_cache) {
+  opt->rep.fill_cache = fill_cache;
 }
 
 void rocksdb_ingestexternalfileoptions_destroy(
