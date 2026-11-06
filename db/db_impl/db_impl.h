@@ -1571,6 +1571,19 @@ class DBImpl : public DB
   static Status TEST_ValidateOptions(const DBOptions& db_options) {
     return ValidateOptions(db_options);
   }
+
+  // Exposes sequence and optional WAL-index allocation for concurrency tests.
+  IOStatus TEST_AllocateSequenceAndWALIndex(
+      size_t sequence_count, bool write_wal,
+      SequenceNumber* last_sequence_before, uint64_t* wal_index) {
+    return AllocateSequenceAndWALIndex(sequence_count, write_wal,
+                                       last_sequence_before, wal_index);
+  }
+
+  void TEST_SetNextWALIndex(uint64_t next_wal_index) {
+    InstrumentedMutexLock lock(&sequence_wal_index_mutex_);
+    next_wal_index_ = next_wal_index;
+  }
 #endif  // NDEBUG
 
   // In certain configurations, verify that the table/blob file cache only
@@ -3045,17 +3058,50 @@ class DBImpl : public DB
                     WriteBatch* tmp_batch, WriteBatch** merged_batch,
                     size_t* write_with_wal, WriteBatch** to_be_cached_state);
 
+  // Reserves a sequence block and, when a WAL record will be written, its
+  // wal_index in one DB-wide critical section. The mutex is released before
+  // batch merging, WAL append, or any other I/O. The future durability
+  // watermark's RegisterPending operation belongs in this same section.
+  //
+  // Rule for that watermark diff: a failed append leaves its entry in
+  // pending_low[p], and the cover for the burned index must be written and
+  // synced before that entry may be popped. Popping first would advance the
+  // watermark past an uncovered hole and acknowledge writes above it. With
+  // one WAL at a time (the only layout today) no extra sync is needed --
+  // appends to one file are ordered, so the cover inherits the durability of
+  // whatever is synced after it.
+  IOStatus AllocateSequenceAndWALIndex(size_t sequence_count, bool write_wal,
+                                       SequenceNumber* last_sequence_before,
+                                       uint64_t* wal_index);
+
+  // Writes a void record covering `wal_index`, which was allocated but whose
+  // data record never reached the WAL. Every allocated index must end up
+  // either on a data record or under a cover, so that a later gap check can
+  // tell a deliberate hole from a lost record and does not truncate on it.
+  // No-op when `wal_index` is 0, meaning nothing was consumed.
+  //
+  // A failed cover leaves the index uncovered, and no write above it may then
+  // be acknowledged. See the implementation for why that holds today.
+  //
+  // Taking a single writer means the cover can only go to the one that just
+  // failed. That is the whole story with one WAL at a time, but under
+  // partitioning a poisoned writer for partition p may want to fall back to a
+  // healthy partition, so this signature needs revisiting then -- unless the
+  // durability watermark rule above makes the fallback unnecessary.
+  IOStatus CoverBurnedWALIndex(const WriteOptions& write_options,
+                               log::Writer* log_writer, uint64_t wal_index);
+
   IOStatus WriteToWAL(const WriteBatch& merged_batch,
                       const WriteOptions& write_options,
                       log::Writer* log_writer, uint64_t* wal_used,
                       uint64_t* log_size,
                       WalFileNumberSize& wal_file_number_size,
-                      SequenceNumber sequence);
+                      SequenceNumber sequence, uint64_t wal_index);
 
   IOStatus WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                            log::Writer* log_writer, uint64_t* wal_used,
                            bool need_wal_sync, bool need_wal_dir_sync,
-                           SequenceNumber sequence,
+                           SequenceNumber sequence, uint64_t wal_index,
                            WalFileNumberSize& wal_file_number_size);
 
   IOStatus ConcurrentWriteGroupToWAL(const WriteThread::WriteGroup& write_group,
@@ -3737,6 +3783,11 @@ class DBImpl : public DB
   // Note: to avoid deadlock, if needed to acquire both wal_write_mutex_ and
   // mutex_, the order should be first mutex_ and then wal_write_mutex_.
   InstrumentedMutex wal_write_mutex_;
+
+  // Serializes sequence-block and WAL-index allocation across all WAL
+  // partitions. It is never held across batch merging or I/O.
+  InstrumentedMutex sequence_wal_index_mutex_;
+  uint64_t next_wal_index_ = log::kWALIndexStartNumber;
 
   // If zero, manual compactions are allowed to proceed. If non-zero, manual
   // compactions may still be running, but will quickly fail with

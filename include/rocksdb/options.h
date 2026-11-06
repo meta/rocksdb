@@ -448,6 +448,28 @@ enum class WALRecoveryMode : char {
   kSkipAnyCorruptedRecords = 0x03,
 };
 
+// EXPERIMENTAL. Controls whether WAL records carry a persisted monotonically
+// increasing ordering number (internally: wal_index), and how WAL files are
+// laid out. Every value other than `kNone` prefixes each WAL record with that
+// ordering number and tags the file with an identifying marker record; both
+// change the on-disk WAL format, so older RocksDB versions report corruption
+// rather than reading such WALs.
+//
+// To roll back, set this option to `kNone`, flush every column family so all
+// affected WALs become obsolete, wait for those WAL files to be deleted, and
+// only then downgrade the RocksDB binary. An older binary that encounters a
+// surviving WAL in the new format reports corruption rather than misreading
+// it.
+enum class PartitionWALUsage : char {
+  // Disabled. The WAL keeps the vanilla on-disk format so that files stay
+  // readable by (and are bit-for-bit compatible with) older RocksDB versions.
+  kNone = 0x00,
+  // Every WAL record carries an ordering number, and WAL files are partitioned
+  // by column family. Column-family routing is not implemented yet: until it
+  // is, all column families share one WAL at a time, as with `kNone`.
+  kPartitionByColumnFamily = 0x02,
+};
+
 struct DbPath {
   std::string path;
   uint64_t target_size;  // Target size of total files under the path, in byte.
@@ -1619,6 +1641,13 @@ struct DBOptions {
   // versions (>= RocksDB 7.4.0 for ZSTD) regardless of this setting when
   // the WAL is read.
   CompressionType wal_compression = kNoCompression;
+
+  // Controls whether each WAL record carries an extra monotonically increasing
+  // ordering number persisted on disk, and how WAL files are laid out. `kNone`
+  // (default) keeps the vanilla WAL format for downgrade safety; see
+  // `PartitionWALUsage` for the on-disk format change every other value
+  // implies. Leaves the per-key sequence number and SST format untouched.
+  PartitionWALUsage partition_wal_usage = PartitionWALUsage::kNone;
 
   // Set to true to re-instate an old behavior of keeping complete, synced WAL
   // files open for write until they are collected for deletion by a

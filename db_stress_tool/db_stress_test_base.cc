@@ -7279,6 +7279,23 @@ void InitializeOptionsFromFlags(
   options.wal_compression =
       StringToCompressionType(FLAGS_wal_compression.c_str());
 
+  // Go through the registered option parser rather than duplicating the
+  // string->enum mapping, so db_stress accepts exactly what DBOptions does.
+  {
+    DBOptions parsed_db_options;
+    ConfigOptions config_options;
+    config_options.ignore_unknown_options = false;
+    const Status s = GetDBOptionsFromString(
+        config_options, DBOptions(),
+        "partition_wal_usage=" + FLAGS_partition_wal_usage, &parsed_db_options);
+    if (!s.ok()) {
+      fprintf(stderr, "Cannot parse partition_wal_usage: %s\n",
+              FLAGS_partition_wal_usage.c_str());
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
+    }
+    options.partition_wal_usage = parsed_db_options.partition_wal_usage;
+  }
+
   options.last_level_temperature =
       StringToTemperature(FLAGS_last_level_temperature.c_str());
   options.default_write_temperature =
