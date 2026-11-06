@@ -27,10 +27,6 @@ namespace {
 
 const size_t kSectorSize = 512;
 
-inline bool IsPowerOfTwo(const size_t alignment) {
-  return ((alignment) & (alignment - 1)) == 0;
-}
-
 inline bool IsAligned(size_t alignment, const void* ptr) {
   return ((uintptr_t(ptr)) & (alignment - 1)) == 0;
 }
