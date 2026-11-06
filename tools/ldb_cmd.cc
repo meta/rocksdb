@@ -2880,8 +2880,8 @@ ChangeCompactionStyleCommand::ChangeCompactionStyleCommand(
   if (old_compaction_style_ == kCompactionStyleUniversal &&
       new_compaction_style_ == kCompactionStyleLevel) {
     exec_state_ = LDBCommandExecuteResult::Failed(
-        "Convert from universal compaction to level compaction. "
-        "Nothing to do.\n");
+        "Changing from universal compaction to level compaction is not "
+        "supported by ldb.\n");
     return;
   }
 }
