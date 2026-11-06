@@ -29,7 +29,7 @@ from json import JSONDecoder
 from pathlib import Path
 from typing import Iterable
 
-from generate_c_api import render_decl, render_impl, write_if_changed
+from generate_c_api import CHeaderRenderer, CSourceRenderer, JSONOutputRenderer, write_if_changed
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -99,6 +99,7 @@ class OutputGroup:
     name: str
     header_out: Path
     source_out: Path
+    json_out: Path
     families: tuple[FamilyConfig, ...]
 
 
@@ -115,6 +116,7 @@ READ_OPTIONS_GROUP = OutputGroup(
     name="Auto-discovered ReadOptions simple",
     header_out=GENERATED_INCLUDE_ROOT / "c_generated_readoptions_auto.h.inc",
     source_out=GENERATED_SOURCE_ROOT / "c_generated_readoptions_auto.cc.inc",
+    json_out=GENERATED_SOURCE_ROOT / "c_generated_readoptions_auto.json",
     families=(
         FamilyConfig(
             struct_name="ReadOptions",
@@ -133,6 +135,7 @@ OPTION_STRUCTS_GROUP = OutputGroup(
     name="Auto-discovered option structs simple",
     header_out=GENERATED_INCLUDE_ROOT / "c_generated_option_structs_auto.h.inc",
     source_out=GENERATED_SOURCE_ROOT / "c_generated_option_structs_auto.cc.inc",
+    json_out=GENERATED_SOURCE_ROOT / "c_generated_option_structs_auto.json",
     families=(
         FamilyConfig(
             struct_name="DBOptions",
@@ -458,6 +461,7 @@ JOBINFO_GROUP = OutputGroup(
     name="Auto-discovered JobInfo metadata simple",
     header_out=GENERATED_INCLUDE_ROOT / "c_generated_jobinfo_auto.h.inc",
     source_out=GENERATED_SOURCE_ROOT / "c_generated_jobinfo_auto.cc.inc",
+    json_out=GENERATED_SOURCE_ROOT / "c_generated_jobinfo_auto.json",
     families=(
         FamilyConfig(
             struct_name="FlushJobInfo",
@@ -512,6 +516,7 @@ METADATA_VIEW_GROUP = OutputGroup(
     name="Auto-discovered metadata view structs simple",
     header_out=GENERATED_INCLUDE_ROOT / "c_generated_metadata_structs_auto.h.inc",
     source_out=GENERATED_SOURCE_ROOT / "c_generated_metadata_structs_auto.cc.inc",
+    json_out=GENERATED_SOURCE_ROOT / "c_generated_metadata_structs_auto.json",
     families=(
         FamilyConfig(
             struct_name="TableProperties",
@@ -1204,15 +1209,13 @@ def render_group(output_group: OutputGroup, functions_by_family: dict[str, list[
     lines: list[str] = []
     lines.extend(auto_header_banner(output_group))
     lines.extend(regen_comment_lines(output_group))
+    renderer = CHeaderRenderer(lines) if mode == "header" else CSourceRenderer(lines) if mode == "source" else JSONOutputRenderer(lines)
     for family in output_group.families:
         section_name = family.section_name or family.struct_name
-        lines.append(f"/* {section_name} */")
-        lines.append("")
-        render = render_decl if mode == "header" else render_impl
+        renderer.comment(section_name)
         for fn in functions_by_family[family.struct_name]:
-            lines.extend(render(fn))
-            lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+            renderer.render(fn)
+    return "\n".join(renderer.output()).rstrip() + "\n"
 
 
 def classify_function_coverage(
@@ -1283,6 +1286,9 @@ def generate_groups(blocklist_path: Path) -> tuple[dict[Path, str], list[str]]:
         )
         outputs[output_group.source_out] = render_group(
             output_group, source_generated, "source"
+        )
+        outputs[output_group.json_out] = render_group(
+            output_group, source_generated, "json"
         )
 
     return outputs, errors
