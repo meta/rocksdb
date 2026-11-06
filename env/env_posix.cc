@@ -40,10 +40,17 @@
 #endif
 #include <unistd.h>
 
+#if defined(OS_FREEBSD) || defined(OS_DRAGONFLYBSD)
+#include <pthread_np.h>
+#elif defined(OS_NETBSD)
+#include <lwp.h>
+#endif
+
 #include <algorithm>
 #include <ctime>
 // Get nano time includes
-#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD)
+#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) || \
+    defined(OS_NETBSD) || defined(OS_OPEBSD) || defined(OS_DRAGONFLYBSD)
 #elif defined(__MACH__)
 #include <Availability.h>
 #include <mach/clock.h>
@@ -142,7 +149,8 @@ class PosixClock : public SystemClock {
   }
 
   uint64_t NowNanos() override {
-#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) || \
+#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) ||  \
+    defined(OS_NETBSD) || defined(OS_OPENBSD) || defined(OS_DRAGONFLYBSD) || \
     defined(OS_AIX)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -162,7 +170,8 @@ class PosixClock : public SystemClock {
   }
 
   uint64_t CPUMicros() override {
-#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) || \
+#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) ||  \
+    defined(OS_NETBSD) || defined(OS_OPENBSD) || defined(OS_DRAGONFLYBSD) || \
     defined(OS_AIX) || (defined(__MACH__) && defined(__MAC_10_12))
     struct timespec ts;
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
@@ -173,7 +182,8 @@ class PosixClock : public SystemClock {
   }
 
   uint64_t CPUNanos() override {
-#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) || \
+#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) ||  \
+    defined(OS_NETBSD) || defined(OS_OPENBSD) || defined(OS_DRAGONFLYBSD) || \
     defined(OS_AIX) || (defined(__MACH__) && defined(__MAC_10_12))
     struct timespec ts;
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
@@ -323,6 +333,12 @@ class PosixEnv : public CompositeEnv {
     pthread_t tid = pthread_self();
     memcpy(&thread_id, &tid, std::min(sizeof(thread_id), sizeof(tid)));
 #endif  // __GLIBC_PREREQ(2, 30)
+#elif defined(OS_FREEBSD) || defined(OS_DRAGONFLYBSD)
+    thread_id = pthread_getthreadid_np();
+#elif defined(OS_NETBSD)
+    thread_id = ::_lwp_self();
+#elif defined(OS_OPENBSD)
+    thread_id = ::getthrid();
 #else   // defined(_GNU_SOURCE) && defined(__GLIBC_PREREQ)
     pthread_t tid = pthread_self();
     memcpy(&thread_id, &tid, std::min(sizeof(thread_id), sizeof(tid)));
