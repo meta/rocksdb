@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #ifdef GFLAGS
+#include <array>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
@@ -111,6 +112,11 @@ DEFINE_bool(early_exit, false,
 
 DEFINE_bool(histograms, true,
             "Whether to track and print histogram statistics.");
+
+DEFINE_bool(histograms_by_op, false,
+            "With --histograms, also print the latency of each kind of "
+            "operation: lookup hit, lookup miss, lookup miss then insert, "
+            "insert, erase.");
 
 DEFINE_bool(report_problems, true, "Whether to ReportProblems() at the end.");
 
@@ -247,12 +253,26 @@ class SharedState {
   size_t pinned_count_ = 0;
 };
 
+// Kinds of operation timed separately with --histograms_by_op.
+enum OpKind : size_t {
+  kOpLookupHit,
+  kOpLookupMiss,
+  kOpLookupMissInsert,
+  kOpInsert,
+  kOpErase,
+  kNumOpKinds,
+};
+
+const char* const kOpKindNames[kNumOpKinds] = {
+    "Lookup hit", "Lookup miss", "Lookup miss then insert", "Insert", "Erase"};
+
 // Per-thread state for concurrent executions of the same benchmark.
 struct ThreadState {
   uint32_t tid;
   Random64 rnd;
   SharedState* shared;
   HistogramImpl latency_ns_hist;
+  std::array<HistogramImpl, kNumOpKinds> op_latency_ns_hist;
   uint64_t duration_us = 0;
 
   ThreadState(uint32_t index, SharedState* _shared)
@@ -440,6 +460,14 @@ class CacheBench {
       opts.memory_allocator = allocator;
       ConfigureSecondaryCache(opts);
       return NewLRUCache(opts);
+    } else if (FLAGS_cache_type == "fifo_cache") {
+      FIFOCacheOptions opts(FLAGS_cache_size, FLAGS_num_shard_bits,
+                            false /* strict_capacity_limit */, allocator,
+                            kDefaultToAdaptiveMutex,
+                            kDefaultCacheMetadataChargePolicy);
+      opts.hash_seed = BitwiseAnd(FLAGS_seed, INT32_MAX);
+      ConfigureSecondaryCache(opts);
+      return opts.MakeSharedCache();
     } else {
       fprintf(stderr, "Cache type not supported.\n");
       exit(1);
@@ -565,6 +593,17 @@ class CacheBench {
         combined.Merge(threads[i]->latency_ns_hist);
       }
       printf("%s", combined.ToString().c_str());
+
+      if (FLAGS_histograms_by_op) {
+        for (size_t op = 0; op < kNumOpKinds; op++) {
+          HistogramImpl by_op;
+          for (uint32_t i = 0; i < FLAGS_threads; i++) {
+            by_op.Merge(threads[i]->op_latency_ns_hist[op]);
+          }
+          printf("\n%s latency (ns):\n%s", kOpKindNames[op],
+                 by_op.ToString().c_str());
+        }
+      }
 
       if (FLAGS_gather_stats) {
         printf("\nGather stats latency (us):\n");
@@ -738,6 +777,7 @@ class CacheBench {
       if (FLAGS_histograms) {
         timer.Start();
       }
+      OpKind op_kind = kNumOpKinds;
 
       if (random_op < lookup_insert_threshold_) {
         // do lookup
@@ -745,6 +785,7 @@ class CacheBench {
                                      Cache::Priority::LOW);
         if (handle) {
           ++lookup_hits;
+          op_kind = kOpLookupHit;
           if (!FLAGS_lean) {
             // do something with the data
             result += NPHash64(static_cast<char*>(cache_->Value(handle)),
@@ -753,6 +794,7 @@ class CacheBench {
           pinned.push_back(handle);
         } else {
           ++lookup_misses;
+          op_kind = kOpLookupMissInsert;
           // do insert
           Status s = cache_->Insert(
               key, createValue(thread->rnd, cache_->memory_allocator()),
@@ -761,12 +803,14 @@ class CacheBench {
         }
       } else if (random_op < insert_threshold_) {
         // do insert
+        op_kind = kOpInsert;
         Status s = cache_->Insert(
             key, createValue(thread->rnd, cache_->memory_allocator()), &helper3,
             FLAGS_value_bytes, &pinned.emplace_back());
         assert(s.ok());
       } else if (random_op < blind_insert_threshold_) {
         // insert without keeping a handle
+        op_kind = kOpInsert;
         Status s = cache_->Insert(
             key, createValue(thread->rnd, cache_->memory_allocator()), &helper3,
             FLAGS_value_bytes);
@@ -777,6 +821,7 @@ class CacheBench {
                                      Cache::Priority::LOW);
         if (handle) {
           ++lookup_hits;
+          op_kind = kOpLookupHit;
           if (!FLAGS_lean) {
             // do something with the data
             result += NPHash64(static_cast<char*>(cache_->Value(handle)),
@@ -785,16 +830,22 @@ class CacheBench {
           pinned.push_back(handle);
         } else {
           ++lookup_misses;
+          op_kind = kOpLookupMiss;
         }
       } else if (random_op < erase_threshold_) {
         // do erase
+        op_kind = kOpErase;
         cache_->Erase(key);
       } else {
         // Should be extremely unlikely (noop)
         assert(random_op >= kHundredthUint64 * 100U);
       }
       if (FLAGS_histograms) {
-        thread->latency_ns_hist.Add(timer.ElapsedNanos());
+        const uint64_t elapsed_ns = timer.ElapsedNanos();
+        thread->latency_ns_hist.Add(elapsed_ns);
+        if (FLAGS_histograms_by_op && op_kind != kNumOpKinds) {
+          thread->op_latency_ns_hist[op_kind].Add(elapsed_ns);
+        }
       }
       if (FLAGS_usleep > 0) {
         unsigned us =
