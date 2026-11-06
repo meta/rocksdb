@@ -4452,6 +4452,60 @@ TEST_F(DBBloomFilterTest, FixedWidthSegments) {
   EXPECT_EQ(0, TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA));
 }
 
+TEST_F(DBBloomFilterTest, SstQueryFilterKeySegmentRange) {
+  // Up to seven 1-byte segments, so that each key segment range selects a
+  // distinct substring of the key
+  struct OneByteSegmentsExtractor : public KeySegmentsExtractor {
+    const char* Name() const override { return "OneByteSegmentsExtractor"; }
+    void Extract(const Slice& key_or_bound, KeyKind /*kind*/,
+                 Result* result) const override {
+      for (uint32_t i = 1; i <= key_or_bound.size() && i <= 7; ++i) {
+        result->segment_ends.push_back(i);
+      }
+    }
+  };
+  auto extractor = std::make_shared<OneByteSegmentsExtractor>();
+
+  // All the key segment ranges supported by the filter serialization, which
+  // stores the selected range in the filter and decodes it at query time
+  const std::vector<std::pair<uint8_t, uint8_t>> ranges = {
+      {0, 1}, {0, 2}, {1, 2}, {0, 3}, {1, 3}, {2, 3}, {0, 4}, {1, 4},
+      {2, 4}, {3, 4}, {0, 5}, {1, 5}, {2, 5}, {3, 5}, {4, 5}, {0, 6}};
+
+  using Keys = std::vector<std::string>;
+  for (const auto& [from, to] : ranges) {
+    SCOPED_TRACE("SelectKeySegmentRange(" + std::to_string(from) + ", " +
+                 std::to_string(to) + ")");
+    auto filter = MakeSharedBytewiseMinMaxSQFC(
+        experimental::SelectKeySegmentRange(from, to));
+    SstQueryFilterConfigs configs = {{filter}, extractor};
+    SstQueryFilterConfigsManager::Data data = {{42, {{"foo", configs}}}};
+    std::shared_ptr<SstQueryFilterConfigsManager> configs_manager;
+    ASSERT_OK(SstQueryFilterConfigsManager::MakeShared(data, &configs_manager));
+    std::shared_ptr<SstQueryFilterConfigsManager::Factory> f;
+    ASSERT_OK(configs_manager->MakeSharedFactory("foo", 42, &f));
+
+    Options options = CurrentOptions();
+    options.statistics = CreateDBStatistics();
+    options.table_properties_collector_factories.push_back(f);
+    DestroyAndReopen(options);
+
+    ASSERT_OK(Put("0000000", "val0"));
+    ASSERT_OK(Put("1111111", "val1"));
+    ASSERT_OK(Flush());
+
+    // Found: the selected segments of the bounds are within the min/max of
+    // the same segments in the file
+    EXPECT_EQ(RangeQueryKeys(*f, *db_, "1111111", "1111112"),
+              Keys({"1111111"}));
+    EXPECT_EQ(1, TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA));
+
+    // Filtered: the selected segments of the bounds are above the max
+    EXPECT_EQ(RangeQueryKeys(*f, *db_, "2222222", "2222223"), Keys({}));
+    EXPECT_EQ(0, TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA));
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
