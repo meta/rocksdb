@@ -24,7 +24,7 @@ inline const char* RocksLogShorterFileName(const char* file) {
   return file + (sizeof(__FILE__) > 18 ? sizeof(__FILE__) - 18 : 0);
 }
 
-// Don't inclide file/line info in HEADER level
+// Don't include file/line info in HEADER level
 #define ROCKS_LOG_HEADER(LGR, FMT, ...) \
   ROCKSDB_NAMESPACE::Log(InfoLogLevel::HEADER_LEVEL, LGR, FMT, ##__VA_ARGS__)
 
