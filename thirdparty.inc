@@ -215,10 +215,19 @@ if (WITH_ZSTD)
     set(ZSTD_LIB_RELEASE $ENV{ZSTD_LIB_RELEASE})
   endif()
 
+  if(ZSTD_INCLUDE AND EXISTS "${ZSTD_INCLUDE}")
+    set(ZSTD_LIBS debug ${ZSTD_LIB_DEBUG} optimized ${ZSTD_LIB_RELEASE})
+  else()
+    # No explicit paths provided - try to find config package.
+    find_package(zstd CONFIG REQUIRED)
+    message(STATUS "zstd: found config at '${zstd_DIR}'.")
+    set(ZSTD_LIBS zstd::libzstd_static)
+    # Extract include dirs, because some targets (testutillib) use zstd headers without linking to zstd.
+    get_target_property(ZSTD_INCLUDE zstd::libzstd_static INTERFACE_INCLUDE_DIRECTORIES)
+  endif()
+
   # ZSTD_STATIC_LINKING_ONLY only allows us to create an allocation functions override
   # When jemalloc is in use
-  set(ZSTD_LIBS debug ${ZSTD_LIB_DEBUG} optimized ${ZSTD_LIB_RELEASE})
-
   add_definitions(-DZSTD -DZSTD_STATIC_LINKING_ONLY)
   include_directories(${ZSTD_INCLUDE})
   set (THIRDPARTY_LIBS ${THIRDPARTY_LIBS} ${ZSTD_LIBS})
