@@ -48,6 +48,15 @@ bool LineFileReader::ReadLine(std::string* out,
       return true;
     }
     if (at_eof_) {
+      // A file's final line does not need to end with a newline. The data
+      // preceding EOF may already have been appended to `out`, and a short
+      // read can leave additional data in the buffer.
+      if (buf_begin_ != buf_end_ || !out->empty()) {
+        out->append(buf_begin_, buf_end_ - buf_begin_);
+        buf_begin_ = buf_end_;
+        ++line_number_;
+        return true;
+      }
       io_status_.MustCheck();
       return false;
     }
