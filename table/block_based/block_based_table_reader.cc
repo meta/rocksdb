@@ -2666,11 +2666,14 @@ void BlockBasedTable::FinishTraceRecord(
       lookup_context.get_from_user_specified_snapshot,
       /*referenced_key=*/"", referenced_data_size,
       lookup_context.num_keys_in_block, does_referenced_key_exist);
-  // TODO: Should handle status here?
-  block_cache_tracer_
-      ->WriteBlockAccess(access_record, block_key, rep_->cf_name_for_tracing(),
-                         referenced_key)
-      .PermitUncheckedError();
+  // Tracing is best-effort: a failed write must not fail the user read.
+  const Status trace_s = block_cache_tracer_->WriteBlockAccess(
+      access_record, block_key, rep_->cf_name_for_tracing(), referenced_key);
+  if (!trace_s.ok()) {
+    ROCKS_LOG_WARN(rep_->ioptions.logger,
+                   "Failed to write block cache trace record: %s",
+                   trace_s.ToString().c_str());
+  }
 }
 
 BlockBasedTable::PartitionedIndexIteratorState::PartitionedIndexIteratorState(

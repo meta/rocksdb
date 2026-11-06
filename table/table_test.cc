@@ -59,6 +59,7 @@
 #include "rocksdb/sst_file_reader.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/table_properties.h"
+#include "rocksdb/block_cache_trace_writer.h"
 #include "rocksdb/trace_record.h"
 #include "rocksdb/unique_id.h"
 #include "rocksdb/user_defined_index.h"
@@ -4212,6 +4213,55 @@ TEST_P(BlockBasedTableTest, TracingGetTest) {
   record.block_type = TraceType::kBlockTraceDataBlock;
   expected_records.push_back(record);
   VerifyBlockAccessTrace(&c, expected_records);
+  c.ResetTableReader();
+}
+
+TEST_F(TableTest, GetSucceedsWhenBlockCacheTraceWriteFails) {
+  class FailingBlockCacheTraceWriter : public BlockCacheTraceWriter {
+   public:
+    Status WriteBlockAccess(const BlockCacheTraceRecord& /*record*/,
+                            const Slice& /*block_key*/,
+                            const Slice& /*cf_name*/,
+                            const Slice& /*referenced_key*/) override {
+      return Status::IOError("injected block cache trace write failure");
+    }
+    Status WriteHeader() override { return Status::OK(); }
+  };
+
+  TableConstructor c(BytewiseComparator());
+  Options options;
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = NewLRUCache(1024 * 1024, 0);
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+
+  BlockCacheTraceOptions trace_opt;
+  ASSERT_OK(c.block_cache_tracer_.StartTrace(
+      trace_opt, std::unique_ptr<BlockCacheTraceWriter>(
+                     new FailingBlockCacheTraceWriter())));
+
+  const std::string user_key = "aak01";
+  InternalKey internal_key(user_key, 0, kTypeValue);
+  c.Add(internal_key.Encode().ToString(), kDummyValue);
+
+  std::vector<std::string> keys;
+  stl_wrappers::KVMap kvmap;
+  ImmutableOptions ioptions(options);
+  MutableCFOptions moptions(options);
+  c.Finish(options, ioptions, moptions, table_options,
+           GetPlainInternalComparator(options.comparator), &keys, &kvmap);
+
+  PinnableSlice value;
+  GetContext get_context(options.comparator, nullptr, nullptr, nullptr,
+                         GetContext::kNotFound, user_key, &value, nullptr,
+                         nullptr, nullptr, true, nullptr, nullptr, nullptr,
+                         nullptr, nullptr, nullptr, /*tracing_get_id=*/1);
+  ASSERT_OK(c.GetTableReader()->Get(ReadOptions(), internal_key.Encode(),
+                                    &get_context,
+                                    moptions.prefix_extractor.get()));
+  ASSERT_EQ(get_context.State(), GetContext::kFound);
+  ASSERT_EQ(value.ToString(), kDummyValue);
   c.ResetTableReader();
 }
 
