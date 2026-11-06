@@ -150,11 +150,11 @@ TEST_F(FileIndexerTest, no_overlap_right) {
   AddFile(1, 2500, 2600);
   // level 2
   AddFile(2, 1500, 1600);
-  AddFile(2, 1501, 1699);
+  AddFile(2, 1601, 1699);
   AddFile(2, 1700, 1800);
   // level 3
   AddFile(3, 500, 600);
-  AddFile(3, 501, 699);
+  AddFile(3, 601, 699);
   AddFile(3, 700, 800);
   indexer->UpdateIndex(&arena, kNumLevels, files);
   for (uint32_t level = 1; level < 3; ++level) {
@@ -195,7 +195,7 @@ TEST_F(FileIndexerTest, empty_L2) {
   AddFile(1, 2500, 2600);
   // level 3
   AddFile(3, 500, 600);
-  AddFile(3, 501, 699);
+  AddFile(3, 601, 699);
   AddFile(3, 700, 800);
   indexer->UpdateIndex(&arena, kNumLevels, files);
   for (uint32_t f = 0; f < 3; ++f) {
