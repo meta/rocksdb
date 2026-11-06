@@ -1539,6 +1539,65 @@ TEST_F(DBSSTTest, CancellingManualCompactionsWorks) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
+TEST_F(DBSSTTest, CompactFilesTrivialMoveReleasesReservedSpace) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.level_compaction_dynamic_level_bytes = false;
+  options.compression = kNoCompression;
+  options.sst_file_manager.reset(NewSstFileManager(env_));
+  auto* sfm = static_cast<SstFileManagerImpl*>(options.sst_file_manager.get());
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_GT(sfm->GetTotalSize(), 0);
+  sfm->SetMaxAllowedSpaceUsage(2 * sfm->GetTotalSize());
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(1, metadata.levels[0].files.size());
+  const std::string file_name = metadata.levels[0].files[0].relative_filename;
+
+  CompactionOptions compact_options;
+  compact_options.allow_trivial_move = true;
+  for (int level = 1; level <= 2; ++level) {
+    ASSERT_OK(db_->CompactFiles(compact_options, {file_name}, level));
+    ASSERT_EQ(0, sfm->GetCompactionsReservedSize());
+    db_->GetColumnFamilyMetaData(&metadata);
+    ASSERT_EQ(1, metadata.levels[level].files.size());
+    // A trivial move preserves the SST instead of rewriting it.
+    ASSERT_EQ(file_name, metadata.levels[level].files[0].relative_filename);
+  }
+  ASSERT_EQ("value", Get("key"));
+}
+
+TEST_F(DBSSTTest, CompactFilesTrivialMoveErrorReleasesReservedSpace) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.level_compaction_dynamic_level_bytes = false;
+  options.compression = kNoCompression;
+  options.sst_file_manager.reset(NewSstFileManager(env_));
+  auto* sfm = static_cast<SstFileManagerImpl*>(options.sst_file_manager.get());
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(1, metadata.levels[0].files.size());
+
+  CompactionOptions compact_options;
+  compact_options.allow_trivial_move = true;
+  env_->manifest_write_error_ = true;
+  Status s = db_->CompactFiles(
+      compact_options, {metadata.levels[0].files[0].relative_filename}, 1);
+  env_->manifest_write_error_ = false;
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_EQ(0, sfm->GetCompactionsReservedSize());
+  ASSERT_EQ("1", FilesPerLevel());
+  ASSERT_EQ("value", Get("key"));
+}
+
 TEST_F(DBSSTTest, DBWithMaxSpaceAllowedRandomized) {
   // This test will set a maximum allowed space for the DB, then it will
   // keep filling the DB until the limit is reached and bg_error_ is set.
