@@ -1316,6 +1316,160 @@ void LDBCommand::PrepareOptions() {
   }
 }
 
+namespace {
+
+// Marker prepended to the printed representation of a wide-column entity. It
+// lets `ldb load` tell entities written by `ldb dump`/`ldb scan` apart from
+// plain values. A plain value that starts with the marker is escaped by
+// doubling it, so a marker-prefixed value in the output always denotes an
+// entity.
+constexpr char kEntityMarker = '@';
+
+bool DecodeHexString(const std::string& str, std::string* result) {
+  if (str.size() < 2 || str[0] != '0' || str[1] != 'x') {
+    return false;
+  }
+  return Slice(str.data() + 2, str.size() - 2).DecodeHex(result);
+}
+
+// Parses the wide-column list produced by
+// WideColumnsHelper::DumpWideColumns(), e.g. ":default attr:value" in text
+// mode or ":0x.. 0x..:0x.." in hex mode. The resulting columns reference the
+// strings owned by this object, which must therefore outlive them.
+class ParsedWideColumns {
+ public:
+  Status Parse(const std::string& input, bool is_hex) {
+    names_.clear();
+    values_.clear();
+    columns_.clear();
+
+    if (input.empty()) {
+      return Status::InvalidArgument("empty wide column list");
+    }
+
+    size_t pos = 0;
+    while (true) {
+      const size_t space = input.find(' ', pos);
+      const size_t end = space == std::string::npos ? input.size() : space;
+      const std::string token = input.substr(pos, end - pos);
+
+      const size_t colon = token.find(':');
+      if (colon == std::string::npos) {
+        return Status::InvalidArgument("wide column " + token +
+                                       " is not in <name>:<value> format");
+      }
+
+      std::string name = token.substr(0, colon);
+      std::string value = token.substr(colon + 1);
+
+      if (is_hex) {
+        std::string decoded;
+        if (!name.empty()) {
+          if (!DecodeHexString(name, &decoded)) {
+            return Status::InvalidArgument("invalid hex column name " + name);
+          }
+          name = std::move(decoded);
+        }
+        decoded.clear();
+        if (!value.empty()) {
+          if (!DecodeHexString(value, &decoded)) {
+            return Status::InvalidArgument("invalid hex column value " + value);
+          }
+          value = std::move(decoded);
+        }
+      }
+
+      names_.push_back(std::move(name));
+      values_.push_back(std::move(value));
+
+      if (space == std::string::npos) {
+        break;
+      }
+      pos = space + 1;
+      if (pos == input.size()) {
+        return Status::InvalidArgument("trailing space in wide column list");
+      }
+    }
+
+    columns_.reserve(names_.size());
+    for (size_t i = 0; i < names_.size(); ++i) {
+      columns_.emplace_back(names_[i], values_[i]);
+    }
+
+    return Status::OK();
+  }
+
+  const WideColumns& columns() const { return columns_; }
+
+ private:
+  std::vector<std::string> names_;
+  std::vector<std::string> values_;
+  WideColumns columns_;
+};
+
+// Parses a single line of `ldb dump`/`ldb scan` output. On success, `key` holds
+// the key to write and either `value` holds a plain value, or `is_entity` is
+// true and `columns` holds the wide-column entity to write.
+Status ParseLoadLine(const std::string& line, bool is_key_hex,
+                     bool is_value_hex, std::string* key, std::string* value,
+                     bool* is_entity, ParsedWideColumns* columns) {
+  const size_t pos = line.find(LDBCommand::DELIM);
+  if (pos == std::string::npos) {
+    return Status::InvalidArgument(
+        "missing \"" + std::string(LDBCommand::DELIM) + "\" separator");
+  }
+
+  std::string raw_key = line.substr(0, pos);
+  std::string raw_value = line.substr(pos + strlen(LDBCommand::DELIM));
+
+  if (is_key_hex) {
+    if (!DecodeHexString(raw_key, key)) {
+      return Status::InvalidArgument("invalid hex key " + raw_key);
+    }
+  } else {
+    *key = std::move(raw_key);
+  }
+
+  *is_entity = false;
+
+  if (is_value_hex) {
+    // A hex-encoded plain value is a single 0x-prefixed token and can never
+    // contain a colon, so a colon here means the value is an entity. Dumps
+    // produced before the marker was introduced still print entities this way.
+    if (!raw_value.empty() && raw_value[0] == kEntityMarker) {
+      *is_entity = true;
+      raw_value.erase(0, 1);
+    } else if (raw_value.find(':') != std::string::npos) {
+      *is_entity = true;
+    }
+  } else if (raw_value.size() >= 2 && raw_value[0] == kEntityMarker &&
+             raw_value[1] == kEntityMarker) {
+    // Escaped plain value that starts with the marker.
+    raw_value.erase(0, 1);
+  } else if (!raw_value.empty() && raw_value[0] == kEntityMarker) {
+    *is_entity = true;
+    raw_value.erase(0, 1);
+  }
+
+  if (*is_entity) {
+    return columns->Parse(raw_value, is_value_hex);
+  }
+
+  if (is_value_hex) {
+    std::string decoded;
+    if (!DecodeHexString(raw_value, &decoded)) {
+      return Status::InvalidArgument("invalid hex value " + raw_value);
+    }
+    *value = std::move(decoded);
+  } else {
+    *value = std::move(raw_value);
+  }
+
+  return Status::OK();
+}
+
+}  // namespace
+
 bool LDBCommand::ParseKeyValue(const std::string& line, std::string* key,
                                std::string* value, bool is_key_hex,
                                bool is_value_hex) {
@@ -1420,19 +1574,29 @@ std::string LDBCommand::PrintKeyValueOrWideColumns(
     const Comparator* ucmp) {
   if (wide_columns.empty() ||
       WideColumnsHelper::HasDefaultColumnOnly(wide_columns)) {
-    return PrintKeyValue(key.ToString(), timestamp.ToString(), value.ToString(),
+    std::string plain_value = value.ToString();
+    if (!is_value_hex && !plain_value.empty() &&
+        plain_value.front() == kEntityMarker) {
+      // Escape plain values that would otherwise be read back as entities.
+      plain_value.insert(plain_value.begin(), kEntityMarker);
+    }
+    return PrintKeyValue(key.ToString(), timestamp.ToString(), plain_value,
                          is_key_hex, is_value_hex, ucmp);
   }
   /*
   // Sample plaintext output (first column is kDefaultWideColumnName)
-  key_1 ==> :foo attr_name1:bar attr_name2:baz
+  key_1 ==> @:foo attr_name1:bar attr_name2:baz
 
   // Sample hex output (first column is kDefaultWideColumnName)
-  0x6669727374 ==> :0x68656C6C6F 0x617474725F6E616D6531:0x666F6F
+  0x6669727374 ==> @:0x68656C6C6F 0x617474725F6E616D6531:0x666F6F
+
+  // The '@' marker tells `ldb load` that the value is a wide-column entity.
+  // Plain values that start with '@' are escaped by doubling the marker.
   */
   std::ostringstream oss;
+  oss << kEntityMarker;
   WideColumnsHelper::DumpWideColumns(wide_columns, oss, is_value_hex);
-  return PrintKeyValue(key.ToString(), timestamp.ToString(), oss.str().c_str(),
+  return PrintKeyValue(key.ToString(), timestamp.ToString(), oss.str(),
                        is_key_hex, false,
                        ucmp);  // is_value_hex_ is already honored in oss.
                                // avoid double-hexing it.
@@ -1625,23 +1789,39 @@ void DBLoaderCommand::DoCommand() {
   }
 
   int bad_lines = 0;
+  uint64_t line_number = 0;
   std::string line;
   // prefer ifstream getline performance vs that from std::cin istream
   std::ifstream ifs_stdin("/dev/stdin");
   std::istream* istream_p = ifs_stdin.is_open() ? &ifs_stdin : &std::cin;
   Status s;
   while (s.ok() && getline(*istream_p, line, '\n')) {
+    ++line_number;
+
     std::string key;
     std::string value;
-    if (ParseKeyValue(line, &key, &value, is_key_hex_, is_value_hex_)) {
-      s = db_->Put(write_options, GetCfHandle(), Slice(key), Slice(value));
-    } else if (0 == line.find("Keys in range:")) {
-      // ignore this line
-    } else if (0 == line.find("Created bg thread 0x")) {
-      // ignore this line
-    } else {
-      bad_lines++;
+    bool is_entity = false;
+    ParsedWideColumns columns;
+    const Status parse_status = ParseLoadLine(
+        line, is_key_hex_, is_value_hex_, &key, &value, &is_entity, &columns);
+
+    if (!parse_status.ok()) {
+      if (0 == line.find("Keys in range:")) {
+        // ignore this line
+      } else if (0 == line.find("Created bg thread 0x")) {
+        // ignore this line
+      } else {
+        ++bad_lines;
+        fprintf(stderr, "Warning: bad line %" PRIu64 " ignored: %s\n",
+                line_number, parse_status.ToString().c_str());
+      }
+      continue;
     }
+
+    s = is_entity
+            ? db_->PutEntity(write_options, GetCfHandle(), Slice(key),
+                             columns.columns())
+            : db_->Put(write_options, GetCfHandle(), Slice(key), Slice(value));
   }
 
   if (bad_lines > 0) {
