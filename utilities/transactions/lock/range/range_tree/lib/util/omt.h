@@ -632,7 +632,8 @@ class omt {
   typedef uint32_t node_idx;
   typedef omt_internal::subtree_templated<supports_marks> subtree;
   typedef omt_internal::omt_node_templated<omtdata_t, supports_marks> omt_node;
-  ENSURE_POD(subtree);
+  static_assert(std::is_trivially_copy_constructible_v<subtree>
+                    && std::is_trivially_copy_assignable_v<subtree>);
 
   struct omt_array {
     uint32_t start_idx;
