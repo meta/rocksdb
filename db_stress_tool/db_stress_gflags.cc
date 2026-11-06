@@ -544,6 +544,16 @@ DEFINE_double(experimental_mempurge_threshold, 0.0,
               "Maximum estimated useful payload that triggers a "
               "mempurge process to collect memtable garbage bytes.");
 
+DEFINE_bool(experimental_enable_sst_view_compaction, false,
+            "Enable experimental logical SST views for eligible leveled "
+            "compactions.");
+DEFINE_uint64(experimental_sst_view_min_bytes_saved, 64ULL << 20,
+              "Minimum estimated bytes saved by an SST-view compaction.");
+DEFINE_double(experimental_sst_view_min_reuse_ratio, 0.5,
+              "Minimum source-file fraction retained as SST views.");
+DEFINE_uint64(experimental_sst_view_max_retained_dead_bytes, 1ULL << 30,
+              "Maximum retained dead bytes across live SST view backings.");
+
 DEFINE_bool(enable_write_thread_adaptive_yield,
             ROCKSDB_NAMESPACE::Options().enable_write_thread_adaptive_yield,
             "Use a yielding spin loop for brief writer thread waits.");

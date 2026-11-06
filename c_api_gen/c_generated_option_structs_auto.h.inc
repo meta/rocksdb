@@ -357,6 +357,38 @@ extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_options_get_target_file_size_is_upper_bound(rocksdb_options_t* opt);
 
 extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_experimental_enable_sst_view_compaction(
+    rocksdb_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_options_get_experimental_enable_sst_view_compaction(
+    rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_experimental_sst_view_min_bytes_saved(
+    rocksdb_options_t* opt, uint64_t v);
+
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_options_get_experimental_sst_view_min_bytes_saved(
+    rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_experimental_sst_view_min_reuse_ratio(
+    rocksdb_options_t* opt, double v);
+
+extern ROCKSDB_LIBRARY_API double
+rocksdb_options_get_experimental_sst_view_min_reuse_ratio(
+    rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_experimental_sst_view_max_retained_dead_bytes(
+    rocksdb_options_t* opt, uint64_t v);
+
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_options_get_experimental_sst_view_max_retained_dead_bytes(
+    rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
 rocksdb_options_set_strict_max_successive_merges(rocksdb_options_t* opt,
                                                  unsigned char v);
 

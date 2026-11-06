@@ -7169,6 +7169,14 @@ void InitializeOptionsFromFlags(
       FLAGS_allow_concurrent_memtable_write;
   options.experimental_mempurge_threshold =
       FLAGS_experimental_mempurge_threshold;
+  options.experimental_enable_sst_view_compaction =
+      FLAGS_experimental_enable_sst_view_compaction;
+  options.experimental_sst_view_min_bytes_saved =
+      FLAGS_experimental_sst_view_min_bytes_saved;
+  options.experimental_sst_view_min_reuse_ratio =
+      FLAGS_experimental_sst_view_min_reuse_ratio;
+  options.experimental_sst_view_max_retained_dead_bytes =
+      FLAGS_experimental_sst_view_max_retained_dead_bytes;
   options.periodic_compaction_seconds = FLAGS_periodic_compaction_seconds;
   options.daily_offpeak_time_utc = FLAGS_daily_offpeak_time_utc;
   options.stats_dump_period_sec =

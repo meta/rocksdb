@@ -66,6 +66,14 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
       target_file_size_is_upper_bound(options.target_file_size_is_upper_bound),
       level_compaction_dynamic_level_bytes(
           options.level_compaction_dynamic_level_bytes),
+      experimental_enable_sst_view_compaction(
+          options.experimental_enable_sst_view_compaction),
+      experimental_sst_view_min_bytes_saved(
+          options.experimental_sst_view_min_bytes_saved),
+      experimental_sst_view_min_reuse_ratio(
+          options.experimental_sst_view_min_reuse_ratio),
+      experimental_sst_view_max_retained_dead_bytes(
+          options.experimental_sst_view_max_retained_dead_bytes),
       max_bytes_for_level_multiplier(options.max_bytes_for_level_multiplier),
       max_bytes_for_level_multiplier_additional(
           options.max_bytes_for_level_multiplier_additional),
@@ -285,6 +293,16 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    max_bytes_for_level_base);
   ROCKS_LOG_HEADER(log, "Options.level_compaction_dynamic_level_bytes: %d",
                    level_compaction_dynamic_level_bytes);
+  ROCKS_LOG_HEADER(log, "Options.experimental_enable_sst_view_compaction: %d",
+                   experimental_enable_sst_view_compaction);
+  ROCKS_LOG_HEADER(log,
+                   "Options.experimental_sst_view_min_bytes_saved: %" PRIu64,
+                   experimental_sst_view_min_bytes_saved);
+  ROCKS_LOG_HEADER(log, "Options.experimental_sst_view_min_reuse_ratio: %f",
+                   experimental_sst_view_min_reuse_ratio);
+  ROCKS_LOG_HEADER(
+      log, "Options.experimental_sst_view_max_retained_dead_bytes: %" PRIu64,
+      experimental_sst_view_max_retained_dead_bytes);
   ROCKS_LOG_HEADER(log, "         Options.max_bytes_for_level_multiplier: %f",
                    max_bytes_for_level_multiplier);
   for (size_t i = 0; i < max_bytes_for_level_multiplier_additional.size();

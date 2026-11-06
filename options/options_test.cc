@@ -128,6 +128,10 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"min_partial_merge_operands", "31"},
       {"prefix_extractor", "fixed:31"},
       {"experimental_mempurge_threshold", "0.003"},
+      {"experimental_enable_sst_view_compaction", "true"},
+      {"experimental_sst_view_min_bytes_saved", "12345"},
+      {"experimental_sst_view_min_reuse_ratio", "0.75"},
+      {"experimental_sst_view_max_retained_dead_bytes", "67890"},
       {"optimize_filters_for_hits", "true"},
       {"enable_blob_files", "true"},
       {"min_blob_size", "1K"},
@@ -291,6 +295,10 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.optimize_filters_for_hits, true);
   ASSERT_EQ(new_cf_opt.prefix_extractor->AsString(), "rocksdb.FixedPrefix.31");
   ASSERT_EQ(new_cf_opt.experimental_mempurge_threshold, 0.003);
+  ASSERT_TRUE(new_cf_opt.experimental_enable_sst_view_compaction);
+  ASSERT_EQ(new_cf_opt.experimental_sst_view_min_bytes_saved, 12345U);
+  ASSERT_EQ(new_cf_opt.experimental_sst_view_min_reuse_ratio, 0.75);
+  ASSERT_EQ(new_cf_opt.experimental_sst_view_max_retained_dead_bytes, 67890U);
   ASSERT_EQ(new_cf_opt.enable_blob_files, true);
   ASSERT_EQ(new_cf_opt.min_blob_size, 1ULL << 10);
   ASSERT_EQ(new_cf_opt.blob_file_size, 1ULL << 30);
@@ -2712,6 +2720,10 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
       {"min_partial_merge_operands", "31"},
       {"prefix_extractor", "fixed:31"},
       {"experimental_mempurge_threshold", "0.003"},
+      {"experimental_enable_sst_view_compaction", "true"},
+      {"experimental_sst_view_min_bytes_saved", "12345"},
+      {"experimental_sst_view_min_reuse_ratio", "0.75"},
+      {"experimental_sst_view_max_retained_dead_bytes", "67890"},
       {"optimize_filters_for_hits", "true"},
       {"enable_blob_files", "true"},
       {"min_blob_size", "1K"},
@@ -2871,6 +2883,10 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.optimize_filters_for_hits, true);
   ASSERT_EQ(new_cf_opt.prefix_extractor->AsString(), "rocksdb.FixedPrefix.31");
   ASSERT_EQ(new_cf_opt.experimental_mempurge_threshold, 0.003);
+  ASSERT_TRUE(new_cf_opt.experimental_enable_sst_view_compaction);
+  ASSERT_EQ(new_cf_opt.experimental_sst_view_min_bytes_saved, 12345U);
+  ASSERT_EQ(new_cf_opt.experimental_sst_view_min_reuse_ratio, 0.75);
+  ASSERT_EQ(new_cf_opt.experimental_sst_view_max_retained_dead_bytes, 67890U);
   ASSERT_EQ(new_cf_opt.verify_output_flags, VerifyOutputFlags::kVerifyNone);
   ASSERT_EQ(new_cf_opt.enable_blob_files, true);
   ASSERT_EQ(new_cf_opt.min_blob_size, 1ULL << 10);

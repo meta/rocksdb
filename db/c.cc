@@ -10587,6 +10587,46 @@ unsigned char rocksdb_options_get_level_compaction_dynamic_level_bytes(
   return opt->rep.level_compaction_dynamic_level_bytes;
 }
 
+void rocksdb_options_set_experimental_enable_sst_view_compaction(
+    rocksdb_options_t* opt, unsigned char v) {
+  opt->rep.experimental_enable_sst_view_compaction = v;
+}
+
+unsigned char rocksdb_options_get_experimental_enable_sst_view_compaction(
+    rocksdb_options_t* opt) {
+  return opt->rep.experimental_enable_sst_view_compaction;
+}
+
+void rocksdb_options_set_experimental_sst_view_min_bytes_saved(
+    rocksdb_options_t* opt, uint64_t v) {
+  opt->rep.experimental_sst_view_min_bytes_saved = v;
+}
+
+uint64_t rocksdb_options_get_experimental_sst_view_min_bytes_saved(
+    rocksdb_options_t* opt) {
+  return opt->rep.experimental_sst_view_min_bytes_saved;
+}
+
+void rocksdb_options_set_experimental_sst_view_min_reuse_ratio(
+    rocksdb_options_t* opt, double v) {
+  opt->rep.experimental_sst_view_min_reuse_ratio = v;
+}
+
+double rocksdb_options_get_experimental_sst_view_min_reuse_ratio(
+    rocksdb_options_t* opt) {
+  return opt->rep.experimental_sst_view_min_reuse_ratio;
+}
+
+void rocksdb_options_set_experimental_sst_view_max_retained_dead_bytes(
+    rocksdb_options_t* opt, uint64_t v) {
+  opt->rep.experimental_sst_view_max_retained_dead_bytes = v;
+}
+
+uint64_t rocksdb_options_get_experimental_sst_view_max_retained_dead_bytes(
+    rocksdb_options_t* opt) {
+  return opt->rep.experimental_sst_view_max_retained_dead_bytes;
+}
+
 void rocksdb_options_set_max_bytes_for_level_multiplier(rocksdb_options_t* opt,
                                                         double v) {
   opt->rep.max_bytes_for_level_multiplier = v;

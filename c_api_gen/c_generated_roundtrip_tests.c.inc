@@ -767,6 +767,32 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(
       rocksdb_options_get_enforce_write_buffer_manager_during_recovery(obj) ==
       0);
+  rocksdb_options_set_experimental_enable_sst_view_compaction(obj, 1);
+  CheckCondition(
+      rocksdb_options_get_experimental_enable_sst_view_compaction(obj) == 1);
+  rocksdb_options_set_experimental_enable_sst_view_compaction(obj, 0);
+  CheckCondition(
+      rocksdb_options_get_experimental_enable_sst_view_compaction(obj) == 0);
+  rocksdb_options_set_experimental_sst_view_max_retained_dead_bytes(obj, 1);
+  CheckCondition(
+      rocksdb_options_get_experimental_sst_view_max_retained_dead_bytes(obj) ==
+      1);
+  rocksdb_options_set_experimental_sst_view_max_retained_dead_bytes(obj, 0);
+  CheckCondition(
+      rocksdb_options_get_experimental_sst_view_max_retained_dead_bytes(obj) ==
+      0);
+  rocksdb_options_set_experimental_sst_view_min_bytes_saved(obj, 1);
+  CheckCondition(
+      rocksdb_options_get_experimental_sst_view_min_bytes_saved(obj) == 1);
+  rocksdb_options_set_experimental_sst_view_min_bytes_saved(obj, 0);
+  CheckCondition(
+      rocksdb_options_get_experimental_sst_view_min_bytes_saved(obj) == 0);
+  rocksdb_options_set_experimental_sst_view_min_reuse_ratio(obj, 1);
+  CheckCondition(
+      rocksdb_options_get_experimental_sst_view_min_reuse_ratio(obj) == 1);
+  rocksdb_options_set_experimental_sst_view_min_reuse_ratio(obj, 0);
+  CheckCondition(
+      rocksdb_options_get_experimental_sst_view_min_reuse_ratio(obj) == 0);
   rocksdb_options_set_fast_sst_open(obj, 1);
   CheckCondition(rocksdb_options_get_fast_sst_open(obj) == 1);
   rocksdb_options_set_fast_sst_open(obj, 0);
