@@ -179,8 +179,9 @@ struct LockHoldingInfo {
   int64_t acquire_time;
   uint64_t acquiring_thread;
 };
-static std::map<std::string, LockHoldingInfo> locked_files;
-static port::Mutex mutex_locked_files;
+using LockedFiles = std::map<std::string, LockHoldingInfo>;
+STATIC_AVOID_DESTRUCTION(LockedFiles, locked_files);
+STATIC_AVOID_DESTRUCTION(port::Mutex, mutex_locked_files);
 
 static int LockOrUnlock(int fd, bool lock) {
   errno = 0;
