@@ -508,13 +508,12 @@ struct CompactionJobInfo {
 struct MemTableInfo {
   // the name of the column family to which memtable belongs
   std::string cf_name;
-  // Sequence number of the first element that was inserted
-  // into the memtable.
+  // Smallest sequence number of any element inserted into the memtable, or 0
+  // if the memtable is empty.
   SequenceNumber first_seqno;
-  // Sequence number that is guaranteed to be smaller than or equal
-  // to the sequence number of any key that could be inserted into this
-  // memtable. It can then be assumed that any write with a larger(or equal)
-  // sequence number will be present in this memtable or a later memtable.
+  // Lower bound on the sequence numbers that may be present in the memtable.
+  // This can be smaller than first_seqno, and does not necessarily correspond
+  // to an entry in the memtable.
   SequenceNumber earliest_seqno;
   // Total number of entries in memtable
   uint64_t num_entries;
