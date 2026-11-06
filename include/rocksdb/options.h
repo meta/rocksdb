@@ -3497,7 +3497,7 @@ struct CompactionServiceOptionsOverride {
   // to set it here.
   std::shared_ptr<Statistics> statistics = nullptr;
 
-  // Info Log. If not overriden, default one will be used.
+  // Info Log. If not overridden, default one will be used.
   std::shared_ptr<Logger> info_log = nullptr;
 
   // Only compaction generated SST files use this user defined table properties

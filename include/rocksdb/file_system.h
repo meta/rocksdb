@@ -994,7 +994,7 @@ struct FSReadRequest {
   //
   // This optimization is enabled for MultiReads (sync and async) with non
   // direct io, when these conditions hold:
-  // 1. The FileSystem has overriden the SupportedOps() API and set
+  // 1. The FileSystem has overridden the SupportedOps() API and set
   // FSSupportedOps::kFSBuffer.
   // 2. FSReadRequest::scratch is set to nullptr.
   //
