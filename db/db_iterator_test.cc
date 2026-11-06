@@ -6030,6 +6030,57 @@ TEST_P(DBMultiScanIteratorTest, FailureTest) {
   iter.reset();
 }
 
+// Regression test: when operator++ throws a MultiScanException mid-iteration,
+// the range-based for loop's ScanIterator / MultiScanIterator locals are
+// destroyed while the exception is unwinding. Their destructors must not
+// assert on the (expectedly) non-ok status_ during unwinding, otherwise the
+// documented "catch (MultiScanException&)" contract aborts in debug builds
+// before the handler ever runs.
+TEST_P(DBMultiScanIteratorTest, ExceptionUnwindsThroughIteratorDestructors) {
+  auto options = CurrentOptions();
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  Random rnd(301);
+  // Create a file large enough that the second range cannot be prefetched
+  // within max_prefetch_size, forcing operator++ to throw.
+  for (int i = 0; i < 100; ++i) {
+    std::stringstream ss;
+    ss << std::setw(2) << std::setfill('0') << i;
+    ASSERT_OK(Put("k" + ss.str(), rnd.RandomString(1024)));
+  }
+  ASSERT_OK(Flush());
+
+  std::vector<std::string> key_ranges({"k04", "k06", "k12", "k14"});
+  ReadOptions ro;
+  ro.fill_cache = GetParam();
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.insert(key_ranges[0], key_ranges[1]);
+  scan_options.insert(key_ranges[2], key_ranges[3]);
+  scan_options.max_prefetch_size = 4500;
+  ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
+  std::unique_ptr<MultiScan> iter =
+      dbfull()->NewMultiScan(ro, cfh, scan_options);
+
+  bool caught = false;
+  Status thrown_status;
+  try {
+    for (auto range : *iter) {
+      for (auto it : range) {
+        (void)it;
+      }
+    }
+  } catch (MultiScanException& ex) {
+    // Reaching here at all means the iterator destructors did not abort while
+    // the exception was in flight.
+    caught = true;
+    thrown_status = ex.status();
+  }
+  ASSERT_TRUE(caught);
+  ASSERT_NOK(thrown_status);
+  iter.reset();
+}
+
 TEST_P(DBMultiScanIteratorTest, OutOfL0FileRange) {
   // Test that prepare does not fail scan when a scan range
   // is outside of a L0 file's key range.
