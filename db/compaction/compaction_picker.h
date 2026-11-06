@@ -133,7 +133,7 @@ class CompactionPicker {
 
   // Converts a set of compaction input file numbers into
   // a list of CompactionInputFiles.
-  // TODO(hx235): remove the unused paramter `compact_options`
+  // TODO(hx235): remove the unused parameter `compact_options`
   Status GetCompactionInputsFromFileNumbers(
       std::vector<CompactionInputFiles>* input_files,
       std::unordered_set<uint64_t>* input_set,
