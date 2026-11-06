@@ -731,12 +731,15 @@ Status TableCache::GetTableProperties(
     const InternalKeyComparator& internal_comparator,
     const FileMetaData& file_meta,
     std::shared_ptr<const TableProperties>* properties,
-    const MutableCFOptions& mutable_cf_options, bool no_io) {
+    const MutableCFOptions& mutable_cf_options, bool no_io, int level,
+    HistogramImpl* file_read_hist, bool prefetch_index_and_filter_in_cache) {
   TypedHandle* table_handle = nullptr;
   TableReader* table = nullptr;
-  Status s =
-      FindTable(read_options, file_options, internal_comparator, file_meta,
-                &table_handle, mutable_cf_options, &table, no_io);
+  Status s = FindTable(
+      read_options, file_options, internal_comparator, file_meta, &table_handle,
+      mutable_cf_options, &table, no_io, file_read_hist, /*skip_filters=*/false,
+      level, prefetch_index_and_filter_in_cache,
+      MaxFileSizeForL0MetaPin(mutable_cf_options), file_meta.temperature);
   if (!s.ok()) {
     return s;
   }

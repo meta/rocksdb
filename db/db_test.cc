@@ -8273,6 +8273,66 @@ TEST_P(OpenFilesAsyncTest, BeforeRead) {
   }
 }
 
+TEST_P(OpenFilesAsyncTest, TableProperties) {
+  Options options = CurrentOptions();
+  ASSERT_NO_FATAL_FAILURE(SetupData(options));
+
+  for (bool before_async_open : {true, false}) {
+    SCOPED_TRACE("before_async_open=" + std::to_string(before_async_open));
+    if (before_async_open) {
+      ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
+          {"OpenFilesAsyncTest::TableProperties::AfterGet",
+           "DBImpl::BGWorkAsyncFileOpen::Start"},
+          {"DBImpl::BGWorkAsyncFileOpen:Done",
+           "OpenFilesAsyncTest::TableProperties::BeforeCheck"},
+      });
+    } else {
+      ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
+          {"DBImpl::BGWorkAsyncFileOpen:Done",
+           "OpenFilesAsyncTest::TableProperties::BeforeCheck"},
+      });
+    }
+
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+    OpenTestDB(options);
+
+    TablePropertiesCollection props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+    ASSERT_EQ(props.size(), num_flushes_);
+
+    if (before_async_open) {
+      if (max_open_files_ == -1) {
+        // Opened through the table cache, as the async opener would
+        EXPECT_EQ(
+            TestGetTickerCount(options, NUMBER_DIRECT_LOAD_TABLE_PROPERTIES),
+            0);
+        EXPECT_EQ(TestGetTickerCount(options, NO_FILE_OPENS), num_flushes_);
+      } else {
+        // Read directly from the files, without using up table cache capacity
+        EXPECT_EQ(
+            TestGetTickerCount(options, NUMBER_DIRECT_LOAD_TABLE_PROPERTIES),
+            num_flushes_);
+        EXPECT_EQ(TestGetTickerCount(options, NO_FILE_OPENS), 0);
+      }
+    }
+
+    TEST_SYNC_POINT("OpenFilesAsyncTest::TableProperties::AfterGet");
+    TEST_SYNC_POINT("OpenFilesAsyncTest::TableProperties::BeforeCheck");
+
+    // Each file is opened only once in total
+    EXPECT_EQ(TestGetTickerCount(options, NO_FILE_OPENS), num_flushes_);
+    if (max_open_files_ == -1) {
+      EXPECT_EQ(
+          TestGetTickerCount(options, NUMBER_DIRECT_LOAD_TABLE_PROPERTIES), 0);
+    }
+
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+    Close();
+  }
+}
+
 // For modern DBs (manifest carries file_creation_time),
 // GetCreationTimeOfOldestFile returns the real value without waiting for async
 // file open.

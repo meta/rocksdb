@@ -1970,20 +1970,25 @@ void LevelIterator::InitFileIterator(size_t new_file_index) {
 
 Status Version::GetTableProperties(const ReadOptions& read_options,
                                    std::shared_ptr<const TableProperties>* tp,
-                                   const FileMetaData* file_meta,
+                                   const FileMetaData* file_meta, int level,
                                    const std::string* fname) const {
   auto* table_cache = cfd_->table_cache();
   const auto& ioptions = cfd_->ioptions();
+  // If every table file gets opened anyway, open this one now (coalesced with
+  // any concurrent open) rather than reading its metadata an extra time.
+  const bool open_table = vset_->OpensAllTableFiles();
   Status s = table_cache->GetTableProperties(
       file_options_, read_options, cfd_->internal_comparator(), *file_meta, tp,
-      mutable_cf_options_, true /* no io */);
+      mutable_cf_options_, /*no_io=*/!open_table, level,
+      cfd_->internal_stats()->GetFileReadHist(level),
+      /*prefetch_index_and_filter_in_cache=*/false);
   if (s.ok()) {
     return s;
   }
 
   // We only ignore error type `Incomplete` since it's by design that we
   // disallow table when it's not in table cache.
-  if (!s.IsIncomplete()) {
+  if (open_table || !s.IsIncomplete()) {
     return s;
   }
 
@@ -2107,8 +2112,8 @@ Status Version::GetPropertiesOfAllTables(const ReadOptions& read_options,
     // 1. If the table is already present in table cache, load table
     // properties from there.
     std::shared_ptr<const TableProperties> table_properties;
-    Status s =
-        GetTableProperties(read_options, &table_properties, file_meta, &fname);
+    Status s = GetTableProperties(read_options, &table_properties, file_meta,
+                                  level, &fname);
     if (s.ok()) {
       props->insert({fname, table_properties});
     } else {
@@ -2139,7 +2144,7 @@ Status Version::GetPropertiesOfTablesInRange(
           // properties from there.
           std::shared_ptr<const TableProperties> table_properties;
           Status s = GetTableProperties(read_options, &table_properties,
-                                        file_meta, &fname);
+                                        file_meta, level, &fname);
           if (s.ok()) {
             props->insert({fname, table_properties});
           } else {
@@ -3354,12 +3359,12 @@ void Version::PrepareAppend(const ReadOptions& read_options,
 }
 
 bool Version::MaybeInitializeFileMetaData(const ReadOptions& read_options,
-                                          FileMetaData* file_meta) {
+                                          FileMetaData* file_meta, int level) {
   if (file_meta->init_stats_from_file || file_meta->compensated_file_size > 0) {
     return false;
   }
   std::shared_ptr<const TableProperties> tp;
-  Status s = GetTableProperties(read_options, &tp, file_meta);
+  Status s = GetTableProperties(read_options, &tp, file_meta, level);
   file_meta->init_stats_from_file = true;
   if (!s.ok()) {
     ROCKS_LOG_ERROR(vset_->db_options_->info_log,
@@ -3429,7 +3434,7 @@ void Version::UpdateAccumulatedStats(const ReadOptions& read_options) {
        level < storage_info_.num_levels_ && init_count < kMaxInitCount;
        ++level) {
     for (auto* file_meta : storage_info_.files_[level]) {
-      if (MaybeInitializeFileMetaData(read_options, file_meta)) {
+      if (MaybeInitializeFileMetaData(read_options, file_meta, level)) {
         // each FileMeta will be initialized only once.
         storage_info_.UpdateAccumulatedStats(file_meta);
         // when option "max_open_files" is -1, all the file metadata has
@@ -3455,7 +3460,7 @@ void Version::UpdateAccumulatedStats(const ReadOptions& read_options) {
     for (int i = static_cast<int>(storage_info_.files_[level].size()) - 1;
          storage_info_.accumulated_raw_value_size_ == 0 && i >= 0; --i) {
       if (MaybeInitializeFileMetaData(read_options,
-                                      storage_info_.files_[level][i])) {
+                                      storage_info_.files_[level][i], level)) {
         storage_info_.UpdateAccumulatedStats(storage_info_.files_[level][i]);
       }
     }

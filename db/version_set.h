@@ -1127,12 +1127,17 @@ class Version {
 
   // REQUIRES: lock is held
   // On success, "tp" will contains the table properties of the file
-  // specified in "file_meta".  If the file name of "file_meta" is
-  // known ahead, passing it by a non-null "fname" can save a
-  // file-name conversion.
+  // specified in "file_meta", which is at "level" of this version. If the
+  // file name of "file_meta" is known ahead, passing it by a non-null "fname"
+  // can save a file-name conversion.
+  //
+  // If VersionSet::OpensAllTableFiles(), this opens the file's TableReader
+  // through the table cache if it is not already open. Otherwise, the
+  // properties block is read directly from the file unless its TableReader is
+  // already in the table cache.
   Status GetTableProperties(const ReadOptions& read_options,
                             std::shared_ptr<const TableProperties>* tp,
-                            const FileMetaData* file_meta,
+                            const FileMetaData* file_meta, int level,
                             const std::string* fname = nullptr) const;
 
   // On success, *props will be populated with all SSTables' table properties.
@@ -1231,7 +1236,7 @@ class Version {
   // fields of file_meta from its associated TableProperties.
   // Returns true if it does initialize FileMetaData.
   bool MaybeInitializeFileMetaData(const ReadOptions& read_options,
-                                   FileMetaData* file_meta);
+                                   FileMetaData* file_meta, int level);
 
   // Update the accumulated stats associated with the current version.
   // This accumulated stats will be used in compaction.
@@ -1548,6 +1553,13 @@ class VersionSet {
 
   virtual void ApplyCommittedOptionsFileNumber(uint64_t number);
   void ApplyLegacyOptionsFileNumber(uint64_t number);
+
+  // True if every live table file is opened and kept open in the table cache
+  // regardless of reads (during recovery and LogAndApply, or by the
+  // open_files_async background opener), as with max_open_files == -1.
+  virtual bool OpensAllTableFiles() const {
+    return table_cache_->GetCapacity() >= TableCache::kInfiniteCapacity;
+  }
 
   uint64_t pending_manifest_file_number() const {
     return pending_manifest_file_number_;
@@ -2194,6 +2206,12 @@ class ReactiveVersionSet : public VersionSet {
   // and reconstructs the version from FileMetaData without stat-ing/opening SST
   // or blob files. Only used by the DB::OpenAndCompact remote-compaction path.
   void SetTrustManifestRecovery(bool v) { trust_manifest_recovery_ = v; }
+
+  // With trusted MANIFEST recovery, only the table files that are read get
+  // opened.
+  bool OpensAllTableFiles() const override {
+    return !trust_manifest_recovery_ && VersionSet::OpensAllTableFiles();
+  }
 
   // Returns the column family's log number as of the Version currently
   // installed for it, i.e. the log number that the MANIFEST records that

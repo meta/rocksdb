@@ -249,6 +249,9 @@ class TableCache {
   // Get the table properties of a given table.
   // @no_io: indicates if we should load table to the cache if it is not present
   //         in table cache yet.
+  // @level, @file_read_hist, @prefetch_index_and_filter_in_cache: as for
+  //         FindTable(), applied if the table is opened here. Pass -1 and
+  //         nullptr if the table's level is unknown.
   // @returns: `properties` will be reset on success. Please note that we will
   //            return Status::Incomplete() if table is not present in cache and
   //            we set `no_io` to be true.
@@ -258,7 +261,9 @@ class TableCache {
                             const FileMetaData& file_meta,
                             std::shared_ptr<const TableProperties>* properties,
                             const MutableCFOptions& mutable_cf_options,
-                            bool no_io = false);
+                            bool no_io, int level,
+                            HistogramImpl* file_read_hist,
+                            bool prefetch_index_and_filter_in_cache);
 
   Status ApproximateKeyAnchors(const ReadOptions& ro,
                                const InternalKeyComparator& internal_comparator,

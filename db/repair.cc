@@ -566,7 +566,9 @@ class Repairer {
       // TODO: plumb Env::IOActivity, Env::IOPriority
       const ReadOptions read_options;
       status = table_cache_->GetTableProperties(
-          file_options_, read_options, icmp_, t->meta, &props, default_mopts_);
+          file_options_, read_options, icmp_, t->meta, &props, default_mopts_,
+          /*no_io=*/false, /*level=*/-1, /*file_read_hist=*/nullptr,
+          /*prefetch_index_and_filter_in_cache=*/true);
     }
     if (status.ok()) {
       auto s =
