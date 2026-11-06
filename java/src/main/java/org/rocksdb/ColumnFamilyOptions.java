@@ -221,7 +221,7 @@ public class ColumnFamilyOptions
   @Override
   public ColumnFamilyOptions setMergeOperator(
       final MergeOperator mergeOperator) {
-    setMergeOperator(nativeHandle_, mergeOperator.nativeHandle_);
+    setMergeOperator(nativeHandle_, mergeOperator.getNativeHandle());
     return this;
   }
 

@@ -10,7 +10,7 @@ package org.rocksdb;
  * StringAppendOperator is a merge operator that concatenates
  * two strings.
  */
-public class StringAppendOperator extends MergeOperator {
+public class StringAppendOperator extends InBuiltMergeOperator {
   public StringAppendOperator() {
     this(',');
   }
