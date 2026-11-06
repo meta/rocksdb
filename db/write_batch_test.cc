@@ -256,6 +256,76 @@ TEST_F(WriteBatchTest, Append) {
   ASSERT_EQ(3u, b2.Count());
 }
 
+TEST_F(WriteBatchTest, AppendWriteBatch) {
+  WriteBatch b1;
+  WriteBatch b2;
+  WriteBatchInternal::SetSequence(&b1, 200);
+  ASSERT_OK(AppendWriteBatch(b1, b2, /*wal_only=*/false));
+  ASSERT_EQ("", PrintContents(&b1));
+  ASSERT_EQ(0u, b1.Count());
+
+  ASSERT_OK(b1.Put("a", "va"));
+  ASSERT_OK(b2.Put("b", "vb"));
+  ASSERT_OK(b2.Delete("c"));
+  b2.MarkWalTerminationPoint();
+  ASSERT_OK(b2.Merge("d", "vd"));
+
+  // Only the entries before the WAL termination point are appended.
+  ASSERT_OK(AppendWriteBatch(b1, b2, /*wal_only=*/true));
+  ASSERT_EQ(
+      "Put(a, va)@200"
+      "Put(b, vb)@201"
+      "Delete(c)@202",
+      PrintContents(&b1));
+  ASSERT_EQ(3u, b1.Count());
+
+  ASSERT_OK(AppendWriteBatch(b1, b2, /*wal_only=*/false));
+  ASSERT_EQ(
+      "Put(a, va)@200"
+      "Put(b, vb)@203"
+      "Put(b, vb)@201"
+      "Delete(c)@204"
+      "Delete(c)@202"
+      "Merge(d, vd)@205",
+      PrintContents(&b1));
+  ASSERT_EQ(6u, b1.Count());
+  ASSERT_EQ(
+      "Put(b, vb)@0"
+      "Delete(c)@1"
+      "Merge(d, vd)@2",
+      PrintContents(&b2));
+  ASSERT_EQ(3u, b2.Count());
+
+  // Per-key checksums are carried over.
+  WriteBatch protected_batch(0, 0, /*protection_bytes_per_key=*/8,
+                             /*default_cf_ts_sz=*/0);
+  WriteBatch protected_batch_to_append(0, 0, /*protection_bytes_per_key=*/8,
+                                       /*default_cf_ts_sz=*/0);
+  ASSERT_OK(protected_batch.Put("e", "ve"));
+  ASSERT_OK(protected_batch_to_append.Put("f", "vf"));
+  ASSERT_OK(AppendWriteBatch(protected_batch, protected_batch_to_append,
+                             /*wal_only=*/false));
+  ASSERT_EQ(2u, protected_batch.Count());
+  ASSERT_OK(protected_batch.VerifyChecksum());
+
+  // Rejected appends leave the destination unchanged.
+  ASSERT_TRUE(AppendWriteBatch(b1, b1, /*wal_only=*/false).IsInvalidArgument());
+  ASSERT_TRUE(AppendWriteBatch(b1, protected_batch, /*wal_only=*/false)
+                  .IsInvalidArgument());
+  ASSERT_TRUE(AppendWriteBatch(protected_batch, b2, /*wal_only=*/false)
+                  .IsInvalidArgument());
+  WriteBatch ts_batch(0, 0, /*protection_bytes_per_key=*/0,
+                      /*default_cf_ts_sz=*/sizeof(uint64_t));
+  ASSERT_OK(ts_batch.Put("g", "vg"));
+  ASSERT_TRUE(
+      AppendWriteBatch(b1, ts_batch, /*wal_only=*/false).IsNotSupported());
+  ASSERT_TRUE(
+      AppendWriteBatch(ts_batch, b2, /*wal_only=*/false).IsNotSupported());
+  ASSERT_EQ(1u, ts_batch.Count());
+  ASSERT_EQ(6u, b1.Count());
+  ASSERT_EQ(2u, protected_batch.Count());
+}
+
 TEST_F(WriteBatchTest, SingleDeletion) {
   WriteBatch batch;
   WriteBatchInternal::SetSequence(&batch, 100);
