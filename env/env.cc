@@ -180,9 +180,7 @@ class LegacyRandomAccessFileWrapper : public FSRandomAccessFile {
   size_t GetUniqueId(char* id, size_t max_size) const override {
     return target_->GetUniqueId(id, max_size);
   }
-  void Hint(AccessPattern pattern) override {
-    target_->Hint((RandomAccessFile::AccessPattern)pattern);
-  }
+  void Hint(AccessPattern pattern) override { target_->Hint(pattern); }
   bool use_direct_io() const override { return target_->use_direct_io(); }
   size_t GetRequiredBufferAlignment() const override {
     return target_->GetRequiredBufferAlignment();
