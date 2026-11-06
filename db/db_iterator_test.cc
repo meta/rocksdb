@@ -1353,6 +1353,75 @@ TEST_P(DBIteratorTest, IterReseek) {
   delete iter;
 }
 
+TEST_F(DBIteratorTest, ReseekAfterBoundarySeek) {
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+  options.max_sequential_skip_in_iterations = 3;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  const std::vector<std::string> keys = {"a0", "a1", "b0", "b1"};
+  for (const std::string& key : keys) {
+    for (int version = 0; version < 20; ++version) {
+      ASSERT_OK(Put(key, std::to_string(version)));
+    }
+  }
+
+  for (bool total_order_seek : {false, true}) {
+    for (bool seek_to_last : {false, true}) {
+      for (bool seek_for_prev : {false, true}) {
+        SCOPED_TRACE(testing::Message()
+                     << "total_order_seek=" << total_order_seek
+                     << " seek_to_last=" << seek_to_last
+                     << " seek_for_prev=" << seek_for_prev);
+        ReadOptions read_options;
+        read_options.total_order_seek = total_order_seek;
+        std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+        const uint64_t before_boundary =
+            TestGetTickerCount(options, NUMBER_OF_RESEEKS_IN_ITERATION);
+        if (seek_to_last) {
+          iter->SeekToLast();
+        } else {
+          iter->SeekToFirst();
+        }
+        // A boundary scan must still cross prefixes without prefix reseeks.
+        for (size_t i = 0; i < keys.size(); ++i) {
+          const size_t index = seek_to_last ? keys.size() - 1 - i : i;
+          ASSERT_EQ(IterStatus(iter.get()), keys[index] + "->19");
+          if (seek_to_last) {
+            iter->Prev();
+          } else {
+            iter->Next();
+          }
+        }
+        ASSERT_FALSE(iter->Valid());
+        ASSERT_OK(iter->status());
+        const uint64_t before_seek =
+            TestGetTickerCount(options, NUMBER_OF_RESEEKS_IN_ITERATION);
+        if (!total_order_seek) {
+          EXPECT_EQ(before_boundary, before_seek);
+        }
+
+        // An explicit seek must restore skipping over old versions efficiently.
+        if (seek_for_prev) {
+          iter->SeekForPrev("a1");
+          ASSERT_EQ(IterStatus(iter.get()), "a1->19");
+          iter->Prev();
+          ASSERT_EQ(IterStatus(iter.get()), "a0->19");
+        } else {
+          iter->Seek("a0");
+          ASSERT_EQ(IterStatus(iter.get()), "a0->19");
+          iter->Next();
+          ASSERT_EQ(IterStatus(iter.get()), "a1->19");
+        }
+        ASSERT_OK(iter->status());
+        EXPECT_GT(TestGetTickerCount(options, NUMBER_OF_RESEEKS_IN_ITERATION),
+                  before_seek);
+      }
+    }
+  }
+}
+
 TEST_F(DBIteratorTest, ReseekUponDirectionChange) {
   Options options = GetDefaultOptions();
   options.create_if_missing = true;

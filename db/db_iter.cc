@@ -87,7 +87,9 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       sequence_(s),
       value_columns_state_(version, read_options, cfd),
       statistics_(ioptions.stats),
-      max_skip_(mutable_cf_options.max_sequential_skip_in_iterations),
+      configured_max_skip_(
+          mutable_cf_options.max_sequential_skip_in_iterations),
+      max_skip_(configured_max_skip_),
       max_skippable_internal_keys_(read_options.max_skippable_internal_keys),
       num_internal_keys_skipped_(0),
       iterate_lower_bound_(read_options.iterate_lower_bound),
@@ -2028,6 +2030,8 @@ void DBIter::Prepare(const MultiScanArgs& scan_opts) {
 }
 
 void DBIter::Seek(const Slice& target) {
+  // A new seek ends the reseek suppression used by an unrestricted prefix scan.
+  max_skip_ = configured_max_skip_;
   PERF_COUNTER_ADD(iter_seek_count, 1);
   PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
   StopWatch sw(clock_, statistics_, DB_SEEK);
@@ -2144,6 +2148,7 @@ void DBIter::Seek(const Slice& target) {
 }
 
 void DBIter::SeekForPrev(const Slice& target) {
+  max_skip_ = configured_max_skip_;
   PERF_COUNTER_ADD(iter_seek_count, 1);
   PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
   StopWatch sw(clock_, statistics_, DB_SEEK);

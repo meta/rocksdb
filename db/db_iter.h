@@ -686,6 +686,7 @@ class DBIter final : public Iterator {
   DirtyTracked<ValueColumnsState> value_columns_state_;
   Slice pinned_value_;
   Statistics* statistics_;
+  const uint64_t configured_max_skip_;
   uint64_t max_skip_;
   uint64_t max_skippable_internal_keys_;
   uint64_t num_internal_keys_skipped_;
