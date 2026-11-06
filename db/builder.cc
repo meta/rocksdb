@@ -336,6 +336,11 @@ Status BuildTable(
         ThreadStatusUtil::SetThreadOperationProperty(
             ThreadStatus::FLUSH_BYTES_WRITTEN, IOSTATS(bytes_written));
       }
+
+      s = builder->status();
+      if (!s.ok()) {
+        break;
+      }
     }
     if (!s.ok()) {
       c_iter.status().PermitUncheckedError();
