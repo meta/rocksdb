@@ -121,7 +121,23 @@ class Arena : public Allocator {
   AllocTracker* tracker_;
 };
 
+#if defined(__clang__)
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define ROCKSDB_ARENA_ASAN 1
+#endif  // __has_feature(address_sanitizer)
+#endif  // defined(__has_feature)
+#else   // __clang__
+#ifdef __SANITIZE_ADDRESS__
+#define ROCKSDB_ARENA_ASAN 1
+#endif  // __SANITIZE_ADDRESS__
+#endif  // __clang__
+
 inline char* Arena::Allocate(size_t bytes) {
+#ifdef ROCKSDB_ARENA_ASAN
+  // Help ASAN diagnose memory errors in Arena-allocated memory
+  return AllocateNewBlock(bytes);
+#else
   // The semantics of what to return are a bit messy if we allow
   // 0-byte allocations, so we disallow them here (we don't need
   // them for our internal use).
@@ -132,6 +148,7 @@ inline char* Arena::Allocate(size_t bytes) {
     return unaligned_alloc_ptr_;
   }
   return AllocateFallback(bytes, false /* unaligned */);
+#endif  // ROCKSDB_ARENA_ASAN
 }
 
 // Like std::destroy_at but a callable type
