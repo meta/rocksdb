@@ -1429,6 +1429,29 @@ INSTANTIATE_TEST_CASE_P(
     ::testing::ValuesIn(std::vector<SpotLockManagerTestParam>{
         {true, 0}, {true, 100}, {true, 1000}, {false, 0}}));
 
+// Regression test for a heap out-of-bounds write in
+// DeadlockInfoBufferTempl::Resize. When the requested size equals the number of
+// deadlock paths currently recorded, Resize used to leave buffer_idx_ equal to
+// paths_buffer_.size() (one past the end). AddNewPath indexes
+// paths_buffer_[buffer_idx_] before applying its own modulo, so the next
+// recorded deadlock wrote past the end of the vector. Reachable in production
+// via TransactionDB::SetDeadlockInfoBufferSize(current_recorded_count). Under
+// ASAN the unpatched code aborts here with a heap-buffer-overflow.
+TEST(DeadlockInfoBufferTest, ResizeToRecordedCountKeepsIndexInBounds) {
+  DeadlockInfoBuffer buffer(1);
+  // limit_exceeded = true makes the path non-empty so Normalize() counts it.
+  buffer.AddNewPath(DeadlockPath(/*dl_time=*/1, /*limit=*/true));
+  // Resize to exactly the one recorded path: the buffer is full, so the next
+  // write must wrap to index 0, not land at index 1 of a one-element vector.
+  buffer.Resize(1);
+  buffer.AddNewPath(DeadlockPath(/*dl_time=*/2, /*limit=*/true));
+  // Reaching here (and under ASAN, not aborting) means the write stayed in
+  // bounds; the latest path overwrote the single slot.
+  auto paths = buffer.PrepareBuffer();
+  ASSERT_EQ(paths.size(), 1U);
+  ASSERT_EQ(paths[0].deadlock_time, 2);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
