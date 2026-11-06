@@ -238,6 +238,160 @@ TEST_F(WritePreparedTransactionSeqnoTest,
   Close();
 }
 
+// Recovery does not wait for a main write queue whose leader is in a write
+// stall. If that stall ends while recovery is joining the nonmem queue, the
+// leader can allocate a sequence range before recovery syncs. Recovery must
+// then retry and wait for the leader to publish, instead of publishing the
+// leader's allocation for it.
+TEST_F(WritePreparedTransactionSeqnoTest,
+       RecoverySeqnoSyncRetriesWhenStallEndsDuringNonmemJoin) {
+  txn_db_options_.write_policy = TxnDBWritePolicy::WRITE_UNPREPARED;
+  ASSERT_OK(Open());
+  TransactionDB& db = AssertNotNull(db_);
+  DBImpl& db_impl =
+      AssertNotNull(static_cast_with_check<DBImpl>(db.GetRootDB()));
+  VersionSet& versions = AssertNotNull(db_impl.GetVersionSet());
+  SyncPoint& sync_point = AssertNotNull(SyncPoint::GetInstance());
+
+  const std::string test_prefix =
+      "RecoverySeqnoSyncRetriesWhenStallEndsDuringNonmemJoin";
+  sync_point.LoadDependency(
+      {{"DBImpl::DelayWrite:Wait", test_prefix + ":writer_stalled"},
+       {"DBImpl::WriteImpl:AfterWBWIIngestBeforeSetLastSequence:pause",
+        test_prefix + ":writer_paused"},
+       {test_prefix + ":release_writer",
+        "DBImpl::WriteImpl:AfterWBWIIngestBeforeSetLastSequence:resume"}});
+
+  std::unique_ptr<WriteControllerToken> stop_token =
+      db_impl.TEST_write_controler().GetStopToken();
+  std::atomic<int> non_blocking_joins{0};
+  std::atomic<bool> release_writer_called{false};
+  std::atomic<bool> recovery_waited_for_writer{false};
+  std::atomic<bool> writer_published_before_sync{false};
+  auto release_writer = [&]() {
+    if (!release_writer_called.exchange(true)) {
+      sync_point.Process(test_prefix + ":release_writer");
+    }
+  };
+  // The first non-blocking join is refused by the main queue stall. The second
+  // one joins the nonmem queue without the DB mutex. End the stall there and
+  // let the stalled writer allocate and pause before it publishes.
+  sync_point.SetCallBack("WriteThread::EnterUnbatchedNonBlocking:BeforeLock",
+                         [&](void*) {
+                           if (non_blocking_joins.fetch_add(1) == 1) {
+                             stop_token.reset();
+                             db_impl.TEST_SignalAllBgCv();
+                             sync_point.Process(test_prefix + ":writer_paused");
+                           }
+                         });
+  // On retry, recovery queues behind the paused writer in the main queue.
+  sync_point.SetCallBack("WriteThread::EnterUnbatched:Wait", [&](void*) {
+    recovery_waited_for_writer.store(true);
+    release_writer();
+  });
+  // Fallback so a path that syncs without retrying fails instead of hanging.
+  sync_point.SetCallBack("DBImpl::ResumeImpl:AfterSyncSeq", [&](void*) {
+    writer_published_before_sync.store(release_writer_called.load());
+    release_writer();
+  });
+  sync_point.EnableProcessing();
+
+  WriteOptions write_opts;
+  TransactionOptions txn_opts;
+  Status prepare_status;
+  std::unique_ptr<Transaction> stalled_txn(
+      db.BeginTransaction(write_opts, txn_opts));
+  Transaction& stalled_txn_ref = AssertNotNull(stalled_txn.get());
+  ASSERT_OK(stalled_txn_ref.SetName("stalled_txn"));
+  ASSERT_OK(stalled_txn_ref.Put("stalled_key", "stalled_value"));
+  std::thread writer([&]() { prepare_status = stalled_txn_ref.Prepare(); });
+
+  // The writer leads the main queue and waits on the write stop.
+  TEST_SYNC_POINT(test_prefix + ":writer_stalled");
+  DBRecoverContext context(FlushReason::kErrorRecoveryRetryFlush);
+  Status resume_status = db_impl.TEST_ResumeImpl(context);
+  writer.join();
+  sync_point.DisableProcessing();
+  sync_point.ClearAllCallBacks();
+  sync_point.LoadDependency({});
+
+  ASSERT_OK(resume_status);
+  ASSERT_OK(prepare_status);
+  ASSERT_GE(non_blocking_joins.load(), 3);
+  ASSERT_TRUE(recovery_waited_for_writer.load());
+  ASSERT_TRUE(writer_published_before_sync.load());
+  ASSERT_EQ(versions.LastSequence(), versions.LastAllocatedSequence());
+  ASSERT_OK(stalled_txn_ref.Commit());
+
+  stalled_txn.reset();
+  Close();
+}
+
+// Recovery does not wait for a nonmem write queue whose leader, a WAL-only
+// commit, is in a write stall. The stalled commit has not allocated, so
+// recovery syncs and finishes while the commit is still waiting.
+TEST_F(WritePreparedTransactionSeqnoTest,
+       RecoverySeqnoSyncSkipsStalledWalOnlyCommit) {
+  txn_db_options_.write_policy = TxnDBWritePolicy::WRITE_UNPREPARED;
+  ASSERT_OK(Open());
+  TransactionDB& db = AssertNotNull(db_);
+  DBImpl& db_impl =
+      AssertNotNull(static_cast_with_check<DBImpl>(db.GetRootDB()));
+  VersionSet& versions = AssertNotNull(db_impl.GetVersionSet());
+  SyncPoint& sync_point = AssertNotNull(SyncPoint::GetInstance());
+
+  WriteOptions write_opts;
+  TransactionOptions txn_opts;
+  // The data goes to the memtable at Prepare(), so Commit() writes only a WAL
+  // marker on the nonmem write queue.
+  std::unique_ptr<Transaction> wal_only_commit_txn(
+      db.BeginTransaction(write_opts, txn_opts));
+  Transaction& wal_only_commit_txn_ref =
+      AssertNotNull(wal_only_commit_txn.get());
+  ASSERT_OK(wal_only_commit_txn_ref.SetName("wal_only_commit_txn"));
+  ASSERT_OK(wal_only_commit_txn_ref.Put("commit_key", "commit_value"));
+  ASSERT_OK(wal_only_commit_txn_ref.Prepare());
+
+  const std::string test_prefix = "RecoverySeqnoSyncSkipsStalledWalOnlyCommit";
+  sync_point.LoadDependency(
+      {{"DBImpl::DelayWrite:NonmemWait", test_prefix + ":commit_stalled"}});
+  sync_point.EnableProcessing();
+
+  std::unique_ptr<WriteControllerToken> stop_token =
+      db_impl.TEST_write_controler().GetStopToken();
+  std::atomic<bool> commit_done{false};
+  Status commit_status;
+  std::thread committer([&]() {
+    commit_status = wal_only_commit_txn_ref.Commit();
+    commit_done.store(true);
+  });
+
+  // The commit leads the nonmem queue and waits on the write stop.
+  TEST_SYNC_POINT(test_prefix + ":commit_stalled");
+  DBRecoverContext context(FlushReason::kErrorRecoveryRetryFlush);
+  Status resume_status = db_impl.TEST_ResumeImpl(context);
+  const bool commit_done_at_recovery_end = commit_done.load();
+  const bool synced =
+      versions.LastSequence() == versions.LastAllocatedSequence();
+
+  stop_token.reset();
+  db_impl.TEST_SignalAllBgCv();
+  committer.join();
+  sync_point.DisableProcessing();
+  sync_point.LoadDependency({});
+
+  ASSERT_OK(resume_status);
+  ASSERT_FALSE(commit_done_at_recovery_end);
+  ASSERT_TRUE(synced);
+  ASSERT_OK(commit_status);
+  std::string value;
+  ASSERT_OK(db.Get(ReadOptions(), "commit_key", &value));
+  ASSERT_EQ("commit_value", value);
+
+  wal_only_commit_txn.reset();
+  Close();
+}
+
 // Regression test for the gap left by syncing only at the start of
 // ResumeImpl(). Recovery drops mutex_ in FlushAllColumnFamilies() before it
 // enters AtomicFlushMemTables(), so a WriteUnprepared WAL-only commit can

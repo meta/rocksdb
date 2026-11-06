@@ -354,6 +354,47 @@ Status DBImpl::Resume() {
   return s;
 }
 
+void DBImpl::SyncLastSequenceWithAllocatedAtRecoveryStart() {
+  mutex_.AssertHeld();
+  assert(two_write_queues_);
+  for (;;) {
+    WriteThread::Writer w;
+    const bool entered = write_thread_.EnterUnbatchedNonBlocking(&w, &mutex_);
+    const uint64_t stall =
+        entered ? 0 : write_thread_.GetBegunCountOfOutstandingStall();
+    WriteThread::Writer nonmem_w;
+    const bool nonmem_entered =
+        nonmem_write_thread_.EnterUnbatchedNonBlocking(&nonmem_w, &mutex_);
+    const uint64_t nonmem_stall =
+        nonmem_entered ? 0
+                       : nonmem_write_thread_.GetBegunCountOfOutstandingStall();
+    WaitForPendingWrites();
+
+    // A queue that was not entered must still be in the same stall, so that
+    // no writer in it can have allocated since.
+    const bool no_writer_in_flight =
+        (entered ||
+         (stall != 0 &&
+          write_thread_.GetBegunCountOfOutstandingStall() == stall)) &&
+        (nonmem_entered ||
+         (nonmem_stall != 0 &&
+          nonmem_write_thread_.GetBegunCountOfOutstandingStall() ==
+              nonmem_stall));
+    if (no_writer_in_flight) {
+      versions_->SyncLastSequenceWithAllocated();
+    }
+    if (nonmem_entered) {
+      nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+    }
+    if (entered) {
+      write_thread_.ExitUnbatched(&w);
+    }
+    if (no_writer_in_flight) {
+      return;
+    }
+  }
+}
+
 // This function implements both manual and automatic background-error
 // recovery. It discards stale queued flush requests, waits for scheduled work
 // to exit, rebuilds and runs the flush work required by the recovery context,
@@ -425,16 +466,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   // memtable-switch fence, after FlushAllColumnFamilies() has dropped and
   // re-acquired the DB mutex.
   if (two_write_queues_) {
-    WriteThread::Writer w;
-    write_thread_.EnterUnbatched(&w, &mutex_);
-    WriteThread::Writer nonmem_w;
-    nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
-    WaitForPendingWrites();
-
-    versions_->SyncLastSequenceWithAllocated();
-
-    nonmem_write_thread_.ExitUnbatched(&nonmem_w);
-    write_thread_.ExitUnbatched(&w);
+    SyncLastSequenceWithAllocatedAtRecoveryStart();
   }
 
   TEST_SYNC_POINT("DBImpl::ResumeImpl:AfterSyncSeq");

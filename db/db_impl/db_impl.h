@@ -2900,6 +2900,12 @@ class DBImpl : public DB
   // fence that is about to switch memtables.
   void MaybeSyncLastSequenceWithAllocatedForRecovery(FlushReason flush_reason);
 
+  // Like the memtable-switch fence, but does not wait for a write queue whose
+  // leader is in a write stall: that leader has not allocated sequence numbers
+  // yet, and it can be waiting for this recovery.
+  // REQUIRES: mutex locked, two_write_queues
+  void SyncLastSequenceWithAllocatedAtRecoveryStart();
+
   Status RetryFlushesForErrorRecovery(FlushReason flush_reason, bool wait);
 
   // Wait until flushing this column family won't stall writes

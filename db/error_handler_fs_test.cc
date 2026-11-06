@@ -413,6 +413,113 @@ TEST_F(DBErrorHandlingFSTest, FlushWriteFileScopeError) {
   }
 }
 
+// A retryable SST write error during a flush is a soft error that recovery
+// fixes by retrying the flush. A writer that waits for that flush must finish
+// once recovery is done.
+TEST_F(DBErrorHandlingFSTest, RetryableFlushErrorWithWriterStalledOnFlush) {
+  for (bool two_write_queues : {false, true}) {
+    SCOPED_TRACE("two_write_queues=" + std::to_string(two_write_queues));
+    Options options = GetDefaultOptions();
+    options.env = fault_env_.get();
+    options.create_if_missing = true;
+    options.two_write_queues = two_write_queues;
+    options.write_buffer_size = 64 << 10;
+    options.max_write_buffer_number = 2;
+    options.min_write_buffer_number_to_merge = 1;
+    options.bgerror_resume_retry_interval = 100000;
+    DestroyAndReopen(options);
+
+    IOStatus error_msg = IOStatus::IOError("Retryable IO Error");
+    error_msg.SetRetryable(true);
+    std::atomic<bool> injected{false};
+    // The first flush fails only after the writer stops on its memtables.
+    SyncPoint::GetInstance()->LoadDependency(
+        {{"DBImpl::DelayWrite:Wait", "BuildTable:BeforeFinishBuildTable"}});
+    SyncPoint::GetInstance()->SetCallBack(
+        "BuildTable:BeforeFinishBuildTable", [&](void*) {
+          if (!injected.exchange(true)) {
+            fault_fs_->SetFilesystemActive(false, error_msg);
+          }
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "RecoverFromRetryableBGIOError:BeforeStart",
+        [&](void*) { fault_fs_->SetFilesystemActive(true); });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    const std::string value(40 << 10, 'v');
+    for (int i = 0; i < 8; ++i) {
+      ASSERT_OK(Put(Key(i), value));
+    }
+    ASSERT_TRUE(injected);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    SyncPoint::GetInstance()->LoadDependency({});
+    for (int i = 0; i < 8; ++i) {
+      ASSERT_EQ(value, Get(Key(i)));
+    }
+  }
+}
+
+// A retryable error syncing closed WALs during a flush is a hard error. A
+// writer that waits for that flush gets the error, and recovery then flushes
+// and resumes writes.
+TEST_F(DBErrorHandlingFSTest, FlushWALSyncErrorWithWriterStalledOnFlush) {
+  Options options = GetDefaultOptions();
+  options.env = fault_env_.get();
+  options.create_if_missing = true;
+  options.write_buffer_size = 64 << 10;
+  options.max_write_buffer_number = 2;
+  options.min_write_buffer_number_to_merge = 1;
+  options.bgerror_resume_retry_interval = 100000;
+  // With two column families, a flush syncs the closed WALs.
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  IOStatus error_msg = IOStatus::IOError("Retryable IO Error");
+  error_msg.SetRetryable(true);
+  std::atomic<bool> injected{false};
+  // The first flush fails only after the writer stops on its memtables.
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::DelayWrite:Wait", "DBImpl::SyncClosedWals:Start"},
+       {"RecoverFromRetryableBGIOError:RecoverSuccess",
+        "DBErrorHandlingFSTest::FlushWALSyncErrorWithWriterStalledOnFlush:"
+        "Recovered"}});
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncClosedWals:Start", [&](void*) {
+        if (!injected.exchange(true)) {
+          fault_fs_->SetFilesystemActive(false, error_msg);
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "RecoverFromRetryableBGIOError:BeforeStart",
+      [&](void*) { fault_fs_->SetFilesystemActive(true); });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  const std::string value(40 << 10, 'v');
+  Status s;
+  int num_written = 0;
+  while (num_written < 8) {
+    s = Put(Key(num_written), value);
+    if (!s.ok()) {
+      break;
+    }
+    ++num_written;
+  }
+  ASSERT_TRUE(injected);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  ASSERT_EQ(s.severity(), Status::Severity::kHardError);
+
+  TEST_SYNC_POINT(
+      "DBErrorHandlingFSTest::FlushWALSyncErrorWithWriterStalledOnFlush:"
+      "Recovered");
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->LoadDependency({});
+  ASSERT_OK(Put(Key(num_written), value));
+  for (int i = 0; i <= num_written; ++i) {
+    ASSERT_EQ(value, Get(Key(i)));
+  }
+}
+
 TEST_F(DBErrorHandlingFSTest, FlushWALWriteRetryableError) {
   std::shared_ptr<ErrorHandlerFSListener> listener =
       std::make_shared<ErrorHandlerFSListener>();
