@@ -463,6 +463,21 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
   RecordStats({ERROR_HANDLER_BG_ERROR_COUNT, ERROR_HANDLER_BG_IO_ERROR_COUNT},
               {} /* int_histograms */);
 
+  // Called when an EventListener reset the error to OK in OnBackgroundError(),
+  // in which case the error is not set.
+  auto handle_suppressed = [&](const Status& suppressed_err) {
+    ROCKS_LOG_INFO(db_options_.info_log,
+                   "ErrorHandler: Background error %s suppressed by listener\n",
+                   suppressed_err.ToString().c_str());
+    // As in HandleKnownErrors(), an error hit during an in-progress recovery
+    // still counts against that recovery even if the listener suppressed it.
+    if (recovery_in_prog_ && recovery_error_.ok()) {
+      recovery_error_ = status_to_io_status(Status(suppressed_err));
+    }
+    // Keep any failed WAL cutoff so that a later recovery still honors it.
+    UpdateRecoveryContext(context, /*replace_existing_context=*/false);
+  };
+
   Status new_bg_io_err = bg_io_err;
   if (bg_io_err.GetScope() != IOStatus::IOErrorScope::kIOErrorScopeFile &&
       bg_io_err.GetDataLoss()) {
@@ -470,20 +485,18 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
     // it can directly overwrite any existing bg_error_.
     bool auto_recovery = false;
     Status bg_err(new_bg_io_err, Status::Severity::kUnrecoverableError);
-    if (!allow_auto_recovery) {
-      EventHelpers::NotifyOnBackgroundError(db_options_.listeners, reason,
-                                            &bg_err, db_mutex_, &auto_recovery);
-      if (!bg_err.ok()) {
-        CheckAndSetRecoveryAndBGError(bg_err, context);
-      }
+    // Listeners see the error before it is set and may suppress it.
+    EventHelpers::NotifyOnBackgroundError(db_options_.listeners, reason,
+                                          &bg_err, db_mutex_, &auto_recovery);
+    if (bg_err.ok()) {
+      handle_suppressed(
+          Status(new_bg_io_err, Status::Severity::kUnrecoverableError));
       return;
     }
     CheckAndSetRecoveryAndBGError(bg_err, context);
     ROCKS_LOG_INFO(
         db_options_.info_log,
         "ErrorHandler: Set background IO error as unrecoverable error\n");
-    EventHelpers::NotifyOnBackgroundError(db_options_.listeners, reason,
-                                          &bg_err, db_mutex_, &auto_recovery);
     return;
   }
   if (wal_related) {
@@ -545,15 +558,23 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
       return;
     }
 
-    Status::Severity severity;
-    if (!auto_resume_enabled) {
-      // Without auto resume, nothing retries or recovers from the error on the
-      // user's behalf, so stop writes until the user calls DB::Resume(). This
-      // includes compaction and no-WAL flush errors, which would otherwise be
-      // retried by compaction or tolerated as soft errors.
-      severity = Status::Severity::kHardError;
-    } else if (BackgroundErrorReason::kFlushNoWAL == reason ||
-               BackgroundErrorReason::kManifestWriteNoWAL == reason) {
+    // A no-WAL error is soft only when automatic resume can recover it.
+    const bool no_wal = BackgroundErrorReason::kFlushNoWAL == reason ||
+                        BackgroundErrorReason::kManifestWriteNoWAL == reason;
+    const Status::Severity severity = auto_resume_enabled && no_wal
+                                          ? Status::Severity::kSoftError
+                                          : Status::Severity::kHardError;
+    Status bg_err(new_bg_io_err, severity);
+    bool auto_recovery =
+        allow_auto_recovery && db_options_.max_bgerror_resume_count > 0;
+    // Listeners see the error before it is set and may suppress it.
+    EventHelpers::NotifyOnBackgroundError(db_options_.listeners, reason,
+                                          &bg_err, db_mutex_, &auto_recovery);
+    if (bg_err.ok()) {
+      handle_suppressed(Status(new_bg_io_err, severity));
+      return;
+    }
+    if (no_wal && bg_err.severity() == Status::Severity::kSoftError) {
       // When the BG Retryable IO error reason is flush without WAL,
       // We map it to a soft error. At the same time, all the background work
       // should be stopped except the BG work from recovery. Therefore, we
@@ -561,28 +582,13 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
       // continues to receive writes when BG error is soft error, to avoid
       // to many small memtable being generated during auto resume, the flush
       // reason is set to kErrorRecoveryRetryFlush.
-      severity = Status::Severity::kSoftError;
       soft_error_no_bg_work_ = true;
       context.flush_reason = FlushReason::kErrorRecoveryRetryFlush;
-    } else {
-      severity = Status::Severity::kHardError;
-    }
-    Status bg_err(new_bg_io_err, severity);
-    if (!allow_auto_recovery) {
-      bool auto_recovery = false;
-      EventHelpers::NotifyOnBackgroundError(db_options_.listeners, reason,
-                                            &bg_err, db_mutex_, &auto_recovery);
-      if (!bg_err.ok()) {
-        CheckAndSetRecoveryAndBGError(bg_err, context);
-      }
-      return;
     }
     CheckAndSetRecoveryAndBGError(bg_err, context);
-    bool auto_recovery = auto_resume_enabled;
-    EventHelpers::NotifyOnBackgroundError(db_options_.listeners, reason,
-                                          &new_bg_io_err, db_mutex_,
-                                          &auto_recovery);
-    StartRecoverFromRetryableBGIOError(bg_io_err);
+    if (allow_auto_recovery) {
+      StartRecoverFromRetryableBGIOError(bg_io_err);
+    }
     return;
   }
   HandleKnownErrors(new_bg_io_err, reason, context, allow_auto_recovery);
