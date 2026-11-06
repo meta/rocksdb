@@ -1224,22 +1224,28 @@ const void* BlockBasedTableFactory::GetOptionsPtr(
 // options in BlockBasedTableOptions:
 //
 // * filter_policy:
-//   We currently only support the following FilterPolicy in the convenience
-//   functions:
-//   - BloomFilter: use "bloomfilter:[bits_per_key]:[use_block_based_builder]"
-//     to specify BloomFilter.  The above string is equivalent to calling
-//     NewBloomFilterPolicy(bits_per_key, use_block_based_builder).
+//   The built-in filter policies can be specified as strings:
+//   - BloomFilter: use "bloomfilter:[bits_per_key]" to specify BloomFilter.
+//     The above string is equivalent to calling
+//     NewBloomFilterPolicy(bits_per_key). A trailing ":true" or ":false" (the
+//     former use_block_based_builder parameter) is still accepted, but has
+//     been ignored since RocksDB 7.0.
 //     [Example]:
-//     - Pass {"filter_policy", "bloomfilter:4:true"} in
+//     - Pass {"filter_policy", "bloomfilter:4"} in
 //       GetBlockBasedTableOptionsFromMap to use a BloomFilter with 4-bits
-//       per key and use_block_based_builder enabled.
+//       per key.
+//   - RibbonFilter: use "ribbonfilter:[bits_per_key]" or
+//     "ribbonfilter:[bits_per_key]:[bloom_before_level]". The above strings
+//     are equivalent to calling NewRibbonFilterPolicy() with the same
+//     arguments.
 //
-// * block_cache / block_cache_compressed:
+// * block_cache:
 //   We currently only support LRU cache in the GetOptions API.  The LRU
 //   cache can be set by directly specifying its size.
 //   [Example]:
 //   - Passing {"block_cache", "1M"} in GetBlockBasedTableOptionsFromMap is
 //     equivalent to setting block_cache using NewLRUCache(1024 * 1024).
+//   block_cache_compressed has been removed; it is accepted but ignored.
 //
 // @param table_options the default options of the output "new_table_options".
 // @param opts_map an option name to value map for specifying how
