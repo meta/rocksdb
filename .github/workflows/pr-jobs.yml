@@ -688,13 +688,15 @@ jobs:
     - name: PMD RocksDBJava
       run: make V=1 J=8 -j8 jpmd
     - uses: actions/upload-artifact@v4.0.0
+      if: failure()
       with:
         name: pmd-report
-        path: "${{ github.workspace }}/java/target/pmd.xml"
+        path: java/target/pmd.xml
     - uses: actions/upload-artifact@v4.0.0
+      if: failure()
       with:
         name: maven-site
-        path: "${{ github.workspace }}/java/target/site"
+        path: java/target/site
   build-linux-arm:
     if: needs.config.outputs.only_job == 'build-linux-arm' || (needs.config.outputs.only_job == '' && github.repository_owner == 'meta')
     needs: config
