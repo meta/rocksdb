@@ -2237,7 +2237,7 @@ WithBlocklikeCheck<Status, TBlocklike> BlockBasedTable::PutDataBlockToCache(
     // Retrieve the uncompressed contents into a new buffer
     s = DecompressBlockData(
         compressed_block_contents.data.data(),
-        compressed_block_contents.data.size(), block_comp_type, *decomp,
+        compressed_block_contents.data.size(), block_comp_type, decomp,
         &uncompressed_block_contents, ioptions, memory_allocator);
     if (!s.ok()) {
       return s;
@@ -2452,7 +2452,7 @@ Status BlockBasedTable::CreateAndPinBlockInCache(
     BlockContents tmp_contents;
     if (compression_type != kNoCompression) {
       s = DecompressSerializedBlock(contents->data.data(), handle.size(),
-                                    compression_type, *decomp, &tmp_contents,
+                                    compression_type, decomp, &tmp_contents,
                                     rep_->ioptions,
                                     GetMemoryAllocator(rep_->table_options));
     } else {
