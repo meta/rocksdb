@@ -160,7 +160,10 @@ struct BatchResult {
 //      file, as on a rotation. Whether the iterator ends the run at a
 //      rotation or continues across it is not guaranteed either way, so a
 //      consumer tailing a DB must be prepared to build a new iterator
-//      whenever the run ends.
+//      whenever the run ends. With DBOptions::wal_iterator_tail_rotations
+//      enabled, reaching the end of the file snapshot can continue into a
+//      newer live WAL when its records are contiguous with the run. Callers
+//      still need the recovery path below when continuation is not possible.
 //
 //   3. Valid() == false, status() is not OK
 //      The run is over and the iterator is spent. status() will not change
@@ -171,7 +174,7 @@ struct BatchResult {
 //   * Status::TryAgain -- not an error in itself. The iterator has reached
 //     the end of the WAL data it can currently see while the DB has moved on,
 //     e.g. after a WAL rotation or when newer writes are not yet readable
-//     from the WAL. A new iterator may be able to continue from here.
+//     from the WAL; a new iterator may be able to continue from here.
 //   * Status::NotFound("Gap in sequence numbers") -- the batch just read is
 //     not contiguous with the previous one, i.e. a discontinuity in the WAL
 //     (see SOURCE OF DATA and GAPS). This status is also returned before a

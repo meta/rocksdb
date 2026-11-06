@@ -52,6 +52,7 @@
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_util.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
+#include "rocksdb/wal_iterator.h"
 #include "test_util/simple_external_table_factory.h"
 #include "test_util/testutil.h"
 #include "util/aligned_buffer.h"
@@ -4012,6 +4013,119 @@ Status StressTest::TestGetCurrentWalFile() const {
   return db_->GetCurrentWalFile(&cur_wal_file);
 }
 
+void StressTest::TailWalUpdates(ThreadState* thread) {
+  assert(FLAGS_tail_wal_updates);
+  SharedState* shared = thread->shared;
+
+  // Seed at the DB's current sequence so we tail the updates the worker threads
+  // are about to produce. `expected_seq` is the sequence we expect the next
+  // delivered WriteBatch to start at.
+  SequenceNumber expected_seq = db_->GetLatestSequenceNumber();
+  std::unique_ptr<WalIterator> iter;
+
+  // (Re)open the iterator at `from`. After any (re)seek the next delivered
+  // batch re-establishes the baseline (see `need_baseline`), because
+  // GetUpdatesSince may legitimately position before/after the requested
+  // sequence (e.g. a straddling batch, or resync past purged WALs).
+  bool need_baseline = true;
+  auto reseek = [&](SequenceNumber from) -> Status {
+    iter.reset();
+    need_baseline = true;
+    return db_->GetUpdatesSince(from, &iter);
+  };
+
+  Status s = reseek(expected_seq);
+
+  while (true) {
+    const bool status_ok = s.ok();
+    // `should_stop_bg_thread_` is a plain bool written under the shared mutex
+    // (see db_stress_driver.cc), so it must be read under the same mutex to
+    // avoid a data race, matching PoolSizeChangeThread/DbVerificationThread.
+    {
+      MutexLock l(shared->GetMutex());
+      if (shared->ShouldStopBgThread()) {
+        return;
+      }
+    }
+    if (shared->HasVerificationFailedYet()) {
+      return;
+    }
+
+    if (!status_ok) {
+      if (s.IsNotSupported()) {
+        // GetUpdatesSince is not available in this DB configuration (e.g.
+        // write-prepared/write-unprepared transactions, which set
+        // seq_per_batch). There is nothing to tail; exit the workload
+        // gracefully rather than treating it as a failure.
+        return;
+      }
+      // GetUpdatesSince can otherwise legitimately fail: the requested sequence
+      // may have been purged (NotFound), no data is available yet (TryAgain),
+      // or a fault was injected. Tolerate these by resyncing from the DB's
+      // latest sequence; abort only on a genuine, non-retryable error.
+      if (s.IsNotFound() || s.IsTryAgain() || IsErrorInjectedAndRetryable(s)) {
+        raw_env->SleepForMicroseconds(1000);
+        expected_seq = db_->GetLatestSequenceNumber();
+        s = reseek(expected_seq);
+        continue;
+      }
+      ProcessStatus(shared, "TailWalUpdates:GetUpdatesSince", s);
+      return;
+    }
+
+    if (!iter->Valid()) {
+      const Status iter_s = iter->status();
+      if (iter_s.ok()) {
+        raw_env->SleepForMicroseconds(1000);
+        if (need_baseline) {
+          // An initially empty snapshot has no log reader to advance. Retry
+          // from a published sequence until the first batch is available.
+          expected_seq = db_->GetLatestSequenceNumber();
+          s = reseek(expected_seq);
+        } else {
+          // Keep a caught-up iterator and its baseline across later rotations.
+          iter->Next();
+        }
+        continue;
+      }
+      if (!iter_s.IsNotFound() && !iter_s.IsTryAgain() &&
+          !IsErrorInjectedAndRetryable(iter_s)) {
+        // A real read/corruption error surfaced by the iterator is a failure;
+        // the feature must propagate such errors rather than mask them.
+        ProcessStatus(shared, "TailWalUpdates:iterator", iter_s);
+        return;
+      }
+      // Ingestion can consume sequence numbers without a WAL record, ending
+      // this contiguous run with NotFound even within a single WAL. TryAgain
+      // is also a valid fallback when a successor WAL is missing, empty, or
+      // non-contiguous. Reseek spent iterators with a fresh baseline, while
+      // preserving strict continuity checks within each run. Deterministic
+      // fast-path continuation is covered by db/db_log_iter_test.cc.
+      raw_env->SleepForMicroseconds(1000);
+      s = reseek(expected_seq);
+      continue;
+    }
+
+    BatchResult res = iter->GetBatch();
+    if (!need_baseline && res.sequence != expected_seq) {
+      // Core invariant: a single iterator must deliver strictly contiguous
+      // sequences, including across WAL rotations handled in-place by
+      // wal_iterator_tail_rotations. A mismatch mid-stream means the iterator
+      // skipped or repeated records -- a correctness violation.
+      std::ostringstream oss;
+      oss << "TailWalUpdates: non-contiguous sequence across WAL: expected "
+          << expected_seq << " but got " << res.sequence;
+      VerificationAbort(shared, oss.str());
+      return;
+    }
+
+    need_baseline = false;
+    assert(res.writeBatchPtr);
+    expected_seq = res.sequence + res.writeBatchPtr->Count();
+    iter->Next();
+  }
+}
+
 void StressTest::DumpIteratorDivergenceDiagnostics(
     ColumnFamilyHandle* cmp_cfh, const ReadOptions& ro, const Slice& verify_key,
     const std::vector<int>& rand_column_families) const {
@@ -7352,6 +7466,7 @@ void InitializeOptionsFromFlags(
   // `WAL_size_limit_MB` i.e, `GetUpdatesSince()`
   options.WAL_ttl_seconds = FLAGS_WAL_ttl_seconds;
   options.WAL_size_limit_MB = FLAGS_WAL_size_limit_MB;
+  options.wal_iterator_tail_rotations = FLAGS_wal_iterator_tail_rotations;
   options.wal_bytes_per_sync = FLAGS_wal_bytes_per_sync;
   options.strict_bytes_per_sync = FLAGS_strict_bytes_per_sync;
   options.avoid_flush_during_shutdown = FLAGS_avoid_flush_during_shutdown;

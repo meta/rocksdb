@@ -455,6 +455,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, background_close_inactive_wals),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"wal_iterator_tail_rotations",
+         {offsetof(struct ImmutableDBOptions, wal_iterator_tail_rotations),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"seq_per_batch",
          {0, OptionType::kBoolean, OptionVerificationType::kDeprecated,
           OptionTypeFlags::kNone}},
@@ -857,6 +861,7 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       manual_wal_flush(options.manual_wal_flush),
       wal_compression(options.wal_compression),
       background_close_inactive_wals(options.background_close_inactive_wals),
+      wal_iterator_tail_rotations(options.wal_iterator_tail_rotations),
       atomic_flush(options.atomic_flush),
       avoid_unnecessary_blocking_io(options.avoid_unnecessary_blocking_io),
       prefix_seek_opt_in_only(options.prefix_seek_opt_in_only),
@@ -1043,6 +1048,8 @@ void ImmutableDBOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log,
                    "            Options.background_close_inactive_wals: %d",
                    background_close_inactive_wals);
+  ROCKS_LOG_HEADER(log, "            Options.wal_iterator_tail_rotations: %d",
+                   wal_iterator_tail_rotations);
   ROCKS_LOG_HEADER(log, "            Options.atomic_flush: %d", atomic_flush);
   ROCKS_LOG_HEADER(log, "            Options.avoid_unnecessary_blocking_io: %d",
                    avoid_unnecessary_blocking_io);

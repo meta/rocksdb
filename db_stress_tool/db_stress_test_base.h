@@ -146,6 +146,10 @@ class StressTest {
   void OperateDb(ThreadState* thread);
   virtual void VerifyDb(ThreadState* thread) const = 0;
   virtual void ContinuouslyVerifyDb(ThreadState* /*thread*/) const = 0;
+  // Tails WAL updates in a background thread and verifies continuity within
+  // each run, with wal_iterator_tail_rotations either on or off. Reseeks spent
+  // iterators and stops when shutdown or a verification failure is signaled.
+  void TailWalUpdates(ThreadState* thread);
   void PrintStatistics();
   bool MightHaveUnsyncedDataLoss() {
     return FLAGS_sync_fault_injection || FLAGS_disable_wal ||

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "db/version_set.h"
+#include "db/wal_iterator_impl.h"
 #include "file/file_util.h"
 #include "options/db_options.h"
 #include "port/port.h"
@@ -49,7 +50,8 @@ class WalManager {
   Status GetUpdatesSince(SequenceNumber seq_number,
                          std::unique_ptr<WalIterator>* iter,
                          const WalIterator::ReadOptions& read_options,
-                         VersionSet* version_set);
+                         VersionSet* version_set,
+                         NextWalForTailFn next_wal_for_tail_fn);
 
   // Record the end of a write group's sequence range when its WAL append has
   // an indeterminate outcome. TransactionLogIterator uses this process-lifetime
