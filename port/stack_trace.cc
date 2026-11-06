@@ -79,13 +79,12 @@ const char* GetExecutableName() {
 #elif defined(OS_OPENBSD)
   int mib[4] = {CTL_KERN, KERN_PROC_ARGS, getpid(), KERN_PROC_ARGV};
   size_t namesz = sizeof(name);
-  char* bin[namesz];
 
-  auto ret = sysctl(mib, 4, bin, &namesz, nullptr, 0);
+  auto ret = sysctl(mib, 4, name, &namesz, nullptr, 0);
   if (-1 == ret) {
     return nullptr;
   } else {
-    return bin[0];
+    return name;
   }
 #else
   char link[1024];
