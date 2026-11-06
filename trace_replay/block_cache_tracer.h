@@ -75,7 +75,7 @@ struct BlockCacheLookupContext {
         get_from_user_specified_snapshot(_get_from_user_specified_snapshot) {}
   const TableReaderCaller caller;
   // These are populated when we perform lookup/insert on block cache. The block
-  // cache tracer uses these inforation when logging the block access at
+  // cache tracer uses these information when logging the block access at
   // BlockBasedTable::GET and BlockBasedTable::MultiGet.
   bool is_cache_hit = false;
   bool no_insert = false;
