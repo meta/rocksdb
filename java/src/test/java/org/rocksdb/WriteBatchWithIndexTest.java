@@ -11,6 +11,7 @@ package org.rocksdb;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -1062,6 +1063,67 @@ public class WriteBatchWithIndexTest {
         assertThat(wbwiIter).isNotNull();
         assertThat(wbwiIter.nativeHandle_).isGreaterThan(0);
         wbwiIter.status();
+      }
+    }
+  }
+
+  @Test
+  public void byteBuffers() throws RocksDBException {
+    try (final Options options = new Options().setCreateIfMissing(true);
+        final RocksDB db = RocksDB.open(options, dbFolder.getRoot().getAbsolutePath())) {
+      try (WriteBatchWithIndex wbwi = new WriteBatchWithIndex(true);
+          final DBOptions dbOptions = new DBOptions()) {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+        key.put("key".getBytes(UTF_8)).flip();
+        value.put("value".getBytes(UTF_8)).flip();
+        wbwi.put(key, value);
+        byte[] readBackValue = wbwi.getFromBatch(dbOptions, "key".getBytes(UTF_8));
+        assertThat(readBackValue).isEqualTo("value".getBytes(UTF_8));
+      }
+      try (WriteBatchWithIndex wbwi = new WriteBatchWithIndex(true);
+          final DBOptions dbOptions = new DBOptions()) {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+        key.put("key".getBytes(UTF_8)).flip();
+        value.put("value".getBytes(UTF_8)).flip();
+        wbwi.put(db.getDefaultColumnFamily(), key, value);
+        byte[] readBackValue = wbwi.getFromBatch(dbOptions, "key".getBytes(UTF_8));
+        assertThat(readBackValue).isEqualTo("value".getBytes(UTF_8));
+      }
+
+      try (WriteBatchWithIndex wbwi = new WriteBatchWithIndex(true);
+          final DBOptions dbOptions = new DBOptions()) {
+        byte[] keyByffer = new byte[16];
+        byte[] valueByffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyByffer, 2, 6).slice();
+        ByteBuffer value = ByteBuffer.wrap(valueByffer, 2, 6).slice();
+        key.put("key".getBytes(UTF_8)).flip();
+        value.put("value".getBytes(UTF_8)).flip();
+        wbwi.put(key, value);
+        byte[] readBackValue = wbwi.getFromBatch(dbOptions, "key".getBytes(UTF_8));
+        assertThat(readBackValue).isEqualTo("value".getBytes(UTF_8));
+      }
+      try (WriteBatchWithIndex wbwi = new WriteBatchWithIndex(true);
+          final DBOptions dbOptions = new DBOptions()) {
+        byte[] keyByffer = new byte[16];
+        byte[] valueByffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyByffer, 2, 6).slice();
+        ByteBuffer value = ByteBuffer.wrap(valueByffer, 2, 6).slice();
+        key.put("key".getBytes(UTF_8)).flip();
+        value.put("value".getBytes(UTF_8)).flip();
+        wbwi.put(db.getDefaultColumnFamily(), key, value);
+        byte[] readBackValue = wbwi.getFromBatch(dbOptions, "key".getBytes(UTF_8));
+        assertThat(readBackValue).isEqualTo("value".getBytes(UTF_8));
+      }
+      try (WriteBatchWithIndex wbwi = new WriteBatchWithIndex(true)) {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        ByteBuffer value = ByteBuffer.allocate(16);
+        key.put("key".getBytes(UTF_8)).flip();
+        value.put("value".getBytes(UTF_8)).flip();
+        assertThatThrownBy(() -> wbwi.put(db.getDefaultColumnFamily(), key, value))
+            .isInstanceOf(RocksDBException.class)
+            .hasMessage(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
       }
     }
   }

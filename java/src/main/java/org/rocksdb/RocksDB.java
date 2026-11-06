@@ -36,8 +36,8 @@ public class RocksDB extends RocksObject {
   static final String PERFORMANCE_OPTIMIZATION_FOR_A_VERY_SPECIFIC_WORKLOAD =
       "Performance optimization for a very specific workload";
 
-  private static final String BB_ALL_DIRECT_OR_INDIRECT =
-      "ByteBuffer parameters must all be direct, or must all be indirect";
+  static final String BB_ALL_DIRECT_OR_INDIRECT =
+      "ByteBuffer parameters must all be direct, or must all be indirect and not read only";
   private ColumnFamilyHandle defaultColumnFamilyHandle_;
   private final ReadOptions defaultReadOptions_ = new ReadOptions();
 
@@ -1069,9 +1069,7 @@ public class RocksDB extends RocksObject {
     if (key.isDirect() && value.isDirect()) {
       putDirect(nativeHandle_, writeOpts.nativeHandle_, key, key.position(), key.remaining(), value,
           value.position(), value.remaining(), columnFamilyHandle.nativeHandle_);
-    } else if (!key.isDirect() && !value.isDirect()) {
-      assert key.hasArray();
-      assert value.hasArray();
+    } else if (key.hasArray() && value.hasArray()) {
       put(nativeHandle_, writeOpts.nativeHandle_, key.array(), key.arrayOffset() + key.position(),
           key.remaining(), value.array(), value.arrayOffset() + value.position(), value.remaining(),
           columnFamilyHandle.nativeHandle_);
@@ -1102,9 +1100,7 @@ public class RocksDB extends RocksObject {
     if (key.isDirect() && value.isDirect()) {
       putDirect(nativeHandle_, writeOpts.nativeHandle_, key, key.position(), key.remaining(), value,
           value.position(), value.remaining(), 0);
-    } else if (!key.isDirect() && !value.isDirect()) {
-      assert key.hasArray();
-      assert value.hasArray();
+    } else if (key.hasArray() && value.hasArray()) {
       put(nativeHandle_, writeOpts.nativeHandle_, key.array(), key.arrayOffset() + key.position(),
           key.remaining(), value.array(), value.arrayOffset() + value.position(),
           value.remaining());
@@ -1325,7 +1321,7 @@ public class RocksDB extends RocksObject {
     if (key.isDirect() && value.isDirect()) {
       result = getDirect(nativeHandle_, opt.nativeHandle_, key, key.position(), key.remaining(),
           value, value.position(), value.remaining(), 0);
-    } else if (!key.isDirect() && !value.isDirect()) {
+    } else if (key.hasArray() && value.hasArray()) {
       result =
           get(nativeHandle_, opt.nativeHandle_, key.array(), key.arrayOffset() + key.position(),
               key.remaining(), value.array(), value.arrayOffset() + value.position(),
@@ -1363,15 +1359,27 @@ public class RocksDB extends RocksObject {
    */
   public int get(final ColumnFamilyHandle columnFamilyHandle, final ReadOptions opt,
       final ByteBuffer key, final ByteBuffer value) throws RocksDBException {
-    assert key.isDirect() && value.isDirect();
-    final int result =
-        getDirect(nativeHandle_, opt.nativeHandle_, key, key.position(), key.remaining(), value,
-            value.position(), value.remaining(), columnFamilyHandle.nativeHandle_);
-    if (result != NOT_FOUND) {
-      value.limit(Math.min(value.limit(), value.position() + result));
+    if (key.isDirect() && value.isDirect()) {
+      final int result =
+          getDirect(nativeHandle_, opt.nativeHandle_, key, key.position(), key.remaining(), value,
+              value.position(), value.remaining(), columnFamilyHandle.nativeHandle_);
+      if (result != NOT_FOUND) {
+        value.position(Math.min(value.limit(), value.position() + result));
+      }
+      key.position(key.limit());
+      return result;
+    } else if (key.hasArray() && value.hasArray()) {
+      final int result = get(nativeHandle_, opt.nativeHandle_, key.array(),
+          key.arrayOffset() + key.position(), key.remaining(), value.array(),
+          value.arrayOffset() + value.position(), value.remaining());
+      if (result != NOT_FOUND) {
+        value.position(Math.min(value.limit(), value.position() + result));
+      }
+      key.position(key.limit());
+      return result;
+    } else {
+      throw new RocksDBException(BB_ALL_DIRECT_OR_INDIRECT);
     }
-    key.position(key.limit());
-    return result;
   }
 
   /**
@@ -1721,9 +1729,7 @@ public class RocksDB extends RocksObject {
     if (key.isDirect() && value.isDirect()) {
       mergeDirect(nativeHandle_, writeOpts.nativeHandle_, key, key.position(), key.remaining(),
           value, value.position(), value.remaining(), 0);
-    } else if (!key.isDirect() && !value.isDirect()) {
-      assert key.hasArray();
-      assert value.hasArray();
+    } else if (key.hasArray() && value.hasArray()) {
       merge(nativeHandle_, writeOpts.nativeHandle_, key.array(), key.arrayOffset() + key.position(),
           key.remaining(), value.array(), value.arrayOffset() + value.position(),
           value.remaining());
@@ -1739,9 +1745,7 @@ public class RocksDB extends RocksObject {
     if (key.isDirect() && value.isDirect()) {
       mergeDirect(nativeHandle_, writeOpts.nativeHandle_, key, key.position(), key.remaining(),
           value, value.position(), value.remaining(), columnFamilyHandle.nativeHandle_);
-    } else if (!key.isDirect() && !value.isDirect()) {
-      assert key.hasArray();
-      assert value.hasArray();
+    } else if (key.hasArray() && value.hasArray()) {
       merge(nativeHandle_, writeOpts.nativeHandle_, key.array(), key.arrayOffset() + key.position(),
           key.remaining(), value.array(), value.arrayOffset() + value.position(), value.remaining(),
           columnFamilyHandle.nativeHandle_);
@@ -1765,8 +1769,14 @@ public class RocksDB extends RocksObject {
    *    native library.
    */
   public void delete(final WriteOptions writeOpt, final ByteBuffer key) throws RocksDBException {
-    assert key.isDirect();
-    deleteDirect(nativeHandle_, writeOpt.nativeHandle_, key, key.position(), key.remaining(), 0);
+    if (key.isDirect()) {
+      deleteDirect(nativeHandle_, writeOpt.nativeHandle_, key, key.position(), key.remaining(), 0);
+    } else if (key.hasArray()) {
+      assert key.hasArray();
+      delete(nativeHandle_, key.array(), key.arrayOffset() + key.position(), key.remaining());
+    } else {
+      throw new RocksDBException(BB_ALL_DIRECT_OR_INDIRECT);
+    }
     key.position(key.limit());
   }
 
@@ -1786,9 +1796,15 @@ public class RocksDB extends RocksObject {
    */
   public void delete(final ColumnFamilyHandle columnFamilyHandle, final WriteOptions writeOpt,
       final ByteBuffer key) throws RocksDBException {
-    assert key.isDirect();
-    deleteDirect(nativeHandle_, writeOpt.nativeHandle_, key, key.position(), key.remaining(),
-        columnFamilyHandle.nativeHandle_);
+    if (key.isDirect()) {
+      deleteDirect(nativeHandle_, writeOpt.nativeHandle_, key, key.position(), key.remaining(),
+          columnFamilyHandle.nativeHandle_);
+    } else if (key.hasArray()) {
+      delete(nativeHandle_, key.array(), key.arrayOffset() + key.position(), key.remaining(),
+          columnFamilyHandle.nativeHandle_);
+    } else {
+      throw new RocksDBException(BB_ALL_DIRECT_OR_INDIRECT);
+    }
     key.position(key.limit());
   }
 
@@ -2844,7 +2860,7 @@ public class RocksDB extends RocksObject {
    * @param key ByteBuffer with key. Must be allocated as direct.
    * @return true if key exist in database, otherwise false.
    */
-  public boolean keyExists(final ByteBuffer key) {
+  public boolean keyExists(final ByteBuffer key) throws RocksDBException {
     return keyExists(null, null, key);
   }
 
@@ -2863,7 +2879,8 @@ public class RocksDB extends RocksObject {
    * @param key ByteBuffer with key. Must be allocated as direct.
    * @return true if key exist in database, otherwise false.
    */
-  public boolean keyExists(final ColumnFamilyHandle columnFamilyHandle, final ByteBuffer key) {
+  public boolean keyExists(final ColumnFamilyHandle columnFamilyHandle, final ByteBuffer key)
+      throws RocksDBException {
     return keyExists(columnFamilyHandle, null, key);
   }
 
@@ -2882,7 +2899,8 @@ public class RocksDB extends RocksObject {
    * @param key ByteBuffer with key. Must be allocated as direct.
    * @return true if key exist in database, otherwise false.
    */
-  public boolean keyExists(final ReadOptions readOptions, final ByteBuffer key) {
+  public boolean keyExists(final ReadOptions readOptions, final ByteBuffer key)
+      throws RocksDBException {
     return keyExists(null, readOptions, key);
   }
 
@@ -2903,13 +2921,26 @@ public class RocksDB extends RocksObject {
    * @return true if key exist in database, otherwise false.
    */
   public boolean keyExists(final ColumnFamilyHandle columnFamilyHandle,
-      final ReadOptions readOptions, final ByteBuffer key) {
+      final ReadOptions readOptions, final ByteBuffer key) throws RocksDBException {
     assert key != null : "key ByteBuffer parameter cannot be null";
-    assert key.isDirect() : "key parameter must be a direct ByteBuffer";
 
-    return keyExistsDirect(nativeHandle_,
-        columnFamilyHandle == null ? 0 : columnFamilyHandle.nativeHandle_,
-        readOptions == null ? 0 : readOptions.nativeHandle_, key, key.position(), key.limit());
+    boolean result;
+
+    if (key.isDirect()) {
+      result = keyExistsDirect(nativeHandle_,
+          columnFamilyHandle == null ? 0 : columnFamilyHandle.nativeHandle_,
+          readOptions == null ? 0 : readOptions.nativeHandle_, key, key.position(), key.limit());
+
+    } else if (key.hasArray()) {
+      result = keyExists(nativeHandle_,
+          columnFamilyHandle == null ? 0 : columnFamilyHandle.nativeHandle_,
+          readOptions == null ? 0 : readOptions.nativeHandle_, key.array(),
+          key.arrayOffset() + key.position(), key.remaining());
+    } else {
+      throw new RocksDBException(BB_ALL_DIRECT_OR_INDIRECT);
+    }
+    key.position(key.limit());
+    return result;
   }
 
   /**
@@ -3192,7 +3223,7 @@ public class RocksDB extends RocksObject {
    * @return false if the key definitely does not exist in the database,
    *     otherwise true.
    */
-  public boolean keyMayExist(final ByteBuffer key) {
+  public boolean keyMayExist(final ByteBuffer key) throws RocksDBException {
     return keyMayExist(null, (ReadOptions) null, key);
   }
 
@@ -3207,7 +3238,8 @@ public class RocksDB extends RocksObject {
    * @return false if the key definitely does not exist in the database,
    *     otherwise true.
    */
-  public boolean keyMayExist(final ColumnFamilyHandle columnFamilyHandle, final ByteBuffer key) {
+  public boolean keyMayExist(final ColumnFamilyHandle columnFamilyHandle, final ByteBuffer key)
+      throws RocksDBException {
     return keyMayExist(columnFamilyHandle, (ReadOptions) null, key);
   }
 
@@ -3222,7 +3254,8 @@ public class RocksDB extends RocksObject {
    * @return false if the key definitely does not exist in the database,
    *     otherwise true.
    */
-  public boolean keyMayExist(final ReadOptions readOptions, final ByteBuffer key) {
+  public boolean keyMayExist(final ReadOptions readOptions, final ByteBuffer key)
+      throws RocksDBException {
     return keyMayExist(null, readOptions, key);
   }
 
@@ -3239,7 +3272,8 @@ public class RocksDB extends RocksObject {
    * @param value bytebuffer which will receive a value if the key exists and a value is known
    * @return a {@link KeyMayExist} object reporting if key may exist and if a value is provided
    */
-  public KeyMayExist keyMayExist(final ByteBuffer key, final ByteBuffer value) {
+  public KeyMayExist keyMayExist(final ByteBuffer key, final ByteBuffer value)
+      throws RocksDBException {
     return keyMayExist(null, null, key, value);
   }
 
@@ -3257,8 +3291,8 @@ public class RocksDB extends RocksObject {
    * @param value bytebuffer which will receive a value if the key exists and a value is known
    * @return a {@link KeyMayExist} object reporting if key may exist and if a value is provided
    */
-  public KeyMayExist keyMayExist(
-      final ColumnFamilyHandle columnFamilyHandle, final ByteBuffer key, final ByteBuffer value) {
+  public KeyMayExist keyMayExist(final ColumnFamilyHandle columnFamilyHandle, final ByteBuffer key,
+      final ByteBuffer value) throws RocksDBException {
     return keyMayExist(columnFamilyHandle, null, key, value);
   }
 
@@ -3276,8 +3310,8 @@ public class RocksDB extends RocksObject {
    * @param value bytebuffer which will receive a value if the key exists and a value is known
    * @return a {@link KeyMayExist} object reporting if key may exist and if a value is provided
    */
-  public KeyMayExist keyMayExist(
-      final ReadOptions readOptions, final ByteBuffer key, final ByteBuffer value) {
+  public KeyMayExist keyMayExist(final ReadOptions readOptions, final ByteBuffer key,
+      final ByteBuffer value) throws RocksDBException {
     return keyMayExist(null, readOptions, key, value);
   }
 
@@ -3294,14 +3328,23 @@ public class RocksDB extends RocksObject {
    *     otherwise true.
    */
   public boolean keyMayExist(final ColumnFamilyHandle columnFamilyHandle,
-      final ReadOptions readOptions, final ByteBuffer key) {
-    assert key != null : "key ByteBuffer parameter cannot be null";
-    assert key.isDirect() : "key parameter must be a direct ByteBuffer";
-    final boolean result = keyMayExistDirect(nativeHandle_,
-        columnFamilyHandle == null ? 0 : columnFamilyHandle.nativeHandle_,
-        readOptions == null ? 0 : readOptions.nativeHandle_, key, key.position(), key.limit());
-    key.position(key.limit());
-    return result;
+      final ReadOptions readOptions, final ByteBuffer key) throws RocksDBException {
+    if (key.isDirect()) {
+      final boolean result = keyMayExistDirect(nativeHandle_,
+          columnFamilyHandle == null ? 0 : columnFamilyHandle.nativeHandle_,
+          readOptions == null ? 0 : readOptions.nativeHandle_, key, key.position(), key.limit());
+      key.position(key.limit());
+      return result;
+    } else if (key.hasArray()) {
+      final boolean result = keyMayExist(nativeHandle_,
+          columnFamilyHandle == null ? 0 : columnFamilyHandle.nativeHandle_,
+          readOptions == null ? 0 : readOptions.nativeHandle_, key.array(),
+          key.arrayOffset() + key.position(), key.limit());
+      key.position(key.limit());
+      return result;
+    } else {
+      throw new RocksDBException(BB_ALL_DIRECT_OR_INDIRECT);
+    }
   }
 
   /**
@@ -3320,22 +3363,41 @@ public class RocksDB extends RocksObject {
    * @return a {@link KeyMayExist} object reporting if key may exist and if a value is provided
    */
   public KeyMayExist keyMayExist(final ColumnFamilyHandle columnFamilyHandle,
-      final ReadOptions readOptions, final ByteBuffer key, final ByteBuffer value) {
+      final ReadOptions readOptions, final ByteBuffer key, final ByteBuffer value)
+      throws RocksDBException {
     assert key != null : "key ByteBuffer parameter cannot be null";
-    assert key.isDirect() : "key parameter must be a direct ByteBuffer";
     assert value
         != null
         : "value ByteBuffer parameter cannot be null. If you do not need the value, use a different version of the method";
-    assert value.isDirect() : "value parameter must be a direct ByteBuffer";
 
-    final int[] result = keyMayExistDirectFoundValue(nativeHandle_,
-        columnFamilyHandle == null ? 0 : columnFamilyHandle.nativeHandle_,
-        readOptions == null ? 0 : readOptions.nativeHandle_, key, key.position(), key.remaining(),
-        value, value.position(), value.remaining());
-    final int valueLength = result[1];
-    value.limit(value.position() + Math.min(valueLength, value.remaining()));
-    key.position(key.limit());
-    return new KeyMayExist(KeyMayExist.KeyMayExistEnum.values()[result[0]], valueLength);
+    if (key.isDirect()) {
+      final int[] result = keyMayExistDirectFoundValue(nativeHandle_,
+          columnFamilyHandle == null ? 0 : columnFamilyHandle.nativeHandle_,
+          readOptions == null ? 0 : readOptions.nativeHandle_, key, key.position(), key.remaining(),
+          value, value.position(), value.remaining());
+      final int valueLength = result[1];
+      value.position(value.position() + Math.min(valueLength, value.remaining()));
+      key.position(key.limit());
+      return new KeyMayExist(KeyMayExist.KeyMayExistEnum.values()[result[0]], valueLength);
+    } else if (key.hasArray() && value.hasArray()) {
+      Holder<byte[]> holder = new Holder<>();
+      final boolean ret = keyMayExist(columnFamilyHandle, readOptions, key.array(),
+          key.arrayOffset() + key.position(), key.remaining(), holder);
+      key.position(key.limit());
+      if (ret) {
+        if (holder.getValue() == null) {
+          return new KeyMayExist(KeyMayExist.KeyMayExistEnum.kExistsWithoutValue, 0);
+        } else {
+          value.put(holder.getValue(), 0, Math.min(holder.getValue().length, value.remaining()));
+          return new KeyMayExist(
+              KeyMayExist.KeyMayExistEnum.kExistsWithValue, holder.getValue().length);
+        }
+      } else {
+        return new KeyMayExist(KeyMayExist.KeyMayExistEnum.kNotExist, 0);
+      }
+    } else {
+      throw new RocksDBException(BB_ALL_DIRECT_OR_INDIRECT);
+    }
   }
 
   /**
@@ -5050,9 +5112,11 @@ public class RocksDB extends RocksObject {
   private static native int get(final long handle, final byte[] key, final int keyOffset,
       final int keyLength, byte[] value, final int valueOffset, final int valueLength,
       final long cfHandle) throws RocksDBException;
+
   private static native int get(final long handle, final long readOptHandle, final byte[] key,
       final int keyOffset, final int keyLength, final byte[] value, final int valueOffset,
       final int valueLength) throws RocksDBException;
+
   private static native int get(final long handle, final long readOptHandle, final byte[] key,
       final int keyOffset, final int keyLength, final byte[] value, final int valueOffset,
       final int valueLength, final long cfHandle) throws RocksDBException;

@@ -21,13 +21,13 @@ public abstract class AbstractWriteBatch extends RocksObject
 
   @Override
   public void put(final byte[] key, final byte[] value) throws RocksDBException {
-    put(nativeHandle_, key, key.length, value, value.length);
+    put(nativeHandle_, key, 0, key.length, value, 0, value.length);
   }
 
   @Override
   public void put(final ColumnFamilyHandle columnFamilyHandle, final byte[] key, final byte[] value)
       throws RocksDBException {
-    put(nativeHandle_, key, key.length, value, value.length,
+    put(nativeHandle_, key, 0, key.length, value, 0, value.length,
         columnFamilyHandle.nativeHandle_);
   }
 
@@ -45,9 +45,15 @@ public abstract class AbstractWriteBatch extends RocksObject
 
   @Override
   public void put(final ByteBuffer key, final ByteBuffer value) throws RocksDBException {
-    assert key.isDirect() && value.isDirect();
-    putDirect(nativeHandle_, key, key.position(), key.remaining(), value, value.position(),
-        value.remaining(), 0);
+    if (key.isDirect() && value.isDirect()) {
+      putDirect(nativeHandle_, key, key.position(), key.remaining(), value, value.position(),
+          value.remaining(), 0);
+    } else if (key.hasArray() && value.hasArray()) {
+      put(nativeHandle_, key.array(), key.arrayOffset() + key.position(), key.remaining(),
+          value.array(), value.arrayOffset() + value.position(), value.remaining());
+    } else {
+      throw new RocksDBException(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+    }
     key.position(key.limit());
     value.position(value.limit());
   }
@@ -55,9 +61,16 @@ public abstract class AbstractWriteBatch extends RocksObject
   @Override
   public void put(final ColumnFamilyHandle columnFamilyHandle, final ByteBuffer key,
       final ByteBuffer value) throws RocksDBException {
-    assert key.isDirect() && value.isDirect();
-    putDirect(nativeHandle_, key, key.position(), key.remaining(), value, value.position(),
-        value.remaining(), columnFamilyHandle.nativeHandle_);
+    if (key.isDirect() && value.isDirect()) {
+      putDirect(nativeHandle_, key, key.position(), key.remaining(), value, value.position(),
+          value.remaining(), columnFamilyHandle.nativeHandle_);
+    } else if (key.hasArray() && value.hasArray()) {
+      put(nativeHandle_, key.array(), key.arrayOffset() + key.position(), key.remaining(),
+          value.array(), value.arrayOffset() + value.position(), value.remaining(),
+          columnFamilyHandle.nativeHandle_);
+    } else {
+      throw new RocksDBException(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+    }
     key.position(key.limit());
     value.position(value.limit());
   }
@@ -75,16 +88,30 @@ public abstract class AbstractWriteBatch extends RocksObject
 
   @Override
   public void delete(final ByteBuffer key) throws RocksDBException {
-    deleteDirect(nativeHandle_, key, key.position(), key.remaining(), 0);
+    if (key.isDirect()) {
+      deleteDirect(nativeHandle_, key, key.position(), key.remaining(), 0);
+    } else if (key.hasArray()) {
+      delete(nativeHandle_, key.array(), key.arrayOffset() + key.position(), key.remaining());
+    } else {
+      throw new RocksDBException(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+    }
     key.position(key.limit());
   }
 
   @Override
   public void delete(final ColumnFamilyHandle columnFamilyHandle, final ByteBuffer key)
       throws RocksDBException {
-    deleteDirect(
-        nativeHandle_, key, key.position(), key.remaining(), columnFamilyHandle.nativeHandle_);
-    key.position(key.limit());
+    if (key.isDirect()) {
+      deleteDirect(
+          nativeHandle_, key, key.position(), key.remaining(), columnFamilyHandle.nativeHandle_);
+      key.position(key.limit());
+    } else if (key.hasArray()) {
+      // TODO - Refactor, add native method
+      ByteBuffer buffer = ByteBuffer.allocateDirect(key.remaining());
+      buffer.put(key).flip();
+      deleteDirect(nativeHandle_, buffer, buffer.position(), buffer.remaining(),
+          columnFamilyHandle.nativeHandle_);
+    }
   }
 
   @Override
@@ -147,11 +174,11 @@ public abstract class AbstractWriteBatch extends RocksObject
 
   abstract int count0(final long handle);
 
-  abstract void put(final long handle, final byte[] key, final int keyLen,
-      final byte[] value, final int valueLen) throws RocksDBException;
+  abstract void put(final long handle, final byte[] key, final int keyOffset, final int keyLen,
+      final byte[] value, final int valueOffset, final int valueLen) throws RocksDBException;
 
-  abstract void put(final long handle, final byte[] key, final int keyLen,
-      final byte[] value, final int valueLen, final long cfHandle)
+  abstract void put(final long handle, final byte[] key, final int keyOffset, final int keyLen,
+      final byte[] value, final int valueOffset, final int valueLen, final long cfHandle)
       throws RocksDBException;
 
   abstract void putDirect(final long handle, final ByteBuffer key, final int keyOffset,
