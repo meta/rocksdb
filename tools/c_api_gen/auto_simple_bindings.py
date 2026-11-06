@@ -145,6 +145,7 @@ OPTION_STRUCTS_GROUP = OutputGroup(
                 "InfoLogLevel",
                 "WALRecoveryMode",
                 "CompressionType",
+                "ChecksumType",
                 "CacheTier",
                 "Temperature",
             ),

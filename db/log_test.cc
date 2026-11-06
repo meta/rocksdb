@@ -281,6 +281,35 @@ class LogTest
 
 TEST_P(LogTest, Empty) { ASSERT_EQ("EOF", Read()); }
 
+TEST_P(LogTest, CloseBeforeFirstRecord) {
+  ASSERT_OK(writer_->Close(WriteOptions()));
+  ASSERT_EQ(writer_->file(), nullptr);
+  ASSERT_TRUE(writer_->PublishIfClosed());
+  ASSERT_TRUE(writer_->BufferIsEmpty());
+}
+
+// FSWritableFile whose Close fails, to pin Close-on-error behavior.
+class FailingCloseSink : public test::StringSink {
+ public:
+  IOStatus Close(const IOOptions& /*opts*/, IODebugContext* /*dbg*/) override {
+    return IOStatus::IOError("Injected close error");
+  }
+};
+
+TEST(LogWriterCloseError, PropagatesFileCloseError) {
+  std::unique_ptr<FSWritableFile> sink(new FailingCloseSink());
+  std::unique_ptr<WritableFileWriter> file_writer(
+      new WritableFileWriter(std::move(sink), "", FileOptions()));
+  Writer writer(std::move(file_writer), /*log_number=*/123,
+                /*recycle_log_files=*/false);
+  IOStatus s = writer.Close(WriteOptions());
+  ASSERT_TRUE(!s.ok());
+  // The file is released even when close fails; repeat Close is a no-op.
+  ASSERT_EQ(writer.file(), nullptr);
+  ASSERT_TRUE(writer.PublishIfClosed());
+  ASSERT_OK(writer.Close(WriteOptions()));
+}
+
 TEST_P(LogTest, ReadWrite) {
   Write("foo");
   Write("bar");
@@ -1246,7 +1275,7 @@ TEST_P(StreamingCompressionTest, Basic) {
     allocator->Deallocate((void*)output_buffer);
   } while (remaining > 0);
   std::string uncompressed_buffer;
-  int ret_val = 0;
+  int64_t ret_val = 0;
   size_t output_pos;
   char* uncompressed_output_buffer = (char*)allocator->Allocate(kBlockSize);
   // Uncompress the fragments and concatenate them.

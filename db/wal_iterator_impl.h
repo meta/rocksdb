@@ -8,8 +8,8 @@
 #include <memory>
 #include <vector>
 
-#include "db/log_reader.h"
 #include "db/version_set.h"
+#include "db/wal_reader.h"
 #include "file/filename.h"
 #include "logging/logging.h"
 #include "options/db_options.h"
@@ -52,9 +52,10 @@ class WalRecoverySequenceTracker {
 class WalFileImpl : public WalFile {
  public:
   WalFileImpl(uint64_t logNum, WalFileType logType, SequenceNumber startSeq,
-              uint64_t sizeBytes)
+              bool startSeqIsPlaceholder, uint64_t sizeBytes)
       : logNumber_(logNum),
         type_(logType),
+        startSequenceIsPlaceholder_(startSeqIsPlaceholder),
         startSequence_(startSeq),
         sizeFileBytes_(sizeBytes) {}
 
@@ -71,6 +72,12 @@ class WalFileImpl : public WalFile {
 
   SequenceNumber StartSequence() const override { return startSequence_; }
 
+  // True when the WAL holds no WriteBatch records yet, so StartSequence() is
+  // only a nonzero marker that keeps the file listed, not a real sequence.
+  bool StartSequenceIsPlaceholder() const {
+    return startSequenceIsPlaceholder_;
+  }
+
   uint64_t SizeFileBytes() const override { return sizeFileBytes_; }
 
   bool operator<(const WalFile& that) const {
@@ -80,6 +87,7 @@ class WalFileImpl : public WalFile {
  private:
   uint64_t logNumber_;
   WalFileType type_;
+  bool startSequenceIsPlaceholder_;
   SequenceNumber startSequence_;
   uint64_t sizeFileBytes_;
 };
@@ -120,12 +128,16 @@ class WalIteratorImpl : public WalIterator {
   // State variables
   bool started_;
   bool is_valid_;  // not valid when it starts of.
+  // The pending open hit a read error, which it latches; a re-seek must open
+  // the file afresh rather than reuse it.
+  bool pending_log_reader_read_error_ = false;
   // Once this is set to a non-OK status the iterator is spent: Next() is a
   // no-op and the status never changes again.
   Status current_status_;
   size_t current_file_index_;
   std::unique_ptr<WriteBatch> current_batch_;
-  std::unique_ptr<log::Reader> current_log_reader_;
+  std::unique_ptr<WalReader> current_log_reader_;
+  std::unique_ptr<WalReaderOpenState> pending_log_reader_;
   std::string scratch_;
   Status OpenLogFile(const WalFile* log_file,
                      std::unique_ptr<SequentialFileReader>* file);
@@ -137,6 +149,13 @@ class WalIteratorImpl : public WalIterator {
                     uint64_t /*log_number*/ = kMaxSequenceNumber) override {
       ROCKS_LOG_ERROR(info_log, "dropping %" ROCKSDB_PRIszt " bytes; %s", bytes,
                       s.ToString().c_str());
+    }
+    void ToleratedCorruption(
+        size_t bytes, const Status& s,
+        uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+      ROCKS_LOG_WARN(info_log,
+                     "dropping %" ROCKSDB_PRIszt " bytes (tolerated); %s",
+                     bytes, s.ToString().c_str());
     }
     virtual void Info(const char* s) { ROCKS_LOG_INFO(info_log, "%s", s); }
   } reporter_;
@@ -164,6 +183,7 @@ class WalIteratorImpl : public WalIterator {
   bool StopBeforeRecoveryGap(uint64_t wal_number,
                              SequenceNumber batch_last_sequence);
   Status OpenLogReader(const WalFile* file);
+  bool TryOpenLogReader();
 };
 
 }  // namespace ROCKSDB_NAMESPACE

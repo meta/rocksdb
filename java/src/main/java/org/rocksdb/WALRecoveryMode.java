@@ -14,6 +14,9 @@ public enum WALRecoveryMode {
    * <p>
    * We tolerate incomplete record in trailing data on all logs
    * Use case : This is legacy behavior (default)
+   * For blog-format WALs, unreadable data with no later record boundary is
+   * also treated as a tolerable tail; a later boundary proves mid-file
+   * corruption and still refuses to open the DB.
    */
   TolerateCorruptedTailRecords((byte)0x00),
 
@@ -40,6 +43,9 @@ public enum WALRecoveryMode {
    * possible
    * Use case : Ideal for last ditch effort to recover data or systems that
    * operate with low grade unrelated data
+   * Corruption and I/O errors are ignored: an unreadable device truncates
+   * replay like a torn tail rather than failing the open, matching legacy
+   * WALs. A WAL written in an unsupported format still fails the open.
    */
   SkipAnyCorruptedRecords((byte)0x03);
 

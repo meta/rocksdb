@@ -6,6 +6,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
+#include "db/wal_reader.h"
 #include "logging/logging.h"
 #include "port/port.h"
 
@@ -41,20 +43,26 @@ class LogReaderContainer {
     // paranoid_checks==false so that corruptions cause entire commits
     // to be skipped instead of propagating bad information (like overly
     // large sequence numbers).
-    reader_ = new log::FragmentBufferedReader(info_log, std::move(file_reader),
-                                              reporter, true /*checksum*/,
-                                              log_number);
+    reader_ =
+        NewWalReader(info_log, std::move(file_reader), reporter,
+                     true /*checksum*/, log_number,
+                     /*track_and_verify_wals=*/false,
+                     /*stop_replay_for_corruption=*/false,
+                     std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
+                     /*buffered=*/true, &pending_open_);
   }
   // No copying allowed
   LogReaderContainer(const LogReaderContainer&) = delete;
   LogReaderContainer& operator=(const LogReaderContainer&) = delete;
   LogReaderContainer(LogReaderContainer&&) = delete;
   LogReaderContainer& operator=(LogReaderContainer&&) = delete;
-  log::FragmentBufferedReader* reader_;
+  std::unique_ptr<WalReader> reader_;
+  std::unique_ptr<WalReaderOpenState> pending_open_;
   log::Reader::Reporter* reporter_;
   Status* status_;
   ~LogReaderContainer() {
-    delete reader_;
+    reader_.reset();
+    pending_open_.reset();
     delete reporter_;
     delete status_;
   }
@@ -74,6 +82,13 @@ class LogReaderContainer {
       if (this->status != nullptr && this->status->ok()) {
         *this->status = s;
       }
+    }
+    void ToleratedCorruption(
+        size_t bytes, const Status& s,
+        uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+      ROCKS_LOG_WARN(info_log, "%s: dropping %d bytes (tolerated); %s",
+                     fname.c_str(), static_cast<int>(bytes),
+                     s.ToString().c_str());
     }
   };
 };
@@ -300,8 +315,7 @@ class DBImplSecondary : public DBImpl {
 
   // Try to find log reader using log_number from log_readers_ map, initialize
   // if it doesn't exist
-  Status MaybeInitLogReader(uint64_t log_number,
-                            log::FragmentBufferedReader** log_reader);
+  Status MaybeInitLogReader(uint64_t log_number, WalReader** log_reader);
 
 #ifndef NDEBUG
   Status TEST_CompactWithoutInstallation(const OpenAndCompactOptions& options,

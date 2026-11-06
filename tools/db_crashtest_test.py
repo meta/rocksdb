@@ -997,6 +997,34 @@ class DBCrashTestTest(unittest.TestCase):
         self.assertEqual(1, finalized["disable_wal"])
         self.assertEqual(0, finalized["test_batches_snapshots"])
 
+    def test_finalize_blog_wal_streaming_compression(self):
+        db_crashtest = self.load_db_crashtest()
+        for use_blog in [0, 1]:
+            for compression in ["none", "zstd"]:
+                for streaming in [0, 1]:
+                    with self.subTest(
+                        use_blog=use_blog,
+                        compression=compression,
+                        streaming=streaming,
+                    ):
+                        params = self.build_params(
+                            db_crashtest.default_params,
+                            {
+                                "use_blog_format_for_wals": use_blog,
+                                "wal_compression": compression,
+                                "blog_wal_streaming_compression": streaming,
+                            },
+                        )
+
+                        finalized = db_crashtest.finalize_and_sanitize(params)
+
+                        self.assertEqual(use_blog, finalized["use_blog_format_for_wals"])
+                        self.assertEqual(compression, finalized["wal_compression"])
+                        self.assertEqual(
+                            int(streaming and use_blog and compression == "zstd"),
+                            finalized["blog_wal_streaming_compression"],
+                        )
+
     def test_finalize_file_scoped_wal_fault_profile(self):
         db_crashtest = self.load_db_crashtest()
         params = self.build_params(

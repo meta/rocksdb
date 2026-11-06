@@ -1071,7 +1071,10 @@ class VersionBuilder::Rep : public MutableScalars {
         blob_file_number, blob_file_addition.GetTotalBlobCount(),
         blob_file_addition.GetTotalBlobBytes(),
         blob_file_addition.GetChecksumMethod(),
-        blob_file_addition.GetChecksumValue(), std::move(deleter));
+        blob_file_addition.GetChecksumValue(),
+        blob_file_addition.GetPhysicalBlobFileSize(),
+        blob_file_addition.GetSchemaVersion(),
+        blob_file_addition.GetFileIdentity(), std::move(deleter));
 
     mutable_blob_file_metas_.emplace(
         blob_file_number, MutableBlobFileMetaData(std::move(shared_meta)));

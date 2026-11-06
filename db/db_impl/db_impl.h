@@ -36,7 +36,6 @@
 #include "db/flush_scheduler.h"
 #include "db/import_column_family_job.h"
 #include "db/internal_stats.h"
-#include "db/log_writer.h"
 #include "db/logs_with_prep_tracker.h"
 #include "db/memtable_list.h"
 #include "db/periodic_task_scheduler.h"
@@ -50,6 +49,7 @@
 #include "db/trim_history_scheduler.h"
 #include "db/version_edit.h"
 #include "db/wal_manager.h"
+#include "db/wal_writer.h"
 #include "db/write_controller.h"
 #include "db/write_thread.h"
 #include "logging/event_logger.h"
@@ -101,6 +101,7 @@ class TaskLimiterToken;
 class Version;
 class VersionEdit;
 class VersionSet;
+class WalReader;
 class WriteCallback;
 struct JobContext;
 struct ExternalSstFileInfo;
@@ -196,17 +197,28 @@ struct DBOpenLogRecordReadReporter : public log::Reader::Reporter {
   Env* env;
   Logger* info_log;
   const char* fname;
-  Status* status;  // nullptr if immutable_db_options_.paranoid_checks==false
+  // nullptr when corruption should not fail the open.
+  Status* status;
+  // Set even when `status` is nullptr.
+  Status* unrecoverable_status = nullptr;
   bool* old_log_record;
   void Corruption(size_t bytes, const Status& s,
                   uint64_t log_number = kMaxSequenceNumber) override;
+  void UnrecoverableError(size_t bytes, const Status& s,
+                          uint64_t log_number = kMaxSequenceNumber) override;
+  void ToleratedCorruption(size_t bytes, const Status& s,
+                           uint64_t log_number = kMaxSequenceNumber) override;
 
   void OldLogRecord(size_t bytes) override;
 
   uint64_t GetCorruptedLogNumber() const { return corrupted_wal_number_; }
 
+  // True when the WAL reader stored an error into `unrecoverable_status`.
+  bool HasUnrecoverableError() const { return has_unrecoverable_error_; }
+
  private:
   uint64_t corrupted_wal_number_ = kMaxSequenceNumber;
+  bool has_unrecoverable_error_ = false;
 };
 
 // While DB is the public interface of RocksDB, and DBImpl is the actual
@@ -1358,7 +1370,7 @@ class DBImpl : public DB
     recovered_transactions_.clear();
   }
 
-  void AddToLogsToFreeQueue(log::Writer* log_writer) {
+  void AddToLogsToFreeQueue(WalWriter* log_writer) {
     mutex_.AssertHeld();
     wals_to_free_queue_.push_back(log_writer);
   }
@@ -2373,25 +2385,54 @@ class DBImpl : public DB
 
   struct LogWriterNumber {
     // pass ownership of _writer
-    LogWriterNumber(uint64_t _number, log::Writer* _writer)
+    LogWriterNumber(uint64_t _number, WalWriter* _writer)
         : number(_number), writer(_writer) {}
 
-    log::Writer* ReleaseWriter() {
+    WalWriter* ReleaseWriter() {
       auto* w = writer;
       writer = nullptr;
       return w;
     }
-    Status ClearWriter() {
+    Status ClearWriter(FileSystem* fs) {
       Status s;
       if (writer->file()) {
-        // TODO: plumb Env::IOActivity, Env::IOPriority
-        s = writer->WriteBuffer(WriteOptions());
+        const WriteOptions write_options;
         if (attempt_truncate_size < SIZE_MAX &&
             attempt_truncate_size < writer->file()->GetFileSize()) {
-          Status s2 = writer->file()->writable_file()->Truncate(
-              attempt_truncate_size, IOOptions{}, nullptr);
-          // This is just a best effort attempt
-          s2.PermitUncheckedError();
+          TEST_SYNC_POINT("DBImpl::ClearWriter:SkippedSealForTruncate");
+          const std::string fname = writer->file()->file_name();
+          const bool use_direct_io = writer->file()->use_direct_io();
+          s = writer->WriteBuffer(write_options);
+          // Removing the failed batch remains best effort.
+          Status truncate_s;
+          if (!use_direct_io) {
+            // Buffered writes are all issued by now, so truncate the open
+            // handle; this needs no FileSystem::ReopenWritableFile support.
+            truncate_s = writer->file()->writable_file()->Truncate(
+                attempt_truncate_size, IOOptions{}, nullptr);
+          }
+          Status close_s = writer->file()->Close(IOOptions{}, nullptr);
+          if (s.ok()) {
+            s = close_s;
+          }
+          close_s.PermitUncheckedError();
+          writer->PublishIfClosed();
+          if (use_direct_io) {
+            // Direct I/O Close rewrites the aligned tail and trims to its own
+            // logical size, so truncate only after it can issue no more
+            // writes.
+            std::unique_ptr<FSWritableFile> truncate_file;
+            truncate_s = fs->ReopenWritableFile(fname, FileOptions(),
+                                                &truncate_file, nullptr);
+            if (truncate_s.ok()) {
+              truncate_s = truncate_file->Truncate(attempt_truncate_size,
+                                                   IOOptions{}, nullptr);
+              truncate_file->Close(IOOptions{}, nullptr).PermitUncheckedError();
+            }
+          }
+          truncate_s.PermitUncheckedError();
+        } else {
+          s = writer->Close(write_options);
         }
       }
       delete writer;
@@ -2433,7 +2474,7 @@ class DBImpl : public DB
     uint64_t number;
     // Visual Studio doesn't support deque's member to be noncopyable because
     // of a std::unique_ptr as a member.
-    log::Writer* writer;  // own
+    WalWriter* writer;  // own
 
    private:
     // true for some prefix of logs_
@@ -2453,7 +2494,7 @@ class DBImpl : public DB
         : need_wal_sync(need_sync), need_wal_dir_sync(need_sync) {}
     bool need_wal_sync = false;
     bool need_wal_dir_sync = false;
-    log::Writer* writer = nullptr;
+    WalWriter* writer = nullptr;
     WalFileNumberSize* wal_file_number_size = nullptr;
     uint64_t prev_size = SIZE_MAX;
   };
@@ -2724,18 +2765,16 @@ class DBImpl : public DB
 
   void SetupLogFileProcessing(uint64_t wal_number);
 
-  Status InitializeLogReader(uint64_t wal_number, bool is_retry,
-                             std::string& fname,
+  Status InitializeLogReader(
+      uint64_t wal_number, bool is_retry, std::string& fname,
 
-                             bool stop_replay_for_corruption,
-                             uint64_t min_wal_number,
-                             const PredecessorWALInfo& predecessor_wal_info,
-                             bool* const old_log_record,
-                             Status* const reporter_status,
-                             DBOpenLogRecordReadReporter* reporter,
-                             std::unique_ptr<log::Reader>& reader);
+      bool stop_replay_for_corruption, uint64_t min_wal_number,
+      const PredecessorWALInfo& predecessor_wal_info,
+      bool* const old_log_record, Status* const reporter_status,
+      DBOpenLogRecordReadReporter* reporter, bool* const open_error_ignored,
+      std::unique_ptr<WalReader>& reader);
   Status ProcessLogRecord(
-      Slice record, const std::unique_ptr<log::Reader>& reader,
+      Slice record, const std::unique_ptr<WalReader>& reader,
       const UnorderedMap<uint32_t, size_t>& running_ts_sz, uint64_t wal_number,
       const std::string& fname, bool read_only, int job_id,
       const std::function<void()>& logFileDropped,
@@ -2746,7 +2785,7 @@ class DBImpl : public DB
       std::unordered_map<int, VersionEdit>* version_edits, bool* flushed);
 
   Status InitializeWriteBatchForLogRecord(
-      Slice record, const std::unique_ptr<log::Reader>& reader,
+      Slice record, const std::unique_ptr<WalReader>& reader,
       const UnorderedMap<uint32_t, size_t>& running_ts_sz, WriteBatch* batch,
       std::unique_ptr<WriteBatch>& new_batch, WriteBatch*& batch_to_use,
       uint64_t* record_checksum);
@@ -2774,6 +2813,7 @@ class DBImpl : public DB
   Status UpdatePredecessorWALInfo(uint64_t wal_number,
                                   const SequenceNumber last_seqno_observed,
                                   const std::string& fname,
+                                  const WalReader* reader,
                                   PredecessorWALInfo& predecessor_wal_info);
 
   void FinishLogFileProcessing(const Status& status,
@@ -3046,16 +3086,15 @@ class DBImpl : public DB
                     size_t* write_with_wal, WriteBatch** to_be_cached_state);
 
   IOStatus WriteToWAL(const WriteBatch& merged_batch,
-                      const WriteOptions& write_options,
-                      log::Writer* log_writer, uint64_t* wal_used,
-                      uint64_t* log_size,
+                      const WriteOptions& write_options, WalWriter* log_writer,
+                      uint64_t* wal_used, uint64_t* log_size,
                       WalFileNumberSize& wal_file_number_size,
-                      SequenceNumber sequence);
+                      SequenceNumber sequence, size_t seq_inc);
 
   IOStatus WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
-                           log::Writer* log_writer, uint64_t* wal_used,
+                           WalWriter* log_writer, uint64_t* wal_used,
                            bool need_wal_sync, bool need_wal_dir_sync,
-                           SequenceNumber sequence,
+                           SequenceNumber sequence, size_t seq_inc,
                            WalFileNumberSize& wal_file_number_size);
 
   IOStatus ConcurrentWriteGroupToWAL(const WriteThread::WriteGroup& write_group,
@@ -3426,7 +3465,7 @@ class DBImpl : public DB
   // (logs_ and alive_wal_files_).
   struct UnpublishedWAL {
     uint64_t log_number = 0;
-    std::unique_ptr<log::Writer> writer;
+    std::unique_ptr<WalWriter> writer;
 
     UnpublishedWAL() = default;
     UnpublishedWAL(const UnpublishedWAL&) = delete;
@@ -3477,12 +3516,12 @@ class DBImpl : public DB
   // can be installed as the current WAL for foreground writes.
   IOStatus StartWALFile(const WriteOptions& write_options,
                         const PredecessorWALInfo& predecessor_wal_info,
-                        log::Writer* new_log);
+                        WalWriter* new_log);
   IOStatus CreateWAL(const DBOptions& db_options,
                      const WriteOptions& write_options, uint64_t log_file_num,
                      uint64_t recycle_log_number, size_t preallocate_block_size,
                      const PredecessorWALInfo& predecessor_wal_info,
-                     log::Writer** new_log);
+                     WalWriter** new_log);
 
   // Validate self-consistency of DB options
   static Status ValidateOptions(const DBOptions& db_options);
@@ -3918,7 +3957,7 @@ class DBImpl : public DB
 
   // If this is non-empty, we need to delete these log files in background
   // threads. Protected by wal_write_mutex_.
-  autovector<log::Writer*> wals_to_free_;
+  autovector<WalWriter*> wals_to_free_;
 
   // Written with mutex_ held. Read without mutex_ when creating a snapshot.
   std::atomic<bool> is_snapshot_supported_{true};
@@ -4029,7 +4068,7 @@ class DBImpl : public DB
   std::unordered_set<uint64_t> files_grabbed_for_purge_;
 
   // A queue to store log writers to close. Protected by db mutex_.
-  std::deque<log::Writer*> wals_to_free_queue_;
+  std::deque<WalWriter*> wals_to_free_queue_;
 
   std::deque<SuperVersion*> superversions_to_free_queue_;
 

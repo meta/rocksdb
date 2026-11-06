@@ -8,16 +8,34 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <algorithm>
+#include <cstring>
 #include <future>
+#include <limits>
 
+#include "db/blog/blog_format.h"
+#include "db/blog/blog_reader.h"
+#include "db/blog/blog_writer.h"
+#include "db/blog_wal_reader.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
+#include "db/legacy_wal_reader.h"
+#include "db/legacy_wal_writer.h"
+#include "db/wal_reader.h"
+#include "db/write_batch_internal.h"
+#include "file/sequence_file_reader.h"
+#include "file/writable_file_writer.h"
 #include "options/options_helper.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/file_system.h"
+#include "table/format.h"
 #include "test_util/sync_point.h"
+#include "test_util/testutil.h"
+#include "util/coding.h"
+#include "util/compression.h"
 #include "util/defer.h"
+#include "util/prefix_varint.h"
+#include "util/random.h"
 #include "util/udt_util.h"
 #include "utilities/fault_injection_env.h"
 #include "utilities/fault_injection_fs.h"
@@ -76,6 +94,1025 @@ class DBWALTestBase : public DBTestBase {
                                     EnvOptions()));
     ASSERT_OK(file->Append(contents));
     ASSERT_OK(file->Close());
+  }
+
+  void WriteWalForOpenTest(bool blog, std::string* contents,
+                           uint64_t* log_number) {
+    Options options = CurrentOptions();
+    options.use_blog_format_for_wals = blog;
+    options.wal_compression = kNoCompression;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key", "value"));
+    ASSERT_OK(db_->FlushWAL(true));
+    std::unique_ptr<LogFile> wal_file;
+    ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+    *log_number = wal_file->LogNumber();
+    ASSERT_OK(
+        ReadFileToString(env_, LogFileName(dbname_, *log_number), contents));
+  }
+
+  void OverwriteFile(const std::string& fname, const Slice& contents) {
+    std::unique_ptr<WritableFile> file;
+    ASSERT_OK(env_->NewWritableFile(fname, &file, EnvOptions()));
+    ASSERT_OK(file->Append(contents));
+    ASSERT_OK(file->Close());
+  }
+
+  // Location of a compact-format record within a blog file body.
+  struct CompactRecordLayout {
+    size_t escape_offset = 0;
+    size_t length_varint_offset = 0;
+    size_t varint_size = 0;
+    uint64_t payload_length = 0;
+    // One past the record's trailer, before any padding.
+    size_t end_offset = 0;
+  };
+
+  // Location of a full-format record. The type byte is followed by the
+  // compression byte and the 4-byte prefix checksum.
+  struct FullRecordLayout {
+    size_t escape_offset = 0;
+    size_t length_varint_offset = 0;
+    size_t varint_size = 0;
+    size_t type_offset = 0;
+    uint64_t payload_length = 0;
+  };
+
+  // Offset of the next escape sequence, given one past a record's trailer.
+  static size_t RecordEndWithPadding(const std::string& contents, size_t end) {
+    const uint8_t last_byte = static_cast<uint8_t>(contents[end - 1]);
+    size_t padding = (kBlogMinRecordAlignment - end % kBlogMinRecordAlignment) %
+                     kBlogMinRecordAlignment;
+    if (padding == 0 && (last_byte == 0x00 || last_byte == 0xFF)) {
+      padding = kBlogMinRecordAlignment;
+    }
+    return end + padding;
+  }
+
+  // Stops at the nth (0-based) body record of the requested format, filling
+  // whichever of `compact`/`full` matches `want_compact`.
+  void FindNthRecordOfFormat(const std::string& contents, size_t n,
+                             bool want_compact, CompactRecordLayout* compact,
+                             FullRecordLayout* full) {
+    Slice header_input(contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&header_input));
+    size_t pos = contents.size() - header_input.size();
+    while (pos < contents.size() &&
+           (contents[pos] == '\0' || contents[pos] == '\xff')) {
+      ++pos;
+    }
+    while (true) {
+      ASSERT_LT(pos + kBlogEscapeSequenceSize, contents.size());
+      ASSERT_EQ(pos % kBlogMinRecordAlignment, 0u);
+      ASSERT_EQ(memcmp(contents.data() + pos, header.escape_sequence,
+                       kBlogEscapeSequenceSize),
+                0);
+      const size_t varint_offset = pos + kBlogEscapeSequenceSize;
+      uint64_t length = 0;
+      const char* const varint_end =
+          GetPrefixVarint64Ptr(contents.data() + varint_offset,
+                               contents.data() + contents.size(), &length);
+      ASSERT_TRUE(varint_end != nullptr);
+      const size_t varint_size =
+          static_cast<size_t>(varint_end - (contents.data() + varint_offset));
+      const bool is_compact = varint_size <= kBlogCompactVarintMaxBytes;
+      ASSERT_TRUE(is_compact || length != kBlogUnspecifiedSize);
+      // Full-format records carry type + compression type + prefix checksum
+      // between the length varint and the payload.
+      const size_t kFullPrefixRestSize = 6;
+      const size_t payload_offset =
+          varint_offset + varint_size + (is_compact ? 0 : kFullPrefixRestSize);
+      const size_t end =
+          payload_offset + static_cast<size_t>(length) + kBlogBlockTrailerSize;
+      if (is_compact == want_compact) {
+        if (n == 0) {
+          if (want_compact) {
+            compact->escape_offset = pos;
+            compact->length_varint_offset = varint_offset;
+            compact->varint_size = varint_size;
+            compact->payload_length = length;
+            compact->end_offset = end;
+          } else {
+            full->escape_offset = pos;
+            full->length_varint_offset = varint_offset;
+            full->varint_size = varint_size;
+            full->type_offset = varint_offset + varint_size;
+            full->payload_length = length;
+          }
+          return;
+        }
+        --n;
+      }
+      ASSERT_LT(end, contents.size());
+      pos = RecordEndWithPadding(contents, end);
+    }
+  }
+
+  void FindNthCompactRecord(const std::string& contents, size_t n,
+                            CompactRecordLayout* layout) {
+    FindNthRecordOfFormat(contents, n, /*want_compact=*/true, layout, nullptr);
+  }
+
+  void FindNthFullRecord(const std::string& contents, size_t n,
+                         FullRecordLayout* layout) {
+    FindNthRecordOfFormat(contents, n, /*want_compact=*/false, nullptr, layout);
+  }
+
+  void FindFirstCompactRecord(const std::string& contents,
+                              size_t* length_varint_offset,
+                              uint64_t* payload_length) {
+    CompactRecordLayout layout;
+    FindNthCompactRecord(contents, 0, &layout);
+    *length_varint_offset = layout.length_varint_offset;
+    *payload_length = layout.payload_length;
+  }
+
+  // Fails the nth compact record's checksum while leaving its framing intact,
+  // so the reader identifies the boundary and then rejects the record.
+  void CorruptNthCompactRecordPayload(std::string* contents, size_t n) {
+    CompactRecordLayout layout;
+    FindNthCompactRecord(*contents, n, &layout);
+    ASSERT_GT(layout.payload_length, 2u);
+    (*contents)[layout.length_varint_offset + layout.varint_size + 2] ^= 0x01;
+  }
+
+  void CorruptFirstCompactRecordPayload(std::string* contents) {
+    CorruptNthCompactRecordPayload(contents, 0);
+  }
+
+  // Drops everything after the nth compact record's trailer, so that no
+  // record boundary follows the damage.
+  void TruncateAfterNthCompactRecord(std::string* contents, size_t n) {
+    CompactRecordLayout layout;
+    FindNthCompactRecord(*contents, n, &layout);
+    ASSERT_LE(layout.end_offset, contents->size());
+    contents->resize(layout.end_offset);
+  }
+
+  // Re-encodes the nth compact record with the unspecified-size length
+  // sentinel and drops everything after it. That record's extent is then
+  // defined only by the escape sequence of a record that does not exist,
+  // which is how a crash leaves the tail of a blog file that used the
+  // encoding. The payload and both checksums are rebuilt for the record's new
+  // framing, so the only unusual thing about the file is the encoding.
+  void RewriteNthCompactRecordAsUnspecifiedSizeTail(std::string* contents,
+                                                    size_t n) {
+    Slice header_input(*contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&header_input));
+
+    CompactRecordLayout layout;
+    FindNthCompactRecord(*contents, n, &layout);
+    const std::string payload(
+        contents->data() + layout.length_varint_offset + layout.varint_size,
+        static_cast<size_t>(layout.payload_length));
+    const char compression_byte =
+        (*contents)[layout.end_offset - kBlogBlockTrailerSize];
+
+    std::string record(header.escape_sequence, kBlogEscapeSequenceSize);
+    const size_t varint_start = record.size();
+    PutPrefixVarint64(&record, kBlogUnspecifiedSize);
+    record.push_back(static_cast<char>(header.compact_record_type));
+    record.push_back(compression_byte);
+    const uint32_t prefix_checksum =
+        ComputeBuiltinChecksum(header.checksum_type,
+                               record.data() + varint_start,
+                               record.size() - varint_start) +
+        ChecksumModifierForContext(header.incarnation_id(),
+                                   layout.escape_offset);
+    PutFixed32(&record, prefix_checksum);
+
+    const uint64_t payload_file_offset = layout.escape_offset + record.size();
+    record.append(payload);
+    record.push_back(compression_byte);
+    PutFixed32(&record, ComputeBlogRecordChecksum(
+                            header.checksum_type, payload.data(),
+                            payload.size(), compression_byte,
+                            header.incarnation_id(), payload_file_offset));
+    const BlogPadding pad(lossless_cast<uint8_t>(record.back()),
+                          layout.escape_offset + record.size());
+    pad.AppendTo(&record);
+
+    contents->resize(layout.escape_offset);
+    contents->append(record);
+  }
+
+  // Sets kBlogFileRecycled, as a recycled WAL file would carry.
+  void MarkBlogFileRecycled(std::string* contents) {
+    Slice header_input(*contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&header_input));
+    const size_t header_len = contents->size() - header_input.size();
+    header.flags = static_cast<uint8_t>(header.flags | kBlogFileRecycled);
+    std::string encoded;
+    header.EncodeTo(&encoded);
+    ASSERT_EQ(encoded.size(), header_len);
+    memcpy(&(*contents)[0], encoded.data(), header_len);
+  }
+
+  // Retypes a full-format record to a reserved value and repairs its prefix
+  // checksum, so the type is the only thing the reader objects to.
+  void SetFullRecordReservedType(std::string* contents,
+                                 const FullRecordLayout& layout,
+                                 uint8_t reserved_type) {
+    Slice header_input(*contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&header_input));
+    ASSERT_LE(layout.type_offset + 6, contents->size());
+    (*contents)[layout.type_offset] = static_cast<char>(reserved_type);
+    const uint32_t checksum =
+        ComputeBuiltinChecksum(header.checksum_type,
+                               contents->data() + layout.length_varint_offset,
+                               layout.varint_size + 2) +
+        ChecksumModifierForContext(header.incarnation_id(),
+                                   layout.escape_offset);
+    EncodeFixed32(&(*contents)[layout.type_offset + 2], checksum);
+  }
+
+  // Keeps the first status, as DBOpenLogRecordReadReporter does.
+  class CountingWalReporter : public log::Reader::Reporter {
+   public:
+    ~CountingWalReporter() override {
+      first_status.PermitUncheckedError();
+      first_tolerated.PermitUncheckedError();
+      last_status.PermitUncheckedError();
+    }
+
+    void Corruption(size_t /*bytes*/, const Status& s,
+                    uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+      ++corruption_count;
+      RecordFirst(s);
+      last_status = s;
+    }
+
+    void UnrecoverableError(size_t bytes, const Status& s,
+                            uint64_t log_number = kMaxSequenceNumber) override {
+      ++unrecoverable_count;
+      Corruption(bytes, s, log_number);
+    }
+
+    void ToleratedCorruption(
+        size_t /*bytes*/, const Status& s,
+        uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+      ++tolerated_count;
+      if (first_tolerated.ok()) {
+        first_tolerated = s;
+      }
+      last_status = s;
+    }
+
+    void OldLogRecord(size_t /*bytes*/) override { ++old_log_record_count; }
+
+    // Reports that would fail DB::Open, whatever channel they arrived on.
+    size_t failing_count() const { return corruption_count; }
+
+    size_t corruption_count = 0;
+    size_t unrecoverable_count = 0;
+    size_t tolerated_count = 0;
+    size_t old_log_record_count = 0;
+    Status first_status;
+    Status first_tolerated;
+    Status last_status;
+
+   private:
+    void RecordFirst(const Status& s) {
+      if (first_status.ok()) {
+        first_status = s;
+      }
+    }
+  };
+
+  // Serves contents the test can grow between reads, as a live WAL does.
+  class GrowingSequentialFile : public FSSequentialFile {
+   public:
+    explicit GrowingSequentialFile(const std::string* contents)
+        : contents_(contents) {}
+
+    IOStatus Read(size_t n, const IOOptions& /*opts*/, Slice* result,
+                  char* scratch, IODebugContext* /*dbg*/) override {
+      ++read_count;
+      n = std::min(n, contents_->size() - offset_);
+      if (n > 0) {
+        memcpy(scratch, contents_->data() + offset_, n);
+        offset_ += n;
+      }
+      *result = Slice(scratch, n);
+      return IOStatus::OK();
+    }
+
+    IOStatus Skip(uint64_t n) override {
+      offset_ += static_cast<size_t>(n);
+      return IOStatus::OK();
+    }
+
+    size_t read_count = 0;
+
+   private:
+    const std::string* contents_;
+    size_t offset_ = 0;
+  };
+
+  // Serves fixed contents and fails every read at or past `fail_at_offset`.
+  class FaultySequentialFile : public FSSequentialFile {
+   public:
+    FaultySequentialFile(std::string contents, size_t fail_at_offset)
+        : contents_(std::move(contents)), fail_at_(fail_at_offset) {}
+
+    IOStatus Read(size_t n, const IOOptions& /*opts*/, Slice* result,
+                  char* scratch, IODebugContext* /*dbg*/) override {
+      ++read_count;
+      if (offset_ >= fail_at_) {
+        return IOStatus::IOError("injected read failure");
+      }
+      n = std::min(n, std::min(fail_at_, contents_.size()) - offset_);
+      if (n > 0) {
+        memcpy(scratch, contents_.data() + offset_, n);
+        offset_ += n;
+      }
+      *result = Slice(scratch, n);
+      return IOStatus::OK();
+    }
+
+    IOStatus Skip(uint64_t n) override {
+      offset_ += static_cast<size_t>(n);
+      return IOStatus::OK();
+    }
+
+    size_t read_count = 0;
+
+   private:
+    const std::string contents_;
+    const size_t fail_at_;
+    size_t offset_ = 0;
+  };
+
+  // Fails sequential reads at or past `fail_at`, surfacing a mid-file
+  // device error. Reads before it behave normally.
+  class FailReadsPastOffsetFile : public FSSequentialFileOwnerWrapper {
+   public:
+    FailReadsPastOffsetFile(std::unique_ptr<FSSequentialFile> base,
+                            uint64_t fail_at)
+        : FSSequentialFileOwnerWrapper(std::move(base)), fail_at_(fail_at) {}
+
+    IOStatus Read(size_t n, const IOOptions& opts, Slice* result, char* scratch,
+                  IODebugContext* dbg) override {
+      if (position_ >= fail_at_) {
+        return IOStatus::IOError("injected mid-file read failure");
+      }
+      // Clamp at the fault so the primed prefix ends here and the first
+      // read touching it fails, whatever the reader's block size.
+      n = std::min(n, static_cast<size_t>(fail_at_ - position_));
+      IOStatus s =
+          FSSequentialFileOwnerWrapper::Read(n, opts, result, scratch, dbg);
+      if (s.ok()) {
+        position_ += result->size();
+      }
+      return s;
+    }
+
+    IOStatus Skip(uint64_t n) override {
+      position_ += static_cast<size_t>(n);
+      return FSSequentialFileOwnerWrapper::Skip(n);
+    }
+
+    IOStatus PositionedRead(uint64_t offset, size_t n, const IOOptions& opts,
+                            Slice* result, char* scratch,
+                            IODebugContext* dbg) override {
+      if (offset >= fail_at_) {
+        return IOStatus::IOError("injected mid-file read failure");
+      }
+      return FSSequentialFileOwnerWrapper::PositionedRead(offset, n, opts,
+                                                          result, scratch, dbg);
+    }
+
+   private:
+    const uint64_t fail_at_;
+    uint64_t position_ = 0;
+  };
+
+  // Fails sequential reads past `fail_at` for files whose name ends with
+  // `target_suffix`, so WAL recovery hits a device error mid-file.
+  class FailWalReadsPastOffsetFS : public FileSystemWrapper {
+   public:
+    FailWalReadsPastOffsetFS(const std::shared_ptr<FileSystem>& base,
+                             std::string target_suffix, uint64_t fail_at)
+        : FileSystemWrapper(base),
+          target_suffix_(std::move(target_suffix)),
+          fail_at_(fail_at) {}
+
+    const char* Name() const override { return "FailWalReadsPastOffsetFS"; }
+
+    IOStatus NewSequentialFile(const std::string& f,
+                               const FileOptions& file_opts,
+                               std::unique_ptr<FSSequentialFile>* r,
+                               IODebugContext* dbg) override {
+      IOStatus s = FileSystemWrapper::NewSequentialFile(f, file_opts, r, dbg);
+      if (s.ok() && f.size() >= target_suffix_.size() &&
+          f.compare(f.size() - target_suffix_.size(), target_suffix_.size(),
+                    target_suffix_) == 0) {
+        r->reset(new FailReadsPastOffsetFile(std::move(*r), fail_at_));
+      }
+      return s;
+    }
+
+   private:
+    const std::string target_suffix_;
+    const uint64_t fail_at_;
+  };
+
+  // Fails the first FileSystem::GetFileSize for a WAL file once the WAL was
+  // opened for reading, then forwards normally. Recovery reads each WAL fully
+  // before UpdatePredecessorWALInfo stats it, so the single failure lands on
+  // that call; later stats (alive-log restore, truncation) succeed.
+  class WalGetFileSizeFailFS : public FileSystemWrapper {
+   public:
+    WalGetFileSizeFailFS(const std::shared_ptr<FileSystem>& base,
+                         std::string target_suffix)
+        : FileSystemWrapper(base), target_suffix_(std::move(target_suffix)) {}
+
+    const char* Name() const override { return "WalGetFileSizeFailFS"; }
+
+    IOStatus NewSequentialFile(const std::string& f,
+                               const FileOptions& file_opts,
+                               std::unique_ptr<FSSequentialFile>* r,
+                               IODebugContext* dbg) override {
+      if (IsTarget(f)) {
+        wal_opened_for_read_.store(true);
+      }
+      return FileSystemWrapper::NewSequentialFile(f, file_opts, r, dbg);
+    }
+
+    IOStatus GetFileSize(const std::string& f, const IOOptions& options,
+                         uint64_t* file_size, IODebugContext* dbg) override {
+      if (IsTarget(f) && wal_opened_for_read_.load() &&
+          !failed_once_.exchange(true)) {
+        failed_count_.fetch_add(1);
+        return IOStatus::IOError("injected WAL GetFileSize failure");
+      }
+      return FileSystemWrapper::GetFileSize(f, options, file_size, dbg);
+    }
+
+    size_t failed_count() const { return failed_count_.load(); }
+
+   private:
+    bool IsTarget(const std::string& f) const {
+      return f.size() >= target_suffix_.size() &&
+             f.compare(f.size() - target_suffix_.size(), target_suffix_.size(),
+                       target_suffix_) == 0;
+    }
+
+    const std::string target_suffix_;
+    std::atomic<bool> wal_opened_for_read_{false};
+    std::atomic<bool> failed_once_{false};
+    std::atomic<size_t> failed_count_{0};
+  };
+
+  std::unique_ptr<WalReader> NewWalReaderOver(
+      std::unique_ptr<FSSequentialFile> source, const std::string& fname,
+      log::Reader::Reporter* reporter, uint64_t log_number) {
+    std::unique_ptr<SequentialFileReader> file_reader(
+        new SequentialFileReader(std::move(source), fname));
+    std::unique_ptr<WalReaderOpenState> pending_open;
+    return NewWalReader(nullptr, std::move(file_reader), reporter,
+                        /*checksum=*/true, log_number,
+                        /*track_and_verify_wals=*/false,
+                        /*stop_replay_for_corruption=*/false,
+                        std::numeric_limits<uint64_t>::max(),
+                        PredecessorWALInfo(), /*buffered=*/false,
+                        &pending_open);
+  }
+
+  // Opens a WAL reader over in-memory contents, which must outlive the reader.
+  std::unique_ptr<WalReader> NewMemWalReader(const std::string* contents,
+                                             log::Reader::Reporter* reporter,
+                                             uint64_t log_number) {
+    return NewWalReaderOver(
+        std::unique_ptr<FSSequentialFile>(new GrowingSequentialFile(contents)),
+        "mem-blog-wal", reporter, log_number);
+  }
+
+  // Drains a WAL reader, returning how many records it yielded.
+  size_t ReadAllRecords(WalReader* reader, WALRecoveryMode mode) {
+    Slice record;
+    std::string scratch;
+    size_t records = 0;
+    while (reader->ReadRecord(&record, &scratch, mode)) {
+      ++records;
+    }
+    return records;
+  }
+
+  struct BlogWalRecordLayout {
+    uint64_t record_offset;
+    uint64_t payload_offset;
+    uint64_t length;
+  };
+
+  // Locates the WriteBatch records in blog WAL bytes: offsets from
+  // BlogFileReader plus a framing peek for payload starts.
+  std::vector<BlogWalRecordLayout> ParseBlogWalRecordLayout(
+      const std::string& contents) {
+    std::vector<BlogWalRecordLayout> layout;
+    std::unique_ptr<FSSequentialFile> source(
+        new GrowingSequentialFile(&contents));
+    std::unique_ptr<SequentialFileReader> file_reader(
+        new SequentialFileReader(std::move(source), "layout-wal"));
+    BlogFileReader reader(std::move(file_reader), /*reporter=*/nullptr,
+                          /*verify_checksums=*/true);
+    BlogFileHeader header;
+    if (!reader.ReadHeader(&header).ok()) {
+      ADD_FAILURE() << "unreadable blog WAL header";
+      return layout;
+    }
+    BlogRecordType type;
+    Slice record;
+    std::string scratch;
+    uint64_t record_offset = 0;
+    Status s;
+    while ((s = reader.ReadRecord(&type, &record, &scratch, &record_offset))
+               .ok()) {
+      if (type != kBlogWriteBatchRecord) {
+        continue;
+      }
+      const size_t varint_off = record_offset + kBlogEscapeSequenceSize;
+      if (varint_off >= contents.size()) {
+        ADD_FAILURE() << "record runs past end of file";
+        return layout;
+      }
+      const size_t varint_len =
+          PrefixVarint64AddlByteCount(contents[varint_off]) + 1;
+      uint64_t payload_off = varint_off + varint_len;
+      if (varint_len > kBlogCompactVarintMaxBytes) {
+        payload_off += 6;  // type + compression + prefix checksum
+      }
+      layout.push_back(
+          {record_offset, payload_off, static_cast<uint64_t>(record.size())});
+    }
+    if (!s.IsNotFound()) {
+      ADD_FAILURE() << "layout walk failed: " << s.ToString();
+    }
+    return layout;
+  }
+
+  // Builds a two-batch hand-built WAL and returns the second record's
+  // escape-sequence offset, so tests can replace what follows it.
+  size_t CutBeforeSecondBlogRecord(std::string* contents, bool recycled,
+                                   uint64_t log_number) {
+    {
+      std::unique_ptr<BlogFileWriter> writer =
+          MakeHandBuiltWalWriter(contents, log_number, recycled);
+      EXPECT_OK(writer->WriteHeader(WriteOptions()));
+      EXPECT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch-one",
+                                            kNoCompression));
+      EXPECT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch-two",
+                                            kNoCompression));
+      EXPECT_OK(writer->Close(WriteOptions()));
+    }
+    std::vector<BlogWalRecordLayout> layout =
+        ParseBlogWalRecordLayout(*contents);
+    EXPECT_EQ(layout.size(), 2u);
+    return static_cast<size_t>(layout[1].record_offset);
+  }
+
+  // A byte that is neither padding nor equal to `avoid`.
+  static char NonPaddingByteOtherThan(char avoid) {
+    return avoid == '\xab' ? '\xcd' : '\xab';
+  }
+
+  // Asserts that, in every recovery mode, `contents` yields its first record
+  // and then ends as a stale recycled tail: nothing failing, tolerated, or
+  // unrecoverable is reported, and only kPointInTimeRecovery gets the
+  // old-record signal that checks the next WAL's continuity.
+  void AssertFirstRecordThenStaleTail(const std::string& contents,
+                                      uint64_t log_number) {
+    for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                                 WALRecoveryMode::kAbsoluteConsistency,
+                                 WALRecoveryMode::kPointInTimeRecovery,
+                                 WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+      SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+      CountingWalReporter reporter;
+      std::unique_ptr<WalReader> reader =
+          NewMemWalReader(&contents, &reporter, log_number);
+      ASSERT_EQ(ReadAllRecords(reader.get(), mode), 1u);
+      ASSERT_EQ(reporter.failing_count(), 0u)
+          << reporter.first_status.ToString();
+      ASSERT_EQ(reporter.tolerated_count, 0u)
+          << reporter.first_tolerated.ToString();
+      ASSERT_EQ(reporter.unrecoverable_count, 0u);
+      ASSERT_EQ(reporter.old_log_record_count,
+                mode == WALRecoveryMode::kPointInTimeRecovery ? 1u : 0u);
+    }
+  }
+
+  struct TornWalFixture {
+    std::string fname;
+    size_t torn_size = 0;
+    size_t batch_count = 0;
+  };
+
+  // Reads a blog WAL fully: counts the WriteBatch records delivered and
+  // returns the terminal status.
+  static Status CountWalBatches(const std::string& contents, size_t* batches) {
+    *batches = 0;
+    std::unique_ptr<FSSequentialFile> source(
+        new GrowingSequentialFile(&contents));
+    std::unique_ptr<SequentialFileReader> file_reader(
+        new SequentialFileReader(std::move(source), "count-wal"));
+    BlogFileReader reader(std::move(file_reader), /*reporter=*/nullptr,
+                          /*verify_checksums=*/true);
+    BlogFileHeader header;
+    Status s = reader.ReadHeader(&header);
+    if (!s.ok()) {
+      return s;
+    }
+    BlogRecordType type;
+    Slice record;
+    std::string scratch;
+    while ((s = reader.ReadRecord(&type, &record, &scratch)).ok()) {
+      *batches += (type == kBlogWriteBatchRecord) ? 1 : 0;
+    }
+    return s;
+  }
+
+  // Writes key1/key2 to a blog WAL, seals it with Close(), then truncates
+  // the last record's tail: mid-padding (every record intact) or mid-record
+  // (the last record torn). The truncate must come after Close(): truncating
+  // the live file lets Close() rewrite the footer at the writer's remembered
+  // end offset, backfilling the cut range with zeros (valid padding) and
+  // hiding the tear from recovery.
+  void BuildTornWal(TornWalFixture* fixture, bool tear_mid_record) {
+    fixture->torn_size = 0;
+    Options options = CurrentOptions();
+    options.use_blog_format_for_wals = true;
+    // Keep the torn WAL live across closes: a shutdown flush would obsolete
+    // it and the reopen would skip replaying it.
+    options.avoid_flush_during_shutdown = true;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key1", "value1"));
+    ASSERT_OK(Put("key2", "value2"));
+    ASSERT_OK(db_->FlushWAL(true));
+
+    std::unique_ptr<LogFile> wal_file;
+    ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+    fixture->fname = LogFileName(dbname_, wal_file->LogNumber());
+    std::string complete_contents;
+    ASSERT_OK(ReadFileToString(env_, fixture->fname, &complete_contents));
+
+    const std::vector<BlogWalRecordLayout> layout =
+        ParseBlogWalRecordLayout(complete_contents);
+    ASSERT_GE(layout.size(), 2u);
+    const size_t last_end = static_cast<size_t>(layout.back().payload_offset +
+                                                layout.back().length) +
+                            kBlogBlockTrailerSize;
+    ASSERT_LT(last_end, complete_contents.size());
+    const size_t gap = complete_contents.size() - last_end;
+    ASSERT_GE(gap, 2u) << "fixture lacks a 2-byte last gap; adjust keys";
+    ASSERT_LE(gap, 3u) << "non-canonical trailing gap";
+    const size_t torn = tear_mid_record ? last_end - 1 : last_end + 1;
+
+    // Self-check: the torn prefix delivers the intact records, then
+    // Incomplete.
+    {
+      size_t batches = 0;
+      const Status s =
+          CountWalBatches(complete_contents.substr(0, torn), &batches);
+      ASSERT_TRUE(s.IsIncomplete()) << s.ToString();
+      ASSERT_EQ(batches, tear_mid_record ? layout.size() - 1 : layout.size());
+    }
+
+    Close();
+    ASSERT_OK(test::TruncateFile(env_, fixture->fname, torn));
+    uint64_t size_after = 0;
+    ASSERT_OK(env_->GetFileSize(fixture->fname, &size_after));
+    ASSERT_EQ(size_after, torn);
+    fixture->torn_size = torn;
+    fixture->batch_count = layout.size();
+  }
+
+  // Asserts the WAL on disk is really cut off at the fixture's torn size:
+  // the intact records deliver, then Incomplete. Without this, a test whose
+  // file regrew before reopen would pass without recovery ever facing the
+  // tear.
+  void AssertWalIsCutOff(const TornWalFixture& fixture, bool tear_mid_record) {
+    uint64_t size = 0;
+    ASSERT_OK(env_->GetFileSize(fixture.fname, &size));
+    ASSERT_EQ(size, fixture.torn_size);
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env_, fixture.fname, &contents));
+    size_t batches = 0;
+    const Status s = CountWalBatches(contents, &batches);
+    ASSERT_TRUE(s.IsIncomplete()) << s.ToString();
+    ASSERT_EQ(batches,
+              tear_mid_record ? fixture.batch_count - 1 : fixture.batch_count);
+  }
+
+  // Header for a hand-built WAL whose escape sequence matches `log_number`,
+  // so BlogWalReader accepts it. Declares BuiltinV2 per-record compression
+  // compatibility without streaming.
+  BlogFileHeader MakeBuiltinV2WalHeader(uint64_t log_number) {
+    BlogFileHeader header;
+    header.checksum_type = kXXH3;
+    header.compact_record_type = kBlogWriteBatchRecord;
+    header.GenerateWalFromUniqueId("db-id", "session-id", log_number);
+    header.SetProperty(kBlogPropRole, "wal");
+    header.SetProperty(kBlogPropCompressionCompatibilityName, "BuiltinV2");
+    return header;
+  }
+
+  // Header for a hand-built streaming WAL whose escape sequence matches
+  // `log_number`, so BlogWalReader accepts it. `streaming_type` is the hex
+  // value of the declared streaming type.
+  BlogFileHeader MakeStreamingWalHeader(uint64_t log_number,
+                                        const std::string& streaming_type) {
+    BlogFileHeader header = MakeBuiltinV2WalHeader(log_number);
+    header.SetProperty(kBlogPropWriteBatchStreamingCompressionType,
+                       streaming_type);
+    return header;
+  }
+
+  // Opens a BlogFileWriter over `contents` for a hand-built WAL.
+  std::unique_ptr<BlogFileWriter> MakeHandBuiltWalWriterWithHeader(
+      std::string* contents, const BlogFileHeader& header) {
+    std::unique_ptr<WritableFileWriter> file_writer(
+        new WritableFileWriter(std::unique_ptr<FSWritableFile>(
+                                   new test::StringFS::StringSink(contents)),
+                               "" /* file name */, FileOptions()));
+    return std::make_unique<BlogFileWriter>(
+        std::move(file_writer), header,
+        BlogUnspecifiedSizeRecords::kDisallowed);
+  }
+
+  // Opens a BlogFileWriter for a hand-built WAL declaring no compression
+  // properties. `log_number` must match the reading log number.
+  std::unique_ptr<BlogFileWriter> MakeHandBuiltWalWriter(std::string* contents,
+                                                         uint64_t log_number,
+                                                         bool recycled) {
+    BlogFileHeader header;
+    header.checksum_type = kXXH3;
+    header.compact_record_type = kBlogWriteBatchRecord;
+    if (recycled) {
+      header.flags = static_cast<uint8_t>(header.flags | kBlogFileRecycled);
+    }
+    header.GenerateWalFromUniqueId("db-id", "session-id", log_number);
+    return MakeHandBuiltWalWriterWithHeader(contents, header);
+  }
+
+  // Opens a BlogFileWriter for a hand-built streaming WAL.
+  std::unique_ptr<BlogFileWriter> MakeHandBuiltStreamingWalWriter(
+      std::string* contents, uint64_t log_number,
+      const std::string& streaming_type) {
+    return MakeHandBuiltWalWriterWithHeader(
+        contents, MakeStreamingWalHeader(log_number, streaming_type));
+  }
+
+  // Opens a BlogFileWriter for a hand-built (non-streaming) WAL
+  // declaring BuiltinV2 compression compatibility.
+  std::unique_ptr<BlogFileWriter> MakeHandBuiltWalWriter(std::string* contents,
+                                                         uint64_t log_number) {
+    return MakeHandBuiltWalWriterWithHeader(contents,
+                                            MakeBuiltinV2WalHeader(log_number));
+  }
+
+  // Flips a full-format record's type byte to `new_type`, repairing its
+  // prefix checksum. The header is decoded from the file bytes, since
+  // header construction randomizes the escape for these test IDs.
+  void RewriteFullRecordType(std::string* contents, uint64_t record_offset,
+                             uint8_t new_type) {
+    FullRecordLayout layout;
+    layout.escape_offset = record_offset;
+    layout.length_varint_offset = record_offset + kBlogEscapeSequenceSize;
+    Slice varint_input(contents->data() + layout.length_varint_offset,
+                       contents->size() - layout.length_varint_offset);
+    ASSERT_TRUE(GetPrefixVarint64(&varint_input, &layout.payload_length));
+    layout.varint_size =
+        contents->size() - layout.length_varint_offset - varint_input.size();
+    ASSERT_GT(layout.varint_size, kBlogCompactVarintMaxBytes);
+    layout.type_offset = layout.length_varint_offset + layout.varint_size;
+    SetFullRecordReservedType(contents, layout, new_type);
+  }
+
+  // Compresses each input in order as one ZSTD stream; returns the
+  // per-record fragments.
+  std::vector<std::string> CompressStreamFragments(
+      const std::vector<std::string>& inputs) {
+    std::vector<std::string> fragments;
+    std::unique_ptr<StreamingCompress> compress = StreamingCompress::Create(
+        kZSTD, CompressionOptions(), /*compress_format_version=*/2,
+        /*max_output_len=*/0);
+    if (compress == nullptr) {
+      ADD_FAILURE() << "ZSTD streaming compression unavailable";
+      return fragments;
+    }
+    for (const std::string& input : inputs) {
+      fragments.emplace_back();
+      EXPECT_OK(compress->CompressAndFlush(input, &fragments.back()));
+    }
+    return fragments;
+  }
+
+  uint64_t WalLogNumberFromFname(const std::string& fname) {
+    const std::string base = fname.substr(fname.find_last_of('/') + 1);
+    uint64_t log_number = 0;
+    FileType type = kWalFile;
+    EXPECT_TRUE(ParseFileName(base, &log_number, &type));
+    EXPECT_EQ(type, kWalFile);
+    return log_number;
+  }
+
+  // Corrupts a compact record's length varint in place. A longer encoding
+  // overwrites leading payload bytes so that later records stay put.
+  void OverwriteCompactRecordLength(size_t length_varint_offset,
+                                    uint64_t length,
+                                    size_t expected_encoded_size,
+                                    std::string* contents) {
+    char encoded[kMaxPrefixVarint64Length];
+    char* const end = EncodePrefixVarint64(encoded, length);
+    ASSERT_EQ(static_cast<size_t>(end - encoded), expected_encoded_size);
+    ASSERT_LE(expected_encoded_size, kBlogCompactVarintMaxBytes);
+    ASSERT_LE(length_varint_offset + expected_encoded_size, contents->size());
+    memcpy(contents->data() + length_varint_offset, encoded,
+           expected_encoded_size);
+  }
+
+  void WriteThreeRecordBlogWal(const Options& options, std::string* fname) {
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key1", "value1"));
+    ASSERT_OK(Put("key2", "value2"));
+    ASSERT_OK(Put("key3", "value3"));
+    VectorWalPtr log_files;
+    ASSERT_OK(db_->GetSortedWalFiles(log_files));
+    ASSERT_EQ(log_files.size(), 1);
+    *fname = LogFileName(dbname_, log_files[0]->LogNumber());
+    Close();
+  }
+
+  // Blog twin of GetCompressedWalsAfterSync's flow: rotates a WAL before its
+  // first record so it stays header-only, syncs, and checks the header-only
+  // WAL is listed. `streaming` selects blog_wal_streaming_compression (with
+  // ZSTD); otherwise wal_compression stays kNoCompression.
+  void CheckBlogWalsAfterSync(CompressionType wal_compression, bool streaming) {
+    Options options = GetDefaultOptions();
+    options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+    options.create_if_missing = true;
+    options.env = env_;
+    options.avoid_flush_during_recovery = true;
+    // No shutdown flush: Close must not need the background pool blocked
+    // below.
+    options.avoid_flush_during_shutdown = true;
+    options.track_and_verify_wals_in_manifest = true;
+    options.use_blog_format_for_wals = true;
+    options.wal_compression = wal_compression;
+    options.blog_wal_streaming_compression = streaming;
+
+    // Stop background flush so that no WAL is deleted before it is listed.
+    options.env->SetBackgroundThreads(1, Env::HIGH);
+    test::SleepingBackgroundTask sleeping_task;
+    options.env->Schedule(&test::SleepingBackgroundTask::DoSleepTask,
+                          &sleeping_task, Env::Priority::HIGH);
+    // Release the pool on every exit, including a failed assertion, so the
+    // background thread never outlives `sleeping_task`.
+    Defer wake_background([&sleeping_task]() {
+      sleeping_task.WakeUp();
+      sleeping_task.WaitUntilDone();
+    });
+
+    DestroyAndReopen(options);
+
+    // Write something to memtable and WAL so that wal_empty_ will be false
+    // after next DB::Open().
+    ASSERT_OK(Put("a", "v"));
+
+    Reopen(options);
+
+    // New WAL is created, thanks to !wal_empty_.
+    ASSERT_OK(dbfull()->TEST_SwitchWAL());
+
+    ASSERT_OK(Put("b", "v"));
+
+    ASSERT_OK(db_->SyncWAL());
+
+    VectorLogPtr wals;
+    ASSERT_OK(dbfull()->GetSortedWalFiles(wals));
+    // The header-only middle WAL must be listed, not dropped.
+    ASSERT_EQ(wals.size(), 3u);
+    std::vector<uint64_t> listed;
+    for (const auto& w : wals) {
+      listed.push_back(w->LogNumber());
+    }
+    std::vector<uint64_t> on_disk;
+    {
+      std::vector<std::string> files;
+      ASSERT_OK(env_->GetChildren(dbname_, &files));
+      for (const auto& file : files) {
+        uint64_t number = 0;
+        FileType type = kWalFile;
+        if (ParseFileName(file, &number, &type) && type == kWalFile) {
+          on_disk.push_back(number);
+        }
+      }
+    }
+    std::sort(listed.begin(), listed.end());
+    std::sort(on_disk.begin(), on_disk.end());
+    ASSERT_EQ(listed, on_disk);
+  }
+
+  // Reads the min/maxSequence footer properties of a sealed blog WAL file.
+  // Returns NotFound if the file has no footer properties record or no
+  // sequence range (e.g. it holds no sequence-consuming records).
+  Status ReadBlogWalFooterSequenceRange(const std::string& fname,
+                                        uint64_t* min_sequence,
+                                        uint64_t* max_sequence) {
+    assert(min_sequence != nullptr);
+    assert(max_sequence != nullptr);
+    std::unique_ptr<FSSequentialFile> file;
+    FileOptions file_options;
+    Status s = env_->GetFileSystem()->NewSequentialFile(fname, file_options,
+                                                        &file, /*dbg=*/nullptr);
+    if (!s.ok()) {
+      return s;
+    }
+    auto file_reader =
+        std::make_unique<SequentialFileReader>(std::move(file), fname);
+    BlogFileReader reader(std::move(file_reader), /*reporter=*/nullptr,
+                          /*verify_checksums=*/true);
+    BlogFileHeader header;
+    s = reader.ReadHeader(&header);
+    if (!s.ok()) {
+      return s;
+    }
+    BlogRecordType type;
+    Slice record;
+    std::string scratch;
+    while ((s = reader.ReadRecord(&type, &record, &scratch)).ok()) {
+      if (type != kBlogFooterPropertiesRecord) {
+        continue;
+      }
+      BlogFileFooterProperties properties;
+      s = properties.DecodeFrom(record);
+      if (!s.ok()) {
+        return s;
+      }
+      bool found_min = false;
+      bool found_max = false;
+      for (const auto& [name, value] : properties.properties) {
+        Slice encoded(value);
+        if (name == "minSequence") {
+          if (!GetPrefixVarint64(&encoded, min_sequence) || !encoded.empty()) {
+            return Status::Corruption("bad minSequence encoding");
+          }
+          found_min = true;
+        } else if (name == "maxSequence") {
+          if (!GetPrefixVarint64(&encoded, max_sequence) || !encoded.empty()) {
+            return Status::Corruption("bad maxSequence encoding");
+          }
+          found_max = true;
+        }
+      }
+      if (!found_min || !found_max) {
+        return Status::NotFound("sequence range absent from footer");
+      }
+      return Status::OK();
+    }
+    if (s.IsNotFound()) {
+      return Status::NotFound("no footer properties record");
+    }
+    return s;
+  }
+
+  // Creates a live blog WAL reusing a retired larger WAL file, so the
+  // recycled file starts with a stale tail. Requires recycle_log_file_num > 0
+  // in options. Uses TEST_SwitchMemtable (not TEST_SwitchWAL) so rotation is
+  // deterministic and schedules no background flushes.
+  void CreateRecycledBlogWal(const Options& options, std::string* fname,
+                             uint64_t* log_number) {
+    Options setup_options = options;
+    // Recycling is sanitized away under Tolerate/Absolute; PIT keeps it.
+    setup_options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+    DestroyAndReopen(setup_options);
+    for (int i = 0; i < 200; ++i) {
+      ASSERT_OK(Put("bulk" + std::to_string(i), std::string(500, 'x')));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+    JobContext job_context(0);
+    dbfull()->TEST_LockMutex();
+    dbfull()->FindObsoleteFiles(&job_context, true /* force */);
+    dbfull()->TEST_UnlockMutex();
+    dbfull()->PurgeObsoleteFiles(job_context);
+    job_context.Clean();
+    ASSERT_OK(Put("key2", "value2"));
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    ASSERT_OK(Put("key3", "value3"));
+    ASSERT_OK(Put("key3b", "value3b"));
+    VectorWalPtr log_files;
+    ASSERT_OK(db_->GetSortedWalFiles(log_files));
+    ASSERT_EQ(log_files.size(), 2);
+    *log_number = log_files[1]->LogNumber();
+    *fname = LogFileName(dbname_, *log_number);
+    uint64_t size = 0;
+    ASSERT_OK(env_->GetFileSize(*fname, &size));
+    ASSERT_GT(size, 50 * 1024);
   }
 
 #if defined(ROCKSDB_PLATFORM_POSIX)
@@ -417,6 +1454,8 @@ class DBWALTestWithTimestamp
                                     bool avoid_flush_during_recovery = false) {
     Options default_options = CurrentOptions();
     default_options.create_if_missing = false;
+    default_options.use_blog_format_for_wals =
+        ts_options.use_blog_format_for_wals;
     default_options.allow_concurrent_memtable_write =
         persist_udt ? true : false;
     default_options.avoid_flush_during_recovery = avoid_flush_during_recovery;
@@ -573,6 +1612,30 @@ TEST_P(DBWALTestWithTimestamp, RecoverAndFlush) {
     GetFullHistoryTsLowFromU64CutoffTs(&write_ts_slice, &effective_cutoff);
     ASSERT_EQ(effective_cutoff, full_history_ts_low);
   }
+}
+
+TEST_P(DBWALTestWithTimestamp, RecoverBlogWal) {
+  std::string timestamp;
+  PutFixed64(&timestamp, 1);
+  Options ts_options;
+  ts_options.create_if_missing = true;
+  ts_options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  ts_options.persist_user_defined_timestamps =
+      test::ShouldPersistUDT(GetParam());
+  ts_options.use_blog_format_for_wals = true;
+
+  ASSERT_OK(CreateAndReopenWithTs({"pikachu"}, ts_options,
+                                  ts_options.persist_user_defined_timestamps,
+                                  /*avoid_flush_during_recovery=*/true));
+  ASSERT_OK(Put(1, "key", timestamp, "value"));
+  ASSERT_OK(ReopenColumnFamiliesWithTs(
+      {"pikachu"}, ts_options, ts_options.persist_user_defined_timestamps,
+      /*avoid_flush_during_recovery=*/true));
+
+  Slice read_timestamp = timestamp;
+  ReadOptions read_options;
+  read_options.timestamp = &read_timestamp;
+  CheckGet(read_options, 1, "key", "value", timestamp);
 }
 
 // Param 0: test mode for the user-defined timestamp feature
@@ -980,10 +2043,11 @@ class DBRecoveryTestBlobError
   std::string sync_point_;
 };
 
-INSTANTIATE_TEST_CASE_P(DBRecoveryTestBlobError, DBRecoveryTestBlobError,
-                        ::testing::ValuesIn(std::vector<std::string>{
-                            "BlobFileBuilder::WriteBlobToFile:AddRecord",
-                            "BlobFileBuilder::WriteBlobToFile:AppendFooter"}));
+INSTANTIATE_TEST_CASE_P(
+    DBRecoveryTestBlobError, DBRecoveryTestBlobError,
+    ::testing::ValuesIn(std::vector<std::string>{
+        "BlobFileBuilder::WriteBlobToFile:AddRecord",
+        "BlobFileBuilder::WriteBlobToFile:LegacyAppendFooterAndClose"}));
 
 TEST_P(DBRecoveryTestBlobError, RecoverWithBlobError) {
   // Write a value. Note that blob files are not actually enabled at this point.
@@ -1425,6 +2489,42 @@ TEST_F(DBWALTest, GetCurrentWalFile) {
     ASSERT_GT(log_file->LogNumber(), 0);
 
   } while (ChangeWalOptions());
+}
+
+TEST_F(DBWALTest, BlogWalHeaderTimestampSizeFromOption) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.blog_timestamp_size = 8;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+
+  std::unique_ptr<LogFile> wal_file;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, wal_file->LogNumber()),
+                             &contents));
+  Slice input(contents);
+  BlogFileHeader header;
+  ASSERT_OK(header.DecodeFrom(&input));
+  uint64_t timestamp_size = 0;
+  ASSERT_TRUE(
+      header.GetUint64Property(kBlogPropTimestampSize, &timestamp_size));
+  ASSERT_EQ(timestamp_size, 8);
+
+  // Default zero omits the property on the next WAL.
+  options.blog_timestamp_size = 0;
+  Reopen(options);
+  ASSERT_OK(Put("key2", "value2"));
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+  ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, wal_file->LogNumber()),
+                             &contents));
+  Slice input2(contents);
+  ASSERT_OK(header.DecodeFrom(&input2));
+  ASSERT_FALSE(header.HasProperty(kBlogPropTimestampSize));
+
+  options.blog_timestamp_size =
+      size_t{std::numeric_limits<uint16_t>::max()} + 1;
+  ASSERT_TRUE(TryReopen(options).IsInvalidArgument());
 }
 
 TEST_F(DBWALTest, RecoveryWithLogDataForSomeCFs) {
@@ -1915,7 +3015,7 @@ class RecoveryTestHelper {
     wal_manager.reset(
         new WalManager(db_options, file_options, /*io_tracer=*/nullptr));
 
-    std::unique_ptr<log::Writer> current_log_writer;
+    std::unique_ptr<WalWriter> current_log_writer;
 
     for (size_t j = kWALFileOffset; j < wal_count + kWALFileOffset; j++) {
       uint64_t current_log_number = j;
@@ -1924,11 +3024,13 @@ class RecoveryTestHelper {
       ASSERT_OK(WritableFileWriter::Create(db_options.env->GetFileSystem(),
                                            fname, file_options, &file_writer,
                                            nullptr));
-      log::Writer* log_writer =
-          new log::Writer(std::move(file_writer), current_log_number,
-                          db_options.recycle_log_file_num > 0, false,
-                          db_options.wal_compression);
-      ASSERT_OK(log_writer->AddCompressionTypeRecord(WriteOptions()));
+      WalWriter* log_writer = new LegacyWalWriter(
+          std::move(file_writer), current_log_number,
+          db_options.recycle_log_file_num > 0, /*manual_flush=*/false,
+          db_options.wal_compression, /*track_and_verify_wals=*/false,
+          /*initial_block_offset=*/0);
+      ASSERT_OK(
+          log_writer->WriteFileStart(WriteOptions(), PredecessorWALInfo()));
       current_log_writer.reset(log_writer);
 
       WriteBatch batch;
@@ -2943,6 +4045,7 @@ TEST_F(DBWALTest, TruncateLastLogAfterRecoverWithoutFlush) {
     }
   }
 }
+
 // Tests that we will truncate the preallocated space of the last log from
 // previous.
 TEST_F(DBWALTest, TruncateLastLogAfterRecoverWithFlush) {
@@ -3380,6 +4483,18 @@ TEST_F(DBWALTest, GetCompressedWalsAfterSync) {
   ASSERT_OK(s);
 }
 
+TEST_F(DBWALTest, GetBlogWalsAfterSync) {
+  CheckBlogWalsAfterSync(kNoCompression, /*streaming=*/false);
+}
+
+TEST_F(DBWALTest, GetBlogWalsAfterSyncStreaming) {
+  if (!StreamingCompressionTypeSupported(kZSTD)) {
+    ROCKSDB_GTEST_BYPASS("Test requires ZSTD streaming support");
+    return;
+  }
+  CheckBlogWalsAfterSync(kZSTD, /*streaming=*/true);
+}
+
 TEST_F(DBWALTest, EmptyWalReopenTest) {
   Options options = CurrentOptions();
   options.env = env_;
@@ -3494,6 +4609,2548 @@ TEST_F(DBWALTest, AsyncWalPrecreateConsumesReadyFile) {
   ASSERT_EQ(0, options.statistics->getTickerCount(WAL_PRECREATE_WAITED));
 }
 
+TEST_F(DBWALTest, BlogWalAsyncPrecreateInitializesOnActivation) {
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.async_wal_precreate = true;
+  options.recycle_log_file_num = 0;
+  options.use_blog_format_for_wals = true;
+  options.write_buffer_size = 1024;
+  options.max_write_buffer_number = 4;
+
+  SyncPoint::GetInstance()->LoadDependency({
+      {"DBImpl::BGWorkAsyncWALPrecreate:Done",
+       "DBWALTest::BlogWalAsyncPrecreateInitializesOnActivation:PrecreateDone"},
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Defer cleanup_sync_point([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  Reopen(options);
+  TEST_SYNC_POINT(
+      "DBWALTest::BlogWalAsyncPrecreateInitializesOnActivation:PrecreateDone");
+
+  const std::vector<uint64_t> wal_numbers = ListWalNumbers();
+  ASSERT_GE(wal_numbers.size(), 2);
+  const uint64_t prepared_wal_number = wal_numbers.back();
+  ASSERT_NE(prepared_wal_number, dbfull()->TEST_GetCurrentLogNumber());
+  uint64_t prepared_size = 1;
+  ASSERT_OK(env_->GetFileSize(LogFileName(dbname_, prepared_wal_number),
+                              &prepared_size));
+  ASSERT_EQ(0, prepared_size);
+
+  ASSERT_OK(Put("fill", "value"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_EQ(prepared_wal_number, dbfull()->TEST_GetCurrentLogNumber());
+
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, prepared_wal_number),
+                             &contents));
+  ASSERT_TRUE(BlogFileHeader::IsBlogFormat(contents.data(), contents.size()));
+}
+
+TEST_F(DBWALTest, WalObsoleteWalClosedTwice) {
+  // The obsolete WAL closes twice (one setting); repeat Close() must no-op.
+  for (bool use_blog_format : {false, true}) {
+    for (bool background_close_inactive_wals : {false, true}) {
+      SCOPED_TRACE(std::string("use_blog_format=") +
+                   (use_blog_format ? "true" : "false") +
+                   std::string(", background_close_inactive_wals=") +
+                   (background_close_inactive_wals ? "true" : "false"));
+      Options options = CurrentOptions();
+      options.use_blog_format_for_wals = use_blog_format;
+      options.background_close_inactive_wals = background_close_inactive_wals;
+      DestroyAndReopen(options);
+
+      // Flush retires key1's WAL so it is closed and purged while the DB is
+      // open.
+      ASSERT_OK(Put("key1", "value1"));
+      ASSERT_OK(Flush());
+      ASSERT_OK(Put("key2", "value2"));
+      ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+
+      ASSERT_EQ("value1", Get("key1"));
+      ASSERT_EQ("value2", Get("key2"));
+
+      Reopen(options);
+      ASSERT_EQ("value1", Get("key1"));
+      ASSERT_EQ("value2", Get("key2"));
+    }
+  }
+}
+
+TEST_F(DBWALTest, SelectBlogWalWriterAtOpen) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  DestroyAndReopen(options);
+
+  std::unique_ptr<LogFile> wal_file;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, wal_file->LogNumber()),
+                             &contents));
+  ASSERT_TRUE(BlogFileHeader::IsBlogFormat(contents.data(), contents.size()));
+
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(db_->FlushWAL(true));
+  ASSERT_EQ("value", Get("key"));
+
+  std::unique_ptr<TransactionLogIterator> iterator;
+  ASSERT_OK(db_->GetUpdatesSince(/*seq_number=*/1, &iterator));
+  ASSERT_TRUE(iterator->Valid());
+
+  options.use_blog_format_for_wals = false;
+  Reopen(options);
+  ASSERT_EQ("value", Get("key"));
+
+  ASSERT_OK(Put("legacy-key", "legacy-value"));
+  options.use_blog_format_for_wals = true;
+  Reopen(options);
+  ASSERT_EQ("value", Get("key"));
+  ASSERT_EQ("legacy-value", Get("legacy-key"));
+}
+
+TEST_F(DBWALTest, WalReaderFactoryReturnsConcreteReaders) {
+  for (bool blog : {false, true}) {
+    std::string contents;
+    uint64_t log_number = 0;
+    WriteWalForOpenTest(blog, &contents, &log_number);
+    ASSERT_FALSE(contents.empty());
+    for (bool buffered : {false, true}) {
+      SCOPED_TRACE(testing::Message()
+                   << "blog=" << blog << " buffered=" << buffered);
+      CountingWalReporter reporter;
+      std::unique_ptr<SequentialFileReader> file(new SequentialFileReader(
+          std::make_unique<GrowingSequentialFile>(&contents), "factory-wal"));
+      std::unique_ptr<WalReaderOpenState> pending_open;
+      std::unique_ptr<WalReader> reader =
+          NewWalReader(nullptr, std::move(file), &reporter, true, log_number,
+                       false, false, std::numeric_limits<uint64_t>::max(),
+                       PredecessorWALInfo(), buffered, &pending_open);
+      ASSERT_NE(nullptr, reader);
+      ASSERT_EQ(nullptr, pending_open);
+      ASSERT_EQ(blog, dynamic_cast<BlogWalReader*>(reader.get()) != nullptr);
+      ASSERT_EQ(!blog && !buffered,
+                dynamic_cast<LegacyWalReader*>(reader.get()) != nullptr);
+      ASSERT_EQ(!blog && buffered, dynamic_cast<BufferedLegacyWalReader*>(
+                                       reader.get()) != nullptr);
+      ASSERT_EQ(log_number, reader->GetLogNumber());
+      ASSERT_EQ(&reporter, reader->GetReporter());
+      Slice record;
+      std::string scratch;
+      ASSERT_TRUE(reader->ReadRecord(&record, &scratch));
+      WriteBatch batch;
+      ASSERT_OK(WriteBatchInternal::SetContents(&batch, record));
+      ASSERT_EQ(1U, WriteBatchInternal::Sequence(&batch));
+      ASSERT_EQ(1, WriteBatchInternal::Count(&batch));
+      ASSERT_FALSE(reader->ReadRecord(&record, &scratch));
+      ASSERT_EQ(0U, reporter.failing_count());
+    }
+  }
+}
+
+TEST_F(DBWALTest, WalReaderFactoryRetriesGrowingFiles) {
+  for (bool blog : {false, true}) {
+    std::string contents;
+    uint64_t log_number = 0;
+    WriteWalForOpenTest(blog, &contents, &log_number);
+    ASSERT_FALSE(contents.empty());
+    for (bool buffered : {false, true}) {
+      SCOPED_TRACE(testing::Message()
+                   << "blog=" << blog << " buffered=" << buffered);
+      std::string visible;
+      CountingWalReporter reporter;
+      std::unique_ptr<SequentialFileReader> file(new SequentialFileReader(
+          std::make_unique<GrowingSequentialFile>(&visible), "growing-wal"));
+      std::unique_ptr<WalReaderOpenState> pending_open;
+      std::unique_ptr<WalReader> reader =
+          NewWalReader(nullptr, std::move(file), &reporter, true, log_number,
+                       false, false, std::numeric_limits<uint64_t>::max(),
+                       PredecessorWALInfo(), buffered, &pending_open);
+      ASSERT_EQ(nullptr, reader);
+      ASSERT_NE(nullptr, pending_open);
+      ASSERT_EQ(WalReaderOpenState::Result::kPending,
+                pending_open->TryOpen(&reader));
+      if (blog && buffered) {
+        for (size_t prefix_size = 1; prefix_size < kBlogFileMagicSize;
+             ++prefix_size) {
+          visible.assign(contents.data(), prefix_size);
+          ASSERT_EQ(WalReaderOpenState::Result::kPending,
+                    pending_open->TryOpen(&reader));
+          ASSERT_EQ(nullptr, reader);
+          ASSERT_EQ(0U, reporter.failing_count());
+        }
+      }
+      visible = contents;
+      ASSERT_EQ(WalReaderOpenState::Result::kReady,
+                pending_open->TryOpen(&reader));
+      pending_open.reset();
+      ASSERT_EQ(blog, dynamic_cast<BlogWalReader*>(reader.get()) != nullptr);
+      ASSERT_EQ(!blog && !buffered,
+                dynamic_cast<LegacyWalReader*>(reader.get()) != nullptr);
+      ASSERT_EQ(!blog && buffered, dynamic_cast<BufferedLegacyWalReader*>(
+                                       reader.get()) != nullptr);
+      Slice record;
+      std::string scratch;
+      ASSERT_TRUE(reader->ReadRecord(&record, &scratch));
+      ASSERT_FALSE(reader->ReadRecord(&record, &scratch));
+      ASSERT_EQ(0U, reporter.failing_count());
+    }
+  }
+}
+
+TEST_F(DBWALTest, BufferedLegacyWalReaderKeepsPrimedPartialRecord) {
+  std::string contents;
+  uint64_t log_number = 0;
+  WriteWalForOpenTest(/*blog=*/false, &contents, &log_number);
+  ASSERT_GT(contents.size(), log::kHeaderSize);
+  for (size_t prefix_size = log::kHeaderSize; prefix_size < contents.size();
+       ++prefix_size) {
+    SCOPED_TRACE("prefix_size=" + std::to_string(prefix_size));
+    std::string visible(contents.data(), prefix_size);
+    CountingWalReporter reporter;
+    std::unique_ptr<GrowingSequentialFile> source =
+        std::make_unique<GrowingSequentialFile>(&visible);
+    GrowingSequentialFile* source_ptr = source.get();
+    std::unique_ptr<SequentialFileReader> file(
+        new SequentialFileReader(std::move(source), "primed-legacy-wal"));
+    std::unique_ptr<WalReaderOpenState> pending_open;
+    std::unique_ptr<WalReader> reader =
+        NewWalReader(nullptr, std::move(file), &reporter, true, log_number,
+                     false, false, std::numeric_limits<uint64_t>::max(),
+                     PredecessorWALInfo(), /*buffered=*/true, &pending_open);
+    ASSERT_NE(nullptr, reader);
+    ASSERT_EQ(nullptr, pending_open);
+    ASSERT_EQ(1U, source_ptr->read_count);
+    ASSERT_NE(nullptr, dynamic_cast<BufferedLegacyWalReader*>(reader.get()));
+    Slice record;
+    std::string scratch;
+    ASSERT_FALSE(reader->ReadRecord(&record, &scratch));
+    ASSERT_EQ(0U, reporter.failing_count());
+    visible = contents;
+    reader->UnmarkEOF();
+    const size_t primed_read_count = source_ptr->read_count;
+    ASSERT_TRUE(reader->ReadRecord(&record, &scratch));
+    ASSERT_EQ(primed_read_count, source_ptr->read_count);
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::SetContents(&batch, record));
+    ASSERT_EQ(1U, WriteBatchInternal::Sequence(&batch));
+    ASSERT_EQ(1, WriteBatchInternal::Count(&batch));
+    ASSERT_FALSE(reader->ReadRecord(&record, &scratch));
+    ASSERT_EQ(0U, reporter.failing_count());
+  }
+}
+
+TEST_F(DBWALTest, WalReaderFactoryReadErrorsAreTerminal) {
+  for (size_t prefix_size : {size_t{0}, size_t{3}}) {
+    SCOPED_TRACE("prefix_size=" + std::to_string(prefix_size));
+    CountingWalReporter reporter;
+    std::string contents(kBlogFileMagic, kBlogFileMagicSize);
+    std::unique_ptr<FaultySequentialFile> source =
+        std::make_unique<FaultySequentialFile>(contents, prefix_size);
+    FaultySequentialFile* source_ptr = source.get();
+    std::unique_ptr<SequentialFileReader> file(
+        new SequentialFileReader(std::move(source), "faulty-prefix"));
+    std::unique_ptr<WalReaderOpenState> pending_open;
+    std::unique_ptr<WalReader> reader =
+        NewWalReader(nullptr, std::move(file), &reporter, true, 1, false, false,
+                     std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
+                     true, &pending_open);
+    ASSERT_EQ(nullptr, reader);
+    ASSERT_NE(nullptr, pending_open);
+    ASSERT_EQ(1U, source_ptr->read_count);
+    if (prefix_size != 0) {
+      ASSERT_EQ(0U, reporter.failing_count());
+    }
+    ASSERT_EQ(WalReaderOpenState::Result::kReadError,
+              pending_open->TryOpen(&reader));
+    ASSERT_EQ(1U, reporter.failing_count());
+    ASSERT_TRUE(reporter.first_status.IsIOError());
+    const size_t failed_read_count = source_ptr->read_count;
+    for (int retry = 0; retry < 3; ++retry) {
+      ASSERT_EQ(WalReaderOpenState::Result::kReadError,
+                pending_open->TryOpen(&reader));
+    }
+    ASSERT_EQ(failed_read_count, source_ptr->read_count);
+    ASSERT_EQ(1U, reporter.failing_count());
+  }
+}
+
+TEST_F(DBWALTest, BlogWalReaderDefersDetectionAndRetriesPartialRecord) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(db_->FlushWAL(true));
+
+  std::unique_ptr<LogFile> wal_file;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+  std::string complete_contents;
+  ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, wal_file->LogNumber()),
+                             &complete_contents));
+
+  const uint32_t property_size = DecodeFixed32(
+      complete_contents.data() + kBlogFilePropertySectionSizeOffset);
+  size_t record_offset = kBlogFileFixedHeaderSize + property_size;
+  while (record_offset < complete_contents.size() &&
+         (complete_contents[record_offset] == '\0' ||
+          complete_contents[record_offset] == '\xff')) {
+    ++record_offset;
+  }
+  ASSERT_LT(record_offset + kBlogEscapeSequenceSize + 1,
+            complete_contents.size());
+
+  size_t compact_length_varint_offset = 0;
+  uint64_t compact_payload_length = 0;
+  FindFirstCompactRecord(complete_contents, &compact_length_varint_offset,
+                         &compact_payload_length);
+  const size_t compact_record_offset =
+      compact_length_varint_offset - kBlogEscapeSequenceSize;
+  const size_t compact_record_end =
+      compact_length_varint_offset +
+      PrefixVarint64AddlByteCount(
+          complete_contents[compact_length_varint_offset]) +
+      1 + static_cast<size_t>(compact_payload_length) + kBlogBlockTrailerSize;
+
+  // A tailing reader (for example a secondary DB, which constructs its reader
+  // with buffered=true) must treat every partially visible prefix of a compact
+  // record as an incomplete trailing record in every recovery mode, never as a
+  // length that overran a later record boundary.
+  for (WALRecoveryMode wal_recovery_mode :
+       {WALRecoveryMode::kTolerateCorruptedTailRecords,
+        WALRecoveryMode::kAbsoluteConsistency,
+        WALRecoveryMode::kPointInTimeRecovery,
+        WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE("wal_recovery_mode=" +
+                 std::to_string(static_cast<int>(wal_recovery_mode)));
+    std::string visible_contents;
+    CountingWalReporter reporter;
+    std::unique_ptr<FSSequentialFile> source(
+        new GrowingSequentialFile(&visible_contents));
+    std::unique_ptr<SequentialFileReader> file_reader(new SequentialFileReader(
+        std::move(source), "growing-blog-wal" /* file name */));
+    std::unique_ptr<WalReaderOpenState> pending_open;
+    std::unique_ptr<WalReader> reader = NewWalReader(
+        nullptr, std::move(file_reader), &reporter, /*checksum=*/true,
+        wal_file->LogNumber(), /*track_and_verify_wals=*/false,
+        /*stop_replay_for_corruption=*/false,
+        std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
+        /*buffered=*/true, &pending_open);
+
+    Slice record;
+    std::string scratch;
+    ASSERT_EQ(nullptr, reader);
+    ASSERT_NE(nullptr, pending_open);
+    ASSERT_EQ(WalReaderOpenState::Result::kPending,
+              pending_open->TryOpen(&reader));
+
+    visible_contents.assign(complete_contents.data(), 5);
+    ASSERT_EQ(WalReaderOpenState::Result::kPending,
+              pending_open->TryOpen(&reader));
+
+    visible_contents.assign(complete_contents.data(),
+                            record_offset + kBlogEscapeSequenceSize + 1);
+    ASSERT_EQ(WalReaderOpenState::Result::kReady,
+              pending_open->TryOpen(&reader));
+    pending_open.reset();
+    ASSERT_FALSE(reader->ReadRecord(&record, &scratch, wal_recovery_mode));
+
+    for (size_t visible_end = compact_record_offset + 1;
+         visible_end < compact_record_end; ++visible_end) {
+      visible_contents.assign(complete_contents.data(), visible_end);
+      ASSERT_FALSE(reader->ReadRecord(&record, &scratch, wal_recovery_mode));
+      ASSERT_EQ(reporter.failing_count(), 0u)
+          << "visible_end=" << visible_end << " "
+          << reporter.first_status.ToString();
+    }
+
+    visible_contents.assign(complete_contents);
+    ASSERT_TRUE(reader->ReadRecord(&record, &scratch, wal_recovery_mode));
+    ASSERT_GE(record.size(), WriteBatchInternal::kHeader);
+    ASSERT_EQ(reporter.failing_count(), 0u) << reporter.first_status.ToString();
+  }
+}
+
+TEST_F(DBWALTest, BlogWalReaderTailingPartialHeaderIsSilent) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(db_->FlushWAL(true));
+
+  std::unique_ptr<LogFile> wal_file;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+  std::string complete_contents;
+  ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, wal_file->LogNumber()),
+                             &complete_contents));
+
+  const uint32_t property_size = DecodeFixed32(
+      complete_contents.data() + kBlogFilePropertySectionSizeOffset);
+  size_t record_offset = kBlogFileFixedHeaderSize + property_size;
+  while (record_offset < complete_contents.size() &&
+         (complete_contents[record_offset] == '\0' ||
+          complete_contents[record_offset] == '\xff')) {
+    ++record_offset;
+  }
+  ASSERT_LT(record_offset + kBlogEscapeSequenceSize, complete_contents.size());
+
+  // A tailing reader (for example a secondary DB, which constructs its reader
+  // with buffered=true) must treat every partially visible header prefix as
+  // an incomplete tail in every recovery mode, never as a loud corruption.
+  for (WALRecoveryMode wal_recovery_mode :
+       {WALRecoveryMode::kTolerateCorruptedTailRecords,
+        WALRecoveryMode::kAbsoluteConsistency,
+        WALRecoveryMode::kPointInTimeRecovery,
+        WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE("wal_recovery_mode=" +
+                 std::to_string(static_cast<int>(wal_recovery_mode)));
+    std::string visible_contents;
+    CountingWalReporter reporter;
+    std::unique_ptr<FSSequentialFile> source(
+        new GrowingSequentialFile(&visible_contents));
+    std::unique_ptr<SequentialFileReader> file_reader(new SequentialFileReader(
+        std::move(source), "growing-blog-wal" /* file name */));
+    std::unique_ptr<WalReaderOpenState> pending_open;
+    std::unique_ptr<WalReader> reader = NewWalReader(
+        nullptr, std::move(file_reader), &reporter, /*checksum=*/true,
+        wal_file->LogNumber(), /*track_and_verify_wals=*/false,
+        /*stop_replay_for_corruption=*/false,
+        std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
+        /*buffered=*/true, &pending_open);
+
+    Slice record;
+    std::string scratch;
+    for (size_t visible_end = kBlogFileMagicSize;
+         visible_end <= record_offset + kBlogEscapeSequenceSize;
+         ++visible_end) {
+      SCOPED_TRACE("visible_end=" + std::to_string(visible_end));
+      visible_contents.assign(complete_contents.data(), visible_end);
+      if (pending_open) {
+        ASSERT_EQ(WalReaderOpenState::Result::kReady,
+                  pending_open->TryOpen(&reader));
+        pending_open.reset();
+      }
+      ASSERT_FALSE(reader->ReadRecord(&record, &scratch, wal_recovery_mode));
+      ASSERT_EQ(reporter.failing_count(), 0u)
+          << "visible_end=" << visible_end << " "
+          << reporter.first_status.ToString();
+    }
+  }
+}
+
+// Sibling of the header-silence test past delivery: a tailing reader that
+// already delivered record 1 stays silent when the file ends anywhere inside
+// the following gap (or inside record 2). Fresh reader per sweep point so
+// every point asserts the same delivery sequence.
+TEST_F(DBWALTest, BlogWalReaderTailingTornGapAfterDeliveryIsSilent) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key1", "value1"));
+  ASSERT_OK(Put("key2", "value2"));
+  ASSERT_OK(db_->FlushWAL(true));
+
+  std::unique_ptr<LogFile> wal_file;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+  std::string complete_contents;
+  ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, wal_file->LogNumber()),
+                             &complete_contents));
+
+  const uint32_t property_size = DecodeFixed32(
+      complete_contents.data() + kBlogFilePropertySectionSizeOffset);
+  size_t first_offset = kBlogFileFixedHeaderSize + property_size;
+  while (first_offset < complete_contents.size() &&
+         (complete_contents[first_offset] == '\0' ||
+          complete_contents[first_offset] == '\xff')) {
+    ++first_offset;
+  }
+  ASSERT_LT(first_offset, complete_contents.size());
+
+  std::string visible_contents;
+  auto make_tailing_reader = [&](CountingWalReporter* reporter) {
+    std::unique_ptr<FSSequentialFile> source(
+        new GrowingSequentialFile(&visible_contents));
+    std::unique_ptr<SequentialFileReader> file_reader(
+        new SequentialFileReader(std::move(source), "growing-blog-wal"));
+    std::unique_ptr<WalReaderOpenState> pending_open;
+    return NewWalReader(nullptr, std::move(file_reader), reporter,
+                        /*checksum=*/true, wal_file->LogNumber(),
+                        /*track_and_verify_wals=*/false,
+                        /*stop_replay_for_corruption=*/false,
+                        std::numeric_limits<uint64_t>::max(),
+                        PredecessorWALInfo(), /*buffered=*/true, &pending_open);
+  };
+  constexpr WALRecoveryMode kProbeMode =
+      WALRecoveryMode::kTolerateCorruptedTailRecords;
+
+  // Control: the complete file delivers both batches, then clean EOF.
+  CountingWalReporter control_reporter;
+  std::string rec1_control;
+  std::string rec2_control;
+  visible_contents = complete_contents;
+  {
+    std::unique_ptr<WalReader> reader = make_tailing_reader(&control_reporter);
+    Slice record;
+    std::string scratch;
+    ASSERT_TRUE(reader->ReadRecord(&record, &scratch, kProbeMode));
+    rec1_control = record.ToString();
+    ASSERT_TRUE(reader->ReadRecord(&record, &scratch, kProbeMode));
+    rec2_control = record.ToString();
+    ASSERT_FALSE(reader->ReadRecord(&record, &scratch, kProbeMode));
+    ASSERT_EQ(control_reporter.failing_count(), 0u);
+  }
+
+  // Locate record 1's end empirically: the smallest visible prefix delivering
+  // it. (Parsing the boundary would have to replicate preamble and ignorable
+  // record skipping.) Delivery implies completeness and vice versa, so the
+  // minimum is exact; a regression that withholds complete records fails here
+  // instead of silently shrinking the sweep below.
+  CountingWalReporter search_reporter;
+  size_t rec1_end = 0;
+  for (size_t end = first_offset + 1; end <= complete_contents.size(); ++end) {
+    visible_contents.assign(complete_contents.data(), end);
+    std::unique_ptr<WalReader> reader = make_tailing_reader(&search_reporter);
+    Slice record;
+    std::string scratch;
+    if (reader->ReadRecord(&record, &scratch, kProbeMode) &&
+        record.ToString() == rec1_control) {
+      rec1_end = end;
+      break;
+    }
+  }
+  ASSERT_GT(rec1_end, first_offset);
+  ASSERT_LT(rec1_end, complete_contents.size());
+  ASSERT_EQ(search_reporter.failing_count(), 0u);
+
+  for (WALRecoveryMode wal_recovery_mode :
+       {WALRecoveryMode::kTolerateCorruptedTailRecords,
+        WALRecoveryMode::kAbsoluteConsistency,
+        WALRecoveryMode::kPointInTimeRecovery,
+        WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE("wal_recovery_mode=" +
+                 std::to_string(static_cast<int>(wal_recovery_mode)));
+    CountingWalReporter reporter;
+    for (size_t visible_end = rec1_end; visible_end <= complete_contents.size();
+         ++visible_end) {
+      SCOPED_TRACE("visible_end=" + std::to_string(visible_end));
+      visible_contents.assign(complete_contents.data(), visible_end);
+      std::unique_ptr<WalReader> reader = make_tailing_reader(&reporter);
+      Slice record;
+      std::string scratch;
+      ASSERT_TRUE(reader->ReadRecord(&record, &scratch, wal_recovery_mode));
+      ASSERT_EQ(record.ToString(), rec1_control);
+      int extra_records = 0;
+      while (reader->ReadRecord(&record, &scratch, wal_recovery_mode)) {
+        ASSERT_EQ(record.ToString(), rec2_control);
+        ++extra_records;
+      }
+      ASSERT_LE(extra_records, 1);
+      ASSERT_EQ(reporter.failing_count(), 0u)
+          << reporter.first_status.ToString();
+    }
+  }
+}
+
+TEST_F(DBWALTest, BlogWalPredecessorVerificationUsesBodySize) {
+  for (bool streaming : {false, true}) {
+    if (streaming && !StreamingCompressionTypeSupported(kZSTD)) {
+      continue;
+    }
+    for (bool sealed : {false, true}) {
+      for (bool blog_successor : {false, true}) {
+        SCOPED_TRACE(streaming);
+        SCOPED_TRACE(sealed);
+        SCOPED_TRACE(blog_successor);
+        Options options = CurrentOptions();
+        options.use_blog_format_for_wals = true;
+        options.track_and_verify_wals = true;
+        options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+        options.avoid_flush_during_shutdown = true;
+        options.max_write_buffer_number = 10;
+        options.blog_wal_streaming_compression = streaming;
+        options.wal_compression = streaming ? kZSTD : kNoCompression;
+        DestroyAndReopen(options);
+        ASSERT_OK(Put("first", "value-one"));
+        ASSERT_OK(db_->FlushWAL(false));
+        std::unique_ptr<LogFile> predecessor_file;
+        ASSERT_OK(dbfull()->GetCurrentWalFile(&predecessor_file));
+        const std::string predecessor_name =
+            LogFileName(dbname_, predecessor_file->LogNumber());
+        std::string unsealed;
+        ASSERT_OK(ReadFileToString(env_, predecessor_name, &unsealed));
+        ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+        ASSERT_OK(Put("second", "value-two"));
+        std::unique_ptr<LogFile> successor_file;
+        ASSERT_OK(dbfull()->GetCurrentWalFile(&successor_file));
+        const std::string successor_name =
+            LogFileName(dbname_, successor_file->LogNumber());
+        Close();
+
+        std::string successor_contents;
+        ASSERT_OK(ReadFileToString(env_, successor_name, &successor_contents));
+        Slice input(successor_contents);
+        BlogFileHeader successor_header;
+        ASSERT_OK(successor_header.DecodeFrom(&input));
+        const std::string encoded =
+            successor_header.GetProperty(kBlogPropPredecessorWalInfo);
+        Slice predecessor_input(encoded);
+        PredecessorWALInfo predecessor_info;
+        ASSERT_OK(predecessor_info.DecodeFrom(&predecessor_input));
+        ASSERT_TRUE(predecessor_input.empty());
+        ASSERT_EQ(predecessor_info.GetLogNumber(),
+                  predecessor_file->LogNumber());
+        if (!sealed) {
+          OverwriteFile(predecessor_name, unsealed);
+        }
+        if (!blog_successor) {
+          std::unique_ptr<FSWritableFile> dest;
+          ASSERT_OK(env_->GetFileSystem()->NewWritableFile(
+              successor_name, FileOptions(), &dest, nullptr));
+          LegacyWalWriter writer(
+              std::make_unique<WritableFileWriter>(
+                  std::move(dest), successor_name, FileOptions()),
+              successor_file->LogNumber(), false, false, kNoCompression, true,
+              0);
+          ASSERT_OK(writer.WriteFileStart(WriteOptions(), predecessor_info));
+          WriteBatch batch;
+          ASSERT_OK(batch.Put("second", "value-two"));
+          WriteBatchInternal::SetSequence(&batch, 2);
+          ASSERT_OK(writer.AddRecord(
+              WriteOptions(), WriteBatchInternal::Contents(&batch), 2, 1));
+          ASSERT_OK(writer.Close(WriteOptions()));
+        }
+        uint64_t physical_size = 0;
+        ASSERT_OK(env_->GetFileSize(predecessor_name, &physical_size));
+        ASSERT_GE(physical_size, predecessor_info.GetSizeBytes());
+        if (sealed) {
+          ASSERT_GT(physical_size, predecessor_info.GetSizeBytes());
+        }
+        ASSERT_OK(TryReopen(options));
+        ASSERT_EQ("value-one", Get("first"));
+        ASSERT_EQ("value-two", Get("second"));
+        Close();
+      }
+    }
+  }
+}
+
+TEST_F(DBWALTest, BlogWalVerificationSizePreservesFooterRecoveryModes) {
+  constexpr uint64_t kLogNumber = 101;
+  std::string complete;
+  std::unique_ptr<BlogFileWriter> writer =
+      MakeHandBuiltWalWriter(&complete, kLogNumber, false);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+  ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch"));
+  ASSERT_OK(writer->AddIgnorablePropertiesRecord(WriteOptions(),
+                                                 {{"diagnostic", "tail"}}));
+  const uint64_t body_end = writer->body_end_offset();
+  const size_t unsealed_size = complete.size();
+  ASSERT_OK(writer->WriteFooter(WriteOptions(), BlogFileFooterProperties{}));
+  ASSERT_OK(writer->Close(WriteOptions()));
+  // Reports per footer shape, indexed as {kAbsoluteConsistency,
+  // kPointInTimeRecovery, kTolerateCorruptedTailRecords,
+  // kSkipAnyCorruptedRecords}. Damage confined to footer records ends the WAL
+  // cleanly in every mode and is only logged as a tolerated drop. A byte after
+  // an intact locator is not footer damage and keeps the trailing-bytes policy.
+  constexpr size_t kExpectedReports[5][4] = {
+      {0, 0, 0, 0},  // Complete footer
+      {0, 0, 0, 0},  // No footer
+      {0, 0, 0, 0},  // Truncated locator
+      {0, 0, 0, 0},  // Corrupt locator
+      {1, 1, 0, 1},  // Byte after the locator
+  };
+  constexpr size_t kExpectedToleratedReports[5][4] = {
+      {0, 0, 0, 0},  // Complete footer
+      {0, 0, 0, 0},  // No footer
+      {1, 1, 1, 1},  // Truncated locator
+      {1, 1, 1, 1},  // Corrupt locator
+      {0, 0, 1, 0},  // Byte after the locator
+  };
+  for (int shape = 0; shape < 5; ++shape) {
+    std::string contents = complete;
+    if (shape == 1) {
+      contents.resize(unsealed_size);
+    } else if (shape == 2) {
+      contents.pop_back();
+    } else if (shape == 3) {
+      contents.back() ^= 1;
+    } else if (shape == 4) {
+      contents.push_back('x');
+    }
+    const WALRecoveryMode modes[] = {
+        WALRecoveryMode::kAbsoluteConsistency,
+        WALRecoveryMode::kPointInTimeRecovery,
+        WALRecoveryMode::kTolerateCorruptedTailRecords,
+        WALRecoveryMode::kSkipAnyCorruptedRecords};
+    for (size_t m = 0; m < 4; ++m) {
+      SCOPED_TRACE(shape);
+      SCOPED_TRACE(lossless_cast<int>(modes[m]));
+      CountingWalReporter reporter;
+      std::unique_ptr<WalReader> reader =
+          NewWalReaderOver(std::unique_ptr<FSSequentialFile>(
+                               new GrowingSequentialFile(&contents)),
+                           "/contract-wal", &reporter, kLogNumber);
+      ASSERT_EQ(ReadAllRecords(reader.get(), modes[m]), 1u);
+      ASSERT_EQ(reporter.failing_count(), kExpectedReports[shape][m]);
+      ASSERT_EQ(reporter.tolerated_count, kExpectedToleratedReports[shape][m]);
+      ASSERT_EQ(reader->GetVerificationSize(contents.size()), body_end);
+    }
+  }
+}
+
+TEST_F(DBWALTest, BlogWalTornFooterEndsCleanly) {
+  // Close does not sync the footer, so a crash can keep any prefix of it.
+  // Every tear ends the WAL cleanly except one inside the first footer
+  // record's prefix: before the prefix checksum authenticates the footer
+  // type, the tear is indistinguishable from a torn data record. Like the DB
+  // writer, record a sequence range so the properties use the full format.
+  constexpr uint64_t kLogNumber = 101;
+  std::string complete;
+  std::unique_ptr<BlogFileWriter> writer =
+      MakeHandBuiltWalWriter(&complete, kLogNumber, false);
+  ASSERT_OK(writer->WriteHeader(WriteOptions()));
+  ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch"));
+  const size_t footer_start = complete.size();
+  BlogFileFooterProperties properties;
+  properties.SetSequenceRange(1, 1);
+  ASSERT_OK(writer->WriteFooter(WriteOptions(), properties));
+  ASSERT_OK(writer->Close(WriteOptions()));
+  const char* varint_start =
+      complete.data() + footer_start + kBlogEscapeSequenceSize;
+  uint64_t length = 0;
+  const char* varint_end = GetPrefixVarint64Ptr(
+      varint_start, complete.data() + complete.size(), &length);
+  ASSERT_NE(varint_end, nullptr);
+  ASSERT_GT(lossless_cast<size_t>(varint_end - varint_start),
+            kBlogCompactVarintMaxBytes);
+  const size_t authenticated_prefix_end =
+      lossless_cast<size_t>(varint_end - complete.data()) +
+      kBlogFullFormatPrefixRestSize;
+  for (size_t cut = footer_start + 1; cut < complete.size(); ++cut) {
+    const std::string contents = complete.substr(0, cut);
+    for (WALRecoveryMode mode : {WALRecoveryMode::kAbsoluteConsistency,
+                                 WALRecoveryMode::kPointInTimeRecovery,
+                                 WALRecoveryMode::kTolerateCorruptedTailRecords,
+                                 WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+      SCOPED_TRACE(cut);
+      SCOPED_TRACE(lossless_cast<int>(mode));
+      CountingWalReporter reporter;
+      std::unique_ptr<WalReader> reader =
+          NewWalReaderOver(std::unique_ptr<FSSequentialFile>(
+                               new GrowingSequentialFile(&contents)),
+                           "/torn-footer-wal", &reporter, kLogNumber);
+      ASSERT_EQ(ReadAllRecords(reader.get(), mode), 1u);
+      const bool reports_torn_tail =
+          cut < authenticated_prefix_end &&
+          (mode == WALRecoveryMode::kAbsoluteConsistency ||
+           mode == WALRecoveryMode::kPointInTimeRecovery);
+      ASSERT_EQ(reporter.failing_count(), reports_torn_tail ? 1u : 0u);
+    }
+  }
+}
+
+TEST_F(DBWALTest, BlogWalTornFooterOpensWithAbsoluteConsistency) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+  options.avoid_flush_during_shutdown = true;
+  DestroyAndReopen(options);
+  WriteOptions sync_write;
+  sync_write.sync = true;
+  ASSERT_OK(Put("key", "value", sync_write));
+  std::unique_ptr<LogFile> wal;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal));
+  const std::string wal_name = LogFileName(dbname_, wal->LogNumber());
+  Close();
+
+  // The footer appended by Close is the only unsynced data; tear its locator.
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, wal_name, &contents));
+  contents.pop_back();
+  OverwriteFile(wal_name, contents);
+  ASSERT_OK(TryReopen(options));
+  ASSERT_EQ("value", Get("key"));
+  Close();
+}
+
+TEST_F(DBWALTest, BlogWalSealedOnShutdownAfterRotation) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.avoid_flush_during_shutdown = true;
+  options.max_write_buffer_number = 10;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("key1", "value1"));
+  std::unique_ptr<LogFile> old_wal;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&old_wal));
+  const std::string old_wal_name = LogFileName(dbname_, old_wal->LogNumber());
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+
+  auto verify_sealed = [&](const std::string& fname) {
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env_, fname, &contents));
+    Slice input(contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&input));
+    BlogFileFooterLocator locator;
+    ASSERT_TRUE(VerifyBlogFooterLocator(
+        contents.data(), contents.size(), /*buffer_file_offset=*/0,
+        header.escape_sequence, header.checksum_type, header.incarnation_id(),
+        &locator));
+    ASSERT_FALSE(locator.entries.empty());
+  };
+
+  ASSERT_OK(Put("key2", "value2"));
+  std::unique_ptr<LogFile> active_wal;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&active_wal));
+  const std::string active_wal_name =
+      LogFileName(dbname_, active_wal->LogNumber());
+  Close();
+  verify_sealed(old_wal_name);
+  verify_sealed(active_wal_name);
+
+  ASSERT_OK(DB::Open(options, dbname_, &db_));
+  ASSERT_EQ("value1", Get("key1"));
+  ASSERT_EQ("value2", Get("key2"));
+}
+
+TEST_F(DBWALTest, BlogWalCompression) {
+  if (!CompressionTypeSupported(kZSTD)) {
+    ROCKSDB_GTEST_BYPASS("ZSTD is not supported");
+    return;
+  }
+
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.wal_compression = kZSTD;
+  DestroyAndReopen(options);
+
+  const std::string value(10000, 'v');
+  ASSERT_OK(Put("key", value));
+  Reopen(options);
+  ASSERT_EQ(value, Get("key"));
+}
+
+TEST_F(DBWALTest, BlogWalStreamingCompression) {
+  if (!StreamingCompressionTypeSupported(kZSTD)) {
+    ROCKSDB_GTEST_BYPASS("Test requires ZSTD streaming support");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.wal_compression = kZSTD;
+  options.blog_wal_streaming_compression = true;
+  options.avoid_flush_during_shutdown = true;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), "value" + std::to_string(i)));
+  }
+  // Larger than the reader's 32 KiB output chunk, so decoding drains it.
+  const std::string big_value(100 * 1024, 'b');
+  ASSERT_OK(Put("big-key", big_value));
+
+  std::unique_ptr<LogFile> wal_file;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+  std::string wal_contents;
+  ASSERT_OK(ReadFileToString(env_, LogFileName(dbname_, wal_file->LogNumber()),
+                             &wal_contents));
+  Slice header_input(wal_contents);
+  BlogFileHeader header;
+  ASSERT_OK(header.DecodeFrom(&header_input));
+  ASSERT_EQ(header.GetProperty(kBlogPropWriteBatchStreamingCompressionType),
+            "07");
+  Close();
+
+  // All values below must come from WAL replay, not flushed SSTs.
+  std::vector<std::string> children;
+  ASSERT_OK(env_->GetChildren(dbname_, &children));
+  for (const auto& child : children) {
+    uint64_t number = 0;
+    FileType type = kWalFile;
+    if (ParseFileName(child, &number, &type)) {
+      ASSERT_NE(type, kTableFile) << child;
+    }
+  }
+
+  auto verify_all = [&]() {
+    for (int i = 0; i < 100; ++i) {
+      ASSERT_EQ("value" + std::to_string(i), Get("key" + std::to_string(i)));
+    }
+    ASSERT_EQ(big_value, Get("big-key"));
+  };
+
+  // Reading works with the option on ...
+  ASSERT_OK(DB::Open(options, dbname_, &db_));
+  verify_all();
+  Close();
+
+  // ... and existing files stay readable with the option off.
+  options.blog_wal_streaming_compression = false;
+  ASSERT_OK(DB::Open(options, dbname_, &db_));
+  verify_all();
+}
+
+// A crash that cuts off only padding still fails a strict open: every record
+// is intact, but the torn tail is reported like any other torn tail. This
+// matches the legacy WAL behavior pinned by kAbsoluteConsistency.
+TEST_F(DBWALTest, BlogWalTornGapFailsAbsoluteConsistency) {
+  TornWalFixture fixture;
+  BuildTornWal(&fixture, /*tear_mid_record=*/false);
+  ASSERT_GT(fixture.torn_size, 0u);
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+  options.create_if_missing = false;
+  const Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  AssertWalIsCutOff(fixture, /*tear_mid_record=*/false);
+}
+
+// A torn record still fails a strict open; the last batch is lost.
+TEST_F(DBWALTest, BlogWalTornRecordFailsAbsoluteConsistency) {
+  TornWalFixture fixture;
+  BuildTornWal(&fixture, /*tear_mid_record=*/true);
+  ASSERT_GT(fixture.torn_size, 0u);
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+  options.create_if_missing = false;
+  const Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  AssertWalIsCutOff(fixture, /*tear_mid_record=*/true);
+}
+
+// Point-in-time recovery stops at the torn gap with every record replayed.
+TEST_F(DBWALTest, BlogWalTornGapStopsPointInTimeRecovery) {
+  TornWalFixture fixture;
+  BuildTornWal(&fixture, /*tear_mid_record=*/false);
+  ASSERT_GT(fixture.torn_size, 0u);
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  options.create_if_missing = false;
+  // Keep the replayed WAL on disk so the cut-off assertion below can read
+  // it; otherwise recovery flushes and deletes it as obsolete.
+  options.avoid_flush_during_recovery = true;
+  ASSERT_OK(TryReopen(options));
+  AssertWalIsCutOff(fixture, /*tear_mid_record=*/false);
+  ASSERT_EQ("value1", Get("key1"));
+  ASSERT_EQ("value2", Get("key2"));
+}
+
+TEST_F(DBWALTest, BlogWalStreamingCompressionRequiresStreamingType) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.blog_wal_streaming_compression = true;
+  Destroy(options);
+  for (CompressionType compression : {kNoCompression, kSnappyCompression}) {
+    options.wal_compression = compression;
+    Status s = DB::Open(options, dbname_, &db_);
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    ASSERT_NE(s.ToString().find("blog_wal_streaming_compression requires "
+                                "wal_compression=kZSTD"),
+              std::string::npos)
+        << s.ToString();
+  }
+}
+
+TEST_F(DBWALTest, BlogWalStreamingCompressionRequiresBlogFormat) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = false;
+  options.wal_compression = kZSTD;
+  options.blog_wal_streaming_compression = true;
+  Destroy(options);
+  Status s = DB::Open(options, dbname_, &db_);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_NE(s.ToString().find("blog_wal_streaming_compression requires "
+                              "use_blog_format_for_wals=true"),
+            std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(DBWALTest, BlogWalReaderStreamingRecords) {
+  if (!StreamingCompressionTypeSupported(kZSTD)) {
+    ROCKSDB_GTEST_BYPASS("Test requires ZSTD streaming support");
+    return;
+  }
+  constexpr uint64_t kLogNumber = 7;
+  constexpr WALRecoveryMode kMode =
+      WALRecoveryMode::kTolerateCorruptedTailRecords;
+  const WriteOptions wo;
+
+  // Streamed, raw, then streamed: the raw record is not part of the stream.
+  std::string ordered_contents;
+  {
+    std::unique_ptr<BlogFileWriter> writer =
+        MakeHandBuiltStreamingWalWriter(&ordered_contents, kLogNumber, "07");
+    ASSERT_OK(writer->WriteHeader(wo));
+    std::vector<std::string> fragments =
+        CompressStreamFragments({"streamed-one", "streamed-two"});
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, fragments[0],
+                                          kStreamingCompressionSentinel));
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, "raw-one", kNoCompression));
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, fragments[1],
+                                          kStreamingCompressionSentinel));
+    ASSERT_OK(writer->Close(wo));
+  }
+  {
+    CountingWalReporter reporter;
+    std::unique_ptr<WalReader> reader =
+        NewMemWalReader(&ordered_contents, &reporter, kLogNumber);
+    Slice record;
+    std::string scratch;
+    std::vector<std::string> records;
+    while (reader->ReadRecord(&record, &scratch, kMode)) {
+      records.emplace_back(record.data(), record.size());
+    }
+    ASSERT_EQ(records, std::vector<std::string>(
+                           {"streamed-one", "raw-one", "streamed-two"}));
+    ASSERT_EQ(reporter.failing_count(), 0u) << reporter.first_status.ToString();
+  }
+
+  // A streamed record whose stream predecessor is missing: the raw record
+  // reads, then decompression fails.
+  Random rnd(117);
+  std::string history(4096, '\0');
+  for (size_t i = 0; i < history.size(); ++i) {
+    history[i] = static_cast<char>(rnd.Next());
+  }
+  std::string missing_contents;
+  {
+    std::unique_ptr<BlogFileWriter> writer =
+        MakeHandBuiltStreamingWalWriter(&missing_contents, kLogNumber, "07");
+    ASSERT_OK(writer->WriteHeader(wo));
+    std::vector<std::string> fragments =
+        CompressStreamFragments({history, history});
+    // Tiny output proves the fragment references the missing history, so
+    // the decompression failure below is meaningful, not accidental.
+    ASSERT_LT(fragments[1].size(), 64u);
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, "raw-one", kNoCompression));
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, fragments[1],
+                                          kStreamingCompressionSentinel));
+    ASSERT_OK(writer->Close(wo));
+  }
+  {
+    CountingWalReporter reporter;
+    std::unique_ptr<WalReader> reader =
+        NewMemWalReader(&missing_contents, &reporter, kLogNumber);
+    Slice record;
+    std::string scratch;
+    ASSERT_TRUE(reader->ReadRecord(&record, &scratch, kMode));
+    ASSERT_EQ(record, "raw-one");
+    ASSERT_FALSE(reader->ReadRecord(&record, &scratch, kMode));
+    ASSERT_EQ(reporter.failing_count(), 1u);
+    ASSERT_NE(
+        reporter.first_status.ToString().find("could not decompress streaming"),
+        std::string::npos)
+        << reporter.first_status.ToString();
+  }
+}
+
+TEST_F(DBWALTest, BlogWalStreamingRecoveryAfterBrokenStream) {
+  if (!StreamingCompressionTypeSupported(kZSTD)) {
+    ROCKSDB_GTEST_BYPASS("Test requires ZSTD streaming support");
+    return;
+  }
+  constexpr uint64_t kLogNumber = 7;
+  const WriteOptions wo;
+
+  // r2 references r1, so a missing r1 makes r2 undecodable rather than
+  // silently wrong.
+  Random rnd(1211);
+  std::string history(4096, '\0');
+  for (size_t i = 0; i < history.size(); ++i) {
+    history[i] = static_cast<char>(rnd.Next());
+  }
+  const std::vector<std::string> fragments =
+      CompressStreamFragments({history, history, "r3"});
+  // Tiny output proves the fragment references the missing history, so a
+  // decompression failure below is meaningful, not accidental.
+  ASSERT_LT(fragments[1].size(), 64u);
+
+  struct BrokenStreamCase {
+    std::string name;
+    std::string contents;
+    std::vector<std::string> skip_any_records;
+    std::vector<std::string> stopped_records;
+  };
+  // r1 is left out of the file: the first streamed record has no stream
+  // start to decode from.
+  BrokenStreamCase missing_case;
+  missing_case.name = "missing-r1";
+  {
+    std::unique_ptr<BlogFileWriter> writer = MakeHandBuiltStreamingWalWriter(
+        &missing_case.contents, kLogNumber, "07");
+    ASSERT_OK(writer->WriteHeader(wo));
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, fragments[1],
+                                          kStreamingCompressionSentinel));
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, "raw", kNoCompression));
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, fragments[2],
+                                          kStreamingCompressionSentinel));
+    ASSERT_OK(writer->Close(wo));
+  }
+  missing_case.skip_any_records = {"raw"};
+  // The first record is undecodable, so the other modes stop with nothing.
+  missing_case.stopped_records = {};
+  // r2's payload is damaged: the record is skipped, breaking the stream.
+  BrokenStreamCase corrupt_case;
+  corrupt_case.name = "corrupt-r2";
+  {
+    std::unique_ptr<BlogFileWriter> writer = MakeHandBuiltStreamingWalWriter(
+        &corrupt_case.contents, kLogNumber, "07");
+    ASSERT_OK(writer->WriteHeader(wo));
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, fragments[0],
+                                          kStreamingCompressionSentinel));
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, fragments[1],
+                                          kStreamingCompressionSentinel));
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, "raw", kNoCompression));
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, fragments[2],
+                                          kStreamingCompressionSentinel));
+    ASSERT_OK(writer->Close(wo));
+  }
+  std::vector<BlogWalRecordLayout> layout =
+      ParseBlogWalRecordLayout(corrupt_case.contents);
+  ASSERT_EQ(layout.size(), 4u);
+  corrupt_case.contents[layout[1].payload_offset + 2] ^= 0x01;
+  corrupt_case.skip_any_records = {history, "raw"};
+  corrupt_case.stopped_records = {history};
+
+  for (const BrokenStreamCase* c : {&missing_case, &corrupt_case}) {
+    SCOPED_TRACE(c->name);
+    // SkipAny recovers around the break; r3 is dropped without decoding.
+    {
+      CountingWalReporter reporter;
+      std::unique_ptr<WalReader> reader =
+          NewMemWalReader(&c->contents, &reporter, kLogNumber);
+      Slice record;
+      std::string scratch;
+      std::vector<std::string> records;
+      while (reader->ReadRecord(&record, &scratch,
+                                WALRecoveryMode::kSkipAnyCorruptedRecords)) {
+        records.emplace_back(record.data(), record.size());
+      }
+      ASSERT_EQ(records, c->skip_any_records);
+      ASSERT_EQ(reporter.failing_count(), 2u);
+      ASSERT_NE(reporter.last_status.ToString().find(
+                    "streaming Blog WAL record follows a skipped or "
+                    "undecodable record"),
+                std::string::npos)
+          << reporter.last_status.ToString();
+    }
+    // Other modes stop at the first undecodable record.
+    for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                                 WALRecoveryMode::kAbsoluteConsistency,
+                                 WALRecoveryMode::kPointInTimeRecovery}) {
+      SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+      CountingWalReporter reporter;
+      std::unique_ptr<WalReader> reader =
+          NewMemWalReader(&c->contents, &reporter, kLogNumber);
+      Slice record;
+      std::string scratch;
+      std::vector<std::string> records;
+      while (reader->ReadRecord(&record, &scratch, mode)) {
+        records.emplace_back(record.data(), record.size());
+      }
+      ASSERT_EQ(records, c->stopped_records);
+      ASSERT_EQ(reporter.failing_count(), 1u);
+    }
+  }
+}
+
+TEST_F(DBWALTest, BlogWalReaderUnsupportedStreamingType) {
+  // A header declaring a streaming type this build cannot decode (Snappy)
+  // is reported as NotSupported, not corruption or a misread. The writer
+  // refuses to produce such a file, so the header is encoded directly.
+  // No ZSTD guard: rejection happens before any decoder is created.
+  constexpr uint64_t kLogNumber = 7;
+  std::string contents;
+  BlogFileHeader header = MakeStreamingWalHeader(kLogNumber, "01");
+  header.EncodeTo(&contents);
+  const BlogPadding pad(lossless_cast<uint8_t>(contents.back()),
+                        contents.size(), kBlogMinRecordAlignment,
+                        /*prefer_0xff_when_legal=*/false);
+  pad.AppendTo(&contents);
+
+  CountingWalReporter reporter;
+  std::unique_ptr<WalReader> reader =
+      NewMemWalReader(&contents, &reporter, kLogNumber);
+  Slice record;
+  std::string scratch;
+  ASSERT_FALSE(reader->ReadRecord(
+      &record, &scratch, WALRecoveryMode::kTolerateCorruptedTailRecords));
+  ASSERT_EQ(reporter.failing_count(), 1u);
+  ASSERT_TRUE(reporter.first_status.IsNotSupported())
+      << reporter.first_status.ToString();
+  ASSERT_NE(reporter.first_status.ToString().find(
+                "only ZSTD (0x07) currently supported"),
+            std::string::npos)
+      << reporter.first_status.ToString();
+}
+
+TEST_F(DBWALTest, BlogWalReaderUnsupportedRecordCompression) {
+  // A record whose trailer compression byte names a codec this build cannot
+  // decode (a custom type under BuiltinV2) is readable data of unknown
+  // meaning, not damage: every recovery mode must report it as unrecoverable
+  // (NotSupported) and replay nothing, like an unknown record type. No codec
+  // guard: custom types are never built in.
+  constexpr uint64_t kLogNumber = 7;
+  const WriteOptions wo;
+
+  std::string contents;
+  {
+    std::unique_ptr<BlogFileWriter> writer =
+        MakeHandBuiltWalWriter(&contents, kLogNumber);
+    ASSERT_OK(writer->WriteHeader(wo));
+    // Encoded uncompressed size followed by opaque bytes: size extraction
+    // succeeds, then decoding fails with NotSupported.
+    std::string custom_payload;
+    PutVarint64(&custom_payload, 8);
+    custom_payload.append("custom-data");
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, custom_payload,
+                                          kFirstCustomCompression));
+    ASSERT_OK(writer->AddWriteBatchRecord(wo, "after", kNoCompression));
+    ASSERT_OK(writer->Close(wo));
+  }
+
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kAbsoluteConsistency,
+                               WALRecoveryMode::kPointInTimeRecovery,
+                               WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE(lossless_cast<int>(mode));
+    CountingWalReporter reporter;
+    std::unique_ptr<WalReader> reader =
+        NewMemWalReader(&contents, &reporter, kLogNumber);
+    ASSERT_EQ(ReadAllRecords(reader.get(), mode), 0u);
+    ASSERT_EQ(reporter.failing_count(), 1u);
+    ASSERT_EQ(reporter.unrecoverable_count, 1u);
+    ASSERT_TRUE(reporter.first_status.IsNotSupported())
+        << reporter.first_status.ToString();
+    ASSERT_NE(reporter.first_status.ToString().find("not built-in"),
+              std::string::npos)
+        << reporter.first_status.ToString();
+  }
+}
+
+TEST_F(DBWALTest, BlogWalRecoveryMidFileVsTailDamage) {
+  const struct {
+    int corrupt_idx;
+    WALRecoveryMode mode;
+    bool expect_ok;
+    std::vector<std::string> present;
+    std::vector<std::string> absent;
+  } cases[] = {
+      // Mid-file damage: SkipAny resumes past it, Tolerate/Absolute
+      // refuse, PointInTime stops before it.
+      {1,
+       WALRecoveryMode::kSkipAnyCorruptedRecords,
+       true,
+       {"key1", "key3"},
+       {"key2"}},
+      {1, WALRecoveryMode::kTolerateCorruptedTailRecords, false, {}, {}},
+      {1, WALRecoveryMode::kAbsoluteConsistency, false, {}, {}},
+      {1,
+       WALRecoveryMode::kPointInTimeRecovery,
+       true,
+       {"key1"},
+       {"key2", "key3"}},
+      // Footer damage (torn seal; corrupt_idx -1 truncates the file tail
+      // inside the footer): every mode accepts it.
+      {-1,
+       WALRecoveryMode::kSkipAnyCorruptedRecords,
+       true,
+       {"key1", "key2", "key3"},
+       {}},
+      {-1,
+       WALRecoveryMode::kTolerateCorruptedTailRecords,
+       true,
+       {"key1", "key2", "key3"},
+       {}},
+      {-1,
+       WALRecoveryMode::kAbsoluteConsistency,
+       true,
+       {"key1", "key2", "key3"},
+       {}},
+      {-1,
+       WALRecoveryMode::kPointInTimeRecovery,
+       true,
+       {"key1", "key2", "key3"},
+       {}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE("corrupt_idx=" + std::to_string(c.corrupt_idx) +
+                 " mode=" + std::to_string(static_cast<int>(c.mode)));
+    Options options = CurrentOptions();
+    options.use_blog_format_for_wals = true;
+    options.avoid_flush_during_shutdown = true;
+    options.track_and_verify_wals = false;
+    std::string fname;
+    WriteThreeRecordBlogWal(options, &fname);
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env_, fname, &contents));
+    if (c.corrupt_idx < 0) {
+      ASSERT_GT(contents.size(), 64u);
+      contents.resize(contents.size() - 10);
+    } else {
+      std::vector<BlogWalRecordLayout> layout =
+          ParseBlogWalRecordLayout(contents);
+      ASSERT_EQ(layout.size(), 3u);
+      ASSERT_GT(layout[c.corrupt_idx].length, 8u);
+      contents[layout[c.corrupt_idx].payload_offset + 2] ^= 0x01;
+    }
+    OverwriteFile(fname, contents);
+
+    options.wal_recovery_mode = c.mode;
+    Status s = DB::Open(options, dbname_, &db_);
+    if (!c.expect_ok) {
+      ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+      continue;
+    }
+    ASSERT_OK(s);
+    for (const std::string& key : c.present) {
+      ASSERT_EQ(std::string("value") + key.back(), Get(key));
+    }
+    for (const std::string& key : c.absent) {
+      ASSERT_EQ("NOT_FOUND", Get(key));
+    }
+    Close();
+  }
+}
+
+TEST_F(DBWALTest, BlogWalRecycledStaleTailTruncatesSilently) {
+  for (int recycle_log_file_num : {1, 0}) {
+    SCOPED_TRACE("recycle_log_file_num=" +
+                 std::to_string(recycle_log_file_num));
+    Options options = CurrentOptions();
+    options.use_blog_format_for_wals = true;
+    options.recycle_log_file_num = recycle_log_file_num;
+    options.avoid_flush_during_shutdown = true;
+    options.write_buffer_size = 10 * 1024 * 1024;
+    options.max_write_buffer_number = 10;
+    options.compression = kNoCompression;
+    options.track_and_verify_wals = false;
+
+    std::string fname;
+    if (recycle_log_file_num > 0) {
+      uint64_t log_number = 0;
+      CreateRecycledBlogWal(options, &fname, &log_number);
+    } else {
+      WriteThreeRecordBlogWal(options, &fname);
+    }
+    Close();
+
+    // Stale bytes past the seal carry no escape sequence of ours.
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env_, fname, &contents));
+    contents.append(128, '\xab');
+    OverwriteFile(fname, contents);
+
+    options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+    Status s = DB::Open(options, dbname_, &db_);
+    if (recycle_log_file_num > 0) {
+      ASSERT_OK(s);
+      ASSERT_EQ("value3", Get("key3"));
+      ASSERT_EQ("value3b", Get("key3b"));
+      Close();
+    } else {
+      ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+    }
+  }
+}
+
+TEST_F(DBWALTest, BlogWalRecycledStaleTailStopsPointInTimeReplay) {
+  // Unsynced records of a recycled WAL lost back to the previous
+  // incarnation's bytes look like its stale tail. kPointInTimeRecovery must
+  // then skip a later WAL that does not continue the sequence.
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.recycle_log_file_num = 1;
+  options.avoid_flush_during_shutdown = true;
+  options.write_buffer_size = 10 * 1024 * 1024;
+  options.max_write_buffer_number = 10;
+  options.compression = kNoCompression;
+  options.track_and_verify_wals = false;
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+
+  std::string recycled_fname;
+  uint64_t recycled_log_number = 0;
+  CreateRecycledBlogWal(options, &recycled_fname, &recycled_log_number);
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_OK(Put("key4", "value4"));
+  Close();
+
+  // Replace key3b's record and everything after it with bytes that carry no
+  // escape sequence of this WAL.
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, recycled_fname, &contents));
+  std::vector<BlogWalRecordLayout> layout = ParseBlogWalRecordLayout(contents);
+  ASSERT_EQ(layout.size(), 2u);
+  const size_t lost_from = static_cast<size_t>(layout[1].record_offset);
+  contents.replace(lost_from, std::string::npos, contents.size() - lost_from,
+                   '\xab');
+  OverwriteFile(recycled_fname, contents);
+
+  ASSERT_OK(DB::Open(options, dbname_, &db_));
+  ASSERT_EQ("value2", Get("key2"));
+  ASSERT_EQ("value3", Get("key3"));
+  ASSERT_EQ("NOT_FOUND", Get("key3b"));
+  ASSERT_EQ("NOT_FOUND", Get("key4"));
+  Close();
+}
+
+TEST_F(DBWALTest, BlogWalReaderStaleIncarnationDeclaredEmpty) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.avoid_flush_during_shutdown = true;
+  std::string fname;
+  WriteThreeRecordBlogWal(options, &fname);
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, fname, &contents));
+
+  // A recycled WAL renamed to a new log number before its header was
+  // rewritten: the file is declared empty, not corruption.
+  CountingWalReporter reporter;
+  std::unique_ptr<WalReader> reader =
+      NewMemWalReader(&contents, &reporter, WalLogNumberFromFname(fname) + 100);
+  Slice record;
+  std::string scratch;
+  ASSERT_FALSE(reader->ReadRecord(&record, &scratch,
+                                  WALRecoveryMode::kAbsoluteConsistency));
+  ASSERT_EQ(reporter.failing_count(), 0u);
+  ASSERT_EQ(reporter.tolerated_count, 0u);
+  ASSERT_EQ(reporter.unrecoverable_count, 0u);
+}
+
+TEST_F(DBWALTest, BlogWalReaderUnsupportedRecordIsUnrecoverable) {
+  constexpr uint64_t kLogNumber = 7;
+  std::string contents;
+  {
+    std::unique_ptr<BlogFileWriter> writer =
+        MakeHandBuiltWalWriter(&contents, kLogNumber, /*recycled=*/false);
+    ASSERT_OK(writer->WriteHeader(WriteOptions()));
+    ASSERT_OK(writer->AddWriteBatchRecord(
+        WriteOptions(), std::string(20 * 1024, 'r'), kNoCompression));
+    ASSERT_OK(writer->Close(WriteOptions()));
+  }
+  // Flip the full-format record's type byte to a reserved value, keeping
+  // its prefix checksum valid.
+  std::vector<BlogWalRecordLayout> layout = ParseBlogWalRecordLayout(contents);
+  ASSERT_EQ(layout.size(), 1u);
+  RewriteFullRecordType(&contents, layout[0].record_offset, 0x14);
+
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    CountingWalReporter reporter;
+    std::unique_ptr<WalReader> reader =
+        NewMemWalReader(&contents, &reporter, kLogNumber);
+    Slice record;
+    std::string scratch;
+    ASSERT_FALSE(reader->ReadRecord(&record, &scratch, mode));
+    // Reported on the unrecoverable channel, which no mode suppresses for
+    // unsupported formats.
+    ASSERT_EQ(reporter.unrecoverable_count, 1u);
+    ASSERT_TRUE(reporter.first_status.IsNotSupported())
+        << reporter.first_status.ToString();
+  }
+}
+
+TEST_F(DBWALTest, BlogWalReaderToleratedTailDrop) {
+  constexpr uint64_t kLogNumber = 7;
+  constexpr WALRecoveryMode kMode =
+      WALRecoveryMode::kTolerateCorruptedTailRecords;
+  std::string contents;
+  {
+    std::unique_ptr<BlogFileWriter> writer =
+        MakeHandBuiltWalWriter(&contents, kLogNumber, /*recycled=*/false);
+    ASSERT_OK(writer->WriteHeader(WriteOptions()));
+    ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch-one",
+                                          kNoCompression));
+    ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch-two",
+                                          kNoCompression));
+    ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch-three",
+                                          kNoCompression));
+    ASSERT_OK(writer->Close(WriteOptions()));
+  }
+  // Unsealed, so the damaged last record has no boundary beyond it.
+  std::vector<BlogWalRecordLayout> layout = ParseBlogWalRecordLayout(contents);
+  ASSERT_EQ(layout.size(), 3u);
+  contents[layout[2].payload_offset + 2] ^= 0x01;
+
+  CountingWalReporter reporter;
+  std::unique_ptr<WalReader> reader =
+      NewMemWalReader(&contents, &reporter, kLogNumber);
+  Slice record;
+  std::string scratch;
+  ASSERT_TRUE(reader->ReadRecord(&record, &scratch, kMode));
+  ASSERT_EQ(record, "batch-one");
+  ASSERT_TRUE(reader->ReadRecord(&record, &scratch, kMode));
+  ASSERT_EQ(record, "batch-two");
+  ASSERT_FALSE(reader->ReadRecord(&record, &scratch, kMode));
+  ASSERT_EQ(reporter.failing_count(), 0u);
+  ASSERT_EQ(reporter.tolerated_count, 1u);
+  ASSERT_NE(reporter.first_tolerated.ToString().find(
+                "no further Blog WAL record boundary"),
+            std::string::npos)
+      << reporter.first_tolerated.ToString();
+}
+
+TEST_F(DBWALTest, BlogWalReaderIoErrorIsUnrecoverable) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.avoid_flush_during_shutdown = true;
+  std::string fname;
+  WriteThreeRecordBlogWal(options, &fname);
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, fname, &contents));
+  std::vector<BlogWalRecordLayout> layout = ParseBlogWalRecordLayout(contents);
+  ASSERT_EQ(layout.size(), 3u);
+
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    // Reads fail inside the second record: the first record reads, then
+    // the device error stops the read on the unrecoverable channel. The +8
+    // keeps the fault past the padding-skip lookahead; the primed prefix is
+    // served from the first block read, so only the second record faults.
+    CountingWalReporter reporter;
+    std::unique_ptr<WalReader> reader = NewWalReaderOver(
+        std::unique_ptr<FSSequentialFile>(new FaultySequentialFile(
+            contents, static_cast<size_t>(layout[1].record_offset) + 8)),
+        "faulty-blog-wal", &reporter, WalLogNumberFromFname(fname));
+    Slice record;
+    std::string scratch;
+    ASSERT_TRUE(reader->ReadRecord(&record, &scratch, mode));
+    ASSERT_FALSE(reader->ReadRecord(&record, &scratch, mode));
+    ASSERT_EQ(reporter.unrecoverable_count, 1u);
+    ASSERT_TRUE(reporter.first_status.IsIOError())
+        << reporter.first_status.ToString();
+  }
+}
+
+TEST_F(DBWALTest, BlogWalSkipAnyResumesPastCompactLengthOverrun) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.avoid_flush_during_shutdown = true;
+  options.track_and_verify_wals = false;
+  options.wal_recovery_mode = WALRecoveryMode::kSkipAnyCorruptedRecords;
+  std::string fname;
+  WriteThreeRecordBlogWal(options, &fname);
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, fname, &contents));
+  std::vector<BlogWalRecordLayout> layout = ParseBlogWalRecordLayout(contents);
+  ASSERT_EQ(layout.size(), 3u);
+  // Inflate the first record's unauthenticated compact length so its
+  // framing consumes the second record; the trailer read then lands
+  // inside the second record and fails its checksum. The reader must
+  // rewind and resume at the real second boundary.
+  const size_t varint_off = layout[0].record_offset + kBlogEscapeSequenceSize;
+  Slice varint_input(contents.data() + varint_off,
+                     contents.size() - varint_off);
+  uint64_t old_length = 0;
+  ASSERT_TRUE(GetPrefixVarint64(&varint_input, &old_length));
+  const size_t old_varint_len =
+      contents.size() - varint_off - varint_input.size();
+  const uint64_t new_length =
+      layout[1].payload_offset + 2 - layout[0].payload_offset;
+  ASSERT_GT(new_length, old_length);
+  OverwriteCompactRecordLength(varint_off, new_length, old_varint_len,
+                               &contents);
+  OverwriteFile(fname, contents);
+
+  ASSERT_OK(DB::Open(options, dbname_, &db_));
+  ASSERT_EQ("NOT_FOUND", Get("key1"));
+  ASSERT_EQ("value2", Get("key2"));
+  ASSERT_EQ("value3", Get("key3"));
+}
+
+TEST_F(DBWALTest, BlogWalRecoveryReadErrorFailsOpenExceptSkipAny) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.avoid_flush_during_shutdown = true;
+  options.track_and_verify_wals = false;
+  std::string fname;
+  WriteThreeRecordBlogWal(options, &fname);
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, fname, &contents));
+  std::vector<BlogWalRecordLayout> layout = ParseBlogWalRecordLayout(contents);
+  ASSERT_EQ(layout.size(), 3u);
+
+  // Header and format detection read fine; the first record read fails,
+  // so the error flows through the recovery loop in every mode.
+  auto fail_fs = std::make_shared<FailWalReadsPastOffsetFS>(
+      env_->GetFileSystem(), ".log", layout[0].record_offset);
+  std::unique_ptr<Env> fail_env(NewCompositeEnv(fail_fs));
+  // Holders for the per-mode fault env below; declared before the Defer so
+  // a fatal assert with the DB open still closes against a live Env.
+  std::shared_ptr<FailWalReadsPastOffsetFS> mode_fail_fs;
+  std::unique_ptr<Env> mode_fail_env;
+  Defer close_db_on_exit([this]() { Close(); });
+  options.env = fail_env.get();
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kAbsoluteConsistency,
+                               WALRecoveryMode::kPointInTimeRecovery}) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    options.wal_recovery_mode = mode;
+    Status s = DB::Open(options, dbname_, &db_);
+    ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  }
+
+  // SkipAny truncates replay at the device error like legacy WALs: the
+  // open succeeds with nothing replayed past the failure.
+  options.wal_recovery_mode = WALRecoveryMode::kSkipAnyCorruptedRecords;
+  ASSERT_OK(DB::Open(options, dbname_, &db_));
+  ASSERT_EQ("NOT_FOUND", Get("key1"));
+  ASSERT_EQ("NOT_FOUND", Get("key2"));
+  ASSERT_EQ("NOT_FOUND", Get("key3"));
+  Close();
+
+  // paranoid_checks=false also truncates on I/O errors like legacy WALs,
+  // in every mode. Each iteration rebuilds the WAL: a successful open
+  // purges it on close.
+  options.paranoid_checks = false;
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kAbsoluteConsistency,
+                               WALRecoveryMode::kPointInTimeRecovery}) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    options.env = env_;
+    options.wal_recovery_mode = mode;
+    WriteThreeRecordBlogWal(options, &fname);
+    ASSERT_OK(ReadFileToString(env_, fname, &contents));
+    layout = ParseBlogWalRecordLayout(contents);
+    ASSERT_EQ(layout.size(), 3u);
+    mode_fail_fs = std::make_shared<FailWalReadsPastOffsetFS>(
+        env_->GetFileSystem(), ".log", layout[0].record_offset);
+    mode_fail_env = NewCompositeEnv(mode_fail_fs);
+    options.env = mode_fail_env.get();
+    ASSERT_OK(DB::Open(options, dbname_, &db_));
+    ASSERT_EQ("NOT_FOUND", Get("key1"));
+    ASSERT_EQ("NOT_FOUND", Get("key2"));
+    ASSERT_EQ("NOT_FOUND", Get("key3"));
+    Close();
+  }
+}
+
+TEST_F(DBWALTest, LegacyWalGetFileSizeFailureFailsOpen) {
+  // Complement of BlogWalRecoveryReadErrorFailsOpenExceptSkipAny: a
+  // GetFileSize failure for a fully-read WAL surfaces from
+  // UpdatePredecessorWALInfo, not the reader, so paranoid_checks=false must
+  // not swallow it -- the open fails as at base.
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.paranoid_checks = false;
+  options.avoid_flush_during_shutdown = true;
+  // Holders for the per-mode fault env below; declared before the Defer so
+  // a fatal assert with the DB open still closes against a live Env.
+  std::shared_ptr<WalGetFileSizeFailFS> mode_fail_fs;
+  std::unique_ptr<Env> mode_fail_env;
+  Defer close_db_on_exit([this]() { Close(); });
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kPointInTimeRecovery}) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    options.env = env_;
+    options.wal_recovery_mode = mode;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key", "value"));
+    Close();
+    mode_fail_fs =
+        std::make_shared<WalGetFileSizeFailFS>(env_->GetFileSystem(), ".log");
+    mode_fail_env = NewCompositeEnv(mode_fail_fs);
+    options.env = mode_fail_env.get();
+    Status s = DB::Open(options, dbname_, &db_);
+    ASSERT_TRUE(s.IsIOError()) << s.ToString();
+    ASSERT_NE(s.ToString().find("injected WAL GetFileSize failure"),
+              std::string::npos)
+        << s.ToString();
+    ASSERT_EQ(mode_fail_fs->failed_count(), 1u);
+  }
+}
+
+TEST_F(DBWALTest, WalOpenFailureSkippedWithoutParanoidChecks) {
+  // With paranoid_checks=false, a WAL that cannot be opened during recovery
+  // is skipped and later WALs still replay.
+  Options options = CurrentOptions();
+  options.paranoid_checks = false;
+  options.avoid_flush_during_shutdown = true;
+  options.avoid_flush_during_recovery = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key1", "value1"));
+  Reopen(options);
+  ASSERT_OK(Put("key2", "value2"));
+  VectorWalPtr wals;
+  ASSERT_OK(db_->GetSortedWalFiles(wals));
+  ASSERT_EQ(wals.size(), 2u);
+  const std::string first_wal = LogFileName(dbname_, wals[0]->LogNumber());
+  Close();
+
+  // Delete the first WAL after recovery has listed it, before it is opened.
+  bool deleted = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RecoverLogFiles:BeforeReadWal", [&](void* /*arg*/) {
+        if (!deleted) {
+          deleted = true;
+          ASSERT_OK(env_->DeleteFile(first_wal));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  options.avoid_flush_during_recovery = false;
+  Status s = TryReopen(options);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(s);
+  ASSERT_TRUE(deleted);
+  ASSERT_EQ("NOT_FOUND", Get("key1"));
+  ASSERT_EQ("value2", Get("key2"));
+}
+
+TEST_F(DBWALTest, BlogWalRecoveryReadErrorSkipAnyPreservesPrefix) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.avoid_flush_during_shutdown = true;
+  options.track_and_verify_wals = false;
+  std::string fname;
+  WriteThreeRecordBlogWal(options, &fname);
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, fname, &contents));
+  std::vector<BlogWalRecordLayout> layout = ParseBlogWalRecordLayout(contents);
+  ASSERT_EQ(layout.size(), 3u);
+
+  // A fault at the second record's payload start replays the first record
+  // before the device error truncates the rest: SkipAny preserves the
+  // prefix like legacy WALs.
+  auto fail_fs = std::make_shared<FailWalReadsPastOffsetFS>(
+      env_->GetFileSystem(), ".log", layout[1].payload_offset);
+  std::unique_ptr<Env> fail_env(NewCompositeEnv(fail_fs));
+  Defer close_db_on_exit([this]() { Close(); });
+  options.env = fail_env.get();
+  options.wal_recovery_mode = WALRecoveryMode::kSkipAnyCorruptedRecords;
+  ASSERT_OK(DB::Open(options, dbname_, &db_));
+  ASSERT_EQ("value1", Get("key1"));
+  ASSERT_EQ("NOT_FOUND", Get("key2"));
+  ASSERT_EQ("NOT_FOUND", Get("key3"));
+  Close();
+}
+
+TEST_F(DBWALTest, BlogWalRecoveryUnsupportedRecordFailsOpen) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.avoid_flush_during_shutdown = true;
+  options.track_and_verify_wals = false;
+  std::string fname;
+  WriteThreeRecordBlogWal(options, &fname);
+  const uint64_t log_number = WalLogNumberFromFname(fname);
+
+  // A WAL whose first record has a reserved type: no valid batch precedes
+  // the failure, so every mode must refuse to open.
+  std::string contents;
+  {
+    std::unique_ptr<BlogFileWriter> writer =
+        MakeHandBuiltWalWriter(&contents, log_number, /*recycled=*/false);
+    ASSERT_OK(writer->WriteHeader(WriteOptions()));
+    ASSERT_OK(writer->AddWriteBatchRecord(
+        WriteOptions(), std::string(20 * 1024, 'r'), kNoCompression));
+    ASSERT_OK(writer->Close(WriteOptions()));
+  }
+  std::vector<BlogWalRecordLayout> layout = ParseBlogWalRecordLayout(contents);
+  ASSERT_EQ(layout.size(), 1u);
+  RewriteFullRecordType(&contents, layout[0].record_offset, 0x14);
+  OverwriteFile(fname, contents);
+
+  // SkipAny and paranoid_checks=false suppress corruption, but an
+  // unreadable format is unrecoverable and must still fail the open.
+  options.wal_recovery_mode = WALRecoveryMode::kSkipAnyCorruptedRecords;
+  Status s = DB::Open(options, dbname_, &db_);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+
+  options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+  s = DB::Open(options, dbname_, &db_);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  options.paranoid_checks = false;
+  s = DB::Open(options, dbname_, &db_);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+
+  options.wal_recovery_mode = WALRecoveryMode::kTolerateCorruptedTailRecords;
+  options.paranoid_checks = true;
+  s = DB::Open(options, dbname_, &db_);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+}
+
+TEST_F(DBWALTest, BlogWalReaderUnexpectedTypeHandling) {
+  constexpr uint64_t kLogNumber = 7;
+  std::string contents;
+  {
+    std::unique_ptr<BlogFileWriter> writer =
+        MakeHandBuiltWalWriter(&contents, kLogNumber, /*recycled=*/false);
+    ASSERT_OK(writer->WriteHeader(WriteOptions()));
+    uint64_t blob_offset = 0;
+    ASSERT_OK(writer->AddBlobRecord(WriteOptions(), "not-a-batch",
+                                    kNoCompression, &blob_offset,
+                                    strlen("not-a-batch")));
+    ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch-after-blob",
+                                          kNoCompression));
+    ASSERT_OK(writer->Close(WriteOptions()));
+  }
+
+  // SkipAny reports the unexpected type but continues past it.
+  {
+    CountingWalReporter reporter;
+    std::unique_ptr<WalReader> reader =
+        NewMemWalReader(&contents, &reporter, kLogNumber);
+    Slice record;
+    std::string scratch;
+    ASSERT_TRUE(reader->ReadRecord(&record, &scratch,
+                                   WALRecoveryMode::kSkipAnyCorruptedRecords));
+    ASSERT_EQ(record, "batch-after-blob");
+    ASSERT_FALSE(reader->ReadRecord(&record, &scratch,
+                                    WALRecoveryMode::kSkipAnyCorruptedRecords));
+    ASSERT_EQ(reporter.failing_count(), 1u);
+  }
+  // Other modes stop at it.
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kAbsoluteConsistency,
+                               WALRecoveryMode::kPointInTimeRecovery}) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    CountingWalReporter reporter;
+    std::unique_ptr<WalReader> reader =
+        NewMemWalReader(&contents, &reporter, kLogNumber);
+    Slice record;
+    std::string scratch;
+    ASSERT_FALSE(reader->ReadRecord(&record, &scratch, mode));
+    ASSERT_EQ(reporter.failing_count(), 1u);
+  }
+}
+
+TEST_F(DBWALTest, BlogWalReaderScanFailureReportsUnrecoverableFirst) {
+  constexpr uint64_t kLogNumber = 7;
+  constexpr WALRecoveryMode kMode = WALRecoveryMode::kSkipAnyCorruptedRecords;
+  std::string contents;
+  {
+    std::unique_ptr<BlogFileWriter> writer =
+        MakeHandBuiltWalWriter(&contents, kLogNumber, /*recycled=*/false);
+    ASSERT_OK(writer->WriteHeader(WriteOptions()));
+    ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch-one",
+                                          kNoCompression));
+    ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch-two",
+                                          kNoCompression));
+    ASSERT_OK(writer->Close(WriteOptions()));
+  }
+  std::vector<BlogWalRecordLayout> layout = ParseBlogWalRecordLayout(contents);
+  ASSERT_EQ(layout.size(), 2u);
+  contents[layout[0].payload_offset + 2] ^= 0x01;
+  // Fail right past the first record's trailer: the corrupt record reads
+  // fully, then the boundary scan itself hits the device error.
+  const size_t fail_at =
+      layout[0].payload_offset + layout[0].length + kBlogBlockTrailerSize + 1;
+
+  CountingWalReporter reporter;
+  std::unique_ptr<WalReader> reader =
+      NewWalReaderOver(std::unique_ptr<FSSequentialFile>(
+                           new FaultySequentialFile(contents, fail_at)),
+                       "faulty-blog-wal", &reporter, kLogNumber);
+  Slice record;
+  std::string scratch;
+  ASSERT_FALSE(reader->ReadRecord(&record, &scratch, kMode));
+  // The scan failure is reported first (reporters keep the first status),
+  // then the original corruption.
+  ASSERT_EQ(reporter.unrecoverable_count, 1u);
+  ASSERT_EQ(reporter.failing_count(), 2u);
+  ASSERT_TRUE(reporter.first_status.IsIOError())
+      << reporter.first_status.ToString();
+}
+
+TEST_F(DBWALTest, BlogWalReaderRecycledStaleTail) {
+  constexpr uint64_t kLogNumber = 7;
+  std::string contents;
+  {
+    std::unique_ptr<BlogFileWriter> writer =
+        MakeHandBuiltWalWriter(&contents, kLogNumber, /*recycled=*/true);
+    ASSERT_OK(writer->WriteHeader(WriteOptions()));
+    ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch-one",
+                                          kNoCompression));
+    ASSERT_OK(writer->Close(WriteOptions()));
+  }
+  // Stale bytes from the previous incarnation carry no escape of ours.
+  contents.append(128, '\xab');
+
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kAbsoluteConsistency,
+                               WALRecoveryMode::kPointInTimeRecovery,
+                               WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    CountingWalReporter reporter;
+    std::unique_ptr<WalReader> reader =
+        NewMemWalReader(&contents, &reporter, kLogNumber);
+    Slice record;
+    std::string scratch;
+    ASSERT_TRUE(reader->ReadRecord(&record, &scratch, mode));
+    ASSERT_EQ(record, "batch-one");
+    ASSERT_FALSE(reader->ReadRecord(&record, &scratch, mode));
+    // A stale tail is a clean end in every mode: no failing, tolerated, or
+    // unrecoverable report.
+    ASSERT_EQ(reporter.failing_count(), 0u) << reporter.first_status.ToString();
+    ASSERT_EQ(reporter.tolerated_count, 0u)
+        << reporter.first_tolerated.ToString();
+    ASSERT_EQ(reporter.unrecoverable_count, 0u);
+  }
+}
+
+TEST_F(DBWALTest, BlogWalReaderUnsealedRecycledStaleTailReportsOldRecord) {
+  constexpr uint64_t kLogNumber = 7;
+  std::string contents;
+  {
+    std::unique_ptr<BlogFileWriter> writer =
+        MakeHandBuiltWalWriter(&contents, kLogNumber, /*recycled=*/true);
+    ASSERT_OK(writer->WriteHeader(WriteOptions()));
+    ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch-one",
+                                          kNoCompression));
+    ASSERT_OK(writer->AddWriteBatchRecord(WriteOptions(), "batch-two",
+                                          kNoCompression));
+    ASSERT_OK(writer->Close(WriteOptions()));
+  }
+  // Stale bytes from the previous incarnation replace the second record and
+  // the footer.
+  std::vector<BlogWalRecordLayout> layout = ParseBlogWalRecordLayout(contents);
+  ASSERT_EQ(layout.size(), 2u);
+  contents.resize(static_cast<size_t>(layout[1].record_offset));
+  contents.append(128, '\xab');
+
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kAbsoluteConsistency,
+                               WALRecoveryMode::kPointInTimeRecovery,
+                               WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    CountingWalReporter reporter;
+    std::unique_ptr<WalReader> reader =
+        NewMemWalReader(&contents, &reporter, kLogNumber);
+    ASSERT_EQ(ReadAllRecords(reader.get(), mode), 1u);
+    ASSERT_EQ(reporter.failing_count(), 0u) << reporter.first_status.ToString();
+    ASSERT_EQ(reporter.tolerated_count, 0u)
+        << reporter.first_tolerated.ToString();
+    // Only kPointInTimeRecovery needs the signal to check the next WAL.
+    const size_t expected_old_records =
+        mode == WALRecoveryMode::kPointInTimeRecovery ? 1u : 0u;
+    ASSERT_EQ(reporter.old_log_record_count, expected_old_records);
+  }
+}
+
+// Fewer stale bytes than an escape sequence after the last record of a
+// recycled WAL end it exactly like a longer stale tail.
+TEST_F(DBWALTest, BlogWalReaderShortRecycledStaleTail) {
+  constexpr uint64_t kLogNumber = 7;
+  for (size_t stale_len :
+       {size_t{1}, size_t{3}, size_t{4}, size_t{8}, size_t{9}}) {
+    SCOPED_TRACE("stale_len=" + std::to_string(stale_len));
+    std::string contents;
+    const size_t cut =
+        CutBeforeSecondBlogRecord(&contents, /*recycled=*/true, kLogNumber);
+    const char stale = NonPaddingByteOtherThan(contents[cut]);
+    contents.resize(cut);
+    contents.append(stale_len, stale);
+    AssertFirstRecordThenStaleTail(contents, kLogNumber);
+  }
+}
+
+// A torn prefix of this incarnation's own escape sequence reads as a stale
+// tail whether or not stale bytes follow it: a recycled file cannot tell the
+// two apart, so the position of the previous incarnation's EOF must not
+// change the outcome.
+TEST_F(DBWALTest, BlogWalReaderRecycledOwnTornEscapeIsStaleTail) {
+  constexpr uint64_t kLogNumber = 7;
+  for (size_t stale_after : {size_t{0}, size_t{28}}) {
+    for (size_t torn_len : {size_t{1}, size_t{4}, size_t{9}}) {
+      SCOPED_TRACE("stale_after=" + std::to_string(stale_after) +
+                   " torn_len=" + std::to_string(torn_len));
+      std::string contents;
+      const size_t cut =
+          CutBeforeSecondBlogRecord(&contents, /*recycled=*/true, kLogNumber);
+      const char stale = NonPaddingByteOtherThan(contents[cut + torn_len]);
+      contents.resize(cut + torn_len);
+      contents.append(stale_after, stale);
+      AssertFirstRecordThenStaleTail(contents, kLogNumber);
+    }
+  }
+}
+
+// Without recycling, a short tail can only be a torn write of this file, so
+// kAbsoluteConsistency and kPointInTimeRecovery report it as corruption.
+TEST_F(DBWALTest, BlogWalReaderShortNonRecycledTailIsTornTail) {
+  constexpr uint64_t kLogNumber = 7;
+  for (size_t tail_len : {size_t{1}, size_t{4}, size_t{9}}) {
+    std::string contents;
+    const size_t cut =
+        CutBeforeSecondBlogRecord(&contents, /*recycled=*/false, kLogNumber);
+    const char junk = NonPaddingByteOtherThan(contents[cut]);
+    contents.resize(cut);
+    contents.append(tail_len, junk);
+    for (WALRecoveryMode mode : {WALRecoveryMode::kAbsoluteConsistency,
+                                 WALRecoveryMode::kPointInTimeRecovery}) {
+      SCOPED_TRACE("tail_len=" + std::to_string(tail_len) +
+                   " mode=" + std::to_string(static_cast<int>(mode)));
+      CountingWalReporter reporter;
+      std::unique_ptr<WalReader> reader =
+          NewMemWalReader(&contents, &reporter, kLogNumber);
+      ASSERT_EQ(ReadAllRecords(reader.get(), mode), 1u);
+      ASSERT_EQ(reporter.failing_count(), 1u);
+      ASSERT_TRUE(reporter.first_status.IsCorruption())
+          << reporter.first_status.ToString();
+    }
+  }
+}
+
+// A header torn by a crash is reported as corruption, like a legacy WAL's
+// truncated header, by readers that are not tailing the file.
+TEST_F(DBWALTest, BlogWalReaderTornHeaderIsCorruption) {
+  constexpr uint64_t kLogNumber = 7;
+  std::string complete;
+  CutBeforeSecondBlogRecord(&complete, /*recycled=*/false, kLogNumber);
+  const uint32_t property_size =
+      DecodeFixed32(complete.data() + kBlogFilePropertySectionSizeOffset);
+  for (size_t cut :
+       {size_t{kBlogFileMagicSize}, size_t{kBlogFileFixedHeaderSize - 1},
+        size_t{kBlogFileFixedHeaderSize + property_size - 1}}) {
+    const std::string contents = complete.substr(0, cut);
+    for (WALRecoveryMode mode : {WALRecoveryMode::kAbsoluteConsistency,
+                                 WALRecoveryMode::kPointInTimeRecovery}) {
+      SCOPED_TRACE("cut=" + std::to_string(cut) +
+                   " mode=" + std::to_string(static_cast<int>(mode)));
+      CountingWalReporter reporter;
+      std::unique_ptr<WalReader> reader =
+          NewMemWalReader(&contents, &reporter, kLogNumber);
+      ASSERT_EQ(ReadAllRecords(reader.get(), mode), 0u);
+      ASSERT_EQ(reporter.failing_count(), 1u);
+      ASSERT_TRUE(reporter.first_status.IsCorruption())
+          << reporter.first_status.ToString();
+    }
+  }
+}
+
+// DB::Open, whose WAL reader cannot reopen the file, accepts a short stale
+// tail in a recycled WAL under kAbsoluteConsistency.
+TEST_F(DBWALTest, BlogWalShortRecycledStaleTailOpensAbsoluteConsistency) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.recycle_log_file_num = 1;
+  options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+  options.avoid_flush_during_shutdown = true;
+  options.avoid_flush_during_recovery = true;
+  DestroyAndReopen(options);
+
+  // Roll WALs until the live one is a recycled file.
+  std::string fname;
+  std::string contents;
+  bool recycled = false;
+  for (int i = 0; i < 8 && !recycled; ++i) {
+    ASSERT_OK(Put("roll" + std::to_string(i), "v"));
+    ASSERT_OK(Flush());
+    std::unique_ptr<LogFile> wal_file;
+    ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+    fname = LogFileName(dbname_, wal_file->LogNumber());
+    ASSERT_OK(ReadFileToString(env_, fname, &contents));
+    Slice header_input(contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&header_input));
+    recycled = header.is_recycled();
+  }
+  ASSERT_TRUE(recycled) << "never got a recycled WAL";
+
+  ASSERT_OK(Put("key3", "value3"));
+  ASSERT_OK(Put("key4", "value4"));
+  ASSERT_OK(db_->FlushWAL(true));
+  Close();
+
+  // Replace key4's record and the footer with four stale bytes.
+  ASSERT_OK(ReadFileToString(env_, fname, &contents));
+  std::vector<BlogWalRecordLayout> layout = ParseBlogWalRecordLayout(contents);
+  ASSERT_GE(layout.size(), 2u);
+  const size_t cut = static_cast<size_t>(layout.back().record_offset);
+  const char stale = NonPaddingByteOtherThan(contents[cut]);
+  contents.resize(cut);
+  contents.append(4, stale);
+  ASSERT_OK(WriteStringToFile(env_, contents, fname, /*should_sync=*/true));
+
+  ASSERT_OK(TryReopen(options));
+  ASSERT_EQ("value3", Get("key3"));
+  ASSERT_EQ("NOT_FOUND", Get("key4"));
+}
+
+TEST_F(DBWALTest, BlogWalChecksumChangeAcrossReopen) {
+  // The reader verifies against each file's stored checksum type.
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.blog_checksum = kCRC32c;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+  Close();
+
+  options.blog_checksum = kXXH3;
+  ASSERT_OK(DB::Open(options, dbname_, &db_));
+  ASSERT_EQ("value", Get("key"));
+  Close();
+}
+
+TEST_F(DBWALTest, BlogWalDetectsMissingPredecessorWal) {
+  // A deleted middle WAL exercises the predecessor-mismatch path in blog mode.
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.track_and_verify_wals = true;
+  options.avoid_flush_during_shutdown = true;
+  options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+  // Keep the unflushed memtables around rather than stalling writes.
+  options.max_write_buffer_number = 10;
+
+  // Stop background flush so that no WAL is deleted before one is picked.
+  options.env->SetBackgroundThreads(1, Env::HIGH);
+  test::SleepingBackgroundTask sleeping_task;
+  options.env->Schedule(&test::SleepingBackgroundTask::DoSleepTask,
+                        &sleeping_task, Env::Priority::HIGH);
+
+  // Three WALs so recovery observes one predecessor before the hole.
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key1", "value1"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_OK(Put("key2", "value2"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_OK(Put("key3", "value3"));
+
+  VectorWalPtr log_files;
+  ASSERT_OK(db_->GetSortedWalFiles(log_files));
+  ASSERT_EQ(log_files.size(), 3);
+  const std::string middle_log_name =
+      LogFileName(dbname_, log_files[1]->LogNumber());
+  Close();
+  ASSERT_OK(options.env->DeleteFile(middle_log_name));
+
+  // The hole must be reported as corruption, not crash the reader.
+  Status s = DB::Open(options, dbname_, &db_);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+
+  sleeping_task.WakeUp();
+  sleeping_task.WaitUntilDone();
+}
+
+TEST_F(DBWALTest, BlogWalRecycledMidFileCorruptionStillReported) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.recycle_log_file_num = 1;
+  options.avoid_flush_during_shutdown = true;
+  options.write_buffer_size = 10 * 1024 * 1024;
+  options.max_write_buffer_number = 10;
+  options.compression = kNoCompression;
+  options.track_and_verify_wals = false;
+
+  std::string recycled_fname;
+  uint64_t recycled_number = 0;
+  CreateRecycledBlogWal(options, &recycled_fname, &recycled_number);
+  Close();
+
+  // Corrupt one payload byte of the first record; the intact second record
+  // proves genuine data extends past the damage.
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, recycled_fname, &contents));
+  const uint32_t prop_size =
+      DecodeFixed32(contents.data() + kBlogFilePropertySectionSizeOffset);
+  size_t pos = kBlogFileFixedHeaderSize + prop_size;
+  while (pos < contents.size() &&
+         (contents[pos] == '\0' || contents[pos] == '\xff')) {
+    ++pos;
+  }
+  ASSERT_EQ(pos % 4, 0);
+  pos += 10;
+  Slice rest(contents.data() + pos, contents.size() - pos);
+  uint32_t record_len = 0;
+  ASSERT_TRUE(GetPrefixVarint32(&rest, &record_len));
+  const size_t payload = contents.size() - rest.size();
+  ASSERT_GT(record_len, 8);
+  contents[payload + 2] ^= 0x01;
+  OverwriteFile(recycled_fname, contents);
+
+  options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+  Status s = DB::Open(options, dbname_, &db_);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+}
+// The last record of a WAL abandoned by a crashed process has nothing after
+// it, so an unspecified-size record there is delimited only by the end of the
+// file. It is fully written and durable, and every recovery mode must replay
+// it rather than drop it.
+// Config that makes every eligible record use the unspecified-size encoding
+// and otherwise keeps the on-disk layout canonical.
+TEST_BlogNoncanonicalConfig UnspecifiedSizeOnlyWalConfig(uint64_t seed) {
+  TEST_BlogNoncanonicalConfig config;
+  config.enabled = true;
+  config.seed = seed;
+  config.force_full_record_one_in = 1;
+  config.unspecified_size_record_one_in = 1;
+  config.overlong_full_varint_one_in = 0;
+  config.inject_auxiliary_record_one_in = 0;
+  config.extra_padding_512b_one_in = 0;
+  config.extra_padding_4k_one_in = 0;
+  config.prefer_padding_with_0xff_one_in = 0;
+  config.shuffle_properties_one_in = 0;
+  config.split_ignorable_properties_one_in = 0;
+  return config;
+}
+
+// The other half of the policy: a fresh file ends exactly at its last written
+// byte, so the encoding stays available and the writer really does emit it.
+// The recycled flag is per-file, so this holds even when the DB has recycling
+// enabled (the first WAL of a fresh DB has no recyclable predecessor). This
+// covers the writer and the reader's end-of-file termination together, which
+// is what keeps the crash test able to regress the reader fix.
+TEST_F(DBWALTest, BlogWalNonRecycledUnspecifiedSizeRecordReplays) {
+  for (int recycle_log_file_num : {0, 1}) {
+    SCOPED_TRACE("recycle_log_file_num=" +
+                 std::to_string(recycle_log_file_num));
+    Options options = CurrentOptions();
+    options.use_blog_format_for_wals = true;
+    options.recycle_log_file_num = recycle_log_file_num;
+    options.avoid_flush_during_shutdown = true;
+
+    std::string wal_name;
+    std::string contents;
+    {
+      TEST_BlogNoncanonicalConfigScope config_scope(
+          UnspecifiedSizeOnlyWalConfig(/*seed=*/17));
+      DestroyAndReopen(options);
+      WriteOptions write_options;
+      write_options.sync = true;
+      ASSERT_OK(db_->Put(write_options, "key1", "value1"));
+      ASSERT_OK(db_->Put(write_options, "key2", "value2"));
+      std::unique_ptr<LogFile> wal_file;
+      ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+      wal_name = LogFileName(dbname_, wal_file->LogNumber());
+      Close();
+    }
+    ASSERT_OK(ReadFileToString(env_, wal_name, &contents));
+
+    // The writer really did choose the encoding, so the rest of this test is
+    // not vacuous.
+    Slice header_input(contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&header_input));
+    ASSERT_FALSE(header.is_recycled());
+    std::string unspecified_size_prefix(header.escape_sequence,
+                                        kBlogEscapeSequenceSize);
+    PutPrefixVarint64(&unspecified_size_prefix, kBlogUnspecifiedSize);
+    ASSERT_NE(contents.find(unspecified_size_prefix), std::string::npos);
+
+    // Find where the footer starts, and cut there: a crash after the last
+    // synced WriteBatch but before the WAL was sealed leaves exactly that.
+    uint64_t footer_offset = 0;
+    {
+      std::unique_ptr<FSSequentialFile> file;
+      ASSERT_OK(env_->GetFileSystem()->NewSequentialFile(
+          wal_name, FileOptions(), &file, /*dbg=*/nullptr));
+      BlogFileReader reader(
+          std::make_unique<SequentialFileReader>(std::move(file), wal_name),
+          /*reporter=*/nullptr, /*verify_checksums=*/true);
+      BlogFileHeader read_header;
+      ASSERT_OK(reader.ReadHeader(&read_header));
+      BlogRecordType type;
+      Slice record;
+      std::string scratch;
+      uint64_t record_offset = 0;
+      do {
+        ASSERT_OK(reader.ReadRecord(&type, &record, &scratch, &record_offset));
+      } while (!IsBlogFooterRecordType(type));
+      footer_offset = record_offset;
+    }
+    ASSERT_LT(footer_offset, contents.size());
+    contents.resize(lossless_cast<size_t>(footer_offset));
+    OverwriteFile(wal_name, contents);
+
+    for (WALRecoveryMode wal_recovery_mode :
+         {WALRecoveryMode::kTolerateCorruptedTailRecords,
+          WALRecoveryMode::kAbsoluteConsistency,
+          WALRecoveryMode::kPointInTimeRecovery,
+          WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+      SCOPED_TRACE("wal_recovery_mode=" +
+                   std::to_string(static_cast<int>(wal_recovery_mode)));
+      options.wal_recovery_mode = wal_recovery_mode;
+      ASSERT_OK(DB::Open(options, dbname_, &db_));
+      ASSERT_EQ("value1", Get("key1"));
+      ASSERT_EQ("value2", Get("key2"));
+      Close();
+    }
+  }
+}
+
+TEST_F(DBWALTest, BlogWalUnspecifiedSizeLastRecordReplays) {
+  for (WALRecoveryMode wal_recovery_mode :
+       {WALRecoveryMode::kTolerateCorruptedTailRecords,
+        WALRecoveryMode::kAbsoluteConsistency,
+        WALRecoveryMode::kPointInTimeRecovery,
+        WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE("wal_recovery_mode=" +
+                 std::to_string(static_cast<int>(wal_recovery_mode)));
+    Options options = CurrentOptions();
+    options.use_blog_format_for_wals = true;
+    options.avoid_flush_during_shutdown = true;
+    std::string fname;
+    WriteThreeRecordBlogWal(options, &fname);
+
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env_, fname, &contents));
+    RewriteNthCompactRecordAsUnspecifiedSizeTail(&contents, 2);
+    OverwriteFile(fname, contents);
+
+    options.wal_recovery_mode = wal_recovery_mode;
+    ASSERT_OK(TryReopen(options));
+    ASSERT_EQ("value1", Get("key1"));
+    ASSERT_EQ("value2", Get("key2"));
+    ASSERT_EQ("value3", Get("key3"));
+    Close();
+  }
+}
+
+TEST_F(DBWALTest, BlogWalNonRecycledTrailingGarbageStillReported) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.avoid_flush_during_shutdown = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key1", "value1"));
+  VectorWalPtr log_files;
+  ASSERT_OK(db_->GetSortedWalFiles(log_files));
+  ASSERT_EQ(log_files.size(), 1);
+  const std::string fname = LogFileName(dbname_, log_files[0]->LogNumber());
+  Close();
+
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, fname, &contents));
+  contents.append(128, '\x5a');
+  OverwriteFile(fname, contents);
+
+  options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+  Status s = DB::Open(options, dbname_, &db_);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+}
+
+namespace {
+// Controls WAL direct writes, and whether ReopenWritableFile is supported.
+class WalIOTestFS : public FileSystemWrapper {
+ public:
+  explicit WalIOTestFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+  const char* Name() const override { return "WalIOTestFS"; }
+  FileOptions OptimizeForLogWrite(const FileOptions& options,
+                                  const DBOptions& db_options) const override {
+    FileOptions result =
+        FileSystemWrapper::OptimizeForLogWrite(options, db_options);
+    result.use_direct_writes = direct_io;
+    return result;
+  }
+  IOStatus ReopenWritableFile(const std::string& fname,
+                              const FileOptions& file_opts,
+                              std::unique_ptr<FSWritableFile>* result,
+                              IODebugContext* dbg) override {
+    if (!reopen_supported) {
+      return IOStatus::NotSupported("ReopenWritableFile");
+    }
+    return target()->ReopenWritableFile(fname, file_opts, result, dbg);
+  }
+  bool direct_io = false;
+  bool reopen_supported = true;
+};
+}  // namespace
+
+TEST_F(DBWALTest, BlogWalCloseAfterMemtableFailureSkipsSeal) {
+  std::shared_ptr<WalIOTestFS> fs =
+      std::make_shared<WalIOTestFS>(Env::Default()->GetFileSystem());
+  std::unique_ptr<Env> wal_env = NewCompositeEnv(fs);
+  Defer close_db([&] { Close(); });
+  for (int config = 0; config < 8; ++config) {
+    SCOPED_TRACE(config);
+    fs->direct_io = (config & 2) != 0;
+    fs->reopen_supported = (config & 4) == 0;
+    if (fs->direct_io && (!fs->reopen_supported ||
+                          !test::IsDirectIOSupported(wal_env.get(), dbname_))) {
+      // Direct I/O truncation after Close requires ReopenWritableFile.
+      continue;
+    }
+    Options options = CurrentOptions();
+    options.env = wal_env.get();
+    options.manual_wal_flush = (config & 1) != 0;
+    options.use_blog_format_for_wals = true;
+    options.avoid_flush_during_shutdown = true;
+    DestroyAndReopen(options);
+
+    ASSERT_OK(Put("good", "value"));
+    ASSERT_OK(db_->FlushWAL(false));
+    std::unique_ptr<LogFile> wal;
+    ASSERT_OK(dbfull()->GetCurrentWalFile(&wal));
+    const std::string wal_name = LogFileName(dbname_, wal->LogNumber());
+    std::string good_prefix;
+    ASSERT_OK(ReadFileToString(wal_env.get(), wal_name, &good_prefix));
+    std::unique_ptr<FSSequentialFile> file;
+    ASSERT_OK(fs->NewSequentialFile(wal_name, FileOptions(), &file, nullptr));
+    BlogFileReader reader(
+        std::make_unique<SequentialFileReader>(std::move(file), wal_name),
+        nullptr, true);
+    BlogFileHeader prefix_header;
+    ASSERT_OK(reader.ReadHeader(&prefix_header));
+    BlogRecordType type;
+    Slice record;
+    std::string scratch;
+    ASSERT_OK(reader.ReadRecord(&type, &record, &scratch));
+    ASSERT_EQ(type, kBlogWriteBatchRecord);
+    CompactRecordLayout layout;
+    FindNthCompactRecord(good_prefix, 0, &layout);
+    const size_t body_end = layout.end_offset;
+    const BlogPadding padding(lossless_cast<uint8_t>(good_prefix[body_end - 1]),
+                              body_end);
+    good_prefix.resize(body_end + padding.count);
+
+    // A batch for an unknown column family appends to the WAL, then fails
+    // memtable insert, recording a truncate back to the pre-write size.
+    // (The raw-ID Put bypasses the handle validation in WriteBatch::Put.)
+    WriteBatch bad;
+    ASSERT_OK(WriteBatchInternal::Put(&bad, /*column_family_id=*/100, "bad",
+                                      "value"));
+    ASSERT_TRUE(db_->Write(WriteOptions(), &bad).IsInvalidArgument());
+
+    std::atomic<int> skipped_seal_count{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ClearWriter:SkippedSealForTruncate",
+        [&](void*) { ++skipped_seal_count; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    Defer cleanup_sync_point([] {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+    });
+
+    Close();
+    ASSERT_EQ(skipped_seal_count.load(), 1);
+
+    // The truncated WAL is left unsealed: no footer locator at its tail.
+    std::string contents;
+    ASSERT_OK(ReadFileToString(wal_env.get(), wal_name, &contents));
+    ASSERT_EQ(contents, good_prefix);
+    Slice input(contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&input));
+    ASSERT_FALSE(VerifyBlogFooterLocator(
+        contents.data(), contents.size(),
+        /*buffer_file_offset=*/0, header.escape_sequence, header.checksum_type,
+        header.incarnation_id()));
+    // Recovery replays the good prefix; the failed batch is gone.
+    Reopen(options);
+    ASSERT_EQ("value", Get("good"));
+    Close();
+  }
+}
+
+TEST_F(DBWALTest, LegacyWalCloseAfterMemtableFailureTruncatesWithoutReopen) {
+  std::shared_ptr<WalIOTestFS> fs =
+      std::make_shared<WalIOTestFS>(Env::Default()->GetFileSystem());
+  fs->reopen_supported = false;
+  std::unique_ptr<Env> wal_env = NewCompositeEnv(fs);
+  Defer close_db([&] { Close(); });
+  Options options = CurrentOptions();
+  options.env = wal_env.get();
+  options.avoid_flush_during_shutdown = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("good", "value"));
+  std::unique_ptr<LogFile> wal;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal));
+  const std::string wal_name = LogFileName(dbname_, wal->LogNumber());
+  std::string good_prefix;
+  ASSERT_OK(ReadFileToString(wal_env.get(), wal_name, &good_prefix));
+
+  // A batch for an unknown column family appends to the WAL, then fails
+  // memtable insert, recording a truncate back to the pre-write size.
+  WriteBatch bad;
+  ASSERT_OK(
+      WriteBatchInternal::Put(&bad, /*column_family_id=*/100, "bad", "value"));
+  ASSERT_TRUE(db_->Write(WriteOptions(), &bad).IsInvalidArgument());
+  std::string with_bad;
+  ASSERT_OK(ReadFileToString(wal_env.get(), wal_name, &with_bad));
+  ASSERT_GT(with_bad.size(), good_prefix.size());
+
+  Close();
+  std::string contents;
+  ASSERT_OK(ReadFileToString(wal_env.get(), wal_name, &contents));
+  ASSERT_EQ(contents, good_prefix);
+}
+
+TEST_F(DBWALTest, BlogWalFooterSequenceRangeCoversMultiKeyBatches) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.avoid_flush_during_shutdown = true;
+  DestroyAndReopen(options);
+
+  // Sequences 1-3 and 4-5. The footer maxSequence must be the last sequence
+  // consumed (5), not the largest batch-start sequence (4).
+  WriteBatch batch1;
+  ASSERT_OK(batch1.Put("k1", "v1"));
+  ASSERT_OK(batch1.Put("k2", "v2"));
+  ASSERT_OK(batch1.Put("k3", "v3"));
+  ASSERT_OK(db_->Write(WriteOptions(), &batch1));
+  WriteBatch batch2;
+  ASSERT_OK(batch2.Put("k4", "v4"));
+  ASSERT_OK(batch2.Put("k5", "v5"));
+  ASSERT_OK(db_->Write(WriteOptions(), &batch2));
+  ASSERT_EQ(dbfull()->GetLatestSequenceNumber(), 5);
+
+  std::unique_ptr<LogFile> old_wal;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&old_wal));
+  const std::string old_wal_name = LogFileName(dbname_, old_wal->LogNumber());
+  Close();
+
+  uint64_t min_sequence = 0;
+  uint64_t max_sequence = 0;
+  ASSERT_OK(ReadBlogWalFooterSequenceRange(old_wal_name, &min_sequence,
+                                           &max_sequence));
+  ASSERT_EQ(min_sequence, 1);
+  ASSERT_EQ(max_sequence, 5);
+}
+
+TEST_F(DBWALTest, BlogWalRecycledFlagOnlyForReusedFile) {
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  options.recycle_log_file_num = 1;
+  options.avoid_flush_during_shutdown = true;
+  options.write_buffer_size = 10 * 1024 * 1024;
+  options.max_write_buffer_number = 10;
+  options.compression = kNoCompression;
+  options.track_and_verify_wals = false;
+
+  // Fresh WAL: no recyclable file exists yet, so the flag must be clear even
+  // though recycling is enabled.
+  {
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key1", "value1"));
+    std::unique_ptr<LogFile> wal_file;
+    ASSERT_OK(dbfull()->GetCurrentWalFile(&wal_file));
+    const std::string fname = LogFileName(dbname_, wal_file->LogNumber());
+    Close();
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env_, fname, &contents));
+    Slice header_input(contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&header_input));
+    ASSERT_FALSE(header.is_recycled());
+  }
+
+  // Recycled WAL: reuses a retired larger file, so the flag must be set.
+  {
+    std::string recycled_fname;
+    uint64_t recycled_number = 0;
+    CreateRecycledBlogWal(options, &recycled_fname, &recycled_number);
+    Close();
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env_, recycled_fname, &contents));
+    Slice header_input(contents);
+    BlogFileHeader header;
+    ASSERT_OK(header.DecodeFrom(&header_input));
+    ASSERT_TRUE(header.is_recycled());
+  }
+}
+
 TEST_F(DBWALTest, AsyncWalPrecreateRecoveryToleratesActualFutureWal) {
   Options options = CurrentOptions();
   options.env = env_;
@@ -3568,7 +7225,7 @@ TEST_F(DBWALTest, AsyncWalPrecreateDeletesFileOnStartFailure) {
   TEST_SYNC_POINT(
       "DBWALTest::AsyncWalPrecreateDeletesFileOnStartFailure:PrecreateDone");
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::StartWALFile:AfterCompressionTypeRecord", [](void* arg) {
+      "DBImpl::StartWALFile:AfterWriteFileStart", [](void* arg) {
         *static_cast<IOStatus*>(arg) =
             IOStatus::IOError("injected async WAL start failure");
       });

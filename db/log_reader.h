@@ -12,7 +12,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "db/log_format.h"
@@ -26,6 +28,7 @@
 #include "util/xxhash.h"
 
 namespace ROCKSDB_NAMESPACE {
+class BlogWalReader;
 class Logger;
 
 namespace log {
@@ -47,6 +50,23 @@ class Reader {
     // of bytes dropped due to the corruption.
     virtual void Corruption(size_t bytes, const Status& status,
                             uint64_t log_number = kMaxSequenceNumber) = 0;
+
+    // A failure that is not damaged data: unsupported format, or an I/O
+    // failure. Unlike Corruption, this bypasses the reporter->status
+    // suppression used by tolerant modes and paranoid_checks=false; DB open
+    // still fails on these except that I/O errors are truncated under
+    // kSkipAnyCorruptedRecords or with paranoid_checks=false, matching
+    // legacy WALs.
+    virtual void UnrecoverableError(size_t bytes, const Status& status,
+                                    uint64_t log_number = kMaxSequenceNumber) {
+      Corruption(bytes, status, log_number);
+    }
+
+    // Corruption the active recovery mode accepts. Must never fail the open;
+    // reported so the loss stays observable.
+    virtual void ToleratedCorruption(size_t /*bytes*/, const Status& /*status*/,
+                                     uint64_t /*log_number*/
+                                     = kMaxSequenceNumber) {}
 
     virtual void OldLogRecord(size_t /*bytes*/) {}
   };
@@ -119,6 +139,19 @@ class Reader {
   // block that was partially read.
   virtual void UnmarkEOF();
 
+  // Reads or extends the first block through the normal read path, as if the
+  // first ReadRecord had been called: sync points fire and read errors are
+  // reported via the reporter. Repeated calls after a temporary EOF retain the
+  // bytes already read and look for newly appended bytes. Must only be called
+  // before any ReadRecord.
+  virtual Slice PrimeFirstBlock();
+
+  // Releases ownership of the underlying file. The reader must not be used
+  // afterwards. Used with PrimeFirstBlock when the primed bytes reveal a
+  // non-legacy format: the file is handed to the format-specific reader
+  // together with a copy of the primed bytes.
+  std::unique_ptr<SequentialFileReader> ReleaseFile();
+
   SequentialFileReader* file() { return file_.get(); }
 
   Reporter* GetReporter() const { return reporter_; }
@@ -133,9 +166,26 @@ class Reader {
     return !first_record_read_ && compression_type_record_read_;
   }
 
+  // WAL-level metadata helpers, also used by BlogWalReader which replays the
+  // same records (predecessor info, timestamp sizes) from blog-format files.
+  // Public so the readers stay decoupled; they touch no framing state.
+  static Status UpdateRecordedTimestampSize(
+      UnorderedMap<uint32_t, size_t>& recorded_cf_to_ts_sz,
+      const std::vector<std::pair<uint32_t, size_t>>& cf_to_ts_sz);
+
+  static void MaybeVerifyPredecessorWALInfo(
+      Reporter* reporter, WALRecoveryMode wal_recovery_mode,
+      bool track_and_verify_wals, bool stop_replay_for_corruption,
+      uint64_t min_wal_number_to_keep,
+      const PredecessorWALInfo& observed_predecessor_wal_info,
+      const std::string& file_name, size_t fragment_size,
+      const PredecessorWALInfo& recorded_predecessor_wal_info);
+
  protected:
   std::shared_ptr<Logger> info_log_;
-  const std::unique_ptr<SequentialFileReader> file_;
+  // Non-const: ReleaseFile() moves it out when handing the file to a
+  // format-specific reader.
+  std::unique_ptr<SequentialFileReader> file_;
   Reporter* const reporter_;
   bool const checksum_;
   char* const backing_store_;
@@ -219,7 +269,7 @@ class Reader {
   // Read some more
   bool ReadMore(size_t* drop_size, uint8_t* error);
 
-  void UnmarkEOFInternal();
+  void UnmarkEOFInternal(bool report_empty_read_error);
 
   // Reports dropped bytes to the reporter.
   // buffer_ must be updated to remove the dropped bytes prior to invocation.
@@ -230,13 +280,6 @@ class Reader {
   void ReportOldLogRecord(size_t bytes);
 
   void InitCompression(const CompressionTypeRecord& compression_record);
-
-  Status UpdateRecordedTimestampSize(
-      const std::vector<std::pair<uint32_t, size_t>>& cf_to_ts_sz);
-
-  void MaybeVerifyPredecessorWALInfo(
-      WALRecoveryMode wal_recovery_mode, Slice fragment,
-      const PredecessorWALInfo& recorded_predecessor_wal_info);
 };
 
 class FragmentBufferedReader : public Reader {
@@ -252,6 +295,7 @@ class FragmentBufferedReader : public Reader {
         fragments_(),
         in_fragmented_record_(false) {}
   ~FragmentBufferedReader() override {}
+  Slice PrimeFirstBlock() override;
   bool ReadRecord(Slice* record, std::string* scratch,
                   WALRecoveryMode wal_recovery_mode =
                       WALRecoveryMode::kTolerateCorruptedTailRecords,

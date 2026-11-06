@@ -45,9 +45,11 @@ class SameFileBlobReader;
 // resolver (ensured by SuperVersion pinning in the caller).
 class ReadPathBlobResolver {
  public:
-  ReadPathBlobResolver(const Version* version, const ReadOptions& read_options,
-                       BlobFileCache* blob_file_cache = nullptr,
-                       bool allow_write_path_fallback = false);
+  ReadPathBlobResolver(
+      const Version* version, const ReadOptions& read_options,
+      BlobFileCache* blob_file_cache = nullptr,
+      bool allow_write_path_fallback = false,
+      CompressionManager* configured_compression_manager = nullptr);
 
   // Reset the resolver for a new entity. Clears all cached values.
   // The columns and blob_columns pointers must remain valid for the lifetime

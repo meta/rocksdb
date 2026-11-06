@@ -29,11 +29,13 @@
 #include "db/manifest_ops.h"
 #include "db/version_set.h"
 #include "db/version_util.h"
+#include "db/wal_reader.h"
 #include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_columns_helper.h"
 #include "db/write_batch_internal.h"
 #include "db_stress_tool/db_stress_compression_manager.h"
 #include "file/filename.h"
+#include "file/sequence_file_reader.h"
 #include "options/options_parser.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/comparator.h"
@@ -2992,6 +2994,20 @@ struct StdErrReporter : public log::Reader::Reporter {
                   uint64_t /*log_number*/ = kMaxSequenceNumber) override {
     std::cerr << "Corruption detected in log file " << s.ToString() << "\n";
   }
+  void ToleratedCorruption(
+      size_t /*bytes*/, const Status& s,
+      uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+    std::cerr << "Tolerated corruption in log file " << s.ToString() << "\n";
+  }
+  void OldLogRecord(size_t bytes) override {
+    std::cerr << "Skipped " << bytes
+              << " bytes of WAL data that does not belong to log number "
+              << log_number
+              << " (a stale incarnation of a recycled WAL, or a file name "
+                 "that does not match the WAL's log number)\n";
+  }
+
+  uint64_t log_number = 0;
 };
 
 class InMemoryHandler : public WriteBatch::Handler {
@@ -3204,10 +3220,14 @@ void DumpWalFile(Options options, const std::string& wal_file,
                  std::optional<uint32_t>* prev_batch_count) {
   const auto& fs = options.env->GetFileSystem();
   FileOptions soptions(options);
+  bool is_blog_wal = false;
+  Status status = IsBlogFormatWalFile(fs, wal_file, soptions, &is_blog_wal);
   std::unique_ptr<SequentialFileReader> wal_file_reader;
-  Status status = SequentialFileReader::Create(
-      fs, wal_file, soptions, &wal_file_reader, nullptr /* dbg */,
-      nullptr /* rate_limiter */);
+  if (status.ok()) {
+    status = SequentialFileReader::Create(fs, wal_file, soptions,
+                                          &wal_file_reader, nullptr /* dbg */,
+                                          nullptr /* rate_limiter */);
+  }
   if (!status.ok()) {
     if (exec_state) {
       *exec_state = LDBCommandExecuteResult::Failed("Failed to open WAL file " +
@@ -3234,11 +3254,36 @@ void DumpWalFile(Options options, const std::string& wal_file,
       sanitized = sanitized.substr(lastslash + 1);
     }
     if (!ParseFileName(sanitized, &log_number, &type)) {
+      if (is_blog_wal) {
+        // A blog WAL header is verified against its log number, so with a
+        // guessed number every record would be rejected.
+        const std::string msg =
+            "Cannot determine the log number of blog-format WAL file " +
+            wal_file +
+            ": the file name must be the WAL's original NNNNNN.log name";
+        if (exec_state) {
+          *exec_state = LDBCommandExecuteResult::Failed(msg);
+        } else {
+          std::cerr << "Error: " << msg << std::endl;
+        }
+        return;
+      }
       // bogus input, carry on as best we can
       log_number = 0;
     }
-    log::Reader reader(options.info_log, std::move(wal_file_reader), &reporter,
-                       true /* checksum */, log_number);
+    reporter.log_number = log_number;
+    // See "WAL Recovery Modes" in wiki/blog_format_spec.html for why the
+    // formats need different modes to dump past corrupted records.
+    const WALRecoveryMode read_mode =
+        is_blog_wal ? WALRecoveryMode::kSkipAnyCorruptedRecords
+                    : WALRecoveryMode::kTolerateCorruptedTailRecords;
+    std::unique_ptr<WalReaderOpenState> pending_open;
+    std::unique_ptr<WalReader> reader = NewWalReader(
+        options.info_log, std::move(wal_file_reader), &reporter,
+        true /* checksum */, log_number, /*track_and_verify_wals=*/false,
+        /*stop_replay_for_corruption=*/false,
+        std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
+        /*buffered=*/false, &pending_open);
     std::unordered_set<uint32_t> encountered_cf_ids;
     std::string scratch;
     WriteBatch batch;
@@ -3251,7 +3296,8 @@ void DumpWalFile(Options options, const std::string& wal_file,
       }
       std::cout << "\n";
     }
-    while (status.ok() && reader.ReadRecord(&record, &scratch)) {
+    while (status.ok() && reader &&
+           reader->ReadRecord(&record, &scratch, read_mode)) {
       row.str("");
       if (record.size() < WriteBatchInternal::kHeader) {
         reporter.Corruption(record.size(),
@@ -3269,7 +3315,7 @@ void DumpWalFile(Options options, const std::string& wal_file,
           break;
         }
         const UnorderedMap<uint32_t, size_t> recorded_ts_sz =
-            reader.GetRecordedTimestampSize();
+            reader->GetRecordedTimestampSize();
         if (!running_ts_sz.empty()) {
           status = HandleWriteBatchTimestampSizeDifference(
               &batch, running_ts_sz, recorded_ts_sz,
@@ -3332,7 +3378,7 @@ void DumpWalFile(Options options, const std::string& wal_file,
         *prev_batch_seqno = sequence_number;
         *prev_batch_count = batch_count;
         row << WriteBatchInternal::ByteSize(&batch) << ",";
-        row << reader.LastRecordOffset() << ",";
+        row << reader->LastRecordOffset() << ",";
         ColumnFamilyCollector cf_collector;
         status = batch.Iterate(&cf_collector);
         auto cf_ids = cf_collector.column_families();
@@ -5628,12 +5674,17 @@ Status RebindManifestToSelectedOptions(
         return s;
       }
       WalCountReporter reporter;
-      log::Reader reader(nullptr, std::move(wal_file_reader), &reporter,
-                         /*checksum=*/true, wal_number);
+      std::unique_ptr<WalReaderOpenState> pending_open;
+      std::unique_ptr<WalReader> reader = NewWalReader(
+          base_options.info_log, std::move(wal_file_reader), &reporter,
+          /*checksum=*/true, wal_number, /*track_and_verify_wals=*/false,
+          /*stop_replay_for_corruption=*/false,
+          std::numeric_limits<uint64_t>::max(), PredecessorWALInfo(),
+          /*buffered=*/false, &pending_open);
       Slice record;
       std::string scratch;
       WriteBatch batch;
-      while (reader.ReadRecord(&record, &scratch)) {
+      while (reader && reader->ReadRecord(&record, &scratch)) {
         if (record.size() < WriteBatchInternal::kHeader) {
           return Status::Corruption("WAL record too small to bound recovery");
         }

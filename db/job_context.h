@@ -14,8 +14,8 @@
 #include <vector>
 
 #include "db/column_family.h"
-#include "db/log_writer.h"
 #include "db/version_set.h"
+#include "db/wal_writer.h"
 #include "util/autovector.h"
 #include "util/hash_containers.h"
 
@@ -236,7 +236,7 @@ struct JobContext {
   // contexts for installing superversions for multiple column families
   std::vector<SuperVersionContext> superversion_contexts;
 
-  autovector<log::Writer*> wals_to_free;
+  autovector<WalWriter*> wals_to_free;
 
   // the current manifest_file_number, log_number and prev_log_number
   // that corresponds to the set of files in 'live'.

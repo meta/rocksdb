@@ -333,6 +333,11 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
     }
   }
 
+  // A quarantined WAL cannot serve further writes, even with paranoid checks
+  // disabled.
+  if (context.IsWALWriteErrorRecovery() && sev < Status::Severity::kHardError) {
+    sev = Status::Severity::kHardError;
+  }
   new_bg_err = Status(bg_err, sev);
 
   // Check if recovery is currently in progress. If it is, we will save this

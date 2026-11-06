@@ -69,12 +69,16 @@ class WalManager {
 
   Status TEST_ReadFirstRecord(const WalFileType type, const uint64_t number,
                               SequenceNumber* sequence) {
-    return ReadFirstRecord(type, number, sequence);
+    bool start_sequence_is_placeholder = false;
+    return ReadFirstRecord(type, number, sequence,
+                           &start_sequence_is_placeholder);
   }
 
   Status TEST_ReadFirstLine(const std::string& fname, const uint64_t number,
                             SequenceNumber* sequence) {
-    return ReadFirstLine(fname, number, sequence);
+    bool start_sequence_is_placeholder = false;
+    return ReadFirstLine(fname, number, sequence,
+                         &start_sequence_is_placeholder);
   }
 
  private:
@@ -82,31 +86,30 @@ class WalManager {
                              WalFileType type, bool need_seqnos);
   // Requires: all_logs should be sorted with earliest log file first
   // Retains all log files in all_logs which contain updates with seq no.
-  // Greater Than or Equal to the requested SequenceNumber.
+  // Greater Than or Equal to the requested SequenceNumber. Files whose start
+  // sequence is a placeholder hold no updates and are not searched.
   Status RetainProbableWalFiles(VectorWalPtr& all_logs,
                                 const SequenceNumber target);
 
   // ReadFirstRecord checks the read_first_record_cache_ to see if the entry
   // exists or not. If not, it will read the WAL file.
-  // In case of wal_compression, WAL contains a `kSetCompressionType` record
-  // which is not associated with any sequence number. So the sequence_number is
-  // set to 1 if that WAL doesn't include any other record (basically empty) in
-  // order to include that WAL and is inserted in read_first_record_cache_.
-  // Therefore, sequence_number is used as boolean if WAL should be included or
-  // not and that sequence_number shouldn't be use for any other purpose.
+  // See ReadFirstLine for the placeholder case. A placeholder is not cached,
+  // because the WAL may still gain records.
   Status ReadFirstRecord(const WalFileType type, const uint64_t number,
-                         SequenceNumber* sequence);
+                         SequenceNumber* sequence,
+                         bool* start_sequence_is_placeholder);
 
   // In case of no wal_compression, ReadFirstLine returns status.ok() and
   // sequence == 0 if the file exists, but is empty.
-  // In case of wal_compression, WAL contains
-  // `kSetCompressionType` record which is not associated with any sequence
-  // number if that WAL doesn't include any other record (basically empty). As
-  // result for an empty file, GetSortedWalsOfType() will skip these WALs
-  // causing the operations to fail. To avoid that, it sets sequence_number to
-  // 1 inorder to include that WAL.
+  // A WAL with wal_compression starts with a `kSetCompressionType` record, and
+  // a blog-format WAL starts with a header; neither carries a sequence
+  // number. If such a WAL has no other record, GetSortedWalsOfType() would
+  // skip it, causing operations that need every WAL to fail. To include it,
+  // ReadFirstLine sets sequence to 1 and *start_sequence_is_placeholder to
+  // true; that sequence must not be used as a real sequence number.
   Status ReadFirstLine(const std::string& fname, const uint64_t number,
-                       SequenceNumber* sequence);
+                       SequenceNumber* sequence,
+                       bool* start_sequence_is_placeholder);
 
   // ------- state from DBImpl ------
   const ImmutableDBOptions& db_options_;

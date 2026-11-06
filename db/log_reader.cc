@@ -62,6 +62,32 @@ Reader::~Reader() {
   }
 }
 
+Slice Reader::PrimeFirstBlock() {
+  if (read_error_) {
+    return buffer_;
+  }
+
+  assert(end_of_buffer_offset_ == buffer_.size());
+
+  if (eof_) {
+    eof_ = false;
+    if (eof_offset_ != 0) {
+      UnmarkEOFInternal(/*report_empty_read_error=*/true);
+    }
+  }
+  if (end_of_buffer_offset_ != 0) {
+    return buffer_;
+  }
+  size_t drop_size = 0;
+  uint8_t error = kEof;
+  ReadMore(&drop_size, &error);
+  return buffer_;
+}
+
+std::unique_ptr<SequentialFileReader> Reader::ReleaseFile() {
+  return std::move(file_);
+}
+
 // For kAbsoluteConsistency, on clean shutdown we don't expect any error
 // in the log files.  For other modes, we can ignore only incomplete records
 // in the last log file, which are presumably due to a write in progress
@@ -204,8 +230,11 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
           ReportCorruption(fragment.size(),
                            "could not decode PredecessorWALInfoType record");
         } else {
-          MaybeVerifyPredecessorWALInfo(wal_recovery_mode, fragment,
-                                        recorded_predecessor_wal_info);
+          MaybeVerifyPredecessorWALInfo(
+              reporter_, wal_recovery_mode, track_and_verify_wals_,
+              stop_replay_for_corruption_, min_wal_number_to_keep_,
+              observed_predecessor_wal_info_, file()->file_name(),
+              fragment.size(), recorded_predecessor_wal_info);
         }
         break;  // switch
       }
@@ -227,7 +256,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
               "could not decode user-defined timestamp size record");
         } else {
           s = UpdateRecordedTimestampSize(
-              ts_record.GetUserDefinedTimestampSize());
+              recorded_cf_to_ts_sz_, ts_record.GetUserDefinedTimestampSize());
           if (!s.ok()) {
             ReportCorruption(fragment.size(), s.getState());
           }
@@ -354,59 +383,67 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
 }
 
 void Reader::MaybeVerifyPredecessorWALInfo(
-    WALRecoveryMode wal_recovery_mode, Slice fragment,
+    Reporter* reporter, WALRecoveryMode wal_recovery_mode,
+    bool track_and_verify_wals, bool stop_replay_for_corruption,
+    uint64_t min_wal_number_to_keep,
+    const PredecessorWALInfo& observed_predecessor_wal_info,
+    const std::string& file_name, size_t fragment_size,
     const PredecessorWALInfo& recorded_predecessor_wal_info) {
-  if (!track_and_verify_wals_ ||
+  if (!track_and_verify_wals ||
       wal_recovery_mode == WALRecoveryMode::kSkipAnyCorruptedRecords ||
-      stop_replay_for_corruption_) {
+      stop_replay_for_corruption) {
     return;
   }
   assert(recorded_predecessor_wal_info.IsInitialized());
   uint64_t recorded_predecessor_log_number =
       recorded_predecessor_wal_info.GetLogNumber();
+  auto report = [&](const std::string& reason, uint64_t log_number) {
+    if (reporter != nullptr) {
+      reporter->Corruption(fragment_size, Status::Corruption(reason),
+                           log_number);
+    }
+  };
 
   // This is the first WAL recovered thus with no predecessor WAL info has been
   // initialized
-  if (!observed_predecessor_wal_info_.IsInitialized()) {
-    if (recorded_predecessor_log_number >= min_wal_number_to_keep_) {
-      std::string reason = "Missing WAL of log number " +
-                           std::to_string(recorded_predecessor_log_number);
-      ReportCorruption(fragment.size(), reason.c_str(),
-                       recorded_predecessor_log_number);
+  if (!observed_predecessor_wal_info.IsInitialized()) {
+    if (recorded_predecessor_log_number >= min_wal_number_to_keep) {
+      report("Missing WAL of log number " +
+                 std::to_string(recorded_predecessor_log_number),
+             recorded_predecessor_log_number);
     }
   } else {
-    if (observed_predecessor_wal_info_.GetLogNumber() !=
+    if (observed_predecessor_wal_info.GetLogNumber() !=
         recorded_predecessor_log_number) {
-      std::string reason =
-          "Mismatched predecessor log number of WAL file " +
-          file_->file_name() + " Recorded " +
-          std::to_string(recorded_predecessor_log_number) + ". Observed " +
-          std::to_string(observed_predecessor_wal_info_.GetLogNumber());
-      ReportCorruption(fragment.size(), reason.c_str(),
-                       recorded_predecessor_log_number);
-    } else if (observed_predecessor_wal_info_.GetLastSeqnoRecorded() !=
+      report("Mismatched predecessor log number of WAL file " + file_name +
+                 " Recorded " +
+                 std::to_string(recorded_predecessor_log_number) +
+                 ". Observed " +
+                 std::to_string(observed_predecessor_wal_info.GetLogNumber()),
+             recorded_predecessor_log_number);
+    } else if (observed_predecessor_wal_info.GetLastSeqnoRecorded() !=
                recorded_predecessor_wal_info.GetLastSeqnoRecorded()) {
-      std::string reason =
-          "Mismatched last sequence number recorded in the WAL of log number " +
-          std::to_string(recorded_predecessor_log_number) + ". Recorded " +
-          std::to_string(recorded_predecessor_wal_info.GetLastSeqnoRecorded()) +
-          ". Observed " +
-          std::to_string(
-              observed_predecessor_wal_info_.GetLastSeqnoRecorded()) +
-          ". (Last sequence number equal to 0 indicates no WAL records)";
-      ReportCorruption(fragment.size(), reason.c_str(),
-                       recorded_predecessor_log_number);
-    } else if (observed_predecessor_wal_info_.GetSizeBytes() !=
+      report(
+          "Mismatched last sequence number recorded in the WAL of log "
+          "number " +
+              std::to_string(recorded_predecessor_log_number) + ". Recorded " +
+              std::to_string(
+                  recorded_predecessor_wal_info.GetLastSeqnoRecorded()) +
+              ". Observed " +
+              std::to_string(
+                  observed_predecessor_wal_info.GetLastSeqnoRecorded()) +
+              ". (Last sequence number equal to 0 indicates no WAL records)",
+          recorded_predecessor_log_number);
+    } else if (observed_predecessor_wal_info.GetSizeBytes() !=
                recorded_predecessor_wal_info.GetSizeBytes()) {
-      std::string reason =
-          "Mismatched size of the WAL of log number " +
-          std::to_string(recorded_predecessor_log_number) + ". Recorded " +
-          std::to_string(recorded_predecessor_wal_info.GetSizeBytes()) +
-          " bytes. Observed " +
-          std::to_string(observed_predecessor_wal_info_.GetSizeBytes()) +
-          " bytes.";
-      ReportCorruption(fragment.size(), reason.c_str(),
-                       recorded_predecessor_log_number);
+      report("Mismatched size of the WAL of log number " +
+                 std::to_string(recorded_predecessor_log_number) +
+                 ". Recorded " +
+                 std::to_string(recorded_predecessor_wal_info.GetSizeBytes()) +
+                 " bytes. Observed " +
+                 std::to_string(observed_predecessor_wal_info.GetSizeBytes()) +
+                 " bytes.",
+             recorded_predecessor_log_number);
     }
   }
 }
@@ -425,10 +462,10 @@ void Reader::UnmarkEOF() {
   if (eof_offset_ == 0) {
     return;
   }
-  UnmarkEOFInternal();
+  UnmarkEOFInternal(/*report_empty_read_error=*/false);
 }
 
-void Reader::UnmarkEOFInternal() {
+void Reader::UnmarkEOFInternal(bool report_empty_read_error) {
   // If the EOF was in the middle of a block (a partial block was read) we have
   // to read the rest of the block as ReadPhysicalRecord can only read full
   // blocks and expects the file position indicator to be aligned to the start
@@ -462,7 +499,7 @@ void Reader::UnmarkEOFInternal() {
   end_of_buffer_offset_ += added;
 
   if (!status.ok()) {
-    if (added > 0) {
+    if (added > 0 || report_empty_read_error) {
       ReportDrop(added, status);
     }
 
@@ -653,7 +690,7 @@ uint8_t Reader::ReadPhysicalRecord(Slice* result, size_t* drop_size,
       }
 
       size_t uncompressed_size = 0;
-      int remaining = 0;
+      int64_t remaining = 0;
       const char* input = header + header_size;
       do {
         remaining = uncompress_->Uncompress(
@@ -707,6 +744,7 @@ void Reader::InitCompression(const CompressionTypeRecord& compression_record) {
 }
 
 Status Reader::UpdateRecordedTimestampSize(
+    UnorderedMap<uint32_t, size_t>& recorded_cf_to_ts_sz,
     const std::vector<std::pair<uint32_t, size_t>>& cf_to_ts_sz) {
   for (const auto& [cf, ts_sz] : cf_to_ts_sz) {
     // Zero user-defined timestamp size are not recorded.
@@ -716,12 +754,12 @@ Status Reader::UpdateRecordedTimestampSize(
     }
     // The user-defined timestamp size record for a column family should not be
     // updated in the same log file.
-    if (recorded_cf_to_ts_sz_.count(cf) != 0) {
+    if (recorded_cf_to_ts_sz.count(cf) != 0) {
       return Status::Corruption(
           "User-defined timestamp size record contains update to "
           "recorded column family.");
     }
-    recorded_cf_to_ts_sz_.insert(std::make_pair(cf, ts_sz));
+    recorded_cf_to_ts_sz.insert(std::make_pair(cf, ts_sz));
   }
   return Status::OK();
 }
@@ -832,8 +870,11 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
           ReportCorruption(fragment.size(),
                            "could not decode PredecessorWALInfoType record");
         } else {
-          MaybeVerifyPredecessorWALInfo(wal_recovery_mode, fragment,
-                                        recorded_predecessor_wal_info);
+          MaybeVerifyPredecessorWALInfo(
+              reporter_, wal_recovery_mode, track_and_verify_wals_,
+              stop_replay_for_corruption_, min_wal_number_to_keep_,
+              observed_predecessor_wal_info_, file()->file_name(),
+              fragment.size(), recorded_predecessor_wal_info);
         }
         break;
       }
@@ -856,7 +897,7 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
               "could not decode user-defined timestamp size record");
         } else {
           s = UpdateRecordedTimestampSize(
-              ts_record.GetUserDefinedTimestampSize());
+              recorded_cf_to_ts_sz_, ts_record.GetUserDefinedTimestampSize());
           if (!s.ok()) {
             ReportCorruption(fragment.size(), s.getState());
           }
@@ -910,7 +951,27 @@ void FragmentBufferedReader::UnmarkEOF() {
     return;
   }
   eof_ = false;
-  UnmarkEOFInternal();
+  UnmarkEOFInternal(/*report_empty_read_error=*/false);
+}
+
+Slice FragmentBufferedReader::PrimeFirstBlock() {
+  if (read_error_) {
+    return buffer_;
+  }
+
+  assert(end_of_buffer_offset_ == buffer_.size());
+
+  if (eof_) {
+    eof_ = false;
+    UnmarkEOFInternal(/*report_empty_read_error=*/true);
+  }
+  if (end_of_buffer_offset_ != 0) {
+    return buffer_;
+  }
+  size_t drop_size = 0;
+  uint8_t error = kEof;
+  TryReadMore(&drop_size, &error);
+  return buffer_;
 }
 
 bool FragmentBufferedReader::TryReadMore(size_t* drop_size, uint8_t* error) {
@@ -1045,7 +1106,7 @@ bool FragmentBufferedReader::TryReadFragment(Slice* fragment, size_t* drop_size,
     // Uncompress compressed records
     uncompressed_record_.clear();
     size_t uncompressed_size = 0;
-    int remaining = 0;
+    int64_t remaining = 0;
     const char* input = header + header_size;
     do {
       remaining = uncompress_->Uncompress(

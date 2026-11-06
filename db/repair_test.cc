@@ -4,12 +4,16 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <string>
 #include <vector>
 
+#include "db/blog/blog_format.h"
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
+#include "db/log_format.h"
 #include "file/file_util.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
@@ -123,6 +127,91 @@ TEST_F(RepairTest, LostManifest) {
 
   ASSERT_EQ(Get("key"), "val");
   ASSERT_EQ(Get("key2"), "val2");
+}
+
+TEST_F(RepairTest, RecoverPastCorruptedWalRecord) {
+  for (bool blog : {false, true}) {
+    SCOPED_TRACE(blog ? "blog WAL" : "legacy WAL");
+    Options options = CurrentOptions();
+    options.use_blog_format_for_wals = blog;
+    options.wal_compression = kNoCompression;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key1", std::string(1000, 'a')));
+    ASSERT_OK(Put("key2", std::string(1000, 'b')));
+    // Legacy readers resynchronize at block boundaries after a bad checksum.
+    ASSERT_OK(Put("filler", std::string(40000, 'f')));
+    ASSERT_OK(Put("key3", std::string(1000, 'c')));
+    VectorLogPtr wal_files;
+    ASSERT_OK(dbfull()->GetSortedWalFiles(wal_files));
+    ASSERT_EQ(wal_files.size(), 1U);
+    const std::string wal_path =
+        LogFileName(dbname_, wal_files[0]->LogNumber());
+    const std::string manifest_path =
+        DescriptorFileName(dbname_, dbfull()->TEST_Current_Manifest_FileNo());
+    Close();
+
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env_, wal_path, &contents));
+    const size_t pos = contents.find(std::string(1000, 'b'));
+    ASSERT_NE(pos, std::string::npos);
+    contents[pos + 500] = 'Z';
+    ASSERT_OK(WriteStringToFile(env_, contents, wal_path, /*sync=*/true));
+    ASSERT_OK(env_->DeleteFile(manifest_path));
+    ASSERT_OK(RepairDB(dbname_, options));
+    Reopen(options);
+    EXPECT_EQ(Get("key1"), std::string(1000, 'a'));
+    EXPECT_EQ(Get("key2"), "NOT_FOUND");
+    EXPECT_EQ(Get("key3"), std::string(1000, 'c'));
+    Close();
+  }
+}
+
+TEST_F(RepairTest, RecycledLegacyWalReportsNoCorruption) {
+  class WalDropCountingLogger : public Logger {
+   public:
+    using Logger::Logv;
+    void Logv(const char* format, va_list /*ap*/) override {
+      if (std::strstr(format, "dropping") != nullptr) {
+        drop_count++;
+      }
+    }
+    std::atomic<int> drop_count{0};
+  };
+
+  Options options = CurrentOptions();
+  // Legacy WAL recycling is disabled in kTolerateCorruptedTailRecords.
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  options.recycle_log_file_num = 1;
+  options.wal_compression = kNoCompression;
+  DestroyAndReopen(options);
+  // Retire WALs holding large records so the current WAL reuses one of them.
+  // The stale tail must extend past the first block, or the legacy reader
+  // reaches EOF and stops quietly in every mode.
+  constexpr size_t kLargeValueSize = 3 * log::kBlockSize;
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(
+        Put("large" + std::to_string(i), std::string(kLargeValueSize, 'x')));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(Put("small", "value"));
+  std::unique_ptr<LogFile> wal;
+  ASSERT_OK(dbfull()->GetCurrentWalFile(&wal));
+  const std::string wal_path = LogFileName(dbname_, wal->LogNumber());
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, wal_path, &contents));
+  Close();
+  ASSERT_GT(contents.size(), kLargeValueSize);
+  // Close trims the previous incarnation's stale tail; restore it as a crash
+  // would have left it.
+  ASSERT_OK(WriteStringToFile(env_, contents, wal_path, /*sync=*/true));
+
+  auto logger = std::make_shared<WalDropCountingLogger>();
+  options.info_log = logger;
+  ASSERT_OK(RepairDB(dbname_, options));
+  EXPECT_EQ(logger->drop_count.load(), 0);
+  Reopen(options);
+  EXPECT_EQ(Get("small"), "value");
+  Close();
 }
 
 TEST_F(RepairTest, LostManifestMoreDbFeatures) {
@@ -299,6 +388,34 @@ TEST_F(RepairTest, UnflushedSst) {
     ASSERT_OK(GetAllDataFiles(kTableFile, &sst_files, &total_ssts_size));
     ASSERT_GT(total_ssts_size, 0);
   }
+  ASSERT_EQ(Get("key"), "val");
+}
+
+TEST_F(RepairTest, RepairBlogWal) {
+  // Repair must replay blog-format WALs, not misparse them as legacy framing
+  // (repair continues past corruption, so a misparse silently drops data).
+  Options options = CurrentOptions();
+  options.use_blog_format_for_wals = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "val"));
+  VectorLogPtr wal_files;
+  ASSERT_OK(dbfull()->GetSortedWalFiles(wal_files));
+  ASSERT_EQ(wal_files.size(), 1);
+  // Guard against a vacuous pass: the WAL under repair must be blog-format.
+  {
+    std::string wal_contents;
+    ASSERT_OK(ReadFileToString(
+        env_, LogFileName(dbname_, wal_files[0]->LogNumber()), &wal_contents));
+    ASSERT_TRUE(
+        BlogFileHeader::IsBlogFormat(wal_contents.data(), wal_contents.size()));
+  }
+  std::string manifest_path =
+      DescriptorFileName(dbname_, dbfull()->TEST_Current_Manifest_FileNo());
+  Close();
+  ASSERT_OK(env_->FileExists(manifest_path));
+  ASSERT_OK(env_->DeleteFile(manifest_path));
+  ASSERT_OK(RepairDB(dbname_, options));
+  ReopenWithSstIdVerify();
   ASSERT_EQ(Get("key"), "val");
 }
 

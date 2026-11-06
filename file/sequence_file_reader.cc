@@ -149,6 +149,37 @@ IOStatus SequentialFileReader::Skip(uint64_t n) {
   return file_->Skip(n);
 }
 
+void SequentialFileReader::SetReopenOptions(
+    const std::shared_ptr<FileSystem>& fs, const FileOptions& file_options,
+    size_t readahead_size, const std::shared_ptr<IOTracer>& io_tracer) {
+  reopen_options_.reset(
+      new ReopenOptions{fs, file_options, readahead_size, io_tracer});
+}
+
+IOStatus SequentialFileReader::ReopenAt(
+    uint64_t offset, std::unique_ptr<SequentialFileReader>* reader) const {
+  if (!CanReopen()) {
+    return IOStatus::NotSupported("Sequential reader cannot reopen its input");
+  }
+  const ReopenOptions& options = *reopen_options_;
+  std::unique_ptr<FSSequentialFile> file;
+  IOStatus s = options.fs->NewSequentialFile(file_name_, options.file_options,
+                                             &file, nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  std::unique_ptr<SequentialFileReader> fresh(new SequentialFileReader(
+      std::move(file), file_name_, options.readahead_size, options.io_tracer,
+      listeners_, rate_limiter_, verify_and_reconstruct_read_));
+  fresh->SetReopenOptions(options.fs, options.file_options,
+                          options.readahead_size, options.io_tracer);
+  s = fresh->Skip(offset);
+  if (s.ok()) {
+    *reader = std::move(fresh);
+  }
+  return s;
+}
+
 namespace {
 // This class wraps a SequentialFile, exposing same API, with the differenece
 // of being able to prefetch up to readahead_size bytes and then serve them

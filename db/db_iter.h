@@ -279,9 +279,11 @@ class DBIter final : public Iterator {
   class BlobReader {
    public:
     BlobReader(const Version* version, const ReadOptions& read_options,
-               BlobFileCache* blob_file_cache, bool allow_write_path_fallback)
+               BlobFileCache* blob_file_cache, bool allow_write_path_fallback,
+               CompressionManager* configured_compression_manager)
         : blob_fetcher_(version, ReadOptions(read_options), blob_file_cache,
-                        allow_write_path_fallback) {}
+                        allow_write_path_fallback,
+                        configured_compression_manager) {}
 
     const Slice& GetBlobValue() const { return blob_value_; }
     Status RetrieveAndSetBlobValue(const Slice& user_key,
@@ -316,10 +318,12 @@ class DBIter final : public Iterator {
   class ValueColumnsState {
    public:
     ValueColumnsState(const Version* version, const ReadOptions& read_options,
-                      ColumnFamilyData* cfd)
+                      ColumnFamilyData* cfd,
+                      CompressionManager* configured_compression_manager)
         : entity_blob_resolver_(
               version, read_options, cfd ? cfd->blob_file_cache() : nullptr,
-              cfd != nullptr && cfd->blob_partition_manager() != nullptr) {}
+              cfd != nullptr && cfd->blob_partition_manager() != nullptr,
+              configured_compression_manager) {}
 
     Slice& value() { return value_; }
     const Slice& value() const { return value_; }

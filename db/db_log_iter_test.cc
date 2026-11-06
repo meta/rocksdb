@@ -15,6 +15,7 @@
 #include "env/mock_env.h"
 #include "port/stack_trace.h"
 #include "util/atomic.h"
+#include "util/defer.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -60,6 +61,60 @@ void ExpectRecords(const int expected_no_records,
   ASSERT_EQ(num_records, expected_no_records);
 }
 }  // anonymous namespace
+
+// A WAL iterator tailing a recycled blog WAL must resume past the stale tail
+// left by the previous incarnation: bytes past the writer's frontier are old
+// data, not corruption, and later appends must become visible via Next().
+TEST_F(DBWalIteratorTest, RecycledWalResumesAfterCachedStaleTail) {
+  Options options = OptionsForLogIterTest();
+  options.use_blog_format_for_wals = true;
+  options.recycle_log_file_num = 1;
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  DestroyAndReopen(options);
+  Random rnd(301);
+  ASSERT_OK(Put("big", rnd.RandomString(256 * 1024)));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("seed", "s"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("first", "v"));
+  ASSERT_OK(db_->FlushWAL(true));
+  const SequenceNumber first_sequence = db_->GetLatestSequenceNumber();
+  std::unique_ptr<WalIterator> iter = OpenWalIter(first_sequence);
+  ExpectRecords(1, iter);
+  for (int round = 0; round < 4; ++round) {
+    ASSERT_OK(Put(Key(round), rnd.RandomString(40000)));
+    ASSERT_OK(db_->FlushWAL(true));
+    iter->Next();
+    ASSERT_TRUE(iter->Valid()) << iter->status().ToString();
+    ASSERT_EQ(iter->GetBatch().sequence, first_sequence + round + 1);
+    iter->Next();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+  }
+}
+
+// A live reader on a non-recycled blog WAL hits short tails as the file
+// grows, but those bytes are never invalidated, so the tail must be
+// continued sequentially without reopening the input.
+TEST_F(DBWalIteratorTest, LiveNonRecycledTailDoesNotRefresh) {
+  Options options = OptionsForLogIterTest();
+  options.use_blog_format_for_wals = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key1", DummyString(128)));
+  auto iter = OpenWalIter(0);
+  ASSERT_TRUE(iter->Valid());
+  // Short tail on a live file: nothing to deliver yet, no error.
+  iter->Next();
+  ASSERT_TRUE(!iter->Valid());
+  ASSERT_OK(iter->status());
+  // The writer finishes the tail; the next poll delivers it in place.
+  ASSERT_OK(Put("key2", DummyString(128)));
+  ASSERT_OK(db_->FlushWAL(true));
+  iter->Next();
+  ASSERT_TRUE(iter->Valid()) << iter->status().ToString();
+  ASSERT_EQ(iter->GetBatch().sequence, 2U);
+  ASSERT_OK(iter->status());
+}
 
 TEST_F(DBWalIteratorTest, Basic) {
   do {
@@ -357,6 +412,69 @@ TEST_F(DBWalIteratorTest, CaughtUpThenResumes) {
   ASSERT_TRUE(iter->Valid()) << iter->status().ToString();
   ASSERT_OK(iter->status());
   ASSERT_EQ(2U, iter->GetBatch().sequence);
+}
+
+TEST_F(DBWalIteratorTest, CaughtUpAfterShortReadResumesBothFormats) {
+  for (bool blog : {false, true}) {
+    SCOPED_TRACE(blog ? "blog WAL" : "legacy WAL");
+    Options options = OptionsForLogIterTest();
+    options.use_blog_format_for_wals = blog;
+    options.wal_compression = kNoCompression;
+    DestroyAndReopen(options);
+
+    for (int i = 0; i < 40; ++i) {
+      ASSERT_OK(Put(Key(i), DummyString(1024)));
+    }
+    std::unique_ptr<WalIterator> iter = OpenWalIter(0);
+    ExpectRecords(40, iter);
+    ASSERT_OK(iter->status());
+
+    for (SequenceNumber sequence = 41; sequence <= 43; ++sequence) {
+      ASSERT_OK(Put("tail", DummyString(128)));
+      iter->Next();
+      ASSERT_TRUE(iter->Valid()) << iter->status().ToString();
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(sequence, iter->GetBatch().sequence);
+      iter->Next();
+      ASSERT_FALSE(iter->Valid());
+      ASSERT_OK(iter->status());
+    }
+    Close();
+  }
+}
+
+// A WAL with no records yet (blog header only, or a legacy compression type
+// record only) is listed with a placeholder start sequence. Neither listing it
+// in that state nor searching past it may hide the earlier WAL that holds the
+// requested sequence.
+TEST_F(DBWalIteratorTest, NoRecordWalDoesNotHideEarlierWal) {
+  for (bool blog : {false, true}) {
+    if (!blog && !StreamingCompressionTypeSupported(kZSTD)) {
+      continue;
+    }
+    SCOPED_TRACE(blog ? "blog WAL" : "legacy compressed WAL");
+    Options options = OptionsForLogIterTest();
+    options.use_blog_format_for_wals = blog;
+    options.wal_compression = blog ? kNoCompression : kZSTD;
+    DestroyAndReopen(options);
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_OK(Put(Key(i), DummyString(16)));
+    }
+    // The new live WAL holds no records until the next write.
+    Reopen(options);
+    VectorWalPtr wals;
+    ASSERT_OK(db_->GetSortedWalFiles(wals));
+    {
+      std::unique_ptr<WalIterator> iter = OpenWalIter(5);
+      ASSERT_EQ(iter->GetBatch().sequence, 5U);
+    }
+    ASSERT_OK(Put("after", DummyString(16)));
+    {
+      std::unique_ptr<WalIterator> iter = OpenWalIter(5);
+      ASSERT_EQ(iter->GetBatch().sequence, 5U);
+    }
+    Close();
+  }
 }
 
 // Writes that bypass the WAL still consume sequence numbers, so they leave

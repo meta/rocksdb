@@ -9,11 +9,15 @@
 #include <cinttypes>
 
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blog_wal_writer.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
+#include "db/legacy_wal_writer.h"
+#include "db/log_writer.h"
 #include "db/periodic_task_scheduler.h"
 #include "db/version_util.h"
+#include "db/wal_reader.h"
 #include "env/composite_env_wrapper.h"
 #include "file/filename.h"
 #include "file/read_write_util.h"
@@ -28,6 +32,7 @@
 #include "rocksdb/table.h"
 #include "rocksdb/wal_filter.h"
 #include "test_util/sync_point.h"
+#include "util/cast_util.h"
 #include "util/rate_limiter_impl.h"
 #include "util/string_util.h"
 #include "util/udt_util.h"
@@ -104,7 +109,7 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
     result.recycle_log_file_num = false;
   }
 
-  if (result.recycle_log_file_num &&
+  if (result.recycle_log_file_num && !result.use_blog_format_for_wals &&
       (result.wal_recovery_mode ==
            WALRecoveryMode::kTolerateCorruptedTailRecords ||
        result.wal_recovery_mode == WALRecoveryMode::kAbsoluteConsistency)) {
@@ -120,6 +125,9 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
     //   hole in the recovered data
     //   (https://github.com/meta/rocksdb/pull/7252#issuecomment-673766236).
     //   Besides this bug, we believe the features are fundamentally compatible.
+    // Blog-format WALs are exempt from the above: the per-incarnation escape
+    // sequence lets the reader distinguish stale recycled tail data from real
+    // corruption, so both modes stay compatible with recycling.
     result.recycle_log_file_num = 0;
   }
 
@@ -197,8 +205,12 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
     result.sst_file_manager = sst_file_manager;
   }
 
-  // Supported wal compression types
-  if (!StreamingCompressionTypeSupported(result.wal_compression)) {
+  // Legacy WALs use streaming compression, which supports only ZSTD.
+  // Blog-format WALs use per-record block compression instead and accept any
+  // type the compression manager supports (validated when the WAL is created),
+  // so they are exempt from the streaming-only override below.
+  if (!result.use_blog_format_for_wals &&
+      !StreamingCompressionTypeSupported(result.wal_compression)) {
     result.wal_compression = kNoCompression;
     ROCKS_LOG_WARN(result.info_log,
                    "wal_compression is disabled since only zstd is supported");
@@ -243,6 +255,19 @@ Status DBImpl::ValidateOptions(
 }
 
 Status DBImpl::ValidateOptions(const DBOptions& db_options) {
+  if (db_options.blog_wal_streaming_compression &&
+      !db_options.use_blog_format_for_wals) {
+    return Status::NotSupported(
+        "blog_wal_streaming_compression requires "
+        "use_blog_format_for_wals=true");
+  }
+
+  if (db_options.blog_wal_streaming_compression &&
+      db_options.wal_compression != kZSTD) {
+    return Status::NotSupported(
+        "blog_wal_streaming_compression requires wal_compression=kZSTD");
+  }
+
   if (db_options.read_io_executor_threads <= 0) {
     return Status::InvalidArgument(
         "read_io_executor_threads must be greater than zero");
@@ -323,6 +348,12 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
   if (!db_options.write_dbid_to_manifest && !db_options.write_identity_file) {
     return Status::InvalidArgument(
         "write_dbid_to_manifest and write_identity_file cannot both be false");
+  }
+
+  if (db_options.blog_timestamp_size > std::numeric_limits<uint16_t>::max()) {
+    return Status::InvalidArgument(
+        "blog_timestamp_size must not exceed " +
+        std::to_string(std::numeric_limits<uint16_t>::max()));
   }
   return Status::OK();
 }
@@ -1216,6 +1247,25 @@ void DBOpenLogRecordReadReporter::Corruption(size_t bytes, const Status& s,
   }
 }
 
+void DBOpenLogRecordReadReporter::UnrecoverableError(size_t bytes,
+                                                     const Status& s,
+                                                     uint64_t log_number) {
+  ROCKS_LOG_ERROR(info_log, "%s: cannot read %d bytes; %s", fname,
+                  static_cast<int>(bytes), s.ToString().c_str());
+  if (unrecoverable_status != nullptr && unrecoverable_status->ok()) {
+    *unrecoverable_status = s;
+    corrupted_wal_number_ = log_number;
+    has_unrecoverable_error_ = true;
+  }
+}
+
+void DBOpenLogRecordReadReporter::ToleratedCorruption(size_t bytes,
+                                                      const Status& s,
+                                                      uint64_t /*log_number*/) {
+  ROCKS_LOG_WARN(info_log, "%s: dropping %d bytes (tolerated); %s", fname,
+                 static_cast<int>(bytes), s.ToString().c_str());
+}
+
 void DBOpenLogRecordReadReporter::OldLogRecord(size_t bytes) {
   if (old_log_record != nullptr) {
     *old_log_record = true;
@@ -1342,7 +1392,7 @@ Status DBImpl::ProcessLogFile(
   bool old_log_record = false;
 
   DBOpenLogRecordReadReporter reporter;
-  std::unique_ptr<log::Reader> reader;
+  std::unique_ptr<WalReader> reader;
 
   std::string fname =
       LogFileName(immutable_db_options_.GetWalDir(), wal_number);
@@ -1385,16 +1435,23 @@ Status DBImpl::ProcessLogFile(
     return status;
   }
 
+  // Fired before the reader is created (not just before the read loop)
+  // because reader creation already performs the first block read for format
+  // detection.
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RecoverLogFiles:BeforeReadWal",
+                           /*cb_arg=*/nullptr);
+  bool open_error_ignored = false;
   Status init_status = InitializeLogReader(
       wal_number, is_retry, fname, *stop_replay_for_corruption, min_wal_number,
-      predecessor_wal_info, &old_log_record, &status, &reporter, reader);
+      predecessor_wal_info, &old_log_record, &status, &reporter,
+      &open_error_ignored, reader);
 
   // FIXME(hx235): Consolidate `!init_status.ok()` and `reader == nullptr` cases
   if (!init_status.ok()) {
     assert(status.ok());
     status.PermitUncheckedError();
     return init_status;
-  } else if (reader == nullptr) {
+  } else if (open_error_ignored) {
     // TODO(hx235): remove this case since it's confusing
     assert(status.ok());
     // Fail initializing log reader for one log file with an ok status.
@@ -1402,9 +1459,7 @@ Status DBImpl::ProcessLogFile(
     return status;
   }
 
-  TEST_SYNC_POINT_CALLBACK("DBImpl::RecoverLogFiles:BeforeReadWal",
-                           /*cb_arg=*/nullptr);
-  while (true) {
+  while (reader) {
     if (*stop_replay_by_wal_filter) {
       break;
     }
@@ -1447,7 +1502,7 @@ Status DBImpl::ProcessLogFile(
 
   if (status.ok()) {
     status = UpdatePredecessorWALInfo(wal_number, last_seqno_observed, fname,
-                                      predecessor_wal_info);
+                                      reader.get(), predecessor_wal_info);
   }
 
   if (!status.ok() || old_log_record) {
@@ -1477,10 +1532,12 @@ Status DBImpl::InitializeLogReader(
     bool stop_replay_for_corruption, uint64_t min_wal_number,
     const PredecessorWALInfo& predecessor_wal_info, bool* const old_log_record,
     Status* const reporter_status, DBOpenLogRecordReadReporter* reporter,
-    std::unique_ptr<log::Reader>& reader) {
+    bool* const open_error_ignored, std::unique_ptr<WalReader>& reader) {
   assert(old_log_record);
   assert(reporter_status);
   assert(reporter);
+  assert(open_error_ignored);
+  *open_error_ignored = false;
 
   Status status;
 
@@ -1491,6 +1548,7 @@ Status DBImpl::InitializeLogReader(
         fname, fs_->OptimizeForLogRead(file_options_), &file, nullptr);
     if (!status.ok()) {
       MaybeIgnoreError(&status);
+      *open_error_ignored = status.ok();
       return status;
     }
     file_reader.reset(new SequentialFileReader(
@@ -1504,6 +1562,9 @@ Status DBImpl::InitializeLogReader(
   reporter->info_log = immutable_db_options_.info_log.get();
   reporter->fname = fname.c_str();
   reporter->old_log_record = old_log_record;
+  // Unsupported formats and I/O errors are surfaced regardless of the
+  // corruption-tolerance settings applied to `status` below.
+  reporter->unrecoverable_status = reporter_status;
   if (!immutable_db_options_.paranoid_checks ||
       immutable_db_options_.wal_recovery_mode ==
           WALRecoveryMode::kSkipAnyCorruptedRecords) {
@@ -1515,16 +1576,17 @@ Status DBImpl::InitializeLogReader(
   // paranoid_checks==false so that corruptions cause entire commits
   // to be skipped instead of propagating bad information (like overly
   // large sequence numbers).
-  reader.reset(new log::Reader(
+  std::unique_ptr<WalReaderOpenState> pending_open;
+  reader = NewWalReader(
       immutable_db_options_.info_log, std::move(file_reader), reporter,
       true /*checksum*/, wal_number,
       immutable_db_options_.track_and_verify_wals, stop_replay_for_corruption,
-      min_wal_number, predecessor_wal_info));
+      min_wal_number, predecessor_wal_info, /*buffered=*/false, &pending_open);
   return status;
 }
 
 Status DBImpl::ProcessLogRecord(
-    Slice record, const std::unique_ptr<log::Reader>& reader,
+    Slice record, const std::unique_ptr<WalReader>& reader,
     const UnorderedMap<uint32_t, size_t>& running_ts_sz, uint64_t wal_number,
     const std::string& fname, bool read_only, int job_id,
     const std::function<void()>& logFileDropped,
@@ -1616,7 +1678,7 @@ Status DBImpl::ProcessLogRecord(
 // We create a new batch and initialize with a valid prot_info_ to store
 // the data checksum
 Status DBImpl::InitializeWriteBatchForLogRecord(
-    Slice record, const std::unique_ptr<log::Reader>& reader,
+    Slice record, const std::unique_ptr<WalReader>& reader,
     const UnorderedMap<uint32_t, size_t>& running_ts_sz, WriteBatch* batch,
     std::unique_ptr<WriteBatch>& new_batch, WriteBatch*& batch_to_use,
     uint64_t* record_checksum) {
@@ -1777,17 +1839,27 @@ Status DBImpl::HandleNonOkStatusOrOldLogRecord(
       WALRecoveryMode::kSkipAnyCorruptedRecords) {
     // We should ignore all errors unconditionally
     return Status::OK();
-  } else if (immutable_db_options_.wal_recovery_mode ==
-             WALRecoveryMode::kPointInTimeRecovery) {
-    if (status.IsIOError()) {
+  }
+
+  if (status.IsIOError()) {
+    if (!immutable_db_options_.paranoid_checks &&
+        reporter.HasUnrecoverableError()) {
+      return Status::OK();
+    }
+    if (immutable_db_options_.wal_recovery_mode ==
+        WALRecoveryMode::kPointInTimeRecovery) {
       ROCKS_LOG_ERROR(immutable_db_options_.info_log,
                       "IOError during point-in-time reading log #%" PRIu64
                       " seq #%" PRIu64
                       ". %s. This likely mean loss of synced WAL, "
                       "thus recovery fails.",
                       wal_number, *next_sequence, status.ToString().c_str());
-      return status;
     }
+    return status;
+  }
+
+  if (immutable_db_options_.wal_recovery_mode ==
+      WALRecoveryMode::kPointInTimeRecovery) {
     // We should ignore the error but not continue replaying
     *old_log_record = false;
     *stop_replay_for_corruption = true;
@@ -1812,12 +1884,17 @@ Status DBImpl::HandleNonOkStatusOrOldLogRecord(
 
 Status DBImpl::UpdatePredecessorWALInfo(
     uint64_t wal_number, const SequenceNumber last_seqno_observed,
-    const std::string& fname, PredecessorWALInfo& predecessor_wal_info) {
+    const std::string& fname, const WalReader* reader,
+    PredecessorWALInfo& predecessor_wal_info) {
   uint64_t bytes;
 
   Status s = env_->GetFileSize(fname, &bytes);
   if (!s.ok()) {
     return s;
+  }
+
+  if (reader != nullptr) {
+    bytes = reader->GetVerificationSize(bytes);
   }
 
   SequenceNumber mock_seqno = kMaxSequenceNumber;
@@ -2515,12 +2592,30 @@ IOStatus DBImpl::CreateWALWriter(const DBOptions& db_options,
         tmp_set.Contains(FileType::kWalFile),
         tmp_set.Contains(FileType::kWalFile)));
     new_wal->log_number = log_file_num;
-    new_wal->writer = std::make_unique<log::Writer>(
-        std::move(file_writer), log_file_num,
-        immutable_db_options_.recycle_log_file_num > 0,
-        immutable_db_options_.manual_wal_flush,
-        immutable_db_options_.wal_compression,
-        immutable_db_options_.track_and_verify_wals);
+    if (db_options.use_blog_format_for_wals) {
+      int64_t current_time = 0;
+      immutable_db_options_.clock->GetCurrentTime(&current_time)
+          .PermitUncheckedError();
+      // kBlogFileRecycled marks whether this file itself was recycled, not
+      // whether the DB has recycling enabled. A fresh file must not carry the
+      // flag even when recycle_log_file_num > 0.
+      const bool is_recycled = recycle_log_number != 0;
+      new_wal->writer = std::make_unique<BlogWalWriter>(
+          std::move(file_writer), log_file_num, is_recycled,
+          db_options.manual_wal_flush, db_options.wal_compression,
+          db_options.blog_wal_streaming_compression,
+          db_options.track_and_verify_wals, db_options.blog_checksum,
+          db_options.blog_timestamp_size, db_id_, db_session_id_,
+          db_options.db_host_id, lossless_cast<uint64_t>(current_time));
+    } else {
+      // Deliberately still DB-wide: log::Writer needs recyclable record types
+      // in every WAL (even fresh ones) so a later reuse stays detectable.
+      new_wal->writer = std::make_unique<LegacyWalWriter>(
+          std::move(file_writer), log_file_num,
+          db_options.recycle_log_file_num > 0, db_options.manual_wal_flush,
+          db_options.wal_compression, db_options.track_and_verify_wals,
+          /*initial_block_offset=*/0);
+    }
   }
 
   return io_s;
@@ -2528,15 +2623,10 @@ IOStatus DBImpl::CreateWALWriter(const DBOptions& db_options,
 
 IOStatus DBImpl::StartWALFile(const WriteOptions& write_options,
                               const PredecessorWALInfo& predecessor_wal_info,
-                              log::Writer* new_log) {
+                              WalWriter* new_log) {
   assert(new_log);
-  IOStatus io_s = new_log->AddCompressionTypeRecord(write_options);
-  TEST_SYNC_POINT_CALLBACK("DBImpl::StartWALFile:AfterCompressionTypeRecord",
-                           &io_s);
-  if (io_s.ok()) {
-    io_s = new_log->MaybeAddPredecessorWALInfo(write_options,
-                                               predecessor_wal_info);
-  }
+  IOStatus io_s = new_log->WriteFileStart(write_options, predecessor_wal_info);
+  TEST_SYNC_POINT_CALLBACK("DBImpl::StartWALFile:AfterWriteFileStart", &io_s);
   return io_s;
 }
 
@@ -2545,7 +2635,7 @@ IOStatus DBImpl::CreateWAL(const DBOptions& db_options,
                            uint64_t log_file_num, uint64_t recycle_log_number,
                            size_t preallocate_block_size,
                            const PredecessorWALInfo& predecessor_wal_info,
-                           log::Writer** new_log) {
+                           WalWriter** new_log) {
   assert(new_log);
   assert(*new_log == nullptr);
   UnpublishedWAL wal;
@@ -2777,7 +2867,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                     &recovered_seq, &recovery_ctx, can_retry);
   if (s.ok()) {
     uint64_t new_log_number = impl->versions_->NewFileNumber();
-    log::Writer* new_log = nullptr;
+    WalWriter* new_log = nullptr;
     const size_t preallocate_block_size =
         impl->GetWalPreallocateBlockSize(max_write_buffer_size);
     // TODO(hx235): Pass in the correct `predecessor_wal_info` for the first WAL
@@ -2819,13 +2909,16 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         WriteBatchInternal::SetSequence(&empty_batch, recovered_seq);
         uint64_t wal_used;
         uint64_t log_size;
-        log::Writer* log_writer = impl->logs_.back().writer;
+        WalWriter* log_writer = impl->logs_.back().writer;
         WalFileNumberSize& wal_file_number_size = impl->alive_wal_files_.back();
 
         assert(log_writer->get_log_number() == wal_file_number_size.number);
         impl->mutex_.AssertHeld();
+        // The dummy batch is empty and consumes no sequences; its header
+        // sequence is only a hint for corruption classification.
         s = impl->WriteToWAL(empty_batch, write_options, log_writer, &wal_used,
-                             &log_size, wal_file_number_size, recovered_seq);
+                             &log_size, wal_file_number_size, recovered_seq,
+                             /*seq_inc=*/0);
         if (s.ok()) {
           // Need to fsync, otherwise it might get lost after a power reset.
           s = impl->FlushWAL(write_options, false);
@@ -3042,7 +3135,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       if (s.ok()) {
         // Sync is needed otherwise WAL buffered data might get lost after a
         // power reset.
-        log::Writer* log_writer = impl->logs_.back().writer;
+        WalWriter* log_writer = impl->logs_.back().writer;
         IOOptions opts;
         s = WritableFileWriter::PrepareIOOptions(write_options, opts);
         if (s.ok()) {
