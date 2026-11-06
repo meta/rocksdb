@@ -133,7 +133,7 @@ class TransactionNotifier {
 // TODO(agiardullo): Not yet implemented
 //  -PerfContext statistics
 //  -Support for using Transactions with DBWithTTL
-class Transaction {
+class ROCKSDB_API Transaction {
  public:
   // No copying allowed
   Transaction(const Transaction&) = delete;

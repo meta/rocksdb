@@ -15,6 +15,7 @@
 
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -55,7 +56,6 @@ struct CheckpointOrBackupEngineOptions {
   // Default: 1
   int max_background_operations = 1;
 };
-
 struct CheckpointEngineOptions : public CheckpointOrBackupEngineOptions {
   // Whether to hard-link data files when the destination supports it, instead
   // of copying.
@@ -138,7 +138,7 @@ class CheckpointEngine : public CheckpointEngineBase {
                      std::unique_ptr<CheckpointEngine>* out_checkpoint_engine);
 };
 
-class Checkpoint {
+class ROCKSDB_API Checkpoint {
  public:
   // Creates a Checkpoint object to be used for creating openable snapshots
   static Status Create(DB* db, Checkpoint** checkpoint_ptr);

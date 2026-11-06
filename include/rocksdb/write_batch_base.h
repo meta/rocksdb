@@ -11,6 +11,7 @@
 #include <cstddef>
 
 #include "rocksdb/attribute_groups.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -24,7 +25,7 @@ struct SliceParts;
 // Abstract base class that defines the basic interface for a write batch.
 // See WriteBatch for a basic implementation and WrithBatchWithIndex for an
 // indexed implementation.
-class WriteBatchBase {
+class ROCKSDB_API WriteBatchBase {
  public:
   WriteBatchBase() = default;
   WriteBatchBase(const WriteBatchBase&) = default;

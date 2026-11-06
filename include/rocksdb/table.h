@@ -27,6 +27,7 @@
 #include "rocksdb/customizable.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -1224,7 +1225,7 @@ TableFactory* NewCuckooTableFactory(
 class RandomAccessFileReader;
 
 // A base class for table factories.
-class TableFactory : public Customizable {
+class ROCKSDB_API TableFactory : public Customizable {
  public:
   static const char* kBlockCacheOpts() { return "BlockCache"; }
   static const char* kBlockBasedTableName() { return "BlockBasedTable"; }

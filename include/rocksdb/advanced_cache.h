@@ -41,7 +41,7 @@ class Statistics;
 //
 // INTERNAL: See typed_cache.h for convenient wrappers on top of this API.
 // New virtual functions must also be added to CacheWrapper below.
-class Cache : public Customizable {
+class ROCKSDB_API Cache : public Customizable {
  public:  // types hidden from API client
   // Opaque handle to an entry stored in the cache.
   struct Handle {};

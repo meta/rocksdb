@@ -32,6 +32,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "rocksdb/port_defs.h"
 #include "rocksdb/status.h"
 #include "rocksdb/write_batch_base.h"
 
@@ -61,7 +62,7 @@ struct SavePoint {
   bool is_cleared() const { return (size | count | content_flags) == 0; }
 };
 
-class WriteBatch : public WriteBatchBase {
+class ROCKSDB_API WriteBatch : public WriteBatchBase {
  public:
   explicit WriteBatch(size_t reserved_bytes = 0, size_t max_bytes = 0)
       : WriteBatch(reserved_bytes, max_bytes, 0, 0) {}

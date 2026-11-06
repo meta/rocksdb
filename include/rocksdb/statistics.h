@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "rocksdb/customizable.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {

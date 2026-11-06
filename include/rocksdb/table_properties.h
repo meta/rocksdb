@@ -276,7 +276,7 @@ struct LsmInfoAtCreation {
 
 // TableProperties contains a bunch of read-only properties of its associated
 // table.
-struct TableProperties {
+struct ROCKSDB_API TableProperties {
  public:
   // the file number at creation time, or 0 for unknown. When known,
   // combining with db_session_id must uniquely identify an SST file.

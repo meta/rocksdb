@@ -104,9 +104,22 @@ if (WITH_WINDOWS_UTF8_FILENAMES)
   add_definitions(-DROCKSDB_WINDOWS_UTF8_FILENAMES)
 endif()
 option(ROCKSDB_BUILD_SHARED "Build shared versions of the RocksDB libraries" ON)
+option(HIDE_PRIVATE_SYMBOLS "Hide private symbols in shared library (improves ABI stability)" OFF)
 
 if( NOT DEFINED CMAKE_CXX_STANDARD )
   set(CMAKE_CXX_STANDARD 20)
+endif()
+
+# Configure symbol visibility for shared libraries
+if(ROCKSDB_BUILD_SHARED AND HIDE_PRIVATE_SYMBOLS)
+  if(NOT WIN32)
+    set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+    set(CMAKE_C_VISIBILITY_PRESET hidden)
+    set(CMAKE_VISIBILITY_INLINES_HIDDEN YES)
+    message(STATUS "Symbol visibility: hidden (ABI-stable mode enabled)")
+  endif()
+else()
+  message(STATUS "Symbol visibility: default (all symbols exported)")
 endif()
 
 include(CMakeDependentOption)
@@ -1337,6 +1350,7 @@ if(ROCKSDB_BUILD_SHARED)
     endif()
   else()
     set_target_properties(${ROCKSDB_SHARED_LIB} PROPERTIES
+                          COMPILE_DEFINITIONS "ROCKSDB_DLL;ROCKSDB_LIBRARY_EXPORTS"
                           LINKER_LANGUAGE CXX
                           VERSION ${rocksdb_VERSION}
                           SOVERSION ${rocksdb_VERSION_MAJOR}
