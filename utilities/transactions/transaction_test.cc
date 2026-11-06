@@ -3370,6 +3370,89 @@ TEST_P(TransactionTest, MultiGetLargeBatchedTest) {
   }
 }
 
+// MultiGetForUpdate() locks every key, then reads them with one batched lookup
+// per column family. Keys from two column families are interleaved (including
+// a duplicate) to check that results land back in the caller's key order.
+TEST_P(TransactionTest, MultiGetForUpdateBatched) {
+  WriteOptions write_options;
+  ReadOptions read_options;
+
+  ColumnFamilyHandle* cf = nullptr;
+  ColumnFamilyOptions cf_options;
+  ASSERT_OK(db->CreateColumnFamily(cf_options, "CF", &cf));
+  delete cf;
+  delete db;
+  db = nullptr;
+
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.emplace_back(kDefaultColumnFamilyName, ColumnFamilyOptions());
+  cf_options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  column_families.emplace_back("CF", cf_options);
+
+  std::vector<ColumnFamilyHandle*> handles;
+  options.statistics = CreateDBStatistics();
+  ASSERT_OK(ReOpenNoDelete(column_families, &handles));
+  ASSERT_NE(db, nullptr);
+
+  WriteBatch batch;
+  ASSERT_OK(batch.Put(handles[0], "a", "db_a"));
+  ASSERT_OK(batch.Put(handles[0], "b", "db_b"));
+  ASSERT_OK(batch.Put(handles[1], "a", "cf_a"));
+  ASSERT_OK(batch.Put(handles[1], "c", "cf_c"));
+  ASSERT_OK(batch.Put(handles[1], "d", "cf_d"));
+  ASSERT_OK(db->Write(write_options, &batch));
+
+  Transaction* txn = db->BeginTransaction(write_options);
+  ASSERT_NE(txn, nullptr);
+  ASSERT_OK(txn->Put(handles[0], "b", "txn_b"));
+  ASSERT_OK(txn->Delete(handles[1], "c"));
+  ASSERT_OK(txn->Merge(handles[1], "d", "txn_d"));
+
+  std::vector<std::string> values;
+  ASSERT_TRUE(txn->MultiGetForUpdate(read_options, {}, {}, &values).empty());
+
+  const std::vector<ColumnFamilyHandle*> multiget_cfs = {
+      handles[1], handles[0], handles[1], handles[0],
+      handles[1], handles[1], handles[0]};
+  const std::vector<Slice> multiget_keys = {"a", "a", "c", "b", "d", "a", "z"};
+  ASSERT_OK(options.statistics->Reset());
+  std::vector<Status> statuses = txn->MultiGetForUpdate(
+      read_options, multiget_cfs, multiget_keys, &values);
+  ASSERT_EQ(statuses.size(), multiget_keys.size());
+  ASSERT_EQ(values.size(), multiget_keys.size());
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0], "cf_a");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1], "db_a");
+  ASSERT_TRUE(statuses[2].IsNotFound());
+  ASSERT_OK(statuses[3]);
+  ASSERT_EQ(values[3], "txn_b");
+  ASSERT_OK(statuses[4]);
+  ASSERT_EQ(values[4], "cf_d,txn_d");
+  ASSERT_OK(statuses[5]);
+  ASSERT_EQ(values[5], "cf_a");
+  ASSERT_TRUE(statuses[6].IsNotFound());
+  // One batched DB lookup per column family rather than one Get() per key.
+  ASSERT_EQ(2, options.statistics->getTickerCount(NUMBER_MULTIGET_CALLS));
+
+  // Every requested key, including ones that were not found, is locked.
+  TransactionOptions txn_options2;
+  txn_options2.lock_timeout = 1;
+  Transaction* txn2 = db->BeginTransaction(write_options, txn_options2);
+  ASSERT_NE(txn2, nullptr);
+  ASSERT_TRUE(txn2->Put(handles[0], "z", "x").IsTimedOut());
+  ASSERT_TRUE(txn2->Put(handles[1], "c", "x").IsTimedOut());
+  ASSERT_OK(txn2->Put(handles[1], "z", "x"));
+  ASSERT_OK(txn2->Rollback());
+  delete txn2;
+
+  ASSERT_OK(txn->Commit());
+  delete txn;
+  for (auto handle : handles) {
+    delete handle;
+  }
+}
+
 TEST_P(TransactionTest, MultiGetSnapshot) {
   WriteOptions write_options;
   TransactionOptions transaction_options;

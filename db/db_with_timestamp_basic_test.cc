@@ -4128,6 +4128,18 @@ TEST_F(DBBasicTestWithTimestamp, FullHistoryTsLowSanityCheckFail) {
     }
   }
 
+  // Single column family MultiGetEntity()
+  {
+    Slice keys[] = {"foo", "foo"};
+    PinnableWideColumns results[2];
+    Status statuses[2];
+    db_->MultiGetEntity(read_opts, db_->DefaultColumnFamily(), /*num_keys=*/2,
+                        &keys[0], &results[0], &statuses[0]);
+    for (const auto& status : statuses) {
+      ASSERT_TRUE(status.IsInvalidArgument());
+    }
+  }
+
   // NewIterator()
   std::unique_ptr<Iterator> iter(
       db_->NewIterator(read_opts, db_->DefaultColumnFamily()));
