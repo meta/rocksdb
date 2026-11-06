@@ -3759,6 +3759,18 @@ TEST_F(DBWALTest, WALWriteErrorNoRecovery) {
   fault_fs->DisableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
   Destroy(options);
 }
+
+TEST_F(DBWALTest, PartitionWALUsageOpenValidation) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+
+  for (PartitionWALUsage usage :
+       {PartitionWALUsage::kNone,
+        PartitionWALUsage::kPartitionByColumnFamily}) {
+    options.partition_wal_usage = usage;
+    ASSERT_OK(TryReopen(options));
+  }
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
