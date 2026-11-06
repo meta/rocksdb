@@ -364,6 +364,107 @@ TEST_F(WalManagerTest, WalIteratorNewFileWhileScanning) {
   ASSERT_TRUE(iter->status().ok());
 }
 
+TEST_F(WalManagerTest, DeleteWALFile) {
+  Init(nullptr /* clock_override */);
+
+  // Create a WAL file in the wal_dir
+  uint64_t log_number = 123;
+  std::string log_file_name = LogFileName("", log_number);
+  std::string log_file_path = dbname_ + "/" + log_file_name;
+
+  // Create the file with some content
+  std::unique_ptr<FSWritableFile> file;
+  ASSERT_OK(env_->GetFileSystem()->NewWritableFile(log_file_path, FileOptions(),
+                                                   &file, nullptr));
+
+  std::unique_ptr<WritableFileWriter> file_writer(
+      new WritableFileWriter(std::move(file), log_file_path, FileOptions()));
+  log::Writer writer(std::move(file_writer), log_number,
+                     db_options_.recycle_log_file_num > 0);
+
+  // Write a record to the file
+  WriteBatch batch;
+  ASSERT_OK(batch.Put("key1", "value1"));
+  WriteBatchInternal::SetSequence(&batch, 100);
+  ASSERT_OK(
+      writer.AddRecord(WriteOptions(), WriteBatchInternal::Contents(&batch)));
+
+  // Verify file exists
+  ASSERT_OK(env_->FileExists(log_file_path));
+
+  // Populate the read_first_record_cache by reading the file
+  SequenceNumber seq;
+  ASSERT_OK(
+      wal_manager_->TEST_ReadFirstRecord(kAliveLogFile, log_number, &seq));
+  ASSERT_EQ(seq, 100U);
+
+  // Call DeleteFile
+  Status delete_status = wal_manager_->DeleteFile(log_file_name, log_number);
+  ASSERT_OK(delete_status);
+
+  // Verify file is deleted
+  ASSERT_TRUE(env_->FileExists(log_file_path).IsNotFound());
+
+  // Verify cache entry is removed by trying to read again
+  // Since the file doesn't exist and cache is cleared, ReadFirstRecord
+  // returns OK with sequence=0 to indicate an empty/missing file
+  SequenceNumber seq_after;
+  Status read_status =
+      wal_manager_->TEST_ReadFirstRecord(kAliveLogFile, log_number, &seq_after);
+  ASSERT_OK(read_status);
+  // Sequence should be 0 (indicating file not found), not 100 (cached value)
+  ASSERT_EQ(seq_after, 0U) << "Cache should be cleared after DeleteFile";
+}
+
+TEST_F(WalManagerTest, ArchiveWALFile) {
+  Init(nullptr /* clock_override */);
+
+  // Create a WAL file in the main wal_dir
+  uint64_t log_number = 456;
+  std::string log_file_name = LogFileName("", log_number);
+  std::string log_file_path = dbname_ + "/" + log_file_name;
+
+  // Create the file with some content
+  std::unique_ptr<FSWritableFile> file;
+  ASSERT_OK(env_->GetFileSystem()->NewWritableFile(log_file_path, FileOptions(),
+                                                   &file, nullptr));
+
+  std::unique_ptr<WritableFileWriter> file_writer(
+      new WritableFileWriter(std::move(file), log_file_path, FileOptions()));
+  log::Writer writer(std::move(file_writer), log_number,
+                     db_options_.recycle_log_file_num > 0);
+
+  // Write a record to the file
+  WriteBatch batch;
+  ASSERT_OK(batch.Put("archive_key", "archive_value"));
+  WriteBatchInternal::SetSequence(&batch, 200);
+  ASSERT_OK(
+      writer.AddRecord(WriteOptions(), WriteBatchInternal::Contents(&batch)));
+
+  // Verify file exists in main directory
+  ASSERT_OK(env_->FileExists(log_file_path));
+
+  // Verify archive directory exists (created in Init)
+  std::string archive_dir = ArchivalDirectory(dbname_);
+  ASSERT_OK(env_->FileExists(archive_dir));
+
+  // Call ArchiveWALFile
+  wal_manager_->ArchiveWALFile(log_file_path, log_number);
+
+  // Verify original file is moved (no longer in main directory)
+  ASSERT_TRUE(env_->FileExists(log_file_path).IsNotFound());
+
+  // Verify file now exists in archive directory
+  std::string archived_file_path = ArchivedLogFileName(dbname_, log_number);
+  ASSERT_OK(env_->FileExists(archived_file_path));
+
+  // Verify the archived file has the correct content
+  SequenceNumber seq;
+  ASSERT_OK(
+      wal_manager_->TEST_ReadFirstRecord(kArchivedLogFile, log_number, &seq));
+  ASSERT_EQ(seq, 200U);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
