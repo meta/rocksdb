@@ -330,6 +330,10 @@ class Repairer {
             } else if (type == kTableFile) {
               table_fds_.emplace_back(number, static_cast<uint32_t>(path_id),
                                       0);
+            } else if (type == kBlobFile) {
+              return Status::NotSupported(
+                  "RepairDB does not support blob files, found blob file: " +
+                  filenames[i]);
             } else {
               // Ignore other files
             }
