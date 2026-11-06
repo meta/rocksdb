@@ -168,7 +168,7 @@ IOStatus Writer::AddRecord(const WriteOptions& write_options,
         type = recycle_log_files_ ? kRecyclableMiddleType : kMiddleType;
       }
 
-      s = EmitPhysicalRecord(write_options, type, ptr, fragment_length);
+      s = EmitPhysicalRecord(opts, type, ptr, fragment_length);
       ptr += fragment_length;
       left -= fragment_length;
       begin = false;
@@ -307,6 +307,16 @@ bool Writer::BufferIsEmpty() { return dest_->BufferIsEmpty(); }
 
 IOStatus Writer::EmitPhysicalRecord(const WriteOptions& write_options,
                                     RecordType t, const char* ptr, size_t n) {
+  IOOptions opts;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(write_options, opts);
+  if (!s.ok()) {
+    return s;
+  }
+  return EmitPhysicalRecord(opts, t, ptr, n);
+}
+
+IOStatus Writer::EmitPhysicalRecord(const IOOptions& opts, RecordType t,
+                                    const char* ptr, size_t n) {
   assert(n <= 0xffff);  // Must fit in two bytes
 
   size_t header_size;
@@ -346,11 +356,7 @@ IOStatus Writer::EmitPhysicalRecord(const WriteOptions& write_options,
   EncodeFixed32(buf, crc);
 
   // Write the header and the payload
-  IOOptions opts;
-  IOStatus s = WritableFileWriter::PrepareIOOptions(write_options, opts);
-  if (s.ok()) {
-    s = dest_->Append(Slice(buf, header_size), opts);
-  }
+  IOStatus s = dest_->Append(Slice(buf, header_size), opts);
   if (s.ok()) {
     s = dest_->Append(Slice(ptr, n), opts, Crc32cChecksum(payload_crc));
   }

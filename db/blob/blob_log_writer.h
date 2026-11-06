@@ -32,8 +32,8 @@ class BlobLogWriter {
   // "*dest" must be initially empty.
   // "*dest" must remain live while this BlobLogWriter is in use.
   BlobLogWriter(std::unique_ptr<WritableFileWriter>&& dest, SystemClock* clock,
-                Statistics* statistics, uint64_t log_number, bool use_fsync,
-                bool do_flush, uint64_t boffset = 0);
+                Statistics* statistics, bool use_fsync, bool do_flush,
+                uint64_t boffset = 0);
   // No copying allowed
   BlobLogWriter(const BlobLogWriter&) = delete;
   BlobLogWriter& operator=(const BlobLogWriter&) = delete;
@@ -58,9 +58,10 @@ class BlobLogWriter {
                             const Slice& val, uint64_t* key_offset,
                             uint64_t* blob_offset);
 
-  Status AppendFooter(const WriteOptions& write_options, BlobLogFooter& footer,
-                      std::string* checksum_method,
-                      std::string* checksum_value);
+  Status LegacyAppendFooterAndClose(const WriteOptions& write_options,
+                                    BlobLogFooter& footer,
+                                    std::string* checksum_method,
+                                    std::string* checksum_value);
 
   Status WriteHeader(const WriteOptions& write_options, BlobLogHeader& header);
 
@@ -68,7 +69,7 @@ class BlobLogWriter {
 
   const WritableFileWriter* file() const { return dest_.get(); }
 
-  uint64_t get_log_number() const { return log_number_; }
+  uint64_t current_offset() const { return block_offset_; }
 
   uint64_t get_file_size() const { return block_offset_; }
 
@@ -78,7 +79,6 @@ class BlobLogWriter {
   std::unique_ptr<WritableFileWriter> dest_;
   SystemClock* clock_;
   Statistics* statistics_;
-  uint64_t log_number_;
   uint64_t block_offset_;  // Current offset in block
   bool use_fsync_;
   bool do_flush_;

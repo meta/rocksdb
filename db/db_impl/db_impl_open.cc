@@ -12,6 +12,8 @@
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
+#include "db/legacy_wal_writer.h"
+#include "db/log_writer.h"
 #include "db/periodic_task_scheduler.h"
 #include "db/version_util.h"
 #include "env/composite_env_wrapper.h"
@@ -2515,12 +2517,13 @@ IOStatus DBImpl::CreateWALWriter(const DBOptions& db_options,
         tmp_set.Contains(FileType::kWalFile),
         tmp_set.Contains(FileType::kWalFile)));
     new_wal->log_number = log_file_num;
-    new_wal->writer = std::make_unique<log::Writer>(
+    new_wal->writer = std::make_unique<LegacyWalWriter>(
         std::move(file_writer), log_file_num,
         immutable_db_options_.recycle_log_file_num > 0,
         immutable_db_options_.manual_wal_flush,
         immutable_db_options_.wal_compression,
-        immutable_db_options_.track_and_verify_wals);
+        immutable_db_options_.track_and_verify_wals,
+        /*initial_block_offset=*/0);
   }
 
   return io_s;
@@ -2528,7 +2531,7 @@ IOStatus DBImpl::CreateWALWriter(const DBOptions& db_options,
 
 IOStatus DBImpl::StartWALFile(const WriteOptions& write_options,
                               const PredecessorWALInfo& predecessor_wal_info,
-                              log::Writer* new_log) {
+                              WalWriter* new_log) {
   assert(new_log);
   IOStatus io_s = new_log->AddCompressionTypeRecord(write_options);
   TEST_SYNC_POINT_CALLBACK("DBImpl::StartWALFile:AfterCompressionTypeRecord",
@@ -2545,7 +2548,7 @@ IOStatus DBImpl::CreateWAL(const DBOptions& db_options,
                            uint64_t log_file_num, uint64_t recycle_log_number,
                            size_t preallocate_block_size,
                            const PredecessorWALInfo& predecessor_wal_info,
-                           log::Writer** new_log) {
+                           WalWriter** new_log) {
   assert(new_log);
   assert(*new_log == nullptr);
   UnpublishedWAL wal;
@@ -2777,7 +2780,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                     &recovered_seq, &recovery_ctx, can_retry);
   if (s.ok()) {
     uint64_t new_log_number = impl->versions_->NewFileNumber();
-    log::Writer* new_log = nullptr;
+    WalWriter* new_log = nullptr;
     const size_t preallocate_block_size =
         impl->GetWalPreallocateBlockSize(max_write_buffer_size);
     // TODO(hx235): Pass in the correct `predecessor_wal_info` for the first WAL
@@ -2819,7 +2822,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         WriteBatchInternal::SetSequence(&empty_batch, recovered_seq);
         uint64_t wal_used;
         uint64_t log_size;
-        log::Writer* log_writer = impl->logs_.back().writer;
+        WalWriter* log_writer = impl->logs_.back().writer;
         WalFileNumberSize& wal_file_number_size = impl->alive_wal_files_.back();
 
         assert(log_writer->get_log_number() == wal_file_number_size.number);
@@ -3042,7 +3045,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       if (s.ok()) {
         // Sync is needed otherwise WAL buffered data might get lost after a
         // power reset.
-        log::Writer* log_writer = impl->logs_.back().writer;
+        WalWriter* log_writer = impl->logs_.back().writer;
         IOOptions opts;
         s = WritableFileWriter::PrepareIOOptions(write_options, opts);
         if (s.ok()) {

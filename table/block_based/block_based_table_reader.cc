@@ -79,6 +79,7 @@
 #include "table/two_level_iterator.h"
 #include "test_util/sync_point.h"
 #include "util/coding.h"
+#include "util/compression.h"
 #include "util/crc32c.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
@@ -594,29 +595,20 @@ Status GetDecompressor(const std::string& compression_name,
     // identifying its compatibility name, which is the first field here.
     Slice compatibility_name(compression_name.data(), separator_pos);
     std::shared_ptr<CompressionManager> mgr_to_use;
-    if (compression_manager) {
-      // First attempt to go through the compression manager configured for
-      // writing new files, for efficiency (usually correct) and not forcing
-      // use of ObjectLibrary registration (dependency injection).
-      mgr_to_use = compression_manager->FindCompatibleCompressionManager(
-          compatibility_name);
+    // First attempt to go through the compression manager configured for
+    // writing new files, for efficiency (usually correct) and not forcing
+    // use of ObjectLibrary registration (dependency injection).
+    Status s = ResolveCompressionManagerByCompatibilityName(
+        compatibility_name, compression_manager.get(), &mgr_to_use);
+    // Even though we might be able to recover from "not found" if only
+    // built-in compression types are used (would be checked below), it
+    // would provide misleading or unreliable success to allow that to
+    // succeed.
+    if (!s.ok()) {
+      return s;
     }
-    if (mgr_to_use == nullptr) {
-      ConfigOptions strict;
-      strict.ignore_unknown_options = false;
-      strict.ignore_unsupported_options = false;
-      Status s = CompressionManager::CreateFromString(
-          strict, compatibility_name.ToString(), &mgr_to_use);
-      // Even though we might be able to recover from "not found" if only
-      // built-in compression types are used (would be checked below), it
-      // would provide misleading or unreliable success to allow that to
-      // succeed.
-      if (!s.ok()) {
-        return s;
-      }
-      assert(mgr_to_use || compatibility_name == kNullptrString ||
-             compatibility_name.empty());
-    }
+    assert(mgr_to_use || compatibility_name == kNullptrString ||
+           compatibility_name.empty());
 
     // Second field is set of compression types actually used in the file
     size_t start_pos = separator_pos + 1;

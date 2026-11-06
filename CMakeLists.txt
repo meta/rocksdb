@@ -791,6 +791,9 @@ set(SOURCES
         db/blob/blob_source.cc
         db/blob/blob_write_batch_transformer.cc
         db/blob/prefetch_buffer_collection.cc
+        db/blog/blog_format.cc
+        db/blog/blog_reader.cc
+        db/blog/blog_writer.cc
         db/builder.cc
         db/c.cc
         db/coalescing_iterator.cc
@@ -834,6 +837,7 @@ set(SOURCES
         db/forward_iterator.cc
         db/import_column_family_job.cc
         db/internal_stats.cc
+        db/legacy_wal_writer.cc
         db/logs_with_prep_tracker.cc
         db/log_reader.cc
         db/log_writer.cc
@@ -1491,6 +1495,8 @@ if(WITH_TESTS)
         db/blob/db_blob_compaction_test.cc
         db/blob/db_blob_corruption_test.cc
         db/blob/db_blob_index_test.cc
+        db/blog/blog_format_test.cc
+        db/blog/blog_writer_test.cc
         db/column_family_test.cc
         db/compact_files_test.cc
         db/compaction/clipping_iterator_test.cc

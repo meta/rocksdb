@@ -197,6 +197,18 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_two_write_queues(
 extern ROCKSDB_LIBRARY_API unsigned char rocksdb_options_get_two_write_queues(
     rocksdb_options_t* opt);
 
+extern ROCKSDB_LIBRARY_API void rocksdb_options_set_use_blog_format_for_blobs(
+    rocksdb_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_options_get_use_blog_format_for_blobs(rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_options_set_blog_checksum(
+    rocksdb_options_t* opt, int v);
+
+extern ROCKSDB_LIBRARY_API int rocksdb_options_get_blog_checksum(
+    rocksdb_options_t* opt);
+
 extern ROCKSDB_LIBRARY_API void
 rocksdb_options_set_background_close_inactive_wals(rocksdb_options_t* opt,
                                                    unsigned char v);

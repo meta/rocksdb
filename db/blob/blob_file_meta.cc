@@ -13,6 +13,16 @@
 
 namespace ROCKSDB_NAMESPACE {
 uint64_t SharedBlobFileMetaData::GetBlobFileSize() const {
+  if (physical_blob_file_size_ != 0) {
+    return physical_blob_file_size_;
+  }
+
+  // TODO: for blog format, the header/footer sizes differ from legacy
+  // (blog header ~48-60 bytes + padding vs legacy 30, blog footer ~128 bytes
+  // vs legacy 32). total_blob_bytes_ includes estimated per-record framing for
+  // both formats, so the main error is the header/footer constant. When the
+  // physical file size is not available in MANIFEST (old manifests), fall back
+  // to this estimate.
   return BlobLogHeader::kSize + total_blob_bytes_ + BlobLogFooter::kSize;
 }
 
@@ -31,6 +41,14 @@ std::ostream& operator<<(std::ostream& os,
      << " checksum_method: " << shared_meta.GetChecksumMethod()
      << " checksum_value: "
      << Slice(shared_meta.GetChecksumValue()).ToString(/* hex */ true);
+  if (shared_meta.GetPhysicalBlobFileSize() != 0) {
+    os << " physical_blob_file_size: " << shared_meta.GetPhysicalBlobFileSize();
+  }
+  if (shared_meta.GetSchemaVersion() != kLegacyBlobFileSchemaVersion) {
+    os << " schema_version: " << uint32_t{shared_meta.GetSchemaVersion()}
+       << " file_identity: "
+       << Slice(shared_meta.GetFileIdentity()).ToString(/* hex */ true);
+  }
 
   return os;
 }

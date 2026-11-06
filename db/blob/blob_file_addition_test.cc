@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string>
 
+#include "db/blog/blog_format.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/coding.h"
@@ -37,6 +38,10 @@ TEST_F(BlobFileAdditionTest, Empty) {
   ASSERT_EQ(blob_file_addition.GetTotalBlobBytes(), 0);
   ASSERT_TRUE(blob_file_addition.GetChecksumMethod().empty());
   ASSERT_TRUE(blob_file_addition.GetChecksumValue().empty());
+  ASSERT_EQ(blob_file_addition.GetPhysicalBlobFileSize(), 0);
+  ASSERT_EQ(blob_file_addition.GetSchemaVersion(),
+            kLegacyBlobFileSchemaVersion);
+  ASSERT_TRUE(blob_file_addition.GetFileIdentity().empty());
 
   TestEncodeDecode(blob_file_addition);
 }
@@ -59,6 +64,32 @@ TEST_F(BlobFileAdditionTest, NonEmpty) {
   ASSERT_EQ(blob_file_addition.GetTotalBlobBytes(), total_blob_bytes);
   ASSERT_EQ(blob_file_addition.GetChecksumMethod(), checksum_method);
   ASSERT_EQ(blob_file_addition.GetChecksumValue(), checksum_value);
+  ASSERT_EQ(blob_file_addition.GetPhysicalBlobFileSize(), 0);
+  ASSERT_EQ(blob_file_addition.GetSchemaVersion(),
+            kLegacyBlobFileSchemaVersion);
+  ASSERT_TRUE(blob_file_addition.GetFileIdentity().empty());
+
+  TestEncodeDecode(blob_file_addition);
+}
+
+TEST_F(BlobFileAdditionTest, NonLegacyFormatDescriptorAndPhysicalSize) {
+  constexpr uint64_t blob_file_number = 321;
+  constexpr uint64_t total_blob_count = 7;
+  constexpr uint64_t total_blob_bytes = 456789;
+  constexpr uint64_t physical_blob_file_size = 456999;
+  const std::string checksum_method("XXH64");
+  const std::string checksum_value("\x01\x02\x03\x04\x05\x06\x07\x08", 8);
+  const std::string file_identity("0123456789", kBlobFileIdentitySize);
+
+  BlobFileAddition blob_file_addition(blob_file_number, total_blob_count,
+                                      total_blob_bytes, checksum_method,
+                                      checksum_value, physical_blob_file_size,
+                                      kBlogCurrentSchemaVersion, file_identity);
+
+  ASSERT_EQ(blob_file_addition.GetPhysicalBlobFileSize(),
+            physical_blob_file_size);
+  ASSERT_EQ(blob_file_addition.GetSchemaVersion(), kBlogCurrentSchemaVersion);
+  ASSERT_EQ(blob_file_addition.GetFileIdentity(), file_identity);
 
   TestEncodeDecode(blob_file_addition);
 }
@@ -136,6 +167,42 @@ TEST_F(BlobFileAdditionTest, DecodeErrors) {
     ASSERT_TRUE(s.IsCorruption());
     ASSERT_TRUE(std::strstr(s.getState(), "custom field value"));
   }
+}
+
+TEST_F(BlobFileAdditionTest, FutureSchemaVersionDiagnostic) {
+  constexpr uint64_t blob_file_number = 123;
+  constexpr uint64_t total_blob_count = 1;
+  constexpr uint64_t total_blob_bytes = 2;
+  constexpr uint32_t kFormatDescriptorTag = 1 << 6;
+
+  std::string encoded;
+  PutVarint64(&encoded, blob_file_number);
+  PutVarint64(&encoded, total_blob_count);
+  PutVarint64(&encoded, total_blob_bytes);
+  PutLengthPrefixedSlice(&encoded, Slice());
+  PutLengthPrefixedSlice(&encoded, Slice());
+
+  std::string format_descriptor;
+  const uint8_t future_schema_version = kBlogCurrentSchemaVersion + 1;
+  format_descriptor.push_back(static_cast<char>(future_schema_version));
+  format_descriptor.append("0123456789", kBlobFileIdentitySize);
+  PutVarint32(&encoded, kFormatDescriptorTag);
+  PutLengthPrefixedSlice(&encoded, format_descriptor);
+  PutVarint32(&encoded, 0);
+
+  BlobFileAddition blob_file_addition;
+  Slice input(encoded);
+  const Status s = blob_file_addition.DecodeFrom(&input);
+  ASSERT_TRUE(s.IsCorruption());
+
+  const std::string diagnostic = s.ToString();
+  ASSERT_NE(diagnostic.find("schema version " +
+                            std::to_string(future_schema_version)),
+            std::string::npos);
+  ASSERT_NE(
+      diagnostic.find("supported non-legacy blog schema versions are 1.." +
+                      std::to_string(kBlogCurrentSchemaVersion)),
+      std::string::npos);
 }
 
 TEST_F(BlobFileAdditionTest, ForwardCompatibleCustomField) {

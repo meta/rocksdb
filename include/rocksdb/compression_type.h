@@ -30,7 +30,12 @@ enum CompressionType : unsigned char {
   kZSTD = 0x07,
   kLastBuiltinCompression = kZSTD,
 
-  // Reserved for future use: up to 0x7F
+  // Values here reserved for future use by RocksDB
+
+  // Sentinel value used in blog file record trailers to indicate the
+  // payload uses streaming compression configured in the file header.
+  // See WriteBatchStreamingCompressionType header property.
+  kStreamingCompressionSentinel = 0x7F,
 
   // For use by user custom CompressionManagers
   kCustomCompression80 = 0x80,
