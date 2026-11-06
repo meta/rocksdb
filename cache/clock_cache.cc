@@ -1244,10 +1244,8 @@ Status ClockCacheShard<Table>::Insert(const Slice& key,
                                       const Cache::CacheItemHelper* helper,
                                       size_t charge, HandleImpl** handle,
                                       Cache::Priority priority) {
-  if (UNLIKELY(key.size() != kCacheKeySize)) {
-    return Status::NotSupported("ClockCache only supports key size " +
-                                std::to_string(kCacheKeySize) + "B");
-  }
+  assert(key.size() == kCacheKeySize);
+  (void)key;
   ClockHandleBasicData proto;
   proto.hashed_key = hashed_key;
   proto.value = value;
@@ -1260,9 +1258,8 @@ template <class Table>
 typename Table::HandleImpl* ClockCacheShard<Table>::CreateStandalone(
     const Slice& key, const UniqueId64x2& hashed_key, Cache::ObjectPtr obj,
     const Cache::CacheItemHelper* helper, size_t charge, bool allow_uncharged) {
-  if (UNLIKELY(key.size() != kCacheKeySize)) {
-    return nullptr;
-  }
+  assert(key.size() == kCacheKeySize);
+  (void)key;
   ClockHandleBasicData proto;
   proto.hashed_key = hashed_key;
   proto.value = obj;
@@ -1274,9 +1271,8 @@ typename Table::HandleImpl* ClockCacheShard<Table>::CreateStandalone(
 template <class Table>
 typename ClockCacheShard<Table>::HandleImpl* ClockCacheShard<Table>::Lookup(
     const Slice& key, const UniqueId64x2& hashed_key) {
-  if (UNLIKELY(key.size() != kCacheKeySize)) {
-    return nullptr;
-  }
+  assert(key.size() == kCacheKeySize);
+  (void)key;
   return table_.Lookup(hashed_key);
 }
 
@@ -1319,9 +1315,8 @@ bool ClockCacheShard<Table>::Release(HandleImpl* handle,
 template <class Table>
 void ClockCacheShard<Table>::Erase(const Slice& key,
                                    const UniqueId64x2& hashed_key) {
-  if (UNLIKELY(key.size() != kCacheKeySize)) {
-    return;
-  }
+  assert(key.size() == kCacheKeySize);
+  (void)key;
   table_.Erase(hashed_key);
 }
 
@@ -1402,6 +1397,48 @@ BaseHyperClockCache<Table>::BaseHyperClockCache(
                    opts.metadata_charge_policy, alloc,
                    &this->eviction_callback_, &this->hash_seed_, table_opts);
   });
+}
+
+template <class Table>
+Status BaseHyperClockCache<Table>::Insert(
+    const Slice& key, Cache::ObjectPtr obj, const CacheItemHelper* helper,
+    size_t charge, Handle** handle, Cache::Priority priority,
+    const Slice& compressed_value, CompressionType type) {
+  if (UNLIKELY(key.size() != kCacheKeySize)) {
+    return Status::NotSupported("ClockCache only supports key size " +
+                                std::to_string(kCacheKeySize) + "B");
+  }
+  return Base::Insert(key, obj, helper, charge, handle, priority,
+                      compressed_value, type);
+}
+
+template <class Table>
+Cache::Handle* BaseHyperClockCache<Table>::CreateStandalone(
+    const Slice& key, Cache::ObjectPtr obj, const CacheItemHelper* helper,
+    size_t charge, bool allow_uncharged) {
+  if (UNLIKELY(key.size() != kCacheKeySize)) {
+    return nullptr;
+  }
+  return Base::CreateStandalone(key, obj, helper, charge, allow_uncharged);
+}
+
+template <class Table>
+Cache::Handle* BaseHyperClockCache<Table>::Lookup(
+    const Slice& key, const CacheItemHelper* helper,
+    Cache::CreateContext* create_context, Cache::Priority priority,
+    Statistics* stats) {
+  if (UNLIKELY(key.size() != kCacheKeySize)) {
+    return nullptr;
+  }
+  return Base::Lookup(key, helper, create_context, priority, stats);
+}
+
+template <class Table>
+void BaseHyperClockCache<Table>::Erase(const Slice& key) {
+  if (UNLIKELY(key.size() != kCacheKeySize)) {
+    return;
+  }
+  Base::Erase(key);
 }
 
 template <class Table>
