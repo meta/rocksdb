@@ -1716,7 +1716,7 @@ BuiltinFilterBitsReader* BuiltinFilterPolicy::GetBuiltinFilterBitsReader(
   uint32_t num_lines = DecodeFixed32(contents.data() + len_with_meta - 4);
   uint32_t log2_cache_line_size;
 
-  if (num_lines * CACHE_LINE_SIZE == len) {
+  if (uint64_t{num_lines} * CACHE_LINE_SIZE == len) {
     // Common case
     log2_cache_line_size = ConstexprFloorLog2(CACHE_LINE_SIZE);
   } else if (num_lines == 0 || len % num_lines != 0) {
