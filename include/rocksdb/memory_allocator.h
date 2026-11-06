@@ -60,6 +60,11 @@ struct JemallocAllocatorOptions {
   // this setting can mitigate arena mutex contention. The value must be
   // positive.
   size_t num_arenas = 1;
+
+  // If "" then use default arena name.
+  // If not "" then use arena name with prefix, length <= 20.
+  // e.g arena_name_prefix:"rocksdb_", then arena name is "rocksdb_1", 1 is index of num_arenas.
+  std::string arena_name_prefix = "";
 };
 
 // Generate memory allocator which allocates through Jemalloc and utilize

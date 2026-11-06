@@ -128,6 +128,22 @@ uint32_t JemallocNodumpAllocator::GetArenaIndex() const {
       tl_random.Next(), static_cast<uint32_t>(arena_indexes_.size()))];
 }
 
+static bool RenameArena(int arena_index, const char* new_arena_name) {
+    size_t mib[3];
+    size_t miblen = sizeof(mib) / sizeof(size_t);
+
+    // ref:https://github.com/jemalloc/jemalloc/blob/dev/test/unit/mallctl.c#L742
+    const std::string name_ctl = "arena." + std::to_string(arena_index) + ".name";
+    mallctlnametomib(name_ctl.c_str(), mib, &miblen);
+
+    int ret = mallctlbymib(mib, miblen, nullptr, nullptr, (void*)&new_arena_name, sizeof(new_arena_name));
+    if (ret != 0) {
+        std::cout << "mallctlbymib:" << ret << " " << strerror(errno);
+        return false;
+    }
+    return true;
+}
+
 Status JemallocNodumpAllocator::InitializeArenas() {
   assert(!init_);
   init_ = true;
@@ -144,6 +160,13 @@ Status JemallocNodumpAllocator::InitializeArenas() {
           std::to_string(ret));
     }
     arena_indexes_.push_back(arena_index);
+
+    if (!options_.arena_name_prefix.empty() && options_.arena_name_prefix.size() <= 20) {
+        std::string new_arena_name = options_.arena_name_prefix + std::to_string(i);
+        if (!RenameArena(arena_index, new_arena_name.c_str())) {
+            return Status::Incomplete("Failed to rename arena." + new_arena_name);
+        }
+    }
 
     // Read existing hooks.
     std::string key =
