@@ -292,6 +292,77 @@ TEST_F(ImportColumnFamilyTest, ImportSSTFileWriterFilesWithOverlap) {
   }
 }
 
+// A newer imported file whose first entry is a range deletion must keep
+// covering the start key of that range in the older files below it.
+TEST_F(ImportColumnFamilyTest, ImportRangeDeletionAtFileStartCoversStartKey) {
+  Options options = CurrentOptions();
+  CreateAndReopenWithCF({"koko"}, options);
+  SstFileWriter sfw_cf1(EnvOptions(), options, handles_[1]);
+
+  // The control delta starts with a point key before the range deletion, so
+  // the range deletion is not the first entry of its file.
+  for (bool delta_writes_first_point_key : {true, false}) {
+    SCOPED_TRACE("delta_writes_first_point_key=" +
+                 std::to_string(delta_writes_first_point_key));
+    const std::string tag = delta_writes_first_point_key ? "control" : "bug";
+    const std::string base_sst_name = "base_" + tag + ".sst";
+    const std::string delta_sst_name = "delta_" + tag + ".sst";
+
+    ASSERT_OK(sfw_cf1.Open(sst_files_dir_ + base_sst_name));
+    ASSERT_OK(sfw_cf1.Put("r1", "old"));
+    ASSERT_OK(sfw_cf1.Put("r2", "old"));
+    ASSERT_OK(sfw_cf1.Put("r3", "old"));
+    ASSERT_OK(sfw_cf1.Finish());
+
+    ASSERT_OK(sfw_cf1.Open(sst_files_dir_ + delta_sst_name));
+    if (delta_writes_first_point_key) {
+      ASSERT_OK(sfw_cf1.Put("r0", "new"));
+    }
+    ASSERT_OK(sfw_cf1.DeleteRange("r1", "r4"));
+    ASSERT_OK(sfw_cf1.Put("r2", "new"));
+    ASSERT_OK(sfw_cf1.Finish());
+
+    ExportImportFilesMetaData metadata;
+    metadata.files.push_back(
+        LiveFileMetaDataInit(base_sst_name, sst_files_dir_, 2, 10, 19));
+    metadata.files.push_back(
+        LiveFileMetaDataInit(delta_sst_name, sst_files_dir_, 1, 20, 29));
+    metadata.db_comparator_name = options.comparator->Name();
+
+    ColumnFamilyHandle* import_cfh = nullptr;
+    ASSERT_OK(db_->CreateColumnFamilyWithImport(options, "import_" + tag,
+                                                ImportColumnFamilyOptions(),
+                                                metadata, &import_cfh));
+    ASSERT_NE(import_cfh, nullptr);
+
+    auto verify = [&]() {
+      std::string value;
+      ASSERT_TRUE(
+          db_->Get(ReadOptions(), import_cfh, "r1", &value).IsNotFound());
+      ASSERT_OK(db_->Get(ReadOptions(), import_cfh, "r2", &value));
+      ASSERT_EQ(value, "new");
+      ASSERT_TRUE(
+          db_->Get(ReadOptions(), import_cfh, "r3", &value).IsNotFound());
+      std::unique_ptr<Iterator> iter(
+          db_->NewIterator(ReadOptions(), import_cfh));
+      iter->Seek("r1");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key().ToString(), "r2");
+      ASSERT_EQ(iter->value().ToString(), "new");
+      iter->Next();
+      ASSERT_FALSE(iter->Valid() && iter->key().compare("r4") < 0);
+      ASSERT_OK(iter->status());
+    };
+    verify();
+    ASSERT_OK(
+        db_->CompactRange(CompactRangeOptions(), import_cfh, nullptr, nullptr));
+    verify();
+
+    ASSERT_OK(db_->DropColumnFamily(import_cfh));
+    ASSERT_OK(db_->DestroyColumnFamilyHandle(import_cfh));
+  }
+}
+
 TEST_F(ImportColumnFamilyTest, ImportSSTFileWriterFilesWithRangeTombstone) {
   // Test for a bug where import file's smallest and largest key did not
   // consider range tombstone.

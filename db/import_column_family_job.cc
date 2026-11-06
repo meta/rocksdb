@@ -483,6 +483,26 @@ Status ImportColumnFamilyJob::GetIngestedFileInfo(
       }
     }
     assert(bound_set);
+
+    // The entries of an external file are stored with sequence number 0 and
+    // read back with the file's largest seqno. Like ingestion does, move
+    // bounds at seqno 0 there too, or a range tombstone truncated to the
+    // file's smallest key would no longer cover the older versions of that key.
+    if (file_meta.largest_seqno != 0) {
+      for (InternalKey* bound : {&file_to_import->smallest_internal_key,
+                                 &file_to_import->largest_internal_key}) {
+        ParsedInternalKey parsed;
+        Status bound_status = ParseInternalKey(
+            bound->Encode(), &parsed, db_options_.allow_data_in_errors);
+        if (!bound_status.ok()) {
+          return Status::Corruption("Corrupted key in external file. ",
+                                    bound_status.getState());
+        }
+        if (parsed.sequence == 0) {
+          UpdateInternalKey(bound->rep(), file_meta.largest_seqno, parsed.type);
+        }
+      }
+    }
   } else {
     assert(!file_meta.largest.empty());
     file_to_import->smallest_internal_key.DecodeFrom(file_meta.smallest);
