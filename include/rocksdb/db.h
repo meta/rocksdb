@@ -2827,15 +2827,15 @@ class DB {
 
   virtual Status VerifyChecksum() { return VerifyChecksum(ReadOptions()); }
 
-  // Returns the unique ID which is read from IDENTITY file during the opening
-  // of database by setting in the identity variable
-  // Returns Status::OK if identity could be set properly
+  // Copies the database's unique ID into identity. The ID is read from the
+  // MANIFEST file when opening the database. See the write_dbid_to_manifest
+  // option for details. Returns Status::OK if identity was set.
   virtual Status GetDbIdentity(std::string& identity) const = 0;
 
   // Return a unique identifier for each DB object that is opened
   // This DB session ID should be unique among all open DB instances on all
   // hosts, and should be unique among re-openings of the same or other DBs.
-  // (Two open DBs have the same identity from other function GetDbIdentity when
+  // (Two open DBs have the same identity from GetDbIdentity when
   // one is physically copied from the other.)
   virtual Status GetDbSessionId(std::string& session_id) const = 0;
 
