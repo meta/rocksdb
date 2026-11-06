@@ -241,12 +241,12 @@ static const uint32_t table3_[256] = {
     0xc747336e, 0x1a0299d6, 0x782010ef, 0xa565ba57, 0xbc65029d, 0x6120a825,
     0x0302211c, 0xde478ba4, 0x31035088, 0xec46fa30, 0x8e647309, 0x5321d9b1,
     0x4a21617b, 0x9764cbc3, 0xf54642fa, 0x2803e842};
+#endif  // !__SSE4_2__
 
 // Used to fetch a naturally-aligned 32-bit word in little endian byte-order
 static inline uint32_t LE_LOAD32(const uint8_t* p) {
   return DecodeFixed32(reinterpret_cast<const char*>(p));
 }
-#endif  // !__SSE4_2__
 
 static inline void DefaultCRC32(uint64_t* l, uint8_t const** p) {
 #ifndef __SSE4_2__
