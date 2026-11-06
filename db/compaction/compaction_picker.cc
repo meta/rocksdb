@@ -863,7 +863,8 @@ Compaction* CompactionPicker::PickCompactionForCompactRange(
       return nullptr;
     }
     // set covering_the_whole_range to false if there is any file that need to
-    // be compacted in the range of inputs[skip_input_index+1, inputs.size())
+    // be compacted in the range of inputs[skip_input_index+1, inputs.size()).
+    // This must check the original inputs, so it runs before the swap below.
     for (size_t i = skip_input_index + 1; i < inputs.size(); ++i) {
       if (inputs[i]->fd.GetNumber() < max_file_num_to_ignore) {
         covering_the_whole_range = false;
