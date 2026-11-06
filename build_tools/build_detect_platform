@@ -617,6 +617,21 @@ EOF
         fi
     fi
 
+    if ! test $ROCKSDB_DISABLE_AUXV_ELF_AUX_INFO; then
+        # Test whether elf_aux_info is supported
+        $CXX $PLATFORM_CXXFLAGS -x c++ - -o test.o 2>/dev/null  <<EOF
+          #include <sys/auxv.h>
+          int main() {
+            uint64_t auxv = 0;
+            elf_aux_info(AT_HWCAP, &auxv, sizeof(auxv));
+            (void)auxv;
+          }
+EOF
+        if [ "$?" = 0 ]; then
+            COMMON_FLAGS="$COMMON_FLAGS -DROCKSDB_AUXV_ELF_AUX_INFO_PRESENT"
+        fi
+    fi
+
     if ! test $ROCKSDB_DISABLE_ALIGNED_NEW; then
         # Test whether c++17 aligned-new is supported
         $CXX $PLATFORM_CXXFLAGS -faligned-new -x c++ - -o test.o 2>/dev/null <<EOF
