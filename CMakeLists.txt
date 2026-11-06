@@ -329,10 +329,6 @@ else()
 endif()
 
 include(CheckCXXSourceCompiles)
-set(OLD_CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS})
-if(NOT MSVC)
-  set(CMAKE_REQUIRED_FLAGS "-msse4.2 -mpclmul")
-endif()
 
 # Check if -latomic is required or not
 if (NOT MSVC AND NOT APPLE)
@@ -358,9 +354,6 @@ if (WITH_LIBURING)
     list(APPEND THIRDPARTY_LIBS uring::uring)
   endif()
 endif()
-
-# Reset the required flags
-set(CMAKE_REQUIRED_FLAGS ${OLD_CMAKE_REQUIRED_FLAGS})
 
 option(WITH_IOSTATS_CONTEXT "Enable IO stats context" ON)
 if (NOT WITH_IOSTATS_CONTEXT)
