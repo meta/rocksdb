@@ -2955,6 +2955,33 @@ TEST_P(WriteBatchWithIndexTest, TestBadMergeOperator) {
   ASSERT_OK(batch_->GetFromBatch(column_family, options_, "b", &value));
 }
 
+TEST_P(WriteBatchWithIndexTest, UDTRollback) {
+  ASSERT_OK(OpenDB());
+  ColumnFamilyHandleImplDummy cf2(2,
+                                  test::BytewiseComparatorWithU64TsWrapper());
+  ASSERT_OK(batch_->Put(&cf2, "k1", "v1"));
+  ASSERT_OK(batch_->Put(&cf2, "k1", "v2"));
+  batch_->SetSavePoint();
+  ASSERT_OK(batch_->RollbackToSavePoint());
+  std::string value;
+  Status s = batch_->GetFromBatch(&cf2, db_->GetDBOptions(), "k1", &value);
+  EXPECT_OK(s);
+  EXPECT_EQ(value, "v2");
+  std::unique_ptr<WBWIIterator> iter(batch_->NewIterator(&cf2));
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  EXPECT_EQ(iter->Entry().key.ToString(), "k1");
+  EXPECT_EQ(iter->Entry().value.ToString(), "v2");
+  iter->Next();
+  const bool overwrite = GetParam();
+  ASSERT_EQ(iter->Valid(), !overwrite);
+  if (!overwrite) {
+    ASSERT_OK(iter->status());
+    EXPECT_EQ(iter->Entry().value.ToString(), "v1");
+  }
+}
+
 TEST_P(WriteBatchWithIndexTest, ColumnFamilyWithTimestamp) {
   ASSERT_OK(OpenDB());
 
