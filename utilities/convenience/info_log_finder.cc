@@ -20,7 +20,17 @@ Status GetInfoLogList(DB* db, std::vector<std::string>* info_log_list) {
   }
   std::string parent_path;
   const Options& options = db->GetOptions();
+  std::string dbname = db->GetName();
+
+  std::string db_absolute_path;
+  Status s = options.env->GetAbsolutePath(dbname, &db_absolute_path);
+  if (s.IsNotSupported()) {
+    db_absolute_path = dbname;
+  } else if (!s.ok()) {
+    return s;
+  }
+
   return GetInfoLogFiles(options.env->GetFileSystem(), options.db_log_dir,
-                         db->GetName(), &parent_path, info_log_list);
+                         dbname, db_absolute_path, &parent_path, info_log_list);
 }
 }  // namespace ROCKSDB_NAMESPACE

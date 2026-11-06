@@ -564,6 +564,7 @@ IOStatus SyncManifest(const ImmutableDBOptions* db_options,
 
 Status GetInfoLogFiles(const std::shared_ptr<FileSystem>& fs,
                        const std::string& db_log_dir, const std::string& dbname,
+                       const std::string& db_absolute_path,
                        std::string* parent_dir,
                        std::vector<std::string>* info_log_list) {
   assert(parent_dir != nullptr);
@@ -577,7 +578,7 @@ Status GetInfoLogFiles(const std::shared_ptr<FileSystem>& fs,
     *parent_dir = dbname;
   }
 
-  InfoLogPrefix info_log_prefix(!db_log_dir.empty(), dbname);
+  InfoLogPrefix info_log_prefix(!db_log_dir.empty(), db_absolute_path);
 
   std::vector<std::string> file_names;
   Status s = fs->GetChildren(*parent_dir, IOOptions(), &file_names, nullptr);

@@ -720,6 +720,49 @@ TEST_F(AutoRollLoggerTest, RenameError) {
   }
 }
 
+TEST_F(AutoRollLoggerTest, GetInfoLogFilesPrefixMismatch) {
+
+  InitTestDb();
+  const size_t kFileNum = 3;
+  const size_t kMaxFileSize = 512;
+
+
+  std::string relative_dbname = "test_relative_db";
+  std::string db_log_dir = kTestDir; 
+
+ 
+  ASSERT_OK(default_env->CreateDirIfMissing(relative_dbname));
+
+
+  {
+    AutoRollLogger logger(FileSystem::Default(), SystemClock::Default(),
+                          relative_dbname, db_log_dir, kMaxFileSize, 0, kFileNum);
+
+    RollNTimesBySize(&logger, kFileNum + 2, kMaxFileSize);
+  }
+  std::vector<std::string> files = GetLogFiles();
+  ASSERT_EQ(kFileNum, files.size())
+      << "Log files should be created";
+  
+  {
+    AutoRollLogger logger(FileSystem::Default(), SystemClock::Default(),
+                          relative_dbname, db_log_dir, kMaxFileSize, 0, kFileNum);
+
+    RollNTimesBySize(&logger, 1, kMaxFileSize);
+  }
+
+
+  files = GetLogFiles();
+
+  ASSERT_EQ(kFileNum, files.size())
+      << "Log files exceed keep_log_file_num limit. "
+      << "Bug: GetInfoLogFiles uses wrong prefix when db_log_dir is set. "
+      << "Expected: " << kFileNum << ", Actual: " << files.size();
+
+  default_env->DeleteDir(relative_dbname).PermitUncheckedError();
+  CleanupLogFiles();
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
