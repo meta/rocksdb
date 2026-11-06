@@ -3785,6 +3785,19 @@ void rocksdb_iter_refresh(const rocksdb_iterator_t* iter, char** errptr) {
   SaveError(errptr, iter->rep->Refresh());
 }
 
+unsigned char rocksdb_iter_is_key_pinned(const rocksdb_iterator_t* iter) {
+  std::string result;
+  Status s = iter->rep->GetProperty("rocksdb.iterator.is-key-pinned", &result);
+  return s.ok() && result == "1";
+}
+
+unsigned char rocksdb_iter_is_value_pinned(const rocksdb_iterator_t* iter) {
+  std::string result;
+  Status s =
+      iter->rep->GetProperty("rocksdb.iterator.is-value-pinned", &result);
+  return s.ok() && result == "1";
+}
+
 rocksdb_writebatch_t* rocksdb_writebatch_create() {
   return new rocksdb_writebatch_t;
 }
