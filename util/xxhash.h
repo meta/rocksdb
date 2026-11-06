@@ -3065,6 +3065,7 @@ XXH_PUBLIC_API XXH64_hash_t XXH64_hashFromCanonical(XXH_NOESCAPE const XXH64_can
 #if defined(__GNUC__) || defined(__clang__)
 #  if defined(__ARM_FEATURE_SVE)
 #    include <arm_sve.h>
+#    include <arm_neon.h>
 #  elif defined(__ARM_NEON__) || defined(__ARM_NEON) \
    || defined(__aarch64__)  || defined(_M_ARM) \
    || defined(_M_ARM64)     || defined(_M_ARM64EC)
@@ -3316,7 +3317,7 @@ enum XXH_VECTOR_TYPE /* fake enum */ {
 #endif
 
 
-#if XXH_VECTOR == XXH_NEON
+#if (XXH_VECTOR == XXH_NEON || XXH_VECTOR == XXH_SVE)
 /*
  * NEON's setup for vmlal_u32 is a little more complicated than it is on
  * SSE2, AVX2, and VSX.
@@ -3603,21 +3604,6 @@ XXH_FORCE_INLINE xxh_u64x2 XXH_vec_mule(xxh_u32x4 a, xxh_u32x4 b)
 }
 # endif /* XXH_vec_mulo, XXH_vec_mule */
 #endif /* XXH_VECTOR == XXH_VSX */
-
-#if XXH_VECTOR == XXH_SVE
-#define ACCRND(acc, offset) \
-do { \
-    svuint64_t input_vec = svld1_u64(mask, xinput + offset);         \
-    svuint64_t secret_vec = svld1_u64(mask, xsecret + offset);       \
-    svuint64_t mixed = sveor_u64_x(mask, secret_vec, input_vec);     \
-    svuint64_t swapped = svtbl_u64(input_vec, kSwap);                \
-    svuint64_t mixed_lo = svextw_u64_x(mask, mixed);                 \
-    svuint64_t mixed_hi = svlsr_n_u64_x(mask, mixed, 32);            \
-    svuint64_t mul = svmad_u64_x(mask, mixed_lo, mixed_hi, swapped); \
-    acc = svadd_u64_x(mask, acc, mul);                               \
-} while (0)
-#endif /* XXH_VECTOR == XXH_SVE */
-
 
 /* prefetch
  * can be disabled, by declaring XXH_NO_PREFETCH build macro */
@@ -4558,7 +4544,7 @@ XXH_FORCE_INLINE XXH_TARGET_SSE2 void XXH3_initCustomSecret_sse2(void* XXH_RESTR
 
 #endif
 
-#if (XXH_VECTOR == XXH_NEON)
+#if (XXH_VECTOR == XXH_NEON || XXH_VECTOR == XXH_SVE)
 
 /* forward declarations for the scalar routines */
 XXH_FORCE_INLINE void
@@ -4800,6 +4786,19 @@ XXH3_scrambleAcc_vsx(void* XXH_RESTRICT acc, const void* XXH_RESTRICT secret)
 
 #if (XXH_VECTOR == XXH_SVE)
 
+static inline void XXH_ACCRND(svuint64_t* vacc, const uint64_t* xinput, 
+                              const uint64_t* xsecret, svuint64_t kSwap, 
+                              svbool_t mask, uint64_t offset) {
+    svuint64_t input_vec = svld1_u64(mask, xinput + offset);
+    svuint64_t secret_vec = svld1_u64(mask, xsecret + offset);
+    svuint64_t mixed = sveor_u64_x(mask, secret_vec, input_vec);
+    svuint64_t swapped = svtbl_u64(input_vec, kSwap);
+    svuint64_t mixed_lo = svextw_u64_x(mask, mixed);
+    svuint64_t mixed_hi = svlsr_n_u64_x(mask, mixed, 32);
+    svuint64_t mul = svmad_u64_x(mask, mixed_lo, mixed_hi, swapped);
+    *vacc = svadd_u64_x(mask, *vacc, mul);
+}
+
 XXH_FORCE_INLINE void
 XXH3_accumulate_512_sve( void* XXH_RESTRICT acc,
                    const void* XXH_RESTRICT input,
@@ -4813,7 +4812,7 @@ XXH3_accumulate_512_sve( void* XXH_RESTRICT acc,
     if (element_count >= 8) {
         svbool_t mask = svptrue_pat_b64(SV_VL8);
         svuint64_t vacc = svld1_u64(mask, xacc);
-        ACCRND(vacc, 0);
+        XXH_ACCRND(&vacc, xinput, xsecret, kSwap, mask, 0);
         svst1_u64(mask, xacc, vacc);
     } else if (element_count == 2) {   /* sve128 */
         svbool_t mask = svptrue_pat_b64(SV_VL2);
@@ -4821,10 +4820,10 @@ XXH3_accumulate_512_sve( void* XXH_RESTRICT acc,
         svuint64_t acc1 = svld1_u64(mask, xacc + 2);
         svuint64_t acc2 = svld1_u64(mask, xacc + 4);
         svuint64_t acc3 = svld1_u64(mask, xacc + 6);
-        ACCRND(acc0, 0);
-        ACCRND(acc1, 2);
-        ACCRND(acc2, 4);
-        ACCRND(acc3, 6);
+        XXH_ACCRND(&acc0, xinput, xsecret, kSwap, mask, 0);
+        XXH_ACCRND(&acc1, xinput, xsecret, kSwap, mask, 2);
+        XXH_ACCRND(&acc2, xinput, xsecret, kSwap, mask, 4);
+        XXH_ACCRND(&acc3, xinput, xsecret, kSwap, mask, 6);
         svst1_u64(mask, xacc + 0, acc0);
         svst1_u64(mask, xacc + 2, acc1);
         svst1_u64(mask, xacc + 4, acc2);
@@ -4833,8 +4832,8 @@ XXH3_accumulate_512_sve( void* XXH_RESTRICT acc,
         svbool_t mask = svptrue_pat_b64(SV_VL4);
         svuint64_t acc0 = svld1_u64(mask, xacc + 0);
         svuint64_t acc1 = svld1_u64(mask, xacc + 4);
-        ACCRND(acc0, 0);
-        ACCRND(acc1, 4);
+        XXH_ACCRND(&acc0, xinput, xsecret, kSwap, mask, 0);
+        XXH_ACCRND(&acc1, xinput, xsecret, kSwap, mask, 4);
         svst1_u64(mask, xacc + 0, acc0);
         svst1_u64(mask, xacc + 4, acc1);
     }
@@ -4858,7 +4857,7 @@ XXH3_accumulate_sve(xxh_u64* XXH_RESTRICT acc,
             do {
                 /* svprfd(svbool_t, void *, enum svfprop); */
                 svprfd(mask, xinput + 128, SV_PLDL1STRM);
-                ACCRND(vacc, 0);
+                XXH_ACCRND(&vacc, xinput, xsecret, kSwap, mask, 0);
                 xinput += 8;
                 xsecret += 1;
                 nbStripes--;
@@ -4873,10 +4872,10 @@ XXH3_accumulate_sve(xxh_u64* XXH_RESTRICT acc,
             svuint64_t acc3 = svld1_u64(mask, xacc + 6);
             do {
                 svprfd(mask, xinput + 128, SV_PLDL1STRM);
-                ACCRND(acc0, 0);
-                ACCRND(acc1, 2);
-                ACCRND(acc2, 4);
-                ACCRND(acc3, 6);
+                XXH_ACCRND(&acc0, xinput, xsecret, kSwap, mask, 0);
+                XXH_ACCRND(&acc1, xinput, xsecret, kSwap, mask, 2);
+                XXH_ACCRND(&acc2, xinput, xsecret, kSwap, mask, 4);
+                XXH_ACCRND(&acc3, xinput, xsecret, kSwap, mask, 6);
                 xinput += 8;
                 xsecret += 1;
                 nbStripes--;
@@ -4892,8 +4891,8 @@ XXH3_accumulate_sve(xxh_u64* XXH_RESTRICT acc,
             svuint64_t acc1 = svld1_u64(mask, xacc + 4);
             do {
                 svprfd(mask, xinput + 128, SV_PLDL1STRM);
-                ACCRND(acc0, 0);
-                ACCRND(acc1, 4);
+                XXH_ACCRND(&acc0, xinput, xsecret, kSwap, mask, 0);
+                XXH_ACCRND(&acc1, xinput, xsecret, kSwap, mask, 4);
                 xinput += 8;
                 xsecret += 1;
                 nbStripes--;
@@ -5065,6 +5064,49 @@ XXH3_initCustomSecret_scalar(void* XXH_RESTRICT customSecret, xxh_u64 seed64)
     }   }
 }
 
+#if (XXH_VECTOR == XXH_SVE)
+
+#if defined(__linux__) && defined(__aarch64__)
+#include <sys/auxv.h>
+#ifndef HWCAP_SVE
+#define HWCAP_SVE (1UL << 22)
+#endif
+
+static int XXH_sve_available(void)
+{
+    static const int result = (getauxval(AT_HWCAP) & HWCAP_SVE) != 0;
+    return result;
+}
+#else
+static int XXH_sve_available(void) { return 0; }
+#endif
+
+
+XXH_FORCE_INLINE void
+XXH3_accumulate_512_sve_or_neon(void* XXH_RESTRICT acc,
+                                const void* XXH_RESTRICT input,
+                                const void* XXH_RESTRICT secret)
+{
+    if (XXH_sve_available())
+        XXH3_accumulate_512_sve(acc, input, secret);
+    else
+        XXH3_accumulate_512_neon(acc, input, secret);
+}
+
+XXH_FORCE_INLINE void
+XXH3_accumulate_sve_or_neon(xxh_u64* XXH_RESTRICT acc,
+                             const xxh_u8* XXH_RESTRICT input,
+                             const xxh_u8* XXH_RESTRICT secret,
+                             size_t nbStripes)
+{
+    if (XXH_sve_available())
+        XXH3_accumulate_sve(acc, input, secret, nbStripes);
+    else
+        XXH3_accumulate_neon(acc, input, secret, nbStripes);
+}
+
+#endif
+
 
 typedef void (*XXH3_f_accumulate)(xxh_u64* XXH_RESTRICT, const xxh_u8* XXH_RESTRICT, const xxh_u8* XXH_RESTRICT, size_t);
 typedef void (*XXH3_f_scrambleAcc)(void* XXH_RESTRICT, const void*);
@@ -5092,13 +5134,6 @@ typedef void (*XXH3_f_initCustomSecret)(void* XXH_RESTRICT, xxh_u64);
 #define XXH3_scrambleAcc    XXH3_scrambleAcc_sse2
 #define XXH3_initCustomSecret XXH3_initCustomSecret_sse2
 
-#elif (XXH_VECTOR == XXH_NEON)
-
-#define XXH3_accumulate_512 XXH3_accumulate_512_neon
-#define XXH3_accumulate     XXH3_accumulate_neon
-#define XXH3_scrambleAcc    XXH3_scrambleAcc_neon
-#define XXH3_initCustomSecret XXH3_initCustomSecret_scalar
-
 #elif (XXH_VECTOR == XXH_VSX)
 
 #define XXH3_accumulate_512 XXH3_accumulate_512_vsx
@@ -5106,10 +5141,10 @@ typedef void (*XXH3_f_initCustomSecret)(void* XXH_RESTRICT, xxh_u64);
 #define XXH3_scrambleAcc    XXH3_scrambleAcc_vsx
 #define XXH3_initCustomSecret XXH3_initCustomSecret_scalar
 
-#elif (XXH_VECTOR == XXH_SVE)
-#define XXH3_accumulate_512 XXH3_accumulate_512_sve
-#define XXH3_accumulate     XXH3_accumulate_sve
-#define XXH3_scrambleAcc    XXH3_scrambleAcc_scalar
+#elif (XXH_VECTOR == XXH_SVE || XXH_VECTOR == XXH_NEON)
+#define XXH3_accumulate_512 XXH3_accumulate_512_sve_or_neon
+#define XXH3_accumulate     XXH3_accumulate_sve_or_neon
+#define XXH3_scrambleAcc    XXH3_scrambleAcc_neon
 #define XXH3_initCustomSecret XXH3_initCustomSecret_scalar
 
 #else /* scalar */
