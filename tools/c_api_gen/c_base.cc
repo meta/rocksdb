@@ -1202,7 +1202,12 @@ static rocksdb_optimistictransactiondb_t* WrapOptimisticTransactionDB(
 // Works with std::string, Slice, and PinnableSlice through implicit conversion
 static inline char* CopyString(const Slice& slice) {
   char* result = reinterpret_cast<char*>(malloc(slice.size()));
-  memcpy(result, slice.data(), slice.size());
+  if (result == nullptr) {
+    return nullptr;
+  }
+  if (slice.size() > 0) {
+    memcpy(result, slice.data(), slice.size());
+  }
   return result;
 }
 
@@ -1216,6 +1221,14 @@ static inline char** CopyStringVector(const std::vector<std::string>& values) {
   }
   for (size_t i = 0; i < values.size(); ++i) {
     result[i] = strdup(values[i].c_str());
+    if (result[i] == nullptr) {
+      // Unwind and free already allocated strings to prevent memory leaks
+      for (size_t j = 0; j < i; ++j) {
+        free(result[j]);
+      }
+      free(result);
+      return nullptr;
+    }
   }
   return result;
 }
@@ -3230,7 +3243,11 @@ char* rocksdb_property_value(rocksdb_t* db, const char* propname) {
   std::string tmp;
   if (db->rep->GetProperty(Slice(propname), &tmp)) {
     // We use strdup() since we expect human readable output.
-    return strdup(tmp.c_str());
+    char* result = strdup(tmp.c_str());
+    if (result == nullptr) {
+      return nullptr;
+    }
+    return result;
   } else {
     return nullptr;
   }
@@ -3261,11 +3278,16 @@ char* rocksdb_property_value_cf(rocksdb_t* db,
   std::string tmp;
   if (db->rep->GetProperty(column_family->rep, Slice(propname), &tmp)) {
     // We use strdup() since we expect human readable output.
-    return strdup(tmp.c_str());
+    char* result = strdup(tmp.c_str());
+    if (result == nullptr) {
+      return nullptr;
+    }
+    return result;
   } else {
     return nullptr;
   }
 }
+
 
 void rocksdb_approximate_sizes(rocksdb_t* db, int num_ranges,
                                const char* const* range_start_key,
@@ -3488,11 +3510,19 @@ void rocksdb_compact_files_cf(rocksdb_t* db,
     return;
   }
 
-  if (num_output_file_names != nullptr) {
-    *num_output_file_names = output_files.size();
-  }
   if (output_file_names != nullptr) {
     *output_file_names = CopyStringVector(output_files);
+    if (*output_file_names == nullptr && !output_files.empty()) {
+      if (num_output_file_names != nullptr) {
+        *num_output_file_names = 0;
+      }
+      SaveError(errptr,
+                Status::MemoryLimit("Failed to allocate output file names"));
+      return;
+    }
+  }
+  if (num_output_file_names != nullptr) {
+    *num_output_file_names = output_files.size();
   }
 }
 
@@ -7706,6 +7736,9 @@ size_t rocksdb_column_family_metadata_get_file_count(
 
 char* rocksdb_column_family_metadata_get_name(
     rocksdb_column_family_metadata_t* cf_meta) {
+  if (cf_meta == nullptr) {
+    return nullptr;
+  }
   return strdup(cf_meta->rep.name.c_str());
 }
 
@@ -7716,13 +7749,15 @@ size_t rocksdb_column_family_metadata_get_level_count(
 
 rocksdb_level_metadata_t* rocksdb_column_family_metadata_get_level_metadata(
     rocksdb_column_family_metadata_t* cf_meta, size_t i) {
-  if (i >= cf_meta->rep.levels.size()) {
+  if (cf_meta == nullptr || i >= cf_meta->rep.levels.size()) {
     return nullptr;
   }
   rocksdb_level_metadata_t* level_meta =
       (rocksdb_level_metadata_t*)malloc(sizeof(rocksdb_level_metadata_t));
+  if (level_meta == nullptr) {
+    return nullptr;
+  }
   level_meta->rep = &cf_meta->rep.levels[i];
-
   return level_meta;
 }
 
@@ -7747,11 +7782,15 @@ size_t rocksdb_level_metadata_get_file_count(
 
 rocksdb_sst_file_metadata_t* rocksdb_level_metadata_get_sst_file_metadata(
     rocksdb_level_metadata_t* level_meta, size_t i) {
-  if (i >= level_meta->rep->files.size()) {
+  if (level_meta == nullptr || level_meta->rep == nullptr ||
+      i >= level_meta->rep->files.size()) {
     return nullptr;
   }
   rocksdb_sst_file_metadata_t* file_meta =
       (rocksdb_sst_file_metadata_t*)malloc(sizeof(rocksdb_sst_file_metadata_t));
+  if (file_meta == nullptr) {
+    return nullptr;
+  }
   file_meta->rep = &level_meta->rep->files[i];
   return file_meta;
 }
@@ -7764,11 +7803,17 @@ void rocksdb_sst_file_metadata_destroy(rocksdb_sst_file_metadata_t* file_meta) {
 
 char* rocksdb_sst_file_metadata_get_relative_filename(
     rocksdb_sst_file_metadata_t* file_meta) {
+  if (file_meta == nullptr || file_meta->rep == nullptr) {
+    return nullptr;
+  }
   return strdup(file_meta->rep->relative_filename.c_str());
 }
 
 char* rocksdb_sst_file_metadata_get_directory(
     rocksdb_sst_file_metadata_t* file_meta) {
+  if (file_meta == nullptr || file_meta->rep == nullptr) {
+    return nullptr;
+  }
   return strdup(file_meta->rep->directory.c_str());
 }
 
@@ -7813,6 +7858,9 @@ rocksdb_export_import_files_metadata_create() {
 
 char* rocksdb_export_import_files_metadata_get_db_comparator_name(
     rocksdb_export_import_files_metadata_t* metadata) {
+  if (metadata == nullptr || metadata->rep == nullptr) {
+    return nullptr;
+  }
   return strdup(metadata->rep->db_comparator_name.c_str());
 }
 
@@ -8101,6 +8149,10 @@ rocksdb_transaction_t** rocksdb_transactiondb_get_prepared_transactions(
   } else {
     rocksdb_transaction_t** buf = (rocksdb_transaction_t**)malloc(
         txns.size() * sizeof(rocksdb_transaction_t*));
+    if (buf == nullptr) {
+      *cnt = 0;
+      return nullptr;
+    }
     for (size_t i = 0; i < txns.size(); i++) {
       buf[i] = new rocksdb_transaction_t;
       buf[i]->rep = txns[i];
@@ -8130,6 +8182,9 @@ rocksdb_writebatch_wi_t* rocksdb_transaction_get_writebatch_wi(
     rocksdb_transaction_t* txn) {
   rocksdb_writebatch_wi_t* wi =
       (rocksdb_writebatch_wi_t*)malloc(sizeof(rocksdb_writebatch_wi_t));
+  if (wi == nullptr) {
+    return nullptr;
+  }
   wi->rep = txn->rep->GetWriteBatch();
 
   return wi;
@@ -8160,6 +8215,9 @@ const rocksdb_snapshot_t* rocksdb_transaction_get_snapshot(
   // mismatch
   rocksdb_snapshot_t* result =
       (rocksdb_snapshot_t*)malloc(sizeof(rocksdb_snapshot_t));
+  if (result == nullptr) {
+    return nullptr;
+  }
   result->rep = txn->rep->GetSnapshot();
   return result;
 }
