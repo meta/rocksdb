@@ -3045,17 +3045,32 @@ class DBImpl : public DB
                     WriteBatch* tmp_batch, WriteBatch** merged_batch,
                     size_t* write_with_wal, WriteBatch** to_be_cached_state);
 
+  // `sequence` is the sequence number of `merged_batch` and `seq_inc` is how
+  // many sequence numbers WAL recovery advances by when replaying it.
   IOStatus WriteToWAL(const WriteBatch& merged_batch,
                       const WriteOptions& write_options,
                       log::Writer* log_writer, uint64_t* wal_used,
                       uint64_t* log_size,
                       WalFileNumberSize& wal_file_number_size,
-                      SequenceNumber sequence);
+                      SequenceNumber sequence, size_t seq_inc);
+
+  // With recycle_log_file_num > 0, point-in-time recovery treats a record left
+  // over from a previous incarnation of a recycled WAL as possible corruption,
+  // and continues into the next WAL only if that WAL's first WriteBatch has
+  // the next expected sequence number. Sequence numbers consumed without a WAL
+  // record (e.g. disableWAL writes or external file ingestion) would break
+  // that check. So before the first WriteBatch of a WAL whose `sequence` skips
+  // ahead of `next_seq_after_last_wal_record_`, this writes an empty WriteBatch
+  // with the expected sequence number. Not done with seq_per_batch_.
+  // REQUIRES: same synchronization as WriteToWAL()
+  IOStatus MaybeAddWalSeqnoGapFiller(const WriteOptions& write_options,
+                                     log::Writer* log_writer,
+                                     SequenceNumber sequence);
 
   IOStatus WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                            log::Writer* log_writer, uint64_t* wal_used,
                            bool need_wal_sync, bool need_wal_dir_sync,
-                           SequenceNumber sequence,
+                           SequenceNumber sequence, size_t seq_inc,
                            WalFileNumberSize& wal_file_number_size);
 
   IOStatus ConcurrentWriteGroupToWAL(const WriteThread::WriteGroup& write_group,
@@ -3800,6 +3815,13 @@ class DBImpl : public DB
   // instances of the database are not recycled, as we cannot be sure they
   // were created in the recyclable format.
   uint64_t min_wal_number_to_recycle_ = 0;
+
+  // The sequence number WAL recovery is expected to reach after replaying the
+  // last WriteBatch successfully written to a WAL by this DB instance, or 0 if
+  // unknown, such as before the first WAL write or after a failed one.
+  // Accessed only by WriteToWAL() and its callees (see the synchronization
+  // comment there).
+  SequenceNumber next_seq_after_last_wal_record_ = 0;
 
   // Protected by wal_write_mutex_.
   bool wal_dir_synced_ = false;

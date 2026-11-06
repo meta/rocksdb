@@ -1016,6 +1016,9 @@ struct DBOptions {
   // use.  This is more efficient because the blocks are already
   // allocated and fdatasync does not need to update the inode after
   // each write.
+  // With a WritePrepared or WriteUnprepared TransactionDB, writes with
+  // WriteOptions::disableWAL return Status::InvalidArgument when this is
+  // non-zero.
   // Default: 0
   size_t recycle_log_file_num = 0;
 
