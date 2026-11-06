@@ -537,6 +537,46 @@ TEST_P(TransactionTest, ValidateSnapshotTest) {
   }
 }
 
+TEST_P(TransactionTest, SharedLockUpgradeValidatesSnapshotTest) {
+  WriteOptions write_options;
+  ReadOptions read_options;
+  TransactionOptions txn_options;
+  std::string value;
+
+  ASSERT_OK(db->Put(write_options, "foo", "v0"));
+
+  Transaction* txn1 = db->BeginTransaction(write_options, txn_options);
+  ASSERT_TRUE(txn1);
+  txn1->SetSnapshot();
+
+  // The key is modified after txn1's snapshot
+  ASSERT_OK(db->Put(write_options, "foo", "v1"));
+
+  // Share-lock the key without validating it against the snapshot
+  ASSERT_OK(txn1->GetForUpdate(read_options, "foo", &value,
+                               false /* exclusive */, false /* do_validate */));
+
+  // Writing upgrades the lock to exclusive and validates against the
+  // snapshot. The key changed since the snapshot, so the write must conflict.
+  ASSERT_TRUE(txn1->Put("foo", "v2").IsBusy());
+
+  // The failed upgrade leaves the key share-locked, so others can still share
+  // it
+  Transaction* txn2 = db->BeginTransaction(write_options, txn_options);
+  ASSERT_TRUE(txn2);
+  ASSERT_OK(txn2->GetForUpdate(read_options, "foo", &value,
+                               false /* exclusive */, false /* do_validate */));
+  ASSERT_EQ("v1", value);
+  ASSERT_OK(txn2->Rollback());
+  delete txn2;
+
+  ASSERT_OK(txn1->Rollback());
+  delete txn1;
+
+  ASSERT_OK(db->Get(read_options, "foo", &value));
+  ASSERT_EQ("v1", value);
+}
+
 TEST_P(TransactionTest, WaitingTxn) {
   WriteOptions write_options;
   ReadOptions read_options;

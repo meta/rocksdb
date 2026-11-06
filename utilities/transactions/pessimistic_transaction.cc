@@ -1228,8 +1228,12 @@ Status PessimisticTransaction::TryLock(ColumnFamilyHandle* column_family,
       // Failed to validate key
       // Unlock key we just locked
       if (lock_upgrade) {
-        s = txn_db_impl_->TryLock(this, cfh_id, key_str, false /* exclusive */);
-        assert(s.ok());
+        // Downgrade back to the shared lock held before. Keep `s`, which holds
+        // the validation failure to return to the caller.
+        Status downgrade_status =
+            txn_db_impl_->TryLock(this, cfh_id, key_str, false /* exclusive */);
+        assert(downgrade_status.ok());
+        downgrade_status.PermitUncheckedError();
       } else if (!previously_locked) {
         txn_db_impl_->UnLock(this, cfh_id, key.ToString());
       }
