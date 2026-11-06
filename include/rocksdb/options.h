@@ -2962,10 +2962,9 @@ struct CompactionOptions {
   // If > 0, it will replace the option in the DBOptions for this compaction.
   uint32_t max_subcompactions;
 
-  // Allows cancellation of an in-progress manual compaction.
-  //
-  // Cancellation can be delayed waiting on automatic compactions when used
-  // together with `exclusive_manual_compaction == true`.
+  // Allows cancellation of an in-progress manual compaction run by
+  // `CompactFiles()`. The flag is checked before the compaction starts and
+  // periodically while it runs.
   std::atomic<bool>* canceled;
   // NOTE: Calling DisableManualCompaction() will not override the
   // canceled variable in CompactionOptions, as it does for CompactRangeOptions
