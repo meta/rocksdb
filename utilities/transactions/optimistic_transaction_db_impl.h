@@ -81,7 +81,9 @@ class OptimisticTransactionDBImpl : public OptimisticTransactionDB {
     return OptimisticTransactionDB::Write(write_opts, batch);
   }
 
-  OccValidationPolicy GetValidatePolicy() const { return validate_policy_; }
+  OccValidationPolicy GetValidatePolicy() const override {
+    return validate_policy_;
+  }
 
   port::Mutex& GetLockBucket(const Slice& key, uint64_t seed) {
     return bucketed_locks_->GetLockBucket(key, seed);

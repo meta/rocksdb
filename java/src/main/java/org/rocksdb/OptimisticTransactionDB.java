@@ -65,11 +65,32 @@ public class OptimisticTransactionDB extends RocksDB
    *
    * @throws RocksDBException if an error occurs whilst opening the database.
    */
-  public static OptimisticTransactionDB open(final DBOptions dbOptions,
-      final String path,
+  public static OptimisticTransactionDB open(final DBOptions dbOptions, final String path,
       final List<ColumnFamilyDescriptor> columnFamilyDescriptors,
-      final List<ColumnFamilyHandle> columnFamilyHandles)
-      throws RocksDBException {
+      final List<ColumnFamilyHandle> columnFamilyHandles) throws RocksDBException {
+    return open(dbOptions, new OptimisticTransactionDBOptions(), path, columnFamilyDescriptors,
+        columnFamilyHandles);
+  }
+
+  /**
+   * Open an OptimisticTransactionDB similar to
+   * {@link RocksDB#open(DBOptions, String, List, List)}.
+   *
+   * @param dbOptions {@link org.rocksdb.DBOptions} instance.
+   * @param optimisticDbOptions {@link org.rocksdb.OptimisticTransactionDBOptions} instance.
+   * @param path the path to the rocksdb.
+   * @param columnFamilyDescriptors list of column family descriptors
+   * @param columnFamilyHandles will be filled with ColumnFamilyHandle instances
+   *
+   * @return a {@link OptimisticTransactionDB} instance on success, null if the
+   *     specified {@link OptimisticTransactionDB} can not be opened.
+   *
+   * @throws RocksDBException if an error occurs whilst opening the database.
+   */
+  public static OptimisticTransactionDB open(final DBOptions dbOptions,
+      final OptimisticTransactionDBOptions optimisticDbOptions, final String path,
+      final List<ColumnFamilyDescriptor> columnFamilyDescriptors,
+      final List<ColumnFamilyHandle> columnFamilyHandles) throws RocksDBException {
     int defaultColumnFamilyIndex = -1;
     final byte[][] cfNames = new byte[columnFamilyDescriptors.size()][];
     final long[] cfOptionHandles = new long[columnFamilyDescriptors.size()];
@@ -87,8 +108,8 @@ public class OptimisticTransactionDB extends RocksDB
           "You must provide the default column family in your columnFamilyDescriptors");
     }
 
-    final long[] handles = open(dbOptions.nativeHandle_, path, cfNames,
-        cfOptionHandles);
+    final long[] handles = open(
+        dbOptions.nativeHandle_, optimisticDbOptions.nativeHandle_, path, cfNames, cfOptionHandles);
     final OptimisticTransactionDB otdb =
         new OptimisticTransactionDB(handles[0]);
 
@@ -213,6 +234,15 @@ public class OptimisticTransactionDB extends RocksDB
   }
 
   /**
+   * Get the underlying {@link OccValidationPolicy}.
+   *
+   * @return The underlying {@link OccValidationPolicy}.
+   */
+  public OccValidationPolicy occValidationPolicy() {
+    return OccValidationPolicy.getOccValidationPolicy(occValidationPolicy(nativeHandle_));
+  }
+
+  /**
    * Get the underlying database that was opened.
    *
    * @return The underlying database that was opened.
@@ -231,8 +261,9 @@ public class OptimisticTransactionDB extends RocksDB
 
   protected static native long open(final long optionsHandle,
       final String path) throws RocksDBException;
-  protected static native long[] open(final long handle, final String path,
-      final byte[][] columnFamilyNames, final long[] columnFamilyOptions);
+  protected static native long[] open(final long optionsHandle,
+      final long optimisticDbOptionsHandle, final String path, final byte[][] columnFamilyNames,
+      final long[] columnFamilyOptions);
   private static native void closeDatabase(final long handle) throws RocksDBException;
   private static native long beginTransaction(final long handle, final long writeOptionsHandle);
   private static native long beginTransaction(final long handle, final long writeOptionsHandle,
@@ -242,5 +273,6 @@ public class OptimisticTransactionDB extends RocksDB
   private static native long beginTransaction_withOld(final long handle,
       final long writeOptionsHandle, final long optimisticTransactionOptionsHandle,
       final long oldTransactionHandle);
+  private static native byte occValidationPolicy(final long handle);
   private static native long getBaseDB(final long handle);
 }

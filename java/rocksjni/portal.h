@@ -33,6 +33,7 @@
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/backup_engine.h"
 #include "rocksdb/utilities/memory_util.h"
+#include "rocksdb/utilities/optimistic_transaction_db.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
 #include "rocksjni/compaction_filter_factory_jnicallback.h"
@@ -6613,6 +6614,31 @@ class TransactionDBJni : public JavaClass {
     }
 
     return jdeadlock_info;
+  }
+};
+// The portal class for org.rocksdb.OccValidationPolicy.
+class OccValidationPolicyJni {
+ public:
+  static jbyte toJavaOccValidationPolicy(
+      const ROCKSDB_NAMESPACE::OccValidationPolicy policy) {
+    switch (policy) {
+      case ROCKSDB_NAMESPACE::OccValidationPolicy::kValidateSerial:
+        return 0x0;
+      case ROCKSDB_NAMESPACE::OccValidationPolicy::kValidateParallel:
+      default:
+        return 0x1;
+    }
+  }
+
+  static ROCKSDB_NAMESPACE::OccValidationPolicy toCppOccValidationPolicy(
+      const jbyte policy) {
+    switch (policy) {
+      case 0x0:
+        return ROCKSDB_NAMESPACE::OccValidationPolicy::kValidateSerial;
+      case 0x1:
+      default:
+        return ROCKSDB_NAMESPACE::OccValidationPolicy::kValidateParallel;
+    }
   }
 };
 

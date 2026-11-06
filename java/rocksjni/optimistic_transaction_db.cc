@@ -48,11 +48,12 @@ jlong Java_org_rocksdb_OptimisticTransactionDB_open__JLjava_lang_String_2(
 /*
  * Class:     org_rocksdb_OptimisticTransactionDB
  * Method:    open
- * Signature: (JLjava/lang/String;[[B[J)[J
+ * Signature: (JJLjava/lang/String;[[B[J)[J
  */
 jlongArray
 Java_org_rocksdb_OptimisticTransactionDB_open__JLjava_lang_String_2_3_3B_3J(
-    JNIEnv* env, jclass, jlong jdb_options_handle, jstring jdb_path,
+    JNIEnv* env, jclass, jlong jdb_options_handle,
+    jlong jdb_optimistic_options_handle, jstring jdb_path,
     jobjectArray jcolumn_names, jlongArray jcolumn_options_handles) {
   const char* db_path = env->GetStringUTFChars(jdb_path, nullptr);
   if (db_path == nullptr) {
@@ -103,13 +104,21 @@ Java_org_rocksdb_OptimisticTransactionDB_open__JLjava_lang_String_2_3_3B_3J(
     env->ReleaseLongArrayElements(jcolumn_options_handles, jco, JNI_ABORT);
   }
 
-  auto* db_options =
+  const auto* db_options =
       reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jdb_options_handle);
   std::vector<ROCKSDB_NAMESPACE::ColumnFamilyHandle*> handles;
+  ROCKSDB_NAMESPACE::Status s;
   ROCKSDB_NAMESPACE::OptimisticTransactionDB* otdb = nullptr;
-  const ROCKSDB_NAMESPACE::Status s =
-      ROCKSDB_NAMESPACE::OptimisticTransactionDB::Open(
-          *db_options, db_path, column_families, &handles, &otdb);
+  if (jdb_options_handle) {
+    const auto* otdb_options =
+        reinterpret_cast<ROCKSDB_NAMESPACE::OptimisticTransactionDBOptions*>(
+            jdb_options_handle);
+    s = ROCKSDB_NAMESPACE::OptimisticTransactionDB::Open(
+        *db_options, *otdb_options, db_path, column_families, &handles, &otdb);
+  } else {
+    s = ROCKSDB_NAMESPACE::OptimisticTransactionDB::Open(
+        *db_options, db_path, column_families, &handles, &otdb);
+  }
 
   env->ReleaseStringUTFChars(jdb_path, db_path);
 
@@ -255,6 +264,19 @@ jlong Java_org_rocksdb_OptimisticTransactionDB_beginTransaction_1withOld__JJJJ(
   assert(txn == old_txn);
 
   return GET_CPLUSPLUS_POINTER(txn);
+}
+
+/*
+ * Class:     org_rocksdb_OptimisticTransactionDB
+ * Method:    getOccValidationPolicy
+ * Signature: (J)B
+ */
+jbyte Java_org_rocksdb_OptimisticTransactionDB_getOccValidationPolicy(
+    JNIEnv*, jclass, jlong jhandle) {
+  const auto* optimistic_txn_db =
+      reinterpret_cast<ROCKSDB_NAMESPACE::OptimisticTransactionDB*>(jhandle);
+  return ROCKSDB_NAMESPACE::OccValidationPolicyJni::toJavaOccValidationPolicy(
+      optimistic_txn_db->GetValidatePolicy());
 }
 
 /*

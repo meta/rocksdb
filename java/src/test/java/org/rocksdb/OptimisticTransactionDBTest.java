@@ -30,6 +30,36 @@ public class OptimisticTransactionDBTest {
   }
 
   @Test
+  public void open_OptimisticTransactionDBOptions() throws RocksDBException {
+    try (final DBOptions dbOptions =
+             new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
+         final OptimisticTransactionDBOptions optimisticOptions =
+             new OptimisticTransactionDBOptions().setOccValidationPolicy(
+                 OccValidationPolicy.VALIDATE_SERIAL);
+         final ColumnFamilyOptions myCfOpts = new ColumnFamilyOptions()) {
+      final List<ColumnFamilyDescriptor> columnFamilyDescriptors =
+          Arrays.asList(new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY),
+              new ColumnFamilyDescriptor("myCf".getBytes(), myCfOpts));
+
+      final List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>();
+
+      try (final OptimisticTransactionDB otdb = OptimisticTransactionDB.open(dbOptions,
+               optimisticOptions, dbFolder.getRoot().getAbsolutePath(), columnFamilyDescriptors,
+               columnFamilyHandles)) {
+        try {
+          assertThat(otdb).isNotNull();
+          assertThat(otdb.occValidationPolicy())
+              .isEqualTo(optimisticOptions.occValidationPolicy());
+        } finally {
+          for (final ColumnFamilyHandle handle : columnFamilyHandles) {
+            handle.close();
+          }
+        }
+      }
+    }
+  }
+
+  @Test
   public void open_columnFamilies() throws RocksDBException {
     try(final DBOptions dbOptions = new DBOptions().setCreateIfMissing(true)
           .setCreateMissingColumnFamilies(true);
@@ -47,6 +77,8 @@ public class OptimisticTransactionDBTest {
                columnFamilyDescriptors, columnFamilyHandles)) {
         try {
           assertThat(otdb).isNotNull();
+          assertThat(otdb.occValidationPolicy())
+              .isEqualTo(OccValidationPolicy.VALIDATE_PARALLEL);
         } finally {
           for (final ColumnFamilyHandle handle : columnFamilyHandles) {
             handle.close();

@@ -165,6 +165,7 @@ JAVA_TESTS = \
 	org.rocksdb.NativeLibraryLoaderTest\
 	org.rocksdb.OptimisticTransactionTest\
 	org.rocksdb.OptimisticTransactionDBTest\
+	org.rocksdb.OptimisticTransactionOptionsDBTest\
 	org.rocksdb.OptimisticTransactionOptionsTest\
 	org.rocksdb.OptionsUtilTest\
 	org.rocksdb.OptionsTest\
