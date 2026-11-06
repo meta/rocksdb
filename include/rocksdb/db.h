@@ -2950,6 +2950,11 @@ class DB {
   // is reclaimed only once those files become readable or this instance is
   // reopened; `rocksdb.num-immutable-mem-table` reports how many memtables are
   // being held.
+  // With `recycle_log_file_num > 0`, WAL replay can stop at data left from a
+  // reused WAL file's previous use; writes after that point, including those in
+  // newer WALs, become visible only after the primary flushes them. Flushes of
+  // other column families stay visible meanwhile, so this instance can show a
+  // newer write in one column family without an older write in another.
   virtual Status TryCatchUpWithPrimary() {
     return Status::NotSupported("Supported only by secondary instance");
   }

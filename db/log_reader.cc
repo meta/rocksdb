@@ -9,9 +9,12 @@
 
 #include "db/log_reader.h"
 
+#include <algorithm>
+#include <cinttypes>
 #include <cstdio>
 
 #include "file/sequence_file_reader.h"
+#include "logging/logging.h"
 #include "port/lang.h"
 #include "rocksdb/env.h"
 #include "test_util/sync_point.h"
@@ -567,26 +570,24 @@ uint8_t Reader::ReadPhysicalRecord(Slice* result, size_t* drop_size,
     const uint32_t b = static_cast<uint32_t>(header[5]) & 0xff;
     const uint8_t type = static_cast<uint8_t>(header[6]);
     const uint32_t length = a | (b << 8);
-    int header_size = kHeaderSize;
     const bool is_recyclable_type =
         ((type >= kRecyclableFullType && type <= kRecyclableLastType) ||
          type == kRecyclableUserDefinedTimestampSizeType ||
          type == kRecyclePredecessorWALInfoType);
-    if (is_recyclable_type) {
-      header_size = kRecyclableHeaderSize;
-      if (first_record_read_ && !recycled_) {
-        // A recycled log should have started with a recycled record
-        return kBadRecord;
+    const size_t header_size =
+        is_recyclable_type ? kRecyclableHeaderSize : kHeaderSize;
+    if (buffer_.size() < header_size) {
+      if (!eof_ && !read_error_) {
+        // Physical record headers cannot cross block boundaries.
+        *drop_size = buffer_.size();
+        buffer_.clear();
+        return kBadRecordLen;
       }
-      recycled_ = true;
-      // We need enough for the larger header
-      if (buffer_.size() < static_cast<size_t>(kRecyclableHeaderSize)) {
-        uint8_t r = kEof;
-        if (!ReadMore(drop_size, &r)) {
-          return r;
-        }
-        continue;
+      uint8_t r = kEof;
+      if (!ReadMore(drop_size, &r)) {
+        return r;
       }
+      continue;
     }
 
     if (header_size + length > buffer_.size()) {
@@ -598,14 +599,6 @@ uint8_t Reader::ReadPhysicalRecord(Slice* result, size_t* drop_size,
       // higher layers can decide how to handle it based on the recovery mode,
       // whether this occurred at EOF, whether this is the final WAL, etc.
       return kBadRecordLen;
-    }
-
-    if (is_recyclable_type) {
-      const uint32_t log_num = DecodeFixed32(header + 7);
-      if (log_num != log_number_) {
-        buffer_.remove_prefix(header_size + length);
-        return kOldRecord;
-      }
     }
 
     if (type == kZeroType && length == 0) {
@@ -634,6 +627,20 @@ uint8_t Reader::ReadPhysicalRecord(Slice* result, size_t* drop_size,
     }
 
     buffer_.remove_prefix(header_size + length);
+
+    if (is_recyclable_type) {
+      if (first_record_read_ && !recycled_) {
+        // A recycled log should have started with a recycled record
+        ReportCorruption(header_size + length,
+                         "recyclable record in non-recyclable log");
+        return kBadRecord;
+      }
+      recycled_ = true;
+      const uint32_t log_num = DecodeFixed32(header + 7);
+      if (log_num != log_number_) {
+        return kOldRecord;
+      }
+    }
 
     if (!uncompress_ || type == kSetCompressionType ||
         type == kPredecessorWALInfoType ||
@@ -864,10 +871,22 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
         break;
       }
 
+      case kOldRecord:
+        // TryReadFragment() left the old data in buffer_, so this and later
+        // calls stop here. A partial record is kept because its remaining
+        // fragments may not have been written yet.
+        if (!stopped_at_old_record_) {
+          stopped_at_old_record_ = true;
+          ROCKS_LOG_WARN(info_log_,
+                         "Stopped reading WAL #%" PRIu64 " at offset %" PRIu64
+                         " before data from a previous use of the file",
+                         log_number_, end_of_buffer_offset_ - buffer_.size());
+        }
+        return false;
+
       case kBadHeader:
       case kBadRecord:
       case kEof:
-      case kOldRecord:
         if (in_fragmented_record_) {
           ReportCorruption(fragments_.size(), "error in middle of record");
           in_fragmented_record_ = false;
@@ -875,12 +894,12 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
         }
         break;
 
+      case kBadRecordLen:
       case kBadRecordChecksum:
-        if (recycled_) {
-          fragments_.clear();
-          return false;
-        }
-        ReportCorruption(drop_size, "checksum mismatch");
+        assert(!recycled_);
+        ReportCorruption(drop_size, fragment_type_or_err == kBadRecordLen
+                                        ? "bad record length"
+                                        : "checksum mismatch");
         if (in_fragmented_record_) {
           ReportCorruption(fragments_.size(), "error in middle of record");
           in_fragmented_record_ = false;
@@ -903,6 +922,14 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
     }
   }
   return false;
+}
+
+bool FragmentBufferedReader::IsZeroBlockTrailer() const {
+  const uint64_t block_remaining =
+      kBlockSize - (end_of_buffer_offset_ - buffer_.size()) % kBlockSize;
+  return buffer_.size() == block_remaining &&
+         std::all_of(buffer_.data(), buffer_.data() + buffer_.size(),
+                     [](char c) { return c == 0; });
 }
 
 void FragmentBufferedReader::UnmarkEOF() {
@@ -975,35 +1002,34 @@ bool FragmentBufferedReader::TryReadFragment(Slice* fragment, size_t* drop_size,
   const uint32_t b = static_cast<uint32_t>(header[5]) & 0xff;
   const uint8_t type = static_cast<uint8_t>(header[6]);
   const uint32_t length = a | (b << 8);
-  int header_size = kHeaderSize;
-  if ((type >= kRecyclableFullType && type <= kRecyclableLastType) ||
-      type == kRecyclableUserDefinedTimestampSizeType ||
-      type == kRecyclePredecessorWALInfoType) {
-    if (first_record_read_ && !recycled_) {
-      // A recycled log should have started with a recycled record
-      *fragment_type_or_err = kBadRecord;
-      return true;
-    }
-    recycled_ = true;
-    header_size = kRecyclableHeaderSize;
-    while (buffer_.size() < static_cast<size_t>(kRecyclableHeaderSize)) {
-      size_t old_size = buffer_.size();
-      uint8_t error = kEof;
-      if (!TryReadMore(drop_size, &error)) {
-        *fragment_type_or_err = error;
-        return false;
-      } else if (old_size == buffer_.size()) {
-        return false;
-      }
-    }
-    const uint32_t log_num = DecodeFixed32(header + 7);
-    if (log_num != log_number_) {
-      *fragment_type_or_err = kOldRecord;
-      return true;
-    }
-  }
-
+  const bool is_recyclable_type =
+      ((type >= kRecyclableFullType && type <= kRecyclableLastType) ||
+       type == kRecyclableUserDefinedTimestampSizeType ||
+       type == kRecyclePredecessorWALInfoType);
+  const size_t header_size =
+      is_recyclable_type ? kRecyclableHeaderSize : kHeaderSize;
+  // In a recycled log, data left by the file's previous use follows the
+  // records written so far, and the writer may later overwrite it. Such data
+  // is reported as an old record and left in buffer_ so that ReadRecord()
+  // stops before it instead of skipping what is written there. Before any
+  // record has been read, an invalid recyclable record is treated the same
+  // way, because the writer may still be writing the first record of a
+  // reused file.
+  const bool stop_at_invalid_record =
+      recycled_ || (is_recyclable_type && !first_record_read_);
   while (header_size + length > buffer_.size()) {
+    if (!eof_ && !read_error_) {
+      // Physical records cannot cross block boundaries. At EOF, a live
+      // writer can still append the missing bytes to the current block.
+      if (stop_at_invalid_record) {
+        *fragment_type_or_err = kOldRecord;
+        return true;
+      }
+      *drop_size = buffer_.size();
+      buffer_.clear();
+      *fragment_type_or_err = kBadRecordLen;
+      return true;
+    }
     size_t old_size = buffer_.size();
     uint8_t error = kEof;
     if (!TryReadMore(drop_size, &error)) {
@@ -1012,9 +1038,18 @@ bool FragmentBufferedReader::TryReadFragment(Slice* fragment, size_t* drop_size,
     } else if (old_size == buffer_.size()) {
       return false;
     }
+    // Extending the buffer can move its contents into backing_store_.
+    header = buffer_.data();
   }
 
   if (type == kZeroType && length == 0) {
+    // The writer zero-fills the rest of a block when the next record does not
+    // fit. In a recycled log, zeros that do not reach the end of the block are
+    // old data.
+    if (recycled_ && !IsZeroBlockTrailer()) {
+      *fragment_type_or_err = kOldRecord;
+      return true;
+    }
     buffer_.clear();
     *fragment_type_or_err = kBadRecord;
     return true;
@@ -1024,9 +1059,30 @@ bool FragmentBufferedReader::TryReadFragment(Slice* fragment, size_t* drop_size,
     uint32_t expected_crc = crc32c::Unmask(DecodeFixed32(header));
     uint32_t actual_crc = crc32c::Value(header + 6, length + header_size - 6);
     if (actual_crc != expected_crc) {
+      if (stop_at_invalid_record) {
+        *fragment_type_or_err = kOldRecord;
+        return true;
+      }
       *drop_size = buffer_.size();
       buffer_.clear();
       *fragment_type_or_err = kBadRecordChecksum;
+      return true;
+    }
+  }
+
+  if (is_recyclable_type) {
+    if (first_record_read_ && !recycled_) {
+      // A recycled log should have started with a recycled record
+      buffer_.remove_prefix(header_size + length);
+      ReportCorruption(header_size + length,
+                       "recyclable record in non-recyclable log");
+      *fragment_type_or_err = kBadRecord;
+      return true;
+    }
+    recycled_ = true;
+    const uint32_t log_num = DecodeFixed32(header + 7);
+    if (log_num != log_number_) {
+      *fragment_type_or_err = kOldRecord;
       return true;
     }
   }

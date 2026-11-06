@@ -140,4 +140,6 @@ Auto-sync provides the strongest durability guarantee but has the highest latenc
 
 When `recycle_log_file_num > 0`, obsolete WAL files are retained in a recycle pool (`wal_recycle_files_`) instead of being deleted. New WAL creation reuses a recycled file by renaming it, avoiding filesystem allocation overhead. Recyclable record headers include the log number to distinguish current data from stale data left over from the previous incarnation.
 
+A secondary instance tailing a recycled WAL stops at the first record it cannot use (an old log number, bad checksum, bad length, or zeros outside a block trailer), because the primary may later write over that data, and does not replay newer WALs meanwhile. The remaining writes become visible to the secondary once the primary flushes them. Until then, flushes of other column families still become visible, so the secondary can show a newer write in one column family without an older write in another.
+
 Note: WAL recycling is generally incompatible with `disableWAL` because corruption detection in recycled files relies on sequential sequence numbers. However, the internal WAL-only path used with `two_write_queues && disable_memtable` (e.g., 2PC prepare) is exempt from this restriction.

@@ -14,6 +14,7 @@
 #include "rocksdb/env.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
 #include "util/random.h"
@@ -126,14 +127,16 @@ class LogTest
   class ReportCollector : public Reader::Reporter {
    public:
     size_t dropped_bytes_;
+    size_t old_log_records_;
     std::string message_;
 
-    ReportCollector() : dropped_bytes_(0) {}
+    ReportCollector() : dropped_bytes_(0), old_log_records_(0) {}
     void Corruption(size_t bytes, const Status& status,
                     uint64_t /*log_number*/ = kMaxSequenceNumber) override {
       dropped_bytes_ += bytes;
       message_.append(status.ToString());
     }
+    void OldLogRecord(size_t /*bytes*/) override { ++old_log_records_; }
   };
 
   std::string& dest_contents() { return sink_->contents_; }
@@ -157,7 +160,7 @@ class LogTest
   LogTest()
       : reader_contents_(),
         sink_(new test::StringSink(&reader_contents_)),
-        source_(new StringSource(reader_contents_, !std::get<1>(GetParam()))),
+        source_(nullptr),
         allow_retry_read_(std::get<1>(GetParam())),
         compression_type_(std::get<2>(GetParam())) {
     std::unique_ptr<FSWritableFile> sink_holder(sink_);
@@ -167,6 +170,11 @@ class LogTest
         new Writer(std::move(file_writer), 123, std::get<0>(GetParam()), false,
                    compression_type_);
     writer_.reset(writer);
+    CreateReader();
+  }
+
+  void CreateReader() {
+    source_ = new StringSource(reader_contents_, !allow_retry_read_);
     std::unique_ptr<FSSequentialFile> source_holder(source_);
     std::unique_ptr<SequentialFileReader> file_reader(
         new SequentialFileReader(std::move(source_holder), "" /* file name */));
@@ -178,6 +186,22 @@ class LogTest
       reader_.reset(new Reader(nullptr, std::move(file_reader), &report_,
                                true /* checksum */, 123 /* log_number */));
     }
+  }
+
+  // Starts reading the written log again from the beginning, with a new reader
+  // and no reports collected.
+  void ReopenReader() {
+    reset_source_contents();
+    report_ = ReportCollector();
+    CreateReader();
+  }
+
+  // Whether log::Reader reports invalid data at the end of a recycled log as
+  // corruption. It does not in kTolerateCorruptedTailRecords mode, and
+  // FragmentBufferedReader stops before such data in every mode.
+  bool ReportsRecycledLogTailCorruption(WALRecoveryMode mode) const {
+    return !allow_retry_read_ &&
+           mode != WALRecoveryMode::kTolerateCorruptedTailRecords;
   }
 
   Slice* get_reader_contents() { return &reader_contents_; }
@@ -192,6 +216,88 @@ class LogTest
   }
 
   size_t WrittenBytes() const { return dest_contents().size(); }
+
+  void FillBlock() {
+    const int header_size =
+        std::get<0>(GetParam()) != 0 ? kRecyclableHeaderSize : kHeaderSize;
+    Write(BigString("padding",
+                    kBlockSize - writer_->TEST_block_offset() - header_size));
+  }
+
+  std::string PadForBlockTail(size_t payload_size) {
+    const int header_size =
+        std::get<0>(GetParam()) != 0 ? kRecyclableHeaderSize : kHeaderSize;
+    std::string padding =
+        BigString("padding", kBlockSize - writer_->TEST_block_offset() -
+                                 2 * header_size - payload_size);
+    Write(padding);
+    return padding;
+  }
+
+  void CheckCorruptedFirstRecyclableType(const std::string& payload) {
+    if (std::get<0>(GetParam()) != 0) {
+      return;
+    }
+    Write(payload);
+    FillBlock();
+    Write("after");
+    SetByte(6, kRecyclableFullType);
+
+    if (allow_retry_read_) {
+      CheckStoppedAtOldRecord();
+      return;
+    }
+    ASSERT_EQ("after", Read());
+    ASSERT_EQ(kBlockSize, DroppedBytes());
+    ASSERT_EQ("OK", MatchError("checksum mismatch"));
+    ASSERT_EQ("EOF", Read());
+  }
+
+  // FragmentBufferedReader stays stopped before data that a recycled log may
+  // hold from a previous use of the file, without reporting it.
+  void CheckStoppedAtOldRecord() {
+    ASSERT_EQ("EOF", Read());
+    ASSERT_EQ("EOF", Read());
+    ASSERT_TRUE(StoppedAtOldRecord());
+    ASSERT_EQ(0U, DroppedBytes());
+    ASSERT_EQ("", ReportMessage());
+  }
+
+  void CheckCorruptLengthAtBlockEnd(bool partial_read) {
+    if (partial_read && !allow_retry_read_) {
+      return;
+    }
+    const size_t header_size =
+        std::get<0>(GetParam()) != 0 ? kRecyclableHeaderSize : kHeaderSize;
+    Write("foo");
+    const std::string padding = PadForBlockTail(3);
+    const int header_offset = static_cast<int>(WrittenBytes());
+    Write("BAD");
+    Write("after_data");
+    IncrementByte(header_offset + 4, 2);
+
+    for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                                 WALRecoveryMode::kPointInTimeRecovery}) {
+      SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+      ReopenReader();
+      if (partial_read) {
+        ForceEOF(kBlockSize - 2);
+      }
+      ASSERT_EQ("foo", Read(mode));
+      ASSERT_EQ(padding, Read(mode));
+      if (std::get<0>(GetParam()) != 0 &&
+          !ReportsRecycledLogTailCorruption(mode)) {
+        ASSERT_EQ("EOF", Read(mode));
+        ASSERT_EQ(0U, DroppedBytes());
+        ASSERT_EQ("", ReportMessage());
+      } else {
+        ASSERT_EQ("after_data", Read(mode));
+        ASSERT_EQ(header_size + 3, DroppedBytes());
+        ASSERT_EQ("OK", MatchError("bad record length"));
+        ASSERT_EQ("EOF", Read(mode));
+      }
+    }
+  }
 
   std::string Read(const WALRecoveryMode wal_recovery_mode =
                        WALRecoveryMode::kTolerateCorruptedTailRecords,
@@ -244,6 +350,14 @@ class LogTest
   }
 
   size_t DroppedBytes() const { return report_.dropped_bytes_; }
+
+  size_t OldLogRecords() const { return report_.old_log_records_; }
+
+  bool StoppedAtOldRecord() const {
+    return allow_retry_read_ &&
+           static_cast_with_check<FragmentBufferedReader>(reader_.get())
+               ->StoppedAtOldRecord();
+  }
 
   std::string ReportMessage() const { return report_.message_; }
 
@@ -472,12 +586,6 @@ TEST_P(LogTest, TruncatedTrailingRecordIsNotIgnored) {
 }
 
 TEST_P(LogTest, BadLength) {
-  if (allow_retry_read_) {
-    // If read retry is allowed, then we should not raise an error when the
-    // record length specified in header is longer than data currently
-    // available. It's possible that the body of the record is not written yet.
-    return;
-  }
   bool recyclable_log = (std::get<0>(GetParam()) != 0);
   int header_size = recyclable_log ? kRecyclableHeaderSize : kHeaderSize;
   const int kPayloadSize = kBlockSize - header_size;
@@ -485,13 +593,13 @@ TEST_P(LogTest, BadLength) {
   Write("foo");
   // Least significant size byte is stored in header[4].
   IncrementByte(4, 1);
-  if (!recyclable_log) {
-    ASSERT_EQ("foo", Read());
-    ASSERT_EQ(kBlockSize, DroppedBytes());
-    ASSERT_EQ("OK", MatchError("bad record length"));
-  } else {
-    ASSERT_EQ("EOF", Read());
+  if (recyclable_log && allow_retry_read_) {
+    CheckStoppedAtOldRecord();
+    return;
   }
+  ASSERT_EQ("foo", Read());
+  ASSERT_EQ(kBlockSize, DroppedBytes());
+  ASSERT_EQ("OK", MatchError("bad record length"));
 }
 
 TEST_P(LogTest, BadLengthAtEndIsIgnored) {
@@ -522,17 +630,69 @@ TEST_P(LogTest, BadLengthAtEndIsNotIgnored) {
   ASSERT_EQ("OK", MatchError("Corruption: truncated record body"));
 }
 
+TEST_P(LogTest, CorruptLengthAtBlockEnd) {
+  CheckCorruptLengthAtBlockEnd(false /* partial_read */);
+}
+
+TEST_P(LogTest, CorruptLengthAtBlockEndAfterPartialRead) {
+  CheckCorruptLengthAtBlockEnd(true /* partial_read */);
+}
+
+TEST_P(LogTest, RecyclableTypeAtBlockEnd) {
+  if (std::get<0>(GetParam()) != 0) {
+    return;
+  }
+  Write("foo");
+  const std::string padding = PadForBlockTail(3);
+  const int header_offset = static_cast<int>(WrittenBytes());
+  Write("bar");
+  Write("after_data");
+  SetByte(header_offset + 6, kRecyclableFullType);
+
+  ASSERT_EQ("foo", Read());
+  ASSERT_EQ(padding, Read());
+  ASSERT_EQ("after_data", Read(WALRecoveryMode::kAbsoluteConsistency));
+  ASSERT_EQ(kHeaderSize + 3U, DroppedBytes());
+  ASSERT_EQ("OK", MatchError("bad record length"));
+  ASSERT_EQ("EOF", Read());
+}
+
 TEST_P(LogTest, ChecksumMismatch) {
   Write("foooooo");
   IncrementByte(0, 14);
-  ASSERT_EQ("EOF", Read());
   bool recyclable_log = (std::get<0>(GetParam()) != 0);
-  if (!recyclable_log) {
-    ASSERT_EQ(14U, DroppedBytes());
-    ASSERT_EQ("OK", MatchError("checksum mismatch"));
-  } else {
-    ASSERT_EQ(0U, DroppedBytes());
-    ASSERT_EQ("", ReportMessage());
+  if (recyclable_log && allow_retry_read_) {
+    CheckStoppedAtOldRecord();
+    return;
+  }
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ((recyclable_log ? kRecyclableHeaderSize : kHeaderSize) + 7U,
+            DroppedBytes());
+  ASSERT_EQ("OK", MatchError("checksum mismatch"));
+}
+
+TEST_P(LogTest, RecycledChecksumMismatchAfterValidRecord) {
+  if (std::get<0>(GetParam()) == 0) {
+    return;
+  }
+  Write("foo");
+  const int header_offset = static_cast<int>(WrittenBytes());
+  Write("bar");
+  IncrementByte(header_offset + kRecyclableHeaderSize, 1);
+
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kPointInTimeRecovery}) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    ReopenReader();
+    ASSERT_EQ("foo", Read(mode));
+    ASSERT_EQ("EOF", Read(mode));
+    if (ReportsRecycledLogTailCorruption(mode)) {
+      ASSERT_EQ(kRecyclableHeaderSize + 3U, DroppedBytes());
+      ASSERT_EQ("OK", MatchError("checksum mismatch"));
+    } else {
+      ASSERT_EQ(0U, DroppedBytes());
+      ASSERT_EQ("", ReportMessage());
+    }
   }
 }
 
@@ -545,6 +705,250 @@ TEST_P(LogTest, UnexpectedMiddleType) {
   ASSERT_EQ("EOF", Read());
   ASSERT_EQ(3U, DroppedBytes());
   ASSERT_EQ("OK", MatchError("missing start"));
+}
+
+TEST_P(LogTest, RecyclableTypeInLegacyLog) {
+  if (std::get<0>(GetParam()) != 0) {
+    return;
+  }
+  const RecordType recyclable_types[] = {
+      kRecyclableFullType,
+      kRecyclableFirstType,
+      kRecyclableMiddleType,
+      kRecyclableLastType,
+      kRecyclableUserDefinedTimestampSizeType,
+      kRecyclePredecessorWALInfoType};
+  for (RecordType type : recyclable_types) {
+    Write("foo");
+    const int header_offset = static_cast<int>(WrittenBytes());
+    Write("bad");
+    FillBlock();
+    SetByte(header_offset + 6, static_cast<char>(type));
+  }
+  Write("after");
+
+  size_t expected_dropped_bytes = 0;
+  for (RecordType type : recyclable_types) {
+    SCOPED_TRACE(type);
+    ASSERT_EQ("foo", Read(WALRecoveryMode::kAbsoluteConsistency));
+    ASSERT_EQ(expected_dropped_bytes, DroppedBytes());
+    expected_dropped_bytes += kBlockSize - kHeaderSize - 3;
+  }
+  ASSERT_EQ("after", Read(WALRecoveryMode::kAbsoluteConsistency));
+  ASSERT_EQ(expected_dropped_bytes, DroppedBytes());
+  ASSERT_EQ("OK", MatchError("checksum mismatch"));
+  ASSERT_EQ("EOF", Read());
+}
+
+TEST_P(LogTest, RecyclableTypeInLegacyLogAtEOF) {
+  if (std::get<0>(GetParam()) != 0) {
+    return;
+  }
+  Write("foo");
+  Write("");
+  SetByte(kHeaderSize + 3 + 6, kRecyclableFullType);
+
+  ASSERT_EQ("foo", Read());
+  ASSERT_EQ("EOF", Read(WALRecoveryMode::kAbsoluteConsistency));
+  if (allow_retry_read_) {
+    ASSERT_EQ(0U, DroppedBytes());
+    ASSERT_EQ("", ReportMessage());
+  } else {
+    ASSERT_EQ(kHeaderSize, DroppedBytes());
+    ASSERT_EQ("OK", MatchError("truncated header"));
+  }
+}
+
+TEST_P(LogTest, CorruptedFirstRecyclableType) {
+  CheckCorruptedFirstRecyclableType("bad");
+}
+
+TEST_P(LogTest, CorruptedFirstRecyclableTypeMatchingLogNumber) {
+  std::string payload;
+  PutFixed32(&payload, 123);
+  payload.append("bad");
+  CheckCorruptedFirstRecyclableType(payload);
+}
+
+TEST_P(LogTest, RecyclableTypeInLegacyLogWithValidChecksum) {
+  if (std::get<0>(GetParam()) != 0) {
+    return;
+  }
+  Write("foo");
+  const int header_offset = static_cast<int>(WrittenBytes());
+  Write(std::string(4, '\0') + "bad");
+  Write("after");
+  SetByte(header_offset + 4, 3);
+  SetByte(header_offset + 6, kRecyclableFullType);
+  SetByte(header_offset + 7, 123);
+  FixChecksum(header_offset, 3, true);
+
+  ASSERT_EQ("foo", Read());
+  ASSERT_EQ("after", Read());
+  ASSERT_EQ(kRecyclableHeaderSize + 3U, DroppedBytes());
+  ASSERT_EQ("OK", MatchError("recyclable record in non-recyclable log"));
+  ASSERT_EQ("EOF", Read());
+}
+
+TEST_P(LogTest, CorruptedRecyclableLogNumber) {
+  if (std::get<0>(GetParam()) == 0) {
+    return;
+  }
+  Write("foo");
+  const int header_offset = static_cast<int>(WrittenBytes());
+  Write("bad");
+  FillBlock();
+  Write("after");
+  IncrementByte(header_offset + 7, 1);
+
+  for (WALRecoveryMode mode : {WALRecoveryMode::kAbsoluteConsistency,
+                               WALRecoveryMode::kPointInTimeRecovery}) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    ReopenReader();
+    ASSERT_EQ("foo", Read(mode));
+    if (allow_retry_read_) {
+      // The buffered reader treats the invalid record as data from the file's
+      // previous use and stays stopped before it.
+      ASSERT_EQ("EOF", Read(mode));
+      ASSERT_EQ("EOF", Read(mode));
+      ASSERT_TRUE(StoppedAtOldRecord());
+      ASSERT_EQ(0U, DroppedBytes());
+      ASSERT_EQ("", ReportMessage());
+    } else {
+      ASSERT_EQ("after", Read(mode));
+      ASSERT_EQ(kBlockSize - kRecyclableHeaderSize - 3U, DroppedBytes());
+      ASSERT_EQ("OK", MatchError("checksum mismatch"));
+      ASSERT_EQ("EOF", Read(mode));
+    }
+  }
+}
+
+TEST_P(LogTest, OldRecyclableRecordMakesProgress) {
+  if (std::get<0>(GetParam()) == 0) {
+    return;
+  }
+  Write("foo");
+  const int header_offset = static_cast<int>(WrittenBytes());
+  Write("old");
+  Write("after");
+  IncrementByte(header_offset + 7, 1);
+  FixChecksum(header_offset, 3, true);
+
+  ASSERT_EQ("foo", Read(WALRecoveryMode::kSkipAnyCorruptedRecords));
+  if (allow_retry_read_) {
+    // The buffered reader stops before the old record even in this mode, so
+    // it never returns a record written after data it has not read.
+    ASSERT_EQ("EOF", Read(WALRecoveryMode::kSkipAnyCorruptedRecords));
+    ASSERT_EQ("EOF", Read(WALRecoveryMode::kSkipAnyCorruptedRecords));
+    ASSERT_TRUE(StoppedAtOldRecord());
+  } else {
+    ASSERT_EQ("after", Read(WALRecoveryMode::kSkipAnyCorruptedRecords));
+    ASSERT_EQ("EOF", Read());
+  }
+  ASSERT_EQ(0U, DroppedBytes());
+  ASSERT_EQ("", ReportMessage());
+}
+
+TEST_P(LogTest, OldRecyclableRecordInFragmentedRecord) {
+  if (std::get<0>(GetParam()) == 0) {
+    return;
+  }
+  Write(BigString("big", kBlockSize));
+  // The first fragment fills the first block, so the last fragment starts the
+  // second block and carries the remaining kRecyclableHeaderSize bytes.
+  IncrementByte(kBlockSize + 7, 1);
+  FixChecksum(kBlockSize, kRecyclableHeaderSize, true);
+
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kPointInTimeRecovery}) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    ReopenReader();
+    ASSERT_EQ("EOF", Read(mode));
+    ASSERT_EQ("EOF", Read(mode));
+    ASSERT_EQ(allow_retry_read_, StoppedAtOldRecord());
+    ASSERT_EQ(0U, OldLogRecords());
+    if (ReportsRecycledLogTailCorruption(mode)) {
+      // The first fragment's data is dropped as an incomplete record.
+      ASSERT_EQ(kBlockSize - kRecyclableHeaderSize, DroppedBytes());
+      ASSERT_EQ("OK", MatchError("encountering old record"));
+    } else {
+      ASSERT_EQ(0U, DroppedBytes());
+      ASSERT_EQ("", ReportMessage());
+    }
+  }
+}
+
+TEST_P(LogTest, ZeroHeaderInRecycledLog) {
+  if (std::get<0>(GetParam()) == 0) {
+    return;
+  }
+  Write("foo");
+  const int header_offset = static_cast<int>(WrittenBytes());
+  Write("bar");
+  FillBlock();
+  Write("after");
+  // Old data at the write position can have zero length and type bytes.
+  for (int i = 4; i <= 6; ++i) {
+    SetByte(header_offset + i, 0);
+  }
+
+  ASSERT_EQ("foo", Read());
+  if (allow_retry_read_) {
+    CheckStoppedAtOldRecord();
+    return;
+  }
+  // log::Reader skips the rest of the block, as for preallocated zeros.
+  ASSERT_EQ("after", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+  ASSERT_EQ("EOF", Read());
+}
+
+TEST_P(LogTest, RecycledLogTrailerReadsAsZeroHeader) {
+  if (std::get<0>(GetParam()) == 0) {
+    return;
+  }
+  // Leave a trailer long enough to parse as a zero header but too short for a
+  // recyclable one, so the writer zero-fills it.
+  const std::string first(kBlockSize - kRecyclableHeaderSize - kHeaderSize,
+                          'x');
+  Write(first);
+  Write("bar");
+
+  ASSERT_EQ(first, Read());
+  ASSERT_EQ("bar", Read());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_FALSE(StoppedAtOldRecord());
+  ASSERT_EQ(0U, DroppedBytes());
+  ASSERT_EQ("", ReportMessage());
+}
+
+TEST_P(LogTest, RecycledLogWithOnlyOldRecords) {
+  if (std::get<0>(GetParam()) == 0) {
+    return;
+  }
+  Write("old1");
+  const int second_header_offset = static_cast<int>(WrittenBytes());
+  Write("old2");
+  for (int header_offset : {0, second_header_offset}) {
+    SetByte(header_offset + 7, 122);
+    FixChecksum(header_offset, 4, true);
+  }
+
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kPointInTimeRecovery}) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    ReopenReader();
+    ASSERT_EQ("EOF", Read(mode));
+    ASSERT_EQ("EOF", Read(mode));
+    ASSERT_EQ(allow_retry_read_, StoppedAtOldRecord());
+    // In point-in-time mode, log::Reader reports each old record it stops at
+    // as such rather than as corruption.
+    const bool reports_old_records =
+        !allow_retry_read_ && mode == WALRecoveryMode::kPointInTimeRecovery;
+    ASSERT_EQ(reports_old_records ? 2U : 0U, OldLogRecords());
+    ASSERT_EQ(0U, DroppedBytes());
+    ASSERT_EQ("", ReportMessage());
+  }
 }
 
 TEST_P(LogTest, UnexpectedLastType) {
@@ -1196,14 +1600,13 @@ TEST_P(CompressionLogTest, ChecksumMismatch) {
   IncrementByte(compression_record_len + header_len /* offset */,
                 14 /* delta */);
 
-  ASSERT_EQ("EOF", Read());
-  if (!kRecyclableLog) {
-    ASSERT_GT(DroppedBytes(), 0U);
-    ASSERT_EQ("OK", MatchError("checksum mismatch"));
-  } else {
-    ASSERT_EQ(0U, DroppedBytes());
-    ASSERT_EQ("", ReportMessage());
+  if (kRecyclableLog && allow_retry_read_) {
+    CheckStoppedAtOldRecord();
+    return;
   }
+  ASSERT_EQ("EOF", Read());
+  ASSERT_GT(DroppedBytes(), 0U);
+  ASSERT_EQ("OK", MatchError("checksum mismatch"));
 }
 
 INSTANTIATE_TEST_CASE_P(

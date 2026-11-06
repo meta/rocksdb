@@ -431,6 +431,7 @@ Status DBImplSecondary::RecoverLogFiles(
 
   const UnorderedMap<uint32_t, size_t>& running_ts_sz =
       versions_->GetRunningColumnFamiliesTimestampSize();
+  bool stopped_at_old_record = false;
   for (auto log_number : log_numbers) {
     auto it = log_readers_.find(log_number);
     assert(it != log_readers_.end());
@@ -439,6 +440,12 @@ Status DBImplSecondary::RecoverLogFiles(
     assert(wal_read_status);
     // Manually update the file number allocation counter in VersionSet.
     versions_->MarkFileNumberUsed(log_number);
+    if (stopped_at_old_record) {
+      // The reader is not used in this round, so its status holds no new
+      // error.
+      wal_read_status->PermitUncheckedError();
+      continue;
+    }
 
     // Determine if we should tolerate incomplete records at the tail end of the
     // Read all the records and add to a memtable
@@ -567,6 +574,11 @@ Status DBImplSecondary::RecoverLogFiles(
       wal_read_status->PermitUncheckedError();
       return status;
     }
+    // Records the primary writes over the old data in this recycled WAL
+    // become readable only after it flushes them, so later WALs are not
+    // replayed until then either. Flushes of other column families that the
+    // MANIFEST records still become visible meanwhile.
+    stopped_at_old_record = reader->StoppedAtOldRecord();
   }
   return status;
 }
