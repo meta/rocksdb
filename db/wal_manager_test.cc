@@ -10,7 +10,7 @@
 
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
-#include "db/log_writer.h"
+#include "db/legacy_wal_writer.h"
 #include "db/version_set.h"
 #include "env/mock_env.h"
 #include "file/writable_file_writer.h"
@@ -92,8 +92,10 @@ class WalManagerTest : public testing::Test {
     std::unique_ptr<WritableFileWriter> file_writer;
     ASSERT_OK(WritableFileWriter::Create(fs, fname, env_options_, &file_writer,
                                          nullptr));
-    current_log_writer_.reset(
-        new log::Writer(std::move(file_writer), 0, false));
+    current_log_writer_.reset(new LegacyWalWriter(
+        std::move(file_writer), /*log_number=*/0,
+        /*recycle_log_files=*/false, /*manual_flush=*/false, kNoCompression,
+        /*track_and_verify_wals=*/false, /*initial_block_offset=*/0));
   }
 
   void CreateArchiveLogs(int num_logs, int entries_per_log) {
@@ -123,7 +125,7 @@ class WalManagerTest : public testing::Test {
   std::unique_ptr<VersionSet> versions_;
   std::unique_ptr<WalManager> wal_manager_;
 
-  std::unique_ptr<log::Writer> current_log_writer_;
+  std::unique_ptr<WalWriter> current_log_writer_;
   uint64_t current_log_number_;
 };
 
@@ -144,8 +146,11 @@ TEST_F(WalManagerTest, ReadFirstRecordCache) {
 
   std::unique_ptr<WritableFileWriter> file_writer(
       new WritableFileWriter(std::move(file), path, FileOptions()));
-  log::Writer writer(std::move(file_writer), 1,
-                     db_options_.recycle_log_file_num > 0);
+  LegacyWalWriter writer(std::move(file_writer), /*log_number=*/1,
+                         db_options_.recycle_log_file_num > 0,
+                         /*manual_flush=*/false, kNoCompression,
+                         /*track_and_verify_wals=*/false,
+                         /*initial_block_offset=*/0);
   WriteBatch batch;
   ASSERT_OK(batch.Put("foo", "bar"));
   WriteBatchInternal::SetSequence(&batch, 10);

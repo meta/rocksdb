@@ -116,6 +116,30 @@ CompressionType CompressionTypeFromString(std::string compression_type_str) {
   return kDisableCompressionOption;
 }
 
+Status ResolveCompressionManagerByCompatibilityName(
+    Slice compatibility_name,
+    CompressionManager* configured_compression_manager,
+    std::shared_ptr<CompressionManager>* resolved_manager) {
+  assert(resolved_manager != nullptr);
+  resolved_manager->reset();
+
+  if (configured_compression_manager != nullptr) {
+    *resolved_manager =
+        configured_compression_manager->FindCompatibleCompressionManager(
+            compatibility_name);
+  }
+
+  if (*resolved_manager != nullptr) {
+    return Status::OK();
+  }
+
+  ConfigOptions strict;
+  strict.ignore_unknown_options = false;
+  strict.ignore_unsupported_options = false;
+  return CompressionManager::CreateFromString(
+      strict, compatibility_name.ToString(), resolved_manager);
+}
+
 std::string CompressionOptionsToString(
     const CompressionOptions& compression_options) {
   std::string result;
@@ -236,6 +260,84 @@ int ZSTDStreamingCompress::Compress(const char* input, size_t input_size,
   // Success
   *output_pos = output_buffer.pos;
   return (int)remaining;
+#endif
+}
+
+Status ZSTDStreamingCompress::CompressAndFlush(const Slice& input,
+                                               std::string* output) {
+  assert(output != nullptr);
+  if (input.empty()) {
+    return Status::OK();
+  }
+#ifndef ZSTD
+  (void)output;
+  return Status::NotSupported("ZSTD streaming compression not supported");
+#else
+  // No Compress() input may be pending within this frame.
+  assert(input_buffer_.pos == input_buffer_.size);
+  ZSTD_inBuffer input_buffer = {input.data(), input.size(), /*pos=*/0};
+  size_t output_size = output->size();
+  // The bound normally fits the whole flush; the loop covers the rest.
+  size_t available = ZSTD_compressBound(input.size());
+  while (true) {
+    output->resize(output_size + available);
+    ZSTD_outBuffer output_buffer = {&(*output)[output_size], available,
+                                    /*pos=*/0};
+    const size_t remaining = ZSTD_compressStream2(cctx_, &output_buffer,
+                                                  &input_buffer, ZSTD_e_flush);
+    output_size += output_buffer.pos;
+    if (ZSTD_isError(remaining)) {
+      output->resize(output_size);
+      Reset();
+      return Status::Corruption(std::string("ZSTD_compressStream2 failed: ") +
+                                ZSTD_getErrorName(remaining));
+    }
+    if (remaining == 0) {
+      break;
+    }
+    available = std::max(remaining, ZSTD_CStreamOutSize());
+  }
+  output->resize(output_size);
+  return Status::OK();
+#endif
+}
+
+Status ZSTDStreamingCompress::CompressAndFlushToSink(
+    const Slice& input, StreamingCompressOutput* output) {
+  assert(output != nullptr);
+  if (input.empty()) {
+    return Status::OK();
+  }
+#ifndef ZSTD
+  (void)output;
+  return Status::NotSupported("ZSTD streaming compression not supported");
+#else
+  // No Compress() input may be pending within this frame.
+  assert(input_buffer_.pos == input_buffer_.size);
+  if (chunk_.empty()) {
+    chunk_.resize(ZSTD_CStreamOutSize());
+  }
+  ZSTD_inBuffer input_buffer = {input.data(), input.size(), /*pos=*/0};
+  size_t remaining = 0;
+  do {
+    ZSTD_outBuffer output_buffer = {chunk_.data(), chunk_.size(), /*pos=*/0};
+    remaining = ZSTD_compressStream2(cctx_, &output_buffer, &input_buffer,
+                                     ZSTD_e_flush);
+    if (ZSTD_isError(remaining)) {
+      Reset();
+      return Status::Corruption(std::string("ZSTD_compressStream2 failed: ") +
+                                ZSTD_getErrorName(remaining));
+    }
+    if (output_buffer.pos > 0) {
+      Status s = output->Append(chunk_.data(), output_buffer.pos);
+      if (!s.ok()) {
+        return s;
+      }
+    }
+    // Unlike CompressAndFlush(), whose first buffer fits compressBound(input),
+    // a fixed chunk may not consume the whole input at once.
+  } while (input_buffer.pos < input_buffer.size || remaining != 0);
+  return Status::OK();
 #endif
 }
 

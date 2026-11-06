@@ -528,8 +528,8 @@ class SeqStringSource : public FSSequentialFile {
       offset_ += n;
       *result = Slice(scratch, n);
     } else {
-      return IOStatus::InvalidArgument(
-          "Attempt to read when it already reached eof.");
+      *result = Slice();
+      return IOStatus::OK();
     }
     (*read_count_)++;
     return IOStatus::OK();

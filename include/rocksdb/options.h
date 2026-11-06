@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "rocksdb/advanced_options.h"
+#include "rocksdb/checksum_type.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/compression_type.h"
 #include "rocksdb/customizable.h"
@@ -1613,12 +1614,43 @@ struct DBOptions {
   // file.
   bool manual_wal_flush = false;
 
-  // If enabled WAL records will be compressed before they are written. Only
-  // ZSTD (= kZSTD) is supported (until streaming support is adapted for other
-  // compression types). Compressed WAL records will be read in supported
+  // If enabled WAL records will be compressed before they are written. For
+  // legacy WALs, only ZSTD (= kZSTD) is supported (until streaming support
+  // is adapted for other compression types); other types are silently
+  // disabled. Blog-format WALs (`use_blog_format_for_wals`) use per-record
+  // block compression instead and support any type accepted by the
+  // compression manager. Compressed WAL records will be read in supported
   // versions (>= RocksDB 7.4.0 for ZSTD) regardless of this setting when
   // the WAL is read.
   CompressionType wal_compression = kNoCompression;
+
+  // If true, new WAL files use the blog file format instead of the legacy
+  // log format. Existing WAL files are readable regardless of this setting.
+  //
+  // Default: false
+  bool use_blog_format_for_wals = false;
+
+  // If true, new blob files use the blog file format instead of the legacy
+  // blob log format. The blog format provides context checksums and a
+  // unified file structure shared with WAL. Existing legacy blob files are
+  // still readable regardless of this setting.
+  //
+  // Default: false
+  bool use_blog_format_for_blobs = false;
+
+  // Checksum type used for integrity checks within blog format files
+  // (both WAL and blob). Uses the same ChecksumType enum as
+  // BlockBasedTableOptions::checksum.
+  //
+  // Default: kXXH3
+  ChecksumType blog_checksum = kXXH3;
+
+  // File-wide default user-defined timestamp size written to the header of new
+  // blog format WAL files. Per-column-family timestamp sizes are still
+  // recorded separately in the WAL. Must not exceed 65535.
+  //
+  // Default: 0
+  size_t blog_timestamp_size = 0;
 
   // Set to true to re-instate an old behavior of keeping complete, synced WAL
   // files open for write until they are collected for deletion by a

@@ -13,6 +13,7 @@
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blog/blog_format.h"
 #include "db/wide/wide_column_serialization.h"
 #include "db/write_batch_internal.h"
 #include "port/likely.h"
@@ -93,7 +94,7 @@ Status BlobWriteBatchTransformer::MaybePreprocessWideColumns(
 
   for (size_t column_idx = 0; column_idx < columns.size(); ++column_idx) {
     const Slice& column_value = columns[column_idx].value();
-    if (column_value.size() < settings.min_blob_size) {
+    if (column_value.empty() || column_value.size() < settings.min_blob_size) {
       continue;
     }
     if (!has_entity_partition) {
@@ -115,7 +116,9 @@ Status BlobWriteBatchTransformer::MaybePreprocessWideColumns(
 
     if (rollback_infos != nullptr) {
       const uint64_t record_bytes =
-          BlobLogRecord::kHeaderSize + key.size() + blob_size;
+          partition_mgr->is_blog_format()
+              ? ComputeBlogRecordSize(blob_size, /*compact_eligible=*/true)
+              : BlobLogRecord::kHeaderSize + key.size() + blob_size;
       rollback_infos->push_back(
           {partition_mgr, blob_file_number, /*count=*/1, record_bytes});
     }
@@ -159,7 +162,7 @@ Status BlobWriteBatchTransformer::PutCF(uint32_t column_family_id,
   const auto& settings = cached_settings_;
 
   if (!cached_partition_mgr_ || !settings.enable_blob_direct_write ||
-      value.size() < settings.min_blob_size) {
+      value.empty() || value.size() < settings.min_blob_size) {
     return WriteBatchInternal::Put(output_batch_, column_family_id, key, value);
   }
 
@@ -179,7 +182,9 @@ Status BlobWriteBatchTransformer::PutCF(uint32_t column_family_id,
   // Track the exact file so stale transformed attempts can rollback
   // per-file rather than smearing bytes across all partitions at seal time.
   const uint64_t record_bytes =
-      BlobLogRecord::kHeaderSize + key.size() + blob_size;
+      cached_partition_mgr_->is_blog_format()
+          ? ComputeBlogRecordSize(blob_size, /*compact_eligible=*/true)
+          : BlobLogRecord::kHeaderSize + key.size() + blob_size;
   rollback_infos_.push_back(
       {cached_partition_mgr_, blob_file_number, /*count=*/1, record_bytes});
 

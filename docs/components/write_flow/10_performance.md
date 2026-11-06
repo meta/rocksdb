@@ -109,7 +109,7 @@ make clean && DEBUG_LEVEL=0 make -j128 db_bench
 | From | To | Interaction |
 |------|-----|-------------|
 | WriteImpl | WriteThread | Leader election, group batching |
-| WriteImpl | log::Writer | Serialize WriteBatch via `AddRecord()` |
+| WriteImpl | WalWriter | Serialize WriteBatch via `AddRecord()` |
 | WriteImpl | MemTable | Insert via `WriteBatchInternal::InsertInto()` |
 | WriteImpl | WriteController | Check `IsStopped()` / `NeedsDelay()` in `PreprocessWrite()` |
 | WriteImpl | WriteBufferManager | Check `ShouldFlush()` / `ShouldStall()` |

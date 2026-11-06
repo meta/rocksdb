@@ -41,7 +41,7 @@ Status VersionBlobFetcherBase::FetchBlob(const Slice& user_key,
 
   return BlobFilePartitionManager::ResolveBlobDirectWriteIndex(
       read_options, user_key, blob_index, version_, blob_file_cache_,
-      prefetch_buffer, blob_value, bytes_read);
+      configured_compression_manager_, prefetch_buffer, blob_value, bytes_read);
 }
 
 Status VersionBlobFetcherBase::FetchBlobRange(
@@ -59,9 +59,9 @@ Status VersionBlobFetcherBase::FetchBlobRange(
         !read_options().verify_checksums) {
       ReadOptions verify_read_options = read_options();
       verify_read_options.verify_checksums = true;
-      VersionBlobFetcher verifying_fetcher(version_, verify_read_options,
-                                           blob_file_cache_,
-                                           allow_write_path_fallback_);
+      VersionBlobFetcher verifying_fetcher(
+          version_, verify_read_options, blob_file_cache_,
+          allow_write_path_fallback_, configured_compression_manager_);
       return verifying_fetcher.FetchBlob(user_key, blob_index, prefetch_buffer,
                                          blob_value, bytes_read);
     }

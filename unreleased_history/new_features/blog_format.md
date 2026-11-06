@@ -1,0 +1,1 @@
+Added new DB options `use_blog_format_for_wals`, `use_blog_format_for_blobs`, `blog_checksum`, and `blog_timestamp_size` to enable the new "blog" file format for WAL and blob files. The blog format uses escape-sequence record framing with context checksums. Existing legacy format files remain readable regardless of these settings.

@@ -953,10 +953,14 @@ class VersionEdit {
   // Add a new blob file.
   void AddBlobFile(uint64_t blob_file_number, uint64_t total_blob_count,
                    uint64_t total_blob_bytes, std::string checksum_method,
-                   std::string checksum_value) {
+                   std::string checksum_value,
+                   uint64_t physical_blob_file_size = 0,
+                   uint8_t schema_version = kLegacyBlobFileSchemaVersion,
+                   std::string file_identity = {}) {
     blob_file_additions_.emplace_back(
         blob_file_number, total_blob_count, total_blob_bytes,
-        std::move(checksum_method), std::move(checksum_value));
+        std::move(checksum_method), std::move(checksum_value),
+        physical_blob_file_size, schema_version, std::move(file_identity));
     files_to_quarantine_.push_back(blob_file_number);
   }
 

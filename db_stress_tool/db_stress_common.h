@@ -95,6 +95,7 @@ DECLARE_string(options_file);
 DECLARE_int64(active_width);
 DECLARE_bool(test_batches_snapshots);
 DECLARE_bool(atomic_flush);
+DECLARE_bool(test_noncanonical_blog);
 DECLARE_int32(lock_wal_one_in);
 DECLARE_bool(test_cf_consistency);
 DECLARE_bool(test_multi_ops_txns);
@@ -405,6 +406,10 @@ DECLARE_uint64(wp_commit_cache_bits);
 DECLARE_bool(adaptive_readahead);
 DECLARE_bool(async_io);
 DECLARE_string(wal_compression);
+DECLARE_bool(use_blog_format_for_wals);
+DECLARE_bool(use_blog_format_for_blobs);
+DECLARE_string(blog_checksum);
+DECLARE_uint64(blog_timestamp_size);
 DECLARE_bool(verify_sst_unique_id_in_manifest);
 DECLARE_bool(fast_sst_open);
 

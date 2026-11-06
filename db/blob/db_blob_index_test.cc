@@ -144,9 +144,12 @@ class DBBlobIndexTest : public DBTestBase {
       bool resolve_direct_write_value, const Version* current,
       PinnableSlice* value, PinnableWideColumns* columns, Status* s,
       bool* is_blob_index, bool* value_found = nullptr) {
-    VersionBlobFetcher blob_fetcher(current, read_options,
-                                    cfd()->blob_file_cache(),
-                                    /*allow_write_path_fallback=*/true);
+    VersionBlobFetcher blob_fetcher(
+        current, read_options, cfd()->blob_file_cache(),
+        /*allow_write_path_fallback=*/true,
+        current != nullptr
+            ? current->GetMutableCFOptions().compression_manager.get()
+            : cfd()->GetLatestMutableCFOptions().compression_manager.get());
     return DBImpl::MaybeResolveDirectWriteValue(
         read_options, key, resolve_direct_write_value, blob_fetcher, value,
         columns, s, is_blob_index, value_found);
