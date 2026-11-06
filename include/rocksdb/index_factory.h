@@ -352,6 +352,13 @@ struct IndexFactoryOptions {
 //
 // Extends Customizable for string-based construction (CreateFromString),
 // options serialization, and Name()-based identification.
+//
+// A factory can override ValidateOptions() to reject options it does not
+// support. BlockBasedTableFactory calls it in every index mode except
+// kStandardOnly, which ignores the factory. It runs when DB::Open() and
+// CreateColumnFamily() validate the options, but not for SetOptions() or
+// SstFileWriter, so a factory that cannot build with an option should also
+// fail NewBuilder().
 // ---------------------------------------------------------------------------
 class IndexFactory : public Customizable {
  public:
@@ -359,7 +366,7 @@ class IndexFactory : public Customizable {
 
   static const char* Type() { return "UserDefinedIndexFactory"; }
 
-  // Create an IndexFactory from a string identifier (e.g., "trie").
+  // Create an IndexFactory from a string identifier (e.g., "trie_index").
   static Status CreateFromString(const ConfigOptions& config_options,
                                  const std::string& value,
                                  std::shared_ptr<IndexFactory>* factory);

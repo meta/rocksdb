@@ -1643,12 +1643,7 @@ def finalize_and_sanitize(src_params):
         dest_params["open_read_fault_one_in"] = 0
         dest_params["sync_fault_injection"] = 0
 
-    # UDI is compatible with all operation types and iteration directions
-    # except mmap_read.
     if dest_params.get("use_trie_index") == 1:
-        # Trie UDI uses zero-copy pointers into block data, which is
-        # incompatible with mmap_read.
-        dest_params["mmap_read"] = 0
         index_mode = dest_params.get("index_mode")
         if index_mode in (2, 3):
             # kCustomDefault/kCustomOnly reject partitioned index
@@ -2290,6 +2285,17 @@ def gen_cmd_params(args, unknown_params=None):
     for k, v in vars(args).items():
         if v is not None:
             params[k] = v
+
+    # With the default 16 KiB blocks an SST has only a few dozen separators.
+    # Smaller blocks give the trie more buckets and nodes, and user keys whose
+    # versions span several blocks. kStandardOnly (index_mode 0) never builds
+    # the trie, and an explicit --block_size wins.
+    if (
+        getattr(args, "block_size", None) is None
+        and params.get("use_trie_index") == 1
+        and params.get("index_mode") != 0
+    ):
+        params["block_size"] = lambda: random.choice([1024, 4096, 16384])
 
     # Reserve a small fraction of ordinary crash-test invocations for the
     # file-scoped WAL recovery state machine. Do this after merging command

@@ -14,7 +14,7 @@ of, the built-in index selected by `BlockBasedTableOptions::index_type`.
 | Mode / read selection options | [`include/rocksdb/table.h`](../../../include/rocksdb/table.h), [`include/rocksdb/options.h`](../../../include/rocksdb/options.h) |
 | Built-in index adapter | `table/block_based/builtin_index_factory.{h,cc}` |
 | Reader wrapper | `table/block_based/user_defined_index_wrapper.h` |
-| Reference implementation | `utilities/trie_index/` (LOUDS trie, registered as `trie_index`) |
+| Reference implementation | `utilities/trie_index/` (registered as `trie_index`) |
 
 ## SPI shape
 
@@ -40,7 +40,7 @@ tiers an SST is written with and which one reads use by default.
 | Mode | Standard index written | Custom index written | Default read target | Missing/unusable custom block |
 |------|------------------------|----------------------|---------------------|-------------------------------|
 | `kStandardOnly` | full | no (factory ignored entirely) | standard | n/a |
-| `kStandardDefault` | full | yes | standard | warn, fall back to standard |
+| `kStandardDefault` | full | yes | standard | log, fall back to standard |
 | `kStandardRequired` | full | yes | standard | hard error at open |
 | `kCustomDefault` | full | yes | custom | hard error at open |
 | `kCustomOnly` | stub only | yes | custom | hard error at open |
@@ -129,12 +129,14 @@ baking a degraded reader into a long-lived `Rep`.
 Custom factories cannot be combined with user-defined timestamps unless
 `kStandardOnly` ignores the factory.
 
-The trie format stores data-block offsets and sizes as 32-bit integers. A block
-with either field above `UINT32_MAX` makes construction return `NotSupported`,
-including in `kStandardDefault`, where trie construction is optional. This can
-fail flushes, compactions, or `SstFileWriter::Finish()`. Total SST size above
-4 GiB alone is not the rejection condition. File-size targets do not split L0
-outputs or `SstFileWriter` outputs; bound those outputs or use `kStandardOnly`.
+`BlockBasedTableFactory::ValidateOptions()` calls the factory's
+`ValidateOptions()` in every mode except `kStandardOnly`. `DB::Open()` and
+`CreateColumnFamily()` run that validation; `SetOptions()` and `SstFileWriter`
+do not, and the table builder does not repeat it. A factory that cannot build
+with some option should therefore also fail `NewBuilder()`. The built-in trie
+rejects comparators other than `BytewiseComparator` in both places, so
+`DB::Open()` and `CreateColumnFamily()` fail up front, and the other paths fail
+at the first table build.
 
 ## Cache and memory accounting
 
@@ -150,7 +152,7 @@ outputs or `SstFileWriter` outputs; bound those outputs or use `kStandardOnly`.
   allocations, excluding the serialized block. A reader whose estimate includes
   the block can override `MemoryUsageIncludesIndexBlock()` to return true; the
   wrapper then subtracts the block size from that estimate. `TrieIndexReader`
-  reports just its auxiliary lookup tables.
+  reads the block in place, so it reports only its own object.
 
 ## Parallel compression
 
@@ -172,9 +174,11 @@ Recommended path: `kStandardDefault` -> `kStandardRequired` -> `kCustomDefault`
 -> `kCustomOnly`, compacting between steps so existing SSTs pick up the new
 layout.
 
-Rolling back from `kCustomDefault` or below is immediate: those files always
-carry a full standard index, so lowering `index_mode` sends reads back to it
-without waiting for compaction.
+Rolling back from `kCustomDefault` or below needs no compaction: those files
+always carry a full standard index. Index routing is fixed when a table reader
+opens, though. Lowering `index_mode` through `SetOptions()` reaches only SSTs
+opened afterwards; SSTs already open keep their routing until they are
+reopened, e.g. by reopening the DB.
 
 `kCustomOnly` is effectively a one-way door. Those SSTs have no usable standard
 index, so before dropping the factory you must move to `kCustomDefault` and
@@ -215,11 +219,15 @@ compact every file, with the factory still attached.
 `ValidateOptions()` (and, for callers such as `SstFileWriter` that never reach
 it, the table builder) rejects:
 
-- a custom factory together with user-defined timestamps;
+- a custom factory together with user-defined timestamps, except in
+  `kStandardOnly`;
 - `kCustomDefault` / `kCustomOnly` with `kTwoLevelIndexSearch` or
   `partition_filters`;
 - `kCustomOnly` with `format_version < 6`;
 - `kCustomDefault` / `kCustomOnly` with no factory.
+
+`ValidateOptions()` alone also rejects anything the factory's own
+`ValidateOptions()` rejects, except in `kStandardOnly`.
 
 ## Observability
 

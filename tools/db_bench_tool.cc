@@ -777,9 +777,7 @@ DEFINE_bool(index_with_first_key, false, "Include first key in the index");
 
 DEFINE_bool(use_trie_index, false,
             "Use trie-based user-defined index (UDI) for block-based tables. "
-            "Builds a LOUDS-encoded succinct trie from separator keys, "
-            "providing space reduction compared to the standard index. "
-            "Requires BytewiseComparator.");
+            "Builds a trie from separator keys. Requires BytewiseComparator.");
 
 DEFINE_int32(index_mode,
              static_cast<int32_t>(
