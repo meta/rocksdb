@@ -926,6 +926,11 @@ Status BlockBasedTableFactory::ValidateOptions(
     return Status::InvalidArgument(
         "Super block alignment size exceeds maximum number (4GiB) allowed");
   }
+  if (table_options_.super_block_alignment_size != 0 &&
+      table_options_.super_block_alignment_size <= table_options_.block_size) {
+    return Status::InvalidArgument(
+        "super_block_alignment_size must be larger than block_size");
+  }
   if (table_options_.super_block_alignment_space_overhead_ratio > 0 &&
       table_options_.super_block_alignment_space_overhead_ratio < 4) {
     return Status::InvalidArgument(

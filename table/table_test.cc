@@ -6280,6 +6280,60 @@ TEST(TableTest, UnsupportedFormatVersionConfigTest) {
   }
 }
 
+TEST(TableTest, SuperBlockAlignmentSizeValidation) {
+  {
+    BlockBasedTableOptions table_options;
+    table_options.block_size = 4096;
+    table_options.super_block_alignment_size = 4096;
+    BlockBasedTableFactory factory(table_options);
+
+    ColumnFamilyOptions cf_opts;
+    DBOptions db_opts;
+    Status s = factory.ValidateOptions(db_opts, cf_opts);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_TRUE(s.ToString().find("larger than block_size") != std::string::npos)
+        << s.ToString();
+  }
+
+  {
+    BlockBasedTableOptions table_options;
+    table_options.block_size = 4096;
+    table_options.super_block_alignment_size = 2048;
+    BlockBasedTableFactory factory(table_options);
+
+    ColumnFamilyOptions cf_opts;
+    DBOptions db_opts;
+    Status s = factory.ValidateOptions(db_opts, cf_opts);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_TRUE(s.ToString().find("larger than block_size") != std::string::npos)
+        << s.ToString();
+  }
+
+  {
+    BlockBasedTableOptions table_options;
+    table_options.block_size = 4096;
+    table_options.super_block_alignment_size = 8192;
+    BlockBasedTableFactory factory(table_options);
+
+    ColumnFamilyOptions cf_opts;
+    DBOptions db_opts;
+    Status s = factory.ValidateOptions(db_opts, cf_opts);
+    ASSERT_OK(s) << s.ToString();
+  }
+
+  {
+    BlockBasedTableOptions table_options;
+    table_options.block_size = 4096;
+    table_options.super_block_alignment_size = 0;
+    BlockBasedTableFactory factory(table_options);
+
+    ColumnFamilyOptions cf_opts;
+    DBOptions db_opts;
+    Status s = factory.ValidateOptions(db_opts, cf_opts);
+    ASSERT_OK(s) << s.ToString();
+  }
+}
+
 class IndexBlockRestartIntervalTest
     : public TableTest,
       public ::testing::WithParamInterface<std::pair<int, bool>> {
