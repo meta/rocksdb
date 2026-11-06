@@ -123,7 +123,7 @@ enum CacheMetadataChargePolicy {
 const CacheMetadataChargePolicy kDefaultCacheMetadataChargePolicy =
     kFullChargeCacheMetadata;
 
-// Options shared betweeen various cache implementations that
+// Options shared between various cache implementations that
 // divide the key space into shards using hashing.
 struct ShardedCacheOptions {
   // Capacity of the cache, in the same units as the `charge` of each entry.
