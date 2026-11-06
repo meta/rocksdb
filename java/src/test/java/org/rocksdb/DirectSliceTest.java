@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 package org.rocksdb;
 
+import org.junit.Assert;
 import org.junit.ClassRule;
 import org.junit.Test;
 
@@ -52,6 +53,37 @@ public class DirectSliceTest {
     try(final DirectSlice directSlice = new DirectSlice(buffer, 4)) {
       assertThat(directSlice.toString()).isEqualTo("Some");
     }
+  }
+
+
+  @Test
+  public void directSliceWithByteBufferOffsetAndLength() {
+    final byte[] data = "Some text".getBytes();
+    final ByteBuffer buffer = ByteBuffer.allocateDirect(data.length);
+    buffer.put(data);
+    try(final DirectSlice directSlice = new DirectSlice(buffer, 2, 6)) {
+      assertThat(directSlice.toString()).isEqualTo("me tex");
+    }
+  }
+
+  @Test
+  public void directSliceWithInvalidLength() {
+    final byte[] data = "Some text".getBytes();
+    final ByteBuffer buffer = ByteBuffer.allocateDirect(data.length);
+    buffer.put(data);
+    Assert.assertThrows(IllegalArgumentException.class, () -> {
+      new DirectSlice(buffer, 2, 100);
+    });
+  }
+
+  @Test
+  public void directSliceWithInvalidOffset() {
+    final byte[] data = "Some text".getBytes();
+    final ByteBuffer buffer = ByteBuffer.allocateDirect(data.length);
+    buffer.put(data);
+    Assert.assertThrows(IllegalArgumentException.class, () -> {
+      new DirectSlice(buffer, data.length + 2, 4);
+    });
   }
 
   @Test(expected = IllegalArgumentException.class)
