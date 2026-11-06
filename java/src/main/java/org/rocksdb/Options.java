@@ -1218,6 +1218,19 @@ public class Options extends RocksObject
   }
 
   @Override
+  public Options setWalCompression(CompressionType compressionType) {
+    assert (isOwningHandle());
+    setWalCompression(nativeHandle_, compressionType.getValue());
+    return this;
+  }
+
+  @Override
+  public CompressionType walCompression() {
+    assert (isOwningHandle());
+    return CompressionType.getCompressionType((byte) walCompression(nativeHandle_));
+  }
+
+  @Override
   public MemTableConfig memTableConfig() {
     return this.memTableConfig_;
   }
@@ -2361,6 +2374,8 @@ public class Options extends RocksObject
   private static native boolean twoWriteQueues(final long handle);
   private static native void setManualWalFlush(final long handle, final boolean manualWalFlush);
   private static native boolean manualWalFlush(final long handle);
+  private static native void setWalCompression(final long handle, final int walCompression);
+  private static native int walCompression(final long handle);
 
   // CF native handles
   private static native void oldDefaults(
