@@ -4631,6 +4631,19 @@ public class RocksDB extends RocksObject {
   }
 
   /**
+   * Verify checksums of files in the db.
+   * This performs verification of the file checksum with the entire file data,
+   * as opposed to {@link #verifyChecksum()} which checks blocks of data read during operation.
+   *
+   * @param readOptions Read options for the verification
+   * @throws RocksDBException if the checksum fails
+   *
+   */
+  public void verifyFileChecksums(final ReadOptions readOptions) throws RocksDBException {
+    verifyFileChecksums(nativeHandle_, readOptions.nativeHandle_);
+  }
+
+  /**
    * Gets the handle for the default column family
    *
    * @return The handle of the default column family
@@ -5180,6 +5193,8 @@ public class RocksDB extends RocksObject {
       final String[] filePathList, final int filePathListLen,
       final long ingestExternalFileOptionsHandle) throws RocksDBException;
   private static native void verifyChecksum(final long handle) throws RocksDBException;
+  private static native void verifyFileChecksums(final long handle, final long readOptionsHandle)
+      throws RocksDBException;
   private static native long getDefaultColumnFamily(final long handle);
   private static native Map<String, TableProperties> getPropertiesOfAllTables(
       final long handle, final long columnFamilyHandle) throws RocksDBException;

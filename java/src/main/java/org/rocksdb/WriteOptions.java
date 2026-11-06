@@ -233,6 +233,34 @@ public class WriteOptions extends RocksObject {
     return this;
   }
 
+  /**
+   * Set the number of bytes per key-value checksum for write batches.
+   * Enables per-KV checksum protection in write batches to detect silent data corruption.
+   * <p>
+   * Default: 0
+   * <p>
+   * Supported values: 0, 8
+   *
+   * @param protectionBytesPerKey number of checksum bytes per key-value
+   *
+   * @return the instance of the current WriteOptions.
+   */
+  public WriteOptions setProtectionBytesPerKey(final long protectionBytesPerKey) {
+    setProtectionBytesPerKey(nativeHandle_, protectionBytesPerKey);
+    return this;
+  }
+
+  /**
+   * Get the number of bytes per key-value checksum for write batches.
+   * <p>
+   * Default: 0
+   *
+   * @return the number of checksum bytes per key-value
+   */
+  public long protectionBytesPerKey() {
+    return protectionBytesPerKey(nativeHandle_);
+  }
+
   private static native long newWriteOptions();
   private static native long copyWriteOptions(long handle);
   @Override
@@ -255,4 +283,7 @@ public class WriteOptions extends RocksObject {
   private static native boolean memtableInsertHintPerBatch(final long handle);
   private static native void setMemtableInsertHintPerBatch(
       final long handle, final boolean memtableInsertHintPerBatch);
+  private static native void setProtectionBytesPerKey(
+      final long handle, final long protectionBytesPerKey);
+  private static native long protectionBytesPerKey(final long handle);
 }

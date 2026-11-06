@@ -3593,6 +3593,23 @@ void Java_org_rocksdb_RocksDB_verifyChecksum(JNIEnv* env, jclass,
 
 /*
  * Class:     org_rocksdb_RocksDB
+ * Method:    verifyFileChecksums
+ * Signature: (JJ)V
+ */
+void Java_org_rocksdb_RocksDB_verifyFileChecksums(JNIEnv* env, jclass,
+                                                  jlong jdb_handle,
+                                                  jlong jread_options_handle) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  auto* read_options =
+      reinterpret_cast<ROCKSDB_NAMESPACE::ReadOptions*>(jread_options_handle);
+  auto s = db->VerifyFileChecksums(*read_options);
+  if (!s.ok()) {
+    ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
+  }
+}
+
+/*
+ * Class:     org_rocksdb_RocksDB
  * Method:    getDefaultColumnFamily
  * Signature: (J)J
  */

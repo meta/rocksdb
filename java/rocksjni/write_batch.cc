@@ -39,6 +39,20 @@ jlong Java_org_rocksdb_WriteBatch_newWriteBatch__I(JNIEnv* /*env*/,
 /*
  * Class:     org_rocksdb_WriteBatch
  * Method:    newWriteBatch
+ * Signature: (IJ)J
+ */
+jlong Java_org_rocksdb_WriteBatch_newWriteBatch__IJ(
+    JNIEnv* /*env*/, jclass /*jcls*/, jint jreserved_bytes,
+    jlong jprotection_bytes_per_key) {
+  auto* wb = new ROCKSDB_NAMESPACE::WriteBatch(
+      static_cast<size_t>(jreserved_bytes), /*max_bytes=*/0,
+      static_cast<size_t>(jprotection_bytes_per_key), /*default_cf_ts_sz=*/0);
+  return GET_CPLUSPLUS_POINTER(wb);
+}
+
+/*
+ * Class:     org_rocksdb_WriteBatch
+ * Method:    newWriteBatch
  * Signature: ([BI)J
  */
 jlong Java_org_rocksdb_WriteBatch_newWriteBatch___3BI(JNIEnv* env,
