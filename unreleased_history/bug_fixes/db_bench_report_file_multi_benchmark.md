@@ -1,0 +1,1 @@
+Fixed `db_bench` with `--report_interval_seconds` > 0 overwriting `--report_file` at the start of each benchmark run, so that only the last run's rows were kept when `--benchmarks` listed several benchmarks or used `[Xn]`. All runs except warm-up runs now go to one file, with `secs_elapsed` measured from the start of the first run.
