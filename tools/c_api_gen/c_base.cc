@@ -13,6 +13,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -245,6 +246,47 @@ static rocksdb_wal_file_t CaptureWalFile(const WalFile& wal_file) {
   result.size_file_bytes = wal_file.SizeFileBytes();
   return result;
 }
+
+static Status CheckWriteBatchSliceParts(const char* parts_name, int num_parts,
+                                        const rocksdb_slice_t* parts) {
+  if (num_parts < 0) {
+    return Status::InvalidArgument(
+        std::string(parts_name) +
+        " part count must be non-negative: " + std::to_string(num_parts));
+  }
+  if (num_parts > 0 && parts == nullptr) {
+    return Status::InvalidArgument(
+        std::string(parts_name) +
+        " parts must not be null when part count is positive: " +
+        std::to_string(num_parts));
+  }
+  for (int i = 0; i < num_parts; ++i) {
+    if (parts[i].data == nullptr && parts[i].size != 0) {
+      return Status::InvalidArgument(std::string(parts_name) + " part " +
+                                     std::to_string(i) +
+                                     " has null data with non-zero size: " +
+                                     std::to_string(parts[i].size));
+    }
+  }
+  return Status::OK();
+}
+
+class CWriteBatchSliceParts {
+ public:
+  CWriteBatchSliceParts(int num_parts, const rocksdb_slice_t* parts) {
+    slices_.reserve(num_parts);
+    for (int i = 0; i < num_parts; ++i) {
+      slices_.emplace_back(parts[i].data, parts[i].size);
+    }
+  }
+
+  SliceParts Get() const {
+    return SliceParts(slices_.data(), static_cast<int>(slices_.size()));
+  }
+
+ private:
+  std::vector<Slice> slices_;
+};
 
 extern "C" {
 
@@ -751,6 +793,7 @@ struct rocksdb_compactionservice_scheduleresponse_t {
 struct rocksdb_compactionservice_jobinfo_t {
   CompactionServiceJobInfo rep;
 };
+
 // Layout assertions: these structs must be reinterpret_cast-compatible
 // with their rep field (single-member struct, standard-layout).
 static_assert(sizeof(rocksdb_writebatch_t) == sizeof(WriteBatch),
@@ -3664,6 +3707,40 @@ void rocksdb_writebatch_putv_cf(rocksdb_writebatch_t* b,
              SliceParts(value_slices.get(), num_values));
 }
 
+void rocksdb_writebatch_put_slice_parts(rocksdb_writebatch_t* b,
+                                        int num_key_parts,
+                                        const rocksdb_slice_t* key_parts,
+                                        int num_value_parts,
+                                        const rocksdb_slice_t* value_parts,
+                                        char** errptr) {
+  Status s = CheckWriteBatchSliceParts("key", num_key_parts, key_parts);
+  if (s.ok()) {
+    s = CheckWriteBatchSliceParts("value", num_value_parts, value_parts);
+  }
+  if (s.ok()) {
+    CWriteBatchSliceParts keys(num_key_parts, key_parts);
+    CWriteBatchSliceParts values(num_value_parts, value_parts);
+    s = b->rep.Put(keys.Get(), values.Get());
+  }
+  SaveError(errptr, s);
+}
+
+void rocksdb_writebatch_put_slice_parts_cf(
+    rocksdb_writebatch_t* b, rocksdb_column_family_handle_t* column_family,
+    int num_key_parts, const rocksdb_slice_t* key_parts, int num_value_parts,
+    const rocksdb_slice_t* value_parts, char** errptr) {
+  Status s = CheckWriteBatchSliceParts("key", num_key_parts, key_parts);
+  if (s.ok()) {
+    s = CheckWriteBatchSliceParts("value", num_value_parts, value_parts);
+  }
+  if (s.ok()) {
+    CWriteBatchSliceParts keys(num_key_parts, key_parts);
+    CWriteBatchSliceParts values(num_value_parts, value_parts);
+    s = b->rep.Put(column_family->rep, keys.Get(), values.Get());
+  }
+  SaveError(errptr, s);
+}
+
 void rocksdb_writebatch_merge(rocksdb_writebatch_t* b, const char* key,
                               size_t klen, const char* val, size_t vlen) {
   b->rep.Merge(Slice(key, klen), Slice(val, vlen));
@@ -3713,6 +3790,40 @@ void rocksdb_writebatch_mergev_cf(rocksdb_writebatch_t* b,
   }
   b->rep.Merge(column_family->rep, SliceParts(key_slices.get(), num_keys),
                SliceParts(value_slices.get(), num_values));
+}
+
+void rocksdb_writebatch_merge_slice_parts(rocksdb_writebatch_t* b,
+                                          int num_key_parts,
+                                          const rocksdb_slice_t* key_parts,
+                                          int num_value_parts,
+                                          const rocksdb_slice_t* value_parts,
+                                          char** errptr) {
+  Status s = CheckWriteBatchSliceParts("key", num_key_parts, key_parts);
+  if (s.ok()) {
+    s = CheckWriteBatchSliceParts("value", num_value_parts, value_parts);
+  }
+  if (s.ok()) {
+    CWriteBatchSliceParts keys(num_key_parts, key_parts);
+    CWriteBatchSliceParts values(num_value_parts, value_parts);
+    s = b->rep.Merge(keys.Get(), values.Get());
+  }
+  SaveError(errptr, s);
+}
+
+void rocksdb_writebatch_merge_slice_parts_cf(
+    rocksdb_writebatch_t* b, rocksdb_column_family_handle_t* column_family,
+    int num_key_parts, const rocksdb_slice_t* key_parts, int num_value_parts,
+    const rocksdb_slice_t* value_parts, char** errptr) {
+  Status s = CheckWriteBatchSliceParts("key", num_key_parts, key_parts);
+  if (s.ok()) {
+    s = CheckWriteBatchSliceParts("value", num_value_parts, value_parts);
+  }
+  if (s.ok()) {
+    CWriteBatchSliceParts keys(num_key_parts, key_parts);
+    CWriteBatchSliceParts values(num_value_parts, value_parts);
+    s = b->rep.Merge(column_family->rep, keys.Get(), values.Get());
+  }
+  SaveError(errptr, s);
 }
 
 void rocksdb_writebatch_singledelete(rocksdb_writebatch_t* b, const char* key,
@@ -3768,6 +3879,29 @@ void rocksdb_writebatch_deletev_cf(
   b->rep.Delete(column_family->rep, SliceParts(key_slices.get(), num_keys));
 }
 
+void rocksdb_writebatch_delete_slice_parts(rocksdb_writebatch_t* b,
+                                           int num_key_parts,
+                                           const rocksdb_slice_t* key_parts,
+                                           char** errptr) {
+  Status s = CheckWriteBatchSliceParts("key", num_key_parts, key_parts);
+  if (s.ok()) {
+    CWriteBatchSliceParts keys(num_key_parts, key_parts);
+    s = b->rep.Delete(keys.Get());
+  }
+  SaveError(errptr, s);
+}
+
+void rocksdb_writebatch_delete_slice_parts_cf(
+    rocksdb_writebatch_t* b, rocksdb_column_family_handle_t* column_family,
+    int num_key_parts, const rocksdb_slice_t* key_parts, char** errptr) {
+  Status s = CheckWriteBatchSliceParts("key", num_key_parts, key_parts);
+  if (s.ok()) {
+    CWriteBatchSliceParts keys(num_key_parts, key_parts);
+    s = b->rep.Delete(column_family->rep, keys.Get());
+  }
+  SaveError(errptr, s);
+}
+
 void rocksdb_writebatch_delete_range(rocksdb_writebatch_t* b,
                                      const char* start_key,
                                      size_t start_key_len, const char* end_key,
@@ -3817,6 +3951,41 @@ void rocksdb_writebatch_delete_rangev_cf(
   b->rep.DeleteRange(column_family->rep,
                      SliceParts(start_key_slices.get(), num_keys),
                      SliceParts(end_key_slices.get(), num_keys));
+}
+
+void rocksdb_writebatch_delete_range_slice_parts(
+    rocksdb_writebatch_t* b, int num_begin_key_parts,
+    const rocksdb_slice_t* begin_key_parts, int num_end_key_parts,
+    const rocksdb_slice_t* end_key_parts, char** errptr) {
+  Status s = CheckWriteBatchSliceParts("begin key", num_begin_key_parts,
+                                       begin_key_parts);
+  if (s.ok()) {
+    s = CheckWriteBatchSliceParts("end key", num_end_key_parts, end_key_parts);
+  }
+  if (s.ok()) {
+    CWriteBatchSliceParts begin_key(num_begin_key_parts, begin_key_parts);
+    CWriteBatchSliceParts end_key(num_end_key_parts, end_key_parts);
+    s = b->rep.DeleteRange(begin_key.Get(), end_key.Get());
+  }
+  SaveError(errptr, s);
+}
+
+void rocksdb_writebatch_delete_range_slice_parts_cf(
+    rocksdb_writebatch_t* b, rocksdb_column_family_handle_t* column_family,
+    int num_begin_key_parts, const rocksdb_slice_t* begin_key_parts,
+    int num_end_key_parts, const rocksdb_slice_t* end_key_parts,
+    char** errptr) {
+  Status s = CheckWriteBatchSliceParts("begin key", num_begin_key_parts,
+                                       begin_key_parts);
+  if (s.ok()) {
+    s = CheckWriteBatchSliceParts("end key", num_end_key_parts, end_key_parts);
+  }
+  if (s.ok()) {
+    CWriteBatchSliceParts begin_key(num_begin_key_parts, begin_key_parts);
+    CWriteBatchSliceParts end_key(num_end_key_parts, end_key_parts);
+    s = b->rep.DeleteRange(column_family->rep, begin_key.Get(), end_key.Get());
+  }
+  SaveError(errptr, s);
 }
 
 class H : public WriteBatch::Handler {
