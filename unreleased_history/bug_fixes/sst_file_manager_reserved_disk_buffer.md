@@ -1,0 +1,1 @@
+Fixed an `SstFileManager` shared across DB instances or reopens keeping the disk buffer that each `DB::Open()` reserves after that DB was closed. The reservation grew by one write buffer per open, and once it exceeded the free space (capped at `max_allowed_space`) the DB could no longer auto-recover from an out of space error.

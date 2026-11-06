@@ -261,6 +261,18 @@ void SstFileManagerImpl::ReserveDiskBuffer(uint64_t size,
   }
 }
 
+void SstFileManagerImpl::ReleaseDiskBuffer(uint64_t size) {
+  MutexLock l(&mu_);
+
+  assert(reserved_disk_buffer_ >= size);
+  reserved_disk_buffer_ -= std::min(reserved_disk_buffer_, size);
+}
+
+uint64_t SstFileManagerImpl::GetReservedDiskBuffer() {
+  MutexLock l(&mu_);
+  return reserved_disk_buffer_;
+}
+
 void SstFileManagerImpl::ClearError() {
   while (true) {
     MutexLock l(&mu_);

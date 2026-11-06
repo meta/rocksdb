@@ -115,6 +115,10 @@ class SstFileManagerImpl : public SstFileManager {
   // disk buffer space for recovery from out of space errors
   void ReserveDiskBuffer(uint64_t buffer, const std::string& path);
 
+  // Called by a DB instance on close to give back the disk buffer it reserved
+  // with ReserveDiskBuffer()
+  void ReleaseDiskBuffer(uint64_t buffer);
+
   // Set a flag upon encountering disk full. May enqueue the ErrorHandler
   // instance for background polling and recovery
   void StartErrorRecovery(ErrorHandler* db, Status bg_error);
@@ -179,6 +183,12 @@ class SstFileManagerImpl : public SstFileManager {
   }
 
  private:
+  friend class DBSSTTest;
+
+  // Total disk buffer currently reserved by the DB instances using this sst
+  // file manager
+  uint64_t GetReservedDiskBuffer();
+
   // REQUIRES: mutex locked
   void OnAddFileImpl(const std::string& file_path, uint64_t file_size);
   // REQUIRES: mutex locked
