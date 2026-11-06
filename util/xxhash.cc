@@ -45,4 +45,14 @@
 #endif // !defined(XXH_STATIC_LINKING_ONLY)
 #define XXH_IMPLEMENTATION   /* access definitions */
 
+// xxhash.h follows upstream and uses NULL pervasively; silence the warning here.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wzero-as-null-pointer-constant"
+#endif
+
 #include "xxhash.h"
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
