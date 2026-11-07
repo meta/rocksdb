@@ -444,6 +444,7 @@ const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
      "rocksdb.flush.write_buffer_manager.memtable.memory.bytes"},
     {OPEN_AND_COMPACT_DB_OPEN_MICROS,
      "rocksdb.open.and.compact.db.open.micros"},
+    {COMPACTION_QUEUE_WAIT_TIME, "rocksdb.compaction.queue.wait.micros"},
 };
 
 std::shared_ptr<Statistics> CreateDBStatistics() {

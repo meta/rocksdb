@@ -541,6 +541,12 @@ class ColumnFamilyData {
   void set_queued_for_compaction(bool value) { queued_for_compaction_ = value; }
   bool queued_for_flush() { return queued_for_flush_; }
   bool queued_for_compaction() { return queued_for_compaction_; }
+  void set_compaction_queued_at_micros(uint64_t v) {
+    compaction_queued_at_micros_ = v;
+  }
+  uint64_t compaction_queued_at_micros() const {
+    return compaction_queued_at_micros_;
+  }
 
   int compaction_aborted() const {
     return compaction_aborted_.obj_.load(std::memory_order_acquire);
@@ -769,6 +775,10 @@ class ColumnFamilyData {
   // If true, this ColumnFamily is in DBImpl::compaction_queue_ or its parked
   // compaction set.
   bool queued_for_compaction_;
+
+  // Timestamp (in microseconds) when this CF was added to the compaction queue.
+  // Used to measure compaction queue wait time.
+  uint64_t compaction_queued_at_micros_;
 
   // Read outside the DB mutex by compaction workers (acquire-loaded roughly
   // every 1024 records in ProcessKeyValueCompaction). Given its own cache line

@@ -7598,6 +7598,88 @@ TEST_F(DBCompactionTest, CompactionHasEmptyOutput) {
   ASSERT_EQ(2, collector->num_ssts_creation_started());
 }
 
+TEST_F(DBCompactionTest, CompactionQueueWaitTime) {
+  // Verify that COMPACTION_QUEUE_WAIT_TIME histogram records nonzero delay
+  // when compactions are queued and blocked by occupied thread pool.
+  const int kNumKeysPerFile = 10;
+
+  Options options = CurrentOptions();
+  options.write_buffer_size = 110 * 1024;  // 110KB
+  options.arena_block_size = 4096;
+  options.num_levels = 3;
+  options.level0_file_num_compaction_trigger = 4;
+  options.level0_slowdown_writes_trigger = 64;
+  options.level0_stop_writes_trigger = 64;
+  options.max_background_jobs = 4;
+  options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+  options.memtable_factory.reset(
+      test::NewSpecialSkipListFactory(kNumKeysPerFile));
+  options.max_write_buffer_number = 10;
+  DestroyAndReopen(options);
+
+  env_->SetBackgroundThreads(1, Env::HIGH);  // 1 flush thread
+  env_->SetBackgroundThreads(1, Env::LOW);   // 1 compaction thread
+
+  // Block the single compaction thread so queued compactions wait.
+  test::SleepingBackgroundTask sleeping_task;
+  env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &sleeping_task,
+                 Env::LOW);
+  sleeping_task.WaitUntilSleeping();
+
+  // Set up a sync point callback to know when compaction is definitely queued.
+  port::Mutex enqueue_mutex;
+  port::CondVar enqueue_cv(&enqueue_mutex);
+  std::atomic<bool> compaction_queued{false};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::AddToCompactionQueue:Enqueued", [&](void* /* arg */) {
+        enqueue_mutex.Lock();
+        compaction_queued.store(true, std::memory_order_release);
+        enqueue_cv.Signal();
+        enqueue_mutex.Unlock();
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  // Write enough L0 files to trigger compaction.
+  for (int n = 0; n < options.level0_file_num_compaction_trigger; n++) {
+    for (int i = 0; i < kNumKeysPerFile; i++) {
+      ASSERT_OK(Put(Key(i), "value"));
+    }
+    ASSERT_OK(Put("", ""));  // extra key to trigger flush
+    ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  }
+  ASSERT_EQ(NumTableFilesAtLevel(0),
+            options.level0_file_num_compaction_trigger);
+
+  // Wait until compaction is definitely queued before starting the timer.
+  {
+    enqueue_mutex.Lock();
+    while (!compaction_queued.load(std::memory_order_acquire)) {
+      enqueue_cv.Wait();
+    }
+    enqueue_mutex.Unlock();
+  }
+
+  // Now that compaction is queued, sleep to accumulate measurable wait time.
+  env_->SleepForMicroseconds(100000);  // 100ms
+
+  // Unblock the compaction thread.
+  sleeping_task.WakeUp();
+  sleeping_task.WaitUntilDone();
+
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Verify the histogram recorded at least one entry with nonzero wait time.
+  HistogramData hist_data;
+  options.statistics->histogramData(COMPACTION_QUEUE_WAIT_TIME, &hist_data);
+  ASSERT_GE(hist_data.count, 1U);
+  ASSERT_GT(hist_data.max, 0.0);
+  // The wait should be at least ~100ms (100000 micros)
+  ASSERT_GE(hist_data.max, 100000.0);
+}
+
 TEST_F(DBCompactionTest, CompactionLimiter) {
   const int kNumKeysPerFile = 10;
   const int kMaxBackgroundThreads = 64;
