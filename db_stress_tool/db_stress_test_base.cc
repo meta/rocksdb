@@ -1925,7 +1925,7 @@ Status StressTest::AssertSame(DB* db, ColumnFamilyHandle* cf,
   return Status::OK();
 }
 
-void StressTest::ProcessStatus(SharedState* shared, std::string opname,
+void StressTest::ProcessStatus(SharedState* shared, const std::string& opname,
                                const Status& s,
                                bool ignore_injected_error) const {
   if (s.ok()) {
@@ -1939,13 +1939,14 @@ void StressTest::ProcessStatus(SharedState* shared, std::string opname,
   }
 }
 
-void StressTest::VerificationAbort(SharedState* shared, std::string msg) const {
+void StressTest::VerificationAbort(SharedState* shared,
+                                   const std::string& msg) const {
   fprintf(stderr, "Verification failed: %s\n", msg.c_str());
   shared->SetVerificationFailure();
 }
 
-void StressTest::VerificationAbort(SharedState* shared, std::string msg, int cf,
-                                   int64_t key) const {
+void StressTest::VerificationAbort(SharedState* shared, const std::string& msg,
+                                   int cf, int64_t key) const {
   auto key_str = Key(key);
   Slice key_slice = key_str;
   fprintf(stderr,
@@ -1954,8 +1955,8 @@ void StressTest::VerificationAbort(SharedState* shared, std::string msg, int cf,
   shared->SetVerificationFailure();
 }
 
-void StressTest::VerificationAbort(SharedState* shared, std::string msg, int cf,
-                                   int64_t key, Slice value_from_db,
+void StressTest::VerificationAbort(SharedState* shared, const std::string& msg,
+                                   int cf, int64_t key, Slice value_from_db,
                                    Slice value_from_expected) const {
   auto key_str = Key(key);
   fprintf(stderr,

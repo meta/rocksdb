@@ -73,8 +73,8 @@ class CacheSimulatorTest : public testing::Test {
                    const MissRatioStats& miss_ratio_stats,
                    uint64_t expected_usage, uint64_t expected_num_accesses,
                    uint64_t expected_num_misses,
-                   std::vector<std::string> blocks,
-                   std::vector<std::string> keys) {
+                   const std::vector<std::string>& blocks,
+                   const std::vector<std::string>& keys) {
     EXPECT_EQ(expected_usage, sim_cache->GetUsage());
     EXPECT_EQ(expected_num_accesses, miss_ratio_stats.total_accesses());
     EXPECT_EQ(expected_num_misses, miss_ratio_stats.total_misses());

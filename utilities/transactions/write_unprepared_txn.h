@@ -232,7 +232,7 @@ class WriteUnpreparedTxn : public WritePreparedTxn {
   Status FlushWriteBatchToDBInternal(bool prepared);
   Status FlushWriteBatchWithSavePointToDB();
   Status RollbackToSavePointInternal();
-  Status HandleWrite(std::function<Status()> do_write);
+  Status HandleWrite(const std::function<Status()>& do_write);
 
   // For write unprepared, we check on every writebatch append to see if
   // write_batch_flush_threshold_ has been exceeded, and then call

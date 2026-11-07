@@ -27,7 +27,7 @@ std::tuple<int8_t, int8_t, int64_t> CreateTestColumnSpec(int8_t mask,
                                                          int64_t timestamp);
 
 RowValue CreateTestRowValue(
-    std::vector<std::tuple<int8_t, int8_t, int64_t>> column_specs);
+    const std::vector<std::tuple<int8_t, int8_t, int64_t>>& column_specs);
 
 RowValue CreateRowTombstone(int64_t timestamp);
 

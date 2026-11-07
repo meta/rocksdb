@@ -124,7 +124,7 @@ void DoRandomIteraratorTest(DB* db, std::vector<std::string> source_strings,
       case 2: {
         // Seek to random key
         auto key_idx = rnd->Uniform(static_cast<int>(source_strings.size()));
-        auto key = source_strings[key_idx];
+        const auto& key = source_strings[key_idx];
         iter->Seek(key);
         result_iter->Seek(key);
         break;
@@ -150,7 +150,7 @@ void DoRandomIteraratorTest(DB* db, std::vector<std::string> source_strings,
       default: {
         assert(type == 5);
         auto key_idx = rnd->Uniform(static_cast<int>(source_strings.size()));
-        auto key = source_strings[key_idx];
+        const auto& key = source_strings[key_idx];
         std::string result;
         auto status = db->Get(ReadOptions(), key, &result);
         if (map.find(key) == map.end()) {

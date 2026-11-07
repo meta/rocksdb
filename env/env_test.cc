@@ -183,7 +183,7 @@ bool WriteFdExactly(int fd, const void* data, size_t size, std::string* error) {
 
 template <typename ProduceMappingFn>
 std::string RunDeterministicMappingReuseScenario(
-    ProduceMappingFn&& produce_mapping) {
+    const ProduceMappingFn& produce_mapping) {
   int pipe_fds[2];
   if (pipe(pipe_fds) != 0) {
     return "pipe failed: " + errnoStr(errno);

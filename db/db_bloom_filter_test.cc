@@ -4205,7 +4205,7 @@ TEST_F(DBBloomFilterTest, SstQueryFilter) {
   using Keys = std::vector<std::string>;
   auto RangeQuery =
       [factory, db = db_.get()](
-          std::string lb, std::string ub,
+          const std::string& lb, const std::string& ub,
           std::shared_ptr<SstQueryFilterConfigsManager::Factory> alt_factory =
               nullptr) {
         return RangeQueryKeys(alt_factory ? *alt_factory : *factory, *db, lb,

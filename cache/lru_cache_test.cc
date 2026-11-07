@@ -82,7 +82,7 @@ class LRUCacheTest : public testing::Test {
 
   void Erase(const std::string& key) { cache_->Erase(key, 0 /*hash*/); }
 
-  void ValidateLRUList(std::vector<std::string> keys,
+  void ValidateLRUList(const std::vector<std::string>& keys,
                        size_t num_high_pri_pool_keys = 0,
                        size_t num_low_pri_pool_keys = 0,
                        size_t num_bottom_pri_pool_keys = 0) {

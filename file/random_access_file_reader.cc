@@ -259,7 +259,7 @@ IOStatus RandomAccessFileReader::ReadAsync(
                 std::placeholders::_1, std::placeholders::_2);
 
   ReadAsyncInfo* read_async_info = new ReadAsyncInfo(
-      cb, cb_arg, (clock_ != nullptr ? clock_->NowMicros() : 0));
+      std::move(cb), cb_arg, (clock_ != nullptr ? clock_->NowMicros() : 0));
 
   if (ShouldNotifyListeners()) {
     read_async_info->fs_start_ts_ = FileOperationInfo::StartNow();

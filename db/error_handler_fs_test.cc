@@ -11,6 +11,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <utility>
 
 #include "db/db_test_util.h"
 #include "file/sst_file_manager_impl.h"
@@ -167,7 +168,7 @@ class ErrorHandlerFSListener : public EventListener {
   void EnableAutoRecovery(bool enable = true) { no_auto_recovery_ = !enable; }
 
   void OverrideBGError(Status bg_err) {
-    bg_error_ = bg_err;
+    bg_error_ = std::move(bg_err);
     override_bg_error_ = true;
   }
 
@@ -175,7 +176,7 @@ class ErrorHandlerFSListener : public EventListener {
                                IOStatus io_s) {
     fault_fs_ = fs;
     file_count_ = file_count;
-    file_creation_error_ = io_s;
+    file_creation_error_ = std::move(io_s);
   }
 
   Status new_bg_error() { return new_bg_error_; }

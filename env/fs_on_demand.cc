@@ -324,8 +324,8 @@ Temperature OnDemandSequentialFile::GetTemperature() const {
 }
 
 std::shared_ptr<FileSystem> NewOnDemandFileSystem(
-    const std::shared_ptr<FileSystem>& fs, std::string src_path,
-    std::string dest_path) {
+    const std::shared_ptr<FileSystem>& fs, const std::string& src_path,
+    const std::string& dest_path) {
   return std::make_shared<OnDemandFileSystem>(fs, src_path, dest_path);
 }
 }  // namespace ROCKSDB_NAMESPACE

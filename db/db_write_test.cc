@@ -881,7 +881,7 @@ TEST_P(DBWriteTest, ConcurrentlyDisabledWAL) {
   ASSERT_LE(bytes_num, 1024 * 100);
 }
 
-void CorruptLogFile(Env* env, Options& options, std::string log_path,
+void CorruptLogFile(Env* env, Options& options, const std::string& log_path,
                     uint64_t log_num, int record_num) {
   std::shared_ptr<FileSystem> fs = env->GetFileSystem();
   std::unique_ptr<SequentialFileReader> file_reader;

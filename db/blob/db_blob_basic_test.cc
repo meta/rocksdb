@@ -3396,8 +3396,8 @@ TEST_F(DBBlobBasicTest, GetApproximateSizesIncludingBlobFiles) {
 
     std::string mid = Key(kNumKeys / 2);
     std::string r1_start = Key(0);
-    std::string r1_end = mid;
-    std::string r2_start = mid;
+    const std::string& r1_end = mid;
+    const std::string& r2_start = mid;
     std::string r2_end = Key(kNumKeys);
     Range ranges[2] = {Range(r1_start, r1_end), Range(r2_start, r2_end)};
     uint64_t sizes[2] = {0, 0};

@@ -36,7 +36,7 @@ struct KillPoint {
   // If kill point has a prefix on this list, will skip killing.
   std::vector<std::string> rocksdb_kill_exclude_prefixes;
   // Kill the process with probability 1/odds for testing.
-  void TestKillRandom(std::string kill_point, int odds,
+  void TestKillRandom(const std::string& kill_point, int odds,
                       const std::string& srcfile, int srcline);
 
   static KillPoint* GetInstance();

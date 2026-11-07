@@ -620,7 +620,7 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     return filesystem_writable_;
   }
   void SetFilesystemActiveNoLock(
-      bool active, IOStatus error = IOStatus::Corruption("Not active")) {
+      bool active, const IOStatus& error = IOStatus::Corruption("Not active")) {
     error.PermitUncheckedError();
     filesystem_active_ = active;
     if (!active) {
@@ -628,7 +628,7 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     }
   }
   void SetFilesystemActive(
-      bool active, IOStatus error = IOStatus::Corruption("Not active")) {
+      bool active, const IOStatus& error = IOStatus::Corruption("Not active")) {
     MutexLock l(&mutex_);
     error.PermitUncheckedError();
     SetFilesystemActiveNoLock(active, error);
@@ -687,7 +687,7 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     return fs_error_;
   }
 
-  void SetFileSystemIOError(IOStatus io_error) {
+  void SetFileSystemIOError(const IOStatus& io_error) {
     MutexLock l(&mutex_);
     io_error.PermitUncheckedError();
     fs_error_ = io_error;

@@ -172,7 +172,7 @@ TEST_F(WalManagerTest, ReadFirstRecordCache) {
 }
 
 namespace {
-uint64_t GetLogDirSize(std::string dir_path, Env* env) {
+uint64_t GetLogDirSize(const std::string& dir_path, Env* env) {
   uint64_t dir_size = 0;
   std::vector<std::string> files;
   EXPECT_OK(env->GetChildren(dir_path, &files));

@@ -655,7 +655,6 @@ class CompressedSecondaryCacheTestBase : public testing::Test,
     ASSERT_OK(cache->Insert(key1, item1_1, GetHelper(), str1.length()));
 
     std::string str2 = rnd.RandomString(1002);
-    std::string str2_clone{str2};
     auto item2 = new TestItem(str2.data(), str2.length());
     // After this Insert, primary cache contains k2 and secondary cache contains
     // k1's dummy item.

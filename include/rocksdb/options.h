@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "rocksdb/advanced_options.h"
@@ -533,7 +534,7 @@ struct CompactionServiceScheduleResponse {
   CompactionServiceJobStatus status;
   CompactionServiceScheduleResponse(std::string scheduled_job_id_,
                                     CompactionServiceJobStatus status_)
-      : scheduled_job_id(scheduled_job_id_), status(status_) {}
+      : scheduled_job_id(std::move(scheduled_job_id_)), status(status_) {}
   explicit CompactionServiceScheduleResponse(CompactionServiceJobStatus status_)
       : status(status_) {}
 };

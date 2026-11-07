@@ -34,7 +34,7 @@ std::tuple<int8_t, int8_t, int64_t> CreateTestColumnSpec(int8_t mask,
 }
 
 RowValue CreateTestRowValue(
-    std::vector<std::tuple<int8_t, int8_t, int64_t>> column_specs) {
+    const std::vector<std::tuple<int8_t, int8_t, int64_t>>& column_specs) {
   std::vector<std::shared_ptr<ColumnBase>> columns;
   int64_t last_modified_time = 0;
   for (auto spec : column_specs) {

@@ -23,6 +23,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "env/composite_env_wrapper.h"
@@ -2297,7 +2298,7 @@ IOStatus BackupEngineImpl::AddBackupFileWorkItem(
         src_dir.empty() ? "" : src_path, *copy_dest_path, src_temperature,
         Temperature::kUnknown /*dst_temp*/, contents, db_env_, backup_env_,
         src_env_options, options_.sync, false /* use_fsync */, rate_limiter,
-        size_limit, stats, progress_callback, src_checksum_func_name,
+        size_limit, stats, std::move(progress_callback), src_checksum_func_name,
         checksum_hex, db_id, db_session_id);
     BackupAfterCopyOrCreateWorkItem after_copy_or_create_work_item(
         copy_or_create_work_item.result.get_future(), shared, need_to_copy,

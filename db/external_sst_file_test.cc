@@ -10,6 +10,7 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <utility>
 
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
@@ -289,8 +290,9 @@ class ExternalSSTFileTest
   }
 
   Status GenerateAndAddExternalFile(
-      const Options options, std::vector<std::pair<int, std::string>> data,
-      int file_id = -1, bool allow_global_seqno = false,
+      const Options& options,
+      const std::vector<std::pair<int, std::string>>& data, int file_id = -1,
+      bool allow_global_seqno = false,
       bool verify_checksums_before_ingest = true, bool ingest_behind = false,
       bool sort_data = false,
       std::map<std::string, std::string>* true_data = nullptr,
@@ -306,7 +308,7 @@ class ExternalSSTFileTest
   }
 
   Status GenerateAndAddExternalFile(
-      const Options options, std::vector<int> keys, int file_id = -1,
+      const Options& options, const std::vector<int>& keys, int file_id = -1,
       bool allow_global_seqno = false,
       bool verify_checksums_before_ingest = true, bool ingest_behind = false,
       bool sort_data = false,
@@ -1855,7 +1857,7 @@ TEST_F(ExternalSSTFileTest, BasicMixed) {
 
 class SstFileWriterCollector : public TablePropertiesCollector {
  public:
-  explicit SstFileWriterCollector(const std::string prefix) : prefix_(prefix) {
+  explicit SstFileWriterCollector(const std::string& prefix) : prefix_(prefix) {
     name_ = prefix_ + "_SstFileWriterCollector";
   }
 
@@ -1888,7 +1890,7 @@ class SstFileWriterCollector : public TablePropertiesCollector {
 class SstFileWriterCollectorFactory : public TablePropertiesCollectorFactory {
  public:
   explicit SstFileWriterCollectorFactory(std::string prefix)
-      : prefix_(prefix), num_created_(0) {}
+      : prefix_(std::move(prefix)), num_created_(0) {}
   TablePropertiesCollector* CreateTablePropertiesCollector(
       TablePropertiesCollectorFactory::Context /*context*/) override {
     num_created_++;

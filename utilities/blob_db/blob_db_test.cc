@@ -14,6 +14,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "db/blob/blob_index.h"
@@ -103,7 +104,7 @@ class BlobDBTest : public testing::Test {
 
   void Open(BlobDBOptions bdb_options = BlobDBOptions(),
             Options options = Options()) {
-    ASSERT_OK(TryOpen(bdb_options, options));
+    ASSERT_OK(TryOpen(bdb_options, std::move(options)));
   }
 
   void Reopen(BlobDBOptions bdb_options = BlobDBOptions(),
@@ -111,7 +112,7 @@ class BlobDBTest : public testing::Test {
     assert(blob_db_ != nullptr);
     delete blob_db_;
     blob_db_ = nullptr;
-    Open(bdb_options, options);
+    Open(bdb_options, std::move(options));
   }
 
   void Close() {
@@ -1619,7 +1620,7 @@ TEST_F(BlobDBTest, EvictExpiredFile) {
   ASSERT_OK(PutWithTTL("foo", "bar", 100, &data));
   auto blob_files = blob_db_impl()->TEST_GetBlobFiles();
   ASSERT_EQ(1, blob_files.size());
-  auto blob_file = blob_files[0];
+  const auto& blob_file = blob_files[0];
   ASSERT_FALSE(blob_file->Immutable());
   ASSERT_FALSE(blob_file->Obsolete());
   VerifyDB(data);
@@ -1980,7 +1981,7 @@ TEST_F(BlobDBTest, ShutdownWait) {
   ASSERT_OK(PutWithTTL("foo", "bar", 100, &data));
   auto blob_files = blob_db_impl()->TEST_GetBlobFiles();
   ASSERT_EQ(1, blob_files.size());
-  auto blob_file = blob_files[0];
+  const auto& blob_file = blob_files[0];
   ASSERT_FALSE(blob_file->Immutable());
   ASSERT_FALSE(blob_file->Obsolete());
   VerifyDB(data);

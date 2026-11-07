@@ -686,7 +686,7 @@ void TestValueAsSecondaryIndexHelper(std::vector<Entry> entries,
     ASSERT_EQ(entries.size(), handler.seen[data.GetID()].size());
     size_t i = 0;
     for (const auto& e : handler.seen[data.GetID()]) {
-      auto write_entry = entries[i++];
+      const auto& write_entry = entries[i++];
       ASSERT_EQ(e.type, write_entry.type);
       ASSERT_EQ(e.key, write_entry.key);
       if (e.type != kDeleteRecord) {
@@ -700,7 +700,7 @@ void TestValueAsSecondaryIndexHelper(std::vector<Entry> entries,
     ASSERT_EQ(entries.size(), handler.seen[index.GetID()].size());
     size_t i = 0;
     for (const auto& e : handler.seen[index.GetID()]) {
-      auto write_entry = entries[i++];
+      const auto& write_entry = entries[i++];
       ASSERT_EQ(e.key, write_entry.value);
       if (write_entry.type != kDeleteRecord) {
         ASSERT_EQ(e.value, write_entry.key);
@@ -1156,7 +1156,7 @@ TEST_P(WriteBatchWithIndexTest, TestRandomIteraratorWithBase) {
         case 2: {
           // Seek to random key
           auto key_idx = rnd.Uniform(static_cast<int>(source_strings.size()));
-          auto key = source_strings[key_idx];
+          const auto& key = source_strings[key_idx];
           iter->Seek(key);
           result_iter->Seek(key);
           break;
@@ -1164,7 +1164,7 @@ TEST_P(WriteBatchWithIndexTest, TestRandomIteraratorWithBase) {
         case 3: {
           // SeekForPrev to random key
           auto key_idx = rnd.Uniform(static_cast<int>(source_strings.size()));
-          auto key = source_strings[key_idx];
+          const auto& key = source_strings[key_idx];
           iter->SeekForPrev(key);
           result_iter->SeekForPrev(key);
           break;
@@ -1784,12 +1784,12 @@ TEST_P(WriteBatchWithIndexTest, TestPinnedGetFromBatchAndDB) {
   }
 }
 
-void AssertKey(std::string key, WBWIIterator* iter) {
+void AssertKey(const std::string& key, WBWIIterator* iter) {
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(key, iter->Entry().key.ToString());
 }
 
-void AssertValue(std::string value, WBWIIterator* iter) {
+void AssertValue(const std::string& value, WBWIIterator* iter) {
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(value, iter->Entry().value.ToString());
 }
@@ -1831,12 +1831,12 @@ TEST_F(WBWIOverwriteTest, MutateWhileIteratingCorrectnessTest) {
   AssertKey("w", iter.get());
 }
 
-void AssertIterKey(std::string key, Iterator* iter) {
+void AssertIterKey(const std::string& key, Iterator* iter) {
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(key, iter->key().ToString());
 }
 
-void AssertIterValue(std::string value, Iterator* iter) {
+void AssertIterValue(const std::string& value, Iterator* iter) {
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(value, iter->value().ToString());
 }

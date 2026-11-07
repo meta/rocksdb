@@ -68,9 +68,9 @@ namespace test {
 std::string TmpDir(Env* env = Env::Default());
 
 // A path unique within the thread
-std::string PerThreadDBPath(std::string name);
-std::string PerThreadDBPath(Env* env, std::string name);
-std::string PerThreadDBPath(std::string dir, std::string name);
+std::string PerThreadDBPath(const std::string& name);
+std::string PerThreadDBPath(Env* env, const std::string& name);
+std::string PerThreadDBPath(const std::string& dir, const std::string& name);
 
 // Return a randomization seed for this run.  Typically returns the
 // same number on repeated invocations of this binary, but automated

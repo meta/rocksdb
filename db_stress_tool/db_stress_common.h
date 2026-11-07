@@ -641,7 +641,7 @@ inline std::string TemperatureToString(
   return iter->second;
 }
 
-inline std::vector<std::string> SplitString(std::string src) {
+inline std::vector<std::string> SplitString(const std::string& src) {
   std::vector<std::string> ret;
   if (src.empty()) {
     return ret;

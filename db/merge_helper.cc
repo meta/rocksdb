@@ -229,8 +229,7 @@ Status MergeHelper::TimedFullMergeImpl(
         WideColumnsHelper::SortColumns(sorted_columns);
 
         std::string result;
-        const Status s =
-            WideColumnSerialization::Serialize(sorted_columns, result);
+        Status s = WideColumnSerialization::Serialize(sorted_columns, result);
         if (!s.ok()) {
           result_entity->Reset();
           return s;

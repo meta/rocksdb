@@ -17,8 +17,8 @@ std::string DBBasicTestWithTimestampBase::Key1(uint64_t k) {
   return ret;
 }
 
-std::string DBBasicTestWithTimestampBase::KeyWithPrefix(std::string prefix,
-                                                        uint64_t k) {
+std::string DBBasicTestWithTimestampBase::KeyWithPrefix(
+    const std::string& prefix, uint64_t k) {
   std::string ret;
   PutFixed64(&ret, k);
   std::reverse(ret.begin(), ret.end());

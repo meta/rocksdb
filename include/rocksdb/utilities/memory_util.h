@@ -45,7 +45,7 @@ class MemoryUtil {
   template <typename DBPtr>
   static Status GetApproximateMemoryUsageByType(
       const std::vector<DBPtr>& dbs,
-      const std::unordered_set<const Cache*> cache_set,
+      const std::unordered_set<const Cache*>& cache_set,
       std::map<MemoryUtil::UsageType, uint64_t>* usage_by_type);
 };
 }  // namespace ROCKSDB_NAMESPACE

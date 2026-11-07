@@ -1234,8 +1234,8 @@ Status NewEnvLogger(const std::string& fname, Env* env,
   // TODO: Tune the buffer size.
   options.writable_file_max_buffer_size = 1024 * 1024;
   std::unique_ptr<FSWritableFile> writable_file;
-  const auto status = env->GetFileSystem()->NewWritableFile(
-      fname, options, &writable_file, nullptr);
+  auto status = env->GetFileSystem()->NewWritableFile(fname, options,
+                                                      &writable_file, nullptr);
   if (!status.ok()) {
     return status;
   }

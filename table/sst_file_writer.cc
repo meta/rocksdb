@@ -192,7 +192,7 @@ struct SstFileWriter::Rep {
         internal_comparator(_user_comparator),
         cfh(_cfh),
         invalidate_page_cache(_invalidate_page_cache),
-        db_session_id(_db_session_id),
+        db_session_id(std::move(_db_session_id)),
         ts_sz(_user_comparator->timestamp_size()),
         strip_timestamp(ts_sz > 0 &&
                         !ioptions.persist_user_defined_timestamps) {
@@ -326,7 +326,7 @@ struct SstFileWriter::Rep {
     WideColumnsHelper::SortColumns(sorted_columns);
 
     std::string entity;
-    const Status s = WideColumnSerialization::Serialize(sorted_columns, entity);
+    Status s = WideColumnSerialization::Serialize(sorted_columns, entity);
     if (!s.ok()) {
       return s;
     }

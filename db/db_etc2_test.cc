@@ -2840,7 +2840,7 @@ TEST_F(DBTest2, AutomaticCompactionOverlapManualCompaction) {
   cro.target_level = 2;
   ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
 
-  auto get_stat = [](std::string level_str, LevelStatType type,
+  auto get_stat = [](const std::string& level_str, LevelStatType type,
                      std::map<std::string, std::string> props) {
     auto prop_str =
         "compaction." + level_str + "." +
@@ -4451,7 +4451,8 @@ TEST_F(DBTest2, TraceAndReplay) {
 
   TraceExecutionResultHandler res_handler;
   std::function<void(Status, std::unique_ptr<TraceRecordResult>&&)> res_cb =
-      [&res_handler](Status exec_s, std::unique_ptr<TraceRecordResult>&& res) {
+      [&res_handler](const Status& exec_s,
+                     std::unique_ptr<TraceRecordResult>&& res) {
         ASSERT_TRUE(exec_s.ok() || exec_s.IsNotSupported());
         if (res != nullptr) {
           ASSERT_OK(res->Accept(&res_handler));
@@ -5404,7 +5405,7 @@ TEST_F(DBTest2, TraceReplayPreparesValuesOfCapturedSeekResults) {
   int seeks = 0;
   ASSERT_OK(replayer->Replay(
       ReplayOptions(1, 1.0),
-      [&](Status exec_s, std::unique_ptr<TraceRecordResult>&& res) {
+      [&](const Status& exec_s, std::unique_ptr<TraceRecordResult>&& res) {
         ASSERT_OK(exec_s);
         auto* seek = dynamic_cast<IteratorTraceExecutionResult*>(res.get());
         ASSERT_NE(seek, nullptr);

@@ -104,7 +104,7 @@ class DBWALTestBase : public DBTestBase {
   }
 #endif  // ROCKSDB_FALLOCATE_PRESENT
 
-  uint64_t GetAllocatedFileSize(std::string file_name) {
+  uint64_t GetAllocatedFileSize(const std::string& file_name) {
     struct stat sbuf;
     int err = stat(file_name.c_str(), &sbuf);
     assert(err == 0);
@@ -1754,8 +1754,8 @@ TEST_F(DBWALTest, DISABLED_RecycleMultipleWalsCrash) {
 TEST_F(DBWALTest, SyncWalPartialFailure) {
   class MyTestFileSystem : public FileSystemWrapper {
    public:
-    explicit MyTestFileSystem(std::shared_ptr<FileSystem> base)
-        : FileSystemWrapper(std::move(base)) {}
+    explicit MyTestFileSystem(const std::shared_ptr<FileSystem>& base)
+        : FileSystemWrapper(base) {}
 
     static const char* kClassName() { return "MyTestFileSystem"; }
     const char* Name() const override { return kClassName(); }

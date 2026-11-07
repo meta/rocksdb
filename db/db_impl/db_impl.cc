@@ -5000,7 +5000,7 @@ void DBImpl::MultiGetEntity(const ReadOptions& _read_options, size_t num_keys,
   for (size_t i = 0; i < num_keys; ++i) {
     for (size_t j = 0; j < results[i].size(); ++j) {
       results[i][j].Reset();
-      results[i][j].SetStatus(std::move(statuses[index]));
+      results[i][j].SetStatus(statuses[index]);
       results[i][j].SetColumns(std::move(columns[index]));
       ++index;
     }

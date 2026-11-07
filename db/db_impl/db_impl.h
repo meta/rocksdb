@@ -1549,7 +1549,7 @@ class DBImpl : public DB
   int TEST_BGFlushesAllowed() const;
   int TEST_NumRunningBottomCompactions() const;
   size_t TEST_GetWalPreallocateBlockSize(uint64_t write_buffer_size) const;
-  void TEST_WaitForPeriodicTaskRun(std::function<void()> callback) const;
+  void TEST_WaitForPeriodicTaskRun(const std::function<void()>& callback) const;
   SeqnoToTimeMapping TEST_GetSeqnoToTimeMapping() const;
   const autovector<uint64_t>& TEST_GetFilesToQuarantine() const;
   size_t TEST_EstimateInMemoryStatsHistorySize() const;
@@ -1907,7 +1907,7 @@ class DBImpl : public DB
   void MaybeDeleteObsoleteOptionsFiles();
   Status DeleteObsoleteOptionsFiles(bool schedule_only);
 
-  void NotifyOnManualFlushScheduled(autovector<ColumnFamilyData*> cfds,
+  void NotifyOnManualFlushScheduled(const autovector<ColumnFamilyData*>& cfds,
                                     FlushReason flush_reason);
 
   void NotifyOnFlushBegin(ColumnFamilyData* cfd, FileMetaData* file_meta,
@@ -2468,7 +2468,11 @@ class DBImpl : public DB
     int job_id;
     PurgeFileInfo(std::string fn, std::string d, FileType t, uint64_t num,
                   int jid)
-        : fname(fn), dir_to_sync(d), type(t), number(num), job_id(jid) {}
+        : fname(std::move(fn)),
+          dir_to_sync(std::move(d)),
+          type(t),
+          number(num),
+          job_id(jid) {}
   };
 
   // Argument required by background flush thread.
@@ -3599,7 +3603,7 @@ class DBImpl : public DB
   Status DisableFileDeletionsWithLock();
 
   Status IncreaseFullHistoryTsLowImpl(ColumnFamilyData* cfd,
-                                      std::string ts_low);
+                                      const std::string& ts_low);
 
   // Passes GetMergeOperands collection options to every lookup layer through
   // merge_context. The caller's output array is not touched here.

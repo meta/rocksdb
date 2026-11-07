@@ -20,7 +20,7 @@ KVVector MakeMockFile(std::initializer_list<KVPair> l) { return KVVector(l); }
 void SortKVVector(KVVector* kv_vector, const Comparator* ucmp) {
   InternalKeyComparator icmp(ucmp);
   std::sort(kv_vector->begin(), kv_vector->end(),
-            [icmp](KVPair a, KVPair b) -> bool {
+            [icmp](const KVPair& a, const KVPair& b) -> bool {
               return icmp.Compare(a.first, b.first) < 0;
             });
 }
@@ -44,7 +44,7 @@ class MockTableIterator : public InternalIterator {
     KVPair target_pair(target.ToString(), "");
     InternalKeyComparator icmp(BytewiseComparator());
     itr_ = std::lower_bound(table_.begin(), table_.end(), target_pair,
-                            [icmp](KVPair a, KVPair b) -> bool {
+                            [icmp](const KVPair& a, const KVPair& b) -> bool {
                               return icmp.Compare(a.first, b.first) < 0;
                             });
   }
@@ -53,7 +53,7 @@ class MockTableIterator : public InternalIterator {
     KVPair target_pair(target.ToString(), "");
     InternalKeyComparator icmp(BytewiseComparator());
     itr_ = std::upper_bound(table_.begin(), table_.end(), target_pair,
-                            [icmp](KVPair a, KVPair b) -> bool {
+                            [icmp](const KVPair& a, const KVPair& b) -> bool {
                               return icmp.Compare(a.first, b.first) < 0;
                             });
     Prev();

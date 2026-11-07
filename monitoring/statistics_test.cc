@@ -38,7 +38,7 @@ TEST_F(StatisticsTest, SanityTickers) {
             TickersNameMap.size());
 
   for (uint32_t t = 0; t < Tickers::TICKER_ENUM_MAX; t++) {
-    auto pair = TickersNameMap[static_cast<size_t>(t)];
+    const auto& pair = TickersNameMap[static_cast<size_t>(t)];
     ASSERT_EQ(pair.first, t) << "Miss match at " << pair.second;
   }
 }
@@ -50,7 +50,7 @@ TEST_F(StatisticsTest, SanityHistograms) {
             HistogramsNameMap.size());
 
   for (uint32_t h = 0; h < Histograms::HISTOGRAM_ENUM_MAX; h++) {
-    auto pair = HistogramsNameMap[static_cast<size_t>(h)];
+    const auto& pair = HistogramsNameMap[static_cast<size_t>(h)];
     ASSERT_EQ(pair.first, h) << "Miss match at " << pair.second;
   }
 }

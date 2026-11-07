@@ -5,6 +5,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <functional>
+#include <utility>
 
 #include "db/db_test_util.h"
 #include "port/port.h"
@@ -68,8 +69,8 @@ class ImportColumnFamilyTest : public DBTestBase {
                                         SequenceNumber smallest_seqno,
                                         SequenceNumber largest_seqno) {
     LiveFileMetaData metadata;
-    metadata.name = name;
-    metadata.db_path = path;
+    metadata.name = std::move(name);
+    metadata.db_path = std::move(path);
     metadata.smallest_seqno = smallest_seqno;
     metadata.largest_seqno = largest_seqno;
     metadata.level = level;

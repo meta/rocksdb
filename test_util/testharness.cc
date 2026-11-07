@@ -81,16 +81,16 @@ std::string TmpDir(Env* env) {
   return dir;
 }
 
-std::string PerThreadDBPath(std::string dir, std::string name) {
+std::string PerThreadDBPath(const std::string& dir, const std::string& name) {
   size_t tid = std::hash<std::thread::id>()(std::this_thread::get_id());
   return dir + "/" + name + "_" + GetPidStr() + "_" + std::to_string(tid);
 }
 
-std::string PerThreadDBPath(std::string name) {
+std::string PerThreadDBPath(const std::string& name) {
   return PerThreadDBPath(test::TmpDir(), name);
 }
 
-std::string PerThreadDBPath(Env* env, std::string name) {
+std::string PerThreadDBPath(Env* env, const std::string& name) {
   return PerThreadDBPath(test::TmpDir(env), name);
 }
 

@@ -269,7 +269,8 @@ class LogTest
   }
 
   void CheckRecordAndTimestampSize(
-      std::string record, UnorderedMap<uint32_t, size_t>& expected_ts_sz) {
+      const std::string& record,
+      UnorderedMap<uint32_t, size_t>& expected_ts_sz) {
     UnorderedMap<uint32_t, size_t> recorded_ts_sz;
     ASSERT_EQ(record,
               Read(WALRecoveryMode::

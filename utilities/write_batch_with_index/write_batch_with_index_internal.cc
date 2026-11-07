@@ -5,6 +5,8 @@
 
 #include "utilities/write_batch_with_index/write_batch_with_index_internal.h"
 
+#include <utility>
+
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 #include "db/merge_helper.h"
@@ -176,7 +178,7 @@ Status BaseDeltaIterator::status() const {
   return delta_iterator_->status();
 }
 
-void BaseDeltaIterator::Invalidate(Status s) { status_ = s; }
+void BaseDeltaIterator::Invalidate(Status s) { status_ = std::move(s); }
 
 void BaseDeltaIterator::AssertInvariants() {
 #ifndef NDEBUG
@@ -980,7 +982,7 @@ WBWIIteratorImpl::Result WriteBatchWithIndexInternal::GetEntityFromBatch(
     static Status SetWideColumnValue(const Slice& entity, OutputType* output) {
       assert(output);
 
-      const Status s = output->SetWideColumnValue(entity);
+      Status s = output->SetWideColumnValue(entity);
       if (!s.ok()) {
         ClearOutput(output);
         return s;

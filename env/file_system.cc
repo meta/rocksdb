@@ -5,6 +5,8 @@
 //
 #include "rocksdb/file_system.h"
 
+#include <utility>
+
 #include "env/composite_env_wrapper.h"
 #include "env/env_chroot.h"
 #include "env/env_encryption_ctr.h"
@@ -137,7 +139,7 @@ IOStatus FileSystem::NewLogger(const std::string& fname,
   // TODO: Tune the buffer size.
   options.writable_file_max_buffer_size = 1024 * 1024;
   std::unique_ptr<FSWritableFile> writable_file;
-  const IOStatus status = NewWritableFile(fname, options, &writable_file, dbg);
+  IOStatus status = NewWritableFile(fname, options, &writable_file, dbg);
   if (!status.ok()) {
     return status;
   }
@@ -301,7 +303,7 @@ DirFsyncOptions::DirFsyncOptions() { reason = kDefault; }
 
 DirFsyncOptions::DirFsyncOptions(std::string file_renamed_new_name) {
   reason = kFileRenamed;
-  renamed_new_name = file_renamed_new_name;
+  renamed_new_name = std::move(file_renamed_new_name);
 }
 
 DirFsyncOptions::DirFsyncOptions(FsyncReason fsync_reason) {

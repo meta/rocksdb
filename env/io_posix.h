@@ -36,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "port/lang.h"
 #include "port/port.h"
@@ -170,7 +171,7 @@ struct Posix_IOHandle {
                  uint64_t _offset, size_t _len, char* _scratch,
                  bool _use_direct_io, size_t _alignment)
       : iu(_iu),
-        cb(_cb),
+        cb(std::move(_cb)),
         cb_arg(_cb_arg),
         offset(_offset),
         len(_len),
@@ -290,9 +291,9 @@ class LogicalBlockSizeCache {
       std::function<Status(const std::string&, size_t*)>
           get_logical_block_size_of_directory =
               PosixHelper::GetLogicalBlockSizeOfDirectory)
-      : get_logical_block_size_of_fd_(get_logical_block_size_of_fd),
+      : get_logical_block_size_of_fd_(std::move(get_logical_block_size_of_fd)),
         get_logical_block_size_of_directory_(
-            get_logical_block_size_of_directory) {}
+            std::move(get_logical_block_size_of_directory)) {}
 
   // Takes the following actions:
   // 1. Increases reference count of the directories;

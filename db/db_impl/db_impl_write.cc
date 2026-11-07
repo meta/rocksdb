@@ -96,7 +96,7 @@ class PutEntityFastPathWriteCallback final : public WriteCallback {
 // Convenience methods
 Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
                    const Slice& key, const Slice& val) {
-  const Status s = FailIfCfHasTs(column_family);
+  Status s = FailIfCfHasTs(column_family);
   if (!s.ok()) {
     return s;
   }
@@ -105,7 +105,7 @@ Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
 
 Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
                    const Slice& key, const Slice& ts, const Slice& val) {
-  const Status s = FailIfTsMismatchCf(column_family, ts);
+  Status s = FailIfTsMismatchCf(column_family, ts);
   if (!s.ok()) {
     return s;
   }
@@ -115,7 +115,7 @@ Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
 Status DBImpl::PutEntity(const WriteOptions& options,
                          ColumnFamilyHandle* column_family, const Slice& key,
                          const WideColumns& columns) {
-  const Status s = FailIfCfHasTs(column_family);
+  Status s = FailIfCfHasTs(column_family);
   if (!s.ok()) {
     return s;
   }
@@ -131,7 +131,7 @@ Status DBImpl::PutEntity(const WriteOptions& options, const Slice& key,
   }
 
   for (const AttributeGroup& ag : attribute_groups) {
-    const Status s = FailIfCfHasTs(ag.column_family());
+    Status s = FailIfCfHasTs(ag.column_family());
     if (!s.ok()) {
       return s;
     }
@@ -141,7 +141,7 @@ Status DBImpl::PutEntity(const WriteOptions& options, const Slice& key,
 
 Status DBImpl::Merge(const WriteOptions& o, ColumnFamilyHandle* column_family,
                      const Slice& key, const Slice& val) {
-  const Status s = FailIfCfHasTs(column_family);
+  Status s = FailIfCfHasTs(column_family);
   if (!s.ok()) {
     return s;
   }
@@ -155,7 +155,7 @@ Status DBImpl::Merge(const WriteOptions& o, ColumnFamilyHandle* column_family,
 
 Status DBImpl::Merge(const WriteOptions& o, ColumnFamilyHandle* column_family,
                      const Slice& key, const Slice& ts, const Slice& val) {
-  const Status s = FailIfTsMismatchCf(column_family, ts);
+  Status s = FailIfTsMismatchCf(column_family, ts);
   if (!s.ok()) {
     return s;
   }
@@ -164,7 +164,7 @@ Status DBImpl::Merge(const WriteOptions& o, ColumnFamilyHandle* column_family,
 
 Status DBImpl::Delete(const WriteOptions& write_options,
                       ColumnFamilyHandle* column_family, const Slice& key) {
-  const Status s = FailIfCfHasTs(column_family);
+  Status s = FailIfCfHasTs(column_family);
   if (!s.ok()) {
     return s;
   }
@@ -174,7 +174,7 @@ Status DBImpl::Delete(const WriteOptions& write_options,
 Status DBImpl::Delete(const WriteOptions& write_options,
                       ColumnFamilyHandle* column_family, const Slice& key,
                       const Slice& ts) {
-  const Status s = FailIfTsMismatchCf(column_family, ts);
+  Status s = FailIfTsMismatchCf(column_family, ts);
   if (!s.ok()) {
     return s;
   }
@@ -184,7 +184,7 @@ Status DBImpl::Delete(const WriteOptions& write_options,
 Status DBImpl::SingleDelete(const WriteOptions& write_options,
                             ColumnFamilyHandle* column_family,
                             const Slice& key) {
-  const Status s = FailIfCfHasTs(column_family);
+  Status s = FailIfCfHasTs(column_family);
   if (!s.ok()) {
     return s;
   }
@@ -194,7 +194,7 @@ Status DBImpl::SingleDelete(const WriteOptions& write_options,
 Status DBImpl::SingleDelete(const WriteOptions& write_options,
                             ColumnFamilyHandle* column_family, const Slice& key,
                             const Slice& ts) {
-  const Status s = FailIfTsMismatchCf(column_family, ts);
+  Status s = FailIfTsMismatchCf(column_family, ts);
   if (!s.ok()) {
     return s;
   }
@@ -204,7 +204,7 @@ Status DBImpl::SingleDelete(const WriteOptions& write_options,
 Status DBImpl::DeleteRange(const WriteOptions& write_options,
                            ColumnFamilyHandle* column_family,
                            const Slice& begin_key, const Slice& end_key) {
-  const Status s = FailIfCfHasTs(column_family);
+  Status s = FailIfCfHasTs(column_family);
   if (!s.ok()) {
     return s;
   }
@@ -215,7 +215,7 @@ Status DBImpl::DeleteRange(const WriteOptions& write_options,
                            ColumnFamilyHandle* column_family,
                            const Slice& begin_key, const Slice& end_key,
                            const Slice& ts) {
-  const Status s = FailIfTsMismatchCf(column_family, ts);
+  Status s = FailIfTsMismatchCf(column_family, ts);
   if (!s.ok()) {
     return s;
   }
@@ -3694,7 +3694,7 @@ Status DB::PutEntity(const WriteOptions& options,
                    options.protection_bytes_per_key,
                    default_cf_ucmp->timestamp_size());
 
-  const Status s = batch.PutEntity(column_family, key, columns);
+  Status s = batch.PutEntity(column_family, key, columns);
   if (!s.ok()) {
     return s;
   }
@@ -3711,7 +3711,7 @@ Status DB::PutEntity(const WriteOptions& options, const Slice& key,
   WriteBatch batch(0 /* reserved_bytes */, 0 /* max_bytes */,
                    options.protection_bytes_per_key,
                    default_cf_ucmp->timestamp_size());
-  const Status s = batch.PutEntity(key, attribute_groups);
+  Status s = batch.PutEntity(key, attribute_groups);
   if (!s.ok()) {
     return s;
   }

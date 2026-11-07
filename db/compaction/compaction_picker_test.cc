@@ -5527,17 +5527,18 @@ TEST_F(CompactionPickerTest, FIFORatioBasedCompactionFallbackToOldPath) {
 // ============================================================================
 
 TEST_F(CompactionPickerTest, FIFOOptionValidation) {
-  auto validate = [](std::function<void(ColumnFamilyOptions&)> configure) {
-    ColumnFamilyOptions cf_opts;
-    cf_opts.compaction_style = kCompactionStyleFIFO;
-    cf_opts.compaction_options_fifo.allow_compaction = true;
-    cf_opts.compaction_options_fifo.use_kv_ratio_compaction = true;
-    cf_opts.compaction_options_fifo.max_data_files_size =
-        1ULL * 1024 * 1024 * 1024;
-    cf_opts.num_levels = 1;
-    configure(cf_opts);
-    return ColumnFamilyData::ValidateOptions(DBOptions(), cf_opts);
-  };
+  auto validate =
+      [](const std::function<void(ColumnFamilyOptions&)>& configure) {
+        ColumnFamilyOptions cf_opts;
+        cf_opts.compaction_style = kCompactionStyleFIFO;
+        cf_opts.compaction_options_fifo.allow_compaction = true;
+        cf_opts.compaction_options_fifo.use_kv_ratio_compaction = true;
+        cf_opts.compaction_options_fifo.max_data_files_size =
+            1ULL * 1024 * 1024 * 1024;
+        cf_opts.num_levels = 1;
+        configure(cf_opts);
+        return ColumnFamilyData::ValidateOptions(DBOptions(), cf_opts);
+      };
 
   // These used to be InvalidArgument, now accepted (handled at runtime
   // in the picker with fallback to cost-based intra-L0 compaction):

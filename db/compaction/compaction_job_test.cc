@@ -11,6 +11,7 @@
 #include <map>
 #include <string>
 #include <tuple>
+#include <utility>
 
 #include "db/blob/blob_index.h"
 #include "db/column_family.h"
@@ -631,7 +632,7 @@ class CompactionJobTestBase : public testing::Test {
   // input_files[i] on input_levels[i]
   void RunLastLevelCompaction(
       const std::vector<std::vector<FileMetaData*>>& input_files,
-      const std::vector<int> input_levels,
+      const std::vector<int>& input_levels,
       std::function<void(Compaction& comp)>&& verify_func,
       std::vector<SequenceNumber>&& snapshots = {}) {
     const int kLastLevel = cf_options_.num_levels - 1;
@@ -735,7 +736,7 @@ class CompactionJobTestBase : public testing::Test {
       ASSERT_EQ(compaction_job_stats_.num_input_files, num_input_files);
 
       VerifyTables(output_level, expected_results,
-                   expected_oldest_blob_file_numbers);
+                   std::move(expected_oldest_blob_file_numbers));
     }
 
     if (check_get_priority) {

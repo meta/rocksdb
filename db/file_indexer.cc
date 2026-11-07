@@ -143,8 +143,8 @@ void FileIndexer::UpdateIndex(Arena* arena, const size_t num_levels,
 void FileIndexer::CalculateLB(
     const std::vector<FileMetaData*>& upper_files,
     const std::vector<FileMetaData*>& lower_files, IndexLevel* index_level,
-    std::function<int(const FileMetaData*, const FileMetaData*)> cmp_op,
-    std::function<void(IndexUnit*, int32_t)> set_index) {
+    const std::function<int(const FileMetaData*, const FileMetaData*)>& cmp_op,
+    const std::function<void(IndexUnit*, int32_t)>& set_index) {
   const int32_t upper_size = static_cast<int32_t>(upper_files.size());
   const int32_t lower_size = static_cast<int32_t>(lower_files.size());
   int32_t upper_idx = 0;
@@ -180,8 +180,8 @@ void FileIndexer::CalculateLB(
 void FileIndexer::CalculateRB(
     const std::vector<FileMetaData*>& upper_files,
     const std::vector<FileMetaData*>& lower_files, IndexLevel* index_level,
-    std::function<int(const FileMetaData*, const FileMetaData*)> cmp_op,
-    std::function<void(IndexUnit*, int32_t)> set_index) {
+    const std::function<int(const FileMetaData*, const FileMetaData*)>& cmp_op,
+    const std::function<void(IndexUnit*, int32_t)>& set_index) {
   const int32_t upper_size = static_cast<int32_t>(upper_files.size());
   const int32_t lower_size = static_cast<int32_t>(lower_files.size());
   int32_t upper_idx = upper_size - 1;

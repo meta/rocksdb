@@ -6,6 +6,7 @@
 #include "db/blob/blob_file_builder.h"
 
 #include <cassert>
+#include <utility>
 
 #include "db/blob/blob_contents.h"
 #include "db/blob/blob_file_addition.h"

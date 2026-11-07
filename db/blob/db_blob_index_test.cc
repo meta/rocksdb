@@ -1411,8 +1411,9 @@ TEST_F(DBBlobIndexTest, Iterate) {
 
   auto verify = [&](int index, Status::Code expected_status,
                     const Slice& forward_value, const Slice& backward_value,
-                    std::function<Iterator*()> create_iterator,
-                    std::function<void(Iterator*)> extra_check = nullptr) {
+                    const std::function<Iterator*()>& create_iterator,
+                    const std::function<void(Iterator*)>& extra_check =
+                        nullptr) {
     // Seek
     auto* iterator = create_iterator();
     ASSERT_OK(iterator->status());
@@ -2720,7 +2721,7 @@ TEST_F(DBBlobIndexTest, IntegratedBlobIterate) {
     return get_key(index) + "_value" + std::to_string(version);
   };
 
-  auto check_iterator = [&](Iterator* iterator, Status expected_status,
+  auto check_iterator = [&](Iterator* iterator, const Status& expected_status,
                             const Slice& expected_value) {
     ASSERT_EQ(expected_status, iterator->status());
     if (expected_status.ok()) {
@@ -2731,7 +2732,7 @@ TEST_F(DBBlobIndexTest, IntegratedBlobIterate) {
     }
   };
 
-  auto verify = [&](size_t index, Status expected_status,
+  auto verify = [&](size_t index, const Status& expected_status,
                     const Slice& expected_value) {
     // Seek
     {
