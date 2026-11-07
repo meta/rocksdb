@@ -75,7 +75,7 @@ int main() {
   }
   ROCKSDB_NAMESPACE::Options options;
   options.create_if_missing = true;
-  options.merge_operator.reset(new MyMerge);
+  options.merge_operator = std::make_shared<MyMerge>();
   options.compaction_filter = &filter;
   status = ROCKSDB_NAMESPACE::DB::Open(options, kDBPath, &db);
   assert(status.ok());

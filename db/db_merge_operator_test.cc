@@ -143,7 +143,7 @@ TEST_F(DBMergeOperatorTest, LimitMergeOperands) {
 TEST_F(DBMergeOperatorTest, MergeErrorOnRead) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
   options.env = env_;
   Reopen(options);
   ASSERT_OK(Merge("k1", "v1"));
@@ -156,7 +156,7 @@ TEST_F(DBMergeOperatorTest, MergeErrorOnRead) {
 TEST_F(DBMergeOperatorTest, MergeErrorOnWrite) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
   options.max_successive_merges = 3;
   options.env = env_;
   Reopen(options);
@@ -172,7 +172,7 @@ TEST_F(DBMergeOperatorTest, MergeErrorOnWrite) {
 TEST_F(DBMergeOperatorTest, MergeErrorOnIteration) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
   options.env = env_;
 
   DestroyAndReopen(options);
@@ -228,7 +228,7 @@ TEST_F(DBMergeOperatorTest, MergeOperatorFailsWithMustMerge) {
   // only by APIs that do not require merging, such as `GetMergeOperands()`.
   const int kNumOperands = 3;
   Options options = CurrentOptions();
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
   options.env = env_;
   Reopen(options);
 
@@ -484,7 +484,7 @@ TEST_F(DBMergeOperatorTest, DataBlockBinaryAndHash) {
   // DataBlockBinaryAndHash.
   Options options = CurrentOptions();
   options.create_if_missing = true;
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
   options.env = env_;
   BlockBasedTableOptions table_options;
   table_options.block_restart_interval = 16;

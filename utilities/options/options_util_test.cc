@@ -296,7 +296,7 @@ TEST_F(OptionsUtilTest, SanityCheck) {
     ASSERT_NOK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
-    cf_descs[0].options.merge_operator.reset(new DummyMergeOperator());
+    cf_descs[0].options.merge_operator = std::make_shared<DummyMergeOperator>();
     ASSERT_NOK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
