@@ -12,6 +12,7 @@
 
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
+#include "db/log_format.h"
 #include "options/options_helper.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
@@ -142,6 +143,54 @@ class DBWALTest : public DBWALTestBase {
  public:
   DBWALTest() : DBWALTestBase("/db_wal_test") {}
 };
+
+TEST_F(DBWALTest, RecyclableTypeInLegacyLog) {
+  for (size_t corrupt_index : {size_t{0}, size_t{1}}) {
+    SCOPED_TRACE(corrupt_index);
+    for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                                 WALRecoveryMode::kAbsoluteConsistency,
+                                 WALRecoveryMode::kPointInTimeRecovery,
+                                 WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+      SCOPED_TRACE(static_cast<int>(mode));
+      Options options;
+      options.env = env_;
+      options.create_if_missing = true;
+      options.avoid_flush_during_shutdown = true;
+      options.wal_recovery_mode = mode;
+      DestroyAndReopen(options);
+
+      const uint64_t wal_number = dbfull()->TEST_GetCurrentLogNumber();
+      const std::string wal_path = LogFileName(dbname_, wal_number);
+      ASSERT_OK(Put("key0", "value0"));
+      uint64_t second_record_offset;
+      ASSERT_OK(env_->GetFileSize(wal_path, &second_record_offset));
+      ASSERT_OK(Put("key1", "value1"));
+      ASSERT_OK(Put("key2", "value2"));
+      Close();
+
+      std::string contents;
+      ASSERT_OK(ReadFileToString(env_, wal_path, &contents));
+      ASSERT_GT(contents.size(), second_record_offset + 6);
+      ASSERT_EQ(log::kFullType, contents[6]);
+      const uint64_t corrupt_offset =
+          corrupt_index == 0 ? 0 : second_record_offset;
+      ASSERT_EQ(log::kFullType, contents[corrupt_offset + 6]);
+      contents[corrupt_offset + 6] ^= log::kFullType ^ log::kRecyclableFullType;
+      CreateWalWithContents(wal_number, contents);
+
+      Status s = TryReopen(options);
+      if (mode == WALRecoveryMode::kTolerateCorruptedTailRecords ||
+          mode == WALRecoveryMode::kAbsoluteConsistency) {
+        ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+      } else {
+        ASSERT_OK(s);
+        ASSERT_EQ(corrupt_index == 0 ? "NOT_FOUND" : "value0", Get("key0"));
+        ASSERT_EQ("NOT_FOUND", Get("key1"));
+        ASSERT_EQ("NOT_FOUND", Get("key2"));
+      }
+    }
+  }
+}
 
 // A SpecialEnv enriched to give more insight about deleted files
 class EnrichedSpecialEnv : public SpecialEnv {

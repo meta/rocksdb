@@ -412,7 +412,9 @@ class DBImplSecondary : public DBImpl {
   Status FindNewLogNumbers(std::vector<uint64_t>* logs);
   // Replays WALs after manifest recovery, refreshes log_readers_ as needed, and
   // drops recovered transactions the primary resolved. Cleanup runs even when
-  // `log_numbers` is empty.
+  // `log_numbers` is empty. Replay stops at the first WAL whose reader stopped
+  // at data left by a recycled file's previous use, and resumes with later
+  // WALs once the primary's flushes make that WAL obsolete.
   // REQUIRES: log_numbers are sorted in ascending order
   Status RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
                          SequenceNumber* next_sequence,

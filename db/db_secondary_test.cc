@@ -1758,6 +1758,69 @@ TEST_F(DBSecondaryTest, CatchUpTailsCurrentWalWhenFutureWalExists) {
   ASSERT_EQ("value2", value);
 }
 
+TEST_F(DBSecondaryTest, StopsAtOldDataInRecycledWal) {
+  // A recycled WAL keeps its previous contents after the records written so
+  // far, and the primary later writes over them. The secondary must stop
+  // before the old data rather than skip what is written there, and must not
+  // replay a newer WAL meanwhile, which would expose newer writes without the
+  // older ones.
+  Options options;
+  options.env = env_;
+  options.recycle_log_file_num = 1;
+  CreateAndReopenWithCF({"cf1"}, options);
+
+  // Fill a WAL, retire it to the recycle list, and reuse it.
+  Random rnd(301);
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put(0, Key(i), rnd.RandomString(1000)));
+  }
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Put(1, "cf1_key", "v1"));
+  ASSERT_OK(Flush(1));
+
+  ASSERT_OK(Put(0, "k1", "v1"));
+  ASSERT_OK(db_->FlushWAL(/*sync=*/true));
+  std::unique_ptr<WalFile> recycled_wal;
+  ASSERT_OK(db_->GetCurrentWalFile(&recycled_wal));
+  uint64_t recycled_wal_size = 0;
+  ASSERT_OK(env_->GetFileSize(LogFileName(dbname_, recycled_wal->LogNumber()),
+                              &recycled_wal_size));
+  ASSERT_GT(recycled_wal_size, 100 * 1000);
+
+  Options secondary_options;
+  secondary_options.env = env_;
+  secondary_options.max_open_files = -1;
+  OpenSecondaryWithColumnFamilies({"cf1"}, secondary_options);
+  VerifySecondaryValue("k1", "v1");
+
+  // "k2" goes over the old data the secondary stopped at. Flushing "cf1" then
+  // moves the primary to a newer WAL, which receives "k3", while the default
+  // column family still needs the recycled WAL.
+  ASSERT_OK(Put(0, "k2", "v2"));
+  ASSERT_OK(Put(1, "cf1_key", "v2"));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(Put(0, "k3", "v3"));
+  ASSERT_OK(db_->FlushWAL(/*sync=*/true));
+  std::unique_ptr<WalFile> newer_wal;
+  ASSERT_OK(db_->GetCurrentWalFile(&newer_wal));
+  ASSERT_GT(newer_wal->LogNumber(), recycled_wal->LogNumber());
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  VerifySecondaryValue("k1", "v1");
+  std::string value;
+  ASSERT_TRUE(db_secondary_->Get(ReadOptions(), "k2", &value).IsNotFound());
+  ASSERT_TRUE(db_secondary_->Get(ReadOptions(), "k3", &value).IsNotFound());
+  // The flush of "cf1", which is newer than "k2", is still visible.
+  VerifySecondaryValue(handles_secondary_[1], "cf1_key", "v2");
+
+  // Once the primary flushes them, the writes are readable from table files.
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  VerifySecondaryValue("k1", "v1");
+  VerifySecondaryValue("k2", "v2");
+  VerifySecondaryValue("k3", "v3");
+}
+
 TEST_F(DBSecondaryTest, SecondaryTailingBug_ISSUE_8467) {
   Options options;
   options.env = env_;
