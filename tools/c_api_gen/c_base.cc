@@ -8911,14 +8911,9 @@ void rocksdb_free(void* ptr) { free(ptr); }
 rocksdb_pinnableslice_t* rocksdb_get_pinned(
     rocksdb_t* db, const rocksdb_readoptions_t* options, const char* key,
     size_t keylen, char** errptr) {
-  rocksdb_pinnableslice_t* v = new (rocksdb_pinnableslice_t);
-  Status s = db->rep->Get(options->rep, db->rep->DefaultColumnFamily(),
-                          Slice(key, keylen), &v->rep);
-  if (!s.ok()) {
-    delete (v);
-    if (!s.IsNotFound()) {
-      SaveError(errptr, s);
-    }
+  rocksdb_pinnableslice_t* v = rocksdb_pinnableslice_create();
+  if (!rocksdb_get_pinned_into(db, options, key, keylen, v, errptr)) {
+    rocksdb_pinnableslice_destroy(v);
     return nullptr;
   }
   return v;
@@ -8928,18 +8923,55 @@ rocksdb_pinnableslice_t* rocksdb_get_pinned_cf(
     rocksdb_t* db, const rocksdb_readoptions_t* options,
     rocksdb_column_family_handle_t* column_family, const char* key,
     size_t keylen, char** errptr) {
-  rocksdb_pinnableslice_t* v = new (rocksdb_pinnableslice_t);
-  Status s = db->rep->Get(options->rep, column_family->rep, Slice(key, keylen),
-                          &v->rep);
-  if (!s.ok()) {
-    delete v;
-    if (!s.IsNotFound()) {
-      SaveError(errptr, s);
-    }
+  rocksdb_pinnableslice_t* v = rocksdb_pinnableslice_create();
+  if (!rocksdb_get_pinned_cf_into(db, options, column_family, key, keylen, v,
+                                  errptr)) {
+    rocksdb_pinnableslice_destroy(v);
     return nullptr;
   }
   return v;
 }
+
+unsigned char rocksdb_get_pinned_into(rocksdb_t* db,
+                                      const rocksdb_readoptions_t* options,
+                                      const char* key, size_t keylen,
+                                      rocksdb_pinnableslice_t* value,
+                                      char** errptr) {
+  value->rep.Reset();
+  Status s = db->rep->Get(options->rep, db->rep->DefaultColumnFamily(),
+                          Slice(key, keylen), &value->rep);
+  if (s.ok()) {
+    return 1;
+  }
+  value->rep.Reset();
+  if (!s.IsNotFound()) {
+    SaveError(errptr, s);
+  }
+  return 0;
+}
+
+unsigned char rocksdb_get_pinned_cf_into(
+    rocksdb_t* db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, const char* key,
+    size_t keylen, rocksdb_pinnableslice_t* value, char** errptr) {
+  value->rep.Reset();
+  Status s = db->rep->Get(options->rep, column_family->rep, Slice(key, keylen),
+                          &value->rep);
+  if (s.ok()) {
+    return 1;
+  }
+  value->rep.Reset();
+  if (!s.IsNotFound()) {
+    SaveError(errptr, s);
+  }
+  return 0;
+}
+
+rocksdb_pinnableslice_t* rocksdb_pinnableslice_create() {
+  return new rocksdb_pinnableslice_t;
+}
+
+void rocksdb_pinnableslice_reset(rocksdb_pinnableslice_t* v) { v->rep.Reset(); }
 
 void rocksdb_pinnableslice_destroy(rocksdb_pinnableslice_t* v) { delete v; }
 

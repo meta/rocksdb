@@ -2464,6 +2464,54 @@ int main(int argc, char** argv) {
     CheckPinGet(db, roptions, "notfound", NULL);
   }
 
+  StartPhase("pin_get_reuse");
+  {
+    rocksdb_pinnableslice_t* p = rocksdb_pinnableslice_create();
+    size_t val_len;
+    const char* val;
+    unsigned char found;
+
+    found = rocksdb_get_pinned_into(db, roptions, "box", 3, p, &err);
+    CheckNoError(err);
+    CheckCondition(found);
+    val = rocksdb_pinnableslice_value(p, &val_len);
+    CheckEqual("c", val, val_len);
+
+    found = rocksdb_get_pinned_into(db, roptions, "foo", 3, p, &err);
+    CheckNoError(err);
+    CheckCondition(found);
+    val = rocksdb_pinnableslice_value(p, &val_len);
+    CheckEqual("hello", val, val_len);
+
+    found = rocksdb_get_pinned_into(db, roptions, "notfound", 8, p, &err);
+    CheckNoError(err);
+    CheckCondition(!found);
+    rocksdb_pinnableslice_value(p, &val_len);
+    CheckCondition(val_len == 0);
+
+    rocksdb_pinnableslice_destroy(p);
+  }
+
+  StartPhase("pin_reset");
+  {
+    rocksdb_pinnableslice_t* p = rocksdb_pinnableslice_create();
+    size_t val_len;
+    const char* val;
+    unsigned char found;
+
+    found = rocksdb_get_pinned_into(db, roptions, "box", 3, p, &err);
+    CheckNoError(err);
+    CheckCondition(found);
+    val = rocksdb_pinnableslice_value(p, &val_len);
+    CheckEqual("c", val, val_len);
+
+    rocksdb_pinnableslice_reset(p);
+    rocksdb_pinnableslice_value(p, &val_len);
+    CheckCondition(val_len == 0);
+
+    rocksdb_pinnableslice_destroy(p);
+  }
+
   StartPhase("approximate_sizes");
   {
     int i;
