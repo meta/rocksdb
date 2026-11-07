@@ -9620,7 +9620,7 @@ class Benchmark {
       double u = static_cast<double>(rand_v) / FLAGS_num;
 
       // Generate the keyID based on the key hotness and prefix hotness
-      if (use_random_modeling) {
+      if (use_random_modeling && !use_prefix_modeling) {
         key_rand = ini_rand;
       } else if (use_prefix_modeling) {
         key_rand =
