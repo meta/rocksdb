@@ -614,6 +614,21 @@ BlockBasedTableFactory::BlockBasedTableFactory(
                 CacheEntryRole::kBlockBasedTableReader>>(
                 table_options_.block_cache));
   }
+
+  const auto readahead_charged =
+      table_options_.cache_usage_options.options_overrides
+          .at(CacheEntryRole::kReadaheadBuffer)
+          .charged;
+  if (table_options_.block_cache &&
+      readahead_charged == CacheEntryRoleOptions::Decision::kEnabled) {
+    // No delayed decrease: FilePrefetchBuffer gives back a failed reservation
+    // by decreasing the memory used, which must release the dummy entries.
+    shared_state_->readahead_cache_res_mgr =
+        std::make_shared<ConcurrentCacheReservationManager>(
+            std::make_shared<
+                CacheReservationManagerImpl<CacheEntryRole::kReadaheadBuffer>>(
+                table_options_.block_cache));
+  }
 }
 
 void BlockBasedTableFactory::InitializeOptions() {
@@ -767,6 +782,7 @@ Status BlockBasedTableFactory::NewTableReader(
       file_size, table_reader_options.block_protection_bytes_per_key,
       table_reader, table_reader_options.tail_size,
       shared_state_->table_reader_cache_res_mgr,
+      shared_state_->readahead_cache_res_mgr,
       table_reader_options.prefix_extractor,
       table_reader_options.compression_manager,
       prefetch_index_and_filter_in_cache, table_reader_options.skip_filters,
@@ -989,8 +1005,10 @@ Status BlockBasedTableFactory::ValidateOptions(
     static const std::set<CacheEntryRole> kMemoryChargingSupported = {
         CacheEntryRole::kCompressionDictionaryBuildingBuffer,
         CacheEntryRole::kFilterConstruction,
-        CacheEntryRole::kBlockBasedTableReader, CacheEntryRole::kFileMetadata,
-        CacheEntryRole::kBlobCache};
+        CacheEntryRole::kBlockBasedTableReader,
+        CacheEntryRole::kFileMetadata,
+        CacheEntryRole::kBlobCache,
+        CacheEntryRole::kReadaheadBuffer};
     if (options.charged != CacheEntryRoleOptions::Decision::kFallback &&
         kMemoryChargingSupported.count(role) == 0) {
       return Status::NotSupported(

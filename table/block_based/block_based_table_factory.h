@@ -109,6 +109,7 @@ class BlockBasedTableFactory : public TableFactory {
   // Share some state among cloned instances
   struct SharedState {
     std::shared_ptr<CacheReservationManager> table_reader_cache_res_mgr;
+    std::shared_ptr<CacheReservationManager> readahead_cache_res_mgr;
     TailPrefetchStats tail_prefetch_stats;
   };
   std::shared_ptr<SharedState> shared_state_;

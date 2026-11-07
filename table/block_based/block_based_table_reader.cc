@@ -743,6 +743,7 @@ Status BlockBasedTable::Open(
     uint8_t block_protection_bytes_per_key,
     std::unique_ptr<TableReader>* table_reader, uint64_t tail_size,
     std::shared_ptr<CacheReservationManager> table_reader_cache_res_mgr,
+    std::shared_ptr<CacheReservationManager> readahead_cache_res_mgr,
     const std::shared_ptr<const SliceTransform>& prefix_extractor,
     UnownedPtr<CompressionManager> compression_manager,
     const bool prefetch_index_and_filter_in_cache, const bool skip_filters,
@@ -785,7 +786,7 @@ Status BlockBasedTable::Open(
     s = PrefetchTail(ro, ioptions, file.get(), file_size, force_direct_prefetch,
                      tail_prefetch_stats, prefetch_all, preload_all,
                      &prefetch_buffer, ioptions.stats, tail_size,
-                     ioptions.logger);
+                     ioptions.logger, readahead_cache_res_mgr);
     // Return error in prefetch path to users.
     if (!s.ok()) {
       return s;
@@ -833,6 +834,7 @@ Status BlockBasedTable::Open(
   rep->file = std::move(file);
   rep->footer = footer;
   rep->blob_source_ = blob_source;
+  rep->readahead_cache_res_mgr = std::move(readahead_cache_res_mgr);
 
   // For fully portable/stable cache keys, we need to read the properties
   // block before setting up cache keys. TODO: consider setting up a bootstrap
@@ -1040,7 +1042,8 @@ Status BlockBasedTable::PrefetchTail(
     bool force_direct_prefetch, TailPrefetchStats* tail_prefetch_stats,
     const bool prefetch_all, const bool preload_all,
     std::unique_ptr<FilePrefetchBuffer>* prefetch_buffer, Statistics* stats,
-    uint64_t tail_size, Logger* const logger) {
+    uint64_t tail_size, Logger* const logger,
+    const std::shared_ptr<CacheReservationManager>& readahead_cache_res_mgr) {
   assert(tail_size <= file_size);
 
   size_t tail_prefetch_size = 0;
@@ -1112,6 +1115,9 @@ Status BlockBasedTable::PrefetchTail(
       ioptions.fs.get() /* fs */, nullptr /* clock */, stats,
       /* readahead_cb */ nullptr,
       FilePrefetchBufferUsage::kTableOpenPrefetchTail));
+  if (readahead_cache_res_mgr) {
+    (*prefetch_buffer)->SetCacheReservationManager(readahead_cache_res_mgr);
+  }
 
   if (s.ok()) {
     s = (*prefetch_buffer)->Prefetch(opts, file, prefetch_off, prefetch_len);
@@ -3176,6 +3182,9 @@ Status BlockBasedTable::VerifyChecksumInBlocks(
   readahead_params.max_readahead_size = readahead_size;
   FilePrefetchBuffer prefetch_buffer(
       readahead_params, !rep_->ioptions.allow_mmap_reads /* enable */);
+  if (rep_->readahead_cache_res_mgr) {
+    prefetch_buffer.SetCacheReservationManager(rep_->readahead_cache_res_mgr);
+  }
 
   for (index_iter->SeekToFirst(); index_iter->Valid(); index_iter->Next()) {
     s = index_iter->status();
