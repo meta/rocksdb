@@ -3263,10 +3263,13 @@ class DBImpl : public DB
 
   // Compute the repeat period for the kTriggerCompaction task, which ensures
   // compactions not dependent on writes (flushes) are eventually triggered when
-  // there are no writes (flushes). NOT thread safe; only called during DB open
-  // (StartPeriodicTaskScheduler). KNOWN LIMITATION: doesn't get updated with
-  // dynamic option updates. (Probably not worth the extra complexity.)
+  // there are no writes (flushes). Call only during DB open or while holding
+  // options_mutex_, which serializes changes to the options and CF set.
   uint64_t ComputeTriggerCompactionPeriod();
+
+  // Refresh the task after a change to its DB or CF options, or the CF set.
+  // Requires options_mutex_.
+  Status RegisterTriggerCompactionTask();
 
   // Cancel scheduled periodic tasks
   Status CancelPeriodicTaskScheduler();
