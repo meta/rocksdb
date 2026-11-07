@@ -769,8 +769,20 @@ Status CheckpointImpl::ExportColumnFamily(
           [&](const std::string& src_dirname, const std::string& fname) {
             ROCKS_LOG_INFO(db_options.info_log, "[%s] HardLinking %s",
                            cf_name.c_str(), fname.c_str());
-            return db_->GetEnv()->LinkFile(src_dirname + fname,
-                                           tmp_export_dir + fname);
+            Status link_status = db_->GetEnv()->LinkFile(
+                src_dirname + fname, tmp_export_dir + fname);
+            if (link_status.IsNotSupported()) {
+              ROCKS_LOG_INFO(db_options.info_log,
+                             "[%s] LinkFile not supported for %s. Falling back"
+                             " to copy.",
+                             cf_name.c_str(), fname.c_str());
+              Status copy_status = CopyFile(
+                  db_->GetFileSystem(), src_dirname + fname,
+                  Temperature::kUnknown, tmp_export_dir + fname,
+                  Temperature::kUnknown, 0, db_options.use_fsync, nullptr);
+              return copy_status;
+            }
+            return link_status;
           } /*link_file_cb*/,
           [&](const std::string& src_dirname, const std::string& fname) {
             ROCKS_LOG_INFO(db_options.info_log, "[%s] Copying %s",
