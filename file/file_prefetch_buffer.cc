@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cassert>
 
+#include "cache/cache_reservation_manager.h"
 #include "file/random_access_file_reader.h"
 #include "monitoring/histogram.h"
 #include "monitoring/iostats_context_imp.h"
@@ -72,6 +73,7 @@ void FilePrefetchBuffer::PrepareBufferForRead(
     buf->buffer_.AllocateNewBuffer(
         static_cast<size_t>(roundup_len), copy_data_to_new_buffer,
         aligned_useful_offset_in_buf, static_cast<size_t>(aligned_useful_len));
+    UpdateCacheReservation();
   } else if (aligned_useful_len > 0 && refit_tail) {
     // New buffer not needed. But memmove bytes from tail to the beginning
     // since aligned_useful_len is greater than 0.
@@ -87,6 +89,7 @@ void FilePrefetchBuffer::PrepareBufferForRead(
     buf->buffer_.AllocateNewBuffer(
         static_cast<size_t>(roundup_len), copy_data_to_new_buffer,
         aligned_useful_offset_in_buf, static_cast<size_t>(aligned_useful_len));
+    UpdateCacheReservation();
   }
 }
 
@@ -506,6 +509,7 @@ void FilePrefetchBuffer::HandleOverlappingSyncData(uint64_t offset,
     overlap_buf_->ClearBuffer();
     overlap_buf_->buffer_.Alignment(1);
     overlap_buf_->buffer_.AllocateNewBuffer(length);
+    UpdateCacheReservation();
     overlap_buf_->offset_ = offset;
     CopyDataToOverlapBuffer(buf, tmp_offset, tmp_length);
     UpdateStats(/*found_in_buffer=*/false, overlap_buf_->CurrentSize());
@@ -561,6 +565,7 @@ Status FilePrefetchBuffer::HandleOverlappingAsyncData(
     overlap_buf_->ClearBuffer();
     overlap_buf_->buffer_.Alignment(alignment);
     overlap_buf_->buffer_.AllocateNewBuffer(length);
+    UpdateCacheReservation();
     overlap_buf_->offset_ = offset;
     copy_to_overlap_buffer = true;
 
@@ -1119,4 +1124,65 @@ Status FilePrefetchBuffer::PrefetchRemBuffers(const IOOptions& opts,
   return s;
 }
 
+void FilePrefetchBuffer::SetCacheReservationManager(
+    std::shared_ptr<CacheReservationManager> cache_res_mgr) {
+  assert(cache_res_mgr_ == nullptr);
+  cache_res_mgr_ = std::move(cache_res_mgr);
+  UpdateCacheReservation();
+}
+
+size_t FilePrefetchBuffer::TotalBufferCapacity() const {
+  size_t total_capacity =
+      overlap_buf_ != nullptr ? overlap_buf_->buffer_.Capacity() : 0;
+  for (const BufferInfo* buf : bufs_) {
+    total_capacity += buf->buffer_.Capacity();
+  }
+  for (const BufferInfo* buf : free_bufs_) {
+    total_capacity += buf->buffer_.Capacity();
+  }
+  return total_capacity;
+}
+
+void FilePrefetchBuffer::UpdateCacheReservation() {
+  if (cache_res_mgr_ == nullptr) {
+    return;
+  }
+  const size_t total_capacity = TotalBufferCapacity();
+  if (total_capacity == reserved_memory_) {
+    return;
+  }
+  if (total_capacity > reserved_memory_) {
+    const size_t increase = total_capacity - reserved_memory_;
+    Status s = cache_res_mgr_->UpdateCacheReservation(increase,
+                                                      /*increase=*/true);
+    if (!s.ok()) {
+      // Best effort: leave this increase uncharged and give back the part of
+      // it that was reserved, so that a failed reservation does not leave the
+      // cache fuller. A later buffer allocation retries the charge. Releasing a
+      // reservation does not fail.
+      Status release_s =
+          cache_res_mgr_->UpdateCacheReservation(increase, /*increase=*/false);
+      release_s.PermitUncheckedError();
+      return;
+    }
+  } else {
+    // Releasing a reservation does not fail.
+    Status s = cache_res_mgr_->UpdateCacheReservation(
+        reserved_memory_ - total_capacity, /*increase=*/false);
+    s.PermitUncheckedError();
+  }
+  reserved_memory_ = total_capacity;
+}
+
+void FilePrefetchBuffer::ReleaseCacheReservation() {
+  if (reserved_memory_ == 0) {
+    return;
+  }
+  assert(cache_res_mgr_ != nullptr);
+  // Releasing a reservation does not fail.
+  Status s = cache_res_mgr_->UpdateCacheReservation(reserved_memory_,
+                                                    /*increase=*/false);
+  s.PermitUncheckedError();
+  reserved_memory_ = 0;
+}
 }  // namespace ROCKSDB_NAMESPACE

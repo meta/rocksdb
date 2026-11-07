@@ -475,6 +475,11 @@ DEFINE_bool(charge_blob_cache, false,
             "CacheEntryRoleOptions::charged of "
             "kBlobCache");
 
+DEFINE_bool(charge_readahead_buffer, false,
+            "Setting for "
+            "CacheEntryRoleOptions::charged of "
+            "kReadaheadBuffer");
+
 DEFINE_bool(
     decouple_partitioned_filters,
     ROCKSDB_NAMESPACE::BlockBasedTableOptions().decouple_partitioned_filters,

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <deque>
+#include <memory>
 #include <sstream>
 #include <string>
 
@@ -30,6 +31,8 @@
 namespace ROCKSDB_NAMESPACE {
 
 #define DEFAULT_DECREMENT 8 * 1024
+
+class CacheReservationManager;
 
 struct IOOptions;
 class RandomAccessFileReader;
@@ -295,9 +298,28 @@ class FilePrefetchBuffer {
       delete overlap_buf_;
       overlap_buf_ = nullptr;
     }
+
+    ReleaseCacheReservation();
   }
 
   bool Enabled() const { return enable_; }
+
+  // Charges the memory of the prefetch buffers to `cache_res_mgr`. The charge
+  // follows the total capacity of the buffers and is released when this
+  // object is destroyed. `cache_res_mgr` must be safe for concurrent use
+  // (e.g. ConcurrentCacheReservationManager) when it is shared with other
+  // objects. `cache_res_mgr` must release dummy entries as soon as memory use
+  // decreases (no delayed decrease), so that a failed reservation is fully
+  // given back.
+  //
+  // Charging is best effort: if the reservation for a capacity increase fails
+  // (e.g. a full cache with strict capacity limit), the increase stays
+  // uncharged, the part of it that was reserved is given back, and the read
+  // continues. A later buffer allocation retries the charge.
+  //
+  // REQUIRES: no cache reservation manager has been set yet.
+  void SetCacheReservationManager(
+      std::shared_ptr<CacheReservationManager> cache_res_mgr);
 
   // Called externally by user to only load data into the buffer from a file
   // with num_buffers_ should be set to default(1).
@@ -422,6 +444,8 @@ class FilePrefetchBuffer {
     }
   }
 
+  size_t TEST_GetTotalBufferCapacity() const { return TotalBufferCapacity(); }
+
  private:
   // Calculates roundoff offset and length to be prefetched based on alignment
   // and data present in buffer_. It also allocates new buffer or refit tail if
@@ -544,6 +568,7 @@ class FilePrefetchBuffer {
       return s;
     }
     buf->buffer_.SetBuffer(read_req.result, std::move(read_req.fs_scratch));
+    UpdateCacheReservation();
     buf->offset_ = offset;
     buf->initial_end_offset_ = offset + read_req.result.size();
     result = read_req.result;
@@ -671,6 +696,14 @@ class FilePrefetchBuffer {
 
   // *** END APIs related to allocating and freeing buffers ***
 
+  size_t TotalBufferCapacity() const;
+
+  // Updates the cache reservation to match the total capacity of all buffers.
+  // Must be called after any buffer capacity change.
+  void UpdateCacheReservation();
+
+  void ReleaseCacheReservation();
+
   std::deque<BufferInfo*> bufs_;
   std::deque<BufferInfo*> free_bufs_;
   BufferInfo* overlap_buf_ = nullptr;
@@ -717,5 +750,9 @@ class FilePrefetchBuffer {
   // num_buffers_ is the number of buffers maintained by FilePrefetchBuffer to
   // prefetch the data at a time.
   size_t num_buffers_;
+
+  // Optional. Memory currently charged to it is `reserved_memory_`.
+  std::shared_ptr<CacheReservationManager> cache_res_mgr_;
+  size_t reserved_memory_ = 0;
 };
 }  // namespace ROCKSDB_NAMESPACE

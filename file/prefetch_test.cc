@@ -3,6 +3,9 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <memory>
+
+#include "cache/cache_reservation_manager.h"
 #include "db/db_test_util.h"
 #include "file/file_prefetch_buffer.h"
 #include "file/file_util.h"
@@ -2971,6 +2974,153 @@ void RunIOTracerParserTool(const std::string& trace_file) {
 #endif  // GFLAGS
 }  // namespace
 
+class ReadaheadBufferChargeTest : public DBTestBase,
+                                  public ::testing::WithParamInterface<bool> {
+ public:
+  ReadaheadBufferChargeTest()
+      : DBTestBase("readahead_buffer_charge_test", /*env_do_fsync=*/false) {}
+};
+
+INSTANTIATE_TEST_CASE_P(ReadaheadBufferChargeTest, ReadaheadBufferChargeTest,
+                        ::testing::Bool());
+
+// Checks that readahead buffers of user scans and compactions are charged to
+// the block cache only when kReadaheadBuffer charging is enabled, and that the
+// charge is released when the buffers are freed.
+TEST_P(ReadaheadBufferChargeTest, ScanAndCompaction) {
+  const bool charged = GetParam();
+  constexpr size_t kReadaheadSize = 1024 * 1024;
+  // Without file system prefetch, compaction uses the internal readahead
+  // buffer.
+  std::shared_ptr<MockFS> fs = std::make_shared<MockFS>(
+      env_->GetFileSystem(), /*support_prefetch=*/false);
+  std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, fs));
+  auto cache = std::make_shared<
+      TargetCacheChargeTrackingCache<CacheEntryRole::kReadaheadBuffer>>(
+      NewLRUCache(64 << 20));
+
+  Options options = CurrentOptions();
+  options.env = env.get();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  options.compaction_readahead_size = kReadaheadSize;
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = cache;
+  table_options.cache_usage_options.options_overrides.insert(
+      {CacheEntryRole::kReadaheadBuffer,
+       {/*.charged = */ charged ? CacheEntryRoleOptions::Decision::kEnabled
+                                : CacheEntryRoleOptions::Decision::kDisabled}});
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  // Two overlapping files, so that the compaction below reads both.
+  Random rnd(301);
+  for (int file = 0; file < 2; ++file) {
+    for (int i = 0; i < 2000; ++i) {
+      ASSERT_OK(Put(Key(i), rnd.RandomString(1000)));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_EQ(cache->GetCacheCharge(), 0);
+
+  {
+    ReadOptions ro;
+    ro.readahead_size = kReadaheadSize;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    int count = 0;
+    for (iter->SeekToFirst(); iter->Valid() && count < 100; iter->Next()) {
+      ++count;
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(count, 100);
+    if (charged) {
+      ASSERT_GE(cache->GetCacheCharge(), kReadaheadSize);
+    } else {
+      ASSERT_EQ(cache->GetCacheCharge(), 0);
+    }
+  }
+  ASSERT_EQ(cache->GetCacheCharge(), 0);
+
+  const size_t num_peaks_before_compaction =
+      cache->GetChargedCachePeaks().size();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(cache->GetCacheCharge(), 0);
+  const std::deque<size_t> peaks = cache->GetChargedCachePeaks();
+  if (charged) {
+    ASSERT_GT(peaks.size(), num_peaks_before_compaction);
+    ASSERT_GE(*std::max_element(peaks.begin() + num_peaks_before_compaction,
+                                peaks.end()),
+              kReadaheadSize);
+  } else {
+    ASSERT_TRUE(peaks.empty());
+  }
+  Close();
+}
+
+// With a strict single-shard block cache, checks how readahead charging affects
+// a scan with 1 MiB readahead, whose buffer needs five 256 KiB dummy entries.
+// With 512 KiB, the reservation fails and is given back, so the scan still
+// succeeds. With 1280 KiB, the reservation succeeds and takes the whole cache,
+// so inserting a data block fails with MemoryLimit, as with other charged
+// memory. Without charging, both scans succeed.
+TEST_P(ReadaheadBufferChargeTest, StrictCapacityLimit) {
+  const bool charged = GetParam();
+  constexpr size_t kReadaheadSize = 1024 * 1024;
+  constexpr size_t kFullyReservedCapacity = 1280 * 1024;
+  constexpr int kNumKeys = 2000;
+  for (size_t capacity : {size_t{512 * 1024}, kFullyReservedCapacity}) {
+    SCOPED_TRACE("capacity=" + std::to_string(capacity));
+    LRUCacheOptions cache_opts;
+    cache_opts.capacity = capacity;
+    cache_opts.num_shard_bits = 0;
+    cache_opts.strict_capacity_limit = true;
+    cache_opts.metadata_charge_policy = kDontChargeCacheMetadata;
+    auto cache = std::make_shared<
+        TargetCacheChargeTrackingCache<CacheEntryRole::kReadaheadBuffer>>(
+        cache_opts.MakeSharedCache());
+
+    Options options = CurrentOptions();
+    options.create_if_missing = true;
+    options.disable_auto_compactions = true;
+    options.compression = kNoCompression;
+    BlockBasedTableOptions table_options;
+    table_options.block_cache = cache;
+    table_options.cache_index_and_filter_blocks = false;
+    table_options.cache_usage_options.options_overrides.insert(
+        {CacheEntryRole::kReadaheadBuffer,
+         {/*.charged = */ charged
+              ? CacheEntryRoleOptions::Decision::kEnabled
+              : CacheEntryRoleOptions::Decision::kDisabled}});
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    DestroyAndReopen(options);
+
+    Random rnd(301);
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_OK(Put(Key(i), rnd.RandomString(1000)));
+    }
+    ASSERT_OK(Flush());
+
+    ReadOptions ro;
+    ro.readahead_size = kReadaheadSize;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    int count = 0;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      ++count;
+    }
+    if (charged && capacity == kFullyReservedCapacity) {
+      ASSERT_TRUE(iter->status().IsMemoryLimit()) << iter->status().ToString();
+    } else {
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(count, kNumKeys);
+    }
+    ASSERT_LE(cache->GetCacheCharge(), capacity);
+    iter.reset();
+    ASSERT_EQ(cache->GetCacheCharge(), 0);
+  }
+  Close();
+}
+
 // Tests the default implementation of ReadAsync API with PosixFileSystem during
 // prefetching.
 TEST_P(PrefetchTest, ReadAsyncWithPosixFS) {
@@ -3460,6 +3610,97 @@ TEST_P(PrefetchTest, TraceReadAsyncWithCallbackWrapper) {
 }
 #endif  // GFLAGS
 
+namespace {
+// Reads `content` through a FilePrefetchBuffer charged to a cache reservation
+// manager. With a non-strict cache, checks that the charge always matches the
+// total buffer capacity. With a strict cache, checks that a failed reservation
+// is given back, so the charged memory is always fully reserved and the cache
+// never gets fuller than its capacity, while reads still return correct data.
+// Also checks that the charge is released when the buffer is destroyed.
+void VerifyFilePrefetchBufferCacheReservation(
+    const std::string& content, RandomAccessFileReader* reader,
+    const ReadaheadParams& readahead_params, bool for_compaction,
+    FileSystem* fs, SystemClock* clock, Statistics* stats) {
+  const uint32_t seed = static_cast<uint32_t>(clock->NowMicros());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+  const bool use_async_prefetch = readahead_params.num_buffers > 1;
+
+  struct CacheConfig {
+    size_t capacity;
+    bool strict_capacity_limit;
+  };
+  // A strict cache without capacity rejects every reservation. A strict cache
+  // of one dummy entry (256 KiB) accepts small reservations and rejects the
+  // ones that need a second entry.
+  for (const CacheConfig& config :
+       {CacheConfig{64 << 20, false}, CacheConfig{0, true},
+        CacheConfig{256 << 10, true}}) {
+    SCOPED_TRACE("capacity=" + std::to_string(config.capacity) +
+                 " strict_capacity_limit=" +
+                 std::to_string(config.strict_capacity_limit));
+    LRUCacheOptions cache_opts;
+    cache_opts.capacity = config.capacity;
+    cache_opts.num_shard_bits = 0;
+    cache_opts.strict_capacity_limit = config.strict_capacity_limit;
+    cache_opts.metadata_charge_policy = kDontChargeCacheMetadata;
+    std::shared_ptr<Cache> cache = cache_opts.MakeSharedCache();
+    auto cache_res_mgr = std::make_shared<ConcurrentCacheReservationManager>(
+        std::make_shared<
+            CacheReservationManagerImpl<CacheEntryRole::kReadaheadBuffer>>(
+            cache));
+    size_t max_charged = 0;
+    bool saw_uncharged_memory = false;
+    {
+      FilePrefetchBuffer fpb(readahead_params, true /* enable */,
+                             false /* track_min_offset */, fs, clock, stats);
+      fpb.SetCacheReservationManager(cache_res_mgr);
+      Slice result;
+      Status s;
+      uint64_t offset = 0;
+      while (offset < content.size()) {
+        // Table readers never read past the end of the file.
+        size_t len =
+            std::min<size_t>(rnd.Uniform(16 * 1024), content.size() - offset);
+        bool could_read_from_cache = fpb.TryReadFromCache(
+            IOOptions(), reader, offset, len, &result, &s, for_compaction);
+        // Platforms that don't have IO uring may not support async IO.
+        if (use_async_prefetch && s.IsNotSupported()) {
+          return;
+        }
+        ASSERT_TRUE(could_read_from_cache);
+        ASSERT_OK(s);
+        ASSERT_EQ(result.ToString(), content.substr(offset, len));
+
+        const size_t charged = cache_res_mgr->GetTotalMemoryUsed();
+        const size_t reserved = cache_res_mgr->GetTotalReservedCacheSize();
+        const size_t buffer_capacity = fpb.TEST_GetTotalBufferCapacity();
+        if (config.strict_capacity_limit) {
+          ASSERT_LE(charged, buffer_capacity);
+          ASSERT_LE(reserved, config.capacity);
+          saw_uncharged_memory |= charged < buffer_capacity;
+        } else {
+          ASSERT_EQ(charged, buffer_capacity);
+        }
+        ASSERT_GE(reserved, charged);
+        max_charged = std::max(max_charged, charged);
+        // Mix back to back reads with forward skips.
+        offset += len + (rnd.OneIn(4) ? rnd.Uniform(128 * 1024) : 0);
+      }
+    }
+    if (config.strict_capacity_limit) {
+      ASSERT_TRUE(saw_uncharged_memory);
+    }
+    if (config.capacity > 0) {
+      ASSERT_GT(max_charged, 0);
+    }
+    ASSERT_EQ(cache_res_mgr->GetTotalMemoryUsed(), 0);
+    ASSERT_EQ(cache_res_mgr->GetTotalReservedCacheSize(), 0);
+    ASSERT_EQ(cache->GetUsage(), 0);
+  }
+}
+}  // namespace
+
 class FilePrefetchBufferTest : public testing::Test {
  public:
   void SetUp() override {
@@ -3809,6 +4050,27 @@ TEST_F(FilePrefetchBufferTest, ForCompaction) {
       strncmp(result.data(), content.substr(60000, 64 * 1024 - 60000).c_str(),
               64 * 1024 - 60000),
       0);
+}
+
+TEST_F(FilePrefetchBufferTest, CacheReservation) {
+  std::string fname = "file-prefetch-buffer-cache-reservation";
+  Random rand(0);
+  std::string content = rand.RandomString(4 * 1024 * 1024);
+  Write(fname, content);
+
+  FileOptions opts;
+  std::unique_ptr<RandomAccessFileReader> r;
+  Read(fname, opts, &r);
+
+  ReadaheadParams readahead_params;
+  readahead_params.initial_readahead_size = 4096;
+  readahead_params.max_readahead_size = 256 * 1024;
+  for (bool for_compaction : {false, true}) {
+    SCOPED_TRACE("for_compaction=" + std::to_string(for_compaction));
+    ASSERT_NO_FATAL_FAILURE(VerifyFilePrefetchBufferCacheReservation(
+        content, r.get(), readahead_params, for_compaction, fs(),
+        SystemClock::Default().get(), stats()));
+  }
 }
 
 TEST_F(FilePrefetchBufferTest, PollErrorPropagation) {
@@ -4486,6 +4748,31 @@ TEST_P(FSBufferPrefetchTest, FSBufferPrefetchRandomized) {
       offset += len;
     }
   }
+}
+
+TEST_P(FSBufferPrefetchTest, CacheReservation) {
+  std::string fname = "fs-buffer-prefetch-cache-reservation";
+  Random rand(0);
+  std::string content = rand.RandomString(4 * 1024 * 1024);
+  Write(fname, content);
+
+  FileOptions opts;
+  std::unique_ptr<RandomAccessFileReader> r;
+  Read(fname, opts, &r);
+
+  bool use_async_prefetch = std::get<0>(GetParam());
+  bool for_compaction = std::get<1>(GetParam());
+  // Async IO is not enabled for compaction prefetching
+  if (use_async_prefetch && for_compaction) {
+    return;
+  }
+  ReadaheadParams readahead_params;
+  readahead_params.initial_readahead_size = 4096;
+  readahead_params.max_readahead_size = 256 * 1024;
+  readahead_params.num_buffers = use_async_prefetch ? 2 : 1;
+  VerifyFilePrefetchBufferCacheReservation(content, r.get(), readahead_params,
+                                           for_compaction, fs(), clock(),
+                                           stats());
 }
 
 }  // namespace ROCKSDB_NAMESPACE

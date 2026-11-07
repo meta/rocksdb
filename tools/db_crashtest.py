@@ -279,6 +279,7 @@ default_params = {
     "charge_filter_construction": lambda: random.choice([0, 1]),
     "charge_table_reader": lambda: random.choice([0, 1]),
     "charge_file_metadata": lambda: random.choice([0, 1]),
+    "charge_readahead_buffer": lambda: random.choice([0, 1]),
     "checkpoint_one_in": lambda: random.choice([0, 0, 10000, 1000000]),
     "checkpoint_engine_max_background_operations": lambda: random.choice([4, 8]),
     "checkpoint_engine_use_link_file_when_available": lambda: random.randint(0, 1),

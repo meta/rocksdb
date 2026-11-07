@@ -1470,6 +1470,11 @@ DEFINE_bool(charge_blob_cache, false,
             "CacheEntryRoleOptions::charged of "
             "CacheEntryRole::kBlobCache");
 
+DEFINE_bool(charge_readahead_buffer, false,
+            "Setting for "
+            "CacheEntryRoleOptions::charged of "
+            "CacheEntryRole::kReadaheadBuffer");
+
 DEFINE_uint64(backup_rate_limit, 0ull,
               "If non-zero, db_bench will rate limit reads and writes for DB "
               "backup. This "
@@ -6193,6 +6198,11 @@ class Benchmark {
       block_based_options.cache_usage_options.options_overrides.insert(
           {CacheEntryRole::kBlobCache,
            {/*.charged = */ FLAGS_charge_blob_cache
+                ? CacheEntryRoleOptions::Decision::kEnabled
+                : CacheEntryRoleOptions::Decision::kDisabled}});
+      block_based_options.cache_usage_options.options_overrides.insert(
+          {CacheEntryRole::kReadaheadBuffer,
+           {/*.charged = */ FLAGS_charge_readahead_buffer
                 ? CacheEntryRoleOptions::Decision::kEnabled
                 : CacheEntryRoleOptions::Decision::kDisabled}});
       block_based_options.block_size = FLAGS_block_size;
