@@ -4415,6 +4415,51 @@ TEST_P(DBTestWithParam, FIFOCompactionTest) {
   }
 }
 
+TEST_F(DBTest, FIFODataSizeLimitPreservesRecentFiles) {
+  for (bool use_data_limit : {false, true}) {
+    SCOPED_TRACE("use_data_limit=" + std::to_string(use_data_limit));
+    Options options = CurrentOptions();
+    options.compaction_style = kCompactionStyleFIFO;
+    options.compaction_options_fifo.allow_compaction = false;
+    options.disable_auto_compactions = true;
+    options.enable_blob_files = false;
+    options.compression = kNoCompression;
+    options.num_levels = 1;
+    options.ttl = 0;
+    options.write_buffer_size = 16 * 1024 * 1024;
+    options.compaction_options_fifo.max_table_files_size = 2 * 1024 * 1024;
+    options.compaction_options_fifo.max_data_files_size =
+        use_data_limit ? 2 * 1024 * 1024 : 0;
+    DestroyAndReopen(options);
+
+    // Removing the large oldest file is enough to satisfy either limit.
+    ASSERT_OK(Put("old", std::string(9 * 1024 * 1024, 'a')));
+    ASSERT_OK(Flush());
+    const std::string recent_value(32 * 1024, 'b');
+    for (int i = 0; i < 30; ++i) {
+      ASSERT_OK(Put(Key(i), recent_value));
+      ASSERT_OK(Flush());
+    }
+    ASSERT_EQ(31, NumTableFilesAtLevel(0));
+
+    options.disable_auto_compactions = false;
+    Reopen(options);
+    ASSERT_OK(Put("trigger", "value"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    EXPECT_EQ("NOT_FOUND", Get("old"));
+    int surviving_recent_keys = 0;
+    for (int i = 0; i < 30; ++i) {
+      const std::string value = Get(Key(i));
+      EXPECT_TRUE(value == recent_value) << "recent key " << i;
+      surviving_recent_keys += value == recent_value;
+    }
+    EXPECT_EQ(30, surviving_recent_keys);
+    EXPECT_EQ("value", Get("trigger"));
+    EXPECT_EQ(31, NumTableFilesAtLevel(0));
+  }
+}
+
 TEST_F(DBTest, FIFOCompactionTestWithCompaction) {
   Options options;
   options.compaction_style = kCompactionStyleFIFO;

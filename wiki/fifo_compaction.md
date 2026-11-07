@@ -162,15 +162,18 @@ Example: total_sst = 10MB, total_blob = 9.99GB
   max_data_files_size = 10GB  --> sees 10GB, drops when exceeded (CORRECT)
 ```
 
-When dropping files, proportional estimation is used to account for blob
-data freed per SST file:
+When selecting files to drop, actual SST bytes are subtracted. Remaining blob
+bytes are estimated in proportion to the remaining SST bytes, using SST sizes
+across all levels as the reference:
 
 ```
-data_per_file = effective_size / num_files
+estimated_remaining_data = remaining_sst + (remaining_sst / total_sst) * total_blob
 ```
 
 Blob files are automatically cleaned up when their linked SSTs are deleted
 (via `BlobFileMetaData::GetLinkedSsts()` reference counting).
+The blob estimate is approximate: SSTs can reference different amounts of blob
+data, and shared blob files remain until all their linked SSTs are deleted.
 
 **Config**:
 - `CompactionOptionsFIFO::max_table_files_size` (default: 1GB)
