@@ -1347,6 +1347,51 @@ TEST_F(WriteBatchTest, SanityChecks) {
   ASSERT_TRUE(wb1.Merge(&cf0, "key", "value").IsInvalidArgument());
   ASSERT_TRUE(
       wb1.DeleteRange(&cf0, "begin_key", "end_key").IsInvalidArgument());
+
+  // Sanity checks for the WriteBatch SliceParts APIs without extra 'ts' arg
+  Slice key_slices[2] = {Slice("key_part1"), Slice("key_part2")};
+  Slice value_slices[2] = {Slice("value_part1"), Slice("value_part2")};
+  // wb has right timestamp size
+  ASSERT_TRUE(
+      wb.Put(&cf0, SliceParts(key_slices, 2), SliceParts(value_slices, 2))
+          .ok());
+  ASSERT_TRUE(wb.Delete(&cf0, SliceParts(key_slices, 2)).ok());
+  ASSERT_TRUE(wb.SingleDelete(&cf0, SliceParts(key_slices, 2)).ok());
+  ASSERT_TRUE(
+      wb.Merge(&cf0, SliceParts(key_slices, 2), SliceParts(value_slices, 2))
+          .ok());
+  ASSERT_TRUE(
+      wb.DeleteRange(&cf0, SliceParts(key_slices, 2), SliceParts(key_slices, 2))
+          .ok());
+
+  // wb1 has wrong timestamp size
+  ASSERT_TRUE(
+      wb1.Put(&cf0, SliceParts(key_slices, 2), SliceParts(value_slices, 2))
+          .IsInvalidArgument());
+  ASSERT_TRUE(wb1.Delete(&cf0, SliceParts(key_slices, 2)).IsInvalidArgument());
+  ASSERT_TRUE(
+      wb1.SingleDelete(&cf0, SliceParts(key_slices, 2)).IsInvalidArgument());
+  ASSERT_TRUE(
+      wb1.Merge(&cf0, SliceParts(key_slices, 2), SliceParts(value_slices, 2))
+          .IsInvalidArgument());
+  ASSERT_TRUE(wb1.DeleteRange(&cf0, SliceParts(key_slices, 2),
+                              SliceParts(key_slices, 2))
+                  .IsInvalidArgument());
+
+  // Sanity checks for the new WriteBatch SliceParts APIs with extra 'ts' arg.
+  ASSERT_TRUE(
+      wb.Put(&cf0, SliceParts(key_slices, 2), "ts", SliceParts(value_slices, 2))
+          .IsInvalidArgument());
+  ASSERT_TRUE(
+      wb.Delete(&cf0, SliceParts(key_slices, 2), "ts").IsInvalidArgument());
+  ASSERT_TRUE(wb.SingleDelete(&cf0, SliceParts(key_slices, 2), "ts")
+                  .IsInvalidArgument());
+  ASSERT_TRUE(wb.Merge(&cf0, SliceParts(key_slices, 2), "ts",
+                       SliceParts(value_slices, 2))
+                  .IsInvalidArgument());
+  ASSERT_TRUE(wb.DeleteRange(&cf0, SliceParts(key_slices, 2),
+                             SliceParts(key_slices, 2), "ts")
+                  .IsInvalidArgument());
 }
 
 TEST_F(WriteBatchTest, UpdateTimestamps) {
