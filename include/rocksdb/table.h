@@ -37,6 +37,8 @@ class FilterPolicy;
 class FlushBlockPolicyFactory;
 class PersistentCache;
 class RandomAccessFile;
+class FSRandomAccessFile;
+struct IOOptions;
 struct TableReaderOptions;
 struct TableBuilderOptions;
 class TableBuilder;
@@ -1223,6 +1225,9 @@ TableFactory* NewCuckooTableFactory(
 
 class RandomAccessFileReader;
 
+// Returns a non-owning public view of the file passed to NewTableReader().
+FSRandomAccessFile* AsFSRandomAccessFile(RandomAccessFileReader* reader);
+
 // A base class for table factories.
 class TableFactory : public Customizable {
  public:
@@ -1237,6 +1242,16 @@ class TableFactory : public Customizable {
                                  std::shared_ptr<TableFactory>* factory);
 
   static const char* Type() { return "TableFactory"; }
+
+  // Recognizes this factory's table format without taking ownership of file.
+  // On OK, matches reports recognition. NewTableReader validates contents;
+  // I/O failures are returned as Status.
+  virtual Status FileIsValidTable(const IOOptions& /*io_options*/,
+                                  FSRandomAccessFile& /*file*/,
+                                  uint64_t /*file_size*/,
+                                  bool* /*matches*/) const {
+    return Status::NotSupported("Table format probing is unsupported");
+  }
 
   // Returns a Table object table that can fetch data from file specified
   // in parameter file. It's the caller's responsibility to make sure
