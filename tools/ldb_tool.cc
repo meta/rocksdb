@@ -194,7 +194,7 @@ int LDBCommandRunner::RunCommand(
   return ret.IsFailed() ? 1 : 0;
 }
 
-void LDBTool::Run(int argc, char** argv, Options options,
+void LDBTool::Run(int argc, char** argv, const Options& options,
                   const LDBOptions& ldb_options,
                   const std::vector<ColumnFamilyDescriptor>* column_families) {
   exit(RunAndReturn(argc, argv, options, ldb_options, column_families));

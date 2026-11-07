@@ -53,7 +53,7 @@ class RangeLockList {
 
  private:
   void Clear() {
-    for (auto it : buffers_) {
+    for (const auto& it : buffers_) {
       it.second->destroy();
     }
     buffers_.clear();

@@ -4646,12 +4646,11 @@ void rocksdb_load_latest_options(
         cf_descs.size() * sizeof(rocksdb_options_t*));
     for (size_t i = 0; i < cf_descs.size(); ++i) {
       cf_names[i] = strdup(cf_descs[i].name.c_str());
-      cf_options[i] = new rocksdb_options_t{
-          Options(DBOptions(), std::move(cf_descs[i].options))};
+      cf_options[i] =
+          new rocksdb_options_t{Options(DBOptions(), cf_descs[i].options)};
     }
     *num_column_families = cf_descs.size();
-    *db_options = new rocksdb_options_t{
-        Options(std::move(db_opt), ColumnFamilyOptions())};
+    *db_options = new rocksdb_options_t{Options(db_opt, ColumnFamilyOptions())};
     *list_column_family_names = cf_names;
     *list_column_family_options = cf_options;
   } else {

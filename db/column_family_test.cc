@@ -11,6 +11,7 @@
 #include <atomic>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
@@ -238,19 +239,19 @@ class ColumnFamilyTestBase : public testing::Test {
 
   void AssertOpenReadOnly(std::vector<std::string> cf,
                           std::vector<ColumnFamilyOptions> options = {}) {
-    ASSERT_OK(OpenReadOnly(cf, options));
+    ASSERT_OK(OpenReadOnly(std::move(cf), std::move(options)));
   }
 
   void Open(std::vector<std::string> cf,
             std::vector<ColumnFamilyOptions> options = {}) {
-    ASSERT_OK(TryOpen(cf, options));
+    ASSERT_OK(TryOpen(std::move(cf), std::move(options)));
   }
 
   void Open() { Open({"default"}); }
 
   DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_.get()); }
 
-  int GetProperty(int cf, std::string property) {
+  int GetProperty(int cf, const std::string& property) {
     std::string value;
     EXPECT_TRUE(dbfull()->GetProperty(handles_[cf], property, &value));
 #ifndef CYGWIN
@@ -282,7 +283,7 @@ class ColumnFamilyTestBase : public testing::Test {
 
   void CreateColumnFamilies(
       const std::vector<std::string>& cfs,
-      const std::vector<ColumnFamilyOptions> options = {}) {
+      const std::vector<ColumnFamilyOptions>& options = {}) {
     int cfi = static_cast<int>(handles_.size());
     handles_.resize(cfi + cfs.size());
     names_.resize(cfi + cfs.size());
@@ -306,7 +307,7 @@ class ColumnFamilyTestBase : public testing::Test {
     }
   }
 
-  void Reopen(const std::vector<ColumnFamilyOptions> options = {}) {
+  void Reopen(const std::vector<ColumnFamilyOptions>& options = {}) {
     std::vector<std::string> names;
     for (const auto& name : names_) {
       if (name != "") {
@@ -507,7 +508,7 @@ class ColumnFamilyTestBase : public testing::Test {
     ASSERT_OK(destfile->Close());
   }
 
-  int GetSstFileCount(std::string path) {
+  int GetSstFileCount(const std::string& path) {
     std::vector<std::string> files;
     DBTestBase::GetSstFiles(env_, path, &files);
     return static_cast<int>(files.size());

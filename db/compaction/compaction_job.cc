@@ -2119,7 +2119,7 @@ Status CompactionJob::FinalizeProcessKeyValueStatus(
 }
 
 Status CompactionJob::CleanupCompactionFiles(
-    SubcompactionState* sub_compact, Status status,
+    SubcompactionState* sub_compact, const Status& status,
     const CompactionFileOpenFunc& open_file_func,
     const CompactionFileCloseFunc& close_file_func) {
   // Call FinishCompactionOutputFile() even if status is not ok: it needs to

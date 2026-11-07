@@ -204,7 +204,7 @@ INSTANTIATE_TEST_CASE_P(PrefetchTest, PrefetchTest,
                         ::testing::Combine(::testing::Bool(),
                                            ::testing::Bool()));
 
-std::string BuildKey(int num, std::string postfix = "") {
+std::string BuildKey(int num, const std::string& postfix = "") {
   return "my_key_" + std::to_string(num) + postfix;
 }
 
@@ -2949,7 +2949,7 @@ namespace {
 const int kMaxArgCount = 100;
 const size_t kArgBufferSize = 100000;
 
-void RunIOTracerParserTool(std::string trace_file) {
+void RunIOTracerParserTool(const std::string& trace_file) {
   std::vector<std::string> params = {"./io_tracer_parser",
                                      "-io_trace_file=" + trace_file};
 

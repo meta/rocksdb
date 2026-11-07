@@ -859,9 +859,8 @@ Status RepairDB(const std::string& dbname, const DBOptions& db_options,
 }
 
 Status RepairDB(const std::string& dbname, const Options& options) {
-  Options opts(options);
-  DBOptions db_options(opts);
-  ColumnFamilyOptions cf_options(opts);
+  DBOptions db_options(options);
+  ColumnFamilyOptions cf_options(options);
 
   Repairer repairer(dbname, db_options, {}, cf_options /* default_cf_opts */,
                     cf_options /* unknown_cf_opts */,

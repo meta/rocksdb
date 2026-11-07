@@ -362,7 +362,7 @@ Status TransactionBaseImpl::GetEntityForUpdate(
         "Snapshot must not be set if validation is disabled");
   }
 
-  const Status s =
+  Status s =
       TryLock(column_family, key, true /* read_only */, exclusive, do_validate);
   if (!s.ok()) {
     return s;
@@ -910,7 +910,7 @@ Status TransactionBaseImpl::RebuildFromWriteBatch(WriteBatch* src_batch) {
       Slice user_key = GetUserKey(cf, key);
       Slice entity_copy = entity;
       WideColumns columns;
-      const Status s =
+      Status s =
           WideColumnSerialization::DeserializeSimple(entity_copy, columns);
       if (!s.ok()) {
         return s;

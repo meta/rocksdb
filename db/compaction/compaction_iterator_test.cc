@@ -7,6 +7,7 @@
 
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "db/blob/blob_fetcher.h"
@@ -32,7 +33,7 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 std::string ValueWithPreferredSeqno(std::string val,
                                     SequenceNumber preferred_seqno = 0) {
-  std::string result = val;
+  std::string result = std::move(val);
   PutFixed64(&result, preferred_seqno);
   return result;
 }
@@ -128,7 +129,7 @@ class LoggingForwardVectorIterator : public VectorIterator {
     std::string arg;
 
     explicit Action(Type _type, std::string _arg = "")
-        : type(_type), arg(_arg) {}
+        : type(_type), arg(std::move(_arg)) {}
 
     bool operator==(const Action& rhs) const {
       return std::tie(type, arg) == std::tie(rhs.type, rhs.arg);
@@ -2676,13 +2677,11 @@ TEST_P(CompactionIteratorTsGcTest, SomeMergesOlderThanThreshold) {
       const bool bottommost_level = param.first;
       const bool key_not_exists_beyond_output_level = param.second;
       auto expected_keys_copy = expected_keys;
-      auto expected_values_copy = expected_values;
       if (bottommost_level) {
         expected_keys_copy[1] =
             test::KeyStr(/*ts=*/0, user_key[1], /*seq=*/0, kTypeValue);
       }
-      RunTest(input_keys, input_values, expected_keys_copy,
-              expected_values_copy,
+      RunTest(input_keys, input_values, expected_keys_copy, expected_values,
               /*last_committed_seq=*/kMaxSequenceNumber, merge_op.get(),
               /*compaction_filter=*/nullptr, bottommost_level,
               /*earliest_write_conflict_snapshot=*/kMaxSequenceNumber,

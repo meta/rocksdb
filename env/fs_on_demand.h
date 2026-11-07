@@ -133,7 +133,7 @@ class OnDemandSequentialFile : public FSSequentialFile {
 };
 
 std::shared_ptr<FileSystem> NewOnDemandFileSystem(
-    const std::shared_ptr<FileSystem>& fs, std::string remote_path,
-    std::string local_path);
+    const std::shared_ptr<FileSystem>& fs, const std::string& remote_path,
+    const std::string& local_path);
 
 }  // namespace ROCKSDB_NAMESPACE

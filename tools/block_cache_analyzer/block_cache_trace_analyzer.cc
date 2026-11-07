@@ -260,7 +260,7 @@ std::string caller_to_string(TableReaderCaller caller) {
   return "InvalidCaller";
 }
 
-TableReaderCaller string_to_caller(std::string caller_str) {
+TableReaderCaller string_to_caller(const std::string& caller_str) {
   if (caller_str == "Get") {
     return kUserGet;
   } else if (caller_str == "MultiGet") {
@@ -774,12 +774,11 @@ std::string BlockCacheTraceAnalyzer::BuildLabel(
 }
 
 void BlockCacheTraceAnalyzer::TraverseBlocks(
-    std::function<void(const std::string& /*cf_name*/, uint64_t /*fd*/,
-                       uint32_t /*level*/, TraceType /*block_type*/,
-                       const std::string& /*block_key*/,
-                       uint64_t /*block_key_id*/,
-                       const BlockAccessInfo& /*block_access_info*/)>
-        block_callback,
+    const std::function<
+        void(const std::string& /*cf_name*/, uint64_t /*fd*/,
+             uint32_t /*level*/, TraceType /*block_type*/,
+             const std::string& /*block_key*/, uint64_t /*block_key_id*/,
+             const BlockAccessInfo& /*block_access_info*/)>& block_callback,
     std::set<std::string>* labels) const {
   for (auto const& cf_aggregates : cf_aggregates_map_) {
     // Stats per column family.
@@ -1026,7 +1025,7 @@ void BlockCacheTraceAnalyzer::WriteReuseDistance(
 
 void BlockCacheTraceAnalyzer::UpdateReuseIntervalStats(
     const std::string& label, const std::vector<uint64_t>& time_buckets,
-    const std::map<uint64_t, uint64_t> timeline,
+    const std::map<uint64_t, uint64_t>& timeline,
     std::map<std::string, std::map<uint64_t, uint64_t>>* label_time_num_reuses,
     uint64_t* total_num_reuses) const {
   assert(label_time_num_reuses);

@@ -1108,7 +1108,7 @@ Status WriteBatchInternal::PutEntity(WriteBatch* b, uint32_t column_family_id,
   WideColumnsHelper::SortColumns(sorted_columns);
 
   std::string entity;
-  const Status s = WideColumnSerialization::Serialize(sorted_columns, entity);
+  Status s = WideColumnSerialization::Serialize(sorted_columns, entity);
   if (!s.ok()) {
     return s;
   }

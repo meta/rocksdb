@@ -16,6 +16,7 @@
 #include <future>
 #include <set>
 #include <tuple>
+#include <utility>
 
 #include "db/blob/blob_log_writer.h"
 #include "db/db_impl/db_impl.h"
@@ -4025,7 +4026,7 @@ TEST_P(VersionSetTestDropOneCF, HandleDroppedColumnFamilyInAtomicGroup) {
   // Drop one column family
   VersionEdit drop_cf_edit;
   drop_cf_edit.DropColumnFamily();
-  const std::string cf_to_drop_name(GetParam());
+  const std::string& cf_to_drop_name(GetParam());
   auto cfd_to_drop =
       versions_->GetColumnFamilySet()->GetColumnFamily(cf_to_drop_name);
   ASSERT_NE(nullptr, cfd_to_drop);
@@ -4799,8 +4800,8 @@ class BestEffortsRecoverIncompleteVersionTest
              std::string _blob)
         : file_number(_file_number),
           file_missing(_file_missing),
-          key(_key),
-          blob(_blob) {}
+          key(std::move(_key)),
+          blob(std::move(_blob)) {}
   };
 
   void CreateDummyBlobFiles(const std::vector<BlobInfo>& infos,

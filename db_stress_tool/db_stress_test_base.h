@@ -573,15 +573,15 @@ class StressTest {
     return Status::NotSupported("TestCustomOperations() must be overridden");
   }
 
-  void ProcessStatus(SharedState* shared, std::string msg, const Status& s,
-                     bool ignore_injected_error = true) const;
+  void ProcessStatus(SharedState* shared, const std::string& msg,
+                     const Status& s, bool ignore_injected_error = true) const;
 
-  void VerificationAbort(SharedState* shared, std::string msg) const;
+  void VerificationAbort(SharedState* shared, const std::string& msg) const;
 
-  void VerificationAbort(SharedState* shared, std::string msg, int cf,
+  void VerificationAbort(SharedState* shared, const std::string& msg, int cf,
                          int64_t key) const;
 
-  void VerificationAbort(SharedState* shared, std::string msg, int cf,
+  void VerificationAbort(SharedState* shared, const std::string& msg, int cf,
                          int64_t key, Slice value_from_db,
                          Slice value_from_expected) const;
 

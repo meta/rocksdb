@@ -2658,7 +2658,7 @@ struct DBWithColumnFamilies {
 
   // stage: assume CF from 0 to stage * num_hot has be created. Need to create
   //        stage * num_hot + 1 to stage * (num_hot + 1).
-  void CreateNewCf(ColumnFamilyOptions options, int64_t stage) {
+  void CreateNewCf(const ColumnFamilyOptions& options, int64_t stage) {
     MutexLock l(&create_cf_mutex);
     if ((stage + 1) * num_hot <= num_created) {
       // Already created.
@@ -9379,7 +9379,7 @@ class Benchmark {
     QueryDecider() = default;
     ~QueryDecider() = default;
 
-    Status Initiate(std::vector<double> ratio_input) {
+    Status Initiate(const std::vector<double>& ratio_input) {
       int range_max = 1000;
       double sum = 0.0;
       for (auto& ratio : ratio_input) {

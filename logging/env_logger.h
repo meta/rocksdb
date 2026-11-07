@@ -104,7 +104,7 @@ class EnvLogger : public Logger {
 
   Status CloseHelper() {
     FileOpGuard guard(*this);
-    const auto close_status = file_.Close(IOOptions());
+    auto close_status = file_.Close(IOOptions());
 
     if (close_status.ok()) {
       return close_status;

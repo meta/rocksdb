@@ -58,7 +58,7 @@ class WithCacheType : public TestCreateContext {
 
   std::shared_ptr<Cache> NewCache(
       size_t capacity,
-      std::function<void(ShardedCacheOptions&)> modify_opts_fn = {}) {
+      const std::function<void(ShardedCacheOptions&)>& modify_opts_fn = {}) {
     const auto& type = Type();
     if (type == kLRU) {
       LRUCacheOptions lru_opts;

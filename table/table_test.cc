@@ -24,6 +24,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "cache/cache_reservation_manager.h"
@@ -982,7 +983,7 @@ class MemTableConstructor : public Constructor {
                     const InternalKeyComparator& /*internal_comparator*/,
                     const stl_wrappers::KVMap& kv_map) override {
     delete memtable_->Unref();
-    ImmutableOptions mem_ioptions(ioptions);
+    const ImmutableOptions& mem_ioptions = ioptions;
     memtable_ = new MemTable(internal_comparator_, mem_ioptions,
                              MutableCFOptions(options_), write_buffer_manager_,
                              kMaxSequenceNumber, 0 /* column_family_id */,
@@ -2690,7 +2691,7 @@ void PrefetchRange(TableConstructor* c, Options* opt,
                    const char* key_end,
                    const std::vector<std::string>& keys_in_cache,
                    const std::vector<std::string>& keys_not_in_cache,
-                   const Status expected_status = Status::OK()) {
+                   const Status& expected_status = Status::OK()) {
   // reset the cache and reopen the table
   table_options->block_cache = NewLRUCache(16 * 1024 * 1024, 4);
   opt->table_factory.reset(NewBlockBasedTableFactory(*table_options));
@@ -3032,7 +3033,7 @@ TEST_P(BlockBasedTableTest, ReservedBitInDataBlockFooter) {
 
   // Try to construct a Block from the data with the reserved bit set. The
   // footer decode must reject it.
-  BlockContents contents(std::move(block_data));
+  BlockContents contents(block_data);
   Block block(std::move(contents), 0 /* read_amp_bytes_per_bit */);
 
   // Block should have size() == 0 indicating error
@@ -3204,7 +3205,7 @@ TEST_P(BuiltinChecksumTest, ChecksumZeroInputs) {
 }
 
 void AddInternalKey(TableConstructor* c, const std::string& prefix,
-                    std::string value = "v", int /*suffix_len*/ = 800) {
+                    const std::string& value = "v", int /*suffix_len*/ = 800) {
   static Random rnd(1023);
   InternalKey k(prefix + rnd.RandomString(800), 0, kTypeValue);
   c->Add(k.Encode().ToString(), value);
@@ -3787,7 +3788,7 @@ class CustomFlushBlockPolicy : public FlushBlockPolicyFactory,
                                public FlushBlockPolicy {
  public:
   explicit CustomFlushBlockPolicy(std::vector<int> keys_per_block)
-      : keys_per_block_(keys_per_block) {}
+      : keys_per_block_(std::move(keys_per_block)) {}
 
   const char* Name() const override { return "CustomFlushBlockPolicy"; }
 
@@ -5499,7 +5500,7 @@ TEST_P(BlockBasedTableTest, MemoryAllocator) {
     lruOptions.memory_allocator = custom_memory_allocator;
     lruOptions.capacity = 16 * 1024 * 1024;
     lruOptions.num_shard_bits = 4;
-    table_options.block_cache = NewLRUCache(std::move(lruOptions));
+    table_options.block_cache = NewLRUCache(lruOptions);
     opt.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
     TableConstructor c(BytewiseComparator(),
@@ -6462,7 +6463,7 @@ TEST_P(BlockBasedTableTest, LegacyGlobalSeqnoChecksumRecovery) {
 
   for (char c = 'a'; c <= 'z'; ++c) {
     std::string key(8, c);
-    std::string value = key;
+    const std::string& value = key;
     InternalKey ik(key, 0, kTypeValue);
 
     builder->Add(ik.Encode(), value);
@@ -10838,7 +10839,7 @@ class UserDefinedIndexTestBase : public BlockBasedTableTestBase {
     read_opts.iterate_upper_bound = &ub;
     std::unique_ptr<Iterator> iter(db->NewIterator(read_opts, cfh));
     iter->Prepare(scan_opts);
-    for (auto opt : opts) {
+    for (const auto& opt : opts) {
       ub = opt.range.limit.value();
       iter->Seek(opt.range.start.value());
       if (kVerbose) {

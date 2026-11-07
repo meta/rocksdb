@@ -175,8 +175,7 @@ Status BlockCacheTier::Insert(const Slice& key, const char* data,
 
   if (opt_.pipeline_writes) {
     // off load the write to the write thread
-    insert_ops_.Push(
-        InsertOp(key.ToString(), std::move(std::string(data, size))));
+    insert_ops_.Push(InsertOp(key.ToString(), std::string(data, size)));
     return Status::OK();
   }
 

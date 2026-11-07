@@ -445,7 +445,8 @@ class CompactionJob {
                                        InternalIterator* input_iter,
                                        CompactionIterator* c_iter,
                                        Status status);
-  Status CleanupCompactionFiles(SubcompactionState* sub_compact, Status status,
+  Status CleanupCompactionFiles(SubcompactionState* sub_compact,
+                                const Status& status,
                                 const CompactionFileOpenFunc& open_file_func,
                                 const CompactionFileCloseFunc& close_file_func);
   Status FinalizeBlobFiles(SubcompactionState* sub_compact,

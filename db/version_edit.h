@@ -560,8 +560,8 @@ struct FdWithKeyRange {
   FdWithKeyRange()
       : fd(), file_metadata(nullptr), smallest_key(), largest_key() {}
 
-  FdWithKeyRange(FileDescriptor _fd, Slice _smallest_key, Slice _largest_key,
-                 FileMetaData* _file_metadata)
+  FdWithKeyRange(const FileDescriptor& _fd, Slice _smallest_key,
+                 Slice _largest_key, FileMetaData* _file_metadata)
       : fd(_fd),
         file_metadata(_file_metadata),
         smallest_key(_smallest_key),

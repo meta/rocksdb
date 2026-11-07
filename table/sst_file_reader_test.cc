@@ -9,6 +9,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <memory>
+#include <utility>
 
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
@@ -1267,7 +1268,7 @@ class SstFileReaderTimestampTest : public testing::Test {
 
   struct OutputKeyValueDesc : public KeyValueDesc {
     OutputKeyValueDesc(std::string k, std::string ts, std::string v)
-        : KeyValueDesc(std::move(k), std::string(ts), std::string(v)) {}
+        : KeyValueDesc(std::move(k), std::move(ts), std::move(v)) {}
   };
 
   void CreateFile(const std::vector<InputKeyValueDesc>& descs,

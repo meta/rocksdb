@@ -9,6 +9,7 @@
 #include <array>
 #include <map>
 #include <string>
+#include <utility>
 
 #include "db/blob/blob_index.h"
 #include "db/column_family.h"
@@ -28,13 +29,13 @@
 namespace ROCKSDB_NAMESPACE {
 namespace {
 std::string ValueWithWriteTime(std::string val, uint64_t write_time = 0) {
-  std::string result = val;
+  std::string result = std::move(val);
   PutFixed64(&result, write_time);
   return result;
 }
 std::string ValueWithPreferredSeqno(std::string val,
                                     SequenceNumber preferred_seqno = 0) {
-  std::string result = val;
+  std::string result = std::move(val);
   PutFixed64(&result, preferred_seqno);
   return result;
 }

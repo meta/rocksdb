@@ -1503,7 +1503,8 @@ TEST_F(TieredCompactionTest, DISABLED_RangeBasedTieredStorageLevel) {
 
 class PrecludeLastLevelTestBase : public DBTestBase {
  public:
-  PrecludeLastLevelTestBase(std::string test_name = "preclude_last_level_test")
+  PrecludeLastLevelTestBase(
+      const std::string& test_name = "preclude_last_level_test")
       : DBTestBase(test_name, /*env_do_fsync=*/false) {
     mock_clock_ = std::make_shared<MockSystemClock>(env_->GetSystemClock());
     mock_clock_->SetCurrentTime(kMockStartTime);

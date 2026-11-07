@@ -3631,7 +3631,7 @@ class NonBatchedOpsStressTest : public StressTest {
 
   bool VerifyOrSyncValue(int cf, int64_t key, const ReadOptions& opts,
                          SharedState* shared, const std::string& value_from_db,
-                         std::string msg_prefix, const Status& s) const {
+                         const std::string& msg_prefix, const Status& s) const {
     if (shared->HasVerificationFailedYet()) {
       return false;
     }

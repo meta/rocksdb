@@ -682,23 +682,23 @@ TEST_F(DBBasicTestWithTimestamp, TrimHistoryTest) {
   TestComparator test_cmp(kTimestampSize);
   options.comparator = &test_cmp;
   DestroyAndReopen(options);
-  auto check_value_by_ts = [](DB* db, Slice key, std::string readTs,
-                              Status status, std::string checkValue,
-                              std::string expected_ts) {
-    ReadOptions ropts;
-    Slice ts = readTs;
-    ropts.timestamp = &ts;
-    std::string value;
-    std::string key_ts;
-    Status s = db->Get(ropts, key, &value, &key_ts);
-    ASSERT_TRUE(s == status);
-    if (s.ok()) {
-      ASSERT_EQ(checkValue, value);
-    }
-    if (s.ok() || s.IsNotFound()) {
-      ASSERT_EQ(expected_ts, key_ts);
-    }
-  };
+  auto check_value_by_ts =
+      [](DB* db, Slice key, const std::string& readTs, const Status& status,
+         const std::string& checkValue, const std::string& expected_ts) {
+        ReadOptions ropts;
+        Slice ts = readTs;
+        ropts.timestamp = &ts;
+        std::string value;
+        std::string key_ts;
+        Status s = db->Get(ropts, key, &value, &key_ts);
+        ASSERT_TRUE(s == status);
+        if (s.ok()) {
+          ASSERT_EQ(checkValue, value);
+        }
+        if (s.ok() || s.IsNotFound()) {
+          ASSERT_EQ(expected_ts, key_ts);
+        }
+      };
   // Construct data of different versions with different ts
   ASSERT_OK(db_->Put(WriteOptions(), "k1", Timestamp(2, 0), "v1"));
   ASSERT_OK(db_->Put(WriteOptions(), "k1", Timestamp(4, 0), "v2"));

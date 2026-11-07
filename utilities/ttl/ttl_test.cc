@@ -197,7 +197,7 @@ class TtlTest : public testing::Test {
   }
 
   // Runs a DeleteRange
-  void MakeDeleteRange(std::string start, std::string end,
+  void MakeDeleteRange(const std::string& start, const std::string& end,
                        ColumnFamilyHandle* cf = nullptr) {
     ASSERT_TRUE(db_ttl_);
     static WriteOptions wops;
@@ -745,7 +745,7 @@ TEST_F(TtlTest, NewIteratorsStripTimestamps) {
         db_ttl_->Put(WriteOptions(), column_families[i], "key", values[i]));
   }
 
-  const auto verify_iterators = [&](Status status,
+  const auto verify_iterators = [&](const Status& status,
                                     std::vector<Iterator*>* iterators) {
     ASSERT_OK(status);
     ASSERT_EQ(iterators->size(), column_families.size());

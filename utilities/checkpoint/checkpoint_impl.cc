@@ -581,18 +581,16 @@ Status CheckpointImpl::CreateCheckpointImpl(
 }
 
 Status CheckpointImpl::CreateCustomCheckpoint(
-    std::function<Status(const std::string& src_dirname,
-                         const std::string& src_fname, FileType type,
-                         const Temperature temperature)>
-        link_file_cb,
-    std::function<
-        Status(const std::string& src_dirname, const std::string& src_fname,
-               uint64_t size_limit_bytes, FileType type,
-               const std::string& checksum_func_name,
-               const std::string& checksum_val, const Temperature temperature)>
-        copy_file_cb,
-    std::function<Status(const std::string& fname, const std::string& contents,
-                         FileType type)>
+    const std::function<Status(const std::string& src_dirname,
+                               const std::string& src_fname, FileType type,
+                               const Temperature temperature)>& link_file_cb,
+    const std::function<Status(
+        const std::string& src_dirname, const std::string& src_fname,
+        uint64_t size_limit_bytes, FileType type,
+        const std::string& checksum_func_name, const std::string& checksum_val,
+        const Temperature temperature)>& copy_file_cb,
+    const std::function<Status(const std::string& fname,
+                               const std::string& contents, FileType type)>&
         create_file_cb,
     uint64_t* sequence_number, uint64_t log_size_for_flush,
     bool get_live_table_checksum, bool atomic_flush,
@@ -873,12 +871,10 @@ Status CheckpointImpl::ExportColumnFamily(
 
 Status CheckpointImpl::ExportFilesInMetaData(
     const DBOptions& db_options, const ColumnFamilyMetaData& metadata,
-    std::function<Status(const std::string& src_dirname,
-                         const std::string& src_fname)>
-        link_file_cb,
-    std::function<Status(const std::string& src_dirname,
-                         const std::string& src_fname)>
-        copy_file_cb) {
+    const std::function<Status(const std::string& src_dirname,
+                               const std::string& src_fname)>& link_file_cb,
+    const std::function<Status(const std::string& src_dirname,
+                               const std::string& src_fname)>& copy_file_cb) {
   Status s;
   auto hardlink_file = true;
 

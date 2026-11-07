@@ -8779,13 +8779,11 @@ Status VersionSet::VerifyFileMetadata(const ReadOptions& read_options,
 
     TableCache::TypedHandle* handle = nullptr;
     TableReader* table_reader = nullptr;
-    FileMetaData meta_copy = meta;
     status = table_cache->FindTable(
-        read_options, file_opts, *icmp, meta_copy, &handle, cf_opts,
-        &table_reader, /*no_io=*/false, internal_stats->GetFileReadHist(level),
-        false, level,
+        read_options, file_opts, *icmp, meta, &handle, cf_opts, &table_reader,
+        /*no_io=*/false, internal_stats->GetFileReadHist(level), false, level,
         /*prefetch_index_and_filter_in_cache*/ false, max_sz_for_l0_meta_pin,
-        meta_copy.temperature);
+        meta.temperature);
     if (handle) {
       table_cache->get_cache().Release(handle);
     }

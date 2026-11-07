@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <iomanip>
 #include <memory>
+#include <utility>
 
 #include "db/db_test_util.h"
 #include "db/version_edit.h"
@@ -187,7 +188,7 @@ class FileChecksumTestHelper {
 
  public:
   FileChecksumTestHelper(Options& options, DB* db, std::string db_name)
-      : options_(options), db_(db), dbname_(db_name) {}
+      : options_(options), db_(db), dbname_(std::move(db_name)) {}
   ~FileChecksumTestHelper() = default;
 
   // Verify the checksum information in Manifest.

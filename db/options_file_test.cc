@@ -36,8 +36,9 @@ bool IsOptionsFile(const std::string& fname) {
 
 class FailOptionsDirFsyncFileSystem : public FileSystemWrapper {
  public:
-  explicit FailOptionsDirFsyncFileSystem(std::shared_ptr<FileSystem> target)
-      : FileSystemWrapper(std::move(target)) {}
+  explicit FailOptionsDirFsyncFileSystem(
+      const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
 
   static const char* kClassName() { return "FailOptionsDirFsyncFileSystem"; }
   const char* Name() const override { return kClassName(); }

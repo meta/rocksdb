@@ -1061,7 +1061,7 @@ bool FragmentBufferedReader::TryReadFragment(Slice* fragment, size_t* drop_size,
                                     uncompressed_size);
       }
     } while (remaining > 0 || uncompressed_size == kBlockSize);
-    *fragment = Slice(std::move(uncompressed_record_));
+    *fragment = Slice(uncompressed_record_);
     *fragment_type_or_err = type;
     return true;
   }

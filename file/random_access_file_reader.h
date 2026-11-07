@@ -12,6 +12,7 @@
 #include <functional>
 #include <sstream>
 #include <string>
+#include <utility>
 
 #include "env/file_system_tracer.h"
 #include "port/port.h"
@@ -108,7 +109,7 @@ class RandomAccessFileReader final : public FSRandomAccessFile {
   struct ReadAsyncInfo {
     ReadAsyncInfo(std::function<void(FSReadRequest&, void*)> cb, void* cb_arg,
                   uint64_t start_time)
-        : cb_(cb),
+        : cb_(std::move(cb)),
           cb_arg_(cb_arg),
           start_time_(start_time),
           user_scratch_(nullptr),
@@ -151,7 +152,7 @@ class RandomAccessFileReader final : public FSRandomAccessFile {
       bool is_last_level = false, FileSystem* file_system = nullptr)
       : file_system_(file_system),
         file_(std::move(raf), io_tracer, _file_name),
-        file_name_(std::move(_file_name)),
+        file_name_(_file_name),
         clock_(clock),
         stats_(stats),
         hist_type_(hist_type),

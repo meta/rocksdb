@@ -4060,7 +4060,8 @@ TEST_F(DBSecondaryTestWithTimestamp, IteratorAndGet) {
   ASSERT_OK(ReopenAsSecondary(options));
 
   auto get_value_and_check = [](DB* db, ReadOptions read_opts, Slice key,
-                                Slice expected_value, std::string expected_ts) {
+                                Slice expected_value,
+                                const std::string& expected_ts) {
     std::string value_from_get;
     std::string timestamp;
     ASSERT_OK(db->Get(read_opts, key.ToString(), &value_from_get, &timestamp));

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <utility>
 
 #include "db/blob/blob_index.h"
 #include "db/db_impl/db_impl.h"
@@ -936,7 +937,7 @@ class TableFileCreationListener : public EventListener {
     static const char* kClassName() { return "TestEnv"; }
     const char* Name() const override { return kClassName(); }
 
-    void SetStatus(IOStatus s) { status_ = s; }
+    void SetStatus(IOStatus s) { status_ = std::move(s); }
 
     IOStatus NewWritableFile(const std::string& fname, const FileOptions& opts,
                              std::unique_ptr<FSWritableFile>* result,

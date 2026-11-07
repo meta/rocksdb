@@ -3030,7 +3030,7 @@ TEST_P(DBBlockChecksumTest, BlockChecksumTest) {
   Options options = CurrentOptions();
   const int kNumPerFile = 2;
 
-  const auto algs = GetSupportedChecksums();
+  const auto& algs = GetSupportedChecksums();
   const int algs_size = static_cast<int>(algs.size());
 
   // generate one table with each type of checksum
@@ -6341,7 +6341,7 @@ INSTANTIATE_TEST_CASE_P(DBBasicTestTrackWal, DBBasicTestTrackWal,
 
 class DBBasicTestMultiGet : public DBTestBase {
  public:
-  DBBasicTestMultiGet(std::string test_dir, int num_cfs,
+  DBBasicTestMultiGet(const std::string& test_dir, int num_cfs,
                       bool uncompressed_cache, bool _compression_enabled,
                       bool _fill_cache, uint32_t compression_parallel_threads)
       : DBTestBase(test_dir, /*env_do_fsync=*/false) {

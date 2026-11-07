@@ -175,7 +175,7 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
     std::vector<std::string> filenames;
     IOOptions io_opts;
     io_opts.do_not_recurse = true;
-    auto wal_dir = immutable_db_options.GetWalDir();
+    const auto& wal_dir = immutable_db_options.GetWalDir();
     Status s = immutable_db_options.fs->GetChildren(
         wal_dir, io_opts, &filenames, /*IODebugContext*=*/nullptr);
     s.PermitUncheckedError();  //**TODO: What to do on error?
@@ -2321,7 +2321,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
     // a flush happens.
     if (logical_strip_timestamp) {
       Slice mem_newest_udt = mem->GetNewestUDT();
-      std::string full_history_ts_low = cfd->GetFullHistoryTsLow();
+      const std::string& full_history_ts_low = cfd->GetFullHistoryTsLow();
       if (full_history_ts_low.empty() ||
           ucmp->CompareTimestamp(mem_newest_udt, full_history_ts_low) >= 0) {
         std::string new_full_history_ts_low;

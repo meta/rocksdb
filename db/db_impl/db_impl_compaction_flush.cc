@@ -11,6 +11,7 @@
 #include <deque>
 #include <memory>
 #include <unordered_map>
+#include <utility>
 
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/builder.h"
@@ -474,8 +475,7 @@ Status DBImpl::FlushMemTableToOutputFile(
       }
     } else {
       assert(s == log_io_s);
-      Status new_bg_error = s;
-      error_handler_.SetBGError(new_bg_error, BackgroundErrorReason::kFlush);
+      error_handler_.SetBGError(s, BackgroundErrorReason::kFlush);
     }
   }
   // If flush ran smoothly and no mempurge happened
@@ -1102,8 +1102,7 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
       }
     } else {
       assert(s == log_io_s);
-      Status new_bg_error = s;
-      error_handler_.SetBGError(new_bg_error, BackgroundErrorReason::kFlush);
+      error_handler_.SetBGError(s, BackgroundErrorReason::kFlush);
     }
   }
 
@@ -1256,7 +1255,7 @@ Status DBImpl::IncreaseFullHistoryTsLow(ColumnFamilyHandle* column_family,
 }
 
 Status DBImpl::IncreaseFullHistoryTsLowImpl(ColumnFamilyData* cfd,
-                                            std::string ts_low) {
+                                            const std::string& ts_low) {
   VersionEdit edit;
   edit.SetColumnFamily(cfd->GetID());
   edit.SetFullHistoryTsLow(ts_low);
@@ -2712,8 +2711,8 @@ void DBImpl::GenerateFlushRequest(const autovector<ColumnFamilyData*>& cfds,
   }
 }
 
-void DBImpl::NotifyOnManualFlushScheduled(autovector<ColumnFamilyData*> cfds,
-                                          FlushReason flush_reason) {
+void DBImpl::NotifyOnManualFlushScheduled(
+    const autovector<ColumnFamilyData*>& cfds, FlushReason flush_reason) {
   if (immutable_db_options_.listeners.size() == 0U) {
     return;
   }
@@ -4591,7 +4590,8 @@ void DBImpl::SchedulePendingPurge(std::string fname, std::string dir_to_sync,
   if (reject_new_background_jobs_) {
     return;
   }
-  PurgeFileInfo file_info(fname, dir_to_sync, type, number, job_id);
+  PurgeFileInfo file_info(std::move(fname), std::move(dir_to_sync), type,
+                          number, job_id);
   purge_files_.insert({{number, std::move(file_info)}});
 }
 

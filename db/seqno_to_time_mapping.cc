@@ -155,7 +155,7 @@ void SeqnoToTimeMapping::EnforceCapacity(bool strict) {
     uint64_t new_time_gap;
     std::deque<SeqnoTimePair>::iterator it;
     RemovalCandidate(uint64_t _new_time_gap,
-                     std::deque<SeqnoTimePair>::iterator _it)
+                     const std::deque<SeqnoTimePair>::iterator& _it)
         : new_time_gap(_new_time_gap), it(_it) {}
     bool operator>(const RemovalCandidate& other) const {
       if (new_time_gap == other.new_time_gap) {

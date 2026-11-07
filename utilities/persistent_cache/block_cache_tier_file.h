@@ -254,7 +254,7 @@ class ThreadedWriter : public Writer {
   struct IO {
     explicit IO(const bool signal) : signal_(signal) {}
     explicit IO(WritableFile* const file, CacheWriteBuffer* const buf,
-                const uint64_t file_off, const std::function<void()> callback)
+                const uint64_t file_off, const std::function<void()>& callback)
         : file_(file), buf_(buf), file_off_(file_off), callback_(callback) {}
 
     IO(const IO&) = default;

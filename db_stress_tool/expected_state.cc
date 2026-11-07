@@ -339,10 +339,9 @@ Status FileExpectedStateManager::Open() {
   }
 
   if (s.ok()) {
-    latest_.reset(
-        new FileExpectedState(std::move(expected_state_file_path),
-                              std::move(expected_persisted_seqno_file_path),
-                              max_key_, num_column_families_));
+    latest_.reset(new FileExpectedState(expected_state_file_path,
+                                        expected_persisted_seqno_file_path,
+                                        max_key_, num_column_families_));
     s = latest_->Open(false /* create */);
   }
   return s;

@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "rocksdb/advanced_options.h"
@@ -94,7 +95,7 @@ struct BlobFileCreationInfo : public BlobFileCreationBriefInfo {
                                   _reason),
         total_blob_count(_total_blob_count),
         total_blob_bytes(_total_blob_bytes),
-        status(_status),
+        status(std::move(_status)),
         file_checksum(_file_checksum),
         file_checksum_func_name(_file_checksum_func_name) {}
 
@@ -225,7 +226,7 @@ struct FileDeletionInfo {
       : db_name(_db_name),
         file_path(_file_path),
         job_id(_job_id),
-        status(_status) {}
+        status(std::move(_status)) {}
   // The name of the database where the file was deleted.
   std::string db_name;
   // The path to the deleted file.
@@ -242,7 +243,7 @@ struct BlobFileDeletionInfo : public FileDeletionInfo {
   BlobFileDeletionInfo(const std::string& _db_name,
                        const std::string& _file_path, int _job_id,
                        Status _status)
-      : FileDeletionInfo(_db_name, _file_path, _job_id, _status) {}
+      : FileDeletionInfo(_db_name, _file_path, _job_id, std::move(_status)) {}
 };
 
 enum class FileOperationType {

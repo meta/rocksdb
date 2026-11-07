@@ -732,10 +732,11 @@ VersionEditHandlerPointInTime::VersionEditHandlerPointInTime(
     const ReadOptions& read_options, bool allow_incomplete_valid_version,
     bool trust_manifest_recovery, bool defer_sst_file_opening,
     EpochNumberRequirement epoch_number_requirement)
-    : VersionEditHandler(read_only, column_families, version_set,
+    : VersionEditHandler(read_only, std::move(column_families), version_set,
                          /*track_found_and_missing_files=*/true,
                          /*no_error_if_files_missing=*/true, io_tracer,
-                         read_options, allow_incomplete_valid_version,
+                         read_options, /*skip_load_table_files=*/false,
+                         allow_incomplete_valid_version,
                          epoch_number_requirement),
       trust_manifest_recovery_(trust_manifest_recovery),
       defer_sst_file_opening_(defer_sst_file_opening) {}

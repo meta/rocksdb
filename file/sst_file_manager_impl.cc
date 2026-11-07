@@ -361,7 +361,7 @@ void SstFileManagerImpl::ClearError() {
 }
 
 void SstFileManagerImpl::StartErrorRecovery(ErrorHandler* handler,
-                                            Status bg_error) {
+                                            const Status& bg_error) {
   MutexLock l(&mu_);
   if (bg_error.severity() == Status::Severity::kSoftError) {
     if (bg_err_.ok()) {
@@ -494,7 +494,7 @@ void SstFileManagerImpl::OnDeleteFileImpl(const std::string& file_path) {
 }
 
 SstFileManager* NewSstFileManager(Env* env, std::shared_ptr<Logger> info_log,
-                                  std::string trash_dir,
+                                  const std::string& trash_dir,
                                   int64_t rate_bytes_per_sec,
                                   bool delete_existing_trash, Status* status,
                                   double max_trash_db_ratio,

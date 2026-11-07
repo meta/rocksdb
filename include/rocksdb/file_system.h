@@ -365,7 +365,7 @@ struct IODebugContext {
   std::string ToString() {
     std::ostringstream ss;
     ss << file_path << ", ";
-    for (auto counter : counters) {
+    for (const auto& counter : counters) {
       ss << counter.first << " = " << counter.second << ",";
     }
     ss << msg;

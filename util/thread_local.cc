@@ -78,7 +78,7 @@ class ThreadLocalPtr::StaticMeta {
   // prevents unref handler from running during this call, but clients must
   // still provide external synchronization since the owning thread can
   // access the values without internal locking, e.g., via Get() and Reset().
-  void Fold(uint32_t id, FoldFunc func, void* res);
+  void Fold(uint32_t id, const FoldFunc& func, void* res);
 
   // Register the UnrefHandler for id
   void SetHandler(uint32_t id, UnrefHandler handler);
@@ -436,7 +436,8 @@ void ThreadLocalPtr::StaticMeta::Scrape(uint32_t id, autovector<void*>* ptrs,
   }
 }
 
-void ThreadLocalPtr::StaticMeta::Fold(uint32_t id, FoldFunc func, void* res) {
+void ThreadLocalPtr::StaticMeta::Fold(uint32_t id, const FoldFunc& func,
+                                      void* res) {
   MutexLock l(Mutex());
   for (ThreadData* t = head_.next; t != &head_; t = t->next) {
     if (id < t->entries.size()) {
@@ -523,7 +524,7 @@ void ThreadLocalPtr::Scrape(autovector<void*>* ptrs, void* const replacement) {
   Instance()->Scrape(id_, ptrs, replacement);
 }
 
-void ThreadLocalPtr::Fold(FoldFunc func, void* res) {
+void ThreadLocalPtr::Fold(const FoldFunc& func, void* res) {
   Instance()->Fold(id_, func, res);
 }
 

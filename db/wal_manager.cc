@@ -331,7 +331,7 @@ Status WalManager::GetSortedWalsOfType(const std::string& path,
                                        VectorWalPtr& log_files,
                                        WalFileType log_type, bool need_seqnos) {
   std::vector<std::string> all_files;
-  const Status status = env_->GetChildren(path, &all_files);
+  Status status = env_->GetChildren(path, &all_files);
   if (!status.ok()) {
     return status;
   }

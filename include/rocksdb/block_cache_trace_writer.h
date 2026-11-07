@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <utility>
+
 #include "rocksdb/options.h"
 #include "rocksdb/system_clock.h"
 #include "rocksdb/table_reader_caller.h"
@@ -91,11 +93,11 @@ struct BlockCacheTraceRecord {
                         uint64_t _num_keys_in_block = 0,
                         bool _referenced_key_exist_in_block = false)
       : access_timestamp(_access_timestamp),
-        block_key(_block_key),
+        block_key(std::move(_block_key)),
         block_type(_block_type),
         block_size(_block_size),
         cf_id(_cf_id),
-        cf_name(_cf_name),
+        cf_name(std::move(_cf_name)),
         level(_level),
         sst_fd_number(_sst_fd_number),
         caller(_caller),
@@ -103,7 +105,7 @@ struct BlockCacheTraceRecord {
         no_insert(_no_insert),
         get_id(_get_id),
         get_from_user_specified_snapshot(_get_from_user_specified_snapshot),
-        referenced_key(_referenced_key),
+        referenced_key(std::move(_referenced_key)),
         referenced_data_size(_referenced_data_size),
         num_keys_in_block(_num_keys_in_block),
         referenced_key_exist_in_block(_referenced_key_exist_in_block) {}
