@@ -3002,9 +3002,11 @@ enum {
   rocksdb_uninitialized = 0,
   rocksdb_disable = 1,
   rocksdb_enable_count = 2,
-  rocksdb_enable_time_except_for_mutex = 3,
-  rocksdb_enable_time = 4,
-  rocksdb_out_of_bounds = 5
+  rocksdb_enable_wait = 3,
+  rocksdb_enable_time_except_for_mutex = 4,
+  rocksdb_enable_time_and_cpu_time_except_for_mutex = 5,
+  rocksdb_enable_time = 6,
+  rocksdb_out_of_bounds = 7
 };
 
 enum {
@@ -3092,7 +3094,7 @@ enum {
   rocksdb_compression_dict_block_read_byte,
   rocksdb_metadata_block_read_byte,
   rocksdb_blob_cache_read_byte,
-  rocksdb_total_metric_count = 86
+  rocksdb_total_metric_count = 84
 };
 
 extern ROCKSDB_LIBRARY_API void rocksdb_set_perf_level(int);

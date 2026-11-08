@@ -55,8 +55,9 @@ public class PerfLevelTest {
 
   @Test
   public void testAllPerfLevels() {
-    for (PerfLevel level : new PerfLevel[] {DISABLE, ENABLE_COUNT, ENABLE_TIME_EXCEPT_FOR_MUTEX,
-             ENABLE_TIME_AND_CPU_TIME_EXCEPT_FOR_MUTEX, ENABLE_TIME}) {
+    for (PerfLevel level :
+        new PerfLevel[] {DISABLE, ENABLE_COUNT, ENABLE_WAIT, ENABLE_TIME_EXCEPT_FOR_MUTEX,
+            ENABLE_TIME_AND_CPU_TIME_EXCEPT_FOR_MUTEX, ENABLE_TIME}) {
       db.setPerfLevel(level);
       assertThat(db.getPerfLevel()).isEqualTo(level);
     }
