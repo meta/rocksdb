@@ -3004,6 +3004,16 @@ int main(int argc, char** argv) {
 
     rocksdb_flush_wal(db, 1, &err);
     CheckNoError(err);
+
+    // With no background error outstanding, Resume() succeeds and the DB
+    // keeps taking writes.
+    rocksdb_resume(db, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "resumed", 7, "yes", 3, &err);
+    CheckNoError(err);
+    CheckGet(db, roptions, "resumed", "yes");
+    rocksdb_delete(db, woptions, "resumed", 7, &err);
+    CheckNoError(err);
     {
       rocksdb_flushwaloptions_t* flush_wal_options =
           rocksdb_flushwaloptions_create();
@@ -6041,6 +6051,8 @@ int main(int argc, char** argv) {
     rocksdb_transactiondb_flush_cf(txn_db, flush_options, cfh, &err);
     CheckNoError(err);
     rocksdb_transactiondb_flush(txn_db, flush_options, &err);
+    CheckNoError(err);
+    rocksdb_transactiondb_resume(txn_db, &err);
     CheckNoError(err);
     rocksdb_flushwaloptions_destroy(txn_flush_wal_options);
     rocksdb_flushoptions_destroy(flush_options);

@@ -89,3 +89,8 @@ void rocksdb_transactiondb_flush_cf(
     rocksdb_column_family_handle_t* column_family, char** errptr) {
   SaveError(errptr, txn_db->rep->Flush(options->rep, column_family->rep));
 }
+
+void rocksdb_transactiondb_resume(rocksdb_transactiondb_t* txn_db,
+                                  char** errptr) {
+  SaveError(errptr, txn_db->rep->Resume());
+}
