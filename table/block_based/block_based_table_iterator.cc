@@ -101,14 +101,12 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
     seek_key_prefix_for_readahead_trimming_.clear();
   } else if (prefix_extractor_ && read_options_.prefix_same_as_start) {
     const Slice& seek_user_key = ExtractUserKey(*target);
-    if (prefix_extractor_->InDomain(seek_user_key)) {
-      const Slice prefix = prefix_extractor_->Transform(seek_user_key);
-      // assign() reuses the buffer kept from earlier seeks.
-      seek_key_prefix_for_readahead_trimming_.assign(prefix.data(),
-                                                     prefix.size());
-    } else {
-      seek_key_prefix_for_readahead_trimming_.clear();
-    }
+    const Slice prefix = prefix_extractor_->InDomain(seek_user_key)
+                             ? prefix_extractor_->Transform(seek_user_key)
+                             : Slice();
+    // assign() reuses the buffer kept from earlier seeks.
+    seek_key_prefix_for_readahead_trimming_.assign(prefix.data(),
+                                                   prefix.size());
   }
 
   bool need_seek_index = true;
@@ -897,6 +895,9 @@ void BlockBasedTableIterator::BlockCacheLookupForReadAheadSize(
   if (!readahead_cache_lookup_) {
     return;
   }
+  TEST_SYNC_POINT_CALLBACK(
+      "BlockBasedTableIterator::BlockCacheLookupForReadAheadSize:TrimPrefix",
+      &seek_key_prefix_for_readahead_trimming_);
 
   // Readahead lookup may advance index_iter_ to the end of the file while the
   // current block is still being consumed. In that case there is no next block
