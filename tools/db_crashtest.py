@@ -644,9 +644,7 @@ default_params = {
     "default_temperature": lambda: random.choice(
         ["kUnknown", "kHot", "kWarm", "kCool", "kCold", "kIce"]
     ),
-    # TODO(hx235): enable `enable_memtable_insert_with_hint_prefix_extractor`
-    # after fixing the surfaced issue with delete range
-    "enable_memtable_insert_with_hint_prefix_extractor": 0,
+    "enable_memtable_insert_with_hint_prefix_extractor": lambda: random.choice([0, 1]),
     "check_multiget_consistency": lambda: random.choice([0, 0, 0, 1]),
     "check_multiget_entity_consistency": lambda: random.choice([0, 0, 0, 1]),
     "use_timed_put_one_in": lambda: random.choice([0] * 7 + [1, 5, 10]),
