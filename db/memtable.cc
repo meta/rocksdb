@@ -1141,12 +1141,24 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
   //  value_size   : varint32 of value.size()
   //  value bytes  : char[value.size()]
   //  checksum     : char[moptions_.protection_bytes_per_key]
-  uint32_t key_size = static_cast<uint32_t>(key.size());
-  uint32_t val_size = static_cast<uint32_t>(value.size());
-  uint32_t internal_key_size = key_size + 8;
-  const uint32_t encoded_len = VarintLength(internal_key_size) +
-                               internal_key_size + VarintLength(val_size) +
-                               val_size + moptions_.protection_bytes_per_key;
+  constexpr uint64_t kMaxEncodedEntrySize =
+      std::numeric_limits<uint32_t>::max();
+  if (UNLIKELY(key.size() > kMaxEncodedEntrySize - kNumInternalBytes ||
+               value.size() > kMaxEncodedEntrySize)) {
+    return Status::InvalidArgument("memtable entry is too large");
+  }
+
+  const uint32_t key_size = static_cast<uint32_t>(key.size());
+  const uint32_t val_size = static_cast<uint32_t>(value.size());
+  const uint32_t internal_key_size = key_size + kNumInternalBytes;
+  const uint64_t encoded_len64 = VarintLength(internal_key_size) +
+                                 uint64_t{internal_key_size} +
+                                 VarintLength(val_size) + uint64_t{val_size} +
+                                 moptions_.protection_bytes_per_key;
+  if (UNLIKELY(encoded_len64 > kMaxEncodedEntrySize)) {
+    return Status::InvalidArgument("memtable entry is too large");
+  }
+  const uint32_t encoded_len = static_cast<uint32_t>(encoded_len64);
   char* buf = nullptr;
   std::unique_ptr<MemTableRep>& table =
       type == kTypeRangeDeletion ? range_del_table_ : table_;

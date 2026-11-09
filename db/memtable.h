@@ -706,6 +706,8 @@ class MemTable final : public ReadOnlyMemTable {
   // Returns `Status::TryAgain` if the `seq`, `key` combination already exists
   // in the memtable and `MemTableRepFactory::CanHandleDuplicatedKey()` is true.
   // The next attempt should try a larger value for `seq`.
+  // Returns `Status::InvalidArgument` if the key, value, or full encoded entry
+  // cannot be represented by the memtable entry format.
   Status Add(SequenceNumber seq, ValueType type, const Slice& key,
              const Slice& value, const ProtectionInfoKVOS64* kv_prot_info,
              bool allow_concurrent = false,
