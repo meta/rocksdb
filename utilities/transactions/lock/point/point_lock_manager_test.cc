@@ -31,17 +31,21 @@ class SpotLockManagerTest
  public:
   void SetUp() override {
     init();
-    // If a custom setup function was provided, use it. Otherwise, use what we
-    // have inherited.
     auto param = GetParam();
-    if (param.use_per_key_point_lock_manager) {
+    ResetLocker();
+    deadlock_timeout_us = param.deadlock_timeout_us;
+  }
+
+  // (Re)creates the lock manager under test from txndb_opt_, so that a test
+  // can change the TransactionDBOptions (e.g. max_num_locks) before locking.
+  void ResetLocker() {
+    if (GetParam().use_per_key_point_lock_manager) {
       locker_.reset(new PerKeyPointLockManager(
           static_cast<PessimisticTransactionDB*>(db_), txndb_opt_));
     } else {
       locker_.reset(new PointLockManager(
           static_cast<PessimisticTransactionDB*>(db_), txndb_opt_));
     }
-    deadlock_timeout_us = param.deadlock_timeout_us;
   }
 };
 
@@ -134,6 +138,72 @@ TEST_P(SpotLockManagerTest, UnlockShared) {
 
   delete txn1;
   delete txn2;
+}
+
+TEST_P(SpotLockManagerTest, LockLimitSharedLocks) {
+  // Multiple shared locks on the same key count as one lock towards
+  // max_num_locks, and that lock is released only when the last shared
+  // holder unlocks the key.
+  txndb_opt_.max_num_locks = 1;
+  ResetLocker();
+  MockColumnFamilyHandle cf(1);
+  locker_->AddColumnFamily(&cf);
+
+  auto txn1 = NewTxn();
+  auto txn2 = NewTxn();
+  auto txn3 = NewTxn();
+  ASSERT_OK(locker_->TryLock(txn1, 1, "a", env_, false));
+  ASSERT_OK(locker_->TryLock(txn2, 1, "a", env_, false));
+
+  // "a" is the one locked key, so no other key can be locked.
+  ASSERT_TRUE(locker_->TryLock(txn3, 1, "b", env_, true).IsLockLimit());
+
+  // "a" is still locked by txn2, so the limit is still reached.
+  locker_->UnLock(txn1, 1, "a", env_);
+  ASSERT_TRUE(locker_->TryLock(txn3, 1, "b", env_, true).IsLockLimit());
+
+  // The last shared holder of "a" unlocks it, which frees the one lock.
+  locker_->UnLock(txn2, 1, "a", env_);
+  ASSERT_OK(locker_->TryLock(txn3, 1, "b", env_, true));
+
+  // Cleanup
+  locker_->UnLock(txn3, 1, "b", env_);
+
+  delete txn1;
+  delete txn2;
+  delete txn3;
+}
+
+TEST_P(SpotLockManagerTest, LockLimitSharedLocksAllReleased) {
+  // Releasing all shared holders of a key must free exactly the one lock
+  // that the key consumed, otherwise the limit is silently raised.
+  txndb_opt_.max_num_locks = 2;
+  ResetLocker();
+  MockColumnFamilyHandle cf(1);
+  locker_->AddColumnFamily(&cf);
+
+  auto txn1 = NewTxn();
+  auto txn2 = NewTxn();
+  auto txn3 = NewTxn();
+  ASSERT_OK(locker_->TryLock(txn1, 1, "a", env_, false));
+  ASSERT_OK(locker_->TryLock(txn2, 1, "a", env_, false));
+  ASSERT_OK(locker_->TryLock(txn3, 1, "a", env_, false));
+  locker_->UnLock(txn1, 1, "a", env_);
+  locker_->UnLock(txn2, 1, "a", env_);
+  locker_->UnLock(txn3, 1, "a", env_);
+
+  // No key is locked now, so exactly two keys can be locked.
+  ASSERT_OK(locker_->TryLock(txn1, 1, "b", env_, true));
+  ASSERT_OK(locker_->TryLock(txn1, 1, "c", env_, true));
+  ASSERT_TRUE(locker_->TryLock(txn1, 1, "d", env_, true).IsLockLimit());
+
+  // Cleanup
+  locker_->UnLock(txn1, 1, "b", env_);
+  locker_->UnLock(txn1, 1, "c", env_);
+
+  delete txn1;
+  delete txn2;
+  delete txn3;
 }
 
 // This test doesn't work with Range Lock Manager, because Range Lock Manager
