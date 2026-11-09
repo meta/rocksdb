@@ -9730,6 +9730,53 @@ TEST_F(ResumableCompactionServiceTest,
 }
 
 TEST_F(ResumableCompactionServiceTest,
+       PerKeyPlacementResumeWithBothOutputLevels) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  // Compact L0 straight into the last level, which per-key placement needs.
+  options.num_levels = 3;
+  options.level_compaction_dynamic_level_bytes = true;
+  std::shared_ptr<Statistics> statistics = CreateDBStatistics();
+
+  auto resume_cs = std::make_shared<ResumableCompactionService>(
+      dbname_, options, statistics,
+      ResumableCompactionService::TestScenario::kCancelThenResume,
+      /*output_file_key_interval=*/1);
+  resume_cs->SetCancelAtKey("c", kMaxSequenceNumber);
+  options.compaction_service = resume_cs;
+
+  DestroyAndReopen(options);
+  // "a", "c", and "e" get sequence numbers 1 to 3 and go to the last level.
+  // "b", "d", and "f" get 4 to 6 and go to the proximal level. When the file
+  // with "a" closes at "c", the proximal level still has an open file with
+  // "b".
+  for (const char* const key : {"a", "c", "e", "b", "d", "f"}) {
+    ASSERT_OK(Put(key, std::string(100, key[0])));
+  }
+  ASSERT_OK(Flush());
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "Compaction::SupportsPerKeyPlacement:Enabled",
+      [&](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::PrepareTimes():preclude_last_level_min_seqno",
+      [&](void* arg) { *static_cast<SequenceNumber*>(arg) = 3; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  CompactionServiceResult result;
+  resume_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_GT(NumTableFilesAtLevel(1), 0);
+  ASSERT_GT(NumTableFilesAtLevel(2), 0);
+  for (const char* const key : {"a", "b", "c", "d", "e", "f"}) {
+    EXPECT_EQ(Get(key), std::string(100, key[0]));
+  }
+  ASSERT_OK(Put("g", "g"));
+}
+
+TEST_F(ResumableCompactionServiceTest,
        BlobPerKeyPlacementDoesNotPersistProgress) {
   const auto run_compaction = [&](bool supports_per_key_placement,
                                   size_t* persisted_progress_count) {
