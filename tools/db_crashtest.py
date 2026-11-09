@@ -1817,6 +1817,9 @@ def finalize_and_sanitize(src_params):
         dest_params["commit_bypass_memtable_one_in"] = 0
         # not compatible with Remote Compaction yet
         dest_params["remote_compaction_worker_threads"] = 0
+        # Pipelined write does not support seq_per_batch, which WritePrepared
+        # and WriteUnprepared use.
+        dest_params["enable_pipelined_write"] = 0
     # TODO(hx235): enable test_multi_ops_txns with fault injection after stabilizing the CI
     if dest_params.get("test_multi_ops_txns") == 1:
         dest_params["write_fault_one_in"] = 0
@@ -1829,8 +1832,6 @@ def finalize_and_sanitize(src_params):
             # try small wp_commit_cache_bits, e.g. 0 once we explore storing full
             # commit sequence numbers in commit cache
             dest_params["wp_commit_cache_bits"] = 10
-            # pipeline write is not currnetly compatible with WritePrepared txns
-            dest_params["enable_pipelined_write"] = 0
             # OpenReadOnly after checkpoint is not currently compatible with WritePrepared txns
             dest_params["checkpoint_one_in"] = 0
             # Required to be 1 in order to use commit-time-batch
