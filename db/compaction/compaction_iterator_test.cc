@@ -3817,6 +3817,67 @@ class DropKeyKeepRestCompactionFilter : public CompactionFilter {
   std::string dropped_key_;
 };
 
+// A compaction filter without FilterV4 support, so the iterator resolves blob
+// columns before it calls the filter.
+class KeepAllWithoutFilterV4CompactionFilter : public CompactionFilter {
+ public:
+  Decision FilterV2(int /*level*/, const Slice& /*key*/, ValueType /*type*/,
+                    const Slice& /*existing_value*/, std::string* /*new_value*/,
+                    std::string* /*skip_until*/) const override {
+    return Decision::kKeep;
+  }
+  const char* Name() const override {
+    return "KeepAllWithoutFilterV4CompactionFilter";
+  }
+};
+
+// Without a blob fetcher, resolving the blob columns of an entity for a filter
+// without FilterV4 support fails with NotSupported, as the FilterV4 resolver
+// does.
+TEST_F(WideColumnEntityBlobGCTest, EagerBlobResolutionWithoutFetcher) {
+  const std::string entity_value = CreateEntityWithBlobIndices(
+      {{"col1", "value1"}, {"col2", std::string(100, 'X')}},
+      {{1 /*col_idx*/, 5 /*file_number*/, 0 /*offset*/, 100 /*size*/}});
+  std::vector<std::string> input_keys = {
+      test::KeyStr("key1", 10, kTypeWideColumnEntity)};
+  std::vector<std::string> input_values = {entity_value};
+
+  KeepAllWithoutFilterV4CompactionFilter filter;
+
+  const Comparator* cmp = BytewiseComparator();
+  InternalKeyComparator icmp(cmp);
+  std::vector<SequenceNumber> snapshots;
+  std::atomic<bool> shutting_down{false};
+  const std::atomic<bool> manual_compaction_canceled{false};
+
+  MergeHelper merge_helper(Env::Default(), cmp, nullptr, nullptr,
+                           CompactionFilter::MergeOrder::kFilterBeforeMerge,
+                           nullptr, false, 0, nullptr, 0, nullptr,
+                           &shutting_down);
+
+  // FakeCompactionWithBlobGC has no input version, so the iterator has no
+  // blob fetcher.
+  auto fake_compaction = std::make_unique<FakeCompactionWithBlobGC>();
+
+  std::unique_ptr<CompactionRangeDelAggregator> range_del_agg(
+      new CompactionRangeDelAggregator(&icmp, snapshots));
+
+  std::unique_ptr<VectorIterator> iter(
+      new VectorIterator(input_keys, input_values, &icmp));
+  iter->SeekToFirst();
+
+  CompactionIterator c_iter(
+      iter.get(), cmp, &merge_helper, kMaxSequenceNumber, &snapshots,
+      kMaxSequenceNumber, kMaxSequenceNumber, kMaxSequenceNumber, nullptr,
+      Env::Default(), false, range_del_agg.get(), nullptr /*blob_file_builder*/,
+      true, true, manual_compaction_canceled, std::move(fake_compaction), false,
+      &filter, &shutting_down);
+
+  c_iter.SeekToFirst();
+  ASSERT_FALSE(c_iter.Valid());
+  ASSERT_TRUE(c_iter.status().IsNotSupported()) << c_iter.status().ToString();
+}
+
 // Test that when a compaction filter is active and returns kKeep for a
 // wide column entity with blob columns, PrepareOutput skips redundant
 // deserialization (since InvokeFilterIfNeeded already deserialized it).

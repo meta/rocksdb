@@ -749,7 +749,9 @@ Status CompactionOutputs::AddRangeDels(
          ucmp->CompareWithoutTimestamp(ExtractUserKey(*upper_bound),
                                        *comp_end_user_key) <= 0);
   auto it = range_del_agg.NewIterator(lower_bound, upper_bound);
-  Slice last_tombstone_start_user_key{};
+  // The empty user key is a valid start key, so "no previous tombstone" needs
+  // its own state.
+  OptSlice last_tombstone_start_user_key;
   bool reached_lower_bound = false;
   const ReadOptions read_options(Env::IOActivity::kCompaction);
   for (it->SeekToFirst(); it->Valid(); it->Next()) {
@@ -891,8 +893,8 @@ Status CompactionOutputs::AddRangeDels(
                                   tombstone.seq_, icmp);
     if (!bottommost_level) {
       bool start_user_key_changed =
-          last_tombstone_start_user_key.empty() ||
-          ucmp->CompareWithoutTimestamp(last_tombstone_start_user_key,
+          !last_tombstone_start_user_key ||
+          ucmp->CompareWithoutTimestamp(*last_tombstone_start_user_key,
                                         it->start_key()) < 0;
       last_tombstone_start_user_key = it->start_key();
       if (start_user_key_changed) {
