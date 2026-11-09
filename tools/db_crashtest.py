@@ -2268,16 +2268,18 @@ def gen_cmd_params(args, unknown_params=None):
         and params.get("test_secondary", 0) == 0
         and random.choice([0] * 9 + [1]) == 1
     ):
-        params.update(
-            random.choice(
-                [
-                    blob_params,
-                    blob_direct_write_params,
-                    blob_direct_write_get_entity_params,
-                    blob_direct_write_multi_get_entity_params,
-                ]
-            )
-        )
+        blob_profiles = [blob_params]
+        # Blob direct write turns off transactions and user-defined timestamps,
+        # so it would silently drop the feature these flavors exist to test.
+        if not (
+            args.txn or args.optimistic_txn or args.test_multiops_txn or args.enable_ts
+        ):
+            blob_profiles += [
+                blob_direct_write_params,
+                blob_direct_write_get_entity_params,
+                blob_direct_write_multi_get_entity_params,
+            ]
+        params.update(random.choice(blob_profiles))
 
     if "compaction_style" not in params:
         # Default to leveled compaction
