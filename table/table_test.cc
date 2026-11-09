@@ -9187,6 +9187,8 @@ TEST_P(ExternalTablePointReadTest, FullModeLiveWritesAndCompaction) {
 
   Options options = GetDefaultOptions();
   options.disable_auto_compactions = true;
+  options.flush_verify_memtable_count = true;
+  options.compaction_verify_record_count = true;
   options.merge_operator = MergeOperators::CreateStringAppendOperator();
   options.table_factory = NewExternalTableFactory(
       std::make_shared<SimpleFullExternalTableFactory>());

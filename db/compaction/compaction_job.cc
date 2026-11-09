@@ -1249,10 +1249,7 @@ Status CompactionJob::VerifyCompactionRecordCounts(
   }
 
   const auto& mutable_cf_options = compact_->compaction->mutable_cf_options();
-  if ((mutable_cf_options.table_factory->IsInstanceOf(
-           TableFactory::kBlockBasedTableName()) ||
-       mutable_cf_options.table_factory->IsInstanceOf(
-           TableFactory::kPlainTableName()))) {
+  if (mutable_cf_options.table_factory->IsRecordCountSupported()) {
     status = VerifyOutputRecordCount();
     if (!status.ok()) {
       return status;

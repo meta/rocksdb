@@ -1118,6 +1118,8 @@ class ExternalTableFactoryAdapter : public TableFactory {
     return supports_table_builder_;
   }
 
+  bool IsRecordCountSupported() const override { return true; }
+
   bool IsInstanceOf(const std::string& name) const override {
     return name == kClassName() || TableFactory::IsInstanceOf(name);
   }

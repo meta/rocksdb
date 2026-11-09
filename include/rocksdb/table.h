@@ -1322,6 +1322,15 @@ class TableFactory : public Customizable {
   // set disallow_memtable_writes, automatic compactions are not scheduled for
   // it, and CompactRange() and CompactFiles() on it return NotSupported.
   virtual bool IsTableBuilderSupported() const { return true; }
+
+  // Returns whether builders report accurate logical record counts in
+  // TableProperties::num_entries and num_range_deletions, so flush, recovery,
+  // and compaction can verify output counts. num_entries includes range
+  // deletions. Custom table factories can opt in by overriding this method.
+  virtual bool IsRecordCountSupported() const {
+    return IsInstanceOf(kBlockBasedTableName()) ||
+           IsInstanceOf(kPlainTableName());
+  }
 };
 
 // Create a special table factory that can open either of the supported
