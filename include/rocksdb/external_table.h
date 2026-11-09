@@ -555,6 +555,15 @@ class ExternalTableFactoryBase : public Customizable {
       const ExternalTableBuilderOptions& builder_options,
       const std::string& file_path, FSWritableFile* file) const = 0;
 
+  // Recognizes this factory's table format without taking ownership of file.
+  // On OK, matches reports recognition. I/O failures are returned as Status.
+  virtual Status FileIsValidTable(const IOOptions& /*io_options*/,
+                                  FSRandomAccessFile& /*file*/,
+                                  uint64_t /*file_size*/,
+                                  bool* /*matches*/) const {
+    return Status::NotSupported("External table format probing is unsupported");
+  }
+
   // Configures this factory using an implementation-defined string. RocksDB
   // calls this method while preparing the table factory, before it is used to
   // create table readers or builders. The configuration is immutable after
