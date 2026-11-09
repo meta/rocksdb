@@ -103,6 +103,22 @@ INSTANTIATE_TEST_CASE_P(
 
 #endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 
+TEST_P(TransactionTest, PipelinedWriteRequiresSingleQueueWriteCommitted) {
+  // Pipelined write cannot be combined with two write queues or with
+  // WritePrepared/WriteUnprepared (seq_per_batch). The DB is rejected at open
+  // instead of opening and then failing every write.
+  options.enable_pipelined_write = true;
+  Status s = ReOpen();
+  if (options.unordered_write || options.two_write_queues) {
+    ASSERT_EQ(s.code(), Status::Code::kInvalidArgument);
+  } else if (txn_db_options.write_policy != WRITE_COMMITTED) {
+    ASSERT_EQ(s.code(), Status::Code::kNotSupported);
+  } else {
+    ASSERT_OK(s);
+    ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  }
+}
+
 TEST_P(TransactionTest, TestUpperBoundUponDeletion) {
   // Reproduction from the original bug report, 11606
   // This test does writes without snapshot validation, and then tries to create
