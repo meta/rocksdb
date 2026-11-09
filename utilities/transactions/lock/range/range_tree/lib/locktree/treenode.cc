@@ -219,7 +219,7 @@ treenode *treenode::find_node_with_overlapping_child(
 }
 
 bool treenode::insert(const keyrange &range, TXNID txnid, bool is_shared) {
-  int rc = true;
+  bool rc = true;
   // choose a child to check. if that child is null, then insert the new node
   // there. otherwise recur down that child's subtree
   keyrange::comparison c = range.compare(*m_cmp, m_range);

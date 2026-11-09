@@ -5,10 +5,12 @@
 
 #ifndef OS_WIN
 
+#include <algorithm>
 #include <functional>
 #include <iomanip>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "db/db_impl/db_impl.h"
 #include "rocksdb/db.h"
@@ -350,6 +352,68 @@ TEST_F(RangeLockingTest, MultipleTrxLockStatusData) {
   delete txn1;
 }
 
+// A transaction that requests a shared lock it already owns must not account
+// lock memory a second time, wherever the lock sits in the tree.
+TEST_F(RangeLockingTest, SharedLockReacquireMemory) {
+  auto cf = db->DefaultColumnFamily();
+  Transaction* txn0 = NewTxn();
+  Transaction* txn1 = NewTxn();
+  std::string value;
+
+  // A second transaction ends the single-transaction optimization, so the
+  // shared lock on "b" becomes a child of the tree root "a".
+  ASSERT_OK(txn1->GetRangeLock(cf, Endpoint("a"), Endpoint("a")));
+  for (int i = 0; i < 2; i++) {
+    ASSERT_TRUE(txn0->GetForUpdate(ReadOptions(), cf, "b", &value,
+                                   /*exclusive=*/false)
+                    .IsNotFound());
+  }
+
+  ASSERT_OK(txn0->Rollback());
+  ASSERT_OK(txn1->Rollback());
+  delete txn0;
+  delete txn1;
+  ASSERT_EQ(range_lock_mgr->GetStatus().current_lock_memory, 0);
+}
+
+// A transaction that already shares a lock with other owners must not account
+// it again when it requests it once more, whatever the release order.
+TEST_F(RangeLockingTest, SharedLockMultiOwnerReacquireMemory) {
+  auto cf = db->DefaultColumnFamily();
+  std::string value;
+  for (const size_t n_owners : {2, 3}) {
+    for (const bool reverse_release : {false, true}) {
+      Transaction* other = NewTxn();
+      ASSERT_OK(other->GetRangeLock(cf, Endpoint("a"), Endpoint("a")));
+      std::vector<Transaction*> owners;
+      for (size_t i = 0; i < n_owners; i++) {
+        owners.push_back(NewTxn());
+        ASSERT_TRUE(owners.back()
+                        ->GetForUpdate(ReadOptions(), cf, "b", &value,
+                                       /*exclusive=*/false)
+                        .IsNotFound());
+      }
+      const auto lock_memory = range_lock_mgr->GetStatus().current_lock_memory;
+      ASSERT_TRUE(owners.front()
+                      ->GetForUpdate(ReadOptions(), cf, "b", &value,
+                                     /*exclusive=*/false)
+                      .IsNotFound());
+      ASSERT_EQ(range_lock_mgr->GetStatus().current_lock_memory, lock_memory);
+
+      if (reverse_release) {
+        std::reverse(owners.begin(), owners.end());
+      }
+      for (auto* owner : owners) {
+        ASSERT_OK(owner->Rollback());
+        delete owner;
+      }
+      ASSERT_OK(other->Rollback());
+      delete other;
+      ASSERT_EQ(range_lock_mgr->GetStatus().current_lock_memory, 0);
+    }
+  }
+}
+
 #if defined(__has_feature)
 #if __has_feature(thread_sanitizer)
 #define SKIP_LOCK_ESCALATION_TEST 1
@@ -417,6 +481,158 @@ TEST_F(RangeLockingTest, LockEscalationReleasesSharedLockMemory) {
 
   delete txn0;
   delete txn1;
+}
+
+// Shared locks with several owners must not leave lock memory accounted after
+// escalation once all of their owners have ended.
+TEST_F(RangeLockingTest, SharedLockEscalationMemory) {
+  auto cf = db->DefaultColumnFamily();
+  ASSERT_EQ(range_lock_mgr->GetStatus().current_lock_memory, 0);
+
+  Transaction* txn0 = NewTxn();
+  Transaction* txn1 = NewTxn();
+  std::string value;
+  for (const char* key : {"a", "b", "c"}) {
+    ASSERT_TRUE(txn0->GetForUpdate(ReadOptions(), cf, key, &value,
+                                   /*exclusive=*/false)
+                    .IsNotFound());
+    ASSERT_TRUE(txn1->GetForUpdate(ReadOptions(), cf, key, &value,
+                                   /*exclusive=*/false)
+                    .IsNotFound());
+  }
+  for (int i = 0; i < 10; i++) {
+    const std::string key = "x" + std::to_string(i);
+    ASSERT_OK(txn0->GetRangeLock(cf, Endpoint(key), Endpoint(key)));
+  }
+
+  const auto escalations = range_lock_mgr->GetStatus().escalation_count;
+  ASSERT_EQ(0, range_lock_mgr->SetMaxLockMemory(
+                   range_lock_mgr->GetStatus().current_lock_memory + 4));
+  for (int i = 0; i < 10; i++) {
+    const std::string key = "y" + std::to_string(i);
+    ASSERT_OK(txn0->GetRangeLock(cf, Endpoint(key), Endpoint(key)));
+  }
+  ASSERT_GT(range_lock_mgr->GetStatus().escalation_count, escalations);
+
+  ASSERT_OK(txn0->Rollback());
+  ASSERT_OK(txn1->Rollback());
+  delete txn0;
+  delete txn1;
+  ASSERT_EQ(range_lock_mgr->GetStatus().current_lock_memory, 0);
+}
+
+// Re-requesting a shared lock with several owners after escalation must not
+// account it again either.
+TEST_F(RangeLockingTest, SharedLockReacquireAfterEscalationMemory) {
+  auto cf = db->DefaultColumnFamily();
+  Transaction* txn0 = NewTxn();
+  Transaction* txn1 = NewTxn();
+  std::string value;
+  for (const char* key : {"a", "b", "c"}) {
+    ASSERT_TRUE(txn0->GetForUpdate(ReadOptions(), cf, key, &value,
+                                   /*exclusive=*/false)
+                    .IsNotFound());
+    ASSERT_TRUE(txn1->GetForUpdate(ReadOptions(), cf, key, &value,
+                                   /*exclusive=*/false)
+                    .IsNotFound());
+  }
+  for (int i = 0; i < 10; i++) {
+    const std::string key = "x" + std::to_string(i);
+    ASSERT_OK(txn0->GetRangeLock(cf, Endpoint(key), Endpoint(key)));
+  }
+  const auto escalations = range_lock_mgr->GetStatus().escalation_count;
+  ASSERT_EQ(0, range_lock_mgr->SetMaxLockMemory(
+                   range_lock_mgr->GetStatus().current_lock_memory + 4));
+  for (int i = 0; i < 10; i++) {
+    const std::string key = "y" + std::to_string(i);
+    ASSERT_OK(txn0->GetRangeLock(cf, Endpoint(key), Endpoint(key)));
+  }
+  ASSERT_GT(range_lock_mgr->GetStatus().escalation_count, escalations);
+  ASSERT_EQ(0, range_lock_mgr->SetMaxLockMemory(1 << 30));
+
+  const auto lock_memory = range_lock_mgr->GetStatus().current_lock_memory;
+  ASSERT_TRUE(txn0->GetForUpdate(ReadOptions(), cf, "b", &value,
+                                 /*exclusive=*/false)
+                  .IsNotFound());
+  ASSERT_EQ(range_lock_mgr->GetStatus().current_lock_memory, lock_memory);
+
+  ASSERT_OK(txn0->Rollback());
+  ASSERT_OK(txn1->Rollback());
+  delete txn0;
+  delete txn1;
+  ASSERT_EQ(range_lock_mgr->GetStatus().current_lock_memory, 0);
+}
+
+// Escalation must not merge a shared lock with the transaction's exclusive
+// locks in either order: exclusive keys stay exclusive and shared keys stay
+// shareable by other transactions.
+TEST_F(RangeLockingTest, MixedModeLockEscalation) {
+  auto cf = db->DefaultColumnFamily();
+  TransactionOptions short_wait;
+  short_wait.lock_timeout = 1;
+  Transaction* txn0 = NewTxn();
+  Transaction* txn1 = NewTxn(short_wait);
+  std::string value;
+  // txn1's lock ends the single-transaction optimization.
+  ASSERT_OK(txn1->GetRangeLock(cf, Endpoint("z"), Endpoint("z")));
+  // Shared before exclusive (k), and exclusive before shared (j).
+  ASSERT_TRUE(txn0->GetForUpdate(ReadOptions(), cf, "k0", &value,
+                                 /*exclusive=*/false)
+                  .IsNotFound());
+  for (int i = 1; i < 10; i++) {
+    const std::string k = "k" + std::to_string(i);
+    const std::string j = "j" + std::to_string(i - 1);
+    ASSERT_TRUE(txn0->GetForUpdate(ReadOptions(), cf, k, &value).IsNotFound());
+    ASSERT_TRUE(txn0->GetForUpdate(ReadOptions(), cf, j, &value).IsNotFound());
+  }
+  ASSERT_TRUE(txn0->GetForUpdate(ReadOptions(), cf, "j9", &value,
+                                 /*exclusive=*/false)
+                  .IsNotFound());
+
+  const auto escalations = range_lock_mgr->GetStatus().escalation_count;
+  ASSERT_EQ(0, range_lock_mgr->SetMaxLockMemory(
+                   range_lock_mgr->GetStatus().current_lock_memory + 200));
+  for (int i = 0;
+       i < 10 && range_lock_mgr->GetStatus().escalation_count == escalations;
+       i++) {
+    const std::string key = "y" + std::to_string(i);
+    ASSERT_OK(txn0->GetRangeLock(cf, Endpoint(key), Endpoint(key)));
+  }
+  ASSERT_GT(range_lock_mgr->GetStatus().escalation_count, escalations);
+  ASSERT_EQ(0, range_lock_mgr->SetMaxLockMemory(1 << 30));
+
+  // Each escalated lock of txn0 is shared only if it is one of the shared
+  // point locks.
+  for (const auto& entry : range_lock_mgr->GetRangeLockStatusData()) {
+    const auto& info = entry.second;
+    if (info.ids != std::vector<TransactionID>{txn0->GetID()}) {
+      continue;
+    }
+    const bool shared_point =
+        info.start.slice == info.end.slice &&
+        (info.start.slice == "k0" || info.start.slice == "j9");
+    EXPECT_EQ(info.exclusive, !shared_point)
+        << "[" << info.start.slice << ", " << info.end.slice << "]";
+  }
+
+  for (const char* key : {"k1", "j8"}) {
+    EXPECT_TRUE(txn1->GetForUpdate(ReadOptions(), cf, key, &value,
+                                   /*exclusive=*/false)
+                    .IsTimedOut());
+    EXPECT_TRUE(
+        txn1->GetForUpdate(ReadOptions(), cf, key, &value).IsTimedOut());
+  }
+  for (const char* key : {"k0", "j9"}) {
+    EXPECT_TRUE(txn1->GetForUpdate(ReadOptions(), cf, key, &value,
+                                   /*exclusive=*/false)
+                    .IsNotFound());
+  }
+
+  ASSERT_OK(txn0->Rollback());
+  ASSERT_OK(txn1->Rollback());
+  delete txn0;
+  delete txn1;
+  ASSERT_EQ(range_lock_mgr->GetStatus().current_lock_memory, 0);
 }
 
 // An escalation barrier function. Allow escalation iff the first two bytes are
