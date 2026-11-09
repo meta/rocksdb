@@ -16,6 +16,7 @@
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_reservation_manager.h"
 #include "db/db_test_util.h"
+#include "db/table_cache.h"
 #include "options/options_helper.h"
 #include "port/stack_trace.h"
 #include "rocksdb/advanced_options.h"
@@ -3734,6 +3735,31 @@ class DBBloomFilterLevelSeekTest : public DBBloomFilterTest {
     ASSERT_EQ("0,2", FilesPerLevel());
   }
 
+  // Moves the two files down to L2 and puts two files on L1. DB open with
+  // max_open_files=20 pins the table readers of at most two files (a quarter
+  // of the table cache capacity), taking them level by level, so it pins only
+  // those of the L1 files. File iterators of the L2 files then hold table
+  // cache handles.
+  void MoveFilesBelowPreloadedLevel() {
+    MoveFilesToLevel(2);
+    for (const char* key : {"a000:a", "a001:a"}) {
+      ASSERT_OK(Put(key, "v"));
+      ASSERT_OK(Flush());
+      MoveFilesToLevel(1);
+    }
+    ASSERT_EQ("0,2,2", FilesPerLevel());
+  }
+
+  // Counts in retries_ the positioning calls that find the level iterator on
+  // the stand-in for a file whose filter ruled out an earlier seek, and so
+  // build the file's iterator from the stand-in's table reader.
+  void CountRetriesOfFilteredFiles() {
+    SyncPoint::GetInstance()->SetCallBack(
+        "LevelIterator::RetryPrefixFilteredFile",
+        [this](void* /*arg*/) { retries_++; });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+
   uint64_t Ticker(Tickers ticker) {
     return options_.statistics->getTickerCount(ticker);
   }
@@ -3750,6 +3776,7 @@ class DBBloomFilterLevelSeekTest : public DBBloomFilterTest {
   }
 
   Options options_;
+  std::atomic<int> retries_{0};
 };
 
 TEST_F(DBBloomFilterLevelSeekTest, FilteredSeekReadsNoIndex) {
@@ -3826,49 +3853,69 @@ TEST_F(DBBloomFilterLevelSeekTest, AutoPrefixModeFilteredSeekReadsNoIndex) {
   EXPECT_EQ(SeeksFiltered(), 1);
 }
 
+// A filtered seek leaves an empty stand-in as the level's file iterator, and
+// the file's boundary sentinel in the merging iterator's heap. When no other
+// key sorts before the sentinel, the merging iterator skips it within the same
+// seek, which moves the level iterator off the file and drops the stand-in.
+// Here memtable keys sort before the sentinels, so the next positioning call
+// into the file finds the stand-in and builds the file's iterator from the
+// stand-in's table reader.
 TEST_F(DBBloomFilterLevelSeekTest, PositioningIntoFileOfFilteredSeek) {
   ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
+  ASSERT_OK(Put("p003:m", "v"));
+  ASSERT_OK(Put("p011:m", "v"));
+  CountRetriesOfFilteredFiles();
   for (bool pin_data : {false, true}) {
     SCOPED_TRACE("pin_data=" + std::to_string(pin_data));
     ASSERT_OK(options_.statistics->Reset());
+    retries_ = 0;
     ReadOptions read_options;
     read_options.prefix_same_as_start = true;
     read_options.pin_data = pin_data;
     std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
 
-    // Further seeks into the file whose filter ruled out the first one.
+    // Further seeks into the file whose filter ruled out the first one check
+    // its filter again before building its iterator.
     iter->Seek("p001");
     ASSERT_OK(iter->status());
     ASSERT_FALSE(iter->Valid());
     iter->Seek("p003");
     ASSERT_OK(iter->status());
-    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), "p003:m");
+    EXPECT_EQ(retries_.load(), 1);
     EXPECT_EQ(SeeksFiltered(), 2);
     EXPECT_EQ(SeeksPassingFilter(), 0);
     iter->Seek("p004");
     ASSERT_OK(iter->status());
     ASSERT_TRUE(iter->Valid());
     EXPECT_EQ(iter->key(), "p004:a");
+    EXPECT_EQ(retries_.load(), 2);
     EXPECT_EQ(SeeksFiltered(), 2);
     EXPECT_EQ(SeeksPassingFilter(), 1);
     const Slice key_from_retried_file = iter->key();
     std::string key_pinned;
     ASSERT_OK(iter->GetProperty("rocksdb.iterator.is-key-pinned", &key_pinned));
     EXPECT_EQ(key_pinned, pin_data ? "1" : "0");
+    // The file's iterator is real now and checks the filter on its own.
     iter->Seek("p003");
     ASSERT_OK(iter->status());
-    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), "p003:m");
+    EXPECT_EQ(retries_.load(), 2);
     EXPECT_EQ(SeeksFiltered(), 3);
     EXPECT_EQ(SeeksPassingFilter(), 1);
 
     // Positioning calls other than Seek() into such a file.
     iter->Seek("p011");
     ASSERT_OK(iter->status());
-    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), "p011:m");
     iter->SeekForPrev("p012:b");
     ASSERT_OK(iter->status());
     ASSERT_TRUE(iter->Valid());
     EXPECT_EQ(iter->key(), "p012:a");
+    EXPECT_EQ(retries_.load(), 3);
 
     iter->Seek("p001");
     ASSERT_OK(iter->status());
@@ -3877,18 +3924,106 @@ TEST_F(DBBloomFilterLevelSeekTest, PositioningIntoFileOfFilteredSeek) {
     ASSERT_OK(iter->status());
     ASSERT_TRUE(iter->Valid());
     EXPECT_EQ(iter->key(), "p000:a");
+    EXPECT_EQ(retries_.load(), 4);
 
     iter->Seek("p011");
     ASSERT_OK(iter->status());
-    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), "p011:m");
     iter->SeekToLast();
     ASSERT_OK(iter->status());
     ASSERT_TRUE(iter->Valid());
     EXPECT_EQ(iter->key(), "p012:a");
+    EXPECT_EQ(retries_.load(), 5);
 
     if (pin_data) {
       EXPECT_EQ(key_from_retried_file, "p004:a");
     }
+
+    // Prev() goes back into such a file through the level iterator's
+    // SeekForPrev(). A total order scan lets it return the file's key of an
+    // earlier prefix, while the bound right after prefix p011 still lets the
+    // filter rule out the seek.
+    ReadOptions total_order_options;
+    total_order_options.pin_data = pin_data;
+    total_order_options.total_order_seek = true;
+    total_order_options.auto_prefix_mode = true;
+    const Slice upper_bound = "p012";
+    total_order_options.iterate_upper_bound = &upper_bound;
+    iter.reset(db_->NewIterator(total_order_options));
+    iter->Seek("p011");
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), "p011:m");
+    iter->Prev();
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), "p010:a");
+    EXPECT_EQ(retries_.load(), 6);
+  }
+}
+
+// The stand-in for a file whose table reader is not pinned holds the file's
+// table cache handle. When a later positioning call into the file builds the
+// file's iterator from the stand-in's table reader, the handle moves to that
+// iterator, which keeps the reader alive after the table cache evicts it.
+TEST_F(DBBloomFilterLevelSeekTest, RetriedFileKeepsTableCacheHandle) {
+  ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
+  ASSERT_NO_FATAL_FAILURE(MoveFilesBelowPreloadedLevel());
+  options_.max_open_files = 20;
+  Reopen(options_);
+  // Holds the level iterator at the file of p011 after a seek to p011.
+  ASSERT_OK(Put("p011:m", "v"));
+  uint64_t file_number = 0;
+  std::vector<LiveFileMetaData> files;
+  db_->GetLiveFilesMetaData(&files);
+  for (const LiveFileMetaData& file : files) {
+    if (file.smallestkey == "p010:a") {
+      file_number = file.file_number;
+    }
+  }
+  ASSERT_NE(file_number, 0);
+  CountRetriesOfFilteredFiles();
+  std::atomic<int> dropped_with_cleanups{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "LevelIterator::SetFileIterator:DeleteIterator", [&](void* old_iter) {
+        if (old_iter != nullptr &&
+            static_cast<InternalIterator*>(old_iter)->HasCleanups()) {
+          dropped_with_cleanups++;
+        }
+      });
+
+  struct Reentry {
+    const char* name;
+    void (*position)(Iterator* it);
+  };
+  for (const Reentry& reentry :
+       {Reentry{"Seek", [](Iterator* it) { it->Seek("p012"); }},
+        Reentry{"SeekForPrev", [](Iterator* it) { it->SeekForPrev("p012:b"); }},
+        Reentry{"SeekToLast", [](Iterator* it) { it->SeekToLast(); }}}) {
+    SCOPED_TRACE(reentry.name);
+    ReadOptions read_options;
+    read_options.prefix_same_as_start = true;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+    iter->Seek("p011");
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), "p011:m");
+    // Leaves the stand-in's handle as the only reference to the table reader.
+    TableCache::Evict(dbfull()->TEST_table_cache(), file_number);
+    const uint64_t file_opens = Ticker(NO_FILE_OPENS);
+    retries_ = 0;
+    dropped_with_cleanups = 0;
+    reentry.position(iter.get());
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), "p012:a");
+    EXPECT_EQ(iter->value(), "v");
+    EXPECT_EQ(retries_.load(), 1);
+    // The file's iterator came from the stand-in's table reader.
+    EXPECT_EQ(Ticker(NO_FILE_OPENS), file_opens);
+    // The stand-in was dropped without releasing the handle.
+    EXPECT_EQ(dropped_with_cleanups.load(), 0);
   }
 }
 
@@ -3897,14 +4032,7 @@ TEST_F(DBBloomFilterLevelSeekTest, PositioningIntoFileOfFilteredSeek) {
 // whose filter ruled out the seek never returned any, so it is dropped instead.
 TEST_F(DBBloomFilterLevelSeekTest, FilteredSeekStandInsAreNotPinned) {
   ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
-  // A third L1 file, ahead of the others, so that DB open with a finite
-  // max_open_files pins the table readers of only the first two files (a
-  // quarter of the table cache capacity) and file iterators of the last one
-  // hold table cache handles.
-  ASSERT_OK(Put("a000:a", "v"));
-  ASSERT_OK(Flush());
-  MoveFilesToLevel(1);
-  ASSERT_EQ("0,3", FilesPerLevel());
+  ASSERT_NO_FATAL_FAILURE(MoveFilesBelowPreloadedLevel());
   std::atomic<int> pinned{0};
   std::atomic<int> dropped{0};
   // A dropped stand-in still holding a cleanup releases a table cache handle.
@@ -3939,7 +4067,7 @@ TEST_F(DBBloomFilterLevelSeekTest, FilteredSeekStandInsAreNotPinned) {
       // LevelIterator also drops the real iterators of mmap-read files.
       Close();
       options_.max_open_files = -1;
-      options_.allow_mmap_reads = true;
+      options_.allow_mmap_reads = IsMemoryMappedAccessSupported();
       ASSERT_OK(ReadOnlyReopen(options_));
     }
     pinned = 0;
@@ -3950,10 +4078,10 @@ TEST_F(DBBloomFilterLevelSeekTest, FilteredSeekStandInsAreNotPinned) {
     read_options.prefix_same_as_start = true;
     read_options.pin_data = true;
     std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
-    // Each seek goes to the other file and is ruled out by its filter. A seek
-    // to p001 leaves the stand-in for the file of p011; one to p011 leaves the
-    // stand-in for the file of p001, then its own when it moves past the end
-    // of the level.
+    // Each seek is ruled out by the filter of the file it lands in. With the
+    // memtable empty, the merging iterator then skips that file's boundary
+    // sentinel within the same seek, which moves the level iterator off the
+    // file and drops the stand-in.
     constexpr int kSeeks = 100;
     for (int i = 0; i < kSeeks; i++) {
       iter->Seek(i % 2 == 0 ? "p001" : "p011");
@@ -3963,10 +4091,9 @@ TEST_F(DBBloomFilterLevelSeekTest, FilteredSeekStandInsAreNotPinned) {
     EXPECT_EQ(SeeksFiltered() - seeks_filtered, kSeeks);
     EXPECT_EQ(pinned.load(), 0);
     EXPECT_EQ(dropped.load(), kSeeks);
-    // Only the stand-ins for the file of p011 hold a handle, and only with a
-    // finite max_open_files.
+    // Only with a finite max_open_files do the stand-ins hold a handle.
     EXPECT_EQ(dropped_with_cleanups.load(),
-              mode == Mode::kTableCacheHandles ? kSeeks / 2 : 0);
+              mode == Mode::kTableCacheHandles ? kSeeks : 0);
   }
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();

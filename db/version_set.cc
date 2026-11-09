@@ -2017,6 +2017,7 @@ void LevelIterator::InitFileIterator(size_t new_file_index,
 // iterator is replaced: TableCache::NewIterator() already set up the file's
 // range tombstones, if any, along with the stand-in.
 void LevelIterator::RetryPrefixFilteredFile(const Slice* seek_target) {
+  TEST_SYNC_POINT("LevelIterator::RetryPrefixFilteredFile");
   PERF_TIMER_GUARD(new_table_iterator_nanos);
   const bool skip_filters =
       skip_filters_ || table_cache_open_options_.skip_filters;
