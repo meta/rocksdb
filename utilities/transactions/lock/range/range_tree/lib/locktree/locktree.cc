@@ -221,7 +221,11 @@ static uint64_t row_lock_size_in_tree(const row_lock &lock) {
 static void remove_row_lock_from_tree(concurrent_tree::locked_keyrange *lkr,
                                       const row_lock &lock, TXNID txnid,
                                       locktree_manager *mgr) {
-  const uint64_t mem_released = row_lock_size_in_tree(lock);
+  // Each owner of a shared lock was charged for it. Removing the lock for all
+  // owners releases all of those charges.
+  const uint64_t num_charges =
+      (txnid == TXNID_ANY && lock.owners != nullptr) ? lock.owners->size() : 1;
+  const uint64_t mem_released = row_lock_size_in_tree(lock) * num_charges;
   lkr->remove(lock.range, txnid);
   if (mgr != nullptr) {
     mgr->note_mem_released(mem_released);

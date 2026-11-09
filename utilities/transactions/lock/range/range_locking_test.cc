@@ -387,6 +387,38 @@ TEST_F(RangeLockingTest, BasicLockEscalation) {
   delete txn;
 }
 
+TEST_F(RangeLockingTest, LockEscalationReleasesSharedLockMemory) {
+  auto cf = db->DefaultColumnFamily();
+  std::string value;
+  Transaction* txn0 = db->BeginTransaction(WriteOptions());
+  Transaction* txn1 = db->BeginTransaction(WriteOptions());
+
+  // Both transactions share the lock on "a". Escalation can merge the
+  // exclusive locks of txn0 on "b" and "c".
+  for (Transaction* txn : {txn0, txn1}) {
+    ASSERT_TRUE(
+        txn->GetForUpdate(ReadOptions(), cf, "a", &value, false /*exclusive*/)
+            .IsNotFound());
+  }
+  ASSERT_OK(txn0->Put(cf, "b", "v"));
+  ASSERT_OK(txn0->Put(cf, "c", "v"));
+
+  // At the limit, the next lock request escalates first, and the merge frees
+  // enough memory for the request.
+  auto counters = range_lock_mgr->GetStatus();
+  ASSERT_EQ(0, range_lock_mgr->SetMaxLockMemory(counters.current_lock_memory));
+  EXPECT_OK(txn1->Put(cf, "d", "v"));
+  EXPECT_EQ(range_lock_mgr->GetStatus().escalation_count,
+            counters.escalation_count + 1);
+
+  ASSERT_OK(txn0->Commit());
+  ASSERT_OK(txn1->Commit());
+  EXPECT_EQ(range_lock_mgr->GetStatus().current_lock_memory, 0);
+
+  delete txn0;
+  delete txn1;
+}
+
 // An escalation barrier function. Allow escalation iff the first two bytes are
 // identical.
 static bool escalation_barrier(const Endpoint& a, const Endpoint& b) {
