@@ -104,6 +104,50 @@ TEST_P(OptimisticTransactionTest, SuccessTest) {
   delete txn;
 }
 
+TEST_P(OptimisticTransactionTest, InplaceUpdateSupportNotSupported) {
+  // An in-place update does not advance the sequence number of the key it
+  // overwrites, so validation would accept a transaction that conflicts with
+  // it. Such column families are rejected at open and at creation.
+  ColumnFamilyOptions cf_options(options);
+  cf_options.inplace_update_support = true;
+  ColumnFamilyHandle* cfh = nullptr;
+  ASSERT_EQ(txn_db->CreateColumnFamily(cf_options, "cf", &cfh).code(),
+            Status::Code::kNotSupported);
+  std::vector<ColumnFamilyHandle*> handles;
+  ASSERT_EQ(
+      txn_db->CreateColumnFamilies(cf_options, {"cf1", "cf2"}, &handles).code(),
+      Status::Code::kNotSupported);
+  ASSERT_EQ(txn_db
+                ->CreateColumnFamilies(
+                    {ColumnFamilyDescriptor("cf3", ColumnFamilyOptions()),
+                     ColumnFamilyDescriptor("cf4", cf_options)},
+                    &handles)
+                .code(),
+            Status::Code::kNotSupported);
+  ASSERT_TRUE(handles.empty());
+  ASSERT_EQ(txn_db
+                ->CreateColumnFamilyWithImport(
+                    cf_options, "cf5", ImportColumnFamilyOptions(),
+                    ExportImportFilesMetaData(), &cfh)
+                .code(),
+            Status::Code::kNotSupported);
+  std::vector<std::string> cf_names;
+  ASSERT_OK(DB::ListColumnFamilies(DBOptions(options), dbname, &cf_names));
+  ASSERT_EQ(cf_names, std::vector<std::string>{kDefaultColumnFamilyName});
+
+  ASSERT_OK(txn_db->Close());
+  txn_db.reset();
+  Options inplace_options = options;
+  inplace_options.inplace_update_support = true;
+  inplace_options.allow_concurrent_memtable_write = false;
+  OptimisticTransactionDB* raw_txn_db = nullptr;
+  ASSERT_EQ(OptimisticTransactionDB::Open(inplace_options, dbname, &raw_txn_db)
+                .code(),
+            Status::Code::kNotSupported);
+  ASSERT_EQ(raw_txn_db, nullptr);
+  Reopen();
+}
+
 TEST_P(OptimisticTransactionTest, WriteConflictTest) {
   WriteOptions write_options;
   ReadOptions read_options;
