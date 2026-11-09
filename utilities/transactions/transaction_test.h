@@ -222,12 +222,13 @@ class TransactionTestBase : public ::testing::Test {
     }
     StackableDB* stackable_db = new StackableDB(std::move(root_db));
     assert(handles.size() == 1);
+    // If WrapStackableDB() returns non-ok, it has already deleted the handles
+    // and stackable_db.
     s = TransactionDB::WrapStackableDB(stackable_db, txn_db_options,
                                        compaction_enabled_cf_indices, handles,
                                        &db);
-    delete handles[0];
-    if (!s.ok()) {
-      delete stackable_db;
+    if (s.ok()) {
+      delete handles[0];
     }
     return s;
   }
