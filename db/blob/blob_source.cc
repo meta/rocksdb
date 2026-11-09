@@ -978,70 +978,73 @@ void BlobSource::MultiGetBlobFromOneFile(const ReadOptions& read_options,
       blob_file_cache_->Evict(file_number);
 
       std::unique_ptr<BlobFileReader> fresh_reader;
-      s = blob_file_cache_->OpenBlobFileReaderUncached(
+      const Status open_status = blob_file_cache_->OpenBlobFileReaderUncached(
           read_options, blob_file, &fresh_reader,
           /*allow_footer_skip_retry=*/false);
-      if (!s.ok()) {
+      if (!open_status.ok()) {
+        // Only the corrupted requests fail. The other requests in the batch
+        // already read their blobs, so fall through to pin them and update
+        // the stats below.
         for (const auto& blob_req : _blob_reqs) {
           BlobReadRequest* const req = blob_req.first;
           assert(req != nullptr);
           assert(req->status != nullptr);
           if (req->status->IsCorruption()) {
-            *req->status = AppendBlobRefreshRetryFailure(*req->status, s);
+            *req->status =
+                AppendBlobRefreshRetryFailure(*req->status, open_status);
           }
         }
-        return;
-      }
-
-      autovector<std::pair<BlobReadRequest*, std::unique_ptr<BlobContents>>>
-          retry_blob_reqs;
-      autovector<Status> stale_statuses;
-      for (auto& blob_req : _blob_reqs) {
-        BlobReadRequest* const req = blob_req.first;
-        assert(req != nullptr);
-        assert(req->status != nullptr);
-        if (!req->status->IsCorruption()) {
-          continue;
-        }
-
-        stale_statuses.emplace_back(*req->status);
-        *req->status = Status::OK();
-        blob_req.second.reset();
-        retry_blob_reqs.emplace_back(req, std::unique_ptr<BlobContents>());
-      }
-
-      uint64_t refreshed_bytes_read = 0;
-      fresh_reader->MultiGetBlob(read_options, allocator, retry_blob_reqs,
-                                 &refreshed_bytes_read);
-      _bytes_read += refreshed_bytes_read;
-
-      bool install_fresh_reader = false;
-      for (size_t i = 0; i < retry_blob_reqs.size(); ++i) {
-        auto& retried_blob_req = retry_blob_reqs[i];
-        BlobReadRequest* const retried_req = retried_blob_req.first;
-        assert(retried_req != nullptr);
-        if (retried_req->status->ok()) {
-          install_fresh_reader = true;
-        } else {
-          *retried_req->status = AppendBlobRefreshRetryFailure(
-              stale_statuses[i], *retried_req->status);
-        }
-
+      } else {
+        autovector<std::pair<BlobReadRequest*, std::unique_ptr<BlobContents>>>
+            retry_blob_reqs;
+        autovector<Status> stale_statuses;
         for (auto& blob_req : _blob_reqs) {
-          if (blob_req.first != retried_req) {
+          BlobReadRequest* const req = blob_req.first;
+          assert(req != nullptr);
+          assert(req->status != nullptr);
+          if (!req->status->IsCorruption()) {
             continue;
           }
 
-          blob_req.second = std::move(retried_blob_req.second);
-          break;
+          stale_statuses.emplace_back(*req->status);
+          *req->status = Status::OK();
+          blob_req.second.reset();
+          retry_blob_reqs.emplace_back(req, std::unique_ptr<BlobContents>());
         }
-      }
 
-      if (install_fresh_reader) {
-        CacheHandleGuard<BlobFileReader> ignored_reader;
-        blob_file_cache_
-            ->RefreshBlobFileReader(blob_file, &fresh_reader, &ignored_reader)
-            .PermitUncheckedError();
+        uint64_t refreshed_bytes_read = 0;
+        fresh_reader->MultiGetBlob(read_options, allocator, retry_blob_reqs,
+                                   &refreshed_bytes_read);
+        _bytes_read += refreshed_bytes_read;
+
+        bool install_fresh_reader = false;
+        for (size_t i = 0; i < retry_blob_reqs.size(); ++i) {
+          auto& retried_blob_req = retry_blob_reqs[i];
+          BlobReadRequest* const retried_req = retried_blob_req.first;
+          assert(retried_req != nullptr);
+          if (retried_req->status->ok()) {
+            install_fresh_reader = true;
+          } else {
+            *retried_req->status = AppendBlobRefreshRetryFailure(
+                stale_statuses[i], *retried_req->status);
+          }
+
+          for (auto& blob_req : _blob_reqs) {
+            if (blob_req.first != retried_req) {
+              continue;
+            }
+
+            blob_req.second = std::move(retried_blob_req.second);
+            break;
+          }
+        }
+
+        if (install_fresh_reader) {
+          CacheHandleGuard<BlobFileReader> ignored_reader;
+          blob_file_cache_
+              ->RefreshBlobFileReader(blob_file, &fresh_reader, &ignored_reader)
+              .PermitUncheckedError();
+        }
       }
     }
 
