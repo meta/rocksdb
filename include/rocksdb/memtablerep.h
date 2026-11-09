@@ -494,4 +494,5 @@ MemTableRepFactory* NewHashLinkListRepFactory(
     bool if_log_bucket_dist_when_flash = true,
     uint32_t threshold_use_skiplist = 256);
 
+MemTableRepFactory* NewHashSortedVectorRepFactory(size_t bucket_count = 1000000);
 }  // namespace ROCKSDB_NAMESPACE

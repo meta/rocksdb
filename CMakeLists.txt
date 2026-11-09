@@ -910,6 +910,7 @@ set(SOURCES
         memtable/vectorrep.cc
         memtable/wbwi_memtable.cc
         memtable/write_buffer_manager.cc
+        memtable/hash_sortedvector_rep.cc
         monitoring/histogram.cc
         monitoring/histogram_windowing.cc
         monitoring/in_memory_stats_history.cc
