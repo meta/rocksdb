@@ -302,6 +302,26 @@ class RetryCloseTableFactory : public TableFactory {
   BlockBasedTableFactory base_factory_;
 };
 
+class UnregisteredFilterPolicy : public FilterPolicy {
+ public:
+  UnregisteredFilterPolicy() : base_policy_(NewBloomFilterPolicy(10)) {}
+
+  const char* Name() const override { return "UnregisteredFilterPolicy"; }
+  const char* CompatibilityName() const override {
+    return base_policy_->CompatibilityName();
+  }
+  FilterBitsBuilder* GetBuilderWithContext(
+      const FilterBuildingContext& context) const override {
+    return base_policy_->GetBuilderWithContext(context);
+  }
+  FilterBitsReader* GetFilterBitsReader(const Slice& contents) const override {
+    return base_policy_->GetFilterBitsReader(contents);
+  }
+
+ private:
+  std::unique_ptr<const FilterPolicy> base_policy_;
+};
+
 }  // namespace
 
 class MyTestCompactionService : public CompactionService {
@@ -436,7 +456,9 @@ class MyTestCompactionService : public CompactionService {
     options_override.compaction_filter_factory =
         options_.compaction_filter_factory;
     options_override.prefix_extractor = options_.prefix_extractor;
-    options_override.table_factory = options_.table_factory;
+    if (!table_factory_from_options_file_) {
+      options_override.table_factory = options_.table_factory;
+    }
     options_override.sst_partitioner_factory = options_.sst_partitioner_factory;
     options_override.statistics = statistics_;
     options_override.info_log = options_.info_log;
@@ -507,6 +529,10 @@ class MyTestCompactionService : public CompactionService {
 
   void ReturnIncompleteAsFailure(bool value) {
     return_incomplete_as_failure_ = value;
+  }
+
+  void SetTableFactoryFromOptionsFile(bool value) {
+    table_factory_from_options_file_ = value;
   }
 
   void SetWorkerOptionOverride(const std::string& name,
@@ -593,6 +619,7 @@ class MyTestCompactionService : public CompactionService {
   std::string override_wait_result_;
   std::function<void(std::string*)> wait_result_mutator_;
   bool return_incomplete_as_failure_ = false;
+  bool table_factory_from_options_file_ = false;
   std::unordered_map<std::string, std::string> worker_options_override_;
   std::vector<std::shared_ptr<EventListener>> listeners_;
   std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>
@@ -638,6 +665,33 @@ class CompactionServiceTest : public DBTestBase {
   MyTestCompactionService* GetCompactionService() {
     CompactionService* cs = compaction_service_.get();
     return static_cast_with_check<MyTestCompactionService>(cs);
+  }
+
+  // Writes two overlapping files to column family cf, compacts them remotely,
+  // and returns the average data block size of the column family's files.
+  uint64_t CompactAndGetAverageDataBlockSize(int cf) {
+    Random rnd(301);
+    for (int file = 0; file < 2; file++) {
+      for (int i = 0; i < 1000; i++) {
+        EXPECT_OK(Put(cf, Key(i), rnd.RandomString(100)));
+      }
+      EXPECT_OK(Flush(cf));
+    }
+    const int compactions_before = GetCompactionService()->GetCompactionNum();
+    EXPECT_OK(db_->CompactRange(CompactRangeOptions(), handles_[cf], nullptr,
+                                nullptr));
+    EXPECT_GT(GetCompactionService()->GetCompactionNum(), compactions_before);
+
+    TablePropertiesCollection props;
+    EXPECT_OK(db_->GetPropertiesOfAllTables(handles_[cf], &props));
+    uint64_t data_size = 0;
+    uint64_t num_data_blocks = 0;
+    for (const auto& file_and_props : props) {
+      data_size += file_and_props.second->data_size;
+      num_data_blocks += file_and_props.second->num_data_blocks;
+    }
+    EXPECT_GT(num_data_blocks, 0);
+    return num_data_blocks == 0 ? 0 : data_size / num_data_blocks;
   }
 
   void GenerateTestData(bool move_files_manually = false) {
@@ -1657,6 +1711,178 @@ TEST_F(CompactionServiceTest, MissingBlobRepairRejectsFIFOWithoutFlushing) {
   ASSERT_EQ(Get("sst"), "value");
   ASSERT_EQ(Get("memtable"), "value");
   ASSERT_EQ(GetCompactionService()->GetCompactionNum(), 0);
+}
+
+TEST_F(CompactionServiceTest, NullTableFactoryOverrideUsesOptionsFile) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 4096;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  ReopenWithCompactionService(&options);
+  MyTestCompactionService* cs = GetCompactionService();
+  cs->ReturnIncompleteAsFailure(true);
+
+  ASSERT_OK(
+      db_->SetOptions({{"block_based_table_factory", "{block_size=32768;}"}}));
+
+  // The worker's table factory override still has the block size from open.
+  EXPECT_LT(CompactAndGetAverageDataBlockSize(0), 8192);
+
+  // Without an override, the worker uses the table options in the OPTIONS
+  // file, which SetOptions() rewrote.
+  cs->SetTableFactoryFromOptionsFile(true);
+  EXPECT_GT(CompactAndGetAverageDataBlockSize(0), 16384);
+
+  // Each column family gets its own table options, and
+  // CompactionServiceOptionsOverride::options_map applies on top of them.
+  EXPECT_LT(CompactAndGetAverageDataBlockSize(1), 8192);
+  cs->SetWorkerOptionOverride("block_based_table_factory",
+                              "{block_size=65536;}");
+  EXPECT_GT(CompactAndGetAverageDataBlockSize(1), 32768);
+}
+
+TEST_F(CompactionServiceTest, NullTableFactoryOverrideUnregisteredFactory) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  // Not registered with the object registry, so the worker cannot create it
+  // from the OPTIONS file.
+  options.table_factory = std::make_shared<RetryCloseTableFactory>(
+      "", std::make_shared<RetryCloseTableFactoryState>());
+  ReopenWithCompactionService(&options);
+  MyTestCompactionService* cs = GetCompactionService();
+  cs->SetTableFactoryFromOptionsFile(true);
+
+  for (int i = 0; i < 2; i++) {
+    ASSERT_OK(Put("key", "value" + std::to_string(i)));
+    ASSERT_OK(Flush());
+  }
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  const Status s = db_->CompactRange(cro, nullptr, nullptr);
+  ASSERT_EQ(s.code(), Status::kIncomplete) << s.ToString();
+  ASSERT_EQ(cs->GetCompactionNum(), 1);
+  // The worker writes no result, so the primary handles this like any failed
+  // remote compaction.
+  ASSERT_EQ(dbfull()->TEST_GetBGError().severity(),
+            Status::Severity::kFatalError);
+  ASSERT_EQ(Get("key"), "value1");
+}
+
+TEST_F(CompactionServiceTest, NullTableFactoryOverrideFilterPolicy) {
+  // The worker creates the filter policy named in the OPTIONS file if it is
+  // registered, and fails the compaction if it is not.
+  for (bool registered : {true, false}) {
+    SCOPED_TRACE(registered ? "registered" : "unregistered");
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    BlockBasedTableOptions table_options;
+    if (registered) {
+      table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+    } else {
+      table_options.filter_policy =
+          std::make_shared<UnregisteredFilterPolicy>();
+    }
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    ReopenWithCompactionService(&options);
+    MyTestCompactionService* cs = GetCompactionService();
+    cs->ReturnIncompleteAsFailure(true);
+    cs->SetTableFactoryFromOptionsFile(true);
+
+    for (int file = 0; file < 2; file++) {
+      for (int i = 0; i < 100; i++) {
+        ASSERT_OK(Put(Key(i), "value" + std::to_string(file)));
+      }
+      ASSERT_OK(Flush());
+    }
+    CompactRangeOptions cro;
+    cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    const Status s = db_->CompactRange(cro, nullptr, nullptr);
+    ASSERT_GT(cs->GetCompactionNum(), 0);
+    if (!registered) {
+      ASSERT_EQ(s.code(), Status::kIncomplete) << s.ToString();
+      ASSERT_EQ(dbfull()->TEST_GetBGError().severity(),
+                Status::Severity::kFatalError);
+      ASSERT_EQ(Get(Key(0)), "value1");
+      continue;
+    }
+    ASSERT_OK(s);
+    TablePropertiesCollection props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+    ASSERT_EQ(props.size(), 1);
+    const TableProperties& table_properties = *props.begin()->second;
+    EXPECT_GT(table_properties.filter_size, 0);
+    EXPECT_FALSE(table_properties.filter_policy_name.empty());
+  }
+}
+
+TEST_F(CompactionServiceTest, NullTableFactoryOverrideUnknownTableOption) {
+  // As for any option in the OPTIONS file, the worker ignores a table option it
+  // does not know only if a newer RocksDB wrote the file.
+  for (bool newer : {true, false}) {
+    SCOPED_TRACE(newer ? "newer" : "same version");
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    ReopenWithCompactionService(&options);
+    MyTestCompactionService* cs = GetCompactionService();
+    cs->ReturnIncompleteAsFailure(true);
+    cs->SetTableFactoryFromOptionsFile(true);
+
+    // Point the worker at a copy of the OPTIONS file with an unknown table
+    // option.
+    std::string copy_name;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImplSecondary::OpenAndCompact::BeforeLoadingOptions:0",
+        [&](void* arg) {
+          uint64_t* options_file_number = static_cast<uint64_t*>(arg);
+          std::string contents;
+          ASSERT_OK(ReadFileToString(
+              env_, OptionsFileName(dbname_, *options_file_number), &contents));
+          const std::string table_section =
+              "[TableOptions/BlockBasedTable \"default\"]\n";
+          const size_t pos = contents.find(table_section);
+          ASSERT_NE(pos, std::string::npos);
+          contents.insert(pos + table_section.size(),
+                          "  unknown_table_option=1\n");
+          if (newer) {
+            const std::string version_key = "rocksdb_version=";
+            const size_t version_pos = contents.find(version_key);
+            ASSERT_NE(version_pos, std::string::npos);
+            const size_t version_end = contents.find('\n', version_pos);
+            contents.replace(
+                version_pos, version_end - version_pos,
+                version_key + std::to_string(ROCKSDB_MAJOR + 1) + ".0.0");
+          }
+          *options_file_number += 1000;
+          copy_name = OptionsFileName(dbname_, *options_file_number);
+          ASSERT_OK(WriteStringToFile(env_, contents, copy_name));
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    for (int file = 0; file < 2; file++) {
+      for (int i = 0; i < 100; i++) {
+        ASSERT_OK(Put(Key(i), "value" + std::to_string(file)));
+      }
+      ASSERT_OK(Flush());
+    }
+    CompactRangeOptions cro;
+    cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    const Status s = db_->CompactRange(cro, nullptr, nullptr);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    ASSERT_GT(cs->GetCompactionNum(), 0);
+    ASSERT_FALSE(copy_name.empty());
+    ASSERT_OK(env_->DeleteFile(copy_name));
+    if (newer) {
+      ASSERT_OK(s);
+      ASSERT_OK(dbfull()->TEST_GetBGError());
+    } else {
+      ASSERT_EQ(s.code(), Status::kIncomplete) << s.ToString();
+    }
+    ASSERT_EQ(Get(Key(0)), "value1");
+  }
 }
 
 TEST_F(CompactionServiceTest, ManualCompaction) {

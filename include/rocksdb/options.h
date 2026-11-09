@@ -3482,6 +3482,21 @@ struct CompactionServiceOptionsOverride {
   const CompactionFilter* compaction_filter = nullptr;
   std::shared_ptr<CompactionFilterFactory> compaction_filter_factory = nullptr;
   std::shared_ptr<const SliceTransform> prefix_extractor = nullptr;
+  // If null, the column family uses the table factory loaded from the OPTIONS
+  // file the primary referenced when it scheduled the compaction. That file is
+  // only guaranteed to see the result of DB::SetOptions() calls that have
+  // returned. In fact, a compaction that SetOptions() itself triggers can
+  // reference the previous OPTIONS file.
+  // As with other options in that file, table options the worker's RocksDB
+  // does not know are ignored only if a newer RocksDB wrote the file.
+  // OpenAndCompact() returns NotSupported if it cannot create the table factory
+  // or a component of it, such as a filter_policy, because it is not
+  // registered with the worker's object registry. Built-in components are
+  // always registered. A component the table factory replaces with its default
+  // instead, such as a BlockBasedTable flush_block_policy_factory, is not
+  // detected. OpenAndCompact() returns these errors without writing a result,
+  // so the primary sees a failed remote compaction rather than a fallback to
+  // local compaction. With paranoid_checks, that is a fatal background error.
   std::shared_ptr<TableFactory> table_factory;
   std::shared_ptr<SstPartitionerFactory> sst_partitioner_factory = nullptr;
 
