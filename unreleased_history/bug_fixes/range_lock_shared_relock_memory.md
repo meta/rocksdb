@@ -1,0 +1,1 @@
+* Fixed a lock memory leak in `TransactionDB` with range locking: a transaction that took a shared lock it already held counted the lock's memory again, and that memory was never released. Over time, `current_lock_memory` reached the lock memory limit, and lock requests failed with "max_num_locks limit" although few or no locks were held.

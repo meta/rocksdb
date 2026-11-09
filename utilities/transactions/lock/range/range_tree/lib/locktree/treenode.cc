@@ -150,8 +150,7 @@ bool treenode::add_shared_owner(TXNID txnid) {
     m_owners->insert(m_txnid);
     m_txnid = TXNID_SHARED;
   }
-  m_owners->insert(txnid);
-  return true;
+  return m_owners->insert(txnid).second;
 }
 
 void treenode::free(treenode *node) {
@@ -230,7 +229,7 @@ bool treenode::insert(const keyrange &range, TXNID txnid, bool is_shared) {
       left_child = treenode::alloc(m_cmp, range, txnid, is_shared);
       m_left_child.set(left_child);
     } else {
-      left_child->insert(range, txnid, is_shared);
+      rc = left_child->insert(range, txnid, is_shared);
       left_child->mutex_unlock();
     }
   } else if (c == keyrange::comparison::GREATER_THAN) {
@@ -240,7 +239,7 @@ bool treenode::insert(const keyrange &range, TXNID txnid, bool is_shared) {
       right_child = treenode::alloc(m_cmp, range, txnid, is_shared);
       m_right_child.set(right_child);
     } else {
-      right_child->insert(range, txnid, is_shared);
+      rc = right_child->insert(range, txnid, is_shared);
       right_child->mutex_unlock();
     }
   } else if (c == keyrange::comparison::EQUALS) {
