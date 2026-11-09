@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cinttypes>
 #include <cstring>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -500,7 +501,7 @@ TEST_F(CustomizableTest, IsInstanceOfTest) {
   ASSERT_EQ(tc->CheckedCast<TestCustomizable>(), tc.get());
   ASSERT_EQ(tc->CheckedCast<BCustomizable>(), nullptr);
 
-  tc.reset(new BCustomizable("B"));
+  tc = std::make_shared<BCustomizable>("B");
   ASSERT_TRUE(tc->IsInstanceOf("B"));
   ASSERT_TRUE(tc->IsInstanceOf("TestCustomizable"));
   ASSERT_FALSE(tc->IsInstanceOf("A"));
@@ -825,24 +826,24 @@ TEST_F(CustomizableTest, NewEmptySharedTest) {
   SimpleOptions* simple = base->GetOptions<SimpleOptions>();
   ASSERT_NE(simple, nullptr);
   ASSERT_EQ(simple->cs, nullptr);
-  simple->cs.reset(new BCustomizable("B"));
+  simple->cs = std::make_shared<BCustomizable>("B");
 
   ASSERT_OK(base->ConfigureFromString(config_options_, "shared={id=}"));
   ASSERT_NE(simple, nullptr);
   ASSERT_EQ(simple->cs, nullptr);
-  simple->cs.reset(new BCustomizable("B"));
+  simple->cs = std::make_shared<BCustomizable>("B");
 
   ASSERT_OK(base->ConfigureFromString(config_options_, "shared={id=nullptr}"));
   ASSERT_EQ(simple->cs, nullptr);
-  simple->cs.reset(new BCustomizable("B"));
+  simple->cs = std::make_shared<BCustomizable>("B");
 
   ASSERT_OK(base->ConfigureFromString(config_options_, "shared.id="));
   ASSERT_EQ(simple->cs, nullptr);
-  simple->cs.reset(new BCustomizable("B"));
+  simple->cs = std::make_shared<BCustomizable>("B");
 
   ASSERT_OK(base->ConfigureFromString(config_options_, "shared.id=nullptr"));
   ASSERT_EQ(simple->cs, nullptr);
-  simple->cs.reset(new BCustomizable("B"));
+  simple->cs = std::make_shared<BCustomizable>("B");
 
   ASSERT_OK(base->ConfigureFromString(config_options_, "shared=nullptr"));
   ASSERT_EQ(simple->cs, nullptr);

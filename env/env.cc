@@ -9,6 +9,7 @@
 
 #include "rocksdb/env.h"
 
+#include <memory>
 #include <sstream>
 #include <thread>
 
@@ -721,7 +722,7 @@ Status Env::CreateFromUri(const ConfigOptions& config_options,
     std::shared_ptr<FileSystem> fs;
     Status s = FileSystem::CreateFromString(config_options, fs_uri, &fs);
     if (s.ok()) {
-      guard->reset(new CompositeEnvWrapper(*result, fs));
+      *guard = std::make_shared<CompositeEnvWrapper>(*result, fs);
       *result = guard->get();
     }
     return s;

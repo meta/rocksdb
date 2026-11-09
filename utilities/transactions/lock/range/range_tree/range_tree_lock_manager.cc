@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <memory>
 #include <mutex>
 
 #include "monitoring/perf_context_imp.h"
@@ -31,7 +32,7 @@ RangeLockManagerHandle* NewRangeLockManager(
   if (mutex_factory) {
     use_factory = mutex_factory;
   } else {
-    use_factory.reset(new TransactionDBMutexFactoryImpl());
+    use_factory = std::make_shared<TransactionDBMutexFactoryImpl>();
   }
   return new RangeTreeLockManager(use_factory);
 }

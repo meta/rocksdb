@@ -1159,7 +1159,8 @@ TEST_F(BlobDBTest, UserCompactionFilter) {
     if (case_num == 0) {
       options.compaction_filter = new CustomerFilter();
     } else {
-      options.compaction_filter_factory.reset(new CustomerFilterFactory());
+      options.compaction_filter_factory =
+          std::make_shared<CustomerFilterFactory>();
     }
     options.disable_auto_compactions = true;
     options.env = mock_env_.get();

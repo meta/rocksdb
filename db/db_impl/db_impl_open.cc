@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include <cinttypes>
+#include <memory>
 
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/builder.h"
@@ -74,8 +75,8 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
   }
 
   if (!result.write_buffer_manager) {
-    result.write_buffer_manager.reset(
-        new WriteBufferManager(result.db_write_buffer_size));
+    result.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(result.db_write_buffer_size);
   }
   auto bg_job_limits = DBImpl::GetBGJobLimits(
       result.max_background_flushes, result.max_background_compactions,

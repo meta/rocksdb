@@ -9,6 +9,7 @@
 
 #include <cstring>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <string>
 
@@ -791,8 +792,8 @@ TEST_P(DBBloomFilterTestWithFormatParams, SkipFilterOnEssentiallyZeroBpk) {
 
   // Test 2: use custom API to skip filters -> no filter constructed
   // or read.
-  table_options.filter_policy.reset(
-      new AlwaysTrueFilterPolicy(/* skip */ true));
+  table_options.filter_policy = std::make_shared<AlwaysTrueFilterPolicy>(
+      /* skip */ true);
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
   DestroyAndReopen(options);
   PutAndGetFn();
@@ -807,8 +808,8 @@ TEST_P(DBBloomFilterTestWithFormatParams, SkipFilterOnEssentiallyZeroBpk) {
 
   // Control test: using an actual filter with 100% FP rate -> the filter
   // is constructed and checked on read.
-  table_options.filter_policy.reset(
-      new AlwaysTrueFilterPolicy(/* skip */ false));
+  table_options.filter_policy = std::make_shared<AlwaysTrueFilterPolicy>(
+      /* skip */ false);
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
   DestroyAndReopen(options);
   PutAndGetFn();
@@ -2315,8 +2316,8 @@ TEST_F(DBBloomFilterTest, TestMemtableBloomAndWBM) {
       nullptr /* memory_allocator */, kDefaultToAdaptiveMutex,
       kDontChargeCacheMetadata));
 
-  options.write_buffer_manager.reset(
-      new WriteBufferManager(options.write_buffer_size, cache));
+  options.write_buffer_manager =
+      std::make_shared<WriteBufferManager>(options.write_buffer_size, cache);
   Reopen(options);
   ASSERT_OK(Put("foo", "bar"));
 

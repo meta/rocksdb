@@ -2293,12 +2293,12 @@ static Status CreateMemTableRepFactory(
     std::shared_ptr<MemTableRepFactory>* factory) {
   Status s;
   if (!strcasecmp(FLAGS_memtablerep.c_str(), SkipListFactory::kNickName())) {
-    factory->reset(new SkipListFactory(FLAGS_skip_list_lookahead));
+    *factory = std::make_shared<SkipListFactory>(FLAGS_skip_list_lookahead);
   } else if (!strcasecmp(FLAGS_memtablerep.c_str(), "prefix_hash")) {
     factory->reset(NewHashSkipListRepFactory(FLAGS_hash_bucket_count));
   } else if (!strcasecmp(FLAGS_memtablerep.c_str(),
                          VectorRepFactory::kNickName())) {
-    factory->reset(new VectorRepFactory());
+    *factory = std::make_shared<VectorRepFactory>();
   } else if (!strcasecmp(FLAGS_memtablerep.c_str(), "hash_linkedlist")) {
     factory->reset(NewHashLinkListRepFactory(FLAGS_hash_bucket_count));
   } else {
@@ -4547,7 +4547,7 @@ class Benchmark {
       }
     }
 
-    listener_.reset(new ErrorHandlerListener());
+    listener_ = std::make_shared<ErrorHandlerListener>();
     if (user_timestamp_size_ > 0) {
       mock_app_clock_.reset(new TimestampEmulator());
     }
@@ -5105,7 +5105,7 @@ class Benchmark {
         fresh_db = true;
         method = &Benchmark::RandomReplaceKeys;
       } else if (name == "timeseries") {
-        timestamp_emulator_.reset(new TimestampEmulator());
+        timestamp_emulator_ = std::make_shared<TimestampEmulator>();
         if (FLAGS_expire_style == "compaction_filter") {
           filter.reset(new ExpiredTimeFilter(timestamp_emulator_));
           fprintf(stdout, "Compaction filter is used to remove expired data");
@@ -6651,8 +6651,8 @@ class Benchmark {
 
     if (options.file_checksum_gen_factory == nullptr) {
       if (FLAGS_file_checksum) {
-        options.file_checksum_gen_factory.reset(
-            new FileChecksumGenCrc32cFactory());
+        options.file_checksum_gen_factory =
+            std::make_shared<FileChecksumGenCrc32cFactory>();
       }
     }
 

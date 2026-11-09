@@ -11,6 +11,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <type_traits>
 #include <unordered_map>
 
@@ -3659,7 +3660,9 @@ TEST_F(OptionsOldApiTest, ColumnFamilyOptionsSerialization) {
 
 class OptionsParserTest : public testing::Test {
  public:
-  OptionsParserTest() { fs_.reset(new test::StringFS(FileSystem::Default())); }
+  OptionsParserTest() {
+    fs_ = std::make_shared<test::StringFS>(FileSystem::Default());
+  }
 
  protected:
   std::shared_ptr<test::StringFS> fs_;
@@ -4176,7 +4179,7 @@ TEST_F(OptionsParserTest, DumpAndParse) {
     } else if (c == 5) {
       // A table factory that doesn't support deserialization should be
       // supported.
-      cf_opt.table_factory.reset(new UnregisteredTableFactory());
+      cf_opt.table_factory = std::make_shared<UnregisteredTableFactory>();
     }
     base_cf_opts.emplace_back(cf_opt);
   }
@@ -4631,7 +4634,8 @@ TEST_P(OptionsSanityCheckTest, DBOptionsSanityCheck) {
 
     // Okay to change file_checksum_gen_factory form nullptr to non-nullptr
     ASSERT_EQ(opts.file_checksum_gen_factory.get(), nullptr);
-    opts.file_checksum_gen_factory.reset(new MockFileChecksumGenFactory());
+    opts.file_checksum_gen_factory =
+        std::make_shared<MockFileChecksumGenFactory>();
 
     // persist the change
     ASSERT_OK(PersistDBOptions(opts));

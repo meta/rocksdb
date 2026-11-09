@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cinttypes>
+#include <memory>
 #include <unordered_map>
 
 #include "db/db_impl/db_impl.h"
@@ -296,7 +297,7 @@ TEST_F(OptionsUtilTest, SanityCheck) {
     ASSERT_NOK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
-    cf_descs[0].options.merge_operator.reset(new DummyMergeOperator());
+    cf_descs[0].options.merge_operator = std::make_shared<DummyMergeOperator>();
     ASSERT_NOK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
@@ -316,7 +317,8 @@ TEST_F(OptionsUtilTest, SanityCheck) {
     ASSERT_OK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
-    cf_descs[1].options.prefix_extractor.reset(new DummySliceTransform());
+    cf_descs[1].options.prefix_extractor =
+        std::make_shared<DummySliceTransform>();
     ASSERT_OK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
@@ -337,7 +339,8 @@ TEST_F(OptionsUtilTest, SanityCheck) {
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
     // It's okay to change prefix_extractor from nullptr to non-nullptr
-    cf_descs[0].options.prefix_extractor.reset(new DummySliceTransform());
+    cf_descs[0].options.prefix_extractor =
+        std::make_shared<DummySliceTransform>();
     ASSERT_OK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
@@ -366,7 +369,7 @@ TEST_F(OptionsUtilTest, SanityCheck) {
         cf_descs[3].options.table_factory;
 
     ASSERT_NE(table_factory, nullptr);
-    cf_descs[3].options.table_factory.reset(new DummyTableFactory());
+    cf_descs[3].options.table_factory = std::make_shared<DummyTableFactory>();
     ASSERT_NOK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 

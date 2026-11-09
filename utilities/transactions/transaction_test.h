@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -72,7 +73,7 @@ class TransactionTestBase : public ::testing::Test {
     // Recycling log file is generally more challenging for correctness
     options.recycle_log_file_num = 2;
     special_env.skip_fsync_ = true;
-    fault_fs.reset(new FaultInjectionTestFS(FileSystem::Default()));
+    fault_fs = std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
     env.reset(new CompositeEnvWrapper(&special_env, fault_fs));
     options.env = env.get();
     options.two_write_queues = two_write_queue;

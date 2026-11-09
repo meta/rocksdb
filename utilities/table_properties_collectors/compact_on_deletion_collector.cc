@@ -219,10 +219,8 @@ NewCompactOnDeletionCollectorFactory(size_t sliding_window_size,
                                      size_t deletion_trigger,
                                      double deletion_ratio,
                                      uint64_t min_file_size) {
-  return std::shared_ptr<CompactOnDeletionCollectorFactory>(
-      new CompactOnDeletionCollectorFactory(sliding_window_size,
-                                            deletion_trigger, deletion_ratio,
-                                            min_file_size));
+  return std::make_shared<CompactOnDeletionCollectorFactory>(
+      sliding_window_size, deletion_trigger, deletion_ratio, min_file_size);
 }
 
 namespace {

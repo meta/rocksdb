@@ -14,6 +14,7 @@
 #include <chrono>
 #include <functional>
 #include <future>
+#include <memory>
 #include <set>
 #include <tuple>
 #include <utility>
@@ -1201,12 +1202,12 @@ class VersionSetTestBase {
     cf_options_.table_factory = table_factory_;
     mutable_cf_options_.table_factory = table_factory_;
 
-    versions_.reset(new VersionSet(
+    versions_ = std::make_shared<VersionSet>(
         dbname_, &imm_db_options_, mutable_db_options_, env_options_,
         table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*read_only=*/false);
     reactive_versions_ = std::make_shared<ReactiveVersionSet>(
         dbname_, &imm_db_options_, mutable_db_options_, env_options_,
         table_cache_.get(), &write_buffer_manager_, &write_controller_,
@@ -1398,12 +1399,12 @@ class VersionSetTestBase {
   }
 
   void ReopenDB() {
-    versions_.reset(new VersionSet(
+    versions_ = std::make_shared<VersionSet>(
         dbname_, &imm_db_options_, mutable_db_options_, env_options_,
         table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*read_only=*/false);
     EXPECT_OK(versions_->Recover(column_families_, false));
   }
 

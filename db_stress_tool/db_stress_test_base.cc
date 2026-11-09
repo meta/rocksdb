@@ -7312,7 +7312,7 @@ void InitializeOptionsFromFlags(
       options.memtable_factory.reset(NewHashSkipListRepFactory(10000));
       break;
     case kVectorRep:
-      options.memtable_factory.reset(new VectorRepFactory());
+      options.memtable_factory = std::make_shared<VectorRepFactory>();
       break;
   }
 

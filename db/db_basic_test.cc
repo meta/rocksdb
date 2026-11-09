@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <cstring>
+#include <memory>
 
 #include "db/db_test_util.h"
 #include "db/log_writer.h"
@@ -3125,7 +3126,7 @@ class TestEnv : public EnvWrapper {
 
   Status NewLogger(const std::string& /*fname*/,
                    std::shared_ptr<Logger>* result) override {
-    result->reset(new TestLogger(this));
+    *result = std::make_shared<TestLogger>(this);
     return Status::OK();
   }
 
@@ -3177,7 +3178,7 @@ TEST_F(DBBasicTest, DBClose) {
   ASSERT_EQ(env->GetCloseCount(), 3);
 
   // Provide our own logger and ensure DB::Close() does not close it
-  options.info_log.reset(new TestEnv::TestLogger(env));
+  options.info_log = std::make_shared<TestEnv::TestLogger>(env);
   s = DB::Open(options, dbname, &db);
   ASSERT_OK(s);
   ASSERT_TRUE(db != nullptr);
@@ -3837,9 +3838,10 @@ TEST_P(DBMultiGetTestWithParam, MultiGetDuplicatesEmptyLevel) {
       BlockBasedTableOptions::IndexType::kTwoLevelIndexSearch;
   table_opts.cache_index_and_filter_blocks = true;
   table_opts.block_cache = cache_opts.MakeSharedCache();
-  table_opts.flush_block_policy_factory.reset(new MyFlushBlockPolicyFactory(1));
+  table_opts.flush_block_policy_factory =
+      std::make_shared<MyFlushBlockPolicyFactory>(1);
 
-  options.table_factory.reset(new BlockBasedTableFactory(table_opts));
+  options.table_factory = std::make_shared<BlockBasedTableFactory>(table_opts);
   Reopen(options);
   int key;
 
@@ -3936,9 +3938,10 @@ TEST_P(DBMultiGetTestWithParam, MultiGetDuplicatesNonEmptyLevel) {
       BlockBasedTableOptions::IndexType::kTwoLevelIndexSearch;
   table_opts.cache_index_and_filter_blocks = true;
   table_opts.block_cache = cache_opts.MakeSharedCache();
-  table_opts.flush_block_policy_factory.reset(new MyFlushBlockPolicyFactory(1));
+  table_opts.flush_block_policy_factory =
+      std::make_shared<MyFlushBlockPolicyFactory>(1);
 
-  options.table_factory.reset(new BlockBasedTableFactory(table_opts));
+  options.table_factory = std::make_shared<BlockBasedTableFactory>(table_opts);
   Reopen(options);
   int key;
 
@@ -6384,8 +6387,8 @@ class DBBasicTestMultiGet : public DBTestBase {
     } else {
       table_options.pin_l0_filter_and_index_blocks_in_cache = true;
     }
-    table_options.flush_block_policy_factory.reset(
-        new MyFlushBlockPolicyFactory(10));
+    table_options.flush_block_policy_factory =
+        std::make_shared<MyFlushBlockPolicyFactory>(10);
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
     if (!compression_enabled_) {
       options.compression = kNoCompression;
@@ -7315,7 +7318,8 @@ TEST_F(DBBasicTest, VerifyFileChecksums) {
     }
   };
 
-  options.file_checksum_gen_factory.reset(new MisnamedFileChecksumGenFactory());
+  options.file_checksum_gen_factory =
+      std::make_shared<MisnamedFileChecksumGenFactory>();
   Reopen(options);
   ASSERT_TRUE(db_->VerifyFileChecksums(ReadOptions()).IsInvalidArgument());
 }

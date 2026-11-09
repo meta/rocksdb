@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 
 #include "env/emulated_clock.h"
 #include "file/filename.h"
@@ -1002,7 +1003,7 @@ IOStatus MockFileSystem::NewLogger(const std::string& fname,
     file = iter->second;
   }
   std::unique_ptr<FSWritableFile> f(new MockWritableFile(file, FileOptions()));
-  result->reset(new TestMemLogger(std::move(f), clock_, io_opts, dbg));
+  *result = std::make_shared<TestMemLogger>(std::move(f), clock_, io_opts, dbg);
   return IOStatus::OK();
 }
 

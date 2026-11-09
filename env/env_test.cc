@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <unordered_set>
 
@@ -2806,7 +2807,7 @@ class TestEnv : public EnvWrapper {
 
   Status NewLogger(const std::string& /*fname*/,
                    std::shared_ptr<Logger>* result) override {
-    result->reset(new TestLogger(this));
+    *result = std::make_shared<TestLogger>(this);
     return Status::OK();
   }
 
@@ -3780,15 +3781,16 @@ TEST_F(CreateEnvTest, CreateWrappedEnv) {
   ASSERT_NE(copy, guard);
   ASSERT_TRUE(guard->AreEquivalent(options, copy.get(), &mismatch));
 
-  guard.reset(new WrappedEnv(std::make_shared<WrappedEnv>(Env::Default())));
+  guard = std::make_shared<WrappedEnv>(
+      std::make_shared<WrappedEnv>(Env::Default()));
   ASSERT_NE(guard.get(), env);
   opt_str = guard->ToString(options);
   ASSERT_OK(Env::CreateFromString(options, opt_str, &env, &copy));
   ASSERT_NE(copy, guard);
   ASSERT_TRUE(guard->AreEquivalent(options, copy.get(), &mismatch));
 
-  guard.reset(new WrappedEnv(std::make_shared<WrappedEnv>(
-      std::make_shared<WrappedEnv>(Env::Default()))));
+  guard = std::make_shared<WrappedEnv>(std::make_shared<WrappedEnv>(
+      std::make_shared<WrappedEnv>(Env::Default())));
   ASSERT_NE(guard.get(), env);
   opt_str = guard->ToString(options);
   ASSERT_OK(Env::CreateFromString(options, opt_str, &env, &copy));
@@ -3831,7 +3833,7 @@ TEST_F(CreateEnvTest, CreateCompositeEnv) {
   ASSERT_EQ(env->GetSystemClock(), SystemClock::Default());
 
   env = nullptr;
-  guard.reset(new CompositeEnvWrapper(wrapped.get(), timed_fs));
+  guard = std::make_shared<CompositeEnvWrapper>(wrapped.get(), timed_fs);
   opt_str = guard->ToString(options);
   ASSERT_OK(Env::CreateFromString(options, opt_str, &env, &copy));
   ASSERT_NE(env, nullptr);
@@ -3839,7 +3841,7 @@ TEST_F(CreateEnvTest, CreateCompositeEnv) {
   ASSERT_TRUE(guard->AreEquivalent(options, copy.get(), &mismatch));
 
   env = nullptr;
-  guard.reset(new CompositeEnvWrapper(wrapped.get(), clock));
+  guard = std::make_shared<CompositeEnvWrapper>(wrapped.get(), clock);
   opt_str = guard->ToString(options);
   ASSERT_OK(Env::CreateFromString(options, opt_str, &env, &copy));
   ASSERT_NE(env, nullptr);
@@ -3847,14 +3849,14 @@ TEST_F(CreateEnvTest, CreateCompositeEnv) {
   ASSERT_TRUE(guard->AreEquivalent(options, copy.get(), &mismatch));
 
   env = nullptr;
-  guard.reset(new CompositeEnvWrapper(wrapped.get(), timed_fs, clock));
+  guard = std::make_shared<CompositeEnvWrapper>(wrapped.get(), timed_fs, clock);
   opt_str = guard->ToString(options);
   ASSERT_OK(Env::CreateFromString(options, opt_str, &env, &copy));
   ASSERT_NE(env, nullptr);
   ASSERT_NE(env, Env::Default());
   ASSERT_TRUE(guard->AreEquivalent(options, copy.get(), &mismatch));
 
-  guard.reset(new CompositeEnvWrapper(nullptr, timed_fs, clock));
+  guard = std::make_shared<CompositeEnvWrapper>(nullptr, timed_fs, clock);
   ColumnFamilyOptions cf_opts;
   DBOptions db_opts;
   db_opts.env = guard.get();

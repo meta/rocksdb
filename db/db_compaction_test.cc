@@ -6858,8 +6858,8 @@ TEST_F(DBCompactionTest, LevelPeriodicCompactionWithCompactionFilters) {
       options.compaction_filter_factory.reset();
     } else if (comp_filter_type == kUseCompactionFilterFactory) {
       options.compaction_filter = nullptr;
-      options.compaction_filter_factory.reset(
-          new TestCompactionFilterFactory());
+      options.compaction_filter_factory =
+          std::make_shared<TestCompactionFilterFactory>();
     }
     DestroyAndReopen(options);
 
@@ -8877,7 +8877,7 @@ TEST_F(DBCompactionTest, PartialManualCompaction) {
   opts.num_levels = 3;
   opts.level0_file_num_compaction_trigger = 10;
   opts.compression = kNoCompression;
-  opts.merge_operator.reset(new NoopMergeOperator());
+  opts.merge_operator = std::make_shared<NoopMergeOperator>();
   opts.target_file_size_base = 10240;
   DestroyAndReopen(opts);
 
@@ -9014,7 +9014,7 @@ TEST_F(DBCompactionTest, ManualCompactionBottomLevelOptimized) {
   opts.num_levels = 3;
   opts.level0_file_num_compaction_trigger = 5;
   opts.compression = kNoCompression;
-  opts.merge_operator.reset(new NoopMergeOperator());
+  opts.merge_operator = std::make_shared<NoopMergeOperator>();
   opts.target_file_size_base = 1024;
   opts.max_bytes_for_level_multiplier = 2;
   opts.disable_auto_compactions = true;
@@ -9278,7 +9278,7 @@ class DBCompactionTestWithOngoingFileIngestionParam
   }
 
   void PauseCompactionThread() {
-    sleeping_task_.reset(new test::SleepingBackgroundTask());
+    sleeping_task_ = std::make_shared<test::SleepingBackgroundTask>();
     env_->SetBackgroundThreads(1, Env::LOW);
     env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask,
                    sleeping_task_.get(), Env::Priority::LOW);
@@ -9656,7 +9656,7 @@ class DBCompactionTestL0FilesMisorderCorruption : public DBCompactionTest {
   }
 
   void PauseCompactionThread() {
-    sleeping_task_.reset(new test::SleepingBackgroundTask());
+    sleeping_task_ = std::make_shared<test::SleepingBackgroundTask>();
     env_->SetBackgroundThreads(1, Env::LOW);
     env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask,
                    sleeping_task_.get(), Env::Priority::LOW);

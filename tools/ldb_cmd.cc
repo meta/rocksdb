@@ -4586,7 +4586,7 @@ void RepairCommand::Help(std::string& ret) {
 void RepairCommand::OverrideBaseOptions() {
   LDBCommand::OverrideBaseOptions();
   auto level = verbose_ ? InfoLogLevel::INFO_LEVEL : InfoLogLevel::WARN_LEVEL;
-  options_.info_log.reset(new StderrLogger(level));
+  options_.info_log = std::make_shared<StderrLogger>(level);
 }
 
 void RepairCommand::DoCommand() {

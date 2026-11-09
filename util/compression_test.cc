@@ -2333,8 +2333,8 @@ class DBCompressionCostPredictor : public DBTestBase {
     options.statistics->set_stats_level(StatsLevel::kExceptTimeForMutex);
     BlockBasedTableOptions bbto;
     bbto.enable_index_compression = false;
-    bbto.flush_block_policy_factory.reset(
-        new CostAwareTestFlushBlockPolicyFactory(10));
+    bbto.flush_block_policy_factory =
+        std::make_shared<CostAwareTestFlushBlockPolicyFactory>(10);
     options.table_factory.reset(NewBlockBasedTableFactory(bbto));
     DestroyAndReopen(options);
   }

@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "db/db_test_util.h"
@@ -76,7 +77,8 @@ class DBRateLimiterOnReadTest
   Options GetOptions() {
     Options options = CurrentOptions();
     options.disable_auto_compactions = true;
-    options.file_checksum_gen_factory.reset(new FileChecksumGenCrc32cFactory());
+    options.file_checksum_gen_factory =
+        std::make_shared<FileChecksumGenCrc32cFactory>();
     options.rate_limiter.reset(NewGenericRateLimiter(
         1 << 20 /* rate_bytes_per_sec */, 100 * 1000 /* refill_period_us */,
         10 /* fairness */, RateLimiter::Mode::kAllIo));

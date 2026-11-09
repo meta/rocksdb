@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <cstdint>
+#include <memory>
 
 #include "db/wide/wide_column_serialization.h"
 #include "env/composite_env_wrapper.h"
@@ -206,7 +207,7 @@ class SSTDumpToolTest : public testing::Test {
       table_opts.filter_policy.reset(
           ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10));
     }
-    opts.table_factory.reset(new BlockBasedTableFactory(table_opts));
+    opts.table_factory = std::make_shared<BlockBasedTableFactory>(table_opts);
     std::string file_path = MakeFilePath("rocksdb_sst_test.sst");
     createSST(opts, file_path, wide_column_one_in);
 
@@ -286,7 +287,7 @@ TEST_F(SSTDumpToolTest, VerifyCompression) {
   opts.env = env();
   BlockBasedTableOptions table_opts;
   table_opts.filter_policy.reset(NewBloomFilterPolicy(10, false));
-  opts.table_factory.reset(new BlockBasedTableFactory(table_opts));
+  opts.table_factory = std::make_shared<BlockBasedTableFactory>(table_opts);
   std::string file_path = MakeFilePath("rocksdb_sst_test.sst");
   createSST(opts, file_path, 10);
 
@@ -433,7 +434,7 @@ TEST_F(SSTDumpToolTest, CompressionManager) {
   BlockBasedTableOptions table_opts;
   table_opts.filter_policy.reset(
       ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10, false));
-  opts.table_factory.reset(new BlockBasedTableFactory(table_opts));
+  opts.table_factory = std::make_shared<BlockBasedTableFactory>(table_opts);
   std::string file_path = MakeFilePath("rocksdb_sst_test.sst");
   createSST(opts, file_path, 10);
 

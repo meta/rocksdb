@@ -1225,35 +1225,36 @@ class HarnessTest : public testing::Test {
       options_.comparator = &reverse_key_comparator;
     }
 
-    internal_comparator_.reset(
-        new test::PlainInternalKeyComparator(options_.comparator));
+    internal_comparator_ =
+        std::make_shared<test::PlainInternalKeyComparator>(options_.comparator);
 
     options_.allow_mmap_reads = args_.use_mmap;
     switch (args_.type) {
       case BLOCK_BASED_TABLE_TEST:
-        table_options_.flush_block_policy_factory.reset(
-            new FlushBlockBySizePolicyFactory());
+        table_options_.flush_block_policy_factory =
+            std::make_shared<FlushBlockBySizePolicyFactory>();
         table_options_.block_size = 256;
         table_options_.block_restart_interval = args_.restart_interval;
         table_options_.index_block_restart_interval = args_.restart_interval;
         table_options_.format_version = args_.format_version;
-        options_.table_factory.reset(
-            new BlockBasedTableFactory(table_options_));
+        options_.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options_);
         constructor_.reset(new TableConstructor(
             options_.comparator, true /* convert_to_internal_key_ */));
-        internal_comparator_.reset(
-            new InternalKeyComparator(options_.comparator));
+        internal_comparator_ =
+            std::make_shared<InternalKeyComparator>(options_.comparator);
         break;
 
       case PLAIN_TABLE_SEMI_FIXED_PREFIX:
         support_prev_ = false;
         only_support_prefix_seek_ = true;
-        options_.prefix_extractor.reset(new FixedOrLessPrefixTransform(2));
+        options_.prefix_extractor =
+            std::make_shared<FixedOrLessPrefixTransform>(2);
         options_.table_factory.reset(NewPlainTableFactory());
         constructor_.reset(new TableConstructor(
             options_.comparator, true /* convert_to_internal_key_ */));
-        internal_comparator_.reset(
-            new InternalKeyComparator(options_.comparator));
+        internal_comparator_ =
+            std::make_shared<InternalKeyComparator>(options_.comparator);
         break;
       case PLAIN_TABLE_FULL_STR_PREFIX:
         support_prev_ = false;
@@ -1262,8 +1263,8 @@ class HarnessTest : public testing::Test {
         options_.table_factory.reset(NewPlainTableFactory());
         constructor_.reset(new TableConstructor(
             options_.comparator, true /* convert_to_internal_key_ */));
-        internal_comparator_.reset(
-            new InternalKeyComparator(options_.comparator));
+        internal_comparator_ =
+            std::make_shared<InternalKeyComparator>(options_.comparator);
         break;
       case PLAIN_TABLE_TOTAL_ORDER:
         support_prev_ = false;
@@ -1281,26 +1282,26 @@ class HarnessTest : public testing::Test {
         }
         constructor_.reset(new TableConstructor(
             options_.comparator, true /* convert_to_internal_key_ */));
-        internal_comparator_.reset(
-            new InternalKeyComparator(options_.comparator));
+        internal_comparator_ =
+            std::make_shared<InternalKeyComparator>(options_.comparator);
         break;
       case BLOCK_TEST:
         table_options_.block_size = 256;
-        options_.table_factory.reset(
-            new BlockBasedTableFactory(table_options_));
+        options_.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options_);
         constructor_.reset(new BlockConstructor(options_.comparator));
         break;
       case MEMTABLE_TEST:
         table_options_.block_size = 256;
-        options_.table_factory.reset(
-            new BlockBasedTableFactory(table_options_));
+        options_.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options_);
         constructor_.reset(
             new MemTableConstructor(options_.comparator, &write_buffer_));
         break;
       case DB_TEST:
         table_options_.block_size = 256;
-        options_.table_factory.reset(
-            new BlockBasedTableFactory(table_options_));
+        options_.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options_);
         constructor_.reset(new DBConstructor(options_.comparator));
         break;
     }
@@ -2810,31 +2811,36 @@ TEST_P(BlockBasedTableTest, TotalOrderSeekOnHashIndex) {
       case 0:
         // Binary search index
         table_options.index_type = BlockBasedTableOptions::kBinarySearch;
-        options.table_factory.reset(new BlockBasedTableFactory(table_options));
+        options.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options);
         break;
       case 1:
         // Hash search index
         table_options.index_type = BlockBasedTableOptions::kHashSearch;
-        options.table_factory.reset(new BlockBasedTableFactory(table_options));
+        options.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options);
         options.prefix_extractor.reset(NewFixedPrefixTransform(4));
         break;
       case 2:
         // Hash search index with filter policy
         table_options.index_type = BlockBasedTableOptions::kHashSearch;
         table_options.filter_policy.reset(NewBloomFilterPolicy(10));
-        options.table_factory.reset(new BlockBasedTableFactory(table_options));
+        options.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options);
         options.prefix_extractor.reset(NewFixedPrefixTransform(4));
         break;
       case 3:
         // Two-level index
         table_options.index_type = BlockBasedTableOptions::kTwoLevelIndexSearch;
-        options.table_factory.reset(new BlockBasedTableFactory(table_options));
+        options.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options);
         break;
       case 4:
         // Binary search with first key
         table_options.index_type =
             BlockBasedTableOptions::kBinarySearchWithFirstKey;
-        options.table_factory.reset(new BlockBasedTableFactory(table_options));
+        options.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options);
         break;
     }
 
@@ -2897,7 +2903,8 @@ TEST_P(BlockBasedTableTest, NoopTransformSeek) {
 
   Options options;
   options.comparator = BytewiseComparator();
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   options.prefix_extractor.reset(NewNoopTransform());
 
   TableConstructor c(options.comparator);
@@ -2938,7 +2945,8 @@ TEST_P(BlockBasedTableTest, SkipPrefixBloomFilter) {
 
   Options options;
   options.comparator = BytewiseComparator();
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   options.prefix_extractor.reset(NewFixedPrefixTransform(1));
 
   TableConstructor c(options.comparator);
@@ -2978,7 +2986,8 @@ TEST_P(BlockBasedTableTest, BadChecksumType) {
 
   Options options;
   options.comparator = BytewiseComparator();
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
 
   TableConstructor c(options.comparator);
   InternalKey key("abc", 1, kTypeValue);
@@ -4151,7 +4160,8 @@ TEST_P(BlockBasedTableTest, TracingGetTest) {
   table_options.block_cache = NewLRUCache(1024 * 1024, 0);
   table_options.cache_index_and_filter_blocks = true;
   table_options.filter_policy.reset(NewBloomFilterPolicy(10));
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   SetupTracingTest(&c);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
@@ -4263,7 +4273,8 @@ TEST_P(BlockBasedTableTest, BlockCacheLookupSeqScans) {
   table_options.cache_index_and_filter_blocks = true;
   table_options.filter_policy.reset(NewBloomFilterPolicy(10, true));
   table_options.block_align = true;
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   ASSERT_OK(options.table_factory->ValidateOptions(
       DBOptions(options), ColumnFamilyOptions(options)));
 
@@ -4408,7 +4419,8 @@ TEST_P(BlockBasedTableTest, BlockCacheLookupAsyncScansSeek) {
   table_options.cache_index_and_filter_blocks = true;
   table_options.filter_policy.reset(NewBloomFilterPolicy(10, true));
   table_options.block_align = true;
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   ASSERT_OK(options.table_factory->ValidateOptions(
       DBOptions(options), ColumnFamilyOptions(options)));
 
@@ -4773,7 +4785,8 @@ TEST_P(BlockBasedTableTest, TracingMultiGetTest) {
   table_options.filter_policy.reset(NewBloomFilterPolicy(10));
   // Put auto_add_key1 and auto_add_key2 in the same data block
   table_options.block_size = kDummyValue.size() * 2 + 100;
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   SetupTracingTest(&c);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
@@ -4877,7 +4890,8 @@ TEST_P(BlockBasedTableTest, TracingApproximateOffsetOfTest) {
   table_options.block_cache = NewLRUCache(1024 * 1024, 0);
   table_options.cache_index_and_filter_blocks = true;
   table_options.filter_policy.reset(NewBloomFilterPolicy(10, true));
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   SetupTracingTest(&c);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
@@ -4921,7 +4935,8 @@ TEST_P(BlockBasedTableTest, TracingIterator) {
   table_options.block_cache = NewLRUCache(1024 * 1024, 0);
   table_options.cache_index_and_filter_blocks = true;
   table_options.filter_policy.reset(NewBloomFilterPolicy(10, true));
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   SetupTracingTest(&c);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
@@ -5049,7 +5064,8 @@ TEST_P(BlockBasedTableTest, BlockCacheDisabledTest) {
   BlockBasedTableOptions table_options = GetBlockBasedTableOptions();
   table_options.block_cache = NewLRUCache(1024, 4);
   table_options.filter_policy.reset(NewBloomFilterPolicy(10));
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
 
@@ -5101,7 +5117,8 @@ TEST_P(BlockBasedTableTest, FilterBlockInBlockCache) {
   co.metadata_charge_policy = kDontChargeCacheMetadata;
   table_options.block_cache = NewLRUCache(co);
   table_options.cache_index_and_filter_blocks = true;
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
 
@@ -5186,7 +5203,8 @@ TEST_P(BlockBasedTableTest, FilterBlockInBlockCache) {
   // too small to fit even one entry.
   table_options.block_cache = NewLRUCache(1, 4);
   options.statistics = CreateDBStatistics();
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   const ImmutableOptions ioptions2(options);
   const MutableCFOptions moptions2(options);
   ASSERT_OK(c.Reopen(ioptions2, moptions2));
@@ -5243,7 +5261,8 @@ TEST_P(BlockBasedTableTest, FilterBlockInBlockCache) {
 
   // Open table with filter policy
   table_options.filter_policy.reset(NewBloomFilterPolicy(1));
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   options.statistics = CreateDBStatistics();
   ImmutableOptions ioptions4(options);
   MutableCFOptions moptions4(options);
@@ -5325,7 +5344,8 @@ TEST_P(BlockBasedTableTest, BlockReadCountTest) {
       table_options.cache_index_and_filter_blocks = index_and_filter_in_cache;
       table_options.filter_policy.reset(
           NewBloomFilterPolicy(10, bloom_filter_type == 2));
-      options.table_factory.reset(new BlockBasedTableFactory(table_options));
+      options.table_factory =
+          std::make_shared<BlockBasedTableFactory>(table_options);
       std::vector<std::string> keys;
       stl_wrappers::KVMap kvmap;
 
@@ -5815,7 +5835,8 @@ static void DoCompressionTest(CompressionType comp) {
   options.db_host_id = "";
   BlockBasedTableOptions table_options;
   table_options.block_size = 1024;
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   const ImmutableOptions ioptions(options);
   const MutableCFOptions moptions(options);
   c.Finish(options, ioptions, moptions, table_options, ikc, &keys, &kvmap);
@@ -6313,7 +6334,8 @@ TEST_P(IndexBlockRestartIntervalTest, IndexBlockRestartInterval) {
   } else {
     table_options.format_version = 3;
   }
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
 
   TableConstructor c(BytewiseComparator());
   static Random rnd(301);
@@ -7827,7 +7849,8 @@ TEST_P(BlockBasedTableTest, DataBlockHashIndex) {
   Options options;
   options.comparator = BytewiseComparator();
 
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
 
   TableConstructor c(options.comparator);
 

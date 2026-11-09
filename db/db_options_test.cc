@@ -560,7 +560,7 @@ TEST_F(DBOptionsTest, SetWithCustomMemTableFactory) {
   options.env = env_;
   options.disable_auto_compactions = false;
 
-  options.memtable_factory.reset(new DummySkipListFactory());
+  options.memtable_factory = std::make_shared<DummySkipListFactory>();
   Reopen(options);
 
   ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
@@ -1851,7 +1851,7 @@ TEST_F(DBOptionsTest, TempOptionsFailTest) {
   std::shared_ptr<FaultInjectionTestFS> fs;
   std::unique_ptr<Env> env;
 
-  fs.reset(new FaultInjectionTestFS(env_->GetFileSystem()));
+  fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
   env = NewCompositeEnv(fs);
   Options options = CurrentOptions();
   options.env = env.get();

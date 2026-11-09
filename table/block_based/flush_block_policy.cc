@@ -6,6 +6,7 @@
 #include "rocksdb/flush_block_policy.h"
 
 #include <cassert>
+#include <memory>
 #include <mutex>
 
 #include "rocksdb/options.h"
@@ -129,7 +130,7 @@ Status FlushBlockPolicyFactory::CreateFromString(
   });
 
   if (value.empty()) {
-    factory->reset(new FlushBlockBySizePolicyFactory());
+    *factory = std::make_shared<FlushBlockBySizePolicyFactory>();
     return Status::OK();
   } else {
     return LoadSharedObject<FlushBlockPolicyFactory>(config_options, value,

@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <iomanip>
+#include <memory>
 
 #include "db/db_test_util.h"
 #include "port/stack_trace.h"
@@ -817,9 +818,9 @@ class DBIOCorruptionTest
 
     base_env_ = env_;
     EXPECT_NE(base_env_, nullptr);
-    fs_.reset(new CorruptionFS(base_env_->GetFileSystem(),
-                               std::get<0>(GetParam()),
-                               std::get<2>(GetParam())));
+    fs_ = std::make_shared<CorruptionFS>(base_env_->GetFileSystem(),
+                                         std::get<0>(GetParam()),
+                                         std::get<2>(GetParam()));
     env_guard_ = NewCompositeEnv(fs_);
     options_.env = env_guard_.get();
     bbto.num_file_reads_for_auto_readahead = 0;

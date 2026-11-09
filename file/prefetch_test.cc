@@ -3,6 +3,8 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <memory>
+
 #include "db/db_test_util.h"
 #include "file/file_prefetch_buffer.h"
 #include "file/file_util.h"
@@ -1593,8 +1595,8 @@ class PrefetchTrimReadaheadTestParam
     // To force keys with different prefixes are in different data blocks of the
     // file for testing purpose
     table_options.block_size = 1;
-    table_options.flush_block_policy_factory.reset(
-        new FlushBlockBySizePolicyFactory());
+    table_options.flush_block_policy_factory =
+        std::make_shared<FlushBlockBySizePolicyFactory>();
   }
 
   void RunSeekToFirstAfterSeekIgnoresStalePrefix(bool async_io) {

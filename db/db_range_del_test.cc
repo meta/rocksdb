@@ -3,6 +3,8 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <memory>
+
 #include "db/db_test_util.h"
 #include "db/version_set.h"
 #include "port/stack_trace.h"
@@ -1303,7 +1305,7 @@ TEST_F(DBRangeDelTest, KeyAtOverlappingEndpointReappears) {
   Options options = CurrentOptions();
   options.compression = kNoCompression;
   options.disable_auto_compactions = true;
-  options.merge_operator.reset(new MockMergeOperator());
+  options.merge_operator = std::make_shared<MockMergeOperator>();
   options.target_file_size_base = kFileBytes;
   Reopen(options);
 
@@ -1390,7 +1392,7 @@ TEST_F(DBRangeDelTest, UntruncatedTombstoneDoesNotDeleteNewerKey) {
   Options options = CurrentOptions();
   options.compression = kNoCompression;
   options.disable_auto_compactions = true;
-  options.merge_operator.reset(new MockMergeOperator());
+  options.merge_operator = std::make_shared<MockMergeOperator>();
   options.num_levels = 2;
   options.target_file_size_base = kFileBytes;
   Reopen(options);
@@ -1490,7 +1492,7 @@ TEST_F(DBRangeDelTest, DeletedMergeOperandReappearsIterPrev) {
   Options options = CurrentOptions();
   options.compression = kNoCompression;
   options.disable_auto_compactions = true;
-  options.merge_operator.reset(new MockMergeOperator());
+  options.merge_operator = std::make_shared<MockMergeOperator>();
   options.target_file_size_base = kFileBytes;
   Reopen(options);
 
