@@ -1919,6 +1919,7 @@ TEST_F(DBWriteBufferManagerTest,
   ASSERT_OK(DestroyDB(other_dbname, options));
   std::unique_ptr<DB> other_db;
   ASSERT_OK(DB::Open(options, other_dbname, &other_db));
+  auto* other_dbimpl = static_cast_with_check<DBImpl>(other_db.get());
 
   test::SleepingBackgroundTask sleeping_task_high;
   const int saved_high = env_->GetBackgroundThreads(Env::Priority::HIGH);
@@ -1945,9 +1946,19 @@ TEST_F(DBWriteBufferManagerTest,
   bool handoff_done = false;
   bool made_progress = true;
   bool already_flushing_rejected = false;
+  // Only other_db's handoff is parked and observed. While it is parked, its
+  // 20 ms lease can expire and the coordinator then hands off to db_, which
+  // must not be mistaken for the handoff under test. MadeProgress and
+  // AlreadyFlushing do not pass the DB, so they are matched by the thread
+  // that runs other_db's handoff.
+  std::thread::id other_handoff_thread;
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::BackgroundCallWBMFlush:AfterPick", [&](void*) {
+      "DBImpl::BackgroundCallWBMFlush:AfterPick", [&](void* arg) {
+        if (arg != other_dbimpl) {
+          return;
+        }
         InstrumentedMutexLock l(&mu);
+        other_handoff_thread = std::this_thread::get_id();
         candidate_picked = true;
         cv.SignalAll();
         while (!release_handoff) {
@@ -1957,15 +1968,24 @@ TEST_F(DBWriteBufferManagerTest,
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::BackgroundCallWBMFlush:MadeProgress", [&](void* arg) {
         InstrumentedMutexLock l(&mu);
+        if (std::this_thread::get_id() != other_handoff_thread) {
+          return;
+        }
         made_progress = *static_cast<bool*>(arg);
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::FlushMemTableImpl:AlreadyFlushing", [&](void*) {
         InstrumentedMutexLock l(&mu);
+        if (std::this_thread::get_id() != other_handoff_thread) {
+          return;
+        }
         already_flushing_rejected = true;
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::BGWorkWBMFlush:done", [&](void*) {
+      "DBImpl::BGWorkWBMFlush:done", [&](void* arg) {
+        if (arg != other_dbimpl) {
+          return;
+        }
         InstrumentedMutexLock l(&mu);
         handoff_done = true;
         cv.SignalAll();
