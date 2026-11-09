@@ -2034,10 +2034,14 @@ TEST_F(DBWriteBufferManagerTest,
   ASSERT_OK(DestroyDB(other_dbname, options));
   std::unique_ptr<DB> other_db;
   ASSERT_OK(DB::Open(options, other_dbname, &other_db));
+  auto* other_dbimpl = static_cast_with_check<DBImpl>(other_db.get());
   ColumnFamilyHandle* other_cfh = nullptr;
   ASSERT_OK(other_db->CreateColumnFamily(ColumnFamilyOptions(), "victim",
                                          &other_cfh));
 
+  // Only other_db's handoff is parked and awaited. While it is parked, its
+  // 20 ms lease can expire and the coordinator then hands off to db_, which
+  // must not be mistaken for the handoff under test.
   InstrumentedMutex mu;
   InstrumentedCondVar cv(&mu);
   bool candidate_picked = false;
@@ -2045,7 +2049,10 @@ TEST_F(DBWriteBufferManagerTest,
   bool handoff_done = false;
   bool dropped_candidate_rejected = false;
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::BackgroundCallWBMFlush:AfterPick", [&](void*) {
+      "DBImpl::BackgroundCallWBMFlush:AfterPick", [&](void* arg) {
+        if (arg != other_dbimpl) {
+          return;
+        }
         InstrumentedMutexLock l(&mu);
         candidate_picked = true;
         cv.SignalAll();
@@ -2059,7 +2066,10 @@ TEST_F(DBWriteBufferManagerTest,
         dropped_candidate_rejected = true;
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::BGWorkWBMFlush:done", [&](void*) {
+      "DBImpl::BGWorkWBMFlush:done", [&](void* arg) {
+        if (arg != other_dbimpl) {
+          return;
+        }
         InstrumentedMutexLock l(&mu);
         handoff_done = true;
         cv.SignalAll();

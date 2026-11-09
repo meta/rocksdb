@@ -4808,7 +4808,7 @@ void DBImpl::BackgroundCallWBMFlush() {
       }
     }
   }
-  TEST_SYNC_POINT("DBImpl::BackgroundCallWBMFlush:AfterPick");
+  TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCallWBMFlush:AfterPick", this);
 
   FlushOptions flush_options;
   flush_options.wait = false;
