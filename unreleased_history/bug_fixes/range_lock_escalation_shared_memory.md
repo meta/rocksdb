@@ -1,0 +1,1 @@
+* Fixed a lock memory leak in `TransactionDB` with range locking: lock escalation released the memory of a shared lock once, although each of its owners had been charged for it. Every escalation with such a lock lost memory for good, so escalation freed less than it should, and lock requests failed with "max_num_locks limit" although few or no locks were held.
