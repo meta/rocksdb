@@ -483,6 +483,42 @@ TEST_P(TransactionTest, AssumeExclusiveTracked) {
   delete txn;
 }
 
+TEST_P(TransactionTest, InplaceUpdateSupportRequiresWriteCommitted) {
+  if (options.unordered_write) {
+    ROCKSDB_GTEST_BYPASS(
+        "unordered_write requires concurrent memtable writes, which "
+        "inplace_update_support does not support");
+    return;
+  }
+  // In-place updates are only accepted with WriteCommitted. WritePrepared and
+  // WriteUnprepared reject them both at open and when creating a column
+  // family.
+  const bool supported = txn_db_options.write_policy == WRITE_COMMITTED;
+  options.allow_concurrent_memtable_write = false;
+  ASSERT_OK(ReOpen());
+
+  ColumnFamilyOptions cf_options(options);
+  cf_options.inplace_update_support = true;
+  ColumnFamilyHandle* cfh = nullptr;
+  Status s = db->CreateColumnFamily(cf_options, "inplace", &cfh);
+  if (supported) {
+    ASSERT_OK(s);
+    ASSERT_OK(db->Put(WriteOptions(), cfh, "key", "value"));
+    ASSERT_OK(db->DestroyColumnFamilyHandle(cfh));
+  } else {
+    ASSERT_EQ(s.code(), Status::Code::kNotSupported);
+  }
+
+  options.inplace_update_support = true;
+  s = ReOpen();
+  if (supported) {
+    ASSERT_OK(s);
+    ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  } else {
+    ASSERT_EQ(s.code(), Status::Code::kNotSupported);
+  }
+}
+
 // This test clarifies the contract of ValidateSnapshot
 TEST_P(TransactionTest, ValidateSnapshotTest) {
   for (bool with_flush : {true}) {
