@@ -2283,10 +2283,11 @@ def gen_cmd_params(args, unknown_params=None):
         params.update(random.choice(blob_profiles))
 
     if "compaction_style" not in params:
-        # Default to leveled compaction
-        # TODO: Fix "Unsafe to store Seq later" with tiered+leveled and
-        # enable that combination rather than falling back to universal.
-        params["compaction_style"] = 0 if not args.test_tiered_storage else 1
+        # Default to leveled compaction. Tiered storage picks leveled or
+        # universal at random, fixed for all runs of the series.
+        params["compaction_style"] = (
+            0 if not args.test_tiered_storage else random.choice([0, 1])
+        )
 
     for k, v in vars(args).items():
         if v is not None:
