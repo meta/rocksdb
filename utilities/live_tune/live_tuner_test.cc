@@ -87,6 +87,8 @@ class CountingAdvisor : public TestAdvisor {
                            LiveTuneRecommendation* recommendation) override {
     if (block_) {
       std::unique_lock<std::mutex> lock(cancel_mutex_);
+      called_ = true;
+      cancel_cv_.notify_all();
       cancel_cv_.wait_for(lock, std::chrono::seconds(30),
                           [this] { return cancels_ > 0; });
       return Status::Aborted("canceled");
@@ -105,10 +107,18 @@ class CountingAdvisor : public TestAdvisor {
     return cancels_;
   }
 
+  // Waits for a blocking GetRecommendation() to be called.
+  bool WaitForCall() {
+    std::unique_lock<std::mutex> lock(cancel_mutex_);
+    return cancel_cv_.wait_for(lock, std::chrono::seconds(30),
+                               [this] { return called_; });
+  }
+
  private:
   const bool block_;
   std::mutex cancel_mutex_;
   std::condition_variable cancel_cv_;
+  bool called_ = false;
   int cancels_ = 0;
 };
 
@@ -1313,7 +1323,9 @@ TEST_F(LiveTunerTest, OnlyARecommendationInProgressIsCanceled) {
       std::map<std::string, std::string>{}, /*block=*/true);
   auto verdict2 = std::make_shared<TestVerdict>(true, LatencyBetterAt4);
   ASSERT_OK(StartLiveTuneCycle(db_.get(), TuneOptions(blocked, verdict2)));
-  ASSERT_TRUE(verdict2->WaitFor("\"event\": \"request\""));
+  // Not the "request" event: it comes before the advisor call, and a Stop()
+  // before the call skips the call instead of canceling it.
+  ASSERT_TRUE(blocked->WaitForCall());
   ASSERT_OK(StopLiveTuneCycle(db_.get()));
   EXPECT_EQ(blocked->Cancels(), 1);
   EXPECT_TRUE(verdict2->WaitFor("\"outcome\": \"stopped\""));
