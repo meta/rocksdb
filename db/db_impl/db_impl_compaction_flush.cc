@@ -6036,10 +6036,10 @@ Compaction* DBImpl::CreateIntendedCompactionForwardedToBottomPriorityPool(
   int max_intput_level = 0;
 
   for (size_t i = c->num_input_levels(); i >= 1; --i) {
-    size_t level = i - 1;
-    if (c->num_input_files(level) > 0) {
-      max_intput_level = static_cast<int>(level);
-      max_intput_level_files = c->inputs(level);
+    size_t which = i - 1;
+    if (c->num_input_files(which) > 0) {
+      max_intput_level = c->level(which);
+      max_intput_level_files = c->inputs(which);
       break;
     }
   }
