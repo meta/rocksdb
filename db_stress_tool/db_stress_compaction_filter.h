@@ -57,6 +57,7 @@ inline DbStressMergeFilterCounters& GetDbStressMergeFilterCounters() {
 // `kChangeValue` rewrites the same bytes, and `kRemove` /
 // `kRemoveAndSkipUntil` only apply to deleted keys when
 // merge_before_filter_remove_deleted is set (which requires no snapshots).
+// `kRemove` is further limited to keys that allow overwrite.
 // Skips cover only the current key and only in full compactions, so no older
 // version outside the compaction can reappear. The filter also checks that
 // every value it sees is a well-formed stress value for its key.
@@ -191,8 +192,14 @@ class DbStressCompactionFilter : public CompactionFilter {
           counters.Record(value_type, DbStressMergeFilterCounters::kSkip);
           return Decision::kRemoveAndSkipUntil;
         }
-        counters.Record(value_type, DbStressMergeFilterCounters::kRemove);
-        return Decision::kRemove;
+        // Keys that disallow overwrite are deleted with SingleDelete, whose
+        // SD may still be outside this compaction. Merge-before-filter turns
+        // both kRemove and kPurge into an ordinary Delete, and mixing that
+        // with the SingleDelete violates its contract, so keep these keys.
+        if (allow_overwrite) {
+          counters.Record(value_type, DbStressMergeFilterCounters::kRemove);
+          return Decision::kRemove;
+        }
       }
     }
     if (FLAGS_merge_before_filter_change_one_in > 0 &&
