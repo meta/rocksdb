@@ -7385,7 +7385,7 @@ TEST_F(CompactionServiceTest, CompactionFilter) {
 
 TEST_F(CompactionServiceTest, MergeOperator) {
   Options options = CurrentOptions();
-  options.merge_operator.reset(new StringAppendOperator(','));
+  options.merge_operator = std::make_shared<StringAppendOperator>(',');
   ReopenWithCompactionService(&options);
   GenerateTestData();
   ASSERT_OK(dbfull()->TEST_WaitForCompact());

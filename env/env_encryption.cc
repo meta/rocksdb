@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cctype>
 #include <iostream>
+#include <memory>
 
 #include "env/composite_env_wrapper.h"
 #include "env/env_encryption_ctr.h"
@@ -1055,7 +1056,7 @@ Status CTREncryptionProvider::AddCipher(const std::string& /*descriptor*/,
   if (cipher_) {
     return Status::NotSupported("Cannot add keys to CTREncryptionProvider");
   } else if (strcmp(ROT13BlockCipher::kClassName(), cipher) == 0) {
-    cipher_.reset(new ROT13BlockCipher(len));
+    cipher_ = std::make_shared<ROT13BlockCipher>(len);
     return Status::OK();
   } else {
     return BlockCipher::CreateFromString(ConfigOptions(), std::string(cipher),

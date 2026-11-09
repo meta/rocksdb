@@ -9,6 +9,8 @@
 
 #include "db/db_test_util.h"
 
+#include <memory>
+
 #include "cache/cache_reservation_manager.h"
 #include "db/forward_iterator.h"
 #include "env/fs_readonly.h"
@@ -417,7 +419,7 @@ Options DBTestBase::GetOptions(
       set_block_based_table_factory = false;
       break;
     case kVectorRep:
-      options.memtable_factory.reset(new VectorRepFactory(100));
+      options.memtable_factory = std::make_shared<VectorRepFactory>(100);
       options.allow_concurrent_memtable_write = false;
       options.unordered_write = false;
       break;

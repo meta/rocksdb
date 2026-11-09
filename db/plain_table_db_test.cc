@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <algorithm>
+#include <memory>
 #include <set>
 
 #include "db/db_impl/db_impl.h"
@@ -568,9 +569,9 @@ TEST_P(PlainTableDBTest, Flush2) {
             plain_table_options.huge_page_tlb_size = huge_page_tlb_size;
             plain_table_options.encoding_type = encoding_type;
             plain_table_options.store_index_in_file = store_index_in_file;
-            options.table_factory.reset(new TestPlainTableFactory(
+            options.table_factory = std::make_shared<TestPlainTableFactory>(
                 &expect_bloom_not_match, plain_table_options,
-                0 /* column_family_id */, kDefaultColumnFamilyName));
+                0 /* column_family_id */, kDefaultColumnFamilyName);
 
             DestroyAndReopen(&options);
             ASSERT_OK(Put("0000000000000bar", "b"));
@@ -682,9 +683,9 @@ TEST_P(PlainTableDBTest, Iterator) {
             plain_table_options.huge_page_tlb_size = huge_page_tlb_size;
             plain_table_options.encoding_type = encoding_type;
 
-            options.table_factory.reset(new TestPlainTableFactory(
+            options.table_factory = std::make_shared<TestPlainTableFactory>(
                 &expect_bloom_not_match, plain_table_options,
-                0 /* column_family_id */, kDefaultColumnFamilyName));
+                0 /* column_family_id */, kDefaultColumnFamilyName);
           } else {
             PlainTableOptions plain_table_options;
             plain_table_options.user_key_len = 16;
@@ -694,9 +695,9 @@ TEST_P(PlainTableDBTest, Iterator) {
             plain_table_options.huge_page_tlb_size = huge_page_tlb_size;
             plain_table_options.encoding_type = encoding_type;
 
-            options.table_factory.reset(new TestPlainTableFactory(
+            options.table_factory = std::make_shared<TestPlainTableFactory>(
                 &expect_bloom_not_match, plain_table_options,
-                0 /* column_family_id */, kDefaultColumnFamilyName));
+                0 /* column_family_id */, kDefaultColumnFamilyName);
           }
           DestroyAndReopen(&options);
 
@@ -812,9 +813,9 @@ TEST_P(PlainTableDBTest, BloomSchema) {
     plain_table_options.encoding_type = kPlain;
 
     bool expect_bloom_not_match = false;
-    options.table_factory.reset(new TestPlainTableFactory(
+    options.table_factory = std::make_shared<TestPlainTableFactory>(
         &expect_bloom_not_match, plain_table_options, 0 /* column_family_id */,
-        kDefaultColumnFamilyName));
+        kDefaultColumnFamilyName);
     DestroyAndReopen(&options);
 
     for (unsigned i = 0; i < 2345; ++i) {

@@ -185,8 +185,9 @@ TEST_F(DBMemTableTest, DuplicateSeq) {
   delete mem;
 
   // Test with InsertWithHint
-  options.memtable_insert_with_hint_prefix_extractor.reset(
-      new TestPrefixExtractor());  // which uses _ to extract the prefix
+  // TestPrefixExtractor uses _ to extract the prefix
+  options.memtable_insert_with_hint_prefix_extractor =
+      std::make_shared<TestPrefixExtractor>();
   ioptions = ImmutableOptions(options);
   mem = new MemTable(cmp, ioptions, MutableCFOptions(options), &wb,
                      kMaxSequenceNumber, 0 /* column_family_id */,
@@ -298,9 +299,9 @@ TEST_F(DBMemTableTest, InsertWithHint) {
   Options options;
   options.allow_concurrent_memtable_write = false;
   options.create_if_missing = true;
-  options.memtable_factory.reset(new MockMemTableRepFactory());
-  options.memtable_insert_with_hint_prefix_extractor.reset(
-      new TestPrefixExtractor());
+  options.memtable_factory = std::make_shared<MockMemTableRepFactory>();
+  options.memtable_insert_with_hint_prefix_extractor =
+      std::make_shared<TestPrefixExtractor>();
   options.env = env_;
   Reopen(options);
   MockMemTableRep* rep =
@@ -343,7 +344,7 @@ TEST_F(DBMemTableTest, ColumnFamilyId) {
   options.env = CurrentOptions().env;
   options.allow_concurrent_memtable_write = false;
   options.create_if_missing = true;
-  options.memtable_factory.reset(new MockMemTableRepFactory());
+  options.memtable_factory = std::make_shared<MockMemTableRepFactory>();
   DestroyAndReopen(options);
   CreateAndReopenWithCF({"pikachu"}, options);
 
@@ -576,7 +577,7 @@ TEST_F(DBMemTableTest, VectorConcurrentInsert) {
   options.create_if_missing = true;
   options.create_missing_column_families = true;
   options.allow_concurrent_memtable_write = true;
-  options.memtable_factory.reset(new VectorRepFactory());
+  options.memtable_factory = std::make_shared<VectorRepFactory>();
   DestroyAndReopen(options);
   CreateAndReopenWithCF({"cf1"}, options);
 

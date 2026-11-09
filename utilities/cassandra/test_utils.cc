@@ -5,6 +5,8 @@
 
 #include "test_utils.h"
 
+#include <memory>
+
 namespace ROCKSDB_NAMESPACE::cassandra {
 const char kData[] = {'d', 'a', 't', 'a'};
 const char kExpiringData[] = {'e', 'd', 'a', 't', 'a'};
@@ -16,14 +18,14 @@ const int8_t kExpiringColumn = 2;
 std::shared_ptr<ColumnBase> CreateTestColumn(int8_t mask, int8_t index,
                                              int64_t timestamp) {
   if ((mask & ColumnTypeMask::DELETION_MASK) != 0) {
-    return std::shared_ptr<Tombstone>(
-        new Tombstone(mask, index, ToSeconds(timestamp), timestamp));
+    return std::make_shared<Tombstone>(mask, index, ToSeconds(timestamp),
+                                       timestamp);
   } else if ((mask & ColumnTypeMask::EXPIRATION_MASK) != 0) {
-    return std::shared_ptr<ExpiringColumn>(new ExpiringColumn(
-        mask, index, timestamp, sizeof(kExpiringData), kExpiringData, kTtl));
+    return std::make_shared<ExpiringColumn>(
+        mask, index, timestamp, sizeof(kExpiringData), kExpiringData, kTtl);
   } else {
-    return std::shared_ptr<Column>(
-        new Column(mask, index, timestamp, sizeof(kData), kData));
+    return std::make_shared<Column>(mask, index, timestamp, sizeof(kData),
+                                    kData);
   }
 }
 

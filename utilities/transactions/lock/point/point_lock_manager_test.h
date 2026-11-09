@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include "file/file_util.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "test_util/testharness.h"
@@ -37,8 +39,8 @@ class PointLockManagerTest : public testing::Test {
     init();
     // CAUTION: This test creates a separate lock manager object (right, NOT
     // the one that the TransactionDB is using!), and runs tests on it.
-    locker_.reset(new PointLockManager(
-        static_cast<PessimisticTransactionDB*>(db_), txndb_opt_));
+    locker_ = std::make_shared<PointLockManager>(
+        static_cast<PessimisticTransactionDB*>(db_), txndb_opt_);
   }
 
   void TearDown() override {
@@ -60,8 +62,8 @@ class PointLockManagerTest : public testing::Test {
   int64_t deadlock_timeout_us = 0;
 
   void UsePerKeyPointLockManager() {
-    locker_.reset(new PerKeyPointLockManager(
-        static_cast<PessimisticTransactionDB*>(db_), txndb_opt_));
+    locker_ = std::make_shared<PerKeyPointLockManager>(
+        static_cast<PessimisticTransactionDB*>(db_), txndb_opt_);
   }
 
  protected:

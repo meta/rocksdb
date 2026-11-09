@@ -5445,7 +5445,7 @@ TEST_P(IngestDBGeneratedFileTest2, NotOverlapWithDB) {
     Options temp_cf_opts;
     ColumnFamilyHandle* temp_cfh;
     temp_cf_opts.target_file_size_base = 4 << 10;
-    temp_cf_opts.memtable_factory.reset(new VectorRepFactory());
+    temp_cf_opts.memtable_factory = std::make_shared<VectorRepFactory>();
     temp_cf_opts.allow_concurrent_memtable_write = false;
     temp_cf_opts.compaction_style = kCompactionStyleUniversal;
     ASSERT_OK(db_->CreateColumnFamily(temp_cf_opts, "temp_cf", &temp_cfh));
@@ -5795,7 +5795,7 @@ TEST_P(IngestDBGeneratedFileTest2, ZeroAndNonZeroSeqno) {
     auto* target_cfh = handles_[1];
 
     Options live_write_cf_opts = options;
-    live_write_cf_opts.memtable_factory.reset(new VectorRepFactory());
+    live_write_cf_opts.memtable_factory = std::make_shared<VectorRepFactory>();
     live_write_cf_opts.compaction_style = kCompactionStyleUniversal;
     live_write_cf_opts.cf_allow_ingest_behind = true;
     live_write_cf_opts.num_levels = 50;
@@ -5829,7 +5829,7 @@ TEST_P(IngestDBGeneratedFileTest2, ZeroAndNonZeroSeqno) {
     temp_db_opts.create_if_missing = true;
     temp_db_opts.target_file_size_base = 1 << 10;
     temp_db_opts.write_buffer_size = 1 << 10;
-    temp_db_opts.memtable_factory.reset(new VectorRepFactory());
+    temp_db_opts.memtable_factory = std::make_shared<VectorRepFactory>();
     temp_db_opts.allow_concurrent_memtable_write = false;
     temp_db_opts.compaction_style = kCompactionStyleUniversal;
     temp_db_opts.env = env_;

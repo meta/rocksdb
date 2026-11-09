@@ -1358,8 +1358,8 @@ TEST_F(DBIteratorTest, ReseekUponDirectionChange) {
   options.create_if_missing = true;
   options.prefix_extractor.reset(NewFixedPrefixTransform(1));
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
-  options.merge_operator.reset(
-      new StringAppendTESTOperator(/*delim_char=*/' '));
+  options.merge_operator = std::make_shared<StringAppendTESTOperator>(
+      /*delim_char=*/' ');
   DestroyAndReopen(options);
   ASSERT_OK(Put("foo", "value"));
   ASSERT_OK(Put("bar", "value"));

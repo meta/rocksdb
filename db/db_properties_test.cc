@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <memory>
 #include <string>
 
 #include "db/db_test_util.h"
@@ -372,7 +373,7 @@ TEST_F(DBPropertiesTest, AggregatedTableProperties) {
     options.level0_file_num_compaction_trigger = 8;
     options.compression = kNoCompression;
     options.create_if_missing = true;
-    options.merge_operator.reset(new TestPutOperator());
+    options.merge_operator = std::make_shared<TestPutOperator>();
 
     BlockBasedTableOptions table_options;
     table_options.filter_policy.reset(
@@ -573,7 +574,7 @@ TEST_F(DBPropertiesTest, AggregatedTablePropertiesAtLevel) {
   options.max_bytes_for_level_multiplier = 2;
   // The checks assume kTableCount number of files
   options.disable_auto_compactions = true;
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
 
   BlockBasedTableOptions table_options;
   table_options.filter_policy.reset(
@@ -2358,8 +2359,8 @@ TEST_F(DBPropertiesTest, GetMapPropertyWriteStallStats) {
   for (auto test_cause : {WriteStallCause::kWriteBufferManagerLimit,
                           WriteStallCause::kMemtableLimit}) {
     if (test_cause == WriteStallCause::kWriteBufferManagerLimit) {
-      options.write_buffer_manager.reset(
-          new WriteBufferManager(100000, nullptr, true));
+      options.write_buffer_manager =
+          std::make_shared<WriteBufferManager>(100000, nullptr, true);
     } else if (test_cause == WriteStallCause::kMemtableLimit) {
       options.max_write_buffer_number = 2;
       options.disable_auto_compactions = true;

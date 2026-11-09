@@ -13,6 +13,7 @@
 #include <fcntl.h>
 
 #include <algorithm>
+#include <memory>
 #include <set>
 #include <thread>
 #include <unordered_set>
@@ -4873,7 +4874,8 @@ class MockedRateLimiterWithNoOptionalAPIImpl : public RateLimiter {
 // operations (e.g, Put, Get, Flush)
 TEST_F(DBTest, CustomedRateLimiterWithNoOptionalAPIImplTest) {
   Options options = CurrentOptions();
-  options.rate_limiter.reset(new MockedRateLimiterWithNoOptionalAPIImpl());
+  options.rate_limiter =
+      std::make_shared<MockedRateLimiterWithNoOptionalAPIImpl>();
   DestroyAndReopen(options);
   ASSERT_OK(Put("abc", "def"));
   ASSERT_EQ(Get("abc"), "def");
@@ -4915,7 +4917,7 @@ TEST_F(DBTest, ConcurrentMemtableNotSupported) {
   options.memtable_factory.reset(NewHashLinkListRepFactory(4, 0, 3, true, 4));
   ASSERT_NOK(TryReopen(options));
 
-  options.memtable_factory.reset(new SkipListFactory);
+  options.memtable_factory = std::make_shared<SkipListFactory>();
   ASSERT_OK(TryReopen(options));
 
   ColumnFamilyOptions cf_options(options);
@@ -6327,7 +6329,7 @@ TEST_F(DBTest, MergeTestTime) {
   SetPerfLevel(kEnableTime);
   Options options = CurrentOptions();
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
-  options.merge_operator.reset(new DelayedMergeOperator(this));
+  options.merge_operator = std::make_shared<DelayedMergeOperator>(this);
   SetTimeElapseOnlySleepOnReopen(&options);
   DestroyAndReopen(options);
 
@@ -6370,7 +6372,7 @@ TEST_P(DBTestWithParam, MergeCompactionTimeTest) {
   Options options = CurrentOptions();
   options.compaction_filter_factory = std::make_shared<KeepFilterFactory>();
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
-  options.merge_operator.reset(new DelayedMergeOperator(this));
+  options.merge_operator = std::make_shared<DelayedMergeOperator>(this);
   options.disable_auto_compactions = true;
   options.max_subcompactions = max_subcompactions_;
   SetTimeElapseOnlySleepOnReopen(&options);
@@ -6536,8 +6538,8 @@ TEST_F(DBTest, SuggestCompactRangeTest) {
   options.memtable_factory.reset(test::NewSpecialSkipListFactory(
       DBTestBase::kNumKeysByGenerateNewRandomFile));
   options.compaction_style = kCompactionStyleLevel;
-  options.compaction_filter_factory.reset(
-      new CompactionFilterFactoryGetContext());
+  options.compaction_filter_factory =
+      std::make_shared<CompactionFilterFactoryGetContext>();
   options.write_buffer_size = 200 << 10;
   options.arena_block_size = 4 << 10;
   options.level0_file_num_compaction_trigger = 4;

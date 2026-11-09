@@ -395,9 +395,10 @@ TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
   if (use_old_interface_) {
     options.db_write_buffer_size = 120000;  // this is the real limit
   } else if (!cost_cache_) {
-    options.write_buffer_manager.reset(new WriteBufferManager(114285));
+    options.write_buffer_manager = std::make_shared<WriteBufferManager>(114285);
   } else {
-    options.write_buffer_manager.reset(new WriteBufferManager(114285, cache));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(114285, cache);
   }
   options.write_buffer_size = 500000;  // this is never hit
   CreateAndReopenWithCF({"pikachu", "dobrynia", "nikitich"}, options);
@@ -599,7 +600,7 @@ TEST_F(DBTest2, SharedWriteBufferLimitAcrossDB) {
   options.write_buffer_size = 500000;  // this is never hit
   // Use a write buffer total size so that the soft limit is about
   // 105000.
-  options.write_buffer_manager.reset(new WriteBufferManager(120000));
+  options.write_buffer_manager = std::make_shared<WriteBufferManager>(120000);
   CreateAndReopenWithCF({"cf1", "cf2"}, options);
 
   ASSERT_OK(DestroyDB(dbname2, options));
@@ -695,7 +696,7 @@ TEST_F(DBTest2, TestWriteBufferNoLimitWithCache) {
   options.write_buffer_size = 50000;  // this is never hit
   // Use a write buffer total size so that the soft limit is about
   // 105000.
-  options.write_buffer_manager.reset(new WriteBufferManager(0, cache));
+  options.write_buffer_manager = std::make_shared<WriteBufferManager>(0, cache);
   Reopen(options);
 
   ASSERT_OK(Put("foo", "bar"));
@@ -2522,8 +2523,8 @@ TEST_F(DBTest2, PersistentCache) {
   for (auto bsize : bsizes) {
     for (auto type : types) {
       BlockBasedTableOptions table_options;
-      table_options.persistent_cache.reset(
-          new MockPersistentCache(type, 10 * 1024));
+      table_options.persistent_cache =
+          std::make_shared<MockPersistentCache>(type, 10 * 1024);
       table_options.no_block_cache = true;
       table_options.block_cache = bsize ? NewLRUCache(bsize) : nullptr;
       options.table_factory.reset(NewBlockBasedTableFactory(table_options));

@@ -618,8 +618,8 @@ BlockBasedTableFactory::BlockBasedTableFactory(
 
 void BlockBasedTableFactory::InitializeOptions() {
   if (table_options_.flush_block_policy_factory == nullptr) {
-    table_options_.flush_block_policy_factory.reset(
-        new FlushBlockBySizePolicyFactory());
+    table_options_.flush_block_policy_factory =
+        std::make_shared<FlushBlockBySizePolicyFactory>();
   }
   if (table_options_.no_block_cache) {
     table_options_.block_cache.reset();

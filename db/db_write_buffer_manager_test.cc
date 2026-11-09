@@ -37,11 +37,11 @@ TEST_P(DBWriteBufferManagerTest, SharedBufferAcrossCFs1) {
   cost_cache_ = GetParam();
 
   if (cost_cache_) {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, cache, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, cache, true);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, nullptr, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, nullptr, true);
   }
 
   WriteOptions wo;
@@ -80,11 +80,11 @@ TEST_P(DBWriteBufferManagerTest, SharedWriteBufferAcrossCFs2) {
   cost_cache_ = GetParam();
 
   if (cost_cache_) {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, cache, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, cache, true);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, nullptr, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, nullptr, true);
   }
   WriteOptions wo;
   wo.disableWAL = true;
@@ -207,11 +207,11 @@ TEST_P(DBWriteBufferManagerTest, SharedWriteBufferLimitAcrossDB) {
   cost_cache_ = GetParam();
 
   if (cost_cache_) {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, cache, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, cache, true);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, nullptr, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, nullptr, true);
   }
   CreateAndReopenWithCF({"cf1", "cf2"}, options);
 
@@ -324,11 +324,11 @@ TEST_P(DBWriteBufferManagerTest, SharedWriteBufferLimitAcrossDB1) {
   cost_cache_ = GetParam();
 
   if (cost_cache_) {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, cache, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, cache, true);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, nullptr, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, nullptr, true);
   }
   CreateAndReopenWithCF({"cf1", "cf2"}, options);
 
@@ -467,11 +467,11 @@ TEST_P(DBWriteBufferManagerTest, MixedSlowDownOptionsSingleDB) {
   cost_cache_ = GetParam();
 
   if (cost_cache_) {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, cache, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, cache, true);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, nullptr, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, nullptr, true);
   }
   WriteOptions wo;
   wo.disableWAL = true;
@@ -630,11 +630,11 @@ TEST_P(DBWriteBufferManagerTest, MixedSlowDownOptionsMultipleDB) {
   cost_cache_ = GetParam();
 
   if (cost_cache_) {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, cache, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, cache, true);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, nullptr, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, nullptr, true);
   }
   CreateAndReopenWithCF({"cf1", "cf2"}, options);
 
@@ -809,12 +809,12 @@ TEST_P(DBWriteBufferManagerTest, StopSwitchingMemTablesOnceFlushing) {
   ASSERT_LT(cache->GetUsage(), 256 << 10 /* 256KB */);
   cost_cache_ = GetParam();
   if (cost_cache_) {
-    options.write_buffer_manager.reset(new WriteBufferManager(
-        512 << 10 /* buffer_size (512KB) */, cache, false /* allow_stall */));
+    options.write_buffer_manager = std::make_shared<WriteBufferManager>(
+        512 << 10 /* buffer_size (512KB) */, cache, false /* allow_stall */);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(512 << 10 /* buffer_size (512KB) */,
-                               nullptr /* cache */, false /* allow_stall */));
+    options.write_buffer_manager = std::make_shared<WriteBufferManager>(
+        512 << 10 /* buffer_size (512KB) */, nullptr /* cache */,
+        false /* allow_stall */);
   }
 
   Reopen(options);
@@ -2377,8 +2377,8 @@ TEST_F(DBWriteBufferManagerTest, RuntimeChangeableAllowStall) {
   constexpr int kBigValue = 10000;
 
   Options options = CurrentOptions();
-  options.write_buffer_manager.reset(
-      new WriteBufferManager(1, nullptr /* cache */, true /* allow_stall */));
+  options.write_buffer_manager = std::make_shared<WriteBufferManager>(
+      1, nullptr /* cache */, true /* allow_stall */);
   DestroyAndReopen(options);
 
   // Pause flush thread so that

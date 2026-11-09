@@ -30,7 +30,7 @@ class DBErrorHandlingFSTest : public DBTestBase {
  public:
   DBErrorHandlingFSTest()
       : DBTestBase("db_error_handling_fs_test", /*env_do_fsync=*/true) {
-    fault_fs_.reset(new FaultInjectionTestFS(env_->GetFileSystem()));
+    fault_fs_ = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
     fault_env_.reset(new CompositeEnvWrapper(env_, fault_fs_));
   }
 

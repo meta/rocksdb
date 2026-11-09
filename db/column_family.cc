@@ -13,6 +13,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -742,10 +743,11 @@ ColumnFamilyData::ColumnFamilyData(
       // TODO(hx235): Add a `ConcurrentCacheReservationManager` at DB scope
       // responsible for reservation of `ObsoleteFileInfo` so that we can keep
       // this `file_metadata_cache_res_mgr_` nonconcurrent
-      file_metadata_cache_res_mgr_.reset(new ConcurrentCacheReservationManager(
-          std::make_shared<
-              CacheReservationManagerImpl<CacheEntryRole::kFileMetadata>>(
-              bbto->block_cache)));
+      file_metadata_cache_res_mgr_ =
+          std::make_shared<ConcurrentCacheReservationManager>(
+              std::make_shared<
+                  CacheReservationManagerImpl<CacheEntryRole::kFileMetadata>>(
+                  bbto->block_cache));
     }
   }
 }

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
+#include <memory>
 
 #include "monitoring/statistics_impl.h"
 #include "rocksdb/convenience.h"
@@ -471,7 +472,7 @@ Status Statistics::CreateFromString(const ConfigOptions& config_options,
   });
   Status s;
   if (id == "" || id == StatisticsImpl::kClassName()) {
-    result->reset(new StatisticsImpl(nullptr));
+    *result = std::make_shared<StatisticsImpl>(nullptr);
   } else if (id == kNullptrString) {
     result->reset();
   } else {

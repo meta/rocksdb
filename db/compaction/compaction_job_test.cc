@@ -9,6 +9,7 @@
 #include <array>
 #include <cinttypes>
 #include <map>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -657,8 +658,8 @@ class CompactionJobTestBase : public testing::Test {
       int max_subcompactions = 0) {
     // For compaction, set fs as MockTestFileSystem to check the io_priority.
     if (test_io_priority_) {
-      db_options_.fs.reset(
-          new MockTestFileSystem(fs_, read_io_priority, write_io_priority));
+      db_options_.fs = std::make_shared<MockTestFileSystem>(
+          fs_, read_io_priority, write_io_priority);
     }
 
     auto cfd = versions_->GetColumnFamilySet()->GetDefault();

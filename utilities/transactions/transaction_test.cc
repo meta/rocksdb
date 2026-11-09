@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <functional>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <thread>
@@ -2674,7 +2675,7 @@ TEST_P(TransactionTest, FlushTest2) {
       case 0:
         break;
       case 1:
-        options.table_factory.reset(new mock::MockTableFactory());
+        options.table_factory = std::make_shared<mock::MockTableFactory>();
         break;
       case 2: {
         PlainTableOptions pt_opts;

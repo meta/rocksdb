@@ -761,7 +761,7 @@ TEST_F(DBBlockCacheTest, IndexAndFilterBlocksCachePriority) {
     options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
     BlockBasedTableOptions table_options;
     table_options.cache_index_and_filter_blocks = true;
-    table_options.block_cache.reset(new MockCache());
+    table_options.block_cache = std::make_shared<MockCache>();
     table_options.filter_policy.reset(NewBloomFilterPolicy(20));
     table_options.cache_index_and_filter_blocks_with_high_priority =
         priority == Cache::Priority::HIGH ? true : false;
@@ -921,7 +921,7 @@ TEST_F(DBBlockCacheTest, CacheCompressionDict) {
       options.target_file_size_base = kNumEntriesPerFile * kNumBytesPerEntry;
       BlockBasedTableOptions table_options;
       table_options.cache_index_and_filter_blocks = true;
-      table_options.block_cache.reset(new MockCache());
+      table_options.block_cache = std::make_shared<MockCache>();
       table_options.format_version = format_version;
       options.table_factory.reset(NewBlockBasedTableFactory(table_options));
       DestroyAndReopen(options);

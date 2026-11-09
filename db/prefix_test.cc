@@ -13,6 +13,7 @@ int main() {
 
 #include <algorithm>
 #include <iostream>
+#include <memory>
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
@@ -306,7 +307,7 @@ TEST(SamePrefixTest, InDomainTest) {
   std::unique_ptr<DB> db;
   Options options;
   options.create_if_missing = true;
-  options.prefix_extractor.reset(new SamePrefixTransform("HHKB"));
+  options.prefix_extractor = std::make_shared<SamePrefixTransform>("HHKB");
   BlockBasedTableOptions bbto;
   bbto.filter_policy.reset(NewBloomFilterPolicy(10, false));
   bbto.whole_key_filtering = false;
@@ -688,7 +689,7 @@ TEST_F(PrefixTest, DynamicPrefixIterator) {
 
 TEST_F(PrefixTest, PrefixSeekModePrev) {
   // Only for SkipListFactory
-  options.memtable_factory.reset(new SkipListFactory);
+  options.memtable_factory = std::make_shared<SkipListFactory>();
   options.merge_operator = MergeOperators::CreatePutOperator();
   options.write_buffer_size = 1024 * 1024;
   Random rnd(1);
@@ -811,7 +812,7 @@ TEST_F(PrefixTest, PrefixSeekModePrev2) {
   // after seek(15), iter1 will be at 21 and iter2 will be 33.
   // Then if call Prev() in prefix mode where SeekForPrev(21) gets called,
   // iter2 should turn to invalid state because of bloom filter.
-  options.memtable_factory.reset(new SkipListFactory);
+  options.memtable_factory = std::make_shared<SkipListFactory>();
   options.write_buffer_size = 1024 * 1024;
   std::string v13("v13");
   ASSERT_OK(DestroyDB(kDbName, Options()));
@@ -842,7 +843,7 @@ TEST_F(PrefixTest, PrefixSeekModePrev2) {
 TEST_F(PrefixTest, PrefixSeekModePrev3) {
   // Only for SkipListFactory
   // test SeekToLast() with iterate_upper_bound_ in prefix_seek_mode
-  options.memtable_factory.reset(new SkipListFactory);
+  options.memtable_factory = std::make_shared<SkipListFactory>();
   options.write_buffer_size = 1024 * 1024;
   std::string v14("v14");
   TestKey upper_bound_key = TestKey(1, 5);

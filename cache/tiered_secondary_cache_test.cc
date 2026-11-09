@@ -3,6 +3,8 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 //
+#include <memory>
+
 #include "cache/compressed_secondary_cache.h"
 #include "cache/secondary_cache_adapter.h"
 #include "db/db_test_util.h"
@@ -199,8 +201,8 @@ class DBTieredSecondaryCacheTest : public DBTestBase {
     opts.compressed_secondary_ratio = compressed_secondary_ratio_ =
         (double)compressed_capacity / opts.total_capacity;
     if (nvm_capacity > 0) {
-      nvm_sec_cache_.reset(
-          new TestSecondaryCache(nvm_capacity, ready_before_wait));
+      nvm_sec_cache_ =
+          std::make_shared<TestSecondaryCache>(nvm_capacity, ready_before_wait);
       opts.nvm_sec_cache = nvm_sec_cache_;
     }
     opts.adm_policy = adm_policy;
