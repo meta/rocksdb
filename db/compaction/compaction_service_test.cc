@@ -9319,6 +9319,16 @@ class ResumableCompactionServiceTest : public CompactionServiceTest {
     ASSERT_TRUE(result.stats.is_remote_compaction);
     ASSERT_GT(result.output_files.size(), 0);
 
+    // The output stats cover every output file, including the files that a
+    // resumed run restored instead of writing again.
+    uint64_t output_file_bytes = 0;
+    for (const auto& file : result.output_files) {
+      output_file_bytes += file.file_size;
+    }
+    ASSERT_EQ(result.internal_stats.output_level_stats.bytes_written,
+              output_file_bytes);
+    ASSERT_EQ(result.stats.total_output_bytes, output_file_bytes);
+
     uint64_t resumed_bytes =
         statistics->getTickerCount(REMOTE_COMPACT_RESUMED_BYTES);
     if (scenario ==

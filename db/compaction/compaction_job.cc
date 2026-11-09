@@ -3476,8 +3476,10 @@ void CompactionJob::RestoreCompactionOutputs(
       !!(compact_->compaction->mutable_cf_options().verify_output_flags &
          VerifyOutputFlags::kVerifyIteration);
 
+  uint64_t restored_bytes = 0;
   for (size_t i = 0; i < output_files.size(); i++) {
     FileMetaData file_copy = output_files[i];
+    restored_bytes += file_copy.fd.GetFileSize();
 
     outputs_to_restore->AddOutput(std::move(file_copy),
                                   cfd->internal_comparator(),
@@ -3489,6 +3491,7 @@ void CompactionJob::RestoreCompactionOutputs(
 
   outputs_to_restore->SetNumOutputRecords(
       subcompaction_progress_per_level.GetNumProcessedOutputRecords());
+  outputs_to_restore->AddRestoredBytesWritten(restored_bytes);
 }
 
 Status CompactionJob::RestoreBlobCompactionProgress(

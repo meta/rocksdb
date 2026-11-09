@@ -221,6 +221,12 @@ class CompactionOutputs {
     stats_.num_output_records = num_output_records;
   }
 
+  // Counts the bytes of output files that an earlier run of this compaction
+  // wrote and this run restored.
+  void AddRestoredBytesWritten(uint64_t bytes) {
+    stats_.bytes_written += bytes;
+  }
+
  private:
   friend class SubcompactionState;
 
