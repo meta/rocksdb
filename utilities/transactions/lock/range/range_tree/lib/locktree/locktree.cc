@@ -874,12 +874,13 @@ void locktree::escalate(lt_escalate_cb after_escalate_callback,
       // first, find the index of the next row lock that
       //  - belongs to a different txnid, or
       //  - belongs to several txnids, or
-      //  - is a shared lock (we could potentially merge those but
-      //    currently we don't), or
+      //  - is a shared lock or follows one (we could potentially merge
+      //    those but currently we don't), or
       //  - is across a lock escalation barrier.
       int next_txnid_index = current_index + 1;
 
       while (next_txnid_index < num_extracted &&
+             !extracted_buf[current_index].is_shared &&
              (extracted_buf[current_index].txnid ==
               extracted_buf[next_txnid_index].txnid) &&
              !extracted_buf[next_txnid_index].is_shared &&
