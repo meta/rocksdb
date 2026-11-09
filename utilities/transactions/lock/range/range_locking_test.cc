@@ -237,6 +237,39 @@ TEST_F(RangeLockingTest, UpgradeLockAndGetConflict) {
   delete txn1;
 }
 
+TEST_F(RangeLockingTest, ReacquireSharedLockKeepsLockMemory) {
+  auto cf = db->DefaultColumnFamily();
+  std::string value;
+  Transaction* txn0 = db->BeginTransaction(WriteOptions());
+  Transaction* txn1 = db->BeginTransaction(WriteOptions());
+  const std::vector<std::pair<Transaction*, std::string>> shared_locks = {
+      {txn0, "b"}, {txn1, "b"}, {txn0, "a"}, {txn0, "c"}, {txn1, "c"}};
+
+  // "b" becomes the root of the lock tree, with "a" and "c" below it.
+  // "a" has one owner, "b" and "c" have two.
+  for (const auto& [txn, key] : shared_locks) {
+    ASSERT_TRUE(
+        txn->GetForUpdate(ReadOptions(), cf, key, &value, false /*exclusive*/)
+            .IsNotFound());
+  }
+  const uint64_t lock_memory = range_lock_mgr->GetStatus().current_lock_memory;
+
+  for (const auto& [txn, key] : shared_locks) {
+    ASSERT_TRUE(
+        txn->GetForUpdate(ReadOptions(), cf, key, &value, false /*exclusive*/)
+            .IsNotFound());
+    EXPECT_EQ(range_lock_mgr->GetStatus().current_lock_memory, lock_memory)
+        << "after locking " << key << " again";
+  }
+
+  ASSERT_OK(txn0->Commit());
+  ASSERT_OK(txn1->Commit());
+  EXPECT_EQ(range_lock_mgr->GetStatus().current_lock_memory, 0);
+
+  delete txn0;
+  delete txn1;
+}
+
 TEST_F(RangeLockingTest, SnapshotValidation) {
   Status s;
   Slice key_slice = Slice("k");
