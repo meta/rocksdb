@@ -919,11 +919,11 @@ Status SstFileDumper::ReadSequential(bool print_kv, uint64_t read_num_limit,
     }
     Slice key = iter->key();
     Slice value = iter->value();
-    ++i;
 
     ParsedInternalKey ikey;
     Status pik_status = ParseInternalKey(key, &ikey, true /* log_err_key */);
     if (!pik_status.ok()) {
+      ++i;
       std::cerr << pik_status.getState() << "\n";
       continue;
     }
@@ -937,6 +937,10 @@ Status SstFileDumper::ReadSequential(bool print_kv, uint64_t read_num_limit,
     if (to.has_value() && ucmp->Compare(ikey.user_key, to.value()) >= 0) {
       break;
     }
+
+    // Count the entry only once it is inside the range, so a key that ends
+    // the scan does not use up the --read_num budget.
+    ++i;
 
     if (print_kv) {
       if (!decode_blob_index_ || ikey.type != kTypeBlobIndex) {

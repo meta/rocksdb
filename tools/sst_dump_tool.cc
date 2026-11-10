@@ -1195,9 +1195,6 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
         fprintf(stderr, "%s: %s\n", filename.c_str(), st.ToString().c_str());
       }
       total_read += dumper.GetReadNumber();
-      if (read_num > 0 && total_read > read_num) {
-        break;
-      }
     }
 
     if (command == "verify") {
@@ -1278,6 +1275,10 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
       }
     } else if (list_meta_blocks) {
       fprintf(stderr, "Could not read the meta index block\n");
+    }
+
+    if (read_num > 0 && total_read >= read_num) {
+      break;
     }
   }
 
