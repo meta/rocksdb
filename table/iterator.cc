@@ -79,6 +79,8 @@ class EmptyInternalIterator : public InternalIteratorBase<TValue> {
     return std::numeric_limits<uint64_t>::max();
   }
   Status status() const override { return status_; }
+  // Never Valid(), so no key() or value() slice can depend on it.
+  bool IsSafeToDropWhilePinned() const override { return true; }
 
  private:
   Status status_;

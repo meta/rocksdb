@@ -524,7 +524,8 @@ Status BuildTable(
           MaxFileSizeForL0MetaPin(mutable_cf_options),
           /*smallest_compaction_key=*/nullptr,
           /*largest_compaction_key*/ nullptr,
-          /*allow_unprepared_value*/ false,
+          /*allow_unprepared_value*/ false, /*seek_target=*/nullptr,
+          /*prefix_filtered_table=*/nullptr,
           /*range_del_read_seqno=*/nullptr,
           /*range_del_iter=*/nullptr,
           /*maybe_pin_table_handle=*/false, file_open_metadata_ptr));

@@ -90,14 +90,23 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
   is_out_of_bound_ = false;
   is_at_first_key_from_index_ = false;
   seek_stat_state_ = kNone;
+  assert(target != nullptr ||
+         first_seek_prefix_check_ == FirstSeekPrefixCheck::kNotRun);
   bool filter_checked = false;
-  if (target &&
-      !CheckPrefixMayMatch(*target, IterDirection::kForward, &filter_checked)) {
-    ResetDataIter();
-    RecordTick(table_->GetStatistics(), is_last_level_
-                                            ? LAST_LEVEL_SEEK_FILTERED
-                                            : NON_LAST_LEVEL_SEEK_FILTERED);
-    return;
+  if (target) {
+    if (first_seek_prefix_check_ != FirstSeekPrefixCheck::kNotRun) {
+      // BlockBasedTable::NewIteratorForSeek() ran this seek's prefix check.
+      filter_checked =
+          first_seek_prefix_check_ == FirstSeekPrefixCheck::kPassedFilter;
+      first_seek_prefix_check_ = FirstSeekPrefixCheck::kNotRun;
+    } else if (!CheckPrefixMayMatch(*target, IterDirection::kForward,
+                                    &filter_checked)) {
+      ResetDataIter();
+      RecordTick(table_->GetStatistics(), is_last_level_
+                                              ? LAST_LEVEL_SEEK_FILTERED
+                                              : NON_LAST_LEVEL_SEEK_FILTERED);
+      return;
+    }
   }
   if (filter_checked) {
     seek_stat_state_ = kFilterUsed;

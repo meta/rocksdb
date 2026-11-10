@@ -117,6 +117,13 @@ class TableCache {
   //                       not combine `open_ephemeral_table_reader` with
   //                       `ReadOptions::read_tier = kBlockCacheTier` (no_io);
   //                       opening an ephemeral reader inherently requires I/O.
+  // @param seek_target If non-null, the caller's first operation on the
+  //    returned iterator will be Seek(*seek_target); see
+  //    TableReader::NewIteratorForSeek(). If the table rules that seek out, an
+  //    empty iterator is returned and *prefix_filtered_table is set to the
+  //    table reader, which that iterator keeps alive; otherwise
+  //    *prefix_filtered_table is left unchanged. The empty iterator stands in
+  //    for the table only for this seek target.
   InternalIterator* NewIterator(
       const ReadOptions& options, const FileOptions& toptions,
       const InternalKeyComparator& internal_comparator,
@@ -127,6 +134,7 @@ class TableCache {
       size_t max_file_size_for_l0_meta_pin,
       const InternalKey* smallest_compaction_key,
       const InternalKey* largest_compaction_key, bool allow_unprepared_value,
+      const Slice* seek_target, TableReader** prefix_filtered_table,
       const SequenceNumber* range_del_read_seqno = nullptr,
       std::unique_ptr<TruncatedRangeDelIterator>* range_del_iter = nullptr,
       bool maybe_pin_table_handle = false,
