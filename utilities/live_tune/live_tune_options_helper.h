@@ -52,9 +52,9 @@ Status NormalizeOptionValues(DB* db, ColumnFamilyHandle* cf,
 // The DB options are checked before anything is set. After
 // a failure the values are read back, because SetOptions() and
 // SetDBOptions() can fail with the options already in effect (e.g. when the
-// OPTIONS file write fails): if the DB options turn out not to be set, the
-// column family options set before them are restored (Incomplete if that
-// fails too).
+// OPTIONS file write fails): OK if they are all in effect. If the DB options
+// turn out not to be set, the column family options set before them are
+// restored (Incomplete if that fails too).
 Status SetOptionValues(DB* db, ColumnFamilyHandle* cf,
                        const std::map<std::string, std::string>& values);
 

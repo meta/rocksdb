@@ -343,11 +343,8 @@ Status SetOptionValues(DB* db, ColumnFamilyHandle* cf,
       }
       return db_status;
     }
-    if (s.ok()) {
-      s = db_status;
-    }
   }
-  return s;
+  return Status::OK();
 }
 
 }  // namespace live_tune

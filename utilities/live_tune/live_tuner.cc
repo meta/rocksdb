@@ -249,7 +249,13 @@ void AddTraceSummary(JSONWriter* jw, const LiveTuneTraceSummary& t) {
   jw->EndObject();
 }
 
-// ---- Built-in verdicts ----
+// ---- Built-in verdict and applier ----
+
+// The default Apply() and Revert(): SetOptions() / SetDBOptions() on the DB.
+class DefaultApplier : public LiveTuneApplier {
+ public:
+  const char* Name() const override { return "DefaultApplier"; }
+};
 
 // The default GetWindowDecision(), keeping every change that reaches
 // min_confidence.
@@ -271,6 +277,18 @@ const char* DecisionName(LiveTuneWindowDecision::Action action) {
 }
 
 }  // namespace
+
+Status LiveTuneApplier::Apply(
+    DB* db, ColumnFamilyHandle* cf,
+    const std::map<std::string, std::string>& changes) {
+  return live_tune::SetOptionValues(db, cf, changes);
+}
+
+Status LiveTuneApplier::Revert(
+    DB* db, ColumnFamilyHandle* cf,
+    const std::map<std::string, std::string>& previous) {
+  return live_tune::SetOptionValues(db, cf, previous);
+}
 
 std::shared_ptr<LiveTuneTraceAnalyzer> NewLiveTuneTraceAnalyzer() {
   return std::make_shared<BuiltinTraceAnalyzer>();
@@ -360,14 +378,14 @@ const char* LiveTunePhaseName(LiveTuneStatus::Phase phase) {
 LiveTuner::LiveTuner(DB* db, LiveTuneOptions options,
                      std::unique_ptr<ColumnFamilyHandle> cf,
                      std::shared_ptr<Logger> info_log,
-                     std::vector<std::string> history,
-                     std::map<std::string, std::string> kept)
+                     std::vector<std::string> history)
     : db_(db),
       options_(std::move(options)),
+      applier_(options_.applier ? options_.applier
+                                : std::make_shared<DefaultApplier>()),
       cf_(std::move(cf)),
       info_log_(std::move(info_log)),
       history_(std::move(history)),
-      kept_(std::move(kept)),
       statistics_(db_->GetDBOptions().statistics) {
   status_.intent = options_.intent;
 }
@@ -401,15 +419,20 @@ void LiveTuner::Start() {
 
 void LiveTuner::Stop() {
   bool cancel = false;
+  bool cancel_apply = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     stopping_ = true;
     cancel = in_recommendation_;
+    cancel_apply = in_apply_;
   }
   compaction_canceled_.store(true);
   cv_.notify_all();
   if (cancel) {
     options_.advisor->CancelRecommendation();
+  }
+  if (cancel_apply) {
+    applier_->CancelApply();
   }
   if (OnCycleThread()) {
     // The cycle sees stopping_ and ends itself; it can't join its own thread.
@@ -442,15 +465,6 @@ LiveTuneStatus LiveTuner::GetStatus() const {
 std::vector<std::string> LiveTuner::History() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return history_;
-}
-
-std::map<std::string, std::string> LiveTuner::AppliedOptions() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::map<std::string, std::string> options = kept_;
-  for (const auto& entry : applied_) {
-    options[entry.first] = entry.second;
-  }
-  return options;
 }
 
 bool LiveTuner::Wait(double seconds) {
@@ -954,37 +968,13 @@ Status LiveTuner::Compact() {
 
 Status LiveTuner::Revert(const LiveTuneWatch& watch,
                          const std::string& reason) {
-  Status s = live_tune::SetOptionValues(db_, cf_.get(), watch.previous);
-  // SetOptionValues() can fail with some options already set, so read back
-  // which changes are still in effect.
-  std::map<std::string, std::pair<double, double>> names;
-  for (const auto& entry : watch.previous) {
-    names[entry.first] = {0, 0};
-  }
-  std::map<std::string, std::string> now;
-  const Status read = live_tune::GetOptionValues(db_, cf_.get(), names, &now);
-  std::string still_applied;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto& entry : watch.previous) {
-      if (read.ok() && now[entry.first] == entry.second) {
-        applied_.erase(entry.first);
-      } else {
-        still_applied += (still_applied.empty() ? "" : ", ") + entry.first;
-      }
-    }
-  }
-  Status result;
-  if (!still_applied.empty()) {
-    result = Status::Incomplete("still applied: " + still_applied + "; " +
-                                (s.ok() ? read : s).ToString());
-  }
+  const Status s = applier_->Revert(db_, cf_.get(), watch.previous);
   JSONWriter jw = StartEvent("reverted");
   jw << "reason" << reason;
   AddObject(&jw, "previous", watch.previous);
-  jw << "status" << (result.ok() ? s : result).ToString();
+  jw << "status" << s.ToString();
   LogEvent(&jw);
-  return result;
+  return s;
 }
 
 void LiveTuner::Reject(const std::string& reason) {
@@ -1247,10 +1237,19 @@ void LiveTuner::Run() {
     std::lock_guard<std::mutex> lock(mutex_);
     status_.previous = watch.previous;
     status_.constraints = watch.constraints;
-    // Before they are set, so the application does not undo them.
-    applied_ = watch.changes;
+    // A Stop() before this point can't cancel the call, so skip it.
+    stopped = stopping_;
+    in_apply_ = !stopped;
   }
-  s = live_tune::SetOptionValues(db_, cf_.get(), watch.changes);
+  if (stopped) {
+    Finish("stopped", "");
+    return;
+  }
+  s = applier_->Apply(db_, cf_.get(), watch.changes);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    in_apply_ = false;
+  }
   if (s.ok()) {
     // Before the "applied" event, so its listeners see the new phase.
     SetPhase(recommendation.requires_compaction
@@ -1268,8 +1267,9 @@ void LiveTuner::Run() {
     LogEvent(&jw);
   }
   if (!s.ok()) {
-    // Some of the changes may be in effect anyway; Revert() reads them back.
-    std::string outcome = "apply failed: " + s.ToString();
+    // Some of the changes may be in effect anyway.
+    std::string outcome =
+        Stopping() ? "stopped" : "apply failed: " + s.ToString();
     const Status reverted = Revert(watch, outcome);
     if (!reverted.ok()) {
       outcome += "; revert failed: " + reverted.ToString();
@@ -1293,13 +1293,7 @@ void LiveTuner::Run() {
   }
   bool keep = false;
   std::string outcome = Watch(&watch, &keep);
-  if (keep) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto& entry : applied_) {
-      kept_[entry.first] = entry.second;
-    }
-    applied_.clear();
-  } else {
+  if (!keep) {
     const Status reverted = Revert(watch, outcome);
     if (!reverted.ok()) {
       outcome += "; revert failed: " + reverted.ToString();

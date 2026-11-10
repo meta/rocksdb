@@ -2209,7 +2209,6 @@ Status DBImpl::StartLiveTuneCycle(const LiveTuneOptions& options) {
       return Status::Aborted("DB is closing");
     }
     std::vector<std::string> history;
-    std::map<std::string, std::string> kept;
     if (live_tuner_ != nullptr) {
       if (live_tuner_->Running()) {
         return Status::Busy("a live tune cycle is running");
@@ -2220,12 +2219,11 @@ Status DBImpl::StartLiveTuneCycle(const LiveTuneOptions& options) {
             "live_tune: start the next cycle from another thread");
       }
       history = live_tuner_->History();
-      kept = live_tuner_->AppliedOptions();
     }
     previous = std::move(live_tuner_);
-    live_tuner_ = std::make_shared<LiveTuner>(
-        this, options, std::move(cf), immutable_db_options_.info_log,
-        std::move(history), std::move(kept));
+    live_tuner_ = std::make_shared<LiveTuner>(this, options, std::move(cf),
+                                              immutable_db_options_.info_log,
+                                              std::move(history));
     live_tuner_->Start();
   }
   // The previous cycle is done but its thread may still be delivering the
@@ -2247,18 +2245,6 @@ Status DBImpl::GetLiveTuneStatus(LiveTuneStatus* status) {
     live_tuner = live_tuner_;
   }
   *status = live_tuner ? live_tuner->GetStatus() : LiveTuneStatus();
-  return Status::OK();
-}
-
-Status DBImpl::GetLiveTuneAppliedOptions(
-    std::map<std::string, std::string>* options) {
-  std::shared_ptr<LiveTuner> live_tuner;
-  {
-    std::lock_guard<std::mutex> lock(live_tune_mutex_);
-    live_tuner = live_tuner_;
-  }
-  *options = live_tuner ? live_tuner->AppliedOptions()
-                        : std::map<std::string, std::string>();
   return Status::OK();
 }
 
@@ -2286,12 +2272,6 @@ Status GetLiveTuneStatus(DB* db, LiveTuneStatus* status) {
 
 Status StopLiveTuneCycle(DB* db) {
   return static_cast_with_check<DBImpl>(db->GetRootDB())->StopLiveTuneCycle();
-}
-
-Status GetLiveTuneAppliedOptions(DB* db,
-                                 std::map<std::string, std::string>* options) {
-  return static_cast_with_check<DBImpl>(db->GetRootDB())
-      ->GetLiveTuneAppliedOptions(options);
 }
 
 Status DBImpl::SetDBOptions(

@@ -21,8 +21,9 @@
 //      max_changes, each numeric one at most max_step_ratio times away from
 //      its value right before apply, and a move to or from 0 or a negative
 //      value only within intent bounds; objectives and constraints on
-//      metrics the baseline has) and apply the changes with SetOptions() /
-//      SetDBOptions(). With LiveTuneOptions::skip_apply the cycle ends here
+//      metrics the baseline has) and apply the changes with the
+//      LiveTuneApplier (by default SetOptions() / SetDBOptions() on the DB).
+//      With LiveTuneOptions::skip_apply the cycle ends here
 //      instead, changing nothing; the recommendation is in the status and the
 //      events. The changes are validated against the intent's constraints (or
 //      default_constraints when it has none) plus the advisor's. A
@@ -58,6 +59,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+class ColumnFamilyHandle;
 class DB;
 class TraceReader;
 
@@ -320,6 +322,40 @@ class LiveTuneMetricsProvider : public Customizable {
   virtual void AddMetrics(DB* db, LiveTuneMetrics* metrics) = 0;
 };
 
+// Applies a recommendation's changes and reverts them. The built-in
+// implementation sets them on the cycle's DB with SetOptions() and
+// SetDBOptions(). An application can apply them its own way instead, e.g.
+// through its own configuration to every DB of a group, so that the change is
+// tried on all of them. Either way the cycle measures and, for a
+// recommendation that requires it, compacts only its own DB.
+class LiveTuneApplier : public Customizable {
+ public:
+  static const char* Type() { return "LiveTuneApplier"; }
+
+  // Sets `changes` (named as in LiveTuneIntent::allowed_options) on `db`:
+  // options of column family `cf`, and DB options. Returns once they are in
+  // effect on `db`, as the cycle measures from then on. A failed apply ends
+  // the cycle as "apply failed: <status>" after Revert(), as some of the
+  // changes may be in effect. Called on the cycle's thread, which it may
+  // block until CancelApply().
+  virtual Status Apply(DB* db, ColumnFamilyHandle* cf,
+                       const std::map<std::string, std::string>& changes);
+
+  // Called from another thread when the cycle is stopped while Apply() is in
+  // progress, for example when the DB closes; Apply() should return soon
+  // after, as StopLiveTuneCycle() and the DB close wait for it. An applier
+  // shared by several cycles gets the cancel of any of them.
+  virtual void CancelApply() {}
+
+  // Restores `previous` (the values from right before Apply()) on `db`. A
+  // non-OK status is reported as "; revert failed: <status>". Called on the
+  // cycle's thread after a failed Apply(), when the changes are reverted, and
+  // when the cycle is stopped, e.g. as the DB closes, so it should not block
+  // for long.
+  virtual Status Revert(DB* db, ColumnFamilyHandle* cf,
+                        const std::map<std::string, std::string>& previous);
+};
+
 // How a cycle ended: its outcome and what led to it. See
 // LiveTuneEventListener::OnCycleDone().
 struct LiveTuneCycleResult {
@@ -394,6 +430,8 @@ struct LiveTuneOptions {
   // Optional.
   std::shared_ptr<LiveTuneMetricsProvider> metrics_provider;
   std::shared_ptr<LiveTuneEventListener> event_listener;
+  // nullptr: the built-in LiveTuneApplier, setting the changes on the DB.
+  std::shared_ptr<LiveTuneApplier> applier;
 
   // Do not apply a recommendation that passes the checks: end the cycle
   // after the checks with outcome "recommended", changing nothing. For
@@ -457,9 +495,8 @@ struct LiveTuneStatus {
   // "constraint: <which>", "inconclusive", the reason of a custom
   // GetWindowDecision() (or "reverted"), "stopped",
   // "advisor failed: <status>", "apply failed: <status>" or
-  // "compaction failed: <status>". When a revert leaves a change in effect,
-  // "; revert failed: <status>" follows, and GetLiveTuneAppliedOptions()
-  // still lists the change.
+  // "compaction failed: <status>". When a revert fails,
+  // "; revert failed: <status>" follows.
   std::string outcome;
   uint64_t start_micros = 0;
   uint64_t end_micros = 0;
@@ -498,13 +535,5 @@ Status GetLiveTuneStatus(DB* db, LiveTuneStatus* status);
 // (from the cycle's own event listener, it doesn't wait). OK when no cycle is
 // running.
 Status StopLiveTuneCycle(DB* db);
-
-// The options live tuning has changed on `db` and not reverted, with their
-// values: the changes of the running cycle from just before they are applied
-// until they are reverted, and the changes kept by cycles since the DB was
-// opened. Named as in LiveTuneIntent::allowed_options. For an application that
-// sets options itself, so that it does not undo them.
-Status GetLiveTuneAppliedOptions(DB* db,
-                                 std::map<std::string, std::string>* options);
 
 }  // namespace ROCKSDB_NAMESPACE
