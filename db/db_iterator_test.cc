@@ -4560,6 +4560,42 @@ TEST_P(DBIteratorTest, IterateWithLowerBoundAcrossFileBoundary) {
   ASSERT_OK(iter->status());
 }
 
+TEST_P(DBIteratorTest, LevelIteratorSeekWithUpperBoundLESmallestKey) {
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  Reopen(options);
+  ASSERT_OK(Put("c", ""));
+  ASSERT_OK(Put("d", ""));
+  ASSERT_OK(Put("e", ""));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("f", ""));
+  ASSERT_OK(Put("g", ""));
+  ASSERT_OK(Put("h", ""));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  HistogramData hist_data;
+  ASSERT_OK(options.statistics->Reset());
+  Slice upper_bound("b");
+  ReadOptions read_opts;
+  read_opts.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(NewIterator(read_opts));
+  iter->Seek("a");
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  options.statistics->histogramData(READ_BLOCK_GET_MICROS, &hist_data);
+  ASSERT_EQ(hist_data.count, 0);
+  iter->Seek("b");
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  options.statistics->histogramData(READ_BLOCK_GET_MICROS, &hist_data);
+  ASSERT_EQ(hist_data.count, 0);
+  iter->Seek("c");
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  options.statistics->histogramData(READ_BLOCK_GET_MICROS, &hist_data);
+  ASSERT_EQ(hist_data.count, 0);
+}
+
 TEST_P(DBIteratorTest, Blob) {
   Options options = CurrentOptions();
   options.enable_blob_files = true;
