@@ -15,7 +15,7 @@ namespace ROCKSDB_NAMESPACE {
 // iterator with the max/largest key on top.
 class MaxIteratorComparator {
  public:
-  MaxIteratorComparator(const InternalKeyComparator* comparator)
+  explicit MaxIteratorComparator(const InternalKeyComparator* comparator)
       : comparator_(comparator) {}
 
   bool operator()(IteratorWrapper* a, IteratorWrapper* b) const {
@@ -30,7 +30,7 @@ class MaxIteratorComparator {
 // iterator with the min/smallest key on top.
 class MinIteratorComparator {
  public:
-  MinIteratorComparator(const InternalKeyComparator* comparator)
+  explicit MinIteratorComparator(const InternalKeyComparator* comparator)
       : comparator_(comparator) {}
 
   bool operator()(IteratorWrapper* a, IteratorWrapper* b) const {

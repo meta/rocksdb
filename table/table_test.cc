@@ -1710,7 +1710,7 @@ class BBTTailPrefetchTest : public TableTest {};
 // The helper class to test the file checksum
 class FileChecksumTestHelper {
  public:
-  FileChecksumTestHelper(bool convert_to_internal_key = false)
+  explicit FileChecksumTestHelper(bool convert_to_internal_key = false)
       : convert_to_internal_key_(convert_to_internal_key) {}
   ~FileChecksumTestHelper() = default;
 
@@ -10259,7 +10259,7 @@ class UserDefinedIndexTestBase : public BlockBasedTableTestBase {
 
   class CustomFlushBlockPolicyFactory : public FlushBlockPolicyFactory {
    public:
-    CustomFlushBlockPolicyFactory(int keys_per_block = 3)
+    explicit CustomFlushBlockPolicyFactory(int keys_per_block = 3)
         : keys_per_block_(keys_per_block) {}
     const char* Name() const override { return "CustomFlushBlockPolicy"; }
     FlushBlockPolicy* NewFlushBlockPolicy(const BlockBasedTableOptions&,
@@ -10297,7 +10297,7 @@ class UserDefinedIndexTestBase : public BlockBasedTableTestBase {
         key_type_log_;
 
     struct CustomizedMapComparator {
-      CustomizedMapComparator(const Comparator* _comparator)
+      explicit CustomizedMapComparator(const Comparator* _comparator)
           : comparator(_comparator) {}
       const Comparator* comparator;
       bool operator()(const std::string& lhs, const std::string& rhs) const {
@@ -14459,7 +14459,8 @@ struct UserDefinedIndexStressTestParam {
   using UserDefinedIndexStressTestTuple =
       std::tuple<const Comparator*, bool, bool, bool>;
 
-  UserDefinedIndexStressTestParam(const UserDefinedIndexStressTestTuple& tuple)
+  explicit UserDefinedIndexStressTestParam(
+      const UserDefinedIndexStressTestTuple& tuple)
       : comparator(std::get<0>(tuple)),
         enable_udi(std::get<1>(tuple)),
         enable_compaction_with_sst_partitioner(std::get<2>(tuple)),
@@ -14510,7 +14511,7 @@ class UserDefinedIndexStressTest
     std::cout << "Random seed: " << rand_seed_ << std::endl;
 
     rnd = Random(rand_seed_);
-    UserDefinedIndexStressTestParam param = GetParam();
+    UserDefinedIndexStressTestParam param(GetParam());
     comparator_ = param.comparator;
     enable_udi_ = param.enable_udi;
     enable_compaction_with_sst_partitioner_ =

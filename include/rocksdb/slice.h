@@ -38,6 +38,7 @@ class Slice {
   // Create a slice that refers to d[0,n-1].
   Slice(const char* d, size_t n) : data_(d), size_(n) {}
 
+  // NOLINTBEGIN(google-explicit-constructor)
   // Create a slice that refers to the contents of "s"
   /* implicit */
   Slice(const std::string& s) : data_(s.data()), size_(s.size()) {}
@@ -49,6 +50,7 @@ class Slice {
   // Create a slice that refers to s[0,strlen(s)-1]
   /* implicit */
   Slice(const char* s) : data_(s) { size_ = (s == nullptr) ? 0 : strlen(s); }
+  // NOLINTEND(google-explicit-constructor)
 
   // Create a single slice from SliceParts using buf as storage.
   // buf must exist as long as the returned Slice exists.
@@ -136,6 +138,7 @@ class Slice {
 class OptSlice {
  public:
   OptSlice() : slice_(nullptr, SIZE_MAX) {}
+  // NOLINTBEGIN(google-explicit-constructor)
   /*implicit*/ OptSlice(const Slice& s) : slice_(s) {}
   /*implicit*/ OptSlice(const std::string& s) : slice_(s) {}
   /*implicit*/ OptSlice(const std::string_view& sv) : slice_(sv) {}
@@ -144,6 +147,7 @@ class OptSlice {
   // For easier migrating from APIs uing Slice* as an optional type.
   // CAUTION: OptSlice{nullptr} is "no value" while Slice{nullptr} is "empty"
   /*implicit*/ OptSlice(std::nullptr_t) : OptSlice() {}
+  // NOLINTEND(google-explicit-constructor)
 
   bool has_value() const noexcept { return slice_.size() != SIZE_MAX; }
   explicit operator bool() const noexcept { return has_value(); }

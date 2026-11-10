@@ -43,7 +43,7 @@ struct SuperVersionContext {
   explicit SuperVersionContext(bool create_superversion = false)
       : new_superversion(create_superversion ? new SuperVersion() : nullptr) {}
 
-  explicit SuperVersionContext(SuperVersionContext&& other) noexcept
+  SuperVersionContext(SuperVersionContext&& other) noexcept
       : superversions_to_free(std::move(other.superversions_to_free)),
 #ifndef ROCKSDB_DISABLE_STALL_NOTIFICATION
         write_stall_notifications(std::move(other.write_stall_notifications)),

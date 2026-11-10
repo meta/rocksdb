@@ -2294,8 +2294,10 @@ class MultiScanArgs {
 
   void reserve(size_t size) { original_ranges_.reserve(size); }
 
+  // NOLINTNEXTLINE(google-explicit-constructor)
   operator std::vector<ScanOptions>*() { return &original_ranges_; }
 
+  // NOLINTNEXTLINE(google-explicit-constructor)
   operator const std::vector<ScanOptions>*() const { return &original_ranges_; }
 
   ~MultiScanArgs() {}

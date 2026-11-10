@@ -27,7 +27,7 @@ inline std::string ChecksumInt32ToHex(uint32_t checksum_value) {
 // will be used as the default checksum method for SST file checksum
 class FileChecksumGenCrc32c : public FileChecksumGenerator {
  public:
-  FileChecksumGenCrc32c(const FileChecksumGenContext& /*context*/) {
+  explicit FileChecksumGenCrc32c(const FileChecksumGenContext& /*context*/) {
     checksum_ = 0;
   }
 

@@ -184,7 +184,7 @@ class FilePrefetchBuffer {
   // NOTE: FilePrefetchBuffer is incompatible with prefetching from
   // RandomAccessFileReaders using mmap reads, so it is common to use
   // `!use_mmap_reads` for the `enable` parameter.
-  FilePrefetchBuffer(
+  explicit FilePrefetchBuffer(
       const ReadaheadParams& readahead_params = {}, bool enable = true,
       bool track_min_offset = false, FileSystem* fs = nullptr,
       SystemClock* clock = nullptr, Statistics* stats = nullptr,

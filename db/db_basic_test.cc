@@ -6669,7 +6669,7 @@ TEST_P(DBBasicTestWithParallelIO, MultiGetDirectIO) {
     class FakeDirectIORandomAccessFile;
 
    public:
-    FakeDirectIOEnv(Env* env) : EnvWrapper(env) {}
+    explicit FakeDirectIOEnv(Env* env) : EnvWrapper(env) {}
     static const char* kClassName() { return "FakeDirectIOEnv"; }
     const char* Name() const override { return kClassName(); }
 
@@ -6691,7 +6691,8 @@ TEST_P(DBBasicTestWithParallelIO, MultiGetDirectIO) {
    private:
     class FakeDirectIORandomAccessFile : public RandomAccessFileWrapper {
      public:
-      FakeDirectIORandomAccessFile(std::unique_ptr<RandomAccessFile>&& file)
+      explicit FakeDirectIORandomAccessFile(
+          std::unique_ptr<RandomAccessFile>&& file)
           : RandomAccessFileWrapper(file.get()), file_(std::move(file)) {}
       ~FakeDirectIORandomAccessFile() override {}
 
@@ -7303,7 +7304,8 @@ TEST_F(DBBasicTest, VerifyFileChecksums) {
   // error.
   class MisnamedFileChecksumGenerator : public FileChecksumGenCrc32c {
    public:
-    MisnamedFileChecksumGenerator(const FileChecksumGenContext& context)
+    explicit MisnamedFileChecksumGenerator(
+        const FileChecksumGenContext& context)
         : FileChecksumGenCrc32c(context) {}
 
     const char* Name() const override { return "sha1"; }

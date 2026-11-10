@@ -99,8 +99,8 @@ template <typename T>
 class UnownedPtr {
  public:
   UnownedPtr() = default;
-  UnownedPtr(std::nullptr_t) {}
-  UnownedPtr(T* ptr) : ptr_(ptr) {}
+  UnownedPtr(std::nullptr_t) {}      // NOLINT(google-explicit-constructor)
+  UnownedPtr(T* ptr) : ptr_(ptr) {}  // NOLINT(google-explicit-constructor)
   UnownedPtr(const UnownedPtr&) = default;
   UnownedPtr(UnownedPtr&&) = default;
   UnownedPtr& operator=(const UnownedPtr&) = default;
@@ -110,7 +110,7 @@ class UnownedPtr {
   T* get() const { return ptr_; }
   T* operator->() const { return ptr_; }
   T& operator*() const { return *ptr_; }
-  operator bool() const { return ptr_ != nullptr; }
+  explicit operator bool() const { return ptr_ != nullptr; }
 
  private:
   T* ptr_ = nullptr;

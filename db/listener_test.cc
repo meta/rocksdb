@@ -1369,7 +1369,7 @@ class BackgroundErrorListener : public EventListener {
   int counter_;
 
  public:
-  BackgroundErrorListener(SpecialEnv* env) : env_(env), counter_(0) {}
+  explicit BackgroundErrorListener(SpecialEnv* env) : env_(env), counter_(0) {}
 
   void OnBackgroundError(BackgroundErrorReason /*reason*/,
                          Status* bg_error) override {

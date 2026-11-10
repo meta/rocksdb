@@ -62,7 +62,7 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 class TestCustomizable : public Customizable {
  public:
-  TestCustomizable(const std::string& name) : name_(name) {}
+  explicit TestCustomizable(const std::string& name) : name_(name) {}
   // Method to allow CheckedCast to work for this class
   static const char* kClassName() { return "TestCustomizable"; }
 

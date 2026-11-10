@@ -338,7 +338,8 @@ TEST_P(WriteCallbackPTest, WriteWithCallbackTest) {
       if (seq_per_batch_) {
         class PublishSeqCallback : public PreReleaseCallback {
          public:
-          PublishSeqCallback(DBImpl* db_impl_in) : db_impl_(db_impl_in) {}
+          explicit PublishSeqCallback(DBImpl* db_impl_in)
+              : db_impl_(db_impl_in) {}
           Status Callback(SequenceNumber last_seq, bool /*not used*/, uint64_t,
                           size_t /*index*/, size_t /*total*/) override {
             db_impl_->SetLastPublishedSequence(last_seq);

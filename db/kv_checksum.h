@@ -87,7 +87,7 @@ class ProtectionInfo {
   static const uint64_t kSeedS = 0x77A00858DDD37F21;
   static const uint64_t kSeedC = 0x4A2AB5CBD26F542C;
 
-  ProtectionInfo(T val) : val_(val) {
+  explicit ProtectionInfo(T val) : val_(val) {
     static_assert(sizeof(ProtectionInfo<T>) == sizeof(T), "");
   }
 

@@ -194,7 +194,7 @@ using BlocklikeStatus = WithBlocklikeCheck<Status, TBlocklike>;
 // Helper for the uncache_aggressiveness option
 class UncacheAggressivenessAdvisor {
  public:
-  UncacheAggressivenessAdvisor(uint32_t uncache_aggressiveness) {
+  explicit UncacheAggressivenessAdvisor(uint32_t uncache_aggressiveness) {
     assert(uncache_aggressiveness > 0);
     allowance_ = std::min(uncache_aggressiveness, uint32_t{3});
     threshold_ = std::pow(0.99, uncache_aggressiveness - 1);

@@ -377,7 +377,7 @@ class GrowableBuffer {
   }
 
   Slice AsSlice() const { return Slice(data_, size_); }
-  operator Slice() const { return AsSlice(); }
+  explicit operator Slice() const { return AsSlice(); }
 
  private:
   char* data_ = nullptr;

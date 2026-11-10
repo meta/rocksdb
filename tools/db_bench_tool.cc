@@ -2372,7 +2372,7 @@ class BaseDistribution {
 
 class FixedDistribution : public BaseDistribution {
  public:
-  FixedDistribution(unsigned int size)
+  explicit FixedDistribution(unsigned int size)
       : BaseDistribution(size, size), size_(size) {}
 
  private:
