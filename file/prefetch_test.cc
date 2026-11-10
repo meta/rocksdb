@@ -1599,9 +1599,12 @@ class PrefetchTrimReadaheadTestParam
         std::make_shared<FlushBlockBySizePolicyFactory>();
   }
 
-  void RunSeekToFirstAfterSeekIgnoresStalePrefix(bool async_io) {
-    const bool auto_readahead_size = std::get<1>(GetParam());
+  // Shared setup of the Run*() tests below.
+  static constexpr int kNumKeysUnderPrefix = 40;
 
+  // A mock file system, wrapped in an Env. With `async_io`, it advertises
+  // async IO so that `ReadOptions::async_io` takes the async path.
+  std::unique_ptr<Env> NewTrimTestEnv(bool async_io) {
     std::shared_ptr<MockFS> fs =
         async_io ? std::make_shared<AsyncIOMockFS>(
                        FileSystem::Default(), false /* support_prefetch */,
@@ -1609,32 +1612,36 @@ class PrefetchTrimReadaheadTestParam
                  : std::make_shared<MockFS>(FileSystem::Default(),
                                             false /* support_prefetch */,
                                             true /* small_buffer_alignment */);
-    std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, fs));
-    // Close the DB before the local `env` is destroyed, even if an assertion
-    // below exits early: ~DBTestBase() closes it after `env` is already gone.
-    Defer close_db_on_exit([this]() { Close(); });
+    return std::make_unique<CompositeEnvWrapper>(env_, fs);
+  }
 
-    Options options;
-    SetGenericOptions(env.get(), options);
+  // Reopens the DB on `env` with one L0 file: kNumKeysUnderPrefix keys under
+  // kPrefix, then one key under each of the prefixes "c_prefix_" to
+  // "l_prefix_", each key in its own data block. `*block_cache` is set to the
+  // table's block cache, so that each scan can start equally cold: a warm
+  // cache serves every block without touching the file, which suppresses
+  // readahead.
+  void OpenWithOneL0File(Env* env, bool with_prefix_filter, Options* options,
+                         std::shared_ptr<Cache>* block_cache) {
+    SetGenericOptions(env, *options);
     BlockBasedTableOptions table_options;
     SetBlockBasedTableOptions(table_options);
-    // An explicit cache so both scans below start equally cold: a warm cache
-    // serves every block without touching the file, which suppresses readahead
-    // and would make the comparison meaningless.
-    std::shared_ptr<Cache> block_cache = NewLRUCache(8 * 1024 * 1024);
-    table_options.block_cache = block_cache;
-    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    *block_cache = NewLRUCache(8 * 1024 * 1024);
+    table_options.block_cache = *block_cache;
+    if (with_prefix_filter) {
+      table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+    }
+    options->table_factory.reset(NewBlockBasedTableFactory(table_options));
 
-    ASSERT_OK(TryReopen(options));
+    ASSERT_OK(TryReopen(*options));
 
-    constexpr int kNumKeysUnderPrefix = 40;
     constexpr int kNumOtherPrefixes = 10;
     WriteBatch batch;
     for (int i = 0; i < kNumKeysUnderPrefix; i++) {
       ASSERT_OK(batch.Put(kPrefix + Key(i), rnd.RandomString(100)));
     }
     // Keys under other prefixes, so that a trim against a prefix other than
-    // "a_prefix_" has somewhere to stop short of.
+    // kPrefix has somewhere to stop short of.
     for (int i = 0; i < kNumOtherPrefixes; i++) {
       const std::string diff_prefix =
           std::string(1, char('c' + i)) + kPrefix.substr(1);
@@ -1643,18 +1650,47 @@ class PrefetchTrimReadaheadTestParam
     ASSERT_OK(db_->Write(WriteOptions(), &batch));
     ASSERT_OK(db_->Flush(FlushOptions()));
 
-    // The file must stay in L0 so the merging iterator holds and reuses this
-    // table iterator across Seek()/SeekToFirst() instead of rebuilding it,
-    // which would discard the stale member and hide the bug.
+    // The file must stay in L0 so the merging iterator holds and reuses one
+    // table iterator across positioning calls instead of rebuilding it, which
+    // would discard whatever an earlier call left behind.
     ASSERT_EQ(1, NumTableFilesAtLevel(0));
+  }
 
+  ReadOptions TrimTestReadOptions(bool async_io) const {
     ReadOptions ro;
     ro.prefix_same_as_start = true;
-    ro.auto_readahead_size = auto_readahead_size;
+    ro.auto_readahead_size = std::get<1>(GetParam());
     ro.async_io = async_io;
     // Small enough that the scan exhausts the buffer and re-prefetches, so the
     // trimming prefix is consulted repeatedly rather than once for the file.
     ro.readahead_size = 1024;
+    return ro;
+  }
+
+  // Steps `iter` from where it is to the end, and returns the number of keys.
+  int CountKeysFromHere(Iterator* iter) {
+    int num_keys = 0;
+    for (; iter->Valid(); iter->Next()) {
+      EXPECT_EQ(kPrefix, iter->key().ToString().substr(0, kPrefix.size()));
+      ++num_keys;
+    }
+    EXPECT_OK(iter->status());
+    return num_keys;
+  }
+
+  void RunSeekToFirstAfterSeekIgnoresStalePrefix(bool async_io) {
+    const bool auto_readahead_size = std::get<1>(GetParam());
+
+    std::unique_ptr<Env> env = NewTrimTestEnv(async_io);
+    // Close the DB before the local `env` is destroyed, even if an assertion
+    // below exits early: ~DBTestBase() closes it after `env` is already gone.
+    Defer close_db_on_exit([this]() { Close(); });
+
+    Options options;
+    std::shared_ptr<Cache> block_cache;
+    ASSERT_NO_FATAL_FAILURE(OpenWithOneL0File(
+        env.get(), false /* with_prefix_filter */, &options, &block_cache));
+    const ReadOptions ro = TrimTestReadOptions(async_io);
 
     // The `async_io` variant reaches the key-loss form of the bug only because
     // `FilePrefetchBuffer` has a second buffer, prefetched with
@@ -1670,23 +1706,14 @@ class PrefetchTrimReadaheadTestParam
       SyncPoint::GetInstance()->ClearAllCallBacks();
     });
 
-    auto count_from_seek_to_first = [this](Iterator* iter) {
-      int num_keys = 0;
-      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-        EXPECT_EQ(kPrefix, iter->key().ToString().substr(0, kPrefix.size()));
-        ++num_keys;
-      }
-      EXPECT_OK(iter->status());
-      return num_keys;
-    };
-
     // Control: SeekToFirst() on an iterator with nothing stale, cold cache.
     block_cache->EraseUnRefEntries();
     ASSERT_OK(options.statistics->Reset());
     int num_keys_control = 0;
     {
       auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
-      num_keys_control = count_from_seek_to_first(iter.get());
+      iter->SeekToFirst();
+      num_keys_control = CountKeysFromHere(iter.get());
     }
     const uint64_t trimmed_control =
         options.statistics->getTickerCount(READAHEAD_TRIMMED);
@@ -1708,7 +1735,8 @@ class PrefetchTrimReadaheadTestParam
       ASSERT_EQ(0, options.statistics->getTickerCount(BLOCK_CACHE_DATA_MISS));
       ASSERT_EQ(0, options.statistics->getTickerCount(READAHEAD_TRIMMED));
 
-      num_keys_after_seek = count_from_seek_to_first(iter.get());
+      iter->SeekToFirst();
+      num_keys_after_seek = CountKeysFromHere(iter.get());
     }
     const uint64_t trimmed_after_seek =
         options.statistics->getTickerCount(READAHEAD_TRIMMED);
@@ -1733,6 +1761,131 @@ class PrefetchTrimReadaheadTestParam
     // Last, so the two assertions above stay the ones that report a
     // regression: the `async_io` variant is only worth having while it reaches
     // the extra-buffer prefetch path, and the synchronous one must not.
+    if (async_io) {
+      ASSERT_GT(extra_prefetch_buff_cnt, 0);
+    } else {
+      ASSERT_EQ(0, extra_prefetch_buff_cnt);
+    }
+  }
+
+  void RunFilteredSeekLeavesNextPositioningUnchanged(bool async_io) {
+    const bool auto_readahead_size = std::get<1>(GetParam());
+    const bool successor_index_keys =
+        std::get<0>(GetParam()) == BlockBasedTableOptions::IndexShorteningMode::
+                                       kShortenSeparatorsAndSuccessor;
+    // Whether the scans below must tune readahead, so that checking the prefix
+    // it trims against cannot pass vacuously. Not with successor index keys:
+    // there the passing Seek() below reads the last data block, which leaves
+    // the prefetch buffer above the blocks that the scan reads, so the scan
+    // may read them without readahead.
+    const bool scans_must_tune_readahead =
+        auto_readahead_size && !successor_index_keys;
+
+    std::unique_ptr<Env> env = NewTrimTestEnv(async_io);
+    Defer close_db_on_exit([this]() { Close(); });
+
+    Options options;
+    std::shared_ptr<Cache> block_cache;
+    ASSERT_NO_FATAL_FAILURE(OpenWithOneL0File(
+        env.get(), true /* with_prefix_filter */, &options, &block_cache));
+    const ReadOptions ro = TrimTestReadOptions(async_io);
+
+    // The prefix that readahead tuning sees, each time it runs.
+    std::vector<std::string> trim_prefixes;
+    int extra_prefetch_buff_cnt = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "BlockBasedTableIterator::BlockCacheLookupForReadAheadSize:TrimPrefix",
+        [&trim_prefixes](void* arg) {
+          trim_prefixes.push_back(*static_cast<std::string*>(arg));
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "FilePrefetchBuffer::PrefetchAsync:ExtraPrefetching",
+        [&extra_prefetch_buff_cnt](void*) { ++extra_prefetch_buff_cnt; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    Defer disable_sync_point([]() {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+    });
+
+    auto filtered_seeks = [&options]() {
+      return options.statistics->getTickerCount(LAST_LEVEL_SEEK_FILTERED) +
+             options.statistics->getTickerCount(NON_LAST_LEVEL_SEEK_FILTERED);
+    };
+    auto data_block_reads = [&options]() {
+      return options.statistics->getTickerCount(BLOCK_CACHE_DATA_MISS) +
+             options.statistics->getTickerCount(BLOCK_CACHE_DATA_HIT);
+    };
+    // Its prefix passes the filter, so this Seek() sets the trimming prefix to
+    // "l_prefix_", which neither positioning call below may trim against.
+    const std::string passing_key =
+        std::string(1, 'l') + kPrefix.substr(1) + "zzz";
+    const std::string filtered_key = std::string(1, 'b') + kPrefix.substr(1);
+
+    struct Reposition {
+      std::function<void(Iterator*)> run;
+      // The prefix that readahead tuning must see after `run`.
+      std::string trim_prefix;
+    };
+    const std::vector<Reposition> repositions = {
+        {[this](Iterator* iter) { iter->Seek(kPrefix); }, kPrefix},
+        // No seek key, so no prefix to trim against.
+        {[](Iterator* iter) { iter->SeekToFirst(); }, ""}};
+    for (const Reposition& reposition : repositions) {
+      SCOPED_TRACE("trim prefix \"" + reposition.trim_prefix + "\"");
+      // From a cold cache, positions a fresh iterator with Seek(passing_key),
+      // then the filtered Seek() if `with_filtered_seek`, then `reposition`,
+      // and scans. Checks the prefix that readahead tuning sees during the
+      // reposition and scan, and reports their keys and readahead trims.
+      auto run = [&](bool with_filtered_seek, int* num_keys,
+                     uint64_t* trimmed) {
+        block_cache->EraseUnRefEntries();
+        ASSERT_OK(options.statistics->Reset());
+        std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+        iter->Seek(passing_key);
+        ASSERT_OK(iter->status());
+        ASSERT_FALSE(iter->Valid());
+        if (with_filtered_seek) {
+          const uint64_t data_block_reads_before = data_block_reads();
+          iter->Seek(filtered_key);
+          ASSERT_OK(iter->status());
+          ASSERT_FALSE(iter->Valid());
+          // The filter ruled this Seek() out before it read any data block,
+          // so it kept the trimming prefix of the Seek() before it.
+          ASSERT_EQ(1, filtered_seeks());
+          ASSERT_EQ(data_block_reads_before, data_block_reads());
+        }
+
+        const uint64_t trimmed_before =
+            options.statistics->getTickerCount(READAHEAD_TRIMMED);
+        trim_prefixes.clear();
+        reposition.run(iter.get());
+        *num_keys = CountKeysFromHere(iter.get());
+        *trimmed = options.statistics->getTickerCount(READAHEAD_TRIMMED) -
+                   trimmed_before;
+        if (scans_must_tune_readahead) {
+          ASSERT_FALSE(trim_prefixes.empty());
+          ASSERT_GT(*trimmed, 0);
+        }
+        for (const std::string& prefix : trim_prefixes) {
+          ASSERT_EQ(reposition.trim_prefix, prefix);
+        }
+      };
+
+      int num_keys_control = 0;
+      uint64_t trimmed_control = 0;
+      ASSERT_NO_FATAL_FAILURE(run(false /* with_filtered_seek */,
+                                  &num_keys_control, &trimmed_control));
+      int num_keys_after_filtered_seek = 0;
+      uint64_t trimmed_after_filtered_seek = 0;
+      ASSERT_NO_FATAL_FAILURE(run(true /* with_filtered_seek */,
+                                  &num_keys_after_filtered_seek,
+                                  &trimmed_after_filtered_seek));
+
+      ASSERT_EQ(kNumKeysUnderPrefix, num_keys_control);
+      ASSERT_EQ(num_keys_control, num_keys_after_filtered_seek);
+      ASSERT_EQ(trimmed_control, trimmed_after_filtered_seek);
+    }
+
     if (async_io) {
       ASSERT_GT(extra_prefetch_buff_cnt, 0);
     } else {
@@ -1864,6 +2017,32 @@ TEST_P(PrefetchTrimReadaheadTestParam,
   }
 
   RunSeekToFirstAfterSeekIgnoresStalePrefix(true /* async_io */);
+}
+
+// A Seek() that the prefix filter rules out reads no data block, so it leaves
+// the readahead-trimming prefix of the Seek() before it in place. The next
+// positioning call must replace that prefix before readahead tuning sees it:
+// Seek(kPrefix) must trim against kPrefix, and SeekToFirst() against no
+// prefix. It also has to return the same keys, and trim readahead as often, as
+// it would without the filtered Seek() in between.
+TEST_P(PrefetchTrimReadaheadTestParam,
+       FilteredSeekLeavesNextPositioningUnchanged) {
+  if (mem_env_ || encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-mem or non-encrypted environment");
+    return;
+  }
+
+  RunFilteredSeekLeavesNextPositioningUnchanged(false /* async_io */);
+}
+
+TEST_P(PrefetchTrimReadaheadTestParam,
+       FilteredSeekLeavesNextPositioningUnchangedAsyncIO) {
+  if (mem_env_ || encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-mem or non-encrypted environment");
+    return;
+  }
+
+  RunFilteredSeekLeavesNextPositioningUnchanged(true /* async_io */);
 }
 
 TEST_P(PrefetchTrimReadaheadTestParam, IterateUpperBoundAtEndOfIndex) {
