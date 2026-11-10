@@ -250,7 +250,8 @@ class FragmentBufferedReader : public Reader {
                std::numeric_limits<uint64_t>::max() /*min_wal_number_to_keep*/,
                PredecessorWALInfo() /*observed_predecessor_wal_info*/),
         fragments_(),
-        in_fragmented_record_(false) {}
+        in_fragmented_record_(false),
+        stopped_at_old_record_(false) {}
   ~FragmentBufferedReader() override {}
   bool ReadRecord(Slice* record, std::string* scratch,
                   WALRecoveryMode wal_recovery_mode =
@@ -258,14 +259,24 @@ class FragmentBufferedReader : public Reader {
                   uint64_t* record_checksum = nullptr) override;
   void UnmarkEOF() override;
 
+  // Returns true once ReadRecord() has stopped at data that a recycled log may
+  // hold from the file's previous use. Later calls also return false without
+  // reading past that point, so records written there afterwards are never
+  // returned.
+  bool StoppedAtOldRecord() const { return stopped_at_old_record_; }
+
  private:
   std::string fragments_;
   bool in_fragmented_record_;
+  bool stopped_at_old_record_;
 
   bool TryReadFragment(Slice* result, size_t* drop_size,
                        uint8_t* fragment_type_or_err);
 
   bool TryReadMore(size_t* drop_size, uint8_t* error);
+
+  // Whether buffer_ holds only zeros up to the end of the current block.
+  bool IsZeroBlockTrailer() const;
 
   // No copy allowed
   FragmentBufferedReader(const FragmentBufferedReader&) = delete;

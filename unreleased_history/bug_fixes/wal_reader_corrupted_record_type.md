@@ -1,0 +1,1 @@
+Fixed WAL readers hanging or overlooking corruption when record types or recycled log numbers are corrupted, and a possible buffer overread following a corrupt record length. A secondary instance tailing a WAL reused through `recycle_log_file_num` no longer hangs; writes after the reused file's old data become visible to it once the primary flushes them.
