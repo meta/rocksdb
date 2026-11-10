@@ -207,6 +207,22 @@ static int RegisterBuiltinMemTableRepFactory(ObjectLibrary& library,
         return guard->get();
       });
   library.AddFactory<MemTableRepFactory>(
+      AsPattern("SortedHashRepFactory", "sorted_hash"),
+      [](const std::string& uri, std::unique_ptr<MemTableRepFactory>* guard,
+         std::string* /*errmsg*/) {
+        // Expecting format: sorted_hash:<bucket_count>. Without a count,
+        // bucket_count must come from the options string and is validated
+        // when the column family is opened.
+        auto colon = uri.find(':');
+        if (colon != std::string::npos) {
+          size_t hash_bucket_count = ParseSizeT(uri.substr(colon + 1));
+          guard->reset(NewSortedHashRepFactory(hash_bucket_count));
+        } else {
+          guard->reset(NewSortedHashRepFactory(0));
+        }
+        return guard->get();
+      });
+  library.AddFactory<MemTableRepFactory>(
       "cuckoo",
       [](const std::string& /*uri*/,
          std::unique_ptr<MemTableRepFactory>* /*guard*/, std::string* errmsg) {

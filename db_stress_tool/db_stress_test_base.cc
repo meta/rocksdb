@@ -1719,7 +1719,7 @@ bool StressTest::BuildOptionsTable() {
             std::to_string(options_.level0_file_num_compaction_trigger + 4),
         });
   }
-  if (FLAGS_unordered_write) {
+  if (FLAGS_unordered_write || FLAGS_rep_factory == kSortedHash) {
     options_tbl.emplace("max_successive_merges", std::vector<std::string>{"0"});
   } else {
     options_tbl.emplace("max_successive_merges",
@@ -5747,6 +5747,9 @@ void StressTest::PrintEnv() const {
     case kVectorRep:
       memtablerep = "vector";
       break;
+    case kSortedHash:
+      memtablerep = "sorted_hash";
+      break;
   }
 
   fprintf(stdout, "Memtablerep               : %s\n", memtablerep);
@@ -7313,6 +7316,11 @@ void InitializeOptionsFromFlags(
       break;
     case kVectorRep:
       options.memtable_factory = std::make_shared<VectorRepFactory>();
+      break;
+    case kSortedHash:
+      // About one bucket per KiB of write buffer.
+      options.memtable_factory.reset(NewSortedHashRepFactory(
+          std::max<size_t>(1, FLAGS_write_buffer_size / 1024)));
       break;
   }
 

@@ -161,6 +161,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "memtable/hash_linklist_rep.cc",
         "memtable/hash_skiplist_rep.cc",
         "memtable/skiplistrep.cc",
+        "memtable/sorted_hash_rep.cc",
         "memtable/vectorrep.cc",
         "memtable/wbwi_memtable.cc",
         "memtable/write_buffer_manager.cc",

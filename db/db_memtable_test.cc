@@ -3,15 +3,28 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <array>
+#include <atomic>
+#include <functional>
 #include <memory>
+#include <set>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "db/db_test_util.h"
 #include "db/memtable.h"
 #include "db/range_del_aggregator.h"
+#include "memory/arena.h"
 #include "port/stack_trace.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/slice_transform.h"
+#include "rocksdb/utilities/options_util.h"
+#include "test_util/testutil.h"
+#include "util/coding.h"
+#include "util/defer.h"
+#include "utilities/merge_operators.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -570,6 +583,489 @@ TEST_F(DBMemTableTest, IntegrityChecks) {
               allow_data_in_error);
     ASSERT_FALSE(iter->Valid());
   }
+}
+
+namespace {
+constexpr size_t kSortedHashBucketCount = 8192;
+
+Options SortedHashOptions(Options options) {
+  options.create_if_missing = true;
+  options.memtable_factory.reset(
+      NewSortedHashRepFactory(kSortedHashBucketCount));
+  return options;
+}
+
+// Bytewise ordering that keeps the default
+// CanKeysWithDifferentByteContentsBeEqual() == true.
+class ByteDifferentKeysMayBeEqualComparator : public Comparator {
+ public:
+  const char* Name() const override {
+    return "ByteDifferentKeysMayBeEqualComparator";
+  }
+  int Compare(const Slice& a, const Slice& b) const override {
+    return BytewiseComparator()->Compare(a, b);
+  }
+  void FindShortestSeparator(std::string* /*start*/,
+                             const Slice& /*limit*/) const override {}
+  void FindShortSuccessor(std::string* /*key*/) const override {}
+};
+
+std::vector<std::pair<std::string, std::string>> ReadAll(Iterator* iter) {
+  std::vector<std::pair<std::string, std::string>> contents;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    contents.emplace_back(iter->key().ToString(), iter->value().ToString());
+  }
+  return contents;
+}
+}  // namespace
+
+TEST_F(DBMemTableTest, SortedHashConcurrentInsertAndFlush) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.allow_concurrent_memtable_write = true;
+  options.memtable_batch_lookup_optimization = true;
+  // One bucket forces all writers through the same collision chain.
+  options.memtable_factory.reset(NewSortedHashRepFactory(1));
+  DestroyAndReopen(options);
+
+  constexpr int kNumThreads = 8;
+  constexpr int kEntriesPerThread = 128;
+  std::vector<Status> write_statuses(kNumThreads);
+  std::vector<port::Thread> threads;
+  threads.reserve(kNumThreads);
+  for (int thread = 0; thread < kNumThreads; ++thread) {
+    threads.emplace_back([&, thread]() {
+      const int begin = thread * kEntriesPerThread;
+      WriteBatch batch;
+      for (int key = begin; key < begin + kEntriesPerThread; ++key) {
+        Status s = batch.Put(Key(key), "value" + std::to_string(key));
+        if (!s.ok()) {
+          write_statuses[thread] = s;
+          return;
+        }
+      }
+      write_statuses[thread] = db_->Write(WriteOptions(), &batch);
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  for (const Status& s : write_statuses) {
+    ASSERT_OK(s);
+  }
+
+  std::vector<std::string> key_storage;
+  std::vector<Slice> keys;
+  key_storage.reserve(kNumThreads);
+  keys.reserve(kNumThreads);
+  for (int thread = 0; thread < kNumThreads; ++thread) {
+    key_storage.push_back(Key(thread * kEntriesPerThread));
+    keys.emplace_back(key_storage.back());
+  }
+  std::vector<std::string> values;
+  const std::vector<Status> statuses =
+      db_->MultiGet(ReadOptions(), keys, &values);
+  for (int thread = 0; thread < kNumThreads; ++thread) {
+    ASSERT_OK(statuses[thread]);
+    ASSERT_EQ(values[thread],
+              "value" + std::to_string(thread * kEntriesPerThread));
+  }
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->SeekToFirst();
+  for (int key = 0; key < kNumThreads * kEntriesPerThread; ++key) {
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key().ToString(), Key(key));
+    ASSERT_EQ(iter->value().ToString(), "value" + std::to_string(key));
+    iter->Next();
+  }
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  iter->SeekToLast();
+  for (int key = kNumThreads * kEntriesPerThread - 1; key >= 0; --key) {
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key().ToString(), Key(key));
+    iter->Prev();
+  }
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  iter.reset();
+
+  constexpr int kLastKey = kNumThreads * kEntriesPerThread;
+  ASSERT_OK(Put(Key(kLastKey), "last-value"));
+  iter.reset(db_->NewIterator(ReadOptions()));
+  iter->SeekToLast();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key().ToString(), Key(kLastKey));
+  ASSERT_EQ(iter->value().ToString(), "last-value");
+  iter.reset();
+
+  ASSERT_OK(Flush());
+  Reopen(options);
+  ASSERT_EQ(Get(Key(0)), "value0");
+  ASSERT_EQ(Get(Key(kLastKey)), "last-value");
+}
+
+TEST_F(DBMemTableTest, SortedHashRejectsUnsupportedOptions) {
+  ByteDifferentKeysMayBeEqualComparator byte_different_keys_cmp;
+  struct Case {
+    const char* name;
+    std::function<void(Options*)> mutate;
+    Status::Code expected;
+  };
+  const std::vector<Case> cases = {
+      {"user-defined timestamps",
+       [](Options* o) {
+         o->comparator = test::BytewiseComparatorWithU64TsWrapper();
+       },
+       Status::kNotSupported},
+      {"byte-different keys may compare equal",
+       [&](Options* o) { o->comparator = &byte_different_keys_cmp; },
+       Status::kNotSupported},
+      {"paranoid_memory_checks",
+       [](Options* o) { o->paranoid_memory_checks = true; },
+       Status::kNotSupported},
+      {"memtable_verify_per_key_checksum_on_seek",
+       [](Options* o) { o->memtable_verify_per_key_checksum_on_seek = true; },
+       Status::kNotSupported},
+      {"inplace_update_support",
+       [](Options* o) { o->inplace_update_support = true; },
+       Status::kNotSupported},
+      {"max_successive_merges",
+       [](Options* o) { o->max_successive_merges = 2; }, Status::kNotSupported},
+      {"zero bucket_count",
+       [](Options* o) {
+         o->memtable_factory.reset(NewSortedHashRepFactory(0));
+       },
+       Status::kInvalidArgument},
+      {"bucket array as large as write_buffer_size",
+       [](Options* o) {
+         o->write_buffer_size = 64 << 10;
+         o->memtable_factory.reset(NewSortedHashRepFactory(4096));
+       },
+       Status::kInvalidArgument},
+  };
+
+  Options base = SortedHashOptions(CurrentOptions());
+  // inplace_update_support is rejected earlier with concurrent writes.
+  base.allow_concurrent_memtable_write = false;
+  DestroyAndReopen(base);
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    Options options = base;
+    c.mutate(&options);
+    ASSERT_EQ(TryReopen(options).code(), c.expected);
+
+    Reopen(base);
+    ColumnFamilyHandle* handle = nullptr;
+    ASSERT_EQ(db_->CreateColumnFamily(ColumnFamilyOptions(options),
+                                      "unsupported", &handle)
+                  .code(),
+              c.expected);
+    ASSERT_EQ(handle, nullptr);
+  }
+}
+
+TEST_F(DBMemTableTest, SortedHashRejectsUnsupportedSetOptions) {
+  const Options options = SortedHashOptions(CurrentOptions());
+  DestroyAndReopen(options);
+  const std::string array_sized_write_buffer =
+      std::to_string(kSortedHashBucketCount * 16);
+  const std::vector<
+      std::pair<std::unordered_map<std::string, std::string>, Status::Code>>
+      cases = {
+          {{{"paranoid_memory_checks", "true"}}, Status::kNotSupported},
+          {{{"memtable_verify_per_key_checksum_on_seek", "true"}},
+           Status::kNotSupported},
+          {{{"max_successive_merges", "2"}}, Status::kNotSupported},
+          {{{"write_buffer_size", array_sized_write_buffer}},
+           Status::kInvalidArgument},
+      };
+  for (const auto& [new_options, expected] : cases) {
+    SCOPED_TRACE(new_options.begin()->first);
+    ASSERT_EQ(db_->SetOptions(new_options).code(), expected);
+  }
+
+  const Options current = db_->GetOptions();
+  ASSERT_FALSE(current.paranoid_memory_checks);
+  ASSERT_FALSE(current.memtable_verify_per_key_checksum_on_seek);
+  ASSERT_EQ(current.max_successive_merges, size_t{0});
+  ASSERT_EQ(current.write_buffer_size, options.write_buffer_size);
+}
+
+TEST_F(DBMemTableTest, SortedHashRejectsTailingIterators) {
+  DestroyAndReopen(SortedHashOptions(CurrentOptions()));
+  ReadOptions read_options;
+  read_options.tailing = true;
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  ASSERT_EQ(iter->status().code(), Status::kNotSupported);
+
+  std::vector<Iterator*> iterators;
+  ASSERT_EQ(
+      db_->NewIterators(read_options, {db_->DefaultColumnFamily()}, &iterators)
+          .code(),
+      Status::kNotSupported);
+  ASSERT_TRUE(iterators.empty());
+}
+
+TEST_F(DBMemTableTest, SortedHashIteratorRefreshSeesNewWrites) {
+  DestroyAndReopen(SortedHashOptions(CurrentOptions()));
+  using Contents = std::vector<std::pair<std::string, std::string>>;
+
+  ASSERT_OK(Put("a", "v1"));
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  ASSERT_EQ(ReadAll(iter.get()), (Contents{{"a", "v1"}}));
+
+  ASSERT_OK(Put("a", "v2"));
+  ASSERT_OK(Put("b", "x"));
+  ASSERT_OK(iter->Refresh());
+  ASSERT_EQ(ReadAll(iter.get()), (Contents{{"a", "v2"}, {"b", "x"}}));
+
+  ASSERT_OK(
+      db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "b", "c"));
+  ASSERT_OK(iter->Refresh());
+  ASSERT_EQ(ReadAll(iter.get()), (Contents{{"a", "v2"}}));
+
+  // With range tombstones already in the memtable, a refresh that kept the
+  // memtable iterator would apply the tombstones but miss the new put.
+  ASSERT_OK(Put("b", "y"));
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_OK(Put("c", "z"));
+  ASSERT_OK(iter->Refresh(snapshot));
+  ASSERT_EQ(ReadAll(iter.get()), (Contents{{"a", "v2"}, {"b", "y"}}));
+  ASSERT_OK(iter->status());
+  iter.reset();
+  db_->ReleaseSnapshot(snapshot);
+}
+
+TEST_F(DBMemTableTest, SortedHashMemoryUsageIndependentOfReads) {
+  std::unique_ptr<MemTableRepFactory> factory(NewSortedHashRepFactory(16));
+  const InternalKeyComparator icmp(BytewiseComparator());
+  const MemTable::KeyComparator cmp(icmp);
+  Arena arena;
+  std::unique_ptr<MemTableRep> rep(
+      factory->CreateMemTableRep(cmp, &arena, nullptr, nullptr));
+  constexpr int kNumEntries = 100;
+  for (int i = 0; i < kNumEntries; ++i) {
+    std::string entry;
+    PutLengthPrefixedSlice(&entry,
+                           InternalKey(Key(i), i + 1, kTypeValue).Encode());
+    PutLengthPrefixedSlice(&entry, "value");
+    char* buf = nullptr;
+    const KeyHandle handle = rep->Allocate(entry.size(), &buf);
+    memcpy(buf, entry.data(), entry.size());
+    ASSERT_TRUE(rep->InsertKey(handle));
+  }
+  const size_t usage = rep->ApproximateMemoryUsage();
+  ASSERT_GT(usage, size_t{0});
+
+  std::unique_ptr<MemTableRep::Iterator> iter(rep->GetIterator());
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(rep->ApproximateMemoryUsage(), usage);
+  iter.reset();
+
+  rep->MarkReadOnly();
+  ASSERT_EQ(rep->ApproximateMemoryUsage(), usage);
+}
+
+TEST_F(DBMemTableTest, SortedHashReadSemantics) {
+  Options options = SortedHashOptions(CurrentOptions());
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "a1"));
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_OK(Put("a", "a2"));
+  ASSERT_OK(Put("b", "b1"));
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Put("c", "c1"));
+  ASSERT_OK(SingleDelete("c"));
+  ASSERT_OK(Put("d", "d1"));
+  ASSERT_OK(Merge("d", "d2"));
+  ASSERT_OK(Put("e", "e1"));
+  ASSERT_OK(Put("f", "f1"));
+  ASSERT_OK(
+      db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "e", "f"));
+  ASSERT_OK(Put("g", "g1"));
+
+  const std::vector<std::pair<std::string, std::string>> expected = {
+      {"a", "a2"}, {"d", "d1,d2"}, {"f", "f1"}, {"g", "g1"}};
+  const std::vector<std::pair<std::string, std::string>> expected_at_snapshot =
+      {{"a", "a1"}};
+
+  // Run once against the memtable and once after flushing it.
+  for (bool flushed : {false, true}) {
+    SCOPED_TRACE(flushed ? "after flush" : "memtable");
+    if (flushed) {
+      ASSERT_OK(Flush());
+    }
+    for (const auto& [key, value] : expected) {
+      ASSERT_EQ(Get(key), value);
+    }
+    for (const char* key : {"b", "c", "e"}) {
+      ASSERT_EQ(Get(key), "NOT_FOUND");
+    }
+    ASSERT_EQ(Get("a", snapshot), "a1");
+
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    ASSERT_EQ(ReadAll(iter.get()), expected);
+    ASSERT_OK(iter->status());
+
+    iter->Seek("b");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), "d");
+    iter->Seek("h");
+    ASSERT_FALSE(iter->Valid());
+    iter->SeekForPrev("e");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), "d");
+    iter->SeekForPrev("0");
+    ASSERT_FALSE(iter->Valid());
+    iter->SeekToLast();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), "g");
+    iter->SeekToFirst();
+    iter->Prev();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+
+    ReadOptions snapshot_read;
+    snapshot_read.snapshot = snapshot;
+    iter.reset(db_->NewIterator(snapshot_read));
+    ASSERT_EQ(ReadAll(iter.get()), expected_at_snapshot);
+    ASSERT_OK(iter->status());
+  }
+  db_->ReleaseSnapshot(snapshot);
+}
+
+TEST_F(DBMemTableTest, SortedHashIteratorsDuringConcurrentWrites) {
+  Options options = SortedHashOptions(CurrentOptions());
+  options.allow_concurrent_memtable_write = true;
+  DestroyAndReopen(options);
+
+  constexpr int kNumWriters = 4;
+  constexpr int kKeysPerWriter = 500;
+  std::array<std::atomic<int>, kNumWriters> completed{};
+  std::atomic<int> finished_writers{0};
+  std::vector<Status> write_statuses(kNumWriters);
+  std::vector<port::Thread> writers;
+  for (int writer = 0; writer < kNumWriters; ++writer) {
+    writers.emplace_back([&, writer]() {
+      for (int i = 0; i < kKeysPerWriter; ++i) {
+        Status s = Put(Key(writer * kKeysPerWriter + i), "v");
+        if (!s.ok()) {
+          write_statuses[writer] = s;
+          break;
+        }
+        completed[writer].store(i + 1, std::memory_order_release);
+      }
+      finished_writers.fetch_add(1, std::memory_order_release);
+    });
+  }
+  Defer join_writers([&writers]() {
+    for (auto& writer : writers) {
+      writer.join();
+    }
+  });
+
+  bool writers_done = false;
+  while (!writers_done) {
+    // Read before the progress counters so the last pass checks final counts.
+    writers_done =
+        finished_writers.load(std::memory_order_acquire) == kNumWriters;
+    std::array<int, kNumWriters> completed_before{};
+    for (int writer = 0; writer < kNumWriters; ++writer) {
+      completed_before[writer] =
+          completed[writer].load(std::memory_order_acquire);
+    }
+
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    std::set<std::string> seen;
+    std::string previous;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      const std::string key = iter->key().ToString();
+      ASSERT_LT(previous, key);
+      seen.insert(key);
+      previous = key;
+    }
+    ASSERT_OK(iter->status());
+    for (int writer = 0; writer < kNumWriters; ++writer) {
+      for (int i = 0; i < completed_before[writer]; ++i) {
+        ASSERT_EQ(seen.count(Key(writer * kKeysPerWriter + i)), 1u);
+      }
+    }
+  }
+  for (const Status& s : write_statuses) {
+    ASSERT_OK(s);
+  }
+}
+
+TEST_F(DBMemTableTest, SortedHashDuplicateSeq) {
+  Options options;
+  options.allow_concurrent_memtable_write = true;
+  options.memtable_factory.reset(NewSortedHashRepFactory(16));
+  InternalKeyComparator cmp(BytewiseComparator());
+  ImmutableOptions ioptions(options);
+  WriteBufferManager wb(options.db_write_buffer_size);
+  std::unique_ptr<MemTable> mem(new MemTable(
+      cmp, ioptions, MutableCFOptions(options), &wb, kMaxSequenceNumber,
+      0 /* column_family_id */, nullptr /* flush_initiator */));
+
+  ASSERT_OK(mem->Add(100, kTypeValue, "key", "v1", nullptr /* kv_prot_info */));
+  ASSERT_EQ(
+      mem->Add(100, kTypeValue, "key", "v2", nullptr /* kv_prot_info */).code(),
+      Status::kTryAgain);
+  ASSERT_OK(mem->Add(101, kTypeValue, "key", "v3", nullptr /* kv_prot_info */));
+
+  MemTablePostProcessInfo post_process_info;
+  ASSERT_OK(mem->Add(102, kTypeValue, "key", "v4", nullptr /* kv_prot_info */,
+                     true /* allow_concurrent */, &post_process_info));
+  ASSERT_EQ(mem->Add(102, kTypeValue, "key", "v5", nullptr /* kv_prot_info */,
+                     true /* allow_concurrent */, &post_process_info)
+                .code(),
+            Status::kTryAgain);
+  mem->BatchPostProcess(post_process_info);
+  ASSERT_EQ(mem->NumEntries(), 3u);
+}
+
+TEST_F(DBMemTableTest, SortedHashFactoryFromString) {
+  ConfigOptions config_options;
+  config_options.ignore_unsupported_options = false;
+  std::unique_ptr<MemTableRepFactory> factory;
+  std::string bucket_count;
+
+  ASSERT_OK(MemTableRepFactory::CreateFromString(config_options,
+                                                 "sorted_hash:32", &factory));
+  ASSERT_STREQ(factory->Name(), "SortedHashRepFactory");
+  ASSERT_TRUE(factory->IsInsertConcurrentlySupported());
+  ASSERT_FALSE(factory->IsTailingIteratorSupported());
+  ASSERT_OK(factory->GetOption(config_options, "bucket_count", &bucket_count));
+  ASSERT_EQ(bucket_count, "32");
+
+  ASSERT_OK(MemTableRepFactory::CreateFromString(
+      config_options, "id=SortedHashRepFactory;bucket_count=64", &factory));
+  ASSERT_OK(factory->GetOption(config_options, "bucket_count", &bucket_count));
+  ASSERT_EQ(bucket_count, "64");
+}
+
+TEST_F(DBMemTableTest, SortedHashOptionsFileRoundTrip) {
+  DestroyAndReopen(SortedHashOptions(CurrentOptions()));
+
+  ConfigOptions config_options;
+  config_options.env = env_;
+  DBOptions db_options;
+  std::vector<ColumnFamilyDescriptor> cf_descs;
+  ASSERT_OK(LoadLatestOptions(config_options, dbname_, &db_options, &cf_descs));
+  ASSERT_EQ(cf_descs.size(), 1u);
+  const std::shared_ptr<MemTableRepFactory>& factory =
+      cf_descs[0].options.memtable_factory;
+  ASSERT_STREQ(factory->Name(), "SortedHashRepFactory");
+  std::string bucket_count;
+  ASSERT_OK(factory->GetOption(config_options, "bucket_count", &bucket_count));
+  ASSERT_EQ(bucket_count, std::to_string(kSortedHashBucketCount));
 }
 
 TEST_F(DBMemTableTest, VectorConcurrentInsert) {
