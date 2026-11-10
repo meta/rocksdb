@@ -935,13 +935,15 @@ Status DBImpl::WriteImpl(
     return Status::InvalidArgument(
         "`WriteOptions::protection_bytes_per_key` must be zero or eight");
   } else if (write_options.disableWAL &&
-             immutable_db_options_.recycle_log_file_num > 0 &&
+             immutable_db_options_.recycle_log_file_num > 0 && seq_per_batch_ &&
              !(two_write_queues_ && disable_memtable)) {
     // Corruption detection in recycled WALs relies on sequential sequence
-    // numbers, but WritePreparedTxnDB uses disableWAL internally for split
-    // writes
+    // numbers. MaybeAddWalSeqnoGapFiller() bridges gaps left by disableWAL
+    // writes, except with seq_per_batch_ (WritePrepared and WriteUnprepared).
+    // WritePreparedTxnDB still uses disableWAL internally for split writes.
     return Status::InvalidArgument(
-        "WriteOptions::disableWAL option is not supported if "
+        "WriteOptions::disableWAL option is not supported with WritePrepared "
+        "or WriteUnprepared transactions if "
         "DBOptions::recycle_log_file_num > 0");
   }
   WriteBatch* trace_batch =
@@ -1396,7 +1398,7 @@ Status DBImpl::WriteImpl(
         io_s = WriteGroupToWAL(write_group, wal_context.writer, wal_used,
                                wal_context.need_wal_sync,
                                wal_context.need_wal_dir_sync, last_sequence + 1,
-                               *wal_context.wal_file_number_size);
+                               seq_inc, *wal_context.wal_file_number_size);
       }
     } else {
       if (status.ok() && !write_options.disableWAL) {
@@ -1705,7 +1707,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       io_s = WriteGroupToWAL(wal_write_group, wal_context.writer, wal_used,
                              wal_context.need_wal_sync,
                              wal_context.need_wal_dir_sync, current_sequence,
-                             wal_file_number_size);
+                             total_count, wal_file_number_size);
       w.status = io_s;
     }
 
@@ -2332,7 +2334,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             log::Writer* log_writer, uint64_t* wal_used,
                             uint64_t* log_size,
                             WalFileNumberSize& wal_file_number_size,
-                            SequenceNumber sequence) {
+                            SequenceNumber sequence, size_t seq_inc) {
   assert(log_size != nullptr);
 
   Slice log_entry = WriteBatchInternal::Contents(&merged_batch);
@@ -2360,8 +2362,16 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   if (!io_s.ok()) {
     return io_s;
   }
-  io_s = log_writer->AddRecord(write_options, log_entry, sequence);
+  if (UNLIKELY(log_writer->GetLastSeqnoRecorded() == 0)) {
+    // First WriteBatch in this WAL
+    io_s = MaybeAddWalSeqnoGapFiller(write_options, log_writer, sequence);
+  }
+  if (io_s.ok()) {
+    io_s = log_writer->AddRecord(write_options, log_entry, sequence);
+  }
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:AfterAddRecord", &io_s);
+  // After a failed write, what recovery will read back is unknown
+  next_seq_after_last_wal_record_ = io_s.ok() ? sequence + seq_inc : 0;
 
   if (UNLIKELY(needs_locking)) {
     wal_write_mutex_.Unlock();
@@ -2377,10 +2387,25 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   return io_s;
 }
 
+IOStatus DBImpl::MaybeAddWalSeqnoGapFiller(const WriteOptions& write_options,
+                                           log::Writer* log_writer,
+                                           SequenceNumber sequence) {
+  const SequenceNumber expected_seq = next_seq_after_last_wal_record_;
+  if (immutable_db_options_.recycle_log_file_num == 0 || seq_per_batch_ ||
+      expected_seq == 0 || expected_seq >= sequence) {
+    return IOStatus::OK();
+  }
+  WriteBatch filler;
+  WriteBatchInternal::SetSequence(&filler, expected_seq);
+  TEST_SYNC_POINT("DBImpl::MaybeAddWalSeqnoGapFiller:Add");
+  return log_writer->AddRecord(
+      write_options, WriteBatchInternal::Contents(&filler), expected_seq);
+}
+
 IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                                  log::Writer* log_writer, uint64_t* wal_used,
                                  bool need_wal_sync, bool need_wal_dir_sync,
-                                 SequenceNumber sequence,
+                                 SequenceNumber sequence, size_t seq_inc,
                                  WalFileNumberSize& wal_file_number_size) {
   IOStatus io_s;
   assert(!two_write_queues_);
@@ -2412,7 +2437,7 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, wal_used,
-                    &log_size, wal_file_number_size, sequence);
+                    &log_size, wal_file_number_size, sequence, seq_inc);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
@@ -2539,7 +2564,7 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, wal_used,
-                    &log_size, wal_file_number_size, sequence);
+                    &log_size, wal_file_number_size, sequence, seq_inc);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;

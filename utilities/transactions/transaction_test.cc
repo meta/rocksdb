@@ -2368,8 +2368,11 @@ TEST_P(TransactionTest, TwoPhaseLogMultiMemtableFlush) {
  * hidden behind improperly summed sequence ids
  */
 TEST_P(TransactionTest, TwoPhaseOutOfOrderDelete) {
-  // WAL recycling incompatible with disableWAL (below)
-  options.recycle_log_file_num = 0;
+  // disableWAL (below) is not supported with WAL recycling for WritePrepared
+  // and WriteUnprepared
+  if (txn_db_options.write_policy != WRITE_COMMITTED) {
+    options.recycle_log_file_num = 0;
+  }
   ASSERT_OK(ReOpenNoDelete());
 
   DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());

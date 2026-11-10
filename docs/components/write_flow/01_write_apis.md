@@ -62,7 +62,7 @@ Before entering the write path, `DBImpl::WriteImpl()` validates the request. The
 |-----------|--------|
 | `sync && disableWAL` | Cannot sync without a WAL |
 | `HasDeleteRange() && row_cache` | DeleteRange invalidation not supported with row cache |
-| `disableWAL && recycle_log_file_num > 0` | Recycled WAL corruption detection requires sequential sequences |
+| `disableWAL && recycle_log_file_num > 0` with `seq_per_batch` (WritePrepared or WriteUnprepared) | Recycled WAL corruption detection requires sequential sequences, and sequence gaps are only bridged without `seq_per_batch` (see [Write-Ahead Log](03_wal.md)) |
 | `protection_bytes_per_key` not 0 or 8 | Only two protection levels supported |
 | `rate_limiter_priority` not `IO_TOTAL` or `IO_USER` | Implementation constraint |
 
