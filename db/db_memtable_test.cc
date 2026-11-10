@@ -615,6 +615,7 @@ std::vector<std::pair<std::string, std::string>> ReadAll(Iterator* iter) {
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     contents.emplace_back(iter->key().ToString(), iter->value().ToString());
   }
+  EXPECT_OK(iter->status());
   return contents;
 }
 }  // namespace

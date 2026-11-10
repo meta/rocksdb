@@ -21,11 +21,12 @@ std::shared_ptr<ColumnBase> CreateTestColumn(int8_t mask, int8_t index,
     return std::make_shared<Tombstone>(mask, index, ToSeconds(timestamp),
                                        timestamp);
   } else if ((mask & ColumnTypeMask::EXPIRATION_MASK) != 0) {
-    return std::make_shared<ExpiringColumn>(
-        mask, index, timestamp, sizeof(kExpiringData), kExpiringData, kTtl);
+    return std::make_shared<ExpiringColumn>(mask, index, timestamp,
+                                            int32_t{sizeof(kExpiringData)},
+                                            kExpiringData, kTtl);
   } else {
-    return std::make_shared<Column>(mask, index, timestamp, sizeof(kData),
-                                    kData);
+    return std::make_shared<Column>(mask, index, timestamp,
+                                    int32_t{sizeof(kData)}, kData);
   }
 }
 

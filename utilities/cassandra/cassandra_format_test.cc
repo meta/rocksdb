@@ -225,23 +225,23 @@ TEST(RowValueTest, RowWithColumns) {
   int64_t e_timestamp = 1494022807044;
   int32_t e_ttl = 3600;
   columns.push_back(std::make_shared<ExpiringColumn>(
-      ColumnTypeMask::EXPIRATION_MASK, e_index, e_timestamp, sizeof(e_data),
-      e_data, e_ttl));
+      int8_t{ColumnTypeMask::EXPIRATION_MASK}, e_index, e_timestamp,
+      int32_t{sizeof(e_data)}, e_data, e_ttl));
   columns_data_size += columns[0]->Size();
 
   char c_data[4] = {'d', 'a', 't', 'a'};
   int8_t c_index = 1;
   int64_t c_timestamp = 1494022807048;
-  columns.push_back(std::make_shared<Column>(0, c_index, c_timestamp,
-                                             sizeof(c_data), c_data));
+  columns.push_back(std::make_shared<Column>(int8_t{0}, c_index, c_timestamp,
+                                             int32_t{sizeof(c_data)}, c_data));
   columns_data_size += columns[1]->Size();
 
   int8_t t_index = 2;
   int32_t t_local_deletion_time = 1494022801;
   int64_t t_marked_for_delete_at = 1494022807043;
-  columns.push_back(std::make_shared<Tombstone>(ColumnTypeMask::DELETION_MASK,
-                                                t_index, t_local_deletion_time,
-                                                t_marked_for_delete_at));
+  columns.push_back(std::make_shared<Tombstone>(
+      int8_t{ColumnTypeMask::DELETION_MASK}, t_index, t_local_deletion_time,
+      t_marked_for_delete_at));
   columns_data_size += columns[2]->Size();
 
   RowValue r = RowValue(std::move(columns), last_modified_time);
