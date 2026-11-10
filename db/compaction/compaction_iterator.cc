@@ -566,13 +566,19 @@ bool CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
               if (blob_idx.IsInlined()) {
                 resolved_blobs_storage[bi].PinSelf(blob_idx.value());
               } else {
+                if (blob_fetcher_ == nullptr) {
+                  status_ = Status::NotSupported(
+                      "Blob-backed value filtering requires blob read support "
+                      "in the current table-file creation context");
+                  validity_info_.Invalidate();
+                  return false;
+                }
                 FilePrefetchBuffer* prefetch_buffer =
                     prefetch_buffers_
                         ? prefetch_buffers_->GetOrCreatePrefetchBuffer(
                               blob_idx.file_number())
                         : nullptr;
                 uint64_t bytes_read = 0;
-                assert(blob_fetcher_);
                 Status s_fetch = blob_fetcher_->FetchBlob(
                     ikey_.user_key, blob_idx, prefetch_buffer,
                     &resolved_blobs_storage[bi], &bytes_read);

@@ -4723,6 +4723,32 @@ TEST_F(CompactionServiceTest, FailedToStart) {
   ASSERT_TRUE(s.IsIncomplete()) << s.ToString();
 }
 
+TEST_F(CompactionServiceTest, WorkerRejectsUnknownColumnFamily) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+
+  GenerateTestData();
+
+  // Capture a real compaction input without running the remote worker.
+  auto my_cs = GetCompactionService();
+  my_cs->OverrideStartStatus(CompactionServiceJobStatus::kFailure);
+  ASSERT_TRUE(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr)
+                  .IsIncomplete());
+
+  CompactionServiceInput input;
+  my_cs->GetInput(&input);
+  input.cf_name = "missing_cf";
+  std::string serialized_input;
+  ASSERT_OK(input.Write(&serialized_input));
+
+  std::string serialized_result;
+  Status s = DB::OpenAndCompact(
+      OpenAndCompactOptions(), dbname_, "missing_cf_job", serialized_input,
+      &serialized_result, my_cs->GetOptionsOverride());
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+}
+
 TEST_F(CompactionServiceTest, InvalidResultIsDeclinedRecoverably) {
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;

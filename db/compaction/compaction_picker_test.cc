@@ -2494,6 +2494,18 @@ TEST_F(CompactionPickerTest, FileTtlBoosterLargeNumLevels) {
   ASSERT_EQ(1, booster.GetBoostScore(&meta));
 }
 
+TEST_F(CompactionPickerTest, FileTtlBoosterSmallTtl) {
+  // With a TTL below 32 seconds, boosting still starts after half the TTL.
+  const uint64_t kCurrentTime = 1000000;
+  FileTtlBooster booster(kCurrentTime, /*ttl=*/10,
+                         /*num_non_empty_levels=*/4, /*level=*/1);
+  FileMetaData meta;
+  meta.oldest_ancestor_time = kCurrentTime - 5;
+  ASSERT_EQ(1, booster.GetBoostScore(&meta));
+  meta.oldest_ancestor_time = kCurrentTime - 9;
+  ASSERT_EQ(5, booster.GetBoostScore(&meta));
+}
+
 TEST_F(CompactionPickerTest, FileTtlBooster) {
   // Set TTL to 2048
   // TTL boosting for all levels starts at 1024,

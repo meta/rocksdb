@@ -3279,6 +3279,47 @@ TEST_F(DBRangeDelTest, RangetombesoneCompensateFilesize) {
   ASSERT_EQ(level_to_files[2][0].compensated_range_deletion_size, 0);
 }
 
+TEST_F(DBRangeDelTest, CompensatedSizeCountsEmptyStartKeyOnce) {
+  Options opts = CurrentOptions();
+  opts.disable_auto_compactions = true;
+  DestroyAndReopen(opts);
+
+  Random rnd(301);
+  ASSERT_OK(Put("a", rnd.RandomString(1 << 10)));
+  ASSERT_OK(Put("b", rnd.RandomString(1 << 10)));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+
+  // The snapshot keeps both range tombstones, so the flush and the compaction
+  // output two tombstone fragments that start at the empty user key.
+  ASSERT_OK(
+      db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "", "c"));
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_OK(
+      db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "", "c"));
+  ASSERT_OK(Flush());
+
+  std::vector<std::vector<FileMetaData>> level_to_files;
+  dbfull()->TEST_GetFilesMetaData(dbfull()->DefaultColumnFamily(),
+                                  &level_to_files);
+  ASSERT_EQ(level_to_files[0].size(), 1);
+  ASSERT_EQ(level_to_files[2].size(), 1);
+  const uint64_t l2_size = level_to_files[2][0].fd.GetFileSize();
+  ASSERT_GT(l2_size, 0);
+  // Computed at flush time
+  ASSERT_EQ(level_to_files[0][0].compensated_range_deletion_size, l2_size);
+
+  // Computed at compaction time
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr, nullptr,
+                                        true /* disallow_trivial_move */));
+  dbfull()->TEST_GetFilesMetaData(dbfull()->DefaultColumnFamily(),
+                                  &level_to_files);
+  ASSERT_EQ(level_to_files[0].size(), 0);
+  ASSERT_EQ(level_to_files[1].size(), 1);
+  ASSERT_EQ(level_to_files[1][0].compensated_range_deletion_size, l2_size);
+  db_->ReleaseSnapshot(snapshot);
+}
+
 TEST_F(DBRangeDelTest, RangetombesoneCompensateFilesizePersistDuringReopen) {
   Options opts = CurrentOptions();
   opts.disable_auto_compactions = true;

@@ -345,7 +345,9 @@ Status BuildTable(
 
     if (s.ok()) {
       auto range_del_it = range_del_agg->NewIterator();
-      Slice last_tombstone_start_user_key{};
+      // The empty user key is a valid start key, so "no previous tombstone"
+      // needs its own state.
+      OptSlice last_tombstone_start_user_key;
       for (range_del_it->SeekToFirst(); range_del_it->Valid();
            range_del_it->Next()) {
         auto tombstone = range_del_it->Tombstone();
@@ -358,8 +360,8 @@ Status BuildTable(
         meta->UpdateBoundariesForRange(kv.first, tombstone_end, tombstone.seq_,
                                        tboptions.internal_comparator);
         if (version) {
-          if (last_tombstone_start_user_key.empty() ||
-              ucmp->CompareWithoutTimestamp(last_tombstone_start_user_key,
+          if (!last_tombstone_start_user_key ||
+              ucmp->CompareWithoutTimestamp(*last_tombstone_start_user_key,
                                             range_del_it->start_key()) < 0) {
             SizeApproximationOptions approx_opts;
             approx_opts.files_size_error_margin = 0.1;

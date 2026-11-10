@@ -2383,7 +2383,16 @@ Status DB::OpenAndCompact(
       break;
     }
   }
-  assert(cfh);
+  if (cfh == nullptr) {
+    // The OPTIONS file named by the input does not list this column family, so
+    // step 4 did not open it.
+    for (auto& handle : handles) {
+      delete handle;
+    }
+    db.reset();
+    return Status::InvalidArgument("Column family not found",
+                                   compaction_input.cf_name);
+  }
 
   // 7. Run the compaction without installation.
   // Output will be stored under the DB-owned staging directory.

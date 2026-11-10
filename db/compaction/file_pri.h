@@ -52,7 +52,13 @@ class FileTtlBooster {
     } else {
       enabled_ = true;
       uint64_t all_boost_start_age = ttl / 2;
-      uint64_t all_boost_age_range = (ttl / 32) * 31 - all_boost_start_age;
+      // A TTL below 32 seconds rounds the end of the range down to 0, so clamp
+      // the range instead of letting it wrap around.
+      uint64_t all_boost_end_age = (ttl / 32) * 31;
+      uint64_t all_boost_age_range =
+          all_boost_end_age > all_boost_start_age
+              ? all_boost_end_age - all_boost_start_age
+              : 0;
       // TODO(cbi): more reasonable algorithm that gives different values
       //   when num_non_empty_levels - level - 1 > 63.
       uint64_t boost_age_range =
