@@ -3374,70 +3374,80 @@ TEST_F(DBErrorHandlingFSTest,
   ASSERT_EQ(before + 3, db_->GetLatestSequenceNumber());
 }
 
-TEST_F(DBErrorHandlingFSTest,
-       FileScopedWALGapAfterIteratorSnapshotReturnsTryAgain) {
-  Options options = GetDefaultOptions();
-  options.env = fault_env_.get();
-  options.create_if_missing = true;
-  options.paranoid_checks = true;
-  options.max_bgerror_resume_count = 2;
-  options.bgerror_resume_retry_interval = 1000;
-  options.avoid_flush_during_shutdown = true;
-  options.track_and_verify_wals_in_manifest = false;
-  options.background_close_inactive_wals = false;
-  DestroyAndReopen(options);
+TEST_F(DBErrorHandlingFSTest, FileScopedWALGapAfterIteratorSnapshot) {
+  for (bool tail_rotations : {false, true}) {
+    SCOPED_TRACE(tail_rotations);
+    Options options = GetDefaultOptions();
+    options.env = fault_env_.get();
+    options.wal_iterator_tail_rotations = tail_rotations;
+    options.create_if_missing = true;
+    options.paranoid_checks = true;
+    options.max_bgerror_resume_count = 2;
+    options.bgerror_resume_retry_interval = 1000;
+    options.avoid_flush_during_shutdown = true;
+    options.track_and_verify_wals_in_manifest = false;
+    options.background_close_inactive_wals = false;
+    DestroyAndReopen(options);
 
-  ASSERT_OK(Put("iterator-prefix", "value-prefix"));
-  const SequenceNumber prefix_sequence = db_->GetLatestSequenceNumber();
-  std::unique_ptr<WalIterator> old_iter;
-  ASSERT_OK(db_->GetUpdatesSince(prefix_sequence, &old_iter));
-  ASSERT_TRUE(old_iter->Valid());
-  ASSERT_EQ(prefix_sequence, old_iter->GetBatch().sequence);
+    ASSERT_OK(Put("iterator-prefix", "value-prefix"));
+    const SequenceNumber prefix_sequence = db_->GetLatestSequenceNumber();
+    std::unique_ptr<WalIterator> old_iter;
+    ASSERT_OK(db_->GetUpdatesSince(prefix_sequence, &old_iter));
+    ASSERT_TRUE(old_iter->Valid());
+    ASSERT_EQ(prefix_sequence, old_iter->GetBatch().sequence);
 
-  ASSERT_OK(dbfull()->TEST_SwitchWAL());
-  std::atomic<bool> injected{false};
-  SyncPoint::GetInstance()->LoadDependency(
-      {{"IteratorSnapshotGap:AllowRecovery",
-        "RecoverFromRetryableBGIOError:BeforeStart"},
-       {"RecoverFromRetryableBGIOError:RecoverSuccess",
-        "IteratorSnapshotGap:RecoveryDone"}});
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::WriteToWAL:AfterAddRecord", [&](void* arg) {
-        if (!injected.exchange(true)) {
-          IOStatus error =
-              IOStatus::IOError("injected file-scoped error in later WAL");
-          error.SetScope(IOStatus::IOErrorScope::kIOErrorScopeFile);
-          error.SetRetryable(true);
-          *static_cast<IOStatus*>(arg) = error;
-        }
-      });
-  SyncPoint::GetInstance()->EnableProcessing();
+    ASSERT_OK(dbfull()->TEST_SwitchWAL());
+    std::atomic<bool> injected{false};
+    SyncPoint::GetInstance()->LoadDependency(
+        {{"IteratorSnapshotGap:AllowRecovery",
+          "RecoverFromRetryableBGIOError:BeforeStart"},
+         {"RecoverFromRetryableBGIOError:RecoverSuccess",
+          "IteratorSnapshotGap:RecoveryDone"}});
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:AfterAddRecord", [&](void* arg) {
+          if (!injected.exchange(true)) {
+            IOStatus error =
+                IOStatus::IOError("injected file-scoped error in later WAL");
+            error.SetScope(IOStatus::IOErrorScope::kIOErrorScopeFile);
+            error.SetRetryable(true);
+            *static_cast<IOStatus*>(arg) = error;
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
 
-  Status write_status = Put("failed", "value-failed");
-  ASSERT_TRUE(write_status.IsIOError()) << write_status.ToString();
-  TEST_SYNC_POINT("IteratorSnapshotGap:AllowRecovery");
-  TEST_SYNC_POINT("IteratorSnapshotGap:RecoveryDone");
-  ASSERT_EQ(prefix_sequence + 1, db_->GetLatestSequenceNumber());
+    Status write_status = Put("failed", "value-failed");
+    ASSERT_EQ(Status::kIOError, write_status.code());
+    TEST_SYNC_POINT("IteratorSnapshotGap:AllowRecovery");
+    TEST_SYNC_POINT("IteratorSnapshotGap:RecoveryDone");
+    ASSERT_EQ(prefix_sequence + 1, db_->GetLatestSequenceNumber());
 
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
 
-  old_iter->Next();
-  ASSERT_FALSE(old_iter->Valid());
-  Status old_iter_status = old_iter->status();
-  ASSERT_TRUE(old_iter_status.IsTryAgain()) << old_iter_status.ToString();
+    old_iter->Next();
+    ASSERT_FALSE(old_iter->Valid());
+    Status old_iter_status = old_iter->status();
+    ASSERT_EQ(tail_rotations ? Status::kNotFound : Status::kTryAgain,
+              old_iter_status.code());
+    // The abandoned batch must never become visible, even on a repeated Next.
+    old_iter->Next();
+    ASSERT_FALSE(old_iter->Valid());
+    ASSERT_EQ(old_iter_status.code(), old_iter->status().code());
 
-  std::unique_ptr<WalIterator> new_iter;
-  Status new_iter_status = db_->GetUpdatesSince(prefix_sequence + 1, &new_iter);
-  ASSERT_TRUE(new_iter_status.IsNotFound()) << new_iter_status.ToString();
-  ASSERT_FALSE(new_iter->Valid());
-  Status new_iter_terminal_status = new_iter->status();
-  ASSERT_TRUE(new_iter_terminal_status.IsNotFound())
-      << new_iter_terminal_status.ToString();
+    std::unique_ptr<WalIterator> new_iter;
+    Status new_iter_status =
+        db_->GetUpdatesSince(prefix_sequence + 1, &new_iter);
+    ASSERT_EQ(Status::kNotFound, new_iter_status.code());
+    ASSERT_FALSE(new_iter->Valid());
+    Status new_iter_terminal_status = new_iter->status();
+    ASSERT_EQ(Status::kNotFound, new_iter_terminal_status.code());
 
-  Reopen(options);
-  ASSERT_EQ("value-prefix", Get("iterator-prefix"));
-  ASSERT_EQ("NOT_FOUND", Get("failed"));
+    old_iter.reset();
+    new_iter.reset();
+    Reopen(options);
+    ASSERT_EQ("value-prefix", Get("iterator-prefix"));
+    ASSERT_EQ("NOT_FOUND", Get("failed"));
+  }
 }
 
 TEST_F(DBErrorHandlingFSTest,

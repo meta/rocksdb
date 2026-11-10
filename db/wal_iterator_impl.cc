@@ -9,6 +9,7 @@
 
 #include "db/write_batch_internal.h"
 #include "file/sequence_file_reader.h"
+#include "monitoring/statistics_impl.h"
 #include "util/defer.h"
 #include "util/mutexlock.h"
 
@@ -55,7 +56,8 @@ WalIteratorImpl::WalIteratorImpl(
     VersionSet const* const versions, [[maybe_unused]] const bool seq_per_batch,
     const std::shared_ptr<IOTracer>& io_tracer,
     std::shared_ptr<WalRecoverySequenceTracker> recovery_sequence_tracker,
-    uint64_t recovery_sequence_generation)
+    uint64_t recovery_sequence_generation,
+    NextWalForTailFn next_wal_for_tail_fn)
     : dir_(dir),
       options_(options),
       read_options_(read_options),
@@ -66,6 +68,7 @@ WalIteratorImpl::WalIteratorImpl(
       io_tracer_(io_tracer),
       recovery_sequence_tracker_(std::move(recovery_sequence_tracker)),
       recovery_sequence_generation_(recovery_sequence_generation),
+      next_wal_for_tail_fn_(std::move(next_wal_for_tail_fn)),
       started_(false),
       is_valid_(false),
       current_file_index_(0),
@@ -78,7 +81,6 @@ WalIteratorImpl::WalIteratorImpl(
   // one update always consumes exactly one sequence number below.
   assert(!seq_per_batch);
   current_status_.PermitUncheckedError();  // Clear on start
-  reporter_.env = options_->env;
   reporter_.info_log = options_->info_log.get();
   SeekToStartSequence();  // Seek till starting sequence
 }
@@ -86,6 +88,7 @@ WalIteratorImpl::WalIteratorImpl(
 Status WalIteratorImpl::OpenLogFile(
     const WalFile* log_file,
     std::unique_ptr<SequentialFileReader>* file_reader) {
+  TEST_SYNC_POINT("WalIteratorImpl::OpenLogFile:BeforeOpen");
   FileSystemPtr fs(options_->fs, io_tracer_);
   std::unique_ptr<FSSequentialFile> file;
   std::string fname;
@@ -98,8 +101,12 @@ Status WalIteratorImpl::OpenLogFile(
     fname = LogFileName(dir_, log_file->LogNumber());
     s = fs->NewSequentialFile(fname, optimized_env_options, &file, nullptr);
     if (!s.ok()) {
-      //  If cannot open file in DB directory.
-      //  Try the archive dir, as it could have moved in the meanwhile.
+      // Custom file systems may report a missing file as a generic I/O error.
+      // Preserve the open error if the live file still exists; otherwise it
+      // may have moved to the archive.
+      if (fs->FileExists(fname, IOOptions(), nullptr).ok()) {
+        return s;
+      }
       fname = ArchivedLogFileName(dir_, log_file->LogNumber());
       s = fs->NewSequentialFile(fname, optimized_env_options, &file, nullptr);
     }
@@ -124,12 +131,15 @@ Status WalIteratorImpl::status() { return current_status_; }
 
 bool WalIteratorImpl::Valid() { return started_ && is_valid_; }
 
-bool WalIteratorImpl::RestrictedRead(Slice* record) {
+bool WalIteratorImpl::RestrictedRead(Slice* record, Status* read_status) {
   // Don't read if no more complete entries to read from logs
   if (current_last_seq_ >= versions_->LastSequence()) {
     return false;
   }
-  return current_log_reader_->ReadRecord(record, &scratch_);
+  reporter_.read_status = read_status;
+  const bool read = current_log_reader_->ReadRecord(record, &scratch_);
+  reporter_.read_status = nullptr;
+  return read;
 }
 
 void WalIteratorImpl::SeekToStartSequence(uint64_t start_file_index,
@@ -161,7 +171,7 @@ void WalIteratorImpl::SeekToStartSequence(uint64_t start_file_index,
     reporter_.Info(current_status_.ToString().c_str());
     return;
   }
-  while (RestrictedRead(&record)) {
+  while (RestrictedRead(&record, nullptr)) {
     if (record.size() < WriteBatchInternal::kHeader) {
       reporter_.Corruption(record.size(),
                            Status::Corruption("very small log record"));
@@ -223,6 +233,7 @@ void WalIteratorImpl::Next() {
 
 void WalIteratorImpl::NextImpl(bool internal) {
   Slice record;
+  uint64_t tail_rotations = 0;
   is_valid_ = false;
   if (!internal && !started_) {
     // Runs every time until we can seek to the start sequence
@@ -233,8 +244,25 @@ void WalIteratorImpl::NextImpl(bool internal) {
     if (current_log_reader_->IsEOF()) {
       current_log_reader_->UnmarkEOF();
     }
-    while (RestrictedRead(&record)) {
+    while (true) {
+      Status read_status;
+      const bool read =
+          RestrictedRead(&record, tail_rotations > 0 ? &read_status : nullptr);
+      // Report errors while finding the first batch in a discovered WAL.
+      // Existing snapshot reads keep their error policy.
+      if (!read_status.ok() && (!read || options_->paranoid_checks)) {
+        current_status_ = read_status;
+        return;
+      }
+      if (!read) {
+        break;
+      }
       if (record.size() < WriteBatchInternal::kHeader) {
+        if (tail_rotations > 0) {
+          current_status_ = Status::Corruption("very small log record");
+          reporter_.Info(current_status_.ToString().c_str());
+          return;
+        }
         reporter_.Corruption(record.size(),
                              Status::Corruption("very small log record"));
         continue;
@@ -244,6 +272,10 @@ void WalIteratorImpl::NextImpl(bool internal) {
         // started_ should be false if called internally
         assert(!internal || !started_);
         UpdateCurrentWriteBatch(record);
+        if (is_valid_ && tail_rotations > 0) {
+          RecordTick(options_->statistics.get(), WAL_ITERATOR_TAIL_ROTATIONS,
+                     tail_rotations);
+        }
         if (internal && !started_) {
           started_ = true;
         }
@@ -269,13 +301,37 @@ void WalIteratorImpl::NextImpl(bool internal) {
         // Caught up. Not an error: the caller may call Next() again later to
         // pick up writes that have not happened yet.
         current_status_ = Status::OK();
-      } else {
-        // The DB has moved on but this iterator's set of WAL files is
-        // exhausted, typically because the WAL was rotated after the file
-        // list was collected. The caller must build a new iterator.
-        const char* msg = "Create a new iterator to fetch the new tail.";
-        current_status_ = Status::TryAgain(msg);
+        return;
       }
+      // Discover a newer WAL, then use the ordinary read path's continuity
+      // and recovery-gap checks before delivering any of its records.
+      if (started_ && next_wal_for_tail_fn_) {
+        const uint64_t next_number =
+            next_wal_for_tail_fn_(files_->back()->LogNumber());
+        if (next_number != 0) {
+          std::unique_ptr<WalFile> next_wal(
+              new WalFileImpl(next_number, kAliveLogFile, 0, 0));
+          Status open_s = OpenLogReader(next_wal.get());
+          if (!open_s.ok()) {
+            current_status_ =
+                open_s.IsNotFound() || open_s.IsPathNotFound()
+                    ? Status::TryAgain("Successor WAL is no longer available")
+                    : open_s;
+            return;
+          }
+          // This run only moves forward, so consumed WALs are never revisited.
+          files_->clear();
+          files_->push_back(std::move(next_wal));
+          current_file_index_ = 0;
+          ++tail_rotations;
+          continue;
+        }
+      }
+      // The DB has moved on but this iterator's set of WAL files is
+      // exhausted, typically because the WAL was rotated after the file
+      // list was collected. The caller must build a new iterator.
+      current_status_ =
+          Status::TryAgain("Create a new iterator to fetch the new tail.");
       return;
     }
   }

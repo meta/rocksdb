@@ -1630,6 +1630,14 @@ struct DBOptions {
   // a temporary kill switch, it is already DEPRECATED.
   bool background_close_inactive_wals = false;
 
+  // Allow a WalIterator to continue beyond its initial WAL file snapshot when
+  // the next WAL is still live and its records are contiguous with the run.
+  // Sequence gaps or an unavailable successor still end the run; callers must
+  // be prepared to rebuild the iterator. See WalIterator for its contract.
+  // As this is intended as a temporary kill switch, it is already DEPRECATED.
+  // Immutable.
+  bool wal_iterator_tail_rotations = false;
+
   // If true, RocksDB supports flushing multiple column families and committing
   // their results atomically to MANIFEST. Note that it is not
   // necessary to set atomic_flush to true if WAL is always enabled since WAL

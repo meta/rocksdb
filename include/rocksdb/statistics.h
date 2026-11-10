@@ -684,6 +684,10 @@ enum Tickers : uint32_t {
   // metadata, files, or capabilities failed validation before installation.
   REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT,
 
+  // WAL rotations crossed beyond an iterator's initial file snapshot before
+  // delivering another contiguous batch.
+  WAL_ITERATOR_TAIL_ROTATIONS,
+
   TICKER_ENUM_MAX
 };
 

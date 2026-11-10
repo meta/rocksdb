@@ -119,7 +119,8 @@ Status WalManager::GetSortedWalFiles(VectorWalPtr& files, bool need_seqnos,
 Status WalManager::GetUpdatesSince(SequenceNumber seq,
                                    std::unique_ptr<WalIterator>* iter,
                                    const WalIterator::ReadOptions& read_options,
-                                   VersionSet* version_set) {
+                                   VersionSet* version_set,
+                                   NextWalForTailFn next_wal_for_tail_fn) {
   if (seq_per_batch_) {
     return Status::NotSupported();
   }
@@ -144,7 +145,8 @@ Status WalManager::GetUpdatesSince(SequenceNumber seq,
   iter->reset(new WalIteratorImpl(
       wal_dir_, &db_options_, read_options, file_options_, seq,
       std::move(wal_files), version_set, seq_per_batch_, io_tracer_,
-      recovery_sequence_tracker_, recovery_sequence_generation));
+      recovery_sequence_tracker_, recovery_sequence_generation,
+      std::move(next_wal_for_tail_fn)));
   return (*iter)->status();
 }
 

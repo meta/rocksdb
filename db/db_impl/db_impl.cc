@@ -6919,6 +6919,17 @@ void DBImpl::ReleaseOptionsFileNumber(
   }
 }
 
+uint64_t DBImpl::FindNextLiveWalForTail(uint64_t last_wal_number) {
+  // See the synchronization contract on alive_wal_files_.
+  InstrumentedMutexLock l(&mutex_);
+  const std::deque<WalFileNumberSize>::const_iterator it = std::upper_bound(
+      alive_wal_files_.begin(), alive_wal_files_.end(), last_wal_number,
+      [](uint64_t number, const WalFileNumberSize& wal) {
+        return number < wal.number;
+      });
+  return it == alive_wal_files_.end() ? 0 : it->number;
+}
+
 Status DBImpl::GetUpdatesSince(SequenceNumber seq,
                                std::unique_ptr<WalIterator>* iter,
                                const WalIterator::ReadOptions& read_options) {
@@ -6931,7 +6942,14 @@ Status DBImpl::GetUpdatesSince(SequenceNumber seq,
   if (seq > versions_->LastSequence()) {
     return Status::NotFound("Requested sequence not yet written in the db");
   }
-  return wal_manager_.GetUpdatesSince(seq, iter, read_options, versions_.get());
+  NextWalForTailFn next_wal_for_tail_fn = nullptr;
+  if (immutable_db_options_.wal_iterator_tail_rotations) {
+    next_wal_for_tail_fn = [this](uint64_t last_wal_number) {
+      return FindNextLiveWalForTail(last_wal_number);
+    };
+  }
+  return wal_manager_.GetUpdatesSince(seq, iter, read_options, versions_.get(),
+                                      std::move(next_wal_for_tail_fn));
 }
 
 Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
