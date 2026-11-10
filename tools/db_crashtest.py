@@ -328,18 +328,13 @@ default_params = {
     "merge_before_filter_change_one_in": lambda: random.choice([0, 1, 10, 100]),
     "merge_before_filter_remove_deleted": lambda: random.randint(0, 1),
     "enable_compaction_on_deletion_trigger": lambda: random.choice([0, 0, 0, 1]),
-    # `inplace_update_support` is incompatible with a wide range of features.
-    # The current sanitization process is not sufficient to reliably handle
-    # this. While inplace_update_support is intended to stay on across runs
-    # in default_params, in certain runs it can be toggled off by
-    # sanitization due to some incompatible features being enabled. When
-    # inplace_update_support is off, other incompatible features such as
-    # delete range may be enabled and leave state in the DB. A later run
-    # reads default_params again with inplace_update_support on, but now
-    # operates on a DB containing delete range data from the previous run,
-    # causing stress test failures. Temporarily disabled until the
-    # sanitization can account for cross-run incompatibility.
-    "inplace_update_support": 0,
+    # inplace_update_support has to be the same across invocations, hence no
+    # lambda: a run without it can leave state in the DB, such as range
+    # tombstones in a WAL that a later run recovers into its memtable, that
+    # in-place updates of a later run would read incorrectly. See
+    # resolve_inplace_update_support() and finalize_and_sanitize() for how
+    # incompatible features are kept off for the whole series.
+    "inplace_update_support": random.choice([0] * 9 + [1]),
     "flush_one_in": lambda: random.choice([1000, 1000000]),
     "manual_wal_flush_one_in": lambda: random.choice([0, 1000]),
     "sync_wal_one_in": 0,
@@ -1419,10 +1414,119 @@ multiops_txn_params = {
     "commit_bypass_memtable_one_in": random.choice([0] * 4 + [100]),
 }
 
+# Settings that select a test profile, fixed for a whole crash test series by a
+# preset or the command line, that cannot be combined with
+# inplace_update_support.
+_INPLACE_UPDATE_INCOMPATIBLE_PROFILE_PARAMS = (
+    "best_efforts_recovery",
+    "enable_blob_direct_write",
+    "file_scope_wal_write_faults",
+    "test_cf_consistency",
+    "test_multi_ops_txns",
+    "use_optimistic_txn",
+    "use_txn",
+)
+# Features that finalize_and_sanitize() turns off in every run of a series with
+# inplace_update_support. Explicitly enabling one of them on the command line
+# keeps inplace_update_support off for the series instead.
+_INPLACE_UPDATE_INCOMPATIBLE_RUN_PARAMS = (
+    "acquire_snapshot_one_in",
+    "allow_concurrent_memtable_write",
+    "check_multiget_consistency",
+    "check_multiget_entity_consistency",
+    "compact_range_one_in",
+    "delrangepercent",
+    "disable_wal",
+    "iterpercent",
+    "lazy_entity_read_one_in",
+    "manual_wal_flush_one_in",
+    "memtable_verify_per_key_checksum_on_seek",
+    "min_tombstones_for_range_conversion",
+    "prefixpercent",
+    "remote_compaction_worker_threads",
+    "sync_fault_injection",
+    "test_batches_snapshots",
+    "test_ingest_standalone_range_deletion_one_in",
+    "unordered_write",
+)
+
+
+def inplace_update_support_profile_conflicts(params):
+    conflicts = [
+        name
+        for name in _INPLACE_UPDATE_INCOMPATIBLE_PROFILE_PARAMS
+        if callable(params.get(name)) or params.get(name) not in (None, 0)
+    ]
+    memtablerep = params.get("memtablerep")
+    if callable(memtablerep) or memtablerep in ("vector", "sorted_hash"):
+        conflicts.append("memtablerep")
+    return conflicts
+
+
+def resolve_inplace_update_support(params, args, unknown_params):
+    # Called once per crash test series, after presets and command line
+    # arguments are merged into `params`, so that every run uses the same
+    # inplace_update_support.
+    if params.get("inplace_update_support", 0) != 1:
+        return
+    conflicts = inplace_update_support_profile_conflicts(params)
+    conflicts += [
+        name
+        for name in _INPLACE_UPDATE_INCOMPATIBLE_RUN_PARAMS
+        if getattr(args, name, None) not in (None, 0)
+    ]
+    # Unknown arguments are forwarded to db_stress without being checked here,
+    # so only use inplace_update_support with them when explicitly requested.
+    if unknown_params and getattr(args, "inplace_update_support", None) is None:
+        conflicts.append("unparsed db_stress arguments")
+    if conflicts:
+        print(
+            "inplace_update_support is off for all runs as it is incompatible "
+            "with: " + ", ".join(conflicts) + "\n"
+        )
+        params["inplace_update_support"] = 0
+
 
 def finalize_and_sanitize(src_params):
     dest_params = {k: v() if callable(v) else v for (k, v) in src_params.items()}
     apply_cache_and_write_buffer_size_multiplier(dest_params)
+    # inplace_update_support is fixed for the whole series, so turn off the
+    # features incompatible with it in every run rather than turning it off in
+    # some runs. Profiles that cannot be turned off here must have been ruled
+    # out by resolve_inplace_update_support().
+    if dest_params.get("inplace_update_support", 0) == 1:
+        profile_conflicts = inplace_update_support_profile_conflicts(dest_params)
+        if profile_conflicts:
+            raise ValueError(
+                "inplace_update_support=1 is incompatible with "
+                + ", ".join(profile_conflicts)
+            )
+        # A range tombstone in the memtable hides a value later updated in
+        # place under an older sequence number. Besides DeleteRange,
+        # iterators insert such tombstones when converting point tombstones.
+        dest_params["delpercent"] += dest_params["delrangepercent"]
+        dest_params["delrangepercent"] = 0
+        dest_params["min_tombstones_for_range_conversion"] = 0
+        # Iterators and seek-time key checksum verification can see an entry
+        # while it is being updated in place.
+        dest_params["readpercent"] += dest_params["prefixpercent"]
+        dest_params["prefixpercent"] = 0
+        dest_params["memtable_verify_per_key_checksum_on_seek"] = 0
+        # Rejected together with inplace_update_support by db_stress or
+        # RocksDB, or otherwise unsupported with it.
+        dest_params["test_batches_snapshots"] = 0
+        dest_params["allow_concurrent_memtable_write"] = 0
+        dest_params["unordered_write"] = 0
+        dest_params["remote_compaction_worker_threads"] = 0
+        # Lazy entity reads are checked against eager reads under a snapshot,
+        # but DB::GetSnapshot() returns nullptr with inplace_update_support.
+        dest_params["lazy_entity_read_one_in"] = 0
+        # inplace_update_support does not update sequence number. Our stress test recovery
+        # logic for unsynced data loss relies on max sequence number stored
+        # in MANIFEST, so they don't work together.
+        dest_params["sync_fault_injection"] = 0
+        dest_params["disable_wal"] = 0
+        dest_params["manual_wal_flush_one_in"] = 0
     # Merge-before-filter is only interesting with merges, so use them in about
     # 3/4 of those runs. Later rules can still turn merges off.
     if (
@@ -1450,8 +1554,6 @@ def finalize_and_sanitize(src_params):
         # range tombstone conversion is enabled, because conversion must see
         # the full relevant SST set before synthesizing a memtable tombstone.
         dest_params["use_sqfc_for_range_queries"] = 0
-        # Delete range not compatible with inplace_update_support
-        dest_params["inplace_update_support"] = 0
     if (
         dest_params["use_direct_io_for_flush_and_compaction"] == 1
         or dest_params["use_direct_reads"] == 1
@@ -1509,10 +1611,6 @@ def finalize_and_sanitize(src_params):
         dest_params["enable_pipelined_write"] = 0
         dest_params["two_write_queues"] = 0
         dest_params["unordered_write"] = 0
-        # Keep inplace updates off. The later inplace_update_support
-        # sanitization intentionally forces disable_wal=0 for its own recovery
-        # assumptions, which would silently undo the BDW crash-test profile.
-        dest_params["inplace_update_support"] = 0
         # Direct write is implemented only for integrated BlobDB, without
         # dynamic blob option changes or background blob GC.
         dest_params["use_blob_db"] = 0
@@ -1578,11 +1676,7 @@ def finalize_and_sanitize(src_params):
         dest_params["ingest_external_file_one_in"] = 0
         dest_params["ingest_wbwi_one_in"] = 0
 
-    if dest_params.get("memtablerep") == "vector":
-        dest_params["inplace_update_support"] = 0
-
     if dest_params.get("memtablerep") == "sorted_hash":
-        dest_params["inplace_update_support"] = 0
         dest_params["user_timestamp_size"] = 0
 
     # only skip list memtable representation supports paranoid memory checks
@@ -1592,7 +1686,6 @@ def finalize_and_sanitize(src_params):
 
     if dest_params["test_batches_snapshots"] == 1:
         dest_params["enable_compaction_filter"] = 0
-        dest_params["inplace_update_support"] = 0
         # TODO(hx235): enable test_batches_snapshots with fault injection after stabilizing the CI
         dest_params["write_fault_one_in"] = 0
         dest_params["metadata_write_fault_one_in"] = 0
@@ -1607,7 +1700,6 @@ def finalize_and_sanitize(src_params):
     # incompatible, so force blob-related toggles off even if they came from
     # command-line overrides or another preset.
     if dest_params.get("best_efforts_recovery") == 1:
-        dest_params["inplace_update_support"] = 0
         dest_params["enable_blob_files"] = 0
         dest_params["enable_blob_garbage_collection"] = 0
         dest_params["allow_setting_blob_options_dynamically"] = 0
@@ -1616,7 +1708,6 @@ def finalize_and_sanitize(src_params):
     # Remote Compaction Incompatible Tests and Features
     if dest_params.get("remote_compaction_worker_threads", 0) > 0:
         # Disable Incompatible Ones
-        dest_params["inplace_update_support"] = 0
         dest_params["checkpoint_one_in"] = 0
         dest_params["use_timed_put_one_in"] = 0
         dest_params["test_secondary"] = 0
@@ -1686,22 +1777,6 @@ def finalize_and_sanitize(src_params):
     ):
         dest_params["delpercent"] += dest_params["delrangepercent"]
         dest_params["delrangepercent"] = 0
-    # Since the value of inplace_update_support needs to be fixed across runs,
-    # we disable other incompatible options here instead of disabling
-    # inplace_update_support based on other option values, which may change
-    # across runs.
-    if dest_params["inplace_update_support"] == 1:
-        dest_params["delpercent"] += dest_params["delrangepercent"]
-        dest_params["delrangepercent"] = 0
-        dest_params["readpercent"] += dest_params["prefixpercent"]
-        dest_params["prefixpercent"] = 0
-        dest_params["allow_concurrent_memtable_write"] = 0
-        # inplace_update_support does not update sequence number. Our stress test recovery
-        # logic for unsynced data loss relies on max sequence number stored
-        # in MANIFEST, so they don't work together.
-        dest_params["sync_fault_injection"] = 0
-        dest_params["disable_wal"] = 0
-        dest_params["manual_wal_flush_one_in"] = 0
     if (
         dest_params.get("sync_fault_injection") == 1
         or dest_params.get("disable_wal") == 1
@@ -2114,11 +2189,6 @@ def finalize_and_sanitize(src_params):
     if dest_params.get("skip_stats_update_on_db_open", 0) == 0:
         dest_params["open_files_async"] = 0
 
-    # inplace update and key checksum verification during seek would cause race condition
-    # Therefore, when inplace_update_support is enabled, disable memtable_verify_per_key_checksum_on_seek
-    if dest_params["inplace_update_support"] == 1:
-        dest_params["memtable_verify_per_key_checksum_on_seek"] = 0
-
     # allow_resumption requires remote compaction
     if dest_params.get("remote_compaction_worker_threads", 0) == 0:
         dest_params["allow_resumption_one_in"] = 0
@@ -2278,7 +2348,7 @@ def gen_cmd_params(args, unknown_params=None):
         # so it would silently drop the feature these flavors exist to test.
         if not (
             args.txn or args.optimistic_txn or args.test_multiops_txn or args.enable_ts
-        ):
+        ) and getattr(args, "inplace_update_support", None) != 1:
             blob_profiles += [
                 blob_direct_write_params,
                 blob_direct_write_get_entity_params,
@@ -2329,6 +2399,7 @@ def gen_cmd_params(args, unknown_params=None):
         "open_metadata_write_fault_one_in",
         "open_read_fault_one_in",
         "open_write_fault_one_in",
+        "inplace_update_support",
     ]
     has_explicit_file_scope_conflict = any(
         getattr(args, flag, None) not in (None, 0)
@@ -2365,6 +2436,7 @@ def gen_cmd_params(args, unknown_params=None):
     if args.test_type == "liveness":
         apply_liveness_remote_defaults(params, args)
         params.update(no_fault_injection_params)
+    resolve_inplace_update_support(params, args, unknown_params)
 
     # DB paths must not change between the crash and recovery processes.
     wbm_flush_policy = params["wbm_flush_policy"]
