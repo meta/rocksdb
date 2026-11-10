@@ -40,12 +40,10 @@ class LiveTuner {
  public:
   // `db` must outlive the tuner. `cf` is the intent's column family.
   // `options` must be valid (ValidateLiveTuneOptions()). `history` is what
-  // earlier cycles on this DB did, for the advisor, and `kept` the options
-  // they changed and kept (see GetLiveTuneAppliedOptions()).
+  // earlier cycles on this DB did, for the advisor.
   LiveTuner(DB* db, LiveTuneOptions options,
             std::unique_ptr<ColumnFamilyHandle> cf,
-            std::shared_ptr<Logger> info_log, std::vector<std::string> history,
-            std::map<std::string, std::string> kept);
+            std::shared_ptr<Logger> info_log, std::vector<std::string> history);
   ~LiveTuner();
 
   void Start();
@@ -61,9 +59,6 @@ class LiveTuner {
   LiveTuneStatus GetStatus() const;
   // `history` plus this cycle's outcome once done.
   std::vector<std::string> History() const;
-  // `kept` overlaid with this cycle's changes while they are applied (and
-  // after, if kept).
-  std::map<std::string, std::string> AppliedOptions() const;
 
  private:
   // The DB's counters and gauges at `micros`; two snapshots bound a window
@@ -126,8 +121,7 @@ class LiveTuner {
   void DeleteTraceFile();
   // Compacts the column family for a recommendation that requires it.
   Status Compact();
-  // Reverts applied changes and logs why. Fails if, read back afterwards, a
-  // change is still in effect; it then stays in applied_.
+  // Reverts applied changes with the applier and logs why.
   Status Revert(const LiveTuneWatch& watch, const std::string& reason);
   // Ends the cycle as "rejected: <reason>" before anything is changed.
   void Reject(const std::string& reason);
@@ -143,6 +137,8 @@ class LiveTuner {
 
   DB* const db_;
   const LiveTuneOptions options_;
+  // options_.applier, or the built-in one.
+  const std::shared_ptr<LiveTuneApplier> applier_;
   const std::unique_ptr<ColumnFamilyHandle> cf_;
   const std::shared_ptr<Logger> info_log_;
 
@@ -151,13 +147,13 @@ class LiveTuner {
   bool stopping_ = false;
   // Inside the advisor's GetRecommendation(), which Stop() then cancels.
   bool in_recommendation_ = false;
+  // Inside the applier's Apply(), which Stop() then cancels.
+  bool in_apply_ = false;
   // thread_'s id, for OnCycleThread(); set by thread_ itself, cleared once it
   // is joined.
   std::thread::id thread_id_;
   LiveTuneStatus status_;
   std::vector<std::string> history_;
-  std::map<std::string, std::string> kept_;
-  std::map<std::string, std::string> applied_;
   // The DB's Statistics, or null. With it, the DB keeps per-level file read
   // histograms, and its tickers count reads and block cache lookups.
   const std::shared_ptr<Statistics> statistics_;

@@ -298,6 +298,67 @@ class DecidingVerdict : public TestVerdict {
   const Decide decide_;
 };
 
+// Records each Apply() and Revert() with the DB's max_write_buffer_number
+// before the call. Unless `set` is false, applies and reverts with the
+// built-in implementation; then fails with IOError(`apply_error`) /
+// IOError(`revert_error`) when given.
+class TestApplier : public LiveTuneApplier {
+ public:
+  struct Call {
+    std::string method;
+    std::map<std::string, std::string> values;
+    int max_write_buffer_number = 0;
+  };
+
+  explicit TestApplier(bool set = true, const char* apply_error = nullptr,
+                       const char* revert_error = nullptr)
+      : set_(set), apply_error_(apply_error), revert_error_(revert_error) {}
+  const char* Name() const override { return "TestApplier"; }
+
+  Status Apply(DB* db, ColumnFamilyHandle* cf,
+               const std::map<std::string, std::string>& changes) override {
+    Record("Apply", db, changes);
+    if (set_) {
+      Status s = LiveTuneApplier::Apply(db, cf, changes);
+      if (!s.ok()) {
+        return s;
+      }
+    }
+    return apply_error_ ? Status::IOError(apply_error_) : Status::OK();
+  }
+
+  Status Revert(DB* db, ColumnFamilyHandle* cf,
+                const std::map<std::string, std::string>& previous) override {
+    Record("Revert", db, previous);
+    if (set_) {
+      Status s = LiveTuneApplier::Revert(db, cf, previous);
+      if (!s.ok()) {
+        return s;
+      }
+    }
+    return revert_error_ ? Status::IOError(revert_error_) : Status::OK();
+  }
+
+  std::vector<Call> Calls() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return calls_;
+  }
+
+ private:
+  void Record(const std::string& method, DB* db,
+              const std::map<std::string, std::string>& values) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    calls_.push_back(
+        {method, values, db->GetOptions().max_write_buffer_number});
+  }
+
+  const bool set_;
+  const char* const apply_error_;
+  const char* const revert_error_;
+  std::mutex mutex_;
+  std::vector<Call> calls_;
+};
+
 // Counts the trace's records through the public replayer, into `details`.
 class CountingTraceAnalyzer : public LiveTuneTraceAnalyzer {
  public:
@@ -331,12 +392,6 @@ size_t BlockSize(DB* db) {
   return db->GetOptions()
       .table_factory->GetOptions<BlockBasedTableOptions>()
       ->block_size;
-}
-
-std::map<std::string, std::string> AppliedOptions(DB* db) {
-  std::map<std::string, std::string> options;
-  EXPECT_OK(GetLiveTuneAppliedOptions(db, &options));
-  return options;
 }
 
 }  // namespace
@@ -958,7 +1013,6 @@ TEST_F(LiveTunerTest, FilterOptionChangesOnlyWhenApplied) {
       0u);
   EXPECT_EQ(cycle({{name, {0, 3}}}, "2", true), "recommended");
   EXPECT_EQ(bloom_before_level(), "0");
-  EXPECT_TRUE(AppliedOptions(db_.get()).empty());
 
   EXPECT_EQ(cycle({{name, {0, 3}}}, "2", false), "kept");
   EXPECT_EQ(bloom_before_level(), "2");
@@ -1366,7 +1420,6 @@ TEST_F(LiveTunerTest, RevertOfAMixedChangeSurvivesAnOptionsFileWriteFailure) {
 
   EXPECT_EQ(MaxWriteBufferNumber(db_.get()), 2);
   EXPECT_EQ(db_->GetDBOptions().delayed_write_rate, 1048576u);
-  EXPECT_TRUE(AppliedOptions(db_.get()).empty());
 }
 
 TEST_F(LiveTunerTest, RejectsAMoveToZeroWithoutIntentBounds) {
@@ -1423,10 +1476,10 @@ TEST_F(LiveTunerTest, UnknownAllowedOptionIsRejectedAtStart) {
   ASSERT_OK(StopLiveTuneCycle(db_.get()));
 }
 
-TEST_F(LiveTunerTest, ApplyFailureReportsWhatIsStillInEffect) {
+TEST_F(LiveTunerTest, ApplyWithTheOptionsFileWriteFailingStillApplies) {
+  using Action = LiveTuneWindowDecision::Action;
   // From the advisor call on, every OPTIONS file write fails: SetOptions()
-  // installs a value and then reports an error, for the change and for the
-  // restore.
+  // installs the value and then reports an error.
   class FailingWritesAdvisor : public TestAdvisor {
    public:
     explicit FailingWritesAdvisor(SpecialEnv* env)
@@ -1443,20 +1496,14 @@ TEST_F(LiveTunerTest, ApplyFailureReportsWhatIsStillInEffect) {
     SpecialEnv* const env_;
   };
   auto advisor = std::make_shared<FailingWritesAdvisor>(env_);
-  auto verdict = std::make_shared<TestVerdict>(true, LatencyBetterAt4);
+  auto verdict = std::make_shared<DecidingVerdict>(
+      LatencyBetterAt4, [this](const LiveTuneWatch& /*watch*/) {
+        env_->non_writable_count_ = 0;
+        return LiveTuneWindowDecision{Action::kKeep, ""};
+      });
   ASSERT_OK(StartLiveTuneCycle(db_.get(), TuneOptions(advisor, verdict)));
-  ASSERT_TRUE(verdict->WaitFor("\"event\": \"done\""));
-  env_->non_writable_count_ = 0;
-
-  LiveTuneStatus status;
-  ASSERT_OK(GetLiveTuneStatus(db_.get(), &status));
-  EXPECT_EQ(status.outcome.rfind("apply failed: ", 0), 0u) << status.outcome;
-  // The previous value is back, so no "revert failed".
-  EXPECT_EQ(status.outcome.find("revert failed"), std::string::npos)
-      << status.outcome;
-  EXPECT_EQ(MaxWriteBufferNumber(db_.get()), 2);
-  EXPECT_TRUE(AppliedOptions(db_.get()).empty());
-  EXPECT_TRUE(verdict->WaitFor("\"event\": \"reverted\""));
+  ASSERT_TRUE(verdict->WaitFor("\"outcome\": \"kept\""));
+  EXPECT_EQ(MaxWriteBufferNumber(db_.get()), 4);
 }
 
 TEST_F(LiveTunerTest, NoChangeWithObjectivesOnUnmeasuredMetricIsNoChange) {
@@ -1538,7 +1585,6 @@ TEST_F(LiveTunerTest, RejectedWhenCompactionRequiredButNotAllowed) {
 
   EXPECT_FALSE(advisor->FirstRequest().allow_compaction);
   EXPECT_EQ(MaxWriteBufferNumber(db_.get()), 2);
-  EXPECT_TRUE(AppliedOptions(db_.get()).empty());
 }
 
 TEST_F(LiveTunerTest, CompactsBeforeWatchingWhenRequired) {
@@ -1580,64 +1626,133 @@ TEST_F(LiveTunerTest, CompactsBeforeWatchingWhenRequired) {
   EXPECT_TRUE(verdict->WaitFor("\"rewritten_fraction\": 1}"));
   EXPECT_TRUE(verdict->WaitFor("\"requires_compaction\": \"true\""));
   EXPECT_EQ(BlockSize(db_.get()), before * 2);
-  const std::map<std::string, std::string> kept{
-      {"block_based_table_factory.block_size", doubled}};
-  EXPECT_EQ(AppliedOptions(db_.get()), kept);
 }
 
-TEST_F(LiveTunerTest, AppliedOptionsUntilRevertedOrWhileKept) {
-  using Action = LiveTuneWindowDecision::Action;
-  EXPECT_TRUE(AppliedOptions(db_.get()).empty());
+TEST_F(LiveTunerTest, ApplierAppliesAndReverts) {
   const std::map<std::string, std::string> to4{
       {"max_write_buffer_number", "4"}};
-  std::map<std::string, std::string> while_watching;
-  auto reverting = std::make_shared<DecidingVerdict>(
-      LatencyBetterAt4, [&](const LiveTuneWatch& watch) {
-        if (watch.windows.size() == 1) {
-          while_watching = AppliedOptions(db_.get());
-          return LiveTuneWindowDecision{Action::kContinue, ""};
-        }
-        return LiveTuneWindowDecision{Action::kRevert, "app: revert"};
-      });
-  ASSERT_OK(StartLiveTuneCycle(db_.get(), TuneOptions(To4(), reverting)));
-  ASSERT_TRUE(reverting->WaitFor("\"outcome\": \"app: revert\""));
-  EXPECT_EQ(while_watching, to4);
-  EXPECT_TRUE(AppliedOptions(db_.get()).empty());
+  const std::map<std::string, std::string> to2{
+      {"max_write_buffer_number", "2"}};
+  // Kept: applied once, never reverted.
+  {
+    auto applier = std::make_shared<TestApplier>();
+    auto verdict = std::make_shared<TestVerdict>(true, LatencyBetterAt4);
+    LiveTuneOptions o = TuneOptions(To4(), verdict);
+    o.applier = applier;
+    ASSERT_OK(StartLiveTuneCycle(db_.get(), o));
+    ASSERT_TRUE(verdict->WaitFor("\"outcome\": \"kept\""));
+    const std::vector<TestApplier::Call> calls = applier->Calls();
+    ASSERT_EQ(calls.size(), 1u);
+    EXPECT_EQ(calls[0].method, "Apply");
+    EXPECT_EQ(calls[0].values, to4);
+    // The cycle leaves setting the options to the applier.
+    EXPECT_EQ(calls[0].max_write_buffer_number, 2);
+    EXPECT_EQ(MaxWriteBufferNumber(db_.get()), 4);
+  }
+  // Reverted by the verdict, and stopped while watched.
+  for (const bool stop : {false, true}) {
+    ASSERT_OK(db_->SetOptions({{"max_write_buffer_number", "2"}}));
+    auto applier = std::make_shared<TestApplier>();
+    auto verdict = std::make_shared<TestVerdict>(false, LatencyBetterAt4);
+    LiveTuneOptions o = TuneOptions(To4(), verdict);
+    o.applier = applier;
+    if (stop) {
+      o.max_validation_windows = 4000000000u;
+      o.min_confidence = 0.999999;
+    }
+    ASSERT_OK(StartLiveTuneCycle(db_.get(), o));
+    if (stop) {
+      ASSERT_TRUE(verdict->WaitFor("\"event\": \"applied\""));
+      ASSERT_OK(StopLiveTuneCycle(db_.get()));
+    }
+    ASSERT_TRUE(verdict->WaitFor("\"event\": \"done\""));
+    LiveTuneStatus status;
+    ASSERT_OK(GetLiveTuneStatus(db_.get(), &status));
+    EXPECT_EQ(status.outcome, stop ? "stopped" : "verdict: revert");
+    const std::vector<TestApplier::Call> calls = applier->Calls();
+    ASSERT_EQ(calls.size(), 2u);
+    EXPECT_EQ(calls[0].method, "Apply");
+    EXPECT_EQ(calls[1].method, "Revert");
+    EXPECT_EQ(calls[1].values, to2);
+    EXPECT_EQ(calls[1].max_write_buffer_number, 4);
+    EXPECT_EQ(MaxWriteBufferNumber(db_.get()), 2);
+  }
+}
 
-  auto keeping = std::make_shared<TestVerdict>(true, LatencyBetterAt4);
-  ASSERT_OK(StartLiveTuneCycle(db_.get(), TuneOptions(To4(), keeping)));
-  ASSERT_TRUE(keeping->WaitFor("\"outcome\": \"kept\""));
-  EXPECT_EQ(AppliedOptions(db_.get()), to4);
+TEST_F(LiveTunerTest, StopCancelsABlockingApply) {
+  // Apply() blocks until CancelApply(), then fails without changing anything.
+  class BlockingApplier : public TestApplier {
+   public:
+    BlockingApplier() : TestApplier(false) {}
+    Status Apply(DB* db, ColumnFamilyHandle* cf,
+                 const std::map<std::string, std::string>& changes) override {
+      Status s = TestApplier::Apply(db, cf, changes);
+      std::unique_lock<std::mutex> lock(mutex_);
+      in_apply_ = true;
+      cv_.notify_all();
+      cv_.wait(lock, [this] { return canceled_; });
+      return s.ok() ? Status::Aborted("canceled") : s;
+    }
+    void CancelApply() override {
+      std::lock_guard<std::mutex> lock(mutex_);
+      canceled_ = true;
+      cv_.notify_all();
+    }
+    void WaitInApply() {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait(lock, [this] { return in_apply_; });
+    }
 
-  // A later cycle that keeps another option adds it.
-  const int trigger = db_->GetOptions().level0_file_num_compaction_trigger;
-  const std::string doubled = std::to_string(2 * trigger);
-  auto second =
-      std::make_shared<TestVerdict>(true, [&](DB* db, LiveTuneMetrics* m) {
-        (*m)["latency"] =
-            db->GetOptions().level0_file_num_compaction_trigger == 2 * trigger
-                ? 80
-                : 100;
-      });
-  LiveTuneOptions o = TuneOptions(
-      std::make_shared<TestAdvisor>(std::map<std::string, std::string>{
-          {"level0_file_num_compaction_trigger", doubled}}),
-      second);
-  o.intent.allowed_options = {{"level0_file_num_compaction_trigger", {1, 64}}};
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool in_apply_ = false;
+    bool canceled_ = false;
+  };
+  auto applier = std::make_shared<BlockingApplier>();
+  auto verdict = std::make_shared<TestVerdict>(true, LatencyBetterAt4);
+  LiveTuneOptions o = TuneOptions(To4(), verdict);
+  o.applier = applier;
   ASSERT_OK(StartLiveTuneCycle(db_.get(), o));
-  ASSERT_TRUE(second->WaitFor("\"outcome\": \"kept\""));
-  std::map<std::string, std::string> both = to4;
-  both["level0_file_num_compaction_trigger"] = doubled;
-  EXPECT_EQ(AppliedOptions(db_.get()), both);
+  applier->WaitInApply();
+  ASSERT_OK(StopLiveTuneCycle(db_.get()));
+  LiveTuneStatus status;
+  ASSERT_OK(GetLiveTuneStatus(db_.get(), &status));
+  EXPECT_EQ(status.outcome, "stopped");
+  const std::vector<TestApplier::Call> calls = applier->Calls();
+  ASSERT_EQ(calls.size(), 2u);
+  EXPECT_EQ(calls[1].method, "Revert");
+  EXPECT_EQ(MaxWriteBufferNumber(db_.get()), 2);
+}
 
-  // Later cycles keep reporting them.
-  auto none = std::make_shared<TestVerdict>(true, LatencyBetterAt4);
-  ASSERT_OK(StartLiveTuneCycle(
-      db_.get(), TuneOptions(std::make_shared<TestAdvisor>(
-                                 std::map<std::string, std::string>{}),
-                             none)));
-  ASSERT_TRUE(none->WaitFor("\"outcome\": \"no change\""));
-  EXPECT_EQ(AppliedOptions(db_.get()), both);
+TEST_F(LiveTunerTest, ApplierFailuresEndTheCycle) {
+  struct Case {
+    const char* revert_error;
+    std::string outcome;
+  };
+  const std::vector<Case> cases = {
+      // A failed Apply() reverts through the applier.
+      {nullptr, "apply failed: IO error: apply"},
+      // A failed Revert() is reported.
+      {"revert",
+       "apply failed: IO error: apply; revert failed: IO error: revert"},
+  };
+  for (const Case& c : cases) {
+    auto applier =
+        std::make_shared<TestApplier>(false, "apply", c.revert_error);
+    auto verdict = std::make_shared<TestVerdict>(true, LatencyBetterAt4);
+    LiveTuneOptions o = TuneOptions(To4(), verdict);
+    o.applier = applier;
+    ASSERT_OK(StartLiveTuneCycle(db_.get(), o));
+    ASSERT_TRUE(verdict->WaitFor("\"event\": \"done\""));
+    LiveTuneStatus status;
+    ASSERT_OK(GetLiveTuneStatus(db_.get(), &status));
+    EXPECT_EQ(status.outcome, c.outcome);
+    const std::vector<TestApplier::Call> calls = applier->Calls();
+    ASSERT_EQ(calls.size(), 2u);
+    EXPECT_EQ(calls[1].method, "Revert");
+    EXPECT_EQ(MaxWriteBufferNumber(db_.get()), 2);
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

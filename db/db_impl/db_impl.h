@@ -569,7 +569,6 @@ class DBImpl : public DB
   // See rocksdb/live_tune.h.
   Status StartLiveTuneCycle(const LiveTuneOptions& options);
   Status GetLiveTuneStatus(LiveTuneStatus* status);
-  Status GetLiveTuneAppliedOptions(std::map<std::string, std::string>* options);
   Status StopLiveTuneCycle();
 
   using DB::NumberLevels;
