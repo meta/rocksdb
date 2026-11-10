@@ -4,8 +4,10 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -367,6 +369,41 @@ TEST_P(DBWriteTest, IOErrorOnWALWritePropagateToWriteThreadFollower) {
 
   // Close before mock_env destruct.
   Close();
+}
+
+// Regression test for a self-deadlock (GitHub issue #15097): a WAL-enabled
+// write on a DB opened with unordered_write=true, manual_wal_flush=true, and
+// two_write_queues=false (the default) used to deadlock. Any such write goes
+// through WriteImplWALOnly (used whenever unordered_write is set, regardless
+// of two_write_queues_), which calls ConcurrentWriteGroupToWAL. That function
+// always locks wal_write_mutex_ before calling WriteToWAL, but WriteToWAL
+// used to infer whether the caller already held the mutex from
+// two_write_queues_ alone, so with two_write_queues_ == false it tried to
+// lock the same (non-recursive) mutex again on the same thread.
+TEST_F(DBWriteTestUnparameterized,
+       UnorderedWriteManualWalFlushDoesNotDeadlock) {
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.unordered_write = true;
+  options.manual_wal_flush = true;
+  ASSERT_FALSE(options.two_write_queues);
+  DestroyAndReopen(options);
+
+  std::promise<Status> put_done;
+  std::future<Status> put_result = put_done.get_future();
+  port::Thread writer(
+      [&] { put_done.set_value(dbfull()->Put(WriteOptions(), "k", "v")); });
+
+  // On the buggy code, `writer` self-deadlocks inside WriteToWAL and never
+  // reaches set_value(), so wait with a bound instead of joining directly.
+  if (put_result.wait_for(std::chrono::seconds(30)) !=
+      std::future_status::ready) {
+    writer.detach();
+    FAIL() << "Put() did not return: self-deadlock in WriteToWAL "
+              "(unordered_write + manual_wal_flush + !two_write_queues)";
+  }
+  writer.join();
+  ASSERT_OK(put_result.get());
 }
 
 TEST_F(DBWriteTestUnparameterized, PipelinedWriteRace) {

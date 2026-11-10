@@ -2325,14 +2325,21 @@ Status DBImpl::MergeBatch(const WriteThread::WriteGroup& write_group,
   return Status::OK();
 }
 
-// When two_write_queues_ is disabled, this function is called from the only
-// write thread. Otherwise this must be called holding wal_write_mutex_.
+// `wal_write_mutex_held` must be true iff the caller already holds
+// wal_write_mutex_ (e.g. ConcurrentWriteGroupToWAL, used for both
+// two_write_queues_ and unordered_write, always locks it before calling
+// here). It must be false when the caller does not hold it (e.g.
+// WriteGroupToWAL, called from the single write thread when
+// !two_write_queues_). This cannot be inferred from two_write_queues_ alone:
+// unordered_write routes through ConcurrentWriteGroupToWAL (which pre-locks)
+// even when two_write_queues_ is false.
 IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             const WriteOptions& write_options,
                             log::Writer* log_writer, uint64_t* wal_used,
                             uint64_t* log_size,
                             WalFileNumberSize& wal_file_number_size,
-                            SequenceNumber sequence) {
+                            SequenceNumber sequence,
+                            bool wal_write_mutex_held) {
   assert(log_size != nullptr);
 
   Slice log_entry = WriteBatchInternal::Contents(&merged_batch);
@@ -2342,11 +2349,11 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
     return status_to_io_status(std::move(s));
   }
   *log_size = log_entry.size();
-  // When two_write_queues_ WriteToWAL has to be protected from concurretn calls
-  // from the two queues anyway and wal_write_mutex_ is already held. Otherwise
-  // if manual_wal_flush_ is enabled we need to protect log_writer->AddRecord
-  // from possible concurrent calls via the FlushWAL by the application.
-  const bool needs_locking = manual_wal_flush_ && !two_write_queues_;
+  // If the caller doesn't already hold wal_write_mutex_ (see the parameter
+  // comment above), and manual_wal_flush_ is enabled, we need to protect
+  // log_writer->AddRecord from possible concurrent calls via FlushWAL by the
+  // application.
+  const bool needs_locking = manual_wal_flush_ && !wal_write_mutex_held;
   // Due to performance cocerns of missed branch prediction penalize the new
   // manual_wal_flush_ feature (by UNLIKELY) instead of the more common case
   // when we do not need any locking.
@@ -2358,6 +2365,10 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   TEST_SYNC_POINT_CALLBACK(
       "DBImpl::WriteToWAL:AfterMaybeAddUserDefinedTimestampSizeRecord", &io_s);
   if (!io_s.ok()) {
+    // Nothing was written to the log, so there is nothing else to update.
+    if (UNLIKELY(needs_locking)) {
+      wal_write_mutex_.Unlock();
+    }
     return io_s;
   }
   io_s = log_writer->AddRecord(write_options, log_entry, sequence);
@@ -2412,7 +2423,8 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, wal_used,
-                    &log_size, wal_file_number_size, sequence);
+                    &log_size, wal_file_number_size, sequence,
+                    /*wal_write_mutex_held=*/false);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
@@ -2539,7 +2551,8 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, wal_used,
-                    &log_size, wal_file_number_size, sequence);
+                    &log_size, wal_file_number_size, sequence,
+                    /*wal_write_mutex_held=*/true);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
