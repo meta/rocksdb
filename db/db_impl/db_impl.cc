@@ -435,12 +435,8 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   // Recovery replaces WALs, flushes memtables, and can reserve the sequence
   // numbers of an indeterminate WAL write. Defer it while any LockWAL() is held
   // so the frozen DB state (latest sequence number and current WAL) promised by
-  // LockWAL() stays intact. UnlockWAL() and shutdown signal bg_cv_.
-  while (!lock_wal_owner_thread_id_counts_.empty() && !shutdown_initiated_ &&
-         !shutting_down_.load(std::memory_order_acquire)) {
-    TEST_SYNC_POINT("DBImpl::ResumeImpl:WaitForUnlockWAL");
-    bg_cv_.Wait();
-  }
+  // LockWAL() stays intact.
+  WaitForUnlockWALForRecovery();
 
   assert(static_cast<size_t>(unscheduled_flushes_) <= flush_queue_.size());
   // Recovery rebuilds flush requests for every column family with pending
@@ -562,6 +558,17 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
                                     BackgroundErrorReason::kManifestWrite);
         }
       }
+    }
+  }
+
+  if (s.ok() && context.IsWALWriteErrorRecovery() &&
+      context.failed_wal_sequence > 0) {
+    // WaitForBackgroundWork() and the MANIFEST write above release the DB
+    // mutex, so a LockWAL() can start after the check at the top. Check again
+    // with no mutex release before the latest sequence number advances.
+    WaitForUnlockWALForRecovery();
+    if (!lock_wal_owner_thread_id_counts_.empty()) {
+      s = Status::ShutdownInProgress();
     }
   }
 
@@ -805,6 +812,16 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   // No need to check BGError again. If something happened, event listener would
   // be notified and the operation causing it would have failed
   return s;
+}
+
+void DBImpl::WaitForUnlockWALForRecovery() {
+  mutex_.AssertHeld();
+  // UnlockWAL() and shutdown signal bg_cv_.
+  while (!lock_wal_owner_thread_id_counts_.empty() && !shutdown_initiated_ &&
+         !shutting_down_.load(std::memory_order_acquire)) {
+    TEST_SYNC_POINT("DBImpl::ResumeImpl:WaitForUnlockWAL");
+    bg_cv_.Wait();
+  }
 }
 
 void DBImpl::WaitForBackgroundWork() {

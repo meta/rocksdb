@@ -20,6 +20,7 @@
 #include "rocksdb/sst_file_manager.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
+#include "util/defer.h"
 #include "util/random.h"
 #include "utilities/fault_injection_env.h"
 #include "utilities/fault_injection_fs.h"
@@ -3056,6 +3057,125 @@ TEST_F(DBErrorHandlingFSTest, FileScopedWALWriteErrorRecoveryWaitsForLockWAL) {
   ASSERT_EQ("value", Get("accepted-before-error"));
   ASSERT_EQ("NOT_FOUND", Get("failed"));
   ASSERT_EQ("value2", Get("accepted-after-recovery"));
+}
+
+// Recovery releases the DB mutex while it waits for in-flight background work.
+// A LockWAL() taken in that window must still block the sequence reservation.
+TEST_F(DBErrorHandlingFSTest,
+       FileScopedWALWriteErrorRecoveryRechecksLockWALAfterBackgroundWork) {
+  Options options = GetDefaultOptions();
+  options.env = fault_env_.get();
+  options.create_if_missing = true;
+  options.paranoid_checks = true;
+  options.max_bgerror_resume_count = 2;
+  options.bgerror_resume_retry_interval = 1000;
+  options.avoid_flush_during_shutdown = true;
+  options.track_and_verify_wals_in_manifest = false;
+  options.background_close_inactive_wals = false;
+  options.level0_file_num_compaction_trigger = 2;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("accepted-before-error", "value"));
+
+  std::atomic<bool> inject{false};
+  std::atomic<bool> compaction_blocked{false};
+  std::atomic<bool> recovery_reached_wait{false};
+  std::atomic<bool> recovery_decided{false};
+  std::atomic<bool> recovery_waited_for_unlock{false};
+  std::promise<void> compaction_started;
+  std::promise<void> release_compaction;
+  std::shared_future<void> release_compaction_future =
+      release_compaction.get_future().share();
+  std::promise<void> recovery_at_wait;
+  std::promise<void> recovery_decision;
+  std::atomic<bool> compaction_released{false};
+  // Release the blocked compaction on every exit path, including a failed
+  // assertion, so closing the DB does not hang.
+  Defer release_compaction_on_exit([&]() {
+    if (!compaction_released.exchange(true)) {
+      release_compaction.set_value();
+    }
+  });
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"RecoverFromRetryableBGIOError:RecoverSuccess",
+        "FileScopedWALWriteErrorLockWALRecheck:RecoveryDone"}});
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():Start", [&, release_compaction_future](void*) {
+        if (!compaction_blocked.exchange(true)) {
+          compaction_started.set_value();
+          release_compaction_future.wait();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:AfterAddRecord", [&](void* arg) {
+        if (inject.exchange(false)) {
+          IOStatus error = IOStatus::IOError("injected file-scoped WAL error");
+          error.SetScope(IOStatus::IOErrorScope::kIOErrorScopeFile);
+          error.SetRetryable(true);
+          *static_cast<IOStatus*>(arg) = error;
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ResumeImpl:BeforeWaitForBackgroundWork", [&](void*) {
+        if (!recovery_reached_wait.exchange(true)) {
+          recovery_at_wait.set_value();
+        }
+      });
+  // Recovery either waits for UnlockWAL() (fixed) or proceeds past the
+  // sequence reservation to the recovery flush (bug).
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ResumeImpl:WaitForUnlockWAL", [&](void*) {
+        recovery_waited_for_unlock.store(true);
+        if (!recovery_decided.exchange(true)) {
+          recovery_decision.set_value();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::FlushAllColumnFamilies:BeforeAtomicFlushMemTables", [&](void*) {
+        if (!recovery_decided.exchange(true)) {
+          recovery_decision.set_value();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Keep a real compaction in flight so recovery's WaitForBackgroundWork()
+  // releases the DB mutex.
+  ASSERT_OK(Put("key", "v1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key", "v2"));
+  ASSERT_OK(Flush());
+  compaction_started.get_future().wait();
+
+  inject.store(true);
+  Status s = Put("failed", "value");
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  recovery_at_wait.get_future().wait();
+
+  // Recovery has passed its first LockWAL() check. LockWAL() gets the DB mutex
+  // only once WaitForBackgroundWork() releases it.
+  s = db_->LockWAL();
+  const SequenceNumber locked_seqno = db_->GetLatestSequenceNumber();
+  if (!compaction_released.exchange(true)) {
+    release_compaction.set_value();
+  }
+  ASSERT_OK(s);
+  recovery_decision.get_future().wait();
+
+  EXPECT_EQ(locked_seqno, db_->GetLatestSequenceNumber());
+  EXPECT_TRUE(recovery_waited_for_unlock.load());
+  ASSERT_OK(db_->UnlockWAL());
+
+  TEST_SYNC_POINT("FileScopedWALWriteErrorLockWALRecheck:RecoveryDone");
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_GT(db_->GetLatestSequenceNumber(), locked_seqno);
+  ASSERT_OK(Put("accepted-after-recovery", "value2"));
+  ASSERT_EQ("value", Get("accepted-before-error"));
+  ASSERT_EQ("NOT_FOUND", Get("failed"));
+  ASSERT_EQ("value2", Get("accepted-after-recovery"));
+  ASSERT_EQ("v2", Get("key"));
 }
 
 TEST_F(DBErrorHandlingFSTest,

@@ -3367,6 +3367,11 @@ class DBImpl : public DB
 
   void WaitForBackgroundWork();
 
+  // Waits until no LockWAL() is held or shutdown starts. Error recovery calls
+  // this before it changes state that LockWAL() freezes.
+  // REQUIRES: mutex locked
+  void WaitForUnlockWALForRecovery();
+
   // Background threads call this function, which is just a wrapper around
   // the InstallSuperVersion() function. Background threads carry
   // sv_context to allow allocation of SuperVersion object outside of holding
