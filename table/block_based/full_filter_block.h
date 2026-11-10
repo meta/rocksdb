@@ -128,12 +128,24 @@ class FullFilterBlockReader
                         const SliceTransform* prefix_extractor,
                         BlockCacheLookupContext* lookup_context,
                         const ReadOptions& read_options) override;
+
+  bool KeyMayMatchInMemory(const Slice& key,
+                           const Slice* const const_ikey_ptr) override;
+  bool PrefixMayMatchInMemory(const Slice& prefix,
+                              const Slice* const const_ikey_ptr) override;
+
+  // The filter bits of the filter block that this reader holds for its whole
+  // life (owned, or pinned in the block cache), valid as long as this reader.
+  // nullptr if the reader looks the filter block up when needed.
+  FilterBitsReader* HeldFilterBitsReader() const;
+
   size_t ApproximateMemoryUsage() const override;
 
  private:
   bool MayMatch(const Slice& entry, GetContext* get_context,
                 BlockCacheLookupContext* lookup_context,
                 const ReadOptions& read_options) const;
+  bool MayMatchInMemory(const Slice& entry) const;
   void MayMatch(MultiGetRange* range, const SliceTransform* prefix_extractor,
                 BlockCacheLookupContext* lookup_context,
                 const ReadOptions& read_options) const;

@@ -82,6 +82,25 @@ Status FilterBlockReaderCommon<TBlocklike>::GetOrReadFilterBlock(
 }
 
 template <typename TBlocklike>
+Status FilterBlockReaderCommon<TBlocklike>::GetFilterBlockInMemory(
+    CachableEntry<TBlocklike>* filter_block) const {
+  assert(filter_block);
+  assert(filter_block->IsEmpty());
+
+  if (!filter_block_.IsEmpty()) {
+    filter_block->SetUnownedValue(filter_block_.GetValue());
+    return Status::OK();
+  }
+  // Without cache_index_and_filter_blocks, a filter block that this reader
+  // does not hold could only be read from the file.
+  if (!cache_filter_blocks()) {
+    return Status::OK();
+  }
+  return table_->LookupBlockInPrimaryCache(table_->get_rep()->filter_handle,
+                                           filter_block);
+}
+
+template <typename TBlocklike>
 size_t FilterBlockReaderCommon<TBlocklike>::ApproximateFilterBlockMemoryUsage()
     const {
   assert(!filter_block_.GetOwnValue() || filter_block_.GetValue() != nullptr);

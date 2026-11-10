@@ -135,8 +135,8 @@ CompactionIterator::CompactionIterator(
     BlobFileBuilder* blob_file_builder, bool allow_data_in_errors,
     bool enforce_single_del_contracts,
     const std::atomic<bool>& manual_compaction_canceled,
-    bool must_count_input_entries, const Compaction* compaction,
-    const CompactionFilter* compaction_filter,
+    bool must_count_input_entries, AbsenceProver* absence_prover,
+    const Compaction* compaction, const CompactionFilter* compaction_filter,
     const std::atomic<bool>* shutting_down,
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
@@ -150,9 +150,9 @@ CompactionIterator::CompactionIterator(
           allow_data_in_errors, enforce_single_del_contracts,
           manual_compaction_canceled,
           compaction ? std::make_unique<RealCompaction>(compaction) : nullptr,
-          must_count_input_entries, compaction_filter, shutting_down, info_log,
-          full_history_ts_low, preserve_seqno_min, input_version,
-          blob_read_io_activity, blob_gc_cutoff_file_number) {}
+          must_count_input_entries, absence_prover, compaction_filter,
+          shutting_down, info_log, full_history_ts_low, preserve_seqno_min,
+          input_version, blob_read_io_activity, blob_gc_cutoff_file_number) {}
 
 CompactionIterator::CompactionIterator(
     InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
@@ -166,7 +166,7 @@ CompactionIterator::CompactionIterator(
     bool enforce_single_del_contracts,
     const std::atomic<bool>& manual_compaction_canceled,
     std::unique_ptr<CompactionProxy> compaction, bool must_count_input_entries,
-    const CompactionFilter* compaction_filter,
+    AbsenceProver* absence_prover, const CompactionFilter* compaction_filter,
     const std::atomic<bool>* shutting_down,
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
@@ -186,6 +186,7 @@ CompactionIterator::CompactionIterator(
       range_del_agg_(range_del_agg),
       blob_file_builder_(blob_file_builder),
       compaction_(std::move(compaction)),
+      absence_prover_(absence_prover),
       compaction_filter_(compaction_filter),
       merge_order_(merge_helper
                        ? merge_helper->merge_order()
@@ -222,6 +223,8 @@ CompactionIterator::CompactionIterator(
       level_(compaction_ == nullptr ? 0 : compaction_->level()),
       preserve_seqno_after_(preserve_seqno_min.value_or(earliest_snapshot)) {
   assert(snapshots_ != nullptr);
+  // A compaction has its own rule for dropping obsolete point tombstones.
+  assert(compaction_ == nullptr || absence_prover_ == nullptr);
   if (compaction_filter_ &&
       merge_order_ == CompactionFilter::MergeOrder::kMergeBeforeFilter &&
       (snapshot_checker_ != nullptr || timestamp_size_ != 0 ||
@@ -921,17 +924,22 @@ bool CompactionIterator::SelectMergeOutput(uint8_t valid_context) {
 
 bool CompactionIterator::ProcessDeletion(SequenceNumber prev_snapshot,
                                          bool input_already_advanced) {
-  if (compaction_ != nullptr &&
-      (ikey_.type == kTypeDeletion ||
-       (ikey_.type == kTypeDeletionWithTimestamp &&
-        cmp_with_history_ts_low_ < 0)) &&
-      !compaction_->allow_ingest_behind() &&
-      DefinitelyInSnapshot(ikey_.sequence, earliest_snapshot_) &&
-      compaction_->KeyNotExistsBeyondOutputLevel(ikey_.user_key,
-                                                 &level_ptrs_)) {
+  if ((compaction_ != nullptr &&
+       (ikey_.type == kTypeDeletion ||
+        (ikey_.type == kTypeDeletionWithTimestamp &&
+         cmp_with_history_ts_low_ < 0)) &&
+       !compaction_->allow_ingest_behind() &&
+       DefinitelyInSnapshot(ikey_.sequence, earliest_snapshot_) &&
+       compaction_->KeyNotExistsBeyondOutputLevel(ikey_.user_key,
+                                                  &level_ptrs_)) ||
+      PointTombstoneProvenObsolete()) {
     // TODO(noetzli): This is the only place where we use compaction_
     // (besides the constructor). We should probably get rid of this
-    // dependency and find a way to do similar filtering during flushes.
+    // dependency.
+    //
+    // Without a compaction, PointTombstoneProvenObsolete() instead shows
+    // that no older version of this key exists outside the input, which
+    // takes the place of (1) and (2) below.
     //
     // For this user key:
     // (1) there is no data in higher levels
@@ -1491,7 +1499,10 @@ void CompactionIterator::NextFromInput() {
     } else if (DeletionIsObsolete()) {
       // TODO(noetzli): This is the only place where we use compaction_
       // (besides the constructor). We should probably get rid of this
-      // dependency and find a way to do similar filtering during flushes.
+      // dependency.
+      //
+      // Without a compaction, ProcessDeletion() instead drops a point
+      // tombstone that PointTombstoneProvenObsolete() shows to be obsolete.
       //
       // For this user key:
       // (1) there is no data in higher levels
@@ -1683,6 +1694,18 @@ void CompactionIterator::NextFromInput() {
       status_ = input_.status();
     }
   }
+}
+
+bool CompactionIterator::PointTombstoneProvenObsolete() {
+  // The absence prover shows that no older version of the key exists outside
+  // the input. Older versions inside the input are hidden by this tombstone
+  // and dropped by rule (A) as the iterator advances. With timestamps that
+  // does not hold: older timestamps of the key are kept as separate keys, and
+  // a kTypeDeletion (from a compaction filter's removal) hides them.
+  return absence_prover_ != nullptr && timestamp_size_ == 0 &&
+         ikey_.type == kTypeDeletion &&
+         DefinitelyInSnapshot(ikey_.sequence, earliest_snapshot_) &&
+         absence_prover_->ProveAbsent(ikey_.user_key);
 }
 
 bool CompactionIterator::DeletionIsObsolete() {

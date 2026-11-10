@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "db/blob/blob_index.h"
+#include "db/compaction/absence_prover.h"
 #include "db/compaction/compaction.h"
 #include "db/compaction/compaction_iteration_stats.h"
 #include "db/merge_helper.h"
@@ -262,6 +263,11 @@ class CompactionIterator {
   //     the count becomes unreliable. Always call `HasNumInputEntryScanned()`
   //     first to verify if the count is accurate before using
   //     `NumInputEntryScanned()`.
+  // @param absence_prover If not null, the iterator drops each plain point
+  //   tombstone (kTypeDeletion, without timestamps) older than the earliest
+  //   snapshot for which it proves that no older version of the key exists
+  //   outside the input. Must be null when a compaction is attached. Must
+  //   outlive the iterator.
   CompactionIterator(
       InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
       SequenceNumber last_sequence, std::vector<SequenceNumber>* snapshots,
@@ -273,7 +279,8 @@ class CompactionIterator {
       BlobFileBuilder* blob_file_builder, bool allow_data_in_errors,
       bool enforce_single_del_contracts,
       const std::atomic<bool>& manual_compaction_canceled,
-      bool must_count_input_entries, const Compaction* compaction = nullptr,
+      bool must_count_input_entries, AbsenceProver* absence_prover,
+      const Compaction* compaction = nullptr,
       const CompactionFilter* compaction_filter = nullptr,
       const std::atomic<bool>* shutting_down = nullptr,
       const std::shared_ptr<Logger> info_log = nullptr,
@@ -296,7 +303,7 @@ class CompactionIterator {
       bool enforce_single_del_contracts,
       const std::atomic<bool>& manual_compaction_canceled,
       std::unique_ptr<CompactionProxy> compaction,
-      bool must_count_input_entries,
+      bool must_count_input_entries, AbsenceProver* absence_prover,
       const CompactionFilter* compaction_filter = nullptr,
       const std::atomic<bool>* shutting_down = nullptr,
       const std::shared_ptr<Logger> info_log = nullptr,
@@ -469,6 +476,10 @@ class CompactionIterator {
 
   bool DeletionIsObsolete();
 
+  // True if `absence_prover_` shows the current point tombstone to be
+  // obsolete.
+  bool PointTombstoneProvenObsolete();
+
   Status OutputHasExternalBlobReferences(bool* has_external_refs) const;
 
   // Given a sequence number, return the sequence number of the
@@ -530,6 +541,7 @@ class CompactionIterator {
   CompactionRangeDelAggregator* range_del_agg_;
   BlobFileBuilder* blob_file_builder_;
   std::unique_ptr<CompactionProxy> compaction_;
+  AbsenceProver* const absence_prover_;
   const CompactionFilter* compaction_filter_;
   const CompactionFilter::MergeOrder merge_order_;
   const bool filter_supports_v4_;

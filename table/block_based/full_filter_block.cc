@@ -166,6 +166,35 @@ bool FullFilterBlockReader::MayMatch(const Slice& entry,
   return true;
 }
 
+bool FullFilterBlockReader::KeyMayMatchInMemory(
+    const Slice& key, const Slice* const /*const_ikey_ptr*/) {
+  if (!whole_key_filtering()) {
+    return true;
+  }
+  return MayMatchInMemory(key);
+}
+
+bool FullFilterBlockReader::PrefixMayMatchInMemory(
+    const Slice& prefix, const Slice* const /*const_ikey_ptr*/) {
+  return MayMatchInMemory(prefix);
+}
+
+FilterBitsReader* FullFilterBlockReader::HeldFilterBitsReader() const {
+  const ParsedFullFilterBlock* const filter_block = held_filter_block();
+  return filter_block == nullptr ? nullptr : filter_block->filter_bits_reader();
+}
+
+bool FullFilterBlockReader::MayMatchInMemory(const Slice& entry) const {
+  CachableEntry<ParsedFullFilterBlock> filter_block;
+  const Status s = GetFilterBlockInMemory(&filter_block);
+  if (!s.ok() || filter_block.GetValue() == nullptr) {
+    return true;
+  }
+  FilterBitsReader* const filter_bits_reader =
+      filter_block.GetValue()->filter_bits_reader();
+  return filter_bits_reader == nullptr || filter_bits_reader->MayMatch(entry);
+}
+
 void FullFilterBlockReader::KeysMayMatch(
     MultiGetRange* range, BlockCacheLookupContext* lookup_context,
     const ReadOptions& read_options) {

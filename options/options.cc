@@ -123,7 +123,9 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
       min_tombstones_for_range_conversion(
           options.min_tombstones_for_range_conversion),
       memtable_batch_lookup_optimization(
-          options.memtable_batch_lookup_optimization) {
+          options.memtable_batch_lookup_optimization),
+      flush_drop_obsolete_point_tombstones(
+          options.flush_drop_obsolete_point_tombstones) {
   assert(memtable_factory.get() != nullptr);
   if (max_bytes_for_level_multiplier_additional.size() <
       static_cast<unsigned int>(num_levels)) {
@@ -486,6 +488,8 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    cf_allow_ingest_behind ? "true" : "false");
   ROCKS_LOG_HEADER(log, "  Options.memtable_batch_lookup_optimization: %s",
                    memtable_batch_lookup_optimization ? "true" : "false");
+  ROCKS_LOG_HEADER(log, "Options.flush_drop_obsolete_point_tombstones: %s",
+                   flush_drop_obsolete_point_tombstones ? "true" : "false");
   ROCKS_LOG_HEADER(log, "             Options.enable_blob_direct_write: %s",
                    enable_blob_direct_write ? "true" : "false");
   ROCKS_LOG_HEADER(log,

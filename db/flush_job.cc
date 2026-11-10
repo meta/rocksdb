@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <optional>
 #include <vector>
 
 #include "db/builder.h"
@@ -219,6 +220,19 @@ void FlushJob::PickMemTable() {
 
   base_ = cfd_->current();
   base_->Ref();  // it is likely that we do not need this reference
+
+  if (mutable_cf_options_.flush_drop_obsolete_point_tombstones) {
+    // Data older than mems_ is in base_ or in other unflushed memtables, unless
+    // files can be ingested behind existing data. An absence proof over base_
+    // alone is trusted only if every unflushed memtable outside mems_ is newer.
+    // With user-defined timestamps, the CompactionIterator would not drop
+    // point tombstones anyway, so such flushes count as skipped too.
+    const bool can_drop = cfd_->user_comparator()->timestamp_size() == 0 &&
+                          !cfd_->AllowIngestBehind() &&
+                          cfd_->imm()->UnpickedMemtablesAreNewer(mems_);
+    point_tombstone_drop_ =
+        can_drop ? PointTombstoneDrop::kEnabled : PointTombstoneDrop::kSkipped;
+  }
 }
 
 Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
@@ -338,6 +352,9 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
               !(mempurge_s.ok()) /* write_edit : true if no mempurge happened (or if aborted),
                               but 'false' if mempurge successful: no new min log number
                               or new level 0 file path to write to manifest. */);
+      if (s.ok() && !mempurge_s.ok()) {
+        RecordPointTombstoneDropStats();
+      }
     }
   }
 
@@ -400,6 +417,20 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
 
   TEST_SYNC_POINT("FlushJob::End");
   return s;
+}
+
+void FlushJob::RecordPointTombstoneDropStats() const {
+  switch (point_tombstone_drop_) {
+    case PointTombstoneDrop::kOptionOff:
+      break;
+    case PointTombstoneDrop::kSkipped:
+      RecordTick(stats_, FLUSH_OBSOLETE_POINT_TOMBSTONE_DROP_SKIPPED);
+      break;
+    case PointTombstoneDrop::kEnabled:
+      RecordTick(stats_, FLUSH_OBSOLETE_POINT_TOMBSTONES_DROPPED,
+                 num_point_tombstones_dropped_);
+      break;
+  }
 }
 
 void FlushJob::Cancel() {
@@ -542,8 +573,9 @@ Status FlushJob::MemPurge() {
         ioptions.enforce_single_del_contracts,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse,
         false /* must_count_input_entries */,
-        /*compaction=*/nullptr, compaction_filter.get(),
-        /*shutting_down=*/nullptr, ioptions.info_log, full_history_ts_low);
+        /*absence_prover=*/nullptr, /*compaction=*/nullptr,
+        compaction_filter.get(), /*shutting_down=*/nullptr, ioptions.info_log,
+        full_history_ts_low);
 
     // Set earliest sequence number in the new memtable
     // to be equal to the earliest sequence number of the
@@ -1069,6 +1101,10 @@ Status FlushJob::WriteLevel0Table() {
               ? preclude_last_level_min_seqno_
               : std::min(earliest_snapshot_, preclude_last_level_min_seqno_),
           dbname_ /*db_name*/);
+      std::optional<VersionAbsenceProver> absence_prover;
+      if (point_tombstone_drop_ == PointTombstoneDrop::kEnabled) {
+        absence_prover.emplace(base_);
+      }
       s = BuildTable(
           dbname_, versions_, db_options_, tboptions, file_options_,
           cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
@@ -1078,11 +1114,16 @@ Status FlushJob::WriteLevel0Table() {
           job_context_->snapshot_checker,
           mutable_cf_options_.paranoid_file_checks, cfd_->internal_stats(),
           &io_s, io_tracer_, BlobFileCreationReason::kFlush,
-          seqno_to_time_mapping_.get(), event_logger_, job_context_->job_id,
-          &table_properties_, write_hint, full_history_ts_low, blob_callback_,
-          base_, &memtable_payload_bytes, &memtable_garbage_bytes, &flush_stats,
+          seqno_to_time_mapping_.get(),
+          absence_prover.has_value() ? &*absence_prover : nullptr,
+          event_logger_, job_context_->job_id, &table_properties_, write_hint,
+          full_history_ts_low, blob_callback_, base_, &memtable_payload_bytes,
+          &memtable_garbage_bytes, &flush_stats,
           blob_file_garbages_for_filtering, fast_sst_open_);
       TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
+      if (s.ok() && absence_prover.has_value()) {
+        num_point_tombstones_dropped_ = absence_prover->num_proven_absent();
+      }
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
       io_s.PermitUncheckedError();

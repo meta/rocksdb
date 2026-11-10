@@ -1549,6 +1549,10 @@ DEFINE_bool(paranoid_memory_checks, false,
 DEFINE_bool(memtable_verify_per_key_checksum_on_seek, false,
             "Sets CF option memtable_verify_per_key_checksum_on_seek");
 
+DEFINE_bool(flush_drop_obsolete_point_tombstones,
+            ROCKSDB_NAMESPACE::Options().flush_drop_obsolete_point_tombstones,
+            "Sets CF option flush_drop_obsolete_point_tombstones");
+
 DEFINE_bool(
     auto_refresh_iterator_with_snapshot, false,
     "When set to true, RocksDB iterator will automatically refresh itself "
@@ -6556,6 +6560,8 @@ class Benchmark {
     options.paranoid_memory_checks = FLAGS_paranoid_memory_checks;
     options.memtable_verify_per_key_checksum_on_seek =
         FLAGS_memtable_verify_per_key_checksum_on_seek;
+    options.flush_drop_obsolete_point_tombstones =
+        FLAGS_flush_drop_obsolete_point_tombstones;
     options.memtable_op_scan_flush_trigger =
         FLAGS_memtable_op_scan_flush_trigger;
     options.min_tombstones_for_range_conversion =

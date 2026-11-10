@@ -1782,6 +1782,12 @@ bool StressTest::BuildOptionsTable() {
   }
   options_tbl.emplace("preserve_internal_time_seconds",
                       std::vector<std::string>{"0", "5", "30", "5000"});
+  if (FLAGS_flush_drop_obsolete_point_tombstones) {
+    // Toggle it only in runs that start with it enabled, so that runs with it
+    // disabled never drop point tombstones at flush.
+    options_tbl.emplace("flush_drop_obsolete_point_tombstones",
+                        std::vector<std::string>{"false", "true"});
+  }
 
   options_table_ = std::move(options_tbl);
 
@@ -7229,6 +7235,8 @@ void InitializeOptionsFromFlags(
       FLAGS_memtable_verify_per_key_checksum_on_seek;
   options.memtable_batch_lookup_optimization =
       FLAGS_memtable_batch_lookup_optimization;
+  options.flush_drop_obsolete_point_tombstones =
+      FLAGS_flush_drop_obsolete_point_tombstones;
 
   // Integrated BlobDB
   options.enable_blob_files = FLAGS_enable_blob_files;

@@ -752,6 +752,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
                    memtable_verify_per_key_checksum_on_seek),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"flush_drop_obsolete_point_tombstones",
+         {offsetof(struct MutableCFOptions,
+                   flush_drop_obsolete_point_tombstones),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {kOptNameCompOpts,
          OptionTypeInfo::Struct(
              kOptNameCompOpts, &compression_options_type_info,
@@ -1305,6 +1310,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  paranoid_memory_checks);
   ROCKS_LOG_INFO(log, "memtable_verify_per_key_checksum_on_seek: %d",
                  memtable_verify_per_key_checksum_on_seek);
+  ROCKS_LOG_INFO(log, "    flush_drop_obsolete_point_tombstones: %d",
+                 flush_drop_obsolete_point_tombstones);
   std::string result;
   char buf[10];
   for (const auto m : max_bytes_for_level_multiplier_additional) {

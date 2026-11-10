@@ -7,17 +7,26 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <limits>
+#include <map>
 #include <mutex>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
+#include "db/table_cache.h"
 #include "env/mock_env.h"
 #include "file/filename.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
+#include "rocksdb/secondary_cache.h"
+#include "rocksdb/utilities/debug.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "table/block_based/block_based_table_builder.h"
 #include "table/format.h"
@@ -4449,6 +4458,1257 @@ TEST_F(DBFlushTest, FlushAfterReadPathRangeTombstoneInsertion) {
   ASSERT_EQ(Get("b"), "NOT_FOUND");
   ASSERT_EQ(Get("d"), "NOT_FOUND");
   ASSERT_EQ(Get("f"), "vf");
+}
+
+// Tests for flush_drop_obsolete_point_tombstones.
+class DBFlushDropObsoletePointTombstonesTest : public DBFlushTest {
+ protected:
+  Options OptionsWithFlushDrop(bool enabled) {
+    Options options = CurrentOptions();
+    options.create_if_missing = true;
+    options.disable_auto_compactions = true;
+    options.statistics = CreateDBStatistics();
+    options.flush_drop_obsolete_point_tombstones = enabled;
+    return options;
+  }
+
+  // OptionsWithFlushDrop(/*enabled=*/true) with a block-based table using
+  // `table_options`.
+  Options OptionsWithFlushDropAndTable(
+      const BlockBasedTableOptions& table_options) {
+    Options options = OptionsWithFlushDrop(/*enabled=*/true);
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    return options;
+  }
+
+  // OptionsWithFlushDrop(/*enabled=*/true), letting up to `max_flushes`
+  // flushes of a column family run at the same time.
+  Options OptionsWithConcurrentFlushes(int max_flushes) {
+    Options options = OptionsWithFlushDrop(/*enabled=*/true);
+    options.max_write_buffer_number = 4;
+    options.max_background_flushes = max_flushes;
+    env_->SetBackgroundThreads(max_flushes, Env::HIGH);
+    return options;
+  }
+
+  static BlockBasedTableOptions BloomTableOptions() {
+    BlockBasedTableOptions table_options;
+    table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+    return table_options;
+  }
+
+  // A filter of 2-byte key prefixes only.
+  Options PrefixFilterOptions() {
+    BlockBasedTableOptions table_options = BloomTableOptions();
+    table_options.whole_key_filtering = false;
+    Options options = OptionsWithFlushDropAndTable(table_options);
+    options.prefix_extractor.reset(NewFixedPrefixTransform(2));
+    return options;
+  }
+
+  // Writes each key with value "v" + key and flushes them into one SST file.
+  void WriteSstFile(const std::vector<std::string>& keys) {
+    for (const std::string& key : keys) {
+      ASSERT_OK(Put(key, "v" + key));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  // Deletes each key and flushes.
+  void DeleteAndFlush(const std::vector<std::string>& keys) {
+    for (const std::string& key : keys) {
+      ASSERT_OK(Delete(key));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  // Every stored version in `cfh`, as "<user key>:<type name>", in internal
+  // key order.
+  std::vector<std::string> KeyVersions(ColumnFamilyHandle* cfh) {
+    std::vector<KeyVersion> versions;
+    EXPECT_OK(GetAllKeyVersions(db_.get(), cfh, {}, {},
+                                std::numeric_limits<size_t>::max(), &versions));
+    std::vector<std::string> result;
+    result.reserve(versions.size());
+    for (const KeyVersion& v : versions) {
+      result.push_back(v.user_key + ":" + v.GetTypeName());
+    }
+    return result;
+  }
+
+  // The live SST files, in order of smallest key.
+  std::vector<LiveFileMetaData> LiveFilesBySmallestKey() {
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    std::sort(files.begin(), files.end(),
+              [](const LiveFileMetaData& x, const LiveFileMetaData& y) {
+                return x.smallestkey < y.smallestkey;
+              });
+    return files;
+  }
+
+  // KeyVersions() of the default column family.
+  std::vector<std::string> KeyVersions() {
+    return KeyVersions(db_->DefaultColumnFamily());
+  }
+
+  // KeyVersions() after WriteSstFile({"a", "z"}) and a flush that kept the
+  // point tombstone for "m".
+  const std::vector<std::string> kKeptMBetweenAAndZ = {
+      "a:TypeValue", "m:TypeDeletion", "z:TypeValue"};
+
+  uint64_t DroppedTicker() {
+    return TestGetTickerCount(last_options_,
+                              FLUSH_OBSOLETE_POINT_TOMBSTONES_DROPPED);
+  }
+
+  uint64_t SkippedTicker() {
+    return TestGetTickerCount(last_options_,
+                              FLUSH_OBSOLETE_POINT_TOMBSTONE_DROP_SKIPPED);
+  }
+
+  // Checks reads of `cfh` through `db` with `read_options`: a full scan returns
+  // exactly `live` (user key -> value), Get() returns each of those values,
+  // and Get() finds none of the keys in `deleted`.
+  static void ExpectReads(DB* db, ColumnFamilyHandle* cfh,
+                          const ReadOptions& read_options,
+                          const std::map<std::string, std::string>& live,
+                          const std::vector<std::string>& deleted) {
+    std::map<std::string, std::string> scanned;
+    std::unique_ptr<Iterator> iter(db->NewIterator(read_options, cfh));
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      scanned[iter->key().ToString()] = iter->value().ToString();
+    }
+    EXPECT_OK(iter->status());
+    EXPECT_EQ(scanned, live);
+    for (const auto& [key, value] : live) {
+      std::string actual;
+      EXPECT_OK(db->Get(read_options, cfh, key, &actual)) << key;
+      EXPECT_EQ(actual, value) << key;
+    }
+    for (const std::string& key : deleted) {
+      std::string actual;
+      EXPECT_EQ(db->Get(read_options, cfh, key, &actual).code(),
+                Status::Code::kNotFound)
+          << key;
+    }
+  }
+
+  // ExpectReads() on db_ with default read options.
+  void ExpectReads(ColumnFamilyHandle* cfh,
+                   const std::map<std::string, std::string>& live,
+                   const std::vector<std::string>& deleted) {
+    ExpectReads(db_.get(), cfh, ReadOptions(), live, deleted);
+  }
+
+  static FlushOptions NoWaitFlushOptions() {
+    FlushOptions options;
+    options.wait = false;
+    options.allow_write_stall = true;
+    return options;
+  }
+
+  // Holds the flush jobs that build SST files from now on, each after it has
+  // picked its memtables. The first ("older") job waits until the second
+  // ("newer") job has picked its own; before starting that newer flush, the
+  // test waits for the older job's pick with
+  // TEST_SYNC_POINT("FlushDrop:WriteNewerMemtable"). The newer job then passes
+  // "FlushDrop:ReleaseNewerFlush", and any later job passes
+  // "FlushDrop:LaterFlushPicked"; these only wait if `extra_dependencies`
+  // make them.
+  void HoldOlderFlushUntilNewerFlushPicks(
+      const std::vector<SyncPoint::SyncPointPair>& extra_dependencies) {
+    SyncPoint::GetInstance()->SetCallBack(
+        "FlushJob::WriteLevel0Table:num_memtables", [this](void* /*arg*/) {
+          const int job = num_flush_jobs_.fetch_add(1);
+          if (job == 0) {
+            TEST_SYNC_POINT("FlushDrop:OlderFlushPicked");
+            TEST_SYNC_POINT("FlushDrop:ReleaseOlderFlush");
+          } else if (job == 1) {
+            TEST_SYNC_POINT("FlushDrop:NewerFlushPicked");
+            TEST_SYNC_POINT("FlushDrop:ReleaseNewerFlush");
+          } else {
+            TEST_SYNC_POINT("FlushDrop:LaterFlushPicked");
+          }
+        });
+    std::vector<SyncPoint::SyncPointPair> dependencies = {
+        {"FlushDrop:OlderFlushPicked", "FlushDrop:WriteNewerMemtable"},
+        {"FlushDrop:NewerFlushPicked", "FlushDrop:ReleaseOlderFlush"}};
+    dependencies.insert(dependencies.end(), extra_dependencies.begin(),
+                        extra_dependencies.end());
+    SyncPoint::GetInstance()->LoadDependency(dependencies);
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+
+  void HoldOlderFlushUntilNewerFlushPicks() {
+    HoldOlderFlushUntilNewerFlushPicks(/*extra_dependencies=*/{});
+  }
+
+  static void ClearSyncPoints() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+
+  // Flush jobs that reached WriteLevel0Table under
+  // HoldOlderFlushUntilNewerFlushPicks().
+  std::atomic<int> num_flush_jobs_{0};
+};
+
+// Counts the inserts into a secondary cache, and the lookups of keys that it
+// was asked to insert before.
+class KeyTrackingSecondaryCache : public SecondaryCacheWrapper {
+ public:
+  explicit KeyTrackingSecondaryCache(std::shared_ptr<SecondaryCache> target)
+      : SecondaryCacheWrapper(std::move(target)) {}
+
+  const char* Name() const override { return "KeyTrackingSecondaryCache"; }
+
+  Status Insert(const Slice& key, Cache::ObjectPtr obj,
+                const Cache::CacheItemHelper* helper,
+                bool force_insert) override {
+    RecordInsert(key);
+    return SecondaryCacheWrapper::Insert(key, obj, helper, force_insert);
+  }
+
+  Status InsertSaved(const Slice& key, const Slice& saved, CompressionType type,
+                     CacheTier source) override {
+    RecordInsert(key);
+    return SecondaryCacheWrapper::InsertSaved(key, saved, type, source);
+  }
+
+  std::unique_ptr<SecondaryCacheResultHandle> Lookup(
+      const Slice& key, const Cache::CacheItemHelper* helper,
+      Cache::CreateContext* create_context, bool wait, bool advise_erase,
+      Statistics* stats, bool& kept_in_sec_cache) override {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (inserted_keys_.count(key.ToString()) > 0) {
+        ++num_lookups_of_inserted_keys_;
+      }
+    }
+    return SecondaryCacheWrapper::Lookup(key, helper, create_context, wait,
+                                         advise_erase, stats,
+                                         kept_in_sec_cache);
+  }
+
+  uint64_t num_inserts() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return num_inserts_;
+  }
+
+  uint64_t num_lookups_of_inserted_keys() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return num_lookups_of_inserted_keys_;
+  }
+
+ private:
+  void RecordInsert(const Slice& key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    inserted_keys_.insert(key.ToString());
+    ++num_inserts_;
+  }
+
+  mutable std::mutex mutex_;
+  std::set<std::string> inserted_keys_;
+  uint64_t num_inserts_ = 0;
+  uint64_t num_lookups_of_inserted_keys_ = 0;
+};
+
+// Removes, at flush, every value equal to "remove" (turning it into a
+// kTypeDeletion).
+class RemoveMarkedValuesAtFlushFactory : public CompactionFilterFactory {
+ public:
+  std::unique_ptr<CompactionFilter> CreateCompactionFilter(
+      const CompactionFilter::Context& /*context*/) override {
+    return std::make_unique<RemoveMarkedValueFilter>();
+  }
+
+  bool ShouldFilterTableFileCreation(
+      TableFileCreationReason reason) const override {
+    return reason == TableFileCreationReason::kFlush;
+  }
+
+  const char* Name() const override {
+    return "RemoveMarkedValuesAtFlushFactory";
+  }
+
+ private:
+  class RemoveMarkedValueFilter : public CompactionFilter {
+   public:
+    bool Filter(int /*level*/, const Slice& /*key*/, const Slice& value,
+                std::string* /*new_value*/,
+                bool* /*value_changed*/) const override {
+      return value == "remove";
+    }
+
+    const char* Name() const override { return "RemoveMarkedValueFilter"; }
+  };
+};
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest, OptionOffKeepsPointTombstones) {
+  DestroyAndReopen(OptionsWithFlushDrop(/*enabled=*/false));
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Flush());
+
+  EXPECT_EQ(KeyVersions(),
+            (std::vector<std::string>{"a:TypeDeletion", "b:TypeDeletion"}));
+  EXPECT_EQ(DroppedTicker(), 0);
+  EXPECT_EQ(SkippedTicker(), 0);
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       PutAndDeleteInOneMemtableLeaveNothing) {
+  DestroyAndReopen(OptionsWithFlushDrop(/*enabled=*/true));
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Flush());
+
+  EXPECT_EQ(KeyVersions(), std::vector<std::string>{});
+  EXPECT_EQ(NumTableFilesAtLevel(0), 0);
+  EXPECT_EQ(DroppedTicker(), 2);
+  EXPECT_EQ(SkippedTicker(), 0);
+  EXPECT_EQ(Get("a"), "NOT_FOUND");
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       DropsOnlyKeysOutsideEverySstKeyRange) {
+  DestroyAndReopen(OptionsWithFlushDrop(/*enabled=*/true));
+  // L2: [b, c] [f, g]. L1: [m, n]. L0: [p, q] [x, x].
+  ASSERT_OK(Put("b", "v"));
+  ASSERT_OK(Put("c", "v"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_OK(Put("f", "v"));
+  ASSERT_OK(Put("g", "v"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_OK(Put("m", "v"));
+  ASSERT_OK(Put("n", "v"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_OK(Put("p", "v"));
+  ASSERT_OK(Put("q", "v"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("x", "v"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(FilesPerLevel(), "2,1,2");
+
+  // Inside a file's range: f, m, pp, x. Outside every range: a, d, h, o, r, y.
+  for (const char* key : {"a", "d", "f", "h", "m", "o", "pp", "r", "x", "y"}) {
+    ASSERT_OK(Delete(key));
+  }
+  ASSERT_OK(Flush());
+
+  EXPECT_EQ(KeyVersions(),
+            (std::vector<std::string>{
+                "b:TypeValue", "c:TypeValue", "f:TypeDeletion", "f:TypeValue",
+                "g:TypeValue", "m:TypeDeletion", "m:TypeValue", "n:TypeValue",
+                "p:TypeValue", "pp:TypeDeletion", "q:TypeValue",
+                "x:TypeDeletion", "x:TypeValue"}));
+  EXPECT_EQ(DroppedTicker(), 6);
+  EXPECT_EQ(SkippedTicker(), 0);
+  EXPECT_EQ(Get("b"), "v");
+  EXPECT_EQ(Get("f"), "NOT_FOUND");
+  EXPECT_EQ(Get("m"), "NOT_FOUND");
+  EXPECT_EQ(Get("x"), "NOT_FOUND");
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       KeepsPointTombstoneNewerThanSnapshot) {
+  DestroyAndReopen(OptionsWithFlushDrop(/*enabled=*/true));
+  ASSERT_OK(Delete("a"));
+  ManagedSnapshot snapshot(db_.get());
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Flush());
+
+  EXPECT_EQ(KeyVersions(), std::vector<std::string>{"b:TypeDeletion"});
+  EXPECT_EQ(DroppedTicker(), 1);
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest, IngestBehindKeepsTombstones) {
+  Options options = OptionsWithFlushDrop(/*enabled=*/true);
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 3;
+  options.cf_allow_ingest_behind = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Flush());
+
+  EXPECT_EQ(KeyVersions(),
+            (std::vector<std::string>{"a:TypeDeletion", "b:TypeDeletion"}));
+  EXPECT_EQ(DroppedTicker(), 0);
+  EXPECT_EQ(SkippedTicker(), 1);
+}
+
+// A flush that runs while an older memtable of the same column family is still
+// being flushed must keep its point tombstones: the older memtable's data is
+// in neither the newer flush's input nor its Version.
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       KeepsTombstonesWhileOlderMemtableFlushes) {
+  DestroyAndReopen(OptionsWithConcurrentFlushes(/*max_flushes=*/2));
+  HoldOlderFlushUntilNewerFlushPicks();
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(db_->Flush(NoWaitFlushOptions()));
+  TEST_SYNC_POINT("FlushDrop:WriteNewerMemtable");
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(db_->Flush(NoWaitFlushOptions()));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ClearSyncPoints();
+
+  EXPECT_EQ(num_flush_jobs_.load(), 2);
+  EXPECT_EQ(KeyVersions(),
+            (std::vector<std::string>{"a:TypeDeletion", "a:TypeValue"}));
+  ExpectReads(db_->DefaultColumnFamily(), {}, {"a"});
+  EXPECT_EQ(DroppedTicker(), 0);
+  EXPECT_EQ(SkippedTicker(), 1);
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest, SetOptionsTogglesDrop) {
+  DestroyAndReopen(OptionsWithFlushDrop(/*enabled=*/false));
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(
+      dbfull()->SetOptions({{"flush_drop_obsolete_point_tombstones", "true"}}));
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->SetOptions(
+      {{"flush_drop_obsolete_point_tombstones", "false"}}));
+  ASSERT_OK(Delete("c"));
+  ASSERT_OK(Flush());
+
+  EXPECT_EQ(KeyVersions(),
+            (std::vector<std::string>{"a:TypeDeletion", "c:TypeDeletion"}));
+  EXPECT_EQ(DroppedTicker(), 1);
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest, SingleDeleteUnaffected) {
+  DestroyAndReopen(OptionsWithFlushDrop(/*enabled=*/true));
+  ASSERT_OK(SingleDelete("a"));
+  ASSERT_OK(Flush());
+
+  EXPECT_EQ(KeyVersions(), std::vector<std::string>{"a:TypeSingleDeletion"});
+  EXPECT_EQ(DroppedTicker(), 0);
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest, TimestampedDeleteUnaffected) {
+  Options options = OptionsWithFlushDrop(/*enabled=*/true);
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  DestroyAndReopen(options);
+  std::string ts;
+  PutFixed64(&ts, 1);
+  ASSERT_OK(db_->Delete(WriteOptions(), db_->DefaultColumnFamily(), "a", ts));
+  // With the delete's timestamp below full_history_ts_low, the flush considers
+  // it for dropping like a plain point tombstone.
+  std::string ts_low;
+  PutFixed64(&ts_low, 2);
+  ASSERT_OK(db_->IncreaseFullHistoryTsLow(db_->DefaultColumnFamily(), ts_low));
+  ASSERT_OK(Flush());
+
+  EXPECT_EQ(KeyVersions(),
+            std::vector<std::string>{"a" + ts + ":TypeDeletionWithTimestamp"});
+  EXPECT_EQ(DroppedTicker(), 0);
+  // A column family with user-defined timestamps counts as skipped.
+  EXPECT_EQ(SkippedTicker(), 1);
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest, TimedPutUnaffected) {
+  DestroyAndReopen(OptionsWithFlushDrop(/*enabled=*/true));
+  ASSERT_OK(Put("x", "vx"));
+  ASSERT_OK(TimedPut("a", "va", /*write_unix_time=*/12345));
+  const SequenceNumber timed_put_seq = db_->GetLatestSequenceNumber();
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Flush());
+
+  std::vector<KeyVersion> versions;
+  ASSERT_OK(GetAllKeyVersions(db_.get(), {}, {},
+                              std::numeric_limits<size_t>::max(), &versions));
+  ASSERT_EQ(versions.size(), 2);
+  EXPECT_EQ(versions[0].user_key, "a");
+  EXPECT_EQ(versions[0].GetTypeName(), "TypeValue");
+  EXPECT_EQ(versions[0].sequence, timed_put_seq);
+  EXPECT_EQ(versions[0].value, "va");
+  EXPECT_EQ(versions[1].user_key, "x");
+  EXPECT_EQ(DroppedTicker(), 1);
+  EXPECT_EQ(Get("a"), "va");
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest, FilterProvesInRangeKeyAbsent) {
+  for (bool use_ribbon : {false, true}) {
+    SCOPED_TRACE(use_ribbon ? "Ribbon" : "Bloom");
+    BlockBasedTableOptions table_options;
+    table_options.filter_policy.reset(use_ribbon ? NewRibbonFilterPolicy(10)
+                                                 : NewBloomFilterPolicy(10));
+    DestroyAndReopen(OptionsWithFlushDropAndTable(table_options));
+    // L1: [b, y]. L0: [a, z].
+    WriteSstFile({"b", "y"});
+    MoveFilesToLevel(1);
+    WriteSstFile({"a", "c", "z"});
+    ASSERT_EQ(FilesPerLevel(), "1,1");
+
+    // "m" is inside both files' ranges but in neither file. "b" is in the L1
+    // file and "c" in the L0 file.
+    DeleteAndFlush({"b", "c", "m"});
+
+    EXPECT_EQ(KeyVersions(), (std::vector<std::string>{
+                                 "a:TypeValue", "b:TypeDeletion", "b:TypeValue",
+                                 "c:TypeDeletion", "c:TypeValue", "y:TypeValue",
+                                 "z:TypeValue"}));
+    EXPECT_EQ(DroppedTicker(), 1);
+    EXPECT_EQ(Get("b"), "NOT_FOUND");
+    EXPECT_EQ(Get("c"), "NOT_FOUND");
+    EXPECT_EQ(Get("m"), "NOT_FOUND");
+    EXPECT_EQ(Get("a"), "va");
+    EXPECT_EQ(Get("y"), "vy");
+  }
+}
+
+// Adjacent files in a level below L0 can share a boundary user key. Here a
+// range tombstone ends file 1 at "k" without file 1 holding "k" (so file 1's
+// filter rejects it), while the next file starts with a value for "k". The
+// point tombstone for "k" must be kept.
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       KeepsKeyAtSharedBoundaryOfFilesInOneLevel) {
+  Options options = OptionsWithFlushDropAndTable(BloomTableOptions());
+  // Compaction cuts its output between keys with different first bytes.
+  options.sst_partitioner_factory = NewSstPartitionerFixedPrefixFactory(1);
+  DestroyAndReopen(options);
+  WriteSstFile({"a", "k"});
+  {
+    // The snapshot keeps the range tombstone through the bottommost compaction.
+    ManagedSnapshot snapshot(db_.get());
+    ASSERT_OK(
+        db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "b", "k"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  }
+  const std::vector<LiveFileMetaData> files = LiveFilesBySmallestKey();
+  ASSERT_EQ(files.size(), 2);
+  ASSERT_GT(files[0].level, 0);
+  ASSERT_EQ(files[0].level, files[1].level);
+  ASSERT_EQ(files[0].smallestkey, "a");
+  ASSERT_EQ(files[0].largestkey, "k");
+  ASSERT_EQ(files[1].smallestkey, "k");
+
+  DeleteAndFlush({"k"});
+
+  EXPECT_EQ(Get("k"), "NOT_FOUND");
+  EXPECT_EQ(KeyVersions(),
+            (std::vector<std::string>{"a:TypeValue", "k:TypeDeletion",
+                                      "k:TypeValue"}));
+  EXPECT_EQ(DroppedTicker(), 0);
+}
+
+// Without a usable filter, only key ranges count: a block-based table without
+// a filter policy, or a table format whose own filter the absence proof does
+// not use.
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       FallsBackToKeyRangesWithoutUsableFilter) {
+  Options plain_table_options = OptionsWithFlushDrop(/*enabled=*/true);
+  plain_table_options.table_factory.reset(NewPlainTableFactory());
+  plain_table_options.prefix_extractor.reset(NewNoopTransform());
+  plain_table_options.allow_mmap_reads = true;
+  const std::vector<std::pair<std::string, Options>> cases = {
+      {"BlockBasedTableWithoutFilter",
+       OptionsWithFlushDropAndTable(BlockBasedTableOptions())},
+      {"PlainTable", plain_table_options}};
+  for (const auto& [name, options] : cases) {
+    SCOPED_TRACE(name);
+    // The encrypted env does not support mmap reads. MockEnv's do not fill
+    // the caller's buffer, which reading the MANIFEST at DB open relies on.
+    if (options.allow_mmap_reads &&
+        (!IsMemoryMappedAccessSupported() || mem_env_ != nullptr)) {
+      ROCKSDB_GTEST_BYPASS("Memory-mapped reads not supported by this env");
+      continue;
+    }
+    DestroyAndReopen(options);
+    WriteSstFile({"a", "z"});
+
+    DeleteAndFlush({"m", "zz"});
+
+    EXPECT_EQ(KeyVersions(), kKeptMBetweenAAndZ);
+    EXPECT_EQ(DroppedTicker(), 1);
+    EXPECT_EQ(Get("m"), "NOT_FOUND");
+  }
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest, PrefixFilterProvesPrefixAbsent) {
+  DestroyAndReopen(PrefixFilterOptions());
+  WriteSstFile({"aa1", "zz1"});
+
+  // The file holds prefixes "aa" and "zz" only. "m" is outside the prefix
+  // extractor's domain.
+  DeleteAndFlush({"aa2", "m", "mm1"});
+
+  EXPECT_EQ(KeyVersions(),
+            (std::vector<std::string>{"aa1:TypeValue", "aa2:TypeDeletion",
+                                      "m:TypeDeletion", "zz1:TypeValue"}));
+  EXPECT_EQ(DroppedTicker(), 1);
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       PrefixFilterUnusedAfterPrefixExtractorChange) {
+  DestroyAndReopen(PrefixFilterOptions());
+  WriteSstFile({"aa1", "zz1"});
+
+  // The file was built with another prefix extractor than the current one.
+  ASSERT_OK(dbfull()->SetOptions({{"prefix_extractor", "fixed:3"}}));
+  DeleteAndFlush({"mmm"});
+  EXPECT_EQ(DroppedTicker(), 0);
+
+  // Back to the file's prefix extractor.
+  ASSERT_OK(dbfull()->SetOptions({{"prefix_extractor", "fixed:2"}}));
+  DeleteAndFlush({"nn1"});
+
+  EXPECT_EQ(KeyVersions(),
+            (std::vector<std::string>{"aa1:TypeValue", "mmm:TypeDeletion",
+                                      "zz1:TypeValue"}));
+  EXPECT_EQ(DroppedTicker(), 1);
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       KeepsKeyInBottommostFileWithoutFilter) {
+  Options options = OptionsWithFlushDropAndTable(BloomTableOptions());
+  options.optimize_filters_for_hits = true;
+  DestroyAndReopen(options);
+  WriteSstFile({"a", "z"});
+  // The bottommost compaction output gets no filter.
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  TablePropertiesCollection props;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+  ASSERT_EQ(props.size(), 1);
+  ASSERT_EQ(props.begin()->second->filter_size, 0);
+
+  DeleteAndFlush({"m"});
+
+  EXPECT_EQ(KeyVersions(), kKeptMBetweenAAndZ);
+  EXPECT_EQ(DroppedTicker(), 0);
+}
+
+// With cache_index_and_filter_blocks, only a filter that is in the block cache
+// is used, and the flush never reads the older file. That file is on the last
+// level and was opened there, so its reads count as LAST_LEVEL_READ_*, while
+// the flush output's reads do not.
+TEST_F(DBFlushDropObsoletePointTombstonesTest, UsesOnlyCachedFilterBlocks) {
+  BlockBasedTableOptions table_options = BloomTableOptions();
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.block_cache = NewLRUCache(8 << 20);
+  Options options = OptionsWithFlushDropAndTable(table_options);
+  DestroyAndReopen(options);
+  WriteSstFile({"a", "z"});
+  MoveFilesToLevel(options.num_levels - 1);
+  Reopen(options);
+  auto last_level_reads = [&]() {
+    return std::make_pair(TestGetTickerCount(options, LAST_LEVEL_READ_COUNT),
+                          TestGetTickerCount(options, LAST_LEVEL_READ_BYTES));
+  };
+
+  // Filter not in the block cache: "m" is kept, with no read.
+  table_options.block_cache->EraseUnRefEntries();
+  const std::pair<uint64_t, uint64_t> reads_before_first = last_level_reads();
+  DeleteAndFlush({"m"});
+  EXPECT_EQ(last_level_reads(), reads_before_first);
+  EXPECT_EQ(DroppedTicker(), 0);
+
+  // A Get() caches the filter. "n" is outside the L0 file holding "m".
+  EXPECT_EQ(Get("n"), "NOT_FOUND");
+  const std::pair<uint64_t, uint64_t> reads_before_second = last_level_reads();
+  ASSERT_GT(reads_before_second.first, reads_before_first.first);
+
+  // Filter in the block cache: "o" is dropped, with no read.
+  DeleteAndFlush({"o"});
+  EXPECT_EQ(last_level_reads(), reads_before_second);
+  EXPECT_EQ(DroppedTicker(), 1);
+  EXPECT_EQ(KeyVersions(), kKeptMBetweenAAndZ);
+  EXPECT_EQ(Get("m"), "NOT_FOUND");
+}
+
+// With a secondary cache, only the primary block cache tier is consulted: a
+// filter block that is only in the secondary cache counts as missing, and the
+// flush neither looks it up in the secondary cache nor inserts anything there.
+TEST_F(DBFlushDropObsoletePointTombstonesTest, IgnoresSecondaryCache) {
+  CompressedSecondaryCacheOptions secondary_cache_options;
+  secondary_cache_options.capacity = 8 << 20;
+  secondary_cache_options.compression_type = kNoCompression;
+  const std::shared_ptr<KeyTrackingSecondaryCache> secondary_cache =
+      std::make_shared<KeyTrackingSecondaryCache>(
+          secondary_cache_options.MakeSharedSecondaryCache());
+  LRUCacheOptions cache_options;
+  cache_options.capacity = 8 << 20;
+  cache_options.secondary_cache = secondary_cache;
+  BlockBasedTableOptions table_options = BloomTableOptions();
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.block_cache = cache_options.MakeSharedCache();
+  DestroyAndReopen(OptionsWithFlushDropAndTable(table_options));
+  WriteSstFile({"a", "z"});
+  // Evicting everything from the primary tier moves the file's index and
+  // filter blocks to the secondary cache.
+  table_options.block_cache->SetCapacity(0);
+  table_options.block_cache->SetCapacity(cache_options.capacity);
+  const uint64_t inserts_before = secondary_cache->num_inserts();
+  ASSERT_GT(inserts_before, 0);
+  ASSERT_EQ(secondary_cache->num_lookups_of_inserted_keys(), 0);
+
+  DeleteAndFlush({"m"});
+
+  EXPECT_EQ(secondary_cache->num_lookups_of_inserted_keys(), 0);
+  EXPECT_EQ(secondary_cache->num_inserts(), inserts_before);
+  EXPECT_EQ(DroppedTicker(), 0);
+  // A Get() of a key in the older file's range looks up its filter block in
+  // the secondary cache.
+  EXPECT_EQ(Get("n"), "NOT_FOUND");
+  EXPECT_GT(secondary_cache->num_lookups_of_inserted_keys(), 0);
+  EXPECT_EQ(KeyVersions(), kKeptMBetweenAAndZ);
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       KeepsKeyInFileWithoutOpenTableReader) {
+  Options options = OptionsWithFlushDropAndTable(BloomTableOptions());
+  options.max_open_files = 20;
+  DestroyAndReopen(options);
+  // New files' table readers are pinned to their metadata only while the table
+  // cache is less than a quarter full, so with this capacity they never are,
+  // and evicting a reader from the table cache closes it.
+  dbfull()->TEST_table_cache()->SetCapacity(3);
+  WriteSstFile({"a", "z"});
+  const std::vector<LiveFileMetaData> files = LiveFilesBySmallestKey();
+  ASSERT_EQ(files.size(), 1);
+  TableCache::Evict(dbfull()->TEST_table_cache(), files[0].file_number);
+
+  // Only the flush output is opened.
+  const uint64_t opens_before = TestGetTickerCount(options, NO_FILE_OPENS);
+  DeleteAndFlush({"m"});
+  EXPECT_EQ(TestGetTickerCount(options, NO_FILE_OPENS), opens_before + 1);
+  EXPECT_EQ(DroppedTicker(), 0);
+
+  // Once a Get() has opened the table reader again, its filter is used.
+  EXPECT_EQ(Get("n"), "NOT_FOUND");
+  DeleteAndFlush({"o"});
+  EXPECT_EQ(DroppedTicker(), 1);
+  EXPECT_EQ(KeyVersions(), kKeptMBetweenAAndZ);
+}
+
+// A flush looks up each file's table reader in the table cache at most once,
+// however many point tombstones fall in the file's key range, both when the
+// reader is open and when it is not (the file then counts as possibly holding
+// every key for the rest of the flush).
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       LooksUpEachTableReaderOncePerFlush) {
+  Options options = OptionsWithFlushDropAndTable(BloomTableOptions());
+  options.max_open_files = 20;
+  DestroyAndReopen(options);
+  // Table readers are never pinned to their metadata (see
+  // KeepsKeyInFileWithoutOpenTableReader), so each check of a file looks up
+  // its table reader in the table cache unless the flush remembers it.
+  dbfull()->TEST_table_cache()->SetCapacity(3);
+  WriteSstFile({"a", "z"});
+  const std::vector<LiveFileMetaData> files = LiveFilesBySmallestKey();
+  ASSERT_EQ(files.size(), 1);
+  // Table cache lookups that may not open a table reader, until the flush
+  // has built its output (installing it looks up the output's reader too).
+  std::atomic<int> no_io_lookups{0};
+  std::atomic<int> no_io_lookups_while_building{-1};
+  SyncPoint::GetInstance()->SetCallBack("TableCache::FindTable:0",
+                                        [&](void* arg) {
+                                          if (*static_cast<bool*>(arg)) {
+                                            no_io_lookups.fetch_add(1);
+                                          }
+                                        });
+  SyncPoint::GetInstance()->SetCallBack(
+      "FlushJob::WriteLevel0Table:s", [&](void* /*arg*/) {
+        no_io_lookups_while_building.store(no_io_lookups.load());
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Table reader not open: every tombstone is kept.
+  TableCache::Evict(dbfull()->TEST_table_cache(), files[0].file_number);
+  DeleteAndFlush({"c", "d", "e", "f", "g"});
+  EXPECT_EQ(no_io_lookups_while_building.load(), 1);
+  EXPECT_EQ(DroppedTicker(), 0);
+
+  // Table reader open (a Get() opened it): every tombstone is dropped. The
+  // previous flush's output, [c, g], covers none of these keys.
+  EXPECT_EQ(Get("n"), "NOT_FOUND");
+  no_io_lookups.store(0);
+  DeleteAndFlush({"h", "i", "j", "k", "l"});
+  EXPECT_EQ(no_io_lookups_while_building.load(), 1);
+  EXPECT_EQ(DroppedTicker(), 5);
+  ClearSyncPoints();
+}
+
+// Once a flush's keys have passed the key range of a file below L0, the flush
+// stops referencing that file's table reader, so that the table cache can
+// evict it while the flush goes on.
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       ReleasesTableReadersOfPassedFiles) {
+  Options options = OptionsWithFlushDropAndTable(BloomTableOptions());
+  options.max_open_files = 20;
+  // One table cache shard, holding up to three readers.
+  options.table_cache_numshardbits = 0;
+  DestroyAndReopen(options);
+  // Table readers are never pinned to their metadata (see
+  // KeepsKeyInFileWithoutOpenTableReader), so only lookups reference them.
+  Cache* const table_cache = dbfull()->TEST_table_cache();
+  table_cache->SetCapacity(3);
+  // L1: [a, f] [m, s].
+  WriteSstFile({"a", "f"});
+  MoveFilesToLevel(1);
+  WriteSstFile({"m", "s"});
+  MoveFilesToLevel(1);
+  ASSERT_EQ(FilesPerLevel(), "0,2");
+  const std::vector<LiveFileMetaData> files = LiveFilesBySmallestKey();
+  ASSERT_EQ(files.size(), 2);
+  // Open both table readers.
+  EXPECT_EQ(Get("b"), "NOT_FOUND");
+  EXPECT_EQ(Get("n"), "NOT_FOUND");
+  // For each L1 file, whether its table reader is still referenced once the
+  // flush has built its output, before it lets go of its absence proof.
+  std::vector<bool> referenced_after_build;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FlushJob::WriteLevel0Table:s", [&](void* /*arg*/) {
+        // Only the readers that something references stay in the cache.
+        table_cache->EraseUnRefEntries();
+        for (const LiveFileMetaData& file : files) {
+          Cache::Handle* const handle =
+              TableCache::Lookup(table_cache, file.file_number);
+          referenced_after_build.push_back(handle != nullptr);
+          if (handle != nullptr) {
+            table_cache->Release(handle);
+          }
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // "a" and "b" fall in [a, f] only, then "m" and "n" in [m, s] only.
+  DeleteAndFlush({"a", "b", "m", "n"});
+  ClearSyncPoints();
+
+  EXPECT_EQ(referenced_after_build, (std::vector<bool>{false, true}));
+  EXPECT_EQ(DroppedTicker(), 2);
+  EXPECT_EQ(KeyVersions(),
+            (std::vector<std::string>{"a:TypeDeletion", "a:TypeValue",
+                                      "f:TypeValue", "m:TypeDeletion",
+                                      "m:TypeValue", "s:TypeValue"}));
+  ExpectReads(db_->DefaultColumnFamily(), {{"f", "vf"}, {"s", "vs"}},
+              {"a", "b", "m", "n"});
+}
+
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       PartitionedFilterNeedsPartitionInCache) {
+  BlockBasedTableOptions table_options = BloomTableOptions();
+  table_options.partition_filters = true;
+  table_options.index_type = BlockBasedTableOptions::kTwoLevelIndexSearch;
+  table_options.metadata_block_size = 64;  // A few dozen keys per partition
+  table_options.block_cache = NewLRUCache(8 << 20);
+  DestroyAndReopen(OptionsWithFlushDropAndTable(table_options));
+  std::vector<std::string> even_keys;
+  for (int i = 0; i < 1000; i += 2) {
+    even_keys.push_back(Key(i));
+  }
+  WriteSstFile(even_keys);
+
+  // Only the filter partition covering the first keys is in the block cache.
+  table_options.block_cache->EraseUnRefEntries();
+  EXPECT_EQ(Get(Key(1)), "NOT_FOUND");
+  DeleteAndFlush({Key(3), Key(997)});
+
+  std::vector<std::string> tombstones;
+  for (const std::string& version : KeyVersions()) {
+    if (version.find(":TypeDeletion") != std::string::npos) {
+      tombstones.push_back(version);
+    }
+  }
+  EXPECT_EQ(tombstones, std::vector<std::string>{Key(997) + ":TypeDeletion"});
+  EXPECT_EQ(DroppedTicker(), 1);
+}
+
+// The absence proof checks the levels below L0 from the bottommost one up, and
+// stops at the first file that may hold the key. With
+// cache_index_and_filter_blocks, checking a file's filter is one block cache
+// lookup of its filter block.
+TEST_F(DBFlushDropObsoletePointTombstonesTest, ChecksBottommostLevelFirst) {
+  BlockBasedTableOptions table_options = BloomTableOptions();
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.block_cache = NewLRUCache(8 << 20);
+  Options options = OptionsWithFlushDropAndTable(table_options);
+  DestroyAndReopen(options);
+  // Bottommost level: [a, z] holding "k". L1: [b, y].
+  WriteSstFile({"a", "k", "z"});
+  MoveFilesToLevel(options.num_levels - 1);
+  WriteSstFile({"b", "y"});
+  MoveFilesToLevel(1);
+  ASSERT_EQ(FilesPerLevel(), "0,1,0,0,0,0,1");
+  auto filter_lookups = [&]() {
+    return TestGetTickerCount(options, BLOCK_CACHE_FILTER_HIT) +
+           TestGetTickerCount(options, BLOCK_CACHE_FILTER_MISS);
+  };
+  // The filter lookups of a flush that checks no file: its own output file's.
+  uint64_t lookups_before = filter_lookups();
+  WriteSstFile({"zz"});
+  const uint64_t output_file_lookups = filter_lookups() - lookups_before;
+
+  // "k" costs one check, of the bottommost file. "m" is in neither file and
+  // costs one check of each.
+  lookups_before = filter_lookups();
+  DeleteAndFlush({"k", "m"});
+
+  EXPECT_EQ(filter_lookups() - lookups_before, output_file_lookups + 3);
+  EXPECT_EQ(DroppedTicker(), 1);
+  EXPECT_EQ(KeyVersions(),
+            (std::vector<std::string>{
+                "a:TypeValue", "b:TypeValue", "k:TypeDeletion", "k:TypeValue",
+                "y:TypeValue", "z:TypeValue", "zz:TypeValue"}));
+}
+
+// With user-defined timestamps, flushes keep every point tombstone, and count
+// as skipped. Deletes are timestamped, and a compaction filter's removal of a
+// timestamped value becomes a plain point tombstone that hides the key's older
+// timestamps, which the flush keeps as separate entries. Every read is as with
+// the option off.
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       UserDefinedTimestampsReadAsWithOptionOff) {
+  auto ts = [](uint64_t t) {
+    std::string encoded;
+    PutFixed64(&encoded, t);
+    return encoded;
+  };
+  for (bool enabled : {false, true}) {
+    SCOPED_TRACE(enabled ? "option on" : "option off");
+    Options options = OptionsWithFlushDrop(enabled);
+    options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+    options.compaction_filter_factory =
+        std::make_shared<RemoveMarkedValuesAtFlushFactory>();
+    DestroyAndReopen(options);
+    ColumnFamilyHandle* cfh = db_->DefaultColumnFamily();
+    const WriteOptions wo;
+    ASSERT_OK(db_->Put(wo, cfh, "k", ts(1), "vk"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->Put(wo, cfh, "a", ts(2), "va"));
+    ASSERT_OK(db_->Delete(wo, cfh, "a", ts(3)));
+    ASSERT_OK(db_->Delete(wo, cfh, "b", ts(3)));
+    ASSERT_OK(db_->Delete(wo, cfh, "k", ts(3)));
+    ASSERT_OK(db_->Put(wo, cfh, "c", ts(2), "vc"));
+    ASSERT_OK(db_->Put(wo, cfh, "c", ts(4), "remove"));
+    ASSERT_OK(Flush());
+
+    EXPECT_EQ(KeyVersions(),
+              (std::vector<std::string>{
+                  "a" + ts(3) + ":TypeDeletionWithTimestamp",
+                  "a" + ts(2) + ":TypeValue",
+                  "b" + ts(3) + ":TypeDeletionWithTimestamp",
+                  "c" + ts(4) + ":TypeDeletion", "c" + ts(2) + ":TypeValue",
+                  "k" + ts(3) + ":TypeDeletionWithTimestamp",
+                  "k" + ts(1) + ":TypeValue"}));
+    const std::map<uint64_t, std::map<std::string, std::string>>
+        live_by_read_ts = {{5, {}},
+                           {3, {{"c", "vc"}}},
+                           {2, {{"a", "va"}, {"c", "vc"}, {"k", "vk"}}}};
+    for (const auto& [read_ts, live] : live_by_read_ts) {
+      SCOPED_TRACE("read timestamp " + std::to_string(read_ts));
+      const std::string read_ts_str = ts(read_ts);
+      const Slice read_ts_slice(read_ts_str);
+      ReadOptions ro;
+      ro.timestamp = &read_ts_slice;
+      std::vector<std::string> deleted;
+      for (const char* key : {"a", "b", "c", "k"}) {
+        if (live.count(key) == 0) {
+          deleted.emplace_back(key);
+        }
+      }
+      ExpectReads(db_.get(), cfh, ro, live, deleted);
+    }
+    EXPECT_EQ(DroppedTicker(), 0);
+    EXPECT_EQ(SkippedTicker(), enabled ? 2 : 0);
+  }
+}
+
+// In an atomic flush, each column family keeps its point tombstones when an
+// older memtable of that column family is still being flushed. Here an atomic
+// flush of "pikachu" alone is still running when an atomic flush of both
+// column families picks its memtables.
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       AtomicFlushKeepsTombstonesWhileOlderMemtableFlushes) {
+  Options options = OptionsWithConcurrentFlushes(/*max_flushes=*/2);
+  options.atomic_flush = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"pikachu"}, options);
+  ColumnFamilyHandle* default_cf = handles_[0];
+  ColumnFamilyHandle* pikachu = handles_[1];
+  HoldOlderFlushUntilNewerFlushPicks();
+
+  // Only "pikachu" has data, so the first atomic flush covers it alone.
+  ASSERT_OK(Put(1, "a", "va"));
+  ASSERT_OK(db_->Flush(NoWaitFlushOptions(), handles_));
+  TEST_SYNC_POINT("FlushDrop:WriteNewerMemtable");
+  ASSERT_OK(Delete(1, "a"));
+  ASSERT_OK(Put(0, "c", "vc"));
+  ASSERT_OK(Delete(0, "c"));
+  ASSERT_OK(Delete(0, "d"));
+  ASSERT_OK(db_->Flush(NoWaitFlushOptions(), handles_));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable(pikachu));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable(default_cf));
+  ClearSyncPoints();
+
+  EXPECT_EQ(num_flush_jobs_.load(), 3);
+  EXPECT_EQ(KeyVersions(pikachu),
+            (std::vector<std::string>{"a:TypeDeletion", "a:TypeValue"}));
+  EXPECT_EQ(KeyVersions(default_cf), std::vector<std::string>{});
+  ExpectReads(pikachu, {}, {"a"});
+  ExpectReads(default_cf, {}, {"c", "d"});
+  EXPECT_EQ(DroppedTicker(), 2);
+  EXPECT_EQ(SkippedTicker(), 1);
+}
+
+// The output of a MemPurge is an unflushed memtable with older data than any
+// memtable sealed after it. A flush that runs while that output is still being
+// flushed keeps its point tombstones.
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       KeepsTombstonesWhileMemPurgeOutputFlushes) {
+  Options options = OptionsWithConcurrentFlushes(/*max_flushes=*/2);
+  // A memtable is full at four entries, and a flush of a full memtable always
+  // tries MemPurge.
+  options.memtable_factory.reset(test::NewSpecialSkipListFactory(4));
+  options.experimental_mempurge_threshold = 10.0;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"pikachu"}, options);
+  std::atomic<int> num_mempurges{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::FlushJob:MemPurgeSuccessful",
+      [&](void* /*arg*/) { num_mempurges.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("f", "f1"));
+  ASSERT_OK(Put("f", "f2"));
+  ASSERT_OK(Put("f", "vf"));
+  // The next write switches out the full memtable, which is MemPurged into a
+  // new immutable memtable holding "a" and "f". Writing to the other column
+  // family leaves the default column family's mutable memtable empty.
+  ASSERT_OK(Put(1, "x", "vx"));
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  ASSERT_EQ(num_mempurges.load(), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+
+  // A manual flush (never a MemPurge) picks the MemPurge output alone.
+  HoldOlderFlushUntilNewerFlushPicks();
+  ASSERT_OK(db_->Flush(NoWaitFlushOptions()));
+  TEST_SYNC_POINT("FlushDrop:WriteNewerMemtable");
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Delete("f"));
+  ASSERT_OK(Delete("z"));
+  ASSERT_OK(db_->Flush(NoWaitFlushOptions()));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ClearSyncPoints();
+
+  EXPECT_EQ(num_flush_jobs_.load(), 2);
+  EXPECT_EQ(KeyVersions(),
+            (std::vector<std::string>{"a:TypeDeletion", "a:TypeValue",
+                                      "f:TypeDeletion", "f:TypeValue",
+                                      "z:TypeDeletion"}));
+  ExpectReads(db_->DefaultColumnFamily(), {}, {"a", "f", "z"});
+  EXPECT_EQ(DroppedTicker(), 0);
+  EXPECT_EQ(SkippedTicker(), 1);
+}
+
+// A flush fails after building its table and is rolled back, and a later flush
+// picks its memtable again while a flush of a newer memtable is still running.
+// The newer flush picked its memtable while the older one was being flushed,
+// so it keeps its point tombstones. The retry is older than everything it did
+// not pick, so it drops its own obsolete ones. Only installed flushes count in
+// the statistics.
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       KeepsTombstonesWhileFailedOlderFlushIsRetried) {
+  // The failed flush's thread waits a second before it is free again.
+  Options options = OptionsWithConcurrentFlushes(/*max_flushes=*/3);
+  // Without paranoid checks, an I/O error in a flush sets no background error,
+  // so other flushes go on and the failed memtable can be picked again.
+  options.paranoid_checks = false;
+  DestroyAndReopen(options);
+
+  std::atomic<int> num_built{0};
+  // True on the failed flush's thread until that flush has cleaned up.
+  static thread_local bool on_failed_flush_thread = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FlushJob::Run:PostBuildTable", [&](void* arg) {
+        if (num_built.fetch_add(1) == 0) {
+          *static_cast<Status*>(arg) = Status::IOError("injected");
+          on_failed_flush_thread = true;
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCallFlush:ContextCleanedUp", [](void* /*arg*/) {
+        if (on_failed_flush_thread) {
+          on_failed_flush_thread = false;
+          TEST_SYNC_POINT("FlushDrop:FailedFlushCleanedUp");
+        }
+      });
+  // Request the retry only after the failed flush has cleaned up. Its cleanup
+  // scans for obsolete files, and would delete the newer flush's output if it
+  // ran while that output waited for the retry to commit it (with or without
+  // this option).
+  HoldOlderFlushUntilNewerFlushPicks(
+      {{"FlushDrop:FailedFlushCleanedUp", "FlushDrop:RetryOlderMemtable"},
+       {"FlushDrop:LaterFlushPicked", "FlushDrop:ReleaseNewerFlush"}});
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Delete("x"));
+  ASSERT_OK(db_->Flush(NoWaitFlushOptions()));
+  TEST_SYNC_POINT("FlushDrop:WriteNewerMemtable");
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Delete("y"));
+  ASSERT_OK(db_->Flush(NoWaitFlushOptions()));
+  // The first flush fails, is rolled back, and cleans up. Request a flush that
+  // picks its memtable again.
+  TEST_SYNC_POINT("FlushDrop:RetryOlderMemtable");
+  ASSERT_OK(db_->Flush(NoWaitFlushOptions()));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ClearSyncPoints();
+
+  EXPECT_EQ(num_flush_jobs_.load(), 3);
+  EXPECT_EQ(num_built.load(), 3);
+  // Get() of "a" is checked only after compaction. The retry got a newer
+  // epoch number than the newer flush, so point lookups search its L0 file
+  // (holding "va") first and return "va", with or without this option. Scans
+  // merge by sequence number.
+  const std::vector<std::string> expected_versions = {
+      "a:TypeDeletion", "a:TypeValue", "y:TypeDeletion"};
+  EXPECT_EQ(KeyVersions(), expected_versions);
+  ExpectReads(db_->DefaultColumnFamily(), {}, {"x", "y"});
+  // The failed flush also left out "x", but only the retry counts.
+  EXPECT_EQ(DroppedTicker(), 1);
+  EXPECT_EQ(SkippedTicker(), 1);
+
+  Reopen(options);
+  EXPECT_EQ(KeyVersions(), expected_versions);
+  ExpectReads(db_->DefaultColumnFamily(), {}, {"x", "y"});
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  EXPECT_EQ(KeyVersions(), std::vector<std::string>{});
+  ExpectReads(db_->DefaultColumnFamily(), {}, {"a", "x", "y"});
+}
+
+// WAL recovery flushes do not see each other's output (their version edits are
+// applied at the end of recovery), so they keep every point tombstone.
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       WalRecoveryFlushesKeepTombstones) {
+  Options options = OptionsWithFlushDrop(/*enabled=*/true);
+  DestroyAndReopen(options);
+  // Each write is one WAL record, and nothing is flushed before the reopen.
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Put("d", "vd"));
+  ASSERT_OK(Delete("c"));
+  ASSERT_OK(Delete("x"));
+
+  // Recovery flushes a memtable at every third entry and at the end:
+  // {a, b, c}, {-a, -b, d}, {-c, -x}.
+  options.memtable_factory.reset(test::NewSpecialSkipListFactory(3));
+  options.avoid_flush_during_recovery = false;
+  Reopen(options);
+  EXPECT_EQ(NumTableFilesAtLevel(0), 3);
+  const std::vector<std::string> expected_versions = {
+      "a:TypeDeletion", "a:TypeValue", "b:TypeDeletion", "b:TypeValue",
+      "c:TypeDeletion", "c:TypeValue", "d:TypeValue",    "x:TypeDeletion"};
+  EXPECT_EQ(KeyVersions(), expected_versions);
+  ExpectReads(db_->DefaultColumnFamily(), {{"d", "vd"}}, {"a", "b", "c", "x"});
+  EXPECT_EQ(DroppedTicker(), 0);
+  EXPECT_EQ(SkippedTicker(), 0);
+
+  Reopen(options);
+  EXPECT_EQ(KeyVersions(), expected_versions);
+  ExpectReads(db_->DefaultColumnFamily(), {{"d", "vd"}}, {"a", "b", "c", "x"});
+}
+
+// Begins a transaction that deletes `keys`, and prepares it.
+static std::unique_ptr<Transaction> PrepareDeletes(
+    TransactionDB* txn_db, const std::string& name,
+    const std::vector<std::string>& keys) {
+  std::unique_ptr<Transaction> txn(txn_db->BeginTransaction(WriteOptions()));
+  for (const std::string& key : keys) {
+    EXPECT_OK(txn->Delete(key));
+  }
+  EXPECT_OK(txn->SetName(name));
+  EXPECT_OK(txn->Prepare());
+  return txn;
+}
+
+// With WritePrepared and WriteUnprepared transactions, a flush keeps point
+// tombstones of transactions that are not committed, and those not visible to
+// the earliest snapshot (per the snapshot checker). Every read is as with the
+// option off.
+TEST_F(DBFlushDropObsoletePointTombstonesTest,
+       WritePreparedTxnReadsAsWithOptionOff) {
+  for (TxnDBWritePolicy policy :
+       {TxnDBWritePolicy::WRITE_PREPARED, TxnDBWritePolicy::WRITE_UNPREPARED}) {
+    for (bool enabled : {false, true}) {
+      SCOPED_TRACE(std::string(policy == TxnDBWritePolicy::WRITE_PREPARED
+                                   ? "WritePrepared"
+                                   : "WriteUnprepared") +
+                   (enabled ? ", option on" : ", option off"));
+      Options options = OptionsWithFlushDrop(enabled);
+      Close();
+      Destroy(options);
+      TransactionDBOptions txn_db_options;
+      txn_db_options.write_policy = policy;
+      TransactionDB* txn_db = nullptr;
+      ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname_, &txn_db));
+      db_.reset(txn_db);
+      last_options_ = options;
+      ColumnFamilyHandle* cfh = txn_db->DefaultColumnFamily();
+
+      const WriteOptions wo;
+      ASSERT_OK(txn_db->Put(wo, "a", "va"));
+      ASSERT_OK(txn_db->Put(wo, "c", "vc"));
+      ASSERT_OK(txn_db->Put(wo, "d", "vd"));
+      ASSERT_OK(txn_db->Delete(wo, "z"));
+      // Prepared but not committed when the memtable is flushed.
+      std::unique_ptr<Transaction> committed_after_flush =
+          PrepareDeletes(txn_db, "committed_after_flush", {"a", "b"});
+      std::unique_ptr<Transaction> rolled_back_after_flush =
+          PrepareDeletes(txn_db, "rolled_back_after_flush", {"c"});
+      // Committed before the flush but after the snapshot.
+      std::unique_ptr<Transaction> committed_after_snapshot =
+          PrepareDeletes(txn_db, "committed_after_snapshot", {"d"});
+      ManagedSnapshot snapshot(txn_db);
+      ASSERT_OK(committed_after_snapshot->Commit());
+      ASSERT_OK(Flush());
+
+      std::vector<std::string> expected_versions = {
+          "a:TypeDeletion", "a:TypeValue",   "b:TypeDeletion",
+          "c:TypeDeletion", "c:TypeValue",   "d:TypeDeletion",
+          "d:TypeValue",    "z:TypeDeletion"};
+      if (enabled) {
+        // The only tombstone that is committed and visible to every snapshot.
+        expected_versions.pop_back();
+      }
+      EXPECT_EQ(KeyVersions(), expected_versions);
+      EXPECT_EQ(DroppedTicker(), enabled ? 1 : 0);
+
+      ASSERT_OK(committed_after_flush->Commit());
+      ASSERT_OK(rolled_back_after_flush->Rollback());
+      ReadOptions at_snapshot;
+      at_snapshot.snapshot = snapshot.snapshot();
+      for (int flushes = 1; flushes <= 2; ++flushes) {
+        SCOPED_TRACE("after flush " + std::to_string(flushes));
+        ExpectReads(txn_db, cfh, ReadOptions(), {{"c", "vc"}},
+                    {"a", "b", "d", "z"});
+        ExpectReads(txn_db, cfh, at_snapshot,
+                    {{"a", "va"}, {"c", "vc"}, {"d", "vd"}}, {"b", "z"});
+        // Flush what the commit and the rollback wrote.
+        ASSERT_OK(Flush());
+      }
+      EXPECT_EQ(SkippedTicker(), 0);
+    }
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -5324,6 +5324,121 @@ bool VersionStorageInfo::RangeMightExistAfterSortedRun(
   return false;
 }
 
+VersionAbsenceProver::VersionAbsenceProver(const Version* version)
+    : vstorage_(*version->storage_info()),
+      ucmp_(vstorage_.user_comparator()),
+      table_cache_(version->cfd()->table_cache()),
+      icmp_(version->cfd()->internal_comparator()),
+      mutable_cf_options_(version->GetMutableCFOptions()),
+      level_cursors_(lossless_cast<size_t>(vstorage_.num_levels()), 0),
+      file_probes_(lossless_cast<size_t>(vstorage_.num_levels())) {
+  read_options_.read_tier = kBlockCacheTier;
+}
+
+VersionAbsenceProver::~VersionAbsenceProver() {
+  for (std::vector<FileProbe>& level_probes : file_probes_) {
+    for (FileProbe& probe : level_probes) {
+      ReleaseProbe(&probe);
+    }
+  }
+}
+
+void VersionAbsenceProver::ReleaseProbe(FileProbe* probe) {
+  // The checker must not outlive the table reader.
+  probe->checker.reset();
+  if (probe->handle != nullptr) {
+    table_cache_->get_cache().Release(probe->handle);
+    probe->handle = nullptr;
+  }
+}
+
+void VersionAbsenceProver::ResolveFile(int level, size_t file_index,
+                                       FileProbe* probe) {
+  assert(probe->state == FileProbe::State::kUnresolved);
+  probe->state = FileProbe::State::kResolved;
+  // A table reader that is not open now counts as not open for the rest of
+  // this prover's life, so that a file is looked up in the table cache at
+  // most once, however many keys fall in its range.
+  TableReader* table_reader = nullptr;
+  const Status s = table_cache_->FindTable(
+      read_options_, table_cache_->file_options(), icmp_,
+      *vstorage_.LevelFiles(level)[file_index], &probe->handle,
+      mutable_cf_options_, &table_reader, /*no_io=*/true);
+  if (!s.ok()) {
+    // Any non-OK status counts as "may contain the key". Typically it is
+    // Incomplete because the table reader is not open, which no_io forbids.
+    assert(probe->handle == nullptr);
+    return;
+  }
+  probe->checker = table_reader->NewPointKeyAbsenceChecker(
+      mutable_cf_options_.prefix_extractor.get());
+  if (probe->checker == nullptr && probe->handle != nullptr) {
+    // Nothing to keep open.
+    table_cache_->get_cache().Release(probe->handle);
+    probe->handle = nullptr;
+  }
+}
+
+bool VersionAbsenceProver::FileLacksKey(int level, size_t file_index,
+                                        const Slice& user_key) {
+  std::vector<FileProbe>& level_probes = file_probes_[level];
+  if (UNLIKELY(level_probes.empty())) {
+    level_probes.resize(vstorage_.LevelFiles(level).size());
+  }
+  FileProbe& probe = level_probes[file_index];
+  if (UNLIKELY(probe.state == FileProbe::State::kUnresolved)) {
+    ResolveFile(level, file_index, &probe);
+  }
+  // Queries arrive in key order, so none reaches a released file again.
+  assert(probe.state == FileProbe::State::kResolved);
+  return probe.checker != nullptr && probe.checker->DefinitelyAbsent(user_key);
+}
+
+bool VersionAbsenceProver::ProveAbsent(const Slice& user_key) {
+  for (int level = vstorage_.num_non_empty_levels() - 1; level >= 1; --level) {
+    const std::vector<FileMetaData*>& files = vstorage_.LevelFiles(level);
+    std::vector<FileProbe>& level_probes = file_probes_[level];
+    size_t& cursor = level_cursors_[level];
+    while (cursor < files.size() &&
+           ucmp_->CompareWithoutTimestamp(
+               user_key, files[cursor]->largest.user_key()) > 0) {
+      // No later query can reach this file, so stop holding its table reader
+      // (if it was checked).
+      if (!level_probes.empty()) {
+        FileProbe& passed = level_probes[cursor];
+        if (passed.state == FileProbe::State::kResolved) {
+          ReleaseProbe(&passed);
+          passed.state = FileProbe::State::kReleased;
+        }
+      }
+      ++cursor;
+    }
+    // Adjacent files can share a boundary user key, so check every file
+    // starting at or before the key. Files after the cursor's can only start
+    // exactly at the key, and so also cover it.
+    for (size_t i = cursor;
+         i < files.size() && ucmp_->CompareWithoutTimestamp(
+                                 user_key, files[i]->smallest.user_key()) >= 0;
+         ++i) {
+      if (!FileLacksKey(level, i, user_key)) {
+        return false;
+      }
+    }
+  }
+  // L0 files can overlap each other and are not sorted by key.
+  const std::vector<FileMetaData*>& l0_files = vstorage_.LevelFiles(0);
+  for (size_t i = 0; i < l0_files.size(); ++i) {
+    const FileMetaData& f = *l0_files[i];
+    if (ucmp_->CompareWithoutTimestamp(user_key, f.smallest.user_key()) >= 0 &&
+        ucmp_->CompareWithoutTimestamp(user_key, f.largest.user_key()) <= 0 &&
+        !FileLacksKey(/*level=*/0, i, user_key)) {
+      return false;
+    }
+  }
+  ++num_proven_absent_;
+  return true;
+}
+
 Env::WriteLifeTimeHint VersionStorageInfo::CalculateSSTWriteHint(
     int level, CompactionStyleSet compaction_style_set) const {
   if (!compaction_style_set.Contains(compaction_style_)) {

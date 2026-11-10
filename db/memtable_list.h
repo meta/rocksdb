@@ -344,6 +344,14 @@ class MemTableList {
                             autovector<ReadOnlyMemTable*>* mems,
                             uint64_t* max_next_log_number = nullptr);
 
+  // Returns true if every non-empty memtable in this list that is not in
+  // `picked` is newer than all memtables in `picked`: its earliest sequence
+  // number is greater than the largest earliest sequence number in `picked`.
+  // Memtables kept only as history (already flushed) are not considered.
+  // REQUIRES: DB mutex held.
+  bool UnpickedMemtablesAreNewer(
+      const autovector<ReadOnlyMemTable*>& picked) const;
+
   // Reset status of the given memtable list back to pending state so that
   // they can get picked up again on the next round of flush.
   //

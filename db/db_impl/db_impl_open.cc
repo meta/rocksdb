@@ -2239,9 +2239,9 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           kMaxSequenceNumber, snapshot_checker, paranoid_file_checks,
           cfd->internal_stats(), &io_s, io_tracer_,
           BlobFileCreationReason::kRecovery,
-          nullptr /* seqno_to_time_mapping */, &event_logger_, job_id,
-          &temp_table_proerties /* table_properties */, write_hint,
-          nullptr /*full_history_ts_low*/, &blob_callback_, version,
+          nullptr /* seqno_to_time_mapping */, nullptr /* absence_prover */,
+          &event_logger_, job_id, &temp_table_proerties /* table_properties */,
+          write_hint, nullptr /*full_history_ts_low*/, &blob_callback_, version,
           nullptr /* memtable_payload_bytes */,
           nullptr /* memtable_garbage_bytes */, &flush_stats);
       version->Unref();

@@ -339,6 +339,7 @@ DECLARE_uint32(verify_output_flags);
 DECLARE_bool(paranoid_memory_checks);
 DECLARE_bool(memtable_verify_per_key_checksum_on_seek);
 DECLARE_bool(memtable_batch_lookup_optimization);
+DECLARE_bool(flush_drop_obsolete_point_tombstones);
 
 // Options for transaction dbs.
 // Use TransactionDB (a.k.a. Pessimistic Transaction DB)

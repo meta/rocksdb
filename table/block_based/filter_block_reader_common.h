@@ -63,6 +63,17 @@ class FilterBlockReaderCommon : public FilterBlockReader {
                               CachableEntry<TBlocklike>* filter_block,
                               const ReadOptions& read_options) const;
 
+  // Like GetOrReadFilterBlock(), but if this reader does not hold the filter
+  // block, looks for it only in the primary tier of the block cache (see
+  // BlockBasedTable::LookupBlockInPrimaryCache()). Leaves `filter_block` empty
+  // if the filter block is not found there.
+  Status GetFilterBlockInMemory(CachableEntry<TBlocklike>* filter_block) const;
+
+  // The filter block that this reader holds for its whole life (owned, or
+  // pinned in the block cache), or nullptr if it looks the block up when
+  // needed.
+  TBlocklike* held_filter_block() const { return filter_block_.GetValue(); }
+
   size_t ApproximateFilterBlockMemoryUsage() const;
 
  private:

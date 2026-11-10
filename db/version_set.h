@@ -35,6 +35,7 @@
 #include "db/blob/blob_file_meta.h"
 #include "db/blob/blob_index.h"
 #include "db/column_family.h"
+#include "db/compaction/absence_prover.h"
 #include "db/compaction/compaction.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/dbformat.h"
@@ -1196,7 +1197,9 @@ class Version {
   // Prerequisite for this API is max_open_files = -1
   void GetCreationTimeOfOldestFile(uint64_t* creation_time);
 
-  const MutableCFOptions& GetMutableCFOptions() { return mutable_cf_options_; }
+  const MutableCFOptions& GetMutableCFOptions() const {
+    return mutable_cf_options_;
+  }
 
   InternalIterator* TEST_GetLevelIterator(
       const ReadOptions& read_options, MergeIteratorBuilder* merge_iter_builder,
@@ -1303,6 +1306,85 @@ class Version {
   void operator=(const Version&) = delete;
   Version(Version&&) = delete;
   void operator=(Version&&) = delete;
+};
+
+// Proves, without I/O, that no SST file of a Version contains a user key. A
+// file cannot contain the key if the key is outside the file's key range, or
+// if the file's table reader is open (pinned or in the table cache) when this
+// prover first needs it, and reports the key definitely absent from data
+// already in memory (TableReader::NewPointKeyAbsenceChecker()). The levels
+// below L0 are checked from the bottommost one up, then each L0 file, and the
+// proof stops at the first file that may contain the key. Each level below L0
+// is walked with a cursor that only moves forward, so ascending queries cost
+// O(queries + files) key comparisons in total, plus a filter check for each
+// file whose range covers the key. Timestamps are ignored.
+//
+// Each file's table reader is looked up at most once, when first needed. A
+// reader that is not pinned to its file then stays referenced in the table
+// cache while this prover may still check the file: for a file below L0,
+// until a queried key is past the file's key range; for an L0 file, until
+// this prover is destroyed. So this prover references at most about one or
+// two readers per level below L0 (the file at the level's cursor, plus the
+// next one when the two share a boundary user key), plus the L0 files it
+// checked, and the table cache can hold that many readers beyond its
+// capacity. A file whose reader was not open when first needed may contain
+// any key in its range for the rest of this prover's life.
+//
+// The Version must outlive this object.
+class VersionAbsenceProver : public AbsenceProver {
+ public:
+  explicit VersionAbsenceProver(const Version* version);
+  ~VersionAbsenceProver() override;
+
+  VersionAbsenceProver(const VersionAbsenceProver&) = delete;
+  VersionAbsenceProver& operator=(const VersionAbsenceProver&) = delete;
+
+  bool ProveAbsent(const Slice& user_key) override;
+
+  // Number of ProveAbsent() calls that returned true.
+  uint64_t num_proven_absent() const { return num_proven_absent_; }
+
+ private:
+  // What this prover worked out about one file, the first time it needed to.
+  struct FileProbe {
+    enum class State : uint8_t {
+      kUnresolved,
+      kResolved,
+      // Resolved, then released for good: no later query can reach the file.
+      kReleased,
+    };
+
+    // Null if the file's table reader was not open, or cannot show absence:
+    // the file may then contain any key in its range.
+    std::unique_ptr<PointKeyAbsenceChecker> checker;
+    // Keeps the table reader open while `checker` uses it, unless the reader
+    // is pinned to the file's metadata.
+    TableCache::TypedHandle* handle = nullptr;
+    State state = State::kUnresolved;
+  };
+
+  // Returns true if file `file_index` of `level`, whose key range covers
+  // `user_key`, certainly does not contain it.
+  bool FileLacksKey(int level, size_t file_index, const Slice& user_key);
+  // Fills in `probe`, for file `file_index` of `level`.
+  void ResolveFile(int level, size_t file_index, FileProbe* probe);
+  // Drops what `probe` holds: its checker, then its table cache handle.
+  void ReleaseProbe(FileProbe* probe);
+
+  const VersionStorageInfo& vstorage_;
+  const Comparator* const ucmp_;
+  TableCache* const table_cache_;
+  const InternalKeyComparator& icmp_;
+  const MutableCFOptions& mutable_cf_options_;
+  // For table cache lookups, which never open a table reader (no_io).
+  ReadOptions read_options_;
+  // Indexed by level (entry 0 unused): index of the first file whose largest
+  // key is not before the last queried key.
+  std::vector<size_t> level_cursors_;
+  // Indexed by level, then by the file's index in the level. A level's entry
+  // is empty until one of its files is checked.
+  std::vector<std::vector<FileProbe>> file_probes_;
+  uint64_t num_proven_absent_ = 0;
 };
 
 class BaseReferencedVersionBuilder;
