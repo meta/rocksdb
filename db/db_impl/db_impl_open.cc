@@ -254,6 +254,12 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
         "More than four DB paths are not supported yet. ");
   }
 
+  if (log::WALIndexEnabled(db_options.partition_wal_usage) &&
+      db_options.two_write_queues) {
+    return Status::NotSupported(
+        "partition_wal_usage is not supported with two_write_queues. ");
+  }
+
   if (db_options.allow_mmap_reads && db_options.use_direct_reads) {
     // Protect against assert in PosixMMapReadableFile constructor
     return Status::NotSupported(
@@ -2522,6 +2528,10 @@ IOStatus DBImpl::CreateWALWriter(const DBOptions& db_options,
         immutable_db_options_.manual_wal_flush,
         immutable_db_options_.wal_compression,
         immutable_db_options_.track_and_verify_wals);
+    if (log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
+      new_wal->writer->SetPartitionWALUsage(
+          immutable_db_options_.partition_wal_usage);
+    }
   }
 
   return io_s;
@@ -2534,6 +2544,9 @@ IOStatus DBImpl::StartWALFile(const WriteOptions& write_options,
   IOStatus io_s = new_log->AddCompressionTypeRecord(write_options);
   TEST_SYNC_POINT_CALLBACK("DBImpl::StartWALFile:AfterCompressionTypeRecord",
                            &io_s);
+  if (io_s.ok()) {
+    io_s = new_log->MaybeAddWALIndexMarkerRecord(write_options);
+  }
   if (io_s.ok()) {
     io_s = new_log->MaybeAddPredecessorWALInfo(write_options,
                                                predecessor_wal_info);
@@ -2825,8 +2838,23 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
 
         assert(log_writer->get_log_number() == wal_file_number_size.number);
         impl->mutex_.AssertHeld();
-        s = impl->WriteToWAL(empty_batch, write_options, log_writer, &wal_used,
-                             &log_size, wal_file_number_size, recovered_seq);
+        uint64_t wal_index = 0;
+        if (log::WALIndexEnabled(
+                impl->immutable_db_options_.partition_wal_usage)) {
+          SequenceNumber last_sequence_before = 0;
+          s = impl->AllocateSequenceAndWALIndex(
+              /*sequence_count=*/0, /*write_wal=*/true, &last_sequence_before,
+              &wal_index);
+        }
+        if (s.ok()) {
+          // No cover on this path, deliberately: a failure here fails Open(),
+          // so the DB never becomes writable and nothing can be acknowledged
+          // above the burned index. The file is discarded with the failed
+          // open rather than left holding an undeclared hole.
+          s = impl->WriteToWAL(empty_batch, write_options, log_writer,
+                               &wal_used, &log_size, wal_file_number_size,
+                               recovered_seq, wal_index);
+        }
         if (s.ok()) {
           // Need to fsync, otherwise it might get lost after a power reset.
           s = impl->FlushWAL(write_options, false);

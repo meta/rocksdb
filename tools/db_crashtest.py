@@ -551,6 +551,9 @@ default_params = {
     "adaptive_readahead": lambda: random.choice([0, 1]),
     "async_io": lambda: random.choice([0, 1]),
     "wal_compression": lambda: random.choice(["none", "zstd"]),
+    "partition_wal_usage": lambda: random.choice(
+        ["none", "partition_by_column_family"]
+    ),
     "verify_sst_unique_id_in_manifest": 1,  # always do unique_id verification
     "fast_sst_open": lambda: random.choice([0, 1]),
     "secondary_cache_uri": lambda: random.choice(
@@ -1874,6 +1877,12 @@ def finalize_and_sanitize(src_params):
         dest_params["memtable_prefix_bloom_size_ratio"] = 0
     if dest_params.get("two_write_queues") == 1:
         dest_params["enable_pipelined_write"] = 0
+        # DB::Open rejects WAL indexing together with two_write_queues, whose
+        # second allocation site would need a broader ordering change. Drop the
+        # indexing rather than the queues: WRITE_PREPARED with unordered_write
+        # requires two_write_queues, so clearing that here would trade one
+        # rejected combination for another.
+        dest_params["partition_wal_usage"] = "none"
     if dest_params.get("best_efforts_recovery") == 1:
         dest_params["disable_wal"] = 1
         dest_params["enable_compaction_filter"] = 0

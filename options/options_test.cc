@@ -1606,6 +1606,53 @@ TEST_F(OptionsTest, DBOptionsComposeImmutable) {
                                                   new_opts));
 }
 
+TEST_F(OptionsTest, PartitionWALUsageComposeImmutable) {
+  // partition_wal_usage is only carried by ImmutableDBOptions, and
+  // options_settable_test (which would otherwise catch a missing
+  // BuildDBOptions assignment) is compiled out under clang.
+  for (PartitionWALUsage usage :
+       {PartitionWALUsage::kNone,
+        PartitionWALUsage::kPartitionByColumnFamily}) {
+    DBOptions base_opts;
+    base_opts.partition_wal_usage = usage;
+
+    ImmutableDBOptions i_opts(base_opts);
+    ASSERT_EQ(i_opts.partition_wal_usage, usage);
+
+    MutableDBOptions m_opts(base_opts);
+    ASSERT_EQ(BuildDBOptions(i_opts, m_opts).partition_wal_usage, usage);
+  }
+}
+
+TEST_F(OptionsTest, PartitionWALUsageFromString) {
+  ConfigOptions config_options;
+  config_options.input_strings_escaped = false;
+  config_options.ignore_unknown_options = false;
+
+  const std::vector<std::pair<std::string, PartitionWALUsage>> kCases = {
+      {"kNone", PartitionWALUsage::kNone},
+      {"none", PartitionWALUsage::kNone},
+      {"kPartitionByColumnFamily", PartitionWALUsage::kPartitionByColumnFamily},
+      {"partition_by_column_family",
+       PartitionWALUsage::kPartitionByColumnFamily}};
+  const DBOptions base_opts;
+  for (const auto& [name, expected] : kCases) {
+    DBOptions new_opts;
+    ASSERT_OK(GetDBOptionsFromString(config_options, base_opts,
+                                     "partition_wal_usage=" + name, &new_opts));
+    ASSERT_EQ(new_opts.partition_wal_usage, expected);
+  }
+
+  // The removed single-file value no longer parses.
+  for (const char* name :
+       {"bogus", "kRecordOrderingSingleFile", "record_ordering_single_file"}) {
+    DBOptions new_opts;
+    ASSERT_NOK(GetDBOptionsFromString(
+        config_options, base_opts, std::string("partition_wal_usage=") + name,
+        &new_opts));
+  }
+}
+
 TEST_F(OptionsTest, GetMutableDBOptions) {
   Random rnd(228);
   DBOptions base_opts;

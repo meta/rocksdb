@@ -258,6 +258,7 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
   options.two_write_queues = immutable_db_options.two_write_queues;
   options.manual_wal_flush = immutable_db_options.manual_wal_flush;
   options.wal_compression = immutable_db_options.wal_compression;
+  options.partition_wal_usage = immutable_db_options.partition_wal_usage;
   options.background_close_inactive_wals =
       immutable_db_options.background_close_inactive_wals;
   options.atomic_flush = immutable_db_options.atomic_flush;
