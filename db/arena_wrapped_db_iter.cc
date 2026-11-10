@@ -12,6 +12,7 @@
 #include "memory/arena.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
+#include "rocksdb/memtablerep.h"
 #include "rocksdb/options.h"
 #include "table/internal_iterator.h"
 #include "table/iterator_wrapper.h"
@@ -277,8 +278,12 @@ Status ArenaWrappedDBIter::Refresh(const Snapshot* snapshot) {
     }
   }
 
+  // Keeping the current internal iterator and only advancing its sequence
+  // number relies on the memtable iterator seeing later inserts.
+  const bool memtable_iter_sees_new_writes =
+      cfd->ioptions().memtable_factory->IsTailingIteratorSupported();
   while (true) {
-    if (sv_number_ != cur_sv_number) {
+    if (sv_number_ != cur_sv_number || !memtable_iter_sees_new_writes) {
       DoRefresh(snapshot, cur_sv_number);
       break;
     } else {

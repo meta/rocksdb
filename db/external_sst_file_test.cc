@@ -4896,7 +4896,9 @@ TEST_F(ExternalSSTFileWithTimestampTest, Basic) {
 
     DestroyAndRecreateExternalSSTFilesDir();
   } while (ChangeOptions(kSkipPlainTable | kSkipFIFOCompaction |
-                         kRangeDelSkipConfigs));
+                         kRangeDelSkipConfigs |
+                         // sorted_hash rejects user-defined timestamps.
+                         kSkipSortedHash));
 }
 
 TEST_F(ExternalSSTFileWithTimestampTest, SanityCheck) {
@@ -5205,7 +5207,9 @@ TEST_F(ExternalSSTFileWithTimestampTest, TimestampsNotPersistedBasic) {
 
     DestroyAndRecreateExternalSSTFilesDir();
   } while (ChangeOptions(kSkipPlainTable | kSkipFIFOCompaction |
-                         kRangeDelSkipConfigs));
+                         kRangeDelSkipConfigs |
+                         // sorted_hash rejects user-defined timestamps.
+                         kSkipSortedHash));
 }
 
 TEST_F(ExternalSSTFileWithTimestampTest,
