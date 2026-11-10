@@ -285,7 +285,7 @@ inline void FinalizeAsyncRead(struct io_uring* iu, struct io_uring_cqe* cqe,
 // synchronization.
 class LogicalBlockSizeCache {
  public:
-  LogicalBlockSizeCache(
+  explicit LogicalBlockSizeCache(
       std::function<size_t(int)> get_logical_block_size_of_fd =
           PosixHelper::GetLogicalBlockSizeOfFd,
       std::function<Status(const std::string&, size_t*)>

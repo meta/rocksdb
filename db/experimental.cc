@@ -206,7 +206,7 @@ namespace {
 template <size_t N>
 class SemiStaticCappedKeySegmentsExtractor : public KeySegmentsExtractor {
  public:
-  SemiStaticCappedKeySegmentsExtractor(const uint32_t* byte_widths) {
+  explicit SemiStaticCappedKeySegmentsExtractor(const uint32_t* byte_widths) {
     id_ = kName();
     uint32_t prev_end = 0;
     if constexpr (N > 0) {  // Suppress a compiler warning
@@ -246,7 +246,8 @@ class SemiStaticCappedKeySegmentsExtractor : public KeySegmentsExtractor {
 
 class DynamicCappedKeySegmentsExtractor : public KeySegmentsExtractor {
  public:
-  DynamicCappedKeySegmentsExtractor(const std::vector<uint32_t>& byte_widths) {
+  explicit DynamicCappedKeySegmentsExtractor(
+      const std::vector<uint32_t>& byte_widths) {
     id_ = kName();
     uint32_t prev_end = 0;
     for (size_t i = 0; i < byte_widths.size(); ++i) {

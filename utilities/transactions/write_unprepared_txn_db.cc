@@ -41,7 +41,7 @@ Status WriteUnpreparedTxnDB::RollbackRecoveredTransaction(
 
   class InvalidSnapshotReadCallback : public ReadCallback {
    public:
-    InvalidSnapshotReadCallback(SequenceNumber snapshot)
+    explicit InvalidSnapshotReadCallback(SequenceNumber snapshot)
         : ReadCallback(snapshot) {}
 
     inline bool IsVisibleFullCheck(SequenceNumber) override {

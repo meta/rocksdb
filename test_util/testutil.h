@@ -808,8 +808,9 @@ struct CompressorCustomAlg : public CompressorWrapper {
 struct DecompressorCustomAlg : public DecompressorWrapper {
   using TypeSet = SmallEnumSet<CompressionType, kDisableCompressionOption>;
 
-  DecompressorCustomAlg(std::shared_ptr<Decompressor> wrapped =
-                            GetBuiltinV2CompressionManager()->GetDecompressor())
+  explicit DecompressorCustomAlg(
+      std::shared_ptr<Decompressor> wrapped =
+          GetBuiltinV2CompressionManager()->GetDecompressor())
       : DecompressorWrapper(std::move(wrapped)),
         dictionary_hash_(GetSliceHash(wrapped_->GetSerializedDict())),
         allowed_types_(TypeSet::All()) {}

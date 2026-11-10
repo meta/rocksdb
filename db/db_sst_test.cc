@@ -21,7 +21,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class DBSSTTest : public DBTestBase {
  public:
-  DBSSTTest(const std::string& test_name = "db_sst_test")
+  explicit DBSSTTest(const std::string& test_name = "db_sst_test")
       : DBTestBase(test_name, /*env_do_fsync=*/true) {}
 };
 
@@ -923,7 +923,7 @@ class DBWALTestWithParam
 TEST_P(DBWALTestWithParam, WALTrashCleanupOnOpen) {
   class MyEnv : public EnvWrapper {
    public:
-    MyEnv(Env* t) : EnvWrapper(t), fake_log_delete(false) {}
+    explicit MyEnv(Env* t) : EnvWrapper(t), fake_log_delete(false) {}
     const char* Name() const override { return "MyEnv"; }
     Status DeleteFile(const std::string& fname) override {
       if (fname.find(".log.trash") != std::string::npos && fake_log_delete) {

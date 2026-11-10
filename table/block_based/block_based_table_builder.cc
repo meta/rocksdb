@@ -2684,7 +2684,7 @@ void BlockBasedTableBuilder::BGWorker(WorkingAreaPair& working_area) {
           &block_rep->contents_checksum));
     };
     auto write_fn = [this, block_rep, &ios]() {
-      Slice compressed = block_rep->compressed;
+      Slice compressed = block_rep->compressed.AsSlice();
       Slice uncompressed = block_rep->uncompressed;
       bool skip_delta_encoding = false;
       const bool has_precomputed_block_contents_crc32c =

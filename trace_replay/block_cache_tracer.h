@@ -67,7 +67,8 @@ class BlockCacheTraceHelper {
 // 6. BlockBasedTable::ApproximateOffsetOf. (kCompaction or
 // kUserApproximateSize).
 struct BlockCacheLookupContext {
-  BlockCacheLookupContext(const TableReaderCaller& _caller) : caller(_caller) {}
+  explicit BlockCacheLookupContext(const TableReaderCaller& _caller)
+      : caller(_caller) {}
   BlockCacheLookupContext(const TableReaderCaller& _caller, uint64_t _get_id,
                           bool _get_from_user_specified_snapshot)
       : caller(_caller),
@@ -164,7 +165,7 @@ class BlockCacheHumanReadableTraceWriter {
 // BlockCacheTraceWriter using a user provided TraceReader.
 class BlockCacheTraceReader {
  public:
-  BlockCacheTraceReader(std::unique_ptr<TraceReader>&& reader);
+  explicit BlockCacheTraceReader(std::unique_ptr<TraceReader>&& reader);
   virtual ~BlockCacheTraceReader() = default;
   // No copy and move.
   BlockCacheTraceReader(const BlockCacheTraceReader&) = delete;
@@ -185,7 +186,8 @@ class BlockCacheTraceReader {
 // for detailed.
 class BlockCacheHumanReadableTraceReader : public BlockCacheTraceReader {
  public:
-  BlockCacheHumanReadableTraceReader(const std::string& trace_file_path);
+  explicit BlockCacheHumanReadableTraceReader(
+      const std::string& trace_file_path);
 
   ~BlockCacheHumanReadableTraceReader() override;
 

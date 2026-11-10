@@ -526,7 +526,7 @@ struct BlockContents {
   BlockContents() {}
 
   // Does not take ownership of the underlying data bytes.
-  BlockContents(const Slice& _data) : data(_data) {}
+  explicit BlockContents(const Slice& _data) : data(_data) {}
 
   // Takes ownership of the underlying data bytes.
   BlockContents(CacheAllocationPtr&& _data, size_t _size)

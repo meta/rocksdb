@@ -72,8 +72,8 @@ std::unique_ptr<DB> OpenTtlDb(const std::string& delim) {
 class StringLists {
  public:
   // Constructor: specifies the rocksdb db
-  /* implicit */
-  StringLists(UnownedPtr<DB> db) : db_(db), merge_option_(), get_option_() {
+  explicit StringLists(UnownedPtr<DB> db)
+      : db_(db), merge_option_(), get_option_() {
     assert(db);
   }
 

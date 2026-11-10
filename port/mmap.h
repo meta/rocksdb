@@ -82,6 +82,7 @@ class MemMapping {
 template <typename T>
 class TypedMemMapping : public MemMapping {
  public:
+  // NOLINTNEXTLINE(google-explicit-constructor)
   /*implicit*/ TypedMemMapping(MemMapping&& v) noexcept
       : MemMapping(std::move(v)) {}
   TypedMemMapping& operator=(MemMapping&& v) noexcept {

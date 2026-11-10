@@ -65,7 +65,8 @@ TEST_F(StatisticsTest, NoNameStats) {
 
   class DefaultNameStatistics : public Statistics {
    public:
-    DefaultNameStatistics(const std::shared_ptr<Statistics>& stats = nullptr)
+    explicit DefaultNameStatistics(
+        const std::shared_ptr<Statistics>& stats = nullptr)
         : inner(stats) {
       RegisterOptions("", &inner, &no_name_opt_info);
     }

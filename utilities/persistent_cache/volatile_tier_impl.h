@@ -72,8 +72,7 @@ class VolatileCacheTier : public PersistentCacheTier {
   // Cache data abstraction
   //
   struct CacheData : LRUElement<CacheData> {
-    explicit CacheData(CacheData&& rhs) noexcept
-        : key(rhs.key), value(rhs.value) {}
+    CacheData(CacheData&& rhs) noexcept : key(rhs.key), value(rhs.value) {}
     CacheData& operator=(CacheData&&) = delete;
 
     explicit CacheData(std::string _key, std::string _value = "")

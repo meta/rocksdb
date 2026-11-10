@@ -915,7 +915,7 @@ struct rocksdb_comparator_t : public Comparator {
 
   rocksdb_comparator_t() : Comparator() {}
 
-  rocksdb_comparator_t(size_t ts_size) : Comparator(ts_size) {}
+  explicit rocksdb_comparator_t(size_t ts_size) : Comparator(ts_size) {}
 
   // No copying allowed
   rocksdb_comparator_t(const rocksdb_comparator_t&) = delete;
