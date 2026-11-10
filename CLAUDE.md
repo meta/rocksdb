@@ -54,7 +54,63 @@ which is bad for debugging.
 - **Cold path** (executed rarely, e.g., DB open, configuration parsing, error handling): Maintainability and clarity are more important. Prefer readable code over micro-optimizations. Complex optimizations here add maintenance burden with negligible performance benefit.
 - **Warm path** (moderate frequency): Balance both concerns. Use profiling data to guide optimization decisions.
 
-**Avoid Premature Optimization:** Performance is known critical in places like inner loops of compaction, read path and write path. Elsewhere, try to find a "holy trinity" solution of *correct, simple, and reasonably efficient*. More complex solutions are only appropriate when profiling/benchmarking data shows a measurable payoff.
+**Avoid Premature Optimization:** Performance is known critical in places like inner loops of compaction, read path and write path (the data path in "Design Priorities" below). Elsewhere (control path), try to find a "holy trinity" solution of *correct, simple, and reasonably efficient*. In every case, more complex solutions are only appropriate when profiling/benchmarking data shows a measurable payoff.
+
+### Design Priorities
+
+**Priority order:** Data integrity first. Then efficiency (memory, CPU, I/O).
+Then code simplicity. RocksDB is a storage engine: after integrity, efficiency
+matters as much as correctness. Judge every data structure and algorithm by
+this order.
+
+**Classify the path before choosing a design:**
+- **Data path** (per key, per block or per file: reads, writes, flush,
+  compaction input/output): ask whether the design is the most efficient one
+  possible (fewest bytes per entry, fewest allocations, fewest I/Os, least
+  work under locks). Efficiency beats simplicity here.
+- **Control path** (DB open, option changes, MANIFEST bookkeeping, repair
+  tools; runs rarely): simplicity may win over efficiency, as long as the cost
+  stays bounded at scale (for example 100K SST files, many column families).
+- **Background work** (garbage collection, cleanup, census or statistics
+  rebuilds): latency does not matter (it may start later or run slower), but
+  CPU, memory, I/O and write amplification must stay as low as possible.
+  Prefer slower-but-cheaper over fast-but-costly.
+
+**Measure before choosing, and let numbers decide:** Compare candidate designs
+with db_bench (warm and cold, direct I/O for cold reads, cost per found key) or
+with exact counts (bytes per entry, allocations, I/Os). Drop a design the
+numbers reject, even if it is already written; revert an optimization that
+shows no measurable gain. Label estimates as estimates; never state them as
+measured.
+
+**Bounded, accounted memory:** Every new in-memory structure needs a stated
+size per entry and a bound at realistic scale. Large or data-dependent buffers
+should be charged to the block cache (or another existing memory budget), not
+left uncharged.
+
+**Feature-off cost is zero:** Users who do not enable a feature must not pay
+for it: no extra work under the DB mutex, no extra per-file or per-key
+metadata, no new failure modes. Gate new bookkeeping on the feature (or on its
+persisted format marker), and list anything that remains under "Changes
+visible to existing users" in the diff summary.
+
+**Fail loudly, never skip silently:** A rare path may be slow if it is correct
+and reports errors. Never silently ignore a record, a reference or an
+unexpected state. A retry loop must separate retryable conditions (stale
+input, transient I/O) from permanent ones (unresolvable metadata, missing
+file): permanent conditions return an error (for background jobs, a background
+error) instead of retrying forever.
+
+**Data-loss contracts are explicit:** Recovery modes have contracts users rely
+on (for example, best-efforts recovery yields a consistent point-in-time
+state). Do not add silent data loss to an existing mode. Accepting data loss
+(for example, dropping references to a lost blob file) must be an explicit
+user action through a dedicated API or option, and must never be triggered
+automatically by an error that could be transient.
+
+**Prefer supporting over rejecting:** When two features interact, prefer making
+the combination work if the change is moderate; reject the combination only
+when support is very large or unsafe, and document why.
 
 ### API Design and Compatibility
 
@@ -249,6 +305,28 @@ from an implementation detail instead of an explicit option.
 * Before writing or updating an external RocksDB pull request summary or its
   corresponding internal Phabricator diff summary, read and follow
   `claude_md/pull_request_summary_guideline.md`.
+
+### Multi-diff stacks and change hygiene
+* Each diff must build, pass its tests and be correct on its own.
+* Keep closely related changes in the same diff, so a reviewer can judge each
+  diff without reading later ones. An earlier diff may add code that later
+  diffs build on, but it should use or test that code itself and explain its
+  purpose. Avoid adding code whose only reason to exist is a later diff.
+* Avoid churn inside a stack: do not add a data model, format or interface in
+  one diff that a later diff in the same stack replaces. Put the final design
+  in the first diff that needs it.
+* Fix problems in the diff that introduces them rather than in a follow-up
+  diff. Do not add new diffs to a stack unless the change is very large.
+* Bugs found in existing RocksDB code go into separate diffs on master, not
+  into a feature stack.
+* Remove things that are unused or never verified. If every writer always
+  sets an optional field, make it mandatory.
+* Ask the maintainers before: on-disk or MANIFEST format changes, public API
+  (`include/`) changes, compaction logic changes, deprecating options, or
+  breaking compatibility.
+* Every summary claim must match the code. Include a "Changes visible to
+  existing users" section whenever behavior, cost or failure modes change for
+  users who do not enable the feature.
 
 ### Build system
 * There are 3 build system. Make for git clones, BUCK (meta internal) for hg
