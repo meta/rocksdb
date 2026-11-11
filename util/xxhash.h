@@ -16,8 +16,8 @@
      defined(XXH_IMPLEMENTATION)) &&                        \
     !defined(XXH_IMPLEM_13a8737387)
 #if defined(__cplusplus) && (__cplusplus > 202002L)
-/* C++23 and future versions have std::unreachable() */
-#include <utility> /* std::unreachable() */
+/* C++23 standard libraries may have std::unreachable() */
+#include <utility> /* std::unreachable(), __cpp_lib_unreachable */
 #endif
 #endif
 /* END RocksDB customizations */
@@ -2072,7 +2072,7 @@ static int XXH_isLittleEndian(void)
 #  include <stddef.h>
 #  define XXH_UNREACHABLE() unreachable()
 
-#elif defined(__cplusplus) && (__cplusplus > 202002L)
+#elif defined(__cpp_lib_unreachable) && (__cpp_lib_unreachable >= 202202L)
 #  define XXH_UNREACHABLE() std::unreachable()
 
 #elif XXH_HAS_BUILTIN(__builtin_unreachable)
