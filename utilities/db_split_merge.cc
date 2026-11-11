@@ -439,6 +439,7 @@ DBOptions GetCheckpointDBOptions(DB* source) {
   db_options.create_missing_column_families = false;
   db_options.error_if_exists = false;
   db_options.best_efforts_recovery = false;
+  db_options.best_efforts_blob_db_repair = false;
   db_options.db_paths.clear();
   db_options.wal_dir.clear();
   db_options.db_log_dir.clear();

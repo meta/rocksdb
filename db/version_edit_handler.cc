@@ -505,10 +505,13 @@ ColumnFamilyData* VersionEditHandler::CreateCfAndInit(
   assert(cfd != nullptr);
   cfd->set_initialized();
   assert(builders_.find(cf_id) == builders_.end());
-  builders_.emplace(
-      cf_id, VersionBuilderUPtr(new BaseReferencedVersionBuilder(
-                 cfd, cfd->current(), this, track_found_and_missing_files_,
-                 allow_incomplete_valid_version_)));
+  VersionBuilderUPtr builder(new BaseReferencedVersionBuilder(
+      cfd, cfd->current(), this, track_found_and_missing_files_,
+      allow_incomplete_valid_version_));
+  if (record_missing_blob_files_as_dropped_) {
+    builder->version_builder()->RecordMissingBlobFilesAsDropped();
+  }
+  builders_.emplace(cf_id, std::move(builder));
   return cfd;
 }
 
@@ -730,7 +733,8 @@ VersionEditHandlerPointInTime::VersionEditHandlerPointInTime(
     bool read_only, std::vector<ColumnFamilyDescriptor> column_families,
     VersionSet* version_set, const std::shared_ptr<IOTracer>& io_tracer,
     const ReadOptions& read_options, bool allow_incomplete_valid_version,
-    bool trust_manifest_recovery, bool defer_sst_file_opening,
+    bool record_missing_blob_files_as_dropped, bool trust_manifest_recovery,
+    bool defer_sst_file_opening,
     EpochNumberRequirement epoch_number_requirement)
     : VersionEditHandler(read_only, std::move(column_families), version_set,
                          /*track_found_and_missing_files=*/true,
@@ -739,7 +743,11 @@ VersionEditHandlerPointInTime::VersionEditHandlerPointInTime(
                          allow_incomplete_valid_version,
                          epoch_number_requirement),
       trust_manifest_recovery_(trust_manifest_recovery),
-      defer_sst_file_opening_(defer_sst_file_opening) {}
+      defer_sst_file_opening_(defer_sst_file_opening) {
+  assert(!record_missing_blob_files_as_dropped ||
+         allow_incomplete_valid_version);
+  record_missing_blob_files_as_dropped_ = record_missing_blob_files_as_dropped;
+}
 
 VersionEditHandlerPointInTime::~VersionEditHandlerPointInTime() {
   for (const auto& cfid_and_version : atomic_update_versions_) {

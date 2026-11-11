@@ -863,10 +863,13 @@ Status BlobFilePartitionManager::ResolveBlobDirectWriteIndex(
     // Only fall back when the blob file is still owned exclusively by the
     // write path and therefore absent from Version metadata. Once Version
     // knows the file number, every result from Version::GetBlob(), including
-    // corruption, must propagate directly.
+    // corruption, must propagate directly. A dropped blob file is never owned
+    // by the write path, since new files are numbered above every recovered
+    // one, so Version::GetBlob() reports it.
+    const VersionStorageInfo* const storage_info = version->storage_info();
     if (blob_idx.HasTTL() || blob_idx.IsInlined() ||
-        version->storage_info()->GetBlobFileMetaData(blob_idx.file_number()) !=
-            nullptr) {
+        storage_info->GetBlobFileMetaData(blob_idx.file_number()) != nullptr ||
+        storage_info->IsDroppedBlobFile(blob_idx.file_number())) {
       return version->GetBlob(read_options, user_key, blob_idx, prefetch_buffer,
                               blob_value, bytes_read);
     }

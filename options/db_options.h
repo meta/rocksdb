@@ -98,6 +98,7 @@ struct ImmutableDBOptions {
   size_t log_readahead_size;
   std::shared_ptr<FileChecksumGenFactory> file_checksum_gen_factory;
   bool best_efforts_recovery;
+  bool best_efforts_blob_db_repair;
   int max_bgerror_resume_count;
   uint64_t bgerror_resume_retry_interval;
   bool allow_data_in_errors;
@@ -124,6 +125,11 @@ struct ImmutableDBOptions {
 
   bool IsWalDirSameAsDBPath() const;
   bool IsWalDirSameAsDBPath(const std::string& path) const;
+  // Whether DB open recovers through VersionSet::TryRecover(), which both
+  // best_efforts_recovery and best_efforts_blob_db_repair use.
+  bool UsesBestEffortsRecoveryPath() const {
+    return best_efforts_recovery || best_efforts_blob_db_repair;
+  }
   const std::string& GetWalDir() const;
   const std::string& GetWalDir(const std::string& path) const;
 };

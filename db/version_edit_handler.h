@@ -260,6 +260,10 @@ class VersionEditHandler : public VersionEditHandlerBase {
   // incomplete Version with only a suffix of L0 files missing is also
   // considered valid if the Version is never edited in an atomic group.
   const bool allow_incomplete_valid_version_;
+  // If true, every column family's VersionBuilder records missing blob files
+  // as dropped instead of treating them as missing (see
+  // VersionBuilder::RecordMissingBlobFilesAsDropped()).
+  bool record_missing_blob_files_as_dropped_ = false;
   EpochNumberRequirement epoch_number_requirement_;
   std::unordered_set<uint32_t> cfds_to_mark_no_udt_;
 
@@ -297,13 +301,15 @@ class VersionEditHandler : public VersionEditHandlerBase {
 // VersionEditHandlerPointInTime is shared by multiple threads.
 class VersionEditHandlerPointInTime : public VersionEditHandler {
  public:
+  // `record_missing_blob_files_as_dropped` requires
+  // `allow_incomplete_valid_version`.
   VersionEditHandlerPointInTime(
       bool read_only, std::vector<ColumnFamilyDescriptor> column_families,
       VersionSet* version_set, const std::shared_ptr<IOTracer>& io_tracer,
       const ReadOptions& read_options, bool allow_incomplete_valid_version,
-      bool trust_manifest_recovery, bool defer_sst_file_opening,
-      EpochNumberRequirement epoch_number_requirement =
-          EpochNumberRequirement::kMustPresent);
+      bool record_missing_blob_files_as_dropped, bool trust_manifest_recovery,
+      bool defer_sst_file_opening,
+      EpochNumberRequirement epoch_number_requirement);
   ~VersionEditHandlerPointInTime() override;
 
   bool HasMissingFiles() const;
@@ -434,8 +440,10 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
       : VersionEditHandlerPointInTime(
             /*read_only=*/true, std::move(column_families), version_set,
             io_tracer, read_options,
-            /*allow_incomplete_valid_version=*/false, trust_manifest_recovery,
-            defer_sst_file_opening, epoch_number_requirement),
+            /*allow_incomplete_valid_version=*/false,
+            /*record_missing_blob_files_as_dropped=*/false,
+            trust_manifest_recovery, defer_sst_file_opening,
+            epoch_number_requirement),
         mode_(Mode::kRecovery) {}
 
   Status VerifyFile(ColumnFamilyData* cfd, const std::string& fpath, int level,

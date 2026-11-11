@@ -222,7 +222,8 @@ bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
          HasLastSequence() || !GetCompactCursors().empty() || HasDbId() ||
          IsColumnFamilyManipulation() || IsInAtomicGroup() ||
          HasFullHistoryTsLow() || HasPersistUserDefinedTimestamps() ||
-         HasSubcompactionProgress() || HasCommittedOptionsFileNumber();
+         HasSubcompactionProgress() || HasCommittedOptionsFileNumber() ||
+         HasDroppedBlobFiles();
 }
 
 bool VersionEdit::EncodeTo(std::string* dst,
@@ -356,6 +357,13 @@ bool VersionEdit::EncodeTo(std::string* dst,
     PutVarint32(dst, kCommittedOptionsFileNumber);
     std::string encoded;
     PutVarint64(&encoded, committed_options_file_number_);
+    PutLengthPrefixedSlice(dst, encoded);
+  }
+
+  for (const uint64_t blob_file_number : dropped_blob_files_) {
+    PutVarint32(dst, kDroppedBlobFile);
+    std::string encoded;
+    PutVarint64(&encoded, blob_file_number);
     PutLengthPrefixedSlice(dst, encoded);
   }
 
@@ -1054,6 +1062,18 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         break;
       }
 
+      case kDroppedBlobFile: {
+        Slice encoded;
+        uint64_t blob_file_number = 0;
+        if (GetLengthPrefixedSlice(&input, &encoded) &&
+            GetVarint64(&encoded, &blob_file_number) && encoded.empty()) {
+          dropped_blob_files_.push_back(blob_file_number);
+        } else {
+          msg = "dropped blob file";
+        }
+        break;
+      }
+
       default:
         if (tag & kTagSafeIgnoreMask) {
           // Tag from future which can be safely ignored.
@@ -1245,6 +1265,10 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     r.append("\n  CommittedOptionsFileNumber: ");
     AppendNumberTo(&r, committed_options_file_number_);
   }
+  for (const uint64_t blob_file_number : dropped_blob_files_) {
+    r.append("\n  DroppedBlobFile: ");
+    AppendNumberTo(&r, blob_file_number);
+  }
   r.append("\n}\n");
   return r;
 }
@@ -1415,6 +1439,15 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
 
   if (has_committed_options_file_number_) {
     jw << "CommittedOptionsFileNumber" << committed_options_file_number_;
+  }
+
+  if (!dropped_blob_files_.empty()) {
+    jw << "DroppedBlobFiles";
+    jw.StartArray();
+    for (const uint64_t blob_file_number : dropped_blob_files_) {
+      jw << blob_file_number;
+    }
+    jw.EndArray();
   }
 
   jw.EndObject();

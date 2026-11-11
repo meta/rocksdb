@@ -78,6 +78,7 @@ enum Tag : uint32_t {
   kSubcompactionProgress,
   kLastCompactedManifestFileSize,
   kCommittedOptionsFileNumber,
+  kDroppedBlobFile,
 };
 
 enum SubcompactionProgressPerLevelCustomTag : uint32_t {
@@ -1006,6 +1007,17 @@ class VersionEdit {
     blob_file_garbages_ = std::move(blob_file_garbages);
   }
 
+  // Record a blob file that best-efforts BlobDB repair left out of the column
+  // family because it was missing, while SST files may still reference it (see
+  // VersionStorageInfo::GetDroppedBlobFiles()).
+  void AddDroppedBlobFile(uint64_t blob_file_number) {
+    dropped_blob_files_.push_back(blob_file_number);
+  }
+  const std::vector<uint64_t>& GetDroppedBlobFiles() const {
+    return dropped_blob_files_;
+  }
+  bool HasDroppedBlobFiles() const { return !dropped_blob_files_.empty(); }
+
   // Add a WAL (either just created or closed).
   // AddWal and DeleteWalsBefore cannot be called on the same VersionEdit.
   void AddWal(WalNumber number, WalMetadata metadata = WalMetadata()) {
@@ -1214,6 +1226,7 @@ class VersionEdit {
   NewFiles new_files_;
   BlobFileAdditions blob_file_additions_;
   BlobFileGarbages blob_file_garbages_;
+  std::vector<uint64_t> dropped_blob_files_;
   WalAdditions wal_additions_;
 
   std::string db_id_;

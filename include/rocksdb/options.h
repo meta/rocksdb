@@ -1775,6 +1775,51 @@ struct DBOptions {
   // Default: false
   bool best_efforts_recovery = false;
 
+  // Best-efforts BlobDB repair is a recovery mode only for DBs that use
+  // integrated BlobDB (see ColumnFamilyOptions::enable_blob_files). It opens a
+  // DB whose SST files reference blob files that are missing or cannot be
+  // opened.
+  //
+  // Like best_efforts_recovery, opening a DB with this option can lose data.
+  // Unlike best_efforts_recovery, there is no guarantee that the DB recovers to
+  // a consistent point in time. The repair is purely best effort: it keeps
+  // whatever data the files present at open time still hold.
+  //
+  // Opening a DB with this option:
+  // 1. Replays the MANIFEST and handles missing SST files exactly like
+  //    best_efforts_recovery: it falls back to an older point in time, or
+  //    leaves out a missing suffix of L0 SST files. A missing SST file loses
+  //    keys and deletions, so keeping newer state could bring back older
+  //    values. A missing blob file never causes a fallback, because the keys
+  //    and sequence numbers that reference it are still in the SST files.
+  // 2. At the recovered point in time, leaves missing blob files out of each
+  //    column family, along with the blob files that only left-out L0 SST
+  //    files are linked to, as best_efforts_recovery does. It records the
+  //    ones that kept SST files might still reference as dropped blob files.
+  //    If both SST files and blob files are missing, step 1 picks the point in
+  //    time and this step drops the blob files missing at that point.
+  // 3. Like best_efforts_recovery, does not replay WAL files. It then writes
+  //    the dropped blob files to a new MANIFEST and opens the DB.
+  //
+  // Afterwards, reads of a value stored in a dropped blob file return
+  // Corruption. Recorded dropped blob files stay in effect after the DB is
+  // reopened without this option, as long as an SST file might reference them:
+  // until every SST file's oldest referenced blob file is newer. RocksDB
+  // versions without this option ignore the records and drop them when they
+  // write a new MANIFEST. A blob file that is missing but not recorded causes
+  // Corruption; only this option records dropped blob files.
+  //
+  // Requires enable_blob_files on at least one column family passed to
+  // DB::Open. A read-only DB applies the same recovery in memory but cannot
+  // record dropped blob files in the MANIFEST. Secondary and follower instances
+  // ignore this option. Legacy (stacked) BlobDB is not supported. Setting
+  // best_efforts_recovery as well has no additional effect. Like other DB
+  // options, this one is saved in the OPTIONS file, and every open with it set
+  // skips WAL replay, so set it only for an open that needs the repair.
+  //
+  // Default: false
+  bool best_efforts_blob_db_repair = false;
+
   // It defines how many times DB::Resume() is called by a separate thread when
   // background retryable IO Error happens. When background retryable IO
   // Error happens, SetBGError is called to deal with the error. If the error

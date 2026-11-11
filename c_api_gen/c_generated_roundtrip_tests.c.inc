@@ -659,6 +659,10 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_background_close_inactive_wals(obj) == 1);
   rocksdb_options_set_background_close_inactive_wals(obj, 0);
   CheckCondition(rocksdb_options_get_background_close_inactive_wals(obj) == 0);
+  rocksdb_options_set_best_efforts_blob_db_repair(obj, 1);
+  CheckCondition(rocksdb_options_get_best_efforts_blob_db_repair(obj) == 1);
+  rocksdb_options_set_best_efforts_blob_db_repair(obj, 0);
+  CheckCondition(rocksdb_options_get_best_efforts_blob_db_repair(obj) == 0);
   rocksdb_options_set_best_efforts_recovery(obj, 1);
   CheckCondition(rocksdb_options_get_best_efforts_recovery(obj) == 1);
   rocksdb_options_set_best_efforts_recovery(obj, 0);

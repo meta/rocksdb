@@ -1154,6 +1154,88 @@ TEST_F(VersionBuilderTest, ApplyBlobFileGarbageFileNotFound) {
   ASSERT_TRUE(std::strstr(s.getState(), "Blob file #1234 not found"));
 }
 
+TEST_F(VersionBuilderTest, DroppedBlobFiles) {
+  // Table file 1 references blob file 10, which is in the base version.
+  AddBlob(/* blob_file_number */ 10, /* total_blob_count */ 100,
+          /* total_blob_bytes */ 1000, /* checksum_method */ std::string(),
+          /* checksum_value */ std::string(), BlobFileMetaData::LinkedSsts{1},
+          /* garbage_blob_count */ 0, /* garbage_blob_bytes */ 0);
+  AddDummyFile(/* table_file_number */ 1, /* blob_file_number */ 10,
+               /* epoch_number */ 1);
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  constexpr TableCache* table_cache = nullptr;
+  constexpr VersionSet* version_set = nullptr;
+  constexpr bool force_consistency_checks = false;
+
+  auto save_new_version = [&](VersionBuilder* builder,
+                              VersionStorageInfo* base_vstorage) {
+    auto vstorage = std::make_unique<VersionStorageInfo>(
+        &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel,
+        base_vstorage, force_consistency_checks,
+        EpochNumberRequirement::kMightMissing, nullptr, 0,
+        OffpeakTimeOption(options_.daily_offpeak_time_utc),
+        PeriodicCompactionPhaseParams{});
+    EXPECT_OK(builder->SaveTo(vstorage.get()));
+    UpdateVersionStorageInfo(vstorage.get());
+    return vstorage;
+  };
+
+  // Blob file 5 is older than every blob file a table file references and
+  // blob file 10 is in the version, so only blob files 12 and 15 stay
+  // dropped.
+  VersionBuilder builder(env_options, &ioptions_, table_cache, &vstorage_,
+                         version_set);
+  VersionEdit edit;
+  for (const uint64_t blob_file_number :
+       std::vector<uint64_t>{15, 5, 12, 10, 12}) {
+    edit.AddDroppedBlobFile(blob_file_number);
+  }
+  ASSERT_OK(builder.Apply(&edit));
+  const std::unique_ptr<VersionStorageInfo> new_vstorage =
+      save_new_version(&builder, &vstorage_);
+  ASSERT_EQ(new_vstorage->GetDroppedBlobFiles(),
+            (std::vector<uint64_t>{12, 15}));
+  ASSERT_TRUE(new_vstorage->IsDroppedBlobFile(12));
+  ASSERT_TRUE(new_vstorage->IsDroppedBlobFile(15));
+  ASSERT_FALSE(new_vstorage->IsDroppedBlobFile(10));
+
+  // Dropped blob files carry over while a table file can reference them.
+  VersionBuilder second_builder(env_options, &ioptions_, table_cache,
+                                new_vstorage.get(), version_set);
+  VersionEdit second_edit;
+  AddDummyFileToEdit(&second_edit, /* table_file_number */ 2,
+                     /* blob_file_number */ 10, /* epoch_number */ 2);
+  ASSERT_OK(second_builder.Apply(&second_edit));
+  const std::unique_ptr<VersionStorageInfo> second_vstorage =
+      save_new_version(&second_builder, new_vstorage.get());
+  ASSERT_EQ(second_vstorage->GetDroppedBlobFiles(),
+            (std::vector<uint64_t>{12, 15}));
+
+  // Once every table file only references newer blob files, blob files 12
+  // and 15 can no longer be referenced and are forgotten.
+  VersionBuilder third_builder(env_options, &ioptions_, table_cache,
+                               second_vstorage.get(), version_set);
+  VersionEdit third_edit;
+  third_edit.DeleteFile(/* level */ 0, /* file_number */ 1);
+  third_edit.DeleteFile(/* level */ 0, /* file_number */ 2);
+  third_edit.AddBlobFile(/* blob_file_number */ 20, /* total_blob_count */ 100,
+                         /* total_blob_bytes */ 1000,
+                         /* checksum_method */ std::string(),
+                         /* checksum_value */ std::string());
+  AddDummyFileToEdit(&third_edit, /* table_file_number */ 3,
+                     /* blob_file_number */ 20, /* epoch_number */ 3);
+  ASSERT_OK(third_builder.Apply(&third_edit));
+  const std::unique_ptr<VersionStorageInfo> third_vstorage =
+      save_new_version(&third_builder, second_vstorage.get());
+  ASSERT_TRUE(third_vstorage->GetDroppedBlobFiles().empty());
+
+  UnrefFilesInVersion(third_vstorage.get());
+  UnrefFilesInVersion(second_vstorage.get());
+  UnrefFilesInVersion(new_vstorage.get());
+}
+
 TEST_F(VersionBuilderTest, BlobFileGarbageOverflow) {
   // Test that VersionEdits that would result in the count/total size of garbage
   // exceeding the count/total size of all blobs are rejected.
