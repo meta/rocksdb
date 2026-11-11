@@ -319,6 +319,7 @@ DECLARE_bool(write_dbid_to_manifest);
 DECLARE_bool(track_options_file_number_in_manifest);
 DECLARE_bool(optimize_manifest_for_recovery);
 DECLARE_bool(write_identity_file);
+DECLARE_bool(prefix_seek_opt_in_only);
 DECLARE_bool(reuse_manifest_on_open);
 DECLARE_bool(avoid_flush_during_recovery);
 DECLARE_bool(enforce_write_buffer_manager_during_recovery);

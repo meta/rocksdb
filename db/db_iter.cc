@@ -114,10 +114,13 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       is_key_seqnum_zero_(false),
       prefix_same_as_start_(
           prefix_extractor_ ? read_options.prefix_same_as_start : false),
+      strict_prefix_same_as_start_(prefix_same_as_start_ &&
+                                   ioptions.prefix_seek_opt_in_only),
+      unbounded_prefix_scan_(false),
       pin_thru_lifetime_(read_options.pin_data),
-      expect_total_order_inner_iter_(prefix_extractor_ == nullptr ||
-                                     read_options.total_order_seek ||
-                                     read_options.auto_prefix_mode),
+      expect_total_order_inner_iter_(
+          GetIteratorPrefixMode(read_options, prefix_extractor_ != nullptr) !=
+          IteratorPrefixMode::kPrefix),
       // Read-path range conversion assumes the scan can observe all interior
       // live keys. table_filter can hide whole SSTs, read tiers other than
       // kReadAllTier can skip SSTs or uncached blocks, and timestamp filtering
@@ -1779,7 +1782,8 @@ void DBIter::FlushPendingTombstoneRun(const Slice& end_key,
 }
 
 void DBIter::MaybeInsertRangeTombstone(const Slice& end_key) {
-  if (contiguous_tombstone_count_ < min_tombstones_for_range_conversion_) {
+  if (contiguous_tombstone_count_ < min_tombstones_for_range_conversion_ ||
+      unbounded_prefix_scan_) {
     return;
   }
 
@@ -2031,6 +2035,9 @@ void DBIter::Seek(const Slice& target) {
   PERF_COUNTER_ADD(iter_seek_count, 1);
   PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
   StopWatch sw(clock_, statistics_, DB_SEEK);
+  if (!CheckSeekTargetPrefix(target)) {
+    return;
+  }
 
   if (scan_opts_.has_value()) {
     if (scan_opts_->reverse) {
@@ -2147,6 +2154,9 @@ void DBIter::SeekForPrev(const Slice& target) {
   PERF_COUNTER_ADD(iter_seek_count, 1);
   PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
   StopWatch sw(clock_, statistics_, DB_SEEK);
+  if (!CheckSeekTargetPrefix(target)) {
+    return;
+  }
 
   if (scan_opts_.has_value()) {
     if (!scan_opts_->reverse) {
@@ -2267,11 +2277,35 @@ void DBIter::SeekForPrev(const Slice& target) {
   }
 }
 
+bool DBIter::CheckSeekTargetPrefix(const Slice& target) {
+  unbounded_prefix_scan_ = false;
+  if (expect_total_order_inner_iter_ || prefix_extractor_->InDomain(target)) {
+    return true;
+  }
+  if (strict_prefix_same_as_start_) {
+    valid_ = false;
+    status_ = Status::InvalidArgument(
+        "Seek target outside the prefix extractor's domain is not supported "
+        "with prefix_same_as_start under prefix_seek_opt_in_only");
+    return false;
+  }
+  unbounded_prefix_scan_ = true;
+  return true;
+}
+
 void DBIter::SeekToFirst() {
+  if (strict_prefix_same_as_start_) {
+    valid_ = false;
+    status_ = Status::NotSupported(
+        "SeekToFirst() is not supported with prefix_same_as_start under "
+        "prefix_seek_opt_in_only; Seek() to a key in the wanted prefix");
+    return;
+  }
   if (iterate_lower_bound_ != nullptr) {
     Seek(*iterate_lower_bound_);
     return;
   }
+  unbounded_prefix_scan_ = !expect_total_order_inner_iter_;
   PERF_COUNTER_ADD(iter_seek_count, 1);
   PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
   // Don't use iter_::Seek() if we set a prefix extractor
@@ -2322,6 +2356,14 @@ void DBIter::SeekToFirst() {
 }
 
 void DBIter::SeekToLast() {
+  if (strict_prefix_same_as_start_) {
+    valid_ = false;
+    status_ = Status::NotSupported(
+        "SeekToLast() is not supported with prefix_same_as_start under "
+        "prefix_seek_opt_in_only; SeekForPrev() to a key in the wanted "
+        "prefix");
+    return;
+  }
   if (iterate_upper_bound_ != nullptr) {
     // Seek to last key strictly less than ReadOptions.iterate_upper_bound.
     SeekForPrev(*iterate_upper_bound_);
@@ -2336,6 +2378,7 @@ void DBIter::SeekToLast() {
 #endif
     return;
   }
+  unbounded_prefix_scan_ = !expect_total_order_inner_iter_;
 
   PERF_COUNTER_ADD(iter_seek_count, 1);
   PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);

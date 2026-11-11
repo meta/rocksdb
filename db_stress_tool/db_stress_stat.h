@@ -37,7 +37,6 @@ class Stats {
   long iterator_size_sums_;
   long founds_;
   long iterations_;
-  long seek_to_first_after_seek_;
   long range_deletions_;
   long covered_by_range_deletions_;
   long errors_;
@@ -64,7 +63,6 @@ class Stats {
     iterator_size_sums_ = 0;
     founds_ = 0;
     iterations_ = 0;
-    seek_to_first_after_seek_ = 0;
     range_deletions_ = 0;
     covered_by_range_deletions_ = 0;
     errors_ = 0;
@@ -89,7 +87,6 @@ class Stats {
     iterator_size_sums_ += other.iterator_size_sums_;
     founds_ += other.founds_;
     iterations_ += other.iterations_;
-    seek_to_first_after_seek_ += other.seek_to_first_after_seek_;
     range_deletions_ += other.range_deletions_;
     covered_by_range_deletions_ = other.covered_by_range_deletions_;
     errors_ += other.errors_;
@@ -162,9 +159,6 @@ class Stats {
 
   void AddIterations(long n) { iterations_ += n; }
 
-  // SeekToFirst() after Seek() on one iterator under prefix_same_as_start.
-  void AddSeekToFirstAfterSeek(long n) { seek_to_first_after_seek_ += n; }
-
   void AddDeletes(long n) { deletes_ += n; }
 
   void AddSingleDeletes(size_t n) { single_deletes_ += n; }
@@ -211,10 +205,6 @@ class Stats {
     fprintf(stdout, "%-12s: Iterator size sum is %ld\n", "",
             iterator_size_sums_);
     fprintf(stdout, "%-12s: Iterated %ld times\n", "", iterations_);
-    fprintf(stdout,
-            "%-12s: SeekToFirst() after Seek() under "
-            "prefix_same_as_start %ld times\n",
-            "", seek_to_first_after_seek_);
     fprintf(stdout, "%-12s: Deleted %ld key-ranges\n", "", range_deletions_);
     fprintf(stdout, "%-12s: Range deletions covered %ld keys\n", "",
             covered_by_range_deletions_);
