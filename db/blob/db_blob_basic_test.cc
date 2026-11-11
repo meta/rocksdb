@@ -6,11 +6,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "cache/compressed_secondary_cache.h"
 #include "db/blob/blob_file_partition_manager.h"
@@ -33,6 +36,7 @@
 #include "util/compression.h"
 #include "util/defer.h"
 #include "util/file_checksum_helper.h"
+#include "util/thread_guard.h"
 #include "utilities/fault_injection_env.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -41,6 +45,24 @@ class DBBlobBasicTest : public DBTestBase {
  protected:
   DBBlobBasicTest()
       : DBTestBase("db_blob_basic_test", /* env_do_fsync */ false) {}
+
+  static uint64_t PhysicalBlobSize(const ColumnFamilyMetaData& metadata) {
+    uint64_t size = 0;
+    for (const BlobMetaData& blob : metadata.blob_files) {
+      size += blob.blob_file_size;
+    }
+    return size;
+  }
+
+  static uint64_t SstSize(const ColumnFamilyMetaData& metadata) {
+    uint64_t size = 0;
+    for (const LevelMetaData& level : metadata.levels) {
+      for (const SstFileMetaData& file : level.files) {
+        size += file.size;
+      }
+    }
+    return size;
+  }
 
   Options MissingBlobRepairOptions() {
     Options options = GetDefaultOptions();
@@ -1471,6 +1493,11 @@ TEST_F(DBBlobBasicTest, GetBlobInlinedTTLIndex) {
   ASSERT_OK(db_->Write(WriteOptions(), &batch));
 
   ASSERT_OK(Flush());
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  ASSERT_EQ(properties.begin()->second->referenced_blob_bytes, 0U);
 
   PinnableSlice result;
   ASSERT_TRUE(db_->Get(ReadOptions(), db_->DefaultColumnFamily(), key, &result)
@@ -3848,6 +3875,892 @@ TEST_F(DBBlobBasicTest, GetApproximateSizesIncludingBlobFiles) {
     ASSERT_NEAR(static_cast<double>(sizes[0] + sizes[1]),
                 static_cast<double>(full_size), full_size * 0.1);
   }
+}
+
+TEST_F(DBBlobBasicTest,
+       ReferencedBlobBytesReadFromTablePropertiesAfterReopenAndCompaction) {
+  ASSERT_EQ(TablePropertiesNames::kReferencedBlobBytes,
+            "rocksdb.referenced.blob.bytes");
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 100;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  const std::string first_key = "blob_a";
+  const std::string first_value(1000, 'a');
+  ASSERT_OK(Put(first_key, first_value));
+  ASSERT_OK(Put("inline", "small"));
+  ASSERT_OK(Flush());
+
+  const uint64_t first_record_bytes =
+      first_value.size() +
+      BlobLogRecord::CalculateAdjustmentForRecordHeader(first_key.size());
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  ASSERT_EQ(properties.begin()->second->referenced_blob_bytes,
+            first_record_bytes);
+
+  Reopen(options);
+  properties.clear();
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  ASSERT_EQ(properties.begin()->second->referenced_blob_bytes,
+            first_record_bytes);
+
+  const std::string second_key = "blob_z";
+  const std::string second_value(1500, 'z');
+  ASSERT_OK(Put(second_key, second_value));
+  ASSERT_OK(Flush());
+  const uint64_t second_record_bytes =
+      second_value.size() +
+      BlobLogRecord::CalculateAdjustmentForRecordHeader(second_key.size());
+
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  properties.clear();
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  uint64_t compacted_referenced_bytes = 0;
+  for (const auto& property : properties) {
+    ASSERT_TRUE(property.second->referenced_blob_bytes.has_value());
+    compacted_referenced_bytes += *property.second->referenced_blob_bytes;
+  }
+  ASSERT_GT(properties.size(), 0U);
+  ASSERT_EQ(compacted_referenced_bytes,
+            first_record_bytes + second_record_bytes);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesAccountsForOrphanedBlobFiles) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.enable_blob_garbage_collection = false;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  constexpr int kKeysPerRange = 100;
+  for (int i = 0; i < kKeysPerRange; ++i) {
+    ASSERT_OK(Put("a" + Key(i), std::string(1000, 'a')));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < kKeysPerRange; ++i) {
+    ASSERT_OK(Put("z" + Key(i), std::string(3000, 'z')));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ColumnFamilyMetaData before;
+  db_->GetColumnFamilyMetaData(&before);
+  ASSERT_EQ(before.blob_files.size(), 2U);
+  const uint64_t physical_size = PhysicalBlobSize(before);
+
+  const Slice b_start("z");
+  const Slice b_limit("{");
+  ASSERT_OK(DeleteFilesInRange(db_.get(), db_->DefaultColumnFamily(), &b_start,
+                               &b_limit));
+  ColumnFamilyMetaData after;
+  db_->GetColumnFamilyMetaData(&after);
+  ASSERT_EQ(after.blob_files.size(), 2U);
+  ASSERT_EQ(PhysicalBlobSize(after), physical_size);
+  ASSERT_EQ(Get("a" + Key(0)), std::string(1000, 'a'));
+  ASSERT_EQ(Get("z" + Key(0)), "NOT_FOUND");
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  ASSERT_TRUE(properties.begin()->second->referenced_blob_bytes.has_value());
+  const uint64_t referenced =
+      *properties.begin()->second->referenced_blob_bytes;
+  ASSERT_GT(referenced, 0U);
+  ASSERT_LT(referenced, physical_size / 2);
+
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  const Range ranges[] = {{"a", "b"}, {"z", "{"}, {"a", "{"}};
+  uint64_t sizes[3] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 3, sizes));
+  ASSERT_NEAR(static_cast<double>(sizes[0]), static_cast<double>(physical_size),
+              physical_size * 0.05);
+  ASSERT_EQ(sizes[1], 0U);
+  ASSERT_NEAR(static_cast<double>(sizes[2]), static_cast<double>(physical_size),
+              physical_size * 0.05);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesFallsBackWithNoReferenceWeights) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+  // Model a recorded zero count with a positive physical budget. The SST's
+  // real blob indexes retain that budget while its optional statistic is zero.
+  SyncPoint::GetInstance()->SetCallBack(
+      "PropertyBlockBuilder::AddTableProperty:Start", [](void* arg) {
+        static_cast<TableProperties*>(arg)->referenced_blob_bytes = 0;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(1000, 'v')));
+  }
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  ASSERT_EQ(properties.begin()->second->referenced_blob_bytes, 0U);
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_size = PhysicalBlobSize(metadata);
+  ASSERT_GT(physical_size, 0U);
+  const std::string start = Key(0);
+  const std::string limit = Key(100);
+  const Range range(start, limit);
+  SizeApproximationOptions options_for_size;
+  options_for_size.include_files = false;
+  options_for_size.include_blob_files = true;
+  options_for_size.allow_expensive_query = true;
+  uint64_t size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(
+      options_for_size, db_->DefaultColumnFamily(), &range, 1, &size));
+  ASSERT_NEAR(static_cast<double>(size), static_cast<double>(physical_size),
+              physical_size * 0.05);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesDistinguishesBlobHeavyRange) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 512;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 256;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  Reopen(options);
+
+  constexpr int kKeysPerRange = 200;
+  for (int i = 0; i < kKeysPerRange; ++i) {
+    ASSERT_OK(Put("a" + Key(i), std::string(4096, 'a')));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < kKeysPerRange; ++i) {
+    ASSERT_OK(Put("z" + Key(i), std::string(48, 'z')));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < kKeysPerRange; ++i) {
+    ASSERT_OK(Put("m" + Key(i), std::string(4096, 'm')));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(/*level=*/1);
+
+  const std::string a_start = "a";
+  const std::string a_limit = "b";
+  const std::string z_start = "z";
+  const std::string z_limit = "{";
+  const Range ranges[] = {{a_start, a_limit}, {z_start, z_limit}};
+
+  SizeApproximationOptions file_options;
+  file_options.include_files = true;
+  file_options.include_blob_files = false;
+  uint64_t sst_sizes[2] = {};
+  ASSERT_OK(db_->GetApproximateSizes(file_options, db_->DefaultColumnFamily(),
+                                     ranges, 2, sst_sizes));
+  ASSERT_GT(sst_sizes[0], 0U);
+  ASSERT_GT(sst_sizes[1], 0U);
+  ASSERT_LT(sst_sizes[0], 4 * sst_sizes[1]);
+  ASSERT_LT(sst_sizes[1], 4 * sst_sizes[0]);
+
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t blob_sizes[2] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 2, blob_sizes));
+  ASSERT_GT(blob_sizes[0], 0U);
+  ASSERT_EQ(blob_sizes[1], 0U);
+
+  const std::string half_limit = "a" + Key(kKeysPerRange / 2);
+  const Range half_range(a_start, half_limit);
+  uint64_t half_blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &half_range, 1, &half_blob_size));
+  ASSERT_GT(half_blob_size, blob_sizes[0] / 3);
+  ASSERT_LT(half_blob_size, blob_sizes[0] * 2 / 3);
+
+  SizeApproximationOptions margin_options = blob_options;
+  margin_options.files_size_error_margin = 100.0;
+  const std::string margin_start = "a" + Key(kKeysPerRange / 2);
+  const std::string margin_limit = "z" + Key(kKeysPerRange / 2);
+  const Range margin_range(margin_start, margin_limit);
+  std::vector<uint64_t> intersecting_referenced_blob_bytes;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ApproximateSize:IntersectingReferencedBlobBytes",
+      [&](void* arg) {
+        intersecting_referenced_blob_bytes.push_back(
+            *static_cast<uint64_t*>(arg));
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  uint64_t margin_blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(margin_options, db_->DefaultColumnFamily(),
+                                     &margin_range, 1, &margin_blob_size));
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  ASSERT_GT(margin_blob_size, physical_blob_size / 2);
+  ASSERT_LT(margin_blob_size, physical_blob_size);
+
+  for (int i = 0; i < kKeysPerRange; ++i) {
+    ASSERT_OK(Put("~" + Key(i), std::string(8192, 'o')));
+  }
+  ASSERT_OK(Flush());
+  uint64_t margin_blob_size_with_disjoint_l0_file = 0;
+  ASSERT_OK(db_->GetApproximateSizes(margin_options, db_->DefaultColumnFamily(),
+                                     &margin_range, 1,
+                                     &margin_blob_size_with_disjoint_l0_file));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(intersecting_referenced_blob_bytes.size(), 2U);
+  ASSERT_EQ(intersecting_referenced_blob_bytes[0],
+            intersecting_referenced_blob_bytes[1]);
+
+  uint64_t sst_sizes_again[2] = {};
+  ASSERT_OK(db_->GetApproximateSizes(file_options, db_->DefaultColumnFamily(),
+                                     ranges, 2, sst_sizes_again));
+  ASSERT_EQ(sst_sizes_again[0], sst_sizes[0]);
+  ASSERT_EQ(sst_sizes_again[1], sst_sizes[1]);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesMetadataReuseAcrossReopen) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 512;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  options.max_open_files = -1;
+  options.create_if_missing = true;
+  options.level0_slowdown_writes_trigger = 1000;
+  options.level0_stop_writes_trigger = 1000;
+  Reopen(options);
+
+  constexpr int kNumFiles = 64;
+  for (int i = 0; i < kNumFiles; ++i) {
+    const std::string key = (i % 2 == 0 ? "a" : "z") + Key(i);
+    ASSERT_OK(Put(key, std::string(i % 2 == 0 ? 2048 : 48, 'v')));
+    ASSERT_OK(Flush());
+  }
+  const Range ranges[] = {{"a", "b"}, {"z", "{"}};
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  blob_options.files_size_error_margin = 0;
+
+  struct Mode {
+    int max_open_files;
+    bool skip_stats;
+  };
+  const Mode modes[] = {{-1, false}, {20, false}, {20, true}};
+  constexpr int kIterations = 5;
+  for (const Mode& mode : modes) {
+    SCOPED_TRACE("max_open_files=" + std::to_string(mode.max_open_files) +
+                 ",skip_stats=" + std::to_string(mode.skip_stats));
+    options.max_open_files = mode.max_open_files;
+    options.skip_stats_update_on_db_open = mode.skip_stats;
+    Reopen(options);
+    int property_reads = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::GetApproximateSizes:TablePropertiesStatus",
+        [&](void*) { ++property_reads; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    SizeApproximationOptions sst_options;
+    uint64_t sst_sizes[2] = {};
+    ASSERT_OK(db_->GetApproximateSizes(sst_options, db_->DefaultColumnFamily(),
+                                       ranges, 2, sst_sizes));
+    SizeApproximationOptions fast_options;
+    fast_options.include_files = false;
+    fast_options.include_blob_files = true;
+    const double ratio = static_cast<double>(PhysicalBlobSize(metadata)) /
+                         static_cast<double>(SstSize(metadata));
+    for (int i = 0; i < kIterations; ++i) {
+      uint64_t fast_sizes[2] = {};
+      ASSERT_OK(db_->GetApproximateSizes(
+          fast_options, db_->DefaultColumnFamily(), ranges, 2, fast_sizes));
+      for (int range = 0; range < 2; ++range) {
+        ASSERT_EQ(fast_sizes[range],
+                  static_cast<uint64_t>(static_cast<double>(sst_sizes[range]) *
+                                        ratio));
+      }
+    }
+    ASSERT_EQ(property_reads, 0);
+    for (int i = 0; i < kIterations; ++i) {
+      uint64_t sizes[2] = {};
+      ASSERT_OK(db_->GetApproximateSizes(
+          blob_options, db_->DefaultColumnFamily(), ranges, 2, sizes));
+      ASSERT_GT(sizes[0], 0U);
+      ASSERT_EQ(sizes[1], 0U);
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    if (mode.max_open_files == -1) {
+      ASSERT_EQ(property_reads, 0);
+    } else if (mode.skip_stats) {
+      ASSERT_EQ(property_reads, kNumFiles * kIterations);
+    } else {
+      ASSERT_GT(property_reads, 0);
+      ASSERT_LT(property_reads, kNumFiles * kIterations);
+    }
+  }
+
+  options.max_open_files = -1;
+  options.skip_stats_update_on_db_open = false;
+  Reopen(options);
+  std::mutex start_mutex;
+  std::condition_variable start_cv;
+  bool start = false;
+  std::atomic<bool> read_failed{false};
+  {
+    std::vector<ThreadGuard> readers;
+    readers.reserve(3);
+    for (int reader = 0; reader < 3; ++reader) {
+      readers.emplace_back(port::Thread([&] {
+        {
+          std::unique_lock<std::mutex> lock(start_mutex);
+          start_cv.wait(lock, [&] { return start; });
+        }
+        for (int i = 0; i < 100; ++i) {
+          uint64_t sizes[2] = {};
+          const Status s = db_->GetApproximateSizes(
+              blob_options, db_->DefaultColumnFamily(), ranges, 2, sizes);
+          if (!s.ok() || sizes[0] == 0 || sizes[1] != 0) {
+            read_failed.store(true);
+          }
+        }
+      }));
+    }
+    {
+      std::lock_guard<std::mutex> lock(start_mutex);
+      start = true;
+    }
+    start_cv.notify_all();
+    for (int i = 0; i < 4; ++i) {
+      ASSERT_OK(Put("m" + Key(i), std::string(2048, 'm')));
+      ASSERT_OK(Flush());
+    }
+  }
+  ASSERT_FALSE(read_failed.load());
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesLegacyFallbackIsUnchanged) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "PropertyBlockBuilder::AddTableProperty:SkipReferencedBlobBytes",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(1000, 'v')));
+  }
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  const std::string start = Key(0);
+  const std::string limit = Key(100);
+  const Range range(start, limit);
+  SizeApproximationOptions file_options;
+  file_options.include_files = true;
+  file_options.include_blob_files = false;
+  uint64_t sst_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(file_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &sst_size));
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  const uint64_t total_sst_size = SstSize(metadata);
+
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &blob_size));
+  const uint64_t expected = static_cast<uint64_t>(
+      static_cast<double>(sst_size) * (static_cast<double>(physical_blob_size) /
+                                       static_cast<double>(total_sst_size)));
+  ASSERT_EQ(blob_size, expected);
+}
+
+TEST_F(DBBlobBasicTest,
+       GetApproximateSizesFallsBackWhenTablePropertiesUnavailable) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  options.skip_stats_update_on_db_open = true;
+  Reopen(options);
+
+  constexpr int kNumKeys = 100;
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(1000, 'v')));
+  }
+  ASSERT_OK(Flush());
+  Reopen(options);
+
+  const std::string start = Key(0);
+  const std::string limit = Key(kNumKeys / 2);
+  const Range range(start, limit);
+  SizeApproximationOptions file_options;
+  file_options.include_files = true;
+  uint64_t sst_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(file_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &sst_size));
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  const uint64_t total_sst_size = SstSize(metadata);
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetApproximateSizes:TablePropertiesStatus", [](void* arg) {
+        *static_cast<Status*>(arg) =
+            Status::IOError("injected table properties failure");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &blob_size));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  const uint64_t expected = static_cast<uint64_t>(
+      static_cast<double>(sst_size) * (static_cast<double>(physical_blob_size) /
+                                       static_cast<double>(total_sst_size)));
+  ASSERT_EQ(blob_size, expected);
+}
+
+TEST_F(DBBlobBasicTest,
+       GetApproximateSizesClassifiesEachTablePropertiesReadOnce) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  options.skip_stats_update_on_db_open = true;
+  Reopen(options);
+
+  constexpr int kNumKeys = 100;
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(1000, 'v')));
+  }
+  ASSERT_OK(Flush());
+  Reopen(options);
+
+  int table_properties_reads = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetApproximateSizes:TablePropertiesStatus", [&](void* arg) {
+        ++table_properties_reads;
+        if (table_properties_reads == 1) {
+          *static_cast<Status*>(arg) =
+              Status::IOError("injected table properties failure");
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  const std::string start = Key(0);
+  const std::string middle = Key(kNumKeys / 2);
+  const std::string limit = Key(kNumKeys);
+  const Range ranges[] = {{start, middle}, {middle, limit}, {start, limit}};
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t sst_sizes[3] = {};
+  SizeApproximationOptions sst_options;
+  ASSERT_OK(db_->GetApproximateSizes(sst_options, db_->DefaultColumnFamily(),
+                                     ranges, 3, sst_sizes));
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const double ratio = static_cast<double>(PhysicalBlobSize(metadata)) /
+                       static_cast<double>(SstSize(metadata));
+  uint64_t blob_sizes[3] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 3, blob_sizes));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(table_properties_reads, 1);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(blob_sizes[i],
+              static_cast<uint64_t>(static_cast<double>(sst_sizes[i]) * ratio));
+  }
+  ASSERT_GT(blob_sizes[2], 0U);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesInflatesForGarbage) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  constexpr int kNumKeys = 200;
+  constexpr int kNumOverwrittenKeys = kNumKeys / 2;
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(2000, 'a')));
+  }
+  ASSERT_OK(Flush());
+  const std::string start = Key(0);
+  const std::string limit = Key(kNumKeys);
+  const Range range(start, limit);
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t clean_blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &clean_blob_size));
+  ColumnFamilyMetaData clean_metadata;
+  db_->GetColumnFamilyMetaData(&clean_metadata);
+  const uint64_t clean_physical_blob_size = PhysicalBlobSize(clean_metadata);
+  ASSERT_NEAR(static_cast<double>(clean_blob_size),
+              static_cast<double>(clean_physical_blob_size),
+              static_cast<double>(clean_physical_blob_size) * 0.05);
+
+  for (int i = 0; i < kNumOverwrittenKeys; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(2000, 'b')));
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  uint64_t live_referenced_bytes = 0;
+  for (const auto& property : properties) {
+    ASSERT_TRUE(property.second->referenced_blob_bytes.has_value());
+    live_referenced_bytes += *property.second->referenced_blob_bytes;
+  }
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  uint64_t garbage_blob_bytes = 0;
+  for (const BlobMetaData& blob : metadata.blob_files) {
+    garbage_blob_bytes += blob.garbage_blob_bytes;
+  }
+  uint64_t expected_garbage_blob_bytes = 0;
+  for (int i = 0; i < kNumOverwrittenKeys; ++i) {
+    expected_garbage_blob_bytes +=
+        2000 + BlobLogRecord::CalculateAdjustmentForRecordHeader(Key(i).size());
+  }
+  ASSERT_EQ(garbage_blob_bytes, expected_garbage_blob_bytes);
+
+  uint64_t blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &blob_size));
+  ASSERT_GT(blob_size, live_referenced_bytes);
+  ASSERT_NEAR(static_cast<double>(blob_size),
+              static_cast<double>(physical_blob_size),
+              static_cast<double>(physical_blob_size) * 0.05);
+
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Delete(Key(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  uint64_t all_garbage_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &all_garbage_size));
+  ASSERT_EQ(all_garbage_size, 0U);
+}
+
+TEST_F(DBBlobBasicTest,
+       GetApproximateSizesCapsOvercountedReferencesAtPhysicalBudget) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 512;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  constexpr int kKeysPerRange = 50;
+  for (const char prefix : {'a', 'z'}) {
+    for (int i = 0; i < kKeysPerRange; ++i) {
+      ASSERT_OK(Put(std::string(1, prefix) + Key(i), std::string(2000, 'a')));
+    }
+  }
+  ASSERT_OK(Flush());
+  for (const char prefix : {'a', 'z'}) {
+    for (int i = 0; i < kKeysPerRange - 5; ++i) {
+      ASSERT_OK(Put(std::string(1, prefix) + Key(i), std::string(2000, 'b')));
+    }
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "PropertyBlockBuilder::AddTableProperty:Start", [](void* arg) {
+        auto* properties = static_cast<TableProperties*>(arg);
+        ASSERT_TRUE(properties->referenced_blob_bytes.has_value());
+        *properties->referenced_blob_bytes *= 100;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (const char prefix : {'a', 'z'}) {
+    for (int i = 0; i < kKeysPerRange; ++i) {
+      ASSERT_OK(Put(std::string(1, prefix) + Key(i), std::string(2000, 'c')));
+    }
+  }
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  uint64_t garbage_blob_bytes = 0;
+  for (const BlobMetaData& blob : metadata.blob_files) {
+    garbage_blob_bytes += blob.garbage_blob_bytes;
+  }
+  ASSERT_GT(physical_blob_size, 0U);
+  ASSERT_GT(garbage_blob_bytes, 0U);
+  ASSERT_EQ(FilesPerLevel(), "1,1");
+
+  const std::string a_start = "a";
+  const std::string a_limit = "b";
+  const std::string z_start = "z";
+  const std::string z_limit = "{";
+  const Range ranges[] = {{a_start, a_limit}, {z_start, z_limit}};
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t sizes[2] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 2, sizes));
+  EXPECT_LE(sizes[0], physical_blob_size);
+  EXPECT_LE(sizes[1], physical_blob_size);
+  EXPECT_LE(sizes[0] + sizes[1], physical_blob_size);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesDistributesZeroLiveBudgetBySstSize) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 512;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 256;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  Reopen(options);
+
+  constexpr int kKeysPerRange = 50;
+  for (const char prefix : {'a', 'z'}) {
+    for (int i = 0; i < kKeysPerRange; ++i) {
+      ASSERT_OK(Put(std::string(1, prefix) + Key(i), std::string(2000, 'b')));
+    }
+  }
+  ASSERT_OK(Flush());
+  for (const char prefix : {'a', 'z'}) {
+    for (int i = 0; i < kKeysPerRange; ++i) {
+      ASSERT_OK(Put(std::string(1, prefix) + Key(i), std::string(48, 'i')));
+    }
+  }
+  ASSERT_OK(Flush());
+
+  // A fully garbage blob file is normally retired with its last linked SST.
+  // Override the computed live budget to exercise the zero-live-byte fallback
+  // while retaining real live SSTs and a physical blob file.
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetApproximateSizes:LiveBlobBytes",
+      [](void* arg) { *static_cast<uint64_t*>(arg) = 0; });
+  int table_properties_reads = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetApproximateSizes:TablePropertiesStatus",
+      [&](void*) { ++table_properties_reads; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  ASSERT_GT(physical_blob_size, 0U);
+  ASSERT_NE(FilesPerLevel(), "");
+
+  const std::string a_start = "a";
+  const std::string a_limit = "b";
+  const std::string z_start = "z";
+  const std::string z_limit = "{";
+  const Range ranges[] = {{a_start, a_limit}, {z_start, z_limit}};
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t sizes[2] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 2, sizes));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(table_properties_reads, 0);
+  ASSERT_GT(sizes[0], 0U);
+  ASSERT_GT(sizes[1], 0U);
+  ASSERT_NEAR(static_cast<double>(sizes[0] + sizes[1]),
+              static_cast<double>(physical_blob_size),
+              static_cast<double>(physical_blob_size) * 0.15);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesSaturatesInvalidBlobGarbageTotals) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  ASSERT_OK(Put("key", std::string(2000, 'b')));
+  ASSERT_OK(Flush());
+
+  uint64_t observed_total_blob_bytes = 0;
+  uint64_t observed_garbage_blob_bytes = 0;
+  uint64_t observed_live_blob_bytes = std::numeric_limits<uint64_t>::max();
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetApproximateSizes:BlobByteTotals", [&](void* arg) {
+        auto* const totals = static_cast<std::pair<uint64_t*, uint64_t*>*>(arg);
+        ASSERT_NE(totals, nullptr);
+        observed_total_blob_bytes = *totals->first;
+        ASSERT_LT(observed_total_blob_bytes,
+                  std::numeric_limits<uint64_t>::max());
+        *totals->second = observed_total_blob_bytes + 1;
+        observed_garbage_blob_bytes = *totals->second;
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetApproximateSizes:LiveBlobBytes", [&](void* arg) {
+        observed_live_blob_bytes = *static_cast<uint64_t*>(arg);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  const std::string start = "a";
+  const std::string limit = "z";
+  const Range range(start, limit);
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &blob_size));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_GT(observed_total_blob_bytes, 0U);
+  ASSERT_GT(observed_garbage_blob_bytes, observed_total_blob_bytes);
+  ASSERT_EQ(observed_live_blob_bytes, 0U);
+  ASSERT_GT(blob_size, 0U);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesConservesMixedMetadataBudget) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 512;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "PropertyBlockBuilder::AddTableProperty:SkipReferencedBlobBytes",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put("a" + Key(i), std::string(2000, 'a')));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put("m" + Key(i), std::string(48, 'm')));
+  }
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put("z" + Key(i), std::string(1000, 'z')));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put("z" + Key(i), std::string(1200, 'y')));
+  }
+  ASSERT_OK(Flush());
+
+  const std::string a_start = "a";
+  const std::string a_limit = "b";
+  const std::string m_start = "m";
+  const std::string m_limit = "n";
+  const std::string z_start = "z";
+  const std::string z_limit = "{";
+  const Range ranges[] = {
+      {a_start, a_limit}, {m_start, m_limit}, {z_start, z_limit}};
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t before[3] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 3, before));
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  const uint64_t before_total = before[0] + before[1] + before[2];
+  ASSERT_NEAR(static_cast<double>(before_total),
+              static_cast<double>(physical_blob_size),
+              static_cast<double>(physical_blob_size) * 0.15);
+  ASSERT_GT(before[1], 0U);
+
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  uint64_t after[3] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 3, after));
+  ColumnFamilyMetaData after_metadata;
+  db_->GetColumnFamilyMetaData(&after_metadata);
+  const uint64_t after_physical_blob_size = PhysicalBlobSize(after_metadata);
+  const uint64_t after_total = after[0] + after[1] + after[2];
+  ASSERT_NEAR(static_cast<double>(after_total),
+              static_cast<double>(after_physical_blob_size),
+              static_cast<double>(after_physical_blob_size) * 0.15);
+  const uint64_t distribution_change =
+      after[1] > before[1] ? after[1] - before[1] : before[1] - after[1];
+  ASSERT_GT(distribution_change, physical_blob_size / 100);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

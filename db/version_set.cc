@@ -3438,7 +3438,8 @@ void Version::PrepareAppend(const ReadOptions& read_options,
 }
 
 bool Version::MaybeInitializeFileMetaData(const ReadOptions& read_options,
-                                          FileMetaData* file_meta) {
+                                          FileMetaData* file_meta,
+                                          bool populate_referenced_blob_bytes) {
   if (file_meta->init_stats_from_file || file_meta->compensated_file_size > 0) {
     return false;
   }
@@ -3459,6 +3460,9 @@ bool Version::MaybeInitializeFileMetaData(const ReadOptions& read_options,
   file_meta->num_deletions = tp->num_deletions;
   file_meta->raw_value_size = tp->raw_value_size;
   file_meta->raw_key_size = tp->raw_key_size;
+  if (populate_referenced_blob_bytes) {
+    file_meta->referenced_blob_bytes = tp->referenced_blob_bytes;
+  }
   file_meta->num_range_deletions = tp->num_range_deletions;
   // Ensure new invariants on old files
   file_meta->num_deletions =
@@ -3513,7 +3517,9 @@ void Version::UpdateAccumulatedStats(const ReadOptions& read_options) {
        level < storage_info_.num_levels_ && init_count < kMaxInitCount;
        ++level) {
     for (auto* file_meta : storage_info_.files_[level]) {
-      if (MaybeInitializeFileMetaData(read_options, file_meta)) {
+      if (MaybeInitializeFileMetaData(
+              read_options, file_meta,
+              /*populate_referenced_blob_bytes=*/true)) {
         // each FileMeta will be initialized only once.
         storage_info_.UpdateAccumulatedStats(file_meta);
         // when option "max_open_files" is -1, all the file metadata has
@@ -3538,8 +3544,9 @@ void Version::UpdateAccumulatedStats(const ReadOptions& read_options) {
        storage_info_.accumulated_raw_value_size_ == 0 && level >= 0; --level) {
     for (int i = static_cast<int>(storage_info_.files_[level].size()) - 1;
          storage_info_.accumulated_raw_value_size_ == 0 && i >= 0; --i) {
-      if (MaybeInitializeFileMetaData(read_options,
-                                      storage_info_.files_[level][i])) {
+      if (MaybeInitializeFileMetaData(
+              read_options, storage_info_.files_[level][i],
+              /*populate_referenced_blob_bytes=*/true)) {
         storage_info_.UpdateAccumulatedStats(storage_info_.files_[level][i]);
       }
     }
@@ -8255,12 +8262,62 @@ Status VersionSet::WriteCurrentStateToManifest(
 // (a,b) then (b,c) then (c,d). Knowing this, an optimization is possible
 // where we avoid doing binary search for the keys b and c twice and instead
 // somehow maintain state of where they first appear in the files.
+std::optional<uint64_t> VersionSet::BlobSizeAccounting::GetReferencedBlobBytes(
+    const FileMetaData& file) const {
+  if (file.referenced_blob_bytes.has_value()) {
+    return file.referenced_blob_bytes;
+  }
+  const auto captured = references.find(file.fd.GetNumber());
+  assert(captured != references.end());
+  return captured == references.end() ? std::nullopt : captured->second;
+}
+
 uint64_t VersionSet::ApproximateSize(const SizeApproximationOptions& options,
                                      const ReadOptions& read_options,
                                      Version* v, const Slice& start,
                                      const Slice& end, int start_level,
-                                     int end_level, TableReaderCaller caller) {
+                                     int end_level, TableReaderCaller caller,
+                                     BlobSizeAccounting* blob_accounting) {
   const auto& icmp = v->cfd_->internal_comparator();
+
+  if (blob_accounting != nullptr) {
+    blob_accounting->referenced_blob_bytes = 0;
+    blob_accounting->unknown_sst_bytes = 0;
+  }
+
+  const auto get_referenced_blob_bytes =
+      [&](const FdWithKeyRange& file) -> std::optional<uint64_t> {
+    assert(blob_accounting != nullptr);
+    assert(file.file_metadata != nullptr);
+    return blob_accounting->GetReferencedBlobBytes(*file.file_metadata);
+  };
+
+  auto account_file = [&](const FdWithKeyRange& file, uint64_t sst_bytes) {
+    if (blob_accounting == nullptr) {
+      return;
+    }
+    if (icmp.Compare(file.largest_key, start) <= 0 ||
+        icmp.Compare(file.smallest_key, end) > 0) {
+      return;
+    }
+    const std::optional<uint64_t> file_referenced_blob_bytes =
+        get_referenced_blob_bytes(file);
+    if (!file_referenced_blob_bytes.has_value()) {
+      blob_accounting->unknown_sst_bytes += sst_bytes;
+      return;
+    }
+    if (sst_bytes == 0) {
+      return;
+    }
+    const uint64_t file_size = file.fd.GetFileSize();
+    if (sst_bytes == file_size) {
+      blob_accounting->referenced_blob_bytes += *file_referenced_blob_bytes;
+    } else if (file_size > 0) {
+      blob_accounting->referenced_blob_bytes += static_cast<uint64_t>(
+          static_cast<double>(*file_referenced_blob_bytes) *
+          static_cast<double>(sst_bytes) / static_cast<double>(file_size));
+    }
+  };
 
   // pre-condition
   assert(icmp.Compare(start, end) <= 0);
@@ -8340,6 +8397,7 @@ uint64_t VersionSet::ApproximateSize(const SizeApproximationOptions& options,
       assert(file_size == ApproximateSize(read_options, v, files_brief.files[i],
                                           start, end, caller));
       total_full_size += file_size;
+      account_file(files_brief.files[i], file_size);
     }
 
     // save the first and the last files (which may be the same file), so we
@@ -8353,12 +8411,35 @@ uint64_t VersionSet::ApproximateSize(const SizeApproximationOptions& options,
 
   // The sum of all file sizes that intersect the [start, end] keys range.
   uint64_t total_intersecting_size = 0;
+  uint64_t intersecting_referenced_blob_bytes = 0;
+  uint64_t intersecting_unknown_sst_bytes = 0;
+  auto account_intersecting_file = [&](const FdWithKeyRange& file) {
+    const uint64_t file_size = file.fd.GetFileSize();
+    total_intersecting_size += file_size;
+    if (blob_accounting == nullptr) {
+      return;
+    }
+    if (icmp.Compare(file.largest_key, start) <= 0 ||
+        icmp.Compare(file.smallest_key, end) > 0) {
+      return;
+    }
+    const std::optional<uint64_t> file_referenced_blob_bytes =
+        get_referenced_blob_bytes(file);
+    if (file_referenced_blob_bytes.has_value()) {
+      intersecting_referenced_blob_bytes += *file_referenced_blob_bytes;
+    } else {
+      intersecting_unknown_sst_bytes += file_size;
+    }
+  };
   for (const auto* file_ptr : first_files) {
-    total_intersecting_size += file_ptr->fd.GetFileSize();
+    account_intersecting_file(*file_ptr);
   }
   for (const auto* file_ptr : last_files) {
-    total_intersecting_size += file_ptr->fd.GetFileSize();
+    account_intersecting_file(*file_ptr);
   }
+  TEST_SYNC_POINT_CALLBACK(
+      "VersionSet::ApproximateSize:IntersectingReferencedBlobBytes",
+      &intersecting_referenced_blob_bytes);
 
   // Now scan all the first & last files at each level, and estimate their
   // size. If the total_intersecting_size is less than X% of the
@@ -8370,20 +8451,29 @@ uint64_t VersionSet::ApproximateSize(const SizeApproximationOptions& options,
   if (margin > 0 && total_intersecting_size <
                         static_cast<uint64_t>(total_full_size * margin)) {
     total_full_size += total_intersecting_size / 2;
+    if (blob_accounting != nullptr) {
+      blob_accounting->referenced_blob_bytes +=
+          intersecting_referenced_blob_bytes / 2;
+      blob_accounting->unknown_sst_bytes += intersecting_unknown_sst_bytes / 2;
+    }
   } else {
     // Estimate for all the first files (might also be last files), at each
     // level
     for (const auto file_ptr : first_files) {
-      total_full_size +=
+      const uint64_t file_size =
           ApproximateSize(read_options, v, *file_ptr, start, end, caller);
+      total_full_size += file_size;
+      account_file(*file_ptr, file_size);
     }
 
     // Estimate for all the last files, at each level
     for (const auto file_ptr : last_files) {
       // We could use ApproximateSize here, but calling ApproximateOffsetOf
       // directly is just more efficient.
-      total_full_size +=
+      const uint64_t file_size =
           ApproximateOffsetOf(read_options, v, *file_ptr, end, caller);
+      total_full_size += file_size;
+      account_file(*file_ptr, file_size);
     }
   }
 

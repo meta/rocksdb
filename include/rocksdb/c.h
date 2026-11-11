@@ -2127,6 +2127,14 @@ rocksdb_table_properties_has_key_largest_seqno(
 extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_table_properties_has_key_smallest_seqno(
     const rocksdb_table_properties_t* props);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_table_properties_has_referenced_blob_bytes(
+    const rocksdb_table_properties_t* props);
+/* Returns zero when the property is unknown; use the has accessor to
+ * distinguish unknown from a known zero value. */
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_table_properties_referenced_blob_bytes(
+    const rocksdb_table_properties_t* props);
 extern ROCKSDB_LIBRARY_API size_t
 rocksdb_table_properties_user_collected_properties_count(
     const rocksdb_table_properties_t* props);
@@ -6089,6 +6097,14 @@ rocksdb_size_approximation_options_set_files_size_error_margin(
 
 extern ROCKSDB_LIBRARY_API double
 rocksdb_size_approximation_options_get_files_size_error_margin(
+    rocksdb_size_approximation_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_size_approximation_options_set_allow_expensive_query(
+    rocksdb_size_approximation_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_size_approximation_options_get_allow_expensive_query(
     rocksdb_size_approximation_options_t* opt);
 
 /* LiveFilesStorageInfoOptions */

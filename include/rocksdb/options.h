@@ -3512,18 +3512,12 @@ struct SizeApproximationOptions {
   // If set to false, at least one of include_memtables or include_blob_files
   // must be true.
   bool include_files = true;
-  // Defines whether the returned size should include an approximation of
-  // blob file data in the key range. When enabled, the total blob file size
-  // is prorated by the ratio of SST data in the range to the total SST data:
-  //
-  //   blob_size_in_range ~= total_blob_size * (sst_in_range / total_sst)
-  //
-  // Limitations of this approximation:
-  // - Assumes blob data is distributed proportionally to SST data, which
-  //   may not hold if blob value sizes vary significantly across keys.
-  // - If there are no SST files (all data in memtables), the blob size
-  //   contribution will be 0 even if blob files exist on disk.
-  // Default: false (for backward compatibility).
+  // Include an approximation of separate blob-file bytes attributable to the
+  // key range. By default, the total physical blob-file size is prorated by
+  // the range's share of SST bytes. This assumes that blob bytes are
+  // distributed in proportion to SST bytes, which can be inaccurate when
+  // blob value sizes vary across key ranges. Set allow_expensive_query for
+  // per-file attribution. Default: false.
   bool include_blob_files = false;
   // When approximating the files total size that is used to store a keys range
   // using DB::GetApproximateSizes, allow approximation with an error margin of
@@ -3535,6 +3529,24 @@ struct SizeApproximationOptions {
   // If the value is non-positive - a more precise yet more CPU intensive
   // estimation is performed.
   double files_size_error_margin = -1.0;
+  // Allow estimation methods that can be much more expensive in exchange for
+  // accuracy: work, and possibly synchronous I/O, proportional to the number
+  // of SSTs in the column family, regardless of the requested ranges' sizes.
+  // Currently this only affects include_blob_files: every SST is visited,
+  // and table properties may be read for SSTs whose blob reference counts
+  // are not already in memory. Blob bytes are attributed using these counts
+  // and the estimated fraction of each SST in the range. SSTs that do not
+  // record blob reference counts (written by older versions, or by table
+  // formats other than block-based), or whose properties cannot be read,
+  // share the remaining live blob bytes in proportion to their SST bytes.
+  // Bytes left unreferenced after SST removal are distributed over ranges
+  // that still reference blobs. The estimate includes garbage and file
+  // overhead, so partitioning the key space approximately accounts for all
+  // live blob files. Garbage is not charged to the range that created it.
+  // Within each SST the distribution remains approximate, and superseded
+  // key versions can be counted more than once. Blob references still in
+  // memtables and blobs embedded in SSTs are excluded. Default: false.
+  bool allow_expensive_query = false;
 };
 
 struct CompactionServiceOptionsOverride {

@@ -10,6 +10,7 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 #include "db/db_test_util.h"
@@ -26,6 +27,8 @@
 #include "table/prepared_file_info.h"
 #include "test_util/mock_time_env.h"
 #include "test_util/testutil.h"
+#include "util/coding.h"
+#include "util/crc32c.h"
 #include "util/defer.h"
 #include "util/random.h"
 #include "util/thread_guard.h"
@@ -1287,6 +1290,106 @@ TEST_F(ExternalSSTFileTest, IngestWithSerializedFileInfo) {
   arg.file_infos = {deserialized.get()};
   ASSERT_OK(db_->IngestExternalFiles({arg}));
   ASSERT_EQ(Get(Key(10)), "v10");
+}
+
+TEST_F(ExternalSSTFileTest, PreparedFileInfoCompatibilityAndValidation) {
+  const std::string file_path = sst_files_dir_ + "compatible_file_info.sst";
+  SstFileWriter writer(EnvOptions(), CurrentOptions());
+  ASSERT_OK(writer.Open(file_path));
+  ASSERT_OK(writer.Put(Key(10), "v10"));
+  ExternalSstFileInfo file_info;
+  ASSERT_OK(writer.Finish(&file_info));
+
+  std::string serialized;
+  ASSERT_OK(
+      SerializePreparedFileInfo(*file_info.prepared_file_info, &serialized));
+  ASSERT_GE(serialized.size(), sizeof(uint32_t));
+  std::unordered_map<std::string, std::string> original_fields;
+  ASSERT_OK(
+      StringToMap(serialized.substr(0, serialized.size() - sizeof(uint32_t)),
+                  &original_fields));
+  std::string table_properties;
+  ASSERT_TRUE(Slice(original_fields.at("table_properties"))
+                  .DecodeHex(&table_properties));
+  std::unordered_map<std::string, std::string> original_properties;
+  ASSERT_OK(StringToMap(table_properties, &original_properties));
+
+  struct ParseCase {
+    const char* name;
+    const char* key;
+    const char* value;
+    bool nested;
+    Status::Code expected;
+  };
+  const ParseCase cases[] = {
+      {"unknown top-level", "future_optional_field", "future_value", false,
+       Status::Code::kOk},
+      {"unknown nested", "future_optional_field", "future_value", true,
+       Status::Code::kOk},
+      {"missing file size", "file_size", nullptr, false,
+       Status::Code::kCorruption},
+      {"missing smallest key", "smallest_internal_key", nullptr, false,
+       Status::Code::kCorruption},
+      {"missing largest key", "largest_internal_key", nullptr, false,
+       Status::Code::kCorruption},
+      {"missing properties", "table_properties", nullptr, false,
+       Status::Code::kCorruption},
+      {"invalid file size", "file_size", "not_a_number", false,
+       Status::Code::kInvalidArgument},
+      {"invalid nested number", "raw_value_size", "not_a_number", true,
+       Status::Code::kInvalidArgument},
+      {"invalid optional number", "referenced_blob_bytes", "not_a_number", true,
+       Status::Code::kInvalidArgument},
+      {"invalid property encoding", "table_properties", "not_hex", false,
+       Status::Code::kInvalidArgument},
+      {"invalid key encoding", "smallest_internal_key", "00", false,
+       Status::Code::kInvalidArgument},
+  };
+  std::function<std::string(
+      const std::unordered_map<std::string, std::string>&)>
+      encode_fields =
+          [](const std::unordered_map<std::string, std::string>& fields) {
+            std::string encoded;
+            for (const auto& field : fields) {
+              encoded.append(field.first)
+                  .append("=")
+                  .append(field.second)
+                  .append(";");
+            }
+            return encoded;
+          };
+  for (const ParseCase& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    std::unordered_map<std::string, std::string> fields = original_fields;
+    if (test_case.nested) {
+      std::unordered_map<std::string, std::string> properties =
+          original_properties;
+      properties[test_case.key] = test_case.value;
+      fields["table_properties"] =
+          Slice(encode_fields(properties)).ToString(true);
+    } else if (test_case.value == nullptr) {
+      fields.erase(test_case.key);
+    } else {
+      fields[test_case.key] = test_case.value;
+    }
+    std::string input = encode_fields(fields);
+    PutFixed32(&input, crc32c::Mask(crc32c::Value(input.data(), input.size())));
+    std::shared_ptr<const PreparedFileInfo> parsed =
+        file_info.prepared_file_info;
+    const Status s = DeserializePreparedFileInfo(input, &parsed);
+    ASSERT_EQ(s.code(), test_case.expected);
+    if (s.ok()) {
+      ASSERT_NE(parsed, nullptr);
+      ASSERT_EQ(parsed->file_size, file_info.file_size);
+      ASSERT_EQ(parsed->smallest.Encode(),
+                file_info.prepared_file_info->smallest.Encode());
+      ASSERT_EQ(parsed->largest.Encode(),
+                file_info.prepared_file_info->largest.Encode());
+    } else {
+      ASSERT_EQ(parsed, nullptr);
+    }
+  }
+  ASSERT_EQ(original_properties.count("referenced_blob_bytes"), 0U);
 }
 
 TEST_F(ExternalSSTFileTest, PreparedFileInfoRejectsInvalidSerialization) {

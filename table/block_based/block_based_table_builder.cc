@@ -32,6 +32,7 @@
 #include "db/blob/blob_constants.h"
 #include "db/blob/blob_gen2_format.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_log_format.h"
 #include "db/dbformat.h"
 #include "db/wide/wide_column_serialization.h"
 #include "logging/logging.h"
@@ -1614,6 +1615,7 @@ struct BlockBasedTableBuilder::Rep {
                 ? std::make_unique<EmbeddedBlobSstBuilderOptions>(
                       *tbo.embedded_blob_options)
                 : nullptr) {
+    props.referenced_blob_bytes = 0;
     FilterBuildingContext filter_context(table_options);
 
     filter_context.info_log = ioptions.logger;
@@ -2255,6 +2257,36 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
       return;
     }
 #endif  // !NDEBUG
+
+    const auto account_blob_index = [&](const BlobIndex& blob_index) {
+      if (r->props.referenced_blob_bytes.has_value() &&
+          !blob_index.IsInlined() && !blob_index.HasTTL() &&
+          !blob_index.IsSameFile()) {
+        const uint64_t blob_record_overhead =
+            BlobLogRecord::CalculateAdjustmentForRecordHeader(
+                ExtractUserKey(entry_ikey).size());
+        *r->props.referenced_blob_bytes +=
+            blob_index.size() + blob_record_overhead;
+      }
+    };
+    if (value_type == kTypeBlobIndex) {
+      BlobIndex blob_index;
+      Status s = blob_index.DecodeFrom(entry_value);
+      if (!s.ok()) {
+        r->props.referenced_blob_bytes.reset();
+      } else {
+        account_blob_index(blob_index);
+      }
+    } else if (value_type == kTypeWideColumnEntity) {
+      Status s = WideColumnSerialization::ForEachBlobFileNumber(
+          entry_value, [&](const BlobIndex& blob_index) {
+            account_blob_index(blob_index);
+            return Status::OK();
+          });
+      if (!s.ok()) {
+        r->props.referenced_blob_bytes.reset();
+      }
+    }
 
     auto should_flush = r->flush_block_policy->Update(entry_ikey, entry_value);
     if (should_flush) {

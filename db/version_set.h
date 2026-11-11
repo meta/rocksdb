@@ -1261,8 +1261,13 @@ class Version {
   // The helper function of UpdateAccumulatedStats, which may fill the missing
   // fields of file_meta from its associated TableProperties.
   // Returns true if it does initialize FileMetaData.
+  // populate_referenced_blob_bytes may be true only before file_meta becomes
+  // visible to concurrent readers: GetApproximateSizes reads that count
+  // without synchronization. Use false when initializing already-published
+  // input statistics on a secondary instance.
   bool MaybeInitializeFileMetaData(const ReadOptions& read_options,
-                                   FileMetaData* file_meta);
+                                   FileMetaData* file_meta,
+                                   bool populate_referenced_blob_bytes);
 
   // Update the accumulated stats associated with the current version.
   // This accumulated stats will be used in compaction.
@@ -1785,14 +1790,35 @@ class VersionSet {
       std::vector<ObsoleteFileInfo>& sst_delete_candidates,
       std::vector<ObsoleteBlobFileInfo>& blob_delete_candidates) const;
 
+  using ReferencedBlobBytesByFile =
+      std::unordered_map<uint64_t, std::optional<uint64_t>>;
+  // Optional blob outputs and their required lookup for one pinned Version.
+  // Before traversal, references must contain one captured property result
+  // (including unknown on failure/absence) for every SST without an engaged
+  // FileMetaData::referenced_blob_bytes. The map and Version must outlive this
+  // context and must not change during traversal. GetReferencedBlobBytes does
+  // no I/O and gives the census and range traversal the same classification.
+  struct BlobSizeAccounting {
+    explicit BlobSizeAccounting(
+        const ReferencedBlobBytesByFile& file_references)
+        : references(file_references) {}
+    std::optional<uint64_t> GetReferencedBlobBytes(
+        const FileMetaData& file) const;
+    const ReferencedBlobBytesByFile& references;
+    uint64_t referenced_blob_bytes = 0;
+    uint64_t unknown_sst_bytes = 0;
+  };
+
   // Return the approximate size of data to be scanned for range [start, end)
-  // in levels [start_level, end_level). If end_level == -1 it will search
-  // through all non-empty levels
+  // in levels [start_level, end_level). If end_level == -1, search all nonempty
+  // levels. A non-null blob_accounting resets and fills both blob outputs;
+  // omit it for the SST-only calculation.
   uint64_t ApproximateSize(const SizeApproximationOptions& options,
                            const ReadOptions& read_options, Version* v,
                            const Slice& start, const Slice& end,
                            int start_level, int end_level,
-                           TableReaderCaller caller);
+                           TableReaderCaller caller,
+                           BlobSizeAccounting* blob_accounting = nullptr);
 
   // Return the size of the current manifest file
   uint64_t manifest_file_size() const { return manifest_file_size_; }

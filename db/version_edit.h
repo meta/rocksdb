@@ -291,6 +291,9 @@ struct FileMetaData {
   uint64_t num_deletions = 0;
   uint64_t raw_key_size = 0;    // total uncompressed key size.
   uint64_t raw_value_size = 0;  // total uncompressed value size.
+  // Immutable after a pre-publication table-property statistics read.
+  // Unknown if that read was skipped, failed, or the SST lacks the property.
+  std::optional<uint64_t> referenced_blob_bytes;
   uint64_t num_range_deletions = 0;
   // This is computed during Flush/Compaction, and is added to
   // `compensated_file_size`. Currently, this estimates the size of keys in the

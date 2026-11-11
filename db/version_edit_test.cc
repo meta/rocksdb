@@ -828,7 +828,7 @@ TEST(FileMetaDataTest, UpdateBoundariesBlobIndex) {
     ASSERT_EQ(meta.oldest_blob_file_number, expected_oldest_blob_file_number);
   }
 
-  // Corrupt blob index
+  // A corrupt blob index cannot safely provide dependency metadata.
   {
     constexpr char corrupt_blob_index[] = "!corrupt!";
     constexpr SequenceNumber seq = 205;
@@ -836,6 +836,17 @@ TEST(FileMetaDataTest, UpdateBoundariesBlobIndex) {
     ASSERT_TRUE(
         meta.UpdateBoundaries(key, corrupt_blob_index, seq, kTypeBlobIndex)
             .IsCorruption());
+    ASSERT_EQ(meta.oldest_blob_file_number, expected_oldest_blob_file_number);
+  }
+
+  // A corrupt wide-column entity cannot safely provide dependency metadata.
+  {
+    constexpr char corrupt_wide_column_entity[] = "!corrupt!";
+    constexpr SequenceNumber seq = 206;
+
+    ASSERT_TRUE(meta.UpdateBoundaries(key, corrupt_wide_column_entity, seq,
+                                      kTypeWideColumnEntity)
+                    .IsCorruption());
     ASSERT_EQ(meta.oldest_blob_file_number, expected_oldest_blob_file_number);
   }
 
@@ -848,7 +859,7 @@ TEST(FileMetaDataTest, UpdateBoundariesBlobIndex) {
     BlobIndex::EncodeBlob(&blob_index, kInvalidBlobFileNumber, offset, size,
                           kNoCompression);
 
-    constexpr SequenceNumber seq = 206;
+    constexpr SequenceNumber seq = 207;
 
     ASSERT_TRUE(meta.UpdateBoundaries(key, blob_index, seq, kTypeBlobIndex)
                     .IsCorruption());

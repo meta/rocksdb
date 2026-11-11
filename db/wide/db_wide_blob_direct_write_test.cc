@@ -623,6 +623,30 @@ TEST_F(DBWideBlobDirectWriteTest, PutEntityRejectsEmptyAttributeGroups) {
 }
 
 TEST_F(DBWideBlobDirectWriteTest,
+       ReferencedBlobBytesCountsEveryWideBlobColumn) {
+  Options options = GetBlobTestOptions();
+  Reopen(options);
+
+  const std::string key = "wide_key";
+  const std::string first_blob = GenerateLargeValue(100, 'a');
+  const std::string second_blob = GenerateLargeValue(150, 'b');
+  const WideColumnStringPairs column_data{
+      {"", first_blob}, {"attribute", second_blob}, {"inline", "small"}};
+  const WideColumns columns = ToWideColumns(column_data);
+  ASSERT_OK(
+      db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), key, columns));
+  ASSERT_OK(Flush());
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  const uint64_t record_overhead =
+      BlobLogRecord::CalculateAdjustmentForRecordHeader(key.size());
+  ASSERT_EQ(properties.begin()->second->referenced_blob_bytes,
+            first_blob.size() + second_blob.size() + 2 * record_overhead);
+}
+
+TEST_F(DBWideBlobDirectWriteTest,
        PutEntitySerializedRejectsExistingBlobReferencesWhenDirectWriteEnabled) {
   Options options = GetDirectWriteOptions();
   options.min_blob_size = 64;

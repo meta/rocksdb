@@ -290,7 +290,8 @@ TEST_F(OptionsSettableTest, TablePropertiesAllFieldsSettable) {
       {offsetof(struct TableProperties, user_collected_properties),
        sizeof(UserCollectedProperties)},
       {offsetof(struct TableProperties, readable_properties),
-       sizeof(UserCollectedProperties)},
+       sizeof(TableProperties) -
+           offsetof(struct TableProperties, readable_properties)},
   };
 
   char* tp_ptr = new char[sizeof(TableProperties)];
@@ -321,6 +322,7 @@ TEST_F(OptionsSettableTest, TablePropertiesAllFieldsSettable) {
       "64625F686F73745F6964;db_session_id=64625F73657373696F6E5F6964;creation_"
       "time=0;num_data_blocks=123;num_data_blocks_compression_rejected=42;"
       "num_data_blocks_compression_bypassed=7;"
+      "referenced_blob_bytes=456;"
       "index_value_is_delta_encoded=0;top_level_"
       "index_size=0;data_size=100;uncompressed_data_size=1234;"
       "merge_operator_name=;index_partitions=0;file_"
@@ -360,6 +362,31 @@ TEST_F(OptionsSettableTest, TablePropertiesAllFieldsSettable) {
 
   delete[] tp_ptr;
   delete[] new_tp_ptr;
+}
+
+TEST_F(OptionsSettableTest, TablePropertiesReferencedBlobBytesRoundTrip) {
+  ConfigOptions config_options;
+  const std::optional<uint64_t> kReferencedBlobBytesCases[] = {12345, 0,
+                                                               std::nullopt};
+  for (const std::optional<uint64_t>& referenced_blob_bytes :
+       kReferencedBlobBytesCases) {
+    TableProperties original;
+    original.referenced_blob_bytes = referenced_blob_bytes;
+
+    std::string serialized;
+    ASSERT_OK(original.Serialize(config_options, &serialized));
+
+    TableProperties parsed;
+    ASSERT_OK(TableProperties::Parse(config_options, serialized, &parsed));
+    EXPECT_EQ(parsed.referenced_blob_bytes, referenced_blob_bytes);
+    EXPECT_EQ(
+        parsed.GetAggregatablePropertiesAsMap().at("referenced_blob_bytes"),
+        referenced_blob_bytes.value_or(0));
+
+    std::string mismatch;
+    EXPECT_TRUE(original.AreEqual(config_options, &parsed, &mismatch));
+    EXPECT_TRUE(mismatch.empty());
+  }
 }
 
 // If the test fails, likely a new option is added to DBOptions

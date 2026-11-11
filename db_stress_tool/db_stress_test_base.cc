@@ -4769,6 +4769,7 @@ Status StressTest::TestApproximateSize(
     SizeApproximationOptions sao;
     sao.include_memtables = thread->rand.OneIn(2);
     sao.include_blob_files = thread->rand.OneIn(2);
+    sao.allow_expensive_query = thread->rand.OneIn(2);
     if (sao.include_memtables || sao.include_blob_files) {
       sao.include_files = thread->rand.OneIn(2);
     }

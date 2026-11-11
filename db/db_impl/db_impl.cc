@@ -6820,24 +6820,104 @@ Status DBImpl::GetApproximateSizes(const SizeApproximationOptions& options,
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
 
-  // Pre-compute blob-to-SST ratio once (invariant across ranges for the same
-  // Version). This avoids iterating all levels and blob files per range.
-  double blob_to_sst_ratio = 0.0;
+  uint64_t total_sst_size = 0;
+  uint64_t physical_blob_size = 0;
+  uint64_t live_blob_bytes = 0;
+  uint64_t referenced_blob_bytes = 0;
+  uint64_t unknown_sst_size = 0;
+  uint64_t unknown_live_blob_bytes = 0;
+  VersionSet::ReferencedBlobBytesByFile referenced_blob_bytes_by_file;
+  VersionSet::BlobSizeAccounting blob_census(referenced_blob_bytes_by_file);
+  double referenced_blob_scale = 1.0;
+  bool has_referenced_blob_metadata = false;
+  double blob_inflation = 1.0;
   if (options.include_blob_files) {
     const auto* vstorage = v->storage_info();
-    uint64_t total_sst_size = 0;
+    uint64_t total_blob_bytes = 0;
+    uint64_t garbage_blob_bytes = 0;
     for (int level = 0; level < vstorage->num_non_empty_levels(); ++level) {
       total_sst_size += vstorage->NumLevelBytes(level);
     }
-    if (total_sst_size > 0) {
-      uint64_t total_blob_size = 0;
-      const auto& blob_files = vstorage->GetBlobFiles();
-      for (const auto& blob_file_meta : blob_files) {
-        assert(blob_file_meta);
-        total_blob_size += blob_file_meta->GetBlobFileSize();
+    const auto& blob_files = vstorage->GetBlobFiles();
+    for (const auto& blob_file_meta : blob_files) {
+      assert(blob_file_meta);
+      physical_blob_size += blob_file_meta->GetBlobFileSize();
+      if (options.allow_expensive_query) {
+        total_blob_bytes += blob_file_meta->GetTotalBlobBytes();
+        garbage_blob_bytes += blob_file_meta->GetGarbageBlobBytes();
       }
-      blob_to_sst_ratio = static_cast<double>(total_blob_size) /
-                          static_cast<double>(total_sst_size);
+    }
+    if (options.allow_expensive_query) {
+      std::pair<uint64_t*, uint64_t*> blob_byte_totals{&total_blob_bytes,
+                                                       &garbage_blob_bytes};
+      TEST_SYNC_POINT_CALLBACK("DBImpl::GetApproximateSizes:BlobByteTotals",
+                               &blob_byte_totals);
+      live_blob_bytes = total_blob_bytes > garbage_blob_bytes
+                            ? total_blob_bytes - garbage_blob_bytes
+                            : 0;
+      TEST_SYNC_POINT_CALLBACK("DBImpl::GetApproximateSizes:LiveBlobBytes",
+                               &live_blob_bytes);
+      if (live_blob_bytes > 0) {
+        for (int level = 0; level < vstorage->num_non_empty_levels(); ++level) {
+          for (const FileMetaData* file : vstorage->LevelFiles(level)) {
+            assert(file);
+            std::optional<uint64_t> file_referenced_blob_bytes;
+            if (!file->referenced_blob_bytes.has_value()) {
+              std::shared_ptr<const TableProperties> table_properties;
+              Status properties_status = v->GetTableProperties(
+                  read_options, &table_properties, file, nullptr);
+              TEST_SYNC_POINT_CALLBACK(
+                  "DBImpl::GetApproximateSizes:TablePropertiesStatus",
+                  &properties_status);
+              if (properties_status.ok() && table_properties != nullptr) {
+                file_referenced_blob_bytes =
+                    table_properties->referenced_blob_bytes;
+              }
+              referenced_blob_bytes_by_file.emplace(file->fd.GetNumber(),
+                                                    file_referenced_blob_bytes);
+            }
+            file_referenced_blob_bytes =
+                blob_census.GetReferencedBlobBytes(*file);
+            if (file_referenced_blob_bytes.has_value()) {
+              has_referenced_blob_metadata = true;
+              referenced_blob_bytes += *file_referenced_blob_bytes;
+            } else {
+              unknown_sst_size += file->fd.GetFileSize();
+            }
+          }
+        }
+      }
+      // Live is the recorded blob-byte total minus recorded garbage. Known SSTs
+      // use their own references; unknown SSTs share the unexplained remainder,
+      // with their SST-proportional share as a floor when references overcount.
+      // With no unknown SSTs, all live bytes belong to the precise reference
+      // budget, including bytes orphaned by SST removal. Inflation spreads
+      // garbage and file overhead over these weights to match the physical
+      // size.
+      const uint64_t bounded_referenced_blob_bytes =
+          std::min(referenced_blob_bytes, live_blob_bytes);
+      const uint64_t proportional_unknown_live_blob_bytes =
+          total_sst_size > 0
+              ? static_cast<uint64_t>(static_cast<double>(live_blob_bytes) *
+                                      static_cast<double>(unknown_sst_size) /
+                                      static_cast<double>(total_sst_size))
+              : 0;
+      unknown_live_blob_bytes =
+          unknown_sst_size == 0
+              ? 0
+              : std::max(live_blob_bytes - bounded_referenced_blob_bytes,
+                         proportional_unknown_live_blob_bytes);
+      unknown_live_blob_bytes =
+          std::min(unknown_live_blob_bytes, live_blob_bytes);
+      const uint64_t precise_live_blob_bytes =
+          live_blob_bytes - unknown_live_blob_bytes;
+      if (referenced_blob_bytes > 0) {
+        referenced_blob_scale = static_cast<double>(precise_live_blob_bytes) /
+                                static_cast<double>(referenced_blob_bytes);
+      }
+      blob_inflation = std::max(
+          1.0, static_cast<double>(physical_blob_size) /
+                   static_cast<double>(std::max<uint64_t>(1, live_blob_bytes)));
     }
   }
 
@@ -6856,12 +6936,22 @@ Status DBImpl::GetApproximateSizes(const SizeApproximationOptions& options,
     // Compute SST size in range (needed for both include_files and
     // include_blob_files, since blob size is prorated by SST ratio).
     uint64_t sst_size_in_range = 0;
+    VersionSet::BlobSizeAccounting blob_accounting(
+        referenced_blob_bytes_by_file);
+    const bool use_blob_metadata = options.include_blob_files &&
+                                   options.allow_expensive_query &&
+                                   live_blob_bytes > 0;
     if (options.include_files || options.include_blob_files) {
       sst_size_in_range = versions_->ApproximateSize(
           options, read_options, v, k1.Encode(), k2.Encode(),
           /*start_level=*/0,
-          /*end_level=*/-1, TableReaderCaller::kUserApproximateSize);
+          /*end_level=*/-1, TableReaderCaller::kUserApproximateSize,
+          use_blob_metadata ? &blob_accounting : nullptr);
     }
+    const uint64_t referenced_blob_bytes_in_range =
+        blob_accounting.referenced_blob_bytes;
+    const uint64_t unknown_sst_size_in_range =
+        blob_accounting.unknown_sst_bytes;
     if (options.include_files) {
       sizes[i] += sst_size_in_range;
     }
@@ -6870,8 +6960,31 @@ Status DBImpl::GetApproximateSizes(const SizeApproximationOptions& options,
       sizes[i] += sv->imm->ApproximateStats(k1.Encode(), k2.Encode()).size;
     }
     if (options.include_blob_files) {
-      sizes[i] += static_cast<uint64_t>(static_cast<double>(sst_size_in_range) *
-                                        blob_to_sst_ratio);
+      const bool use_sst_ratio_for_all_ssts =
+          !options.allow_expensive_query || live_blob_bytes == 0 ||
+          (referenced_blob_bytes == 0 && unknown_sst_size == 0);
+      if (use_sst_ratio_for_all_ssts || !has_referenced_blob_metadata) {
+        if (total_sst_size > 0) {
+          const uint64_t sst_bytes = use_sst_ratio_for_all_ssts
+                                         ? sst_size_in_range
+                                         : unknown_sst_size_in_range;
+          sizes[i] +=
+              static_cast<uint64_t>(static_cast<double>(sst_bytes) *
+                                    (static_cast<double>(physical_blob_size) /
+                                     static_cast<double>(total_sst_size)));
+        }
+      } else {
+        const double unknown_blob_bytes_in_range =
+            static_cast<double>(unknown_live_blob_bytes) *
+            static_cast<double>(unknown_sst_size_in_range) /
+            static_cast<double>(std::max<uint64_t>(1, unknown_sst_size));
+        const double live_bytes_in_range =
+            std::min(static_cast<double>(referenced_blob_bytes_in_range) *
+                             referenced_blob_scale +
+                         unknown_blob_bytes_in_range,
+                     static_cast<double>(live_blob_bytes));
+        sizes[i] += static_cast<uint64_t>(live_bytes_in_range * blob_inflation);
+      }
     }
   }
 

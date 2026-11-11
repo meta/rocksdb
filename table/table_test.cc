@@ -19,6 +19,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1859,6 +1860,52 @@ TEST_F(TablePropertyTest, PrefixScanTest) {
     auto pos = props.lower_bound(prefix);
     ASSERT_TRUE(pos == props.end() ||
                 pos->first.compare(0, prefix.size(), prefix) != 0);
+  }
+}
+
+TEST_F(TablePropertyTest, ReferencedBlobBytesAggregationPreservesUnknown) {
+  TableProperties aggregate;
+  TableProperties unknown;
+  aggregate.Add(unknown);
+  aggregate.Add(unknown);
+  ASSERT_FALSE(aggregate.referenced_blob_bytes.has_value());
+  ASSERT_EQ(
+      aggregate.GetAggregatablePropertiesAsMap().at("referenced_blob_bytes"),
+      0U);
+
+  TableProperties zero;
+  zero.referenced_blob_bytes = 0;
+  aggregate.Add(zero);
+  ASSERT_EQ(aggregate.referenced_blob_bytes, 0U);
+  aggregate.Add(unknown);
+  ASSERT_EQ(aggregate.referenced_blob_bytes, 0U);
+
+  TableProperties first;
+  first.referenced_blob_bytes = 123;
+  TableProperties second;
+  second.referenced_blob_bytes = 456;
+  aggregate.Add(first);
+  aggregate.Add(unknown);
+  aggregate.Add(second);
+  ASSERT_EQ(aggregate.referenced_blob_bytes, 579U);
+  ASSERT_EQ(
+      aggregate.GetAggregatablePropertiesAsMap().at("referenced_blob_bytes"),
+      579U);
+}
+
+TEST_F(TablePropertyTest, RandomizationPreservesReferencedBlobBytes) {
+  const std::optional<uint64_t> cases[] = {std::nullopt, 0, 12345};
+  for (const std::optional<uint64_t>& expected : cases) {
+    TableProperties props;
+    props.referenced_blob_bytes = expected;
+    TEST_SetRandomTableProperties(&props);
+    ASSERT_EQ(props.referenced_blob_bytes, expected);
+
+    std::string serialized;
+    ASSERT_OK(props.Serialize(ConfigOptions(), &serialized));
+    TableProperties parsed;
+    ASSERT_OK(TableProperties::Parse(ConfigOptions(), serialized, &parsed));
+    ASSERT_EQ(parsed.referenced_blob_bytes, expected);
   }
 }
 

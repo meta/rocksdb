@@ -16,6 +16,7 @@
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/advanced_compression.h"
+#include "rocksdb/c.h"
 #include "rocksdb/db.h"
 #include "rocksdb/sst_file_reader.h"
 #include "rocksdb/sst_file_writer.h"
@@ -29,6 +30,14 @@
 #include "test_util/testutil.h"
 #include "util/atomic.h"
 #include "util/random.h"
+
+using ROCKSDB_NAMESPACE::TableProperties;
+
+extern "C" {
+struct rocksdb_table_properties_t {
+  TableProperties rep;
+};
+}
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -100,6 +109,18 @@ class DBTablePropertiesTest : public DBTestBase,
   DBTablePropertiesTest()
       : DBTestBase("db_table_properties_test", /*env_do_fsync=*/false) {}
 };
+
+TEST(TablePropertiesCApiTest, ReferencedBlobBytesPreservesUnknownAndKnownZero) {
+  rocksdb_table_properties_t properties;
+
+  ASSERT_FALSE(properties.rep.referenced_blob_bytes.has_value());
+  ASSERT_EQ(rocksdb_table_properties_has_referenced_blob_bytes(&properties), 0);
+  ASSERT_EQ(rocksdb_table_properties_referenced_blob_bytes(&properties), 0U);
+
+  properties.rep.referenced_blob_bytes = 0;
+  ASSERT_EQ(rocksdb_table_properties_has_referenced_blob_bytes(&properties), 1);
+  ASSERT_EQ(rocksdb_table_properties_referenced_blob_bytes(&properties), 0U);
+}
 
 TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTest) {
   Options options = CurrentOptions();
@@ -199,6 +220,30 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTest) {
   }
 
   SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBTablePropertiesTest,
+       ReferencedBlobBytesPresenceIsBlockBasedBuilderOwned) {
+  auto verify = [&](std::shared_ptr<TableFactory> table_factory,
+                    bool expected_presence) {
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.table_factory = std::move(table_factory);
+    options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+    DestroyAndReopen(options);
+
+    ASSERT_OK(Put("key", "value"));
+    ASSERT_OK(Flush());
+
+    TablePropertiesCollection properties;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+    ASSERT_EQ(properties.size(), 1U);
+    EXPECT_EQ(properties.begin()->second->referenced_blob_bytes.has_value(),
+              expected_presence);
+  };
+
+  verify(std::shared_ptr<TableFactory>(NewBlockBasedTableFactory()), true);
+  verify(std::shared_ptr<TableFactory>(NewPlainTableFactory()), false);
 }
 
 TEST_F(DBTablePropertiesTest, InvalidReportedAsCorruption) {
