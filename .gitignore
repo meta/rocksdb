@@ -116,3 +116,5 @@ tools/__pycache__/
 !docs/**
 /java/src/generated
 /java/ffm_generated_java
+/java/japigen/target
+/rocksdb_java_classes

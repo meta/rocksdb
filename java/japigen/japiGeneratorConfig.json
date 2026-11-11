@@ -1,0 +1,19 @@
+{
+  "generatedJSONDir" : "../../c_api_gen",
+  "targetSrcDir" :  "../target/generated-sources/ffmapi",
+  "targetPackage" : "org.rocksdb.ffm",
+  "jextractClass" : "rocksdb_c_api",
+  "noConstructor" : [
+    "RocksdbBlobFileGarbageInfo",
+    "RocksdbCuckooTableOptions",
+    "RocksdbCompactionJobStats",
+    "RocksdbBlockBasedTableOptions",
+    "RocksdbBlobFileAdditionInfo",
+    "RocksdbMemtableinfo",
+    "RocksdbBackupEngineOptions",
+    "RocksdbFlushjobinfo",
+    "RocksdbCompactionFileInfo",
+    "RocksdbSubcompactionjobinfo",
+    "RocksdbTableProperties",
+    "RocksdbExternalfileingestioninfo"]
+}

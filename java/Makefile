@@ -343,12 +343,19 @@ clean-not-downloaded:
 clean-downloaded:
 	$(AM_V_at)rm -rf $(JAVA_TEST_LIBDIR)
 
-java-jextract:
+jextract-capi:
+	# Pass the `jextract` tool over all the header files built by the C API generator
 	# No `--library rocksdb` is passed to `jextract`, because we use the library packed in the jar
 	# via our own special `RocksDB.loadLibrary()`
 	$(AM_V_GEN)jextract --include-dir ../include --output ./$(GENERATED_SRC) --target-package org.rocksdb.ffm --header-class-name rocksdb_c_api ../include/rocksdb/c.h
-	# List the jextract files in a parameter file for javac, working around the fact that
+
+generated-files: jextract-capi
+	# List all the generated files in a parameter file for javac, working around the fact that
 	# names may contain '$'-symbol, then shell substitutes non-existent shell variables in command line parameters
+	# Generated java files come from the `jextract` goal,
+	# and also from Java API sources created by the japigen tool (part of this repo) 
+	# which in turn depends on the `C` API. Which is itself generated.
+	# So, we depend on that running first...
 	$(AM_V_at)@find ./$(GENERATED_SRC) -name \*.java -print > ./ffm_generated_java
 
 javadocs: java
@@ -357,7 +364,7 @@ javadocs: java
 
 javalib: java java_test javadocs
 
-java: java-version java-jextract
+java: java-version generated-files
 	$(AM_V_GEN)mkdir -p $(MAIN_CLASSES)
 	$(AM_V_at) $(JAVAC_CMD) $(JAVAC_ARGS) -h $(NATIVE_INCLUDE) -d $(MAIN_CLASSES) $(SOURCES) @ffm_generated_java
 	$(AM_V_at)@cp ../HISTORY.md ./HISTORY-CPP.md
