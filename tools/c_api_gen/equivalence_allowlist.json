@@ -15,6 +15,22 @@
     {
       "name": "rocksdb_universal_compaction_options_set_stop_style",
       "reason": "Equivalent: the hand-written body spelled the conversion as static_cast<CompactionStopStyle>(v); CompactionStopStyle is the field's declared type, which the generated static_cast<decltype(field)>(v) names."
+    },
+    {
+      "name": "rocksdb_backup_engine_verify_backup",
+      "reason": "Equivalent: the hand-written body cast backup_id with static_cast<BackupID>; BackupID is uint32_t, the C parameter's own type, so the generated body passes it unconverted."
+    },
+    {
+      "name": "rocksdb_column_family_handle_get_name",
+      "reason": "Equivalent result with one fewer copy: ColumnFamilyHandle::GetName() returns const std::string&, which the generated body binds by reference instead of copying into a local before CopyString."
+    },
+    {
+      "name": "rocksdb_transaction_get_name",
+      "reason": "Equivalent: the hand-written body declared the by-value TransactionName (std::string) result as auto; the generated body names the type."
+    },
+    {
+      "name": "rocksdb_writebatch_data",
+      "reason": "Equivalent: WriteBatch::GetDataSize() is Data().size() and std::string::data() is c_str() since C++11; the generated body reads both from the one Data() reference."
     }
   ]
 }

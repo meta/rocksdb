@@ -26,6 +26,7 @@ sys.path.insert(0, str(HERE))
 
 import auto_simple_bindings as asb  # noqa: E402
 import validate_generated_equivalence as veq  # noqa: E402
+import handle_bindings as hb  # noqa: E402
 
 CLANG = os.environ.get("CLANG_CXX") or shutil.which("clang++")
 
@@ -126,7 +127,7 @@ class GenerateGroupsTest(unittest.TestCase):
         self.assertNotIn("rocksdb_fake_set_on", header)
         self.assertIn("rocksdb_fake_get_on", header)
 
-    def test_function_scoped_manual_entry_must_be_hand_written(self):
+    def test_function_scoped_manual_entry_must_exist(self):
         entry = {
             "field": "on",
             "policy": "manual",
@@ -135,7 +136,7 @@ class GenerateGroupsTest(unittest.TestCase):
         }
         _, _, errors = self._run([{"name": "FakeOptions", "entries": [entry]}])
         self.assertEqual(len(errors), 1)
-        self.assertIn("not hand-written", errors[0])
+        self.assertIn("in neither", errors[0])
 
     def test_stale_manual_function(self):
         entry = {
@@ -156,6 +157,63 @@ class GenerateGroupsTest(unittest.TestCase):
         self.assertNotIn("_on", header)
 
 
+class ExistingBindingsTest(unittest.TestCase):
+    """auto_simple_bindings.py runs before handle_bindings.py, so the handle
+    fragments on disk can be from the previous run."""
+
+    def setUp(self):
+        self._saved = (asb.ROOT, asb.TEMPLATE_ROOT, hb.HANDLES_PATH)
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        asb.ROOT = root
+        asb.TEMPLATE_ROOT = root / "tools/c_api_gen"
+        hb.HANDLES_PATH = asb.TEMPLATE_ROOT / "handles.json"
+        asb.TEMPLATE_ROOT.mkdir(parents=True)
+        (root / "c_api_gen").mkdir()
+        for base, ext, body in (("c_base.h", "h", ";"), ("c_base.cc", "cc", " {}")):
+            (asb.TEMPLATE_ROOT / base).write_text(
+                f'#include "c_api_gen/c_generated_handles.{ext}.inc"\n'
+                f"void rocksdb_base_fn(void){body}\n"
+            )
+            # Written before rocksdb_thing_moved was added to handles.json and
+            # rocksdb_thing_dropped was taken out.
+            (root / f"c_api_gen/c_generated_handles.{ext}.inc").write_text(
+                f"void rocksdb_thing_dropped(void){body}\n"
+            )
+        thing = {
+            "c_type": "rocksdb_thing_t",
+            "rep": "Thing",
+            "struct": "generated",
+            "var": "t",
+            "create": "rocksdb_thing_create",
+            "destroy": {"name": "rocksdb_thing_destroy", "owns_rep": False},
+            "methods": [{"name": "rocksdb_thing_moved", "method": "Moved"}],
+        }
+        hb.HANDLES_PATH.write_text(
+            json.dumps({"schema_version": hb.SCHEMA_VERSION, "handles": [thing]})
+        )
+
+    def tearDown(self):
+        asb.ROOT, asb.TEMPLATE_ROOT, hb.HANDLES_PATH = self._saved
+        self.tmp.cleanup()
+
+    def test_handle_functions_come_from_handles_json(self):
+        decls, defs = asb.collect_existing_bindings()
+        expected = {
+            "rocksdb_base_fn",
+            "rocksdb_thing_create",
+            "rocksdb_thing_destroy",
+            "rocksdb_thing_moved",
+        }
+        self.assertEqual(decls, expected)
+        self.assertEqual(defs, expected)
+
+    def test_function_names_match_the_generated_header(self):
+        handles_path = self._saved[2]
+        generated = veq.extract_function_decls(hb.HEADER_OUT.read_text())
+        self.assertEqual(hb.function_names(handles_path), set(generated))
+
+
 class AbiOverrideTest(unittest.TestCase):
     def setUp(self):
         self._saved = dict(asb.ABI_TYPE_OVERRIDES)
@@ -163,6 +221,14 @@ class AbiOverrideTest(unittest.TestCase):
     def tearDown(self):
         asb.ABI_TYPE_OVERRIDES.clear()
         asb.ABI_TYPE_OVERRIDES.update(self._saved)
+
+    def test_enum_getter_widens_with_lossless_cast(self):
+        specs = asb.build_specs(_family(), "mode", "FakeEnum")
+        getter = next(s for s in specs if s["kind"] == "field_getter")
+        self.assertEqual(getter["return_type"], "int")
+        self.assertEqual(
+            getter["expr"], "ROCKSDB_NAMESPACE::lossless_cast<int>(opt->rep.mode)"
+        )
 
     def test_enum_getter_pin_casts_once(self):
         asb.ABI_TYPE_OVERRIDES["rocksdb_fake_get_mode"] = "unsigned char"
@@ -209,10 +275,482 @@ class DiscoverFieldsTest(unittest.TestCase):
                 c_fields = asb.discover_fields(_family(struct_name="C", header=header))
             finally:
                 asb._CLANG_BINARY = saved
-        self.assertEqual(
-            [name for name, _ in s_fields], ["base_public", "a", "b"]
-        )
+        self.assertEqual([name for name, _ in s_fields], ["base_public", "a", "b"])
         self.assertEqual([name for name, _ in c_fields], ["visible"])
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+class FakeIndex:
+    """Stands in for handle_bindings.CxxIndex without parsing C++."""
+
+    def __init__(self, methods=None, enums=(), typedefs=None):
+        self._methods = methods or {}
+        self._enums = set(enums)
+        self._typedefs = typedefs or {}
+
+    def methods(self, cls, name):
+        return list(self._methods.get((cls, name), []))
+
+    def is_enum(self, name):
+        return name in self._enums
+
+    def typedef_target(self, name):
+        return self._typedefs.get(name)
+
+    def prefetch(self, names):
+        pass
+
+    def close(self):
+        pass
+
+
+def _fn(name, params=(), result="void", is_const=False, owner="Thing"):
+    return hb.Function(
+        owner,
+        name,
+        [hb.Param(*p) if len(p) == 3 else hb.Param(p[0], p[1], False) for p in params],
+        result,
+        is_const,
+    )
+
+
+THING = hb.Handle("rocksdb_thing_t", "Thing*", "generated", "t", None, None)
+OTHER_HANDLES = [
+    hb.Handle("rocksdb_val_t", "Val", "generated", "v", None, None),
+    hb.Handle("rocksdb_ptr_t", "Ptr*", "generated", "p", None, None),
+    hb.Handle("rocksdb_sh_t", "std::shared_ptr<Sh>", "generated", "s", None, None),
+]
+
+
+def _render(entry, *fns, enums=(), typedefs=None, handle=THING):
+    index = FakeIndex({(handle.rep_kind()[1], fns[0].name): list(fns)}, enums, typedefs)
+    mapper = hb.TypeMapper(index, [handle] + OTHER_HANDLES)
+    full = {"name": "rocksdb_thing_x", "method": fns[0].name, **entry}
+    rendered = hb.render_binding(hb.Binding(handle, full), index, mapper)
+    return _flat("\n".join(rendered.decl)), _flat("\n".join(rendered.impl))
+
+
+class HandleRenderTest(unittest.TestCase):
+    """C conventions applied by handle_bindings.render_binding."""
+
+    def test_status_slice_and_bool(self):
+        fn = _fn("Put", [("key", "const Slice &"), ("sync", "bool")], "Status")
+        decl, impl = _render({}, fn)
+        self.assertIn(
+            "void rocksdb_thing_x( rocksdb_thing_t* t, const char* key, "
+            "size_t key_len, unsigned char sync, char** errptr) {",
+            impl,
+        )
+        self.assertIn(
+            "SaveError(errptr, t->rep->Put(Slice(key, key_len), sync));", impl
+        )
+        self.assertTrue(
+            decl.startswith("extern ROCKSDB_LIBRARY_API void rocksdb_thing_x(")
+        )
+
+    def test_const_method_gives_const_receiver(self):
+        decl, _ = _render({}, _fn("Size", [], "uint64_t", is_const=True))
+        self.assertIn("(const rocksdb_thing_t* t)", decl)
+        decl, _ = _render(
+            {"receiver_const": False}, _fn("Size", [], "uint64_t", is_const=True)
+        )
+        self.assertIn("(rocksdb_thing_t* t)", decl)
+
+    def test_string_results(self):
+        fn = _fn("Name", [], "const std::string &", is_const=True)
+        _, borrow = _render({"result": "borrow"}, fn)
+        self.assertIn(
+            "const char* rocksdb_thing_x(const rocksdb_thing_t* t, size_t* len) { "
+            "const std::string& s = t->rep->Name(); *len = s.size(); return s.data(); }",
+            borrow,
+        )
+        _, copy = _render({"result": "copy"}, fn)
+        self.assertIn("char* rocksdb_thing_x(", copy)
+        self.assertIn("return CopyString(s);", copy)
+        _, sl = _render({"result": "slice"}, _fn("key", [], "Slice", is_const=True))
+        self.assertIn(
+            "rocksdb_slice_t rocksdb_thing_x(const rocksdb_thing_t* t) { Slice s = "
+            "t->rep->key(); rocksdb_slice_t result; result.data = s.data(); "
+            "result.size = s.size(); return result; }",
+            sl,
+        )
+        with self.assertRaisesRegex(hb.GenError, "needs `result: borrow`"):
+            _render({}, fn)
+        with self.assertRaisesRegex(hb.GenError, "cannot borrow"):
+            _render({"result": "borrow"}, _fn("Name", [], "std::string"))
+
+    def test_typedef_of_string_result(self):
+        fn = _fn("GetName", [], "TransactionName", is_const=True)
+        _, impl = _render(
+            {"result": "copy"}, fn, typedefs={"TransactionName": "std::string"}
+        )
+        self.assertIn("std::string s = t->rep->GetName();", impl)
+
+    def test_discard(self):
+        fn = _fn("Delete", [("key", "const Slice &")], "Status")
+        _, impl = _render({"result": "discard"}, fn)
+        self.assertIn("{ t->rep->Delete(Slice(key, key_len)); }", impl)
+        self.assertNotIn("errptr", impl)
+        with self.assertRaisesRegex(hb.GenError, "discard on a void"):
+            _render({"result": "discard"}, _fn("Clear"))
+
+    def test_enums(self):
+        fn = _fn("SetMode", [("mode", "Mode")])
+        _, impl = _render({}, fn, enums={"Mode"})
+        self.assertIn("int mode", impl)
+        self.assertIn("t->rep->SetMode(static_cast<Mode>(mode));", impl)
+        _, impl = _render({}, _fn("GetMode", [], "Mode"), enums={"Mode"})
+        self.assertIn(
+            "return ROCKSDB_NAMESPACE::lossless_cast<int>(t->rep->GetMode());", impl
+        )
+
+    def test_nested_enum_resolves_in_owner_scope(self):
+        fn = _fn("GetMode", [], "IndexMode", owner="Opts")
+        _, impl = _render({}, fn, enums={"Opts::IndexMode"})
+        self.assertIn("lossless_cast<int>", impl)
+        fn = _fn("SetMode", [("m", "IndexMode")], owner="Opts")
+        _, impl = _render({}, fn, enums={"Opts::IndexMode"})
+        self.assertIn("static_cast<Opts::IndexMode>(m)", impl)
+
+    def test_pins_cast_only_when_types_differ(self):
+        fn = _fn("Set", [("on", "bool")], "bool")
+        _, impl = _render({"c_types": {"on": "bool", "return": "bool"}}, fn)
+        self.assertIn(
+            "bool rocksdb_thing_x(rocksdb_thing_t* t, bool on) { return t->rep->Set(on); }",
+            impl,
+        )
+        fn = _fn("Set", [("n", "uint64_t")], "uint32_t")
+        _, impl = _render({"c_types": {"n": "int", "return": "int"}}, fn)
+        self.assertIn(
+            "return static_cast<int>(t->rep->Set(static_cast<uint64_t>(n)));", impl
+        )
+
+    def test_bind_and_arity(self):
+        fn = _fn("SetThreads", [("n", "int", False), ("pri", "Priority", True)])
+        _, impl = _render({"bind": {"pri": "Env::BOTTOM"}}, fn, enums={"Priority"})
+        self.assertIn("(rocksdb_thing_t* t, int n)", impl)
+        self.assertIn("t->rep->SetThreads(n, Env::BOTTOM);", impl)
+        _, impl = _render({"arity": 1}, fn, enums={"Priority"})
+        self.assertIn("t->rep->SetThreads(n);", impl)
+        with self.assertRaisesRegex(hb.GenError, "past arity"):
+            _render(
+                {"arity": 1, "bind": {"pri": "Env::BOTTOM"}}, fn, enums={"Priority"}
+            )
+        with self.assertRaisesRegex(hb.GenError, "has no default"):
+            _render({"arity": 0}, fn, enums={"Priority"})
+
+    def test_unnamed_parameter_needs_param_names(self):
+        fn = _fn("FlushWAL", [("", "bool")], "Status")
+        with self.assertRaisesRegex(hb.GenError, "unnamed"):
+            _render({}, fn)
+        _, impl = _render({"param_names": {"0": "sync"}}, fn)
+        self.assertIn("unsigned char sync", impl)
+        self.assertIn("t->rep->FlushWAL(sync)", impl)
+        with self.assertRaisesRegex(hb.GenError, "unknown parameters"):
+            _render({"param_names": {"1": "x"}}, fn)
+
+    def test_overload_selection_and_base_names(self):
+        derived = _fn(
+            "DeleteRange", [("", "const Slice &"), ("", "const Slice &")], "Status"
+        )
+        base = _fn(
+            "DeleteRange",
+            [("begin", "const Slice &"), ("end", "const Slice &")],
+            "Status",
+            owner="Base",
+        )
+        cf = _fn(
+            "DeleteRange",
+            [("cf", "Ptr *"), ("begin", "const Slice &"), ("end", "const Slice &")],
+            "Status",
+        )
+        with self.assertRaisesRegex(hb.GenError, "overloaded"):
+            _render({}, derived, cf, base)
+        _, impl = _render(
+            {"overload": ["const Slice &", "const Slice &"]}, derived, cf, base
+        )
+        self.assertIn(
+            "t->rep->DeleteRange(Slice(begin, begin_len), Slice(end, end_len))", impl
+        )
+        _, impl = _render(
+            {"overload": ["Ptr *", "const Slice &", "const Slice &"]}, derived, cf, base
+        )
+        self.assertIn("rocksdb_ptr_t* cf", impl)
+        self.assertIn("t->rep->DeleteRange(cf->rep,", impl)
+
+    def test_handle_parameter_kinds(self):
+        cases = [
+            ("const Val &", "const rocksdb_val_t* x", "x->rep"),
+            ("Val *", "rocksdb_val_t* x", "&x->rep"),
+            ("const Ptr &", "const rocksdb_ptr_t* x", "*x->rep"),
+            ("Ptr *", "rocksdb_ptr_t* x", "x->rep"),
+            ("const std::shared_ptr<Sh> &", "rocksdb_sh_t* x", "x->rep"),
+            ("Sh *", "rocksdb_sh_t* x", "x->rep.get()"),
+        ]
+        for cxx, c_param, arg in cases:
+            with self.subTest(cxx=cxx):
+                _, impl = _render({}, _fn("Use", [("x", cxx)]))
+                self.assertIn(c_param, impl)
+                self.assertIn(f"t->rep->Use({arg});", impl)
+
+    def test_value_rep_uses_member_access(self):
+        handle = hb.Handle("rocksdb_val_t", "Val", "generated", "v", None, None)
+        _, impl = _render({}, _fn("Count", [], "int", True, owner="Val"), handle=handle)
+        self.assertIn("return v->rep.Count();", impl)
+
+
+class HandleLifecycleTest(unittest.TestCase):
+    def test_create_and_destroy(self):
+        handle = hb.Handle(
+            "rocksdb_thing_t",
+            "Thing*",
+            "generated",
+            "t",
+            "rocksdb_thing_create",
+            {"name": "rocksdb_thing_destroy", "owns_rep": True},
+        )
+        impls = [_flat("\n".join(r.impl)) for r in hb.render_lifecycle(handle)]
+        self.assertEqual(
+            impls,
+            [
+                "rocksdb_thing_t* rocksdb_thing_create() { return new rocksdb_thing_t; }",
+                "void rocksdb_thing_destroy(rocksdb_thing_t* t) { delete t->rep; delete t; }",
+            ],
+        )
+
+    def test_const_destroy_without_owned_rep(self):
+        handle = hb.Handle(
+            "rocksdb_thing_t",
+            "Thing",
+            "generated",
+            "t",
+            None,
+            {
+                "name": "rocksdb_thing_destroy",
+                "owns_rep": False,
+                "receiver_const": True,
+            },
+        )
+        (r,) = hb.render_lifecycle(handle)
+        self.assertEqual(
+            _flat("\n".join(r.impl)),
+            "void rocksdb_thing_destroy(const rocksdb_thing_t* t) { delete t; }",
+        )
+
+
+class HandleSchemaTest(unittest.TestCase):
+    def _load(self, handles):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "handles.json"
+            path.write_text(
+                json.dumps({"schema_version": 1, "headers": [], "handles": handles})
+            )
+            return hb.load_handles(path)
+
+    def _handle(self, **kw):
+        h = {
+            "c_type": "rocksdb_thing_t",
+            "rep": "Thing*",
+            "struct": "generated",
+            "var": "t",
+        }
+        h.update(kw)
+        return h
+
+    def test_valid(self):
+        _, handles = self._load(
+            [self._handle(methods=[{"name": "rocksdb_thing_x", "method": "X"}])]
+        )
+        self.assertEqual([b.name for b in handles[0].bindings], ["rocksdb_thing_x"])
+
+    def test_errors(self):
+        cases = [
+            ([self._handle(bogus=1)], "unknown keys"),
+            ([self._handle(struct="maybe")], "struct must be"),
+            (
+                [
+                    self._handle(
+                        methods=[{"name": "rocksdb_a", "method": "A", "extra": 1}]
+                    )
+                ],
+                "unknown keys",
+            ),
+            (
+                [self._handle(methods=[{"name": "rocksdb_a", "method": "A"}] * 2)],
+                "duplicate C function",
+            ),
+            ([self._handle(), self._handle()], "duplicate handle"),
+            (
+                [
+                    self._handle(
+                        rep="Thing", destroy={"name": "rocksdb_d", "owns_rep": True}
+                    )
+                ],
+                "owns_rep only",
+            ),
+            ([self._handle(destroy={"name": "rocksdb_d"})], "destroy takes"),
+            (
+                [
+                    self._handle(
+                        destroy={
+                            "name": "rocksdb_d",
+                            "owns_rep": False,
+                            "receiver_const": 1,
+                        }
+                    )
+                ],
+                "destroy takes",
+            ),
+            ([self._handle(create="not_rocksdb")], "invalid C function name"),
+        ]
+        for handles, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(hb.GenError, message):
+                    self._load(handles)
+
+
+class HandleOwnershipTest(unittest.TestCase):
+    """A generated name that also exists elsewhere fails generation."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=hb.ROOT)
+        root = Path(self.tmp.name)
+        (root / "c_base.h").write_text(
+            "extern ROCKSDB_LIBRARY_API void rocksdb_declared(rocksdb_thing_t* t);\n"
+        )
+        (root / "c_base.cc").write_text(
+            "void rocksdb_defined(rocksdb_thing_t* t) { rocksdb_only_called(t); }\n"
+        )
+        self.saved = hb.TEMPLATE_ROOT
+        hb.TEMPLATE_ROOT = root
+
+    def tearDown(self):
+        hb.TEMPLATE_ROOT = self.saved
+        self.tmp.cleanup()
+
+    def test_calls_are_not_definitions(self):
+        self.assertEqual(hb.existing_names(), {"rocksdb_declared", "rocksdb_defined"})
+
+    def test_conflict_fails_generation(self):
+        path = Path(self.tmp.name) / "handles.json"
+        methods = [
+            {"name": n, "method": "Clear"}
+            for n in ("rocksdb_defined", "rocksdb_only_called")
+        ]
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "headers": [],
+                    "handles": [
+                        {
+                            "c_type": "rocksdb_thing_t",
+                            "rep": "Thing*",
+                            "struct": "generated",
+                            "var": "t",
+                            "methods": methods,
+                        }
+                    ],
+                }
+            )
+        )
+        saved = hb.CxxIndex
+        hb.CxxIndex = lambda clang, headers: FakeIndex(
+            {("Thing", "Clear"): [_fn("Clear")]}
+        )
+        try:
+            with self.assertRaises(hb.GenError) as ctx:
+                hb.generate("unused-clang", path)
+        finally:
+            hb.CxxIndex = saved
+        self.assertIn(
+            "rocksdb_defined is generated from handles.json but also",
+            str(ctx.exception),
+        )
+        self.assertNotIn("rocksdb_only_called", str(ctx.exception))
+
+
+@unittest.skipUnless(CLANG, "needs clang++ (set CLANG_CXX)")
+class CxxIndexTest(unittest.TestCase):
+    """C++ lookup rules handle_bindings relies on."""
+
+    SOURCE = """
+        #include <cstdint>
+        namespace rocksdb {
+        struct Slice {};
+        class Base {
+         public:
+          virtual void Seek(const Slice& target) = 0;
+          virtual int Status() const = 0;
+          virtual void Put(const Slice& key, const Slice& value) = 0;
+          void Reexported(int a);
+        };
+        class Hider : public Base {
+         public:
+          void Seek(const Slice& target) override;
+          void Put(const Slice& /*key*/, const Slice& /*value*/) override;
+          using Base::Reexported;
+          void Reexported(int a, int b);
+         private:
+          void Status(int hidden);
+        };
+        struct Holder {
+          class Hider {
+           public:
+            void Seek(const Slice& t, const char* memtable_key);
+          };
+          enum IndexMode : char { kA };
+          IndexMode GetMode() const;
+        };
+        // Matches the dump filter for `Mode` by prefix but only nests a Mode.
+        struct Mode2 {
+          enum Mode : char { kB };
+        };
+        }  // namespace rocksdb
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(dir=hb.ROOT)
+        header = Path(cls.tmp.name) / "fake.h"
+        header.write_text(cls.SOURCE)
+        cls.index = hb.CxxIndex(CLANG, [str(header.relative_to(hb.ROOT))])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.index.close()
+        cls.tmp.cleanup()
+
+    def _params(self, cls, name):
+        return [[p.type for p in f.params] for f in self.index.methods(cls, name)]
+
+    def test_namespace_class_not_nested_namesake(self):
+        self.assertEqual(self._params("Hider", "Seek"), [["const Slice &"]])
+
+    def test_derived_declaration_hides_base_overloads(self):
+        # Hider declares a private Status(int): Base::Status() is hidden.
+        self.assertEqual(self._params("Hider", "Status"), [])
+
+    def test_using_reexports_base_overloads(self):
+        self.assertEqual(self._params("Hider", "Reexported"), [["int", "int"], ["int"]])
+
+    def test_override_takes_base_parameter_names(self):
+        fn = hb._select("x", self.index.methods("Hider", "Put"), {}, "Put")
+        self.assertEqual(fn.owner, "Hider")
+        self.assertEqual([p.name for p in fn.params], ["key", "value"])
+
+    def test_nested_enum(self):
+        self.assertTrue(self.index.is_enum("Holder::IndexMode"))
+        self.assertFalse(self.index.is_enum("IndexMode"))
+        self.assertFalse(self.index.is_enum("Mode"))
+        self.assertTrue(self.index.is_enum("Mode2::Mode"))
+        mapper = hb.TypeMapper(self.index, [])
+        self.assertEqual(
+            mapper.scalar("IndexMode", "ctx", "Holder"), ("int", "Holder::IndexMode")
+        )
 
 
 class EquivalenceNormalizationTest(unittest.TestCase):
@@ -228,6 +766,66 @@ class EquivalenceNormalizationTest(unittest.TestCase):
     def test_cast_to_other_target_is_kept(self):
         body = "opt->rep.x = static_cast<decltype(opt->rep.y)>(v);"
         self.assertEqual(veq.normalize_decltype_assignments(body), body)
+
+    def test_lossless_cast_is_static_cast_for_values_only(self):
+        body = "return ROCKSDB_NAMESPACE::lossless_cast<int>(x);"
+        self.assertEqual(
+            veq.normalize_lossless_casts(body), "return static_cast<int>(x);"
+        )
+        pointer = "return lossless_cast<int*>(p);"
+        self.assertEqual(veq.normalize_lossless_casts(pointer), pointer)
+
+    def test_void_sole_return(self):
+        self.assertEqual(
+            veq.normalize_void_returns("{ return f(x); }", "void"), "{ f(x); }"
+        )
+        self.assertEqual(
+            veq.normalize_void_returns("{ return f(x); }", "int"), "{ return f(x); }"
+        )
+        lam = "{ g([] { return 1; }); }"
+        self.assertEqual(veq.normalize_void_returns(lam, "void"), lam)
+
+    def test_guarded_delete_is_plain_delete(self):
+        for guarded in ("{ if (p) { delete p; } }", "{ if (p) delete p; }"):
+            self.assertEqual(veq.normalize_guarded_deletes(guarded), "{ delete p; }")
+        self.assertEqual(
+            veq.normalize_guarded_deletes(
+                "{ if (b->rep) { delete b->rep; } delete b; }"
+            ),
+            "{ delete b->rep; delete b; }",
+        )
+        kept = (
+            "{ if (p) { delete q; } }",
+            "{ if (p) { delete p; } else { f(); } }",
+            "{ if (p) { delete p; f(); } }",
+            "{ if (!p) { delete p; } }",
+        )
+        for body in kept:
+            self.assertEqual(veq.normalize_guarded_deletes(body), body)
+
+    def test_returned_local_is_direct_return(self):
+        self.assertEqual(
+            veq.normalize_returned_locals("{ T* opt = new T; return opt; }"),
+            "{ return new T; }",
+        )
+        kept = (
+            "{ T* opt = new T; return other; }",
+            "{ T* opt = new T; opt->x = 1; return opt; }",
+            "{ T opt = make(); return opt; }",
+            "{ if (c) { T* opt = new T; return opt; } return nullptr; }",
+        )
+        for body in kept:
+            self.assertEqual(veq.normalize_returned_locals(body), body)
+
+    def test_bodies_equivalent(self):
+        def make(names, body):
+            return veq.FunctionDef("f", "", "void", ["int"], names, body)
+
+        ref = make(["n"], "{ return o->rep->Set(n); }")
+        gen = make(["v"], "{ o->rep->Set(v); }")
+        self.assertTrue(veq.bodies_equivalent(ref, gen))
+        other = make(["v"], "{ o->rep->Set(v + 1); }")
+        self.assertFalse(veq.bodies_equivalent(ref, other))
 
 
 if __name__ == "__main__":

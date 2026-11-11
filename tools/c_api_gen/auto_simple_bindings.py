@@ -31,6 +31,7 @@ from json import JSONDecoder
 from pathlib import Path
 from typing import Iterable
 
+import handle_bindings
 from generate_c_api import render_decl, render_impl, write_if_changed
 
 
@@ -895,16 +896,23 @@ def collect_function_names(root_file: Path, include_re: re.Pattern[str]) -> set[
     names = set(FUNCTION_RE.findall(root_file.read_text()))
     for rel in include_re.findall(root_file.read_text()):
         include_path = ROOT / Path(rel)
-        if include_path.resolve() in AUTO_OUTPUTS or not include_path.exists():
+        if (
+            include_path.resolve() in AUTO_OUTPUTS
+            or include_path.name in handle_bindings.OWN_OUTPUTS
+            or not include_path.exists()
+        ):
             continue
         names.update(FUNCTION_RE.findall(include_path.read_text()))
     return names
 
 
 def collect_existing_bindings() -> tuple[set[str], set[str]]:
+    # handle_bindings.py runs after this generator, so its fragments can still
+    # be from the previous run. Take its functions from handles.json instead.
+    handle_names = handle_bindings.function_names(handle_bindings.HANDLES_PATH)
     decls = collect_function_names(TEMPLATE_ROOT / "c_base.h", HEADER_INCLUDE_RE)
     defs = collect_function_names(TEMPLATE_ROOT / "c_base.cc", SOURCE_INCLUDE_RE)
-    return decls, defs
+    return decls | handle_names, defs | handle_names
 
 
 def normalize_token(token: str) -> str:
@@ -1069,7 +1077,7 @@ def build_option_specs(family: FamilyConfig, field_name: str, qual_type: str) ->
                 "receiver_type": family.c_receiver_type,
                 "receiver_name": family.c_receiver_name,
                 "return_type": family.enum_c_type,
-                "expr": f"static_cast<{family.enum_c_type}>({expr})",
+                "expr": f"ROCKSDB_NAMESPACE::lossless_cast<{family.enum_c_type}>({expr})",
                 "uncast_expr": expr,
             },
         ]
@@ -1142,7 +1150,7 @@ def build_metadata_specs(
                 "receiver_type": family.c_receiver_type,
                 "receiver_name": family.c_receiver_name,
                 "return_type": family.enum_c_type,
-                "expr": f"static_cast<{family.enum_c_type}>({expr})",
+                "expr": f"ROCKSDB_NAMESPACE::lossless_cast<{family.enum_c_type}>({expr})",
                 "uncast_expr": expr,
             }
         ]
@@ -1322,8 +1330,8 @@ def generate_groups(blocklist_path: Path) -> tuple[dict[Path, str], list[str]]:
                         if coverage != "covered":
                             errors.append(
                                 f"blocklisted manual function {spec['name']} is "
-                                "not hand-written in tools/c_api_gen/c_base.h "
-                                "and c_base.cc"
+                                "in neither tools/c_api_gen/c_base.h and "
+                                "c_base.cc nor handles.json"
                             )
                         continue
                     if coverage == "missing_both":

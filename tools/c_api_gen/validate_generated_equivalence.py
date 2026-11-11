@@ -117,6 +117,92 @@ def normalize_return_casts(body: str, return_type: str) -> str:
     return pattern.sub(lambda m: f"return {m.group(1).strip()};", body)
 
 
+_LOSSLESS_CAST_RE = re.compile(
+    r"\b(?:ROCKSDB_NAMESPACE\s*::\s*)?lossless_cast\s*<(?P<to>[^<>*]+)>"
+)
+
+
+def normalize_lossless_casts(body: str) -> str:
+    """Rewrite `lossless_cast<T>(e)` as `static_cast<T>(e)` for non-pointer T.
+
+    For a non-pointer target, lossless_cast (util/cast_util.h) is static_cast
+    plus compile-time size checks, so the runtime behavior is the same.
+    """
+    return _LOSSLESS_CAST_RE.sub(lambda m: f"static_cast<{m.group('to')}>", body)
+
+
+_SOLE_RETURN_RE = re.compile(r"\{\s*return\s+(?P<expr>[^;{}]+);\s*\}")
+
+
+def normalize_void_returns(body: str, return_type: str) -> str:
+    """In a void function, a body of just `return e;` is `e;`.
+
+    C++ only accepts `return e;` in a void function when e is itself void.
+    Only a whole one-statement body is rewritten, so a `return` inside a
+    lambda is never touched.
+    """
+    if normalize_space(return_type) != "void":
+        return body
+    m = _SOLE_RETURN_RE.fullmatch(body.strip())
+    return f"{{ {m.group('expr')}; }}" if m else body
+
+
+_GUARDED_DELETE_RE = re.compile(
+    r"\bif\s*\(\s*(?P<p>[A-Za-z_][\w.>\-]*)\s*\)\s*"
+    r"(?:\{\s*delete\s+(?P=p)\s*;\s*\}|delete\s+(?P=p)\s*;)"
+    r"(?!\s*else\b)"
+)
+
+
+def normalize_guarded_deletes(body: str) -> str:
+    """Rewrite `if (p) { delete p; }` as `delete p;`.
+
+    Deleting a null pointer does nothing, so the guard never changes what
+    happens. An `if` with an `else` branch is left alone.
+    """
+    return _GUARDED_DELETE_RE.sub(lambda m: f"delete {m.group('p')};", body)
+
+
+_RETURN_LOCAL_RE = re.compile(
+    r"\{\s*[A-Za-z_][\w:]*\s*\*\s*(?P<v>[A-Za-z_]\w*)\s*=\s*(?P<expr>[^;{}]+);"
+    r"\s*return\s+(?P=v)\s*;\s*\}"
+)
+
+
+def normalize_returned_locals(body: str) -> str:
+    """A body of just `T* v = e; return v;` is `return e;`.
+
+    Only a whole two-statement body is rewritten, so v cannot be used
+    anywhere else.
+    """
+    m = _RETURN_LOCAL_RE.fullmatch(body.strip())
+    return f"{{ return {m.group('expr').strip()}; }}" if m else body
+
+
+def normalized_body_tokens(
+    body: str, return_type: str, mapping: dict[str, str] | None = None
+) -> list[str]:
+    body = normalize_lossless_casts(body)
+    body = normalize_guarded_deletes(body)
+    body = normalize_returned_locals(body)
+    body = normalize_void_returns(body, return_type)
+    body = normalize_decltype_assignments(normalize_return_casts(body, return_type))
+    tokens = tokenize(body)
+    return map_identifiers(tokens, mapping) if mapping else tokens
+
+
+def bodies_equivalent(ref_def: "FunctionDef", gen_def: "FunctionDef") -> bool:
+    """Token-equal bodies after parameter renames and the normalizations above."""
+    mapping = {
+        ref_name: gen_name
+        for ref_name, gen_name in zip(ref_def.param_names, gen_def.param_names)
+        if ref_name and gen_name
+    }
+    return normalized_body_tokens(
+        ref_def.body, gen_def.return_type, mapping
+    ) == normalized_body_tokens(gen_def.body, gen_def.return_type)
+
+
 def find_matching(text: str, start: int, open_ch: str, close_ch: str) -> int:
     assert text[start] == open_ch
     depth = 0
@@ -414,20 +500,7 @@ def compare_sources(
                     f"({', '.join(ref_def.param_types)})"
                 )
                 continue
-            mapping = {
-                ref_name: gen_name
-                for ref_name, gen_name in zip(ref_def.param_names, generated.param_names)
-                if ref_name and gen_name
-            }
-            ref_body = normalize_decltype_assignments(
-                normalize_return_casts(ref_def.body, generated.return_type)
-            )
-            gen_body = normalize_decltype_assignments(
-                normalize_return_casts(generated.body, generated.return_type)
-            )
-            ref_tokens = map_identifiers(tokenize(ref_body), mapping)
-            gen_tokens = tokenize(gen_body)
-            if ref_tokens != gen_tokens:
+            if not bodies_equivalent(ref_def, generated):
                 failures.append(f"[source body mismatch] {name}")
     return failures
 
