@@ -68,9 +68,15 @@ class DBBlobBasicTest : public DBTestBase {
     ASSERT_EQ(blob_index.file_number(), blob_file_number);
   }
 
-  void RecoverMissingNonOldestBlob(const Options& options,
-                                   bool preserve_older_value,
-                                   uint64_t* missing_blob_file) {
+  // Writes "a" and "c" (plus an older "b" if `preserve_older_value`) to one
+  // blob file and "b" and "d" to a newer one, compacts both into one SST file
+  // that references both blob files, then closes the DB and deletes the newer
+  // blob file, or the older one if `delete_oldest`. The SST file is linked
+  // only to the older blob file, its oldest referenced one.
+  void CreateSstWithMissingBlobFile(const Options& options,
+                                    bool preserve_older_value,
+                                    bool delete_oldest,
+                                    uint64_t* missing_blob_file) {
     DestroyAndReopen(options);
     ASSERT_OK(Put("a", "va"));
     ASSERT_OK(Put("c", "vc"));
@@ -91,13 +97,22 @@ class DBBlobBasicTest : public DBTestBase {
       ASSERT_OK(Flush());
       const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
       ASSERT_EQ(blob_files.size(), 2);
-      *missing_blob_file = blob_files.back();
+      *missing_blob_file =
+          delete_oldest ? blob_files.front() : blob_files.back();
       ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
       ASSERT_EQ(TotalTableFiles(), 1);
     }
 
     Close();
     ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, *missing_blob_file)));
+  }
+
+  void RecoverMissingNonOldestBlob(const Options& options,
+                                   bool preserve_older_value,
+                                   uint64_t* missing_blob_file) {
+    ASSERT_NO_FATAL_FAILURE(CreateSstWithMissingBlobFile(
+        options, preserve_older_value, /*delete_oldest=*/false,
+        missing_blob_file));
     Options recovery_options = options;
     recovery_options.best_efforts_recovery = true;
     Reopen(recovery_options);
@@ -107,6 +122,46 @@ class DBBlobBasicTest : public DBTestBase {
     ASSERT_EQ(TotalTableFiles(), 1);
     ASSERT_NO_FATAL_FAILURE(AssertBlobReference("b", *missing_blob_file));
     ASSERT_NO_FATAL_FAILURE(AssertBlobReference("d", *missing_blob_file));
+  }
+
+  std::vector<uint64_t> GetDroppedBlobFiles() {
+    return dbfull()
+        ->GetVersionSet()
+        ->GetColumnFamilySet()
+        ->GetDefault()
+        ->current()
+        ->storage_info()
+        ->GetDroppedBlobFiles();
+  }
+
+  static Options RepairOptions(Options options) {
+    options.best_efforts_blob_db_repair = true;
+    return options;
+  }
+
+  static void AssertDroppedBlobStatus(const Status& s) {
+    ASSERT_EQ(s.code(), Status::kCorruption) << s.ToString();
+    ASSERT_NE(s.ToString().find("dropped by best-efforts BlobDB repair"),
+              std::string::npos)
+        << s.ToString();
+  }
+
+  void AssertDroppedBlobRead(const Slice& key) {
+    std::string value;
+    ASSERT_NO_FATAL_FAILURE(
+        AssertDroppedBlobStatus(db_->Get(ReadOptions(), key, &value)));
+  }
+
+  // Runs best-efforts BlobDB repair on a DB whose newer blob file is missing
+  // (see CreateSstWithMissingBlobFile()) and checks what it recorded.
+  void RepairMissingNonOldestBlob(const Options& options,
+                                  uint64_t* missing_blob_file) {
+    ASSERT_NO_FATAL_FAILURE(CreateSstWithMissingBlobFile(
+        options, /*preserve_older_value=*/false, /*delete_oldest=*/false,
+        missing_blob_file));
+    Reopen(RepairOptions(options));
+    ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{*missing_blob_file});
+    ASSERT_EQ(TotalTableFiles(), 1);
   }
 };
 
@@ -1548,6 +1603,326 @@ TEST_F(DBBlobBasicTest, BestEffortsRecoveryMissingNewestBlobFile) {
   std::string value;
   ASSERT_OK(db_->Get(ReadOptions(), "a", &value));
   ASSERT_EQ("value" + std::to_string(kNumTableFiles - 2), value);
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairRecordsMissingBlobFile) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("c"), "vc");
+  ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobRead("b"));
+  ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobRead("d"));
+
+  std::vector<std::string> values;
+  const std::vector<Status> statuses =
+      db_->MultiGet(ReadOptions(), {"a", "b"}, &values);
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0], "va");
+  ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobStatus(statuses[1]));
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->Seek("b");
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobStatus(iter->status()));
+  }
+
+  // The record is persisted in the MANIFEST. It outlives regular reopens and
+  // is replayed by later best-efforts recovery or repair.
+  Options recovery_options = options;
+  recovery_options.best_efforts_recovery = true;
+  for (const Options& reopen_options :
+       {options, options, recovery_options, RepairOptions(options)}) {
+    Reopen(reopen_options);
+    ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+    ASSERT_EQ(Get("a"), "va");
+    ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobRead("b"));
+  }
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairWithBlobDirectWrite) {
+  // With blob direct write, iterators can read blob files that the Version
+  // does not know yet, but a dropped blob file is never one of them.
+  Options options = MissingBlobRepairOptions();
+  options.enable_blob_direct_write = true;
+  options.allow_concurrent_memtable_write = false;
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobRead("b"));
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->Seek("b");
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobStatus(iter->status()));
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairCorruptBlobFile) {
+  // A blob file that is present but cannot be opened counts as missing.
+  Options options = MissingBlobRepairOptions();
+  uint64_t corrupt_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(CreateSstWithMissingBlobFile(
+      options, /*preserve_older_value=*/false, /*delete_oldest=*/false,
+      &corrupt_blob_file));
+  ASSERT_OK(WriteStringToFile(env_, "not a blob file",
+                              BlobFileName(dbname_, corrupt_blob_file),
+                              /*should_sync=*/true));
+  Reopen(RepairOptions(options));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{corrupt_blob_file});
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobRead("b"));
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairRecordSurvivesManifestRollover) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+
+  // Tiny MANIFEST size limits make each flush start a new MANIFEST.
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
+  Reopen(options);
+  const uint64_t manifest_file_number =
+      dbfull()->TEST_Current_Manifest_FileNo();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("e" + std::to_string(i), "ve"));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_GT(dbfull()->TEST_Current_Manifest_FileNo(), manifest_file_number);
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+
+  Reopen(options);
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobRead("b"));
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairFallsBackForMissingSst) {
+  // As in best-efforts recovery, a missing non-L0 SST file makes repair fall
+  // back to an older point in time, even when a blob file is missing too.
+  // Before the compaction that wrote the SST file, both flushed files existed,
+  // and they are gone now, so the column family recovers empty.
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(CreateSstWithMissingBlobFile(
+      options, /*preserve_older_value=*/false, /*delete_oldest=*/false,
+      &missing_blob_file));
+  std::vector<std::string> children;
+  ASSERT_OK(env_->GetChildren(dbname_, &children));
+  std::vector<std::string> table_files;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type = kTempFile;
+    if (ParseFileName(child, &number, &type) && type == kTableFile) {
+      table_files.push_back(child);
+    }
+  }
+  ASSERT_EQ(table_files.size(), 1);
+  ASSERT_OK(env_->DeleteFile(dbname_ + "/" + table_files[0]));
+
+  Reopen(RepairOptions(options));
+  ASSERT_EQ(TotalTableFiles(), 0);
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairOnHealthyDb) {
+  // Leaves a blob file that compaction made obsolete and deleted, while an
+  // older blob file stays live. The obsolete blob file is newer than the
+  // oldest referenced one, so repair must not record it as dropped.
+  Options options = MissingBlobRepairOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Flush());
+  const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+  ASSERT_EQ(blob_files.size(), 2);
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(Put("b", "vb2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(env_->FileExists(BlobFileName(dbname_, blob_files[1])).code(),
+            Status::kNotFound);
+  ASSERT_EQ(GetBlobFileNumbers().front(), blob_files[0]);
+  const std::vector<uint64_t> live_blob_files = GetBlobFileNumbers();
+
+  Reopen(RepairOptions(options));
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  ASSERT_EQ(GetBlobFileNumbers(), live_blob_files);
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("b"), "vb2");
+
+  Reopen(options);
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  ASSERT_EQ(Get("b"), "vb2");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairDropsBlobOfMissingL0File) {
+  // The newest L0 file is missing, but its blob file is present. Both modes
+  // leave the L0 file and its blob file out; only repair records the blob
+  // file as dropped.
+  Options options = MissingBlobRepairOptions();
+  for (const bool repair : {false, true}) {
+    SCOPED_TRACE(repair ? "repair" : "best-efforts recovery");
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("a", "va"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("b", "vb"));
+    ASSERT_OK(Flush());
+    const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+    ASSERT_EQ(blob_files.size(), 2);
+    std::vector<LiveFileMetaData> table_files;
+    db_->GetLiveFilesMetaData(&table_files);
+    ASSERT_EQ(table_files.size(), 2);
+    const LiveFileMetaData& newest_table_file =
+        table_files[0].file_number > table_files[1].file_number
+            ? table_files[0]
+            : table_files[1];
+    const std::string newest_table_file_name =
+        newest_table_file.db_path + "/" + newest_table_file.relative_filename;
+    Close();
+    ASSERT_OK(env_->DeleteFile(newest_table_file_name));
+
+    Options reopen_options = repair ? RepairOptions(options) : options;
+    reopen_options.best_efforts_recovery = !repair;
+    Reopen(reopen_options);
+    ASSERT_EQ(TotalTableFiles(), 1);
+    ASSERT_EQ(Get("a"), "va");
+    ASSERT_EQ(Get("b"), "NOT_FOUND");
+    ASSERT_EQ(GetBlobFileNumbers(), std::vector<uint64_t>{blob_files[0]});
+    ASSERT_EQ(GetDroppedBlobFiles(), repair
+                                         ? std::vector<uint64_t>{blob_files[1]}
+                                         : std::vector<uint64_t>{});
+  }
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairReadOnly) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(CreateSstWithMissingBlobFile(
+      options, /*preserve_older_value=*/false, /*delete_oldest=*/false,
+      &missing_blob_file));
+
+  // A read-only DB applies the repair in memory only.
+  ASSERT_OK(ReadOnlyReopen(RepairOptions(options)));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobRead("b"));
+
+  // Nothing was recorded, so a regular open still has the blob file's
+  // metadata.
+  Reopen(options);
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  ASSERT_EQ(GetBlobFileNumbers().back(), missing_blob_file);
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsRecoveryDoesNotRecordDroppedBlobFiles) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RecoverMissingNonOldestBlob(options, false, &missing_blob_file));
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  std::string value;
+  const Status s = db_->Get(ReadOptions(), "b", &value);
+  ASSERT_EQ(s.code(), Status::kCorruption);
+  ASSERT_NE(s.ToString().find("Invalid blob file number"), std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairKeepsSstMissingOldestBlob) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+
+  // Best-efforts recovery can only recover a point in time before the SST
+  // file existed, which leaves the column family empty.
+  ASSERT_NO_FATAL_FAILURE(
+      CreateSstWithMissingBlobFile(options, /*preserve_older_value=*/false,
+                                   /*delete_oldest=*/true, &missing_blob_file));
+  Options recovery_options = options;
+  recovery_options.best_efforts_recovery = true;
+  Reopen(recovery_options);
+  ASSERT_EQ(TotalTableFiles(), 0);
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+
+  // Repair keeps the SST file and the newer blob file.
+  ASSERT_NO_FATAL_FAILURE(
+      CreateSstWithMissingBlobFile(options, /*preserve_older_value=*/false,
+                                   /*delete_oldest=*/true, &missing_blob_file));
+  Reopen(RepairOptions(options));
+  ASSERT_EQ(TotalTableFiles(), 1);
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  ASSERT_EQ(Get("b"), "vb");
+  ASSERT_EQ(Get("d"), "vd");
+  ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobRead("a"));
+  ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobRead("c"));
+
+  Reopen(options);
+  ASSERT_EQ(Get("b"), "vb");
+  ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobRead("a"));
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairWithAtomicFlush) {
+  // With two column families, atomic flush writes atomic groups, which keeps
+  // best-efforts recovery from accepting a Version that misses any file.
+  // Repair does not need that.
+  Options options = MissingBlobRepairOptions();
+  options.atomic_flush = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"pikachu"}, options);
+  const std::vector<std::string> cf_names{kDefaultColumnFamilyName, "pikachu"};
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Put(1, "x", "vx"));
+  ASSERT_OK(dbfull()->Flush(FlushOptions(), handles_));
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Put(1, "y", "vy"));
+  ASSERT_OK(dbfull()->Flush(FlushOptions(), handles_));
+  const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+  ASSERT_EQ(blob_files.size(), 2);
+  const uint64_t missing_blob_file = blob_files.back();
+  ASSERT_OK(
+      db_->CompactRange(CompactRangeOptions(), handles_[0], nullptr, nullptr));
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, missing_blob_file)));
+
+  ReopenWithColumnFamilies(cf_names, RepairOptions(options));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("c"), "vc");
+  ASSERT_NO_FATAL_FAILURE(AssertDroppedBlobRead("b"));
+  ASSERT_EQ(Get(1, "x"), "vx");
+  ASSERT_EQ(Get(1, "y"), "vy");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairMissingOldestBlobWithForcedGc) {
+  // After repair drops the oldest blob file an SST file references, the
+  // oldest blob file left in the Version has no linked SST file.
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      CreateSstWithMissingBlobFile(options, /*preserve_older_value=*/false,
+                                   /*delete_oldest=*/true, &missing_blob_file));
+  options.enable_blob_garbage_collection = true;
+  options.blob_garbage_collection_age_cutoff = 1.0;
+  options.blob_garbage_collection_force_threshold = 0.5;
+  Reopen(RepairOptions(options));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  ASSERT_EQ(Get("b"), "vb");
+
+  Reopen(options);
+  ASSERT_EQ(Get("b"), "vb");
+  ASSERT_EQ(Get("d"), "vd");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairRequiresBlobFiles) {
+  Options options = MissingBlobRepairOptions();
+  options.enable_blob_files = false;
+  options.best_efforts_blob_db_repair = true;
+  const Status s = TryReopen(options);
+  ASSERT_EQ(s.code(), Status::kInvalidArgument) << s.ToString();
 }
 
 TEST_F(DBBlobBasicTest, RepairMissingNonOldestBlobAfterBestEffortsRecovery) {

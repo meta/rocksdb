@@ -10241,6 +10241,16 @@ unsigned char rocksdb_options_get_best_efforts_recovery(
   return opt->rep.best_efforts_recovery;
 }
 
+void rocksdb_options_set_best_efforts_blob_db_repair(rocksdb_options_t* opt,
+                                                     unsigned char v) {
+  opt->rep.best_efforts_blob_db_repair = v;
+}
+
+unsigned char rocksdb_options_get_best_efforts_blob_db_repair(
+    rocksdb_options_t* opt) {
+  return opt->rep.best_efforts_blob_db_repair;
+}
+
 void rocksdb_options_set_max_bgerror_resume_count(rocksdb_options_t* opt,
                                                   int v) {
   opt->rep.max_bgerror_resume_count = v;

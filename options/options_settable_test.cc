@@ -523,6 +523,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "track_options_file_number_in_manifest=true;"
       "optimize_manifest_for_recovery=false;"
       "best_efforts_recovery=false;"
+      "best_efforts_blob_db_repair=false;"
       "max_bgerror_resume_count=2;"
       "bgerror_resume_retry_interval=1000000;"
       "db_host_id=hostname;"

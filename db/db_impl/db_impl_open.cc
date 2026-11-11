@@ -6,6 +6,7 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#include <algorithm>
 #include <cinttypes>
 #include <memory>
 
@@ -239,6 +240,15 @@ Status DBImpl::ValidateOptions(
       }
     }
   }
+  if (db_options.best_efforts_blob_db_repair &&
+      std::none_of(column_families.begin(), column_families.end(),
+                   [](const ColumnFamilyDescriptor& cf) {
+                     return cf.options.enable_blob_files;
+                   })) {
+    return Status::InvalidArgument(
+        "best_efforts_blob_db_repair requires enable_blob_files on at least "
+        "one column family");
+  }
   s = ValidateOptions(db_options);
   return s;
 }
@@ -471,7 +481,7 @@ Status DBImpl::Recover(
     // MANIFEST indicates the recovery to recover existing db. If no MANIFEST
     // can be found, a new db will be created.
     std::string manifest_path;
-    if (!immutable_db_options_.best_efforts_recovery) {
+    if (!immutable_db_options_.UsesBestEffortsRecoveryPath()) {
       s = env_->FileExists(current_fname);
     } else {
       s = Status::NotFound();
@@ -543,7 +553,7 @@ Status DBImpl::Recover(
         }
       }
     }
-  } else if (immutable_db_options_.best_efforts_recovery) {
+  } else if (immutable_db_options_.UsesBestEffortsRecoveryPath()) {
     assert(files_in_dbname.empty());
     IOOptions io_opts;
     io_opts.do_not_recurse = true;
@@ -560,7 +570,7 @@ Status DBImpl::Recover(
   assert(is_new_db || db_id_.empty());
   Status s;
   bool missing_table_file = false;
-  if (!immutable_db_options_.best_efforts_recovery) {
+  if (!immutable_db_options_.UsesBestEffortsRecoveryPath()) {
     // Status of reading the descriptor file
     Status desc_status;
     s = versions_->Recover(column_families, read_only, &db_id_,
@@ -707,7 +717,7 @@ Status DBImpl::Recover(
     // disabled there (see optimize_manifest_for_recovery doc).
     const bool optimize_manifest_for_recovery =
         mutable_db_options_.optimize_manifest_for_recovery &&
-        !immutable_db_options_.best_efforts_recovery;
+        !immutable_db_options_.UsesBestEffortsRecoveryPath();
     if (!optimize_manifest_for_recovery || edit.HasDbId()) {
       recovery_ctx->UpdateVersionEdits(
           versions_->GetColumnFamilySet()->GetDefault(), edit);
@@ -788,7 +798,7 @@ Status DBImpl::Recover(
     // attention to it in case we are recovering a database
     // produced by an older version of rocksdb.
     auto wal_dir = immutable_db_options_.GetWalDir();
-    if (!immutable_db_options_.best_efforts_recovery) {
+    if (!immutable_db_options_.UsesBestEffortsRecoveryPath()) {
       IOOptions io_opts;
       io_opts.do_not_recurse = true;
       s = immutable_db_options_.fs->GetChildren(
@@ -817,12 +827,13 @@ Status DBImpl::Recover(
     }
 
     if (immutable_db_options_.track_and_verify_wals && !is_new_db &&
-        !immutable_db_options_.best_efforts_recovery && wal_files.empty()) {
+        !immutable_db_options_.UsesBestEffortsRecoveryPath() &&
+        wal_files.empty()) {
       return Status::Corruption("Opening an existing DB with no WAL files");
     }
 
     if (immutable_db_options_.track_and_verify_wals_in_manifest) {
-      if (!immutable_db_options_.best_efforts_recovery) {
+      if (!immutable_db_options_.UsesBestEffortsRecoveryPath()) {
         // Verify WALs in MANIFEST.
         s = versions_->GetWalSet().CheckWals(env_, wal_files);
       }  // else since best effort recovery does not recover from WALs, no need
@@ -910,7 +921,7 @@ Status DBImpl::Recover(
       const std::string normalized_dbname = NormalizePath(dbname_);
       const std::string normalized_wal_dir =
           NormalizePath(immutable_db_options_.GetWalDir());
-      if (immutable_db_options_.best_efforts_recovery) {
+      if (immutable_db_options_.UsesBestEffortsRecoveryPath()) {
         filenames = std::move(files_in_dbname);
       } else if (normalized_dbname == normalized_wal_dir) {
         filenames = std::move(files_in_wal_dir);
@@ -1972,7 +1983,7 @@ Status DBImpl::MaybeFlushFinalMemtableOrRestoreActiveLogFiles(
 
       const bool optimize_manifest_for_recovery =
           mutable_db_options_.optimize_manifest_for_recovery &&
-          !immutable_db_options_.best_efforts_recovery;
+          !immutable_db_options_.UsesBestEffortsRecoveryPath();
       for (auto* cfd : *versions_->GetColumnFamilySet()) {
         auto iter = version_edits->find(cfd->GetID());
         assert(iter != version_edits->end());

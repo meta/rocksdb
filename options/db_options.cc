@@ -495,6 +495,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, best_efforts_recovery),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"best_efforts_blob_db_repair",
+         {offsetof(struct ImmutableDBOptions, best_efforts_blob_db_repair),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"max_bgerror_resume_count",
          {offsetof(struct ImmutableDBOptions, max_bgerror_resume_count),
           OptionType::kInt, OptionVerificationType::kNormal,
@@ -869,6 +873,7 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       log_readahead_size(options.log_readahead_size),
       file_checksum_gen_factory(options.file_checksum_gen_factory),
       best_efforts_recovery(options.best_efforts_recovery),
+      best_efforts_blob_db_repair(options.best_efforts_blob_db_repair),
       max_bgerror_resume_count(options.max_bgerror_resume_count),
       bgerror_resume_retry_interval(options.bgerror_resume_retry_interval),
       allow_data_in_errors(options.allow_data_in_errors),
@@ -1066,6 +1071,8 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                                              : kUnknownFileChecksumFuncName);
   ROCKS_LOG_HEADER(log, "                Options.best_efforts_recovery: %d",
                    static_cast<int>(best_efforts_recovery));
+  ROCKS_LOG_HEADER(log, "          Options.best_efforts_blob_db_repair: %d",
+                   best_efforts_blob_db_repair ? 1 : 0);
   ROCKS_LOG_HEADER(log, "               Options.max_bgerror_resume_count: %d",
                    max_bgerror_resume_count);
   ROCKS_LOG_HEADER(log,

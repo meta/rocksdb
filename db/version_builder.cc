@@ -313,6 +313,10 @@ class VersionBuilder::Rep : public MutableScalars {
   // version edits.
   std::map<uint64_t, MutableBlobFileMetaData> mutable_blob_file_metas_;
 
+  // Dropped blob files (see VersionStorageInfo::GetDroppedBlobFiles())
+  // recorded by the series of version edits.
+  std::unordered_set<uint64_t> dropped_blob_files_;
+
   std::shared_ptr<CacheReservationManager> file_metadata_cache_res_mgr_;
 
   ColumnFamilyData* cfd_;
@@ -323,6 +327,8 @@ class VersionBuilder::Rep : public MutableScalars {
   // never edited in an atomic group, an incomplete Version with only a suffix
   // of L0 files missing is also considered valid.
   bool allow_incomplete_valid_version_;
+  // See RecordMissingBlobFilesAsDropped().
+  bool record_missing_blob_files_as_dropped_ = false;
 
   // These are only tracked if `track_found_and_missing_files_` is enabled.
 
@@ -399,6 +405,7 @@ class VersionBuilder::Rep : public MutableScalars {
     UnorderedMap<uint64_t, bool> l0_missing_files;
     UnorderedMap<uint64_t, bool> non_l0_missing_files;
     UnorderedMap<uint64_t, bool> missing_blob_files;
+    UnorderedMap<uint64_t, bool> dropped_blob_files;
 
     // `intermediate_files_` is append-only within an `Apply()`. Restore by
     // truncating to `intermediate_files_size` (rollback) / re-appending
@@ -632,6 +639,10 @@ class VersionBuilder::Rep : public MutableScalars {
     for (const auto& bg : edit->GetBlobFileGarbages()) {
       touch_blob_file(bg.GetBlobFileNumber());
     }
+    for (const uint64_t blob_file_number : edit->GetDroppedBlobFiles()) {
+      RecordSetMembership(dropped_blob_files_, undo_->dropped_blob_files,
+                          blob_file_number);
+    }
     for (const auto& deleted_file : edit->GetDeletedFiles()) {
       const int level = deleted_file.first;
       const uint64_t fn = deleted_file.second;
@@ -699,6 +710,7 @@ class VersionBuilder::Rep : public MutableScalars {
     ToggleSetMembership(l0_missing_files_, undo_->l0_missing_files);
     ToggleSetMembership(non_l0_missing_files_, undo_->non_l0_missing_files);
     ToggleSetMembership(missing_blob_files_, undo_->missing_blob_files);
+    ToggleSetMembership(dropped_blob_files_, undo_->dropped_blob_files);
 
     if (!undo_->rolled_back) {
       // Forward -> pre-edit: peel off the entries appended by this edit.
@@ -1392,6 +1404,10 @@ class VersionBuilder::Rep : public MutableScalars {
       version_updated = true;
     }
 
+    for (const uint64_t blob_file_number : edit->GetDroppedBlobFiles()) {
+      dropped_blob_files_.insert(blob_file_number);
+    }
+
     // Delete table files
     for (const auto& deleted_file : edit->GetDeletedFiles()) {
       const int level = deleted_file.first;
@@ -1584,21 +1600,37 @@ class VersionBuilder::Rep : public MutableScalars {
   }
 
   // Add the blob file specified by meta to *vstorage if it is determined to
-  // contain valid data (blobs).
+  // contain valid data (blobs). With record_missing_blob_files_as_dropped_, a
+  // missing blob file that SST files might reference is appended to
+  // *dropped_blob_files instead.
   template <typename Meta>
   void AddBlobFileIfNeeded(VersionStorageInfo* vstorage, Meta&& meta,
-                           uint64_t blob_file_number) const {
+                           uint64_t blob_file_number,
+                           std::vector<uint64_t>* dropped_blob_files) const {
     assert(vstorage);
     assert(meta);
+    assert(dropped_blob_files);
 
     const auto& linked_ssts = meta->GetLinkedSsts();
     if (track_found_and_missing_files_) {
       if (missing_blob_files_.find(blob_file_number) !=
           missing_blob_files_.end()) {
+        // A blob file without linked SST files or live blobs was deleted as
+        // obsolete, so no SST file references it.
+        if (record_missing_blob_files_as_dropped_ &&
+            (!linked_ssts.empty() ||
+             meta->GetGarbageBlobCount() < meta->GetTotalBlobCount())) {
+          dropped_blob_files->push_back(blob_file_number);
+        }
         return;
       }
       // Leave the empty case for the below blob garbage collection logic.
       if (!linked_ssts.empty() && OnlyLinkedToMissingL0Files(linked_ssts)) {
+        // Retained SST files can still reference this blob file even though
+        // none of them is linked to it.
+        if (record_missing_blob_files_as_dropped_) {
+          dropped_blob_files->push_back(blob_file_number);
+        }
         return;
       }
     }
@@ -1612,9 +1644,11 @@ class VersionBuilder::Rep : public MutableScalars {
   }
 
   // Merge the blob file metadata from the base version with the changes (edits)
-  // applied, and save the result into *vstorage.
+  // applied, and save the result into *vstorage. Missing blob files recorded
+  // as dropped are appended to *dropped_blob_files (see AddBlobFileIfNeeded()).
   void SaveBlobFilesTo(VersionStorageInfo* vstorage,
-                       uint64_t min_oldest_blob_file_num) const {
+                       uint64_t min_oldest_blob_file_num,
+                       std::vector<uint64_t>* dropped_blob_files) const {
     assert(vstorage);
     assert(!track_found_and_missing_files_ || valid_version_available_);
 
@@ -1627,24 +1661,26 @@ class VersionBuilder::Rep : public MutableScalars {
     }
 
     auto process_base =
-        [this, vstorage](const std::shared_ptr<BlobFileMetaData>& base_meta) {
+        [this, vstorage, dropped_blob_files](
+            const std::shared_ptr<BlobFileMetaData>& base_meta) {
           assert(base_meta);
 
           AddBlobFileIfNeeded(vstorage, base_meta,
-                              base_meta->GetBlobFileNumber());
+                              base_meta->GetBlobFileNumber(),
+                              dropped_blob_files);
 
           return true;
         };
 
-    auto process_mutable =
-        [this, vstorage](const MutableBlobFileMetaData& mutable_meta) {
-          AddBlobFileIfNeeded(vstorage, CreateBlobFileMetaData(mutable_meta),
-                              mutable_meta.GetBlobFileNumber());
+    auto process_mutable = [this, vstorage, dropped_blob_files](
+                               const MutableBlobFileMetaData& mutable_meta) {
+      AddBlobFileIfNeeded(vstorage, CreateBlobFileMetaData(mutable_meta),
+                          mutable_meta.GetBlobFileNumber(), dropped_blob_files);
 
-          return true;
-        };
+      return true;
+    };
 
-    auto process_both = [this, vstorage](
+    auto process_both = [this, vstorage, dropped_blob_files](
                             const std::shared_ptr<BlobFileMetaData>& base_meta,
                             const MutableBlobFileMetaData& mutable_meta) {
       assert(base_meta);
@@ -1657,20 +1693,57 @@ class VersionBuilder::Rep : public MutableScalars {
                mutable_meta.GetGarbageBlobBytes());
         assert(base_meta->GetLinkedSsts() == mutable_meta.GetLinkedSsts());
 
-        AddBlobFileIfNeeded(vstorage, base_meta,
-                            base_meta->GetBlobFileNumber());
+        AddBlobFileIfNeeded(vstorage, base_meta, base_meta->GetBlobFileNumber(),
+                            dropped_blob_files);
 
         return true;
       }
 
       AddBlobFileIfNeeded(vstorage, CreateBlobFileMetaData(mutable_meta),
-                          mutable_meta.GetBlobFileNumber());
+                          mutable_meta.GetBlobFileNumber(), dropped_blob_files);
 
       return true;
     };
 
     MergeBlobFileMetas(min_oldest_blob_file_num, process_base, process_mutable,
                        process_both);
+  }
+
+  // Save into *vstorage the dropped blob files of the base Version and of the
+  // edits, plus `dropped`, the missing blob files SaveBlobFilesTo() recorded.
+  // `min_oldest_blob_file_num` is the oldest blob file referenced by the SST
+  // files in *vstorage; a blob file older than it, or in *vstorage, is not
+  // kept.
+  void SaveDroppedBlobFilesTo(VersionStorageInfo* vstorage,
+                              uint64_t min_oldest_blob_file_num,
+                              std::vector<uint64_t>&& dropped) const {
+    assert(vstorage);
+    assert(base_vstorage_);
+
+    if (min_oldest_blob_file_num == kInvalidBlobFileNumber) {
+      return;
+    }
+
+    const std::vector<uint64_t>& base_dropped =
+        base_vstorage_->GetDroppedBlobFiles();
+    dropped.insert(dropped.end(), base_dropped.begin(), base_dropped.end());
+    dropped.insert(dropped.end(), dropped_blob_files_.begin(),
+                   dropped_blob_files_.end());
+    if (dropped.empty()) {
+      return;
+    }
+
+    dropped.erase(std::remove_if(dropped.begin(), dropped.end(),
+                                 [&](uint64_t blob_file_number) {
+                                   return blob_file_number <
+                                              min_oldest_blob_file_num ||
+                                          vstorage->GetBlobFileMetaData(
+                                              blob_file_number) != nullptr;
+                                 }),
+                  dropped.end());
+    std::sort(dropped.begin(), dropped.end());
+    dropped.erase(std::unique(dropped.begin(), dropped.end()), dropped.end());
+    vstorage->SetDroppedBlobFiles(std::move(dropped));
   }
 
   void MaybeAddFile(VersionStorageInfo* vstorage, int level, FileMetaData* f,
@@ -1713,8 +1786,17 @@ class VersionBuilder::Rep : public MutableScalars {
   bool ContainsCompleteVersion() const {
     assert(track_found_and_missing_files_);
     return l0_missing_files_.empty() && non_l0_missing_files_.empty() &&
-           (missing_blob_files_high_ == kInvalidBlobFileNumber ||
+           (record_missing_blob_files_as_dropped_ ||
+            missing_blob_files_high_ == kInvalidBlobFileNumber ||
             missing_blob_files_high_ < GetMinOldestBlobFileNumber());
+  }
+
+  void RecordMissingBlobFilesAsDropped() {
+    assert(track_found_and_missing_files_);
+    assert(allow_incomplete_valid_version_);
+    assert(mutable_blob_file_metas_.empty());
+    assert(!undo_);
+    record_missing_blob_files_as_dropped_ = true;
   }
 
   bool HasMissingFiles() const {
@@ -1861,7 +1943,8 @@ class VersionBuilder::Rep : public MutableScalars {
     if (!l0_missing_files_.empty() && !MissingL0FilesAreL0Suffix()) {
       return false;
     }
-    if (!missing_blob_files_.empty() &&
+    if (!record_missing_blob_files_as_dropped_ &&
+        !missing_blob_files_.empty() &&
         !RemainingSstFilesNotMissingBlobFiles()) {
       return false;
     }
@@ -1961,7 +2044,11 @@ class VersionBuilder::Rep : public MutableScalars {
 
     const uint64_t min_oldest_blob_file_num = SaveSSTFilesTo(vstorage);
 
-    SaveBlobFilesTo(vstorage, min_oldest_blob_file_num);
+    std::vector<uint64_t> dropped_blob_files;
+    SaveBlobFilesTo(vstorage, min_oldest_blob_file_num, &dropped_blob_files);
+
+    SaveDroppedBlobFilesTo(vstorage, min_oldest_blob_file_num,
+                           std::move(dropped_blob_files));
 
     SaveCompactCursorsTo(vstorage);
 
@@ -2089,6 +2176,10 @@ bool VersionBuilder::ValidVersionAvailable() {
 }
 
 bool VersionBuilder::HasMissingFiles() const { return rep_->HasMissingFiles(); }
+
+void VersionBuilder::RecordMissingBlobFilesAsDropped() {
+  rep_->RecordMissingBlobFilesAsDropped();
+}
 
 std::vector<std::string> VersionBuilder::GetAndClearIntermediateFiles() {
   return rep_->GetAndClearIntermediateFiles();

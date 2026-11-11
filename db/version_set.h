@@ -19,6 +19,7 @@
 // synchronization on all accesses.
 
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <limits>
@@ -492,6 +493,33 @@ class VersionStorageInfo {
     return std::shared_ptr<BlobFileMetaData>();
   }
 
+  // Blob files that best-efforts BlobDB repair (see
+  // DBOptions::best_efforts_blob_db_repair) recorded as dropped: they are not
+  // in this Version, but SST files in it might still reference them. Sorted
+  // and free of duplicates. A number is forgotten once it is in the Version or
+  // is older than every SST file's oldest referenced blob file, so no SST file
+  // can reference it.
+  // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
+  const std::vector<uint64_t>& GetDroppedBlobFiles() const {
+    return dropped_blob_files_;
+  }
+
+  // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
+  bool IsDroppedBlobFile(uint64_t blob_file_number) const {
+    return std::binary_search(dropped_blob_files_.begin(),
+                              dropped_blob_files_.end(), blob_file_number);
+  }
+
+  // REQUIRES: `dropped_blob_files` is sorted and free of duplicates.
+  void SetDroppedBlobFiles(std::vector<uint64_t>&& dropped_blob_files) {
+    assert(
+        std::is_sorted(dropped_blob_files.begin(), dropped_blob_files.end()));
+    assert(std::adjacent_find(dropped_blob_files.begin(),
+                              dropped_blob_files.end()) ==
+           dropped_blob_files.end());
+    dropped_blob_files_ = std::move(dropped_blob_files);
+  }
+
   // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
   struct BlobStats {
     uint64_t total_file_size = 0;
@@ -763,6 +791,9 @@ class VersionStorageInfo {
 
   // Vector of blob files in version sorted by blob file number.
   BlobFiles blob_files_;
+
+  // See GetDroppedBlobFiles().
+  std::vector<uint64_t> dropped_blob_files_;
 
   // Level that L0 data should be compacted to. All levels < base_level_ should
   // be empty. -1 if it is not level-compaction so it's not applicable.
@@ -1476,6 +1507,10 @@ class VersionSet {
   // Recover the next epoch number of each CFs and epoch number
   // of their files (if missing)
   void RecoverEpochNumbers();
+
+  // Logs the dropped blob files (see VersionStorageInfo::GetDroppedBlobFiles())
+  // of each column family's current Version.
+  void LogDroppedBlobFiles() const;
 
   // Reads a manifest file and returns a list of column families in
   // column_families.

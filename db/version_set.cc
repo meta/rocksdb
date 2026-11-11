@@ -320,6 +320,16 @@ Status OverlapWithIterator(const Comparator* ucmp,
   return iter->status();
 }
 
+// The status for a blob index whose blob file is not in `vstorage`.
+Status UnknownBlobFileStatus(const VersionStorageInfo& vstorage,
+                             uint64_t blob_file_number) {
+  if (vstorage.IsDroppedBlobFile(blob_file_number)) {
+    return Status::Corruption("Blob file dropped by best-efforts BlobDB repair",
+                              std::to_string(blob_file_number));
+  }
+  return Status::Corruption("Invalid blob file number");
+}
+
 }  // namespace
 
 // Class to help choose the next file to search for the particular key.
@@ -2900,7 +2910,7 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
     // index, or a same-file reference that should have been resolved by
     // EmbeddedBlobResolvingIterator before reaching the integrated-BlobDB read
     // path. See FileMetaData::UpdateBoundaries for the write-side tripwire.
-    return Status::Corruption("Invalid blob file number");
+    return UnknownBlobFileStatus(storage_info_, blob_file_number);
   }
 
   assert(blob_source_);
@@ -2939,7 +2949,7 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
     // INTEGRITY CHECK -- see Version::GetBlob. No metadata (including
     // file_number 0, the same-file "embedded" sentinel) means a corrupt index
     // or a same-file reference that the lazy caller must not route here.
-    return Status::Corruption("Invalid blob file number");
+    return UnknownBlobFileStatus(storage_info_, blob_file_number);
   }
 
   assert(blob_source_);
@@ -2989,7 +2999,7 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
     if (!blob_file_meta) {
       // INTEGRITY CHECK -- see Version::GetBlob. A same-file/embedded reference
       // (file_number 0) must be resolved via SameFileBlobReader, not here.
-      *req.status = Status::Corruption("Invalid blob file number");
+      *req.status = UnknownBlobFileStatus(storage_info_, file_number);
       continue;
     }
     const uint64_t file_size = blob_file_meta->GetBlobFileSize();
@@ -3088,7 +3098,7 @@ void Version::MultiGetBlob(
         // INTEGRITY CHECK -- do not weaken; see Version::GetBlob and
         // FileMetaData::UpdateBoundaries. A same-file/embedded reference must
         // be resolved before reaching the integrated-BlobDB read path.
-        *key_context->s = Status::Corruption("Invalid blob file number");
+        *key_context->s = UnknownBlobFileStatus(storage_info_, file_number);
         continue;
       }
 
@@ -4178,7 +4188,12 @@ void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
   assert(oldest_meta);
 
   const auto& linked_ssts = oldest_meta->GetLinkedSsts();
-  assert(!linked_ssts.empty());
+  if (linked_ssts.empty()) {
+    // SST files that reference the oldest blob file are linked to an older,
+    // dropped blob file instead, so the SST files to compact are unknown.
+    assert(!dropped_blob_files_.empty());
+    return;
+  }
 
   size_t count = 1;
   uint64_t sum_total_blob_bytes = oldest_meta->GetTotalBlobBytes();
@@ -6944,7 +6959,7 @@ Status VersionSet::ReopenManifestForAppend(const std::string& manifest_path) {
   // MANIFEST + CURRENT from scratch via the side-effect of
   // LogAndApplyForRecovery emitting an edit. Reusing the (possibly
   // stale) prior MANIFEST contradicts the salvage contract.
-  if (db_options_->best_efforts_recovery) {
+  if (db_options_->UsesBestEffortsRecoveryPath()) {
     return Status::OK();
   }
 
@@ -7424,6 +7439,8 @@ Status VersionSet::TryRecoverFromOneManifest(
   VersionEditHandlerPointInTime handler_pit(
       read_only, column_families, const_cast<VersionSet*>(this), io_tracer_,
       read_options, /*allow_incomplete_valid_version=*/true,
+      /*record_missing_blob_files_as_dropped=*/
+      db_options_->best_efforts_blob_db_repair,
       /*trust_manifest_recovery=*/false,
       /*defer_sst_file_opening=*/false, EpochNumberRequirement::kMightMissing);
 
@@ -7437,8 +7454,35 @@ Status VersionSet::TryRecoverFromOneManifest(
   s = handler_pit.status();
   if (s.ok()) {
     RecoverEpochNumbers();
+    if (db_options_->best_efforts_blob_db_repair) {
+      LogDroppedBlobFiles();
+    }
   }
   return s;
+}
+
+void VersionSet::LogDroppedBlobFiles() const {
+  for (ColumnFamilyData* cfd : *column_family_set_) {
+    if (cfd->IsDropped()) {
+      continue;
+    }
+    const std::vector<uint64_t>& dropped_blob_files =
+        cfd->current()->storage_info()->GetDroppedBlobFiles();
+    if (dropped_blob_files.empty()) {
+      continue;
+    }
+    std::string numbers;
+    for (const uint64_t blob_file_number : dropped_blob_files) {
+      numbers.append(" #");
+      AppendNumberTo(&numbers, blob_file_number);
+    }
+    ROCKS_LOG_WARN(db_options_->info_log,
+                   "[%s] %" ROCKSDB_PRIszt
+                   " dropped blob files are in effect after best-efforts "
+                   "BlobDB repair:%s",
+                   cfd->GetName().c_str(), dropped_blob_files.size(),
+                   numbers.c_str());
+  }
 }
 
 void VersionSet::RecoverEpochNumbers() {
@@ -8122,6 +8166,10 @@ Status VersionSet::WriteCurrentStateToManifest(
           edit.AddBlobFileGarbage(blob_file_number, meta->GetGarbageBlobCount(),
                                   meta->GetGarbageBlobBytes());
         }
+      }
+
+      for (const uint64_t blob_file_number : vstorage->GetDroppedBlobFiles()) {
+        edit.AddDroppedBlobFile(blob_file_number);
       }
 
       const auto iter = curr_state.find(cfd->GetID());

@@ -77,6 +77,17 @@ class VersionBuilder {
 
   bool HasMissingFiles() const;
 
+  // Make blob files that are missing on disk never invalidate a Version.
+  // Instead, each such blob file is left out of the saved Version and recorded
+  // in it as a dropped blob file (see
+  // VersionStorageInfo::GetDroppedBlobFiles()), unless no SST file can
+  // reference it. Missing SST files are handled the same way with or without
+  // this, and a blob file left out because it is only linked to missing L0 SST
+  // files is recorded as dropped too.
+  // REQUIRES: track_found_and_missing_files and allow_incomplete_valid_version
+  // are true, and no edit has been applied yet.
+  void RecordMissingBlobFilesAsDropped();
+
   // When applying a sequence of VersionEdits, intermediate files are the ones
   // that are added and then deleted. Returns the tracked files and clears them
   // so that subsequent VersionEdits start with a clean state.

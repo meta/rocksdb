@@ -1269,7 +1269,7 @@ Status DBImpl::MaybeUpdateNextFileNumber(RecoveryContext* recovery_ctx) {
   // requires the MANIFEST rewrite this emit triggers).
   const bool optimize_manifest_for_recovery =
       mutable_db_options_.optimize_manifest_for_recovery &&
-      !immutable_db_options_.best_efforts_recovery;
+      !immutable_db_options_.UsesBestEffortsRecoveryPath();
 
   if (!optimize_manifest_for_recovery ||
       manifest_relevant_file_advanced_counter) {
