@@ -362,6 +362,16 @@ class Compaction {
   // PRE: input version has been set.
   bool DoesInputReferenceBlobFiles() const;
 
+  // Returns true iff this compaction replaces references to blob files missing
+  // from its input Version (see MissingBlobRepairIterator): with
+  // skip_missing_blob_files(), references to any such blob file; otherwise
+  // references to blob files recorded as dropped in the input Version (see
+  // VersionStorageInfo::GetDroppedBlobFiles()), when an input file might
+  // reference one.
+  //
+  // PRE: input version has been set.
+  bool RepairsMissingBlobReferences() const;
+
   // test function to validate the functionality of IsBottommostLevel()
   // function -- determines if compaction with inputs and storage is bottommost
   static bool TEST_IsBottommostLevel(

@@ -20,16 +20,20 @@
 namespace ROCKSDB_NAMESPACE {
 
 // Replaces references absent from an immutable input Version with deletions
-// or entities containing the surviving columns. Input values must already be
+// or entities containing the surviving columns. With `only_dropped_blob_files`,
+// only references to blob files recorded as dropped in the input Version (see
+// VersionStorageInfo::GetDroppedBlobFiles()) are replaced; otherwise
+// references to any blob file absent from it are. Input values must already be
 // prepared, as they are for compaction input. Neither input is owned.
 class MissingBlobRepairIterator : public InternalIterator {
  public:
   MissingBlobRepairIterator(InternalIterator* input,
                             const VersionStorageInfo* input_storage,
-                            size_t timestamp_size)
+                            size_t timestamp_size, bool only_dropped_blob_files)
       : input_(input),
         input_storage_(input_storage),
-        timestamp_size_(timestamp_size) {
+        timestamp_size_(timestamp_size),
+        only_dropped_blob_files_(only_dropped_blob_files) {
     assert(input_);
     assert(input_storage_);
     Update();
@@ -161,6 +165,9 @@ class MissingBlobRepairIterator : public InternalIterator {
     if (index.IsInlined() || index.HasTTL() || index.IsSameFile()) {
       return false;
     }
+    if (only_dropped_blob_files_) {
+      return input_storage_->IsDroppedBlobFile(index.file_number());
+    }
     const VersionStorageInfo::BlobFiles::const_iterator it =
         input_storage_->GetBlobFileMetaDataLB(index.file_number());
     return it == input_storage_->GetBlobFiles().end() ||
@@ -182,6 +189,20 @@ class MissingBlobRepairIterator : public InternalIterator {
   // changes the positions of surviving blob indexes, so rebuild those positions
   // before serialization. Only loss of every column becomes a deletion.
   Status RepairEntity(const ParsedInternalKey& parsed) {
+    if (only_dropped_blob_files_) {
+      // Most entities reference no dropped blob file. Find out from the blob
+      // indexes alone before paying for a full deserialization.
+      bool has_dropped = false;
+      const Status s = WideColumnSerialization::ForEachBlobFileNumber(
+          input_->value(), [this, &has_dropped](const BlobIndex& index) {
+            has_dropped |= IsMissing(index);
+            return Status::OK();
+          });
+      if (!s.ok() || !has_dropped) {
+        return s;
+      }
+    }
+
     columns_.clear();
     blob_columns_.clear();
     Status s = WideColumnSerialization::Deserialize(input_->value(), columns_,
@@ -277,6 +298,7 @@ class MissingBlobRepairIterator : public InternalIterator {
   WideColumns surviving_columns_;
   std::vector<std::pair<size_t, BlobIndex>> surviving_blobs_;
   Status status_;
+  bool only_dropped_blob_files_;
   bool value_rewritten_ = false;
   bool repair_deletion_ = false;
 };

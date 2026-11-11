@@ -1,1 +1,1 @@
-Added `DBOptions::best_efforts_blob_db_repair`, which opens an integrated BlobDB whose blob files are missing. Unlike `best_efforts_recovery`, it keeps the SST files that reference them and records the missing blob files in the MANIFEST.
+Added `DBOptions::best_efforts_blob_db_repair`, which opens an integrated BlobDB whose blob files are missing. Unlike `best_efforts_recovery`, it keeps the SST files that reference them, records the missing blob files in the MANIFEST, and makes later compactions discard the lost values instead of failing.

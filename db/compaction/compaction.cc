@@ -972,6 +972,38 @@ bool Compaction::DoesInputReferenceBlobFiles() const {
   return false;
 }
 
+bool Compaction::RepairsMissingBlobReferences() const {
+  if (skip_missing_blob_files_) {
+    return true;
+  }
+
+  assert(input_version_);
+  const VersionStorageInfo* storage_info = input_version_->storage_info();
+  assert(storage_info);
+
+  const std::vector<uint64_t>& dropped_blob_files =
+      storage_info->GetDroppedBlobFiles();
+  if (dropped_blob_files.empty()) {
+    return false;
+  }
+
+  // An SST file only references blob files at or above its oldest referenced
+  // blob file.
+  const uint64_t newest_dropped_blob_file = dropped_blob_files.back();
+  for (const CompactionInputFiles& level_inputs : inputs_) {
+    for (const FileMetaData* meta : level_inputs.files) {
+      assert(meta);
+
+      if (meta->oldest_blob_file_number != kInvalidBlobFileNumber &&
+          meta->oldest_blob_file_number <= newest_dropped_blob_file) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 uint64_t Compaction::MaxInputFileNewestKeyTime(const InternalKey* start,
                                                const InternalKey* end) const {
   uint64_t newest_key_time = kUnknownNewestKeyTime;

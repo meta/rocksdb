@@ -1897,6 +1897,66 @@ TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairWithAtomicFlush) {
   ASSERT_EQ(Get(1, "y"), "vy");
 }
 
+TEST_F(DBBlobBasicTest,
+       BestEffortsBlobDbRepairAutomaticCompactionDiscardsDroppedValues) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+  ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+
+  // Reopen without repair. Overwriting "b" makes an automatic compaction drop
+  // its old value, which is in the dropped blob file.
+  options.disable_auto_compactions = false;
+  options.level0_file_num_compaction_trigger = 1;
+  Reopen(options);
+  ASSERT_OK(Put("b", "vb2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  uint64_t background_errors = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBackgroundErrors,
+                                  &background_errors));
+  ASSERT_EQ(background_errors, 0);
+
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("b"), "vb2");
+  ASSERT_EQ(Get("c"), "vc");
+  ASSERT_EQ(Get("d"), "NOT_FOUND");
+
+  Reopen(options);
+  ASSERT_EQ(Get("b"), "vb2");
+  ASSERT_EQ(Get("d"), "NOT_FOUND");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairWithBlobGarbageCollection) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+
+  // Garbage collection relocates every blob, so it would read the dropped
+  // blob file if the compaction did not discard its values first.
+  options.enable_blob_garbage_collection = true;
+  options.blob_garbage_collection_age_cutoff = 1.0;
+  Reopen(options);
+  CompactRangeOptions compact_range_options;
+  compact_range_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_range_options, nullptr, nullptr));
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("c"), "vc");
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+  ASSERT_EQ(Get("d"), "NOT_FOUND");
+
+  // The surviving values were relocated to a new blob file, so no SST file
+  // can reference the dropped blob file anymore.
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  Reopen(options);
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  ASSERT_EQ(Get("a"), "va");
+}
+
 TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairMissingOldestBlobWithForcedGc) {
   // After repair drops the oldest blob file an SST file references, the
   // oldest blob file left in the Version has no linked SST file.

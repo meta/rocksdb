@@ -1801,10 +1801,24 @@ struct DBOptions {
   // 3. Like best_efforts_recovery, does not replay WAL files. It then writes
   //    the dropped blob files to a new MANIFEST and opens the DB.
   //
-  // Afterwards, reads of a value stored in a dropped blob file return
-  // Corruption. Recorded dropped blob files stay in effect after the DB is
-  // reopened without this option, as long as an SST file might reference them:
-  // until every SST file's oldest referenced blob file is newer. RocksDB
+  // Afterwards:
+  // * Reads of a value stored in a dropped blob file return Corruption.
+  // * Every compaction, automatic or manual, that reads a value stored in a
+  //   dropped blob file discards it the same way as
+  //   CompactRangeOptions::skip_missing_blob_files: a lost value becomes a
+  //   deletion at its sequence number, so older versions of the key stay
+  //   hidden, and a wide-column entity keeps its surviving columns. Such
+  //   compactions run locally, bypassing DBOptions::compaction_service.
+  // * Compactions do not fail for lack of garbage accounting in dropped blob
+  //   files.
+  // * A deletion written in place of a lost value can later meet a
+  //   SingleDelete of the same key in a compaction. With
+  //   enforce_single_del_contracts (the default), that compaction fails with
+  //   Corruption, so DBs that use SingleDelete should turn the check off.
+  // Recorded dropped blob files stay in effect after the DB is reopened
+  // without this option, as long as an SST file might reference them: until
+  // every SST file's oldest referenced blob file is newer. Blob garbage
+  // collection that relocates the older blobs ends this sooner. RocksDB
   // versions without this option ignore the records and drop them when they
   // write a new MANIFEST. A blob file that is missing but not recorded causes
   // Corruption; only this option records dropped blob files.
