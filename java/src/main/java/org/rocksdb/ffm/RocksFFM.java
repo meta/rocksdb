@@ -26,21 +26,22 @@ public final class RocksFFM {
     return new DBImpl(arena);
   }
 
-  interface DB {
-    DB option();
+  public interface DB {
     OpenDB open(String path) throws RocksFFMException;
+    OpenDB open(RocksdbOptions options, String path) throws RocksFFMException;
   }
 
-  interface OpenDB {
+  public interface OpenDB extends AutoCloseable {
     Getter get(MemorySegment key);
     Putter put(MemorySegment key, MemorySegment value);
+    void close();
   }
 
-  interface Putter {
+  public interface Putter {
     void invoke() throws RocksFFMException;
   }
 
-  interface Getter {
+  public interface Getter {
     MemorySegment invoke() throws RocksFFMException;
   }
 

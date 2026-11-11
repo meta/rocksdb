@@ -23,4 +23,9 @@ final class OpenDBImpl extends WithDB implements RocksFFM.OpenDB {
   public RocksFFM.Putter put(String key, MemorySegment value) {
     return new PutterImpl(arena, db, RocksFFM.segmentOf(arena, key), value);
   }
+
+  @Override
+  public void close() {
+    rocksdb_c_api_2.rocksdb_close(db);
+  }
 }
