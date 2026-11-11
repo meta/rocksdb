@@ -7116,7 +7116,9 @@ Status DBImpl::GetPreparedFileInfoForExternalSstIngestion(
   Status s = file_cfd->table_cache()->GetTableProperties(
       file_options_, read_options, file_cfd->internal_comparator(), *file_meta,
       &table_properties, file_version->GetMutableCFOptions(),
-      false /* no_io */);
+      /*no_io=*/false, file_level,
+      file_cfd->internal_stats()->GetFileReadHist(file_level),
+      /*prefetch_index_and_filter_in_cache=*/true);
   if (!s.ok()) {
     return s;
   }

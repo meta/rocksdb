@@ -1986,7 +1986,8 @@ Status DBImplSecondary::CompactWithoutInstallation(
     const ReadOptions read_options(Env::IOActivity::kCompaction);
     for (const auto& level_files : input_files) {
       for (FileMetaData* file_meta : level_files.files) {
-        version->MaybeInitializeFileMetaData(read_options, file_meta);
+        version->MaybeInitializeFileMetaData(read_options, file_meta,
+                                             level_files.level);
       }
     }
   }

@@ -1,0 +1,1 @@
+With `max_open_files = -1`, getting the table properties of an SST file that is not yet open (e.g. with `open_files_async`), as in `GetPropertiesOfAllTables()` or compaction, now opens it through the table cache, rather than reading its properties separately and opening it again later.
