@@ -212,7 +212,7 @@ TEST_F(InlineSkipTest, InsertAndLookup) {
   }
 }
 
-TEST_F(InlineSkipTest, InsertWithHint_Sequential) {
+TEST_F(InlineSkipTest, InsertWithHintSequential) {
   const int N = 100000;
   Arena arena;
   TestComparator cmp;
@@ -225,7 +225,7 @@ TEST_F(InlineSkipTest, InsertWithHint_Sequential) {
   Validate(&list);
 }
 
-TEST_F(InlineSkipTest, InsertWithHint_MultipleHints) {
+TEST_F(InlineSkipTest, InsertWithHintMultipleHints) {
   const int N = 100000;
   const int S = 100;
   Random rnd(534);
@@ -246,7 +246,7 @@ TEST_F(InlineSkipTest, InsertWithHint_MultipleHints) {
   Validate(&list);
 }
 
-TEST_F(InlineSkipTest, InsertWithHint_MultipleHintsRandom) {
+TEST_F(InlineSkipTest, InsertWithHintMultipleHintsRandom) {
   const int N = 100000;
   const int S = 100;
   Random rnd(534);
@@ -265,7 +265,7 @@ TEST_F(InlineSkipTest, InsertWithHint_MultipleHintsRandom) {
   Validate(&list);
 }
 
-TEST_F(InlineSkipTest, InsertWithHint_CompatibleWithInsertWithoutHint) {
+TEST_F(InlineSkipTest, InsertWithHintCompatibleWithInsertWithoutHint) {
   const int N = 100000;
   const int S1 = 100;
   const int S2 = 100;

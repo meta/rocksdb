@@ -251,7 +251,7 @@ TEST_F(AutoRollLoggerTest, SetInfoLogLevel) {
             auto_roll_logger->TEST_inner_logger()->GetInfoLogLevel());
 }
 
-TEST_F(AutoRollLoggerTest, OpenLogFilesMultipleTimesWithOptionLog_max_size) {
+TEST_F(AutoRollLoggerTest, OpenLogFilesMultipleTimesWithOptionLogMaxSize) {
   // If only 'log_max_size' options is specified, then every time
   // when rocksdb is restarted, a new empty log file will be created.
   InitTestDb();

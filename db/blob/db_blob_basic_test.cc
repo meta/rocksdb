@@ -1270,7 +1270,7 @@ TEST_F(DBBlobBasicTest, MultiGetBlobsFromMultipleFiles) {
   }
 }
 
-TEST_F(DBBlobBasicTest, GetBlob_CorruptIndex) {
+TEST_F(DBBlobBasicTest, GetBlobCorruptIndex) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
   options.min_blob_size = 0;
@@ -1300,7 +1300,7 @@ TEST_F(DBBlobBasicTest, GetBlob_CorruptIndex) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-TEST_F(DBBlobBasicTest, MultiGetBlob_CorruptIndex) {
+TEST_F(DBBlobBasicTest, MultiGetBlobCorruptIndex) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
   options.min_blob_size = 0;
@@ -1359,7 +1359,7 @@ TEST_F(DBBlobBasicTest, MultiGetBlob_CorruptIndex) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-TEST_F(DBBlobBasicTest, MultiGetBlob_ExceedSoftLimit) {
+TEST_F(DBBlobBasicTest, MultiGetBlobExceedSoftLimit) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
   options.min_blob_size = 0;
@@ -1390,7 +1390,7 @@ TEST_F(DBBlobBasicTest, MultiGetBlob_ExceedSoftLimit) {
   }
 }
 
-TEST_F(DBBlobBasicTest, GetBlob_InlinedTTLIndex) {
+TEST_F(DBBlobBasicTest, GetBlobInlinedTTLIndex) {
   constexpr uint64_t min_blob_size = 10;
 
   Options options = GetDefaultOptions();
@@ -1422,7 +1422,7 @@ TEST_F(DBBlobBasicTest, GetBlob_InlinedTTLIndex) {
                   .IsCorruption());
 }
 
-TEST_F(DBBlobBasicTest, GetBlob_IndexWithInvalidFileNumber) {
+TEST_F(DBBlobBasicTest, GetBlobIndexWithInvalidFileNumber) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
   options.min_blob_size = 0;
@@ -1507,7 +1507,7 @@ TEST_F(DBBlobBasicTest, GenerateIOTracing) {
   }
 }
 
-TEST_F(DBBlobBasicTest, BestEffortsRecovery_MissingNewestBlobFile) {
+TEST_F(DBBlobBasicTest, BestEffortsRecoveryMissingNewestBlobFile) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
   options.min_blob_size = 0;
@@ -2152,7 +2152,7 @@ INSTANTIATE_TEST_CASE_P(DBBlobBasicTest, DBBlobBasicIOErrorMultiGetTest,
                             "BlobFileReader::OpenFile:NewRandomAccessFile",
                             "BlobFileReader::MultiGetBlob:ReadFromFile"}));
 
-TEST_P(DBBlobBasicIOErrorTest, GetBlob_IOError) {
+TEST_P(DBBlobBasicIOErrorTest, GetBlobIOError) {
   Options options;
   options.env = fault_injection_env_.get();
   options.enable_blob_files = true;
@@ -2222,7 +2222,7 @@ TEST_P(DBBlobBasicIOErrorTest, GetEntityMergeWithBlobBaseIOError) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-TEST_P(DBBlobBasicIOErrorMultiGetTest, MultiGetBlobs_IOError) {
+TEST_P(DBBlobBasicIOErrorMultiGetTest, MultiGetBlobsIOError) {
   Options options = GetDefaultOptions();
   options.env = fault_injection_env_.get();
   options.enable_blob_files = true;
@@ -2311,7 +2311,7 @@ TEST_P(DBBlobBasicIOErrorMultiGetTest, MultipleBlobFiles) {
   ASSERT_TRUE(statuses[1].IsIOError());
 }
 
-TEST_F(DBBlobBasicTest, MultiGetFindTable_IOError) {
+TEST_F(DBBlobBasicTest, MultiGetFindTableIOError) {
   // Repro test for a specific bug where `MultiGet()` would fail to open a table
   // in `FindTable()` and then proceed to return raw blob handles for the other
   // keys.
@@ -2385,7 +2385,7 @@ class ReadBlobCompactionFilter : public CompactionFilter {
 
 }  // anonymous namespace
 
-TEST_P(DBBlobBasicIOErrorTest, CompactionFilterReadBlob_IOError) {
+TEST_P(DBBlobBasicIOErrorTest, CompactionFilterReadBlobIOError) {
   Options options = GetDefaultOptions();
   options.env = fault_injection_env_.get();
   options.enable_blob_files = true;
@@ -2415,7 +2415,7 @@ TEST_P(DBBlobBasicIOErrorTest, CompactionFilterReadBlob_IOError) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-TEST_P(DBBlobBasicIOErrorTest, IterateBlobsAllowUnpreparedValue_IOError) {
+TEST_P(DBBlobBasicIOErrorTest, IterateBlobsAllowUnpreparedValueIOError) {
   Options options;
   options.env = fault_injection_env_.get();
   options.enable_blob_files = true;

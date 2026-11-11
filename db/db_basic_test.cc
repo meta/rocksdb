@@ -2652,7 +2652,7 @@ INSTANTIATE_TEST_CASE_P(
     DBBasicMultiConfigs, DBBasicMultiConfigs,
     ::testing::ValuesIn(DBBasicMultiConfigs::GenerateOptionConfigs()));
 
-TEST_F(DBBasicTest, DBOpen_Options) {
+TEST_F(DBBasicTest, DBOpenOptions) {
   Options options = CurrentOptions();
   Close();
   Destroy(options);

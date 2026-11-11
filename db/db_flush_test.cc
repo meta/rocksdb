@@ -3190,7 +3190,7 @@ TEST_P(DBAtomicFlushTest, AtomicFlushRollbackSomeJobs) {
   Destroy(options);
 }
 
-TEST_P(DBAtomicFlushTest, FlushMultipleCFs_DropSomeBeforeRequestFlush) {
+TEST_P(DBAtomicFlushTest, FlushMultipleCFsDropSomeBeforeRequestFlush) {
   bool atomic_flush = GetParam();
   if (!atomic_flush) {
     return;
@@ -3219,7 +3219,7 @@ TEST_P(DBAtomicFlushTest, FlushMultipleCFs_DropSomeBeforeRequestFlush) {
 }
 
 TEST_P(DBAtomicFlushTest,
-       FlushMultipleCFs_DropSomeAfterScheduleFlushBeforeFlushJobRun) {
+       FlushMultipleCFsDropSomeAfterScheduleFlushBeforeFlushJobRun) {
   bool atomic_flush = GetParam();
   if (!atomic_flush) {
     return;

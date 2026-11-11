@@ -298,7 +298,7 @@ TEST_P(SpotLockManagerTest,
   delete txn1;
 }
 
-TEST_P(SpotLockManagerTest, Deadlock_MultipleUpgrade) {
+TEST_P(SpotLockManagerTest, DeadlockMultipleUpgrade) {
   // Tests that deadlock can be detected for shared locks and exclusive locks
   // mixed Deadlock scenario:
 
@@ -355,7 +355,7 @@ TEST_P(SpotLockManagerTest, Deadlock_MultipleUpgrade) {
   delete txn1;
 }
 
-TEST_P(SpotLockManagerTest, Deadlock_MultipleUpgradeInterleaveExclusive) {
+TEST_P(SpotLockManagerTest, DeadlockMultipleUpgradeInterleaveExclusive) {
   // Tests that deadlock can be detected for shared locks and exclusive locks
   // mixed Deadlock scenario:
 

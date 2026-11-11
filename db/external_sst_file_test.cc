@@ -4051,7 +4051,7 @@ TEST_P(ExternalSSTBlockChecksumTest, DISABLED_HugeBlockChecksum) {
   }
 }
 
-TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamilies_Success) {
+TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamiliesSuccess) {
   std::unique_ptr<FaultInjectionTestEnv> fault_injection_env(
       new FaultInjectionTestEnv(env_));
   Options options = CurrentOptions();
@@ -4104,7 +4104,7 @@ TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamilies_Success) {
 }
 
 TEST_P(ExternalSSTFileTest,
-       IngestFilesIntoMultipleColumnFamilies_NoMixedStateWithSnapshot) {
+       IngestFilesIntoMultipleColumnFamiliesNoMixedStateWithSnapshot) {
   std::unique_ptr<FaultInjectionTestEnv> fault_injection_env(
       new FaultInjectionTestEnv(env_));
   SyncPoint::GetInstance()->DisableProcessing();
@@ -4224,7 +4224,7 @@ TEST_P(ExternalSSTFileTest,
   Destroy(options, true /* delete_cf_paths */);
 }
 
-TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamilies_PrepareFail) {
+TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamiliesPrepareFail) {
   std::unique_ptr<FaultInjectionTestEnv> fault_injection_env(
       new FaultInjectionTestEnv(env_));
   Options options = CurrentOptions();
@@ -4292,7 +4292,7 @@ TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamilies_PrepareFail) {
   Destroy(options, true /* delete_cf_paths */);
 }
 
-TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamilies_CommitFail) {
+TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamiliesCommitFail) {
   std::unique_ptr<FaultInjectionTestEnv> fault_injection_env(
       new FaultInjectionTestEnv(env_));
   Options options = CurrentOptions();
@@ -4360,7 +4360,7 @@ TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamilies_CommitFail) {
 }
 
 TEST_P(ExternalSSTFileTest,
-       IngestFilesIntoMultipleColumnFamilies_PartialManifestWriteFail) {
+       IngestFilesIntoMultipleColumnFamiliesPartialManifestWriteFail) {
   std::unique_ptr<FaultInjectionTestEnv> fault_injection_env(
       new FaultInjectionTestEnv(env_));
   Options options = CurrentOptions();

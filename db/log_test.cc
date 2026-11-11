@@ -917,7 +917,7 @@ class RetriableLogTest : public ::testing::TestWithParam<int> {
   }
 };
 
-TEST_P(RetriableLogTest, TailLog_PartialHeader) {
+TEST_P(RetriableLogTest, TailLogPartialHeader) {
   ASSERT_OK(SetupTestEnv());
   std::vector<int> remaining_bytes_in_last_record;
   size_t header_size = GetParam() ? kRecyclableHeaderSize : kHeaderSize;
@@ -960,7 +960,7 @@ TEST_P(RetriableLogTest, TailLog_PartialHeader) {
   ASSERT_TRUE(eof);
 }
 
-TEST_P(RetriableLogTest, TailLog_FullHeader) {
+TEST_P(RetriableLogTest, TailLogFullHeader) {
   ASSERT_OK(SetupTestEnv());
   std::vector<int> remaining_bytes_in_last_record;
   size_t header_size = GetParam() ? kRecyclableHeaderSize : kHeaderSize;

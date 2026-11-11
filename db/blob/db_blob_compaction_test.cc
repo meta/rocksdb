@@ -483,7 +483,7 @@ TEST_P(DBBlobBadCompactionFilterTest, BadDecisionFromCompactionFilter) {
   Close();
 }
 
-TEST_F(DBBlobCompactionTest, CompactionFilter_InlinedTTLIndex) {
+TEST_F(DBBlobCompactionTest, CompactionFilterInlinedTTLIndex) {
   Options options = GetDefaultOptions();
   options.create_if_missing = true;
   options.enable_blob_files = true;

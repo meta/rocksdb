@@ -1512,7 +1512,7 @@ INSTANTIATE_TEST_CASE_P(BackupEngineTestWithParam, BackupEngineTestWithParam,
                         ::testing::Bool());
 
 // this will make sure that backup does not copy the same file twice
-TEST_F(BackupEngineTest, NoDoubleCopy_And_AutoGC) {
+TEST_F(BackupEngineTest, NoDoubleCopyAndAutoGC) {
   OpenDBAndBackupEngine(true, true);
 
   // should write 5 DB files + one meta file
@@ -3709,7 +3709,7 @@ TEST_F(BackupEngineTest, MetadataTooLarge) {
   DestroyDBWithoutCheck(dbname_, options_);
 }
 
-TEST_F(BackupEngineTest, MetaSchemaVersion2_SizeCorruption) {
+TEST_F(BackupEngineTest, MetaSchemaVersion2SizeCorruption) {
   engine_options_->schema_version = 1;
   OpenDBAndBackupEngine(/*destroy_old_data*/ true);
 
@@ -3777,7 +3777,7 @@ TEST_F(BackupEngineTest, MetaSchemaVersion2_SizeCorruption) {
   CloseBackupEngine();
 }
 
-TEST_F(BackupEngineTest, MetaSchemaVersion2_NotSupported) {
+TEST_F(BackupEngineTest, MetaSchemaVersion2NotSupported) {
   engine_options_->schema_version = 2;
   TEST_BackupMetaSchemaOptions test_opts;
   std::string app_metadata = "abc\ndef";
@@ -3830,7 +3830,7 @@ TEST_F(BackupEngineTest, MetaSchemaVersion2_NotSupported) {
   CloseBackupEngine();
 }
 
-TEST_F(BackupEngineTest, MetaSchemaVersion2_Restore) {
+TEST_F(BackupEngineTest, MetaSchemaVersion2Restore) {
   engine_options_->schema_version = 2;
   TEST_BackupMetaSchemaOptions test_opts;
   const int keys_iteration = 5000;

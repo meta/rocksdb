@@ -3413,7 +3413,7 @@ TEST_P(DBCompactionTestWithParam, ConvertCompactionStyle) {
   ASSERT_EQ(keys_in_db, expected_keys);
 }
 
-TEST_F(DBCompactionTest, L0_CompactionBug_Issue44_a) {
+TEST_F(DBCompactionTest, L0CompactionBugIssue44A) {
   do {
     CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
     ASSERT_OK(Put(1, "b", "v"));
@@ -3432,7 +3432,7 @@ TEST_F(DBCompactionTest, L0_CompactionBug_Issue44_a) {
   } while (ChangeCompactOptions());
 }
 
-TEST_F(DBCompactionTest, L0_CompactionBug_Issue44_b) {
+TEST_F(DBCompactionTest, L0CompactionBugIssue44B) {
   do {
     CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
     ASSERT_OK(Put(1, "", ""));
@@ -11075,7 +11075,7 @@ TEST_P(DBCompactionTestBlobGC, CompactionWithBlobGC) {
   }
 }
 
-TEST_F(DBCompactionTest, CompactionWithBlobGCError_CorruptIndex) {
+TEST_F(DBCompactionTest, CompactionWithBlobGCErrorCorruptIndex) {
   Options options;
   options.env = env_;
   options.disable_auto_compactions = true;
@@ -11125,7 +11125,7 @@ TEST_F(DBCompactionTest, CompactionWithBlobGCError_CorruptIndex) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-TEST_F(DBCompactionTest, CompactionWithBlobGCError_InlinedTTLIndex) {
+TEST_F(DBCompactionTest, CompactionWithBlobGCErrorInlinedTTLIndex) {
   constexpr uint64_t min_blob_size = 10;
 
   Options options;
@@ -11178,7 +11178,7 @@ TEST_F(DBCompactionTest, CompactionWithBlobGCError_InlinedTTLIndex) {
       db_->CompactRange(CompactRangeOptions(), begin, end).IsCorruption());
 }
 
-TEST_F(DBCompactionTest, CompactionWithBlobGCError_IndexWithInvalidFileNumber) {
+TEST_F(DBCompactionTest, CompactionWithBlobGCErrorIndexWithInvalidFileNumber) {
   Options options;
   options.env = env_;
   options.disable_auto_compactions = true;

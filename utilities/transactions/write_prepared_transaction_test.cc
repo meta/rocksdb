@@ -3041,7 +3041,7 @@ TEST_P(WritePreparedTransactionTest, ReleaseEarliestSnapshotDuringCompaction) {
 }
 
 TEST_P(WritePreparedTransactionTest,
-       ReleaseEarliestSnapshotDuringCompaction_WithSD) {
+       ReleaseEarliestSnapshotDuringCompactionWithSD) {
   constexpr size_t kSnapshotCacheBits = 7;  // same as default
   constexpr size_t kCommitCacheBits = 0;    // minimum commit cache
   UpdateTransactionDBOptions(kSnapshotCacheBits, kCommitCacheBits);
@@ -3093,7 +3093,7 @@ TEST_P(WritePreparedTransactionTest,
 }
 
 TEST_P(WritePreparedTransactionTest,
-       ReleaseEarliestSnapshotDuringCompaction_WithSD2) {
+       ReleaseEarliestSnapshotDuringCompactionWithSD2) {
   constexpr size_t kSnapshotCacheBits = 7;  // same as default
   constexpr size_t kCommitCacheBits = 0;    // minimum commit cache
   UpdateTransactionDBOptions(kSnapshotCacheBits, kCommitCacheBits);
@@ -3141,7 +3141,7 @@ TEST_P(WritePreparedTransactionTest,
 }
 
 TEST_P(WritePreparedTransactionTest,
-       ReleaseEarliestSnapshotDuringCompaction_WithDelete) {
+       ReleaseEarliestSnapshotDuringCompactionWithDelete) {
   constexpr size_t kSnapshotCacheBits = 7;  // same as default
   constexpr size_t kCommitCacheBits = 0;    // minimum commit cache
   UpdateTransactionDBOptions(kSnapshotCacheBits, kCommitCacheBits);
@@ -3232,7 +3232,7 @@ TEST_P(WritePreparedTransactionTest,
 }
 
 TEST_P(WritePreparedTransactionTest,
-       ReleaseEarliestWriteConflictSnapshot_SingleDelete) {
+       ReleaseEarliestWriteConflictSnapshotSingleDelete) {
   constexpr size_t kSnapshotCacheBits = 7;  // same as default
   constexpr size_t kCommitCacheBits = 0;    // minimum commit cache
   UpdateTransactionDBOptions(kSnapshotCacheBits, kCommitCacheBits);
@@ -4265,28 +4265,28 @@ TEST_P(WritePreparedTransactionTest, BasicRollbackDeletionTypeCb) {
 
 // Test that we can change write policy from WriteCommitted to WritePrepared
 // after a clean shutdown (which would empty the WAL)
-TEST_P(WritePreparedTransactionTest, WP_WC_DBBackwardCompatibility) {
+TEST_P(WritePreparedTransactionTest, WPWCDBBackwardCompatibility) {
   bool empty_wal = true;
   CrossCompatibilityTest(WRITE_COMMITTED, WRITE_PREPARED, empty_wal);
 }
 
 // Test that we fail fast if WAL is not emptied between changing the write
 // policy from WriteCommitted to WritePrepared
-TEST_P(WritePreparedTransactionTest, WP_WC_WALBackwardIncompatibility) {
+TEST_P(WritePreparedTransactionTest, WPWCWALBackwardIncompatibility) {
   bool empty_wal = true;
   CrossCompatibilityTest(WRITE_COMMITTED, WRITE_PREPARED, !empty_wal);
 }
 
 // Test that we can change write policy from WritePrepare back to WriteCommitted
 // after a clean shutdown (which would empty the WAL)
-TEST_P(WritePreparedTransactionTest, WC_WP_ForwardCompatibility) {
+TEST_P(WritePreparedTransactionTest, WCWPForwardCompatibility) {
   bool empty_wal = true;
   CrossCompatibilityTest(WRITE_PREPARED, WRITE_COMMITTED, empty_wal);
 }
 
 // Test that we fail fast if WAL is not emptied between changing the write
 // policy from WriteCommitted to WritePrepared
-TEST_P(WritePreparedTransactionTest, WC_WP_WALForwardIncompatibility) {
+TEST_P(WritePreparedTransactionTest, WCWPWALForwardIncompatibility) {
   bool empty_wal = true;
   CrossCompatibilityTest(WRITE_PREPARED, WRITE_COMMITTED, !empty_wal);
 }

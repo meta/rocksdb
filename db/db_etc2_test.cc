@@ -9044,7 +9044,7 @@ TEST_F(DBTest2, MultiGetBlockCacheTierSkipsColdSstData) {
   ASSERT_TRUE(statuses[1].IsIncomplete());
 }
 
-TEST_F(DBTest2, GetFileChecksumsFromCurrentManifest_CRC32) {
+TEST_F(DBTest2, GetFileChecksumsFromCurrentManifestCRC32) {
   Options opts = CurrentOptions();
   opts.create_if_missing = true;
   opts.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
