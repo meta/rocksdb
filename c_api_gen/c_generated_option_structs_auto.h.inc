@@ -9,6 +9,7 @@
 // Sources:
 //   - include/rocksdb/advanced_options.h
 //   - include/rocksdb/block_cache_trace_writer.h
+//   - include/rocksdb/cache.h
 //   - include/rocksdb/env.h
 //   - include/rocksdb/metadata.h
 //   - include/rocksdb/options.h
@@ -16,6 +17,7 @@
 //   - include/rocksdb/universal_compaction.h
 //   - include/rocksdb/utilities/backup_engine.h
 //   - include/rocksdb/utilities/optimistic_transaction_db.h
+//   - include/rocksdb/utilities/replayer.h
 //   - include/rocksdb/utilities/transaction_db.h
 //   - tools/c_api_gen/auto_simple_bindings_blocklist.json
 //   - include/rocksdb/c.h
@@ -2624,6 +2626,144 @@ rocksdb_optimistictransaction_options_set_set_snapshot(
 extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_optimistictransaction_options_get_set_snapshot(
     rocksdb_optimistictransaction_options_t* opt);
+
+/* LRUCacheOptions */
+
+extern ROCKSDB_LIBRARY_API void rocksdb_lru_cache_options_set_capacity(
+    rocksdb_lru_cache_options_t* opt, size_t v);
+
+extern ROCKSDB_LIBRARY_API size_t
+rocksdb_lru_cache_options_get_capacity(rocksdb_lru_cache_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_lru_cache_options_set_num_shard_bits(
+    rocksdb_lru_cache_options_t* opt, int v);
+
+extern ROCKSDB_LIBRARY_API int rocksdb_lru_cache_options_get_num_shard_bits(
+    rocksdb_lru_cache_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_lru_cache_options_set_strict_capacity_limit(
+    rocksdb_lru_cache_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_lru_cache_options_get_strict_capacity_limit(
+    rocksdb_lru_cache_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_lru_cache_options_set_metadata_charge_policy(
+    rocksdb_lru_cache_options_t* opt, int v);
+
+extern ROCKSDB_LIBRARY_API int
+rocksdb_lru_cache_options_get_metadata_charge_policy(
+    rocksdb_lru_cache_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_lru_cache_options_set_hash_seed(
+    rocksdb_lru_cache_options_t* opt, int32_t v);
+
+extern ROCKSDB_LIBRARY_API int32_t
+rocksdb_lru_cache_options_get_hash_seed(rocksdb_lru_cache_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_lru_cache_options_set_high_pri_pool_ratio(
+    rocksdb_lru_cache_options_t* opt, double v);
+
+extern ROCKSDB_LIBRARY_API double
+rocksdb_lru_cache_options_get_high_pri_pool_ratio(
+    rocksdb_lru_cache_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_lru_cache_options_set_low_pri_pool_ratio(
+    rocksdb_lru_cache_options_t* opt, double v);
+
+extern ROCKSDB_LIBRARY_API double
+rocksdb_lru_cache_options_get_low_pri_pool_ratio(
+    rocksdb_lru_cache_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_lru_cache_options_set_use_adaptive_mutex(
+    rocksdb_lru_cache_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_lru_cache_options_get_use_adaptive_mutex(
+    rocksdb_lru_cache_options_t* opt);
+
+/* HyperClockCacheOptions */
+
+extern ROCKSDB_LIBRARY_API void rocksdb_hyper_clock_cache_options_set_capacity(
+    rocksdb_hyper_clock_cache_options_t* opts, size_t v);
+
+extern ROCKSDB_LIBRARY_API size_t
+rocksdb_hyper_clock_cache_options_get_capacity(
+    rocksdb_hyper_clock_cache_options_t* opts);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_hyper_clock_cache_options_set_num_shard_bits(
+    rocksdb_hyper_clock_cache_options_t* opts, int v);
+
+extern ROCKSDB_LIBRARY_API int
+rocksdb_hyper_clock_cache_options_get_num_shard_bits(
+    rocksdb_hyper_clock_cache_options_t* opts);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_hyper_clock_cache_options_set_strict_capacity_limit(
+    rocksdb_hyper_clock_cache_options_t* opts, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_hyper_clock_cache_options_get_strict_capacity_limit(
+    rocksdb_hyper_clock_cache_options_t* opts);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_hyper_clock_cache_options_set_metadata_charge_policy(
+    rocksdb_hyper_clock_cache_options_t* opts, int v);
+
+extern ROCKSDB_LIBRARY_API int
+rocksdb_hyper_clock_cache_options_get_metadata_charge_policy(
+    rocksdb_hyper_clock_cache_options_t* opts);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_hyper_clock_cache_options_set_hash_seed(
+    rocksdb_hyper_clock_cache_options_t* opts, int32_t v);
+
+extern ROCKSDB_LIBRARY_API int32_t
+rocksdb_hyper_clock_cache_options_get_hash_seed(
+    rocksdb_hyper_clock_cache_options_t* opts);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_hyper_clock_cache_options_set_estimated_entry_charge(
+    rocksdb_hyper_clock_cache_options_t* opts, size_t v);
+
+extern ROCKSDB_LIBRARY_API size_t
+rocksdb_hyper_clock_cache_options_get_estimated_entry_charge(
+    rocksdb_hyper_clock_cache_options_t* opts);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_hyper_clock_cache_options_set_min_avg_entry_charge(
+    rocksdb_hyper_clock_cache_options_t* opts, size_t v);
+
+extern ROCKSDB_LIBRARY_API size_t
+rocksdb_hyper_clock_cache_options_get_min_avg_entry_charge(
+    rocksdb_hyper_clock_cache_options_t* opts);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_hyper_clock_cache_options_set_eviction_effort_cap(
+    rocksdb_hyper_clock_cache_options_t* opts, int v);
+
+extern ROCKSDB_LIBRARY_API int
+rocksdb_hyper_clock_cache_options_get_eviction_effort_cap(
+    rocksdb_hyper_clock_cache_options_t* opts);
+
+/* ReplayOptions */
+
+extern ROCKSDB_LIBRARY_API void rocksdb_replay_options_set_num_threads(
+    rocksdb_replay_options_t* options, uint32_t v);
+
+extern ROCKSDB_LIBRARY_API uint32_t
+rocksdb_replay_options_get_num_threads(rocksdb_replay_options_t* options);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_replay_options_set_fast_forward(
+    rocksdb_replay_options_t* options, double v);
+
+extern ROCKSDB_LIBRARY_API double rocksdb_replay_options_get_fast_forward(
+    rocksdb_replay_options_t* options);
 
 /* OptimisticTransactionDBOptions */
 

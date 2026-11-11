@@ -214,6 +214,24 @@ class ExistingBindingsTest(unittest.TestCase):
         self.assertEqual(hb.function_names(handles_path), set(generated))
 
 
+class FieldSpecTest(unittest.TestCase):
+    def test_metadata_getter_name_override(self):
+        family = _family(
+            mode="metadata",
+            c_prefix="rocksdb_fake_t_get",
+            getter_name_overrides=(("bottommost", "rocksdb_fake_t_is_bottommost"),),
+        )
+        (spec,) = asb.build_specs(family, "bottommost", "bool")
+        self.assertEqual(spec["name"], "rocksdb_fake_t_is_bottommost")
+        (spec,) = asb.build_specs(family, "level", "int")
+        self.assertEqual(spec["name"], "rocksdb_fake_t_get_level")
+
+    def test_int32_field(self):
+        setter, getter = asb.build_specs(_family(), "seed", "int32_t")
+        self.assertEqual(setter["value_type"], "int32_t")
+        self.assertEqual(getter["return_type"], "int32_t")
+
+
 class AbiOverrideTest(unittest.TestCase):
     def setUp(self):
         self._saved = dict(asb.ABI_TYPE_OVERRIDES)
@@ -249,34 +267,56 @@ class AbiOverrideTest(unittest.TestCase):
 
 @unittest.skipUnless(CLANG, "needs clang++ (set CLANG_CXX)")
 class DiscoverFieldsTest(unittest.TestCase):
-    def test_only_public_fields_are_discovered(self):
-        source = """
-            struct Base { int base_public; };
-            struct S : public Base {
-              int a;
-             private:
-              int hidden;
-             public:
-              bool b;
-            };
-            class C {
-              int class_default_private;
-             public:
-              int visible;
-            };
-        """
+    SOURCE = """
+        namespace rocksdb {
+        struct Base { int base_public; };
+        struct S : public Base {
+          int a;
+         private:
+          int hidden;
+         public:
+          bool b;
+        };
+        class C {
+          int class_default_private;
+         public:
+          int visible;
+        };
+        struct Outer {
+          struct S { int nested_only; };
+          struct Inner { int inner_field; };
+        };
+        // Matches the dump filter for `Inner` by prefix but only nests one.
+        struct Inner2 {
+          struct Inner { int wrong; };
+        };
+        }  // namespace rocksdb
+    """
+
+    def _fields(self, struct_name):
         with tempfile.TemporaryDirectory(dir=asb.ROOT) as tmp:
             header = Path(tmp) / "fake.h"
-            header.write_text(source)
+            header.write_text(self.SOURCE)
             saved = asb._CLANG_BINARY
             asb._CLANG_BINARY = CLANG
             try:
-                s_fields = asb.discover_fields(_family(struct_name="S", header=header))
-                c_fields = asb.discover_fields(_family(struct_name="C", header=header))
+                family = _family(struct_name=struct_name, header=header)
+                return [name for name, _ in asb.discover_fields(family)]
             finally:
                 asb._CLANG_BINARY = saved
-        self.assertEqual([name for name, _ in s_fields], ["base_public", "a", "b"])
-        self.assertEqual([name for name, _ in c_fields], ["visible"])
+
+    def test_only_public_fields_are_discovered(self):
+        self.assertEqual(self._fields("S"), ["base_public", "a", "b"])
+        self.assertEqual(self._fields("C"), ["visible"])
+
+    def test_nested_struct_family(self):
+        self.assertEqual(self._fields("Outer::Inner"), ["inner_field"])
+
+    def test_namespace_struct_is_not_a_nested_namesake(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "Could not find AST definition for Inner"
+        ):
+            self._fields("Inner")
 
 
 def _flat(text: str) -> str:

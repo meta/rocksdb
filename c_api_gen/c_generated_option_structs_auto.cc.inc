@@ -9,6 +9,7 @@
 // Sources:
 //   - include/rocksdb/advanced_options.h
 //   - include/rocksdb/block_cache_trace_writer.h
+//   - include/rocksdb/cache.h
 //   - include/rocksdb/env.h
 //   - include/rocksdb/metadata.h
 //   - include/rocksdb/options.h
@@ -16,6 +17,7 @@
 //   - include/rocksdb/universal_compaction.h
 //   - include/rocksdb/utilities/backup_engine.h
 //   - include/rocksdb/utilities/optimistic_transaction_db.h
+//   - include/rocksdb/utilities/replayer.h
 //   - include/rocksdb/utilities/transaction_db.h
 //   - tools/c_api_gen/auto_simple_bindings_blocklist.json
 //   - include/rocksdb/c.h
@@ -3665,6 +3667,195 @@ void rocksdb_optimistictransaction_options_set_set_snapshot(
 unsigned char rocksdb_optimistictransaction_options_get_set_snapshot(
     rocksdb_optimistictransaction_options_t* opt) {
   return opt->rep.set_snapshot;
+}
+
+/* LRUCacheOptions */
+
+void rocksdb_lru_cache_options_set_capacity(rocksdb_lru_cache_options_t* opt,
+                                            size_t v) {
+  opt->rep.capacity = v;
+}
+
+size_t rocksdb_lru_cache_options_get_capacity(
+    rocksdb_lru_cache_options_t* opt) {
+  return opt->rep.capacity;
+}
+
+void rocksdb_lru_cache_options_set_num_shard_bits(
+    rocksdb_lru_cache_options_t* opt, int v) {
+  opt->rep.num_shard_bits = v;
+}
+
+int rocksdb_lru_cache_options_get_num_shard_bits(
+    rocksdb_lru_cache_options_t* opt) {
+  return opt->rep.num_shard_bits;
+}
+
+void rocksdb_lru_cache_options_set_strict_capacity_limit(
+    rocksdb_lru_cache_options_t* opt, unsigned char v) {
+  opt->rep.strict_capacity_limit = v;
+}
+
+unsigned char rocksdb_lru_cache_options_get_strict_capacity_limit(
+    rocksdb_lru_cache_options_t* opt) {
+  return opt->rep.strict_capacity_limit;
+}
+
+void rocksdb_lru_cache_options_set_metadata_charge_policy(
+    rocksdb_lru_cache_options_t* opt, int v) {
+  opt->rep.metadata_charge_policy =
+      static_cast<decltype(opt->rep.metadata_charge_policy)>(v);
+}
+
+int rocksdb_lru_cache_options_get_metadata_charge_policy(
+    rocksdb_lru_cache_options_t* opt) {
+  return ROCKSDB_NAMESPACE::lossless_cast<int>(opt->rep.metadata_charge_policy);
+}
+
+void rocksdb_lru_cache_options_set_hash_seed(rocksdb_lru_cache_options_t* opt,
+                                             int32_t v) {
+  opt->rep.hash_seed = v;
+}
+
+int32_t rocksdb_lru_cache_options_get_hash_seed(
+    rocksdb_lru_cache_options_t* opt) {
+  return opt->rep.hash_seed;
+}
+
+void rocksdb_lru_cache_options_set_high_pri_pool_ratio(
+    rocksdb_lru_cache_options_t* opt, double v) {
+  opt->rep.high_pri_pool_ratio = v;
+}
+
+double rocksdb_lru_cache_options_get_high_pri_pool_ratio(
+    rocksdb_lru_cache_options_t* opt) {
+  return opt->rep.high_pri_pool_ratio;
+}
+
+void rocksdb_lru_cache_options_set_low_pri_pool_ratio(
+    rocksdb_lru_cache_options_t* opt, double v) {
+  opt->rep.low_pri_pool_ratio = v;
+}
+
+double rocksdb_lru_cache_options_get_low_pri_pool_ratio(
+    rocksdb_lru_cache_options_t* opt) {
+  return opt->rep.low_pri_pool_ratio;
+}
+
+void rocksdb_lru_cache_options_set_use_adaptive_mutex(
+    rocksdb_lru_cache_options_t* opt, unsigned char v) {
+  opt->rep.use_adaptive_mutex = v;
+}
+
+unsigned char rocksdb_lru_cache_options_get_use_adaptive_mutex(
+    rocksdb_lru_cache_options_t* opt) {
+  return opt->rep.use_adaptive_mutex;
+}
+
+/* HyperClockCacheOptions */
+
+void rocksdb_hyper_clock_cache_options_set_capacity(
+    rocksdb_hyper_clock_cache_options_t* opts, size_t v) {
+  opts->rep.capacity = v;
+}
+
+size_t rocksdb_hyper_clock_cache_options_get_capacity(
+    rocksdb_hyper_clock_cache_options_t* opts) {
+  return opts->rep.capacity;
+}
+
+void rocksdb_hyper_clock_cache_options_set_num_shard_bits(
+    rocksdb_hyper_clock_cache_options_t* opts, int v) {
+  opts->rep.num_shard_bits = v;
+}
+
+int rocksdb_hyper_clock_cache_options_get_num_shard_bits(
+    rocksdb_hyper_clock_cache_options_t* opts) {
+  return opts->rep.num_shard_bits;
+}
+
+void rocksdb_hyper_clock_cache_options_set_strict_capacity_limit(
+    rocksdb_hyper_clock_cache_options_t* opts, unsigned char v) {
+  opts->rep.strict_capacity_limit = v;
+}
+
+unsigned char rocksdb_hyper_clock_cache_options_get_strict_capacity_limit(
+    rocksdb_hyper_clock_cache_options_t* opts) {
+  return opts->rep.strict_capacity_limit;
+}
+
+void rocksdb_hyper_clock_cache_options_set_metadata_charge_policy(
+    rocksdb_hyper_clock_cache_options_t* opts, int v) {
+  opts->rep.metadata_charge_policy =
+      static_cast<decltype(opts->rep.metadata_charge_policy)>(v);
+}
+
+int rocksdb_hyper_clock_cache_options_get_metadata_charge_policy(
+    rocksdb_hyper_clock_cache_options_t* opts) {
+  return ROCKSDB_NAMESPACE::lossless_cast<int>(
+      opts->rep.metadata_charge_policy);
+}
+
+void rocksdb_hyper_clock_cache_options_set_hash_seed(
+    rocksdb_hyper_clock_cache_options_t* opts, int32_t v) {
+  opts->rep.hash_seed = v;
+}
+
+int32_t rocksdb_hyper_clock_cache_options_get_hash_seed(
+    rocksdb_hyper_clock_cache_options_t* opts) {
+  return opts->rep.hash_seed;
+}
+
+void rocksdb_hyper_clock_cache_options_set_estimated_entry_charge(
+    rocksdb_hyper_clock_cache_options_t* opts, size_t v) {
+  opts->rep.estimated_entry_charge = v;
+}
+
+size_t rocksdb_hyper_clock_cache_options_get_estimated_entry_charge(
+    rocksdb_hyper_clock_cache_options_t* opts) {
+  return opts->rep.estimated_entry_charge;
+}
+
+void rocksdb_hyper_clock_cache_options_set_min_avg_entry_charge(
+    rocksdb_hyper_clock_cache_options_t* opts, size_t v) {
+  opts->rep.min_avg_entry_charge = v;
+}
+
+size_t rocksdb_hyper_clock_cache_options_get_min_avg_entry_charge(
+    rocksdb_hyper_clock_cache_options_t* opts) {
+  return opts->rep.min_avg_entry_charge;
+}
+
+void rocksdb_hyper_clock_cache_options_set_eviction_effort_cap(
+    rocksdb_hyper_clock_cache_options_t* opts, int v) {
+  opts->rep.eviction_effort_cap = v;
+}
+
+int rocksdb_hyper_clock_cache_options_get_eviction_effort_cap(
+    rocksdb_hyper_clock_cache_options_t* opts) {
+  return opts->rep.eviction_effort_cap;
+}
+
+/* ReplayOptions */
+
+void rocksdb_replay_options_set_num_threads(rocksdb_replay_options_t* options,
+                                            uint32_t v) {
+  options->rep.num_threads = v;
+}
+
+uint32_t rocksdb_replay_options_get_num_threads(
+    rocksdb_replay_options_t* options) {
+  return options->rep.num_threads;
+}
+
+void rocksdb_replay_options_set_fast_forward(rocksdb_replay_options_t* options,
+                                             double v) {
+  options->rep.fast_forward = v;
+}
+
+double rocksdb_replay_options_get_fast_forward(
+    rocksdb_replay_options_t* options) {
+  return options->rep.fast_forward;
 }
 
 /* OptimisticTransactionDBOptions */

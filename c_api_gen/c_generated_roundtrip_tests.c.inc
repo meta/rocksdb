@@ -690,6 +690,45 @@ static void rocksdb_roundtrip_test_rocksdb_livefiles_storage_info_options(
   rocksdb_livefiles_storage_info_options_destroy(obj);
 }
 
+static void rocksdb_roundtrip_test_rocksdb_lru_cache_options(void) {
+  rocksdb_lru_cache_options_t* obj = rocksdb_lru_cache_options_create();
+  rocksdb_lru_cache_options_set_capacity(obj, 1);
+  CheckCondition(rocksdb_lru_cache_options_get_capacity(obj) == 1);
+  rocksdb_lru_cache_options_set_capacity(obj, 0);
+  CheckCondition(rocksdb_lru_cache_options_get_capacity(obj) == 0);
+  rocksdb_lru_cache_options_set_hash_seed(obj, 1);
+  CheckCondition(rocksdb_lru_cache_options_get_hash_seed(obj) == 1);
+  rocksdb_lru_cache_options_set_hash_seed(obj, 0);
+  CheckCondition(rocksdb_lru_cache_options_get_hash_seed(obj) == 0);
+  rocksdb_lru_cache_options_set_high_pri_pool_ratio(obj, 1);
+  CheckCondition(rocksdb_lru_cache_options_get_high_pri_pool_ratio(obj) == 1);
+  rocksdb_lru_cache_options_set_high_pri_pool_ratio(obj, 0);
+  CheckCondition(rocksdb_lru_cache_options_get_high_pri_pool_ratio(obj) == 0);
+  rocksdb_lru_cache_options_set_low_pri_pool_ratio(obj, 1);
+  CheckCondition(rocksdb_lru_cache_options_get_low_pri_pool_ratio(obj) == 1);
+  rocksdb_lru_cache_options_set_low_pri_pool_ratio(obj, 0);
+  CheckCondition(rocksdb_lru_cache_options_get_low_pri_pool_ratio(obj) == 0);
+  rocksdb_lru_cache_options_set_metadata_charge_policy(obj, 1);
+  CheckCondition(rocksdb_lru_cache_options_get_metadata_charge_policy(obj) ==
+                 1);
+  rocksdb_lru_cache_options_set_metadata_charge_policy(obj, 0);
+  CheckCondition(rocksdb_lru_cache_options_get_metadata_charge_policy(obj) ==
+                 0);
+  rocksdb_lru_cache_options_set_num_shard_bits(obj, 1);
+  CheckCondition(rocksdb_lru_cache_options_get_num_shard_bits(obj) == 1);
+  rocksdb_lru_cache_options_set_num_shard_bits(obj, 0);
+  CheckCondition(rocksdb_lru_cache_options_get_num_shard_bits(obj) == 0);
+  rocksdb_lru_cache_options_set_strict_capacity_limit(obj, 1);
+  CheckCondition(rocksdb_lru_cache_options_get_strict_capacity_limit(obj) == 1);
+  rocksdb_lru_cache_options_set_strict_capacity_limit(obj, 0);
+  CheckCondition(rocksdb_lru_cache_options_get_strict_capacity_limit(obj) == 0);
+  rocksdb_lru_cache_options_set_use_adaptive_mutex(obj, 1);
+  CheckCondition(rocksdb_lru_cache_options_get_use_adaptive_mutex(obj) == 1);
+  rocksdb_lru_cache_options_set_use_adaptive_mutex(obj, 0);
+  CheckCondition(rocksdb_lru_cache_options_get_use_adaptive_mutex(obj) == 0);
+  rocksdb_lru_cache_options_destroy(obj);
+}
+
 static void rocksdb_roundtrip_test_rocksdb_open_and_compact_options(void) {
   rocksdb_open_and_compact_options_t* obj =
       rocksdb_open_and_compact_options_create();
@@ -1637,6 +1676,19 @@ static void rocksdb_roundtrip_test_rocksdb_readoptions(void) {
   rocksdb_readoptions_destroy(obj);
 }
 
+static void rocksdb_roundtrip_test_rocksdb_replay_options(void) {
+  rocksdb_replay_options_t* obj = rocksdb_replay_options_create();
+  rocksdb_replay_options_set_fast_forward(obj, 1);
+  CheckCondition(rocksdb_replay_options_get_fast_forward(obj) == 1);
+  rocksdb_replay_options_set_fast_forward(obj, 0);
+  CheckCondition(rocksdb_replay_options_get_fast_forward(obj) == 0);
+  rocksdb_replay_options_set_num_threads(obj, 1);
+  CheckCondition(rocksdb_replay_options_get_num_threads(obj) == 1);
+  rocksdb_replay_options_set_num_threads(obj, 0);
+  CheckCondition(rocksdb_replay_options_get_num_threads(obj) == 0);
+  rocksdb_replay_options_destroy(obj);
+}
+
 static void rocksdb_roundtrip_test_rocksdb_restore_options(void) {
   rocksdb_restore_options_t* obj = rocksdb_restore_options_create();
   rocksdb_restore_options_set_keep_log_files(obj, 1);
@@ -2030,10 +2082,12 @@ static void rocksdb_run_generated_roundtrip_tests(void) {
   rocksdb_roundtrip_test_rocksdb_import_column_family_options();
   rocksdb_roundtrip_test_rocksdb_ingestexternalfileoptions();
   rocksdb_roundtrip_test_rocksdb_livefiles_storage_info_options();
+  rocksdb_roundtrip_test_rocksdb_lru_cache_options();
   rocksdb_roundtrip_test_rocksdb_open_and_compact_options();
   rocksdb_roundtrip_test_rocksdb_optimistictransactiondb_options();
   rocksdb_roundtrip_test_rocksdb_options();
   rocksdb_roundtrip_test_rocksdb_readoptions();
+  rocksdb_roundtrip_test_rocksdb_replay_options();
   rocksdb_roundtrip_test_rocksdb_restore_options();
   rocksdb_roundtrip_test_rocksdb_size_approximation_options();
   rocksdb_roundtrip_test_rocksdb_trace_options();

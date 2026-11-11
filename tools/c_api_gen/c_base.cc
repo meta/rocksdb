@@ -989,75 +989,6 @@ static Status LoadUserDefinedIndexFactoryFromString(
 #pragma warning(pop)
 #endif
 
-const char* rocksdb_compactionservice_jobinfo_t_get_db_name(
-    const rocksdb_compactionservice_jobinfo_t* info, size_t* len) {
-  *len = info->rep.db_name.size();
-  return info->rep.db_name.data();
-}
-
-const char* rocksdb_compactionservice_jobinfo_t_get_db_id(
-    const rocksdb_compactionservice_jobinfo_t* info, size_t* len) {
-  *len = info->rep.db_id.size();
-  return info->rep.db_id.data();
-}
-
-const char* rocksdb_compactionservice_jobinfo_t_get_db_session_id(
-    const rocksdb_compactionservice_jobinfo_t* info, size_t* len) {
-  *len = info->rep.db_session_id.size();
-  return info->rep.db_session_id.data();
-}
-
-const char* rocksdb_compactionservice_jobinfo_t_get_cf_name(
-    const rocksdb_compactionservice_jobinfo_t* info, size_t* len) {
-  *len = info->rep.cf_name.size();
-  return info->rep.cf_name.data();
-}
-
-uint32_t rocksdb_compactionservice_jobinfo_t_get_cf_id(
-    const rocksdb_compactionservice_jobinfo_t* info) {
-  return info->rep.cf_id;
-}
-
-uint64_t rocksdb_compactionservice_jobinfo_t_get_job_id(
-    const rocksdb_compactionservice_jobinfo_t* info) {
-  return info->rep.job_id;
-}
-
-int rocksdb_compactionservice_jobinfo_t_get_priority(
-    const rocksdb_compactionservice_jobinfo_t* info) {
-  return static_cast<int>(info->rep.priority);
-}
-
-int rocksdb_compactionservice_jobinfo_t_get_compaction_reason(
-    const rocksdb_compactionservice_jobinfo_t* info) {
-  return static_cast<int>(info->rep.compaction_reason);
-}
-
-int rocksdb_compactionservice_jobinfo_t_get_base_input_level(
-    const rocksdb_compactionservice_jobinfo_t* info) {
-  return info->rep.base_input_level;
-}
-
-int rocksdb_compactionservice_jobinfo_t_get_output_level(
-    const rocksdb_compactionservice_jobinfo_t* info) {
-  return info->rep.output_level;
-}
-
-unsigned char rocksdb_compactionservice_jobinfo_t_is_full_compaction(
-    const rocksdb_compactionservice_jobinfo_t* info) {
-  return info->rep.is_full_compaction;
-}
-
-unsigned char rocksdb_compactionservice_jobinfo_t_is_manual_compaction(
-    const rocksdb_compactionservice_jobinfo_t* info) {
-  return info->rep.is_manual_compaction;
-}
-
-unsigned char rocksdb_compactionservice_jobinfo_t_is_bottommost_level(
-    const rocksdb_compactionservice_jobinfo_t* info) {
-  return info->rep.bottommost_level;
-}
-
 // Helper function to validate compaction service job status
 static inline bool IsValidCompactionServiceJobStatus(int status) {
   return status >= rocksdb_compactionservice_jobstatus_success &&
@@ -4997,16 +4928,6 @@ rocksdb_walfilter_t* rocksdb_walfilter_create(
 
 void rocksdb_walfilter_destroy(rocksdb_walfilter_t* filter) { delete filter; }
 
-unsigned char rocksdb_compactionfiltercontext_is_full_compaction(
-    rocksdb_compactionfiltercontext_t* context) {
-  return context->rep.is_full_compaction;
-}
-
-unsigned char rocksdb_compactionfiltercontext_is_manual_compaction(
-    rocksdb_compactionfiltercontext_t* context) {
-  return context->rep.is_manual_compaction;
-}
-
 rocksdb_compactionfilterfactory_t* rocksdb_compactionfilterfactory_create(
     void* state, void (*destructor)(void*),
     rocksdb_compactionfilter_t* (*create_compaction_filter)(
@@ -5412,16 +5333,6 @@ rocksdb_memory_allocator_t* rocksdb_jemalloc_nodump_allocator_create(
   return allocator;
 }
 
-void rocksdb_lru_cache_options_set_capacity(rocksdb_lru_cache_options_t* opt,
-                                            size_t capacity) {
-  opt->rep.capacity = capacity;
-}
-
-void rocksdb_lru_cache_options_set_num_shard_bits(
-    rocksdb_lru_cache_options_t* opt, int num_shard_bits) {
-  opt->rep.num_shard_bits = num_shard_bits;
-}
-
 void rocksdb_lru_cache_options_set_memory_allocator(
     rocksdb_lru_cache_options_t* opt, rocksdb_memory_allocator_t* allocator) {
   opt->rep.memory_allocator = allocator->rep;
@@ -5452,21 +5363,6 @@ rocksdb_hyper_clock_cache_options_t* rocksdb_hyper_clock_cache_options_create(
     size_t capacity, size_t estimated_entry_charge) {
   return new rocksdb_hyper_clock_cache_options_t{
       HyperClockCacheOptions(capacity, estimated_entry_charge)};
-}
-
-void rocksdb_hyper_clock_cache_options_set_capacity(
-    rocksdb_hyper_clock_cache_options_t* opts, size_t capacity) {
-  opts->rep.capacity = capacity;
-}
-
-void rocksdb_hyper_clock_cache_options_set_estimated_entry_charge(
-    rocksdb_hyper_clock_cache_options_t* opts, size_t estimated_entry_charge) {
-  opts->rep.estimated_entry_charge = estimated_entry_charge;
-}
-
-void rocksdb_hyper_clock_cache_options_set_num_shard_bits(
-    rocksdb_hyper_clock_cache_options_t* opts, int num_shard_bits) {
-  opts->rep.num_shard_bits = num_shard_bits;
 }
 
 void rocksdb_hyper_clock_cache_options_set_memory_allocator(
@@ -5665,26 +5561,6 @@ char* rocksdb_trace_reader_read(rocksdb_trace_reader_t* reader, size_t* size,
   }
   *size = data.size();
   return CopyString(Slice(data));
-}
-
-void rocksdb_replay_options_set_num_threads(rocksdb_replay_options_t* options,
-                                            uint32_t num_threads) {
-  options->rep.num_threads = num_threads;
-}
-
-uint32_t rocksdb_replay_options_get_num_threads(
-    rocksdb_replay_options_t* options) {
-  return options->rep.num_threads;
-}
-
-void rocksdb_replay_options_set_fast_forward(rocksdb_replay_options_t* options,
-                                             double fast_forward) {
-  options->rep.fast_forward = fast_forward;
-}
-
-double rocksdb_replay_options_get_fast_forward(
-    rocksdb_replay_options_t* options) {
-  return options->rep.fast_forward;
 }
 
 rocksdb_replayer_t* rocksdb_new_default_replayer(
@@ -7490,51 +7366,6 @@ void rocksdb_resume_all_compactions(rocksdb_t* db) {
 rocksdb_statistics_histogram_data_t*
 rocksdb_statistics_histogram_data_create() {
   return new rocksdb_statistics_histogram_data_t{};
-}
-
-double rocksdb_statistics_histogram_data_get_median(
-    rocksdb_statistics_histogram_data_t* data) {
-  return data->rep.median;
-}
-
-double rocksdb_statistics_histogram_data_get_p95(
-    rocksdb_statistics_histogram_data_t* data) {
-  return data->rep.percentile95;
-}
-
-double rocksdb_statistics_histogram_data_get_p99(
-    rocksdb_statistics_histogram_data_t* data) {
-  return data->rep.percentile99;
-}
-
-double rocksdb_statistics_histogram_data_get_average(
-    rocksdb_statistics_histogram_data_t* data) {
-  return data->rep.average;
-}
-
-double rocksdb_statistics_histogram_data_get_std_dev(
-    rocksdb_statistics_histogram_data_t* data) {
-  return data->rep.standard_deviation;
-}
-
-double rocksdb_statistics_histogram_data_get_max(
-    rocksdb_statistics_histogram_data_t* data) {
-  return data->rep.max;
-}
-
-uint64_t rocksdb_statistics_histogram_data_get_count(
-    rocksdb_statistics_histogram_data_t* data) {
-  return data->rep.count;
-}
-
-uint64_t rocksdb_statistics_histogram_data_get_sum(
-    rocksdb_statistics_histogram_data_t* data) {
-  return data->rep.sum;
-}
-
-double rocksdb_statistics_histogram_data_get_min(
-    rocksdb_statistics_histogram_data_t* data) {
-  return data->rep.min;
 }
 
 void rocksdb_wait_for_compact(rocksdb_t* db,

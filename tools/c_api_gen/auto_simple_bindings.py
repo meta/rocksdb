@@ -450,6 +450,32 @@ OPTION_STRUCTS_GROUP = OutputGroup(
             mode="options",
         ),
         FamilyConfig(
+            struct_name="LRUCacheOptions",
+            header=INCLUDE_ROOT / "cache.h",
+            c_receiver_type="rocksdb_lru_cache_options_t*",
+            c_receiver_name="opt",
+            c_prefix="rocksdb_lru_cache_options",
+            mode="options",
+            enum_types=("CacheMetadataChargePolicy",),
+        ),
+        FamilyConfig(
+            struct_name="HyperClockCacheOptions",
+            header=INCLUDE_ROOT / "cache.h",
+            c_receiver_type="rocksdb_hyper_clock_cache_options_t*",
+            c_receiver_name="opts",
+            c_prefix="rocksdb_hyper_clock_cache_options",
+            mode="options",
+            enum_types=("CacheMetadataChargePolicy",),
+        ),
+        FamilyConfig(
+            struct_name="ReplayOptions",
+            header=INCLUDE_ROOT / "utilities/replayer.h",
+            c_receiver_type="rocksdb_replay_options_t*",
+            c_receiver_name="options",
+            c_prefix="rocksdb_replay_options",
+            mode="options",
+        ),
+        FamilyConfig(
             struct_name="OptimisticTransactionDBOptions",
             header=INCLUDE_ROOT / "utilities/optimistic_transaction_db.h",
             c_receiver_type="rocksdb_optimistictransactiondb_options_t*",
@@ -559,6 +585,45 @@ METADATA_VIEW_GROUP = OutputGroup(
             c_receiver_name="info",
             c_prefix="rocksdb_blob_file_garbage_info",
             mode="metadata",
+        ),
+        FamilyConfig(
+            struct_name="HistogramData",
+            header=INCLUDE_ROOT / "statistics.h",
+            c_receiver_type="rocksdb_statistics_histogram_data_t*",
+            c_receiver_name="data",
+            c_prefix="rocksdb_statistics_histogram_data_get",
+            mode="metadata",
+            getter_name_overrides=(
+                ("percentile95", "rocksdb_statistics_histogram_data_get_p95"),
+                ("percentile99", "rocksdb_statistics_histogram_data_get_p99"),
+                ("standard_deviation", "rocksdb_statistics_histogram_data_get_std_dev"),
+            ),
+        ),
+        FamilyConfig(
+            struct_name="CompactionFilter::Context",
+            header=INCLUDE_ROOT / "compaction_filter.h",
+            c_receiver_type="rocksdb_compactionfiltercontext_t*",
+            c_receiver_name="context",
+            c_prefix="rocksdb_compactionfiltercontext",
+            mode="metadata",
+            enum_types=("TableFileCreationReason",),
+        ),
+        FamilyConfig(
+            struct_name="CompactionServiceJobInfo",
+            header=INCLUDE_ROOT / "options.h",
+            c_receiver_type="const rocksdb_compactionservice_jobinfo_t*",
+            c_receiver_name="info",
+            c_prefix="rocksdb_compactionservice_jobinfo_t_get",
+            mode="metadata",
+            enum_types=("Env::Priority", "CompactionReason"),
+            getter_name_overrides=(
+                ("is_full_compaction", "rocksdb_compactionservice_jobinfo_t_is_full_compaction"),
+                (
+                    "is_manual_compaction",
+                    "rocksdb_compactionservice_jobinfo_t_is_manual_compaction",
+                ),
+                ("bottommost_level", "rocksdb_compactionservice_jobinfo_t_is_bottommost_level"),
+            ),
         ),
     ),
 )
@@ -758,12 +823,6 @@ def iter_json_docs(text: str) -> Iterable[dict]:
 _CLANG_BINARY = ""
 
 
-def walk_ast(node: dict) -> Iterable[dict]:
-    yield node
-    for child in node.get("inner", []):
-        yield from walk_ast(child)
-
-
 _ROCKSDB_NS_PREFIX = "rocksdb::"
 
 
@@ -794,7 +853,11 @@ def _dump_record(struct_name: str, header: Path) -> dict:
         "-Xclang",
         "-ast-dump=json",
         "-Xclang",
-        f"-ast-dump-filter={struct_name}",
+        # The filter is a substring match on the qualified name; the namespace
+        # prefix keeps nested namesakes (WalIterator::ReadOptions) out of a
+        # lookup of a namespace-scope struct (ReadOptions) and lets a family
+        # name a nested struct (CompactionFilter::Context).
+        f"-ast-dump-filter=rocksdb::{struct_name}",
         "-fsyntax-only",
         str(header.relative_to(ROOT)),
     ]
@@ -806,14 +869,16 @@ def _dump_record(struct_name: str, header: Path) -> dict:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    for doc in iter_json_docs(proc.stdout):
-        for node in walk_ast(doc):
-            if (
-                node.get("kind") in ("RecordDecl", "CXXRecordDecl")
-                and node.get("name") == struct_name
-                and node.get("completeDefinition")
-            ):
-                return node
+    # Each declaration matching the filter is its own top-level document, so
+    # only document roots are candidates.
+    last = struct_name.split("::")[-1]
+    for node in iter_json_docs(proc.stdout):
+        if (
+            node.get("kind") in ("RecordDecl", "CXXRecordDecl")
+            and node.get("name") == last
+            and node.get("completeDefinition")
+        ):
+            return node
     raise RuntimeError(f"Could not find AST definition for {struct_name}")
 
 
@@ -953,6 +1018,7 @@ def scalar_return_type(qual_type: str) -> str | None:
         "uint32_t",
         "uint64_t",
         "int",
+        "int32_t",
         "int64_t",
         "unsigned int",
         "size_t",
@@ -1091,7 +1157,9 @@ def build_metadata_specs(
     expr = family.field_expr_format.format(
         receiver_name=family.c_receiver_name, field_name=field_name
     )
-    fn_name = f"{family.c_prefix}_{to_c_suffix(field_name)}"
+    fn_name = lookup_override(family.getter_name_overrides, field_name) or (
+        f"{family.c_prefix}_{to_c_suffix(field_name)}"
+    )
 
     if qual_type == "std::string":
         return [

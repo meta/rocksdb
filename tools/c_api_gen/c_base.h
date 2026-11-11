@@ -1603,16 +1603,6 @@ extern ROCKSDB_LIBRARY_API rocksdb_walfilter_t* rocksdb_walfilter_create(
     const char* (*name)(void*));
 extern ROCKSDB_LIBRARY_API void rocksdb_walfilter_destroy(rocksdb_walfilter_t*);
 
-/* Compaction Filter Context */
-
-extern ROCKSDB_LIBRARY_API unsigned char
-rocksdb_compactionfiltercontext_is_full_compaction(
-    rocksdb_compactionfiltercontext_t* context);
-
-extern ROCKSDB_LIBRARY_API unsigned char
-rocksdb_compactionfiltercontext_is_manual_compaction(
-    rocksdb_compactionfiltercontext_t* context);
-
 /* Compaction Filter Factory */
 
 extern ROCKSDB_LIBRARY_API rocksdb_compactionfilterfactory_t*
@@ -1767,10 +1757,6 @@ rocksdb_jemalloc_nodump_allocator_create(char** errptr);
 
 /* Cache */
 
-extern ROCKSDB_LIBRARY_API void rocksdb_lru_cache_options_set_capacity(
-    rocksdb_lru_cache_options_t*, size_t);
-extern ROCKSDB_LIBRARY_API void rocksdb_lru_cache_options_set_num_shard_bits(
-    rocksdb_lru_cache_options_t*, int);
 extern ROCKSDB_LIBRARY_API void rocksdb_lru_cache_options_set_memory_allocator(
     rocksdb_lru_cache_options_t*, rocksdb_memory_allocator_t*);
 
@@ -1816,14 +1802,6 @@ rocksdb_sst_file_manager_create(rocksdb_env_t* env);
 extern ROCKSDB_LIBRARY_API rocksdb_hyper_clock_cache_options_t*
 rocksdb_hyper_clock_cache_options_create(size_t capacity,
                                          size_t estimated_entry_charge);
-extern ROCKSDB_LIBRARY_API void rocksdb_hyper_clock_cache_options_set_capacity(
-    rocksdb_hyper_clock_cache_options_t*, size_t);
-extern ROCKSDB_LIBRARY_API void
-rocksdb_hyper_clock_cache_options_set_estimated_entry_charge(
-    rocksdb_hyper_clock_cache_options_t*, size_t);
-extern ROCKSDB_LIBRARY_API void
-rocksdb_hyper_clock_cache_options_set_num_shard_bits(
-    rocksdb_hyper_clock_cache_options_t*, int);
 extern ROCKSDB_LIBRARY_API void
 rocksdb_hyper_clock_cache_options_set_memory_allocator(
     rocksdb_hyper_clock_cache_options_t*, rocksdb_memory_allocator_t*);
@@ -1856,14 +1834,6 @@ extern ROCKSDB_LIBRARY_API rocksdb_trace_reader_t* rocksdb_trace_reader_create(
     const char* trace_path, char** errptr);
 extern ROCKSDB_LIBRARY_API char* rocksdb_trace_reader_read(
     rocksdb_trace_reader_t* reader, size_t* size, char** errptr);
-extern ROCKSDB_LIBRARY_API void rocksdb_replay_options_set_num_threads(
-    rocksdb_replay_options_t* options, uint32_t num_threads);
-extern ROCKSDB_LIBRARY_API uint32_t
-rocksdb_replay_options_get_num_threads(rocksdb_replay_options_t* options);
-extern ROCKSDB_LIBRARY_API void rocksdb_replay_options_set_fast_forward(
-    rocksdb_replay_options_t* options, double fast_forward);
-extern ROCKSDB_LIBRARY_API double rocksdb_replay_options_get_fast_forward(
-    rocksdb_replay_options_t* options);
 extern ROCKSDB_LIBRARY_API rocksdb_replayer_t* rocksdb_new_default_replayer(
     rocksdb_t* db, rocksdb_column_family_handle_t** column_families,
     size_t num_column_families, rocksdb_env_t* env,
@@ -2538,24 +2508,6 @@ extern ROCKSDB_LIBRARY_API void rocksdb_cancel_all_background_work(
 
 extern ROCKSDB_LIBRARY_API rocksdb_statistics_histogram_data_t*
 rocksdb_statistics_histogram_data_create(void);
-extern ROCKSDB_LIBRARY_API double rocksdb_statistics_histogram_data_get_median(
-    rocksdb_statistics_histogram_data_t* data);
-extern ROCKSDB_LIBRARY_API double rocksdb_statistics_histogram_data_get_p95(
-    rocksdb_statistics_histogram_data_t* data);
-extern ROCKSDB_LIBRARY_API double rocksdb_statistics_histogram_data_get_p99(
-    rocksdb_statistics_histogram_data_t* data);
-extern ROCKSDB_LIBRARY_API double rocksdb_statistics_histogram_data_get_average(
-    rocksdb_statistics_histogram_data_t* data);
-extern ROCKSDB_LIBRARY_API double rocksdb_statistics_histogram_data_get_std_dev(
-    rocksdb_statistics_histogram_data_t* data);
-extern ROCKSDB_LIBRARY_API double rocksdb_statistics_histogram_data_get_max(
-    rocksdb_statistics_histogram_data_t* data);
-extern ROCKSDB_LIBRARY_API uint64_t rocksdb_statistics_histogram_data_get_count(
-    rocksdb_statistics_histogram_data_t* data);
-extern ROCKSDB_LIBRARY_API uint64_t rocksdb_statistics_histogram_data_get_sum(
-    rocksdb_statistics_histogram_data_t* data);
-extern ROCKSDB_LIBRARY_API double rocksdb_statistics_histogram_data_get_min(
-    rocksdb_statistics_histogram_data_t* data);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_wait_for_compact(
     rocksdb_t* db, rocksdb_wait_for_compact_options_t* options, char** errptr);
@@ -2622,57 +2574,6 @@ rocksdb_compactionservice_scheduleresponse_getstatus(
 extern ROCKSDB_LIBRARY_API const char*
 rocksdb_compactionservice_scheduleresponse_get_scheduled_job_id(
     const rocksdb_compactionservice_scheduleresponse_t* response, size_t* len);
-
-extern ROCKSDB_LIBRARY_API const char*
-rocksdb_compactionservice_jobinfo_t_get_db_name(
-    const rocksdb_compactionservice_jobinfo_t* info, size_t* len);
-
-extern ROCKSDB_LIBRARY_API const char*
-rocksdb_compactionservice_jobinfo_t_get_db_id(
-    const rocksdb_compactionservice_jobinfo_t* info, size_t* len);
-
-extern ROCKSDB_LIBRARY_API const char*
-rocksdb_compactionservice_jobinfo_t_get_db_session_id(
-    const rocksdb_compactionservice_jobinfo_t* info, size_t* len);
-
-extern ROCKSDB_LIBRARY_API const char*
-rocksdb_compactionservice_jobinfo_t_get_cf_name(
-    const rocksdb_compactionservice_jobinfo_t* info, size_t* len);
-
-extern ROCKSDB_LIBRARY_API uint32_t
-rocksdb_compactionservice_jobinfo_t_get_cf_id(
-    const rocksdb_compactionservice_jobinfo_t* info);
-
-extern ROCKSDB_LIBRARY_API uint64_t
-rocksdb_compactionservice_jobinfo_t_get_job_id(
-    const rocksdb_compactionservice_jobinfo_t* info);
-
-extern ROCKSDB_LIBRARY_API int rocksdb_compactionservice_jobinfo_t_get_priority(
-    const rocksdb_compactionservice_jobinfo_t* info);
-
-extern ROCKSDB_LIBRARY_API int
-rocksdb_compactionservice_jobinfo_t_get_compaction_reason(
-    const rocksdb_compactionservice_jobinfo_t* info);
-
-extern ROCKSDB_LIBRARY_API int
-rocksdb_compactionservice_jobinfo_t_get_base_input_level(
-    const rocksdb_compactionservice_jobinfo_t* info);
-
-extern ROCKSDB_LIBRARY_API int
-rocksdb_compactionservice_jobinfo_t_get_output_level(
-    const rocksdb_compactionservice_jobinfo_t* info);
-
-extern ROCKSDB_LIBRARY_API unsigned char
-rocksdb_compactionservice_jobinfo_t_is_full_compaction(
-    const rocksdb_compactionservice_jobinfo_t* info);
-
-extern ROCKSDB_LIBRARY_API unsigned char
-rocksdb_compactionservice_jobinfo_t_is_manual_compaction(
-    const rocksdb_compactionservice_jobinfo_t* info);
-
-extern ROCKSDB_LIBRARY_API unsigned char
-rocksdb_compactionservice_jobinfo_t_is_bottommost_level(
-    const rocksdb_compactionservice_jobinfo_t* info);
 
 extern ROCKSDB_LIBRARY_API rocksdb_compactionservice_t*
 rocksdb_compactionservice_create(

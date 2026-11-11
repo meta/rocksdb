@@ -593,6 +593,46 @@
           "reason": "std::optional uses separate value and presence accessors; nullopt maps to has=false and value=0."
         }
       ]
+    },
+    {
+      "name": "LRUCacheOptions",
+      "entries": [
+        {
+          "field": "memory_allocator",
+          "policy": "manual",
+          "reason": "Takes a rocksdb_memory_allocator_t handle and shares its std::shared_ptr; set with the hand-written rocksdb_*_set_memory_allocator."
+        },
+        {
+          "field": "secondary_cache",
+          "policy": "manual",
+          "reason": "std::shared_ptr<SecondaryCache> needs a C ownership design; the C API has no secondary cache handle."
+        }
+      ]
+    },
+    {
+      "name": "HyperClockCacheOptions",
+      "entries": [
+        {
+          "field": "memory_allocator",
+          "policy": "manual",
+          "reason": "Takes a rocksdb_memory_allocator_t handle and shares its std::shared_ptr; set with the hand-written rocksdb_*_set_memory_allocator."
+        },
+        {
+          "field": "secondary_cache",
+          "policy": "manual",
+          "reason": "std::shared_ptr<SecondaryCache> needs a C ownership design; the C API has no secondary cache handle."
+        }
+      ]
+    },
+    {
+      "name": "CompactionFilter::Context",
+      "entries": [
+        {
+          "field": "input_table_properties",
+          "policy": "manual",
+          "reason": "Map of std::shared_ptr<const TableProperties>; needs a C iteration and lifetime design."
+        }
+      ]
     }
   ]
 }
