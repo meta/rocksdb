@@ -1758,7 +1758,7 @@ TEST_F(DBSecondaryTest, CatchUpTailsCurrentWalWhenFutureWalExists) {
   ASSERT_EQ("value2", value);
 }
 
-TEST_F(DBSecondaryTest, SecondaryTailingBug_ISSUE_8467) {
+TEST_F(DBSecondaryTest, SecondaryTailingBugISSUE8467) {
   Options options;
   options.env = env_;
   Reopen(options);

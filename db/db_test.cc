@@ -2290,7 +2290,7 @@ TEST_F(DBTest, ApproximateSizes) {
                          kSkipPlainTable | kSkipHashIndex));
 }
 
-TEST_F(DBTest, ApproximateSizes_MixOfSmallAndLarge) {
+TEST_F(DBTest, ApproximateSizesMixOfSmallAndLarge) {
   do {
     Options options = CurrentOptions();
     options.compression = kNoCompression;
@@ -2724,7 +2724,7 @@ TEST_F(DBTest, CustomComparator) {
   } while (ChangeCompactOptions());
 }
 
-TEST_F(DBTest, DBOpen_Options) {
+TEST_F(DBTest, DBOpenOptions) {
   Options options = CurrentOptions();
   std::string dbname = test::PerThreadDBPath("db_options_test");
   ASSERT_OK(DestroyDB(dbname, options));
@@ -2769,7 +2769,7 @@ TEST_F(DBTest, DBOpen_Options) {
   db.reset();
 }
 
-TEST_F(DBTest, DBOpen_Change_NumLevels) {
+TEST_F(DBTest, DBOpenChangeNumLevels) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
   DestroyAndReopen(options);

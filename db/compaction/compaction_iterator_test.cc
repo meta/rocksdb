@@ -1757,7 +1757,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 // while committed version of these keys should get compacted as usual.
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       PreserveUncommittedKeys_Value) {
+       PreserveUncommittedKeysValue) {
   RunTest(
       {test::KeyStr("foo", 3, kTypeValue), test::KeyStr("foo", 2, kTypeValue),
        test::KeyStr("foo", 1, kTypeValue)},
@@ -1767,7 +1767,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 }
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       PreserveUncommittedKeys_Deletion) {
+       PreserveUncommittedKeysDeletion) {
   RunTest({test::KeyStr("foo", 2, kTypeDeletion),
            test::KeyStr("foo", 1, kTypeValue)},
           {"", "v1"},
@@ -1777,7 +1777,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 }
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       PreserveUncommittedKeys_Merge) {
+       PreserveUncommittedKeysMerge) {
   auto merge_op = MergeOperators::CreateStringAppendOperator();
   RunTest(
       {test::KeyStr("foo", 3, kTypeMerge), test::KeyStr("foo", 2, kTypeMerge),
@@ -1788,7 +1788,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 }
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       PreserveUncommittedKeys_SingleDelete) {
+       PreserveUncommittedKeysSingleDelete) {
   RunTest({test::KeyStr("foo", 2, kTypeSingleDeletion),
            test::KeyStr("foo", 1, kTypeValue)},
           {"", "v1"},
@@ -1798,7 +1798,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 }
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       PreserveUncommittedKeys_BlobIndex) {
+       PreserveUncommittedKeysBlobIndex) {
   RunTest({test::KeyStr("foo", 3, kTypeBlobIndex),
            test::KeyStr("foo", 2, kTypeBlobIndex),
            test::KeyStr("foo", 1, kTypeBlobIndex)},
@@ -1810,7 +1810,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 
 // Test compaction iterator dedup keys visible to the same snapshot.
 
-TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshot_Value) {
+TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshotValue) {
   AddSnapshot(2, 1);
   RunTest(
       {test::KeyStr("foo", 4, kTypeValue), test::KeyStr("foo", 3, kTypeValue),
@@ -1821,7 +1821,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshot_Value) {
       {"v4", "v3", "v1"}, 3 /*last_committed_seq*/);
 }
 
-TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshot_TimedPut) {
+TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshotTimedPut) {
   AddSnapshot(2, 1);
   RunTest({test::KeyStr("foo", 4, kTypeValuePreferredSeqno),
            test::KeyStr("foo", 3, kTypeValuePreferredSeqno),
@@ -1837,7 +1837,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshot_TimedPut) {
           3 /*last_committed_seq*/);
 }
 
-TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshot_Deletion) {
+TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshotDeletion) {
   AddSnapshot(2, 1);
   RunTest(
       {test::KeyStr("foo", 4, kTypeValue),
@@ -1850,7 +1850,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshot_Deletion) {
       {"v4", "", "v1"}, 3 /*last_committed_seq*/);
 }
 
-TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshot_Merge) {
+TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshotMerge) {
   AddSnapshot(2, 1);
   AddSnapshot(4, 3);
   auto merge_op = MergeOperators::CreateStringAppendOperator();
@@ -1865,7 +1865,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshot_Merge) {
 }
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       DedupSameSnapshot_SingleDeletion) {
+       DedupSameSnapshotSingleDeletion) {
   AddSnapshot(2, 1);
   RunTest(
       {test::KeyStr("foo", 4, kTypeValue),
@@ -1876,7 +1876,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
       {"v4", "v1"}, 3 /*last_committed_seq*/);
 }
 
-TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshot_BlobIndex) {
+TEST_F(CompactionIteratorWithSnapshotCheckerTest, DedupSameSnapshotBlobIndex) {
   AddSnapshot(2, 1);
   RunTest({test::KeyStr("foo", 4, kTypeBlobIndex),
            test::KeyStr("foo", 3, kTypeBlobIndex),
@@ -2004,7 +2004,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 // Same as above but with a blob index. In addition to the value getting
 // trimmed, the type of the KV is changed to kTypeValue.
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       KeepSingleDeletionForWriteConflictChecking_BlobIndex) {
+       KeepSingleDeletionForWriteConflictCheckingBlobIndex) {
   AddSnapshot(2, 0);
   RunTest({test::KeyStr("a", 2, kTypeSingleDeletion),
            test::KeyStr("a", 1, kTypeBlobIndex)},
@@ -2019,7 +2019,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 // Same as above but with a wide-column entity. In addition to the value getting
 // trimmed, the type of the KV is changed to kTypeValue.
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       KeepSingleDeletionForWriteConflictChecking_WideColumnEntity) {
+       KeepSingleDeletionForWriteConflictCheckingWideColumnEntity) {
   AddSnapshot(2, 0);
   RunTest({test::KeyStr("a", 2, kTypeSingleDeletion),
            test::KeyStr("a", 1, kTypeWideColumnEntity)},
@@ -2034,7 +2034,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 // Same as above but with a value with preferred seqno entry. In addition to the
 // value getting trimmed, the type of the KV is changed to kTypeValue.
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       KeepSingleDeletionForWriteConflictChecking_TimedPut) {
+       KeepSingleDeletionForWriteConflictCheckingTimedPut) {
   AddSnapshot(2, 0);
   RunTest({test::KeyStr("a", 2, kTypeSingleDeletion),
            test::KeyStr("a", 1, kTypeValuePreferredSeqno)},
@@ -2057,7 +2057,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 // 3) The entry will not resurface a range deletion entry after swapping in the
 //    preferred sequence number.
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       TimedPut_NotVisibleToEarliestSnapshot_NoSwapPreferredSeqno) {
+       TimedPutNotVisibleToEarliestSnapshotNoSwapPreferredSeqno) {
   AddSnapshot(3);
   RunTest({test::KeyStr("bar", 5, kTypeValuePreferredSeqno)},
           {ValueWithPreferredSeqno("bv2", 2)},
@@ -2070,7 +2070,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 }
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       TimedPut_MoreEntriesInLowerLevels_NoSwapPreferredSeqno) {
+       TimedPutMoreEntriesInLowerLevelsNoSwapPreferredSeqno) {
   // This tests mimics more entries in lower levels with `bottommost_level` and
   // `key_not_exists_beyond_output_level` set to false.
   RunTest({test::KeyStr("bar", 5, kTypeValuePreferredSeqno)},
@@ -2084,7 +2084,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 }
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       TimedPut_ShouldBeCoverredByRangeDeletionBeforeSwap_NoOutput) {
+       TimedPutShouldBeCoverredByRangeDeletionBeforeSwapNoOutput) {
   InitIterators({test::KeyStr("morning", 5, kTypeValuePreferredSeqno),
                  test::KeyStr("morning", 2, kTypeValuePreferredSeqno),
                  test::KeyStr("night", 6, kTypeValue)},
@@ -2106,7 +2106,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 }
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       TimedPut_WillBeHiddenByRangeDeletionAfterSwap_NoSwap) {
+       TimedPutWillBeHiddenByRangeDeletionAfterSwapNoSwap) {
   InitIterators({test::KeyStr("morning", 5, kTypeValuePreferredSeqno),
                  test::KeyStr("night", 6, kTypeValue)},
                 {ValueWithPreferredSeqno("zao", 3), "wan"},
@@ -2131,7 +2131,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 }
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       TimedPut_BottomMostLevelVisibleToEarliestSnapshot_SwapPreferredSeqno) {
+       TimedPutBottomMostLevelVisibleToEarliestSnapshotSwapPreferredSeqno) {
   // Preferred seqno got swapped in and also zeroed out as a bottommost level
   // optimization.
   RunTest(
@@ -2145,9 +2145,8 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
       nullptr /*compaction_filter*/, true /*bottommost_level*/);
 }
 
-TEST_F(
-    CompactionIteratorWithSnapshotCheckerTest,
-    TimedPut_NonBottomMostLevelVisibleToEarliestSnapshot_SwapPreferredSeqno) {
+TEST_F(CompactionIteratorWithSnapshotCheckerTest,
+       TimedPutNonBottomMostLevelVisibleToEarliestSnapshotSwapPreferredSeqno) {
   RunTest(
       {test::KeyStr("bar", 5, kTypeValuePreferredSeqno),
        test::KeyStr("bar", 4, kTypeValuePreferredSeqno),
@@ -2162,7 +2161,7 @@ TEST_F(
 }
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       TimedPut_SequenceNumberAlreadyZeroedOut_ChangeType) {
+       TimedPutSequenceNumberAlreadyZeroedOutChangeType) {
   RunTest(
       {test::KeyStr("bar", 0, kTypeValuePreferredSeqno),
        test::KeyStr("bar", 0, kTypeValuePreferredSeqno),
@@ -2178,7 +2177,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 //   * Convert the latest value to deletion, and/or
 //   * if latest value is a merge, apply filter to all subsequent merges.
 
-TEST_F(CompactionIteratorWithSnapshotCheckerTest, CompactionFilter_Value) {
+TEST_F(CompactionIteratorWithSnapshotCheckerTest, CompactionFilterValue) {
   std::unique_ptr<CompactionFilter> compaction_filter(
       new FilterAllKeysCompactionFilter());
   RunTest(
@@ -2191,7 +2190,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest, CompactionFilter_Value) {
       nullptr /*merge_operator*/, compaction_filter.get());
 }
 
-TEST_F(CompactionIteratorWithSnapshotCheckerTest, CompactionFilter_TimedPut) {
+TEST_F(CompactionIteratorWithSnapshotCheckerTest, CompactionFilterTimedPut) {
   // TODO(yuzhangyu): Add support for this type in compaction filter.
   // Type kTypeValuePreferredSeqno is not explicitly exposed in the compaction
   // filter API, so users can not operate on it through compaction filter API
@@ -2207,7 +2206,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest, CompactionFilter_TimedPut) {
           nullptr /*merge_operator*/, compaction_filter.get());
 }
 
-TEST_F(CompactionIteratorWithSnapshotCheckerTest, CompactionFilter_Deletion) {
+TEST_F(CompactionIteratorWithSnapshotCheckerTest, CompactionFilterDeletion) {
   std::unique_ptr<CompactionFilter> compaction_filter(
       new FilterAllKeysCompactionFilter());
   RunTest(
@@ -2220,7 +2219,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest, CompactionFilter_Deletion) {
 }
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest,
-       CompactionFilter_PartialMerge) {
+       CompactionFilterPartialMerge) {
   std::shared_ptr<MergeOperator> merge_op =
       MergeOperators::CreateStringAppendOperator();
   std::unique_ptr<CompactionFilter> compaction_filter(
@@ -2231,7 +2230,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
           2 /*last_committed_seq*/, merge_op.get(), compaction_filter.get());
 }
 
-TEST_F(CompactionIteratorWithSnapshotCheckerTest, CompactionFilter_FullMerge) {
+TEST_F(CompactionIteratorWithSnapshotCheckerTest, CompactionFilterFullMerge) {
   std::shared_ptr<MergeOperator> merge_op =
       MergeOperators::CreateStringAppendOperator();
   std::unique_ptr<CompactionFilter> compaction_filter(

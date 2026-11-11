@@ -1212,7 +1212,7 @@ TEST_F(BlobDBTest, UserCompactionFilter) {
 }
 
 // Test user comapction filter when there is IO error on blob data.
-TEST_F(BlobDBTest, UserCompactionFilter_BlobIOError) {
+TEST_F(BlobDBTest, UserCompactionFilterBlobIOError) {
   class CustomerFilter : public CompactionFilter {
    public:
     bool Filter(int /*level*/, const Slice& /*key*/, const Slice& value,

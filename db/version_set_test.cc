@@ -248,7 +248,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelStatic) {
   ASSERT_EQ(0, logger_->log_count);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_1) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic1) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 1000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -261,7 +261,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_1) {
   ASSERT_EQ(vstorage_.base_level(), 5);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_2) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic2) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 1000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -276,7 +276,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_2) {
   ASSERT_EQ(vstorage_.base_level(), 4);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_3) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic3) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 1000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -292,7 +292,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_3) {
   ASSERT_EQ(vstorage_.base_level(), 4);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_4) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic4) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 1000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -311,7 +311,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_4) {
   ASSERT_EQ(vstorage_.base_level(), 3);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_5) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic5) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 1000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -377,7 +377,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicLargeLevel) {
   ASSERT_EQ(0, logger_->log_count);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_1) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0Case1) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 40000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -408,7 +408,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_1) {
   ASSERT_EQ(vstorage_.CompactionScoreLevel(0), 0);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_2) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0Case2) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 10000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -443,7 +443,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_2) {
   ASSERT_EQ(4, vstorage_.CompactionScoreLevel(1));
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_3) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0Case3) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 20000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;

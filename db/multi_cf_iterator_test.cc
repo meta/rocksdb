@@ -874,7 +874,7 @@ TEST_F(CoalescingIteratorTest, AllowUnpreparedValue) {
   }
 }
 
-TEST_F(CoalescingIteratorTest, AllowUnpreparedValue_Corruption) {
+TEST_F(CoalescingIteratorTest, AllowUnpreparedValueCorruption) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
 

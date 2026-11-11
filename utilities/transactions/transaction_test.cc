@@ -356,7 +356,7 @@ TEST_P(TransactionTest, SuccessTestPinnable) {
   delete txn;
 }
 
-TEST_P(TransactionTest, SwitchMemtableDuringPrepareAndCommit_WC) {
+TEST_P(TransactionTest, SwitchMemtableDuringPrepareAndCommitWC) {
   const TxnDBWritePolicy write_policy = std::get<2>(GetParam());
 
   if (write_policy != TxnDBWritePolicy::WRITE_COMMITTED) {

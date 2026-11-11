@@ -1359,7 +1359,7 @@ TEST_F(DBBasicTestWithTimestamp, SimpleBackwardIterateLowerTsBound) {
   Close();
 }
 
-TEST_F(DBBasicTestWithTimestamp, BackwardIterateLowerTsBound_Reseek) {
+TEST_F(DBBasicTestWithTimestamp, BackwardIterateLowerTsBoundReseek) {
   Options options = CurrentOptions();
   options.env = env_;
   options.create_if_missing = true;

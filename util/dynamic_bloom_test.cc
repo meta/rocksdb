@@ -217,7 +217,7 @@ TEST_F(DynamicBloomTest, perf) {
   }
 }
 
-TEST_F(DynamicBloomTest, concurrent_with_perf) {
+TEST_F(DynamicBloomTest, ConcurrentWithPerf) {
   uint32_t num_probes = static_cast<uint32_t>(FLAGS_num_probes);
 
   uint32_t m_limit = FLAGS_enable_perf ? 8 : 1;
