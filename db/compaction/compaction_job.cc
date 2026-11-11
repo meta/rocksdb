@@ -1570,11 +1570,11 @@ void CompactionJob::NotifyOnSubcompactionCompleted(
 }
 
 bool CompactionJob::ShouldUseLocalCompaction(SubcompactionState* sub_compact) {
-  if (sub_compact->compaction->skip_missing_blob_files()) {
-    // Remote workers do not receive this flag and reconstruct their input
-    // Version from the MANIFEST. Result validation rejects garbage updates for
-    // blob files absent from the primary's input Version. Keep repair local
-    // until the service supports this policy.
+  if (sub_compact->compaction->RepairsMissingBlobReferences()) {
+    // Remote workers do not receive skip_missing_blob_files, and result
+    // validation rejects garbage updates for blob files absent from the
+    // primary's input Version, which repair produces. Keep repair local until
+    // the service supports this policy.
     sub_compact->compaction_job_stats.is_remote_compaction = false;
     return true;
   }
@@ -1786,7 +1786,7 @@ InternalIterator* CompactionJob::CreateInputIterator(
   }
 
   if (sub_compact->compaction->DoesInputReferenceBlobFiles() ||
-      sub_compact->compaction->skip_missing_blob_files()) {
+      sub_compact->compaction->RepairsMissingBlobReferences()) {
     BlobGarbageMeter* meter = sub_compact->Current().GetBlobGarbageMeter();
     if (meter == nullptr) {
       meter = sub_compact->Current().CreateBlobGarbageMeter();
@@ -1802,9 +1802,11 @@ InternalIterator* CompactionJob::CreateInputIterator(
     input = iterators.trim_history_iter.get();
   }
 
-  if (sub_compact->compaction->skip_missing_blob_files()) {
+  if (sub_compact->compaction->RepairsMissingBlobReferences()) {
     iterators.missing_blob_repair = std::make_unique<MissingBlobRepairIterator>(
-        input, sub_compact->compaction->input_version()->storage_info(), ts_sz);
+        input, sub_compact->compaction->input_version()->storage_info(), ts_sz,
+        /*only_dropped_blob_files=*/
+        !sub_compact->compaction->skip_missing_blob_files());
     input = iterators.missing_blob_repair.get();
   }
 
@@ -1857,7 +1859,7 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
       db_options_.enforce_single_del_contracts, manual_compaction_canceled_,
       sub_compact->compaction->DoesInputReferenceBlobFiles() ||
           sub_compact->compaction
-              ->skip_missing_blob_files() /* must_count_input_entries */,
+              ->RepairsMissingBlobReferences() /* must_count_input_entries */,
       sub_compact->compaction, compaction_filter, shutting_down_,
       db_options_.info_log, full_history_ts_low, preserve_seqno_after_,
       nullptr /* input_version */, Env::IOActivity::kCompaction,
@@ -2760,9 +2762,9 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
           const std::unordered_map<uint64_t, BlobFileState>::const_iterator
               blob_file = blob_files.find(blob_file_number);
           if (blob_file == blob_files.end()) {
-            if (compaction->skip_missing_blob_files() &&
-                blob_file_number != kInvalidBlobFileNumber &&
-                !storage_info->GetBlobFileMetaData(blob_file_number)) {
+            if (blob_file_number != kInvalidBlobFileNumber &&
+                (compaction->skip_missing_blob_files() ||
+                 storage_info->IsDroppedBlobFile(blob_file_number))) {
               ++skipped_missing_blob_flows;
               continue;
             }

@@ -321,7 +321,8 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
     InternalIterator* input = iter_.get();
     if (repair_enabled_) {
       repair_iter_ = std::make_unique<MissingBlobRepairIterator>(
-          input, repair_storage_.get(), cmp_->timestamp_size());
+          input, repair_storage_.get(), cmp_->timestamp_size(),
+          repair_only_dropped_blob_files_);
       input = repair_iter_.get();
     }
     c_iter_.reset(new CompactionIterator(
@@ -336,6 +337,15 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
         std::move(compaction), /*must_count_input_entries=*/false, filter,
         &shutting_down_, /*info_log=*/nullptr, full_history_ts_low));
     c_iter_->SetMissingBlobRepairIterator(repair_iter_.get());
+  }
+
+  // Repairs only references to `dropped_files`, which are recorded as dropped
+  // in a Version that holds `healthy_files`.
+  void EnableDroppedBlobRepair(const std::vector<uint64_t>& healthy_files,
+                               std::vector<uint64_t> dropped_files) {
+    EnableMissingBlobRepair(healthy_files);
+    repair_storage_->SetDroppedBlobFiles(std::move(dropped_files));
+    repair_only_dropped_blob_files_ = true;
   }
 
   void EnableMissingBlobRepair(const std::vector<uint64_t>& healthy_files) {
@@ -415,6 +425,7 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
   const std::atomic<bool> kManualCompactionCanceledFalse_{false};
   FakeCompaction* compaction_proxy_;
   bool repair_enabled_ = false;
+  bool repair_only_dropped_blob_files_ = false;
 };
 
 TEST_P(CompactionIteratorTest, MergeBeforeFilterFullOrder) {
@@ -1088,7 +1099,8 @@ TEST_P(CompactionIteratorTest, MissingBlobRepairPreservesInputErrors) {
   std::unique_ptr<InternalIterator> failed_input(
       NewErrorInternalIterator(Status::IOError("Failed SST read")));
   MissingBlobRepairIterator failed_repair(failed_input.get(),
-                                          repair_storage_.get(), 0);
+                                          repair_storage_.get(), 0,
+                                          /*only_dropped_blob_files=*/false);
   failed_repair.SeekToFirst();
   ASSERT_FALSE(failed_repair.Valid());
   ASSERT_EQ(failed_repair.status().code(), Status::Code::kIOError);
@@ -1129,7 +1141,8 @@ TEST_P(CompactionIteratorTest, MissingBlobRepairPreservesInputErrors) {
 
   FailingNextIterator input({test::KeyStr("a", 5, kTypeBlobIndex)},
                             {BlobIndexForFile(20)}, &icmp_);
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0);
+  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0,
+                                   /*only_dropped_blob_files=*/false);
   repair.SeekToFirst();
   ASSERT_OK(repair.status());
   ASSERT_TRUE(repair.Valid());
@@ -1141,12 +1154,84 @@ TEST_P(CompactionIteratorTest, MissingBlobRepairPreservesInputErrors) {
   ASSERT_FALSE(repair.IsRepairDeletion());
 }
 
+TEST_P(CompactionIteratorTest, MissingBlobRepairOnlyDroppedBlobFiles) {
+  // Blob file 10 is in the Version, 20 is recorded as dropped and 30 is
+  // missing without a record.
+  EnableMissingBlobRepair({10});
+  repair_storage_->SetDroppedBlobFiles({20});
+  VectorIterator input(
+      {test::KeyStr("a", 5, kTypeBlobIndex),
+       test::KeyStr("b", 4, kTypeBlobIndex),
+       test::KeyStr("c", 3, kTypeBlobIndex)},
+      {BlobIndexForFile(10), BlobIndexForFile(20), BlobIndexForFile(30)},
+      &icmp_);
+  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0,
+                                   /*only_dropped_blob_files=*/true);
+  repair.SeekToFirst();
+  ASSERT_TRUE(repair.Valid());
+  ASSERT_EQ(repair.key(), test::KeyStr("a", 5, kTypeBlobIndex));
+  ASSERT_FALSE(repair.IsRepairDeletion());
+  repair.Next();
+  ASSERT_TRUE(repair.Valid());
+  ASSERT_EQ(repair.key(), test::KeyStr("b", 4, kTypeDeletion));
+  ASSERT_TRUE(repair.IsRepairDeletion());
+  repair.Next();
+  ASSERT_TRUE(repair.Valid());
+  ASSERT_EQ(repair.key(), test::KeyStr("c", 3, kTypeBlobIndex));
+  ASSERT_EQ(repair.value(), BlobIndexForFile(30));
+  ASSERT_FALSE(repair.IsRepairDeletion());
+  repair.Next();
+  ASSERT_FALSE(repair.Valid());
+  ASSERT_OK(repair.status());
+}
+
+TEST_P(CompactionIteratorTest, MissingBlobRepairOnlyDroppedWideColumns) {
+  // Blob file 20 is in the Version, 30 is recorded as dropped and 40 is
+  // missing without a record.
+  EnableDroppedBlobRepair({20}, {30});
+  BlobIndex healthy;
+  BlobIndex dropped;
+  BlobIndex unrecorded;
+  ASSERT_OK(healthy.DecodeFrom(BlobIndexForFile(20)));
+  ASSERT_OK(dropped.DecodeFrom(BlobIndexForFile(30)));
+  ASSERT_OK(unrecorded.DecodeFrom(BlobIndexForFile(40)));
+
+  // Only the column in the dropped blob file is removed.
+  std::string mixed;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      WideColumns{{"", "x"}, {"c1", ""}, {"c2", ""}, {"c3", ""}},
+      {{1, dropped}, {2, healthy}, {3, unrecorded}}, mixed));
+  std::string mixed_repaired;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      WideColumns{{"", "x"}, {"c2", ""}, {"c3", ""}},
+      {{1, healthy}, {2, unrecorded}}, mixed_repaired));
+  // An entity without dropped columns is left as is.
+  std::string healthy_only;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(WideColumns{{"c2", ""}},
+                                                 {{0, healthy}}, healthy_only));
+  // An entity that loses every column becomes a deletion.
+  std::string dropped_only;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(WideColumns{{"c1", ""}},
+                                                 {{0, dropped}}, dropped_only));
+
+  RunTest({test::KeyStr("a", 5, kTypeWideColumnEntity),
+           test::KeyStr("b", 5, kTypeWideColumnEntity),
+           test::KeyStr("c", 5, kTypeWideColumnEntity),
+           test::KeyStr("c", 3, kTypeValue)},
+          {mixed, healthy_only, dropped_only, "older"},
+          {test::KeyStr("a", 5, kTypeWideColumnEntity),
+           test::KeyStr("b", 5, kTypeWideColumnEntity),
+           test::KeyStr("c", 5, kTypeDeletion)},
+          {mixed_repaired, healthy_only, ""});
+}
+
 TEST_P(CompactionIteratorTest, MissingBlobRepairSeekAndNextUseRewrittenKeys) {
   EnableMissingBlobRepair({});
   VectorIterator input(
       {test::KeyStr("a", 5, kTypeBlobIndex), test::KeyStr("b", 4, kTypeValue)},
       {BlobIndexForFile(10), "healthy"}, &icmp_);
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0);
+  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0,
+                                   /*only_dropped_blob_files=*/false);
   const std::string deletion = test::KeyStr("a", 5, kTypeDeletion);
   repair.Seek(deletion);
   ASSERT_OK(repair.status());
@@ -1173,14 +1258,16 @@ TEST_P(CompactionIteratorTest,
   {
     std::unique_ptr<InternalIterator> input(
         NewErrorInternalIterator(Status::IOError("Failed SST read")));
-    MissingBlobRepairIterator repair(input.get(), repair_storage_.get(), 0);
+    MissingBlobRepairIterator repair(input.get(), repair_storage_.get(), 0,
+                                     /*only_dropped_blob_files=*/false);
     ASSERT_FALSE(repair.Valid());
   }
   VectorIterator input({test::KeyStr("a", 5, kTypeWideColumnEntity)},
                        {"invalid entity"});
   input.SeekToFirst();
   ASSERT_TRUE(input.Valid());
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0);
+  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0,
+                                   /*only_dropped_blob_files=*/false);
 }
 
 // It is possible that the output of the compaction iterator is empty even if
@@ -2321,7 +2408,8 @@ TEST_P(CompactionIteratorTsGcTest,
   input.SeekToFirst();
   ASSERT_TRUE(input.Valid());
   MissingBlobRepairIterator repair(&input, repair_storage_.get(),
-                                   cmp_->timestamp_size());
+                                   cmp_->timestamp_size(),
+                                   /*only_dropped_blob_files=*/false);
 }
 
 TEST_P(CompactionIteratorTsGcTest, MissingBlobRepairRespectsHistoryTrimming) {
@@ -2336,7 +2424,8 @@ TEST_P(CompactionIteratorTsGcTest, MissingBlobRepairRespectsHistoryTrimming) {
   PutFixed64(&trim_timestamp, 103);
   HistoryTrimmingIterator trimmed(&input, cmp_, trim_timestamp);
   MissingBlobRepairIterator repair(&trimmed, repair_storage_.get(),
-                                   cmp_->timestamp_size());
+                                   cmp_->timestamp_size(),
+                                   /*only_dropped_blob_files=*/false);
   repair.SeekToFirst();
   ASSERT_OK(repair.status());
   ASSERT_TRUE(repair.Valid());
