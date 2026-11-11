@@ -118,6 +118,9 @@ class OptimisticTransactionDB : public StackableDB {
           OptimisticTransactionOptions(),
       Transaction* old_txn = nullptr) = 0;
 
+  // Get the OCC Validation Policy specified for this instance.
+  virtual OccValidationPolicy GetValidatePolicy() const = 0;
+
   OptimisticTransactionDB(const OptimisticTransactionDB&) = delete;
   void operator=(const OptimisticTransactionDB&) = delete;
   OptimisticTransactionDB(OptimisticTransactionDB&&) = delete;

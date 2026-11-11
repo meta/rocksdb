@@ -56,6 +56,7 @@ set(JNI_NATIVE_SOURCES
         rocksjni/merge_operator.cc
         rocksjni/native_comparator_wrapper_test.cc
         rocksjni/optimistic_transaction_db.cc
+        rocksjni/optimistic_transaction_db_options.cc
         rocksjni/optimistic_transaction_options.cc
         rocksjni/options.cc
         rocksjni/options_util.cc
@@ -208,9 +209,11 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/MutableOptionValue.java
   src/main/java/org/rocksdb/NativeComparatorWrapper.java
   src/main/java/org/rocksdb/NativeLibraryLoader.java
+  src/main/java/org/rocksdb/OccValidationPolicy.java
   src/main/java/org/rocksdb/OperationStage.java
   src/main/java/org/rocksdb/OperationType.java
   src/main/java/org/rocksdb/OptimisticTransactionDB.java
+  src/main/java/org/rocksdb/OptimisticTransactionDBOptions.java
   src/main/java/org/rocksdb/OptimisticTransactionOptions.java
   src/main/java/org/rocksdb/OptimizeKeyCommonPrefix.java
   src/main/java/org/rocksdb/OptionString.java
@@ -371,6 +374,7 @@ set(JAVA_TEST_CLASSES
   src/test/java/org/rocksdb/MutableOptionsGetSetTest.java
   src/test/java/org/rocksdb/NativeLibraryLoaderTest.java
   src/test/java/org/rocksdb/OptimisticTransactionDBTest.java
+  src/test/java/org/rocksdb/OptimisticTransactionOptionsDBTest.java
   src/test/java/org/rocksdb/OptimisticTransactionOptionsTest.java
   src/test/java/org/rocksdb/OptimisticTransactionTest.java
   src/test/java/org/rocksdb/OptionsTest.java
@@ -490,6 +494,7 @@ set(JAVA_TEST_RUNNING_CLASSES
   org.rocksdb.NativeComparatorWrapperTest
   org.rocksdb.NativeLibraryLoaderTest
   org.rocksdb.OptimisticTransactionDBTest
+  org.rocksdb.OptimisticTransactionOptionsDBTest
   org.rocksdb.OptimisticTransactionOptionsTest
   org.rocksdb.OptimisticTransactionTest
   org.rocksdb.OptionsTest

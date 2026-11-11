@@ -6169,6 +6169,10 @@ void StressTest::Open(SharedState* shared, bool reopen) {
         } else {
           options_.two_write_queues = FLAGS_two_write_queues;
         }
+        if (FLAGS_use_optimistic_txn) {
+          assert(optimistic_txn_db_->GetValidatePolicy() ==
+                 static_cast<OccValidationPolicy>(FLAGS_occ_validation_policy));
+        }
         txn_db_options.wp_snapshot_cache_bits =
             static_cast<size_t>(FLAGS_wp_snapshot_cache_bits);
         txn_db_options.wp_commit_cache_bits =
