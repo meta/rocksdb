@@ -1963,7 +1963,8 @@ Status TargetCacheChargeTrackingCache<R>::Insert(
     CompressionType type) {
   Status s = target_->Insert(key, value, helper, charge, handle, priority,
                              compressed, type);
-  if (helper == kCrmHelper) {
+  if (helper ==
+      CacheReservationManagerImpl<R>::TEST_GetCacheItemHelperForRole()) {
     if (last_peak_tracked_) {
       cache_charge_peak_ = 0;
       cache_charge_increment_ = 0;
@@ -1983,7 +1984,8 @@ template <CacheEntryRole R>
 bool TargetCacheChargeTrackingCache<R>::Release(Handle* handle,
                                                 bool erase_if_last_ref) {
   auto helper = GetCacheItemHelper(handle);
-  if (helper == kCrmHelper) {
+  if (helper ==
+      CacheReservationManagerImpl<R>::TEST_GetCacheItemHelperForRole()) {
     if (!last_peak_tracked_) {
       cache_charge_peaks_.push_back(cache_charge_peak_);
       cache_charge_increments_sum_ += cache_charge_increment_;
@@ -1995,19 +1997,11 @@ bool TargetCacheChargeTrackingCache<R>::Release(Handle* handle,
   return is_successful;
 }
 
-template <CacheEntryRole R>
-const Cache::CacheItemHelper* TargetCacheChargeTrackingCache<R>::kCrmHelper =
-    CacheReservationManagerImpl<R>::TEST_GetCacheItemHelperForRole();
-
 template class TargetCacheChargeTrackingCache<
     CacheEntryRole::kFilterConstruction>;
 template class TargetCacheChargeTrackingCache<
     CacheEntryRole::kBlockBasedTableReader>;
 template class TargetCacheChargeTrackingCache<CacheEntryRole::kFileMetadata>;
-
-const std::vector<Temperature> kKnownTemperatures = {
-    Temperature::kHot, Temperature::kWarm, Temperature::kCool,
-    Temperature::kCold, Temperature::kIce};
 
 Temperature RandomKnownTemperature() {
   return kKnownTemperatures[Random::GetTLSInstance()->Uniform(

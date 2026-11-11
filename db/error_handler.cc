@@ -21,8 +21,9 @@ namespace ROCKSDB_NAMESPACE {
 // (i.e from all 4 fields in a tuple to only the BackgroundErrorReason and
 // paranoid_checks). The less specific map serves as a catch all in case we miss
 // a specific error code or subcode.
-std::map<std::tuple<BackgroundErrorReason, Status::Code, Status::SubCode, bool>,
-         Status::Severity>
+const std::map<
+    std::tuple<BackgroundErrorReason, Status::Code, Status::SubCode, bool>,
+    Status::Severity>
     ErrorSeverityMap = {
         // Errors during BG compaction
         {std::make_tuple(BackgroundErrorReason::kCompaction,
@@ -136,8 +137,8 @@ std::map<std::tuple<BackgroundErrorReason, Status::Code, Status::SubCode, bool>,
 
 };
 
-std::map<std::tuple<BackgroundErrorReason, Status::Code, bool>,
-         Status::Severity>
+const std::map<std::tuple<BackgroundErrorReason, Status::Code, bool>,
+               Status::Severity>
     DefaultErrorSeverityMap = {
         // Errors during BG compaction
         {std::make_tuple(BackgroundErrorReason::kCompaction,
@@ -224,7 +225,7 @@ std::map<std::tuple<BackgroundErrorReason, Status::Code, bool>,
          Status::Severity::kNoError},
 };
 
-std::map<std::tuple<BackgroundErrorReason, bool>, Status::Severity>
+const std::map<std::tuple<BackgroundErrorReason, bool>, Status::Severity>
     DefaultReasonMap = {
         // Errors during BG compaction
         {std::make_tuple(BackgroundErrorReason::kCompaction, true),

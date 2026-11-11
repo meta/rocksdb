@@ -7,6 +7,7 @@
 
 #include <map>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -31,7 +32,7 @@ enum OptionSection : char {
   kOptionSectionUnknown
 };
 
-static const std::string opt_section_titles[] = {
+inline constexpr std::string_view opt_section_titles[] = {
     "Version", "DBOptions", "CFOptions", "TableOptions/", "Unknown"};
 
 Status PersistRocksDBOptions(const WriteOptions& write_options,

@@ -33,10 +33,10 @@ T Pop(T& var) {
 }
 
 // 16 bytes for HCC compatibility
-const std::string key0 = "____    ____key0";
-const std::string key1 = "____    ____key1";
-const std::string key2 = "____    ____key2";
-const std::string key3 = "____    ____key3";
+constexpr char key0[] = "____    ____key0";
+constexpr char key1[] = "____    ____key1";
+constexpr char key2[] = "____    ____key2";
+constexpr char key3[] = "____    ____key3";
 
 class CompressedSecondaryCacheTestBase : public testing::Test,
                                          public WithCacheType {
@@ -1089,8 +1089,10 @@ class CompressedSecCacheTestWithTiered
 
   const std::string& Type() const override {
     if (std::get<0>(GetParam()) == PrimaryCacheType::kCacheTypeLRU) {
+      static const std::string lru_str(WithCacheType::kLRU);
       return lru_str;
     } else {
+      static const std::string hcc_str(WithCacheType::kFixedHyperClock);
       return hcc_str;
     }
   }
@@ -1119,13 +1121,7 @@ class CompressedSecCacheTestWithTiered
  private:
   std::shared_ptr<Cache> cache_;
   std::shared_ptr<CacheReservationManager> cache_res_mgr_;
-  static std::string lru_str;
-  static std::string hcc_str;
 };
-
-std::string CompressedSecCacheTestWithTiered::lru_str(WithCacheType::kLRU);
-std::string CompressedSecCacheTestWithTiered::hcc_str(
-    WithCacheType::kFixedHyperClock);
 
 bool CacheUsageWithinBounds(size_t val1, size_t val2, size_t error) {
   return ((val1 < (val2 + error)) && (val1 > (val2 - error)));

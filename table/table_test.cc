@@ -546,7 +546,10 @@ TEST(IndexFactoryCompatibilityTest, UnrecognizedIndexModeIsRejected) {
   }
 }
 
-const std::string kDummyValue(10000, 'o');
+const std::string& DummyValue() {
+  static const std::string kDummyValue(10000, 'o');
+  return kDummyValue;
+}
 constexpr auto kVerbose = false;
 
 // DummyPropertiesCollector used to test BlockBasedTableProperties
@@ -624,13 +627,16 @@ class ReverseKeyComparator : public Comparator {
   }
 };
 
-ReverseKeyComparator reverse_key_comparator;
+const Comparator* GetReverseKeyComparator() {
+  static const ReverseKeyComparator kReverseKeyComparator{};
+  return &kReverseKeyComparator;
+}
 
 void Increment(const Comparator* cmp, std::string* key) {
   if (cmp == BytewiseComparator()) {
     key->push_back('\0');
   } else {
-    assert(cmp == &reverse_key_comparator);
+    assert(cmp == GetReverseKeyComparator());
     std::string rev = Reverse(*key);
     rev.push_back('\0');
     *key = Reverse(rev);
@@ -1222,7 +1228,7 @@ class HarnessTest : public testing::Test {
     // Use shorter block size for tests to exercise block boundary
     // conditions more.
     if (args_.reverse_compare) {
-      options_.comparator = &reverse_key_comparator;
+      options_.comparator = GetReverseKeyComparator();
     }
 
     internal_comparator_ =
@@ -1615,12 +1621,12 @@ class BlockBasedTableTest : public BlockBasedTableTestBase,
     {
       InternalKey internal_key(auto_add_key1, 0, kTypeValue);
       std::string encoded_key = internal_key.Encode().ToString();
-      c->Add(encoded_key, kDummyValue);
+      c->Add(encoded_key, DummyValue());
     }
     {
       InternalKey internal_key(auto_add_key2, 0, kTypeValue);
       std::string encoded_key = internal_key.Encode().ToString();
-      c->Add(encoded_key, kDummyValue);
+      c->Add(encoded_key, DummyValue());
     }
   }
 
@@ -2509,7 +2515,7 @@ TEST_P(BlockBasedTableTest, IndexUncompressed) {
 #endif  // SNAPPY
 
 TEST_P(BlockBasedTableTest, BlockBasedTableProperties2) {
-  TableConstructor c(&reverse_key_comparator,
+  TableConstructor c(GetReverseKeyComparator(),
                      true /* convert_to_internal_key_ */);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
@@ -2556,7 +2562,7 @@ TEST_P(BlockBasedTableTest, BlockBasedTableProperties2) {
     Options options;
     BlockBasedTableOptions table_options = GetBlockBasedTableOptions();
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
-    options.comparator = &reverse_key_comparator;
+    options.comparator = GetReverseKeyComparator();
     options.merge_operator = MergeOperators::CreateUInt64AddOperator();
     options.prefix_extractor.reset(NewNoopTransform());
     options.table_properties_collector_factories.emplace_back(
@@ -4181,7 +4187,7 @@ TEST_P(BlockBasedTableTest, TracingGetTest) {
     ASSERT_OK(c.GetTableReader()->Get(ReadOptions(), encoded_key, &get_context,
                                       moptions.prefix_extractor.get()));
     ASSERT_EQ(get_context.State(), GetContext::kFound);
-    ASSERT_EQ(value.ToString(), kDummyValue);
+    ASSERT_EQ(value.ToString(), DummyValue());
   }
 
   // Verify traces.
@@ -4784,7 +4790,7 @@ TEST_P(BlockBasedTableTest, TracingMultiGetTest) {
   table_options.cache_index_and_filter_blocks = true;
   table_options.filter_policy.reset(NewBloomFilterPolicy(10));
   // Put auto_add_key1 and auto_add_key2 in the same data block
-  table_options.block_size = kDummyValue.size() * 2 + 100;
+  table_options.block_size = DummyValue().size() * 2 + 100;
   options.table_factory =
       std::make_shared<BlockBasedTableFactory>(table_options);
   SetupTracingTest(&c);
@@ -4845,7 +4851,7 @@ TEST_P(BlockBasedTableTest, TracingMultiGetTest) {
     for (uint32_t i = 0; i <= 1; i++) {
       ASSERT_OK(statuses[i]);
       ASSERT_EQ(get_contexts[i].State(), GetContext::kFound);
-      ASSERT_EQ(values[i].ToString(), kDummyValue);
+      ASSERT_EQ(values[i].ToString(), DummyValue());
     }
 
     // Verify traces.

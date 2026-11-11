@@ -15,11 +15,16 @@ namespace ROCKSDB_NAMESPACE {
 // `CompactForTieringCollectorFactory`.
 class CompactForTieringCollector : public TablePropertiesCollector {
  public:
-  static const std::string kNumEligibleLastLevelEntriesPropertyName;
-  static const std::string kAverageDataUnixWriteTimePropertyName;
-  static const std::string kMaxDataUnixWriteTimePropertyName;
-  static const std::string kMinDataUnixWriteTimePropertyName;
-  static const std::string kNumInfinitelyOldEntriesPropertyName;
+  static constexpr char kNumEligibleLastLevelEntriesPropertyName[] =
+      "rocksdb.eligible.last.level.entries";
+  static constexpr char kAverageDataUnixWriteTimePropertyName[] =
+      "rocksdb.data.unix.write.time.average";
+  static constexpr char kMaxDataUnixWriteTimePropertyName[] =
+      "rocksdb.data.unix.write.time.max";
+  static constexpr char kMinDataUnixWriteTimePropertyName[] =
+      "rocksdb.data.unix.write.time.min";
+  static constexpr char kNumInfinitelyOldEntriesPropertyName[] =
+      "rocksdb.num.infinitely.old.entries";
 
   CompactForTieringCollector(
       SequenceNumber last_level_inclusive_max_seqno_threshold,

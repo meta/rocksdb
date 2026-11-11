@@ -94,8 +94,8 @@ Status GetStringFromCompressionType(std::string* compression_str,
                                     CompressionType compression_type);
 
 struct OptionsHelper {
-  static const std::string kCFOptionsName /*= "ColumnFamilyOptions"*/;
-  static const std::string kDBOptionsName /*= "DBOptions" */;
+  static constexpr char kCFOptionsName[] = "ColumnFamilyOptions";
+  static constexpr char kDBOptionsName[] = "DBOptions";
   static std::map<CompactionStyle, std::string> compaction_style_to_string;
   static std::map<CompactionPri, std::string> compaction_pri_to_string;
   static std::map<CompactionStopStyle, std::string>

@@ -175,16 +175,6 @@ struct Hash64KeyGenWrapper : public KeyGen {
 
 using ROCKSDB_NAMESPACE::ribbon::ConstructionFailureChance;
 
-const std::vector<ConstructionFailureChance> kFailureOnly50Pct = {
-    ROCKSDB_NAMESPACE::ribbon::kOneIn2};
-
-const std::vector<ConstructionFailureChance> kFailureOnlyRare = {
-    ROCKSDB_NAMESPACE::ribbon::kOneIn1000};
-
-const std::vector<ConstructionFailureChance> kFailureAll = {
-    ROCKSDB_NAMESPACE::ribbon::kOneIn2, ROCKSDB_NAMESPACE::ribbon::kOneIn20,
-    ROCKSDB_NAMESPACE::ribbon::kOneIn1000};
-
 }  // namespace
 
 using ROCKSDB_NAMESPACE::ribbon::ExpectedCollisionFpRate;
@@ -212,6 +202,9 @@ struct DefaultTypesAndSettings {
   // For testing
   using KeyGen = StandardKeyGen;
   static const std::vector<ConstructionFailureChance>& FailureChanceToTest() {
+    static const std::vector<ConstructionFailureChance> kFailureAll = {
+        ROCKSDB_NAMESPACE::ribbon::kOneIn2, ROCKSDB_NAMESPACE::ribbon::kOneIn20,
+        ROCKSDB_NAMESPACE::ribbon::kOneIn1000};
     return kFailureAll;
   }
 };
@@ -239,6 +232,8 @@ struct TypesAndSettings_Coeff128_Homog : public DefaultTypesAndSettings {
   // Homogeneous only makes sense with sufficient slots for equivalent of
   // almost sure construction success
   static const std::vector<ConstructionFailureChance>& FailureChanceToTest() {
+    static const std::vector<ConstructionFailureChance> kFailureOnlyRare = {
+        ROCKSDB_NAMESPACE::ribbon::kOneIn1000};
     return kFailureOnlyRare;
   }
 };
@@ -262,6 +257,8 @@ struct TypesAndSettings_Coeff64Smash_Homog
 // (only 50% construction success)
 struct AbridgedTypesAndSettings : public DefaultTypesAndSettings {
   static const std::vector<ConstructionFailureChance>& FailureChanceToTest() {
+    static const std::vector<ConstructionFailureChance> kFailureOnly50Pct = {
+        ROCKSDB_NAMESPACE::ribbon::kOneIn2};
     return kFailureOnly50Pct;
   }
 };

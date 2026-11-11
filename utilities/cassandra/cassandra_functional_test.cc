@@ -21,8 +21,14 @@
 
 namespace ROCKSDB_NAMESPACE::cassandra {
 
+namespace {
 // Path to the database on file system
-const std::string kDbName = test::PerThreadDBPath("cassandra_functional_test");
+const std::string& DbName() {
+  static const std::string db_name =
+      test::PerThreadDBPath("cassandra_functional_test");
+  return db_name;
+}
+}  // namespace
 
 class CassandraStore {
  public:
@@ -120,7 +126,7 @@ class CassandraFunctionalTest : public testing::Test {
  public:
   CassandraFunctionalTest() {
     EXPECT_OK(
-        DestroyDB(kDbName, Options()));  // Start each test with a fresh DB
+        DestroyDB(DbName(), Options()));  // Start each test with a fresh DB
   }
 
   std::unique_ptr<DB> OpenDb() {
@@ -132,7 +138,7 @@ class CassandraFunctionalTest : public testing::Test {
         purge_ttl_on_expiration_, gc_grace_period_in_seconds_);
     options.compaction_filter_factory.reset(cf_factory);
     std::unique_ptr<DB> db;
-    EXPECT_OK(DB::Open(options, kDbName, &db));
+    EXPECT_OK(DB::Open(options, DbName(), &db));
     return db;
   }
 

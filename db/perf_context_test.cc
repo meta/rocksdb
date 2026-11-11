@@ -50,8 +50,8 @@ bool FLAGS_random_key = false;
 bool FLAGS_use_set_based_memetable = false;
 int FLAGS_total_keys = 100;
 int FLAGS_write_buffer_size = 1000000000;
-int FLAGS_max_write_buffer_number = 8;
-int FLAGS_min_write_buffer_number_to_merge = 7;
+const int FLAGS_max_write_buffer_number = 8;
+const int FLAGS_min_write_buffer_number_to_merge = 7;
 bool FLAGS_verbose = false;
 
 // Path to the database on file system

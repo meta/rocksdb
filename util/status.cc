@@ -26,7 +26,7 @@ std::unique_ptr<const char[]> Status::CopyState(const char* s) {
   return std::unique_ptr<const char[]>(rv);
 }
 
-static const char* msgs[static_cast<int>(Status::kMaxSubCode)] = {
+static const char* const msgs[static_cast<int>(Status::kMaxSubCode)] = {
     "",                                                   // kNone
     "Timeout Acquiring Mutex",                            // kMutexTimeout
     "Timeout waiting to lock key",                        // kLockTimeout

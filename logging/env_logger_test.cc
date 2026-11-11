@@ -46,13 +46,12 @@ class EnvLoggerTest : public testing::Test {
 
   void DeleteLogFile() { ASSERT_OK(env_->DeleteFile(kLogFile)); }
 
-  static const std::string kSampleMessage;
+  static constexpr char kSampleMessage[] =
+      "this is the message to be written to the log file!!";
   static const std::string kTestDir;
   static const std::string kLogFile;
 };
 
-const std::string EnvLoggerTest::kSampleMessage =
-    "this is the message to be written to the log file!!";
 const std::string EnvLoggerTest::kLogFile = test::PerThreadDBPath("log_file");
 
 TEST_F(EnvLoggerTest, EmptyLogFile) {

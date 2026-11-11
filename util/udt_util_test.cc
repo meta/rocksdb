@@ -14,8 +14,8 @@
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
-static const std::string kTestKeyWithoutTs = "key";
-static const std::string kValuePlaceHolder = "value";
+static constexpr char kTestKeyWithoutTs[] = "key";
+static constexpr char kValuePlaceHolder[] = "value";
 static const uint64_t kWriteUnixTime = 100;
 }  // namespace
 

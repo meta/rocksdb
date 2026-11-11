@@ -113,7 +113,7 @@ class DeleteScheduler {
     max_trash_db_ratio_.store(r);
   }
 
-  static const std::string kTrashExtension;
+  static constexpr char kTrashExtension[] = ".trash";
   static bool IsTrashFile(const std::string& file_path);
 
   // Check if there are any .trash files in path, and schedule their deletion

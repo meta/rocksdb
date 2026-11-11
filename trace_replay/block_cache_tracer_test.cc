@@ -17,11 +17,11 @@ namespace ROCKSDB_NAMESPACE {
 
 namespace {
 const uint64_t kBlockSize = 1024;
-const std::string kBlockKeyPrefix = "test-block-";
+constexpr char kBlockKeyPrefix[] = "test-block-";
 const uint32_t kCFId = 0;
 const uint32_t kLevel = 1;
 const uint64_t kSSTFDNumber = 100;
-const std::string kRefKeyPrefix = "test-get-";
+constexpr char kRefKeyPrefix[] = "test-get-";
 const uint64_t kNumKeysInBlock = 1024;
 const uint64_t kReferencedDataSize = 10;
 }  // namespace

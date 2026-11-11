@@ -26,7 +26,7 @@
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
-static std::unordered_map<std::string, WALRecoveryMode>
+static const std::unordered_map<std::string, WALRecoveryMode>
     wal_recovery_mode_string_map = {
         {"kTolerateCorruptedTailRecords",
          WALRecoveryMode::kTolerateCorruptedTailRecords},
@@ -35,18 +35,18 @@ static std::unordered_map<std::string, WALRecoveryMode>
         {"kSkipAnyCorruptedRecords",
          WALRecoveryMode::kSkipAnyCorruptedRecords}};
 
-static std::unordered_map<std::string, CacheTier> cache_tier_string_map = {
-    {"kVolatileTier", CacheTier::kVolatileTier},
-    {"kVolatileCompressedTier", CacheTier::kVolatileCompressedTier},
-    {"kNonVolatileBlockTier", CacheTier::kNonVolatileBlockTier}};
+static const std::unordered_map<std::string, CacheTier> cache_tier_string_map =
+    {{"kVolatileTier", CacheTier::kVolatileTier},
+     {"kVolatileCompressedTier", CacheTier::kVolatileCompressedTier},
+     {"kNonVolatileBlockTier", CacheTier::kNonVolatileBlockTier}};
 
-static std::unordered_map<std::string, InfoLogLevel> info_log_level_string_map =
-    {{"DEBUG_LEVEL", InfoLogLevel::DEBUG_LEVEL},
-     {"INFO_LEVEL", InfoLogLevel::INFO_LEVEL},
-     {"WARN_LEVEL", InfoLogLevel::WARN_LEVEL},
-     {"ERROR_LEVEL", InfoLogLevel::ERROR_LEVEL},
-     {"FATAL_LEVEL", InfoLogLevel::FATAL_LEVEL},
-     {"HEADER_LEVEL", InfoLogLevel::HEADER_LEVEL}};
+static const std::unordered_map<std::string, InfoLogLevel>
+    info_log_level_string_map = {{"DEBUG_LEVEL", InfoLogLevel::DEBUG_LEVEL},
+                                 {"INFO_LEVEL", InfoLogLevel::INFO_LEVEL},
+                                 {"WARN_LEVEL", InfoLogLevel::WARN_LEVEL},
+                                 {"ERROR_LEVEL", InfoLogLevel::ERROR_LEVEL},
+                                 {"FATAL_LEVEL", InfoLogLevel::FATAL_LEVEL},
+                                 {"HEADER_LEVEL", InfoLogLevel::HEADER_LEVEL}};
 
 static std::unordered_map<std::string, OptionTypeInfo>
     db_mutable_options_type_info = {
@@ -672,8 +672,6 @@ static std::unordered_map<std::string, OptionTypeInfo>
           OptionType::kTemperature, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
 };
-
-const std::string OptionsHelper::kDBOptionsName = "DBOptions";
 
 class MutableDBConfigurable : public Configurable {
  public:

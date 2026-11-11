@@ -13,8 +13,10 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-extern const std::string kFormatVersionKeyString;
-extern const std::string kCompatibleVersionKeyString;
+inline constexpr char kFormatVersionKeyString[] =
+    "__persistent_stats_format_version__";
+inline constexpr char kCompatibleVersionKeyString[] =
+    "__persistent_stats_compatible_version__";
 extern const uint64_t kStatsCFCurrentFormatVersion;
 extern const uint64_t kStatsCFCompatibleFormatVersion;
 

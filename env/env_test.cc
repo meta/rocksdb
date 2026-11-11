@@ -1201,7 +1201,6 @@ bool IsUniqueIDValid(const std::string& s) {
 }
 
 const size_t MAX_ID_SIZE = 100;
-char temp_id[MAX_ID_SIZE];
 
 }  // namespace
 
@@ -1375,6 +1374,7 @@ TEST_P(EnvPosixTestWithParam, RandomAccessUniqueID) {
     ASSERT_OK(env_->NewWritableFile(fname, &wfile, soptions));
 
     std::unique_ptr<RandomAccessFile> file;
+    char temp_id[MAX_ID_SIZE];
 
     // Get Unique ID
     ASSERT_OK(env_->NewRandomAccessFile(fname, &file, soptions));
@@ -1574,6 +1574,7 @@ TEST_P(EnvPosixTestWithParam, RandomAccessUniqueIDConcurrent) {
     for (const std::string& fname : fnames) {
       std::unique_ptr<RandomAccessFile> file;
       std::string unique_id;
+      char temp_id[MAX_ID_SIZE];
       ASSERT_OK(env_->NewRandomAccessFile(fname, &file, soptions));
       size_t id_size = file->GetUniqueId(temp_id, MAX_ID_SIZE);
       ASSERT_TRUE(id_size > 0);
@@ -1622,6 +1623,7 @@ TEST_P(EnvPosixTestWithParam, DISABLED_RandomAccessUniqueIDDeletes) {
       std::string unique_id;
       {
         std::unique_ptr<RandomAccessFile> file;
+        char temp_id[MAX_ID_SIZE];
         ASSERT_OK(env_->NewRandomAccessFile(fname, &file, soptions));
         size_t id_size = file->GetUniqueId(temp_id, MAX_ID_SIZE);
         ASSERT_TRUE(id_size > 0);

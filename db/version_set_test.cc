@@ -1164,9 +1164,9 @@ TEST_F(FindLevelFileTest, LevelOverlappingFiles) {
 
 class VersionSetTestBase {
  public:
-  const static std::string kColumnFamilyName1;
-  const static std::string kColumnFamilyName2;
-  const static std::string kColumnFamilyName3;
+  static constexpr char kColumnFamilyName1[] = "alice";
+  static constexpr char kColumnFamilyName2[] = "bob";
+  static constexpr char kColumnFamilyName3[] = "charles";
   const static int kNumColumnFamilies = 4;
   int num_initial_edits_;
 
@@ -1508,10 +1508,6 @@ class VersionSetTestBase {
   std::shared_ptr<TableFactory> table_factory_;
   std::vector<ColumnFamilyDescriptor> column_families_;
 };
-
-const std::string VersionSetTestBase::kColumnFamilyName1 = "alice";
-const std::string VersionSetTestBase::kColumnFamilyName2 = "bob";
-const std::string VersionSetTestBase::kColumnFamilyName3 = "charles";
 
 class VersionSetTest : public VersionSetTestBase, public testing::Test {
  public:
@@ -3019,7 +3015,7 @@ TEST_F(VersionStorageInfoTest, AddRangeDeletionCompensatedFileSize) {
 
 class VersionSetWithTimestampTest : public VersionSetTest {
  public:
-  static const std::string kNewCfName;
+  static constexpr char kNewCfName[] = "new_cf";
 
   explicit VersionSetWithTimestampTest() : VersionSetTest() {}
 
@@ -3093,8 +3089,6 @@ class VersionSetWithTimestampTest : public VersionSetTest {
  private:
   const ReadOptions read_options_;
 };
-
-const std::string VersionSetWithTimestampTest::kNewCfName("new_cf");
 
 TEST_F(VersionSetWithTimestampTest, SetFullHistoryTsLbOnce) {
   constexpr uint64_t kTsLow = 100;
@@ -4163,7 +4157,7 @@ class VersionSetTestEmptyDb
       public testing::TestWithParam<
           std::tuple<bool, bool, std::vector<std::string>>> {
  public:
-  static const std::string kUnknownColumnFamilyName;
+  static constexpr char kUnknownColumnFamilyName[] = "unknown";
   VersionSetTestEmptyDb() : VersionSetTestBase("version_set_test_empty_db") {}
 
  protected:
@@ -4201,8 +4195,6 @@ class VersionSetTestEmptyDb
 
   std::unique_ptr<log::Writer> log_writer_;
 };
-
-const std::string VersionSetTestEmptyDb::kUnknownColumnFamilyName = "unknown";
 
 TEST_P(VersionSetTestEmptyDb, OpenFromIncompleteManifest0) {
   imm_db_options_.write_dbid_to_manifest = std::get<0>(GetParam());

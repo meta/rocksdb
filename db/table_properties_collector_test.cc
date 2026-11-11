@@ -39,7 +39,6 @@ class TablePropertiesTest : public testing::Test,
 // Utilities test functions
 namespace {
 static const uint32_t kTestColumnFamilyId = 66;
-static const std::string kTestColumnFamilyName = "test_column_fam";
 static const int kTestLevel = 1;
 
 void MakeBuilder(
@@ -49,6 +48,7 @@ void MakeBuilder(
     const InternalTblPropCollFactories* internal_tbl_prop_coll_factories,
     std::unique_ptr<WritableFileWriter>* writable,
     std::unique_ptr<TableBuilder>* builder) {
+  static const std::string kTestColumnFamilyName = "test_column_fam";
   std::unique_ptr<FSWritableFile> wf(new test::StringSink);
   writable->reset(
       new WritableFileWriter(std::move(wf), "" /* don't care */, EnvOptions()));

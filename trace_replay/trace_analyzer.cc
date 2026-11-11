@@ -27,28 +27,6 @@ const size_t kShadowValueSize = 10;
 
 namespace {
 
-const std::map<std::string, int> taOptToIndex = {
-    {"get", kGet},
-    {"put", kPut},
-    {"delete", kDelete},
-    {"single_delete", kSingleDelete},
-    {"range_delete", kRangeDelete},
-    {"merge", kMerge},
-    {"iterator_Seek", kIteratorSeek},
-    {"iterator_SeekForPrev", kIteratorSeekForPrev},
-    {"multiget", kMultiGet}};
-
-const std::map<int, std::string> taIndexToOpt = {
-    {kGet, "get"},
-    {kPut, "put"},
-    {kDelete, "delete"},
-    {kSingleDelete, "single_delete"},
-    {kRangeDelete, "range_delete"},
-    {kMerge, "merge"},
-    {kIteratorSeek, "iterator_Seek"},
-    {kIteratorSeekForPrev, "iterator_SeekForPrev"},
-    {kMultiGet, "multiget"}};
-
 uint64_t MultiplyCheckOverflow(uint64_t op1, uint64_t op2) {
   if (op1 == 0 || op2 == 0) {
     return 0;
@@ -78,6 +56,16 @@ AnalyzerOptions::AnalyzerOptions()
     : correlation_map(kTaTypeNum, std::vector<int>(kTaTypeNum, -1)) {}
 
 Status AnalyzerOptions::SparseCorrelationInput(const std::string& in_str) {
+  static const std::map<std::string, int> taOptToIndex = {
+      {"get", kGet},
+      {"put", kPut},
+      {"delete", kDelete},
+      {"single_delete", kSingleDelete},
+      {"range_delete", kRangeDelete},
+      {"merge", kMerge},
+      {"iterator_Seek", kIteratorSeek},
+      {"iterator_SeekForPrev", kIteratorSeekForPrev},
+      {"multiget", kMultiGet}};
   const Status invalid =
       Status::InvalidArgument("Invalid correlation input: " + in_str);
   std::string cur = in_str;
@@ -1775,6 +1763,16 @@ void TraceAnalyzer::PrintStatistics() {
 
       // print the operation correlations
       if (!options_.print_correlation.empty()) {
+        static const std::map<int, std::string> taIndexToOpt = {
+            {kGet, "get"},
+            {kPut, "put"},
+            {kDelete, "delete"},
+            {kSingleDelete, "single_delete"},
+            {kRangeDelete, "range_delete"},
+            {kMerge, "merge"},
+            {kIteratorSeek, "iterator_Seek"},
+            {kIteratorSeekForPrev, "iterator_SeekForPrev"},
+            {kMultiGet, "multiget"}};
         for (int correlation = 0;
              correlation <
              static_cast<int>(analyzer_opts_.correlation_list.size());

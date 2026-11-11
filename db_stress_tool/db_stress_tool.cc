@@ -36,7 +36,6 @@
 namespace ROCKSDB_NAMESPACE {
 namespace {
 static std::shared_ptr<ROCKSDB_NAMESPACE::Env> env_guard;
-static std::shared_ptr<ROCKSDB_NAMESPACE::Env> legacy_env_wrapper_guard;
 // Raw pointers for signal-safe crash callback. Signal handlers can only
 // access file-static/global variables; can't capture StressTest instances.
 static std::vector<ROCKSDB_NAMESPACE::FaultInjectionTestFS*>

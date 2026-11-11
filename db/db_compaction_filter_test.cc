@@ -22,7 +22,7 @@ static int cfilter_skips = 0;
 
 // This is a static filter used for filtering
 // kvs during the compaction process.
-static std::string NEW_VALUE = "NewValue";
+static constexpr char NEW_VALUE[] = "NewValue";
 
 class DBTestCompactionFilter : public DBTestBase {
  public:

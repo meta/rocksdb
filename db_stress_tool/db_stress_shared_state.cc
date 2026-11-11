@@ -31,8 +31,6 @@ constexpr size_t kOperationBreadcrumbHeaderBytes =
     kOperationBreadcrumbRecordBytes;
 constexpr size_t kOperationBreadcrumbRecordsPerInitializationWrite = 128;
 
-std::atomic<uint64_t> next_operation_breadcrumb_file_id{0};
-
 std::string SanitizePathComponent(const std::string& value) {
   std::string result;
   result.reserve(value.size());
@@ -273,6 +271,7 @@ bool ThreadState::InitializeOperationBreadcrumbs() {
     }
   }
 
+  static std::atomic<uint64_t> next_operation_breadcrumb_file_id{0};
   operation_breadcrumb_file_id =
       next_operation_breadcrumb_file_id.fetch_add(1, std::memory_order_relaxed);
   const std::string path =

@@ -1731,7 +1731,7 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
                          kPartitionedFilterBlockPrefix),
           std::make_pair(Rep::FilterType::kNoFilter,
                          kObsoleteFilterBlockPrefix)}) {
-      std::string filter_block_key = prefix + name;
+      std::string filter_block_key = std::string(prefix) + name;
       if (FindMetaBlock(meta_iter, filter_block_key, &rep_->filter_handle)
               .ok()) {
         rep_->filter_type = filter_type;

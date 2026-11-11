@@ -87,8 +87,8 @@ static Status NoopCreate(const Slice& /*data*/, CompressionType /*type*/,
   return Status::NotSupported();
 }
 
-static Cache::CacheItemHelper kBasicCacheItemHelper(CacheEntryRole::kMisc,
-                                                    &NoopDelete);
+static const Cache::CacheItemHelper kBasicCacheItemHelper(CacheEntryRole::kMisc,
+                                                          &NoopDelete);
 }  // namespace
 
 const Cache::CacheItemHelper kSliceCacheItemHelper{

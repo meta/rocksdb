@@ -5815,8 +5815,8 @@ void CompactionProgressDumpCommand::DoCommand() {
 
 namespace {
 
-const std::string kInputFile = "input.bin";
-const std::string kResultFile = "result.bin";
+constexpr char kInputFile[] = "input.bin";
+constexpr char kResultFile[] = "result.bin";
 constexpr int kPollIntervalMs = 100;
 constexpr int kPollTimeoutMs = 120000;
 constexpr int kPollMaxAttempts = kPollTimeoutMs / kPollIntervalMs;

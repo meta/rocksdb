@@ -18,21 +18,6 @@
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
-const std::string
-    CompactForTieringCollector::kNumEligibleLastLevelEntriesPropertyName =
-        "rocksdb.eligible.last.level.entries";
-const std::string
-    CompactForTieringCollector::kAverageDataUnixWriteTimePropertyName =
-        "rocksdb.data.unix.write.time.average";
-const std::string
-    CompactForTieringCollector::kMaxDataUnixWriteTimePropertyName =
-        "rocksdb.data.unix.write.time.max";
-const std::string
-    CompactForTieringCollector::kMinDataUnixWriteTimePropertyName =
-        "rocksdb.data.unix.write.time.min";
-const std::string
-    CompactForTieringCollector::kNumInfinitelyOldEntriesPropertyName =
-        "rocksdb.num.infinitely.old.entries";
 
 CompactForTieringCollector::CompactForTieringCollector(
     SequenceNumber last_level_inclusive_max_seqno_threshold,

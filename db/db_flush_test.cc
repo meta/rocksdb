@@ -33,7 +33,7 @@ namespace ROCKSDB_NAMESPACE {
 
 // This is a static filter used for filtering
 // kvs during the compaction process.
-static std::string NEW_VALUE = "NewValue";
+static constexpr char NEW_VALUE[] = "NewValue";
 
 class DBFlushTest : public DBTestBase {
  public:

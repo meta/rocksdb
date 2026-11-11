@@ -205,6 +205,4 @@ Slice PlainTableIndexBuilder::FillIndexes(
   return Slice(allocated, GetTotalSize());
 }
 
-const std::string PlainTableIndexBuilder::kPlainTableIndexBlock =
-    "PlainTableIndexBlock";
 }  // namespace ROCKSDB_NAMESPACE

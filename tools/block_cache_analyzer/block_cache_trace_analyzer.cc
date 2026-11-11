@@ -154,44 +154,41 @@ DEFINE_string(human_readable_trace_file_path, "",
 namespace ROCKSDB_NAMESPACE {
 namespace {
 
-const std::string kMissRatioCurveFileName = "mrc";
-const std::string kGroupbyBlock = "block";
-const std::string kGroupbyTable = "table";
-const std::string kGroupbyColumnFamily = "cf";
-const std::string kGroupbySSTFile = "sst";
-const std::string kGroupbyBlockType = "bt";
-const std::string kGroupbyCaller = "caller";
-const std::string kGroupbyLevel = "level";
-const std::string kGroupbyAll = "all";
-const std::set<std::string> kGroupbyLabels{
-    kGroupbyBlock,     kGroupbyColumnFamily, kGroupbySSTFile, kGroupbyLevel,
-    kGroupbyBlockType, kGroupbyCaller,       kGroupbyAll};
-const std::string kSupportedCacheNames =
+constexpr char kMissRatioCurveFileName[] = "mrc";
+constexpr char kGroupbyBlock[] = "block";
+constexpr char kGroupbyTable[] = "table";
+constexpr char kGroupbyColumnFamily[] = "cf";
+constexpr char kGroupbySSTFile[] = "sst";
+constexpr char kGroupbyBlockType[] = "bt";
+constexpr char kGroupbyCaller[] = "caller";
+constexpr char kGroupbyLevel[] = "level";
+constexpr char kGroupbyAll[] = "all";
+constexpr char kSupportedCacheNames[] =
     " lru ghost_lru lru_priority ghost_lru_priority lru_hybrid "
     "ghost_lru_hybrid lru_hybrid_no_insert_on_row_miss "
     "ghost_lru_hybrid_no_insert_on_row_miss ";
 
 // The suffix for the generated csv files.
-const std::string kFileNameSuffixMissRatioTimeline = "miss_ratio_timeline";
-const std::string kFileNameSuffixMissTimeline = "miss_timeline";
-const std::string kFileNameSuffixSkew = "skewness";
-const std::string kFileNameSuffixAccessTimeline = "access_timeline";
-const std::string kFileNameSuffixCorrelation = "correlation_input";
-const std::string kFileNameSuffixAvgReuseIntervalNaccesses =
+constexpr char kFileNameSuffixMissRatioTimeline[] = "miss_ratio_timeline";
+constexpr char kFileNameSuffixMissTimeline[] = "miss_timeline";
+constexpr char kFileNameSuffixSkew[] = "skewness";
+constexpr char kFileNameSuffixAccessTimeline[] = "access_timeline";
+constexpr char kFileNameSuffixCorrelation[] = "correlation_input";
+constexpr char kFileNameSuffixAvgReuseIntervalNaccesses[] =
     "avg_reuse_interval_naccesses";
-const std::string kFileNameSuffixAvgReuseInterval = "avg_reuse_interval";
-const std::string kFileNameSuffixReuseInterval = "access_reuse_interval";
-const std::string kFileNameSuffixReuseLifetime = "reuse_lifetime";
-const std::string kFileNameSuffixAccessReuseBlocksTimeline =
+constexpr char kFileNameSuffixAvgReuseInterval[] = "avg_reuse_interval";
+constexpr char kFileNameSuffixReuseInterval[] = "access_reuse_interval";
+constexpr char kFileNameSuffixReuseLifetime[] = "reuse_lifetime";
+constexpr char kFileNameSuffixAccessReuseBlocksTimeline[] =
     "reuse_blocks_timeline";
-const std::string kFileNameSuffixPercentOfAccessSummary =
+constexpr char kFileNameSuffixPercentOfAccessSummary[] =
     "percentage_of_accesses_summary";
-const std::string kFileNameSuffixPercentRefKeys = "percent_ref_keys";
-const std::string kFileNameSuffixPercentDataSizeOnRefKeys =
+constexpr char kFileNameSuffixPercentRefKeys[] = "percent_ref_keys";
+constexpr char kFileNameSuffixPercentDataSizeOnRefKeys[] =
     "percent_data_size_on_ref_keys";
-const std::string kFileNameSuffixPercentAccessesOnRefKeys =
+constexpr char kFileNameSuffixPercentAccessesOnRefKeys[] =
     "percent_accesses_on_ref_keys";
-const std::string kFileNameSuffixAccessCountSummary = "access_count_summary";
+constexpr char kFileNameSuffixAccessCountSummary[] = "access_count_summary";
 
 std::string block_type_to_string(TraceType type) {
   switch (type) {
@@ -731,6 +728,9 @@ void BlockCacheTraceAnalyzer::WriteCorrelationFeaturesForGet(
 
 std::set<std::string> BlockCacheTraceAnalyzer::ParseLabelStr(
     const std::string& label_str) const {
+  static const std::set<std::string> kGroupbyLabels{
+      kGroupbyBlock,     kGroupbyColumnFamily, kGroupbySSTFile, kGroupbyLevel,
+      kGroupbyBlockType, kGroupbyCaller,       kGroupbyAll};
   std::stringstream ss(label_str);
   std::set<std::string> labels;
   // label_str is in the form of "label1_label2_label3", e.g., cf_bt.
@@ -2113,10 +2113,10 @@ std::vector<CacheConfiguration> parse_cache_config_file(
               line.c_str());
       exit(1);
     }
-    if (kSupportedCacheNames.find(" " + config_strs[0] + " ") ==
+    if (std::string(kSupportedCacheNames).find(" " + config_strs[0] + " ") ==
         std::string::npos) {
       fprintf(stderr, "Invalid cache name %s. Supported cache names are %s\n",
-              line.c_str(), kSupportedCacheNames.c_str());
+              line.c_str(), kSupportedCacheNames);
       exit(1);
     }
     cache_config.cache_name = config_strs[0];

@@ -12,9 +12,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-extern std::array<std::string, kNumCacheEntryRoles>
+extern const std::array<std::string, kNumCacheEntryRoles>
     kCacheEntryRoleToCamelString;
-extern std::array<std::string, kNumCacheEntryRoles>
+extern const std::array<std::string, kNumCacheEntryRoles>
     kCacheEntryRoleToHyphenString;
 
 }  // namespace ROCKSDB_NAMESPACE

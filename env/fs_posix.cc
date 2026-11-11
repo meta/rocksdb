@@ -1485,7 +1485,7 @@ std::shared_ptr<FileSystem> FileSystem::Default() {
   return instance;
 }
 
-static FactoryFunc<FileSystem> posix_filesystem_reg =
+static const FactoryFunc<FileSystem> posix_filesystem_reg =
     ObjectLibrary::Default()->AddFactory<FileSystem>(
         ObjectLibrary::PatternEntry("posix").AddSeparator("://", false),
         [](const std::string& /* uri */, std::unique_ptr<FileSystem>* f,

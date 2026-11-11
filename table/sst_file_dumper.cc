@@ -73,7 +73,7 @@ SstFileDumper::SstFileDumper(const Options& options,
   init_result_ = GetTableReader(file_name_);
 }
 
-const char* testFileName = "test_file_name";
+constexpr char testFileName[] = "test_file_name";
 
 Status SstFileDumper::GetTableReader(const std::string& file_path) {
   // Warning about 'magic_number' being uninitialized shows up only in UBsan

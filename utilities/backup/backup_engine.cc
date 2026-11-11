@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cstdlib>
@@ -72,14 +73,13 @@ inline std::string ChecksumStrToHex(const std::string& checksum_str) {
   return Slice(checksum_str).ToString(true);
 }
 
-const std::string kPrivateDirName = "private";
-const std::string kMetaDirName = "meta";
-const std::string kSharedDirName = "shared";
-const std::string kSharedChecksumDirName = "shared_checksum";
-const std::string kPrivateDirSlash = kPrivateDirName + "/";
-const std::string kMetaDirSlash = kMetaDirName + "/";
-const std::string kSharedDirSlash = kSharedDirName + "/";
-const std::string kSharedChecksumDirSlash = kSharedChecksumDirName + "/";
+constexpr char kPrivateDirName[] = "private";
+constexpr char kMetaDirName[] = "meta";
+constexpr char kSharedChecksumDirName[] = "shared_checksum";
+constexpr char kPrivateDirSlash[] = "private/";
+constexpr char kMetaDirSlash[] = "meta/";
+constexpr char kSharedDirSlash[] = "shared/";
+constexpr char kSharedChecksumDirSlash[] = "shared_checksum/";
 
 }  // namespace
 
@@ -460,7 +460,7 @@ class BackupEngineImpl {
         auto i = dst_dir.rfind(kMetaDirSlash);
         assert(i != std::string::npos);
         std::string src_base_dir = dst_dir.substr(0, i);
-        dst_dir.replace(i, kMetaDirSlash.size(), kPrivateDirSlash);
+        dst_dir.replace(i, sizeof(kMetaDirSlash) - 1, kPrivateDirSlash);
         // Make the RemapSharedFileSystem
         std::shared_ptr<FileSystem> remap_fs =
             std::make_shared<RemapSharedFileSystem>(fs_, dst_dir, src_base_dir,
@@ -2911,16 +2911,16 @@ IOStatus BackupEngineImpl::BackupMeta::Delete(bool delete_meta) {
 }
 
 // Constants for backup meta file schema (see LoadFromFile)
-const std::string kSchemaVersionPrefix{"schema_version "};
-const std::string kFooterMarker{"// FOOTER"};
+constexpr char kSchemaVersionPrefix[] = "schema_version ";
+constexpr char kFooterMarker[] = "// FOOTER";
 
-const std::string kAppMetaDataFieldName{"metadata"};
+constexpr char kAppMetaDataFieldName[] = "metadata";
 
 // WART: The checksums are crc32c but named "crc32"
-const std::string kFileCrc32cFieldName{"crc32"};
-const std::string kFileSizeFieldName{"size"};
-const std::string kTemperatureFieldName{"temp"};
-const std::string kExcludedFieldName{"ni::excluded"};
+constexpr char kFileCrc32cFieldName[] = "crc32";
+constexpr char kFileSizeFieldName[] = "size";
+constexpr char kTemperatureFieldName[] = "temp";
+constexpr char kExcludedFieldName[] = "ni::excluded";
 
 // Marks a (future) field that should cause failure if not recognized.
 // Other fields are assumed to be ignorable. For example, in the future
@@ -2928,7 +2928,7 @@ const std::string kExcludedFieldName{"ni::excluded"};
 //  ni::file_name_escape uri_percent
 // to indicate all file names have had spaces and special characters
 // escaped using a URI percent encoding.
-const std::string kNonIgnorableFieldPrefix{"ni::"};
+constexpr char kNonIgnorableFieldPrefix[] = "ni::";
 
 // Each backup meta file is of the format (schema version 1):
 //----------------------------------------------------------
@@ -3006,7 +3006,7 @@ IOStatus BackupEngineImpl::BackupMeta::LoadFromFile(
   if (backup_meta_reader->ReadLine(&line,
                                    Env::IO_LOW /* rate_limiter_priority */)) {
     if (StartsWith(line, kSchemaVersionPrefix)) {
-      std::string ver = line.substr(kSchemaVersionPrefix.size());
+      std::string ver = line.substr(sizeof(kSchemaVersionPrefix) - 1);
       if (ver == "2" || StartsWith(ver, "2.")) {
         schema_major_version = 2;
       } else {
@@ -3055,7 +3055,8 @@ IOStatus BackupEngineImpl::BackupMeta::LoadFromFile(
       }
     } else if (schema_major_version < 2) {
       return IOStatus::Corruption("Expected number of files or \"" +
-                                  kAppMetaDataFieldName + "\" field");
+                                  std::string(kAppMetaDataFieldName) +
+                                  "\" field");
     } else if (StartsWith(field_name, kNonIgnorableFieldPrefix)) {
       return IOStatus::NotSupported("Unrecognized non-ignorable meta field " +
                                     field_name + " (from future version?)");
@@ -3229,7 +3230,7 @@ IOStatus BackupEngineImpl::BackupMeta::LoadFromFile(
   return IOStatus::OK();
 }
 
-const std::vector<std::string> minor_version_strings{
+constexpr std::array<const char*, 3> minor_version_strings{
     "",  // invalid major version 0
     "",  // implicit major version 1
     "2.1",

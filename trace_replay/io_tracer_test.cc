@@ -16,7 +16,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
-const std::string kDummyFile = "/dummy/file";
+constexpr char kDummyFile[] = "/dummy/file";
 
 }  // namespace
 

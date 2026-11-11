@@ -142,7 +142,7 @@ class VanishingCurrentFileFS : public FileSystemWrapper {
 
  private:
   static bool IsCurrentFileName(const std::string& fname) {
-    const std::string suffix = "/" + kCurrentFileName;
+    const std::string suffix = std::string("/") + kCurrentFileName;
     return fname.size() > suffix.size() &&
            fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) ==
                0;

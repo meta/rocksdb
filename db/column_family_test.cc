@@ -1325,11 +1325,10 @@ class TestComparator : public Comparator {
   void FindShortSuccessor(std::string* /*key*/) const override {}
 };
 
-static TestComparator third_comparator;
-static TestComparator fourth_comparator;
-
 // Test that we can retrieve the comparator from a created CF
 TEST_P(ColumnFamilyTest, GetComparator) {
+  static const TestComparator third_comparator{};
+  static const TestComparator fourth_comparator{};
   Open();
   // Add a column family with no comparator specified
   CreateColumnFamilies({"first"});

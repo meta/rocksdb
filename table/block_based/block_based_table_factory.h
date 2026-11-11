@@ -116,6 +116,6 @@ class BlockBasedTableFactory : public TableFactory {
 
 extern const std::string kHashIndexPrefixesBlock;
 extern const std::string kHashIndexPrefixesMetadataBlock;
-extern const std::string kPropTrue;
-extern const std::string kPropFalse;
+inline constexpr char kPropTrue[] = "1";
+inline constexpr char kPropFalse[] = "0";
 }  // namespace ROCKSDB_NAMESPACE

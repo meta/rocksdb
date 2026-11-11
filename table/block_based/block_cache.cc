@@ -82,48 +82,46 @@ void BlockCreateContext::Create(std::unique_ptr<DecompressorDict>* parsed_out,
       block.data, std::move(block.allocation), *decompressor));
 }
 
-namespace {
-// For getting SecondaryCache-compatible helpers from a BlockType. This is
-// useful for accessing block cache in untyped contexts, such as for generic
-// cache warming in table builder.
-const std::array<const Cache::CacheItemHelper*,
-                 static_cast<unsigned>(BlockType::kInvalid) + 1>
-    kCacheItemFullHelperForBlockType{{
-        BlockCacheInterface<Block_kData>::GetFullHelper(),
-        BlockCacheInterface<ParsedFullFilterBlock>::GetFullHelper(),
-        BlockCacheInterface<Block_kFilterPartitionIndex>::GetFullHelper(),
-        nullptr,  // kProperties
-        BlockCacheInterface<DecompressorDict>::GetFullHelper(),
-        BlockCacheInterface<Block_kRangeDeletion>::GetFullHelper(),
-        nullptr,  // kHashIndexPrefixes
-        nullptr,  // kHashIndexMetadata
-        nullptr,  // kMetaIndex (not yet stored in block cache)
-        BlockCacheInterface<Block_kIndex>::GetFullHelper(),
-        BlockCacheInterface<Block_kUserDefinedIndex>::GetFullHelper(),
-        nullptr,  // kInvalid
-    }};
-
-// For getting basic helpers from a BlockType (no SecondaryCache support)
-const std::array<const Cache::CacheItemHelper*,
-                 static_cast<unsigned>(BlockType::kInvalid) + 1>
-    kCacheItemBasicHelperForBlockType{{
-        BlockCacheInterface<Block_kData>::GetBasicHelper(),
-        BlockCacheInterface<ParsedFullFilterBlock>::GetBasicHelper(),
-        BlockCacheInterface<Block_kFilterPartitionIndex>::GetBasicHelper(),
-        nullptr,  // kProperties
-        BlockCacheInterface<DecompressorDict>::GetBasicHelper(),
-        BlockCacheInterface<Block_kRangeDeletion>::GetBasicHelper(),
-        nullptr,  // kHashIndexPrefixes
-        nullptr,  // kHashIndexMetadata
-        nullptr,  // kMetaIndex (not yet stored in block cache)
-        BlockCacheInterface<Block_kIndex>::GetBasicHelper(),
-        BlockCacheInterface<Block_kUserDefinedIndex>::GetBasicHelper(),
-        nullptr,  // kInvalid
-    }};
-}  // namespace
-
 const Cache::CacheItemHelper* GetCacheItemHelper(
     BlockType block_type, CacheTier lowest_used_cache_tier) {
+  // For getting SecondaryCache-compatible helpers from a BlockType. This is
+  // useful for accessing block cache in untyped contexts, such as for generic
+  // cache warming in table builder.
+  static const std::array<const Cache::CacheItemHelper*,
+                          static_cast<unsigned>(BlockType::kInvalid) + 1>
+      kCacheItemFullHelperForBlockType{{
+          BlockCacheInterface<Block_kData>::GetFullHelper(),
+          BlockCacheInterface<ParsedFullFilterBlock>::GetFullHelper(),
+          BlockCacheInterface<Block_kFilterPartitionIndex>::GetFullHelper(),
+          nullptr,  // kProperties
+          BlockCacheInterface<DecompressorDict>::GetFullHelper(),
+          BlockCacheInterface<Block_kRangeDeletion>::GetFullHelper(),
+          nullptr,  // kHashIndexPrefixes
+          nullptr,  // kHashIndexMetadata
+          nullptr,  // kMetaIndex (not yet stored in block cache)
+          BlockCacheInterface<Block_kIndex>::GetFullHelper(),
+          BlockCacheInterface<Block_kUserDefinedIndex>::GetFullHelper(),
+          nullptr,  // kInvalid
+      }};
+
+  // For getting basic helpers from a BlockType (no SecondaryCache support)
+  static const std::array<const Cache::CacheItemHelper*,
+                          static_cast<unsigned>(BlockType::kInvalid) + 1>
+      kCacheItemBasicHelperForBlockType{{
+          BlockCacheInterface<Block_kData>::GetBasicHelper(),
+          BlockCacheInterface<ParsedFullFilterBlock>::GetBasicHelper(),
+          BlockCacheInterface<Block_kFilterPartitionIndex>::GetBasicHelper(),
+          nullptr,  // kProperties
+          BlockCacheInterface<DecompressorDict>::GetBasicHelper(),
+          BlockCacheInterface<Block_kRangeDeletion>::GetBasicHelper(),
+          nullptr,  // kHashIndexPrefixes
+          nullptr,  // kHashIndexMetadata
+          nullptr,  // kMetaIndex (not yet stored in block cache)
+          BlockCacheInterface<Block_kIndex>::GetBasicHelper(),
+          BlockCacheInterface<Block_kUserDefinedIndex>::GetBasicHelper(),
+          nullptr,  // kInvalid
+      }};
+
   if (lowest_used_cache_tier > CacheTier::kVolatileTier) {
     return kCacheItemFullHelperForBlockType[static_cast<unsigned>(block_type)];
   } else {

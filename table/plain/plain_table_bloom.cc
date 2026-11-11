@@ -74,5 +74,4 @@ void BloomBlockBuilder::AddKeysHashes(
 
 Slice BloomBlockBuilder::Finish() { return bloom_.GetRawData(); }
 
-const std::string BloomBlockBuilder::kBloomBlock = "kBloomBlock";
 }  // namespace ROCKSDB_NAMESPACE

@@ -99,7 +99,7 @@ inline uint64_t GetSliceHash64(const Slice& key) {
 }
 // Provided for convenience for use with template argument deduction, where a
 // specific overload needs to be used.
-extern uint64_t (*kGetSliceNPHash64UnseededFnPtr)(const Slice&);
+extern uint64_t (*const kGetSliceNPHash64UnseededFnPtr)(const Slice&);
 
 inline uint64_t GetSliceNPHash64(const Slice& s) {
   return NPHash64(s.data(), s.size());

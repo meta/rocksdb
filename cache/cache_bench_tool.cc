@@ -338,15 +338,16 @@ void DeleteFn(Cache::ObjectPtr value, MemoryAllocator* alloc) {
   CacheAllocationDeleter{alloc}(static_cast<char*>(value));
 }
 
-Cache::CacheItemHelper helper1_wos(CacheEntryRole::kDataBlock, DeleteFn);
-Cache::CacheItemHelper helper1(CacheEntryRole::kDataBlock, DeleteFn, SizeFn,
-                               SaveToFn, CreateFn, &helper1_wos);
-Cache::CacheItemHelper helper2_wos(CacheEntryRole::kIndexBlock, DeleteFn);
-Cache::CacheItemHelper helper2(CacheEntryRole::kIndexBlock, DeleteFn, SizeFn,
-                               SaveToFn, CreateFn, &helper2_wos);
-Cache::CacheItemHelper helper3_wos(CacheEntryRole::kFilterBlock, DeleteFn);
-Cache::CacheItemHelper helper3(CacheEntryRole::kFilterBlock, DeleteFn, SizeFn,
-                               SaveToFn, CreateFn, &helper3_wos);
+const Cache::CacheItemHelper helper1_wos(CacheEntryRole::kDataBlock, DeleteFn);
+const Cache::CacheItemHelper helper1(CacheEntryRole::kDataBlock, DeleteFn,
+                                     SizeFn, SaveToFn, CreateFn, &helper1_wos);
+const Cache::CacheItemHelper helper2_wos(CacheEntryRole::kIndexBlock, DeleteFn);
+const Cache::CacheItemHelper helper2(CacheEntryRole::kIndexBlock, DeleteFn,
+                                     SizeFn, SaveToFn, CreateFn, &helper2_wos);
+const Cache::CacheItemHelper helper3_wos(CacheEntryRole::kFilterBlock,
+                                         DeleteFn);
+const Cache::CacheItemHelper helper3(CacheEntryRole::kFilterBlock, DeleteFn,
+                                     SizeFn, SaveToFn, CreateFn, &helper3_wos);
 
 void ConfigureSecondaryCache(ShardedCacheOptions& opts) {
   if (!FLAGS_secondary_cache_uri.empty()) {

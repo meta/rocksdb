@@ -506,8 +506,8 @@ class DBRateLimiterOnWriteTest : public DBTestBase {
 
  protected:
   inline const static int64_t kNumFiles = 3;
-  inline const static std::string kStartKey = "a";
-  inline const static std::string kEndKey = "b";
+  static constexpr char kStartKey[] = "a";
+  static constexpr char kEndKey[] = "b";
   Options options_;
 };
 

@@ -451,7 +451,7 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     if (state == nullptr) {
       return false;
     }
-    bool is_injected_error = std::strstr(state, kInjected.c_str()) != nullptr;
+    bool is_injected_error = std::strstr(state, kInjected) != nullptr;
     bool is_specific_error =
         specific_error_marker.empty() ||
         std::strstr(state, specific_error_marker.c_str()) != nullptr;
@@ -871,29 +871,27 @@ class FaultInjectionTestFS : public FileSystemWrapper {
   // it to storage.
   void FlushRecentInjectedErrors() const { injected_error_log_.Flush(); }
 
-  inline static const std::string kInjected = "injected";
+  static constexpr char kInjected[] = "injected";
 
  private:
-  inline static const std::string kFailedToWriteToWAL =
-      "failed to write to WAL";
+  static constexpr char kFailedToWriteToWAL[] = "failed to write to WAL";
 
   IOStatus ValidateNoReopenForWrite(const std::string& fname,
                                     const char* op_name,
                                     bool allow_missing_file);
 
-  inline static const std::string kInjectedReadError = "injected read error";
-  inline static const std::string kInjectedEmptyResult =
-      "injected empty result";
-  inline static const std::string kInjectedCorruptLastByte =
+  static constexpr char kInjectedReadError[] = "injected read error";
+  static constexpr char kInjectedEmptyResult[] = "injected empty result";
+  static constexpr char kInjectedCorruptLastByte[] =
       "injected corrupt last byte";
-  inline static const std::string kInjectedErrorResultMultiGetSingle =
+  static constexpr char kInjectedErrorResultMultiGetSingle[] =
       "injected error result multiget single";
-  inline static const std::string kInjectedWriteError = "injected write error";
-  inline static const std::string kInjectedWriteErrorFailedToWriteToWAL =
+  static constexpr char kInjectedWriteError[] = "injected write error";
+  static constexpr char kInjectedWriteErrorFailedToWriteToWAL[] =
       "injected write error failed to write to WAL";
-  inline static const std::string kInjectedMetadataReadError =
+  static constexpr char kInjectedMetadataReadError[] =
       "injected metadata read error";
-  inline static const std::string kInjectedMetadataWriteError =
+  static constexpr char kInjectedMetadataWriteError[] =
       "injected metadata write error";
   port::Mutex mutex_;
   std::map<std::string, FSFileState> db_file_state_;

@@ -1130,7 +1130,7 @@ static inline Function Choose_Extend() {
 #endif
 }
 
-static Function ChosenExtend = Choose_Extend();
+static const Function ChosenExtend = Choose_Extend();
 uint32_t Extend(uint32_t crc, const char* buf, size_t size) {
   return ChosenExtend(crc, buf, size);
 }

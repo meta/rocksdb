@@ -171,7 +171,7 @@ size_t TailPrefetchStats::GetSuggestedPrefetchSize() {
   return std::min(kMaxPrefetchSize, max_qualified_size);
 }
 
-const std::string kOptNameMetadataCacheOpts = "metadata_cache_options";
+constexpr char kOptNameMetadataCacheOpts[] = "metadata_cache_options";
 
 static std::unordered_map<std::string, PinningTier>
     pinning_tier_type_string_map = {
@@ -1382,7 +1382,5 @@ const std::string BlockBasedTablePropertyNames::kDecoupledPartitionedFilters =
 const std::string kHashIndexPrefixesBlock = "rocksdb.hashindex.prefixes";
 const std::string kHashIndexPrefixesMetadataBlock =
     "rocksdb.hashindex.metadata";
-const std::string kPropTrue = "1";
-const std::string kPropFalse = "0";
 
 }  // namespace ROCKSDB_NAMESPACE

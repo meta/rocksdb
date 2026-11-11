@@ -247,97 +247,92 @@ std::pair<Slice, Slice> GetPropertyNameAndArg(const Slice& property) {
 
 static const std::string rocksdb_prefix = "rocksdb.";
 
-static const std::string num_files_at_level_prefix = "num-files-at-level";
-static const std::string compression_ratio_at_level_prefix =
+static constexpr char num_files_at_level_prefix[] = "num-files-at-level";
+static constexpr char compression_ratio_at_level_prefix[] =
     "compression-ratio-at-level";
-static const std::string allstats = "stats";
-static const std::string sstables = "sstables";
-static const std::string cfstats = "cfstats";
-static const std::string cfstats_no_file_histogram =
-    "cfstats-no-file-histogram";
-static const std::string cf_file_histogram = "cf-file-histogram";
-static const std::string cf_write_stall_stats = "cf-write-stall-stats";
-static const std::string dbstats = "dbstats";
-static const std::string db_write_stall_stats = "db-write-stall-stats";
-static const std::string levelstats = "levelstats";
-static const std::string block_cache_entry_stats = "block-cache-entry-stats";
-static const std::string fast_block_cache_entry_stats =
+static constexpr char allstats[] = "stats";
+static constexpr char sstables[] = "sstables";
+static constexpr char cfstats[] = "cfstats";
+static constexpr char cfstats_no_file_histogram[] = "cfstats-no-file-histogram";
+static constexpr char cf_file_histogram[] = "cf-file-histogram";
+static constexpr char cf_write_stall_stats[] = "cf-write-stall-stats";
+static constexpr char dbstats[] = "dbstats";
+static constexpr char db_write_stall_stats[] = "db-write-stall-stats";
+static constexpr char levelstats[] = "levelstats";
+static constexpr char block_cache_entry_stats[] = "block-cache-entry-stats";
+static constexpr char fast_block_cache_entry_stats[] =
     "fast-block-cache-entry-stats";
-static const std::string num_immutable_mem_table = "num-immutable-mem-table";
-static const std::string num_immutable_mem_table_flushed =
+static constexpr char num_immutable_mem_table[] = "num-immutable-mem-table";
+static constexpr char num_immutable_mem_table_flushed[] =
     "num-immutable-mem-table-flushed";
-static const std::string mem_table_flush_pending = "mem-table-flush-pending";
-static const std::string compaction_pending = "compaction-pending";
-static const std::string background_errors = "background-errors";
-static const std::string cur_size_active_mem_table =
-    "cur-size-active-mem-table";
-static const std::string cur_size_all_mem_tables = "cur-size-all-mem-tables";
-static const std::string size_all_mem_tables = "size-all-mem-tables";
-static const std::string num_entries_active_mem_table =
+static constexpr char mem_table_flush_pending[] = "mem-table-flush-pending";
+static constexpr char compaction_pending[] = "compaction-pending";
+static constexpr char background_errors[] = "background-errors";
+static constexpr char cur_size_active_mem_table[] = "cur-size-active-mem-table";
+static constexpr char cur_size_all_mem_tables[] = "cur-size-all-mem-tables";
+static constexpr char size_all_mem_tables[] = "size-all-mem-tables";
+static constexpr char num_entries_active_mem_table[] =
     "num-entries-active-mem-table";
-static const std::string num_entries_imm_mem_tables =
+static constexpr char num_entries_imm_mem_tables[] =
     "num-entries-imm-mem-tables";
-static const std::string num_deletes_active_mem_table =
+static constexpr char num_deletes_active_mem_table[] =
     "num-deletes-active-mem-table";
-static const std::string num_deletes_imm_mem_tables =
+static constexpr char num_deletes_imm_mem_tables[] =
     "num-deletes-imm-mem-tables";
-static const std::string estimate_num_keys = "estimate-num-keys";
-static const std::string estimate_table_readers_mem =
+static constexpr char estimate_num_keys[] = "estimate-num-keys";
+static constexpr char estimate_table_readers_mem[] =
     "estimate-table-readers-mem";
-static const std::string is_file_deletions_enabled =
-    "is-file-deletions-enabled";
-static const std::string num_snapshots = "num-snapshots";
-static const std::string oldest_snapshot_time = "oldest-snapshot-time";
-static const std::string oldest_snapshot_sequence = "oldest-snapshot-sequence";
-static const std::string num_live_versions = "num-live-versions";
-static const std::string current_version_number =
-    "current-super-version-number";
-static const std::string estimate_live_data_size = "estimate-live-data-size";
-static const std::string min_log_number_to_keep_str = "min-log-number-to-keep";
-static const std::string min_obsolete_sst_number_to_keep_str =
+static constexpr char is_file_deletions_enabled[] = "is-file-deletions-enabled";
+static constexpr char num_snapshots[] = "num-snapshots";
+static constexpr char oldest_snapshot_time[] = "oldest-snapshot-time";
+static constexpr char oldest_snapshot_sequence[] = "oldest-snapshot-sequence";
+static constexpr char num_live_versions[] = "num-live-versions";
+static constexpr char current_version_number[] = "current-super-version-number";
+static constexpr char estimate_live_data_size[] = "estimate-live-data-size";
+static constexpr char min_log_number_to_keep_str[] = "min-log-number-to-keep";
+static constexpr char min_obsolete_sst_number_to_keep_str[] =
     "min-obsolete-sst-number-to-keep";
-static const std::string base_level_str = "base-level";
-static const std::string total_sst_files_size = "total-sst-files-size";
-static const std::string live_sst_files_size = "live-sst-files-size";
-static const std::string obsolete_sst_files_size = "obsolete-sst-files-size";
-static const std::string live_sst_files_size_at_temperature =
+static constexpr char base_level_str[] = "base-level";
+static constexpr char total_sst_files_size[] = "total-sst-files-size";
+static constexpr char live_sst_files_size[] = "live-sst-files-size";
+static constexpr char obsolete_sst_files_size[] = "obsolete-sst-files-size";
+static constexpr char live_sst_files_size_at_temperature[] =
     "live-sst-files-size-at-temperature";
-static const std::string estimate_pending_comp_bytes =
+static constexpr char estimate_pending_comp_bytes[] =
     "estimate-pending-compaction-bytes";
-static const std::string aggregated_table_properties =
+static constexpr char aggregated_table_properties[] =
     "aggregated-table-properties";
-static const std::string aggregated_table_properties_at_level =
-    aggregated_table_properties + "-at-level";
-static const std::string num_running_compactions = "num-running-compactions";
-static const std::string num_running_remote_compactions =
+static constexpr char aggregated_table_properties_at_level[] =
+    "aggregated-table-properties-at-level";
+static constexpr char num_running_compactions[] = "num-running-compactions";
+static constexpr char num_running_remote_compactions[] =
     "num-running-remote-compactions";
-static const std::string num_remote_compaction_pool_threads =
+static constexpr char num_remote_compaction_pool_threads[] =
     "num-remote-compaction-pool-threads";
-static const std::string num_running_bottom_compactions =
+static constexpr char num_running_bottom_compactions[] =
     "num-running-bottom-compactions";
-static const std::string num_running_compaction_sorted_runs =
+static constexpr char num_running_compaction_sorted_runs[] =
     "num-running-compaction-sorted-runs";
-static const std::string compaction_abort_count = "compaction-abort-count";
-static const std::string num_unscheduled_compactions =
+static constexpr char compaction_abort_count[] = "compaction-abort-count";
+static constexpr char num_unscheduled_compactions[] =
     "num-unscheduled-compactions";
-static const std::string num_running_flushes = "num-running-flushes";
-static const std::string actual_delayed_write_rate =
-    "actual-delayed-write-rate";
-static const std::string is_write_stopped = "is-write-stopped";
-static const std::string estimate_oldest_key_time = "estimate-oldest-key-time";
-static const std::string block_cache_capacity = "block-cache-capacity";
-static const std::string block_cache_usage = "block-cache-usage";
-static const std::string block_cache_pinned_usage = "block-cache-pinned-usage";
-static const std::string options_statistics = "options-statistics";
-static const std::string num_blob_files = "num-blob-files";
-static const std::string blob_stats = "blob-stats";
-static const std::string total_blob_file_size = "total-blob-file-size";
-static const std::string live_blob_file_size = "live-blob-file-size";
-static const std::string live_blob_file_garbage_size =
+static constexpr char num_running_flushes[] = "num-running-flushes";
+static constexpr char actual_delayed_write_rate[] = "actual-delayed-write-rate";
+static constexpr char is_write_stopped[] = "is-write-stopped";
+static constexpr char estimate_oldest_key_time[] = "estimate-oldest-key-time";
+static constexpr char block_cache_capacity[] = "block-cache-capacity";
+static constexpr char block_cache_usage[] = "block-cache-usage";
+static constexpr char block_cache_pinned_usage[] = "block-cache-pinned-usage";
+static constexpr char options_statistics[] = "options-statistics";
+static constexpr char num_blob_files[] = "num-blob-files";
+static constexpr char blob_stats[] = "blob-stats";
+static constexpr char total_blob_file_size[] = "total-blob-file-size";
+static constexpr char live_blob_file_size[] = "live-blob-file-size";
+static constexpr char live_blob_file_garbage_size[] =
     "live-blob-file-garbage-size";
-static const std::string blob_cache_capacity = "blob-cache-capacity";
-static const std::string blob_cache_usage = "blob-cache-usage";
-static const std::string blob_cache_pinned_usage = "blob-cache-pinned-usage";
+static constexpr char blob_cache_capacity[] = "blob-cache-capacity";
+static constexpr char blob_cache_usage[] = "blob-cache-usage";
+static constexpr char blob_cache_pinned_usage[] = "blob-cache-pinned-usage";
 
 const std::string DB::Properties::kNumFilesAtLevelPrefix =
     rocksdb_prefix + num_files_at_level_prefix;

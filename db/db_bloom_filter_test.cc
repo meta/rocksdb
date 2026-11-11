@@ -1005,7 +1005,7 @@ struct CompatibilityConfig {
   bool partitioned;
   uint32_t format_version;
 
-  void SetInTableOptions(BlockBasedTableOptions* table_options) {
+  void SetInTableOptions(BlockBasedTableOptions* table_options) const {
     table_options->filter_policy = policy;
     table_options->partition_filters = partitioned;
     if (partitioned) {
@@ -1018,24 +1018,28 @@ struct CompatibilityConfig {
     table_options->format_version = format_version;
   }
 };
-// High bits per key -> almost no FPs
-std::shared_ptr<const FilterPolicy> kCompatibilityBloomPolicy{
-    NewBloomFilterPolicy(20)};
-// bloom_before_level=-1 -> always use Ribbon
-std::shared_ptr<const FilterPolicy> kCompatibilityRibbonPolicy{
-    NewRibbonFilterPolicy(20, -1)};
-
-std::vector<CompatibilityConfig> kCompatibilityConfigs = {
-    {kCompatibilityBloomPolicy, false, BlockBasedTableOptions().format_version},
-    {kCompatibilityBloomPolicy, true, BlockBasedTableOptions().format_version},
-    {kCompatibilityBloomPolicy, false, /* legacy Bloom */ 4U},
-    {kCompatibilityRibbonPolicy, false,
-     BlockBasedTableOptions().format_version},
-    {kCompatibilityRibbonPolicy, true, BlockBasedTableOptions().format_version},
-};
 }  // anonymous namespace
 
 TEST_F(DBBloomFilterTest, BloomFilterCompatibility) {
+  // High bits per key -> almost no FPs
+  const std::shared_ptr<const FilterPolicy> kCompatibilityBloomPolicy{
+      NewBloomFilterPolicy(20)};
+  // bloom_before_level=-1 -> always use Ribbon
+  const std::shared_ptr<const FilterPolicy> kCompatibilityRibbonPolicy{
+      NewRibbonFilterPolicy(20, -1)};
+
+  const std::vector<CompatibilityConfig> kCompatibilityConfigs = {
+      {kCompatibilityBloomPolicy, false,
+       BlockBasedTableOptions().format_version},
+      {kCompatibilityBloomPolicy, true,
+       BlockBasedTableOptions().format_version},
+      {kCompatibilityBloomPolicy, false, /* legacy Bloom */ 4U},
+      {kCompatibilityRibbonPolicy, false,
+       BlockBasedTableOptions().format_version},
+      {kCompatibilityRibbonPolicy, true,
+       BlockBasedTableOptions().format_version},
+  };
+
   Options options = CurrentOptions();
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
   options.level0_file_num_compaction_trigger =
@@ -1835,15 +1839,6 @@ class LevelAndStyleCustomFilterPolicy : public FilterPolicy {
   const std::unique_ptr<const FilterPolicy> policy_otherwise_;
 };
 
-static std::map<TableFileCreationReason, std::string>
-    table_file_creation_reason_to_string{
-        {TableFileCreationReason::kCompaction, "kCompaction"},
-        {TableFileCreationReason::kFlush, "kFlush"},
-        {TableFileCreationReason::kMisc, "kMisc"},
-        {TableFileCreationReason::kRecovery, "kRecovery"},
-        {TableFileCreationReason::kSstFileWriter, "kSstFileWriter"},
-    };
-
 class TestingContextCustomFilterPolicy
     : public LevelAndStyleCustomFilterPolicy {
  public:
@@ -1854,6 +1849,14 @@ class TestingContextCustomFilterPolicy
 
   FilterBitsBuilder* GetBuilderWithContext(
       const FilterBuildingContext& context) const override {
+    static const std::map<TableFileCreationReason, std::string>
+        table_file_creation_reason_to_string{
+            {TableFileCreationReason::kCompaction, "kCompaction"},
+            {TableFileCreationReason::kFlush, "kFlush"},
+            {TableFileCreationReason::kMisc, "kMisc"},
+            {TableFileCreationReason::kRecovery, "kRecovery"},
+            {TableFileCreationReason::kSstFileWriter, "kSstFileWriter"},
+        };
     test_report_ += "cf=";
     test_report_ += context.column_family_name;
     // Token rather than path, so expectations don't depend on test directory
@@ -1875,7 +1878,7 @@ class TestingContextCustomFilterPolicy
     test_report_ += ",b=";
     test_report_ += std::to_string(int{context.is_bottommost});
     test_report_ += ",r=";
-    test_report_ += table_file_creation_reason_to_string[context.reason];
+    test_report_ += table_file_creation_reason_to_string.at(context.reason);
     test_report_ += "\n";
 
     return LevelAndStyleCustomFilterPolicy::GetBuilderWithContext(context);
@@ -2704,7 +2707,7 @@ INSTANTIATE_TEST_CASE_P(DBBloomFilterTestVaryPrefixAndFormatVer,
                             std::make_tuple(true, 5)));
 
 namespace {
-static const std::string kPlainTable = "test_PlainTableBloom";
+constexpr char kPlainTable[] = "test_PlainTableBloom";
 }  // anonymous namespace
 
 class BloomStatsTestWithParam
@@ -4156,8 +4159,6 @@ class BackwardBytewiseComparator : public Comparator {
   void FindShortSuccessor(std::string* /*key*/) const override {}
 };
 
-const BackwardBytewiseComparator kBackwardBytewiseComparator{};
-
 class FixedSuffix4Transform : public SliceTransform {
   const char* Name() const override { return "FixedSuffixTransform"; }
 
@@ -4174,6 +4175,7 @@ class FixedSuffix4Transform : public SliceTransform {
 // * key.starts_with(prefix(key))
 // This axiom is not really needed, and we validate that here.
 TEST_F(DBBloomFilterTest, WeirdPrefixExtractorWithFilter1) {
+  static const BackwardBytewiseComparator kBackwardBytewiseComparator{};
   BlockBasedTableOptions bbto;
   bbto.filter_policy.reset(ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10));
   bbto.whole_key_filtering = false;
@@ -4361,7 +4363,6 @@ class WeirdComparator : public Comparator {
 
   void FindShortSuccessor(std::string* /*key*/) const override {}
 };
-const WeirdComparator kWeirdComparator{};
 
 // Non-idempotentent because prefix is always 4 bytes, but this is
 // out-of-domain for keys to be assigned prefixes (>= 5 bytes)
@@ -4382,6 +4383,7 @@ class NonIdempotentFixed4Transform : public SliceTransform {
 // * If Compare(k1, k2) <= 0, then Compare(prefix(k1), prefix(k2)) <= 0
 // This axiom is not really needed, and we validate that here.
 TEST_F(DBBloomFilterTest, WeirdPrefixExtractorWithFilter3) {
+  static const WeirdComparator kWeirdComparator{};
   BlockBasedTableOptions bbto;
   bbto.filter_policy.reset(ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10));
   bbto.whole_key_filtering = false;

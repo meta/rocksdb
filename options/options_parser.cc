@@ -28,7 +28,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-static const std::string option_file_header =
+static constexpr char option_file_header[] =
     "# This is a RocksDB option file.\n"
     "#\n"
     "# For detailed file format spec, please refer to the example file\n"
@@ -86,14 +86,15 @@ Status PersistRocksDBOptions(const WriteOptions& write_options,
   IOOptions opts;
   s = WritableFileWriter::PrepareIOOptions(write_options, opts);
   if (s.ok()) {
-    s = writable->Append(option_file_header + "[" +
-                             opt_section_titles[kOptionSectionVersion] +
-                             "]\n"
-                             "  rocksdb_version=" +
-                             std::to_string(ROCKSDB_MAJOR) + "." +
-                             std::to_string(ROCKSDB_MINOR) + "." +
-                             std::to_string(ROCKSDB_PATCH) + "\n",
-                         opts);
+    s = writable->Append(
+        std::string(option_file_header) + "[" +
+            std::string(opt_section_titles[kOptionSectionVersion]) +
+            "]\n"
+            "  rocksdb_version=" +
+            std::to_string(ROCKSDB_MAJOR) + "." +
+            std::to_string(ROCKSDB_MINOR) + "." +
+            std::to_string(ROCKSDB_PATCH) + "\n",
+        opts);
   }
   if (s.ok()) {
     s = writable->Append(
@@ -103,7 +104,9 @@ Status PersistRocksDBOptions(const WriteOptions& write_options,
   }
   if (s.ok()) {
     s = writable->Append(
-        "\n[" + opt_section_titles[kOptionSectionDBOptions] + "]\n  ", opts);
+        "\n[" + std::string(opt_section_titles[kOptionSectionDBOptions]) +
+            "]\n  ",
+        opts);
   }
 
   if (s.ok()) {
@@ -115,10 +118,10 @@ Status PersistRocksDBOptions(const WriteOptions& write_options,
 
   for (size_t i = 0; s.ok() && i < cf_opts.size(); ++i) {
     // CFOptions section
-    s = writable->Append("\n[" + opt_section_titles[kOptionSectionCFOptions] +
-                             " \"" + EscapeOptionString(cf_names[i]) +
-                             "\"]\n  ",
-                         opts);
+    s = writable->Append(
+        "\n[" + std::string(opt_section_titles[kOptionSectionCFOptions]) +
+            " \"" + EscapeOptionString(cf_names[i]) + "\"]\n  ",
+        opts);
     if (s.ok()) {
       s = GetStringFromColumnFamilyOptions(config_options, cf_opts[i],
                                            &options_file_content);
@@ -131,8 +134,9 @@ Status PersistRocksDBOptions(const WriteOptions& write_options,
     if (tf != nullptr) {
       if (s.ok()) {
         s = writable->Append(
-            "[" + opt_section_titles[kOptionSectionTableOptions] + tf->Name() +
-                " \"" + EscapeOptionString(cf_names[i]) + "\"]\n  ",
+            "[" + std::string(opt_section_titles[kOptionSectionTableOptions]) +
+                tf->Name() + " \"" + EscapeOptionString(cf_names[i]) +
+                "\"]\n  ",
             opts);
       }
       if (s.ok()) {

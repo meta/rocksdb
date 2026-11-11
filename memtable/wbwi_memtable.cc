@@ -9,18 +9,6 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-const std::unordered_map<WriteType, ValueType>
-    WBWIMemTableIterator::WriteTypeToValueTypeMap = {
-        {kPutRecord, kTypeValue},
-        {kMergeRecord, kTypeMerge},
-        {kDeleteRecord, kTypeDeletion},
-        {kSingleDeleteRecord, kTypeSingleDeletion},
-        {kDeleteRangeRecord, kTypeRangeDeletion},
-        {kPutEntityRecord, kTypeWideColumnEntity},
-        // Only the above record types are added to WBWI.
-        // kLogDataRecord, kXIDRecord, kUnknownRecord
-};
-
 InternalIterator* WBWIMemTable::NewIterator(
     const ReadOptions&, UnownedPtr<const SeqnoToTimeMapping>, Arena* arena,
     const SliceTransform* /* prefix_extractor */, bool for_flush) {

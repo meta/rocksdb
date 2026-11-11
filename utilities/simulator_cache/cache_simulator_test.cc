@@ -14,9 +14,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
-const std::string kBlockKeyPrefix = "test-block-";
+constexpr char kBlockKeyPrefix[] = "test-block-";
 const std::string kRefKeyPrefix = "test-get-";
-const std::string kRefKeySequenceNumber = std::string(8, 'c');
+constexpr char kRefKeySequenceNumber[] = "cccccccc";
 const uint64_t kGetId = 1;
 const uint64_t kGetBlockId = 100;
 const uint64_t kCompactionBlockId = 1000;

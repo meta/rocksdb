@@ -4226,9 +4226,4 @@ void BlockBasedTableBuilder::SetSeqnoTimeTableProperties(
   rep_->props.oldest_ancestor_time = oldest_ancestor_time;
 }
 
-const std::string BlockBasedTable::kObsoleteFilterBlockPrefix = "filter.";
-const std::string BlockBasedTable::kFullFilterBlockPrefix = "fullfilter.";
-const std::string BlockBasedTable::kPartitionedFilterBlockPrefix =
-    "partitionedfilter.";
-
 }  // namespace ROCKSDB_NAMESPACE

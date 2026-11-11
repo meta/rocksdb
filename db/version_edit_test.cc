@@ -839,7 +839,7 @@ class SubcompactionProgressTest : public VersionEditTest {
   static constexpr uint64_t kTestOldestAncestorTime = 12345;
   static constexpr uint64_t kTestFileCreationTime = 67890;
   static constexpr uint64_t kTestEpochNumber = 10;
-  static const std::string kTestChecksumFuncName;
+  static constexpr char kTestChecksumFuncName[] = "crc32c";
 
   FileMetaData CreateTestFile(uint64_t file_number, const std::string& prefix) {
     FileMetaData file;
@@ -968,8 +968,6 @@ class SubcompactionProgressTest : public VersionEditTest {
     }
   }
 };
-
-const std::string SubcompactionProgressTest::kTestChecksumFuncName = "crc32c";
 
 TEST_F(SubcompactionProgressTest, BasicEncodeDecode) {
   // Create progress with files for both levels

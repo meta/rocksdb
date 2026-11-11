@@ -2790,13 +2790,20 @@ enum OperationType : unsigned char {
   kMultiScan
 };
 
-static UnorderedMapH<OperationType, std::string, std::hash<unsigned char>>
-    OperationTypeString = {{kRead, "read"},         {kWrite, "write"},
-                           {kDelete, "delete"},     {kSeek, "seek"},
-                           {kMerge, "merge"},       {kUpdate, "update"},
-                           {kCompress, "compress"}, {kUncompress, "uncompress"},
-                           {kCrc, "crc"},           {kHash, "hash"},
-                           {kOthers, "op"},         {kMultiScan, "multiscan"}};
+static const UnorderedMapH<OperationType, std::string,
+                           std::hash<unsigned char>>&
+OperationTypeString() {
+  static const UnorderedMapH<OperationType, std::string,
+                             std::hash<unsigned char>>
+      kOperationTypeString = {
+          {kRead, "read"},         {kWrite, "write"},
+          {kDelete, "delete"},     {kSeek, "seek"},
+          {kMerge, "merge"},       {kUpdate, "update"},
+          {kCompress, "compress"}, {kUncompress, "uncompress"},
+          {kCrc, "crc"},           {kHash, "hash"},
+          {kOthers, "op"},         {kMultiScan, "multiscan"}};
+  return kOperationTypeString;
+}
 
 static const OperationType kAllOperationTypes[] = {
     kRead,     kWrite,      kDelete, kSeek, kMerge,  kUpdate,
@@ -3297,7 +3304,7 @@ class Stats {
     if (FLAGS_histogram) {
       for (auto it = hist_.begin(); it != hist_.end(); ++it) {
         fprintf(stdout, "Microseconds per %s:\n%s\n",
-                OperationTypeString[it->first].c_str(),
+                OperationTypeString().at(it->first).c_str(),
                 it->second->ToString().c_str());
       }
     }
@@ -3371,8 +3378,8 @@ void IntervalStatsReporter::ReportAndReset(uint64_t now) {
       continue;
     }
 
-    auto op_type_it = OperationTypeString.find(entry.first);
-    const char* op_type = op_type_it == OperationTypeString.end()
+    auto op_type_it = OperationTypeString().find(entry.first);
+    const char* op_type = op_type_it == OperationTypeString().end()
                               ? "op"
                               : op_type_it->second.c_str();
     const uint64_t interval_ops = merged_ops[entry.first];

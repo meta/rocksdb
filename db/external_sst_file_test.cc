@@ -4614,8 +4614,8 @@ class ExternalSSTFileWithTimestampTest : public ExternalSSTFileTest {
  public:
   ExternalSSTFileWithTimestampTest() = default;
 
-  static const std::string kValueNotFound;
-  static const std::string kTsNotFound;
+  static constexpr char kValueNotFound[] = "NOT_FOUND";
+  static constexpr char kTsNotFound[] = "NOT_FOUND_TS";
 
   std::string EncodeAsUint64(uint64_t v) {
     std::string dst;
@@ -4666,11 +4666,6 @@ class ExternalSSTFileWithTimestampTest : public ExternalSSTFileTest {
     }
   }
 };
-
-const std::string ExternalSSTFileWithTimestampTest::kValueNotFound =
-    "NOT_FOUND";
-const std::string ExternalSSTFileWithTimestampTest::kTsNotFound =
-    "NOT_FOUND_TS";
 
 TEST_F(ExternalSSTFileWithTimestampTest, Basic) {
   do {

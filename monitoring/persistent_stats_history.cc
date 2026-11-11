@@ -18,10 +18,6 @@
 namespace ROCKSDB_NAMESPACE {
 // 10 digit seconds timestamp => [Sep 9, 2001 ~ Nov 20, 2286]
 const int kNowSecondsStringLength = 10;
-const std::string kFormatVersionKeyString =
-    "__persistent_stats_format_version__";
-const std::string kCompatibleVersionKeyString =
-    "__persistent_stats_compatible_version__";
 // Every release maintains two versions numbers for persistents stats: Current
 // format version and compatible format version. Current format version
 // designates what type of encoding will be used when writing to stats CF;

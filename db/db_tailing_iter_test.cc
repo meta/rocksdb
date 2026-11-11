@@ -16,7 +16,7 @@
 #include "port/stack_trace.h"
 
 namespace {
-static bool enable_io_uring = true;
+constexpr bool enable_io_uring = true;
 extern "C" bool RocksDbIOUringEnable() { return enable_io_uring; }
 }  // namespace
 

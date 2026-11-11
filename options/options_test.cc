@@ -2636,8 +2636,7 @@ TEST_F(OptionsTest, OptionsListenerTest) {
   ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(config_opts, orig, copy));
 }
 
-const static std::string kCustomEnvName = "Custom";
-const static std::string kCustomEnvProp = "env=" + kCustomEnvName;
+static constexpr char kCustomEnvName[] = "Custom";
 
 static int RegisterCustomEnv(ObjectLibrary& library, const std::string& arg) {
   library.AddFactory<Env>(
@@ -5423,6 +5422,7 @@ TEST_F(OptionTypeInfoTest, TestStaticType) {
 class ConfigOptionsTest : public testing::Test {};
 
 TEST_F(ConfigOptionsTest, EnvFromConfigOptions) {
+  const std::string kCustomEnvProp = std::string("env=") + kCustomEnvName;
   ConfigOptions config_options;
   DBOptions db_opts;
   Options opts;

@@ -373,7 +373,34 @@ class WBWIMemTableIterator final : public InternalIterator {
   bool IsValuePinned() const override { return true; }
 
  private:
-  static const std::unordered_map<WriteType, ValueType> WriteTypeToValueTypeMap;
+  static bool WriteTypeToValueType(WriteType wt, ValueType* vt) {
+    switch (wt) {
+      case kPutRecord:
+        *vt = kTypeValue;
+        return true;
+      case kMergeRecord:
+        *vt = kTypeMerge;
+        return true;
+      case kDeleteRecord:
+        *vt = kTypeDeletion;
+        return true;
+      case kSingleDeleteRecord:
+        *vt = kTypeSingleDeletion;
+        return true;
+      case kDeleteRangeRecord:
+        *vt = kTypeRangeDeletion;
+        return true;
+      case kPutEntityRecord:
+        *vt = kTypeWideColumnEntity;
+        return true;
+      // Only the above record types are added to WBWI.
+      case kLogDataRecord:
+      case kXIDRecord:
+      case kUnknownRecord:
+        break;
+    }
+    return false;
+  }
 
   SequenceNumber CurrentKeySeqno() {
     assert(it_->Valid());
@@ -391,16 +418,17 @@ class WBWIMemTableIterator final : public InternalIterator {
       key_.clear();
       return;
     }
-    auto t = WriteTypeToValueTypeMap.find(it_->Entry().type);
-    assert(t != WriteTypeToValueTypeMap.end());
-    if (t == WriteTypeToValueTypeMap.end()) {
+    ValueType t;
+    bool found = WriteTypeToValueType(it_->Entry().type, &t);
+    assert(found);
+    if (!found) {
       key_.clear();
       valid_ = false;
       s_ = Status::Corruption("Unexpected write_batch_with_index entry type " +
                               std::to_string(it_->Entry().type));
       return;
     }
-    key_buf_.SetInternalKey(it_->Entry().key, CurrentKeySeqno(), t->second);
+    key_buf_.SetInternalKey(it_->Entry().key, CurrentKeySeqno(), t);
     key_ = key_buf_.GetInternalKey();
   }
 

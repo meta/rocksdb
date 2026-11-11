@@ -1355,7 +1355,7 @@ class CountingDeleteTabPropCollectorFactory
 
 class BlockCountingTablePropertiesCollector : public TablePropertiesCollector {
  public:
-  static const std::string kNumSampledBlocksPropertyName;
+  static constexpr char kNumSampledBlocksPropertyName[] = "NumSampledBlocks";
 
   const char* Name() const override {
     return "BlockCountingTablePropertiesCollector";
@@ -1390,10 +1390,6 @@ class BlockCountingTablePropertiesCollector : public TablePropertiesCollector {
  private:
   uint32_t num_sampled_blocks_ = 0;
 };
-
-const std::string
-    BlockCountingTablePropertiesCollector::kNumSampledBlocksPropertyName =
-        "NumSampledBlocks";
 
 class BlockCountingTablePropertiesCollectorFactory
     : public TablePropertiesCollectorFactory {

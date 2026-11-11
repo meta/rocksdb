@@ -247,8 +247,8 @@ static Status TableFactoryParseFn(const ConfigOptions& opts,
   return s;
 }
 
-const std::string kOptNameBMCompOpts = "bottommost_compression_opts";
-const std::string kOptNameCompOpts = "compression_opts";
+constexpr char kOptNameBMCompOpts[] = "bottommost_compression_opts";
+constexpr char kOptNameCompOpts[] = "compression_opts";
 
 // OptionTypeInfo map for CompressionOptions
 static std::unordered_map<std::string, OptionTypeInfo>
@@ -1011,8 +1011,6 @@ static std::unordered_map<std::string, OptionTypeInfo>
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
 };
-
-const std::string OptionsHelper::kCFOptionsName = "ColumnFamilyOptions";
 
 class ConfigurableMutableCFOptions : public Configurable {
  public:

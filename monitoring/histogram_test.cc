@@ -19,8 +19,7 @@ class HistogramTest : public testing::Test {};
 
 namespace {
 const double kIota = 0.1;
-const HistogramBucketMapper bucketMapper;
-std::shared_ptr<MockSystemClock> clock =
+const std::shared_ptr<MockSystemClock> clock =
     std::make_shared<MockSystemClock>(SystemClock::Default());
 }  // namespace
 
@@ -67,6 +66,7 @@ void MergeHistogram(Histogram& histogram, Histogram& other) {
 }
 
 void EmptyHistogram(Histogram& histogram) {
+  const HistogramBucketMapper bucketMapper;
   ASSERT_EQ(histogram.min(), bucketMapper.LastValue());
   ASSERT_EQ(histogram.max(), 0);
   ASSERT_EQ(histogram.num(), 0);

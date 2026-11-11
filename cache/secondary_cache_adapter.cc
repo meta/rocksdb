@@ -21,7 +21,7 @@ struct Dummy {
 };
 const Dummy kDummy{};
 Cache::ObjectPtr const kDummyObj = const_cast<Dummy*>(&kDummy);
-const char* kTieredCacheName = "TieredCache";
+constexpr char kTieredCacheName[] = "TieredCache";
 }  // namespace
 
 // When CacheWithSecondaryAdapter is constructed with the distribute_cache_res

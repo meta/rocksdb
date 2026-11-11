@@ -18,13 +18,14 @@ class ObjRegistryTest : public testing::Test {
 
 int ObjRegistryTest::num_a = 0;
 int ObjRegistryTest::num_b = 0;
-static FactoryFunc<Env> test_reg_a = ObjectLibrary::Default()->AddFactory<Env>(
-    ObjectLibrary::PatternEntry("a", false).AddSeparator("://"),
-    [](const std::string& /*uri*/, std::unique_ptr<Env>* /*env_guard*/,
-       std::string* /* errmsg */) {
-      ++ObjRegistryTest::num_a;
-      return Env::Default();
-    });
+static const FactoryFunc<Env> test_reg_a =
+    ObjectLibrary::Default()->AddFactory<Env>(
+        ObjectLibrary::PatternEntry("a", false).AddSeparator("://"),
+        [](const std::string& /*uri*/, std::unique_ptr<Env>* /*env_guard*/,
+           std::string* /* errmsg */) {
+          ++ObjRegistryTest::num_a;
+          return Env::Default();
+        });
 
 class WrappedEnv : public EnvWrapper {
  private:
@@ -35,16 +36,17 @@ class WrappedEnv : public EnvWrapper {
   const char* Name() const override { return id_.c_str(); }
   std::string GetId() const override { return id_; }
 };
-static FactoryFunc<Env> test_reg_b = ObjectLibrary::Default()->AddFactory<Env>(
-    ObjectLibrary::PatternEntry("b", false).AddSeparator("://"),
-    [](const std::string& uri, std::unique_ptr<Env>* env_guard,
-       std::string* /* errmsg */) {
-      ++ObjRegistryTest::num_b;
-      // Env::Default() is a singleton so we can't grant ownership directly to
-      // the caller - we must wrap it first.
-      env_guard->reset(new WrappedEnv(Env::Default(), uri));
-      return env_guard->get();
-    });
+static const FactoryFunc<Env> test_reg_b =
+    ObjectLibrary::Default()->AddFactory<Env>(
+        ObjectLibrary::PatternEntry("b", false).AddSeparator("://"),
+        [](const std::string& uri, std::unique_ptr<Env>* env_guard,
+           std::string* /* errmsg */) {
+          ++ObjRegistryTest::num_b;
+          // Env::Default() is a singleton so we can't grant ownership directly
+          // to the caller - we must wrap it first.
+          env_guard->reset(new WrappedEnv(Env::Default(), uri));
+          return env_guard->get();
+        });
 
 TEST_F(ObjRegistryTest, Basics) {
   std::string msg;

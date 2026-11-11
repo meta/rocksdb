@@ -779,5 +779,4 @@ void RegisterTestLibrary(const std::string& arg) {
   }
 }
 
-const std::string kUnitTestDbId = "UnitTest";
 }  // namespace ROCKSDB_NAMESPACE::test

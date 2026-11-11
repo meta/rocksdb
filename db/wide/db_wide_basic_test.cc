@@ -1261,15 +1261,12 @@ class DBWideMergeV3Test : public DBWideBasicTest {
   static constexpr char second_merge_op2_upper[] = "BAZ";
 
   static constexpr char third_key[] = "third";
-  static const WideColumns third_columns;
+  const WideColumns third_columns{{"one", "ONE"}, {"two", "TWO"}};
   static constexpr char third_merge_op1[] = "three";
   static constexpr char third_merge_op1_upper[] = "THREE";
   static constexpr char third_merge_op2[] = "four";
   static constexpr char third_merge_op2_upper[] = "FOUR";
 };
-
-const WideColumns DBWideMergeV3Test::third_columns{{"one", "ONE"},
-                                                   {"two", "TWO"}};
 
 TEST_F(DBWideMergeV3Test, MergeV3WideColumnOutput) {
   // A test merge operator that always returns a wide-column result. It adds any

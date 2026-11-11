@@ -6,6 +6,7 @@
 #include "utilities/simulator_cache/cache_simulator.h"
 
 #include <algorithm>
+#include <string_view>
 
 #include "db/dbformat.h"
 #include "rocksdb/trace_record.h"
@@ -13,7 +14,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
-const std::string kGhostCachePrefix = "ghost_";
+constexpr std::string_view kGhostCachePrefix = "ghost_";
 }  // namespace
 
 GhostCache::GhostCache(std::shared_ptr<Cache> sim_cache)

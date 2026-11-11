@@ -40,7 +40,6 @@ class VariableWidthExtractor : public KeySegmentsExtractor {
     }
   }
 };
-const auto kVariableWidthExtractor = std::make_shared<VariableWidthExtractor>();
 class FixedWidthExtractor : public KeySegmentsExtractor {
  public:
   const char* Name() const override { return "FixedWidthExtractor"; }
@@ -60,29 +59,32 @@ class FixedWidthExtractor : public KeySegmentsExtractor {
     }
   }
 };
-const auto kFixedWidthExtractor = std::make_shared<FixedWidthExtractor>();
-// NOTE: MinMax filter on segment 0 is not normally useful because of metadata
-// on smallest and largest key for each SST file. But it doesn't hurt to test.
-const auto kFilter0 = MakeSharedBytewiseMinMaxSQFC(SelectKeySegment(0));
-const auto kFilter1 = MakeSharedBytewiseMinMaxSQFC(SelectKeySegment(1));
-const auto kFilter2 = MakeSharedBytewiseMinMaxSQFC(SelectKeySegment(2));
-const auto kFilter3 = MakeSharedBytewiseMinMaxSQFC(SelectKeySegment(3));
-const SstQueryFilterConfigs fooConfigs1{{kFilter0, kFilter2},
-                                        kVariableWidthExtractor};
-const SstQueryFilterConfigs fooConfigs2{{kFilter1, kFilter3},
-                                        kVariableWidthExtractor};
-const SstQueryFilterConfigs barConfigs2{{kFilter1, kFilter2},
-                                        kFixedWidthExtractor};
-const SstQueryFilterConfigsManager::Data data = {
-    {1, {{"foo", fooConfigs1}}},
-    {2, {{"foo", fooConfigs2}, {"bar", barConfigs2}}},
-};
 }  // namespace
 
 SstQueryFilterConfigsManager& DbStressSqfcManager() {
   std::once_flag flag;
   static std::shared_ptr<SstQueryFilterConfigsManager> mgr;
   std::call_once(flag, []() {
+    const auto kVariableWidthExtractor =
+        std::make_shared<VariableWidthExtractor>();
+    const auto kFixedWidthExtractor = std::make_shared<FixedWidthExtractor>();
+    // NOTE: MinMax filter on segment 0 is not normally useful because of
+    // metadata on smallest and largest key for each SST file. But it doesn't
+    // hurt to test.
+    const auto kFilter0 = MakeSharedBytewiseMinMaxSQFC(SelectKeySegment(0));
+    const auto kFilter1 = MakeSharedBytewiseMinMaxSQFC(SelectKeySegment(1));
+    const auto kFilter2 = MakeSharedBytewiseMinMaxSQFC(SelectKeySegment(2));
+    const auto kFilter3 = MakeSharedBytewiseMinMaxSQFC(SelectKeySegment(3));
+    const SstQueryFilterConfigs fooConfigs1{{kFilter0, kFilter2},
+                                            kVariableWidthExtractor};
+    const SstQueryFilterConfigs fooConfigs2{{kFilter1, kFilter3},
+                                            kVariableWidthExtractor};
+    const SstQueryFilterConfigs barConfigs2{{kFilter1, kFilter2},
+                                            kFixedWidthExtractor};
+    const SstQueryFilterConfigsManager::Data data = {
+        {1, {{"foo", fooConfigs1}}},
+        {2, {{"foo", fooConfigs2}, {"bar", barConfigs2}}},
+    };
     Status s = SstQueryFilterConfigsManager::MakeShared(data, &mgr);
     DB_STRESS_ASSERT_OK(s);
     assert(mgr);

@@ -139,7 +139,7 @@ class XXPH3FilterBitsBuilder : public FilterBitsBuilder {
 
   // Number of hash entries to accumulate before charging their memory usage to
   // the cache when cache charging is available
-  static const std::size_t kUint64tHashEntryCacheResBucketSize =
+  static constexpr std::size_t kUint64tHashEntryCacheResBucketSize =
       CacheReservationManagerImpl<
           CacheEntryRole::kFilterConstruction>::GetDummyEntrySize() /
       sizeof(uint64_t);
@@ -1428,7 +1428,8 @@ bool BuiltinFilterPolicy::IsInstanceOf(const std::string& name) const {
   }
 }
 
-static const char* kBuiltinFilterMetadataName = "rocksdb.BuiltinBloomFilter";
+static constexpr char kBuiltinFilterMetadataName[] =
+    "rocksdb.BuiltinBloomFilter";
 
 const char* BuiltinFilterPolicy::CompatibilityName() const {
   return kBuiltinFilterMetadataName;

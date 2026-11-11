@@ -156,7 +156,7 @@ class PlainTableIndexBuilder {
            PlainTableIndex::kOffsetLen * index_size_ + sub_index_size_;
   }
 
-  static const std::string kPlainTableIndexBlock;
+  static constexpr char kPlainTableIndexBlock[] = "PlainTableIndexBlock";
 
  private:
   struct IndexRecord {

@@ -88,7 +88,7 @@ std::string DescriptorFileName(const std::string& dbname, uint64_t number);
 
 std::string DescriptorFileName(uint64_t number);
 
-extern const std::string kCurrentFileName;  // = "CURRENT"
+inline constexpr char kCurrentFileName[] = "CURRENT";
 
 // Return the name of the current file.  This file contains the name
 // of the current manifest file.  The result will be prefixed with
@@ -123,11 +123,10 @@ std::string OldInfoLogFileName(const std::string& dbname, uint64_t ts,
                                const std::string& db_path = "",
                                const std::string& log_dir = "");
 
-extern const std::string kOptionsFileNamePrefix;  // = "OPTIONS-"
-extern const std::string
-    kCompactionProgressFileNamePrefix;         // =
-                                               // "COMPACTION_PROGRESS-"
-extern const std::string kTempFileNameSuffix;  // = "dbtmp"
+inline constexpr char kOptionsFileNamePrefix[] = "OPTIONS-";
+inline constexpr char kCompactionProgressFileNamePrefix[] =
+    "COMPACTION_PROGRESS-";
+inline constexpr char kTempFileNameSuffix[] = "dbtmp";
 
 // Return a options file name given the "dbname" and file number.
 // Format:  OPTIONS-[number].dbtmp

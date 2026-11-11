@@ -22,25 +22,16 @@ namespace ROCKSDB_NAMESPACE {
 // infrequently.
 static port::Mutex timer_mutex;
 
-static const std::map<PeriodicTaskType, uint64_t> kDefaultPeriodSeconds = {
-    {PeriodicTaskType::kDumpStats, kInvalidPeriodSec},
-    {PeriodicTaskType::kPersistStats, kInvalidPeriodSec},
-    {PeriodicTaskType::kFlushInfoLog, 10},
-    {PeriodicTaskType::kRecordSeqnoTime, kInvalidPeriodSec},
-    {PeriodicTaskType::kTriggerCompaction, kInvalidPeriodSec},
-};
-
-static const std::map<PeriodicTaskType, std::string> kPeriodicTaskTypeNames = {
-    {PeriodicTaskType::kDumpStats, "dump_st"},
-    {PeriodicTaskType::kPersistStats, "pst_st"},
-    {PeriodicTaskType::kFlushInfoLog, "flush_info_log"},
-    {PeriodicTaskType::kRecordSeqnoTime, "record_seq_time"},
-    {PeriodicTaskType::kTriggerCompaction, "trigger_compaction"},
-};
-
 Status PeriodicTaskScheduler::Register(PeriodicTaskType task_type,
                                        const PeriodicTaskFunc& fn,
                                        bool run_immediately) {
+  static const std::map<PeriodicTaskType, uint64_t> kDefaultPeriodSeconds = {
+      {PeriodicTaskType::kDumpStats, kInvalidPeriodSec},
+      {PeriodicTaskType::kPersistStats, kInvalidPeriodSec},
+      {PeriodicTaskType::kFlushInfoLog, 10},
+      {PeriodicTaskType::kRecordSeqnoTime, kInvalidPeriodSec},
+      {PeriodicTaskType::kTriggerCompaction, kInvalidPeriodSec},
+  };
   return Register(task_type, fn, kDefaultPeriodSeconds.at(task_type),
                   run_immediately);
 }
@@ -49,6 +40,14 @@ Status PeriodicTaskScheduler::Register(PeriodicTaskType task_type,
                                        const PeriodicTaskFunc& fn,
                                        uint64_t repeat_period_seconds,
                                        bool run_immediately) {
+  static const std::map<PeriodicTaskType, std::string> kPeriodicTaskTypeNames =
+      {
+          {PeriodicTaskType::kDumpStats, "dump_st"},
+          {PeriodicTaskType::kPersistStats, "pst_st"},
+          {PeriodicTaskType::kFlushInfoLog, "flush_info_log"},
+          {PeriodicTaskType::kRecordSeqnoTime, "record_seq_time"},
+          {PeriodicTaskType::kTriggerCompaction, "trigger_compaction"},
+      };
   MutexLock l(&timer_mutex);
   static std::atomic<uint64_t> initial_delay(0);
 

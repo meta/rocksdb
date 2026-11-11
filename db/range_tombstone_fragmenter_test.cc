@@ -17,7 +17,7 @@ class RangeTombstoneFragmenterTest : public testing::Test {};
 
 namespace {
 
-static auto bytewise_icmp = InternalKeyComparator(BytewiseComparator());
+static const auto bytewise_icmp = InternalKeyComparator(BytewiseComparator());
 
 std::unique_ptr<InternalIterator> MakeRangeDelIter(
     const std::vector<RangeTombstone>& range_dels) {

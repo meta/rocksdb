@@ -12,6 +12,7 @@
 #include <fcntl.h>
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -1008,8 +1009,6 @@ class TargetCacheChargeTrackingCache : public CacheWrapper {
   }
 
  private:
-  static const Cache::CacheItemHelper* kCrmHelper;
-
   std::size_t cur_cache_charge_;
   std::size_t cache_charge_peak_;
   std::size_t cache_charge_increment_;
@@ -1505,7 +1504,9 @@ class DBTestBase : public testing::Test {
 void VerifySstUniqueIds(const TablePropertiesCollection& props);
 
 // Excludes kUnknown
-extern const std::vector<Temperature> kKnownTemperatures;
+inline constexpr std::array<Temperature, 5> kKnownTemperatures = {
+    Temperature::kHot, Temperature::kWarm, Temperature::kCool,
+    Temperature::kCold, Temperature::kIce};
 Temperature RandomKnownTemperature();
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -27,7 +27,7 @@ struct ExpectedResult {
   uint32_t crc32c;
 };
 
-ExpectedResult expectedResults[] = {
+constexpr ExpectedResult expectedResults[] = {
     // Zero-byte input
     {0, 0, ~0U},
     // Small aligned inputs to test special cases in SIMD implementations

@@ -108,7 +108,7 @@ inline void PlainTableBloomV1::AddHash(uint32_t h) {
 
 class BloomBlockBuilder {
  public:
-  static const std::string kBloomBlock;
+  static constexpr char kBloomBlock[] = "kBloomBlock";
 
   explicit BloomBlockBuilder(uint32_t num_probes = 6) : bloom_(num_probes) {}
 

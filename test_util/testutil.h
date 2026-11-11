@@ -1057,7 +1057,7 @@ struct ReadOptionsNoIo : public ReadOptions {
 };
 extern const ReadOptionsNoIo kReadOptionsNoIo;
 
-extern const std::string kUnitTestDbId;
+inline constexpr char kUnitTestDbId[] = "UnitTest";
 
 }  // namespace test
 }  // namespace ROCKSDB_NAMESPACE

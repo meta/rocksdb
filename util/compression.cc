@@ -1884,18 +1884,21 @@ class BuiltinCompressionManagerV2 final : public CompressionManager {
   }
 };
 
-const std::shared_ptr<BuiltinCompressionManagerV2>
-    kBuiltinCompressionManagerV2 =
-        std::make_shared<BuiltinCompressionManagerV2>();
+const std::shared_ptr<BuiltinCompressionManagerV2>&
+BuiltinCompressionManagerV2Instance() {
+  static const std::shared_ptr<BuiltinCompressionManagerV2> instance =
+      std::make_shared<BuiltinCompressionManagerV2>();
+  return instance;
+}
 
 std::shared_ptr<Decompressor>
 BuiltinZSTDCompressorV2::GetOptimizedDecompressor() const {
-  return kBuiltinCompressionManagerV2->GetZstdDecompressor();
+  return BuiltinCompressionManagerV2Instance()->GetZstdDecompressor();
 }
 
 std::shared_ptr<Decompressor>
 BuiltinSnappyCompressorV2::GetOptimizedDecompressor() const {
-  return kBuiltinCompressionManagerV2->GetSnappyDecompressor();
+  return BuiltinCompressionManagerV2Instance()->GetSnappyDecompressor();
 }
 
 }  // namespace
@@ -1913,7 +1916,7 @@ Status CompressionManager::CreateFromString(
     auto& library = *ObjectLibrary::Default();
     // TODO: try to enhance ObjectLibrary to support singletons
     library.AddFactory<CompressionManager>(
-        kBuiltinCompressionManagerV2->CompatibilityName(),
+        BuiltinCompressionManagerV2Instance()->CompatibilityName(),
         [](const std::string& /*uri*/,
            std::unique_ptr<CompressionManager>* guard,
            std::string* /*errmsg*/) {
@@ -1965,7 +1968,7 @@ CompressionManager::FindCompatibleCompressionManager(Slice compatibility_name) {
 
 const std::shared_ptr<CompressionManager>& GetBuiltinV2CompressionManager() {
   static const std::shared_ptr<CompressionManager> v2_as_base =
-      kBuiltinCompressionManagerV2;
+      BuiltinCompressionManagerV2Instance();
   return v2_as_base;
 }
 

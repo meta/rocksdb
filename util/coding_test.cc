@@ -368,41 +368,48 @@ void AssertPrefixVarintTruncation(T value) {
   ASSERT_EQ(value, actual);
 }
 
-const PrefixVarintTestCase<uint32_t> kPrefixVarint32TestCases[] = {
-    {0, 1, ByteString({0x01})},
-    {1, 1, ByteString({0x03})},
-    {127, 1, ByteString({0xFF})},
-    {128, 2, ByteString({0x02, 0x02})},
-    {255, 2, ByteString({0xFE, 0x03})},
-    {16383, 2, ByteString({0xFE, 0xFF})},
-    {16384, 3, ByteString({0x04, 0x00, 0x02})},
-    {(1u << 21) - 1, 3, ByteString({0xFC, 0xFF, 0xFF})},
-    {(1u << 21), 4, ByteString({0x08, 0x00, 0x00, 0x02})},
-    {(1u << 28) - 1, 4, ByteString({0xF8, 0xFF, 0xFF, 0xFF})},
-    {(1u << 28), 5, ByteString({0x10, 0x00, 0x00, 0x00, 0x02})},
-    {~uint32_t{0}, 5, ByteString({0xF0, 0xFF, 0xFF, 0xFF, 0x1F})},
-};
+const auto& PrefixVarint32TestCases() {
+  static const PrefixVarintTestCase<uint32_t> kCases[] = {
+      {0, 1, ByteString({0x01})},
+      {1, 1, ByteString({0x03})},
+      {127, 1, ByteString({0xFF})},
+      {128, 2, ByteString({0x02, 0x02})},
+      {255, 2, ByteString({0xFE, 0x03})},
+      {16383, 2, ByteString({0xFE, 0xFF})},
+      {16384, 3, ByteString({0x04, 0x00, 0x02})},
+      {(1u << 21) - 1, 3, ByteString({0xFC, 0xFF, 0xFF})},
+      {(1u << 21), 4, ByteString({0x08, 0x00, 0x00, 0x02})},
+      {(1u << 28) - 1, 4, ByteString({0xF8, 0xFF, 0xFF, 0xFF})},
+      {(1u << 28), 5, ByteString({0x10, 0x00, 0x00, 0x00, 0x02})},
+      {~uint32_t{0}, 5, ByteString({0xF0, 0xFF, 0xFF, 0xFF, 0x1F})},
+  };
+  return kCases;
+}
 
-const PrefixVarintTestCase<uint64_t> kPrefixVarint64TestCases[] = {
-    {0, 1, ByteString({0x01})},
-    {1, 1, ByteString({0x03})},
-    {127, 1, ByteString({0xFF})},
-    {128, 2, ByteString({0x02, 0x02})},
-    {16383, 2, ByteString({0xFE, 0xFF})},
-    {(uint64_t{1} << 21), 4, ByteString({0x08, 0x00, 0x00, 0x02})},
-    {(uint64_t{1} << 28), 5, ByteString({0x10, 0x00, 0x00, 0x00, 0x02})},
-    {(uint64_t{1} << 35), 6, ByteString({0x20, 0x00, 0x00, 0x00, 0x00, 0x02})},
-    {(uint64_t{1} << 42), 7,
-     ByteString({0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02})},
-    {(uint64_t{1} << 49), 8,
-     ByteString({0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02})},
-    {(uint64_t{1} << 56) - 1, 8,
-     ByteString({0x80, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})},
-    {(uint64_t{1} << 56), 9,
-     ByteString({0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01})},
-    {~uint64_t{0}, 9,
-     ByteString({0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})},
-};
+const auto& PrefixVarint64TestCases() {
+  static const PrefixVarintTestCase<uint64_t> kCases[] = {
+      {0, 1, ByteString({0x01})},
+      {1, 1, ByteString({0x03})},
+      {127, 1, ByteString({0xFF})},
+      {128, 2, ByteString({0x02, 0x02})},
+      {16383, 2, ByteString({0xFE, 0xFF})},
+      {(uint64_t{1} << 21), 4, ByteString({0x08, 0x00, 0x00, 0x02})},
+      {(uint64_t{1} << 28), 5, ByteString({0x10, 0x00, 0x00, 0x00, 0x02})},
+      {(uint64_t{1} << 35), 6,
+       ByteString({0x20, 0x00, 0x00, 0x00, 0x00, 0x02})},
+      {(uint64_t{1} << 42), 7,
+       ByteString({0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02})},
+      {(uint64_t{1} << 49), 8,
+       ByteString({0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02})},
+      {(uint64_t{1} << 56) - 1, 8,
+       ByteString({0x80, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})},
+      {(uint64_t{1} << 56), 9,
+       ByteString({0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01})},
+      {~uint64_t{0}, 9,
+       ByteString({0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})},
+  };
+  return kCases;
+}
 
 template <uint32_t kMinimumBytes>
 void TestPrefixVarint64MinimumBytes(const std::vector<uint64_t>& values) {
@@ -442,14 +449,14 @@ void TestPrefixVarint64MinimumBytes(const std::vector<uint64_t>& values) {
 // Keep PrefixVarint tests after the legacy coding tests so the two varint
 // families stay visually separated.
 TEST(Coding, PrefixVarint32) {
-  for (const auto& tc : kPrefixVarint32TestCases) {
+  for (const auto& tc : PrefixVarint32TestCases()) {
     ASSERT_EQ(tc.length, VarintLength(tc.value));
   }
-  AssertPrefixVarintRoundTrip(kPrefixVarint32TestCases);
+  AssertPrefixVarintRoundTrip(PrefixVarint32TestCases());
 }
 
 TEST(Coding, PrefixVarint32DiskReadApi) {
-  AssertPrefixVarintDiskReadApi(kPrefixVarint32TestCases);
+  AssertPrefixVarintDiskReadApi(PrefixVarint32TestCases());
   ASSERT_EQ(kInvalidPrefixVarint32AddlByteCount,
             PrefixVarint32AddlByteCount('\0'));
   ASSERT_EQ(kInvalidPrefixVarint32AddlByteCount,
@@ -461,16 +468,16 @@ TEST(Coding, PrefixVarint32DiskReadApi) {
 }
 
 TEST(Coding, PrefixVarint64) {
-  for (const auto& tc : kPrefixVarint64TestCases) {
+  for (const auto& tc : PrefixVarint64TestCases()) {
     const uint32_t expected_length =
         tc.value < (uint64_t{1} << 56) ? VarintLength(tc.value) : 9;
     ASSERT_EQ(tc.length, expected_length);
   }
-  AssertPrefixVarintRoundTrip(kPrefixVarint64TestCases);
+  AssertPrefixVarintRoundTrip(PrefixVarint64TestCases());
 }
 
 TEST(Coding, PrefixVarint64DiskReadApi) {
-  AssertPrefixVarintDiskReadApi(kPrefixVarint64TestCases);
+  AssertPrefixVarintDiskReadApi(PrefixVarint64TestCases());
   ASSERT_EQ(8u, PrefixVarint64AddlByteCount('\0'));
   ASSERT_EQ(7u, PrefixVarint64AddlByteCount('\x80'));
 }

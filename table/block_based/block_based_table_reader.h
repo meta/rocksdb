@@ -125,9 +125,9 @@ Status CopyBufferToReadScopedBlockContents(
 // loaded blocks in the memory.
 class BlockBasedTable : public TableReader, public SameFileBlobReader {
  public:
-  static const std::string kObsoleteFilterBlockPrefix;
-  static const std::string kFullFilterBlockPrefix;
-  static const std::string kPartitionedFilterBlockPrefix;
+  static constexpr char kObsoleteFilterBlockPrefix[] = "filter.";
+  static constexpr char kFullFilterBlockPrefix[] = "fullfilter.";
+  static constexpr char kPartitionedFilterBlockPrefix[] = "partitionedfilter.";
 
   // 1-byte compression type + 32-bit checksum
   static constexpr size_t kBlockTrailerSize = 5;

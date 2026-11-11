@@ -32,10 +32,7 @@ struct OperationInfo {
 // When updating a status of a thread, the pointer of the OperationInfo
 // of the current ThreadStatusData will be pointing to one of the
 // rows in this global table.
-//
-// Note that it's not designed to be constant as in the future we
-// might consider adding global count to the OperationInfo.
-static OperationInfo global_operation_table[] = {
+static const OperationInfo global_operation_table[] = {
     {ThreadStatus::OP_UNKNOWN, ""},
     {ThreadStatus::OP_COMPACTION, "Compaction"},
     {ThreadStatus::OP_FLUSH, "Flush"},
@@ -61,7 +58,7 @@ struct OperationStageInfo {
 // A table maintains the mapping from stage type to stage string.
 // Note that the string must be changed accordingly when the
 // associated function name changed.
-static OperationStageInfo global_op_stage_table[] = {
+static const OperationStageInfo global_op_stage_table[] = {
     {ThreadStatus::STAGE_UNKNOWN, ""},
     {ThreadStatus::STAGE_FLUSH_RUN, "FlushJob::Run"},
     {ThreadStatus::STAGE_FLUSH_WRITE_L0, "FlushJob::WriteLevel0Table"},
@@ -91,7 +88,7 @@ struct StateInfo {
 // When updating a status of a thread, the pointer of the StateInfo
 // of the current ThreadStatusData will be pointing to one of the
 // rows in this global table.
-static StateInfo global_state_table[] = {
+static const StateInfo global_state_table[] = {
     {ThreadStatus::STATE_UNKNOWN, ""},
     {ThreadStatus::STATE_MUTEX_WAIT, "Mutex Wait"},
 };
@@ -101,7 +98,7 @@ struct OperationProperty {
   std::string name;
 };
 
-static OperationProperty compaction_operation_properties[] = {
+static const OperationProperty compaction_operation_properties[] = {
     {ThreadStatus::COMPACTION_JOB_ID, "JobID"},
     {ThreadStatus::COMPACTION_INPUT_OUTPUT_LEVEL, "InputOutputLevel"},
     {ThreadStatus::COMPACTION_PROP_FLAGS, "Manual/Deletion/Trivial"},
@@ -110,7 +107,7 @@ static OperationProperty compaction_operation_properties[] = {
     {ThreadStatus::COMPACTION_BYTES_WRITTEN, "BytesWritten"},
 };
 
-static OperationProperty flush_operation_properties[] = {
+static const OperationProperty flush_operation_properties[] = {
     {ThreadStatus::FLUSH_JOB_ID, "JobID"},
     {ThreadStatus::FLUSH_BYTES_MEMTABLES, "BytesMemtables"},
     {ThreadStatus::FLUSH_BYTES_WRITTEN, "BytesWritten"}};

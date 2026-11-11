@@ -261,11 +261,10 @@ std::map<std::string, Status> DeleteScheduler::GetBackgroundErrors() {
   return bg_errors_;
 }
 
-const std::string DeleteScheduler::kTrashExtension = ".trash";
 bool DeleteScheduler::IsTrashFile(const std::string& file_path) {
-  return (file_path.size() >= kTrashExtension.size() &&
-          file_path.rfind(kTrashExtension) ==
-              file_path.size() - kTrashExtension.size());
+  constexpr size_t kExtLen = sizeof(kTrashExtension) - 1;
+  return (file_path.size() >= kExtLen &&
+          file_path.rfind(kTrashExtension) == file_path.size() - kExtLen);
 }
 
 Status DeleteScheduler::CleanupDirectory(Env* env, SstFileManagerImpl* sfm,

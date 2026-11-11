@@ -30,10 +30,13 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// Path to the database on file system
-const std::string kDbName = test::PerThreadDBPath("stringappend_test");
-
 namespace {
+// Path to the database on file system
+const std::string& DbName() {
+  static const std::string db_name = test::PerThreadDBPath("stringappend_test");
+  return db_name;
+}
+
 // OpenDb opens a (possibly new) rocksdb database with a StringAppendOperator
 std::unique_ptr<DB> OpenNormalDb(const std::string& delim) {
   Options options;
@@ -46,7 +49,7 @@ std::unique_ptr<DB> OpenNormalDb(const std::string& delim) {
   }
   options.merge_operator.reset(mergeOperator);
   std::unique_ptr<DB> db;
-  EXPECT_OK(DB::Open(options, kDbName, &db));
+  EXPECT_OK(DB::Open(options, DbName(), &db));
   return db;
 }
 
@@ -62,7 +65,7 @@ std::unique_ptr<DB> OpenTtlDb(const std::string& delim) {
     mergeOperator = new StringAppendTESTOperator(delim);
   }
   options.merge_operator.reset(mergeOperator);
-  EXPECT_OK(DBWithTTL::Open(options, kDbName, &db, 123456));
+  EXPECT_OK(DBWithTTL::Open(options, DbName(), &db, 123456));
   return std::unique_ptr<DB>(db);
 }
 }  // namespace
@@ -124,7 +127,7 @@ class StringAppendOperatorTest : public testing::Test,
  public:
   StringAppendOperatorTest() {
     EXPECT_OK(
-        DestroyDB(kDbName, Options()));  // Start each test with a fresh DB
+        DestroyDB(DbName(), Options()));  // Start each test with a fresh DB
   }
 
   void SetUp() override {

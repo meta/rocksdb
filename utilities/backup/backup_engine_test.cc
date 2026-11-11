@@ -60,7 +60,9 @@ const auto kLegacyCrc32cAndFileSize =
     BackupEngineOptions::kLegacyCrc32cAndFileSize;
 const auto kUseDbSessionId = BackupEngineOptions::kUseDbSessionId;
 const auto kFlagIncludeFileSize = BackupEngineOptions::kFlagIncludeFileSize;
-const auto kNamingDefault = kUseDbSessionId | kFlagIncludeFileSize;
+constexpr auto kNamingDefault =
+    static_cast<ShareFilesNaming>(static_cast<uint32_t>(kUseDbSessionId) |
+                                  static_cast<uint32_t>(kFlagIncludeFileSize));
 
 class DummyDB : public StackableDB {
  public:

@@ -181,7 +181,7 @@ void SeekIterator(Iterator* iter, uint64_t prefix, uint64_t suffix) {
   iter->Seek(key);
 }
 
-const std::string kNotFoundResult = "NOT_FOUND";
+constexpr char kNotFoundResult[] = "NOT_FOUND";
 
 std::string Get(DB* db, const ReadOptions& read_options, uint64_t prefix,
                 uint64_t suffix) {
