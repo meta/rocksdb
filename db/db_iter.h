@@ -543,6 +543,11 @@ class DBIter final : public Iterator {
   // If user-defined timestamp is enabled, `user_key` includes timestamp.
   bool MergeWithNoBaseValue(const Slice& user_key);
   bool MergeWithPlainBaseValue(const Slice& value, const Slice& user_key);
+  // If `result_operand` is non-null, a merge result that is one of the
+  // existing operands or the base value is returned by reference through it
+  // (no copy); otherwise, such a result is copied into saved_value().
+  bool MergeWithPlainBaseValueImpl(const Slice& value, const Slice& user_key,
+                                   Slice* result_operand);
   bool MergeWithBlobBaseValue(const Slice& blob_index, const Slice& user_key);
   bool MergeWithWideColumnBaseValue(const Slice& entity, const Slice& user_key);
 
