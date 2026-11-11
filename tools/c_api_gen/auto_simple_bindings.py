@@ -7,13 +7,15 @@
 
 This script follows a strict policy for the families it manages:
 
-- if a supported simple public C++ field already has matching C bindings,
-  leave the existing binding in place
-- otherwise auto-generate the matching C binding
-- if a managed field is explicitly blocklisted as manual or deferred,
-  leave it for explicit C API follow-up
+- only public members are considered
+- every supported simple field gets its C bindings (declaration and
+  definition) from this generator; a hand-written duplicate in c_base.h or
+  c_base.cc fails regeneration
+- if a managed field is explicitly blocklisted as manual or deferred, leave it
+  for explicit C API follow-up; a blocklist entry with `functions` keeps only
+  those functions manual
 - if a field is in a managed family but is not supported by the simple
-  generator and there is no manual C binding, fail regeneration
+  generator and is not blocklisted, fail regeneration
 """
 
 from __future__ import annotations
@@ -109,6 +111,10 @@ class BlocklistEntry:
     policy: str
     reason: str
     tracking_issue: str | None = None
+    # When set, only these C functions of the field are manual; the generator
+    # still owns the field's other bindings. When None, the whole field is
+    # manual (or deferred).
+    functions: tuple[str, ...] | None = None
 
 
 READ_OPTIONS_GROUP = OutputGroup(
@@ -661,7 +667,8 @@ def load_blocklist(path: Path) -> tuple[dict[str, dict[str, BlocklistEntry]], li
                 errors.append(f"{entry_context} must be an object")
                 continue
             unknown_entry_keys = sorted(
-                set(entry_raw) - {"field", "policy", "reason", "tracking_issue"}
+                set(entry_raw)
+                - {"field", "policy", "reason", "tracking_issue", "functions"}
             )
             if unknown_entry_keys:
                 errors.append(
@@ -685,6 +692,24 @@ def load_blocklist(path: Path) -> tuple[dict[str, dict[str, BlocklistEntry]], li
                     tracking_issue_raw, f"{entry_context}.tracking_issue", errors
                 )
 
+            functions: tuple[str, ...] | None = None
+            functions_raw = entry_raw.get("functions")
+            if functions_raw is not None:
+                if (
+                    not isinstance(functions_raw, list)
+                    or not functions_raw
+                    or not all(
+                        isinstance(f, str) and f.startswith("rocksdb_")
+                        for f in functions_raw
+                    )
+                ):
+                    errors.append(
+                        f"{entry_context}.functions must be a non-empty list "
+                        "of rocksdb_* function names"
+                    )
+                    continue
+                functions = tuple(functions_raw)
+
             if field_name is None or policy is None or reason is None:
                 continue
             if policy not in BLOCKLIST_POLICIES:
@@ -703,6 +728,7 @@ def load_blocklist(path: Path) -> tuple[dict[str, dict[str, BlocklistEntry]], li
                 policy=policy,
                 reason=reason,
                 tracking_issue=tracking_issue,
+                functions=functions,
             )
 
         if family_entries:
@@ -823,8 +849,14 @@ def discover_fields(family: FamilyConfig) -> list[tuple[str, str]]:
         # emits the unnamed union record followed by an implicit unnamed
         # FieldDecl for it.
         anon_union_fields: list[dict] = []
+        # Only public members are part of the API. Members of a `struct`
+        # default to public, members of a `class` to private.
+        access = "private" if node.get("tagUsed") == "class" else "public"
         for child in node.get("inner", []):
             kind = child.get("kind")
+            if kind == "AccessSpecDecl":
+                access = child.get("access", access)
+                continue
             if (
                 kind in ("RecordDecl", "CXXRecordDecl")
                 and child.get("tagUsed") == "union"
@@ -836,7 +868,7 @@ def discover_fields(family: FamilyConfig) -> list[tuple[str, str]]:
                     if c.get("kind") == "FieldDecl" and "name" in c
                 ]
                 continue
-            if kind != "FieldDecl":
+            if kind != "FieldDecl" or access != "public":
                 continue
             if "name" in child:
                 members = [child]
@@ -1015,6 +1047,7 @@ def build_option_specs(family: FamilyConfig, field_name: str, qual_type: str) ->
                 "receiver_name": family.c_receiver_name,
                 "return_type": "uint64_t",
                 "expr": f"{expr}.count()",
+                "uncast_expr": f"{expr}.count()",
             },
         ]
 
@@ -1037,6 +1070,7 @@ def build_option_specs(family: FamilyConfig, field_name: str, qual_type: str) ->
                 "receiver_name": family.c_receiver_name,
                 "return_type": family.enum_c_type,
                 "expr": f"static_cast<{family.enum_c_type}>({expr})",
+                "uncast_expr": expr,
             },
         ]
 
@@ -1109,6 +1143,7 @@ def build_metadata_specs(
                 "receiver_name": family.c_receiver_name,
                 "return_type": family.enum_c_type,
                 "expr": f"static_cast<{family.enum_c_type}>({expr})",
+                "uncast_expr": expr,
             }
         ]
 
@@ -1136,7 +1171,11 @@ def apply_abi_type_overrides(specs: list[dict] | None) -> list[dict] | None:
             )
         elif spec["kind"] == "field_getter":
             spec["return_type"] = c_type
-            spec["expr"] = f"static_cast<{c_type}>({spec['expr']})"
+            # Cast the field value straight to the pinned type (rather than
+            # wrapping the natural mapping's own cast, e.g. enum -> int).
+            spec["expr"] = (
+                f"static_cast<{c_type}>({spec.get('uncast_expr', spec['expr'])})"
+            )
         else:
             raise ValueError(
                 f"ABI type override for {spec['name']} targets unsupported "
@@ -1257,7 +1296,8 @@ def generate_groups(blocklist_path: Path) -> tuple[dict[Path, str], list[str]]:
                         f"{family.header.relative_to(ROOT)}"
                     )
             for field_name, qual_type in fields:
-                if field_name in blocked_fields:
+                entry = blocked_fields.get(field_name)
+                if entry is not None and entry.functions is None:
                     continue
                 specs = build_specs(family, field_name, qual_type)
                 if specs is None:
@@ -1268,15 +1308,38 @@ def generate_groups(blocklist_path: Path) -> tuple[dict[Path, str], list[str]]:
                         f"{display_path(blocklist_path)}"
                     )
                     continue
+                manual_functions = set(entry.functions) if entry else set()
+                for name in sorted(manual_functions - {s["name"] for s in specs}):
+                    errors.append(
+                        f"stale blocklist function: {name} is not a binding of "
+                        f"{family.struct_name}.{field_name}"
+                    )
                 for spec in specs:
                     coverage = classify_function_coverage(
                         spec["name"], decls, defs, errors
                     )
+                    if spec["name"] in manual_functions:
+                        if coverage != "covered":
+                            errors.append(
+                                f"blocklisted manual function {spec['name']} is "
+                                "not hand-written in tools/c_api_gen/c_base.h "
+                                "and c_base.cc"
+                            )
+                        continue
                     if coverage == "missing_both":
                         header_generated[family.struct_name].append(spec)
                         source_generated[family.struct_name].append(spec)
-                    elif coverage == "missing_def":
-                        source_generated[family.struct_name].append(spec)
+                    elif coverage in ("covered", "missing_def"):
+                        # The generator owns every binding of a managed field.
+                        # A hand-written duplicate (declaration and/or
+                        # definition) would silently shadow it.
+                        errors.append(
+                            "hand-written binding for auto-managed field: "
+                            f"{spec['name']} ({family.struct_name}.{field_name}); "
+                            "delete it from tools/c_api_gen/c_base.h/c_base.cc "
+                            "(pin a legacy C type in abi_type_overrides.json if "
+                            "needed) or blocklist it as manual"
+                        )
 
         outputs[output_group.header_out] = render_group(
             output_group, header_generated, "header"

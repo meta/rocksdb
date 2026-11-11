@@ -1683,50 +1683,6 @@
           "receiver_name": "opt",
           "return_type": "unsigned char",
           "expr": "opt->rep.bottommost_compression_opts.use_zstd_dict_trainer"
-        },
-        {
-          "kind": "field_setter",
-          "name": "rocksdb_options_set_use_fsync",
-          "receiver_type": "rocksdb_options_t*",
-          "receiver_name": "opt",
-          "value_type": "int",
-          "value_name": "use_fsync",
-          "field": "opt->rep.use_fsync"
-        },
-        {
-          "kind": "field_getter",
-          "name": "rocksdb_options_get_use_fsync",
-          "receiver_type": "rocksdb_options_t*",
-          "receiver_name": "opt",
-          "return_type": "int",
-          "expr": "opt->rep.use_fsync"
-        },
-        {
-          "kind": "field_setter",
-          "name": "rocksdb_options_set_disable_auto_compactions",
-          "receiver_type": "rocksdb_options_t*",
-          "receiver_name": "opt",
-          "value_type": "int",
-          "value_name": "disable",
-          "field": "opt->rep.disable_auto_compactions"
-        },
-        {
-          "kind": "field_setter",
-          "name": "rocksdb_options_set_optimize_filters_for_hits",
-          "receiver_type": "rocksdb_options_t*",
-          "receiver_name": "opt",
-          "value_type": "int",
-          "value_name": "v",
-          "field": "opt->rep.optimize_filters_for_hits"
-        },
-        {
-          "kind": "field_setter",
-          "name": "rocksdb_options_set_report_bg_io_stats",
-          "receiver_type": "rocksdb_options_t*",
-          "receiver_name": "opt",
-          "value_type": "int",
-          "value_name": "v",
-          "field": "opt->rep.report_bg_io_stats"
         }
       ]
     }

@@ -127,10 +127,13 @@ looks like today's hand-written wrappers:
 
 ### 2. Let auto-discovery handle the simple direct cases
 
-For a small set of mechanically mappable public structs, the generator can
-discover missing bindings directly from the C++ headers and emit the missing C
-wrappers automatically. Existing handwritten wrappers still win when they
-already exist.
+For a set of mechanically mappable public structs, the generator discovers
+the public fields directly from the C++ headers and owns their C bindings, both
+the declaration in `c.h` and the definition in `c.cc`. A hand-written binding
+for such a field in `c_base.h` / `c_base.cc` fails regeneration, so the
+generated and hand-written layers never overlap. When an already-shipped
+binding has a C type that differs from the natural mapping, pin it in
+`abi_type_overrides.json` instead of hand-writing it.
 
 Today this strict auto-discovery path is used for:
 
@@ -198,6 +201,9 @@ Verification (run by `make check-c-api-gen` and in CI):
     the authoritative ABI/API-stability check
 - `verify_generated_up_to_date.py`
   - regenerates in a temp dir and confirms the checked-in output is current
+- `c_api_gen_test.py`
+  - unit tests for the generator rules (coverage policy, blocklist schema,
+    ABI pins, access specifiers) and the equivalence normalizations
 - `validate_generated_equivalence.py` + `equivalence_allowlist.json`
   - best-effort migration aid: compares generated wrapper *bodies* against a
     PRE-migration hand-written revision. Body comparison is heuristic; for
@@ -297,6 +303,11 @@ The blocklist is intentionally strict:
 - each entry must have a non-empty reason
 - policy must be either `manual` or `deferred`
 - stale entries fail regeneration if the field disappears or is renamed
+- an entry may list `functions` to keep only those C functions of the field
+  hand-written (for example a legacy setter with extra behavior); the
+  generator still owns the field's other bindings, and each listed function
+  must exist in `c_base.h` / `c_base.cc`
+- non-public members are never discovered, so they need no entry
 
 Example deferred entry:
 

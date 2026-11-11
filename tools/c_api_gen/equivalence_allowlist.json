@@ -3,6 +3,18 @@
     {
       "name": "rocksdb_transactiondb_options_set_use_per_key_point_lock_mgr",
       "reason": "The old handwritten implementation existed in db/c.cc but was not declared in include/rocksdb/c.h. The generated declaration intentionally fixes that historical inconsistency."
+    },
+    {
+      "name": "rocksdb_options_set_writable_file_max_buffer_size",
+      "reason": "Equivalent: the hand-written body spelled the conversion as static_cast<size_t>(v); size_t is the field's declared type, which the generated static_cast<decltype(field)>(v) names."
+    },
+    {
+      "name": "rocksdb_compactoptions_set_bottommost_level_compaction",
+      "reason": "Equivalent: the hand-written body spelled the conversion as static_cast<BottommostLevelCompaction>(v); BottommostLevelCompaction is the field's declared type, which the generated static_cast<decltype(field)>(v) names."
+    },
+    {
+      "name": "rocksdb_universal_compaction_options_set_stop_style",
+      "reason": "Equivalent: the hand-written body spelled the conversion as static_cast<CompactionStopStyle>(v); CompactionStopStyle is the field's declared type, which the generated static_cast<decltype(field)>(v) names."
     }
   ]
 }

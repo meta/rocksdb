@@ -6181,75 +6181,6 @@ void rocksdb_compactoptions_destroy(rocksdb_compactoptions_t* opt) {
   delete opt;
 }
 
-void rocksdb_compactoptions_set_bottommost_level_compaction(
-    rocksdb_compactoptions_t* opt, unsigned char v) {
-  opt->rep.bottommost_level_compaction =
-      static_cast<BottommostLevelCompaction>(v);
-}
-
-unsigned char rocksdb_compactoptions_get_bottommost_level_compaction(
-    rocksdb_compactoptions_t* opt) {
-  return static_cast<unsigned char>(opt->rep.bottommost_level_compaction);
-}
-
-void rocksdb_compactoptions_set_exclusive_manual_compaction(
-    rocksdb_compactoptions_t* opt, unsigned char v) {
-  opt->rep.exclusive_manual_compaction = v;
-}
-
-unsigned char rocksdb_compactoptions_get_exclusive_manual_compaction(
-    rocksdb_compactoptions_t* opt) {
-  return opt->rep.exclusive_manual_compaction;
-}
-
-void rocksdb_compactoptions_set_change_level(rocksdb_compactoptions_t* opt,
-                                             unsigned char v) {
-  opt->rep.change_level = v;
-}
-
-unsigned char rocksdb_compactoptions_get_change_level(
-    rocksdb_compactoptions_t* opt) {
-  return opt->rep.change_level;
-}
-
-void rocksdb_compactoptions_set_target_level(rocksdb_compactoptions_t* opt,
-                                             int n) {
-  opt->rep.target_level = n;
-}
-
-int rocksdb_compactoptions_get_target_level(rocksdb_compactoptions_t* opt) {
-  return opt->rep.target_level;
-}
-
-void rocksdb_compactoptions_set_target_path_id(rocksdb_compactoptions_t* opt,
-                                               int n) {
-  opt->rep.target_path_id = n;
-}
-
-int rocksdb_compactoptions_get_target_path_id(rocksdb_compactoptions_t* opt) {
-  return opt->rep.target_path_id;
-}
-
-void rocksdb_compactoptions_set_allow_write_stall(rocksdb_compactoptions_t* opt,
-                                                  unsigned char v) {
-  opt->rep.allow_write_stall = v;
-}
-
-unsigned char rocksdb_compactoptions_get_allow_write_stall(
-    rocksdb_compactoptions_t* opt) {
-  return opt->rep.allow_write_stall;
-}
-
-void rocksdb_compactoptions_set_max_subcompactions(
-    rocksdb_compactoptions_t* opt, int n) {
-  opt->rep.max_subcompactions = n;
-}
-
-int rocksdb_compactoptions_get_max_subcompactions(
-    rocksdb_compactoptions_t* opt) {
-  return opt->rep.max_subcompactions;
-}
-
 void rocksdb_compactoptions_set_full_history_ts_low(
     rocksdb_compactoptions_t* opt, char* ts, size_t tslen) {
   if (ts == nullptr) {
@@ -7079,40 +7010,6 @@ rocksdb_ingestexternalfileoptions_create() {
   return opt;
 }
 
-void rocksdb_ingestexternalfileoptions_set_move_files(
-    rocksdb_ingestexternalfileoptions_t* opt, unsigned char move_files) {
-  opt->rep.move_files = move_files;
-}
-
-void rocksdb_ingestexternalfileoptions_set_snapshot_consistency(
-    rocksdb_ingestexternalfileoptions_t* opt,
-    unsigned char snapshot_consistency) {
-  opt->rep.snapshot_consistency = snapshot_consistency;
-}
-
-void rocksdb_ingestexternalfileoptions_set_allow_global_seqno(
-    rocksdb_ingestexternalfileoptions_t* opt,
-    unsigned char allow_global_seqno) {
-  opt->rep.allow_global_seqno = allow_global_seqno;
-}
-
-void rocksdb_ingestexternalfileoptions_set_allow_blocking_flush(
-    rocksdb_ingestexternalfileoptions_t* opt,
-    unsigned char allow_blocking_flush) {
-  opt->rep.allow_blocking_flush = allow_blocking_flush;
-}
-
-void rocksdb_ingestexternalfileoptions_set_ingest_behind(
-    rocksdb_ingestexternalfileoptions_t* opt, unsigned char ingest_behind) {
-  opt->rep.ingest_behind = ingest_behind;
-}
-
-void rocksdb_ingestexternalfileoptions_set_fail_if_not_bottommost_level(
-    rocksdb_ingestexternalfileoptions_t* opt,
-    unsigned char fail_if_not_bottommost_level) {
-  opt->rep.fail_if_not_bottommost_level = fail_if_not_bottommost_level;
-}
-
 void rocksdb_ingestexternalfileoptions_destroy(
     rocksdb_ingestexternalfileoptions_t* opt) {
   delete opt;
@@ -7203,67 +7100,6 @@ rocksdb_universal_compaction_options_create() {
   return result;
 }
 
-void rocksdb_universal_compaction_options_set_size_ratio(
-    rocksdb_universal_compaction_options_t* uco, int ratio) {
-  uco->rep->size_ratio = ratio;
-}
-
-int rocksdb_universal_compaction_options_get_size_ratio(
-    rocksdb_universal_compaction_options_t* uco) {
-  return uco->rep->size_ratio;
-}
-
-void rocksdb_universal_compaction_options_set_min_merge_width(
-    rocksdb_universal_compaction_options_t* uco, int w) {
-  uco->rep->min_merge_width = w;
-}
-
-int rocksdb_universal_compaction_options_get_min_merge_width(
-    rocksdb_universal_compaction_options_t* uco) {
-  return uco->rep->min_merge_width;
-}
-
-void rocksdb_universal_compaction_options_set_max_merge_width(
-    rocksdb_universal_compaction_options_t* uco, int w) {
-  uco->rep->max_merge_width = w;
-}
-
-int rocksdb_universal_compaction_options_get_max_merge_width(
-    rocksdb_universal_compaction_options_t* uco) {
-  return uco->rep->max_merge_width;
-}
-
-void rocksdb_universal_compaction_options_set_max_size_amplification_percent(
-    rocksdb_universal_compaction_options_t* uco, int p) {
-  uco->rep->max_size_amplification_percent = p;
-}
-
-int rocksdb_universal_compaction_options_get_max_size_amplification_percent(
-    rocksdb_universal_compaction_options_t* uco) {
-  return uco->rep->max_size_amplification_percent;
-}
-
-void rocksdb_universal_compaction_options_set_compression_size_percent(
-    rocksdb_universal_compaction_options_t* uco, int p) {
-  uco->rep->compression_size_percent = p;
-}
-
-int rocksdb_universal_compaction_options_get_compression_size_percent(
-    rocksdb_universal_compaction_options_t* uco) {
-  return uco->rep->compression_size_percent;
-}
-
-void rocksdb_universal_compaction_options_set_stop_style(
-    rocksdb_universal_compaction_options_t* uco, int style) {
-  uco->rep->stop_style =
-      static_cast<ROCKSDB_NAMESPACE::CompactionStopStyle>(style);
-}
-
-int rocksdb_universal_compaction_options_get_stop_style(
-    rocksdb_universal_compaction_options_t* uco) {
-  return static_cast<int>(uco->rep->stop_style);
-}
-
 void rocksdb_universal_compaction_options_destroy(
     rocksdb_universal_compaction_options_t* uco) {
   delete uco->rep;
@@ -7275,48 +7111,6 @@ rocksdb_fifo_compaction_options_t* rocksdb_fifo_compaction_options_create() {
       new rocksdb_fifo_compaction_options_t;
   result->rep = CompactionOptionsFIFO();
   return result;
-}
-
-void rocksdb_fifo_compaction_options_set_allow_compaction(
-    rocksdb_fifo_compaction_options_t* fifo_opts,
-    unsigned char allow_compaction) {
-  fifo_opts->rep.allow_compaction = allow_compaction;
-}
-
-unsigned char rocksdb_fifo_compaction_options_get_allow_compaction(
-    rocksdb_fifo_compaction_options_t* fifo_opts) {
-  return fifo_opts->rep.allow_compaction;
-}
-
-void rocksdb_fifo_compaction_options_set_max_table_files_size(
-    rocksdb_fifo_compaction_options_t* fifo_opts, uint64_t size) {
-  fifo_opts->rep.max_table_files_size = size;
-}
-
-uint64_t rocksdb_fifo_compaction_options_get_max_table_files_size(
-    rocksdb_fifo_compaction_options_t* fifo_opts) {
-  return fifo_opts->rep.max_table_files_size;
-}
-
-void rocksdb_fifo_compaction_options_set_max_data_files_size(
-    rocksdb_fifo_compaction_options_t* fifo_opts, uint64_t size) {
-  fifo_opts->rep.max_data_files_size = size;
-}
-
-uint64_t rocksdb_fifo_compaction_options_get_max_data_files_size(
-    rocksdb_fifo_compaction_options_t* fifo_opts) {
-  return fifo_opts->rep.max_data_files_size;
-}
-
-void rocksdb_fifo_compaction_options_set_use_kv_ratio_compaction(
-    rocksdb_fifo_compaction_options_t* fifo_opts,
-    unsigned char use_kv_ratio_compaction) {
-  fifo_opts->rep.use_kv_ratio_compaction = use_kv_ratio_compaction;
-}
-
-unsigned char rocksdb_fifo_compaction_options_get_use_kv_ratio_compaction(
-    rocksdb_fifo_compaction_options_t* fifo_opts) {
-  return fifo_opts->rep.use_kv_ratio_compaction;
 }
 
 void rocksdb_fifo_compaction_options_destroy(
@@ -7803,11 +7597,6 @@ rocksdb_import_column_family_options_create() {
   return new rocksdb_import_column_family_options_t;
 }
 
-void rocksdb_import_column_family_options_set_move_files(
-    rocksdb_import_column_family_options_t* opt, unsigned char v) {
-  opt->rep.move_files = v;
-}
-
 void rocksdb_import_column_family_options_destroy(
     rocksdb_import_column_family_options_t* metadata) {
   delete metadata;
@@ -7903,41 +7692,6 @@ void rocksdb_optimistictransactiondb_options_set_shared_lock_buckets(
     rocksdb_optimistictransactiondb_lock_buckets_t* lock_buckets) {
   opt->rep.shared_lock_buckets =
       lock_buckets != nullptr ? lock_buckets->rep : nullptr;
-}
-
-// Hand-written bindings for ABI-frozen options with type mismatches between
-// the legacy C API and the underlying C++ field types. These are blocklisted
-// from auto-generation to avoid conflicting declarations.
-void rocksdb_options_set_writable_file_max_buffer_size(rocksdb_options_t* opt,
-                                                       uint64_t v) {
-  opt->rep.writable_file_max_buffer_size = static_cast<size_t>(v);
-}
-uint64_t rocksdb_options_get_writable_file_max_buffer_size(
-    rocksdb_options_t* opt) {
-  return opt->rep.writable_file_max_buffer_size;
-}
-void rocksdb_options_set_soft_pending_compaction_bytes_limit(
-    rocksdb_options_t* opt, size_t v) {
-  opt->rep.soft_pending_compaction_bytes_limit = v;
-}
-size_t rocksdb_options_get_soft_pending_compaction_bytes_limit(
-    rocksdb_options_t* opt) {
-  return opt->rep.soft_pending_compaction_bytes_limit;
-}
-void rocksdb_options_set_hard_pending_compaction_bytes_limit(
-    rocksdb_options_t* opt, size_t v) {
-  opt->rep.hard_pending_compaction_bytes_limit = v;
-}
-size_t rocksdb_options_get_hard_pending_compaction_bytes_limit(
-    rocksdb_options_t* opt) {
-  return opt->rep.hard_pending_compaction_bytes_limit;
-}
-void rocksdb_options_set_max_manifest_file_size(rocksdb_options_t* opt,
-                                                size_t v) {
-  opt->rep.max_manifest_file_size = v;
-}
-size_t rocksdb_options_get_max_manifest_file_size(rocksdb_options_t* opt) {
-  return opt->rep.max_manifest_file_size;
 }
 
 #include "c_api_gen/c_generated_option_structs_auto.cc.inc"
@@ -9144,46 +8898,6 @@ rocksdb_wait_for_compact_options_t* rocksdb_wait_for_compact_options_create() {
 void rocksdb_wait_for_compact_options_destroy(
     rocksdb_wait_for_compact_options_t* opt) {
   delete opt;
-}
-
-void rocksdb_wait_for_compact_options_set_abort_on_pause(
-    rocksdb_wait_for_compact_options_t* opt, unsigned char v) {
-  opt->rep.abort_on_pause = v;
-}
-
-unsigned char rocksdb_wait_for_compact_options_get_abort_on_pause(
-    rocksdb_wait_for_compact_options_t* opt) {
-  return opt->rep.abort_on_pause;
-}
-
-void rocksdb_wait_for_compact_options_set_flush(
-    rocksdb_wait_for_compact_options_t* opt, unsigned char v) {
-  opt->rep.flush = v;
-}
-
-unsigned char rocksdb_wait_for_compact_options_get_flush(
-    rocksdb_wait_for_compact_options_t* opt) {
-  return opt->rep.flush;
-}
-
-void rocksdb_wait_for_compact_options_set_close_db(
-    rocksdb_wait_for_compact_options_t* opt, unsigned char v) {
-  opt->rep.close_db = v;
-}
-
-unsigned char rocksdb_wait_for_compact_options_get_close_db(
-    rocksdb_wait_for_compact_options_t* opt) {
-  return opt->rep.close_db;
-}
-
-void rocksdb_wait_for_compact_options_set_timeout(
-    rocksdb_wait_for_compact_options_t* opt, uint64_t microseconds) {
-  opt->rep.timeout = std::chrono::microseconds(microseconds);
-}
-
-uint64_t rocksdb_wait_for_compact_options_get_timeout(
-    rocksdb_wait_for_compact_options_t* opt) {
-  return opt->rep.timeout.count();
 }
 
 /* High-performance zero-copy Get implementations */

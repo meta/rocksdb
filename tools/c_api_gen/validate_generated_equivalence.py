@@ -83,7 +83,29 @@ def tokenize(text: str) -> list[str]:
 
 
 def map_identifiers(tokens: list[str], mapping: dict[str, str]) -> list[str]:
-    return [mapping.get(tok, tok) for tok in tokens]
+    # Rename parameters only. A token right after `.`, `->` or `::` is a member
+    # or qualified name (e.g. the field in `opt->rep.move_files = move_files`),
+    # never a parameter, so it must keep its spelling.
+    return [
+        tok if i > 0 and tokens[i - 1] in (".", "->", "::") else mapping.get(tok, tok)
+        for i, tok in enumerate(tokens)
+    ]
+
+
+_DECLTYPE_ASSIGN_RE = re.compile(
+    r"(?P<lhs>[A-Za-z_][\w.>\-]*)\s*=\s*static_cast\s*<\s*decltype\s*\(\s*"
+    r"(?P=lhs)\s*\)\s*>\s*\((?P<rhs>[^;]*)\)\s*;"
+)
+
+
+def normalize_decltype_assignments(body: str) -> str:
+    """Rewrite `x = static_cast<decltype(x)>(e);` as `x = e;`.
+
+    Converting to the assignment target's own type is the conversion the
+    assignment performs anyway, so the two spellings are equivalent whenever
+    the plain assignment compiles.
+    """
+    return _DECLTYPE_ASSIGN_RE.sub(lambda m: f"{m.group('lhs')} = {m.group('rhs')};", body)
 
 
 def normalize_return_casts(body: str, return_type: str) -> str:
@@ -397,8 +419,12 @@ def compare_sources(
                 for ref_name, gen_name in zip(ref_def.param_names, generated.param_names)
                 if ref_name and gen_name
             }
-            ref_body = normalize_return_casts(ref_def.body, generated.return_type)
-            gen_body = normalize_return_casts(generated.body, generated.return_type)
+            ref_body = normalize_decltype_assignments(
+                normalize_return_casts(ref_def.body, generated.return_type)
+            )
+            gen_body = normalize_decltype_assignments(
+                normalize_return_casts(generated.body, generated.return_type)
+            )
             ref_tokens = map_identifiers(tokenize(ref_body), mapping)
             gen_tokens = tokenize(gen_body)
             if ref_tokens != gen_tokens:
