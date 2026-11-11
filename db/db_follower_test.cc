@@ -439,7 +439,7 @@ TEST_F(DBFollowerTest, CatchUpKeepsViewWhenNewManifestListsDeletedFiles) {
         compact_options.bottommost_level_compaction =
             BottommostLevelCompaction::kForce;
         ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
-        ASSERT_OK(dbfull()->TEST_WaitForPurge());
+        ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
         for (const auto& table : tables) {
           const Status table_status =
               env_->FileExists(MakeTableFileName(dbname_, table.file_number));
