@@ -1808,13 +1808,17 @@ struct DBOptions {
   //    the dropped blob files to a new MANIFEST and opens the DB.
   //
   // Afterwards:
-  // * Reads of a value stored in a dropped blob file return Corruption.
   // * Every compaction, automatic or manual, that reads a value stored in a
   //   dropped blob file discards it the same way as
   //   CompactRangeOptions::skip_missing_blob_files: a lost value becomes a
   //   deletion at its sequence number, so older versions of the key stay
   //   hidden, and a wide-column entity keeps its surviving columns. Such
   //   compactions run locally, bypassing DBOptions::compaction_service.
+  // * Reads return the same results before such a compaction runs: a value
+  //   stored in a dropped blob file reads as deleted (point lookups return
+  //   NotFound, iterators skip the key, and a merge on top of it merges with
+  //   no base value), and a wide-column entity reads as its surviving
+  //   columns. The BLOB_DB_DROPPED_BLOB_READ_COUNT ticker counts these reads.
   // * Compactions do not fail for lack of garbage accounting in dropped blob
   //   files.
   // * A deletion written in place of a lost value can later meet a
@@ -1833,9 +1837,13 @@ struct DBOptions {
   // DB::Open. A read-only DB applies the same recovery in memory but cannot
   // record dropped blob files in the MANIFEST. Secondary and follower instances
   // ignore this option. Legacy (stacked) BlobDB is not supported. Setting
-  // best_efforts_recovery as well has no additional effect. Like other DB
-  // options, this one is saved in the OPTIONS file, and every open with it set
-  // skips WAL replay, so set it only for an open that needs the repair.
+  // best_efforts_recovery as well has no additional effect.
+  //
+  // Unlike other DB options, this one is not saved in the OPTIONS file, so it
+  // applies only to the DB::Open it is passed to: options loaded with
+  // LoadLatestOptions() have it unset. Every open with it set skips WAL replay
+  // and records any blob file missing at that time as dropped, so set it only
+  // for an open that needs the repair.
   //
   // Default: false
   bool best_efforts_blob_db_repair = false;

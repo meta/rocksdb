@@ -546,6 +546,22 @@ class DBIter final : public Iterator {
   bool MergeWithBlobBaseValue(const Slice& blob_index, const Slice& user_key);
   bool MergeWithWideColumnBaseValue(const Slice& entity, const Slice& user_key);
 
+  // True if the current entry, of `type`, reads as a deletion because its
+  // value, or every column of it, is stored in dropped blob files (see
+  // VersionStorageInfo::CheckDroppedBlobReferences()).
+  // REQUIRES: The current entry's value is prepared.
+  bool IsDeletedByDroppedBlobFiles(ValueType type) {
+    return UNLIKELY(!dropped_blob_files_.empty()) &&
+           (type == kTypeBlobIndex || type == kTypeWideColumnEntity) &&
+           CheckDeletedByDroppedBlobFiles(type);
+  }
+  bool CheckDeletedByDroppedBlobFiles(ValueType type);
+
+  // Replaces *entity with its columns not stored in dropped blob files, kept
+  // in *remaining_columns, if it has columns stored in them.
+  // REQUIRES: Not every column of *entity is stored in dropped blob files.
+  void RemoveDroppedBlobColumns(Slice* entity, std::string* remaining_columns);
+
   bool PrepareValueInternal() {
     // Capture this before PrepareValue(): PrepareValue() updates the wrapper
     // state to "prepared" on success. We still call PrepareValue()
@@ -723,6 +739,10 @@ class DBIter final : public Iterator {
   port::RWMutex* ingest_sst_lock_;
   // Number of the Version this iterator reads, or 0 if unknown.
   const uint64_t version_number_;
+  // The dropped blob files of the Version this iterator reads, whose values
+  // read as deleted (see VersionStorageInfo::GetDroppedBlobFiles()). A copy,
+  // because a tailing iterator keeps reading after that Version is freed.
+  const std::vector<uint64_t> dropped_blob_files_;
   const Slice* const timestamp_ub_;
   const Slice* const timestamp_lb_;
   const size_t timestamp_size_;

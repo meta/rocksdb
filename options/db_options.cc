@@ -495,10 +495,12 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, best_efforts_recovery),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        // A repair applies only to the open that requests it, so it is not
+        // saved in the OPTIONS file.
         {"best_efforts_blob_db_repair",
          {offsetof(struct ImmutableDBOptions, best_efforts_blob_db_repair),
           OptionType::kBoolean, OptionVerificationType::kNormal,
-          OptionTypeFlags::kNone}},
+          OptionTypeFlags::kDontSerialize | OptionTypeFlags::kCompareNever}},
         {"max_bgerror_resume_count",
          {offsetof(struct ImmutableDBOptions, max_bgerror_resume_count),
           OptionType::kInt, OptionVerificationType::kNormal,

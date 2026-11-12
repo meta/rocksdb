@@ -43,6 +43,7 @@
 #include "db/version_builder.h"
 #include "db/version_edit.h"
 #include "db/version_edit_handler.h"
+#include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_columns_helper.h"
 #include "file/file_util.h"
 #include "file/filename.h"
@@ -4138,6 +4139,43 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
       }
     }
   }
+}
+
+VersionStorageInfo::DroppedBlobRead
+VersionStorageInfo::CheckDroppedBlobReferences(
+    const std::vector<uint64_t>& dropped_blob_files, ValueType type,
+    const Slice& value, std::string* remaining_columns) {
+  if (type == kTypeBlobIndex) {
+    BlobIndex blob_index;
+    return blob_index.DecodeFrom(value).ok() &&
+                   IsDroppedBlobIndex(dropped_blob_files, blob_index)
+               ? DroppedBlobRead::kDeleted
+               : DroppedBlobRead::kUnaffected;
+  }
+  if (type != kTypeWideColumnEntity) {
+    return DroppedBlobRead::kUnaffected;
+  }
+
+  WideColumnSerialization::BlobColumnRemoval removal;
+  const Status s = WideColumnSerialization::RemoveBlobColumns(
+      value,
+      [&dropped_blob_files](const BlobIndex& blob_index) {
+        return IsDroppedBlobIndex(dropped_blob_files, blob_index);
+      },
+      remaining_columns, removal);
+  if (!s.ok()) {
+    return DroppedBlobRead::kUnaffected;
+  }
+  switch (removal) {
+    case WideColumnSerialization::BlobColumnRemoval::kNone:
+      return DroppedBlobRead::kUnaffected;
+    case WideColumnSerialization::BlobColumnRemoval::kSome:
+      return DroppedBlobRead::kRemainingColumns;
+    case WideColumnSerialization::BlobColumnRemoval::kAll:
+      return DroppedBlobRead::kDeleted;
+  }
+  assert(false);
+  return DroppedBlobRead::kUnaffected;
 }
 
 void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(

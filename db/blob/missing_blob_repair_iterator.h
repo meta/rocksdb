@@ -162,11 +162,11 @@ class MissingBlobRepairIterator : public InternalIterator {
   // Absence is checked in metadata; inline, same-file and legacy TTL indexes
   // retain their existing resolution rules.
   bool IsMissing(const BlobIndex& index) const {
+    if (only_dropped_blob_files_) {
+      return input_storage_->IsDroppedBlobIndex(index);
+    }
     if (index.IsInlined() || index.HasTTL() || index.IsSameFile()) {
       return false;
-    }
-    if (only_dropped_blob_files_) {
-      return input_storage_->IsDroppedBlobFile(index.file_number());
     }
     const VersionStorageInfo::BlobFiles::const_iterator it =
         input_storage_->GetBlobFileMetaDataLB(index.file_number());
@@ -185,71 +185,23 @@ class MissingBlobRepairIterator : public InternalIterator {
     repair_deletion_ = true;
   }
 
-  // Inspect column indexes without resolving blob payloads. Removing columns
-  // changes the positions of surviving blob indexes, so rebuild those positions
-  // before serialization. Only loss of every column becomes a deletion.
+  // Inspect column indexes without resolving blob payloads. Only loss of every
+  // column becomes a deletion.
   Status RepairEntity(const ParsedInternalKey& parsed) {
-    if (only_dropped_blob_files_) {
-      // Most entities reference no dropped blob file. Find out from the blob
-      // indexes alone before paying for a full deserialization.
-      bool has_dropped = false;
-      const Status s = WideColumnSerialization::ForEachBlobFileNumber(
-          input_->value(), [this, &has_dropped](const BlobIndex& index) {
-            has_dropped |= IsMissing(index);
-            return Status::OK();
-          });
-      if (!s.ok() || !has_dropped) {
-        return s;
-      }
-    }
-
-    columns_.clear();
-    blob_columns_.clear();
-    Status s = WideColumnSerialization::Deserialize(input_->value(), columns_,
-                                                    &blob_columns_);
+    WideColumnSerialization::BlobColumnRemoval removal;
+    Status s = WideColumnSerialization::RemoveBlobColumns(
+        input_->value(),
+        [this](const BlobIndex& index) { return IsMissing(index); },
+        &repaired_value_, removal);
     if (!s.ok()) {
       return s;
     }
-
-    bool has_missing = false;
-    for (const std::pair<size_t, BlobIndex>& column : blob_columns_) {
-      has_missing |= IsMissing(column.second);
-    }
-    if (!has_missing) {
-      return Status::OK();
-    }
-
-    surviving_columns_.clear();
-    surviving_blobs_.clear();
-    size_t blob_position = 0;
-    for (size_t i = 0; i < columns_.size(); ++i) {
-      const BlobIndex* index = nullptr;
-      if (blob_position < blob_columns_.size() &&
-          blob_columns_[blob_position].first == i) {
-        index = &blob_columns_[blob_position++].second;
-      }
-      if (index && IsMissing(*index)) {
-        continue;
-      }
-      if (index) {
-        surviving_blobs_.emplace_back(surviving_columns_.size(), *index);
-      }
-      surviving_columns_.push_back(columns_[i]);
-    }
-    if (surviving_columns_.empty()) {
+    if (removal == WideColumnSerialization::BlobColumnRemoval::kAll) {
       SetDeletion(parsed);
-      return Status::OK();
-    }
-
-    s = surviving_blobs_.empty()
-            ? WideColumnSerialization::Serialize(surviving_columns_,
-                                                 repaired_value_)
-            : WideColumnSerialization::SerializeV2(
-                  surviving_columns_, surviving_blobs_, repaired_value_);
-    if (s.ok()) {
+    } else if (removal == WideColumnSerialization::BlobColumnRemoval::kSome) {
       value_rewritten_ = true;
     }
-    return s;
+    return Status::OK();
   }
 
   // Reset rewritten buffers on every movement. Preserve input errors and range
@@ -293,10 +245,6 @@ class MissingBlobRepairIterator : public InternalIterator {
   size_t timestamp_size_;
   std::string repaired_key_;
   std::string repaired_value_;
-  WideColumns columns_;
-  std::vector<std::pair<size_t, BlobIndex>> blob_columns_;
-  WideColumns surviving_columns_;
-  std::vector<std::pair<size_t, BlobIndex>> surviving_blobs_;
   Status status_;
   bool only_dropped_blob_files_;
   bool value_rewritten_ = false;
