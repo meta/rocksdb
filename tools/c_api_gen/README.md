@@ -203,10 +203,13 @@ Verification (run by `make check-c-api-gen` and in CI):
     the authoritative ABI/API-stability check
 - `verify_generated_up_to_date.py`
   - regenerates in a temp dir and confirms the checked-in output is current
+- `check_method_coverage.py` + `method_coverage.json`
+  - fails when a public method of a covered C++ class is neither called from
+    `db/c.cc` nor excluded with a reason, or when an exclusion is stale
 - `c_api_gen_test.py`
   - unit tests for the generator rules (coverage policy, blocklist schema,
-    ABI pins, access specifiers, handle method lookup and C mapping) and the
-    equivalence normalizations
+    ABI pins, access specifiers, handle method lookup and C mapping), the
+    equivalence normalizations and the method coverage rules
 - `validate_generated_equivalence.py` + `equivalence_allowlist.json`
   - best-effort migration aid: compares generated wrapper *bodies* against a
     PRE-migration hand-written revision. Body comparison is heuristic; for
@@ -233,8 +236,8 @@ python3 tools/c_api_gen/regen_all.py --clang-format clang-format-21
 make check-c-api-gen CLANG_FORMAT_BINARY=clang-format-21
 ```
 
-If `clang++` is not installed, `make check` skips the C API staleness check
-with a message instead of failing, so it still works without the codegen
+If `clang++` is not installed, `make check` skips the C API staleness and
+method coverage checks with a message instead of failing, so it still works without the codegen
 toolchain. CI is the authoritative gate.
 
 The dedicated `build-linux-clang-21-no_test_run` CI job runs this target with
@@ -382,6 +385,29 @@ This checks the generated fragments currently included by
 `include/rocksdb/c.h` and `db/c.cc` against `HEAD:include/rocksdb/c.h` and
 `HEAD:db/c.cc`. Known historical inconsistencies can be documented in
 `equivalence_allowlist.json` with a reason instead of being silently ignored.
+
+## Method coverage
+
+`check_method_coverage.py` keeps the list of what the C API leaves out. For
+each class in `method_coverage.json` it takes every public method from the C++
+headers and every call in `db/c.cc` from clang's AST, and fails if a method is
+neither called nor listed in that class's `excluded` map. A call counts for the
+static type of the object it is made on: `db->rep->Put(...)` covers `DB::Put`,
+and a call through a `TransactionDB*` covers `TransactionDB`, not `DB`. Methods
+a class inherits from another covered class (or from a subclass of one) are
+checked on that class only, and the bases in `excluded_bases` are not checked
+at all. Deprecated, deleted and `TEST_` methods are ignored. Coverage is per
+name, so a new overload of a method that is already called does not trip it.
+
+When it fails on a new method, bind the method (in `handles.json`, or by hand)
+or add it to `excluded` with one of the keys in `reasons`. An exclusion also
+fails once its method is removed or `db/c.cc` starts calling it, so the list
+only ever holds methods that really have no binding. `--report` prints how
+many methods of each class are bound and excluded:
+
+```bash
+python3 tools/c_api_gen/check_method_coverage.py --clang clang++ --report
+```
 
 ## Suggested migration path
 

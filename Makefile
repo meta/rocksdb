@@ -1229,20 +1229,24 @@ check-c-api-gen:
 	else \
 	  echo "Skipping C API backward-compatibility check ($(API_COMPAT_REF) not found; set API_COMPAT_REF)"; \
 	fi
-	# Staleness: regenerate and confirm the checked-in output is current. Needs a
-	# clang++ (the generator parses C++ ASTs). Use CLANG_CXX, which
-	# build_tools/build_detect_platform resolves once (the fbcode clang++ in
-	# fbcode builds, else a versioned clang++ on PATH) and passes explicitly, so
-	# the check and the generator agree on the same binary without heuristics.
+	# Staleness: regenerate and confirm the checked-in output is current. Then
+	# method coverage: every public method of the C++ classes listed in
+	# tools/c_api_gen/method_coverage.json is called from db/c.cc or excluded
+	# there with a reason. Both need a clang++ (they parse C++ ASTs). Use
+	# CLANG_CXX, which build_tools/build_detect_platform resolves once (the
+	# fbcode clang++ in fbcode builds, else a versioned clang++ on PATH) and
+	# passes explicitly, so the checks and the generator agree on the same
+	# binary without heuristics.
 	@strict=""; case "$(CHECK_C_API_GEN_STRICT)" in ""|0|no|NO|false|FALSE) ;; *) strict=1 ;; esac; \
 	cf_arg=""; \
 	if [ -n "$(CLANG_FORMAT_BINARY)" ]; then cf_arg="--clang-format $(CLANG_FORMAT_BINARY)"; fi; \
 	if [ -n "$(CLANG_CXX)" ] && command -v "$(CLANG_CXX)" >/dev/null 2>&1; then \
-	  $(PYTHON) tools/c_api_gen/verify_generated_up_to_date.py --clang "$(CLANG_CXX)" $$cf_arg; \
+	  $(PYTHON) tools/c_api_gen/verify_generated_up_to_date.py --clang "$(CLANG_CXX)" $$cf_arg && \
+	  $(PYTHON) tools/c_api_gen/check_method_coverage.py --clang "$(CLANG_CXX)"; \
 	elif [ -n "$$strict" ]; then \
-	  echo "ERROR: no clang++ found (CLANG_CXX unset) and CHECK_C_API_GEN_STRICT is set; cannot run the C API staleness check" >&2; exit 1; \
+	  echo "ERROR: no clang++ found (CLANG_CXX unset) and CHECK_C_API_GEN_STRICT is set; cannot run the C API staleness and method coverage checks" >&2; exit 1; \
 	else \
-	  echo "Skipping C API codegen staleness check (no clang++ found; CLANG_CXX unset, install clang++ to enable)"; \
+	  echo "Skipping C API codegen staleness and method coverage checks (no clang++ found; CLANG_CXX unset, install clang++ to enable)"; \
 	fi
 
 # Regenerate the checked-in C API generated files (fragments under c_api_gen/,

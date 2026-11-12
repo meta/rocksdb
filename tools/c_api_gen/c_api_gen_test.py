@@ -17,6 +17,7 @@ import os
 import shutil
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -27,6 +28,7 @@ sys.path.insert(0, str(HERE))
 import auto_simple_bindings as asb  # noqa: E402
 import validate_generated_equivalence as veq  # noqa: E402
 import handle_bindings as hb  # noqa: E402
+import check_method_coverage as cmc  # noqa: E402
 
 CLANG = os.environ.get("CLANG_CXX") or shutil.which("clang++")
 
@@ -791,6 +793,360 @@ class CxxIndexTest(unittest.TestCase):
         self.assertEqual(
             mapper.scalar("IndexMode", "ctx", "Holder"), ("int", "Holder::IndexMode")
         )
+
+
+class MethodCoverageProblemsTest(unittest.TestCase):
+    REASONS = {"not-yet": "", "internal": ""}
+
+    def _problems(self, called, excluded):
+        methods = {
+            "Bound": cmc.Method("Bound", False),
+            "Unbound": cmc.Method("Unbound", False),
+            "Excluded": cmc.Method("Excluded", False),
+            "TEST_Hook": cmc.Method("TEST_Hook", True),
+        }
+        return cmc.coverage_problems("DB", methods, called, excluded, self.REASONS)
+
+    def test_bound_excluded_and_skipped_methods_pass(self):
+        problems = self._problems({"Bound", "Unbound"}, {"Excluded": "not-yet"})
+        self.assertEqual(problems, [])
+
+    def test_unbound_method_fails(self):
+        problems = self._problems({"Bound"}, {"Excluded": "not-yet"})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("DB::Unbound has no C binding", problems[0])
+
+    def test_unknown_reason_fails(self):
+        problems = self._problems({"Bound", "Unbound"}, {"Excluded": "later"})
+        self.assertEqual(problems, ['DB::Excluded: unknown reason "later".'])
+
+    def test_exclusion_of_missing_or_skipped_method_fails(self):
+        for name in ("Gone", "TEST_Hook"):
+            excluded = {"Excluded": "not-yet", name: "internal"}
+            problems = self._problems({"Bound", "Unbound"}, excluded)
+            self.assertEqual(len(problems), 1, name)
+            self.assertIn(f"DB::{name} is excluded but is not a checked", problems[0])
+
+    def test_exclusion_of_called_method_fails(self):
+        problems = self._problems(
+            {"Bound", "Unbound", "Excluded"}, {"Excluded": "not-yet"}
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("DB::Excluded is excluded but db/c.cc now calls it", problems[0])
+
+    def test_manifest_reasons(self):
+        manifest = {
+            "reasons": {"customizable": "", "not-yet": ""},
+            "excluded_bases": {"Customizable": "customizable"},
+            "classes": {"DB": {"header": "rocksdb/db.h", "excluded": {"X": "not-yet"}}},
+        }
+        self.assertEqual(cmc.manifest_problems(manifest), [])
+        manifest["excluded_bases"]["Configurable"] = "plumbing"
+        manifest["classes"]["DB"]["excluded"] = {}
+        self.assertEqual(
+            cmc.manifest_problems(manifest),
+            [
+                'excluded_bases["Configurable"]: unknown reason "plumbing".',
+                'reason "not-yet" is not used; remove it.',
+            ],
+        )
+
+
+class ReceiverClassTest(unittest.TestCase):
+    def test_libstdcxx_arrow_goes_through_base_cast(self):
+        # `x->s->Use()` as clang dumps it against libstdc++, where
+        # operator-> is declared in __shared_ptr_access.
+        base = {
+            "kind": "CXXOperatorCallExpr",
+            "type": {"qualType": "element_type *"},
+            "inner": [
+                {
+                    "kind": "ImplicitCastExpr",
+                    "inner": [
+                        {
+                            "kind": "DeclRefExpr",
+                            "referencedDecl": {"name": "operator->"},
+                        }
+                    ],
+                },
+                {
+                    "kind": "ImplicitCastExpr",
+                    "type": {
+                        "qualType": "const std::__shared_ptr_access<rocksdb::Cache, "
+                        "__gnu_cxx::_S_atomic>"
+                    },
+                    "inner": [
+                        {
+                            "kind": "MemberExpr",
+                            "name": "s",
+                            "type": {"qualType": "std::shared_ptr<rocksdb::Cache>"},
+                        }
+                    ],
+                },
+            ],
+        }
+        self.assertEqual(cmc.receiver_class(base), "Cache")
+
+    def test_unique_ptr_with_deleter(self):
+        obj = {
+            "kind": "MemberExpr",
+            "type": {
+                "qualType": "std::unique_ptr<rocksdb::Iterator>",
+                "desugaredQualType": "std::unique_ptr<rocksdb::Iterator, "
+                "std::default_delete<rocksdb::Iterator>>",
+            },
+        }
+        get = {
+            "kind": "CXXMemberCallExpr",
+            "type": {"qualType": "pointer"},
+            "inner": [{"kind": "MemberExpr", "name": "get", "inner": [obj]}],
+        }
+        self.assertEqual(cmc.receiver_class(get), "Iterator")
+
+
+class FileScopeNamesTest(unittest.TestCase):
+    def test_names_each_kind_of_definition(self):
+        source = textwrap.dedent(
+            """\
+            #include <memory>
+            using ROCKSDB_NAMESPACE::DB;
+            struct rocksdb_t;
+            struct Forward;
+            static void Prototype(int a);
+            template <typename MapType>
+            // A comment between the template head and the function.
+            static typename MapType::const_iterator GetAt(const MapType& map,
+                                                          size_t pos) {
+              if (pos >= map.size()) {
+                return map.cend();
+              }
+            }
+            static std::unique_ptr<Range[]> BuildRanges(int n) {
+              return nullptr;
+            }
+            struct Thing* MakeThing() { return nullptr; }
+            class H : public WriteBatch::Handler {
+             public:
+              void Put(const Slice& key, const Slice& value) override {}
+            };
+            static const int kTable[] = {1, 2};
+            enum Local { kA };
+            extern "C" {
+            struct rocksdb_t {
+              DB* rep;
+            };
+            void rocksdb_close(rocksdb_t* db) { delete db->rep; }
+            }  // end extern "C"
+            """
+        )
+        self.assertEqual(
+            cmc.file_scope_names(source),
+            ["BuildRanges", "GetAt", "H", "MakeThing", "kTable"],
+        )
+
+    def test_unnamed_definition_is_an_error(self):
+        with self.assertRaisesRegex(hb.GenError, "cannot name"):
+            cmc.file_scope_names("static auto [a, b] {\n}\n")
+
+
+@unittest.skipUnless(CLANG, "needs clang++ (set CLANG_CXX)")
+class CalledMethodsTest(unittest.TestCase):
+    # Each call path calls a differently named method, so a test failure
+    # names the path that broke.
+    HEADER = textwrap.dedent(
+        """\
+        #include <memory>
+        #include <vector>
+        namespace rocksdb {
+        class Base {
+         public:
+          void ViaBase();
+        };
+        class Cache : public Base {
+         public:
+          static Cache* Make();
+          void ViaPointer();
+          void ViaShared();
+          void ViaDeref();
+          void ViaGet();
+          void ViaUnique();
+          void ViaVectorOfPointers();
+          void ViaVector();
+          void ViaHelper();
+          void ViaHandler();
+          void reset();
+          void ViaComment();
+          void NotCalled();
+          // Its name contains "Helper", so the dump for Helper includes it.
+          void InlineHelper() { NotCalled(); }
+        };
+        }  // namespace rocksdb
+        """
+    )
+    SOURCE = textwrap.dedent(
+        """\
+        struct rocksdb_x_t {
+          rocksdb::Cache* p;
+          std::shared_ptr<rocksdb::Cache> s;
+          std::unique_ptr<rocksdb::Cache> u;
+          std::vector<rocksdb::Cache*> v;
+          std::vector<rocksdb::Cache> w;
+        };
+        static void Helper(rocksdb::Cache* c) { c->ViaHelper(); }
+        class Handler {
+         public:
+          void On(rocksdb::Cache* c) { c->ViaHandler(); }
+        };
+        extern "C" void rocksdb_x_call(rocksdb_x_t* x) {
+          x->p->ViaPointer();
+          x->p->ViaBase();
+          x->s->ViaShared();
+          (*x->s).ViaDeref();
+          x->s.get()->ViaGet();
+          x->s.reset();
+          x->u->ViaUnique();
+          x->v[0]->ViaVectorOfPointers();
+          x->w[0].ViaVector();
+          Helper(rocksdb::Cache::Make());
+          // rocksdb::Cache::ViaComment();
+        }
+        """
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory(dir=cmc.ROOT) as tmp:
+            header = Path(tmp) / "fake.h"
+            header.write_text(cls.HEADER)
+            include = header.relative_to(cmc.ROOT)
+            source = f'#include "{include}"\n' + cls.SOURCE
+            path = Path(tmp) / "fake_c.cc"
+            path.write_text(source)
+            docs = cmc.source_ast(CLANG, path, source)
+        cls.called = cmc.called_methods(docs, source)
+
+    def test_calls_count_for_the_receiver_class(self):
+        self.assertEqual(
+            self.called["Cache"],
+            {
+                "Make",
+                "ViaPointer",
+                "ViaBase",
+                "ViaShared",
+                "ViaDeref",
+                "ViaGet",
+                "ViaUnique",
+                "ViaVectorOfPointers",
+                "ViaVector",
+                "ViaHelper",
+                "ViaHandler",
+            },
+        )
+
+    def test_misnamed_definition_is_an_error(self):
+        # The scan takes the first name before a parenthesis, `__attribute__`,
+        # which clang has no declaration for.
+        source = "__attribute__((unused)) static void Quiet() {}\n"
+        with tempfile.TemporaryDirectory(dir=cmc.ROOT) as tmp:
+            path = Path(tmp) / "fake_c.cc"
+            path.write_text(source)
+            with self.assertRaisesRegex(
+                hb.GenError, "no declaration named __attribute__"
+            ):
+                cmc.source_ast(CLANG, path, source)
+
+    def test_comments_and_header_bodies_do_not_count(self):
+        self.assertNotIn("ViaComment", self.called["Cache"])
+        self.assertNotIn("NotCalled", self.called["Cache"])
+
+    def test_base_method_counts_for_the_derived_receiver(self):
+        self.assertNotIn("Base", self.called)
+
+    def test_smart_pointer_methods_are_not_pointee_methods(self):
+        self.assertNotIn("reset", self.called["Cache"])
+        self.assertIn("reset", self.called["std::shared_ptr<rocksdb::Cache>"])
+
+
+@unittest.skipUnless(CLANG, "needs clang++ (set CLANG_CXX)")
+class PublicMethodsTest(unittest.TestCase):
+    SOURCE = """
+        namespace rocksdb {
+        class Configurable {
+         public:
+          void Configure();
+        };
+        class Covered {
+         public:
+          void CoveredMethod();
+        };
+        class CoveredChild : public Covered {
+         public:
+          void ChildMethod();
+        };
+        class Mixin : public Configurable {
+         public:
+          void MixinMethod();
+        };
+        class Target : public CoveredChild, public Mixin {
+         public:
+          Target();
+          ~Target();
+          void Plain();
+          void Overloaded(int a);
+          [[deprecated]] void Overloaded(int a, int b);
+          [[deprecated]] void OnlyDeprecated();
+          void TEST_Hook();
+          void Deleted() = delete;
+          template <typename T>
+          void Templated(T t);
+          bool operator==(const Target& other) const;
+         protected:
+          void Protected();
+         private:
+          void Private();
+        };
+        class DefaultPrivate {
+          void Hidden();
+         public:
+          void Shown();
+        };
+        }  // namespace rocksdb
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(dir=hb.ROOT)
+        header = Path(cls.tmp.name) / "fake.h"
+        header.write_text(cls.SOURCE)
+        cls.index = hb.CxxIndex(CLANG, [str(header.relative_to(hb.ROOT))])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.index.close()
+        cls.tmp.cleanup()
+
+    def _methods(self, cls):
+        methods = cmc.public_methods(
+            self.index, cls, {"Target", "Covered", "DefaultPrivate"}, {"Configurable"}
+        )
+        return {name: m.skip for name, m in methods.items()}
+
+    def test_public_methods_and_skips(self):
+        self.assertEqual(
+            self._methods("Target"),
+            {
+                "Plain": False,
+                "Overloaded": False,
+                "OnlyDeprecated": True,
+                "TEST_Hook": True,
+                "Deleted": True,
+                "Templated": False,
+                "MixinMethod": False,
+            },
+        )
+
+    def test_class_members_default_to_private(self):
+        self.assertEqual(self._methods("DefaultPrivate"), {"Shown": False})
 
 
 class EquivalenceNormalizationTest(unittest.TestCase):
