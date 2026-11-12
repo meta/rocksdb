@@ -212,6 +212,20 @@ class DBBlobIndexTest : public DBTestBase {
   }
 };
 
+TEST_F(DBBlobIndexTest, EmptyBlobIndexFailsFlushWithCorruption) {
+  Options options = GetTestOptions();
+  options.paranoid_checks = true;
+  DestroyAndReopen(options);
+
+  WriteBatch batch;
+  ASSERT_OK(PutBlobIndex(&batch, "key", Slice()));
+  ASSERT_OK(Write(&batch));
+
+  const Status status = Flush();
+  ASSERT_TRUE(status.IsCorruption());
+  ASSERT_NE(status.ToString().find("Empty blob index"), std::string::npos);
+}
+
 // Note: the following test case pertains to the StackableDB-based BlobDB
 // implementation. We should be able to write kTypeBlobIndex to memtables and
 // SST files.

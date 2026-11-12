@@ -1111,6 +1111,12 @@ static void rocksdb_roundtrip_test_rocksdb_restore_options(void) {
 static void rocksdb_roundtrip_test_rocksdb_size_approximation_options(void) {
   rocksdb_size_approximation_options_t* obj =
       rocksdb_size_approximation_options_create();
+  rocksdb_size_approximation_options_set_allow_expensive_query(obj, 1);
+  CheckCondition(
+      rocksdb_size_approximation_options_get_allow_expensive_query(obj) == 1);
+  rocksdb_size_approximation_options_set_allow_expensive_query(obj, 0);
+  CheckCondition(
+      rocksdb_size_approximation_options_get_allow_expensive_query(obj) == 0);
   rocksdb_size_approximation_options_set_files_size_error_margin(obj, 1);
   CheckCondition(
       rocksdb_size_approximation_options_get_files_size_error_margin(obj) == 1);

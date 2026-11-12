@@ -5767,6 +5767,16 @@ unsigned char rocksdb_table_properties_has_key_smallest_seqno(
   return props->rep.HasKeySmallestSeqno();
 }
 
+unsigned char rocksdb_table_properties_has_referenced_blob_bytes(
+    const rocksdb_table_properties_t* props) {
+  return props->rep.referenced_blob_bytes.has_value();
+}
+
+uint64_t rocksdb_table_properties_referenced_blob_bytes(
+    const rocksdb_table_properties_t* props) {
+  return props->rep.referenced_blob_bytes.value_or(0);
+}
+
 size_t rocksdb_table_properties_user_collected_properties_count(
     const rocksdb_table_properties_t* props) {
   return props->rep.user_collected_properties.size();
@@ -11722,6 +11732,16 @@ void rocksdb_size_approximation_options_set_files_size_error_margin(
 double rocksdb_size_approximation_options_get_files_size_error_margin(
     rocksdb_size_approximation_options_t* opt) {
   return opt->rep.files_size_error_margin;
+}
+
+void rocksdb_size_approximation_options_set_allow_expensive_query(
+    rocksdb_size_approximation_options_t* opt, unsigned char v) {
+  opt->rep.allow_expensive_query = v;
+}
+
+unsigned char rocksdb_size_approximation_options_get_allow_expensive_query(
+    rocksdb_size_approximation_options_t* opt) {
+  return opt->rep.allow_expensive_query;
 }
 
 /* LiveFilesStorageInfoOptions */

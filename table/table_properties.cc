@@ -5,6 +5,8 @@
 
 #include "rocksdb/table_properties.h"
 
+#include <unordered_map>
+
 #include "db/seqno_to_time_mapping.h"
 #include "port/malloc.h"
 #include "port/port.h"
@@ -181,6 +183,8 @@ std::string TableProperties::ToString(const std::string& prop_delim,
                  prop_delim, kv_delim);
   AppendProperty(result, "raw value size", raw_value_size, prop_delim,
                  kv_delim);
+  AppendProperty(result, "referenced blob bytes",
+                 referenced_blob_bytes.value_or(0), prop_delim, kv_delim);
   AppendProperty(result, "raw average value size",
                  num_entries != 0 ? 1.0 * raw_value_size / num_entries : 0.0,
                  prop_delim, kv_delim);
@@ -346,6 +350,10 @@ void TableProperties::Add(const TableProperties& tp) {
   filter_size += tp.filter_size;
   raw_key_size += tp.raw_key_size;
   raw_value_size += tp.raw_value_size;
+  if (tp.referenced_blob_bytes.has_value()) {
+    referenced_blob_bytes =
+        referenced_blob_bytes.value_or(0) + *tp.referenced_blob_bytes;
+  }
   num_data_blocks += tp.num_data_blocks;
   num_data_blocks_compression_rejected +=
       tp.num_data_blocks_compression_rejected;
@@ -375,6 +383,7 @@ TableProperties::GetAggregatablePropertiesAsMap() const {
   rv["filter_size"] = filter_size;
   rv["raw_key_size"] = raw_key_size;
   rv["raw_value_size"] = raw_value_size;
+  rv["referenced_blob_bytes"] = referenced_blob_bytes.value_or(0);
   rv["num_data_blocks"] = num_data_blocks;
   rv["num_data_blocks_compression_rejected"] =
       num_data_blocks_compression_rejected;
@@ -449,6 +458,9 @@ const std::string TablePropertiesNames::kFilterSize = "rocksdb.filter.size";
 const std::string TablePropertiesNames::kRawKeySize = "rocksdb.raw.key.size";
 const std::string TablePropertiesNames::kRawValueSize =
     "rocksdb.raw.value.size";
+// NOLINTNEXTLINE(cert-err58-cpp)
+const std::string TablePropertiesNames::kReferencedBlobBytes =
+    "rocksdb.referenced.blob.bytes";
 const std::string TablePropertiesNames::kNumDataBlocks =
     "rocksdb.num.data.blocks";
 const std::string TablePropertiesNames::kNumDataBlocksCompressionRejected =
@@ -569,6 +581,35 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct TableProperties, raw_value_size),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"referenced_blob_bytes",
+         OptionTypeInfo(offsetof(struct TableProperties, referenced_blob_bytes),
+                        OptionType::kUInt64T)
+             .SetParseFunc([](const ConfigOptions&, const std::string&,
+                              const std::string& value, void* addr) {
+               auto* referenced_blob_bytes =
+                   static_cast<std::optional<uint64_t>*>(addr);
+               if (value == kNullptrString) {
+                 referenced_blob_bytes->reset();
+               } else {
+                 *referenced_blob_bytes = ParseUint64(value);
+               }
+               return Status::OK();
+             })
+             .SetSerializeFunc([](const ConfigOptions&, const std::string&,
+                                  const void* addr, std::string* value) {
+               const auto* referenced_blob_bytes =
+                   static_cast<const std::optional<uint64_t>*>(addr);
+               *value = referenced_blob_bytes->has_value()
+                            ? std::to_string(**referenced_blob_bytes)
+                            : kNullptrString;
+               return Status::OK();
+             })
+             .SetEqualsFunc([](const ConfigOptions&, const std::string&,
+                               const void* addr1, const void* addr2,
+                               std::string*) {
+               return *static_cast<const std::optional<uint64_t>*>(addr1) ==
+                      *static_cast<const std::optional<uint64_t>*>(addr2);
+             })},
         {"num_data_blocks",
          {offsetof(struct TableProperties, num_data_blocks),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -719,6 +760,18 @@ static std::unordered_map<std::string, OptionTypeInfo>
              offsetof(struct TableProperties, readable_properties),
              OptionVerificationType::kNormal, OptionTypeFlags::kNone)},
 };
+
+Status SerializeTablePropertiesForPreparedFileInfo(const ConfigOptions& opts,
+                                                   const TableProperties& props,
+                                                   std::string* output) {
+  static const std::unordered_map<std::string, OptionTypeInfo> type_info = [] {
+    std::unordered_map<std::string, OptionTypeInfo> fields =
+        table_properties_type_info;
+    fields.erase("referenced_blob_bytes");
+    return fields;
+  }();
+  return OptionTypeInfo::SerializeType(opts, type_info, &props, output);
+}
 
 Status TableProperties::Serialize(const ConfigOptions& opts,
                                   std::string* output) const {

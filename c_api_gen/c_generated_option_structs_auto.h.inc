@@ -983,6 +983,14 @@ extern ROCKSDB_LIBRARY_API double
 rocksdb_size_approximation_options_get_files_size_error_margin(
     rocksdb_size_approximation_options_t* opt);
 
+extern ROCKSDB_LIBRARY_API void
+rocksdb_size_approximation_options_set_allow_expensive_query(
+    rocksdb_size_approximation_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_size_approximation_options_get_allow_expensive_query(
+    rocksdb_size_approximation_options_t* opt);
+
 /* LiveFilesStorageInfoOptions */
 
 extern ROCKSDB_LIBRARY_API void

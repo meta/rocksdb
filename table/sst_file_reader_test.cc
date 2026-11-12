@@ -540,6 +540,10 @@ TEST_F(SstFileReaderTest, EmbeddedBlobRoundTrip) {
   std::shared_ptr<const TableProperties> props = reader.GetTableProperties();
   ASSERT_NE(props, nullptr);
   EXPECT_EQ(props->index_value_is_delta_encoded, 0);
+  ASSERT_TRUE(props->referenced_blob_bytes.has_value());
+  // Embedded blob records live in the SST and do not consume external blob
+  // file space.
+  EXPECT_EQ(*props->referenced_blob_bytes, 0U);
 
   EmbeddedBlobStats stats;
   GetEmbeddedBlobStats(&reader, &stats);

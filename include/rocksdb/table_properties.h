@@ -8,6 +8,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "rocksdb/customizable.h"
@@ -56,6 +57,7 @@ struct TablePropertiesNames {
   static const std::string kFilterSize;
   static const std::string kRawKeySize;
   static const std::string kRawValueSize;
+  static const std::string kReferencedBlobBytes;
   static const std::string kNumDataBlocks;
   static const std::string kNumDataBlocksCompressionRejected;
   static const std::string kNumDataBlocksCompressionBypassed;
@@ -485,6 +487,14 @@ struct TableProperties {
   // user collected properties
   UserCollectedProperties user_collected_properties;
   UserCollectedProperties readable_properties;
+
+  // Total physical bytes referenced in separate blob files (excluding blobs
+  // embedded in the SST): compressed payload plus each record's key and header
+  // overhead. nullopt means the count was not recorded, the table format does
+  // not track it, or tracking was unavailable; an engaged zero means no such
+  // references. Add() sums recorded counts, so an aggregate with unknown inputs
+  // can be a partial sum; it stays nullopt if every input is unknown.
+  std::optional<uint64_t> referenced_blob_bytes;
 
   // convert this object to a human readable form
   //   @prop_delim: delimiter for each property.

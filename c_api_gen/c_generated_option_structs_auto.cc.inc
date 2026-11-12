@@ -2271,6 +2271,16 @@ double rocksdb_size_approximation_options_get_files_size_error_margin(
   return opt->rep.files_size_error_margin;
 }
 
+void rocksdb_size_approximation_options_set_allow_expensive_query(
+    rocksdb_size_approximation_options_t* opt, unsigned char v) {
+  opt->rep.allow_expensive_query = v;
+}
+
+unsigned char rocksdb_size_approximation_options_get_allow_expensive_query(
+    rocksdb_size_approximation_options_t* opt) {
+  return opt->rep.allow_expensive_query;
+}
+
 /* LiveFilesStorageInfoOptions */
 
 void rocksdb_livefiles_storage_info_options_set_include_checksum_info(

@@ -25,6 +25,7 @@
 #include "table/format.h"
 #include "table/prepared_file_info.h"
 #include "table/sst_file_writer_collectors.h"
+#include "table/table_properties_internal.h"
 #include "test_util/sync_point.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
@@ -76,8 +77,9 @@ OptionTypeInfo TablePropertiesOptionTypeInfo(int offset) {
                            const std::string&, const void* addr,
                            std::string* value) {
     std::string serialized;
-    Status s = static_cast<const TableProperties*>(addr)->Serialize(
-        config_options, &serialized);
+    Status s = SerializeTablePropertiesForPreparedFileInfo(
+        config_options, *static_cast<const TableProperties*>(addr),
+        &serialized);
     if (s.ok()) {
       *value = Slice(serialized).ToString(true);
     }
@@ -158,6 +160,7 @@ Status DeserializePreparedFileInfo(
 
   ConfigOptions config_options;
   config_options.invoke_prepare_options = false;
+  config_options.ignore_unknown_options = true;
   auto result = std::make_shared<PreparedFileInfo>();
   s = OptionTypeInfo::ParseType(config_options, fields,
                                 PreparedFileInfoTypeInfo(), result.get());
