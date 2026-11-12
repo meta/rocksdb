@@ -353,10 +353,19 @@ Only `name` and `method` are required. The optional keys are:
 - `arity`: call with only the first N arguments and let the rest default
 - `bind`: fixed C++ arguments, e.g. `{"pri": "Env::BOTTOM"}`
 - `result`: `discard` to drop a result, `borrow` / `slice` / `copy` for a
-  `Slice` or string result
+  `Slice` or string result, `handle` to return a pointer or smart pointer
+  result in a new handle
+- `result_handle`: the handle to return, when several wrap the result's type
+- `out_handle`: a `T*` out-parameter to fill straight into a new handle, which
+  the C function returns instead of taking the parameter
+- `consumes`: `T*` parameters the C++ call takes ownership of; their C handles
+  are freed after the call (needs `result: handle`)
+- `param_order`: the order of the C parameters, when it differs from the C++
+  one (the handle still comes first, and `errptr` or `len` last)
 - `receiver_const`: override the `const` of the handle parameter, which
   otherwise follows the C++ method
-- `c_types`: pin a parameter's (or `return`'s) C type for ABI compatibility
+- `c_types`: pin a parameter's (or `return`'s) C type for ABI compatibility;
+  for a new handle, `return` can only add `const`
 - `param_handles`: the handle to use for a parameter when several wrap its
   C++ type
 - `param_names`: a C name for a parameter the C++ declaration leaves unnamed,

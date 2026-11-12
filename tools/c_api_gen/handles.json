@@ -283,6 +283,68 @@
         {
           "name": "rocksdb_write",
           "method": "Write"
+        },
+        {
+          "name": "rocksdb_create_iterator",
+          "method": "NewIterator",
+          "overload": [
+            "const ReadOptions &"
+          ],
+          "result": "handle"
+        },
+        {
+          "name": "rocksdb_create_iterator_cf",
+          "method": "NewIterator",
+          "overload": [
+            "const ReadOptions &",
+            "ColumnFamilyHandle *"
+          ],
+          "result": "handle"
+        },
+        {
+          "name": "rocksdb_create_snapshot",
+          "method": "GetSnapshot",
+          "result": "handle",
+          "c_types": {
+            "return": "const rocksdb_snapshot_t*"
+          }
+        },
+        {
+          "name": "rocksdb_livefiles",
+          "method": "GetLiveFilesMetaData",
+          "out_handle": "0",
+          "c_types": {
+            "return": "const rocksdb_livefiles_t*"
+          }
+        },
+        {
+          "name": "rocksdb_get_column_family_metadata",
+          "method": "GetColumnFamilyMetaData",
+          "overload": [
+            "ColumnFamilyMetaData *"
+          ],
+          "out_handle": "metadata"
+        },
+        {
+          "name": "rocksdb_get_column_family_metadata_cf",
+          "method": "GetColumnFamilyMetaData",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "ColumnFamilyMetaData *"
+          ],
+          "out_handle": "1",
+          "param_names": {
+            "0": "column_family"
+          },
+          "doc": [
+            "/**",
+            " * Returns the rocksdb_column_family_metadata_t of the specified",
+            " * column family.",
+            " *",
+            " * Note that the caller is responsible to release the returned memory",
+            " * using rocksdb_column_family_metadata_destroy.",
+            " */"
+          ]
         }
       ]
     },
@@ -349,6 +411,20 @@
           ],
           "arity": 1,
           "receiver_const": false
+        },
+        {
+          "name": "rocksdb_backup_engine_get_backup_info",
+          "method": "GetBackupInfo",
+          "overload": [
+            "std::vector<BackupInfo> *",
+            "bool"
+          ],
+          "arity": 1,
+          "out_handle": "backup_infos",
+          "receiver_const": false,
+          "c_types": {
+            "return": "const rocksdb_backup_engine_info_t*"
+          }
         }
       ]
     },
@@ -769,6 +845,67 @@
         {
           "name": "rocksdb_writebatch_wi_rollback_to_save_point",
           "method": "RollbackToSavePoint"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_create_iterator_with_base",
+          "method": "NewIteratorWithBase",
+          "overload": [
+            "Iterator *",
+            "const ReadOptions *"
+          ],
+          "arity": 1,
+          "result": "handle",
+          "consumes": [
+            "base_iterator"
+          ]
+        },
+        {
+          "name": "rocksdb_writebatch_wi_create_iterator_with_base_readopts",
+          "method": "NewIteratorWithBase",
+          "overload": [
+            "Iterator *",
+            "const ReadOptions *"
+          ],
+          "result": "handle",
+          "consumes": [
+            "base_iterator"
+          ]
+        },
+        {
+          "name": "rocksdb_writebatch_wi_create_iterator_with_base_cf",
+          "method": "NewIteratorWithBase",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "Iterator *",
+            "const ReadOptions *"
+          ],
+          "arity": 2,
+          "result": "handle",
+          "consumes": [
+            "base_iterator"
+          ],
+          "param_order": [
+            "base_iterator",
+            "column_family"
+          ]
+        },
+        {
+          "name": "rocksdb_writebatch_wi_create_iterator_with_base_cf_readopts",
+          "method": "NewIteratorWithBase",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "Iterator *",
+            "const ReadOptions *"
+          ],
+          "result": "handle",
+          "consumes": [
+            "base_iterator"
+          ],
+          "param_order": [
+            "base_iterator",
+            "column_family",
+            "opts"
+          ]
         }
       ]
     },
@@ -1120,7 +1257,14 @@
       "destroy": {
         "name": "rocksdb_hyper_clock_cache_options_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_cache_create_hyper_clock_opts",
+          "method": "MakeSharedCache",
+          "result": "handle"
+        }
+      ]
     },
     {
       "c_type": "rocksdb_memory_allocator_t",
@@ -1723,6 +1867,31 @@
             "const WriteOptions &",
             "WriteBatch *"
           ]
+        },
+        {
+          "name": "rocksdb_transactiondb_create_snapshot",
+          "method": "GetSnapshot",
+          "result": "handle",
+          "c_types": {
+            "return": "const rocksdb_snapshot_t*"
+          }
+        },
+        {
+          "name": "rocksdb_transactiondb_create_iterator",
+          "method": "NewIterator",
+          "overload": [
+            "const ReadOptions &"
+          ],
+          "result": "handle"
+        },
+        {
+          "name": "rocksdb_transactiondb_create_iterator_cf",
+          "method": "NewIterator",
+          "overload": [
+            "const ReadOptions &",
+            "ColumnFamilyHandle *"
+          ],
+          "result": "handle"
         }
       ]
     },
@@ -1851,6 +2020,23 @@
           "method": "GetName",
           "result": "copy",
           "receiver_const": false
+        },
+        {
+          "name": "rocksdb_transaction_create_iterator",
+          "method": "GetIterator",
+          "overload": [
+            "const ReadOptions &"
+          ],
+          "result": "handle"
+        },
+        {
+          "name": "rocksdb_transaction_create_iterator_cf",
+          "method": "GetIterator",
+          "overload": [
+            "const ReadOptions &",
+            "ColumnFamilyHandle *"
+          ],
+          "result": "handle"
         }
       ]
     },

@@ -215,6 +215,49 @@ void rocksdb_write(rocksdb_t* db, const rocksdb_writeoptions_t* options,
   SaveError(errptr, db->rep->Write(options->rep, &updates->rep));
 }
 
+rocksdb_iterator_t* rocksdb_create_iterator(
+    rocksdb_t* db, const rocksdb_readoptions_t* options) {
+  rocksdb_iterator_t* result = new rocksdb_iterator_t;
+  result->rep = db->rep->NewIterator(options->rep);
+  return result;
+}
+
+rocksdb_iterator_t* rocksdb_create_iterator_cf(
+    rocksdb_t* db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family) {
+  rocksdb_iterator_t* result = new rocksdb_iterator_t;
+  result->rep = db->rep->NewIterator(options->rep, column_family->rep);
+  return result;
+}
+
+const rocksdb_snapshot_t* rocksdb_create_snapshot(rocksdb_t* db) {
+  rocksdb_snapshot_t* result = new rocksdb_snapshot_t;
+  result->rep = db->rep->GetSnapshot();
+  return result;
+}
+
+const rocksdb_livefiles_t* rocksdb_livefiles(rocksdb_t* db) {
+  rocksdb_livefiles_t* result = new rocksdb_livefiles_t;
+  db->rep->GetLiveFilesMetaData(&result->rep);
+  return result;
+}
+
+rocksdb_column_family_metadata_t* rocksdb_get_column_family_metadata(
+    rocksdb_t* db) {
+  rocksdb_column_family_metadata_t* result =
+      new rocksdb_column_family_metadata_t;
+  db->rep->GetColumnFamilyMetaData(&result->rep);
+  return result;
+}
+
+rocksdb_column_family_metadata_t* rocksdb_get_column_family_metadata_cf(
+    rocksdb_t* db, rocksdb_column_family_handle_t* column_family) {
+  rocksdb_column_family_metadata_t* result =
+      new rocksdb_column_family_metadata_t;
+  db->rep->GetColumnFamilyMetaData(column_family->rep, &result->rep);
+  return result;
+}
+
 /* rocksdb_backup_engine_t */
 
 void rocksdb_backup_engine_close(rocksdb_backup_engine_t* be) {
@@ -254,6 +297,13 @@ void rocksdb_backup_engine_stop_backup(rocksdb_backup_engine_t* be) {
 void rocksdb_backup_engine_verify_backup(rocksdb_backup_engine_t* be,
                                          uint32_t backup_id, char** errptr) {
   SaveError(errptr, be->rep->VerifyBackup(backup_id));
+}
+
+const rocksdb_backup_engine_info_t* rocksdb_backup_engine_get_backup_info(
+    rocksdb_backup_engine_t* be) {
+  rocksdb_backup_engine_info_t* result = new rocksdb_backup_engine_info_t;
+  be->rep->GetBackupInfo(&result->rep);
+  return result;
 }
 
 /* rocksdb_backup_engine_info_t */
@@ -587,6 +637,44 @@ void rocksdb_writebatch_wi_rollback_to_save_point(rocksdb_writebatch_wi_t* b,
   SaveError(errptr, b->rep->RollbackToSavePoint());
 }
 
+rocksdb_iterator_t* rocksdb_writebatch_wi_create_iterator_with_base(
+    rocksdb_writebatch_wi_t* b, rocksdb_iterator_t* base_iterator) {
+  rocksdb_iterator_t* result = new rocksdb_iterator_t;
+  result->rep = b->rep->NewIteratorWithBase(base_iterator->rep);
+  delete base_iterator;
+  return result;
+}
+
+rocksdb_iterator_t* rocksdb_writebatch_wi_create_iterator_with_base_readopts(
+    rocksdb_writebatch_wi_t* b, rocksdb_iterator_t* base_iterator,
+    const rocksdb_readoptions_t* opts) {
+  rocksdb_iterator_t* result = new rocksdb_iterator_t;
+  result->rep = b->rep->NewIteratorWithBase(base_iterator->rep, &opts->rep);
+  delete base_iterator;
+  return result;
+}
+
+rocksdb_iterator_t* rocksdb_writebatch_wi_create_iterator_with_base_cf(
+    rocksdb_writebatch_wi_t* b, rocksdb_iterator_t* base_iterator,
+    rocksdb_column_family_handle_t* column_family) {
+  rocksdb_iterator_t* result = new rocksdb_iterator_t;
+  result->rep =
+      b->rep->NewIteratorWithBase(column_family->rep, base_iterator->rep);
+  delete base_iterator;
+  return result;
+}
+
+rocksdb_iterator_t* rocksdb_writebatch_wi_create_iterator_with_base_cf_readopts(
+    rocksdb_writebatch_wi_t* b, rocksdb_iterator_t* base_iterator,
+    rocksdb_column_family_handle_t* column_family,
+    const rocksdb_readoptions_t* opts) {
+  rocksdb_iterator_t* result = new rocksdb_iterator_t;
+  result->rep = b->rep->NewIteratorWithBase(column_family->rep,
+                                            base_iterator->rep, &opts->rep);
+  delete base_iterator;
+  return result;
+}
+
 /* rocksdb_table_properties_t */
 
 unsigned char rocksdb_table_properties_has_key_largest_seqno(
@@ -820,6 +908,13 @@ void rocksdb_lru_cache_options_destroy(rocksdb_lru_cache_options_t* opt) {
 void rocksdb_hyper_clock_cache_options_destroy(
     rocksdb_hyper_clock_cache_options_t* opts) {
   delete opts;
+}
+
+rocksdb_cache_t* rocksdb_cache_create_hyper_clock_opts(
+    const rocksdb_hyper_clock_cache_options_t* opts) {
+  rocksdb_cache_t* result = new rocksdb_cache_t;
+  result->rep = opts->rep.MakeSharedCache();
+  return result;
 }
 
 /* rocksdb_memory_allocator_t */
@@ -1315,6 +1410,28 @@ void rocksdb_transactiondb_write(rocksdb_transactiondb_t* txn_db,
   SaveError(errptr, txn_db->rep->Write(opts->rep, &updates->rep));
 }
 
+const rocksdb_snapshot_t* rocksdb_transactiondb_create_snapshot(
+    rocksdb_transactiondb_t* txn_db) {
+  rocksdb_snapshot_t* result = new rocksdb_snapshot_t;
+  result->rep = txn_db->rep->GetSnapshot();
+  return result;
+}
+
+rocksdb_iterator_t* rocksdb_transactiondb_create_iterator(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options) {
+  rocksdb_iterator_t* result = new rocksdb_iterator_t;
+  result->rep = txn_db->rep->NewIterator(options->rep);
+  return result;
+}
+
+rocksdb_iterator_t* rocksdb_transactiondb_create_iterator_cf(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* opts,
+    rocksdb_column_family_handle_t* column_family) {
+  rocksdb_iterator_t* result = new rocksdb_iterator_t;
+  result->rep = txn_db->rep->NewIterator(opts->rep, column_family->rep);
+  return result;
+}
+
 /* rocksdb_transaction_options_t */
 
 rocksdb_transaction_options_t* rocksdb_transaction_options_create() {
@@ -1421,6 +1538,21 @@ char* rocksdb_transaction_get_name(rocksdb_transaction_t* txn, size_t* len) {
   std::string s = txn->rep->GetName();
   *len = s.size();
   return CopyString(s);
+}
+
+rocksdb_iterator_t* rocksdb_transaction_create_iterator(
+    rocksdb_transaction_t* txn, const rocksdb_readoptions_t* read_options) {
+  rocksdb_iterator_t* result = new rocksdb_iterator_t;
+  result->rep = txn->rep->GetIterator(read_options->rep);
+  return result;
+}
+
+rocksdb_iterator_t* rocksdb_transaction_create_iterator_cf(
+    rocksdb_transaction_t* txn, const rocksdb_readoptions_t* read_options,
+    rocksdb_column_family_handle_t* column_family) {
+  rocksdb_iterator_t* result = new rocksdb_iterator_t;
+  result->rep = txn->rep->GetIterator(read_options->rep, column_family->rep);
+  return result;
 }
 
 /* rocksdb_backup_engine_options_t */

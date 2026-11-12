@@ -364,6 +364,7 @@ OTHER_HANDLES = [
     hb.Handle("rocksdb_val_t", "Val", "generated", "v", None, None),
     hb.Handle("rocksdb_ptr_t", "Ptr*", "generated", "p", None, None),
     hb.Handle("rocksdb_sh_t", "std::shared_ptr<Sh>", "generated", "s", None, None),
+    hb.Handle("rocksdb_cptr_t", "const CPtr*", "generated", "c", None, None),
 ]
 
 
@@ -542,6 +543,121 @@ class HandleRenderTest(unittest.TestCase):
         handle = hb.Handle("rocksdb_val_t", "Val", "generated", "v", None, None)
         _, impl = _render({}, _fn("Count", [], "int", True, owner="Val"), handle=handle)
         self.assertIn("return v->rep.Count();", impl)
+
+
+class HandleResultTest(unittest.TestCase):
+    """Results and out-parameters wrapped in a new handle."""
+
+    def test_pointer_results(self):
+        cases = [
+            ("Ptr *", "rocksdb_ptr_t"),
+            ("std::shared_ptr<Sh>", "rocksdb_sh_t"),
+            ("const CPtr *", "rocksdb_cptr_t"),
+            ("CPtr *", "rocksdb_cptr_t"),
+        ]
+        for cxx, c_type in cases:
+            with self.subTest(cxx=cxx):
+                decl, impl = _render({"result": "handle"}, _fn("Make", [], cxx))
+                self.assertIn(
+                    f"extern ROCKSDB_LIBRARY_API {c_type}* rocksdb_thing_x(", decl
+                )
+                self.assertIn(
+                    f"{{ {c_type}* result = new {c_type}; "
+                    "result->rep = t->rep->Make(); return result; }",
+                    impl,
+                )
+
+    def test_result_errors(self):
+        cases = [
+            ("const Ptr *", {}, "does not fit the non-const rep"),
+            ("std::shared_ptr<Ptr>", {}, "needs a shared rep"),
+            ("int", {}, "needs a pointer or smart pointer"),
+            ("Ptr *", {"c_types": {"return": "void*"}}, "only make the returned"),
+        ]
+        for cxx, extra, message in cases:
+            with self.subTest(cxx=cxx):
+                with self.assertRaisesRegex(hb.GenError, message):
+                    _render({"result": "handle", **extra}, _fn("Make", [], cxx))
+
+    def test_returned_handle_can_be_pinned_const(self):
+        entry = {"result": "handle", "c_types": {"return": "const rocksdb_ptr_t*"}}
+        decl, impl = _render(entry, _fn("Make", [], "Ptr *"))
+        self.assertIn("const rocksdb_ptr_t* rocksdb_thing_x(", decl)
+        self.assertIn("{ rocksdb_ptr_t* result = new rocksdb_ptr_t;", impl)
+
+    def test_out_handle(self):
+        fn = _fn("Fill", [("out", "Val *"), ("n", "int")])
+        decl, impl = _render({"out_handle": "out"}, fn)
+        self.assertIn(
+            "rocksdb_val_t* rocksdb_thing_x( rocksdb_thing_t* t, int n);", decl
+        )
+        self.assertIn(
+            "{ rocksdb_val_t* result = new rocksdb_val_t; "
+            "t->rep->Fill(&result->rep, n); return result; }",
+            impl,
+        )
+
+    def test_out_handle_errors(self):
+        cases = [
+            ([("out", "Val *")], "Status", {"out_handle": "out"}, "needs a void"),
+            ([("out", "Val *")], "void", {"out_handle": "o"}, "unknown parameter o"),
+            ([("out", "Ptr *")], "void", {"out_handle": "out"}, "holds a value"),
+            ([("out", "const Val *")], "void", {"out_handle": "out"}, "non-const"),
+        ]
+        for params, result, entry, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(hb.GenError, message):
+                    _render(entry, _fn("Fill", params, result))
+
+    def test_consumes_frees_the_handle_after_the_call(self):
+        fn = _fn("Wrap", [("base", "Ptr *")], "Ptr *")
+        _, impl = _render({"result": "handle", "consumes": ["base"]}, fn)
+        self.assertIn(
+            "result->rep = t->rep->Wrap(base->rep); delete base; return result; }",
+            impl,
+        )
+
+    def test_consumes_errors(self):
+        cases = [
+            ("Ptr *", {"consumes": ["base"]}, "needs `result: handle`"),
+            ("Ptr *", {"result": "handle", "consumes": ["other"]}, "unknown param"),
+        ]
+        for cxx, entry, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(hb.GenError, message):
+                    _render(entry, _fn("Wrap", [("base", cxx)], "Ptr *"))
+        with self.assertRaisesRegex(hb.GenError, "raw pointer"):
+            _render(
+                {"result": "handle", "consumes": ["base"]},
+                _fn("Wrap", [("base", "Val *")], "Ptr *"),
+            )
+
+    def test_result_handle_needs_a_handle_result(self):
+        with self.assertRaisesRegex(hb.GenError, "result_handle needs"):
+            _render({"result_handle": "rocksdb_ptr_t"}, _fn("Make", [], "int"))
+
+    def test_c_parameter_named_result(self):
+        fn = _fn("Make", [("result", "int")], "Ptr *")
+        with self.assertRaisesRegex(hb.GenError, "named result"):
+            _render({"result": "handle"}, fn)
+
+
+class ParamOrderTest(unittest.TestCase):
+    def test_c_order_differs_from_cxx_order(self):
+        fn = _fn("Use", [("a", "Val *"), ("b", "const Slice &")])
+        _, impl = _render({"param_order": ["b", "a"]}, fn)
+        self.assertIn(
+            "void rocksdb_thing_x( rocksdb_thing_t* t, const char* b, size_t b_len, "
+            "rocksdb_val_t* a) { t->rep->Use(&a->rep, Slice(b, b_len)); }",
+            impl,
+        )
+
+    def test_order_must_list_each_parameter(self):
+        fn = _fn("Use", [("a", "Val *"), ("b", "int")])
+        for order in (["b"], ["b", "a", "a"], ["b", "c"]):
+            with self.subTest(order=order):
+                with self.assertRaisesRegex(hb.GenError, "param_order must list"):
+                    _render({"param_order": order}, fn)
 
 
 class HandleLifecycleTest(unittest.TestCase):
@@ -1222,6 +1338,63 @@ class EquivalenceNormalizationTest(unittest.TestCase):
         self.assertTrue(veq.bodies_equivalent(ref, gen))
         other = make(["v"], "{ o->rep->Set(v + 1); }")
         self.assertFalse(veq.bodies_equivalent(ref, other))
+        # A member that happens to share the new name is not a capture.
+        ref = make(["n"], "{ o->rep.v = n; }")
+        self.assertTrue(veq.bodies_equivalent(ref, make(["v"], "{ o->rep.v = v; }")))
+
+    def test_statements_are_not_declarations(self):
+        def make(body):
+            return veq.FunctionDef("f", "", "int", [], [], body)
+
+        pairs = [
+            ("{ return f(x); }", "{ return g(x); }"),
+            ("{ delete p; }", "{ delete q; }"),
+            ("{ throw e; }", "{ throw d; }"),
+            ("{ if (c) { x(); } else f(y); }", "{ if (c) { x(); } else g(y); }"),
+        ]
+        for ref, gen in pairs:
+            with self.subTest(ref=ref):
+                self.assertEqual(veq.local_renames(ref, gen), {})
+                self.assertFalse(veq.bodies_equivalent(make(ref), make(gen)))
+
+    def test_new_handle_locals_pair_up(self):
+        def make(body):
+            return veq.FunctionDef("f", "", "rocksdb_h_t*", [], [], body)
+
+        gen = make(
+            "{ rocksdb_h_t* result = new rocksdb_h_t; "
+            "result->rep = d->rep->Make(); return result; }"
+        )
+        ref = make(
+            "{ rocksdb_h_t* meta = new rocksdb_h_t; "
+            "meta->rep = d->rep->Make(); return meta; }"
+        )
+        self.assertTrue(veq.bodies_equivalent(ref, gen))
+        # A different handle type still differs after the rename.
+        ref = make(
+            "{ rocksdb_g_t* meta = new rocksdb_g_t; "
+            "meta->rep = d->rep->Make(); return meta; }"
+        )
+        self.assertFalse(veq.bodies_equivalent(ref, gen))
+        # The reference returns some other `result`. Renaming `meta` into it
+        # would make the bodies token-equal.
+        ref = make(
+            "{ rocksdb_h_t* meta = new rocksdb_h_t; "
+            "meta->rep = d->rep->Make(); return result; }"
+        )
+        self.assertEqual(veq.local_renames(ref.body, gen.body), {"meta": "result"})
+        self.assertFalse(veq.bodies_equivalent(ref, gen))
+
+    def test_locals_pair_by_type_then_order(self):
+        ref = (
+            "{ Slice a; Slice b; T* t = new T; const O& o = x ? x->rep : d; "
+            "for (size_t i = 0; i < n; i++) {} return f(a, b); }"
+        )
+        gen = "{ T* result = new T; Slice lo(p, n); Slice hi(q, m); const O& o_ref = y; }"
+        self.assertEqual(
+            veq.local_renames(ref, gen),
+            {"a": "lo", "b": "hi", "t": "result", "o": "o_ref"},
+        )
 
 
 if __name__ == "__main__":

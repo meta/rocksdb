@@ -105,7 +105,9 @@ def normalize_decltype_assignments(body: str) -> str:
     assignment performs anyway, so the two spellings are equivalent whenever
     the plain assignment compiles.
     """
-    return _DECLTYPE_ASSIGN_RE.sub(lambda m: f"{m.group('lhs')} = {m.group('rhs')};", body)
+    return _DECLTYPE_ASSIGN_RE.sub(
+        lambda m: f"{m.group('lhs')} = {m.group('rhs')};", body
+    )
 
 
 def normalize_return_casts(body: str, return_type: str) -> str:
@@ -191,13 +193,58 @@ def normalized_body_tokens(
     return map_identifiers(tokens, mapping) if mapping else tokens
 
 
+# A local declared at the start of a statement: `T v;`, `const T& v = ...`,
+# `T* v = new T`, `Slice v(p, n);`.
+_LOCAL_DECL_RE = re.compile(
+    r"(?:^|(?<=[;{}]))\s*"
+    r"(?P<t>(?!(?:return|delete|throw|else|goto|case|new)\b)"
+    r"(?:const\s+)?[A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?"
+    r"(?:\s*[*&]+\s*(?:const\s+)?|\s+))"
+    r"(?P<v>[A-Za-z_]\w*)(?=\s*[=;({])"
+)
+
+
+def local_renames(ref_body: str, gen_body: str) -> dict[str, str]:
+    """Pair the locals both bodies declare, by declared type and then order.
+
+    The generated body names its new handle `result`, where a hand-written
+    one may have said `meta` or `c`.
+    Renaming a local never changes what a body does, so a wrong pairing can
+    only make two equivalent bodies compare unequal; bodies_equivalent
+    rejects the one unsafe case, a new name that is already taken.
+    """
+    gen: dict[str, list[str]] = {}
+    for m in _LOCAL_DECL_RE.finditer(strip_comments(gen_body)):
+        gen.setdefault(" ".join(m.group("t").split()), []).append(m.group("v"))
+    renames = {}
+    for m in _LOCAL_DECL_RE.finditer(strip_comments(ref_body)):
+        names = gen.get(" ".join(m.group("t").split()))
+        if names:
+            g = names.pop(0)
+            if g != m.group("v"):
+                renames[m.group("v")] = g
+    return renames
+
+
 def bodies_equivalent(ref_def: "FunctionDef", gen_def: "FunctionDef") -> bool:
-    """Token-equal bodies after parameter renames and the normalizations above."""
-    mapping = {
-        ref_name: gen_name
+    """Token-equal bodies after parameter and local renames and the
+    normalizations above."""
+    mapping = local_renames(ref_def.body, gen_def.body)
+    mapping.update(
+        (ref_name, gen_name)
         for ref_name, gen_name in zip(ref_def.param_names, gen_def.param_names)
         if ref_name and gen_name
+    )
+    # A rename into a name the reference body already uses for something
+    # else would merge two variables.
+    ref_tokens = tokenize(ref_def.body)
+    free = {
+        tok
+        for i, tok in enumerate(ref_tokens)
+        if not (i > 0 and ref_tokens[i - 1] in (".", "->", "::"))
     }
+    if (free - mapping.keys()) & set(mapping.values()):
+        return False
     return normalized_body_tokens(
         ref_def.body, gen_def.return_type, mapping
     ) == normalized_body_tokens(gen_def.body, gen_def.return_type)
@@ -246,7 +293,11 @@ def find_signature_start(text: str, pos: int) -> int:
             break
         if prev_line.startswith("//"):
             break
-        if prev_line.endswith(";") or prev_line.endswith("}") or prev_line.endswith("{"):
+        if (
+            prev_line.endswith(";")
+            or prev_line.endswith("}")
+            or prev_line.endswith("{")
+        ):
             break
         start = prev_start
     return start
@@ -400,7 +451,7 @@ def extract_function_defs(text: str) -> dict[str, FunctionDef]:
             pos = m.end(1)
             continue
         sig_start = find_signature_start(text, m.start(1))
-        signature = text[sig_start:paren_end + 1]
+        signature = text[sig_start : paren_end + 1]
         body_end = find_matching(text, body_start, "{", "}")
         body = text[body_start : body_end + 1]
         try:

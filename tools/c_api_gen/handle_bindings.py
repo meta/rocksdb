@@ -37,7 +37,14 @@ The C signature of a method is derived from the C++ declaration
                                  trailing `size_t* len`; or a borrowed
                                  rocksdb_slice_t (`result: slice`)
   std::string by value           malloc()ed char* (`result: copy`) only
+  T* / shared_ptr<T> /           a new handle holding it (`result: handle`)
+  unique_ptr<T>
   anything                       void, with `result: discard`
+
+A `T*` out-parameter named by `out_handle` is filled straight into a new
+handle, which the C function returns. A `T*` parameter listed in `consumes`
+is handed to the C++ call, which takes ownership; its C handle is freed after
+the call.
 
 Everything the conventions cannot decide is explicit in the entry: which
 overload, parameters bound to fixed values, whether a string result is
@@ -90,6 +97,10 @@ METHOD_KEYS = {
     "param_handles",
     "param_names",
     "doc",
+    "result_handle",
+    "out_handle",
+    "consumes",
+    "param_order",
 }
 
 # C types that a C++ parameter or result of the same spelling maps to as-is.
@@ -532,6 +543,41 @@ class TypeMapper:
             )
         return candidates[0]
 
+    def result_handle(self, cxx: str, context: str, preferred: str | None) -> Handle:
+        """The handle a returned pointer or smart pointer is stored in."""
+        m = re.fullmatch(r"(const )?([\w:]+) \*", cxx)
+        sp = re.fullmatch(r"std::(shared|unique)_ptr<(const )?([\w:]+)>", cxx)
+        if m:
+            kind, const, cls = "pointer", bool(m.group(1)), m.group(2)
+        elif sp:
+            kind, const, cls = sp.group(1), bool(sp.group(2)), sp.group(3)
+        else:
+            raise GenError(
+                f"{context}: result: handle needs a pointer or smart pointer, "
+                f"not {cxx!r}"
+            )
+        handle = self.handle_for(cls, context, preferred)
+        rep_kind = handle.rep_kind()[0]
+        if rep_kind != kind:
+            raise GenError(
+                f"{context}: {cxx} needs a {kind} rep, {handle.c_type} has {rep_kind}"
+            )
+        if const and not handle.rep_is_const():
+            raise GenError(
+                f"{context}: {cxx} does not fit the non-const rep of {handle.c_type}"
+            )
+        return handle
+
+    def out_handle(self, cxx: str, context: str, preferred: str | None) -> Handle:
+        """The handle whose rep an out-parameter (`T*`) fills."""
+        m = re.fullmatch(r"(?!const )(.+) \*", cxx)
+        if m is None:
+            raise GenError(f"{context}: out_handle needs a non-const T*, not {cxx!r}")
+        handle = self.handle_for(m.group(1), context, preferred)
+        if handle.rep_kind()[0] != "value":
+            raise GenError(f"{context}: out_handle needs a handle that holds a value")
+        return handle
+
     def param(
         self, p: Param, context: str, preferred: str | None, scope: str = ""
     ) -> Mapped:
@@ -678,9 +724,21 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
     c_params.append(
         CParam(f"{'const ' if receiver_const else ''}{handle.c_type}*", handle.var)
     )
+    # The handle a `result: handle` or `out_handle` call returns.
+    new_handle: Handle | None = None
+    out_name = entry.get("out_handle")
+    consumes = list(entry.get("consumes", []))
+    consumed: list[str] = []
+    by_param: dict[str, list[CParam]] = {}
     for p in params[:arity]:
         if p.name in bind:
             args.append(bind.pop(p.name))
+            continue
+        if p.name == out_name:
+            new_handle = mapper.out_handle(
+                p.type, f"{name}({p.name})", entry.get("result_handle")
+            )
+            args.append("&result->rep")
             continue
         c_name = renames.get(p.name, p.name)
         if not re.fullmatch(r"[A-Za-z_]\w*", c_name):
@@ -703,10 +761,43 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
             cxx_type = p.type.removeprefix("const ")
             if mapped.arg == c_name and pinned != cxx_type:
                 mapped.arg = f"static_cast<{cxx_type}>({c_name})"
+        if p.name in consumes:
+            # The call takes ownership of the C++ object, so only the C
+            # handle around it is left to free.
+            consumes.remove(p.name)
+            cls = re.fullmatch(r"([\w:]+) \*", p.type)
+            owner = cls and mapper.handle_for(
+                cls.group(1), f"{name}({p.name})", param_handles.get(p.name)
+            )
+            if not owner or owner.rep_kind()[0] != "pointer":
+                raise GenError(
+                    f"{name}: consumes needs a T* parameter whose handle holds a "
+                    f"raw pointer, not {p.name} ({p.type})"
+                )
+            consumed.append(f"delete {c_name};")
+        by_param[p.name] = mapped.c_params
         c_params.extend(mapped.c_params)
         args.append(mapped.arg)
+    order = entry.get("param_order")
+    if order is not None:
+        # The C parameters follow this order instead of the C++ one. The
+        # receiver stays first, and errptr or len still come last.
+        if sorted(order) != sorted(by_param):
+            raise GenError(
+                f"{name}: param_order must list each C parameter once: "
+                f"{sorted(by_param)}"
+            )
+        c_params = c_params[:1] + [c for key in order for c in by_param[key]]
     if bind:
         raise GenError(f"{name}: bind names unknown parameters {sorted(bind)}")
+    if out_name is not None and new_handle is None:
+        raise GenError(f"{name}: out_handle names unknown parameter {out_name}")
+    if consumes:
+        raise GenError(f"{name}: consumes names unknown parameters {consumes}")
+    if any(p.name == "result" for p in c_params) and (
+        out_name is not None or entry.get("result") == "handle"
+    ):
+        raise GenError(f"{name}: a C parameter is named result; rename it")
 
     access = "." if kind == "value" else "->"
     call = f"{handle.var}->rep{access}{fn.name}({', '.join(args)})"
@@ -715,7 +806,28 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
     body: list[str] = []
     ret = "void"
     result = mapper.resolve_result(fn)
-    if result_policy == "discard" or result == "void":
+    if consumed and result_policy != "handle":
+        raise GenError(f"{name}: consumes needs `result: handle`")
+    if "result_handle" in entry and new_handle is None and result_policy != "handle":
+        raise GenError(f"{name}: result_handle needs `result: handle` or out_handle")
+    if new_handle is not None or result_policy == "handle":
+        if new_handle is not None:
+            if result != "void" or result_policy is not None:
+                raise GenError(f"{name}: out_handle needs a void C++ function")
+            fill = [f"{call};"]
+        else:
+            new_handle = mapper.result_handle(
+                fn.result, f"{name}(result)", entry.get("result_handle")
+            )
+            fill = [f"result->rep = {call};"]
+        local = f"{new_handle.c_type}*"
+        # A shipped function may hand the new handle back as const.
+        ret = c_types.pop("return", local)
+        if ret not in (local, f"const {local}"):
+            raise GenError(f"{name}: c_types can only make the returned handle const")
+        body += [f"{local} result = new {new_handle.c_type};", *fill]
+        body += [*consumed, "return result;"]
+    elif result_policy == "discard" or result == "void":
         if result_policy == "discard" and result == "void":
             raise GenError(f"{name}: result: discard on a void C++ function")
         body.append(f"{call};")
