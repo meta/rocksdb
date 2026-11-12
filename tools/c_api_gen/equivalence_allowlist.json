@@ -55,6 +55,22 @@
     {
       "name": "rocksdb_writebatch_wi_deletev",
       "reason": "Equivalent: the hand-written body built its Slice arrays as std::vector<Slice>(n) and passed data(); the generated body uses std::unique_ptr<Slice[]>(new Slice[n]) and get(), like the other SliceParts functions. Both default-construct n Slices in one allocation."
+    },
+    {
+      "name": "rocksdb_options_set_universal_compaction_options",
+      "reason": "Equivalent: the hand-written body wrote *(uco->rep) and the generated body writes *uco->rep, which parses the same way because -> binds tighter than unary *."
+    },
+    {
+      "name": "rocksdb_wal_readoptions_set_verify_checksums",
+      "reason": "Equivalent: verify_checksums_ is a bool, so assigning the unsigned char argument converts it with != 0, which the hand-written body spelled out."
+    },
+    {
+      "name": "rocksdb_open_and_compact_options_set_allow_resumption",
+      "reason": "Equivalent: allow_resumption is a bool, so assigning the unsigned char argument converts it with != 0, which the hand-written body spelled out."
+    },
+    {
+      "name": "rocksdb_livefile_set_size",
+      "reason": "Equivalent: the shipped parameter is a size_t and LiveFileMetaData::size is a uint64_t; the generated body spells the conversion the assignment performs as static_cast<uint64_t>(size)."
     }
   ]
 }

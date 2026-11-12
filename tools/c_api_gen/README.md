@@ -347,7 +347,8 @@ the handle's `methods` list in `handles.json` and regenerate:
 {"name": "rocksdb_writebatch_put", "method": "Put", "overload": ["const Slice &", "const Slice &"], "result": "discard"}
 ```
 
-Only `name` and `method` are required (or `field` or `count`, described below).
+Only `name` and `method` are required (or `field`, `count` or `set`, described
+below).
 The optional keys are:
 
 - `overload`: the C++ parameter types, when the method is overloaded
@@ -365,9 +366,13 @@ The optional keys are:
 - `param_order`: the order of the C parameters, when it differs from the C++
   one (the handle still comes first, and `errptr` or `len` last)
 - `nullable`: parameters that accept a NULL C pointer. A `const Slice *` takes
-  `const char* x, size_t x_len` and passes `nullptr` when `x` is NULL; a
-  `const T &` whose handle holds a `T` passes a default-constructed `T` when
-  the handle is NULL
+  `const char* x, size_t x_len` and passes `nullptr` when `x` is NULL; a `T*`
+  or `shared_ptr<T>` taken from a handle passes `nullptr` when the handle is
+  NULL; a `const T &` whose handle holds a `T` passes a default-constructed `T`
+  when the handle is NULL
+- `skip_if_null`: pointer parameters, or the handle by its `var`, for which
+  NULL makes the function return without doing anything (only for a function
+  with no result)
 - `shared_count`: one C `int` parameter, of this name, that gives the length
   of every `const SliceParts &` parameter (each one otherwise takes its own
   `num_x`)
@@ -384,11 +389,24 @@ The optional keys are:
 
 Keys naming a parameter use its C++ name (or position, when unnamed).
 
-A handle whose `rep` is a `std::vector<T>` can also read the vector. An entry
+An entry can also name a public data member of `rep` instead of a method.
+`"field": "x"` returns `rep.x`, `"count": "x"` returns `rep.x.size()` for a
+container member, and `"set": "x"` assigns `rep.x` from one C parameter, which
+maps like a by-value C++ parameter of the member's type (a class that a handle
+holds is passed by reference, and `std::string` as `const char*`). The
+parameter takes the member's name, which other keys use for it. Read entries
+take only `result`, `receiver_const`, `c_types` and `doc`; `set` entries take
+`param_names`, `param_handles`, `nullable`, `skip_if_null`, `c_types` and
+`doc`:
+
+```json
+{"name": "rocksdb_options_set_row_cache", "set": "row_cache", "param_names": {"row_cache": "cache"}, "skip_if_null": ["row_cache"]}
+```
+
+A handle whose `rep` is a `std::vector<T>` reads the vector instead: an entry
 with `"count": true` returns `rep.size()`, and an entry with `"field": "x"`
 returns `rep[index].x`, where `index` is a C parameter of the type the handle
-names in `index_type` (`int` or `size_t`). Such entries take only `result`,
-`c_types` and `doc`:
+names in `index_type` (`int` or `size_t`):
 
 ```json
 {"name": "rocksdb_livefiles_name", "field": "name", "result": "c_str"}

@@ -1204,14 +1204,6 @@ rocksdb_compaction_service_options_override_create_from_options(
   return override_opts;
 }
 
-void rocksdb_compaction_service_options_override_set_env(
-    rocksdb_compaction_service_options_override_t* override_options,
-    rocksdb_env_t* env) {
-  if (override_options && env) {
-    override_options->rep.env = env->rep;
-  }
-}
-
 void rocksdb_compaction_service_options_override_set_comparator(
     rocksdb_compaction_service_options_override_t* override_options,
     rocksdb_comparator_t* comparator) {
@@ -1284,35 +1276,11 @@ void rocksdb_compaction_service_options_override_set_statistics(
   }
 }
 
-void rocksdb_compaction_service_options_override_set_info_log(
-    rocksdb_compaction_service_options_override_t* override_options,
-    rocksdb_logger_t* logger) {
-  if (override_options && logger) {
-    override_options->rep.info_log = logger->rep;
-  }
-}
-
 void rocksdb_compaction_service_options_override_set_option(
     rocksdb_compaction_service_options_override_t* override_options,
     const char* key, const char* value) {
   if (override_options && key && value) {
     override_options->rep.options_map[std::string(key)] = std::string(value);
-  }
-}
-
-void rocksdb_compaction_service_options_override_set_file_checksum_gen_factory(
-    rocksdb_compaction_service_options_override_t* override_options,
-    rocksdb_file_checksum_gen_factory_t* factory) {
-  if (override_options && factory) {
-    override_options->rep.file_checksum_gen_factory = factory->rep;
-  }
-}
-
-void rocksdb_compaction_service_options_override_set_sst_partitioner_factory(
-    rocksdb_compaction_service_options_override_t* override_options,
-    rocksdb_sst_partitioner_factory_t* factory) {
-  if (override_options && factory) {
-    override_options->rep.sst_partitioner_factory = factory->rep;
   }
 }
 
@@ -1349,14 +1317,6 @@ void rocksdb_open_and_compact_options_set_canceled(
     rocksdb_open_and_compact_options_t* options, unsigned char* canceled) {
   if (options && canceled) {
     options->rep.canceled = reinterpret_cast<std::atomic<bool>*>(canceled);
-  }
-}
-
-void rocksdb_open_and_compact_options_set_allow_resumption(
-    rocksdb_open_and_compact_options_t* options,
-    unsigned char allow_resumption) {
-  if (options) {
-    options->rep.allow_resumption = allow_resumption != 0;
   }
 }
 
@@ -1612,25 +1572,6 @@ rocksdb_backup_engine_options_t* rocksdb_backup_engine_options_create(
     const char* backup_dir) {
   return new rocksdb_backup_engine_options_t{
       BackupEngineOptions(std::string(backup_dir))};
-}
-
-void rocksdb_backup_engine_options_set_env(
-    rocksdb_backup_engine_options_t* options, rocksdb_env_t* env) {
-  options->rep.backup_env = (env ? env->rep : nullptr);
-}
-
-void rocksdb_backup_engine_options_set_backup_rate_limiter(
-    rocksdb_backup_engine_options_t* options, rocksdb_ratelimiter_t* limiter) {
-  if (limiter) {
-    options->rep.backup_rate_limiter = limiter->rep;
-  }
-}
-
-void rocksdb_backup_engine_options_set_restore_rate_limiter(
-    rocksdb_backup_engine_options_t* options, rocksdb_ratelimiter_t* limiter) {
-  if (limiter) {
-    options->rep.restore_rate_limiter = limiter->rep;
-  }
 }
 
 void rocksdb_status_ptr_get_error(rocksdb_status_ptr_t* status, char** errptr) {
@@ -2579,16 +2520,6 @@ rocksdb_wal_file_t* rocksdb_get_current_wal_file(rocksdb_t* db, char** errptr) {
   return result;
 }
 
-void rocksdb_wal_readoptions_set_verify_checksums(
-    rocksdb_wal_readoptions_t* options, unsigned char verify_checksums) {
-  options->rep.verify_checksums_ = verify_checksums != 0;
-}
-
-unsigned char rocksdb_wal_readoptions_get_verify_checksums(
-    rocksdb_wal_readoptions_t* options) {
-  return options->rep.verify_checksums_;
-}
-
 const char* rocksdb_wal_file_path_name(const rocksdb_wal_file_t* file) {
   return file->path_name.c_str();
 }
@@ -3233,14 +3164,6 @@ void rocksdb_block_based_options_set_filter_policy(
   options->rep.filter_policy.reset(filter_policy);
 }
 
-void rocksdb_block_based_options_set_block_cache(
-    rocksdb_block_based_table_options_t* options,
-    rocksdb_cache_t* block_cache) {
-  if (block_cache) {
-    options->rep.block_cache = block_cache->rep;
-  }
-}
-
 void rocksdb_block_based_options_set_user_defined_index_factory_from_string(
     rocksdb_block_based_table_options_t* options, const char* value,
     size_t value_len, char** errptr) {
@@ -3337,16 +3260,6 @@ void rocksdb_options_set_block_based_table_factory(
 #include "c_api_gen/c_generated_jobinfo_metadata_subset.cc.inc"
 #include "c_api_gen/c_generated_metadata_structs_auto.cc.inc"
 
-unsigned char rocksdb_compactionjobinfo_use_separate_remote_compaction_pool(
-    const rocksdb_compactionjobinfo_t* info) {
-  return info->rep.separate_remote_compaction_pool_selected;
-}
-
-unsigned char rocksdb_subcompactionjobinfo_use_separate_remote_compaction_pool(
-    const rocksdb_subcompactionjobinfo_t* info) {
-  return info->rep.separate_remote_compaction_pool_selected;
-}
-
 void rocksdb_reset_status(rocksdb_status_ptr_t* status_ptr) {
   auto ptr = status_ptr->rep;
   *ptr = Status::OK();
@@ -3360,11 +3273,6 @@ unsigned char rocksdb_table_properties_has_referenced_blob_bytes(
 uint64_t rocksdb_table_properties_referenced_blob_bytes(
     const rocksdb_table_properties_t* props) {
   return props->rep.referenced_blob_bytes.value_or(0);
-}
-
-size_t rocksdb_table_properties_user_collected_properties_count(
-    const rocksdb_table_properties_t* props) {
-  return props->rep.user_collected_properties.size();
 }
 
 const char* rocksdb_table_properties_user_collected_properties_key_at(
@@ -3395,11 +3303,6 @@ const char* rocksdb_table_properties_user_collected_properties_value_at(
     *value_len = it->second.size();
   }
   return it->second.data();
-}
-
-size_t rocksdb_table_properties_readable_properties_count(
-    const rocksdb_table_properties_t* props) {
-  return props->rep.readable_properties.size();
 }
 
 const char* rocksdb_table_properties_readable_properties_key_at(
@@ -3438,11 +3341,6 @@ const rocksdb_table_properties_t* rocksdb_flushjobinfo_table_properties(
       &info->rep.table_properties);
 }
 
-size_t rocksdb_flushjobinfo_blob_file_addition_infos_count(
-    const rocksdb_flushjobinfo_t* info) {
-  return info->rep.blob_file_addition_infos.size();
-}
-
 const rocksdb_blob_file_addition_info_t*
 rocksdb_flushjobinfo_blob_file_addition_info_at(
     const rocksdb_flushjobinfo_t* info, size_t pos) {
@@ -3479,11 +3377,6 @@ const rocksdb_compaction_job_stats_t* rocksdb_compactionjobinfo_stats(
       &info->rep.stats);
 }
 
-size_t rocksdb_compactionjobinfo_input_file_infos_count(
-    const rocksdb_compactionjobinfo_t* info) {
-  return info->rep.input_file_infos.size();
-}
-
 const rocksdb_compaction_file_info_t*
 rocksdb_compactionjobinfo_input_file_info_at(
     const rocksdb_compactionjobinfo_t* info, size_t pos) {
@@ -3492,22 +3385,12 @@ rocksdb_compactionjobinfo_input_file_info_at(
       &info->rep.input_file_infos[pos]);
 }
 
-size_t rocksdb_compactionjobinfo_output_file_infos_count(
-    const rocksdb_compactionjobinfo_t* info) {
-  return info->rep.output_file_infos.size();
-}
-
 const rocksdb_compaction_file_info_t*
 rocksdb_compactionjobinfo_output_file_info_at(
     const rocksdb_compactionjobinfo_t* info, size_t pos) {
   assert(pos < info->rep.output_file_infos.size());
   return reinterpret_cast<const rocksdb_compaction_file_info_t*>(
       &info->rep.output_file_infos[pos]);
-}
-
-size_t rocksdb_compactionjobinfo_table_properties_count(
-    const rocksdb_compactionjobinfo_t* info) {
-  return info->rep.table_properties.size();
 }
 
 const char* rocksdb_compactionjobinfo_table_properties_key_at(
@@ -3547,22 +3430,12 @@ rocksdb_compactionjobinfo_table_properties_for_file(
   return reinterpret_cast<const rocksdb_table_properties_t*>(it->second.get());
 }
 
-size_t rocksdb_compactionjobinfo_blob_file_addition_infos_count(
-    const rocksdb_compactionjobinfo_t* info) {
-  return info->rep.blob_file_addition_infos.size();
-}
-
 const rocksdb_blob_file_addition_info_t*
 rocksdb_compactionjobinfo_blob_file_addition_info_at(
     const rocksdb_compactionjobinfo_t* info, size_t pos) {
   assert(pos < info->rep.blob_file_addition_infos.size());
   return reinterpret_cast<const rocksdb_blob_file_addition_info_t*>(
       &info->rep.blob_file_addition_infos[pos]);
-}
-
-size_t rocksdb_compactionjobinfo_blob_file_garbage_infos_count(
-    const rocksdb_compactionjobinfo_t* info) {
-  return info->rep.blob_file_garbage_infos.size();
 }
 
 const rocksdb_blob_file_garbage_info_t*
@@ -3923,13 +3796,6 @@ rocksdb_file_checksum_gen_crc32c_factory_create() {
   return factory;
 }
 
-void rocksdb_options_set_file_checksum_gen_factory(
-    rocksdb_options_t* opt, rocksdb_file_checksum_gen_factory_t* factory) {
-  if (opt && factory) {
-    opt->rep.file_checksum_gen_factory = factory->rep;
-  }
-}
-
 void rocksdb_options_checksum_handoff_file_types_clear(rocksdb_options_t* opt) {
   opt->rep.checksum_handoff_file_types = {};
 }
@@ -3993,13 +3859,6 @@ rocksdb_sst_partitioner_fixed_prefix_factory_create(size_t prefix_len) {
   return factory;
 }
 
-void rocksdb_options_set_sst_partitioner_factory(
-    rocksdb_options_t* opt, rocksdb_sst_partitioner_factory_t* factory) {
-  if (opt && factory) {
-    opt->rep.sst_partitioner_factory = factory->rep;
-  }
-}
-
 /* Table Properties Collector Factory */
 
 void rocksdb_options_add_table_properties_collector_factory(
@@ -4010,30 +3869,10 @@ void rocksdb_options_add_table_properties_collector_factory(
   }
 }
 
-void rocksdb_options_set_env(rocksdb_options_t* opt, rocksdb_env_t* env) {
-  opt->rep.env = (env ? env->rep : nullptr);
-}
-
-void rocksdb_options_set_info_log(rocksdb_options_t* opt, rocksdb_logger_t* l) {
-  if (l) {
-    opt->rep.info_log = l->rep;
-  }
-}
-
 rocksdb_logger_t* rocksdb_options_get_info_log(rocksdb_options_t* opt) {
   rocksdb_logger_t* info_log = new rocksdb_logger_t;
   info_log->rep = opt->rep.info_log;
   return info_log;
-}
-
-void rocksdb_options_set_write_buffer_manager(
-    rocksdb_options_t* opt, rocksdb_write_buffer_manager_t* wbm) {
-  opt->rep.write_buffer_manager = wbm->rep;
-}
-
-void rocksdb_options_set_sst_file_manager(rocksdb_options_t* opt,
-                                          rocksdb_sst_file_manager_t* sfm) {
-  opt->rep.sst_file_manager = sfm->rep;
 }
 
 void rocksdb_options_enable_statistics(rocksdb_options_t* opt) {
@@ -4061,11 +3900,6 @@ int rocksdb_options_get_statistics_level(rocksdb_options_t* opt) {
   }
 
   return static_cast<int>(opt->rep.statistics->get_stats_level());
-}
-
-void rocksdb_options_set_blob_cache(rocksdb_options_t* opt,
-                                    rocksdb_cache_t* blob_cache) {
-  opt->rep.blob_cache = blob_cache->rep;
 }
 
 void rocksdb_options_set_prefix_extractor(
@@ -4115,16 +3949,6 @@ void rocksdb_options_set_plain_table_factory(
   opt->rep.table_factory.reset(factory);
 }
 
-void rocksdb_options_set_universal_compaction_options(
-    rocksdb_options_t* opt, rocksdb_universal_compaction_options_t* uco) {
-  opt->rep.compaction_options_universal = *(uco->rep);
-}
-
-void rocksdb_options_set_fifo_compaction_options(
-    rocksdb_options_t* opt, rocksdb_fifo_compaction_options_t* fifo) {
-  opt->rep.compaction_options_fifo = fifo->rep;
-}
-
 char* rocksdb_options_statistics_get_string(rocksdb_options_t* opt) {
   ROCKSDB_NAMESPACE::Statistics* statistics = opt->rep.statistics.get();
   if (statistics) {
@@ -4150,13 +3974,6 @@ void rocksdb_options_statistics_get_histogram_data(
     statistics->histogramData(type, &data->rep);
   } else {
     *data = rocksdb_statistics_histogram_data_t{};
-  }
-}
-
-void rocksdb_options_set_ratelimiter(rocksdb_options_t* opt,
-                                     rocksdb_ratelimiter_t* limiter) {
-  if (limiter) {
-    opt->rep.rate_limiter = limiter->rep;
   }
 }
 
@@ -4187,13 +4004,6 @@ rocksdb_ratelimiter_t* rocksdb_ratelimiter_create_with_mode(
       NewGenericRateLimiter(rate_bytes_per_sec, refill_period_us, fairness,
                             static_cast<RateLimiter::Mode>(mode), auto_tuned));
   return rate_limiter;
-}
-
-void rocksdb_options_set_row_cache(rocksdb_options_t* opt,
-                                   rocksdb_cache_t* cache) {
-  if (cache) {
-    opt->rep.row_cache = cache->rep;
-  }
 }
 
 void rocksdb_options_add_compact_on_deletion_collector_factory(
@@ -4649,11 +4459,6 @@ void rocksdb_mergeoperator_destroy(rocksdb_mergeoperator_t* merge_operator) {
 
 #include "c_api_gen/c_generated_readoptions_auto.cc.inc"
 
-void rocksdb_readoptions_set_snapshot(rocksdb_readoptions_t* opt,
-                                      const rocksdb_snapshot_t* snap) {
-  opt->rep.snapshot = (snap ? snap->rep : nullptr);
-}
-
 void rocksdb_readoptions_set_iterate_upper_bound(rocksdb_readoptions_t* opt,
                                                  const char* key,
                                                  size_t keylen) {
@@ -4871,11 +4676,6 @@ rocksdb_memory_allocator_t* rocksdb_jemalloc_nodump_allocator_create(
   return allocator;
 }
 
-void rocksdb_lru_cache_options_set_memory_allocator(
-    rocksdb_lru_cache_options_t* opt, rocksdb_memory_allocator_t* allocator) {
-  opt->rep.memory_allocator = allocator->rep;
-}
-
 rocksdb_cache_t* rocksdb_cache_create_lru(size_t capacity) {
   rocksdb_cache_t* c = new rocksdb_cache_t;
   c->rep = NewLRUCache(capacity);
@@ -4901,12 +4701,6 @@ rocksdb_hyper_clock_cache_options_t* rocksdb_hyper_clock_cache_options_create(
     size_t capacity, size_t estimated_entry_charge) {
   return new rocksdb_hyper_clock_cache_options_t{
       HyperClockCacheOptions(capacity, estimated_entry_charge)};
-}
-
-void rocksdb_hyper_clock_cache_options_set_memory_allocator(
-    rocksdb_hyper_clock_cache_options_t* opts,
-    rocksdb_memory_allocator_t* memory_allocator) {
-  opts->rep.memory_allocator = memory_allocator->rep;
 }
 
 rocksdb_cache_t* rocksdb_cache_create_hyper_clock(
@@ -5373,27 +5167,10 @@ rocksdb_livefiles_storage_info_t* rocksdb_get_livefiles_storage_info(
   return result;
 }
 
-void rocksdb_livefile_set_column_family_name(rocksdb_livefile_t* lf,
-                                             const char* column_family_name) {
-  lf->rep.column_family_name = std::string(column_family_name);
-}
-
-void rocksdb_livefile_set_level(rocksdb_livefile_t* lf, int level) {
-  lf->rep.level = level;
-}
-
-void rocksdb_livefile_set_name(rocksdb_livefile_t* lf, const char* name) {
-  lf->rep.name = std::string(name);
-}
-
 void rocksdb_livefile_set_directory(rocksdb_livefile_t* lf,
                                     const char* directory) {
   lf->rep.directory = std::string(directory);
   lf->rep.db_path = std::string(directory);  // deprecated but still needed
-}
-
-void rocksdb_livefile_set_size(rocksdb_livefile_t* lf, size_t size) {
-  lf->rep.size = size;
 }
 
 void rocksdb_livefile_set_smallest_key(rocksdb_livefile_t* lf,
@@ -5406,26 +5183,6 @@ void rocksdb_livefile_set_largest_key(rocksdb_livefile_t* lf,
                                       const char* largest_key,
                                       size_t largest_key_len) {
   lf->rep.largestkey = std::string(largest_key, largest_key_len);
-}
-
-void rocksdb_livefile_set_smallest_seqno(rocksdb_livefile_t* lf,
-                                         uint64_t smallest_seqno) {
-  lf->rep.smallest_seqno = smallest_seqno;
-}
-
-void rocksdb_livefile_set_largest_seqno(rocksdb_livefile_t* lf,
-                                        uint64_t largest_seqno) {
-  lf->rep.largest_seqno = largest_seqno;
-}
-
-void rocksdb_livefile_set_num_entries(rocksdb_livefile_t* lf,
-                                      uint64_t num_entries) {
-  lf->rep.num_entries = num_entries;
-}
-
-void rocksdb_livefile_set_num_deletions(rocksdb_livefile_t* lf,
-                                        uint64_t num_deletions) {
-  lf->rep.num_deletions = num_deletions;
 }
 
 void rocksdb_livefiles_add(rocksdb_livefiles_t* lf,
@@ -5533,24 +5290,9 @@ const char* rocksdb_column_family_metadata_options_get_end_key(
   return options->end_key.data();
 }
 
-uint64_t rocksdb_column_family_metadata_get_size(
-    rocksdb_column_family_metadata_t* cf_meta) {
-  return cf_meta->rep.size;
-}
-
-size_t rocksdb_column_family_metadata_get_file_count(
-    rocksdb_column_family_metadata_t* cf_meta) {
-  return cf_meta->rep.file_count;
-}
-
 char* rocksdb_column_family_metadata_get_name(
     rocksdb_column_family_metadata_t* cf_meta) {
   return strdup(cf_meta->rep.name.c_str());
-}
-
-size_t rocksdb_column_family_metadata_get_level_count(
-    rocksdb_column_family_metadata_t* cf_meta) {
-  return cf_meta->rep.levels.size();
 }
 
 rocksdb_level_metadata_t* rocksdb_column_family_metadata_get_level_metadata(
@@ -5569,19 +5311,6 @@ void rocksdb_level_metadata_destroy(rocksdb_level_metadata_t* level_meta) {
   // Only free the base pointer as its parent rocksdb_column_family_metadata_t
   // has the ownership of its rep.
   free(level_meta);
-}
-
-int rocksdb_level_metadata_get_level(rocksdb_level_metadata_t* level_meta) {
-  return level_meta->rep->level;
-}
-
-uint64_t rocksdb_level_metadata_get_size(rocksdb_level_metadata_t* level_meta) {
-  return level_meta->rep->size;
-}
-
-size_t rocksdb_level_metadata_get_file_count(
-    rocksdb_level_metadata_t* level_meta) {
-  return level_meta->rep->files.size();
 }
 
 rocksdb_sst_file_metadata_t* rocksdb_level_metadata_get_sst_file_metadata(
@@ -5611,11 +5340,6 @@ char* rocksdb_sst_file_metadata_get_directory(
   return strdup(file_meta->rep->directory.c_str());
 }
 
-uint64_t rocksdb_sst_file_metadata_get_size(
-    rocksdb_sst_file_metadata_t* file_meta) {
-  return file_meta->rep->size;
-}
-
 char* rocksdb_sst_file_metadata_get_smallestkey(
     rocksdb_sst_file_metadata_t* file_meta, size_t* key_len) {
   *key_len = file_meta->rep->smallestkey.size();
@@ -5638,11 +5362,6 @@ rocksdb_export_import_files_metadata_create() {
 char* rocksdb_export_import_files_metadata_get_db_comparator_name(
     rocksdb_export_import_files_metadata_t* metadata) {
   return strdup(metadata->rep->db_comparator_name.c_str());
-}
-
-void rocksdb_export_import_files_metadata_set_db_comparator_name(
-    rocksdb_export_import_files_metadata_t* metadata, const char* name) {
-  metadata->rep->db_comparator_name = std::string(name);
 }
 
 rocksdb_livefiles_t* rocksdb_export_import_files_metadata_get_files(
@@ -5668,13 +5387,6 @@ rocksdb_optimistictransactiondb_lock_buckets_create(
   lock_buckets->rep =
       MakeSharedOccLockBuckets(bucket_count, cache_aligned != 0);
   return lock_buckets;
-}
-
-void rocksdb_optimistictransactiondb_options_set_shared_lock_buckets(
-    rocksdb_optimistictransactiondb_options_t* opt,
-    rocksdb_optimistictransactiondb_lock_buckets_t* lock_buckets) {
-  opt->rep.shared_lock_buckets =
-      lock_buckets != nullptr ? lock_buckets->rep : nullptr;
 }
 
 #include "c_api_gen/c_generated_option_structs_auto.cc.inc"

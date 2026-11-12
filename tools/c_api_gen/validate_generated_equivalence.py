@@ -227,7 +227,10 @@ def normalize_optional_slices(body: str) -> str:
 
 
 def normalized_body_tokens(
-    body: str, return_type: str, mapping: dict[str, str] | None = None
+    body: str,
+    return_type: str,
+    mapping: dict[str, str] | None = None,
+    pointers: frozenset[str] = frozenset(),
 ) -> list[str]:
     body = normalize_lossless_casts(body)
     body = normalize_optional_slices(body)
@@ -235,8 +238,79 @@ def normalized_body_tokens(
     body = normalize_returned_locals(body)
     body = normalize_void_returns(body, return_type)
     body = normalize_decltype_assignments(normalize_return_casts(body, return_type))
-    tokens = tokenize(body)
+    tokens = drop_redundant_parens(
+        normalize_pointer_conditions(tokenize(body), pointers)
+    )
     return map_identifiers(tokens, mapping) if mapping else tokens
+
+
+# The tokens that can come right before and right after a whole operand of
+# `&&`, `||` or the condition of `?:`.
+_OPERAND_BEFORE = {"(", "=", "return", ",", "?", ":", "&&", "||", "{", ";"}
+_OPERAND_AFTER = {")", ";", ",", "?", ":", "&&", "||"}
+
+
+def normalize_pointer_conditions(
+    tokens: list[str], pointers: frozenset[str]
+) -> list[str]:
+    """Rewrite a pointer parameter `p` used as a condition as `p != nullptr`.
+
+    A pointer converts to bool by comparing it with nullptr. Only a whole
+    operand of `&&` or `||`, the whole condition of `?:`, or the whole
+    condition of an `if` or `while` is rewritten, so `!p`, `f(p)` and `x = p`
+    keep their spelling.
+    """
+    out = []
+    for i, tok in enumerate(tokens):
+        out.append(tok)
+        if tok not in pointers:
+            continue
+        # A member `t->p` never matches: `.`, `->` and `::` are not in
+        # _OPERAND_BEFORE.
+        before = tokens[i - 1] if i > 0 else ";"
+        after = tokens[i + 1] if i + 1 < len(tokens) else ";"
+        if before not in _OPERAND_BEFORE or after not in _OPERAND_AFTER:
+            continue
+        logical = before in ("&&", "||") or after in ("&&", "||", "?")
+        sole = (
+            before == "("
+            and after == ")"
+            and i > 1
+            and tokens[i - 2] in ("if", "while")
+        )
+        if logical or sole:
+            out += ["!=", "nullptr"]
+    return out
+
+
+def drop_redundant_parens(tokens: list[str]) -> list[str]:
+    """Rewrite `= (e);` and `return (e);` as `= e;` and `return e;`.
+
+    Parentheses around a whole right-hand side or return value change
+    nothing, unless e has a top-level comma, which would then become the
+    comma operator; those are kept.
+    """
+    out = list(tokens)
+    i = 0
+    while i + 1 < len(out):
+        if out[i] in ("=", "return") and out[i + 1] == "(":
+            depth, j, comma = 0, i + 1, False
+            while j < len(out):
+                if out[j] in ("(", "[", "{"):
+                    depth += 1
+                elif out[j] in (")", "]", "}"):
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif out[j] == "," and depth == 1:
+                    comma = True
+                j += 1
+            if j + 1 < len(out) and out[j] == ")" and out[j + 1] == ";" and not comma:
+                del out[j]
+                del out[i + 1]
+                continue
+        i += 1
+    return out
 
 
 # A local declared at the start of a statement: `T v;`, `const T& v = ...`,
@@ -292,8 +366,18 @@ def bodies_equivalent(ref_def: "FunctionDef", gen_def: "FunctionDef") -> bool:
     if (free - mapping.keys()) & set(mapping.values()):
         return False
     return normalized_body_tokens(
-        ref_def.body, gen_def.return_type, mapping
-    ) == normalized_body_tokens(gen_def.body, gen_def.return_type)
+        ref_def.body, gen_def.return_type, mapping, pointer_params(ref_def)
+    ) == normalized_body_tokens(
+        gen_def.body, gen_def.return_type, pointers=pointer_params(gen_def)
+    )
+
+
+def pointer_params(fn: "FunctionDef") -> frozenset[str]:
+    return frozenset(
+        name
+        for name, type_ in zip(fn.param_names, fn.param_types)
+        if name and normalize_space(type_).endswith("*")
+    )
 
 
 def find_matching(text: str, start: int, open_ch: str, close_ch: str) -> int:

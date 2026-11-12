@@ -1052,6 +1052,16 @@ unsigned char rocksdb_table_properties_has_key_smallest_seqno(
   return props->rep.HasKeySmallestSeqno();
 }
 
+size_t rocksdb_table_properties_user_collected_properties_count(
+    const rocksdb_table_properties_t* props) {
+  return props->rep.user_collected_properties.size();
+}
+
+size_t rocksdb_table_properties_readable_properties_count(
+    const rocksdb_table_properties_t* props) {
+  return props->rep.readable_properties.size();
+}
+
 /* rocksdb_snapshot_t */
 
 uint64_t rocksdb_snapshot_get_sequence_number(
@@ -1092,6 +1102,11 @@ rocksdb_readoptions_t* rocksdb_readoptions_create() {
 
 void rocksdb_readoptions_destroy(rocksdb_readoptions_t* opt) { delete opt; }
 
+void rocksdb_readoptions_set_snapshot(rocksdb_readoptions_t* opt,
+                                      const rocksdb_snapshot_t* snap) {
+  opt->rep.snapshot = snap != nullptr ? snap->rep : nullptr;
+}
+
 /* rocksdb_writeoptions_t */
 
 rocksdb_writeoptions_t* rocksdb_writeoptions_create() {
@@ -1130,6 +1145,69 @@ void rocksdb_options_prepare_for_bulk_load(rocksdb_options_t* opt) {
   opt->rep.PrepareForBulkLoad();
 }
 
+void rocksdb_options_set_file_checksum_gen_factory(
+    rocksdb_options_t* opt, rocksdb_file_checksum_gen_factory_t* factory) {
+  if (opt != nullptr && factory != nullptr) {
+    opt->rep.file_checksum_gen_factory = factory->rep;
+  }
+}
+
+void rocksdb_options_set_sst_partitioner_factory(
+    rocksdb_options_t* opt, rocksdb_sst_partitioner_factory_t* factory) {
+  if (opt != nullptr && factory != nullptr) {
+    opt->rep.sst_partitioner_factory = factory->rep;
+  }
+}
+
+void rocksdb_options_set_env(rocksdb_options_t* opt, rocksdb_env_t* env) {
+  opt->rep.env = env != nullptr ? env->rep : nullptr;
+}
+
+void rocksdb_options_set_info_log(rocksdb_options_t* opt, rocksdb_logger_t* l) {
+  if (l != nullptr) {
+    opt->rep.info_log = l->rep;
+  }
+}
+
+void rocksdb_options_set_write_buffer_manager(
+    rocksdb_options_t* opt, rocksdb_write_buffer_manager_t* wbm) {
+  opt->rep.write_buffer_manager = wbm->rep;
+}
+
+void rocksdb_options_set_sst_file_manager(rocksdb_options_t* opt,
+                                          rocksdb_sst_file_manager_t* sfm) {
+  opt->rep.sst_file_manager = sfm->rep;
+}
+
+void rocksdb_options_set_blob_cache(rocksdb_options_t* opt,
+                                    rocksdb_cache_t* blob_cache) {
+  opt->rep.blob_cache = blob_cache->rep;
+}
+
+void rocksdb_options_set_universal_compaction_options(
+    rocksdb_options_t* opt, rocksdb_universal_compaction_options_t* uco) {
+  opt->rep.compaction_options_universal = *uco->rep;
+}
+
+void rocksdb_options_set_fifo_compaction_options(
+    rocksdb_options_t* opt, rocksdb_fifo_compaction_options_t* fifo) {
+  opt->rep.compaction_options_fifo = fifo->rep;
+}
+
+void rocksdb_options_set_ratelimiter(rocksdb_options_t* opt,
+                                     rocksdb_ratelimiter_t* limiter) {
+  if (limiter != nullptr) {
+    opt->rep.rate_limiter = limiter->rep;
+  }
+}
+
+void rocksdb_options_set_row_cache(rocksdb_options_t* opt,
+                                   rocksdb_cache_t* cache) {
+  if (cache != nullptr) {
+    opt->rep.row_cache = cache->rep;
+  }
+}
+
 /* rocksdb_compaction_options_t */
 
 rocksdb_compaction_options_t* rocksdb_compaction_options_create() {
@@ -1165,6 +1243,14 @@ int rocksdb_block_based_options_get_index_mode(
     rocksdb_block_based_table_options_t* options) {
   return ROCKSDB_NAMESPACE::lossless_cast<int>(
       options->rep.GetEffectiveIndexMode());
+}
+
+void rocksdb_block_based_options_set_block_cache(
+    rocksdb_block_based_table_options_t* options,
+    rocksdb_cache_t* block_cache) {
+  if (block_cache != nullptr) {
+    options->rep.block_cache = block_cache->rep;
+  }
 }
 
 /* rocksdb_block_cache_trace_options_t */
@@ -1229,6 +1315,16 @@ void rocksdb_wal_readoptions_destroy(rocksdb_wal_readoptions_t* options) {
   delete options;
 }
 
+void rocksdb_wal_readoptions_set_verify_checksums(
+    rocksdb_wal_readoptions_t* options, unsigned char verify_checksums) {
+  options->rep.verify_checksums_ = verify_checksums;
+}
+
+unsigned char rocksdb_wal_readoptions_get_verify_checksums(
+    rocksdb_wal_readoptions_t* options) {
+  return options->rep.verify_checksums_;
+}
+
 /* rocksdb_wal_files_t */
 
 void rocksdb_wal_files_destroy(rocksdb_wal_files_t* files) { delete files; }
@@ -1272,6 +1368,11 @@ void rocksdb_lru_cache_options_destroy(rocksdb_lru_cache_options_t* opt) {
   delete opt;
 }
 
+void rocksdb_lru_cache_options_set_memory_allocator(
+    rocksdb_lru_cache_options_t* opt, rocksdb_memory_allocator_t* allocator) {
+  opt->rep.memory_allocator = allocator->rep;
+}
+
 /* rocksdb_hyper_clock_cache_options_t */
 
 void rocksdb_hyper_clock_cache_options_destroy(
@@ -1284,6 +1385,12 @@ rocksdb_cache_t* rocksdb_cache_create_hyper_clock_opts(
   rocksdb_cache_t* result = new rocksdb_cache_t;
   result->rep = opts->rep.MakeSharedCache();
   return result;
+}
+
+void rocksdb_hyper_clock_cache_options_set_memory_allocator(
+    rocksdb_hyper_clock_cache_options_t* opts,
+    rocksdb_memory_allocator_t* memory_allocator) {
+  opts->rep.memory_allocator = memory_allocator->rep;
 }
 
 /* rocksdb_memory_allocator_t */
@@ -1436,6 +1543,43 @@ rocksdb_livefile_t* rocksdb_livefile_create() { return new rocksdb_livefile_t; }
 
 void rocksdb_livefile_destroy(rocksdb_livefile_t* lf) { delete lf; }
 
+void rocksdb_livefile_set_column_family_name(rocksdb_livefile_t* lf,
+                                             const char* column_family_name) {
+  lf->rep.column_family_name = std::string(column_family_name);
+}
+
+void rocksdb_livefile_set_level(rocksdb_livefile_t* lf, int level) {
+  lf->rep.level = level;
+}
+
+void rocksdb_livefile_set_name(rocksdb_livefile_t* lf, const char* name) {
+  lf->rep.name = std::string(name);
+}
+
+void rocksdb_livefile_set_size(rocksdb_livefile_t* lf, size_t size) {
+  lf->rep.size = static_cast<uint64_t>(size);
+}
+
+void rocksdb_livefile_set_smallest_seqno(rocksdb_livefile_t* lf,
+                                         uint64_t smallest_seqno) {
+  lf->rep.smallest_seqno = smallest_seqno;
+}
+
+void rocksdb_livefile_set_largest_seqno(rocksdb_livefile_t* lf,
+                                        uint64_t largest_seqno) {
+  lf->rep.largest_seqno = largest_seqno;
+}
+
+void rocksdb_livefile_set_num_entries(rocksdb_livefile_t* lf,
+                                      uint64_t num_entries) {
+  lf->rep.num_entries = num_entries;
+}
+
+void rocksdb_livefile_set_num_deletions(rocksdb_livefile_t* lf,
+                                        uint64_t num_deletions) {
+  lf->rep.num_deletions = num_deletions;
+}
+
 /* rocksdb_livefiles_t */
 
 rocksdb_livefiles_t* rocksdb_livefiles_create() {
@@ -1518,6 +1662,21 @@ void rocksdb_column_family_metadata_destroy(
   delete cf_meta;
 }
 
+uint64_t rocksdb_column_family_metadata_get_size(
+    rocksdb_column_family_metadata_t* cf_meta) {
+  return cf_meta->rep.size;
+}
+
+size_t rocksdb_column_family_metadata_get_file_count(
+    rocksdb_column_family_metadata_t* cf_meta) {
+  return cf_meta->rep.file_count;
+}
+
+size_t rocksdb_column_family_metadata_get_level_count(
+    rocksdb_column_family_metadata_t* cf_meta) {
+  return cf_meta->rep.levels.size();
+}
+
 /* rocksdb_column_family_metadata_options_t */
 
 void rocksdb_column_family_metadata_options_destroy(
@@ -1533,6 +1692,11 @@ void rocksdb_export_import_files_metadata_destroy(
   delete metadata;
 }
 
+void rocksdb_export_import_files_metadata_set_db_comparator_name(
+    rocksdb_export_import_files_metadata_t* metadata, const char* name) {
+  metadata->rep->db_comparator_name = std::string(name);
+}
+
 /* rocksdb_import_column_family_options_t */
 
 rocksdb_import_column_family_options_t*
@@ -1543,6 +1707,28 @@ rocksdb_import_column_family_options_create() {
 void rocksdb_import_column_family_options_destroy(
     rocksdb_import_column_family_options_t* metadata) {
   delete metadata;
+}
+
+/* rocksdb_level_metadata_t */
+
+int rocksdb_level_metadata_get_level(rocksdb_level_metadata_t* level_meta) {
+  return level_meta->rep->level;
+}
+
+uint64_t rocksdb_level_metadata_get_size(rocksdb_level_metadata_t* level_meta) {
+  return level_meta->rep->size;
+}
+
+size_t rocksdb_level_metadata_get_file_count(
+    rocksdb_level_metadata_t* level_meta) {
+  return level_meta->rep->files.size();
+}
+
+/* rocksdb_sst_file_metadata_t */
+
+uint64_t rocksdb_sst_file_metadata_get_size(
+    rocksdb_sst_file_metadata_t* file_meta) {
+  return file_meta->rep->size;
 }
 
 /* rocksdb_envoptions_t */
@@ -2041,6 +2227,25 @@ void rocksdb_backup_engine_options_destroy(
   delete options;
 }
 
+void rocksdb_backup_engine_options_set_env(
+    rocksdb_backup_engine_options_t* options, rocksdb_env_t* env) {
+  options->rep.backup_env = env != nullptr ? env->rep : nullptr;
+}
+
+void rocksdb_backup_engine_options_set_backup_rate_limiter(
+    rocksdb_backup_engine_options_t* options, rocksdb_ratelimiter_t* limiter) {
+  if (limiter != nullptr) {
+    options->rep.backup_rate_limiter = limiter->rep;
+  }
+}
+
+void rocksdb_backup_engine_options_set_restore_rate_limiter(
+    rocksdb_backup_engine_options_t* options, rocksdb_ratelimiter_t* limiter) {
+  if (limiter != nullptr) {
+    options->rep.restore_rate_limiter = limiter->rep;
+  }
+}
+
 /* rocksdb_checkpoint_t */
 
 void rocksdb_checkpoint_object_destroy(rocksdb_checkpoint_t* checkpoint) {
@@ -2082,6 +2287,13 @@ void rocksdb_optimistictransactiondb_options_destroy(
   delete opt;
 }
 
+void rocksdb_optimistictransactiondb_options_set_shared_lock_buckets(
+    rocksdb_optimistictransactiondb_options_t* opt,
+    rocksdb_optimistictransactiondb_lock_buckets_t* lock_buckets) {
+  opt->rep.shared_lock_buckets =
+      lock_buckets != nullptr ? lock_buckets->rep : nullptr;
+}
+
 /* rocksdb_optimistictransactiondb_lock_buckets_t */
 
 void rocksdb_optimistictransactiondb_lock_buckets_destroy(
@@ -2117,6 +2329,13 @@ void rocksdb_wait_for_compact_options_destroy(
   delete opt;
 }
 
+/* rocksdb_flushjobinfo_t */
+
+size_t rocksdb_flushjobinfo_blob_file_addition_infos_count(
+    const rocksdb_flushjobinfo_t* info) {
+  return info->rep.blob_file_addition_infos.size();
+}
+
 /* rocksdb_compactionjobinfo_t */
 
 rocksdb_compactionjobinfo_t* rocksdb_compactionjobinfo_create() {
@@ -2125,6 +2344,43 @@ rocksdb_compactionjobinfo_t* rocksdb_compactionjobinfo_create() {
 
 void rocksdb_compactionjobinfo_destroy(rocksdb_compactionjobinfo_t* info) {
   delete info;
+}
+
+unsigned char rocksdb_compactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_compactionjobinfo_t* info) {
+  return info->rep.separate_remote_compaction_pool_selected;
+}
+
+size_t rocksdb_compactionjobinfo_input_file_infos_count(
+    const rocksdb_compactionjobinfo_t* info) {
+  return info->rep.input_file_infos.size();
+}
+
+size_t rocksdb_compactionjobinfo_output_file_infos_count(
+    const rocksdb_compactionjobinfo_t* info) {
+  return info->rep.output_file_infos.size();
+}
+
+size_t rocksdb_compactionjobinfo_table_properties_count(
+    const rocksdb_compactionjobinfo_t* info) {
+  return info->rep.table_properties.size();
+}
+
+size_t rocksdb_compactionjobinfo_blob_file_addition_infos_count(
+    const rocksdb_compactionjobinfo_t* info) {
+  return info->rep.blob_file_addition_infos.size();
+}
+
+size_t rocksdb_compactionjobinfo_blob_file_garbage_infos_count(
+    const rocksdb_compactionjobinfo_t* info) {
+  return info->rep.blob_file_garbage_infos.size();
+}
+
+/* rocksdb_subcompactionjobinfo_t */
+
+unsigned char rocksdb_subcompactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_subcompactionjobinfo_t* info) {
+  return info->rep.separate_remote_compaction_pool_selected;
 }
 
 /* rocksdb_statistics_histogram_data_t */
@@ -2153,6 +2409,38 @@ void rocksdb_compaction_service_options_override_destroy(
   delete override_options;
 }
 
+void rocksdb_compaction_service_options_override_set_env(
+    rocksdb_compaction_service_options_override_t* override_options,
+    rocksdb_env_t* env) {
+  if (override_options != nullptr && env != nullptr) {
+    override_options->rep.env = env->rep;
+  }
+}
+
+void rocksdb_compaction_service_options_override_set_info_log(
+    rocksdb_compaction_service_options_override_t* override_options,
+    rocksdb_logger_t* logger) {
+  if (override_options != nullptr && logger != nullptr) {
+    override_options->rep.info_log = logger->rep;
+  }
+}
+
+void rocksdb_compaction_service_options_override_set_file_checksum_gen_factory(
+    rocksdb_compaction_service_options_override_t* override_options,
+    rocksdb_file_checksum_gen_factory_t* factory) {
+  if (override_options != nullptr && factory != nullptr) {
+    override_options->rep.file_checksum_gen_factory = factory->rep;
+  }
+}
+
+void rocksdb_compaction_service_options_override_set_sst_partitioner_factory(
+    rocksdb_compaction_service_options_override_t* override_options,
+    rocksdb_sst_partitioner_factory_t* factory) {
+  if (override_options != nullptr && factory != nullptr) {
+    override_options->rep.sst_partitioner_factory = factory->rep;
+  }
+}
+
 /* rocksdb_open_and_compact_options_t */
 
 rocksdb_open_and_compact_options_t* rocksdb_open_and_compact_options_create() {
@@ -2162,6 +2450,14 @@ rocksdb_open_and_compact_options_t* rocksdb_open_and_compact_options_create() {
 void rocksdb_open_and_compact_options_destroy(
     rocksdb_open_and_compact_options_t* options) {
   delete options;
+}
+
+void rocksdb_open_and_compact_options_set_allow_resumption(
+    rocksdb_open_and_compact_options_t* options,
+    unsigned char allow_resumption) {
+  if (options != nullptr) {
+    options->rep.allow_resumption = allow_resumption;
+  }
 }
 
 /* rocksdb_dbpath_t */

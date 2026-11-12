@@ -1309,6 +1309,14 @@
         {
           "name": "rocksdb_table_properties_has_key_smallest_seqno",
           "method": "HasKeySmallestSeqno"
+        },
+        {
+          "name": "rocksdb_table_properties_user_collected_properties_count",
+          "count": "user_collected_properties"
+        },
+        {
+          "name": "rocksdb_table_properties_readable_properties_count",
+          "count": "readable_properties"
         }
       ]
     },
@@ -1389,7 +1397,19 @@
       "destroy": {
         "name": "rocksdb_readoptions_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_readoptions_set_snapshot",
+          "set": "snapshot",
+          "param_names": {
+            "snapshot": "snap"
+          },
+          "nullable": [
+            "snapshot"
+          ]
+        }
+      ]
     },
     {
       "c_type": "rocksdb_writeoptions_t",
@@ -1437,6 +1457,103 @@
           "name": "rocksdb_options_prepare_for_bulk_load",
           "method": "PrepareForBulkLoad",
           "result": "discard"
+        },
+        {
+          "name": "rocksdb_options_set_file_checksum_gen_factory",
+          "set": "file_checksum_gen_factory",
+          "param_names": {
+            "file_checksum_gen_factory": "factory"
+          },
+          "skip_if_null": [
+            "opt",
+            "file_checksum_gen_factory"
+          ]
+        },
+        {
+          "name": "rocksdb_options_set_sst_partitioner_factory",
+          "set": "sst_partitioner_factory",
+          "param_names": {
+            "sst_partitioner_factory": "factory"
+          },
+          "skip_if_null": [
+            "opt",
+            "sst_partitioner_factory"
+          ]
+        },
+        {
+          "name": "rocksdb_options_set_env",
+          "set": "env",
+          "nullable": [
+            "env"
+          ]
+        },
+        {
+          "name": "rocksdb_options_set_info_log",
+          "set": "info_log",
+          "param_names": {
+            "info_log": "l"
+          },
+          "skip_if_null": [
+            "info_log"
+          ]
+        },
+        {
+          "name": "rocksdb_options_set_write_buffer_manager",
+          "set": "write_buffer_manager",
+          "param_names": {
+            "write_buffer_manager": "wbm"
+          }
+        },
+        {
+          "name": "rocksdb_options_set_sst_file_manager",
+          "set": "sst_file_manager",
+          "param_names": {
+            "sst_file_manager": "sfm"
+          }
+        },
+        {
+          "name": "rocksdb_options_set_blob_cache",
+          "set": "blob_cache"
+        },
+        {
+          "name": "rocksdb_options_set_universal_compaction_options",
+          "set": "compaction_options_universal",
+          "param_names": {
+            "compaction_options_universal": "uco"
+          },
+          "c_types": {
+            "compaction_options_universal": "rocksdb_universal_compaction_options_t*"
+          }
+        },
+        {
+          "name": "rocksdb_options_set_fifo_compaction_options",
+          "set": "compaction_options_fifo",
+          "param_names": {
+            "compaction_options_fifo": "fifo"
+          },
+          "c_types": {
+            "compaction_options_fifo": "rocksdb_fifo_compaction_options_t*"
+          }
+        },
+        {
+          "name": "rocksdb_options_set_ratelimiter",
+          "set": "rate_limiter",
+          "param_names": {
+            "rate_limiter": "limiter"
+          },
+          "skip_if_null": [
+            "rate_limiter"
+          ]
+        },
+        {
+          "name": "rocksdb_options_set_row_cache",
+          "set": "row_cache",
+          "param_names": {
+            "row_cache": "cache"
+          },
+          "skip_if_null": [
+            "row_cache"
+          ]
         }
       ]
     },
@@ -1477,6 +1594,13 @@
           "name": "rocksdb_block_based_options_get_index_mode",
           "method": "GetEffectiveIndexMode",
           "receiver_const": false
+        },
+        {
+          "name": "rocksdb_block_based_options_set_block_cache",
+          "set": "block_cache",
+          "skip_if_null": [
+            "block_cache"
+          ]
         }
       ]
     },
@@ -1567,7 +1691,21 @@
       "destroy": {
         "name": "rocksdb_wal_readoptions_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_wal_readoptions_set_verify_checksums",
+          "set": "verify_checksums_",
+          "param_names": {
+            "verify_checksums_": "verify_checksums"
+          }
+        },
+        {
+          "name": "rocksdb_wal_readoptions_get_verify_checksums",
+          "field": "verify_checksums_",
+          "receiver_const": false
+        }
+      ]
     },
     {
       "c_type": "rocksdb_wal_files_t",
@@ -1640,7 +1778,16 @@
       "destroy": {
         "name": "rocksdb_lru_cache_options_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_lru_cache_options_set_memory_allocator",
+          "set": "memory_allocator",
+          "param_names": {
+            "memory_allocator": "allocator"
+          }
+        }
+      ]
     },
     {
       "c_type": "rocksdb_hyper_clock_cache_options_t",
@@ -1656,6 +1803,10 @@
           "name": "rocksdb_cache_create_hyper_clock_opts",
           "method": "MakeSharedCache",
           "result": "handle"
+        },
+        {
+          "name": "rocksdb_hyper_clock_cache_options_set_memory_allocator",
+          "set": "memory_allocator"
         }
       ]
     },
@@ -1841,7 +1992,44 @@
       "destroy": {
         "name": "rocksdb_livefile_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_livefile_set_column_family_name",
+          "set": "column_family_name"
+        },
+        {
+          "name": "rocksdb_livefile_set_level",
+          "set": "level"
+        },
+        {
+          "name": "rocksdb_livefile_set_name",
+          "set": "name"
+        },
+        {
+          "name": "rocksdb_livefile_set_size",
+          "set": "size",
+          "c_types": {
+            "size": "size_t"
+          }
+        },
+        {
+          "name": "rocksdb_livefile_set_smallest_seqno",
+          "set": "smallest_seqno"
+        },
+        {
+          "name": "rocksdb_livefile_set_largest_seqno",
+          "set": "largest_seqno"
+        },
+        {
+          "name": "rocksdb_livefile_set_num_entries",
+          "set": "num_entries"
+        },
+        {
+          "name": "rocksdb_livefile_set_num_deletions",
+          "set": "num_deletions"
+        }
+      ]
     },
     {
       "c_type": "rocksdb_livefiles_t",
@@ -1939,7 +2127,24 @@
       "destroy": {
         "name": "rocksdb_column_family_metadata_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_column_family_metadata_get_size",
+          "field": "size",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_column_family_metadata_get_file_count",
+          "field": "file_count",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_column_family_metadata_get_level_count",
+          "count": "levels",
+          "receiver_const": false
+        }
+      ]
     },
     {
       "c_type": "rocksdb_column_family_metadata_options_t",
@@ -1959,7 +2164,16 @@
       "destroy": {
         "name": "rocksdb_export_import_files_metadata_destroy",
         "owns_rep": true
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_export_import_files_metadata_set_db_comparator_name",
+          "set": "db_comparator_name",
+          "param_names": {
+            "db_comparator_name": "name"
+          }
+        }
+      ]
     },
     {
       "c_type": "rocksdb_import_column_family_options_t",
@@ -1976,13 +2190,37 @@
       "c_type": "rocksdb_level_metadata_t",
       "rep": "const LevelMetaData*",
       "struct": "generated",
-      "var": "level_meta"
+      "var": "level_meta",
+      "methods": [
+        {
+          "name": "rocksdb_level_metadata_get_level",
+          "field": "level",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_level_metadata_get_size",
+          "field": "size",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_level_metadata_get_file_count",
+          "count": "files",
+          "receiver_const": false
+        }
+      ]
     },
     {
       "c_type": "rocksdb_sst_file_metadata_t",
       "rep": "const SstFileMetaData*",
       "struct": "generated",
-      "var": "file_meta"
+      "var": "file_meta",
+      "methods": [
+        {
+          "name": "rocksdb_sst_file_metadata_get_size",
+          "field": "size",
+          "receiver_const": false
+        }
+      ]
     },
     {
       "c_type": "rocksdb_envoptions_t",
@@ -2550,7 +2788,39 @@
       "destroy": {
         "name": "rocksdb_backup_engine_options_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_backup_engine_options_set_env",
+          "set": "backup_env",
+          "param_names": {
+            "backup_env": "env"
+          },
+          "nullable": [
+            "backup_env"
+          ]
+        },
+        {
+          "name": "rocksdb_backup_engine_options_set_backup_rate_limiter",
+          "set": "backup_rate_limiter",
+          "param_names": {
+            "backup_rate_limiter": "limiter"
+          },
+          "skip_if_null": [
+            "backup_rate_limiter"
+          ]
+        },
+        {
+          "name": "rocksdb_backup_engine_options_set_restore_rate_limiter",
+          "set": "restore_rate_limiter",
+          "param_names": {
+            "restore_rate_limiter": "limiter"
+          },
+          "skip_if_null": [
+            "restore_rate_limiter"
+          ]
+        }
+      ]
     },
     {
       "c_type": "rocksdb_checkpoint_t",
@@ -2599,7 +2869,19 @@
       "destroy": {
         "name": "rocksdb_optimistictransactiondb_options_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_optimistictransactiondb_options_set_shared_lock_buckets",
+          "set": "shared_lock_buckets",
+          "param_names": {
+            "shared_lock_buckets": "lock_buckets"
+          },
+          "nullable": [
+            "shared_lock_buckets"
+          ]
+        }
+      ]
     },
     {
       "c_type": "rocksdb_optimistictransactiondb_lock_buckets_t",
@@ -2650,7 +2932,13 @@
       "c_type": "rocksdb_flushjobinfo_t",
       "rep": "FlushJobInfo",
       "struct": "generated",
-      "var": "info"
+      "var": "info",
+      "methods": [
+        {
+          "name": "rocksdb_flushjobinfo_blob_file_addition_infos_count",
+          "count": "blob_file_addition_infos"
+        }
+      ]
     },
     {
       "c_type": "rocksdb_writestallcondition_t",
@@ -2679,13 +2967,51 @@
       "destroy": {
         "name": "rocksdb_compactionjobinfo_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_compactionjobinfo_use_separate_remote_compaction_pool",
+          "field": "separate_remote_compaction_pool_selected",
+          "doc": [
+            "/* Compatibility alias for the captured compaction pool selection. */"
+          ]
+        },
+        {
+          "name": "rocksdb_compactionjobinfo_input_file_infos_count",
+          "count": "input_file_infos"
+        },
+        {
+          "name": "rocksdb_compactionjobinfo_output_file_infos_count",
+          "count": "output_file_infos"
+        },
+        {
+          "name": "rocksdb_compactionjobinfo_table_properties_count",
+          "count": "table_properties"
+        },
+        {
+          "name": "rocksdb_compactionjobinfo_blob_file_addition_infos_count",
+          "count": "blob_file_addition_infos"
+        },
+        {
+          "name": "rocksdb_compactionjobinfo_blob_file_garbage_infos_count",
+          "count": "blob_file_garbage_infos"
+        }
+      ]
     },
     {
       "c_type": "rocksdb_subcompactionjobinfo_t",
       "rep": "SubcompactionJobInfo",
       "struct": "generated",
-      "var": "info"
+      "var": "info",
+      "methods": [
+        {
+          "name": "rocksdb_subcompactionjobinfo_use_separate_remote_compaction_pool",
+          "field": "separate_remote_compaction_pool_selected",
+          "doc": [
+            "/* Compatibility alias for the captured compaction pool selection. */"
+          ]
+        }
+      ]
     },
     {
       "c_type": "rocksdb_externalfileingestioninfo_t",
@@ -2728,7 +3054,50 @@
       "destroy": {
         "name": "rocksdb_compaction_service_options_override_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_compaction_service_options_override_set_env",
+          "set": "env",
+          "skip_if_null": [
+            "override_options",
+            "env"
+          ]
+        },
+        {
+          "name": "rocksdb_compaction_service_options_override_set_info_log",
+          "set": "info_log",
+          "param_names": {
+            "info_log": "logger"
+          },
+          "skip_if_null": [
+            "override_options",
+            "info_log"
+          ]
+        },
+        {
+          "name": "rocksdb_compaction_service_options_override_set_file_checksum_gen_factory",
+          "set": "file_checksum_gen_factory",
+          "param_names": {
+            "file_checksum_gen_factory": "factory"
+          },
+          "skip_if_null": [
+            "override_options",
+            "file_checksum_gen_factory"
+          ]
+        },
+        {
+          "name": "rocksdb_compaction_service_options_override_set_sst_partitioner_factory",
+          "set": "sst_partitioner_factory",
+          "param_names": {
+            "sst_partitioner_factory": "factory"
+          },
+          "skip_if_null": [
+            "override_options",
+            "sst_partitioner_factory"
+          ]
+        }
+      ]
     },
     {
       "c_type": "rocksdb_open_and_compact_options_t",
@@ -2739,7 +3108,16 @@
       "destroy": {
         "name": "rocksdb_open_and_compact_options_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_open_and_compact_options_set_allow_resumption",
+          "set": "allow_resumption",
+          "skip_if_null": [
+            "options"
+          ]
+        }
+      ]
     },
     {
       "c_type": "rocksdb_dbpath_t",

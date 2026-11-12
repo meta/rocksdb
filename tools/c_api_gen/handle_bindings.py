@@ -51,13 +51,19 @@ A parameter listed in `nullable` accepts a NULL C pointer:
   C++ parameter                  NULL in C passes
   -----------------------------  ---------------------------------------
   const Slice *                  nullptr (C: const char* x, size_t x_len)
+  T* / shared_ptr<T> (handle)    nullptr
   const T & (value handle rep)   a default-constructed T
 
-A handle whose rep is a std::vector<T> can also have entries that read the
-vector instead of calling a method: `count` returns rep.size(), and `field`
-returns one public data member of rep[index], taking the index as a C
-parameter of the handle's `index_type`. A std::string member is returned like
-a `const std::string&` result.
+A parameter listed in `skip_if_null` (or the handle, by its `var`) makes the
+function do nothing when it is NULL.
+
+An entry can name a public data member of rep instead of a method. `field`
+returns it, `count` returns the size() of a container member, and `set`
+assigns it from one C parameter, mapped like a by-value C++ parameter of the
+member's type (a class a handle holds is passed by reference). A std::string
+member is returned like a `const std::string&` result. On a handle whose rep
+is a std::vector<T>, `"count": true` returns rep.size() and `field` reads
+rep[index], taking the index as a C parameter of the handle's `index_type`.
 
 The SliceParts parameters of an entry with `shared_count` all take their
 length from one C parameter of that name instead of one each.
@@ -120,6 +126,7 @@ METHOD_KEYS = {
     "method",
     "field",
     "count",
+    "set",
     "overload",
     "arity",
     "bind",
@@ -135,6 +142,7 @@ METHOD_KEYS = {
     "param_order",
     "nullable",
     "shared_count",
+    "skip_if_null",
 }
 
 # C types that a C++ parameter or result of the same spelling maps to as-is.
@@ -677,8 +685,8 @@ class TypeMapper:
             r"(?:const )?std::(shared_ptr|unique_ptr)<(?:const )?([\w:]+)> ?&?", t
         )
         if m or sp:
-            cls = (sp or m).group(2)
-            if cls in self.by_class or preferred is not None:
+            cls = self._handle_class((sp or m).group(2), preferred)
+            if cls is not None:
                 return self._handle_param(t, cls, n, m, sp, context, preferred)
         c_type, enum = self.scalar(t.removeprefix("const "), context, scope)
         arg = f"static_cast<{enum}>({n})" if enum else n
@@ -727,14 +735,22 @@ class TypeMapper:
                 [f"Slice {local}({n}, {n}_len);"],
                 [local],
             )
+        pointer = re.fullmatch(r"(?:const )?([\w:]+) \*", t) or re.fullmatch(
+            r"(?:const )?std::shared_ptr<(?:const )?([\w:]+)> ?&?", t
+        )
+        if pointer and self._handle_class(pointer.group(1), preferred) is not None:
+            mapped = self.param(Param(n, t, False), context, preferred)
+            mapped.arg = f"{n} != nullptr ? {mapped.arg} : nullptr"
+            return mapped
         m = re.fullmatch(r"const ([\w:]+) &", t)
         handle = None
         if m and (m.group(1) in self.by_class or preferred is not None):
             handle = self.handle_for(m.group(1), context, preferred)
         if handle is None or handle.rep_kind()[0] != "value":
             raise GenError(
-                f"{context}: nullable needs a const Slice * or a const T & whose "
-                f"handle holds a value, not {t!r}"
+                f"{context}: nullable needs a const Slice *, a handle's T* or "
+                f"shared_ptr<T>, or a const T & whose handle holds a value, "
+                f"not {t!r}"
             )
         cls = handle.rep_kind()[1]
         default, ref = f"{n}_default", f"{n}_ref"
@@ -747,6 +763,14 @@ class TypeMapper:
             ],
             [default, ref],
         )
+
+    def _handle_class(self, cls: str, preferred: str | None) -> str | None:
+        """The class a handle wraps that `cls` names, through an alias such as
+        `using RowCache = Cache;`, or None when no handle wraps it."""
+        if cls in self.by_class or preferred is not None:
+            return cls
+        target = self.index.typedef_target(cls)
+        return target if target in self.by_class else None
 
     def _handle_param(self, t, cls, n, m, sp, context, preferred) -> Mapped:
         handle = self.handle_for(cls, context, preferred)
@@ -824,35 +848,90 @@ def _select(name: str, candidates: list[Function], entry: dict, label: str) -> F
     return unique[0]
 
 
-# The keys an entry that reads a std::vector rep (`field` or `count`) takes.
-ELEMENT_KEYS = {"name", "field", "count", "result", "c_types", "doc"}
+# The keys of an entry that reads (`field`, `count`) or assigns (`set`) a data
+# member instead of calling a method.
+MEMBER_KEYS = {
+    "field": {"name", "field", "result", "receiver_const", "c_types", "doc"},
+    "count": {"name", "count", "receiver_const", "c_types", "doc"},
+    "set": {
+        "name",
+        "set",
+        "param_names",
+        "param_handles",
+        "nullable",
+        "skip_if_null",
+        "c_types",
+        "doc",
+    },
+}
+_CONTAINER_RE = re.compile(r"std::(vector|map|unordered_map|set|unordered_set)<.*>")
 
 
-def _element_access(entry: dict, handle: Handle, index: CxxIndex) -> Function:
-    """A const accessor standing in for the C++ method a `field` or `count`
-    entry would otherwise call."""
-    name = entry["name"]
-    access = [k for k in ("method", "field", "count") if k in entry]
-    if len(access) != 1:
-        raise GenError(f"{name}: an entry takes one of method, field or count")
-    extra = set(entry) - ELEMENT_KEYS
-    if extra:
-        raise GenError(f"{name}: {sorted(extra)} do not apply to {access[0]}")
-    element = handle.element()
-    if element is None:
-        raise GenError(f"{name}: {access[0]} needs a std::vector rep")
-    if "count" in entry:
-        if entry["count"] is not True:
-            raise GenError(f"{name}: count must be true")
-        return Function(element, "size", [], "size_t", True)
-    if handle.index_type is None:
-        raise GenError(f"{name}: field needs an index_type on {handle.c_type}")
-    cxx = index.field(element, entry["field"])
+def _member_type(index: CxxIndex, cls: str, member: str, name: str) -> str:
+    cxx = index.field(cls, member)
     if cxx is None:
-        raise GenError(f"{name}: {element} has no public field {entry['field']}")
+        raise GenError(f"{name}: {cls} has no public field {member}")
+    return cxx
+
+
+def _member_access(
+    entry: dict, handle: Handle, index: CxxIndex, mapper: "TypeMapper"
+) -> tuple[Function, str]:
+    """For a `field`, `count` or `set` entry: a Function standing in for the
+    C++ method the entry would otherwise call, and the member expression it
+    reads or assigns."""
+    name = entry["name"]
+    access = [k for k in ("method", "field", "count", "set") if k in entry]
+    if len(access) != 1:
+        raise GenError(f"{name}: an entry takes one of method, field, count or set")
+    kind = access[0]
+    extra = set(entry) - MEMBER_KEYS[kind]
+    if extra:
+        raise GenError(f"{name}: {sorted(extra)} do not apply to {kind}")
+    element = handle.element()
+    rep_kind, cls = handle.rep_kind()
+    rep = f"{handle.var}->rep"
+    if element is not None:
+        if kind == "count":
+            if entry["count"] is not True:
+                raise GenError(f"{name}: count on a std::vector rep must be true")
+            return Function(element, "size", [], "size_t", True), f"{rep}.size()"
+        if kind == "set":
+            raise GenError(f"{name}: set does not apply to a std::vector rep")
+        if handle.index_type is None:
+            raise GenError(f"{name}: field needs an index_type on {handle.c_type}")
+        cls, member = element, f"{rep}[index].{entry['field']}"
+    else:
+        if not isinstance(entry[kind], str):
+            raise GenError(f"{name}: {kind} must name a data member of {cls}")
+        member = f"{rep}{'.' if rep_kind == 'value' else '->'}{entry[kind]}"
+    cxx = _member_type(index, cls, entry[kind], name)
+    if cxx.startswith("const ") and not cxx.endswith(("*", "&")):
+        # A const member reads like its type but cannot be assigned.
+        if kind == "set":
+            raise GenError(f"{name}: cannot assign const member {entry['set']}")
+        cxx = cxx.removeprefix("const ")
+    if kind == "count":
+        container = index.typedef_target(cxx) or cxx
+        if not _CONTAINER_RE.fullmatch(container):
+            raise GenError(f"{name}: count needs a container member, not {cxx!r}")
+        return Function(cls, "size", [], "size_t", True), f"{member}.size()"
+    if kind == "set":
+        # The C parameter takes what a by-value C++ parameter of the member's
+        # type would, with a class held by a handle passed by reference.
+        if cxx == "std::string":
+            param = "const std::string &"
+        elif cxx.startswith("std::unique_ptr<"):
+            raise GenError(f"{name}: cannot assign unique_ptr member {entry['set']}")
+        elif cxx in mapper.by_class:
+            param = f"const {cxx} &"
+        else:
+            param = cxx
+        params = [Param(entry["set"], param, False)]
+        return Function(cls, entry["set"], params, "void", False), member
     # The member is an lvalue that lives as long as the handle.
     result = "const std::string &" if cxx == "std::string" else cxx
-    return Function(element, entry["field"], [], result, True)
+    return Function(cls, entry["field"], [], result, True), member
 
 
 def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Rendered:
@@ -860,7 +939,8 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
     name = entry["name"]
     handle = binding.handle
     kind, cls = handle.rep_kind()
-    if "method" in entry and not {"field", "count"} & set(entry):
+    member = None
+    if "method" in entry and not {"field", "count", "set"} & set(entry):
         fn = _select(
             name,
             index.methods(cls, entry["method"]),
@@ -868,7 +948,7 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
             f"method {cls}::{entry['method']}",
         )
     else:
-        fn = _element_access(entry, handle, index)
+        fn, member = _member_access(entry, handle, index, mapper)
 
     # Entry keys name a C++ parameter by its name, or by its zero-based
     # position when the declaration leaves it unnamed.
@@ -902,7 +982,7 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
     c_params.append(
         CParam(f"{'const ' if receiver_const else ''}{handle.c_type}*", handle.var)
     )
-    if "field" in entry:
+    if "field" in entry and handle.element() is not None:
         c_params.append(CParam(handle.index_type, "index"))
     # The handle a `result: handle` or `out_handle` call returns.
     new_handle: Handle | None = None
@@ -1020,10 +1100,12 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
         local_names.append("result")
 
     access = "." if kind == "value" else "->"
-    if "field" in entry:
-        call = f"{handle.var}->rep[index].{fn.name}"
-    else:
+    if member is None:
         call = f"{handle.var}->rep{access}{fn.name}({', '.join(args)})"
+    elif "set" in entry:
+        call = f"{member} = {args[0]}"
+    else:
+        call = member
 
     result_policy = entry.get("result")
     body: list[str] = []
@@ -1121,7 +1203,28 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
     if repeated:
         raise GenError(f"{name}: C parameters {repeated} appear twice")
     body = setup + body
-
+    skip = entry.get("skip_if_null", [])
+    if skip:
+        # A NULL argument makes the function return without doing anything.
+        if ret != "void" or (result in STATUS_TYPES and result_policy != "discard"):
+            raise GenError(f"{name}: skip_if_null needs a function with no result")
+        guarded = []
+        for key in skip:
+            c = [c_params[0]] if key == handle.var else by_param.get(key, [])
+            if len(c) != 1 or not c[0].c_type.endswith("*"):
+                raise GenError(
+                    f"{name}: skip_if_null names {key}, which is neither the "
+                    "handle nor a pointer parameter"
+                )
+            if key in entry.get("nullable", []):
+                raise GenError(f"{name}: {key} is both nullable and skip_if_null")
+            guarded.append(c[0].name)
+        if len(set(guarded)) != len(guarded):
+            raise GenError(f"{name}: skip_if_null lists a parameter twice")
+        cond = " && ".join(
+            f"{p.name} != nullptr" for p in c_params if p.name in guarded
+        )
+        body = [f"if ({cond}) {{", *(f"  {line}" for line in body), "}"]
     param_texts = [f"{p.c_type} {p.name}" for p in c_params] or ["void"]
     decl = _doc_lines(entry) + format_signature(
         f"extern ROCKSDB_LIBRARY_API {ret} {name}(", param_texts, ");"
@@ -1220,13 +1323,19 @@ def generate(clang: str, path: Path = HANDLES_PATH) -> dict[Path, str]:
     taken = existing_names()
     index = CxxIndex(clang, headers)
     try:
+        # A field of a std::vector rep is a member of its element; a count of
+        # one is its size(), which needs no class.
         index.prefetch(
             {
-                h.element() if "field" in b.entry else h.rep_kind()[1]
+                (
+                    (h.element() if "field" in b.entry else None)
+                    if h.element() is not None
+                    else h.rep_kind()[1]
+                )
                 for h in handles
                 for b in h.bindings
-                if "count" not in b.entry
             }
+            - {None}
         )
         mapper = TypeMapper(index, handles)
         structs = list(BANNER)

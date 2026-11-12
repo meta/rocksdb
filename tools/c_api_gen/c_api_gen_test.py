@@ -677,6 +677,31 @@ class NullableTest(unittest.TestCase):
             impl,
         )
 
+    def test_null_handles_pass_nullptr(self):
+        params = [
+            ("a", "Val *"),
+            ("b", "Ptr *"),
+            ("c", "const CPtr *"),
+            ("d", "std::shared_ptr<Sh>"),
+            ("e", "Sh *"),
+            ("f", "const std::shared_ptr<Sh> &"),
+        ]
+        decl, impl = _render({"nullable": [p for p, _ in params]}, _fn("Use", params))
+        self.assertIn(
+            "rocksdb_thing_t* t, rocksdb_val_t* a, rocksdb_ptr_t* b, "
+            "const rocksdb_cptr_t* c, rocksdb_sh_t* d, rocksdb_sh_t* e, "
+            "rocksdb_sh_t* f);",
+            decl,
+        )
+        self.assertIn(
+            "{ t->rep->Use(a != nullptr ? &a->rep : nullptr, "
+            "b != nullptr ? b->rep : nullptr, c != nullptr ? c->rep : nullptr, "
+            "d != nullptr ? d->rep : nullptr, "
+            "e != nullptr ? e->rep.get() : nullptr, "
+            "f != nullptr ? f->rep : nullptr); }",
+            impl,
+        )
+
     def test_setup_runs_after_the_new_handle(self):
         fn = _fn("Fill", [("opts", "const Val &"), ("out", "Val *")])
         _, impl = _render({"nullable": ["opts"], "out_handle": "out"}, fn)
@@ -696,7 +721,8 @@ class NullableTest(unittest.TestCase):
             ([("k", "const Slice &")], {"nullable": ["k"]}, "nullable needs"),
             ([("k", "Slice *")], {"nullable": ["k"]}, "nullable needs"),
             ([("o", "const Ptr &")], {"nullable": ["o"]}, "nullable needs"),
-            ([("o", "Val *")], {"nullable": ["o"]}, "nullable needs"),
+            ([("o", "std::unique_ptr<Sh>")], {"nullable": ["o"]}, "nullable needs"),
+            ([("o", "int *")], {"nullable": ["o"]}, "nullable needs"),
             ([("n", "int")], {"nullable": ["n"]}, "nullable needs"),
             ([("n", "int")], {"nullable": ["m"]}, "nullable names unknown"),
             (
@@ -903,18 +929,18 @@ class ElementAccessTest(unittest.TestCase):
             "rocksdb_vec_t", "std::vector<Elem>", "generated", "v", None, None
         )
         cases = [
-            ({"field": "level"}, THING, "needs a std::vector rep"),
-            ({"count": True}, THING, "needs a std::vector rep"),
-            ({"count": True}, OTHER_HANDLES[2], "needs a std::vector rep"),
             ({"field": "level"}, no_index, "needs an index_type"),
             ({"field": "missing"}, VEC, "no public field missing"),
-            ({"field": "level", "method": "X"}, VEC, "one of method, field or count"),
-            ({"field": "level", "count": True}, VEC, "one of method, field or count"),
-            ({}, VEC, "one of method, field or count"),
+            ({"field": "level", "method": "X"}, VEC, "one of method, field, count"),
+            ({"field": "level", "count": True}, VEC, "one of method, field, count"),
+            ({"field": "level", "set": "level"}, VEC, "one of method, field, count"),
+            ({}, VEC, "one of method, field, count or set"),
             ({"field": "level", "overload": []}, VEC, "do not apply to field"),
             ({"field": "level", "param_order": []}, VEC, "do not apply to field"),
-            ({"count": True, "receiver_const": False}, VEC, "do not apply to count"),
-            ({"count": 1}, VEC, "count must be true"),
+            ({"count": True, "result": "copy"}, VEC, "do not apply to count"),
+            ({"count": 1}, VEC, "count on a std::vector rep must be true"),
+            ({"count": "level"}, VEC, "count on a std::vector rep must be true"),
+            ({"set": "level"}, VEC, "set does not apply to a std::vector rep"),
             ({"field": "name"}, VEC, "needs `result: borrow`"),
             ({"field": "key", "result": "c_str"}, VEC, "c_str` needs a std::string"),
             ({"field": "level", "result": "c_str"}, VEC, "does not apply"),
@@ -930,6 +956,209 @@ class ElementAccessTest(unittest.TestCase):
         self.assertIn("{ return t->rep->Name().c_str(); }", impl)
         with self.assertRaisesRegex(hb.GenError, "cannot borrow"):
             _render({"result": "c_str"}, _fn("Name", [], "std::string"))
+
+
+MEMBER_FIELDS = {
+    ("Thing", "level"): "int",
+    ("Thing", "name"): "std::string",
+    ("Thing", "flag"): "bool",
+    ("Thing", "kind"): "Kind",
+    ("Thing", "levels"): "std::vector<Level>",
+    ("Thing", "props"): "Props",
+    ("Thing", "env"): "Ptr *",
+    ("Thing", "snap"): "const CPtr *",
+    ("Thing", "cache"): "std::shared_ptr<Sh>",
+    ("Thing", "acache"): "std::shared_ptr<ShAlias>",
+    ("Thing", "owned"): "std::unique_ptr<Sh>",
+    ("Thing", "opts"): "Val",
+    ("Val", "size"): "uint64_t",
+    ("Val", "levels"): "std::vector<Level>",
+    ("Val", "fixed"): "const int",
+    ("Val", "files"): "const std::vector<Level>",
+}
+VAL = OTHER_HANDLES[0]
+
+
+def _render_member(entry, handle=THING):
+    typedefs = {"Props": "std::map<std::string, std::string>", "ShAlias": "Sh"}
+    index = FakeIndex({}, ("Kind",), typedefs, MEMBER_FIELDS)
+    mapper = hb.TypeMapper(index, [THING, VEC] + OTHER_HANDLES)
+    full = {"name": "rocksdb_thing_x", **entry}
+    rendered = hb.render_binding(hb.Binding(handle, full), index, mapper)
+    return tuple(
+        _flat("\n".join(lines)).replace("( ", "(")
+        for lines in (rendered.decl, rendered.impl)
+    )
+
+
+class MemberAccessTest(unittest.TestCase):
+    """`field`, `count` and `set` entries on a handle that is not a vector."""
+
+    def test_field_reads(self):
+        cases = [
+            ({"field": "level"}, THING, "int", "return t->rep->level;"),
+            ({"field": "flag"}, THING, "unsigned char", "return t->rep->flag;"),
+            (
+                {"field": "kind"},
+                THING,
+                "int",
+                "return ROCKSDB_NAMESPACE::lossless_cast<int>(t->rep->kind);",
+            ),
+            (
+                {"field": "name", "result": "c_str"},
+                THING,
+                "const char*",
+                "return t->rep->name.c_str();",
+            ),
+            ({"field": "size"}, VAL, "uint64_t", "return v->rep.size;"),
+            # A const member reads like its type.
+            ({"field": "fixed"}, VAL, "int", "return v->rep.fixed;"),
+        ]
+        for entry, handle, ret, statement in cases:
+            with self.subTest(entry=entry):
+                decl, impl = _render_member(entry, handle)
+                receiver = f"const {handle.c_type}* {handle.var}"
+                self.assertIn(f"{ret} rocksdb_thing_x({receiver});", decl)
+                self.assertIn(f"{receiver}) {{ {statement} }}", impl)
+        decl, _ = _render_member({"field": "level", "receiver_const": False})
+        self.assertIn("int rocksdb_thing_x(rocksdb_thing_t* t);", decl)
+
+    def test_counts(self):
+        cases = [
+            ({"count": "levels"}, THING, "size_t", "return t->rep->levels.size();"),
+            ({"count": "props"}, THING, "size_t", "return t->rep->props.size();"),
+            ({"count": "levels"}, VAL, "size_t", "return v->rep.levels.size();"),
+            ({"count": "files"}, VAL, "size_t", "return v->rep.files.size();"),
+            (
+                {"count": "levels", "c_types": {"return": "int"}},
+                THING,
+                "int",
+                "return static_cast<int>(t->rep->levels.size());",
+            ),
+        ]
+        for entry, handle, ret, statement in cases:
+            with self.subTest(entry=entry):
+                decl, impl = _render_member(entry, handle)
+                receiver = f"const {handle.c_type}* {handle.var}"
+                self.assertIn(f"{ret} rocksdb_thing_x({receiver});", decl)
+                self.assertIn(f"{receiver}) {{ {statement} }}", impl)
+
+    def test_sets(self):
+        cases = [
+            ({"set": "level"}, "int level", "t->rep->level = level;"),
+            ({"set": "flag"}, "unsigned char flag", "t->rep->flag = flag;"),
+            ({"set": "kind"}, "int kind", "t->rep->kind = static_cast<Kind>(kind);"),
+            ({"set": "name"}, "const char* name", "t->rep->name = std::string(name);"),
+            ({"set": "env"}, "rocksdb_ptr_t* env", "t->rep->env = env->rep;"),
+            (
+                {"set": "snap"},
+                "const rocksdb_cptr_t* snap",
+                "t->rep->snap = snap->rep;",
+            ),
+            ({"set": "cache"}, "rocksdb_sh_t* cache", "t->rep->cache = cache->rep;"),
+            # An alias of a class a handle wraps maps to that handle.
+            (
+                {"set": "acache"},
+                "rocksdb_sh_t* acache",
+                "t->rep->acache = acache->rep;",
+            ),
+            ({"set": "opts"}, "const rocksdb_val_t* opts", "t->rep->opts = opts->rep;"),
+            (
+                {"set": "opts", "c_types": {"opts": "rocksdb_val_t*"}},
+                "rocksdb_val_t* opts",
+                "t->rep->opts = opts->rep;",
+            ),
+            (
+                {"set": "env", "param_names": {"env": "e"}},
+                "rocksdb_ptr_t* e",
+                "t->rep->env = e->rep;",
+            ),
+            (
+                {"set": "env", "nullable": ["env"]},
+                "rocksdb_ptr_t* env",
+                "t->rep->env = env != nullptr ? env->rep : nullptr;",
+            ),
+            (
+                {"set": "cache", "nullable": ["cache"]},
+                "rocksdb_sh_t* cache",
+                "t->rep->cache = cache != nullptr ? cache->rep : nullptr;",
+            ),
+            (
+                {"set": "acache", "nullable": ["acache"]},
+                "rocksdb_sh_t* acache",
+                "t->rep->acache = acache != nullptr ? acache->rep : nullptr;",
+            ),
+        ]
+        for entry, param, statement in cases:
+            with self.subTest(entry=entry):
+                decl, impl = _render_member(entry)
+                self.assertIn(
+                    f"void rocksdb_thing_x(rocksdb_thing_t* t, {param});", decl
+                )
+                self.assertIn(f"{param}) {{ {statement} }}", impl)
+        _, impl = _render_member({"set": "size"}, VAL)
+        self.assertIn("{ v->rep.size = size; }", impl)
+
+    def test_skip_if_null(self):
+        _, impl = _render_member({"set": "cache", "skip_if_null": ["cache"]})
+        self.assertIn("{ if (cache != nullptr) { t->rep->cache = cache->rep; } }", impl)
+        # The checks follow the C parameter order.
+        _, impl = _render_member({"set": "cache", "skip_if_null": ["cache", "t"]})
+        self.assertIn("{ if (t != nullptr && cache != nullptr) {", impl)
+        # Setup statements run inside the check.
+        fn = _fn("Verify", [("opts", "const Val &")])
+        _, impl = _render({"nullable": ["opts"], "skip_if_null": ["t"]}, fn)
+        self.assertIn(
+            "{ if (t != nullptr) { Val opts_default; const Val& opts_ref = "
+            "opts != nullptr ? opts->rep : opts_default; "
+            "t->rep->Verify(opts_ref); } }",
+            impl,
+        )
+        _, impl = _render(
+            {"skip_if_null": ["p"], "result": "discard"},
+            _fn("Use", [("p", "Ptr *")], "Status"),
+        )
+        self.assertIn("{ if (p != nullptr) { t->rep->Use(p->rep); } }", impl)
+
+    def test_errors(self):
+        cases = [
+            ({"set": "level", "result": "discard"}, THING, "do not apply to set"),
+            ({"field": "level", "nullable": ["level"]}, THING, "do not apply to field"),
+            ({"field": "level", "skip_if_null": ["t"]}, THING, "do not apply"),
+            ({"count": "level"}, THING, "count needs a container member"),
+            ({"count": True}, THING, "count must name a data member"),
+            ({"field": True}, THING, "field must name a data member"),
+            ({"set": "missing"}, THING, "no public field missing"),
+            ({"field": "missing"}, VAL, "Val has no public field missing"),
+            ({"set": "owned"}, THING, "cannot assign unique_ptr"),
+            ({"set": "fixed"}, VAL, "cannot assign const member fixed"),
+            ({"set": "levels"}, THING, "no C mapping"),
+            ({"set": "cache", "skip_if_null": ["level"]}, THING, "neither the handle"),
+            ({"set": "level", "skip_if_null": ["level"]}, THING, "neither the handle"),
+            (
+                {"set": "cache", "skip_if_null": ["cache"], "nullable": ["cache"]},
+                THING,
+                "both nullable and skip_if_null",
+            ),
+            (
+                {"set": "cache", "skip_if_null": ["cache", "cache"]},
+                THING,
+                "lists a parameter twice",
+            ),
+            (
+                {"set": "env", "c_types": {"env": "rocksdb_val_t*"}},
+                THING,
+                "can only drop const",
+            ),
+        ]
+        for entry, handle, message in cases:
+            with self.subTest(entry=entry):
+                with self.assertRaisesRegex(hb.GenError, message):
+                    _render_member(entry, handle)
+        for result in ("Status", "int"):
+            with self.subTest(result=result):
+                with self.assertRaisesRegex(hb.GenError, "with no result"):
+                    _render({"skip_if_null": ["t"]}, _fn("Run", [], result))
 
 
 class HandleParamPinTest(unittest.TestCase):
@@ -1032,6 +1261,15 @@ class HandleSchemaTest(unittest.TestCase):
             [self._handle(methods=[{"name": "rocksdb_thing_x", "method": "X"}])]
         )
         self.assertEqual([b.name for b in handles[0].bindings], ["rocksdb_thing_x"])
+
+    def test_member_keys_load(self):
+        # load_handles rejects unknown keys before render_binding sees them.
+        for kind, keys in hb.MEMBER_KEYS.items():
+            with self.subTest(kind=kind):
+                self.assertLessEqual(keys, hb.METHOD_KEYS)
+                entry = {k: "x" for k in keys} | {"name": "rocksdb_thing_x"}
+                _, handles = self._load([self._handle(methods=[entry])])
+                self.assertEqual(handles[0].bindings[0].entry, entry)
 
     def test_errors(self):
         cases = [
@@ -1821,6 +2059,100 @@ class EquivalenceNormalizationTest(unittest.TestCase):
             "SaveError(errptr, db->rep->VerifyChecksum(read_options_ref)); }",
         )
         self.assertFalse(veq.bodies_equivalent(ref, unguarded))
+
+    def test_pointer_conditions(self):
+        pointers = frozenset({"p", "q"})
+
+        def norm(text):
+            return " ".join(
+                veq.normalize_pointer_conditions(veq.tokenize(text), pointers)
+            )
+
+        rewritten = [
+            ("if (p) {", "if ( p != nullptr ) {"),
+            ("while (p) {", "while ( p != nullptr ) {"),
+            ("if (p && q) {", "if ( p != nullptr && q != nullptr ) {"),
+            ("if (n && p || q) {", "if ( n && p != nullptr || q != nullptr ) {"),
+            ("x = p ? a : b;", "x = p != nullptr ? a : b ;"),
+            ("return (p ? a : b);", "return ( p != nullptr ? a : b ) ;"),
+            ("f(c, p && q);", "f ( c , p != nullptr && q != nullptr ) ;"),
+            # Only the whole operand is rewritten.
+            ("if (!p && q) {", "if ( ! p && q != nullptr ) {"),
+            ("if (q && p == nullptr) {", "if ( q != nullptr && p == nullptr ) {"),
+            ("if (t->p && q) {", "if ( t -> p && q != nullptr ) {"),
+        ]
+        kept = [
+            "if (!p) {",
+            "if (p != nullptr) {",
+            "if (p == nullptr) {",
+            "f(p);",
+            "x = p;",
+            "x = c ? p : q;",
+            "if (n) {",
+            "if (t->p) {",
+            "if (g(p)) {",
+            "if ((T*)p) {",
+        ]
+        for text, want in rewritten:
+            with self.subTest(text=text):
+                self.assertEqual(norm(text), want)
+        for text in kept:
+            with self.subTest(text=text):
+                self.assertEqual(norm(text), " ".join(veq.tokenize(text)))
+
+    def test_redundant_parens(self):
+        def norm(text):
+            return " ".join(veq.drop_redundant_parens(veq.tokenize(text)))
+
+        cases = [
+            ("x = (a + b);", "x = a + b ;"),
+            ("x = ((a));", "x = a ;"),
+            ("return (c ? a : b);", "return c ? a : b ;"),
+            ("x = (f(a, b));", "x = f ( a , b ) ;"),
+            ("x = (a, b);", "x = ( a , b ) ;"),
+            ("x = (T)(v);", "x = ( T ) ( v ) ;"),
+            ("x = (a) + b;", "x = ( a ) + b ;"),
+            ("x == (a);", "x == ( a ) ;"),
+            ("f((a));", "f ( ( a ) ) ;"),
+        ]
+        for text, want in cases:
+            with self.subTest(text=text):
+                self.assertEqual(norm(text), want)
+
+    def test_null_handle_setter_bodies(self):
+        """The shipped `(env ? env->rep : nullptr)` and `if (a && b)` setters
+        against the generator's shapes."""
+
+        def make(
+            body, names=("opt", "env"), types=("rocksdb_options_t*", "rocksdb_env_t*")
+        ):
+            return veq.FunctionDef("f", "", "void", list(types), list(names), body)
+
+        ref = make("{ opt->rep.env = (env ? env->rep : nullptr); }")
+        gen = make("{ opt->rep.env = env != nullptr ? env->rep : nullptr; }")
+        self.assertTrue(veq.bodies_equivalent(ref, gen))
+        self.assertFalse(
+            veq.bodies_equivalent(ref, make("{ opt->rep.env = env->rep; }"))
+        )
+        ref = make("{ if (opt && env) { opt->rep.env = env->rep; } }")
+        gen = make(
+            "{ if (opt != nullptr && env != nullptr) { opt->rep.env = env->rep; } }"
+        )
+        self.assertTrue(veq.bodies_equivalent(ref, gen))
+        self.assertFalse(
+            veq.bodies_equivalent(
+                ref, make("{ if (env != nullptr) { opt->rep.env = env->rep; } }")
+            )
+        )
+        # A parameter that is not a pointer is not compared with nullptr.
+        ints = ("opt", "n"), ("rocksdb_options_t*", "int")
+        self.assertFalse(
+            veq.bodies_equivalent(
+                make("{ if (n) { f(); } }", *ints),
+                make("{ if (n != nullptr) { f(); } }", *ints),
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
