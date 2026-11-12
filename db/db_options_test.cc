@@ -1039,8 +1039,9 @@ TEST_F(DBOptionsTest, SetStatsDumpPeriodSec) {
   Reopen(options);
   ASSERT_EQ(5u, dbfull()->GetDBOptions().stats_dump_period_sec);
 
+  Random rnd(301);
   for (int i = 0; i < 20; i++) {
-    unsigned int num = rand() % 5000 + 1;
+    unsigned int num = rnd.Uniform(5000) + 1;
     ASSERT_OK(dbfull()->SetDBOptions(
         {{"stats_dump_period_sec", std::to_string(num)}}));
     ASSERT_EQ(num, dbfull()->GetDBOptions().stats_dump_period_sec);

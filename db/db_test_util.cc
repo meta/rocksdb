@@ -77,10 +77,10 @@ DBTestBase::DBTestBase(const std::string& path, bool env_do_fsync)
   ConfigOptions config_options;
   EXPECT_OK(test::CreateEnvFromSystem(config_options, &base_env, &env_guard_));
   EXPECT_NE(nullptr, base_env);
-  if (getenv("MEM_ENV")) {
+  if (getenv("MEM_ENV")) {  // NOLINT(concurrency-mt-unsafe)
     mem_env_ = MockEnv::Create(base_env, base_env->GetSystemClock());
   }
-  if (auto ee = getenv("ENCRYPTED_ENV")) {
+  if (auto ee = getenv("ENCRYPTED_ENV")) {  // NOLINT(concurrency-mt-unsafe)
     std::shared_ptr<EncryptionProvider> provider;
     std::string provider_id = ee;
     if (provider_id.find('=') == std::string::npos &&
@@ -125,7 +125,7 @@ DBTestBase::~DBTestBase() {
   options.db_paths.emplace_back(dbname_ + "_4", 0);
   options.env = env_;
 
-  if (getenv("KEEP_DB")) {
+  if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
     printf("DB is still at %s\n", dbname_.c_str());
   } else {
     EXPECT_OK(DestroyDir(env_, alternative_wal_dir_));

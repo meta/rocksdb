@@ -3186,6 +3186,7 @@ TEST_P(BuiltinChecksumTest, ChecksumZeroInputs) {
     return;
   }
   // "Thorough" case is too slow for continouous testing
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
   bool thorough = getenv("ROCKSDB_THOROUGH_CHECKSUM_TEST") != nullptr;
   // Verified through 10M
   size_t kMaxZerosLen = thorough ? 10000000 : 20000;

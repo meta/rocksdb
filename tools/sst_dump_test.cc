@@ -86,7 +86,7 @@ class SSTDumpToolTest : public testing::Test {
   }
 
   ~SSTDumpToolTest() override {
-    if (getenv("KEEP_DB")) {
+    if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
       fprintf(stdout, "Data is still at %s\n", test_dir_.c_str());
     } else {
       EXPECT_OK(env_->DeleteDir(test_dir_));

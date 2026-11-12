@@ -61,7 +61,7 @@ class FlushJobTestBase : public testing::Test {
 
  public:
   ~FlushJobTestBase() override {
-    if (getenv("KEEP_DB")) {
+    if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
       fprintf(stdout, "db is still in %s\n", dbname_.c_str());
     } else {
       // destroy versions_ to release all file handles

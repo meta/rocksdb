@@ -63,7 +63,7 @@ SimulatedHybridFileSystem::SimulatedHybridFileSystem(
             metadata_file_name.c_str(), s.ToString().c_str());
     // Exit rather than assert as this file system is built to run with
     // benchmarks, which usually run on release mode.
-    std::exit(1);
+    std::exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   std::istringstream input;
   input.str(metadata);

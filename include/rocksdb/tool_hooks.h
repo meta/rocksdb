@@ -120,6 +120,7 @@ class DefaultHooks : public ToolHooks {
   Status Open(const Options& options, const blob_db::BlobDBOptions& bdb_options,
               const std::string& dbname, blob_db::BlobDB** blob_db) override;
 
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
   void Exit(int status) override { exit(status); }
 };
 

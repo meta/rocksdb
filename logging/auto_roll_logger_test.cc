@@ -59,6 +59,7 @@ class AutoRollLoggerTest : public testing::Test {
         '\\');
     std::string deleteDbDirCmd =
         "if exist " + testDbDir + " rd /s /q " + testDbDir;
+    // NOLINTNEXTLINE(concurrency-mt-unsafe,cert-env33-c)
     ASSERT_TRUE(system(deleteDbDirCmd.c_str()) == 0);
 
     std::string testDir(kTestDir);
@@ -69,6 +70,7 @@ class AutoRollLoggerTest : public testing::Test {
 #else
     std::string deleteCmd = "rm -rf " + kTestDir + " " + kTestDbDir;
 #endif
+    // NOLINTNEXTLINE(concurrency-mt-unsafe,cert-env33-c)
     ASSERT_TRUE(system(deleteCmd.c_str()) == 0);
     ASSERT_OK(Env::Default()->CreateDir(kTestDir));
     ASSERT_OK(Env::Default()->CreateDir(kTestDbDir));
@@ -660,6 +662,7 @@ TEST_F(AutoRollLoggerTest, LogFileExistence) {
 #else
   std::string deleteCmd = "rm -rf " + kTestDir;
 #endif
+  // NOLINTNEXTLINE(concurrency-mt-unsafe,cert-env33-c)
   ASSERT_EQ(system(deleteCmd.c_str()), 0);
   options.max_log_file_size = 100 * 1024 * 1024;
   options.create_if_missing = true;

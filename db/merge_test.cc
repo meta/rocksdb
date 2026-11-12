@@ -224,6 +224,7 @@ class Counters {
     int result = get(key, &value);
     assert(result);
     if (result == 0) {
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
       exit(1);  // Disable unused variable warning.
     }
     return value;
@@ -233,6 +234,7 @@ class Counters {
     int result = add(key, value);
     assert(result);
     if (result == 0) {
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
       exit(1);  // Disable unused variable warning.
     }
   }

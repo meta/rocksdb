@@ -175,14 +175,14 @@ int trace_analyzer_tool(int argc, char** argv) {
   if (!s.ok()) {
     fprintf(stderr, "%s\n", s.getState());
     fprintf(stderr, "Cannot initiate the trace reader\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 
   s = analyzer.StartProcessing();
   if (!s.ok() && !FLAGS_try_process_corrupted_trace) {
     fprintf(stderr, "%s\n", s.getState());
     fprintf(stderr, "Cannot process the trace\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 
   s = analyzer.MakeStatistics();
@@ -190,7 +190,7 @@ int trace_analyzer_tool(int argc, char** argv) {
     fprintf(stderr, "%s\n", s.getState());
     analyzer.EndProcessing().PermitUncheckedError();
     fprintf(stderr, "Cannot make the statistics\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 
   s = analyzer.ReProcessing();
@@ -198,7 +198,7 @@ int trace_analyzer_tool(int argc, char** argv) {
     fprintf(stderr, "%s\n", s.getState());
     fprintf(stderr, "Cannot re-process the trace for more statistics\n");
     analyzer.EndProcessing().PermitUncheckedError();
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 
   if (!FLAGS_no_print) {
@@ -208,7 +208,7 @@ int trace_analyzer_tool(int argc, char** argv) {
   if (!s.ok()) {
     fprintf(stderr, "%s\n", s.getState());
     fprintf(stderr, "Cannot close the trace analyzer\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 
   return 0;

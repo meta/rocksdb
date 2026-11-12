@@ -113,7 +113,7 @@ class TransactionTestBase : public ::testing::Test {
     // seems to be a bug in btrfs that the makes readdir return recently
     // unlink-ed files. By using the default fs we simply ignore errors resulted
     // from attempting to delete such files in DestroyDB.
-    if (getenv("KEEP_DB") == nullptr) {
+    if (getenv("KEEP_DB") == nullptr) {  // NOLINT(concurrency-mt-unsafe)
       options.env = Env::Default();
       EXPECT_OK(DestroyDB(dbname, options));
     } else {

@@ -4710,6 +4710,7 @@ TEST_P(WritePreparedTransactionTest, GetEntityCoroutine) {
 int main(int argc, char** argv) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ::testing::InitGoogleTest(&argc, argv);
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
   if (getenv("CIRCLECI") || getenv("GITHUB_ACTIONS")) {
     // Looking for backtrace on "Resource temporarily unavailable" exceptions
     ::testing::FLAGS_gtest_catch_exceptions = false;

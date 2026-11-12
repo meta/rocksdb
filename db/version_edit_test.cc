@@ -16,6 +16,7 @@
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/coding.h"
+#include "util/random.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -445,11 +446,12 @@ TEST_F(VersionEditTest, DroppedBlobFiles) {
 
 TEST_F(VersionEditTest, AddWalEncodeDecode) {
   VersionEdit edit;
+  Random rnd(301);
   for (uint64_t log_number = 1; log_number <= 20; log_number++) {
     WalMetadata meta;
-    bool has_size = rand() % 2 == 0;
+    bool has_size = rnd.Uniform(2) == 0;
     if (has_size) {
-      meta.SetSyncedSizeInBytes(rand() % 1000);
+      meta.SetSyncedSizeInBytes(rnd.Uniform(1000));
     }
     edit.AddWal(log_number, meta);
   }
@@ -624,7 +626,8 @@ TEST_F(VersionEditTest, AddWalDebug) {
 
 TEST_F(VersionEditTest, DeleteWalEncodeDecode) {
   VersionEdit edit;
-  edit.DeleteWalsBefore(rand() % 100);
+  Random rnd(301);
+  edit.DeleteWalsBefore(rnd.Uniform(100));
   TestEncodeDecode(edit);
 }
 

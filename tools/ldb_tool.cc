@@ -197,6 +197,7 @@ int LDBCommandRunner::RunCommand(
 void LDBTool::Run(int argc, char** argv, const Options& options,
                   const LDBOptions& ldb_options,
                   const std::vector<ColumnFamilyDescriptor>* column_families) {
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
   exit(RunAndReturn(argc, argv, options, ldb_options, column_families));
 }
 
