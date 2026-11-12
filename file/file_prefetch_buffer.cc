@@ -262,11 +262,17 @@ void FilePrefetchBuffer::CopyDataToOverlapBuffer(BufferInfo* src,
 // Clear the buffers if it contains outdated data. Outdated data can be because
 // previous sequential reads were read from the cache instead of these buffer.
 // In that case outdated IOs should be aborted.
-void FilePrefetchBuffer::AbortOutdatedIO(uint64_t offset) {
+void FilePrefetchBuffer::AbortOutdatedIO(uint64_t offset, size_t length) {
   std::vector<void*> handles;
   std::vector<BufferInfo*> tmp_buf;
   for (auto& buf : bufs_) {
-    if (buf->IsBufferOutdatedWithAsyncProgress(offset)) {
+    bool outdated = false;
+    if (direction_ == PrefetchDirection::kForward) {
+      outdated = buf->IsBufferOutdatedWithAsyncProgress(offset);
+    } else {
+      outdated = buf->IsBufferOutdatedBackwardWithAsyncProgress(offset, length);
+    }
+    if (outdated) {
       handles.emplace_back(buf->io_handle_);
       tmp_buf.emplace_back(buf);
     }
@@ -318,8 +324,15 @@ void FilePrefetchBuffer::AbortAllIOs() {
 void FilePrefetchBuffer::ClearOutdatedData(uint64_t offset, size_t length) {
   while (!IsBufferQueueEmpty()) {
     BufferInfo* buf = GetFirstBuffer();
-    // Offset is greater than this buffer's end offset.
-    if (buf->IsBufferOutdated(offset)) {
+    // Offset is greater than this buffer's end offset for forward,
+    // or offset+length <= buf start for backward.
+    bool outdated = false;
+    if (direction_ == PrefetchDirection::kForward) {
+      outdated = buf->IsBufferOutdated(offset);
+    } else {
+      outdated = buf->IsBufferOutdatedBackward(offset, length);
+    }
+    if (outdated) {
       FreeFrontBuffer();
     } else {
       break;
@@ -342,11 +355,22 @@ void FilePrefetchBuffer::ClearOutdatedData(uint64_t offset, size_t length) {
 
   if (buf->DoesBufferContainData() && buf->IsOffsetInBuffer(offset)) {
     BufferInfo* next_buf = bufs_[1];
-    if (/* next buffer doesn't align with first buffer and requested data
-       overlaps with next buffer */
-        ((buf->offset_ + buf->CurrentSize() != next_buf->offset_) &&
-         (offset + length > buf->offset_ + buf->CurrentSize()))) {
-      abort_io = true;
+    if (direction_ == PrefetchDirection::kForward) {
+      if (/* next buffer doesn't align with first buffer and requested data
+         overlaps with next buffer */
+          ((buf->offset_ + buf->CurrentSize() != next_buf->offset_) &&
+           (offset + length > buf->offset_ + buf->CurrentSize()))) {
+        abort_io = true;
+      }
+    } else {
+      // Backward: next buffer should start where current ends in reverse
+      // direction? For backward, buffers are ordered with decreasing offsets in
+      // queue front to back? Simplistic check: if requested range extends
+      // before current buffer start, and next buffer doesn't align.
+      if (((next_buf->offset_ + next_buf->CurrentSize() != buf->offset_) &&
+           (offset < buf->offset_))) {
+        abort_io = true;
+      }
     }
   } else {
     // buffer with offset doesn't contain data or offset doesn't lie in this
@@ -418,9 +442,18 @@ void FilePrefetchBuffer::ReadAheadSizeTuning(
     uint64_t prev_buf_end_offset, size_t alignment, size_t length,
     size_t readahead_size, uint64_t& start_offset, uint64_t& end_offset,
     size_t& read_len, uint64_t& aligned_useful_len) {
-  uint64_t updated_start_offset = Rounddown(start_offset, alignment);
-  uint64_t updated_end_offset =
-      Roundup(start_offset + length + readahead_size, alignment);
+  uint64_t updated_start_offset;
+  uint64_t updated_end_offset;
+  if (direction_ == PrefetchDirection::kForward) {
+    updated_start_offset = Rounddown(start_offset, alignment);
+    updated_end_offset =
+        Roundup(start_offset + length + readahead_size, alignment);
+  } else {  // backward
+    uint64_t backward_start =
+        start_offset > readahead_size ? start_offset - readahead_size : 0;
+    updated_start_offset = Rounddown(backward_start, alignment);
+    updated_end_offset = Roundup(start_offset + length, alignment);
+  }
   uint64_t initial_end_offset = updated_end_offset;
   uint64_t initial_start_offset = updated_start_offset;
 
@@ -440,7 +473,7 @@ void FilePrefetchBuffer::ReadAheadSizeTuning(
 
   assert(updated_start_offset < updated_end_offset);
 
-  if (!read_curr_block) {
+  if (!read_curr_block && direction_ == PrefetchDirection::kForward) {
     // Handle the case when callback added block handles which are already
     // prefetched and nothing new needs to be prefetched. In that case end
     // offset updated by callback will be less than prev_buf_end_offset which
@@ -457,7 +490,8 @@ void FilePrefetchBuffer::ReadAheadSizeTuning(
   start_offset = Rounddown(updated_start_offset, alignment);
   end_offset = Roundup(updated_end_offset, alignment);
 
-  if (!read_curr_block && start_offset < prev_buf_end_offset) {
+  if (!read_curr_block && direction_ == PrefetchDirection::kForward &&
+      start_offset < prev_buf_end_offset) {
     // Previous buffer already contains the data till prev_buf_end_offset
     // because of alignment. Update the start offset after that to avoid
     // prefetching it again.
@@ -640,7 +674,7 @@ Status FilePrefetchBuffer::PrefetchInternal(const IOOptions& opts,
 
   // Abort outdated IO.
   if (!explicit_prefetch_submitted_) {
-    AbortOutdatedIO(offset);
+    AbortOutdatedIO(offset, length);
     FreeEmptyBuffers();
   }
   ClearOutdatedData(offset, length);

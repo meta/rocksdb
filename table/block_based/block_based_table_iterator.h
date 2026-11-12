@@ -463,8 +463,9 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   // If `target` is null, seek to first.
   void SeekImpl(const Slice* target, bool async_prefetch);
 
-  void InitDataBlock();
-  void AsyncInitDataBlock(bool is_first_pass);
+  void InitDataBlock(PrefetchDirection direction = PrefetchDirection::kForward);
+  void AsyncInitDataBlock(bool is_first_pass, PrefetchDirection direction =
+                                                  PrefetchDirection::kForward);
   bool MaterializeCurrentBlock();
   void FindKeyForward();
   void FindBlockForward();
@@ -549,6 +550,52 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
     }
 
     return false;
+  }
+
+  bool IsPrevBlockOutOfReadaheadBound() {
+    assert(index_iter_->Valid());
+    const Slice& index_iter_user_key = index_iter_->user_key();
+    // If curr block's index key <= iterate_lower_bound, it means all keys
+    // in previous block or below are out of bound for reverse scan.
+    bool out_of_lower_bound =
+        read_options_.iterate_lower_bound != nullptr &&
+        (user_comparator_.CompareWithoutTimestamp(
+             index_iter_user_key,
+             /*a_has_ts=*/true, *read_options_.iterate_lower_bound,
+             /*b_has_ts=*/false) <= 0
+             ? true
+             : false);
+    if (out_of_lower_bound) {
+      return true;
+    }
+
+    // For prefix check in reverse direction, if current block's index key has
+    // different prefix from seek key's, and is less than seek prefix, then
+    // previous blocks are also out of prefix bound.
+    bool out_of_prefix_bound =
+        (read_options_.prefix_same_as_start &&
+         !seek_key_prefix_for_readahead_trimming_.empty() &&
+         (prefix_extractor_->InDomain(index_iter_user_key)
+              ? (prefix_extractor_->Transform(index_iter_user_key)
+                     .compare(seek_key_prefix_for_readahead_trimming_) != 0)
+              : user_comparator_.CompareWithoutTimestamp(
+                    index_iter_user_key,
+                    /*a_has_ts=*/true, seek_key_prefix_for_readahead_trimming_,
+                    /*b_has_ts=*/false) < 0));
+
+    if (out_of_prefix_bound) {
+      return true;
+    }
+
+    return false;
+  }
+
+  bool IsBlockOutOfReadaheadBound() {
+    // Direction-aware wrapper used by BlockCacheLookupForReadAheadSize
+    if (direction_ == IterDirection::kBackward) {
+      return IsPrevBlockOutOfReadaheadBound();
+    }
+    return IsNextBlockOutOfReadaheadBound();
   }
 
   void ClearBlockHandles() {
