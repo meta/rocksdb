@@ -6952,6 +6952,11 @@ void InitializeOptionsFromFlags(
        {/*.charged = */ FLAGS_charge_blob_cache
             ? CacheEntryRoleOptions::Decision::kEnabled
             : CacheEntryRoleOptions::Decision::kDisabled}});
+  block_based_options.cache_usage_options.options_overrides.insert(
+      {CacheEntryRole::kReadaheadBuffer,
+       {/*.charged = */ FLAGS_charge_readahead_buffer
+            ? CacheEntryRoleOptions::Decision::kEnabled
+            : CacheEntryRoleOptions::Decision::kDisabled}});
   block_based_options.format_version =
       static_cast<uint32_t>(FLAGS_format_version);
   block_based_options.separate_key_value_in_data_block =

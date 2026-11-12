@@ -27,6 +27,7 @@
 #include "rocksdb/flush_block_policy.h"
 #include "rocksdb/index_factory.h"
 #include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/system_clock.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/customizable_util.h"
 #include "rocksdb/utilities/object_registry.h"
@@ -34,6 +35,7 @@
 #include "table/block_based/block_based_table_builder.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/format.h"
+#include "test_util/sync_point.h"
 #include "util/cast_util.h"
 #include "util/mutexlock.h"
 #include "util/string_util.h"
@@ -614,6 +616,29 @@ BlockBasedTableFactory::BlockBasedTableFactory(
                 CacheEntryRole::kBlockBasedTableReader>>(
                 table_options_.block_cache));
   }
+
+  const auto readahead_charged =
+      table_options_.cache_usage_options.options_overrides
+          .at(CacheEntryRole::kReadaheadBuffer)
+          .charged;
+  if (table_options_.block_cache &&
+      readahead_charged == CacheEntryRoleOptions::Decision::kEnabled) {
+    // Readahead buffers are allocated and freed per table read, often by many
+    // threads, so they use the atomic manager. Keep a reservation for 1 second
+    // after it grows, so a buffer allocated and freed on every read does not
+    // insert and erase dummy entries every time.
+    uint64_t release_delay_micros = 1000 * 1000;
+    TEST_SYNC_POINT_CALLBACK(
+        "BlockBasedTableFactory::BlockBasedTableFactory:"
+        "ReadaheadReleaseDelayMicros",
+        &release_delay_micros);
+    shared_state_->readahead_cache_res_mgr =
+        std::make_shared<AtomicCacheReservationManager>(
+            std::make_shared<
+                CacheReservationManagerImpl<CacheEntryRole::kReadaheadBuffer>>(
+                table_options_.block_cache),
+            SystemClock::Default().get(), release_delay_micros);
+  }
 }
 
 void BlockBasedTableFactory::InitializeOptions() {
@@ -767,6 +792,7 @@ Status BlockBasedTableFactory::NewTableReader(
       file_size, table_reader_options.block_protection_bytes_per_key,
       table_reader, table_reader_options.tail_size,
       shared_state_->table_reader_cache_res_mgr,
+      shared_state_->readahead_cache_res_mgr,
       table_reader_options.prefix_extractor,
       table_reader_options.compression_manager,
       prefetch_index_and_filter_in_cache, table_reader_options.skip_filters,
@@ -989,8 +1015,10 @@ Status BlockBasedTableFactory::ValidateOptions(
     static const std::set<CacheEntryRole> kMemoryChargingSupported = {
         CacheEntryRole::kCompressionDictionaryBuildingBuffer,
         CacheEntryRole::kFilterConstruction,
-        CacheEntryRole::kBlockBasedTableReader, CacheEntryRole::kFileMetadata,
-        CacheEntryRole::kBlobCache};
+        CacheEntryRole::kBlockBasedTableReader,
+        CacheEntryRole::kFileMetadata,
+        CacheEntryRole::kBlobCache,
+        CacheEntryRole::kReadaheadBuffer};
     if (options.charged != CacheEntryRoleOptions::Decision::kFallback &&
         kMemoryChargingSupported.count(role) == 0) {
       return Status::NotSupported(

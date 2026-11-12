@@ -169,6 +169,7 @@ DECLARE_bool(charge_filter_construction);
 DECLARE_bool(charge_table_reader);
 DECLARE_bool(charge_file_metadata);
 DECLARE_bool(charge_blob_cache);
+DECLARE_bool(charge_readahead_buffer);
 DECLARE_bool(decouple_partitioned_filters);
 DECLARE_int32(top_level_index_pinning);
 DECLARE_int32(partition_pinning);

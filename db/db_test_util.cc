@@ -2008,6 +2008,7 @@ template class TargetCacheChargeTrackingCache<
 template class TargetCacheChargeTrackingCache<
     CacheEntryRole::kBlockBasedTableReader>;
 template class TargetCacheChargeTrackingCache<CacheEntryRole::kFileMetadata>;
+template class TargetCacheChargeTrackingCache<CacheEntryRole::kReadaheadBuffer>;
 
 const std::vector<Temperature> kKnownTemperatures = {
     Temperature::kHot, Temperature::kWarm, Temperature::kCool,
