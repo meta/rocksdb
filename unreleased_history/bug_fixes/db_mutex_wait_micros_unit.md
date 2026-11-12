@@ -1,0 +1,1 @@
+Fixed the `DB_MUTEX_WAIT_MICROS` ticker (`rocksdb.db.mutex.wait.micros`), which recorded DB mutex and condition-variable wait time in nanoseconds. It now records microseconds, as its name says, so its values are 1000x smaller than before. The perf context counters `db_mutex_lock_nanos` and `db_condition_wait_nanos` stay in nanoseconds.
