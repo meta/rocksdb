@@ -32,6 +32,16 @@ Most of the judgment in a summary is which details to include, and how many.
 The test for each detail: would the skeptical reviewer need it to be
 convinced, or to avoid being misled? If they would not miss it, cut it.
 
+- **Company-confidential data stays out, in the summary and the test plan,
+  even when the test above says to include it.** Most importantly, never give
+  the dollar cost, scale, or hardware mix of company assets, such as fleet,
+  host, or shard counts, storage or dollar costs, or which hardware
+  generations are deployed. Benchmark results on specified host types are
+  fine. Other internal context, such as internal product names, incident
+  details, or how an internal user hit the problem, belongs in a diff comment.
+  An `Internal:` line at the end of the summary is stripped when an
+  internally authored commit is exported to GitHub, but do not rely on it for
+  anything sensitive; pull requests imported from GitHub have no such filter.
 - **Changing existing behavior that has nuance:** err toward detail about that
   behavior: what it does, under which conditions, and why it was built that
   way. Readers need that detail to understand and justify the change.
@@ -163,11 +173,10 @@ rather than "creation time".
   than the evidence.
 - Present non-trivial numbers in markdown tables, with each column defined,
   units given, and the baseline stated for every comparison.
-- Write for open source: no internal product names, local paths, or
-  references to earlier versions of the same diff. For a commit authored
-  internally and exported to GitHub, internal context can go after an
-  `Internal:` line at the end of the summary, which the export strips. Pull
-  requests imported from GitHub have no such filter.
+- Write for open source, in the summary and the test plan: no local paths,
+  internal names or jargon that outside readers cannot follow, or references
+  to earlier versions of the same diff. For confidential data, see "Choosing
+  the detail".
 
 ## Test Plan
 
