@@ -318,9 +318,6 @@ extern ROCKSDB_LIBRARY_API uint32_t rocksdb_backup_engine_info_number_files(
 extern ROCKSDB_LIBRARY_API const char* rocksdb_backup_engine_info_app_metadata(
     const rocksdb_backup_engine_info_t* info, int index, size_t* len);
 
-extern ROCKSDB_LIBRARY_API void rocksdb_backup_engine_close(
-    rocksdb_backup_engine_t* be);
-
 // BEGIN generated: c_generated_db_simple_subset.h.inc
 // @generated
 // -----------------------------------------------------------------------------
@@ -459,8 +456,6 @@ rocksdb_get_default_column_family_handle(rocksdb_t* db);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_column_family_handle_destroy(
     rocksdb_column_family_handle_t*);
-
-extern ROCKSDB_LIBRARY_API void rocksdb_close(rocksdb_t* db);
 
 /* Returns NULL if not found.  A malloc()ed array otherwise.
    Stores the length of the array in *vallen. */
@@ -3355,9 +3350,6 @@ rocksdb_transactiondb_create_iterator_cf(
     rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
     rocksdb_column_family_handle_t* column_family);
 
-extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_close(
-    rocksdb_transactiondb_t* txn_db);
-
 extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_flush_cfs(
     rocksdb_transactiondb_t* txn_db, const rocksdb_flushoptions_t* options,
     rocksdb_column_family_handle_t** column_families, int num_column_families,
@@ -3410,9 +3402,6 @@ rocksdb_optimistictransaction_begin(
     const rocksdb_writeoptions_t* write_options,
     const rocksdb_optimistictransaction_options_t* otxn_options,
     rocksdb_transaction_t* old_txn);
-
-extern ROCKSDB_LIBRARY_API void rocksdb_optimistictransactiondb_close(
-    rocksdb_optimistictransactiondb_t* otxn_db);
 
 extern ROCKSDB_LIBRARY_API rocksdb_checkpoint_t*
 rocksdb_optimistictransactiondb_checkpoint_object_create(
@@ -3693,6 +3682,8 @@ extern ROCKSDB_LIBRARY_API char* rocksdb_open_and_compact_with_options(
 
 /* rocksdb_t */
 
+extern ROCKSDB_LIBRARY_API void rocksdb_close(rocksdb_t* db);
+
 extern ROCKSDB_LIBRARY_API void rocksdb_drop_column_family(
     rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
     char** errptr);
@@ -3821,6 +3812,9 @@ extern ROCKSDB_LIBRARY_API void rocksdb_write(
     rocksdb_writebatch_t* updates, char** errptr);
 
 /* rocksdb_backup_engine_t */
+
+extern ROCKSDB_LIBRARY_API void rocksdb_backup_engine_close(
+    rocksdb_backup_engine_t* be);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_backup_engine_create_new_backup(
     rocksdb_backup_engine_t* be, rocksdb_t* db, char** errptr);
@@ -4542,6 +4536,9 @@ extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_options_destroy(
 
 /* rocksdb_transactiondb_t */
 
+extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_close(
+    rocksdb_transactiondb_t* txn_db);
+
 extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_delete(
     rocksdb_transactiondb_t* txn_db, const rocksdb_writeoptions_t* options,
     const char* key, size_t key_len, char** errptr);
@@ -4670,6 +4667,9 @@ extern ROCKSDB_LIBRARY_API void rocksdb_checkpoint_create(
     uint64_t log_size_for_flush, char** errptr);
 
 /* rocksdb_optimistictransactiondb_t */
+
+extern ROCKSDB_LIBRARY_API void rocksdb_optimistictransactiondb_close(
+    rocksdb_optimistictransactiondb_t* otxn_db);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_optimistictransactiondb_write(
     rocksdb_optimistictransactiondb_t* otxn_db,

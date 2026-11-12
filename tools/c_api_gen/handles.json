@@ -48,6 +48,10 @@
       "rep": "DB*",
       "struct": "generated",
       "var": "db",
+      "destroy": {
+        "name": "rocksdb_close",
+        "owns_rep": true
+      },
       "methods": [
         {
           "name": "rocksdb_drop_column_family",
@@ -293,6 +297,10 @@
       "rep": "BackupEngine*",
       "struct": "generated",
       "var": "be",
+      "destroy": {
+        "name": "rocksdb_backup_engine_close",
+        "owns_rep": true
+      },
       "methods": [
         {
           "name": "rocksdb_backup_engine_create_new_backup",
@@ -1626,6 +1634,10 @@
       "rep": "TransactionDB*",
       "struct": "generated",
       "var": "txn_db",
+      "destroy": {
+        "name": "rocksdb_transactiondb_close",
+        "owns_rep": true
+      },
       "methods": [
         {
           "name": "rocksdb_transactiondb_delete",
@@ -1879,6 +1891,10 @@
       "rep": "OptimisticTransactionDB*",
       "struct": "generated",
       "var": "otxn_db",
+      "destroy": {
+        "name": "rocksdb_optimistictransactiondb_close",
+        "owns_rep": true
+      },
       "methods": [
         {
           "name": "rocksdb_optimistictransactiondb_write",

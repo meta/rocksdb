@@ -1997,11 +1997,6 @@ const char* rocksdb_backup_engine_info_app_metadata(
   return app_metadata.data();
 }
 
-void rocksdb_backup_engine_close(rocksdb_backup_engine_t* be) {
-  delete be->rep;
-  delete be;
-}
-
 rocksdb_backup_engine_options_t* rocksdb_backup_engine_options_create(
     const char* backup_dir) {
   return new rocksdb_backup_engine_options_t{
@@ -2056,11 +2051,6 @@ rocksdb_export_import_files_metadata_t* rocksdb_checkpoint_export_column_family(
       new rocksdb_export_import_files_metadata_t;
   result->rep = metadata;
   return result;
-}
-
-void rocksdb_close(rocksdb_t* db) {
-  delete db->rep;
-  delete db;
 }
 
 void rocksdb_options_set_uint64add_merge_operator(rocksdb_options_t* opt) {
@@ -12691,11 +12681,6 @@ rocksdb_iterator_t* rocksdb_transactiondb_create_iterator_cf(
   return result;
 }
 
-void rocksdb_transactiondb_close(rocksdb_transactiondb_t* txn_db) {
-  delete txn_db->rep;
-  delete txn_db;
-}
-
 void rocksdb_transactiondb_flush_cfs(
     rocksdb_transactiondb_t* txn_db, const rocksdb_flushoptions_t* options,
     rocksdb_column_family_handle_t** column_families, int num_column_families,
@@ -12863,12 +12848,6 @@ rocksdb_transaction_t* rocksdb_optimistictransaction_begin(
   old_txn->rep = otxn_db->rep->BeginTransaction(
       write_options->rep, otxn_options->rep, old_txn->rep);
   return old_txn;
-}
-
-void rocksdb_optimistictransactiondb_close(
-    rocksdb_optimistictransactiondb_t* otxn_db) {
-  delete otxn_db->rep;
-  delete otxn_db;
 }
 
 rocksdb_checkpoint_t* rocksdb_optimistictransactiondb_checkpoint_object_create(
@@ -13151,6 +13130,11 @@ unsigned char rocksdb_get_into_buffer_cf(
 
 /* rocksdb_t */
 
+void rocksdb_close(rocksdb_t* db) {
+  delete db->rep;
+  delete db;
+}
+
 void rocksdb_drop_column_family(rocksdb_t* db,
                                 rocksdb_column_family_handle_t* column_family,
                                 char** errptr) {
@@ -13351,6 +13335,11 @@ void rocksdb_write(rocksdb_t* db, const rocksdb_writeoptions_t* options,
 }
 
 /* rocksdb_backup_engine_t */
+
+void rocksdb_backup_engine_close(rocksdb_backup_engine_t* be) {
+  delete be->rep;
+  delete be;
+}
 
 void rocksdb_backup_engine_create_new_backup(rocksdb_backup_engine_t* be,
                                              rocksdb_t* db, char** errptr) {
@@ -14365,6 +14354,11 @@ void rocksdb_transactiondb_options_destroy(
 
 /* rocksdb_transactiondb_t */
 
+void rocksdb_transactiondb_close(rocksdb_transactiondb_t* txn_db) {
+  delete txn_db->rep;
+  delete txn_db;
+}
+
 void rocksdb_transactiondb_delete(rocksdb_transactiondb_t* txn_db,
                                   const rocksdb_writeoptions_t* options,
                                   const char* key, size_t key_len,
@@ -14570,6 +14564,12 @@ void rocksdb_checkpoint_create(rocksdb_checkpoint_t* checkpoint,
 }
 
 /* rocksdb_optimistictransactiondb_t */
+
+void rocksdb_optimistictransactiondb_close(
+    rocksdb_optimistictransactiondb_t* otxn_db) {
+  delete otxn_db->rep;
+  delete otxn_db;
+}
 
 void rocksdb_optimistictransactiondb_write(
     rocksdb_optimistictransactiondb_t* otxn_db,
