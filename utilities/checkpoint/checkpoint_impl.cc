@@ -852,7 +852,12 @@ Status CheckpointImpl::ExportColumnFamily(
     std::vector<std::string> subchildren;
     const auto cleanup_dir =
         moved_to_user_specified_dir ? export_dir : tmp_export_dir;
-    db_->GetEnv()->GetChildren(cleanup_dir, &subchildren);
+    const auto children_status =
+        db_->GetEnv()->GetChildren(cleanup_dir, &subchildren);
+    if (!children_status.ok()) {
+      ROCKS_LOG_WARN(db_options.info_log, "Failed to list dir %s: %s",
+                     cleanup_dir.c_str(), children_status.ToString().c_str());
+    }
     for (const auto& subchild : subchildren) {
       std::string subchild_path = cleanup_dir;
       subchild_path.append("/").append(subchild);
