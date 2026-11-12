@@ -258,6 +258,99 @@ rocksdb_column_family_metadata_t* rocksdb_get_column_family_metadata_cf(
   return result;
 }
 
+void rocksdb_compact_range(rocksdb_t* db, const char* begin, size_t begin_len,
+                           const char* end, size_t end_len) {
+  Slice begin_slice(begin, begin_len);
+  Slice end_slice(end, end_len);
+  db->rep->CompactRange(CompactRangeOptions(), begin ? &begin_slice : nullptr,
+                        end ? &end_slice : nullptr);
+}
+
+void rocksdb_compact_range_cf(rocksdb_t* db,
+                              rocksdb_column_family_handle_t* column_family,
+                              const char* begin, size_t begin_len,
+                              const char* end, size_t end_len) {
+  Slice begin_slice(begin, begin_len);
+  Slice end_slice(end, end_len);
+  db->rep->CompactRange(CompactRangeOptions(), column_family->rep,
+                        begin ? &begin_slice : nullptr,
+                        end ? &end_slice : nullptr);
+}
+
+void rocksdb_compact_range_opt(rocksdb_t* db, rocksdb_compactoptions_t* options,
+                               const char* begin, size_t begin_len,
+                               const char* end, size_t end_len) {
+  Slice begin_slice(begin, begin_len);
+  Slice end_slice(end, end_len);
+  db->rep->CompactRange(options->rep, begin ? &begin_slice : nullptr,
+                        end ? &end_slice : nullptr);
+}
+
+void rocksdb_compact_range_cf_opt(rocksdb_t* db,
+                                  rocksdb_column_family_handle_t* column_family,
+                                  rocksdb_compactoptions_t* options,
+                                  const char* begin, size_t begin_len,
+                                  const char* end, size_t end_len) {
+  Slice begin_slice(begin, begin_len);
+  Slice end_slice(end, end_len);
+  db->rep->CompactRange(options->rep, column_family->rep,
+                        begin ? &begin_slice : nullptr,
+                        end ? &end_slice : nullptr);
+}
+
+void rocksdb_suggest_compact_range_cf(
+    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
+    const char* begin, size_t begin_len, const char* end, size_t end_len,
+    char** errptr) {
+  Slice begin_slice(begin, begin_len);
+  Slice end_slice(end, end_len);
+  SaveError(errptr, db->rep->SuggestCompactRange(column_family->rep,
+                                                 begin ? &begin_slice : nullptr,
+                                                 end ? &end_slice : nullptr));
+}
+
+void rocksdb_verify_checksum_with_options(
+    rocksdb_t* db, const rocksdb_readoptions_t* read_options, char** errptr) {
+  ReadOptions read_options_default;
+  const ReadOptions& read_options_ref =
+      read_options != nullptr ? read_options->rep : read_options_default;
+  SaveError(errptr, db->rep->VerifyChecksum(read_options_ref));
+}
+
+void rocksdb_verify_file_checksums_with_options(
+    rocksdb_t* db, const rocksdb_readoptions_t* read_options, char** errptr) {
+  ReadOptions read_options_default;
+  const ReadOptions& read_options_ref =
+      read_options != nullptr ? read_options->rep : read_options_default;
+  SaveError(errptr, db->rep->VerifyFileChecksums(read_options_ref));
+}
+
+rocksdb_column_family_metadata_t*
+rocksdb_get_column_family_metadata_with_options(
+    rocksdb_t* db, const rocksdb_column_family_metadata_options_t* options) {
+  rocksdb_column_family_metadata_t* result =
+      new rocksdb_column_family_metadata_t;
+  GetColumnFamilyMetaDataOptions options_default;
+  const GetColumnFamilyMetaDataOptions& options_ref =
+      options != nullptr ? options->rep : options_default;
+  db->rep->GetColumnFamilyMetaData(options_ref, &result->rep);
+  return result;
+}
+
+rocksdb_column_family_metadata_t*
+rocksdb_get_column_family_metadata_cf_with_options(
+    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
+    const rocksdb_column_family_metadata_options_t* options) {
+  rocksdb_column_family_metadata_t* result =
+      new rocksdb_column_family_metadata_t;
+  GetColumnFamilyMetaDataOptions options_default;
+  const GetColumnFamilyMetaDataOptions& options_ref =
+      options != nullptr ? options->rep : options_default;
+  db->rep->GetColumnFamilyMetaData(column_family->rep, options_ref,
+                                   &result->rep);
+  return result;
+}
+
 /* rocksdb_backup_engine_t */
 
 void rocksdb_backup_engine_close(rocksdb_backup_engine_t* be) {

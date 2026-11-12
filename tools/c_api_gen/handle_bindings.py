@@ -41,6 +41,13 @@ The C signature of a method is derived from the C++ declaration
   unique_ptr<T>
   anything                       void, with `result: discard`
 
+A parameter listed in `nullable` accepts a NULL C pointer:
+
+  C++ parameter                  NULL in C passes
+  -----------------------------  ---------------------------------------
+  const Slice *                  nullptr (C: const char* x, size_t x_len)
+  const T & (value handle rep)   a default-constructed T
+
 A `T*` out-parameter named by `out_handle` is filled straight into a new
 handle, which the C function returns. A `T*` parameter listed in `consumes`
 is handed to the C++ call, which takes ownership; its C handle is freed after
@@ -101,6 +108,7 @@ METHOD_KEYS = {
     "out_handle",
     "consumes",
     "param_order",
+    "nullable",
 }
 
 # C types that a C++ parameter or result of the same spelling maps to as-is.
@@ -475,6 +483,9 @@ class CParam:
 class Mapped:
     c_params: list[CParam]
     arg: str
+    # Statements that must run before the call, and the locals they declare.
+    setup: list[str] = field(default_factory=list)
+    locals: list[str] = field(default_factory=list)
 
 
 class TypeMapper:
@@ -579,12 +590,19 @@ class TypeMapper:
         return handle
 
     def param(
-        self, p: Param, context: str, preferred: str | None, scope: str = ""
+        self,
+        p: Param,
+        context: str,
+        preferred: str | None,
+        scope: str = "",
+        nullable: bool = False,
     ) -> Mapped:
         t = p.type
         n = p.name
         if not n:
             raise GenError(f"{context}: unnamed C++ parameter")
+        if nullable:
+            return self._nullable_param(t, n, context, preferred)
         if t in SLICE_TYPES:
             return Mapped(
                 [CParam("const char*", n), CParam("size_t", f"{n}_len")],
@@ -603,6 +621,38 @@ class TypeMapper:
         c_type, enum = self.scalar(t.removeprefix("const "), context, scope)
         arg = f"static_cast<{enum}>({n})" if enum else n
         return Mapped([CParam(c_type, n)], arg)
+
+    def _nullable_param(
+        self, t: str, n: str, context: str, preferred: str | None
+    ) -> Mapped:
+        if t == "const Slice *":
+            local = f"{n}_slice"
+            return Mapped(
+                [CParam("const char*", n), CParam("size_t", f"{n}_len")],
+                f"{n} ? &{local} : nullptr",
+                [f"Slice {local}({n}, {n}_len);"],
+                [local],
+            )
+        m = re.fullmatch(r"const ([\w:]+) &", t)
+        handle = None
+        if m and (m.group(1) in self.by_class or preferred is not None):
+            handle = self.handle_for(m.group(1), context, preferred)
+        if handle is None or handle.rep_kind()[0] != "value":
+            raise GenError(
+                f"{context}: nullable needs a const Slice * or a const T & whose "
+                f"handle holds a value, not {t!r}"
+            )
+        cls = handle.rep_kind()[1]
+        default, ref = f"{n}_default", f"{n}_ref"
+        return Mapped(
+            [CParam(f"const {handle.c_type}*", n)],
+            ref,
+            [
+                f"{cls} {default};",
+                f"const {cls}& {ref} = {n} != nullptr ? {n}->rep : {default};",
+            ],
+            [default, ref],
+        )
 
     def _handle_param(self, t, cls, n, m, sp, context, preferred) -> Mapped:
         handle = self.handle_for(cls, context, preferred)
@@ -729,9 +779,14 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
     out_name = entry.get("out_handle")
     consumes = list(entry.get("consumes", []))
     consumed: list[str] = []
+    nullable = list(entry.get("nullable", []))
+    setup: list[str] = []
+    local_names: list[str] = []
     by_param: dict[str, list[CParam]] = {}
     for p in params[:arity]:
         if p.name in bind:
+            if p.name in nullable:
+                raise GenError(f"{name}: nullable parameter {p.name} is bound")
             args.append(bind.pop(p.name))
             continue
         if p.name == out_name:
@@ -745,18 +800,36 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
             raise GenError(
                 f"{name}: C++ parameter {p.name} is unnamed; name it in param_names"
             )
+        is_nullable = p.name in nullable
+        if is_nullable:
+            nullable.remove(p.name)
         mapped = mapper.param(
             Param(c_name, p.type, p.has_default),
             f"{name}({p.name})",
             param_handles.get(p.name),
             fn.owner,
+            is_nullable,
         )
+        setup += mapped.setup
+        local_names += mapped.locals
         if p.name in c_types:
             if len(mapped.c_params) != 1:
                 raise GenError(
                     f"{name}: c_types cannot pin multi-value parameter {p.name}"
                 )
             pinned = c_types.pop(p.name)
+            derived = mapped.c_params[0].c_type
+            bare = derived.removeprefix("const ")
+            if bare.removesuffix("*") in mapper.handles and pinned not in (
+                derived,
+                bare,
+            ):
+                # A shipped function may take the handle without const; any
+                # other type would reach the C++ call through the wrong rep.
+                raise GenError(
+                    f"{name}: c_types can only drop const from handle parameter "
+                    f"{p.name} ({derived})"
+                )
             mapped.c_params[0].c_type = pinned
             cxx_type = p.type.removeprefix("const ")
             if mapped.arg == c_name and pinned != cxx_type:
@@ -794,10 +867,10 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
         raise GenError(f"{name}: out_handle names unknown parameter {out_name}")
     if consumes:
         raise GenError(f"{name}: consumes names unknown parameters {consumes}")
-    if any(p.name == "result" for p in c_params) and (
-        out_name is not None or entry.get("result") == "handle"
-    ):
-        raise GenError(f"{name}: a C parameter is named result; rename it")
+    if nullable:
+        raise GenError(f"{name}: nullable names unknown parameters {nullable}")
+    if out_name is not None or entry.get("result") == "handle":
+        local_names.append("result")
 
     access = "." if kind == "value" else "->"
     call = f"{handle.var}->rep{access}{fn.name}({', '.join(args)})"
@@ -825,8 +898,9 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
         ret = c_types.pop("return", local)
         if ret not in (local, f"const {local}"):
             raise GenError(f"{name}: c_types can only make the returned handle const")
-        body += [f"{local} result = new {new_handle.c_type};", *fill]
+        body += [f"{local} result = new {new_handle.c_type};", *setup, *fill]
         body += [*consumed, "return result;"]
+        setup = []
     elif result_policy == "discard" or result == "void":
         if result_policy == "discard" and result == "void":
             raise GenError(f"{name}: result: discard on a void C++ function")
@@ -883,6 +957,10 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
             body.append(f"return {call};")
     if c_types:
         raise GenError(f"{name}: c_types names unknown parameters {sorted(c_types)}")
+    clashes = sorted({p.name for p in c_params} & set(local_names))
+    if clashes:
+        raise GenError(f"{name}: C parameters {clashes} clash with generated locals")
+    body = setup + body
 
     param_texts = [f"{p.c_type} {p.name}" for p in c_params] or ["void"]
     decl = _doc_lines(entry) + format_signature(

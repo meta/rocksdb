@@ -1989,23 +1989,6 @@ void rocksdb_column_family_handle_destroy(
 
 #include "c_api_gen/c_generated_db_simple_subset.cc.inc"
 
-void rocksdb_verify_checksum_with_options(rocksdb_t* db,
-                                          const rocksdb_readoptions_t* options,
-                                          char** errptr) {
-  ReadOptions default_options;
-  const ReadOptions& read_options =
-      options != nullptr ? options->rep : default_options;
-  SaveError(errptr, db->rep->VerifyChecksum(read_options));
-}
-
-void rocksdb_verify_file_checksums_with_options(
-    rocksdb_t* db, const rocksdb_readoptions_t* options, char** errptr) {
-  ReadOptions default_options;
-  const ReadOptions& read_options =
-      options != nullptr ? options->rep : default_options;
-  SaveError(errptr, db->rep->VerifyFileChecksums(read_options));
-}
-
 void rocksdb_increase_full_history_ts_low(
     rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
     const char* ts_low, size_t ts_lowlen, char** errptr) {
@@ -2824,31 +2807,6 @@ void rocksdb_approximate_sizes_cf_with_options(
                                          ranges.get(), num_ranges, sizes));
 }
 
-void rocksdb_compact_range(rocksdb_t* db, const char* start_key,
-                           size_t start_key_len, const char* limit_key,
-                           size_t limit_key_len) {
-  Slice a;
-  Slice b;
-  db->rep->CompactRange(
-      CompactRangeOptions(),
-      // Pass nullptr Slice if corresponding "const char*" is nullptr
-      (start_key ? (a = Slice(start_key, start_key_len), &a) : nullptr),
-      (limit_key ? (b = Slice(limit_key, limit_key_len), &b) : nullptr));
-}
-
-void rocksdb_compact_range_cf(rocksdb_t* db,
-                              rocksdb_column_family_handle_t* column_family,
-                              const char* start_key, size_t start_key_len,
-                              const char* limit_key, size_t limit_key_len) {
-  Slice a;
-  Slice b;
-  db->rep->CompactRange(
-      CompactRangeOptions(), column_family->rep,
-      // Pass nullptr Slice if corresponding "const char*" is nullptr
-      (start_key ? (a = Slice(start_key, start_key_len), &a) : nullptr),
-      (limit_key ? (b = Slice(limit_key, limit_key_len), &b) : nullptr));
-}
-
 void rocksdb_suggest_compact_range(rocksdb_t* db, const char* start_key,
                                    size_t start_key_len, const char* limit_key,
                                    size_t limit_key_len, char** errptr) {
@@ -2859,45 +2817,6 @@ void rocksdb_suggest_compact_range(rocksdb_t* db, const char* start_key,
       (start_key ? (a = Slice(start_key, start_key_len), &a) : nullptr),
       (limit_key ? (b = Slice(limit_key, limit_key_len), &b) : nullptr));
   SaveError(errptr, s);
-}
-
-void rocksdb_suggest_compact_range_cf(
-    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
-    const char* start_key, size_t start_key_len, const char* limit_key,
-    size_t limit_key_len, char** errptr) {
-  Slice a;
-  Slice b;
-  Status s = db->rep->SuggestCompactRange(
-      column_family->rep,
-      (start_key ? (a = Slice(start_key, start_key_len), &a) : nullptr),
-      (limit_key ? (b = Slice(limit_key, limit_key_len), &b) : nullptr));
-  SaveError(errptr, s);
-}
-
-void rocksdb_compact_range_opt(rocksdb_t* db, rocksdb_compactoptions_t* opt,
-                               const char* start_key, size_t start_key_len,
-                               const char* limit_key, size_t limit_key_len) {
-  Slice a;
-  Slice b;
-  db->rep->CompactRange(
-      opt->rep,
-      // Pass nullptr Slice if corresponding "const char*" is nullptr
-      (start_key ? (a = Slice(start_key, start_key_len), &a) : nullptr),
-      (limit_key ? (b = Slice(limit_key, limit_key_len), &b) : nullptr));
-}
-
-void rocksdb_compact_range_cf_opt(rocksdb_t* db,
-                                  rocksdb_column_family_handle_t* column_family,
-                                  rocksdb_compactoptions_t* opt,
-                                  const char* start_key, size_t start_key_len,
-                                  const char* limit_key, size_t limit_key_len) {
-  Slice a;
-  Slice b;
-  db->rep->CompactRange(
-      opt->rep, column_family->rep,
-      // Pass nullptr Slice if corresponding "const char*" is nullptr
-      (start_key ? (a = Slice(start_key, start_key_len), &a) : nullptr),
-      (limit_key ? (b = Slice(limit_key, limit_key_len), &b) : nullptr));
 }
 
 void rocksdb_compact_files_output_file_names_destroy(
@@ -5958,17 +5877,6 @@ void rocksdb_delete_file_in_range_cf(
 
 /* MetaData */
 
-rocksdb_column_family_metadata_t*
-rocksdb_get_column_family_metadata_with_options(
-    rocksdb_t* db, const rocksdb_column_family_metadata_options_t* options) {
-  rocksdb_column_family_metadata_t* meta = new rocksdb_column_family_metadata_t;
-  GetColumnFamilyMetaDataOptions default_options;
-  const GetColumnFamilyMetaDataOptions& metadata_options =
-      options != nullptr ? options->rep : default_options;
-  db->rep->GetColumnFamilyMetaData(metadata_options, &meta->rep);
-  return meta;
-}
-
 rocksdb_column_family_metadata_options_t*
 rocksdb_column_family_metadata_options_create() {
   auto* options = new rocksdb_column_family_metadata_options_t;
@@ -6028,19 +5936,6 @@ const char* rocksdb_column_family_metadata_options_get_end_key(
     *key_len = options->end_key.size();
   }
   return options->end_key.data();
-}
-
-rocksdb_column_family_metadata_t*
-rocksdb_get_column_family_metadata_cf_with_options(
-    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
-    const rocksdb_column_family_metadata_options_t* options) {
-  rocksdb_column_family_metadata_t* meta = new rocksdb_column_family_metadata_t;
-  GetColumnFamilyMetaDataOptions default_options;
-  const GetColumnFamilyMetaDataOptions& metadata_options =
-      options != nullptr ? options->rep : default_options;
-  db->rep->GetColumnFamilyMetaData(column_family->rep, metadata_options,
-                                   &meta->rep);
-  return meta;
 }
 
 uint64_t rocksdb_column_family_metadata_get_size(

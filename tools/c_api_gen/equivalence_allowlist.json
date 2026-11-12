@@ -31,6 +31,10 @@
     {
       "name": "rocksdb_writebatch_data",
       "reason": "Equivalent: WriteBatch::GetDataSize() is Data().size() and std::string::data() is c_str() since C++11; the generated body reads both from the one Data() reference."
+    },
+    {
+      "name": "rocksdb_suggest_compact_range_cf",
+      "reason": "Equivalent: the hand-written body stored the Status in a local that it only passed to SaveError(errptr, s); the generated body passes the call's result to SaveError directly."
     }
   ]
 }

@@ -181,10 +181,56 @@ def normalize_returned_locals(body: str) -> str:
     return f"{{ return {m.group('expr').strip()}; }}" if m else body
 
 
+_OPTIONAL_SLICE_RE = re.compile(
+    r"\(\s*(?P<p>[A-Za-z_]\w*)\s*\?\s*\(\s*(?P<v>[A-Za-z_]\w*)\s*=\s*Slice\s*"
+    r"\(\s*(?P=p)\s*,\s*(?P<n>[A-Za-z_]\w*)\s*\)\s*,\s*&\s*(?P=v)\s*\)\s*:\s*"
+    r"nullptr\s*\)"
+)
+
+
+def _may_write(name: str, body: str) -> bool:
+    """Whether body assigns name, increments it or takes its address."""
+    n = re.escape(name)
+    return bool(
+        re.search(
+            rf"(?:\+\+|--)\s*\b{n}\b"
+            rf"|\b{n}\s*(?:\+\+|--|(?:<<|>>|[-+*/%&|^])?=(?!=))"
+            rf"|(?:^|[({{;,=]|\breturn)\s*&\s*{n}\b",
+            body,
+        )
+    )
+
+
+def normalize_optional_slices(body: str) -> str:
+    """Rewrite `Slice v; ... (p ? (v = Slice(p, n), &v) : nullptr)` as
+    `Slice v(p, n); ... p ? &v : nullptr`.
+
+    Slice's constructor only stores the pointer and the length, so building v
+    before the null check passes the same pointer to the same contents. The
+    rewrite only applies when v is declared once and used nowhere else, and
+    nothing in the body writes p or n.
+    """
+    for m in list(_OPTIONAL_SLICE_RE.finditer(body)):
+        p, v, n = m.group("p", "v", "n")
+        decl = re.compile(rf"\bSlice\s+{v}\s*;")
+        # Three tokens: the declaration, the assignment and the address.
+        if (
+            decl.search(body) is None
+            or tokenize(body).count(v) != 3
+            or _may_write(p, body)
+            or _may_write(n, body)
+        ):
+            continue
+        body = decl.sub(f"Slice {v}({p}, {n});", body, count=1)
+        body = body.replace(m.group(0), f"{p} ? &{v} : nullptr", 1)
+    return body
+
+
 def normalized_body_tokens(
     body: str, return_type: str, mapping: dict[str, str] | None = None
 ) -> list[str]:
     body = normalize_lossless_casts(body)
+    body = normalize_optional_slices(body)
     body = normalize_guarded_deletes(body)
     body = normalize_returned_locals(body)
     body = normalize_void_returns(body, return_type)

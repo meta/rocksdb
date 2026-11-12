@@ -345,6 +345,144 @@
             " * using rocksdb_column_family_metadata_destroy.",
             " */"
           ]
+        },
+        {
+          "name": "rocksdb_compact_range",
+          "method": "CompactRange",
+          "overload": [
+            "const CompactRangeOptions &",
+            "const Slice *",
+            "const Slice *"
+          ],
+          "bind": {
+            "options": "CompactRangeOptions()"
+          },
+          "nullable": [
+            "begin",
+            "end"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_compact_range_cf",
+          "method": "CompactRange",
+          "overload": [
+            "const CompactRangeOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice *",
+            "const Slice *"
+          ],
+          "bind": {
+            "options": "CompactRangeOptions()"
+          },
+          "nullable": [
+            "begin",
+            "end"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_compact_range_opt",
+          "method": "CompactRange",
+          "overload": [
+            "const CompactRangeOptions &",
+            "const Slice *",
+            "const Slice *"
+          ],
+          "nullable": [
+            "begin",
+            "end"
+          ],
+          "c_types": {
+            "options": "rocksdb_compactoptions_t*"
+          },
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_compact_range_cf_opt",
+          "method": "CompactRange",
+          "overload": [
+            "const CompactRangeOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice *",
+            "const Slice *"
+          ],
+          "nullable": [
+            "begin",
+            "end"
+          ],
+          "c_types": {
+            "options": "rocksdb_compactoptions_t*"
+          },
+          "param_order": [
+            "column_family",
+            "options",
+            "begin",
+            "end"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_suggest_compact_range_cf",
+          "method": "SuggestCompactRange",
+          "param_names": {
+            "0": "column_family",
+            "1": "begin",
+            "2": "end"
+          },
+          "nullable": [
+            "1",
+            "2"
+          ]
+        },
+        {
+          "name": "rocksdb_verify_checksum_with_options",
+          "method": "VerifyChecksum",
+          "overload": [
+            "const ReadOptions &"
+          ],
+          "nullable": [
+            "read_options"
+          ]
+        },
+        {
+          "name": "rocksdb_verify_file_checksums_with_options",
+          "method": "VerifyFileChecksums",
+          "param_names": {
+            "0": "read_options"
+          },
+          "nullable": [
+            "0"
+          ]
+        },
+        {
+          "name": "rocksdb_get_column_family_metadata_with_options",
+          "method": "GetColumnFamilyMetaData",
+          "overload": [
+            "const GetColumnFamilyMetaDataOptions &",
+            "ColumnFamilyMetaData *"
+          ],
+          "out_handle": "metadata",
+          "nullable": [
+            "options"
+          ]
+        },
+        {
+          "name": "rocksdb_get_column_family_metadata_cf_with_options",
+          "method": "GetColumnFamilyMetaData",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const GetColumnFamilyMetaDataOptions &",
+            "ColumnFamilyMetaData *"
+          ],
+          "param_names": {
+            "0": "column_family",
+            "1": "options"
+          },
+          "out_handle": "2",
+          "nullable": [
+            "1"
+          ]
         }
       ]
     },

@@ -638,8 +638,102 @@ class HandleResultTest(unittest.TestCase):
 
     def test_c_parameter_named_result(self):
         fn = _fn("Make", [("result", "int")], "Ptr *")
-        with self.assertRaisesRegex(hb.GenError, "named result"):
+        with self.assertRaisesRegex(hb.GenError, r"\['result'\] clash"):
             _render({"result": "handle"}, fn)
+
+
+class NullableTest(unittest.TestCase):
+    """Parameters whose C pointer may be NULL."""
+
+    def test_optional_slices(self):
+        fn = _fn(
+            "Compact", [("begin", "const Slice *"), ("end", "const Slice *")], "Status"
+        )
+        decl, impl = _render({"nullable": ["begin", "end"]}, fn)
+        self.assertIn(
+            "void rocksdb_thing_x( rocksdb_thing_t* t, const char* begin, "
+            "size_t begin_len, const char* end, size_t end_len, char** errptr);",
+            decl,
+        )
+        self.assertIn(
+            "{ Slice begin_slice(begin, begin_len); Slice end_slice(end, end_len); "
+            "SaveError(errptr, t->rep->Compact(begin ? &begin_slice : nullptr, "
+            "end ? &end_slice : nullptr)); }",
+            impl,
+        )
+
+    def test_null_options_mean_defaults(self):
+        fn = _fn("Verify", [("opts", "const Val &")], "Status")
+        decl, impl = _render({"nullable": ["opts"]}, fn)
+        self.assertIn("rocksdb_thing_t* t, const rocksdb_val_t* opts, char**", decl)
+        self.assertIn(
+            "{ Val opts_default; "
+            "const Val& opts_ref = opts != nullptr ? opts->rep : opts_default; "
+            "SaveError(errptr, t->rep->Verify(opts_ref)); }",
+            impl,
+        )
+
+    def test_setup_runs_after_the_new_handle(self):
+        fn = _fn("Fill", [("opts", "const Val &"), ("out", "Val *")])
+        _, impl = _render({"nullable": ["opts"], "out_handle": "out"}, fn)
+        self.assertIn(
+            "{ rocksdb_val_t* result = new rocksdb_val_t; Val opts_default; "
+            "const Val& opts_ref = opts != nullptr ? opts->rep : opts_default; "
+            "t->rep->Fill(opts_ref, &result->rep); return result; }",
+            impl,
+        )
+
+    def test_pointer_parameters_need_nullable(self):
+        with self.assertRaisesRegex(hb.GenError, "no C mapping"):
+            _render({}, _fn("Compact", [("begin", "const Slice *")]))
+
+    def test_errors(self):
+        cases = [
+            ([("k", "const Slice &")], {"nullable": ["k"]}, "nullable needs"),
+            ([("k", "Slice *")], {"nullable": ["k"]}, "nullable needs"),
+            ([("o", "const Ptr &")], {"nullable": ["o"]}, "nullable needs"),
+            ([("o", "Val *")], {"nullable": ["o"]}, "nullable needs"),
+            ([("n", "int")], {"nullable": ["n"]}, "nullable needs"),
+            ([("n", "int")], {"nullable": ["m"]}, "nullable names unknown"),
+            (
+                [("b", "const Slice *")],
+                {"nullable": ["b"], "bind": {"b": "nullptr"}},
+                "is bound",
+            ),
+            (
+                [("b", "const Slice *"), ("b_slice", "int")],
+                {"nullable": ["b"]},
+                r"\['b_slice'\] clash",
+            ),
+            (
+                [("o", "const Val &"), ("o_ref", "int")],
+                {"nullable": ["o"]},
+                r"\['o_ref'\] clash",
+            ),
+        ]
+        for params, entry, message in cases:
+            with self.subTest(message=message, params=params):
+                with self.assertRaisesRegex(hb.GenError, message):
+                    _render(entry, _fn("Use", params))
+
+
+class HandleParamPinTest(unittest.TestCase):
+    def test_pin_drops_const(self):
+        fn = _fn("Use", [("o", "const Val &")])
+        decl, impl = _render({"c_types": {"o": "rocksdb_val_t*"}}, fn)
+        self.assertIn("rocksdb_thing_x( rocksdb_thing_t* t, rocksdb_val_t* o);", decl)
+        self.assertIn("t->rep->Use(o->rep);", impl)
+
+    def test_pin_cannot_change_the_handle(self):
+        cases = [
+            ("const Val &", "rocksdb_ptr_t*"),
+            ("const Val &", "void*"),
+            ("Val &", "const rocksdb_val_t*"),
+        ]
+        for cxx, pinned in cases:
+            with self.subTest(cxx=cxx, pinned=pinned):
+                with self.assertRaisesRegex(hb.GenError, "only drop const"):
+                    _render({"c_types": {"o": pinned}}, _fn("Use", [("o", cxx)]))
 
 
 class ParamOrderTest(unittest.TestCase):
@@ -1396,6 +1490,92 @@ class EquivalenceNormalizationTest(unittest.TestCase):
             {"a": "lo", "b": "hi", "t": "result", "o": "o_ref"},
         )
 
+    def test_optional_slice_is_built_before_the_check(self):
+        ref = "{ Slice a; f(x, (p ? (a = Slice(p, n), &a) : nullptr)); }"
+        self.assertEqual(
+            veq.normalize_optional_slices(ref),
+            "{ Slice a(p, n); f(x, p ? &a : nullptr); }",
+        )
+        kept = (
+            # a is read again after the call.
+            "{ Slice a; f((p ? (a = Slice(p, n), &a) : nullptr)); g(a); }",
+            # The Slice would capture p and n before they change.
+            "{ Slice a; p = q; f((p ? (a = Slice(p, n), &a) : nullptr)); }",
+            "{ Slice a; n += 1; f((p ? (a = Slice(p, n), &a) : nullptr)); }",
+            "{ Slice a; ++n; f((p ? (a = Slice(p, n), &a) : nullptr)); }",
+            "{ Slice a; g(&n); f((p ? (a = Slice(p, n), &a) : nullptr)); }",
+            # Two declarations of a.
+            "{ Slice a; { Slice a; } f((p ? (a = Slice(p, n), &a) : nullptr)); }",
+            # a starts out as some other Slice.
+            "{ Slice a = s; f((p ? (a = Slice(p, n), &a) : nullptr)); }",
+            # A Slice of another pointer.
+            "{ Slice a; f((p ? (a = Slice(q, n), &a) : nullptr)); }",
+        )
+        for body in kept:
+            with self.subTest(body=body):
+                self.assertEqual(veq.normalize_optional_slices(body), body)
+        # Comparisons and logical operators are not writes.
+        reads = "{ Slice a; f(n == 1 && p != q, (p ? (a = Slice(p, n), &a) : nullptr)); }"
+        self.assertNotEqual(veq.normalize_optional_slices(reads), reads)
+
+    def test_optional_slice_bodies(self):
+        """The shipped rocksdb_compact_range_cf against the generator's shape."""
+
+        def make(names, body):
+            return veq.FunctionDef("f", "", "void", [], names, body)
+
+        ref = make(
+            ["db", "column_family", "start_key", "start_key_len", "limit_key", "limit_key_len"],
+            "{ Slice a; Slice b; db->rep->CompactRange( CompactRangeOptions(), "
+            "column_family->rep, "
+            "(start_key ? (a = Slice(start_key, start_key_len), &a) : nullptr), "
+            "(limit_key ? (b = Slice(limit_key, limit_key_len), &b) : nullptr)); }",
+        )
+        names = ["db", "column_family", "begin", "begin_len", "end", "end_len"]
+        gen = make(
+            names,
+            "{ Slice begin_slice(begin, begin_len); Slice end_slice(end, end_len); "
+            "db->rep->CompactRange(CompactRangeOptions(), column_family->rep, "
+            "begin ? &begin_slice : nullptr, end ? &end_slice : nullptr); }",
+        )
+        self.assertTrue(veq.bodies_equivalent(ref, gen))
+        swapped = make(
+            names,
+            "{ Slice begin_slice(begin, begin_len); Slice end_slice(end, end_len); "
+            "db->rep->CompactRange(CompactRangeOptions(), column_family->rep, "
+            "end ? &end_slice : nullptr, begin ? &begin_slice : nullptr); }",
+        )
+        self.assertFalse(veq.bodies_equivalent(ref, swapped))
+
+    def test_null_options_bodies(self):
+        """The shipped rocksdb_verify_checksum_with_options against the
+        generator's shape, where the C parameter takes the C++ name that the
+        reference used for its local."""
+
+        def make(names, body):
+            return veq.FunctionDef("f", "", "void", [], names, body)
+
+        ref = make(
+            ["db", "options", "errptr"],
+            "{ ReadOptions default_options; const ReadOptions& read_options = "
+            "options != nullptr ? options->rep : default_options; "
+            "SaveError(errptr, db->rep->VerifyChecksum(read_options)); }",
+        )
+        gen = make(
+            ["db", "read_options", "errptr"],
+            "{ ReadOptions read_options_default; const ReadOptions& read_options_ref = "
+            "read_options != nullptr ? read_options->rep : read_options_default; "
+            "SaveError(errptr, db->rep->VerifyChecksum(read_options_ref)); }",
+        )
+        self.assertTrue(veq.bodies_equivalent(ref, gen))
+        # Passing the possibly-NULL handle's rep directly is not equivalent.
+        unguarded = make(
+            ["db", "read_options", "errptr"],
+            "{ ReadOptions read_options_default; const ReadOptions& read_options_ref = "
+            "read_options->rep; "
+            "SaveError(errptr, db->rep->VerifyChecksum(read_options_ref)); }",
+        )
+        self.assertFalse(veq.bodies_equivalent(ref, unguarded))
 
 if __name__ == "__main__":
     unittest.main()

@@ -362,10 +362,15 @@ Only `name` and `method` are required. The optional keys are:
   are freed after the call (needs `result: handle`)
 - `param_order`: the order of the C parameters, when it differs from the C++
   one (the handle still comes first, and `errptr` or `len` last)
+- `nullable`: parameters that accept a NULL C pointer. A `const Slice *` takes
+  `const char* x, size_t x_len` and passes `nullptr` when `x` is NULL; a
+  `const T &` whose handle holds a `T` passes a default-constructed `T` when
+  the handle is NULL
 - `receiver_const`: override the `const` of the handle parameter, which
   otherwise follows the C++ method
 - `c_types`: pin a parameter's (or `return`'s) C type for ABI compatibility;
-  for a new handle, `return` can only add `const`
+  a handle parameter can only drop `const`, and for a new handle, `return` can
+  only add `const`
 - `param_handles`: the handle to use for a parameter when several wrap its
   C++ type
 - `param_names`: a C name for a parameter the C++ declaration leaves unnamed,

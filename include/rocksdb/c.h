@@ -339,10 +339,6 @@ extern ROCKSDB_LIBRARY_API void rocksdb_destroy_db(
 extern ROCKSDB_LIBRARY_API void rocksdb_repair_db(
     const rocksdb_options_t* options, const char* name, char** errptr);
 // END generated: c_generated_db_simple_subset.h.inc
-extern ROCKSDB_LIBRARY_API void rocksdb_verify_checksum_with_options(
-    rocksdb_t* db, const rocksdb_readoptions_t* options, char** errptr);
-extern ROCKSDB_LIBRARY_API void rocksdb_verify_file_checksums_with_options(
-    rocksdb_t* db, const rocksdb_readoptions_t* options, char** errptr);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_increase_full_history_ts_low(
     rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
@@ -720,34 +716,9 @@ extern ROCKSDB_LIBRARY_API void rocksdb_approximate_sizes_cf_with_options(
     const char* const* range_limit_key, const size_t* range_limit_key_len,
     uint64_t* sizes, char** errptr);
 
-extern ROCKSDB_LIBRARY_API void rocksdb_compact_range(rocksdb_t* db,
-                                                      const char* start_key,
-                                                      size_t start_key_len,
-                                                      const char* limit_key,
-                                                      size_t limit_key_len);
-
-extern ROCKSDB_LIBRARY_API void rocksdb_compact_range_cf(
-    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
-    const char* start_key, size_t start_key_len, const char* limit_key,
-    size_t limit_key_len);
-
 extern ROCKSDB_LIBRARY_API void rocksdb_suggest_compact_range(
     rocksdb_t* db, const char* start_key, size_t start_key_len,
     const char* limit_key, size_t limit_key_len, char** errptr);
-
-extern ROCKSDB_LIBRARY_API void rocksdb_suggest_compact_range_cf(
-    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
-    const char* start_key, size_t start_key_len, const char* limit_key,
-    size_t limit_key_len, char** errptr);
-
-extern ROCKSDB_LIBRARY_API void rocksdb_compact_range_opt(
-    rocksdb_t* db, rocksdb_compactoptions_t* opt, const char* start_key,
-    size_t start_key_len, const char* limit_key, size_t limit_key_len);
-
-extern ROCKSDB_LIBRARY_API void rocksdb_compact_range_cf_opt(
-    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
-    rocksdb_compactoptions_t* opt, const char* start_key, size_t start_key_len,
-    const char* limit_key, size_t limit_key_len);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_compact_files(
     rocksdb_t* db, const rocksdb_compaction_options_t* options,
@@ -2959,10 +2930,6 @@ extern ROCKSDB_LIBRARY_API void rocksdb_delete_file_in_range_cf(
 
 /* MetaData */
 
-extern ROCKSDB_LIBRARY_API rocksdb_column_family_metadata_t*
-rocksdb_get_column_family_metadata_with_options(
-    rocksdb_t* db, const rocksdb_column_family_metadata_options_t* options);
-
 extern ROCKSDB_LIBRARY_API rocksdb_column_family_metadata_options_t*
 rocksdb_column_family_metadata_options_create(void);
 extern ROCKSDB_LIBRARY_API void
@@ -2997,11 +2964,6 @@ rocksdb_export_import_files_metadata_get_files(
 
 extern ROCKSDB_LIBRARY_API void rocksdb_export_import_files_metadata_set_files(
     rocksdb_export_import_files_metadata_t*, rocksdb_livefiles_t*);
-
-extern ROCKSDB_LIBRARY_API rocksdb_column_family_metadata_t*
-rocksdb_get_column_family_metadata_cf_with_options(
-    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
-    const rocksdb_column_family_metadata_options_t* options);
 
 extern ROCKSDB_LIBRARY_API uint64_t rocksdb_column_family_metadata_get_size(
     rocksdb_column_family_metadata_t* cf_meta);
@@ -3768,6 +3730,45 @@ rocksdb_get_column_family_metadata(rocksdb_t* db);
 extern ROCKSDB_LIBRARY_API rocksdb_column_family_metadata_t*
 rocksdb_get_column_family_metadata_cf(
     rocksdb_t* db, rocksdb_column_family_handle_t* column_family);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_compact_range(rocksdb_t* db,
+                                                      const char* begin,
+                                                      size_t begin_len,
+                                                      const char* end,
+                                                      size_t end_len);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_compact_range_cf(
+    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
+    const char* begin, size_t begin_len, const char* end, size_t end_len);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_compact_range_opt(
+    rocksdb_t* db, rocksdb_compactoptions_t* options, const char* begin,
+    size_t begin_len, const char* end, size_t end_len);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_compact_range_cf_opt(
+    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
+    rocksdb_compactoptions_t* options, const char* begin, size_t begin_len,
+    const char* end, size_t end_len);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_suggest_compact_range_cf(
+    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
+    const char* begin, size_t begin_len, const char* end, size_t end_len,
+    char** errptr);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_verify_checksum_with_options(
+    rocksdb_t* db, const rocksdb_readoptions_t* read_options, char** errptr);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_verify_file_checksums_with_options(
+    rocksdb_t* db, const rocksdb_readoptions_t* read_options, char** errptr);
+
+extern ROCKSDB_LIBRARY_API rocksdb_column_family_metadata_t*
+rocksdb_get_column_family_metadata_with_options(
+    rocksdb_t* db, const rocksdb_column_family_metadata_options_t* options);
+
+extern ROCKSDB_LIBRARY_API rocksdb_column_family_metadata_t*
+rocksdb_get_column_family_metadata_cf_with_options(
+    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
+    const rocksdb_column_family_metadata_options_t* options);
 
 /* rocksdb_backup_engine_t */
 

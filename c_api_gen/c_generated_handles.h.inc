@@ -167,6 +167,45 @@ extern ROCKSDB_LIBRARY_API rocksdb_column_family_metadata_t*
 rocksdb_get_column_family_metadata_cf(
     rocksdb_t* db, rocksdb_column_family_handle_t* column_family);
 
+extern ROCKSDB_LIBRARY_API void rocksdb_compact_range(rocksdb_t* db,
+                                                      const char* begin,
+                                                      size_t begin_len,
+                                                      const char* end,
+                                                      size_t end_len);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_compact_range_cf(
+    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
+    const char* begin, size_t begin_len, const char* end, size_t end_len);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_compact_range_opt(
+    rocksdb_t* db, rocksdb_compactoptions_t* options, const char* begin,
+    size_t begin_len, const char* end, size_t end_len);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_compact_range_cf_opt(
+    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
+    rocksdb_compactoptions_t* options, const char* begin, size_t begin_len,
+    const char* end, size_t end_len);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_suggest_compact_range_cf(
+    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
+    const char* begin, size_t begin_len, const char* end, size_t end_len,
+    char** errptr);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_verify_checksum_with_options(
+    rocksdb_t* db, const rocksdb_readoptions_t* read_options, char** errptr);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_verify_file_checksums_with_options(
+    rocksdb_t* db, const rocksdb_readoptions_t* read_options, char** errptr);
+
+extern ROCKSDB_LIBRARY_API rocksdb_column_family_metadata_t*
+rocksdb_get_column_family_metadata_with_options(
+    rocksdb_t* db, const rocksdb_column_family_metadata_options_t* options);
+
+extern ROCKSDB_LIBRARY_API rocksdb_column_family_metadata_t*
+rocksdb_get_column_family_metadata_cf_with_options(
+    rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
+    const rocksdb_column_family_metadata_options_t* options);
+
 /* rocksdb_backup_engine_t */
 
 extern ROCKSDB_LIBRARY_API void rocksdb_backup_engine_close(

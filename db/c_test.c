@@ -1884,6 +1884,9 @@ int main(int argc, char** argv) {
   StartPhase("compactrange");
   rocksdb_compact_range(db, "a", 1, "z", 1);
   CheckGet(db, roptions, "foo", "hello");
+  rocksdb_compact_range(db, NULL, 0, "z", 1);
+  rocksdb_compact_range(db, "a", 1, NULL, 0);
+  CheckGet(db, roptions, "foo", "hello");
 
   StartPhase("compactallopt");
   rocksdb_compact_range_opt(db, coptions, NULL, 0, NULL, 0);
@@ -2572,6 +2575,12 @@ int main(int argc, char** argv) {
         rocksdb_get_column_family_metadata_with_options(db, metadata_options);
     CheckCondition(
         rocksdb_column_family_metadata_get_file_count(filtered_meta) > 0);
+    rocksdb_column_family_metadata_t* unfiltered_meta =
+        rocksdb_get_column_family_metadata_with_options(db, NULL);
+    CheckCondition(
+        rocksdb_column_family_metadata_get_file_count(unfiltered_meta) ==
+        rocksdb_column_family_metadata_get_file_count(filtered_meta));
+    rocksdb_column_family_metadata_destroy(unfiltered_meta);
     rocksdb_column_family_metadata_destroy(filtered_meta);
     rocksdb_column_family_metadata_options_destroy(metadata_options);
   }
@@ -3081,6 +3090,19 @@ int main(int argc, char** argv) {
           0 == rocksdb_column_family_metadata_get_file_count(filtered_meta));
       rocksdb_column_family_metadata_destroy(filtered_meta);
       rocksdb_column_family_metadata_options_destroy(metadata_options);
+
+      rocksdb_column_family_metadata_t* cf_meta =
+          rocksdb_get_column_family_metadata_cf(db, handles[1]);
+      rocksdb_column_family_metadata_t* unfiltered_meta =
+          rocksdb_get_column_family_metadata_cf_with_options(db, handles[1],
+                                                             NULL);
+      CheckCondition(rocksdb_column_family_metadata_get_file_count(cf_meta) >
+                     0);
+      CheckCondition(
+          rocksdb_column_family_metadata_get_file_count(unfiltered_meta) ==
+          rocksdb_column_family_metadata_get_file_count(cf_meta));
+      rocksdb_column_family_metadata_destroy(unfiltered_meta);
+      rocksdb_column_family_metadata_destroy(cf_meta);
     }
 
     {
@@ -3209,11 +3231,17 @@ int main(int argc, char** argv) {
       CheckNoError(err);
       rocksdb_verify_checksum_with_options(db, verify_options, &err);
       CheckNoError(err);
+      rocksdb_verify_checksum_with_options(db, NULL, &err);
+      CheckNoError(err);
       rocksdb_verify_file_checksums(db, &err);
       CheckCondition(err != NULL);
       CheckCondition(strstr(err, "file_checksum_gen_factory is null") != NULL);
       Free(&err);
       rocksdb_verify_file_checksums_with_options(db, verify_options, &err);
+      CheckCondition(err != NULL);
+      CheckCondition(strstr(err, "file_checksum_gen_factory is null") != NULL);
+      Free(&err);
+      rocksdb_verify_file_checksums_with_options(db, NULL, &err);
       CheckCondition(err != NULL);
       CheckCondition(strstr(err, "file_checksum_gen_factory is null") != NULL);
       Free(&err);
