@@ -288,7 +288,8 @@ Status DeleteScheduler::CleanupDirectory(Env* env, SstFileManagerImpl* sfm,
     }
 
     Status file_delete;
-    std::string trash_file = path + "/" + current_file;
+    std::string trash_file = path;
+    trash_file.append("/").append(current_file);
     if (sfm) {
       // We have an SstFileManager that will schedule the file delete
       s = sfm->OnAddFile(trash_file);
@@ -334,7 +335,8 @@ Status DeleteScheduler::MarkAsTrash(const std::string& file_path,
       break;
     } else if (s.ok()) {
       // Name conflict, generate new random suffix
-      *trash_file = file_path + std::to_string(cnt) + kTrashExtension;
+      *trash_file = file_path;
+      trash_file->append(std::to_string(cnt)).append(kTrashExtension);
     } else {
       // Error during FileExists call, we cannot continue
       break;

@@ -681,6 +681,7 @@ Status DBTestBase::TryReopenWithColumnFamilies(
   Close();
   EXPECT_EQ(cfs.size(), options.size());
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cfs.size());
   for (size_t i = 0; i < cfs.size(); ++i) {
     column_families.emplace_back(cfs[i], options[i]);
   }
@@ -703,6 +704,7 @@ Status DBTestBase::TryReopenReadOnlyWithColumnFamilies(
   Close();
   EXPECT_EQ(cfs.size(), options.size());
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cfs.size());
   for (size_t i = 0; i < cfs.size(); ++i) {
     column_families.emplace_back(cfs[i], options[i]);
   }
@@ -1035,6 +1037,7 @@ void DBTestBase::MultiGet(const std::vector<std::string>& k,
   statuses.resize(k.size());
   values.resize(k.size());
 
+  keys.reserve(k.size());
   for (size_t i = 0; i < k.size(); ++i) {
     keys.emplace_back(k[i]);
   }
@@ -1781,6 +1784,7 @@ void DBTestBase::VerifyDBFromMap(
 
   // MultiGet
   std::vector<Slice> key_slice;
+  key_slice.reserve(true_data.size());
   for (const auto& [k, _] : true_data) {
     key_slice.emplace_back(k);
   }

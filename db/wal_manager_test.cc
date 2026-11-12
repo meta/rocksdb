@@ -176,11 +176,12 @@ uint64_t GetLogDirSize(const std::string& dir_path, Env* env) {
   uint64_t dir_size = 0;
   std::vector<std::string> files;
   EXPECT_OK(env->GetChildren(dir_path, &files));
+  const std::string dir_path_prefix = dir_path + "/";
   for (auto& f : files) {
     uint64_t number;
     FileType type;
     if (ParseFileName(f, &number, &type) && type == kWalFile) {
-      std::string const file_path = dir_path + "/" + f;
+      std::string const file_path = dir_path_prefix + f;
       uint64_t file_size;
       EXPECT_OK(env->GetFileSize(file_path, &file_size));
       dir_size += file_size;

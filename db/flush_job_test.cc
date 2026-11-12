@@ -142,6 +142,7 @@ class FlushJobTestBase : public testing::Test {
 
     std::vector<ColumnFamilyDescriptor> column_families;
     cf_options_.table_factory = mock_table_factory_;
+    column_families.reserve(column_family_names_.size());
     for (const auto& cf_name : column_family_names_) {
       column_families.emplace_back(cf_name, cf_options_);
     }
@@ -324,7 +325,7 @@ TEST_F(FlushJobTest, NonEmpty) {
                            nullptr /* kv_prot_info */));
     if ((i + 1000) % 10000 < 9995) {
       InternalKey internal_key(key, SequenceNumber(i), kTypeValue);
-      inserted_keys.push_back({internal_key.Encode().ToString(), value});
+      inserted_keys.emplace_back(internal_key.Encode().ToString(), value);
     }
   }
 
@@ -335,7 +336,7 @@ TEST_F(FlushJobTest, NonEmpty) {
                            true /* allow_concurrent */, &post_process_info));
     new_mem->BatchPostProcess(post_process_info);
     InternalKey internal_key("9995", SequenceNumber(10000), kTypeRangeDeletion);
-    inserted_keys.push_back({internal_key.Encode().ToString(), "9999a"});
+    inserted_keys.emplace_back(internal_key.Encode().ToString(), "9999a");
   }
 
   // Note: the first two blob references will not be considered when resolving
@@ -364,7 +365,7 @@ TEST_F(FlushJobTest, NonEmpty) {
                            nullptr /* kv_prot_info */));
 
     InternalKey internal_key(key, seq, kTypeBlobIndex);
-    inserted_keys.push_back({internal_key.Encode().ToString(), blob_index});
+    inserted_keys.emplace_back(internal_key.Encode().ToString(), blob_index);
   }
   mock::SortKVVector(&inserted_keys);
 
@@ -621,7 +622,7 @@ TEST_F(FlushJobTest, Snapshots) {
                      (snapshots_set.find(seqno) != snapshots_set.end());
       if (visible) {
         InternalKey internal_key(key, seqno, kTypeValue);
-        inserted_keys.push_back({internal_key.Encode().ToString(), value});
+        inserted_keys.emplace_back(internal_key.Encode().ToString(), value);
       }
     }
   }
@@ -749,11 +750,11 @@ TEST_F(FlushJobTest, ReplaceTimedPutWriteTimeWithPreferredSeqno) {
   auto inserted_entries = mock::MakeMockFile();
   InternalKey smallest_internal_key("bar", SequenceNumber(15),
                                     kTypeValuePreferredSeqno);
-  inserted_entries.push_back({smallest_internal_key.Encode().ToString(),
-                              ValueWithPreferredSeqno("bval", 10)});
+  inserted_entries.emplace_back(smallest_internal_key.Encode().ToString(),
+                                ValueWithPreferredSeqno("bval", 10));
   InternalKey largest_internal_key("foo", SequenceNumber(18), kTypeValue);
-  inserted_entries.push_back(
-      {largest_internal_key.Encode().ToString(), "fval"});
+  inserted_entries.emplace_back(largest_internal_key.Encode().ToString(),
+                                "fval");
   autovector<ReadOnlyMemTable*> to_delete;
   new_mem->ConstructFragmentedRangeTombstones();
   cfd->imm()->Add(new_mem, &to_delete);

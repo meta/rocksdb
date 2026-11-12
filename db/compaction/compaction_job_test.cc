@@ -555,7 +555,7 @@ class CompactionJobTestBase : public testing::Test {
           test::CorruptKeyType(&internal_key);
           test::CorruptKeyType(&bottommost_internal_key);
         }
-        contents.push_back({internal_key.Encode().ToString(), value});
+        contents.emplace_back(internal_key.Encode().ToString(), value);
         if (i == 1 || k < kMatchingKeys || corrupt_id(k - kMatchingKeys)) {
           expected_results.insert(
               {bottommost_internal_key.Encode().ToString(), value});
@@ -570,7 +570,7 @@ class CompactionJobTestBase : public testing::Test {
 
     mock::KVVector expected_results_kvvector;
     for (auto& kv : expected_results) {
-      expected_results_kvvector.push_back({kv.first, kv.second});
+      expected_results_kvvector.emplace_back(kv.first, kv.second);
     }
 
     return expected_results_kvvector;

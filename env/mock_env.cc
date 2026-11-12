@@ -937,8 +937,10 @@ bool MockFileSystem::RenameFileInternal(const std::string& src,
   } else {
     std::vector<std::string> children;
     if (GetChildrenInternal(src, &children)) {
+      const std::string src_prefix = src + "/";
+      const std::string dest_prefix = dest + "/";
       for (const auto& child : children) {
-        RenameFileInternal(src + "/" + child, dest + "/" + child);
+        RenameFileInternal(src_prefix + child, dest_prefix + child);
       }
     }
     DeleteFileInternal(dest);

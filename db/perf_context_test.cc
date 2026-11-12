@@ -1003,6 +1003,7 @@ TEST_F(PerfContextTest, SeekKeyComparison) {
   }
 
   std::vector<int> keys;
+  keys.reserve(FLAGS_total_keys);
   for (int i = 0; i < FLAGS_total_keys; ++i) {
     keys.push_back(i);
   }

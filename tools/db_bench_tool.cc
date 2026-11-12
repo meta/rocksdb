@@ -6746,6 +6746,7 @@ class Benchmark {
         FLAGS_num_hot_column_families = FLAGS_num_column_families;
       }
       std::vector<ColumnFamilyDescriptor> column_families;
+      column_families.reserve(num_hot);
       for (size_t i = 0; i < num_hot; i++) {
         column_families.emplace_back(ColumnFamilyName(i),
                                      ColumnFamilyOptions(options));
@@ -7027,9 +7028,10 @@ class Benchmark {
       std::vector<std::string> children;
       Status list_status = FLAGS_env->GetChildren(output_directory, &children);
       if (list_status.ok()) {
+        const std::string dir_prefix = output_directory + "/";
         for (const auto& child : children) {
           if (child != "." && child != "..") {
-            std::string child_path = output_directory + "/" + child;
+            std::string child_path = dir_prefix + child;
             Status del_status = FLAGS_env->DeleteFile(child_path);
             if (!del_status.ok()) {
               fprintf(stderr, "Warning: Failed to delete file %s: %s\n",
@@ -7521,11 +7523,11 @@ class Benchmark {
           // start inserting the selective deletes) starting_idx = index in the
           // keygen of the rand_num to generate the key of the first KV entry to
           // delete (= key of the first selective delete).
-          disposable_entries_q[id].push(std::make_pair(
+          disposable_entries_q[id].emplace(
               FLAGS_env->NowMicros() +
                   FLAGS_disposable_entries_delete_delay /* timestamp */,
               disposable_entries_index[id] - kNumDispAndPersEntries
-              /*starting idx*/));
+              /*starting idx*/);
         }
         if (writes_per_range_tombstone_ > 0 &&
             num_written > writes_before_delete_range_ &&

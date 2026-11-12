@@ -603,6 +603,7 @@ class FlushedFileCollector : public EventListener {
   std::vector<std::string> GetFlushedFiles() {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<std::string> result;
+    result.reserve(flushed_files_.size());
     for (const auto& fname : flushed_files_) {
       result.push_back(fname);
     }
@@ -6446,6 +6447,7 @@ TEST_F(DBCompactionTest, PeriodicCompactionPhaseCfSpread) {
                         uint64_t{12345678901234567ULL}, ~uint64_t{0}}) {
     ASSERT_EQ(Phaser::CfPhaseSeedHash(base, 0), base);
     std::vector<uint64_t> hs;
+    hs.reserve(64);
     for (uint32_t id = 0; id < 64; ++id) {
       hs.push_back(Phaser::CfPhaseSeedHash(base, id));
     }
@@ -6461,6 +6463,7 @@ TEST_F(DBCompactionTest, PeriodicCompactionPhaseCfSpread) {
     for (uint32_t N : {uint32_t{3}, uint32_t{8}, uint32_t{16}, uint32_t{40}}) {
       const uint64_t n = 100000;
       std::vector<uint64_t> phases;
+      phases.reserve(N);
       for (uint32_t id = 0; id < N; ++id) {
         phases.push_back(FastRange64(Phaser::CfPhaseSeedHash(base, id), n));
       }

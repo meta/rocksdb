@@ -50,6 +50,7 @@ void DumpDBFileSummary(const ImmutableDBOptions& options,
           s.ToString().c_str());
   }
   std::sort(files.begin(), files.end());
+  const std::string dbname_prefix = dbname + "/";
   for (const std::string& file : files) {
     if (!ParseFileName(file, &number, &type)) {
       continue;
@@ -62,7 +63,7 @@ void DumpDBFileSummary(const ImmutableDBOptions& options,
         Header(options.info_log, "IDENTITY file:  %s\n", file.c_str());
         break;
       case kDescriptorFile:
-        s = env->GetFileSize(dbname + "/" + file, &file_size);
+        s = env->GetFileSize(dbname_prefix + file, &file_size);
         if (s.ok()) {
           Header(options.info_log,
                  "MANIFEST file:  %s size: %" PRIu64 " Bytes\n", file.c_str(),
@@ -74,7 +75,7 @@ void DumpDBFileSummary(const ImmutableDBOptions& options,
         }
         break;
       case kWalFile:
-        s = env->GetFileSize(dbname + "/" + file, &file_size);
+        s = env->GetFileSize(dbname_prefix + file, &file_size);
         if (s.ok()) {
           wal_info.append(file)
               .append(" size: ")
@@ -148,10 +149,11 @@ void DumpDBFileSummary(const ImmutableDBOptions& options,
       log_wal_info = false;
     }
     wal_info.clear();
+    const std::string wal_dir_prefix = wal_dir + "/";
     for (const std::string& file : files) {
       if (ParseFileName(file, &number, &type)) {
         if (type == kWalFile) {
-          s = env->GetFileSize(wal_dir + "/" + file, &file_size);
+          s = env->GetFileSize(wal_dir_prefix + file, &file_size);
           if (s.ok()) {
             wal_info.append(file)
                 .append(" size: ")

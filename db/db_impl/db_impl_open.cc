@@ -185,7 +185,8 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
       if (filename.find(".log.trash", filename.length() -
                                           std::string(".log.trash").length()) !=
           std::string::npos) {
-        std::string trash_file = wal_dir + "/" + filename;
+        std::string trash_file = wal_dir;
+        trash_file.append("/").append(filename);
         result.env->DeleteFile(trash_file).PermitUncheckedError();
       }
     }

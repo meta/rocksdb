@@ -603,6 +603,7 @@ TEST_F(EventListenerTest, MultiDBMultiListeners) {
   std::vector<TestFlushListener*> listeners;
   const int kNumDBs = 5;
   const int kNumListeners = 10;
+  listeners.reserve(kNumListeners);
   for (int i = 0; i < kNumListeners; ++i) {
     listeners.emplace_back(new TestFlushListener(options.env, this));
   }
@@ -1733,6 +1734,7 @@ class BlobDBJobLevelEventListenerTest : public EventListener {
   std::vector<std::string> GetFlushedFiles() {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<std::string> result;
+    result.reserve(flushed_files_.size());
     for (const auto& fname : flushed_files_) {
       result.push_back(fname);
     }

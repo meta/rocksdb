@@ -3160,6 +3160,7 @@ class NonBatchedOpsStressTest : public StressTest {
     std::vector<ExpectedValue> pre_read_expected_values;
     std::vector<ExpectedValue> post_read_expected_values;
 
+    pre_read_expected_values.reserve(expected_values_size);
     for (int64_t i = 0; i < static_cast<int64_t>(expected_values_size); ++i) {
       pre_read_expected_values.push_back(
           shared->Get(rand_column_family, i + lb));
@@ -3187,6 +3188,7 @@ class NonBatchedOpsStressTest : public StressTest {
       iter = std::unique_ptr<Iterator>(db_->NewIterator(ro, cfh));
     }
 
+    post_read_expected_values.reserve(expected_values_size);
     for (int64_t i = 0; i < static_cast<int64_t>(expected_values_size); ++i) {
       post_read_expected_values.push_back(
           shared->Get(rand_column_family, i + lb));

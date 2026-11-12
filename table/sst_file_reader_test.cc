@@ -367,6 +367,7 @@ const uint64_t kNumKeys = 100;
 
 TEST_F(SstFileReaderTest, Basic) {
   std::vector<std::string> keys;
+  keys.reserve(kNumKeys);
   for (uint64_t i = 0; i < kNumKeys; i++) {
     keys.emplace_back(EncodeAsString(i));
   }
@@ -952,6 +953,7 @@ TEST_F(SstFileReaderTest, EmbeddedBlobValueDeltaEscapeFv8) {
   ASSERT_EQ(static_cast<int>(got8.size()), static_cast<int>(expected.size()));
   ASSERT_EQ(got7, got8);
   std::vector<std::string> expected_values;
+  expected_values.reserve(expected.size());
   for (const auto& kv : expected) {
     expected_values.push_back(kv.second);
   }
@@ -1148,6 +1150,7 @@ TEST_F(SstFileReaderTest, ParseTableIteratorKeyRejectsShortKey) {
 TEST_F(SstFileReaderTest, Uint64Comparator) {
   options_.comparator = test::Uint64Comparator();
   std::vector<std::string> keys;
+  keys.reserve(kNumKeys);
   for (uint64_t i = 0; i < kNumKeys; i++) {
     keys.emplace_back(EncodeAsUint64(i));
   }
@@ -1159,6 +1162,7 @@ TEST_F(SstFileReaderTest, ReadOptionsOutOfScope) {
   // outliving it.
   options_.comparator = test::Uint64Comparator();
   std::vector<std::string> keys;
+  keys.reserve(kNumKeys);
   for (uint64_t i = 0; i < kNumKeys; i++) {
     keys.emplace_back(EncodeAsUint64(i));
   }
@@ -1181,6 +1185,7 @@ TEST_F(SstFileReaderTest, ReadOptionsOutOfScope) {
 
 TEST_F(SstFileReaderTest, ReadFileWithGlobalSeqno) {
   std::vector<std::string> keys;
+  keys.reserve(kNumKeys);
   for (uint64_t i = 0; i < kNumKeys; i++) {
     keys.emplace_back(EncodeAsString(i));
   }
@@ -1528,6 +1533,7 @@ class SstFileReaderTimestampNotPersistedTest
 TEST_F(SstFileReaderTimestampNotPersistedTest, Basic) {
   std::vector<InputKeyValueDesc> input_descs;
 
+  input_descs.reserve(kNumKeys);
   for (uint64_t k = 0; k < kNumKeys; k++) {
     input_descs.emplace_back(
         /* key */ EncodeAsString(k), /* timestamp */ EncodeAsUint64(0),
@@ -1540,6 +1546,7 @@ TEST_F(SstFileReaderTimestampNotPersistedTest, Basic) {
   CreateFile(input_descs, &external_sst_file_info);
   std::vector<OutputKeyValueDesc> output_descs;
 
+  output_descs.reserve(kNumKeys);
   for (uint64_t k = 0; k < kNumKeys; k++) {
     output_descs.emplace_back(/* key */ EncodeAsString(k),
                               /* timestamp */ EncodeAsUint64(0),
@@ -1620,6 +1627,7 @@ TEST_F(SstFileReaderTimestampNotPersistedTest, IncompatibleTimestampFormat) {
 
 TEST_F(SstFileReaderTest, VerifyNumEntriesBasic) {
   std::vector<std::string> keys;
+  keys.reserve(kNumKeys);
   for (uint64_t i = 0; i < kNumKeys; i++) {
     keys.emplace_back(EncodeAsUint64(i));
   }
@@ -1654,6 +1662,7 @@ TEST_F(SstFileReaderTest, VerifyNumEntriesCorruption) {
       });
   SyncPoint::GetInstance()->EnableProcessing();
   std::vector<std::string> keys;
+  keys.reserve(num_keys);
   for (uint64_t i = 0; i < num_keys; i++) {
     keys.emplace_back(EncodeAsUint64(i));
   }

@@ -164,6 +164,7 @@ TEST_P(WriteUnpreparedSnapshotTest, ReadYourOwnWrite) {
   ASSERT_OK(ReOpen());
 
   std::vector<std::string> keys;
+  keys.reserve(kNumKeys);
   for (uint32_t k = 0; k < kNumKeys; k++) {
     keys.push_back("k" + std::to_string(k));
   }

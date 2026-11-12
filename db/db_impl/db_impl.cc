@@ -7470,7 +7470,8 @@ Status DestroyDB(const std::string& dbname, const Options& options,
       if (ParseFileName(fname, &number, info_log_prefix.prefix, &type) &&
           type != kDBLockFile) {  // Lock file will be deleted at end
         Status del;
-        std::string path_to_delete = dbname + "/" + fname;
+        std::string path_to_delete = dbname;
+        path_to_delete.append("/").append(fname);
         if (type == kMetaDatabase) {
           del = DestroyDB(path_to_delete, options);
         } else if (type == kTableFile || type == kWalFile ||
@@ -7526,7 +7527,8 @@ Status DestroyDB(const std::string& dbname, const Options& options,
           } else if (ParseFileName(fname, &number, &type) &&
                      (type == kTableFile ||
                       type == kBlobFile)) {  // Lock file will be deleted at end
-            std::string file_path = path + "/" + fname;
+            std::string file_path = path;
+            file_path.append("/").append(fname);
             Status del = DeleteUnaccountedDBFile(&soptions, file_path, dbname,
                                                  /*force_bg=*/false,
                                                  /*force_fg=*/false, bucket);
@@ -7578,8 +7580,10 @@ Status DestroyDB(const std::string& dbname, const Options& options,
             result = del;
           }
         } else if (ParseFileName(file, &number, &type) && type == kWalFile) {
+          std::string file_path = archivedir;
+          file_path.append("/").append(file);
           Status del = DeleteUnaccountedDBFile(
-              &soptions, archivedir + "/" + file, archivedir,
+              &soptions, file_path, archivedir,
               /*force_bg=*/false, /*force_fg=*/!wal_in_db_path, bucket);
           if (!del.ok() && result.ok()) {
             result = del;
@@ -9176,6 +9180,7 @@ Status DBImpl::VerifyChecksumInternal(const ReadOptions& read_options,
     }
   }
   std::vector<SuperVersion*> sv_list;
+  sv_list.reserve(cfd_list.size());
   for (auto cfd : cfd_list) {
     sv_list.push_back(cfd->GetReferencedSuperVersion(this));
   }

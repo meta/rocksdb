@@ -1715,6 +1715,7 @@ TEST_F(DBFlushTest, DISABLED_MemPurgeWALSupport) {
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
     std::vector<std::string> keys;
+    keys.reserve(KVSIZE);
     for (size_t k = 0; k < KVSIZE; k++) {
       keys.push_back("IamKey" + std::to_string(k));
     }

@@ -1189,6 +1189,7 @@ TEST_P(TransactionStressTest, DeadlockStress) {
   };
 
   std::vector<port::Thread> threads;
+  threads.reserve(NUM_TXN_THREADS);
   for (uint32_t i = 0; i < NUM_TXN_THREADS; i++) {
     threads.emplace_back(stress_thread, rnd.Next());
   }
@@ -1818,6 +1819,7 @@ TEST_P(TransactionTest, DISABLED_TwoPhaseMultiThreadTest) {
 
   // do all the writes
   std::vector<port::Thread> threads;
+  threads.reserve(NUM_TXN_THREADS);
   for (uint32_t i = 0; i < NUM_TXN_THREADS; i++) {
     threads.emplace_back(txn_write_thread);
   }
@@ -3329,6 +3331,7 @@ TEST_P(TransactionTest, MultiGetLargeBatchedTest) {
   ColumnFamilyOptions cf_options;
 
   std::vector<std::string> key_str;
+  key_str.reserve(100);
   for (int i = 0; i < 100; ++i) {
     key_str.emplace_back(std::to_string(i));
   }
@@ -3380,6 +3383,7 @@ TEST_P(TransactionTest, MultiGetLargeBatchedTest) {
 
   // MultiGet a lot of keys in order to force std::vector reallocations
   std::vector<Slice> keys;
+  keys.reserve(MultiGetContext::MAX_BATCH_SIZE + 32);
   for (int i = 0; i < MultiGetContext::MAX_BATCH_SIZE + 32; ++i) {
     keys.emplace_back(key_str[i]);
   }
@@ -6035,6 +6039,9 @@ TEST_P(MySQLStyleTransactionTest, TransactionStressTest) {
     }
   };
 
+  threads.reserve(
+      num_workers + num_checkers +
+      (with_slow_threads_ ? num_slow_checkers + num_slow_workers : 0));
   for (uint32_t i = 0; i < num_workers; i++) {
     threads.emplace_back(call_inserter);
   }

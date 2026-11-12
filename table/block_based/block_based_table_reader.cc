@@ -3628,8 +3628,7 @@ Status BlockBasedTable::GetKVPairsFromDataBlocks(
       std::string key_copy = std::string(key.data(), key.size());
       std::string value_copy = std::string(value.data(), value.size());
 
-      kv_pair_block.push_back(
-          std::make_pair(std::move(key_copy), std::move(value_copy)));
+      kv_pair_block.emplace_back(std::move(key_copy), std::move(value_copy));
     }
     kv_pair_blocks->push_back(std::move(kv_pair_block));
   }

@@ -1268,7 +1268,7 @@ class IoctlFriendlyTmpdir {
     // add 1 for the trailing NUL byte.
     if (tmp && strlen(tmp) + strlen(fmt) - 2 + 1 <= sizeof dir_buf) {
       // use $TEST_IOCTL_FRIENDLY_TMPDIR value
-      candidate_dir_list.push_front(tmp);
+      candidate_dir_list.emplace_front(tmp);
     }
 
     for (const std::string& d : candidate_dir_list) {
@@ -1771,6 +1771,7 @@ TEST_F(EnvPosixTest, MultiReadNonAlignedLargeNum) {
     std::vector<size_t> offsets;
     std::vector<size_t> lens;
     // std::set already sorted the offsets.
+    offsets.reserve(start_offsets.size());
     for (int so : start_offsets) {
       offsets.push_back(so);
     }
@@ -2421,7 +2422,8 @@ TEST_P(EnvPosixTestWithParam, ConsistentChildrenAttributes) {
   ASSERT_OK(env_->GetChildrenFileAttributes(test_base_dir, &file_attrs));
   for (int i = 0; i < kNumChildren; ++i) {
     const std::string name = "testfile_" + std::to_string(i);
-    const std::string path = test_base_dir + "/" + name;
+    std::string path = test_base_dir;
+    path.append("/").append(name);
 
     auto file_attrs_iter = std::find_if(
         file_attrs.begin(), file_attrs.end(),

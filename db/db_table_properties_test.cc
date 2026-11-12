@@ -532,6 +532,7 @@ TEST_P(DBTablePropertiesInRangeTest, GetPropertiesOfTablesInRange) {
     // the below loop requires that random_keys.size() to be even.
     auto n = 2 * (rnd.Uniform(50) + 1);
 
+    random_keys.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
       random_keys.push_back(test::RandomKey(&rnd, 5));
     }

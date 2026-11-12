@@ -250,8 +250,8 @@ TEST_F(DBBasicTestWithTimestamp, MultiGetMultipleCfs) {
   std::vector<Slice> keys;
   std::vector<std::string> expected_values;
   for (int i = 0; i < num_keys; i++) {
-    keys.push_back("a");
-    expected_values.push_back("value");
+    keys.emplace_back("a");
+    expected_values.emplace_back("value");
   }
   std::vector<ColumnFamilyHandle*> handles;
   handles.push_back(db_->DefaultColumnFamily());
@@ -856,9 +856,11 @@ TEST_P(DBBasicTestWithTimestampTableOptions, GetAndMultiGet) {
     for (uint64_t k = 0; k < kNumKeys; k += 2) {
       std::vector<std::string> key_strs;
       std::vector<Slice> keys;
+      key_strs.reserve(step);
       for (size_t i = 0; i < step; ++i) {
         key_strs.push_back(Key1(k + i));
       }
+      keys.reserve(step);
       for (size_t i = 0; i < step; ++i) {
         keys.emplace_back(key_strs[i]);
       }
@@ -4074,6 +4076,7 @@ TEST_F(DBBasicTestWithTimestamp, FullHistoryTsLowSanityCheckFail) {
     std::vector<std::string> key_vals = {"foo", "foo"};
     std::vector<Slice> keys;
     std::vector<std::string> values;
+    keys.reserve(2);
     for (size_t j = 0; j < 2; ++j) {
       keys.emplace_back(key_vals[j]);
     }
@@ -4091,6 +4094,7 @@ TEST_F(DBBasicTestWithTimestamp, FullHistoryTsLowSanityCheckFail) {
     std::vector<std::string> key_vals = {"foo"};
     std::vector<Slice> keys;
     std::vector<std::string> values;
+    keys.reserve(1);
     for (size_t j = 0; j < 1; ++j) {
       keys.emplace_back(key_vals[j]);
     }
@@ -4829,7 +4833,7 @@ TEST_F(DBBasicTestWithTimestamp, MergeBasic) {
       ASSERT_OK(it->status());
       ASSERT_EQ(std::numeric_limits<size_t>::max(), key_int_val);
 
-      value_suffix = value_suffix + "." + std::to_string(i + 1);
+      value_suffix += "." + std::to_string(i + 1);
     }
   };
 

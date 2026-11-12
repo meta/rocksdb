@@ -457,7 +457,7 @@ class DbStressListener : public EventListener {
 
   void VerifyFilePath(const std::string& file_path) {
 #ifndef NDEBUG
-    size_t pos = file_path.find_last_of("/");
+    size_t pos = file_path.find_last_of('/');
     if (pos == std::string::npos) {
       VerifyFileName(file_path);
     } else {

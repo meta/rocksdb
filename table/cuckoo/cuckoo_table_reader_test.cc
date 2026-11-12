@@ -49,6 +49,7 @@ std::unordered_map<std::string, std::vector<uint64_t> > hash_map;
 void AddHashLookups(const std::string& s, uint64_t bucket_id,
                     uint32_t num_hash_fun) {
   std::vector<uint64_t> v;
+  v.reserve(num_hash_fun);
   for (uint32_t i = 0; i < num_hash_fun; i++) {
     v.push_back(bucket_id + i);
   }

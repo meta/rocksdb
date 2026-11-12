@@ -249,13 +249,16 @@ class FileChecksumTestHelper {
       if (live_files[i].file_checksum != stored_checksum ||
           live_files[i].file_checksum_func_name != stored_func_name) {
         return Status::Corruption(
-            "Checksum does not match! The file: " +
-            std::to_string(live_files[i].file_number) +
-            ". In Manifest, checksum name: " + stored_func_name +
-            " and checksum " + stored_checksum +
-            ". However, expected checksum name: " +
-            live_files[i].file_checksum_func_name + " and checksum " +
-            live_files[i].file_checksum);
+            std::string("Checksum does not match! The file: ")
+                .append(std::to_string(live_files[i].file_number))
+                .append(". In Manifest, checksum name: ")
+                .append(stored_func_name)
+                .append(" and checksum ")
+                .append(stored_checksum)
+                .append(". However, expected checksum name: ")
+                .append(live_files[i].file_checksum_func_name)
+                .append(" and checksum ")
+                .append(live_files[i].file_checksum));
       }
     }
     return Status::OK();
@@ -949,6 +952,7 @@ TEST_F(LdbCmdTest, UnsafeRemoveSstFile) {
   db->GetLiveFilesMetaData(&sst_files);
 
   std::vector<uint64_t> numbers;
+  numbers.reserve(sst_files.size());
   for (auto& f : sst_files) {
     numbers.push_back(f.file_number);
   }

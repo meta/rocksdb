@@ -160,6 +160,7 @@ class CheckpointTest : public testing::Test {
     Close();
     EXPECT_EQ(cfs.size(), options.size());
     std::vector<ColumnFamilyDescriptor> column_families;
+    column_families.reserve(cfs.size());
     for (size_t i = 0; i < cfs.size(); ++i) {
       column_families.emplace_back(cfs[i], options[i]);
     }
@@ -208,6 +209,7 @@ class CheckpointTest : public testing::Test {
   Status ReadOnlyReopenWithColumnFamilies(const std::vector<std::string>& cfs,
                                           const Options& options) {
     std::vector<ColumnFamilyDescriptor> column_families;
+    column_families.reserve(cfs.size());
     for (const auto& cf : cfs) {
       column_families.emplace_back(cf, options);
     }
@@ -547,6 +549,7 @@ TEST_F(CheckpointTest, CheckpointCF) {
   std::vector<std::string> cfs;
   cfs = {kDefaultColumnFamilyName, "one", "two", "three", "four", "five"};
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cfs.size());
   for (size_t i = 0; i < cfs.size(); ++i) {
     column_families.emplace_back(cfs[i], options);
   }
@@ -1044,6 +1047,7 @@ TEST_F(CheckpointTest, CheckpointCFNoFlush) {
   std::vector<std::string> cfs;
   cfs = {kDefaultColumnFamilyName, "one", "two", "three", "four", "five"};
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cfs.size());
   for (size_t i = 0; i < cfs.size(); ++i) {
     column_families.emplace_back(cfs[i], options);
   }

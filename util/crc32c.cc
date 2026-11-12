@@ -288,8 +288,9 @@ uint32_t ExtendImpl(uint32_t crc, const char* buf, size_t size) {
   // Point x at first 16-byte aligned byte in string.  This might be
   // just past the end of the string.
   const uintptr_t pval = reinterpret_cast<uintptr_t>(p);
-  const uint8_t* x = reinterpret_cast<const uint8_t*>(ALIGN(pval, 4));
-  if (x <= e) {
+  const size_t align_len = static_cast<size_t>(ALIGN(pval, 4) - pval);
+  if (align_len <= size) {
+    const uint8_t* x = p + align_len;
     // Process bytes until finished or p is 16-byte aligned
     while (p != x) {
       STEP1;

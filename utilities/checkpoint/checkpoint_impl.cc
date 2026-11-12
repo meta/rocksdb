@@ -309,7 +309,8 @@ Status CheckpointImpl::CleanStagingDirectory(
   if (s.ok()) {
     for (auto& subchild : subchildren) {
       Status del_s;
-      std::string subchild_path = full_private_path + "/" + subchild;
+      std::string subchild_path = full_private_path;
+      subchild_path.append("/").append(subchild);
       del_s = db_->GetEnv()->DeleteFile(subchild_path);
       ROCKS_LOG_INFO(info_log, "Delete file %s -- %s", subchild_path.c_str(),
                      del_s.ToString().c_str());
@@ -853,7 +854,8 @@ Status CheckpointImpl::ExportColumnFamily(
         moved_to_user_specified_dir ? export_dir : tmp_export_dir;
     db_->GetEnv()->GetChildren(cleanup_dir, &subchildren);
     for (const auto& subchild : subchildren) {
-      const auto subchild_path = cleanup_dir + "/" + subchild;
+      std::string subchild_path = cleanup_dir;
+      subchild_path.append("/").append(subchild);
       const auto status = db_->GetEnv()->DeleteFile(subchild_path);
       if (!status.ok()) {
         ROCKS_LOG_WARN(db_options.info_log, "Failed to cleanup file %s: %s",

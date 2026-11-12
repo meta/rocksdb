@@ -294,6 +294,7 @@ class Repairer {
     bool found_file = false;
     std::vector<std::string> to_search_paths;
 
+    to_search_paths.reserve(db_options_.db_paths.size() + 1);
     for (size_t path_id = 0; path_id < db_options_.db_paths.size(); path_id++) {
       to_search_paths.push_back(db_options_.db_paths[path_id].path);
     }

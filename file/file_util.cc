@@ -309,7 +309,8 @@ Status DestroyDir(Env* env, const std::string& dir) {
   s = env->GetChildren(dir, &files_in_dir);
   if (s.ok()) {
     for (auto& file_in_dir : files_in_dir) {
-      std::string path = dir + "/" + file_in_dir;
+      std::string path = dir;
+      path.append("/").append(file_in_dir);
       bool is_dir = false;
       s = env->IsDirectory(path, &is_dir);
       if (s.ok()) {

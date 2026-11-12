@@ -4141,6 +4141,7 @@ TEST_P(BlockBasedTableTest, IndexSizeStat) {
   Random rnd(test::RandomSeed());
   std::vector<std::string> keys;
 
+  keys.reserve(100);
   for (int i = 0; i < 100; ++i) {
     keys.push_back(rnd.RandomString(10000));
   }
@@ -11835,6 +11836,7 @@ TEST(IndexFactoryCompatibilityTest, ConsumingReaderPreservesCachedContents) {
       // Each table reader must receive an independent Slice view, including
       // simultaneous opens using the same cached BlockContents.
       std::vector<std::thread> threads;
+      threads.reserve(4);
       for (int i = 0; i < 4; ++i) {
         threads.emplace_back(open_and_scan);
       }

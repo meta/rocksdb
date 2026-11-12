@@ -787,12 +787,12 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
       dir_to_sync = candidate_file.file_path;
     } else {
       dir_to_sync = (type == kWalFile) ? wal_dir : dbname_;
-      fname = dir_to_sync +
-              ((!dir_to_sync.empty() && dir_to_sync.back() == '/') ||
-                       (!to_delete.empty() && to_delete.front() == '/')
-                   ? ""
-                   : "/") +
-              to_delete;
+      fname = dir_to_sync;
+      if ((dir_to_sync.empty() || dir_to_sync.back() != '/') &&
+          (to_delete.empty() || to_delete.front() != '/')) {
+        fname.push_back('/');
+      }
+      fname.append(to_delete);
     }
 
     if (type == kWalFile && (immutable_db_options_.WAL_ttl_seconds > 0 ||

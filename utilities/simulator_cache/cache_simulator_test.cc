@@ -84,7 +84,8 @@ class CacheSimulatorTest : public testing::Test {
       sim_cache->Release(handle);
     }
     for (auto const& key : keys) {
-      std::string row_key = kRefKeyPrefix + key + kRefKeySequenceNumber;
+      std::string row_key = kRefKeyPrefix;
+      row_key.append(key).append(kRefKeySequenceNumber);
       auto handle =
           sim_cache->Lookup("0_" + ExtractUserKey(row_key).ToString());
       EXPECT_NE(nullptr, handle);

@@ -597,6 +597,7 @@ void BlockCacheTraceAnalyzer::WriteSkewness(
   TraverseBlocks(block_callback, &labels);
   std::map<std::string, std::map<uint64_t, uint64_t>> label_bucket_naccesses;
   std::vector<std::pair<std::string, uint64_t>> pairs;
+  pairs.reserve(label_naccesses.size());
   for (auto const& itr : label_naccesses) {
     pairs.emplace_back(itr);
   }
@@ -681,9 +682,13 @@ void BlockCacheTraceAnalyzer::WriteCorrelationFeaturesToFile(
     auto it = label_predictions.find(label_feature_vectors.first);
     assert(it != label_predictions.end());
     const Predictions& future = it->second;
-    const std::string output_path = output_dir_ + "/" + label + "_" +
-                                    label_feature_vectors.first + "_" +
-                                    kFileNameSuffixCorrelation;
+    std::string output_path = output_dir_;
+    output_path.append("/")
+        .append(label)
+        .append("_")
+        .append(label_feature_vectors.first)
+        .append("_")
+        .append(kFileNameSuffixCorrelation);
     std::ofstream out(output_path);
     if (!out.is_open()) {
       return;
@@ -694,6 +699,7 @@ void BlockCacheTraceAnalyzer::WriteCorrelationFeaturesToFile(
         "access");
     out << header << std::endl;
     std::vector<uint32_t> indexes;
+    indexes.reserve(past.num_accesses_since_last_access.size());
     for (uint32_t i = 0; i < past.num_accesses_since_last_access.size(); i++) {
       indexes.push_back(i);
     }

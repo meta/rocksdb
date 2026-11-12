@@ -1887,8 +1887,8 @@ void WriteBatch::SetSavePoint() {
     save_points_.reset(new SavePoints());
   }
   // Record length and count of current batch of writes.
-  save_points_->stack.push(SavePoint(
-      GetDataSize(), Count(), content_flags_.load(std::memory_order_relaxed)));
+  save_points_->stack.emplace(GetDataSize(), Count(),
+                              content_flags_.load(std::memory_order_relaxed));
 }
 
 Status WriteBatch::RollbackToSavePoint() {

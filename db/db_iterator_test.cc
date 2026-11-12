@@ -3725,6 +3725,7 @@ TEST_P(DBIteratorTest, IteratorWithLocalStatistics) {
     total_bytes += bytes;
   };
 
+  threads.reserve(10 + 15);
   for (int i = 0; i < 10; i++) {
     threads.emplace_back(reader_func_next);
   }
@@ -6357,8 +6358,7 @@ TEST_P(DBMultiScanIteratorTest, FragmentedRangeTombstones) {
           if (kiter != kvs.end()) {
             kvs.erase(kiter);
           }
-          auto res =
-              kvs.emplace(std::make_pair(Key(i), rnd->RandomString(2 << 10)));
+          auto res = kvs.emplace(Key(i), rnd->RandomString(2 << 10));
           ASSERT_OK(writer->Put(res.first->first, res.first->second));
         }
         ASSERT_OK(writer->Finish());

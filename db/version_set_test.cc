@@ -1602,6 +1602,7 @@ TEST_F(VersionSetTest, FailedEditReleasesEveryWriterInTheBatch) {
   std::vector<int> callback_calls(edits.size(), 0);
   std::vector<Status::Code> callback_codes(edits.size(), Status::kOk);
   std::vector<std::function<void(const Status&)>> manifest_wcbs;
+  manifest_wcbs.reserve(edits.size());
   for (size_t i = 0; i < edits.size(); ++i) {
     manifest_wcbs.emplace_back([&, i](const Status& cb_status) {
       ++callback_calls[i];
@@ -4218,6 +4219,7 @@ TEST_P(VersionSetTestEmptyDb, OpenFromIncompleteManifest0) {
   const std::vector<std::string> cf_names = std::get<2>(GetParam());
 
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cf_names.size());
   for (const auto& cf_name : cf_names) {
     column_families.emplace_back(cf_name, cf_options_);
   }
@@ -4260,6 +4262,7 @@ TEST_P(VersionSetTestEmptyDb, OpenFromIncompleteManifest1) {
   bool read_only = std::get<1>(GetParam());
   const std::vector<std::string>& cf_names = std::get<2>(GetParam());
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cf_names.size());
   for (const auto& cf_name : cf_names) {
     column_families.emplace_back(cf_name, cf_options_);
   }
@@ -4306,6 +4309,7 @@ TEST_P(VersionSetTestEmptyDb, OpenFromInCompleteManifest2) {
   bool read_only = std::get<1>(GetParam());
   const std::vector<std::string>& cf_names = std::get<2>(GetParam());
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cf_names.size());
   for (const auto& cf_name : cf_names) {
     column_families.emplace_back(cf_name, cf_options_);
   }
@@ -4363,6 +4367,7 @@ TEST_P(VersionSetTestEmptyDb, OpenManifestWithUnknownCF) {
   bool read_only = std::get<1>(GetParam());
   const std::vector<std::string>& cf_names = std::get<2>(GetParam());
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cf_names.size());
   for (const auto& cf_name : cf_names) {
     column_families.emplace_back(cf_name, cf_options_);
   }
@@ -4419,6 +4424,7 @@ TEST_P(VersionSetTestEmptyDb, OpenCompleteManifest) {
   bool read_only = std::get<1>(GetParam());
   const std::vector<std::string>& cf_names = std::get<2>(GetParam());
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cf_names.size());
   for (const auto& cf_name : cf_names) {
     column_families.emplace_back(cf_name, cf_options_);
   }
@@ -4725,6 +4731,7 @@ TEST_F(VersionSetTestMissingFiles, NoFileMissing) {
 
   PrepareManifest(&column_families_, &last_seqno_, &log_writer_);
   std::vector<std::pair<int, FileMetaData>> added_files;
+  added_files.reserve(file_metas.size());
   for (const auto& meta : file_metas) {
     added_files.emplace_back(0, meta);
   }

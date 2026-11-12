@@ -454,7 +454,7 @@ void ThreadPoolImpl::Impl::Submit(std::function<void()>&& schedule,
   StartBGThreads();
 
   // Add to priority queue
-  queue_.push_back(BGItem());
+  queue_.emplace_back();
   TEST_SYNC_POINT("ThreadPoolImpl::Submit::Enqueue");
   auto& item = queue_.back();
   item.tag = tag;

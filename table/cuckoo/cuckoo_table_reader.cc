@@ -208,6 +208,7 @@ void CuckooTableReader::Prepare(const Slice& key) {
                                   identity_as_first_hash_, nullptr);
   uint64_t end_addr = addr + cuckoo_block_bytes_minus_one_;
   for (addr &= CACHE_LINE_MASK; addr < end_addr; addr += CACHE_LINE_SIZE) {
+    // NOLINTNEXTLINE(performance-no-int-to-ptr)
     PREFETCH(reinterpret_cast<const char*>(addr), 0, 3);
   }
 }

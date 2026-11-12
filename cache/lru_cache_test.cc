@@ -2083,6 +2083,7 @@ TEST_P(DBSecondaryCacheTest, TestSecondaryCacheMultiGet) {
   std::vector<PinnableSlice> values(mget_keys.size());
   std::vector<Status> s(keys.size());
   std::vector<Slice> key_slices;
+  key_slices.reserve(mget_keys.size());
   for (const std::string& key : mget_keys) {
     key_slices.emplace_back(key);
   }

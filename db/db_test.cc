@@ -1200,6 +1200,7 @@ TEST_F(DBTest, FlushSchedule) {
     }
   };
 
+  threads.reserve(10);
   for (int i = 0; i < 10; ++i) {
     threads.emplace_back(fill_memtable_func);
   }
@@ -3357,6 +3358,7 @@ TEST_F(DBTest, GroupCommitTest) {
     ASSERT_GT(TestGetTickerCount(options, WRITE_DONE_BY_OTHER), 0);
 
     std::vector<std::string> expected_db;
+    expected_db.reserve(kGCNumThreads * kGCNumKeys);
     for (int i = 0; i < kGCNumThreads * kGCNumKeys; ++i) {
       expected_db.push_back(std::to_string(i));
     }
@@ -6066,6 +6068,7 @@ TEST_F(DBTest, FileCreationRandomFailure) {
   constexpr int kRandomFailureTest = kTotalIteration / 2;
 
   std::vector<std::string> values;
+  values.reserve(kTestSize);
   for (int i = 0; i < kTestSize; ++i) {
     values.emplace_back("NOT_FOUND");
   }

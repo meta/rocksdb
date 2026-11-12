@@ -763,6 +763,7 @@ TEST_F(DBReadOnlyTestWithTimestamp,
   for (uint64_t key = 0; key <= kMaxKey; ++key) {
     key_strs.push_back(Key1(key));
   }
+  keys.reserve(key_strs.size());
   for (const auto& key_str : key_strs) {
     keys.emplace_back(key_str);
   }
@@ -810,6 +811,7 @@ TEST_F(DBReadOnlyTestWithTimestamp,
   for (uint64_t key = 0; key <= kMaxKey; ++key) {
     key_strs.push_back(Key1(key));
   }
+  keys.reserve(key_strs.size());
   for (const auto& key_str : key_strs) {
     keys.emplace_back(key_str);
   }
@@ -859,6 +861,7 @@ TEST_F(DBReadOnlyTestWithTimestamp,
   for (uint64_t key = 0; key <= kMaxKey; ++key) {
     key_strs.push_back(Key1(key));
   }
+  keys.reserve(key_strs.size());
   for (const auto& key_str : key_strs) {
     keys.emplace_back(key_str);
   }
@@ -914,6 +917,7 @@ TEST_F(DBReadOnlyTestWithTimestamp, CompactedDBMultiGetWithOnlyOneL0File) {
     for (uint64_t key = start_keys[i]; key <= kMaxKey; ++key) {
       key_strs.push_back(Key1(key));
     }
+    keys.reserve(key_strs.size());
     for (const auto& key_str : key_strs) {
       keys.emplace_back(key_str);
     }
@@ -980,6 +984,7 @@ TEST_F(DBReadOnlyTestWithTimestamp,
     for (uint64_t key = start_keys[i]; key <= kMaxKey; ++key) {
       key_strs.push_back(Key1(key));
     }
+    keys.reserve(key_strs.size());
     for (const auto& key_str : key_strs) {
       keys.emplace_back(key_str);
     }

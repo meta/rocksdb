@@ -301,6 +301,7 @@ class ExternalSSTFileTest
       std::map<std::string, std::string>* true_data = nullptr,
       ColumnFamilyHandle* cfh = nullptr) {
     std::vector<std::pair<std::string, std::string>> file_data;
+    file_data.reserve(data.size());
     for (auto& entry : data) {
       file_data.emplace_back(Key(entry.first), entry.second);
     }
@@ -318,6 +319,7 @@ class ExternalSSTFileTest
       std::map<std::string, std::string>* true_data = nullptr,
       ColumnFamilyHandle* cfh = nullptr, bool fill_cache = false) {
     std::vector<std::pair<std::string, std::string>> file_data;
+    file_data.reserve(keys.size());
     for (auto& k : keys) {
       file_data.emplace_back(Key(k), Key(k) + std::to_string(file_id));
     }
@@ -2410,6 +2412,7 @@ TEST_F(ExternalSSTFileTest, MultiThreaded) {
     };
     // Write num_files files in parallel
     std::vector<port::Thread> sst_writer_threads;
+    sst_writer_threads.reserve(num_files);
     for (int i = 0; i < num_files; ++i) {
       sst_writer_threads.emplace_back(write_file_func);
     }
@@ -2454,6 +2457,7 @@ TEST_F(ExternalSSTFileTest, MultiThreaded) {
     // Bulk load num_files files in parallel
     std::vector<port::Thread> add_file_threads;
     DestroyAndReopen(options);
+    add_file_threads.reserve(num_files);
     for (int i = 0; i < num_files; ++i) {
       add_file_threads.emplace_back(load_file_func);
     }

@@ -749,6 +749,7 @@ TEST_F(NewBuiltinIndexFactoryBuilderTest, CommonPrefixInEveryIndexBlock) {
       prefix_extractor.get());
   const std::string prefix(64, 'p');
   std::vector<std::string> keys;
+  keys.reserve(64);
   for (int i = 0; i < 64; ++i) {
     keys.push_back(
         MakeInternalKey(prefix + std::to_string(1000 + i), 1, kTypeValue));

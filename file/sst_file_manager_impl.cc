@@ -524,8 +524,9 @@ SstFileManager* NewSstFileManager(Env* env, std::shared_ptr<FileSystem> fs,
     std::vector<std::string> files_in_trash;
     s = fs->GetChildren(trash_dir, IOOptions(), &files_in_trash, nullptr);
     if (s.ok()) {
+      const std::string trash_dir_prefix = trash_dir + "/";
       for (const std::string& trash_file : files_in_trash) {
-        std::string path_in_trash = trash_dir + "/" + trash_file;
+        std::string path_in_trash = trash_dir_prefix + trash_file;
         res->OnAddFile(path_in_trash);
         Status file_delete =
             res->ScheduleFileDeletion(path_in_trash, trash_dir);

@@ -516,6 +516,7 @@ TEST(SemaphoreTest, CountingSemaphore) {
   CountingSemaphore sem{0};
   int kCount = 5;
   std::vector<std::thread> threads;
+  threads.reserve(2 * kCount);
   for (int i = 0; i < kCount; ++i) {
     threads.emplace_back([&sem] { sem.Release(); });
   }
@@ -538,6 +539,7 @@ TEST(SemaphoreTest, BinarySemaphore) {
   BinarySemaphore sem{0};
   int kCount = 5;
   std::vector<std::thread> threads;
+  threads.reserve(kCount + 1);
   for (int i = 0; i < kCount; ++i) {
     threads.emplace_back([&sem] {
       sem.Acquire();
@@ -874,8 +876,9 @@ TEST(SstPartitionerFixedPrefixTest, PrefixConsistentWithShouldPartition) {
         continue;
       }
       for (const std::string& next : kKeys) {
-        SCOPED_TRACE("len=" + std::to_string(len) + " start=" + start +
-                     " next=" + next);
+        std::string trace = "len=" + std::to_string(len);
+        trace.append(" start=").append(start).append(" next=").append(next);
+        SCOPED_TRACE(trace);
         EXPECT_EQ(PrefixImpliesPartition(*prefix, next),
                   FixedPrefixShouldPartition(partitioner, start, next));
       }
