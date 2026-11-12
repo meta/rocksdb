@@ -347,13 +347,15 @@ the handle's `methods` list in `handles.json` and regenerate:
 {"name": "rocksdb_writebatch_put", "method": "Put", "overload": ["const Slice &", "const Slice &"], "result": "discard"}
 ```
 
-Only `name` and `method` are required. The optional keys are:
+Only `name` and `method` are required (or `field` or `count`, described below).
+The optional keys are:
 
 - `overload`: the C++ parameter types, when the method is overloaded
 - `arity`: call with only the first N arguments and let the rest default
 - `bind`: fixed C++ arguments, e.g. `{"pri": "Env::BOTTOM"}`
 - `result`: `discard` to drop a result, `borrow` / `slice` / `copy` for a
-  `Slice` or string result, `handle` to return a pointer or smart pointer
+  `Slice` or string result (`c_str` for a `std::string` returned through
+  `c_str()`, without a length), `handle` to return a pointer or smart pointer
   result in a new handle
 - `result_handle`: the handle to return, when several wrap the result's type
 - `out_handle`: a `T*` out-parameter to fill straight into a new handle, which
@@ -377,8 +379,19 @@ Only `name` and `method` are required. The optional keys are:
   keyed by its zero-based position
 - `doc`: comment lines emitted above the declaration in `c.h`
 
-Keys naming a parameter use its C++ name (or position, when unnamed). A
-function listed here must not also be hand-written; regeneration fails if it
+Keys naming a parameter use its C++ name (or position, when unnamed).
+
+A handle whose `rep` is a `std::vector<T>` can also read the vector. An entry
+with `"count": true` returns `rep.size()`, and an entry with `"field": "x"`
+returns `rep[index].x`, where `index` is a C parameter of the type the handle
+names in `index_type` (`int` or `size_t`). Such entries take only `result`,
+`c_types` and `doc`:
+
+```json
+{"name": "rocksdb_livefiles_name", "field": "name", "result": "c_str"}
+```
+
+A function listed here must not also be hand-written; regeneration fails if it
 is. If the C function needs more than the one call, write it by hand in
 `c_base.h` / `c_base.cc` instead.
 

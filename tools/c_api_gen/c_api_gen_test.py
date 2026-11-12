@@ -328,13 +328,17 @@ def _flat(text: str) -> str:
 class FakeIndex:
     """Stands in for handle_bindings.CxxIndex without parsing C++."""
 
-    def __init__(self, methods=None, enums=(), typedefs=None):
+    def __init__(self, methods=None, enums=(), typedefs=None, fields=None):
         self._methods = methods or {}
         self._enums = set(enums)
         self._typedefs = typedefs or {}
+        self._fields = fields or {}
 
     def methods(self, cls, name):
         return list(self._methods.get((cls, name), []))
+
+    def field(self, cls, name):
+        return self._fields.get((cls, name))
 
     def is_enum(self, name):
         return name in self._enums
@@ -717,6 +721,126 @@ class NullableTest(unittest.TestCase):
                     _render(entry, _fn("Use", params))
 
 
+VEC = hb.Handle("rocksdb_vec_t", "std::vector<Elem>", "generated", "v", None, None, "int")
+ELEM_FIELDS = {
+    ("Elem", "level"): "int",
+    ("Elem", "name"): "std::string",
+    ("Elem", "key"): "Slice",
+    ("Elem", "size"): "uint64_t",
+    ("Elem", "seqno"): "SequenceNumber",
+    ("Elem", "kind"): "Kind",
+    ("Elem", "flag"): "bool",
+}
+
+
+def _render_element(entry, handle=VEC):
+    index = FakeIndex({}, ("Kind",), {"SequenceNumber": "uint64_t"}, ELEM_FIELDS)
+    mapper = hb.TypeMapper(index, [handle, THING] + OTHER_HANDLES)
+    full = {"name": "rocksdb_vec_x", **entry}
+    rendered = hb.render_binding(hb.Binding(handle, full), index, mapper)
+    # The signature wraps after `(` only when it is long.
+    return tuple(
+        _flat("\n".join(lines)).replace("( ", "(")
+        for lines in (rendered.decl, rendered.impl)
+    )
+
+
+class ElementAccessTest(unittest.TestCase):
+    """`field` and `count` entries on a std::vector rep."""
+
+    def test_fields(self):
+        cases = [
+            ({"field": "level"}, "int", "return v->rep[index].level;"),
+            ({"field": "seqno"}, "uint64_t", "return v->rep[index].seqno;"),
+            ({"field": "flag"}, "unsigned char", "return v->rep[index].flag;"),
+            (
+                {"field": "kind"},
+                "int",
+                "return ROCKSDB_NAMESPACE::lossless_cast<int>(v->rep[index].kind);",
+            ),
+            (
+                {"field": "size", "c_types": {"return": "size_t"}},
+                "size_t",
+                "return static_cast<size_t>(v->rep[index].size);",
+            ),
+            (
+                {"field": "name", "result": "c_str"},
+                "const char*",
+                "return v->rep[index].name.c_str();",
+            ),
+        ]
+        for entry, ret, statement in cases:
+            with self.subTest(entry=entry):
+                decl, impl = _render_element(entry)
+                self.assertIn(
+                    f"{ret} rocksdb_vec_x(const rocksdb_vec_t* v, int index);", decl
+                )
+                self.assertIn(f"int index) {{ {statement} }}", impl)
+
+    def test_string_field_with_length(self):
+        _, impl = _render_element({"field": "name", "result": "borrow"})
+        self.assertIn(
+            "const char* rocksdb_vec_x(const rocksdb_vec_t* v, int index, "
+            "size_t* len) { const std::string& s = v->rep[index].name; "
+            "*len = s.size(); return s.data(); }",
+            impl,
+        )
+        _, impl = _render_element({"field": "name", "result": "copy"})
+        self.assertIn("*len = s.size(); return CopyString(s); }", impl)
+
+    def test_index_type(self):
+        handle = hb.Handle(
+            "rocksdb_vec_t", "std::vector<Elem>", "generated", "v", None, None, "size_t"
+        )
+        decl, _ = _render_element({"field": "level"}, handle)
+        self.assertIn("rocksdb_vec_x(const rocksdb_vec_t* v, size_t index);", decl)
+
+    def test_count(self):
+        handle = hb.Handle(
+            "rocksdb_vec_t", "std::vector<Elem>", "generated", "v", None, None
+        )
+        _, impl = _render_element({"count": True}, handle)
+        self.assertEqual(
+            impl,
+            "size_t rocksdb_vec_x(const rocksdb_vec_t* v) { return v->rep.size(); }",
+        )
+        _, impl = _render_element({"count": True, "c_types": {"return": "int"}})
+        self.assertIn("{ return static_cast<int>(v->rep.size()); }", impl)
+
+    def test_errors(self):
+        no_index = hb.Handle(
+            "rocksdb_vec_t", "std::vector<Elem>", "generated", "v", None, None
+        )
+        cases = [
+            ({"field": "level"}, THING, "needs a std::vector rep"),
+            ({"count": True}, THING, "needs a std::vector rep"),
+            ({"count": True}, OTHER_HANDLES[2], "needs a std::vector rep"),
+            ({"field": "level"}, no_index, "needs an index_type"),
+            ({"field": "missing"}, VEC, "no public field missing"),
+            ({"field": "level", "method": "X"}, VEC, "one of method, field or count"),
+            ({"field": "level", "count": True}, VEC, "one of method, field or count"),
+            ({}, VEC, "one of method, field or count"),
+            ({"field": "level", "overload": []}, VEC, "do not apply to field"),
+            ({"field": "level", "param_order": []}, VEC, "do not apply to field"),
+            ({"count": True, "receiver_const": False}, VEC, "do not apply to count"),
+            ({"count": 1}, VEC, "count must be true"),
+            ({"field": "name"}, VEC, "needs `result: borrow`"),
+            ({"field": "key", "result": "c_str"}, VEC, "c_str` needs a std::string"),
+            ({"field": "level", "result": "c_str"}, VEC, "does not apply"),
+        ]
+        for entry, handle, message in cases:
+            with self.subTest(entry=entry):
+                with self.assertRaisesRegex(hb.GenError, message):
+                    _render_element(entry, handle)
+
+    def test_c_str_method_results(self):
+        _, impl = _render({"result": "c_str"}, _fn("Name", [], "const std::string &"))
+        self.assertIn("const char* rocksdb_thing_x(rocksdb_thing_t* t) {", impl)
+        self.assertIn("{ return t->rep->Name().c_str(); }", impl)
+        with self.assertRaisesRegex(hb.GenError, "cannot borrow"):
+            _render({"result": "c_str"}, _fn("Name", [], "std::string"))
+
+
 class HandleParamPinTest(unittest.TestCase):
     def test_pin_drops_const(self):
         fn = _fn("Use", [("o", "const Val &")])
@@ -857,6 +981,11 @@ class HandleSchemaTest(unittest.TestCase):
                 "destroy takes",
             ),
             ([self._handle(create="not_rocksdb")], "invalid C function name"),
+            (
+                [self._handle(rep="std::vector<Elem>", index_type="long")],
+                "index_type is int or size_t",
+            ),
+            ([self._handle(index_type="int")], "index_type is int or size_t"),
         ]
         for handles, message in cases:
             with self.subTest(message=message):
@@ -931,6 +1060,7 @@ class CxxIndexTest(unittest.TestCase):
 
     SOURCE = """
         #include <cstdint>
+        #include <string>
         namespace rocksdb {
         struct Slice {};
         class Base {
@@ -961,6 +1091,18 @@ class CxxIndexTest(unittest.TestCase):
         struct Mode2 {
           enum Mode : char { kB };
         };
+        struct FileBase {
+          uint64_t size = 0;
+         private:
+          int base_secret;
+        };
+        class FileMeta : public FileBase {
+         public:
+          std::string name;
+         private:
+          int secret;
+        };
+        class HiddenBase : FileBase {};
         }  // namespace rocksdb
     """
 
@@ -993,6 +1135,18 @@ class CxxIndexTest(unittest.TestCase):
         fn = hb._select("x", self.index.methods("Hider", "Put"), {}, "Put")
         self.assertEqual(fn.owner, "Hider")
         self.assertEqual([p.name for p in fn.params], ["key", "value"])
+
+    def test_fields(self):
+        self.assertEqual(self.index.field("FileMeta", "name"), "std::string")
+        self.assertEqual(self.index.field("FileMeta", "size"), "uint64_t")
+        for cls, name in (
+            ("FileMeta", "secret"),
+            ("FileMeta", "base_secret"),
+            ("FileMeta", "missing"),
+            ("HiddenBase", "size"),
+        ):
+            with self.subTest(cls=cls, name=name):
+                self.assertIsNone(self.index.field(cls, name))
 
     def test_nested_enum(self):
         self.assertTrue(self.index.is_enum("Holder::IndexMode"))

@@ -571,11 +571,42 @@
       "rep": "std::vector<BackupInfo>",
       "struct": "generated",
       "var": "info",
+      "index_type": "int",
       "destroy": {
         "name": "rocksdb_backup_engine_info_destroy",
         "owns_rep": false,
         "receiver_const": true
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_backup_engine_info_count",
+          "count": true,
+          "c_types": {
+            "return": "int"
+          }
+        },
+        {
+          "name": "rocksdb_backup_engine_info_timestamp",
+          "field": "timestamp"
+        },
+        {
+          "name": "rocksdb_backup_engine_info_backup_id",
+          "field": "backup_id"
+        },
+        {
+          "name": "rocksdb_backup_engine_info_size",
+          "field": "size"
+        },
+        {
+          "name": "rocksdb_backup_engine_info_number_files",
+          "field": "number_files"
+        },
+        {
+          "name": "rocksdb_backup_engine_info_app_metadata",
+          "field": "app_metadata",
+          "result": "borrow"
+        }
+      ]
     },
     {
       "c_type": "rocksdb_create_backup_options_t",
@@ -1328,7 +1359,13 @@
       "destroy": {
         "name": "rocksdb_wal_files_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_wal_files_count",
+          "count": true
+        }
+      ]
     },
     {
       "c_type": "rocksdb_filelock_t",
@@ -1593,12 +1630,69 @@
       "rep": "std::vector<LiveFileMetaData>",
       "struct": "generated",
       "var": "lf",
+      "index_type": "int",
       "create": "rocksdb_livefiles_create",
       "destroy": {
         "name": "rocksdb_livefiles_destroy",
         "owns_rep": false,
         "receiver_const": true
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_livefiles_count",
+          "count": true,
+          "c_types": {
+            "return": "int"
+          }
+        },
+        {
+          "name": "rocksdb_livefiles_column_family_name",
+          "field": "column_family_name",
+          "result": "c_str"
+        },
+        {
+          "name": "rocksdb_livefiles_name",
+          "field": "name",
+          "result": "c_str"
+        },
+        {
+          "name": "rocksdb_livefiles_level",
+          "field": "level"
+        },
+        {
+          "name": "rocksdb_livefiles_size",
+          "field": "size",
+          "c_types": {
+            "return": "size_t"
+          }
+        },
+        {
+          "name": "rocksdb_livefiles_smallestkey",
+          "field": "smallestkey",
+          "result": "borrow"
+        },
+        {
+          "name": "rocksdb_livefiles_largestkey",
+          "field": "largestkey",
+          "result": "borrow"
+        },
+        {
+          "name": "rocksdb_livefiles_smallest_seqno",
+          "field": "smallest_seqno"
+        },
+        {
+          "name": "rocksdb_livefiles_largest_seqno",
+          "field": "largest_seqno"
+        },
+        {
+          "name": "rocksdb_livefiles_entries",
+          "field": "num_entries"
+        },
+        {
+          "name": "rocksdb_livefiles_deletions",
+          "field": "num_deletions"
+        }
+      ]
     },
     {
       "c_type": "rocksdb_column_family_handle_t",
@@ -1783,10 +1877,62 @@
       "rep": "std::vector<LiveFileStorageInfo>",
       "struct": "generated",
       "var": "info",
+      "index_type": "size_t",
       "destroy": {
         "name": "rocksdb_livefiles_storage_info_destroy",
         "owns_rep": false
-      }
+      },
+      "methods": [
+        {
+          "name": "rocksdb_livefiles_storage_info_count",
+          "count": true
+        },
+        {
+          "name": "rocksdb_livefiles_storage_info_relative_filename",
+          "field": "relative_filename",
+          "result": "c_str"
+        },
+        {
+          "name": "rocksdb_livefiles_storage_info_directory",
+          "field": "directory",
+          "result": "c_str"
+        },
+        {
+          "name": "rocksdb_livefiles_storage_info_file_number",
+          "field": "file_number"
+        },
+        {
+          "name": "rocksdb_livefiles_storage_info_file_type",
+          "field": "file_type"
+        },
+        {
+          "name": "rocksdb_livefiles_storage_info_size",
+          "field": "size"
+        },
+        {
+          "name": "rocksdb_livefiles_storage_info_temperature",
+          "field": "temperature"
+        },
+        {
+          "name": "rocksdb_livefiles_storage_info_file_checksum",
+          "field": "file_checksum",
+          "result": "c_str"
+        },
+        {
+          "name": "rocksdb_livefiles_storage_info_file_checksum_func_name",
+          "field": "file_checksum_func_name",
+          "result": "c_str"
+        },
+        {
+          "name": "rocksdb_livefiles_storage_info_replacement_contents",
+          "field": "replacement_contents",
+          "result": "borrow"
+        },
+        {
+          "name": "rocksdb_livefiles_storage_info_trim_to_size",
+          "field": "trim_to_size"
+        }
+      ]
     },
     {
       "c_type": "rocksdb_sstfilewriter_t",

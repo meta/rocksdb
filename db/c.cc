@@ -1959,37 +1959,6 @@ void rocksdb_backup_engine_restore_db_from_backup(
                                                  restore_options->rep));
 }
 
-int rocksdb_backup_engine_info_count(const rocksdb_backup_engine_info_t* info) {
-  return static_cast<int>(info->rep.size());
-}
-
-int64_t rocksdb_backup_engine_info_timestamp(
-    const rocksdb_backup_engine_info_t* info, int index) {
-  return info->rep[index].timestamp;
-}
-
-uint32_t rocksdb_backup_engine_info_backup_id(
-    const rocksdb_backup_engine_info_t* info, int index) {
-  return info->rep[index].backup_id;
-}
-
-uint64_t rocksdb_backup_engine_info_size(
-    const rocksdb_backup_engine_info_t* info, int index) {
-  return info->rep[index].size;
-}
-
-uint32_t rocksdb_backup_engine_info_number_files(
-    const rocksdb_backup_engine_info_t* info, int index) {
-  return info->rep[index].number_files;
-}
-
-const char* rocksdb_backup_engine_info_app_metadata(
-    const rocksdb_backup_engine_info_t* info, int index, size_t* len) {
-  const std::string& app_metadata = info->rep[index].app_metadata;
-  *len = app_metadata.size();
-  return app_metadata.data();
-}
-
 rocksdb_backup_engine_options_t* rocksdb_backup_engine_options_create(
     const char* backup_dir) {
   return new rocksdb_backup_engine_options_t{
@@ -3017,10 +2986,6 @@ uint64_t rocksdb_wal_file_size_file_bytes(const rocksdb_wal_file_t* file) {
 }
 
 void rocksdb_wal_file_destroy(rocksdb_wal_file_t* file) { delete file; }
-
-size_t rocksdb_wal_files_count(const rocksdb_wal_files_t* files) {
-  return files->rep.size();
-}
 
 const rocksdb_wal_file_t* rocksdb_wal_files_get_wal_file(
     const rocksdb_wal_files_t* files, size_t index) {
@@ -7437,19 +7402,6 @@ void rocksdb_options_set_min_level_to_compress(rocksdb_options_t* opt,
   }
 }
 
-int rocksdb_livefiles_count(const rocksdb_livefiles_t* lf) {
-  return static_cast<int>(lf->rep.size());
-}
-
-const char* rocksdb_livefiles_column_family_name(const rocksdb_livefiles_t* lf,
-                                                 int index) {
-  return lf->rep[index].column_family_name.c_str();
-}
-
-const char* rocksdb_livefiles_name(const rocksdb_livefiles_t* lf, int index) {
-  return lf->rep[index].name.c_str();
-}
-
 const char* rocksdb_livefiles_directory(const rocksdb_livefiles_t* lf,
                                         int index) {
   if (lf->rep[index].directory.empty()) {
@@ -7458,44 +7410,6 @@ const char* rocksdb_livefiles_directory(const rocksdb_livefiles_t* lf,
   } else {
     return lf->rep[index].directory.c_str();
   }
-}
-
-int rocksdb_livefiles_level(const rocksdb_livefiles_t* lf, int index) {
-  return lf->rep[index].level;
-}
-
-size_t rocksdb_livefiles_size(const rocksdb_livefiles_t* lf, int index) {
-  return lf->rep[index].size;
-}
-
-const char* rocksdb_livefiles_smallestkey(const rocksdb_livefiles_t* lf,
-                                          int index, size_t* size) {
-  *size = lf->rep[index].smallestkey.size();
-  return lf->rep[index].smallestkey.data();
-}
-
-const char* rocksdb_livefiles_largestkey(const rocksdb_livefiles_t* lf,
-                                         int index, size_t* size) {
-  *size = lf->rep[index].largestkey.size();
-  return lf->rep[index].largestkey.data();
-}
-
-uint64_t rocksdb_livefiles_smallest_seqno(const rocksdb_livefiles_t* lf,
-                                          int index) {
-  return lf->rep[index].smallest_seqno;
-}
-
-uint64_t rocksdb_livefiles_largest_seqno(const rocksdb_livefiles_t* lf,
-                                         int index) {
-  return lf->rep[index].largest_seqno;
-}
-
-uint64_t rocksdb_livefiles_entries(const rocksdb_livefiles_t* lf, int index) {
-  return lf->rep[index].num_entries;
-}
-
-uint64_t rocksdb_livefiles_deletions(const rocksdb_livefiles_t* lf, int index) {
-  return lf->rep[index].num_deletions;
 }
 
 rocksdb_livefiles_storage_info_t* rocksdb_get_livefiles_storage_info(
@@ -7511,62 +7425,6 @@ rocksdb_livefiles_storage_info_t* rocksdb_get_livefiles_storage_info(
     return nullptr;
   }
   return result;
-}
-
-size_t rocksdb_livefiles_storage_info_count(
-    const rocksdb_livefiles_storage_info_t* info) {
-  return info->rep.size();
-}
-
-const char* rocksdb_livefiles_storage_info_relative_filename(
-    const rocksdb_livefiles_storage_info_t* info, size_t index) {
-  return info->rep[index].relative_filename.c_str();
-}
-
-const char* rocksdb_livefiles_storage_info_directory(
-    const rocksdb_livefiles_storage_info_t* info, size_t index) {
-  return info->rep[index].directory.c_str();
-}
-
-uint64_t rocksdb_livefiles_storage_info_file_number(
-    const rocksdb_livefiles_storage_info_t* info, size_t index) {
-  return info->rep[index].file_number;
-}
-
-int rocksdb_livefiles_storage_info_file_type(
-    const rocksdb_livefiles_storage_info_t* info, size_t index) {
-  return static_cast<int>(info->rep[index].file_type);
-}
-
-uint64_t rocksdb_livefiles_storage_info_size(
-    const rocksdb_livefiles_storage_info_t* info, size_t index) {
-  return info->rep[index].size;
-}
-
-int rocksdb_livefiles_storage_info_temperature(
-    const rocksdb_livefiles_storage_info_t* info, size_t index) {
-  return static_cast<int>(info->rep[index].temperature);
-}
-
-const char* rocksdb_livefiles_storage_info_file_checksum(
-    const rocksdb_livefiles_storage_info_t* info, size_t index) {
-  return info->rep[index].file_checksum.c_str();
-}
-
-const char* rocksdb_livefiles_storage_info_file_checksum_func_name(
-    const rocksdb_livefiles_storage_info_t* info, size_t index) {
-  return info->rep[index].file_checksum_func_name.c_str();
-}
-
-const char* rocksdb_livefiles_storage_info_replacement_contents(
-    const rocksdb_livefiles_storage_info_t* info, size_t index, size_t* size) {
-  *size = info->rep[index].replacement_contents.size();
-  return info->rep[index].replacement_contents.data();
-}
-
-unsigned char rocksdb_livefiles_storage_info_trim_to_size(
-    const rocksdb_livefiles_storage_info_t* info, size_t index) {
-  return info->rep[index].trim_to_size;
 }
 
 void rocksdb_livefile_set_column_family_name(rocksdb_livefile_t* lf,
@@ -13286,6 +13144,37 @@ void rocksdb_backup_engine_info_destroy(
   delete info;
 }
 
+int rocksdb_backup_engine_info_count(const rocksdb_backup_engine_info_t* info) {
+  return static_cast<int>(info->rep.size());
+}
+
+int64_t rocksdb_backup_engine_info_timestamp(
+    const rocksdb_backup_engine_info_t* info, int index) {
+  return info->rep[index].timestamp;
+}
+
+uint32_t rocksdb_backup_engine_info_backup_id(
+    const rocksdb_backup_engine_info_t* info, int index) {
+  return info->rep[index].backup_id;
+}
+
+uint64_t rocksdb_backup_engine_info_size(
+    const rocksdb_backup_engine_info_t* info, int index) {
+  return info->rep[index].size;
+}
+
+uint32_t rocksdb_backup_engine_info_number_files(
+    const rocksdb_backup_engine_info_t* info, int index) {
+  return info->rep[index].number_files;
+}
+
+const char* rocksdb_backup_engine_info_app_metadata(
+    const rocksdb_backup_engine_info_t* info, int index, size_t* len) {
+  const std::string& s = info->rep[index].app_metadata;
+  *len = s.size();
+  return s.data();
+}
+
 /* rocksdb_create_backup_options_t */
 
 rocksdb_create_backup_options_t* rocksdb_create_backup_options_create() {
@@ -13841,6 +13730,10 @@ void rocksdb_wal_readoptions_destroy(rocksdb_wal_readoptions_t* options) {
 
 void rocksdb_wal_files_destroy(rocksdb_wal_files_t* files) { delete files; }
 
+size_t rocksdb_wal_files_count(const rocksdb_wal_files_t* files) {
+  return files->rep.size();
+}
+
 /* rocksdb_logger_t */
 
 void rocksdb_logger_destroy(rocksdb_logger_t* logger) { delete logger; }
@@ -14048,6 +13941,59 @@ rocksdb_livefiles_t* rocksdb_livefiles_create() {
 
 void rocksdb_livefiles_destroy(const rocksdb_livefiles_t* lf) { delete lf; }
 
+int rocksdb_livefiles_count(const rocksdb_livefiles_t* lf) {
+  return static_cast<int>(lf->rep.size());
+}
+
+const char* rocksdb_livefiles_column_family_name(const rocksdb_livefiles_t* lf,
+                                                 int index) {
+  return lf->rep[index].column_family_name.c_str();
+}
+
+const char* rocksdb_livefiles_name(const rocksdb_livefiles_t* lf, int index) {
+  return lf->rep[index].name.c_str();
+}
+
+int rocksdb_livefiles_level(const rocksdb_livefiles_t* lf, int index) {
+  return lf->rep[index].level;
+}
+
+size_t rocksdb_livefiles_size(const rocksdb_livefiles_t* lf, int index) {
+  return static_cast<size_t>(lf->rep[index].size);
+}
+
+const char* rocksdb_livefiles_smallestkey(const rocksdb_livefiles_t* lf,
+                                          int index, size_t* len) {
+  const std::string& s = lf->rep[index].smallestkey;
+  *len = s.size();
+  return s.data();
+}
+
+const char* rocksdb_livefiles_largestkey(const rocksdb_livefiles_t* lf,
+                                         int index, size_t* len) {
+  const std::string& s = lf->rep[index].largestkey;
+  *len = s.size();
+  return s.data();
+}
+
+uint64_t rocksdb_livefiles_smallest_seqno(const rocksdb_livefiles_t* lf,
+                                          int index) {
+  return lf->rep[index].smallest_seqno;
+}
+
+uint64_t rocksdb_livefiles_largest_seqno(const rocksdb_livefiles_t* lf,
+                                         int index) {
+  return lf->rep[index].largest_seqno;
+}
+
+uint64_t rocksdb_livefiles_entries(const rocksdb_livefiles_t* lf, int index) {
+  return lf->rep[index].num_entries;
+}
+
+uint64_t rocksdb_livefiles_deletions(const rocksdb_livefiles_t* lf, int index) {
+  return lf->rep[index].num_deletions;
+}
+
 /* rocksdb_column_family_handle_t */
 
 uint32_t rocksdb_column_family_handle_get_id(
@@ -14192,6 +14138,63 @@ void rocksdb_livefiles_storage_info_options_destroy(
 void rocksdb_livefiles_storage_info_destroy(
     rocksdb_livefiles_storage_info_t* info) {
   delete info;
+}
+
+size_t rocksdb_livefiles_storage_info_count(
+    const rocksdb_livefiles_storage_info_t* info) {
+  return info->rep.size();
+}
+
+const char* rocksdb_livefiles_storage_info_relative_filename(
+    const rocksdb_livefiles_storage_info_t* info, size_t index) {
+  return info->rep[index].relative_filename.c_str();
+}
+
+const char* rocksdb_livefiles_storage_info_directory(
+    const rocksdb_livefiles_storage_info_t* info, size_t index) {
+  return info->rep[index].directory.c_str();
+}
+
+uint64_t rocksdb_livefiles_storage_info_file_number(
+    const rocksdb_livefiles_storage_info_t* info, size_t index) {
+  return info->rep[index].file_number;
+}
+
+int rocksdb_livefiles_storage_info_file_type(
+    const rocksdb_livefiles_storage_info_t* info, size_t index) {
+  return ROCKSDB_NAMESPACE::lossless_cast<int>(info->rep[index].file_type);
+}
+
+uint64_t rocksdb_livefiles_storage_info_size(
+    const rocksdb_livefiles_storage_info_t* info, size_t index) {
+  return info->rep[index].size;
+}
+
+int rocksdb_livefiles_storage_info_temperature(
+    const rocksdb_livefiles_storage_info_t* info, size_t index) {
+  return ROCKSDB_NAMESPACE::lossless_cast<int>(info->rep[index].temperature);
+}
+
+const char* rocksdb_livefiles_storage_info_file_checksum(
+    const rocksdb_livefiles_storage_info_t* info, size_t index) {
+  return info->rep[index].file_checksum.c_str();
+}
+
+const char* rocksdb_livefiles_storage_info_file_checksum_func_name(
+    const rocksdb_livefiles_storage_info_t* info, size_t index) {
+  return info->rep[index].file_checksum_func_name.c_str();
+}
+
+const char* rocksdb_livefiles_storage_info_replacement_contents(
+    const rocksdb_livefiles_storage_info_t* info, size_t index, size_t* len) {
+  const std::string& s = info->rep[index].replacement_contents;
+  *len = s.size();
+  return s.data();
+}
+
+unsigned char rocksdb_livefiles_storage_info_trim_to_size(
+    const rocksdb_livefiles_storage_info_t* info, size_t index) {
+  return info->rep[index].trim_to_size;
 }
 
 /* rocksdb_sstfilewriter_t */

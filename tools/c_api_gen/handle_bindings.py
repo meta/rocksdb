@@ -35,7 +35,9 @@ The C signature of a method is derived from the C++ declaration
   Slice / const std::string&     const char* (borrowed, `result: borrow`) or
                                  malloc()ed char* (`result: copy`), plus a
                                  trailing `size_t* len`; or a borrowed
-                                 rocksdb_slice_t (`result: slice`)
+                                 rocksdb_slice_t (`result: slice`); or, for a
+                                 std::string only, its borrowed NUL-terminated
+                                 c_str() (`result: c_str`)
   std::string by value           malloc()ed char* (`result: copy`) only
   T* / shared_ptr<T> /           a new handle holding it (`result: handle`)
   unique_ptr<T>
@@ -47,6 +49,12 @@ A parameter listed in `nullable` accepts a NULL C pointer:
   -----------------------------  ---------------------------------------
   const Slice *                  nullptr (C: const char* x, size_t x_len)
   const T & (value handle rep)   a default-constructed T
+
+A handle whose rep is a std::vector<T> can also have entries that read the
+vector instead of calling a method: `count` returns rep.size(), and `field`
+returns one public data member of rep[index], taking the index as a C
+parameter of the handle's `index_type`. A std::string member is returned like
+a `const std::string&` result.
 
 A `T*` out-parameter named by `out_handle` is filled straight into a new
 handle, which the C function returns. A `T*` parameter listed in `consumes`
@@ -91,10 +99,21 @@ SOURCE_OUT = GENERATED_ROOT / "c_generated_handles.cc.inc"
 OWN_OUTPUTS = {STRUCTS_OUT.name, HEADER_OUT.name, SOURCE_OUT.name}
 
 SCHEMA_VERSION = 1
-HANDLE_KEYS = {"c_type", "rep", "struct", "var", "create", "destroy", "methods"}
+HANDLE_KEYS = {
+    "c_type",
+    "rep",
+    "struct",
+    "var",
+    "create",
+    "destroy",
+    "index_type",
+    "methods",
+}
 METHOD_KEYS = {
     "name",
     "method",
+    "field",
+    "count",
     "overload",
     "arity",
     "bind",
@@ -188,7 +207,13 @@ class Handle:
     var: str
     create: str | None
     destroy: dict | None
+    index_type: str | None = None
     bindings: list[Binding] = field(default_factory=list)
+
+    def element(self) -> str | None:
+        """The element type of a std::vector rep."""
+        m = re.fullmatch(r"std::vector<\s*([\w:]+)\s*>", norm_type(self.rep))
+        return m and m.group(1)
 
     def rep_kind(self) -> tuple[str, str]:
         """Return (kind, C++ class) of rep: value, pointer, shared or unique."""
@@ -254,8 +279,15 @@ def load_handles(path: Path) -> tuple[list[str], list[Handle]]:
             var=raw["var"],
             create=raw.get("create"),
             destroy=destroy,
+            index_type=raw.get("index_type"),
         )
         handle.rep_kind()  # validate
+        if handle.index_type is not None and (
+            handle.index_type not in ("int", "size_t") or handle.element() is None
+        ):
+            raise GenError(
+                f"{c_type}: index_type is int or size_t, for a std::vector rep"
+            )
         if (
             destroy is not None
             and destroy["owns_rep"]
@@ -385,6 +417,26 @@ class CxxIndex:
     def typedef_target(self, name: str) -> str | None:
         node = self._find(name, ("TypedefDecl", "TypeAliasDecl"))
         return None if node is None else norm_type(node["type"]["qualType"])
+
+    def field(self, cls: str, name: str) -> str | None:
+        """The type of public data member `name` of `cls` or a public base."""
+        node = self.record(cls)
+        access = "private" if node.get("tagUsed") == "class" else "public"
+        for child in node.get("inner", []) or []:
+            if child.get("kind") == "AccessSpecDecl":
+                access = child.get("access", access)
+            elif child.get("kind") == "FieldDecl" and child.get("name") == name:
+                if access != "public":
+                    return None
+                return norm_type(child["type"]["qualType"])
+        for base in node.get("bases", []):
+            if base.get("access") == "public":
+                base_name = norm_type(base["type"]["qualType"]).split("<")[0]
+                self.prefetch([base_name])
+                found = self.field(base_name, name)
+                if found is not None:
+                    return found
+        return None
 
     def methods(self, cls: str, name: str) -> list[Function]:
         """Public overloads of `name` that a call through `cls` can resolve to.
@@ -730,17 +782,51 @@ def _select(name: str, candidates: list[Function], entry: dict, label: str) -> F
     return unique[0]
 
 
+# The keys an entry that reads a std::vector rep (`field` or `count`) takes.
+ELEMENT_KEYS = {"name", "field", "count", "result", "c_types", "doc"}
+
+
+def _element_access(entry: dict, handle: Handle, index: CxxIndex) -> Function:
+    """A const accessor standing in for the C++ method a `field` or `count`
+    entry would otherwise call."""
+    name = entry["name"]
+    access = [k for k in ("method", "field", "count") if k in entry]
+    if len(access) != 1:
+        raise GenError(f"{name}: an entry takes one of method, field or count")
+    extra = set(entry) - ELEMENT_KEYS
+    if extra:
+        raise GenError(f"{name}: {sorted(extra)} do not apply to {access[0]}")
+    element = handle.element()
+    if element is None:
+        raise GenError(f"{name}: {access[0]} needs a std::vector rep")
+    if "count" in entry:
+        if entry["count"] is not True:
+            raise GenError(f"{name}: count must be true")
+        return Function(element, "size", [], "size_t", True)
+    if handle.index_type is None:
+        raise GenError(f"{name}: field needs an index_type on {handle.c_type}")
+    cxx = index.field(element, entry["field"])
+    if cxx is None:
+        raise GenError(f"{name}: {element} has no public field {entry['field']}")
+    # The member is an lvalue that lives as long as the handle.
+    result = "const std::string &" if cxx == "std::string" else cxx
+    return Function(element, entry["field"], [], result, True)
+
+
 def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Rendered:
     entry = binding.entry
     name = entry["name"]
     handle = binding.handle
     kind, cls = handle.rep_kind()
-    fn = _select(
-        name,
-        index.methods(cls, entry["method"]),
-        entry,
-        f"method {cls}::{entry['method']}",
-    )
+    if "method" in entry and not {"field", "count"} & set(entry):
+        fn = _select(
+            name,
+            index.methods(cls, entry["method"]),
+            entry,
+            f"method {cls}::{entry['method']}",
+        )
+    else:
+        fn = _element_access(entry, handle, index)
 
     # Entry keys name a C++ parameter by its name, or by its zero-based
     # position when the declaration leaves it unnamed.
@@ -774,6 +860,8 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
     c_params.append(
         CParam(f"{'const ' if receiver_const else ''}{handle.c_type}*", handle.var)
     )
+    if "field" in entry:
+        c_params.append(CParam(handle.index_type, "index"))
     # The handle a `result: handle` or `out_handle` call returns.
     new_handle: Handle | None = None
     out_name = entry.get("out_handle")
@@ -873,7 +961,10 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
         local_names.append("result")
 
     access = "." if kind == "value" else "->"
-    call = f"{handle.var}->rep{access}{fn.name}({', '.join(args)})"
+    if "field" in entry:
+        call = f"{handle.var}->rep[index].{fn.name}"
+    else:
+        call = f"{handle.var}->rep{access}{fn.name}({', '.join(args)})"
 
     result_policy = entry.get("result")
     body: list[str] = []
@@ -909,16 +1000,22 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
         c_params.append(CParam("char**", "errptr"))
         body.append(f"SaveError(errptr, {call});")
     elif result in STRING_RESULT_TYPES:
-        if result_policy not in ("borrow", "slice", "copy"):
+        if result_policy not in ("borrow", "slice", "copy", "c_str"):
             raise GenError(
                 f"{name}: string result {fn.result!r} needs `result: borrow`, "
-                "`result: slice` or `result: copy`"
+                "`result: slice`, `result: copy` or `result: c_str`"
             )
         local_type = STRING_RESULT_TYPES[result]
         if result_policy != "copy" and local_type == "std::string":
             raise GenError(f"{name}: cannot borrow a std::string returned by value")
-        body.append(f"{local_type} s = {call};")
-        if result_policy == "slice":
+        if result_policy == "c_str" and local_type != "const std::string&":
+            raise GenError(f"{name}: `result: c_str` needs a std::string")
+        if result_policy != "c_str":
+            body.append(f"{local_type} s = {call};")
+        if result_policy == "c_str":
+            ret = "const char*"
+            body.append(f"return {call}.c_str();")
+        elif result_policy == "slice":
             ret = "rocksdb_slice_t"
             body += [
                 "rocksdb_slice_t result;",
@@ -1060,7 +1157,14 @@ def generate(clang: str, path: Path = HANDLES_PATH) -> dict[Path, str]:
     taken = existing_names()
     index = CxxIndex(clang, headers)
     try:
-        index.prefetch([h.rep_kind()[1] for h in handles if h.bindings])
+        index.prefetch(
+            {
+                h.element() if "field" in b.entry else h.rep_kind()[1]
+                for h in handles
+                for b in h.bindings
+                if "count" not in b.entry
+            }
+        )
         mapper = TypeMapper(index, handles)
         structs = list(BANNER)
         header = list(BANNER)

@@ -297,24 +297,6 @@ extern ROCKSDB_LIBRARY_API void rocksdb_backup_engine_restore_db_from_backup(
     const rocksdb_restore_options_t* restore_options, const uint32_t backup_id,
     char** errptr);
 
-extern ROCKSDB_LIBRARY_API int rocksdb_backup_engine_info_count(
-    const rocksdb_backup_engine_info_t* info);
-
-extern ROCKSDB_LIBRARY_API int64_t rocksdb_backup_engine_info_timestamp(
-    const rocksdb_backup_engine_info_t* info, int index);
-
-extern ROCKSDB_LIBRARY_API uint32_t rocksdb_backup_engine_info_backup_id(
-    const rocksdb_backup_engine_info_t* info, int index);
-
-extern ROCKSDB_LIBRARY_API uint64_t rocksdb_backup_engine_info_size(
-    const rocksdb_backup_engine_info_t* info, int index);
-
-extern ROCKSDB_LIBRARY_API uint32_t rocksdb_backup_engine_info_number_files(
-    const rocksdb_backup_engine_info_t* info, int index);
-
-extern ROCKSDB_LIBRARY_API const char* rocksdb_backup_engine_info_app_metadata(
-    const rocksdb_backup_engine_info_t* info, int index, size_t* len);
-
 // BEGIN generated: c_generated_db_simple_subset.h.inc
 // @generated
 // -----------------------------------------------------------------------------
@@ -770,8 +752,6 @@ extern ROCKSDB_LIBRARY_API uint64_t
 rocksdb_wal_file_size_file_bytes(const rocksdb_wal_file_t* file);
 extern ROCKSDB_LIBRARY_API void rocksdb_wal_file_destroy(
     rocksdb_wal_file_t* file);
-extern ROCKSDB_LIBRARY_API size_t
-rocksdb_wal_files_count(const rocksdb_wal_files_t* files);
 extern ROCKSDB_LIBRARY_API const rocksdb_wal_file_t*
 rocksdb_wal_files_get_wal_file(const rocksdb_wal_files_t* files, size_t index);
 
@@ -2830,62 +2810,13 @@ rocksdb_universal_compaction_options_create(void);
 extern ROCKSDB_LIBRARY_API rocksdb_fifo_compaction_options_t*
 rocksdb_fifo_compaction_options_create(void);
 
-extern ROCKSDB_LIBRARY_API int rocksdb_livefiles_count(
-    const rocksdb_livefiles_t*);
-extern ROCKSDB_LIBRARY_API const char* rocksdb_livefiles_column_family_name(
-    const rocksdb_livefiles_t*, int index);
-extern ROCKSDB_LIBRARY_API const char* rocksdb_livefiles_name(
-    const rocksdb_livefiles_t*, int index);
 extern ROCKSDB_LIBRARY_API const char* rocksdb_livefiles_directory(
     const rocksdb_livefiles_t*, int index);
-extern ROCKSDB_LIBRARY_API int rocksdb_livefiles_level(
-    const rocksdb_livefiles_t*, int index);
-extern ROCKSDB_LIBRARY_API size_t
-rocksdb_livefiles_size(const rocksdb_livefiles_t*, int index);
-extern ROCKSDB_LIBRARY_API const char* rocksdb_livefiles_smallestkey(
-    const rocksdb_livefiles_t*, int index, size_t* size);
-extern ROCKSDB_LIBRARY_API const char* rocksdb_livefiles_largestkey(
-    const rocksdb_livefiles_t*, int index, size_t* size);
-extern ROCKSDB_LIBRARY_API uint64_t
-rocksdb_livefiles_smallest_seqno(const rocksdb_livefiles_t*, int index);
-extern ROCKSDB_LIBRARY_API uint64_t
-rocksdb_livefiles_largest_seqno(const rocksdb_livefiles_t*, int index);
-extern ROCKSDB_LIBRARY_API uint64_t
-rocksdb_livefiles_entries(const rocksdb_livefiles_t*, int index);
-extern ROCKSDB_LIBRARY_API uint64_t
-rocksdb_livefiles_deletions(const rocksdb_livefiles_t*, int index);
 
 extern ROCKSDB_LIBRARY_API rocksdb_livefiles_storage_info_t*
 rocksdb_get_livefiles_storage_info(
     rocksdb_t* db, const rocksdb_livefiles_storage_info_options_t* options,
     char** errptr);
-extern ROCKSDB_LIBRARY_API size_t rocksdb_livefiles_storage_info_count(
-    const rocksdb_livefiles_storage_info_t* info);
-extern ROCKSDB_LIBRARY_API const char*
-rocksdb_livefiles_storage_info_relative_filename(
-    const rocksdb_livefiles_storage_info_t* info, size_t index);
-extern ROCKSDB_LIBRARY_API const char* rocksdb_livefiles_storage_info_directory(
-    const rocksdb_livefiles_storage_info_t* info, size_t index);
-extern ROCKSDB_LIBRARY_API uint64_t rocksdb_livefiles_storage_info_file_number(
-    const rocksdb_livefiles_storage_info_t* info, size_t index);
-extern ROCKSDB_LIBRARY_API int rocksdb_livefiles_storage_info_file_type(
-    const rocksdb_livefiles_storage_info_t* info, size_t index);
-extern ROCKSDB_LIBRARY_API uint64_t rocksdb_livefiles_storage_info_size(
-    const rocksdb_livefiles_storage_info_t* info, size_t index);
-extern ROCKSDB_LIBRARY_API int rocksdb_livefiles_storage_info_temperature(
-    const rocksdb_livefiles_storage_info_t* info, size_t index);
-extern ROCKSDB_LIBRARY_API const char*
-rocksdb_livefiles_storage_info_file_checksum(
-    const rocksdb_livefiles_storage_info_t* info, size_t index);
-extern ROCKSDB_LIBRARY_API const char*
-rocksdb_livefiles_storage_info_file_checksum_func_name(
-    const rocksdb_livefiles_storage_info_t* info, size_t index);
-extern ROCKSDB_LIBRARY_API const char*
-rocksdb_livefiles_storage_info_replacement_contents(
-    const rocksdb_livefiles_storage_info_t* info, size_t index, size_t* size);
-extern ROCKSDB_LIBRARY_API unsigned char
-rocksdb_livefiles_storage_info_trim_to_size(
-    const rocksdb_livefiles_storage_info_t* info, size_t index);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_livefile_set_column_family_name(
     rocksdb_livefile_t*, const char*);
@@ -3804,6 +3735,24 @@ rocksdb_backup_engine_get_backup_info(rocksdb_backup_engine_t* be);
 extern ROCKSDB_LIBRARY_API void rocksdb_backup_engine_info_destroy(
     const rocksdb_backup_engine_info_t* info);
 
+extern ROCKSDB_LIBRARY_API int rocksdb_backup_engine_info_count(
+    const rocksdb_backup_engine_info_t* info);
+
+extern ROCKSDB_LIBRARY_API int64_t rocksdb_backup_engine_info_timestamp(
+    const rocksdb_backup_engine_info_t* info, int index);
+
+extern ROCKSDB_LIBRARY_API uint32_t rocksdb_backup_engine_info_backup_id(
+    const rocksdb_backup_engine_info_t* info, int index);
+
+extern ROCKSDB_LIBRARY_API uint64_t rocksdb_backup_engine_info_size(
+    const rocksdb_backup_engine_info_t* info, int index);
+
+extern ROCKSDB_LIBRARY_API uint32_t rocksdb_backup_engine_info_number_files(
+    const rocksdb_backup_engine_info_t* info, int index);
+
+extern ROCKSDB_LIBRARY_API const char* rocksdb_backup_engine_info_app_metadata(
+    const rocksdb_backup_engine_info_t* info, int index, size_t* len);
+
 /* rocksdb_create_backup_options_t */
 
 extern ROCKSDB_LIBRARY_API rocksdb_create_backup_options_t*
@@ -4189,6 +4138,9 @@ extern ROCKSDB_LIBRARY_API void rocksdb_wal_readoptions_destroy(
 extern ROCKSDB_LIBRARY_API void rocksdb_wal_files_destroy(
     rocksdb_wal_files_t* files);
 
+extern ROCKSDB_LIBRARY_API size_t
+rocksdb_wal_files_count(const rocksdb_wal_files_t* files);
+
 /* rocksdb_logger_t */
 
 extern ROCKSDB_LIBRARY_API void rocksdb_logger_destroy(
@@ -4347,6 +4299,39 @@ extern ROCKSDB_LIBRARY_API rocksdb_livefiles_t* rocksdb_livefiles_create(void);
 extern ROCKSDB_LIBRARY_API void rocksdb_livefiles_destroy(
     const rocksdb_livefiles_t* lf);
 
+extern ROCKSDB_LIBRARY_API int rocksdb_livefiles_count(
+    const rocksdb_livefiles_t* lf);
+
+extern ROCKSDB_LIBRARY_API const char* rocksdb_livefiles_column_family_name(
+    const rocksdb_livefiles_t* lf, int index);
+
+extern ROCKSDB_LIBRARY_API const char* rocksdb_livefiles_name(
+    const rocksdb_livefiles_t* lf, int index);
+
+extern ROCKSDB_LIBRARY_API int rocksdb_livefiles_level(
+    const rocksdb_livefiles_t* lf, int index);
+
+extern ROCKSDB_LIBRARY_API size_t
+rocksdb_livefiles_size(const rocksdb_livefiles_t* lf, int index);
+
+extern ROCKSDB_LIBRARY_API const char* rocksdb_livefiles_smallestkey(
+    const rocksdb_livefiles_t* lf, int index, size_t* len);
+
+extern ROCKSDB_LIBRARY_API const char* rocksdb_livefiles_largestkey(
+    const rocksdb_livefiles_t* lf, int index, size_t* len);
+
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_livefiles_smallest_seqno(const rocksdb_livefiles_t* lf, int index);
+
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_livefiles_largest_seqno(const rocksdb_livefiles_t* lf, int index);
+
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_livefiles_entries(const rocksdb_livefiles_t* lf, int index);
+
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_livefiles_deletions(const rocksdb_livefiles_t* lf, int index);
+
 /* rocksdb_column_family_handle_t */
 
 extern ROCKSDB_LIBRARY_API uint32_t
@@ -4452,6 +4437,44 @@ extern ROCKSDB_LIBRARY_API void rocksdb_livefiles_storage_info_options_destroy(
 
 extern ROCKSDB_LIBRARY_API void rocksdb_livefiles_storage_info_destroy(
     rocksdb_livefiles_storage_info_t* info);
+
+extern ROCKSDB_LIBRARY_API size_t rocksdb_livefiles_storage_info_count(
+    const rocksdb_livefiles_storage_info_t* info);
+
+extern ROCKSDB_LIBRARY_API const char*
+rocksdb_livefiles_storage_info_relative_filename(
+    const rocksdb_livefiles_storage_info_t* info, size_t index);
+
+extern ROCKSDB_LIBRARY_API const char* rocksdb_livefiles_storage_info_directory(
+    const rocksdb_livefiles_storage_info_t* info, size_t index);
+
+extern ROCKSDB_LIBRARY_API uint64_t rocksdb_livefiles_storage_info_file_number(
+    const rocksdb_livefiles_storage_info_t* info, size_t index);
+
+extern ROCKSDB_LIBRARY_API int rocksdb_livefiles_storage_info_file_type(
+    const rocksdb_livefiles_storage_info_t* info, size_t index);
+
+extern ROCKSDB_LIBRARY_API uint64_t rocksdb_livefiles_storage_info_size(
+    const rocksdb_livefiles_storage_info_t* info, size_t index);
+
+extern ROCKSDB_LIBRARY_API int rocksdb_livefiles_storage_info_temperature(
+    const rocksdb_livefiles_storage_info_t* info, size_t index);
+
+extern ROCKSDB_LIBRARY_API const char*
+rocksdb_livefiles_storage_info_file_checksum(
+    const rocksdb_livefiles_storage_info_t* info, size_t index);
+
+extern ROCKSDB_LIBRARY_API const char*
+rocksdb_livefiles_storage_info_file_checksum_func_name(
+    const rocksdb_livefiles_storage_info_t* info, size_t index);
+
+extern ROCKSDB_LIBRARY_API const char*
+rocksdb_livefiles_storage_info_replacement_contents(
+    const rocksdb_livefiles_storage_info_t* info, size_t index, size_t* len);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_livefiles_storage_info_trim_to_size(
+    const rocksdb_livefiles_storage_info_t* info, size_t index);
 
 /* rocksdb_sstfilewriter_t */
 

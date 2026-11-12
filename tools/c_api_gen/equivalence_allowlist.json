@@ -35,6 +35,18 @@
     {
       "name": "rocksdb_suggest_compact_range_cf",
       "reason": "Equivalent: the hand-written body stored the Status in a local that it only passed to SaveError(errptr, s); the generated body passes the call's result to SaveError directly."
+    },
+    {
+      "name": "rocksdb_livefiles_smallestkey",
+      "reason": "Equivalent: the hand-written body read the std::string member smallestkey twice, for size() and data(); the generated body binds it to a const std::string& once and reads both from that."
+    },
+    {
+      "name": "rocksdb_livefiles_largestkey",
+      "reason": "Equivalent: the hand-written body read the std::string member largestkey twice, for size() and data(); the generated body binds it to a const std::string& once and reads both from that."
+    },
+    {
+      "name": "rocksdb_livefiles_storage_info_replacement_contents",
+      "reason": "Equivalent: the hand-written body read the std::string member replacement_contents twice, for size() and data(); the generated body binds it to a const std::string& once and reads both from that."
     }
   ]
 }

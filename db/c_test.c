@@ -1670,6 +1670,13 @@ int main(int argc, char** argv) {
         const char* app_metadata = rocksdb_backup_engine_info_app_metadata(
             bei, latest_backup, &app_metadata_len);
         CheckEqual("meta-1", app_metadata, app_metadata_len);
+        CheckCondition(rocksdb_backup_engine_info_backup_id(
+                           bei, latest_backup) == backup_id);
+        CheckCondition(
+            rocksdb_backup_engine_info_timestamp(bei, latest_backup) > 0);
+        CheckCondition(rocksdb_backup_engine_info_size(bei, latest_backup) > 0);
+        CheckCondition(
+            rocksdb_backup_engine_info_number_files(bei, latest_backup) > 0);
       }
       rocksdb_backup_engine_info_destroy(bei);
     }
@@ -1895,6 +1902,35 @@ int main(int argc, char** argv) {
   StartPhase("compactrangeopt");
   rocksdb_compact_range_opt(db, coptions, "a", 1, "z", 1);
   CheckGet(db, roptions, "foo", "hello");
+
+  StartPhase("livefiles");
+  {
+    const rocksdb_livefiles_t* files = rocksdb_livefiles(db);
+    CheckCondition(rocksdb_livefiles_count(files) > 0);
+    for (int i = 0; i < rocksdb_livefiles_count(files); i++) {
+      CheckCondition(strcmp(rocksdb_livefiles_column_family_name(files, i),
+                            "default") == 0);
+      CheckCondition(strstr(rocksdb_livefiles_name(files, i), ".sst") != NULL);
+      CheckCondition(rocksdb_livefiles_level(files, i) >= 0);
+      CheckCondition(rocksdb_livefiles_size(files, i) > 0);
+      size_t smallest_len = 0;
+      size_t largest_len = 0;
+      const char* smallest =
+          rocksdb_livefiles_smallestkey(files, i, &smallest_len);
+      const char* largest =
+          rocksdb_livefiles_largestkey(files, i, &largest_len);
+      CheckCondition(smallest_len > 0 && largest_len > 0);
+      size_t common = smallest_len < largest_len ? smallest_len : largest_len;
+      int order = memcmp(smallest, largest, common);
+      CheckCondition(order < 0 || (order == 0 && smallest_len <= largest_len));
+      CheckCondition(rocksdb_livefiles_smallest_seqno(files, i) <=
+                     rocksdb_livefiles_largest_seqno(files, i));
+      CheckCondition(rocksdb_livefiles_entries(files, i) > 0);
+      CheckCondition(rocksdb_livefiles_deletions(files, i) <=
+                     rocksdb_livefiles_entries(files, i));
+    }
+    rocksdb_livefiles_destroy(files);
+  }
 
   // Simple check cache usage
   StartPhase("cache_usage");
