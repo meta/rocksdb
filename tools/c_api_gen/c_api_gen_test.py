@@ -721,6 +721,97 @@ class NullableTest(unittest.TestCase):
                     _render(entry, _fn("Use", params))
 
 
+class SlicePartsTest(unittest.TestCase):
+    """const SliceParts & parameters, built from C arrays."""
+
+    KV = [("key", "const SliceParts &"), ("value", "const SliceParts &")]
+    RANGE = [("begin", "const SliceParts &"), ("end", "const SliceParts &")]
+
+    def _render(self, entry, params):
+        decl, impl = _render(
+            {"result": "discard", **entry}, _fn("Put", params, "Status")
+        )
+        return decl.replace("( ", "("), impl.replace("( ", "(")
+
+    def test_each_parameter_has_its_own_count(self):
+        decl, impl = self._render({"param_names": {"key": "keys"}}, self.KV)
+        self.assertIn(
+            "void rocksdb_thing_x(rocksdb_thing_t* t, int num_keys, "
+            "const char* const* keys_list, const size_t* keys_list_sizes, "
+            "int num_value, const char* const* value_list, "
+            "const size_t* value_list_sizes);",
+            decl,
+        )
+        self.assertIn(
+            "{ std::unique_ptr<Slice[]> keys_slices(new Slice[num_keys]); "
+            "for (int i = 0; i < num_keys; i++) { "
+            "keys_slices[i] = Slice(keys_list[i], keys_list_sizes[i]); } "
+            "std::unique_ptr<Slice[]> value_slices(new Slice[num_value]); "
+            "for (int i = 0; i < num_value; i++) { "
+            "value_slices[i] = Slice(value_list[i], value_list_sizes[i]); } "
+            "t->rep->Put(SliceParts(keys_slices.get(), num_keys), "
+            "SliceParts(value_slices.get(), num_value)); }",
+            impl,
+        )
+
+    def test_shared_count_comes_first_and_fills_in_one_loop(self):
+        decl, impl = self._render(
+            {"shared_count": "n", "param_names": {"begin": "start"}}, self.RANGE
+        )
+        self.assertIn(
+            "(rocksdb_thing_t* t, int n, const char* const* start_list, "
+            "const size_t* start_list_sizes, const char* const* end_list, "
+            "const size_t* end_list_sizes);",
+            decl,
+        )
+        self.assertIn(
+            "{ std::unique_ptr<Slice[]> start_slices(new Slice[n]); "
+            "std::unique_ptr<Slice[]> end_slices(new Slice[n]); "
+            "for (int i = 0; i < n; i++) { "
+            "start_slices[i] = Slice(start_list[i], start_list_sizes[i]); "
+            "end_slices[i] = Slice(end_list[i], end_list_sizes[i]); } "
+            "t->rep->Put(SliceParts(start_slices.get(), n), "
+            "SliceParts(end_slices.get(), n)); }",
+            impl,
+        )
+
+    def test_bound_parameter_does_not_share(self):
+        params = [("fixed", "const SliceParts &"), *self.RANGE]
+        decl, impl = self._render(
+            {"shared_count": "n", "bind": {"fixed": "SliceParts()"}}, params
+        )
+        self.assertIn(
+            "(rocksdb_thing_t* t, int n, const char* const* begin_list,", decl
+        )
+        self.assertIn(
+            "} t->rep->Put(SliceParts(), SliceParts(begin_slices.get(), n), "
+            "SliceParts(end_slices.get(), n)); }",
+            impl,
+        )
+
+    def test_errors(self):
+        one = self.KV[:1]
+        cases = [
+            (one, {"shared_count": "n"}, "needs two SliceParts"),
+            (self.RANGE, {"shared_count": "1n"}, "must name a C parameter"),
+            (one, {"nullable": ["key"]}, "nullable needs"),
+            (
+                [*self.RANGE, ("extra", "const SliceParts &")],
+                {"shared_count": "n", "nullable": ["extra"]},
+                "nullable needs",
+            ),
+            (self.RANGE, {"shared_count": "i"}, r"\['i'\] clash"),
+            ([*one, ("i", "int")], {}, r"\['i'\] clash"),
+            ([*one, ("key_slices", "int")], {}, r"\['key_slices'\] clash"),
+            (self.KV, {"param_names": {"value": "key"}}, "appear twice"),
+            (one, {"c_types": {"key": "int"}}, "multi-value"),
+        ]
+        for params, entry, message in cases:
+            with self.subTest(message=message, entry=entry):
+                with self.assertRaisesRegex(hb.GenError, message):
+                    self._render(entry, params)
+
+
 VEC = hb.Handle("rocksdb_vec_t", "std::vector<Elem>", "generated", "v", None, None, "int")
 ELEM_FIELDS = {
     ("Elem", "level"): "int",

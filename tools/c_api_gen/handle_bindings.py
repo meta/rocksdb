@@ -23,6 +23,9 @@ The C signature of a method is derived from the C++ declaration
   arithmetic / typedef of one    same type                x
   enum                           int                      static_cast<E>(x)
   const std::string&             const char*              std::string(x)
+  const SliceParts&              int num_x, const char*   SliceParts over a
+                                 const* x_list, const     Slice array built
+                                 size_t* x_list_sizes     from the C arrays
   handle rep (value, pointer,    H* / const H*            x->rep, &x->rep,
   reference, smart pointer)                               *x->rep, ...
 
@@ -55,6 +58,9 @@ vector instead of calling a method: `count` returns rep.size(), and `field`
 returns one public data member of rep[index], taking the index as a C
 parameter of the handle's `index_type`. A std::string member is returned like
 a `const std::string&` result.
+
+The SliceParts parameters of an entry with `shared_count` all take their
+length from one C parameter of that name instead of one each.
 
 A `T*` out-parameter named by `out_handle` is filled straight into a new
 handle, which the C function returns. A `T*` parameter listed in `consumes`
@@ -128,6 +134,7 @@ METHOD_KEYS = {
     "consumes",
     "param_order",
     "nullable",
+    "shared_count",
 }
 
 # C types that a C++ parameter or result of the same spelling maps to as-is.
@@ -159,6 +166,7 @@ C_SCALARS = frozenset(
 )
 SLICE_TYPES = frozenset({"const Slice &", "Slice", "const Slice"})
 STRING_PARAM_TYPES = frozenset({"const std::string &", "const std::string"})
+SLICE_PARTS = "const SliceParts &"
 STATUS_TYPES = frozenset({"Status", "IOStatus"})
 STRING_RESULT_TYPES = {
     "Slice": "Slice",
@@ -662,6 +670,8 @@ class TypeMapper:
             )
         if t in STRING_PARAM_TYPES:
             return Mapped([CParam("const char*", n)], f"std::string({n})")
+        if t == SLICE_PARTS:
+            return self.slice_parts([n], f"num_{n}")[0]
         m = re.fullmatch(r"(const )?([\w:]+) (\*|&)", t)
         sp = re.fullmatch(
             r"(?:const )?std::(shared_ptr|unique_ptr)<(?:const )?([\w:]+)> ?&?", t
@@ -673,6 +683,38 @@ class TypeMapper:
         c_type, enum = self.scalar(t.removeprefix("const "), context, scope)
         arg = f"static_cast<{enum}>({n})" if enum else n
         return Mapped([CParam(c_type, n)], arg)
+
+    @staticmethod
+    def slice_parts(names: list[str], count: str) -> list[Mapped]:
+        """One SliceParts argument per name, over Slices built from C arrays
+        of pointers and sizes.
+
+        Every array has `count` elements, a C parameter that comes with the
+        first name, and one loop fills them all. SliceParts only points at an
+        array, which is a local of the C function and so outlives the call.
+        """
+        mapped = []
+        fills = []
+        for n in names:
+            parts = f"{n}_slices"
+            c_params = [
+                CParam("const char* const*", f"{n}_list"),
+                CParam("const size_t*", f"{n}_list_sizes"),
+            ]
+            if not mapped:
+                c_params.insert(0, CParam("int", count))
+            mapped.append(
+                Mapped(
+                    c_params,
+                    f"SliceParts({parts}.get(), {count})",
+                    [f"std::unique_ptr<Slice[]> {parts}(new Slice[{count}]);"],
+                    [parts],
+                )
+            )
+            fills.append(f"  {parts}[i] = Slice({n}_list[i], {n}_list_sizes[i]);")
+        mapped[-1].setup += [f"for (int i = 0; i < {count}; i++) {{", *fills, "}"]
+        mapped[-1].locals.append("i")
+        return mapped
 
     def _nullable_param(
         self, t: str, n: str, context: str, preferred: str | None
@@ -868,6 +910,20 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
     consumes = list(entry.get("consumes", []))
     consumed: list[str] = []
     nullable = list(entry.get("nullable", []))
+    shared: dict[str, Mapped] = {}
+    shared_count = entry.get("shared_count")
+    if shared_count is not None:
+        if not re.fullmatch(r"[A-Za-z_]\w*", shared_count):
+            raise GenError(f"{name}: shared_count must name a C parameter")
+        sharing = [
+            p.name
+            for p in params[:arity]
+            if p.type == SLICE_PARTS and p.name not in bind and p.name not in nullable
+        ]
+        if len(sharing) < 2:
+            raise GenError(f"{name}: shared_count needs two SliceParts parameters")
+        shared_names = [renames.get(n, n) for n in sharing]
+        shared = dict(zip(sharing, mapper.slice_parts(shared_names, shared_count)))
     setup: list[str] = []
     local_names: list[str] = []
     by_param: dict[str, list[CParam]] = {}
@@ -891,13 +947,16 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
         is_nullable = p.name in nullable
         if is_nullable:
             nullable.remove(p.name)
-        mapped = mapper.param(
-            Param(c_name, p.type, p.has_default),
-            f"{name}({p.name})",
-            param_handles.get(p.name),
-            fn.owner,
-            is_nullable,
-        )
+        if p.name in shared:
+            mapped = shared[p.name]
+        else:
+            mapped = mapper.param(
+                Param(c_name, p.type, p.has_default),
+                f"{name}({p.name})",
+                param_handles.get(p.name),
+                fn.owner,
+                is_nullable,
+            )
         setup += mapped.setup
         local_names += mapped.locals
         if p.name in c_types:
@@ -1057,6 +1116,10 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
     clashes = sorted({p.name for p in c_params} & set(local_names))
     if clashes:
         raise GenError(f"{name}: C parameters {clashes} clash with generated locals")
+    c_names = [p.name for p in c_params]
+    repeated = sorted({n for n in c_names if c_names.count(n) > 1})
+    if repeated:
+        raise GenError(f"{name}: C parameters {repeated} appear twice")
     body = setup + body
 
     param_texts = [f"{p.c_type} {p.name}" for p in c_params] or ["void"]

@@ -766,6 +766,33 @@
           "result": "discard"
         },
         {
+          "name": "rocksdb_writebatch_mergev",
+          "method": "Merge",
+          "overload": [
+            "const SliceParts &",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "key": "keys",
+            "value": "values"
+          },
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_mergev_cf",
+          "method": "Merge",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const SliceParts &",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "key": "keys",
+            "value": "values"
+          },
+          "result": "discard"
+        },
+        {
           "name": "rocksdb_writebatch_singledelete",
           "method": "SingleDelete",
           "overload": [
@@ -831,6 +858,35 @@
           "result": "discard"
         },
         {
+          "name": "rocksdb_writebatch_delete_rangev",
+          "method": "DeleteRange",
+          "overload": [
+            "const SliceParts &",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "begin_key": "start_keys",
+            "end_key": "end_keys"
+          },
+          "shared_count": "num_keys",
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_delete_rangev_cf",
+          "method": "DeleteRange",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const SliceParts &",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "begin_key": "start_keys",
+            "end_key": "end_keys"
+          },
+          "shared_count": "num_keys",
+          "result": "discard"
+        },
+        {
           "name": "rocksdb_writebatch_clear",
           "method": "Clear"
         },
@@ -840,6 +896,29 @@
           "overload": [
             "const Slice &"
           ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_deletev",
+          "method": "Delete",
+          "overload": [
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "key": "keys"
+          },
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_deletev_cf",
+          "method": "Delete",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "key": "keys"
+          },
           "result": "discard"
         },
         {
@@ -863,6 +942,33 @@
             "const Slice &",
             "const Slice &"
           ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_putv",
+          "method": "Put",
+          "overload": [
+            "const SliceParts &",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "key": "keys",
+            "value": "values"
+          },
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_putv_cf",
+          "method": "Put",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const SliceParts &",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "key": "keys",
+            "value": "values"
+          },
           "result": "discard"
         },
         {
@@ -925,6 +1031,33 @@
           "result": "discard"
         },
         {
+          "name": "rocksdb_writebatch_wi_putv",
+          "method": "Put",
+          "overload": [
+            "const SliceParts &",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "key": "keys",
+            "value": "values"
+          },
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_putv_cf",
+          "method": "Put",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const SliceParts &",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "key": "keys",
+            "value": "values"
+          },
+          "result": "discard"
+        },
+        {
           "name": "rocksdb_writebatch_wi_merge",
           "method": "Merge",
           "overload": [
@@ -941,6 +1074,33 @@
             "const Slice &",
             "const Slice &"
           ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_mergev",
+          "method": "Merge",
+          "overload": [
+            "const SliceParts &",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "key": "keys",
+            "value": "values"
+          },
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_mergev_cf",
+          "method": "Merge",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const SliceParts &",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "key": "keys",
+            "value": "values"
+          },
           "result": "discard"
         },
         {
@@ -966,6 +1126,29 @@
             "ColumnFamilyHandle *",
             "const Slice &"
           ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_deletev",
+          "method": "Delete",
+          "overload": [
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "key": "keys"
+          },
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_deletev_cf",
+          "method": "Delete",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "key": "keys"
+          },
           "result": "discard"
         },
         {
@@ -1000,6 +1183,41 @@
           "result": "discard",
           "doc": [
             "// DO NOT USE - rocksdb_writebatch_wi_delete_range_cf is not yet supported"
+          ]
+        },
+        {
+          "name": "rocksdb_writebatch_wi_delete_rangev",
+          "method": "DeleteRange",
+          "overload": [
+            "const SliceParts &",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "begin_key": "start_keys",
+            "end_key": "end_keys"
+          },
+          "shared_count": "num_keys",
+          "result": "discard",
+          "doc": [
+            "// DO NOT USE - rocksdb_writebatch_wi_delete_rangev is not yet supported"
+          ]
+        },
+        {
+          "name": "rocksdb_writebatch_wi_delete_rangev_cf",
+          "method": "DeleteRange",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const SliceParts &",
+            "const SliceParts &"
+          ],
+          "param_names": {
+            "begin_key": "start_keys",
+            "end_key": "end_keys"
+          },
+          "shared_count": "num_keys",
+          "result": "discard",
+          "doc": [
+            "// DO NOT USE - rocksdb_writebatch_wi_delete_rangev_cf is not yet supported"
           ]
         },
         {

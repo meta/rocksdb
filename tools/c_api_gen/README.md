@@ -368,6 +368,9 @@ The optional keys are:
   `const char* x, size_t x_len` and passes `nullptr` when `x` is NULL; a
   `const T &` whose handle holds a `T` passes a default-constructed `T` when
   the handle is NULL
+- `shared_count`: one C `int` parameter, of this name, that gives the length
+  of every `const SliceParts &` parameter (each one otherwise takes its own
+  `num_x`)
 - `receiver_const`: override the `const` of the handle parameter, which
   otherwise follows the C++ method
 - `c_types`: pin a parameter's (or `return`'s) C type for ABI compatibility;

@@ -2301,6 +2301,85 @@ int main(int argc, char** argv) {
     rocksdb_writebatch_wi_destroy(wb);
   }
 
+  StartPhase("writebatch_vectors_match");
+  {
+    // Each ...v function records what its single-slice counterpart records
+    // for the concatenated parts, byte for byte.
+    rocksdb_column_family_handle_t* cf =
+        rocksdb_create_column_family(db, options, "wb_vectors_match", &err);
+    CheckNoError(err);
+    const char* k_list[2] = {"z", "ap"};
+    const size_t k_sizes[2] = {1, 2};
+    const char* v_list[3] = {"x", "y", "z"};
+    const size_t v_sizes[3] = {1, 1, 1};
+    const char* e_list[2] = {"zb", ""};
+    const size_t e_sizes[2] = {2, 0};
+    size_t parts_size = 0;
+    size_t whole_size = 0;
+    const char* parts_data;
+    const char* whole_data;
+
+    rocksdb_writebatch_t* parts = rocksdb_writebatch_create();
+    rocksdb_writebatch_t* whole = rocksdb_writebatch_create();
+    rocksdb_writebatch_putv(parts, 2, k_list, k_sizes, 3, v_list, v_sizes);
+    rocksdb_writebatch_put(whole, "zap", 3, "xyz", 3);
+    rocksdb_writebatch_putv_cf(parts, cf, 2, k_list, k_sizes, 3, v_list,
+                               v_sizes);
+    rocksdb_writebatch_put_cf(whole, cf, "zap", 3, "xyz", 3);
+    rocksdb_writebatch_mergev(parts, 2, k_list, k_sizes, 3, v_list, v_sizes);
+    rocksdb_writebatch_merge(whole, "zap", 3, "xyz", 3);
+    rocksdb_writebatch_mergev_cf(parts, cf, 2, k_list, k_sizes, 3, v_list,
+                                 v_sizes);
+    rocksdb_writebatch_merge_cf(whole, cf, "zap", 3, "xyz", 3);
+    rocksdb_writebatch_deletev(parts, 2, k_list, k_sizes);
+    rocksdb_writebatch_delete(whole, "zap", 3);
+    rocksdb_writebatch_deletev_cf(parts, cf, 2, k_list, k_sizes);
+    rocksdb_writebatch_delete_cf(whole, cf, "zap", 3);
+    rocksdb_writebatch_delete_rangev(parts, 2, k_list, k_sizes, e_list,
+                                     e_sizes);
+    rocksdb_writebatch_delete_range(whole, "zap", 3, "zb", 2);
+    rocksdb_writebatch_delete_rangev_cf(parts, cf, 2, k_list, k_sizes, e_list,
+                                        e_sizes);
+    rocksdb_writebatch_delete_range_cf(whole, cf, "zap", 3, "zb", 2);
+    CheckCondition(rocksdb_writebatch_count(parts) == 8);
+    parts_data = rocksdb_writebatch_data(parts, &parts_size);
+    whole_data = rocksdb_writebatch_data(whole, &whole_size);
+    CheckCondition(parts_size == whole_size &&
+                   memcmp(parts_data, whole_data, parts_size) == 0);
+    rocksdb_writebatch_destroy(parts);
+    rocksdb_writebatch_destroy(whole);
+
+    rocksdb_writebatch_wi_t* parts_wi = rocksdb_writebatch_wi_create(0, 0);
+    rocksdb_writebatch_wi_t* whole_wi = rocksdb_writebatch_wi_create(0, 0);
+    rocksdb_writebatch_wi_putv(parts_wi, 2, k_list, k_sizes, 3, v_list,
+                               v_sizes);
+    rocksdb_writebatch_wi_put(whole_wi, "zap", 3, "xyz", 3);
+    rocksdb_writebatch_wi_putv_cf(parts_wi, cf, 2, k_list, k_sizes, 3, v_list,
+                                  v_sizes);
+    rocksdb_writebatch_wi_put_cf(whole_wi, cf, "zap", 3, "xyz", 3);
+    rocksdb_writebatch_wi_mergev(parts_wi, 2, k_list, k_sizes, 3, v_list,
+                                 v_sizes);
+    rocksdb_writebatch_wi_merge(whole_wi, "zap", 3, "xyz", 3);
+    rocksdb_writebatch_wi_mergev_cf(parts_wi, cf, 2, k_list, k_sizes, 3, v_list,
+                                    v_sizes);
+    rocksdb_writebatch_wi_merge_cf(whole_wi, cf, "zap", 3, "xyz", 3);
+    rocksdb_writebatch_wi_deletev(parts_wi, 2, k_list, k_sizes);
+    rocksdb_writebatch_wi_delete(whole_wi, "zap", 3);
+    rocksdb_writebatch_wi_deletev_cf(parts_wi, cf, 2, k_list, k_sizes);
+    rocksdb_writebatch_wi_delete_cf(whole_wi, cf, "zap", 3);
+    CheckCondition(rocksdb_writebatch_wi_count(parts_wi) == 6);
+    parts_data = rocksdb_writebatch_wi_data(parts_wi, &parts_size);
+    whole_data = rocksdb_writebatch_wi_data(whole_wi, &whole_size);
+    CheckCondition(parts_size == whole_size &&
+                   memcmp(parts_data, whole_data, parts_size) == 0);
+    rocksdb_writebatch_wi_destroy(parts_wi);
+    rocksdb_writebatch_wi_destroy(whole_wi);
+
+    rocksdb_drop_column_family(db, cf, &err);
+    CheckNoError(err);
+    rocksdb_column_family_handle_destroy(cf);
+  }
+
   StartPhase("iter");
   {
     rocksdb_iterator_t* iter = rocksdb_create_iterator(db, roptions);
