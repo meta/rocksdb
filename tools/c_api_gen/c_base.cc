@@ -4043,11 +4043,6 @@ rocksdb_perfcontext_t* rocksdb_perfcontext_create() {
   return context;
 }
 
-char* rocksdb_perfcontext_report(rocksdb_perfcontext_t* context,
-                                 unsigned char exclude_zero_counters) {
-  return strdup(context->rep->ToString(exclude_zero_counters).c_str());
-}
-
 uint64_t rocksdb_perfcontext_metric(rocksdb_perfcontext_t* context,
                                     int metric) {
   PerfContext* rep = context->rep;
@@ -5290,11 +5285,6 @@ const char* rocksdb_column_family_metadata_options_get_end_key(
   return options->end_key.data();
 }
 
-char* rocksdb_column_family_metadata_get_name(
-    rocksdb_column_family_metadata_t* cf_meta) {
-  return strdup(cf_meta->rep.name.c_str());
-}
-
 rocksdb_level_metadata_t* rocksdb_column_family_metadata_get_level_metadata(
     rocksdb_column_family_metadata_t* cf_meta, size_t i) {
   if (i >= cf_meta->rep.levels.size()) {
@@ -5330,38 +5320,11 @@ void rocksdb_sst_file_metadata_destroy(rocksdb_sst_file_metadata_t* file_meta) {
   free(file_meta);
 }
 
-char* rocksdb_sst_file_metadata_get_relative_filename(
-    rocksdb_sst_file_metadata_t* file_meta) {
-  return strdup(file_meta->rep->relative_filename.c_str());
-}
-
-char* rocksdb_sst_file_metadata_get_directory(
-    rocksdb_sst_file_metadata_t* file_meta) {
-  return strdup(file_meta->rep->directory.c_str());
-}
-
-char* rocksdb_sst_file_metadata_get_smallestkey(
-    rocksdb_sst_file_metadata_t* file_meta, size_t* key_len) {
-  *key_len = file_meta->rep->smallestkey.size();
-  return CopyString(file_meta->rep->smallestkey);
-}
-
-char* rocksdb_sst_file_metadata_get_largestkey(
-    rocksdb_sst_file_metadata_t* file_meta, size_t* key_len) {
-  *key_len = file_meta->rep->largestkey.size();
-  return CopyString(file_meta->rep->largestkey);
-}
-
 rocksdb_export_import_files_metadata_t*
 rocksdb_export_import_files_metadata_create() {
   auto metadata = new rocksdb_export_import_files_metadata_t;
   metadata->rep = new ExportImportFilesMetaData;
   return metadata;
-}
-
-char* rocksdb_export_import_files_metadata_get_db_comparator_name(
-    rocksdb_export_import_files_metadata_t* metadata) {
-  return strdup(metadata->rep->db_comparator_name.c_str());
 }
 
 rocksdb_livefiles_t* rocksdb_export_import_files_metadata_get_files(

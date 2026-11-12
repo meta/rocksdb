@@ -71,6 +71,14 @@
     {
       "name": "rocksdb_livefile_set_size",
       "reason": "Equivalent: the shipped parameter is a size_t and LiveFileMetaData::size is a uint64_t; the generated body spells the conversion the assignment performs as static_cast<uint64_t>(size)."
+    },
+    {
+      "name": "rocksdb_sst_file_metadata_get_smallestkey",
+      "reason": "Equivalent: the hand-written body read the std::string member smallestkey twice, for size() and CopyString(); the generated body binds it to a const std::string& once and reads both from that."
+    },
+    {
+      "name": "rocksdb_sst_file_metadata_get_largestkey",
+      "reason": "Equivalent: the hand-written body read the std::string member largestkey twice, for size() and CopyString(); the generated body binds it to a const std::string& once and reads both from that."
     }
   ]
 }

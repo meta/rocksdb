@@ -40,8 +40,10 @@ The C signature of a method is derived from the C++ declaration
                                  trailing `size_t* len`; or a borrowed
                                  rocksdb_slice_t (`result: slice`); or, for a
                                  std::string only, its borrowed NUL-terminated
-                                 c_str() (`result: c_str`)
-  std::string by value           malloc()ed char* (`result: copy`) only
+                                 c_str() (`result: c_str`) or a strdup() of it
+                                 (`result: strdup`)
+  std::string by value           malloc()ed char* (`result: copy` or
+                                 `result: strdup`) only
   T* / shared_ptr<T> /           a new handle holding it (`result: handle`)
   unique_ptr<T>
   anything                       void, with `result: discard`
@@ -1141,21 +1143,27 @@ def render_binding(binding: Binding, index: CxxIndex, mapper: TypeMapper) -> Ren
         c_params.append(CParam("char**", "errptr"))
         body.append(f"SaveError(errptr, {call});")
     elif result in STRING_RESULT_TYPES:
-        if result_policy not in ("borrow", "slice", "copy", "c_str"):
+        if result_policy not in ("borrow", "slice", "copy", "c_str", "strdup"):
             raise GenError(
                 f"{name}: string result {fn.result!r} needs `result: borrow`, "
-                "`result: slice`, `result: copy` or `result: c_str`"
+                "`result: slice`, `result: copy`, `result: c_str` or "
+                "`result: strdup`"
             )
         local_type = STRING_RESULT_TYPES[result]
-        if result_policy != "copy" and local_type == "std::string":
+        if result_policy not in ("copy", "strdup") and local_type == "std::string":
             raise GenError(f"{name}: cannot borrow a std::string returned by value")
-        if result_policy == "c_str" and local_type != "const std::string&":
-            raise GenError(f"{name}: `result: c_str` needs a std::string")
-        if result_policy != "c_str":
+        if result_policy in ("c_str", "strdup") and local_type == "Slice":
+            # A Slice need not be NUL-terminated.
+            raise GenError(f"{name}: `result: {result_policy}` needs a std::string")
+        if result_policy not in ("c_str", "strdup"):
             body.append(f"{local_type} s = {call};")
         if result_policy == "c_str":
             ret = "const char*"
             body.append(f"return {call}.c_str();")
+        elif result_policy == "strdup":
+            # A temporary std::string lives until the end of the statement.
+            ret = "char*"
+            body.append(f"return strdup({call}.c_str());")
         elif result_policy == "slice":
             ret = "rocksdb_slice_t"
             body += [

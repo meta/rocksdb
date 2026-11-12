@@ -29,6 +29,7 @@ import auto_simple_bindings as asb  # noqa: E402
 import validate_generated_equivalence as veq  # noqa: E402
 import handle_bindings as hb  # noqa: E402
 import check_method_coverage as cmc  # noqa: E402
+import gen_roundtrip_tests as rt  # noqa: E402
 
 CLANG = os.environ.get("CLANG_CXX") or shutil.which("clang++")
 
@@ -956,6 +957,32 @@ class ElementAccessTest(unittest.TestCase):
         self.assertIn("{ return t->rep->Name().c_str(); }", impl)
         with self.assertRaisesRegex(hb.GenError, "cannot borrow"):
             _render({"result": "c_str"}, _fn("Name", [], "std::string"))
+
+    def test_strdup_results(self):
+        # A std::string returned by value is copied before the temporary goes.
+        for result in ("const std::string &", "std::string"):
+            with self.subTest(result=result):
+                fn = _fn("Name", [("full", "bool")], result, is_const=True)
+                decl, impl = _render({"result": "strdup"}, fn)
+                self.assertIn(
+                    "ROCKSDB_LIBRARY_API char* rocksdb_thing_x(const rocksdb_thing_t* t, "
+                    "unsigned char full);",
+                    decl.replace("( ", "("),
+                )
+                self.assertIn("{ return strdup(t->rep->Name(full).c_str()); }", impl)
+        decl, impl = _render_member({"field": "name", "result": "strdup"})
+        self.assertIn(
+            "ROCKSDB_LIBRARY_API char* rocksdb_thing_x(const rocksdb_thing_t* t);", decl
+        )
+        self.assertIn("{ return strdup(t->rep->name.c_str()); }", impl)
+        _, impl = _render_element({"field": "name", "result": "strdup"})
+        self.assertIn("{ return strdup(v->rep[index].name.c_str()); }", impl)
+        for result in ("Slice", "const Slice"):
+            with self.subTest(result=result):
+                with self.assertRaisesRegex(hb.GenError, "strdup` needs a std::string"):
+                    _render({"result": "strdup"}, _fn("Key", [], result))
+        with self.assertRaisesRegex(hb.GenError, "does not apply"):
+            _render({"result": "strdup"}, _fn("Count", [], "int"))
 
 
 MEMBER_FIELDS = {
@@ -2151,6 +2178,45 @@ class EquivalenceNormalizationTest(unittest.TestCase):
                 make("{ if (n) { f(); } }", *ints),
                 make("{ if (n != nullptr) { f(); } }", *ints),
             )
+        )
+
+
+class RoundtripPairsTest(unittest.TestCase):
+    HEADER = """
+extern ROCKSDB_LIBRARY_API void rocksdb_x_set_n(rocksdb_x_t* x, int n);
+extern ROCKSDB_LIBRARY_API int rocksdb_x_get_n(rocksdb_x_t* x);
+extern ROCKSDB_LIBRARY_API void rocksdb_x_set_dir(rocksdb_x_t* x, const char* dir);
+extern ROCKSDB_LIBRARY_API const char* rocksdb_x_get_dir(rocksdb_x_t* x, size_t* len);
+extern ROCKSDB_LIBRARY_API void rocksdb_x_set_name(rocksdb_x_t* x, const char* name);
+extern ROCKSDB_LIBRARY_API char* rocksdb_x_get_name(rocksdb_x_t* x);
+extern ROCKSDB_LIBRARY_API void rocksdb_x_set_env(rocksdb_x_t* x, rocksdb_env_t* env);
+extern ROCKSDB_LIBRARY_API rocksdb_env_t* rocksdb_x_get_env(rocksdb_x_t* x);
+extern ROCKSDB_LIBRARY_API void rocksdb_x_set_path(rocksdb_x_t* x, const char* path);
+extern ROCKSDB_LIBRARY_API const char* rocksdb_x_get_path(rocksdb_x_t* x);
+extern ROCKSDB_LIBRARY_API void rocksdb_x_set_label(rocksdb_x_t* x, int label);
+extern ROCKSDB_LIBRARY_API char* rocksdb_x_get_label(rocksdb_x_t* x);
+extern ROCKSDB_LIBRARY_API void rocksdb_x_set_cache(rocksdb_x_t* x, rocksdb_cache_t* c);
+extern ROCKSDB_LIBRARY_API int rocksdb_x_get_cache(rocksdb_x_t* x);
+"""
+
+    def test_pairs_by_shape(self):
+        kinds = {p.field: p.kind() for p in rt.pairs_from_texts([self.HEADER])}
+        # A handle on either side, a borrowed string without a length, or a
+        # malloc()ed string for a non-string setter has no sentinel.
+        self.assertEqual(kinds, {"n": "scalar", "dir": "string", "name": "strdup"})
+
+    def test_strdup_round_trip(self):
+        pairs = [p for p in rt.pairs_from_texts([self.HEADER]) if p.field == "name"]
+        lines = rt.emit_test("t", "rocksdb_x", pairs)
+        self.assertEqual(
+            lines[2:7],
+            [
+                '  rocksdb_x_set_name(obj, "test");',
+                "  {",
+                "    char* rt_v = rocksdb_x_get_name(obj);",
+                '    CheckCondition(rt_v != NULL && strcmp(rt_v, "test") == 0);',
+                "    rocksdb_free(rt_v);",
+            ],
         )
 
 

@@ -356,8 +356,8 @@ The optional keys are:
 - `bind`: fixed C++ arguments, e.g. `{"pri": "Env::BOTTOM"}`
 - `result`: `discard` to drop a result, `borrow` / `slice` / `copy` for a
   `Slice` or string result (`c_str` for a `std::string` returned through
-  `c_str()`, without a length), `handle` to return a pointer or smart pointer
-  result in a new handle
+  `c_str()`, and `strdup` for a `strdup()` of it, both without a length),
+  `handle` to return a pointer or smart pointer result in a new handle
 - `result_handle`: the handle to return, when several wrap the result's type
 - `out_handle`: a `T*` out-parameter to fill straight into a new handle, which
   the C function returns instead of taking the parameter

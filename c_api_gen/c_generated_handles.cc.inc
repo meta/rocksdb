@@ -1677,6 +1677,11 @@ size_t rocksdb_column_family_metadata_get_level_count(
   return cf_meta->rep.levels.size();
 }
 
+char* rocksdb_column_family_metadata_get_name(
+    rocksdb_column_family_metadata_t* cf_meta) {
+  return strdup(cf_meta->rep.name.c_str());
+}
+
 /* rocksdb_column_family_metadata_options_t */
 
 void rocksdb_column_family_metadata_options_destroy(
@@ -1695,6 +1700,11 @@ void rocksdb_export_import_files_metadata_destroy(
 void rocksdb_export_import_files_metadata_set_db_comparator_name(
     rocksdb_export_import_files_metadata_t* metadata, const char* name) {
   metadata->rep->db_comparator_name = std::string(name);
+}
+
+char* rocksdb_export_import_files_metadata_get_db_comparator_name(
+    rocksdb_export_import_files_metadata_t* metadata) {
+  return strdup(metadata->rep->db_comparator_name.c_str());
 }
 
 /* rocksdb_import_column_family_options_t */
@@ -1729,6 +1739,30 @@ size_t rocksdb_level_metadata_get_file_count(
 uint64_t rocksdb_sst_file_metadata_get_size(
     rocksdb_sst_file_metadata_t* file_meta) {
   return file_meta->rep->size;
+}
+
+char* rocksdb_sst_file_metadata_get_relative_filename(
+    rocksdb_sst_file_metadata_t* file_meta) {
+  return strdup(file_meta->rep->relative_filename.c_str());
+}
+
+char* rocksdb_sst_file_metadata_get_directory(
+    rocksdb_sst_file_metadata_t* file_meta) {
+  return strdup(file_meta->rep->directory.c_str());
+}
+
+char* rocksdb_sst_file_metadata_get_smallestkey(
+    rocksdb_sst_file_metadata_t* file_meta, size_t* len) {
+  const std::string& s = file_meta->rep->smallestkey;
+  *len = s.size();
+  return CopyString(s);
+}
+
+char* rocksdb_sst_file_metadata_get_largestkey(
+    rocksdb_sst_file_metadata_t* file_meta, size_t* len) {
+  const std::string& s = file_meta->rep->largestkey;
+  *len = s.size();
+  return CopyString(s);
 }
 
 /* rocksdb_envoptions_t */
@@ -1976,6 +2010,11 @@ void rocksdb_perfcontext_destroy(rocksdb_perfcontext_t* context) {
 
 void rocksdb_perfcontext_reset(rocksdb_perfcontext_t* context) {
   context->rep->Reset();
+}
+
+char* rocksdb_perfcontext_report(rocksdb_perfcontext_t* context,
+                                 unsigned char exclude_zero_counters) {
+  return strdup(context->rep->ToString(exclude_zero_counters).c_str());
 }
 
 /* rocksdb_pinnableslice_t */

@@ -2143,6 +2143,12 @@
           "name": "rocksdb_column_family_metadata_get_level_count",
           "count": "levels",
           "receiver_const": false
+        },
+        {
+          "name": "rocksdb_column_family_metadata_get_name",
+          "field": "name",
+          "result": "strdup",
+          "receiver_const": false
         }
       ]
     },
@@ -2172,6 +2178,12 @@
           "param_names": {
             "db_comparator_name": "name"
           }
+        },
+        {
+          "name": "rocksdb_export_import_files_metadata_get_db_comparator_name",
+          "field": "db_comparator_name",
+          "result": "strdup",
+          "receiver_const": false
         }
       ]
     },
@@ -2219,6 +2231,50 @@
           "name": "rocksdb_sst_file_metadata_get_size",
           "field": "size",
           "receiver_const": false
+        },
+        {
+          "name": "rocksdb_sst_file_metadata_get_relative_filename",
+          "field": "relative_filename",
+          "result": "strdup",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_sst_file_metadata_get_directory",
+          "field": "directory",
+          "result": "strdup",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_sst_file_metadata_get_smallestkey",
+          "field": "smallestkey",
+          "result": "copy",
+          "receiver_const": false,
+          "doc": [
+            "/**",
+            " * Returns the smallest key of the specified sst file.",
+            " * The caller is responsible for releasing the returned memory.",
+            " *",
+            " * @param file_meta the metadata of an SST file to obtain its smallest key.",
+            " * @param len the out value which will contain the length of the returned key",
+            " *     after the function call.",
+            " */"
+          ]
+        },
+        {
+          "name": "rocksdb_sst_file_metadata_get_largestkey",
+          "field": "largestkey",
+          "result": "copy",
+          "receiver_const": false,
+          "doc": [
+            "/**",
+            " * Returns the smallest key of the specified sst file.",
+            " * The caller is responsible for releasing the returned memory.",
+            " *",
+            " * @param file_meta the metadata of an SST file to obtain its smallest key.",
+            " * @param len the out value which will contain the length of the returned key",
+            " *     after the function call.",
+            " */"
+          ]
         }
       ]
     },
@@ -2489,6 +2545,12 @@
         {
           "name": "rocksdb_perfcontext_reset",
           "method": "Reset"
+        },
+        {
+          "name": "rocksdb_perfcontext_report",
+          "method": "ToString",
+          "result": "strdup",
+          "receiver_const": false
         }
       ]
     },

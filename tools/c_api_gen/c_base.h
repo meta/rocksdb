@@ -1338,8 +1338,6 @@ enum {
 extern ROCKSDB_LIBRARY_API void rocksdb_set_perf_level(int);
 extern ROCKSDB_LIBRARY_API rocksdb_perfcontext_t* rocksdb_perfcontext_create(
     void);
-extern ROCKSDB_LIBRARY_API char* rocksdb_perfcontext_report(
-    rocksdb_perfcontext_t* context, unsigned char exclude_zero_counters);
 extern ROCKSDB_LIBRARY_API uint64_t
 rocksdb_perfcontext_metric(rocksdb_perfcontext_t* context, int metric);
 
@@ -1735,19 +1733,12 @@ rocksdb_column_family_metadata_options_get_end_key(
 extern ROCKSDB_LIBRARY_API rocksdb_export_import_files_metadata_t*
 rocksdb_export_import_files_metadata_create(void);
 
-extern ROCKSDB_LIBRARY_API char*
-rocksdb_export_import_files_metadata_get_db_comparator_name(
-    rocksdb_export_import_files_metadata_t*);
-
 extern ROCKSDB_LIBRARY_API rocksdb_livefiles_t*
 rocksdb_export_import_files_metadata_get_files(
     rocksdb_export_import_files_metadata_t*);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_export_import_files_metadata_set_files(
     rocksdb_export_import_files_metadata_t*, rocksdb_livefiles_t*);
-
-extern ROCKSDB_LIBRARY_API char* rocksdb_column_family_metadata_get_name(
-    rocksdb_column_family_metadata_t* cf_meta);
 
 /**
  * Returns the rocksdb_level_metadata_t of the ith level from the specified
@@ -1796,35 +1787,6 @@ rocksdb_level_metadata_get_sst_file_metadata(
  */
 extern ROCKSDB_LIBRARY_API void rocksdb_sst_file_metadata_destroy(
     rocksdb_sst_file_metadata_t* file_meta);
-
-extern ROCKSDB_LIBRARY_API char*
-rocksdb_sst_file_metadata_get_relative_filename(
-    rocksdb_sst_file_metadata_t* file_meta);
-
-extern ROCKSDB_LIBRARY_API char* rocksdb_sst_file_metadata_get_directory(
-    rocksdb_sst_file_metadata_t* file_meta);
-
-/**
- * Returns the smallest key of the specified sst file.
- * The caller is responsible for releasing the returned memory.
- *
- * @param file_meta the metadata of an SST file to obtain its smallest key.
- * @param len the out value which will contain the length of the returned key
- *     after the function call.
- */
-extern ROCKSDB_LIBRARY_API char* rocksdb_sst_file_metadata_get_smallestkey(
-    rocksdb_sst_file_metadata_t* file_meta, size_t* len);
-
-/**
- * Returns the smallest key of the specified sst file.
- * The caller is responsible for releasing the returned memory.
- *
- * @param file_meta the metadata of an SST file to obtain its smallest key.
- * @param len the out value which will contain the length of the returned key
- *     after the function call.
- */
-extern ROCKSDB_LIBRARY_API char* rocksdb_sst_file_metadata_get_largestkey(
-    rocksdb_sst_file_metadata_t* file_meta, size_t* len);
 
 /* Transactions */
 

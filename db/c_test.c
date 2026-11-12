@@ -1965,6 +1965,62 @@ int main(int argc, char** argv) {
     rocksdb_livefiles_destroy(files);
   }
 
+  StartPhase("sst_file_metadata_matches_livefiles");
+  {
+    // Both describe the same files, through SstFileMetaData and
+    // LiveFileMetaData.
+    const rocksdb_livefiles_t* files = rocksdb_livefiles(db);
+    rocksdb_column_family_metadata_t* cf_meta =
+        rocksdb_get_column_family_metadata(db);
+    size_t level_count =
+        rocksdb_column_family_metadata_get_level_count(cf_meta);
+    int matched = 0;
+    for (size_t l = 0; l < level_count; l++) {
+      rocksdb_level_metadata_t* level_meta =
+          rocksdb_column_family_metadata_get_level_metadata(cf_meta, l);
+      size_t file_count = rocksdb_level_metadata_get_file_count(level_meta);
+      for (size_t f = 0; f < file_count; f++) {
+        rocksdb_sst_file_metadata_t* file_meta =
+            rocksdb_level_metadata_get_sst_file_metadata(level_meta, f);
+        char* name = rocksdb_sst_file_metadata_get_relative_filename(file_meta);
+        char* directory = rocksdb_sst_file_metadata_get_directory(file_meta);
+        size_t smallest_len = 0;
+        size_t largest_len = 0;
+        char* smallest =
+            rocksdb_sst_file_metadata_get_smallestkey(file_meta, &smallest_len);
+        char* largest =
+            rocksdb_sst_file_metadata_get_largestkey(file_meta, &largest_len);
+        for (int i = 0; i < rocksdb_livefiles_count(files); i++) {
+          // A live file's name has a leading '/'.
+          if (strcmp(rocksdb_livefiles_name(files, i) + 1, name) != 0) {
+            continue;
+          }
+          matched++;
+          size_t key_len = 0;
+          const char* key = rocksdb_livefiles_smallestkey(files, i, &key_len);
+          CheckCondition(key_len == smallest_len);
+          CheckCondition(memcmp(key, smallest, key_len) == 0);
+          key = rocksdb_livefiles_largestkey(files, i, &key_len);
+          CheckCondition(key_len == largest_len);
+          CheckCondition(memcmp(key, largest, key_len) == 0);
+          CheckCondition(
+              strcmp(rocksdb_livefiles_directory(files, i), directory) == 0);
+          CheckCondition(rocksdb_livefiles_level(files, i) == (int)l);
+        }
+        rocksdb_free(largest);
+        rocksdb_free(smallest);
+        rocksdb_free(directory);
+        rocksdb_free(name);
+        rocksdb_sst_file_metadata_destroy(file_meta);
+      }
+      rocksdb_level_metadata_destroy(level_meta);
+    }
+    CheckCondition(matched > 0);
+    CheckCondition(matched == rocksdb_livefiles_count(files));
+    rocksdb_column_family_metadata_destroy(cf_meta);
+    rocksdb_livefiles_destroy(files);
+  }
+
   StartPhase("livefile_setters");
   {
     rocksdb_livefiles_t* files = rocksdb_livefiles_create();
@@ -2964,6 +3020,15 @@ int main(int argc, char** argv) {
       CheckCondition(
           (keys_to_query - hits) ==
           (int)rocksdb_perfcontext_metric(perf, rocksdb_bloom_sst_miss_count));
+
+      // The report names every counter, or only the nonzero ones.
+      char* report = rocksdb_perfcontext_report(perf, 0);
+      char* nonzero_report = rocksdb_perfcontext_report(perf, 1);
+      CheckCondition(strstr(report, "bloom_sst_hit_count") != NULL);
+      CheckCondition(strstr(nonzero_report, "bloom_sst_hit_count") != NULL);
+      CheckCondition(strlen(nonzero_report) < strlen(report));
+      rocksdb_free(nonzero_report);
+      rocksdb_free(report);
 
       rocksdb_perfcontext_destroy(perf);
     }

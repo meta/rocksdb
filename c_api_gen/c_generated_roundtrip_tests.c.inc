@@ -457,6 +457,19 @@ static void rocksdb_roundtrip_test_rocksdb_envoptions(void) {
   rocksdb_envoptions_destroy(obj);
 }
 
+static void rocksdb_roundtrip_test_rocksdb_export_import_files_metadata(void) {
+  rocksdb_export_import_files_metadata_t* obj =
+      rocksdb_export_import_files_metadata_create();
+  rocksdb_export_import_files_metadata_set_db_comparator_name(obj, "test");
+  {
+    char* rt_v =
+        rocksdb_export_import_files_metadata_get_db_comparator_name(obj);
+    CheckCondition(rt_v != NULL && strcmp(rt_v, "test") == 0);
+    rocksdb_free(rt_v);
+  }
+  rocksdb_export_import_files_metadata_destroy(obj);
+}
+
 static void rocksdb_roundtrip_test_rocksdb_fifo_compaction_options(void) {
   rocksdb_fifo_compaction_options_t* obj =
       rocksdb_fifo_compaction_options_create();
@@ -2091,6 +2104,7 @@ static void rocksdb_run_generated_roundtrip_tests(void) {
   rocksdb_roundtrip_test_rocksdb_create_backup_options();
   rocksdb_roundtrip_test_rocksdb_cuckoo_options();
   rocksdb_roundtrip_test_rocksdb_envoptions();
+  rocksdb_roundtrip_test_rocksdb_export_import_files_metadata();
   rocksdb_roundtrip_test_rocksdb_fifo_compaction_options();
   rocksdb_roundtrip_test_rocksdb_flushoptions();
   rocksdb_roundtrip_test_rocksdb_flushwaloptions();
