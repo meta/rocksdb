@@ -106,6 +106,7 @@ class VersionBlobFetcherBase : public BlobFetcher {
   // lazy coalescing path to group and dispatch reads via
   // Version::MultiGetBlobLazy.
   const Version* version() const { return version_; }
+  void SetVersion(const Version* version) { version_ = version; }
 
  protected:
   VersionBlobFetcherBase(const Version* version, BlobFileCache* blob_file_cache,

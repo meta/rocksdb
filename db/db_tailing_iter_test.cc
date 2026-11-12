@@ -702,6 +702,95 @@ TEST_P(DBTestTailingIterator, SeekToFirstWithUpperBoundBug) {
   ASSERT_EQ(iter->key().ToString(), "aa");
 }
 
+TEST_P(DBTestTailingIterator, TailingIteratorBlobVersionRenewal) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+
+  ASSERT_OK(Put("k1", "blob_value_1"));
+  ASSERT_OK(Flush());
+
+  ReadOptions read_options;
+  read_options.tailing = true;
+  if (GetParam()) {
+    read_options.async_io = true;
+  }
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(iter->key().ToString(), "k1");
+  ASSERT_EQ(iter->value().ToString(), "blob_value_1");
+
+  ASSERT_OK(Put("k2", "blob_value_2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("k3", "blob_value_3"));
+  ASSERT_OK(Flush());
+
+  // Advancing the tailing iterator triggers ForwardIterator::RenewIterators(),
+  // which releases the initial SuperVersion/Version. Verifies that blob
+  // resolution resolves through the renewed Version without use-after-free.
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(iter->key().ToString(), "k2");
+  ASSERT_EQ(iter->value().ToString(), "blob_value_2");
+
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(iter->key().ToString(), "k3");
+  ASSERT_EQ(iter->value().ToString(), "blob_value_3");
+
+  ASSERT_OK(Put("k4", "blob_value_4"));
+  ASSERT_OK(Flush());
+
+  iter->Seek("k4");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(iter->key().ToString(), "k4");
+  ASSERT_EQ(iter->value().ToString(), "blob_value_4");
+
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+}
+
+TEST_P(DBTestTailingIterator, TailingIteratorBlobMultipleRenewals) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+
+  ReadOptions read_options;
+  read_options.tailing = true;
+  if (GetParam()) {
+    read_options.async_io = true;
+  }
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->SeekToFirst();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  for (int i = 0; i < 5; ++i) {
+    std::string key = "key_" + std::to_string(i);
+    std::string val = "value_" + std::to_string(i);
+    ASSERT_OK(Put(key, val));
+    ASSERT_OK(Flush());
+
+    iter->Seek(key);
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(iter->key().ToString(), key);
+    ASSERT_EQ(iter->value().ToString(), val);
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
