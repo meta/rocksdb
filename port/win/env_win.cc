@@ -833,8 +833,11 @@ IOStatus WinFileSystem::LinkFile(const std::string& src,
 
   if (!RX_CreateHardLink(RX_FN(target).c_str(), RX_FN(src).c_str(), NULL)) {
     DWORD lastError = GetLastError();
-    if (lastError == ERROR_NOT_SAME_DEVICE) {
-      return IOStatus::NotSupported("No cross FS links allowed");
+    if (lastError == ERROR_NOT_SAME_DEVICE ||
+        lastError == ERROR_INVALID_PARAMETER ||
+        lastError == ERROR_ACCESS_DENIED) {
+      return IOStatus::NotSupported(
+          "LinkFile is not supported by the underlying filesystem");
     }
 
     std::string text("Failed to link: ");
