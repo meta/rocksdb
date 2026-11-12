@@ -510,6 +510,57 @@ class VersionStorageInfo {
                               dropped_blob_files_.end(), blob_file_number);
   }
 
+  // True if `blob_index` references a dropped blob file. Inlined, TTL and
+  // same-file blob indexes never do.
+  // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
+  bool IsDroppedBlobIndex(const BlobIndex& blob_index) const {
+    return IsDroppedBlobIndex(dropped_blob_files_, blob_index);
+  }
+
+  // Like the member function, for the dropped blob files in
+  // `dropped_blob_files`, which must be sorted and free of duplicates.
+  static bool IsDroppedBlobIndex(
+      const std::vector<uint64_t>& dropped_blob_files,
+      const BlobIndex& blob_index) {
+    return !blob_index.IsInlined() && !blob_index.HasTTL() &&
+           !blob_index.IsSameFile() &&
+           std::binary_search(dropped_blob_files.begin(),
+                              dropped_blob_files.end(),
+                              blob_index.file_number());
+  }
+
+  // How a read treats a value that references dropped blob files.
+  enum class DroppedBlobRead {
+    // The value references no dropped blob file.
+    kUnaffected,
+    // A wide-column entity reads as its columns not stored in dropped blob
+    // files.
+    kRemainingColumns,
+    // A blob value stored in a dropped blob file, or a wide-column entity
+    // with every column stored in one, reads as deleted.
+    kDeleted,
+  };
+
+  // Decides how reads treat `value`, an entry of `type`, given the dropped
+  // blob files. Compactions rewrite such entries the same way (see
+  // MissingBlobRepairIterator). For kRemainingColumns, also serializes the
+  // remaining columns into *remaining_columns if it is not null. A value of
+  // another type, or one that fails to decode, is kUnaffected, so that reading
+  // it reports the decoding error.
+  // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
+  DroppedBlobRead CheckDroppedBlobReferences(
+      ValueType type, const Slice& value,
+      std::string* remaining_columns) const {
+    return CheckDroppedBlobReferences(dropped_blob_files_, type, value,
+                                      remaining_columns);
+  }
+
+  // Like the member function, for the dropped blob files in
+  // `dropped_blob_files`, which must be sorted and free of duplicates.
+  static DroppedBlobRead CheckDroppedBlobReferences(
+      const std::vector<uint64_t>& dropped_blob_files, ValueType type,
+      const Slice& value, std::string* remaining_columns);
+
   // REQUIRES: `dropped_blob_files` is sorted and free of duplicates.
   void SetDroppedBlobFiles(std::vector<uint64_t>&& dropped_blob_files) {
     assert(

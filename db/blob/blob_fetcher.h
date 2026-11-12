@@ -15,6 +15,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class BlobFileCache;
 class Version;
+class VersionStorageInfo;
 class Slice;
 class FilePrefetchBuffer;
 class PinnableSlice;
@@ -45,6 +46,17 @@ class BlobFetcher {
   // EmbeddedAwareBlobFetcher decorator) to resolve same-file blob references,
   // which need the current read_tier.
   virtual const ReadOptions& read_options() const = 0;
+
+  // The storage of the Version this fetcher reads through if that Version has
+  // dropped blob files (see VersionStorageInfo::GetDroppedBlobFiles()), or
+  // null. Reads treat values in those files as deleted, which they decide
+  // before fetching anything.
+  const VersionStorageInfo* storage_with_dropped_blob_files() const {
+    return storage_with_dropped_blob_files_;
+  }
+
+ protected:
+  const VersionStorageInfo* storage_with_dropped_blob_files_ = nullptr;
 };
 
 // Shared implementation of the two Version-backed BlobFetchers below. Reads
@@ -109,10 +121,7 @@ class VersionBlobFetcherBase : public BlobFetcher {
 
  protected:
   VersionBlobFetcherBase(const Version* version, BlobFileCache* blob_file_cache,
-                         bool allow_write_path_fallback)
-      : version_(version),
-        blob_file_cache_(blob_file_cache),
-        allow_write_path_fallback_(allow_write_path_fallback) {}
+                         bool allow_write_path_fallback);
 
   const Version* version_;
   BlobFileCache* blob_file_cache_;

@@ -1567,6 +1567,26 @@ TEST_F(OptionsTest, RemoteCompactionPoolNotSerialized) {
             std::string::npos);
 }
 
+TEST_F(OptionsTest, BestEffortsBlobDbRepairNotSerialized) {
+  ConfigOptions config_options;
+  config_options.input_strings_escaped = false;
+  DBOptions options;
+  ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(),
+                                   "best_efforts_blob_db_repair=true",
+                                   &options));
+  ASSERT_TRUE(options.best_efforts_blob_db_repair);
+  std::string serialized;
+  ASSERT_OK(GetStringFromDBOptions(config_options, options, &serialized));
+  ASSERT_EQ(serialized.find("best_efforts_blob_db_repair"), std::string::npos);
+  DBOptions restored;
+  ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(), serialized,
+                                   &restored));
+  ASSERT_FALSE(restored.best_efforts_blob_db_repair);
+  config_options.sanity_level = ConfigOptions::kSanityLevelExactMatch;
+  ASSERT_OK(
+      RocksDBOptionsParser::VerifyDBOptions(config_options, options, restored));
+}
+
 TEST_F(OptionsTest, OptionsComposeDecompose) {
   // build an Options from DBOptions + CFOptions, then decompose it to verify
   // we get same constituent options.

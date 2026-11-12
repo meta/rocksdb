@@ -192,6 +192,20 @@ class WideColumnSerialization {
       const Slice& input,
       const std::function<Status(const BlobIndex&)>& callback);
 
+  // Which columns RemoveBlobColumns() removed from an entity.
+  enum class BlobColumnRemoval { kNone, kSome, kAll };
+
+  // Removes from `input` the blob columns whose BlobIndex `is_removed`
+  // selects, without fetching any blob. Sets `removal` to kNone if it selects
+  // no column and to kAll if it selects every column. Otherwise sets it to
+  // kSome and, if `output` is not null, replaces *output with the remaining
+  // columns serialized in their original order (version 1 if none of them is a
+  // blob reference). Only checks the blob indexes unless some are selected.
+  static Status RemoveBlobColumns(
+      const Slice& input,
+      const std::function<bool(const BlobIndex&)>& is_removed,
+      std::string* output, BlobColumnRemoval& removal);
+
   // Extracts the default column (empty name) from a serialized entity, without
   // fetching any blob. Uses an O(1) fast path (no full deserialization).
   //   is_blob_reference == false: `value` is the inline default column value.
