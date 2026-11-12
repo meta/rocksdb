@@ -46,6 +46,46 @@ inline bool HasTableFilter(const ReadOptions& read_options) {
   return read_options.table_filter != nullptr && *read_options.table_filter;
 }
 
+// How an iterator created with `read_options` uses the prefix extractor, with
+// the precedence prefix_same_as_start > auto_prefix_mode > total_order_seek >
+// implicit prefix seek. DBIter uses it so that it never assumes its inner
+// iterator is in total order while a child iterator may filter by prefix.
+// Some layers (the MergingIterator prefix flag, LevelIterator prefix
+// exhaustion, the SST auto_prefix_mode upper bound check and the hash index)
+// keep their own conditions.
+enum class IteratorPrefixMode {
+  // No prefix seek. The iterator returns all keys in order.
+  kTotalOrder,
+  // auto_prefix_mode: results as in total order. Prefix filters are only used
+  // where iterate_upper_bound shows that a seek stays within one prefix.
+  kAuto,
+  // Prefix seek. Child iterators may skip keys outside the seek key's prefix
+  // (prefix filters, prefix indexes), so only keys within that prefix are
+  // reliable.
+  kPrefix,
+};
+
+// prefix_same_as_start and auto_prefix_mode are explicit requests and take
+// precedence over total_order_seek. total_order_seek only turns off the
+// implicit prefix seek of iterators with default ReadOptions (and is forced on
+// by DBOptions::prefix_seek_opt_in_only).
+inline IteratorPrefixMode GetIteratorPrefixMode(const ReadOptions& read_options,
+                                                bool has_prefix_extractor) {
+  if (!has_prefix_extractor) {
+    return IteratorPrefixMode::kTotalOrder;
+  }
+  if (read_options.prefix_same_as_start) {
+    return IteratorPrefixMode::kPrefix;
+  }
+  if (read_options.auto_prefix_mode) {
+    return IteratorPrefixMode::kAuto;
+  }
+  if (read_options.total_order_seek) {
+    return IteratorPrefixMode::kTotalOrder;
+  }
+  return IteratorPrefixMode::kPrefix;
+}
+
 // Checks that the combination of DBOptions and ColumnFamilyOptions are valid
 Status ValidateOptions(const DBOptions& db_opts,
                        const ColumnFamilyOptions& cf_opts);

@@ -184,6 +184,9 @@ class MultiCfIteratorImpl {
 
   template <typename BinaryHeap, typename ChildSeekFuncType>
   void SeekCommon(BinaryHeap& heap, ChildSeekFuncType child_seek_func) {
+    // Like any Iterator, a seek clears the error status of earlier calls.
+    status_.PermitUncheckedError();
+    status_ = Status::OK();
     reset_func_();
     heap.clear();
     int i = 0;

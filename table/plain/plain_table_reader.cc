@@ -12,6 +12,7 @@
 #include "memory/arena.h"
 #include "monitoring/histogram.h"
 #include "monitoring/perf_context_imp.h"
+#include "options/options_helper.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/env.h"
@@ -206,8 +207,8 @@ InternalIterator* PlainTableReader::NewIterator(
   // Auto prefix mode is not implemented in PlainTable.
   bool use_prefix_seek =
       !IsTotalOrderMode() &&
-      (options.prefix_same_as_start ||
-       (!options.total_order_seek && !options.auto_prefix_mode));
+      GetIteratorPrefixMode(options, /*has_prefix_extractor=*/true) ==
+          IteratorPrefixMode::kPrefix;
   if (arena == nullptr) {
     return new PlainTableIterator(this, use_prefix_seek);
   } else {

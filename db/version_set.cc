@@ -1221,11 +1221,10 @@ class LevelIterator final : public InternalIterator {
         // prefix filter on Seek(). TableCache hands out no reference to an
         // ephemeral table reader, which a stand-in would need.
         files_filterable_on_seek_(
-            prefix_extractor_ != nullptr && !skip_filters_ &&
-            !table_cache_open_options_.skip_filters &&
+            !skip_filters_ && !table_cache_open_options_.skip_filters &&
             !table_cache_open_options_.open_ephemeral_table_reader &&
-            (!read_options.total_order_seek || read_options.auto_prefix_mode ||
-             read_options.prefix_same_as_start)) {
+            GetIteratorPrefixMode(read_options, prefix_extractor_ != nullptr) !=
+                IteratorPrefixMode::kTotalOrder) {
     // Empty level is not supported.
     assert(flevel_ != nullptr && flevel_->num_files > 0);
     if (range_tombstone_iter_ptr_) {

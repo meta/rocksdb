@@ -3165,6 +3165,172 @@ TEST_F(DBRangeDelTest, PrefixSentinelKey) {
   delete iter;
 }
 
+namespace {
+Options PrefixFilterOptions(const Options& base) {
+  Options options = base;
+  options.disable_auto_compactions = true;
+  options.prefix_extractor.reset(NewFixedPrefixTransform(4));
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+  table_options.whole_key_filtering = false;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  return options;
+}
+
+// Scans the whole DB from SeekToFirst() (or SeekToLast() if !forward).
+std::vector<std::string> ScanAllKeys(DB* db, const ReadOptions& ro,
+                                     bool forward) {
+  std::vector<std::string> keys;
+  std::unique_ptr<Iterator> iter(db->NewIterator(ro));
+  if (forward) {
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      keys.push_back(iter->key().ToString());
+    }
+  } else {
+    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+      keys.push_back(iter->key().ToString());
+    }
+  }
+  EXPECT_OK(iter->status());
+  return keys;
+}
+}  // namespace
+
+// Older data with prefixes aaaa, kkkk and xxxx only; newer tombstones whose
+// boundary keys have prefixes cccc and pppp, which the older data lacks.
+class DBRangeDelCrossPrefixTest : public DBRangeDelTest {
+ protected:
+  void Populate(const Options& options, int older_level) {
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("aaaa1", "v"));
+    ASSERT_OK(Put("kkkk1", "v"));
+    ASSERT_OK(Put("kkkk5", "v"));
+    ASSERT_OK(Put("xxxx1", "v"));
+    ASSERT_OK(Flush());
+    if (older_level > 0) {
+      MoveFilesToLevel(older_level);
+      ASSERT_EQ(1, NumTableFilesAtLevel(older_level));
+    }
+    ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                               "aaaa", "cccc2"));
+    ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                               "pppp", "zzzz"));
+  }
+  const std::vector<std::string> kLiveKeys = {"kkkk1", "kkkk5"};
+  const std::vector<std::string> kLiveKeysReversed = {"kkkk5", "kkkk1"};
+};
+
+TEST_F(DBRangeDelCrossPrefixTest, PrefixSameAsStartOptInRequiresSeekPrefix) {
+  // Under prefix_seek_opt_in_only, a prefix_same_as_start scan must take its
+  // prefix from an in-domain seek key, with or without bounds. With upper
+  // bound "kkkl", SeekToLast() would otherwise take prefix "kkkl" from the
+  // bound and return no keys.
+  Options options = PrefixFilterOptions(CurrentOptions());
+  options.prefix_seek_opt_in_only = true;
+  Populate(options, /*older_level=*/1);
+
+  const Slice lower_bound("kkkk");
+  // The immediate successor of prefix "kkkk".
+  const Slice upper_bound("kkkl");
+  for (bool with_bounds : {false, true}) {
+    SCOPED_TRACE(with_bounds ? "with bounds" : "without bounds");
+    ReadOptions ro;
+    ro.prefix_same_as_start = true;
+    if (with_bounds) {
+      ro.iterate_lower_bound = &lower_bound;
+      ro.iterate_upper_bound = &upper_bound;
+    }
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    iter->SeekToFirst();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsNotSupported());
+    iter->SeekToLast();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsNotSupported());
+    // "kkk" is shorter than the 4-byte prefix, so it is out of domain.
+    iter->Seek("kkk");
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsInvalidArgument());
+    iter->SeekForPrev("kkk");
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsInvalidArgument());
+
+    // Seek() and SeekForPrev() to a key in the prefix still work.
+    std::vector<std::string> keys;
+    for (iter->Seek("kkkk"); iter->Valid(); iter->Next()) {
+      keys.push_back(iter->key().ToString());
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(kLiveKeys, keys);
+    keys.clear();
+    for (iter->SeekForPrev("kkkk9"); iter->Valid(); iter->Prev()) {
+      keys.push_back(iter->key().ToString());
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(kLiveKeysReversed, keys);
+  }
+
+  // Total order and auto_prefix_mode iterators are not affected.
+  ReadOptions total_order;
+  ASSERT_EQ(kLiveKeys, ScanAllKeys(db_.get(), total_order, /*forward=*/true));
+  ReadOptions auto_prefix;
+  auto_prefix.auto_prefix_mode = true;
+  ASSERT_EQ(kLiveKeys, ScanAllKeys(db_.get(), auto_prefix, /*forward=*/true));
+}
+
+TEST_F(DBRangeDelCrossPrefixTest, AutoPrefixModeFullScanCrossPrefixTombstone) {
+  ReadOptions auto_prefix;
+  auto_prefix.auto_prefix_mode = true;
+  for (int older_level : {0, 1}) {
+    SCOPED_TRACE("older_level=" + std::to_string(older_level));
+    Populate(PrefixFilterOptions(CurrentOptions()), older_level);
+    ASSERT_EQ(kLiveKeys, ScanAllKeys(db_.get(), auto_prefix, /*forward=*/true));
+    ASSERT_EQ(kLiveKeysReversed,
+              ScanAllKeys(db_.get(), auto_prefix, /*forward=*/false));
+  }
+}
+
+TEST_F(DBRangeDelTest, PrefixSameAsStartUnboundedScanNoRangeConversion) {
+  // A prefix_same_as_start scan with no prefix to bound it (unbounded
+  // SeekToFirst(), or a seek target outside the prefix extractor's domain) can
+  // skip live keys, so it must not convert point deletes into a range
+  // tombstone.
+  Options options = PrefixFilterOptions(CurrentOptions());
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("kkkk1", "v"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Delete("aaaa1"));
+  ASSERT_OK(Delete("aaaa2"));
+  ASSERT_OK(Delete("aaaa3"));
+
+  ReadOptions ro;
+  ro.prefix_same_as_start = true;
+  for (bool seek_to_first : {true, false}) {
+    SCOPED_TRACE(seek_to_first ? "SeekToFirst" : "out-of-domain Seek");
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    if (seek_to_first) {
+      iter->SeekToFirst();
+    } else {
+      // "aaa" is shorter than the 4-byte prefix, so it is out of domain.
+      iter->Seek("aaa");
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(0, options.statistics->getTickerCount(
+                     READ_PATH_RANGE_TOMBSTONES_INSERTED));
+  }
+  // A scan started by an in-domain Seek() still converts the same deletes.
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    iter->Seek("aaaa");
+    ASSERT_OK(iter->status());
+    ASSERT_FALSE(iter->Valid());
+  }
+  ASSERT_EQ(1, options.statistics->getTickerCount(
+                   READ_PATH_RANGE_TOMBSTONES_INSERTED));
+}
+
 TEST_F(DBRangeDelTest, RefreshMemtableIter) {
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;

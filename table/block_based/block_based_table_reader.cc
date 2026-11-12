@@ -35,6 +35,7 @@
 #include "logging/logging.h"
 #include "memory/memory_allocator_impl.h"
 #include "monitoring/perf_context_imp.h"
+#include "options/options_helper.h"
 #include "parsed_full_filter_block.h"
 #include "port/lang.h"
 #include "rocksdb/cache.h"
@@ -2808,9 +2809,8 @@ InternalIterator* BlockBasedTable::NewIteratorImpl(
       read_options.auto_prefix_mode || PrefixExtractorChanged(prefix_extractor);
   bool check_filter =
       !skip_filters &&
-      (!read_options.total_order_seek || read_options.auto_prefix_mode ||
-       read_options.prefix_same_as_start) &&
-      prefix_extractor != nullptr;
+      GetIteratorPrefixMode(read_options, prefix_extractor != nullptr) !=
+          IteratorPrefixMode::kTotalOrder;
   // Runs the check that the iterator's first Seek() would run, with the same
   // arguments.
   auto first_seek_prefix_check =

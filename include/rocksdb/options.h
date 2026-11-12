@@ -1707,6 +1707,12 @@ struct DBOptions {
   // When set to true, it is as if every iterator is created with
   // total_order_seek=true and only auto_prefix_mode=true and
   // prefix_same_as_start=true can take advantage of prefix seek optimizations.
+  // A prefix_same_as_start iterator still uses prefix seek, although
+  // total_order_seek is set (see ReadOptions::total_order_seek).
+  // Also, a prefix_same_as_start iterator returns Status::NotSupported from
+  // SeekToFirst() and SeekToLast(), and Status::InvalidArgument from Seek()
+  // and SeekForPrev() with a target outside the prefix extractor's domain
+  // (see ReadOptions::prefix_same_as_start).
   bool prefix_seek_opt_in_only = false;
 
   // The number of bytes to prefetch when reading the DB manifest and WAL files
@@ -2589,7 +2595,9 @@ struct ReadOptions {
   //
   // If prefix_extractor is not null, the Seek target and `iterate_lower_bound`
   // need to have the same prefix. This is because ordering is not guaranteed
-  // outside of prefix domain.
+  // outside of prefix domain. With prefix_same_as_start, `iterate_lower_bound`
+  // may have another prefix: the iterator stops at whichever of the bound and
+  // the start of the seek prefix it reaches first.
   //
   // In case of user_defined timestamp, if enabled, iterate_lower_bound should
   // point to key without timestamp part.
@@ -2621,9 +2629,16 @@ struct ReadOptions {
   // that were inserted into the database after the creation of the iterator.
   bool tailing = false;
 
-  // Enable a total order seek regardless of index format (e.g. hash index)
-  // used in the table. Some table format (e.g. plain table) may not support
-  // this option.
+  // For iterators: turns off the implicit prefix seek that iterators with
+  // default ReadOptions use when a prefix_extractor is set, so they return
+  // keys in total order. prefix_same_as_start and auto_prefix_mode are
+  // explicit requests and take precedence: with prefix_same_as_start (even
+  // with total_order_seek=true) the iterator uses prefix seek and returns only
+  // keys with the seek key's prefix, when the seek key is in the prefix
+  // extractor's domain; with auto_prefix_mode, results are as in total
+  // order. DBOptions::prefix_seek_opt_in_only forces this option on.
+  // Also forces a total order index seek regardless of index format (e.g.
+  // hash index). Some table formats (e.g. plain table) may not support this.
   // If true when calling Get(), we also skip prefix bloom when reading from
   // block based table, which only affects Get() performance.
   bool total_order_seek = false;
@@ -2631,6 +2646,7 @@ struct ReadOptions {
   // When true, by default use total_order_seek = true, and RocksDB can
   // selectively enable prefix seek mode if won't generate a different result
   // from total_order_seek, based on seek key, and iterator upper bound.
+  // prefix_same_as_start takes precedence over auto_prefix_mode.
   // BUG: Using Comparator::IsSameLengthImmediateSuccessor and
   // SliceTransform::FullLengthEnabled to enable prefix mode in cases where
   // prefix of upper bound differs from prefix of seek key has a flaw.
@@ -2649,6 +2665,17 @@ struct ReadOptions {
   // prefix_extractor, which is mutable. When SST files have been built with
   // the same prefix extractor, prefix filtering optimizations will be used
   // for both Seek and SeekForPrev.
+  //
+  // SeekToFirst() and SeekToLast() have no seek key to take the prefix from
+  // (with a bound, the prefix comes from the bound), and neither does a Seek()
+  // or SeekForPrev() target outside the prefix extractor's domain. Such scans
+  // are not well supported with prefix seek: they can skip keys, for example
+  // when range tombstones cross prefix boundaries. Use total order iteration
+  // or auto_prefix_mode, instead of prefix_same_as_start, for such scans. With
+  // DBOptions::prefix_seek_opt_in_only, SeekToFirst() and SeekToLast() leave
+  // the iterator !Valid() with status NotSupported, and Seek() and
+  // SeekForPrev() with an out-of-domain target leave it !Valid() with status
+  // InvalidArgument.
   bool prefix_same_as_start = false;
 
   // Keep the blocks loaded by the iterator pinned in memory as long as the

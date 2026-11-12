@@ -612,6 +612,12 @@ class DBIter final : public Iterator {
            prefix_extractor_->InDomain(target);
   }
 
+  // Called at the start of Seek() and SeekForPrev(). Returns false, with
+  // status_ set, if target is outside the prefix extractor's domain under
+  // strict_prefix_same_as_start_. Otherwise sets unbounded_prefix_scan_ when
+  // target gives no prefix to bound a prefix seek.
+  bool CheckSeekTargetPrefix(const Slice& target);
+
   void ResetSeekState() {
     ReleaseTempPinnedData();
     ResetBlobData();
@@ -738,6 +744,19 @@ class DBIter final : public Iterator {
   // user key.
   bool is_key_seqnum_zero_;
   const bool prefix_same_as_start_;
+  // prefix_same_as_start_ under DBOptions::prefix_seek_opt_in_only. Every scan
+  // must take its prefix from an in-domain seek key: SeekToFirst() and
+  // SeekToLast() set NotSupported, and Seek() and SeekForPrev() with a target
+  // outside the prefix extractor's domain set InvalidArgument.
+  const bool strict_prefix_same_as_start_;
+  // True while the current scan uses prefix seek in the child iterators but
+  // has no prefix to bound it: after SeekToFirst() without
+  // iterate_lower_bound, SeekToLast() without iterate_upper_bound, or a
+  // Seek()/SeekForPrev() target outside the prefix extractor's domain. Prefix
+  // seek in the child iterators can then skip live keys, so read-path range
+  // tombstone conversion is disabled so that a skipped live key cannot be
+  // covered by a new tombstone.
+  bool unbounded_prefix_scan_;
   // Means that we will pin all data blocks we read as long the Iterator
   // is not deleted, will be true if ReadOptions::pin_data is true
   const bool pin_thru_lifetime_;
