@@ -810,7 +810,8 @@ SnapshotImpl* WritePreparedTxnDB::GetSnapshotInternal(
   // than the smallest uncommitted seq when the snapshot was taken.
   auto min_uncommitted = WritePreparedTxnDB::SmallestUnCommittedSeq();
   SnapshotImpl* snap_impl = db_impl_->GetSnapshotImpl(
-      for_ww_conflict_check, DBImpl::SnapshotLockMode::kTryWithoutDBMutex);
+      for_ww_conflict_check, DBImpl::SnapshotLockMode::kTryWithoutDBMutex,
+      SnapshotKind::kUser);
   TEST_SYNC_POINT("WritePreparedTxnDB::GetSnapshotInternal:first");
   assert(snap_impl);
   SequenceNumber snap_seq = snap_impl->GetSequenceNumber();
@@ -834,7 +835,8 @@ SnapshotImpl* WritePreparedTxnDB::GetSnapshotInternal(
       // by one.
       AdvanceSeqByOne();
       snap_impl = db_impl_->GetSnapshotImpl(
-          for_ww_conflict_check, DBImpl::SnapshotLockMode::kTryWithoutDBMutex);
+          for_ww_conflict_check, DBImpl::SnapshotLockMode::kTryWithoutDBMutex,
+          SnapshotKind::kUser);
       assert(snap_impl);
       retry++;
     }

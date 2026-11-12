@@ -10,19 +10,41 @@
 
 namespace ROCKSDB_NAMESPACE {
 Status OutputValidator::CanAdd(const Slice& key) const {
+  return CanAdd(key, false);
+}
+
+Status OutputValidator::CanAdd(const Slice& key,
+                               bool require_strict_key_order) const {
   if (key.size() < kNumInternalBytes) {
     return Status::Corruption(
         "Compaction tries to write a key without internal bytes.");
   }
   // prev_key_ starts with empty.
-  if (!prev_key_.empty() && icmp_.Compare(key, prev_key_) < 0) {
-    return Status::Corruption("Compaction sees out-of-order keys.");
+  if (!prev_key_.empty()) {
+    const int cmp = icmp_.Compare(key, prev_key_);
+    if (cmp < 0) {
+      return Status::Corruption("Compaction sees out-of-order keys.");
+    }
+    if (cmp == 0 && require_strict_key_order) {
+      return Status::NotSupported(
+          "Unresolved equal-sequence merge operands cannot be stored as "
+          "duplicate internal keys in one SST");
+    }
   }
   return Status::OK();
 }
 
 Status OutputValidator::Add(const Slice& key, const Slice& value) {
   Status s = CanAdd(key);
+  if (!s.ok()) {
+    return s;
+  }
+  AddValidated(key, value);
+  return Status::OK();
+}
+
+Status OutputValidator::AddStrict(const Slice& key, const Slice& value) {
+  Status s = CanAdd(key, true);
   if (!s.ok()) {
     return s;
   }

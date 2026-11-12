@@ -32,6 +32,7 @@
 #include "db/table_properties_collector.h"
 #include "db/version_set.h"
 #include "db/write_controller.h"
+#include "file/file_io_listener.h"
 #include "file/sst_file_manager_impl.h"
 #include "logging/logging.h"
 #include "memtable/flush_initiator.h"
@@ -58,6 +59,7 @@ ColumnFamilyHandleImpl::ColumnFamilyHandleImpl(
 ColumnFamilyHandleImpl::~ColumnFamilyHandleImpl() {
   if (cfd_ != nullptr) {
     for (auto& listener : cfd_->ioptions().listeners) {
+      const ScopedEventListenerCallback callback_scope(listener.get());
       listener->OnColumnFamilyHandleDeletionStarted(this);
     }
     // Job id == 0 means that this is not our background process, but rather

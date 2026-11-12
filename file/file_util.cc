@@ -6,16 +6,411 @@
 #include "file/file_util.h"
 
 #include <algorithm>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <string>
 
+#include "file/file_io_listener.h"
 #include "file/random_access_file_reader.h"
 #include "file/sequence_file_reader.h"
 #include "file/sst_file_manager_impl.h"
 #include "file/writable_file_writer.h"
 #include "rocksdb/env.h"
 #include "rocksdb/statistics.h"
+#include "test_util/sync_point.h"
+#include "util/hash_containers.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+struct ScopedDeferredFileIOListeners::State {
+  explicit State(
+      const std::vector<std::shared_ptr<EventListener>>& source_listeners)
+      : listeners(source_listeners),
+        storage_error(status_to_io_status(Status::MemoryLimit()),
+                      FileOperationType::kRead, std::string(), 0, 0) {
+    storage_error.io_status.PermitUncheckedError();
+  }
+
+  std::vector<std::shared_ptr<EventListener>> listeners;
+  std::mutex mutex;
+  std::vector<std::function<void()>> callbacks;
+  bool closed = false;
+  bool notification_storage_failed = false;
+  IOErrorInfo storage_error;
+  std::shared_ptr<State> previous_owned_scope;
+};
+
+namespace {
+class FileIOCallbackGuard;
+struct CallbackContext {
+  const FileIOCallbackGuard* io_callback = nullptr;
+  std::shared_ptr<ScopedDeferredFileIOListeners::State> owned_scope;
+  const ScopedEventListenerCallback* event_callback = nullptr;
+};
+
+CallbackContext& CurrentCallbacks() {
+  static thread_local CallbackContext context;
+  return context;
+}
+struct FileIOListenerRegistry {
+  // Only edit admission and lease release access this registry.
+  std::mutex mutex;
+  std::condition_variable cv;
+  using ListenerScopes =
+      UnorderedMap<const EventListener*,
+                   std::shared_ptr<ScopedDeferredFileIOListeners::State>>;
+  ListenerScopes leased;
+};
+
+FileIOListenerRegistry& IOListenerRegistry() {
+  static FileIOListenerRegistry registry;
+  return registry;
+}
+
+class FileIOCallbackGuard {
+ public:
+  explicit FileIOCallbackGuard(const std::shared_ptr<EventListener>& listener)
+      : listener_ptr(listener.get()), previous(CurrentCallbacks().io_callback) {
+    for (auto scope = CurrentCallbacks().owned_scope; scope;
+         scope = scope->previous_owned_scope) {
+      if (std::any_of(scope->listeners.begin(), scope->listeners.end(),
+                      [&](const auto& candidate) {
+                        return candidate.get() == listener_ptr;
+                      })) {
+        state = std::move(scope);
+        break;
+      }
+    }
+    CurrentCallbacks().io_callback = this;
+  }
+  ~FileIOCallbackGuard() {
+    assert(CurrentCallbacks().io_callback == this);
+    CurrentCallbacks().io_callback = previous;
+  }
+  FileIOCallbackGuard(const FileIOCallbackGuard&) = delete;
+  FileIOCallbackGuard& operator=(const FileIOCallbackGuard&) = delete;
+  FileIOCallbackGuard(FileIOCallbackGuard&&) = delete;
+  FileIOCallbackGuard& operator=(FileIOCallbackGuard&&) = delete;
+
+  const EventListener* listener_ptr;
+  const FileIOCallbackGuard* previous;
+  std::shared_ptr<ScopedDeferredFileIOListeners::State> state;
+};
+
+bool HasReentrantLeaseDependencyLocked(
+    const std::vector<std::shared_ptr<EventListener>>& listeners,
+    const FileIOListenerRegistry& registry) {
+  const bool nested = CurrentCallbacks().owned_scope ||
+                      CurrentCallbacks().io_callback ||
+                      CurrentCallbacks().event_callback;
+  for (const auto& listener : listeners) {
+    if (nested && registry.leased.count(listener.get()) != 0) {
+      return true;
+    }
+    for (const FileIOCallbackGuard* callback = CurrentCallbacks().io_callback;
+         callback != nullptr; callback = callback->previous) {
+      if (listener.get() == callback->listener_ptr) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// FileOperationInfo borrows both its path and timestamp. The queued event owns
+// those fields, and its address stays fixed until delivery.
+struct OwnedFileOperationInfo {
+  explicit OwnedFileOperationInfo(const FileOperationInfo& source)
+      : path(source.path),
+        start(source.start_ts, FileOperationInfo::SteadyTimePoint()),
+        info(source.type, path, start, start.second + source.duration,
+             source.status, source.temperature) {
+    info.offset = 0;
+    info.length = 0;
+    if (source.type == FileOperationType::kRead ||
+        source.type == FileOperationType::kWrite ||
+        source.type == FileOperationType::kRangeSync) {
+      info.offset = source.offset;
+      info.length = source.length;
+    }
+    info.status.PermitUncheckedError();
+  }
+  OwnedFileOperationInfo(const OwnedFileOperationInfo&) = delete;
+  OwnedFileOperationInfo& operator=(const OwnedFileOperationInfo&) = delete;
+  OwnedFileOperationInfo(OwnedFileOperationInfo&&) = delete;
+  OwnedFileOperationInfo& operator=(OwnedFileOperationInfo&&) = delete;
+  ~OwnedFileOperationInfo() = default;
+
+  std::string path;
+  FileOperationInfo::StartTimePoint start;
+  FileOperationInfo info;
+};
+}  // namespace
+
+ScopedEventListenerCallback::ScopedEventListenerCallback(
+    const EventListener* listener)
+    : listener_(listener), previous_(CurrentCallbacks().event_callback) {
+  assert(listener != nullptr);
+  CurrentCallbacks().event_callback = this;
+}
+
+ScopedEventListenerCallback::~ScopedEventListenerCallback() {
+  assert(CurrentCallbacks().event_callback == this);
+  CurrentCallbacks().event_callback = previous_;
+}
+
+ScopedDeferredFileIOListeners::ScopedDeferredFileIOListeners(
+    bool defer, const std::vector<std::shared_ptr<EventListener>>& listeners,
+    Status* status) {
+  assert(status != nullptr);
+  *status = Status::OK();
+  if (!defer || listeners.empty()) {
+    return;
+  }
+  state_ = std::make_shared<State>(listeners);
+  auto& registry = IOListenerRegistry();
+  std::unique_lock<std::mutex> lock(registry.mutex);
+  TEST_SYNC_POINT("ScopedDeferredFileIOListeners::BeforeWaitForScopes");
+  bool reentrant_dependency = false;
+  registry.cv.wait(lock, [&]() {
+    if (HasReentrantLeaseDependencyLocked(listeners, registry)) {
+      reentrant_dependency = true;
+      return true;
+    }
+    return std::none_of(listeners.begin(), listeners.end(),
+                        [&](const auto& listener) {
+                          return registry.leased.count(listener.get()) != 0;
+                        });
+  });
+  if (reentrant_dependency) {
+    state_.reset();
+    *status = Status::NotSupported(
+        "LSM edit cannot acquire a listener lease needed by the current "
+        "callback");
+    return;
+  }
+  try {
+    for (const auto& listener : listeners) {
+#ifndef NDEBUG
+      std::function<void()> before_register;
+      TEST_SYNC_POINT_CALLBACK(
+          "ScopedDeferredFileIOListeners::BeforeRegisterLease",
+          &before_register);
+      if (before_register) {
+        before_register();
+      }
+#endif
+      registry.leased[listener.get()] = state_;
+    }
+  } catch (...) {
+    for (const auto& listener : listeners) {
+      const auto lease = registry.leased.find(listener.get());
+      if (lease != registry.leased.end() && lease->second == state_) {
+        registry.leased.erase(lease);
+      }
+    }
+    registry.cv.notify_all();
+    throw;
+  }
+  state_->previous_owned_scope = CurrentCallbacks().owned_scope;
+  CurrentCallbacks().owned_scope = state_;
+}
+
+ScopedDeferredFileIOListeners::~ScopedDeferredFileIOListeners() {
+  if (!state_) {
+    return;
+  }
+  assert(CurrentCallbacks().owned_scope == state_);
+  auto& registry = IOListenerRegistry();
+  std::vector<std::function<void()>> callbacks;
+  bool notification_storage_failed;
+  {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    state_->closed = true;
+    callbacks.swap(state_->callbacks);
+    notification_storage_failed = state_->notification_storage_failed;
+  }
+  // Closing stops enqueueing, but retains the listener lease through delivery.
+  for (const auto& callback : callbacks) {
+    callback();
+  }
+  if (notification_storage_failed) {
+    for (const auto& listener : state_->listeners) {
+      if (listener->ShouldBeNotifiedOnFileIO()) {
+        FileIOCallbackGuard callback_guard(listener);
+        listener->OnIOError(state_->storage_error);
+      }
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    for (const auto& listener : state_->listeners) {
+      const FileIOListenerRegistry::ListenerScopes::iterator lease =
+          registry.leased.find(listener.get());
+      if (lease != registry.leased.end()) {
+        assert(lease->second == state_);
+        registry.leased.erase(lease);
+      }
+    }
+    registry.cv.notify_all();
+  }
+  CurrentCallbacks().owned_scope = state_->previous_owned_scope;
+}
+
+ScopedDeferredFileIOListeners::Context
+ScopedDeferredFileIOListeners::CaptureContext() {
+  return CurrentCallbacks().owned_scope;
+}
+
+ScopedDeferredFileIOListeners::ScopedContext::ScopedContext(Context context)
+    : previous_(CurrentCallbacks().owned_scope) {
+  if (context) {
+    CurrentCallbacks().owned_scope = std::move(context);
+  }
+}
+
+ScopedDeferredFileIOListeners::ScopedContext::~ScopedContext() {
+  CurrentCallbacks().owned_scope = std::move(previous_);
+}
+
+bool ScopedDeferredFileIOListeners::HasReentrantLeaseDependency(
+    const std::vector<std::shared_ptr<EventListener>>& listeners) {
+  if (listeners.empty() || (CurrentCallbacks().owned_scope == nullptr &&
+                            CurrentCallbacks().io_callback == nullptr &&
+                            CurrentCallbacks().event_callback == nullptr)) {
+    return false;
+  }
+  auto& registry = IOListenerRegistry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  return HasReentrantLeaseDependencyLocked(listeners, registry);
+}
+
+void ScopedDeferredFileIOListeners::Notify(
+    const std::vector<std::shared_ptr<EventListener>>& listeners,
+    FileCallback callback, const FileOperationInfo& info) {
+  if (listeners.empty()) {
+    return;
+  }
+  for (const auto& listener : listeners) {
+    FileIOCallbackGuard guard(listener);
+    if (!guard.state) {
+      (listener.get()->*callback)(info);
+      continue;
+    }
+    {
+      std::lock_guard<std::mutex> lock(guard.state->mutex);
+      if (!guard.state->closed) {
+#ifndef NDEBUG
+        std::function<void()> before_owned_event;
+        TEST_SYNC_POINT_CALLBACK(
+            "ScopedDeferredFileIOListeners::BeforeOwnedEvent",
+            &before_owned_event);
+        std::function<void()> before_callback_insertion;
+        TEST_SYNC_POINT_CALLBACK(
+            "ScopedDeferredFileIOListeners::BeforeCallbackInsertion",
+            &before_callback_insertion);
+#endif
+        try {
+#ifndef NDEBUG
+          if (before_owned_event) {
+            before_owned_event();
+          }
+#endif
+          const std::shared_ptr<OwnedFileOperationInfo> owned =
+              std::make_shared<OwnedFileOperationInfo>(info);
+#ifndef NDEBUG
+          if (before_callback_insertion) {
+            before_callback_insertion();
+          }
+#endif
+          guard.state->callbacks.emplace_back([listener, callback, owned]() {
+            FileIOCallbackGuard callback_guard(listener);
+            (listener.get()->*callback)(owned->info);
+            owned->info.status.PermitUncheckedError();
+          });
+        } catch (const std::bad_alloc&) {
+          if (!guard.state->notification_storage_failed) {
+            guard.state->storage_error.operation = info.type;
+            if (info.type == FileOperationType::kRead ||
+                info.type == FileOperationType::kWrite ||
+                info.type == FileOperationType::kRangeSync) {
+              guard.state->storage_error.length = info.length;
+              guard.state->storage_error.offset = info.offset;
+            }
+          }
+          guard.state->notification_storage_failed = true;
+        }
+        continue;
+      }
+    }
+    (listener.get()->*callback)(info);
+  }
+}
+
+void ScopedDeferredFileIOListeners::NotifyError(
+    const std::vector<std::shared_ptr<EventListener>>& listeners,
+    const IOErrorInfo& info) {
+  if (listeners.empty()) {
+    return;
+  }
+  for (const auto& listener : listeners) {
+    FileIOCallbackGuard guard(listener);
+    if (!guard.state) {
+      listener->OnIOError(info);
+      continue;
+    }
+    {
+      std::lock_guard<std::mutex> lock(guard.state->mutex);
+      if (!guard.state->closed) {
+#ifndef NDEBUG
+        std::function<void()> before_owned_event;
+        TEST_SYNC_POINT_CALLBACK(
+            "ScopedDeferredFileIOListeners::BeforeOwnedErrorEvent",
+            &before_owned_event);
+        std::function<void()> before_callback_insertion;
+        TEST_SYNC_POINT_CALLBACK(
+            "ScopedDeferredFileIOListeners::BeforeErrorCallbackInsertion",
+            &before_callback_insertion);
+#endif
+        try {
+#ifndef NDEBUG
+          if (before_owned_event) {
+            before_owned_event();
+          }
+#endif
+          const std::shared_ptr<IOErrorInfo> owned =
+              std::make_shared<IOErrorInfo>(IOStatus::OK(), info.operation,
+                                            std::string(), info.length,
+                                            info.offset);
+          owned->io_status.PermitUncheckedOk();
+          owned->file_path = info.file_path;
+          owned->io_status = status_to_io_status(Status(info.io_status));
+          owned->io_status.PermitUncheckedError();
+#ifndef NDEBUG
+          if (before_callback_insertion) {
+            before_callback_insertion();
+          }
+#endif
+          guard.state->callbacks.emplace_back([listener, owned]() {
+            FileIOCallbackGuard callback_guard(listener);
+            listener->OnIOError(*owned);
+            owned->io_status.PermitUncheckedError();
+          });
+        } catch (const std::bad_alloc&) {
+          if (!guard.state->notification_storage_failed) {
+            guard.state->storage_error.operation = info.operation;
+            guard.state->storage_error.length = info.length;
+            guard.state->storage_error.offset = info.offset;
+          }
+          guard.state->notification_storage_failed = true;
+        }
+        continue;
+      }
+    }
+    listener->OnIOError(info);
+  }
+}
 
 // Utility function to copy a file up to a specified length
 IOStatus CopyFile(FileSystem* fs, const std::string& source,

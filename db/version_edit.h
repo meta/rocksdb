@@ -62,6 +62,9 @@ enum Tag : uint32_t {
   kBlobFileAddition = 400,
   kBlobFileGarbage,
 
+  // Older readers must reject layouts that require run priority for ties.
+  kRequireSourcePriorityForEqualSequences = 500,
+
   // Mask for an unidentified tag from the future which can be safely ignored.
   kTagSafeIgnoreMask = 1 << 13,
 
@@ -1062,6 +1065,13 @@ class VersionEdit {
   }
   uint32_t GetColumnFamily() const { return column_family_; }
 
+  void RequireSourcePriorityForEqualSequences() {
+    requires_source_priority_for_equal_sequences_ = true;
+  }
+  bool RequiresSourcePriorityForEqualSequences() const {
+    return requires_source_priority_for_equal_sequences_;
+  }
+
   const std::string& GetColumnFamilyName() const { return column_family_name_; }
 
   // set column family ID by calling SetColumnFamily()
@@ -1277,6 +1287,7 @@ class VersionEdit {
   bool has_subcompaction_progress_ = false;
   bool has_last_compacted_manifest_file_size_ = false;
   bool has_committed_options_file_number_ = false;
+  bool requires_source_priority_for_equal_sequences_ = false;
 
   // Non-persisted marker for the live MANIFEST writer fast path.
   bool is_options_file_manipulation_ = false;

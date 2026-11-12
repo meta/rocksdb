@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <list>
 #include <map>
+#include <queue>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -44,6 +45,7 @@
 #include "db/version_edit.h"
 #include "db/version_edit_handler.h"
 #include "db/wide/wide_columns_helper.h"
+#include "file/file_io_listener.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "file/line_file_reader.h"
@@ -4344,7 +4346,110 @@ VersionStorageInfo::GetBlobFileMetaDataLB(uint64_t blob_file_number) const {
 }
 
 void VersionStorageInfo::SetFinalized() {
+  const auto overlapping_runs = [this](bool zero_only) {
+    struct Cursor {
+      int level;
+      size_t index;
+    };
+    const auto file = [this](const Cursor& cursor) {
+      return files_[cursor.level][cursor.index];
+    };
+    const auto later = [&](const Cursor& a, const Cursor& b) {
+      return sstableKeyCompare(user_comparator_, file(a)->smallest,
+                               file(b)->smallest) > 0;
+    };
+    std::priority_queue<Cursor, std::vector<Cursor>, decltype(later)> heap(
+        later);
+    const auto advance = [&](Cursor cursor) {
+      while (cursor.index < files_[cursor.level].size()) {
+        if (!zero_only || file(cursor)->fd.smallest_seqno == 0) {
+          heap.push(cursor);
+          return;
+        }
+        ++cursor.index;
+      }
+    };
+    for (size_t i = 0; i < files_[0].size(); ++i) {
+      if (!zero_only || files_[0][i]->fd.smallest_seqno == 0) {
+        heap.push({0, i});
+      }
+    }
+    for (int level = 1; level < num_levels_; ++level) {
+      advance({level, 0});
+    }
+    const FileMetaData* furthest = nullptr;
+    int furthest_level = -1;
+    // Nonzero levels are sorted, disjoint runs; each L0 file is its own run.
+    // The heap visits only metadata, in O(files * log(runs)) time.
+    while (!heap.empty()) {
+      const Cursor cursor = heap.top();
+      heap.pop();
+      const FileMetaData* current = file(cursor);
+      if (furthest != nullptr &&
+          (cursor.level == 0 || cursor.level != furthest_level) &&
+          sstableKeyCompare(user_comparator_, furthest->largest,
+                            current->smallest) >= 0) {
+        return true;
+      }
+      if (furthest == nullptr ||
+          sstableKeyCompare(user_comparator_, current->largest,
+                            furthest->largest) > 0) {
+        furthest = current;
+        furthest_level = cursor.level;
+      }
+      if (cursor.level > 0) {
+        advance({cursor.level, cursor.index + 1});
+      }
+    }
+    return false;
+  };
+  std::vector<std::pair<SequenceNumber, SequenceNumber>> run_sequences;
+  bool has_unknown_sequence_range = false;
+  run_sequences.reserve(files_[0].size() + num_levels_);
+  for (int level = 0; level < num_levels_; ++level) {
+    SequenceNumber smallest = kMaxSequenceNumber;
+    SequenceNumber largest = 0;
+    for (const FileMetaData* file : files_[level]) {
+      const bool unknown = file->fd.smallest_seqno == kMaxSequenceNumber ||
+                           file->fd.largest_seqno == kMaxSequenceNumber;
+      has_unknown_sequence_range |= unknown;
+      const SequenceNumber low = unknown ? 0 : file->fd.smallest_seqno;
+      const SequenceNumber high =
+          unknown ? kMaxSequenceNumber : file->fd.largest_seqno;
+      if (level == 0) {
+        run_sequences.emplace_back(low, high);
+      } else {
+        smallest = std::min(smallest, low);
+        largest = std::max(largest, high);
+      }
+    }
+    if (level > 0 && !files_[level].empty()) {
+      run_sequences.emplace_back(smallest, largest);
+    }
+  }
+  may_have_multiple_zero_sequence_runs_ =
+      has_unknown_sequence_range ||
+      (std::count_if(run_sequences.begin(), run_sequences.end(),
+                     [](const auto& range) { return range.first == 0; }) > 1 &&
+       overlapping_runs(/*zero_only=*/true));
+  std::sort(run_sequences.begin(), run_sequences.end());
+  may_have_equal_sequence_runs_ = has_unknown_sequence_range;
+  SequenceNumber previous_max = 0;
+  for (size_t i = 0; i < run_sequences.size(); ++i) {
+    if (i > 0 && run_sequences[i].first <= previous_max) {
+      may_have_equal_sequence_runs_ = true;
+      break;
+    }
+    previous_max = run_sequences[i].second;
+  }
+  if (may_have_equal_sequence_runs_ && !has_unknown_sequence_range) {
+    may_have_equal_sequence_runs_ = overlapping_runs(/*zero_only=*/false);
+  }
   finalized_ = true;
+
+  if (!may_have_equal_sequence_runs_) {
+    requires_source_priority_for_equal_sequences_ = false;
+  }
 
 #ifndef NDEBUG
   if (compaction_style_ != kCompactionStyleLevel) {
@@ -5564,6 +5669,50 @@ std::string Version::DebugString(bool hex, bool print_stats) const {
 }
 
 // this is used to batch writes to the manifest file
+struct VersionSet::ManifestDrainWaiter {
+  ManifestDrainWaiter(VersionSet& versions, InstrumentedMutex* mu)
+      : owner(versions), next(versions.manifest_drain_waiters_), cv(mu) {
+    versions.manifest_drain_waiters_ = this;
+  }
+  ~ManifestDrainWaiter() {
+    auto** entry = &owner.manifest_drain_waiters_;
+    while (*entry != this) {
+      assert(*entry != nullptr);
+      entry = &(*entry)->next;
+    }
+    *entry = next;
+  }
+  ManifestDrainWaiter(const ManifestDrainWaiter&) = delete;
+  ManifestDrainWaiter& operator=(const ManifestDrainWaiter&) = delete;
+  ManifestDrainWaiter(ManifestDrainWaiter&&) = delete;
+  ManifestDrainWaiter& operator=(ManifestDrainWaiter&&) = delete;
+
+  VersionSet& owner;
+  ManifestDrainWaiter* next;
+  InstrumentedCondVar cv;
+};
+
+void VersionSet::WaitForManifestWrites(InstrumentedMutex* mu) {
+  mu->AssertHeld();
+  if (manifest_writers_.empty()) {
+    return;
+  }
+  ManifestDrainWaiter waiter(*this, mu);
+  while (!manifest_writers_.empty()) {
+    TEST_SYNC_POINT("VersionSet::WaitForManifestWrites:Waiting");
+    waiter.cv.Wait();
+  }
+}
+
+void VersionSet::SignalManifestDrainWaiters() {
+  if (manifest_writers_.empty()) {
+    for (auto* waiter = manifest_drain_waiters_; waiter;
+         waiter = waiter->next) {
+      waiter->cv.SignalAll();
+    }
+  }
+}
+
 struct VersionSet::ManifestWriter {
   Status status;
   bool done;
@@ -5572,6 +5721,7 @@ struct VersionSet::ManifestWriter {
   const autovector<VersionEdit*>& edit_list;
   const std::function<void(const Status&)> manifest_write_callback;
   int max_file_opening_threads;
+  const ScopedDeferredFileIOListeners::Context listener_context;
 
   explicit ManifestWriter(
       InstrumentedMutex* mu, ColumnFamilyData* _cfd,
@@ -5583,7 +5733,8 @@ struct VersionSet::ManifestWriter {
         cfd(_cfd),
         edit_list(e),
         manifest_write_callback(manifest_wcb),
-        max_file_opening_threads(_max_file_opening_threads) {}
+        max_file_opening_threads(_max_file_opening_threads),
+        listener_context(ScopedDeferredFileIOListeners::CaptureContext()) {}
   // No copying allowed
   ManifestWriter(const ManifestWriter&) = delete;
   ManifestWriter& operator=(const ManifestWriter&) = delete;
@@ -6078,11 +6229,13 @@ Status VersionSet::ProcessManifestWrites(
     if (!manifest_writers_.empty()) {
       manifest_writers_.front()->cv.Signal();
     }
+    SignalManifestDrainWaiters();
   };
 
   // Supports opening table readers with multiple threads, mostly useful for
   // batched external sst file ingestion.
   int batch_max_file_opening_threads = 1;
+  auto batch_listener_context = first_writer.listener_context;
 
   assert(!manifest_writers_.empty());
   assert(manifest_writers_.front() == &first_writer);
@@ -6121,6 +6274,11 @@ Status VersionSet::ProcessManifestWrites(
     for (;;) {
       assert(!(*it)->edit_list.front()->IsColumnFamilyManipulation());
       last_writer = *it;
+      if (last_writer->listener_context) {
+        assert(!batch_listener_context ||
+               batch_listener_context == last_writer->listener_context);
+        batch_listener_context = last_writer->listener_context;
+      }
       batch_max_file_opening_threads =
           std::max(batch_max_file_opening_threads,
                    last_writer->max_file_opening_threads);
@@ -6231,7 +6389,9 @@ Status VersionSet::ProcessManifestWrites(
       }
       const auto* next = (*it)->edit_list.front();
       if (next->IsColumnFamilyManipulation() ||
-          next->IsNoManifestWriteDummy()) {
+          next->IsNoManifestWriteDummy() ||
+          (batch_listener_context && (*it)->listener_context &&
+           batch_listener_context != (*it)->listener_context)) {
         // no group commits for column family add or drop
         // nor for dummy skipping manifest write
         break;
@@ -6382,6 +6542,8 @@ Status VersionSet::ProcessManifestWrites(
     }
   } else {
     FileOptions opt_file_opts = GetFileOptionsForManifestWrite();
+    ScopedDeferredFileIOListeners::ScopedContext listener_scope(
+        batch_listener_context);
     mu->Unlock();
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifestStart");
     TEST_SYNC_POINT_CALLBACK("VersionSet::LogAndApply:WriteManifest", nullptr);
@@ -6858,6 +7020,7 @@ Status VersionSet::LogAndApplyImpl(
     if (!manifest_writers_.empty()) {
       manifest_writers_.front()->cv.Signal();
     }
+    SignalManifestDrainWaiters();
     return s;
   } else {
     return ProcessManifestWrites(writers, mu, dir_contains_current_file,
@@ -6891,6 +7054,13 @@ Status VersionSet::LogAndApplyHelper(ColumnFamilyData* cfd,
   mu->AssertHeld();
   assert(!edit->IsColumnFamilyManipulation());
   assert(max_last_sequence != nullptr);
+  if (cfd != nullptr &&
+      (!edit->GetNewFiles().empty() || !edit->GetDeletedFiles().empty()) &&
+      cfd->current()
+          ->storage_info()
+          ->RequiresSourcePriorityForEqualSequences()) {
+    edit->RequireSourcePriorityForEqualSequences();
+  }
 
   if (edit->HasLogNumber()) {
     assert(edit->GetLogNumber() >= cfd->GetLogNumber());
@@ -8144,6 +8314,9 @@ Status VersionSet::WriteCurrentStateToManifest(
 
       const auto* vstorage = current->storage_info();
       assert(vstorage);
+      if (vstorage->RequiresSourcePriorityForEqualSequences()) {
+        edit.RequireSourcePriorityForEqualSequences();
+      }
 
       for (int level = 0; level < cfd->NumberLevels(); level++) {
         const auto& level_files = vstorage->LevelFiles(level);
@@ -8738,7 +8911,9 @@ InternalIterator* VersionSet::MakeInputIterator(
   assert(num <= space);
   InternalIterator* result = NewCompactionMergingIterator(
       &c->column_family_data()->internal_comparator(), list,
-      static_cast<int>(num), range_tombstones, /*arena=*/nullptr,
+      static_cast<int>(num),
+      c->input_version()->storage_info()->MayHaveEqualSequenceRuns(),
+      range_tombstones, /*arena=*/nullptr,
       c->column_family_data()->internal_stats());
   delete[] list;
   return result;

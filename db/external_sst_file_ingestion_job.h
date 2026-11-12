@@ -4,8 +4,11 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #pragma once
+#include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "db/column_family.h"
@@ -17,6 +20,7 @@
 #include "options/db_options.h"
 #include "rocksdb/db.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/lsm_edit.h"
 #include "rocksdb/sst_file_writer.h"
 #include "util/autovector.h"
 
@@ -24,6 +28,33 @@ namespace ROCKSDB_NAMESPACE {
 
 class Directories;
 class SystemClock;
+struct JobContext;
+
+// The extra per-job state that turns a file ingestion job into the job behind
+// DB::ApplyLsmEdit(): the caller states where each file goes instead of the
+// job deriving it, and an existing file that only partly overlaps the edit
+// range may be probed for live keys instead of failing the job.
+struct LsmEditJobSpec {
+  // Target level of each file, parallel to the paths passed to Prepare().
+  std::vector<int> levels;
+
+  LsmEditDeletionMode deletion_mode = LsmEditDeletionMode::kFilesInRange;
+
+  bool allow_replacement_file_relocation = false;
+
+  bool merge_incoming_files = false;
+  bool merge_existing_files = false;
+  bool split_existing_files = false;
+  bool snapshot_consistency = true;
+  std::vector<bool> zero_sequence_numbers;
+
+  // Files removed when deletion_mode is kExplicitFiles.
+  std::vector<LsmEditFileDeletion> delete_files;
+  std::vector<LsmEditLevelSplit> level_splits;
+
+  // See LsmEditOptions::probe_straddling_files.
+  bool probe_straddling_files = true;
+};
 
 struct KeyRangeInfo {
   // Smallest internal key in an external file or for a batch of external files.
@@ -120,6 +151,7 @@ class ExternalFileRangeChecker {
 struct IngestedFileInfo : public KeyRangeInfo {
   // External file path
   std::string external_file_path;
+  bool zero_sequence_numbers = false;
   // NOTE: use below two fields for all `*Overlap*` types of checks instead of
   // smallest_internal_key.user_key() and largest_internal_key.user_key().
   // The smallest / largest user key contained in the file for key range checks.
@@ -139,6 +171,7 @@ struct IngestedFileInfo : public KeyRangeInfo {
   uint64_t num_entries;
   // total number of range deletions in external file
   uint64_t num_range_deletions;
+  bool entry_stats_initialized = false;
   // Id of column family this file should be ingested into
   uint32_t cf_id;
   // TableProperties read from external file
@@ -188,9 +221,16 @@ struct IngestedFileInfo : public KeyRangeInfo {
   // file is already in the DB directory and must not be unlinked as a caller
   // input when move_files is enabled.
   bool generated_for_ingestion = false;
+  bool existing_file = false;
+  bool registered_with_sst_file_manager = false;
+  uint64_t oldest_ancestor_time = 0;
 
   SequenceNumber largest_seqno = kMaxSequenceNumber;
   SequenceNumber smallest_seqno = kMaxSequenceNumber;
+
+  // Level this file must be installed at, as declared through
+  // DB::ApplyLsmEdit(). Negative means the job picks the level itself.
+  int declared_level = -1;
 };
 
 // A batch of files.
@@ -260,8 +300,9 @@ class ExternalSstFileIngestionJob {
       const MutableDBOptions& mutable_db_options, const EnvOptions& env_options,
       const ShardedSnapshotList* db_snapshots,
       const IngestExternalFileOptions& ingestion_options,
-      Directories* directories, EventLogger* event_logger,
-      const std::shared_ptr<IOTracer>& io_tracer)
+      std::optional<LsmEditJobSpec> lsm_edit_spec, Directories* directories,
+      EventLogger* event_logger, const std::shared_ptr<IOTracer>& io_tracer,
+      std::shared_ptr<JobContext> merge_snapshot_context = nullptr)
       : clock_(db_options.clock),
         fs_(db_options.fs, io_tracer),
         versions_(versions),
@@ -273,6 +314,8 @@ class ExternalSstFileIngestionJob {
         env_options_(env_options),
         db_snapshots_(db_snapshots),
         ingestion_options_(ingestion_options),
+        lsm_edit_spec_(std::move(lsm_edit_spec)),
+        merge_snapshot_context_(std::move(merge_snapshot_context)),
         directories_(directories),
         event_logger_(event_logger),
         job_start_time_(clock_->NowMicros()),
@@ -370,6 +413,8 @@ class ExternalSstFileIngestionJob {
     return ingestion_options_.file_opening_threads;
   }
 
+  bool BlocksSnapshots() const { return lsm_edit_spec_.has_value(); }
+
   size_t NumFilesToPrepare(
       size_t num_external_files,
       const std::optional<RangeOpt>& atomic_replace_range) const;
@@ -396,6 +441,30 @@ class ExternalSstFileIngestionJob {
                                             SuperVersion* super_version);
 
   void ActivateAtomicReplaceRangeTombstone();
+
+  Status PickLsmEditTombstoneLevel(
+      const autovector<std::pair<int, const FileMetaData*>>& straddling_files);
+
+  void RelocateLsmEditReplacementFiles(int tombstone_level);
+
+  Status MergeIncomingFiles(SuperVersion* sv, uint64_t next_file_number);
+  FSDirectory* GetDataDir(size_t path_id) const;
+  Status SplitExistingFiles(SuperVersion* sv, uint64_t next_file_number);
+  Status SplitDeclaredLevels(SuperVersion* sv, uint64_t next_file_number);
+  Status ValidateLevelSplits() const;
+  Status ValidateLevelSplitSurvivors(const VersionStorageInfo* storage) const;
+  std::vector<Slice> FileSplitPoints(const FileMetaData& file,
+                                     const LsmEditLevelSplit& split) const;
+  Status CheckSplitRangeEmpty(IngestedFileInfo* file, SuperVersion* sv);
+
+  void SelectExistingMergeInputs(int level, const KeyRangeInfo& incoming_range,
+                                 SuperVersion* sv);
+  Status AddRewrittenExistingFileDeletions(const VersionStorageInfo* storage);
+
+  Status BuildMergedFile(const std::vector<IngestedFileInfo*>& inputs,
+                         int level, uint64_t file_number, SuperVersion* sv,
+                         IngestedFileInfo* output,
+                         const RangeOpt* output_bounds = nullptr);
 
   Status ResetTableReader(const std::string& external_file,
                           uint64_t new_file_number,
@@ -476,6 +545,73 @@ class ExternalSstFileIngestionJob {
       SequenceNumber* assigned_seqno,
       std::optional<int> prev_batch_uppermost_level);
 
+  // Validate the levels declared through DB::ApplyLsmEdit() and record each on
+  // its IngestedFileInfo. `external_files_paths` is only used for error
+  // messages.
+  Status RecordDeclaredLevels(
+      const std::vector<std::string>& external_files_paths);
+
+  // Assign the generated covering tombstone first, followed by replacement
+  // files from deeper to shallower levels, preserving input order within L0.
+  // REQUIRES: Mutex held
+  Status AssignLsmEditGlobalSequenceNumbers(SequenceNumber last_seqno);
+
+  // Verify that overlapping files declared at different levels preserve the
+  // LSM invariant that every entry in the higher level is newer than any
+  // intersecting entry in the lower level. For overlapping L0 files, their
+  // order in the input is used and equal sequence numbers are allowed.
+  Status ValidateDeclaredLevelSequenceOrder(SuperVersion* super_version);
+
+  // Verify that added files also preserve sequence-number ordering against
+  // overlapping live files not removed by this edit.
+  // Preparation uses a pinned Version and runs without the DB mutex.
+  Status ValidateDeclaredLevelSurvivingFileSequenceOrder(
+      SuperVersion* super_version);
+  struct DeclaredLevelSurvivor {
+    size_t added_index;
+    int level;
+    const FileMetaData* file;
+  };
+  std::vector<DeclaredLevelSurvivor> GetDeclaredLevelSurvivors(
+      const VersionStorageInfo* vstorage,
+      const VersionEdit::DeletedFiles& deleted) const;
+  bool NeedsSurvivingSequenceValidation() const;
+  // Commit rechecks metadata identities instead of reopening or scanning SSTs.
+  // REQUIRES: Mutex held
+  Status RevalidateDeclaredLevelSurvivors(
+      const VersionStorageInfo* vstorage) const;
+
+  // Add `file` to edit_ and to the synthetic compaction inputs that block
+  // concurrent compactions until the MANIFEST edit is durable.
+  Status DeleteLiveFile(int level, const FileMetaData* file);
+
+  // Validate the caller-declared deletions against the current Version and
+  // add them to edit_.
+  // REQUIRES: Mutex held
+  Status AddExplicitFileDeletions(const VersionStorageInfo* vstorage);
+
+  // Validate the level `file_to_ingest` declared through DB::ApplyLsmEdit()
+  // and record it as the picked level. Never assigns a sequence number: an
+  // LSM edit installs files with the sequence numbers they carry.
+  // REQUIRES: Mutex held
+  Status UseDeclaredLevelForIngestedFile(IngestedFileInfo* file_to_ingest);
+
+  // Like IngestedFileFitInLevel(), but ignores the files this job is about to
+  // remove, so a declared level occupied only by doomed files is still usable.
+  // REQUIRES: Mutex held
+  bool DeclaredFileFitsInLevel(const IngestedFileInfo* file_to_ingest,
+                               int level) const;
+
+  // Verify that no key in [start, limit) survives outside the files the edit
+  // is about to delete, so that installing `add_files` with their own sequence
+  // numbers cannot shadow or resurrect existing data. `straddling_files` are
+  // the files that overlap the range without being contained in it, paired
+  // with their level; each is probed with an iterator.
+  // REQUIRES: Mutex held
+  Status ProbeStraddlingFiles(
+      SuperVersion* super_version,
+      const autovector<std::pair<int, const FileMetaData*>>& straddling_files);
+
   // File that we want to ingest behind always goes to the lowest level;
   // we just check that it fits in the level, that the CF allows ingest_behind,
   // and that we don't have 0 seqnums at the upper levels.
@@ -510,6 +646,8 @@ class ExternalSstFileIngestionJob {
 
   // Remove all the internal files created, called when ingestion job fails.
   void DeleteInternalFiles();
+  Status RegisterGeneratedFile(IngestedFileInfo* file);
+  Status DeleteInternalFile(IngestedFileInfo* file);
 
   SystemClock* clock_;
   FileSystemPtr fs_;
@@ -518,12 +656,23 @@ class ExternalSstFileIngestionJob {
   const Comparator* ucmp_;
   ExternalFileRangeChecker file_range_checker_;
   const ImmutableDBOptions& db_options_;
-  const MutableDBOptions& mutable_db_options_;
-  const EnvOptions& env_options_;
+  // Preparation runs without the DB mutex; retain owned option snapshots.
+  const MutableDBOptions mutable_db_options_;
+  const EnvOptions env_options_;
   const ShardedSnapshotList* db_snapshots_;
   autovector<IngestedFileInfo> files_to_ingest_;
+  autovector<IngestedFileInfo> merged_input_files_;
+  autovector<IngestedFileInfo> merged_existing_files_;
+  std::vector<LsmEditFileDeletion> rewritten_existing_deletions_;
+  std::vector<std::pair<int, uint64_t>> prepared_sequence_survivors_;
+  SequenceNumber max_merged_input_seqno_ = 0;
   std::vector<FileBatchInfo> file_batches_to_ingest_;
   const IngestExternalFileOptions ingestion_options_;
+  // Set when this job backs a DB::ApplyLsmEdit() call rather than an ingestion.
+  const std::optional<LsmEditJobSpec> lsm_edit_spec_;
+  bool requires_source_priority_for_equal_sequences_ = false;
+  std::shared_ptr<JobContext> merge_snapshot_context_;
+  bool assign_lsm_edit_global_seqnos_ = false;
   std::optional<KeyRangeInfo> atomic_replace_range_;
   std::optional<IngestedFileInfo> atomic_replace_range_tombstone_;
   bool atomic_replace_range_tombstone_active_{false};
@@ -546,14 +695,15 @@ class ExternalSstFileIngestionJob {
   // FileMetaData used in inputs of compactions equivalent to this ingestion
   // job
   std::vector<FileMetaData*> compaction_input_metdatas_;
+  // Live files this edit deletes. These are real Version metadata pointers, not
+  // copies, so their being_compacted flag is cleared before unregistering.
+  std::vector<std::pair<int, const FileMetaData*>>
+      deleted_file_compaction_inputs_;
   // Compactions equivalent to this ingestion job
   std::vector<Compaction*> file_ingesting_compactions_;
 
-  // Existing files deleted by atomic replace. Their version is retained until
-  // UnregisterRange() clears their being_compacted flags.
-  std::vector<FileMetaData*> files_to_replace_;
+  // Retain the current Version until deleted-file reservations are released.
   Version* files_to_replace_version_{nullptr};
-  bool files_to_replace_marked_{false};
 };
 
 }  // namespace ROCKSDB_NAMESPACE

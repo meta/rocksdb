@@ -166,6 +166,12 @@ class DBImplReadOnly : public DBImpl {
     return Status::NotSupported("Not supported operation in read only mode.");
   }
 
+  using DB::ApplyLsmEdit;
+  Status ApplyLsmEdit(const LsmEditOptions& /*options*/,
+                      const std::vector<LsmEdit>& /*edits*/) override {
+    return Status::NotSupported("Not supported operation in read only mode.");
+  }
+
   using DB::CommitFileIngestionHandles;
   Status CommitFileIngestionHandles(
       std::vector<std::unique_ptr<FileIngestionHandle>> /*handles*/) override {

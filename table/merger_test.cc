@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "memory/arena.h"
 #include "table/merging_iterator.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -171,6 +172,125 @@ TEST_F(MergerTest, SeekToLastTest) {
     AssertEquivalence();
     Prev(50000);
   }
+}
+
+TEST_F(MergerTest, OrdinaryInputsRetainValueTypeOrdering) {
+  const std::string deletion =
+      InternalKey("m", 7, kTypeDeletion).Encode().ToString();
+  const std::string value = InternalKey("m", 7, kTypeValue).Encode().ToString();
+  InternalIterator* inputs[] = {
+      new VectorIterator({deletion}, {"deleted"}, &icomp_),
+      new VectorIterator({value}, {"value"}, &icomp_)};
+  std::unique_ptr<InternalIterator> iter(
+      NewMergingIterator(&icomp_, inputs, 2));
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(value, iter->key().ToString());
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(deletion, iter->key().ToString());
+  iter->SeekToLast();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(deletion, iter->key().ToString());
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(value, iter->key().ToString());
+  ASSERT_OK(iter->status());
+}
+
+TEST_F(MergerTest, ExplicitSourcePriorityOrdersEqualZeroPoints) {
+  const std::string deletion =
+      InternalKey("m", 0, kTypeDeletion).Encode().ToString();
+  const std::string value = InternalKey("m", 0, kTypeValue).Encode().ToString();
+  Arena arena;
+  MergeIteratorBuilder builder(
+      &icomp_, &arena,
+      MergeIteratorBuilder::EqualSequenceOrder::kSourcePriority,
+      /*prefix_seek_mode=*/false, /*iterate_upper_bound=*/nullptr);
+  builder.AddIterator(new (arena.AllocateAligned(sizeof(VectorIterator)))
+                          VectorIterator({deletion}, {"deleted"}, &icomp_));
+  builder.AddIterator(new (arena.AllocateAligned(sizeof(VectorIterator)))
+                          VectorIterator({value}, {"value"}, &icomp_));
+  ScopedArenaPtr<InternalIterator> iter(builder.Finish());
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(deletion, iter->key().ToString());
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(value, iter->key().ToString());
+  iter->SeekToLast();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(value, iter->key().ToString());
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(deletion, iter->key().ToString());
+  ASSERT_OK(iter->status());
+}
+
+TEST_F(MergerTest, SourcePriorityDirectionSwitchRetriesAsyncSeek) {
+  class DelayedSeekIterator : public VectorIterator {
+   public:
+    using VectorIterator::VectorIterator;
+
+    void Seek(const Slice& target) override {
+      ++seek_calls;
+      pending = delay_next_seek;
+      delay_next_seek = false;
+      if (!pending) {
+        VectorIterator::Seek(target);
+      }
+    }
+    bool Valid() const override { return !pending && VectorIterator::Valid(); }
+    Status status() const override {
+      return pending ? Status::TryAgain() : Status::OK();
+    }
+
+    bool delay_next_seek = false;
+    bool pending = false;
+    int seek_calls = 0;
+  };
+
+  const std::string upper_a =
+      InternalKey("a", 0, kTypeValue).Encode().ToString();
+  const std::string lower_a =
+      InternalKey("a", 0, kTypeWideColumnEntity).Encode().ToString();
+  const std::string b = InternalKey("b", 0, kTypeValue).Encode().ToString();
+  const std::string c = InternalKey("c", 0, kTypeValue).Encode().ToString();
+  Arena arena;
+  MergeIteratorBuilder builder(
+      &icomp_, &arena,
+      MergeIteratorBuilder::EqualSequenceOrder::kSourcePriority,
+      /*prefix_seek_mode=*/false, /*iterate_upper_bound=*/nullptr);
+  auto* upper = new (arena.AllocateAligned(sizeof(DelayedSeekIterator)))
+      DelayedSeekIterator({upper_a, b, c}, {"new", "middle", "last"}, &icomp_);
+  builder.AddIterator(upper);
+  builder.AddIterator(new (arena.AllocateAligned(sizeof(VectorIterator)))
+                          VectorIterator({lower_a}, {"old"}, &icomp_));
+  ScopedArenaPtr<InternalIterator> iter(builder.Finish());
+  iter->SeekToLast();
+  iter->Prev();
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(lower_a, iter->key().ToString());
+  upper->seek_calls = 0;
+  upper->delay_next_seek = true;
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(b, iter->key().ToString());
+  EXPECT_EQ(2, upper->seek_calls);
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(lower_a, iter->key().ToString());
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(upper_a, iter->key().ToString());
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(lower_a, iter->key().ToString());
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(upper_a, iter->key().ToString());
+  ASSERT_OK(iter->status());
 }
 
 }  // namespace ROCKSDB_NAMESPACE

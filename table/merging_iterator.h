@@ -48,11 +48,18 @@ class MergingIterator;
 // processed.
 class MergeIteratorBuilder {
  public:
+  // Equal user-key/sequence pairs follow value-type ordering or input order
+  // (earlier inputs first).
+  enum class EqualSequenceOrder { kInternalKey, kSourcePriority };
+
   // comparator: the comparator used in merging comparator
   // arena: where the merging iterator needs to be allocated from.
   explicit MergeIteratorBuilder(const InternalKeyComparator* comparator,
                                 Arena* arena, bool prefix_seek_mode = false,
                                 const Slice* iterate_upper_bound = nullptr);
+  MergeIteratorBuilder(const InternalKeyComparator* comparator, Arena* arena,
+                       EqualSequenceOrder order, bool prefix_seek_mode,
+                       const Slice* iterate_upper_bound);
   ~MergeIteratorBuilder();
 
   // Add point key iterator `iter` to the merging iterator.

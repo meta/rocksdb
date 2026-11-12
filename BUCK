@@ -5416,6 +5416,12 @@ cpp_unittest_wrapper(name="lru_cache_test",
             extra_compiler_flags=[])
 
 
+cpp_unittest_wrapper(name="lsm_edit_test",
+            srcs=["db/lsm_edit_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
 cpp_unittest_wrapper(name="manual_compaction_test",
             srcs=["db/manual_compaction_test.cc"],
             deps=[":rocksdb_test_lib"],

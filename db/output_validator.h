@@ -25,6 +25,8 @@ class OutputValidator {
   // criteria, e.g. key is ordered.
   Status Add(const Slice& key, const Slice& value);
 
+  Status AddStrict(const Slice& key, const Slice& value);
+
   // Add a key that has already been checked with CanAdd().
   void AddValidated(const Slice& key, const Slice& value);
 
@@ -44,6 +46,7 @@ class OutputValidator {
   uint64_t GetHash() const { return paranoid_hash_; }
 
  private:
+  Status CanAdd(const Slice& key, bool require_strict_key_order) const;
   const InternalKeyComparator& icmp_;
   std::string prev_key_;
   uint64_t paranoid_hash_ = 0;
