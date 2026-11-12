@@ -578,6 +578,33 @@ TEST_F(CoalescingIteratorTest, EmptyCfs) {
   }
 }
 
+TEST_F(CoalescingIteratorTest, SeekClearsErrorStatus) {
+  // Under prefix_seek_opt_in_only, SeekToFirst() and SeekToLast() of a
+  // prefix_same_as_start iterator fail with NotSupported. A later seek must
+  // clear that error, as for any Iterator.
+  Options options = GetDefaultOptions();
+  options.prefix_extractor.reset(NewFixedPrefixTransform(4));
+  options.prefix_seek_opt_in_only = true;
+  CreateAndReopenWithCF({"cf_1"}, options);
+  ASSERT_OK(Put(0, "kkkk1", "cf_0_val"));
+  ASSERT_OK(Put(1, "kkkk2", "cf_1_val"));
+
+  ReadOptions read_options;
+  read_options.prefix_same_as_start = true;
+  std::unique_ptr<Iterator> iter =
+      db_->NewCoalescingIterator(read_options, handles_);
+  iter->SeekToFirst();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_TRUE(iter->status().IsNotSupported());
+  iter->Seek("kkkk");
+  ASSERT_EQ(IterStatus(iter.get()), "kkkk1->cf_0_val");
+  iter->SeekToLast();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_TRUE(iter->status().IsNotSupported());
+  iter->SeekForPrev("kkkk9");
+  ASSERT_EQ(IterStatus(iter.get()), "kkkk2->cf_1_val");
+}
+
 TEST_F(CoalescingIteratorTest, WideColumns) {
   // Set up the DB and Column Families
   Options options = GetDefaultOptions();

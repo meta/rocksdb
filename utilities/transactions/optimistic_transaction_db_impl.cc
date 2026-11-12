@@ -80,6 +80,10 @@ Status OptimisticTransactionDB::Open(
   // Enable MemTable History if not already enabled
   for (auto& column_family : column_families_copy) {
     ColumnFamilyOptions* options = &column_family.options;
+    s = OptimisticTransactionDBImpl::VerifyCFOptions(*options);
+    if (!s.ok()) {
+      return s;
+    }
 
     if (options->max_write_buffer_size_to_maintain == 0) {
       // Setting to -1 will set the History size to
@@ -95,6 +99,67 @@ Status OptimisticTransactionDB::Open(
   }
 
   return s;
+}
+
+Status OptimisticTransactionDBImpl::VerifyCFOptions(
+    const ColumnFamilyOptions& cf_options) {
+  if (cf_options.inplace_update_support) {
+    // An in-place update keeps the sequence number of the entry it overwrites,
+    // so commit-time validation cannot detect a conflicting write.
+    return Status::NotSupported(
+        "inplace_update_support is not supported with "
+        "OptimisticTransactionDB");
+  }
+  return Status::OK();
+}
+
+Status OptimisticTransactionDBImpl::CreateColumnFamily(
+    const ColumnFamilyOptions& options, const std::string& column_family_name,
+    ColumnFamilyHandle** handle) {
+  Status s = VerifyCFOptions(options);
+  if (!s.ok()) {
+    return s;
+  }
+  return OptimisticTransactionDB::CreateColumnFamily(
+      options, column_family_name, handle);
+}
+
+Status OptimisticTransactionDBImpl::CreateColumnFamilies(
+    const ColumnFamilyOptions& options,
+    const std::vector<std::string>& column_family_names,
+    std::vector<ColumnFamilyHandle*>* handles) {
+  Status s = VerifyCFOptions(options);
+  if (!s.ok()) {
+    return s;
+  }
+  return OptimisticTransactionDB::CreateColumnFamilies(
+      options, column_family_names, handles);
+}
+
+Status OptimisticTransactionDBImpl::CreateColumnFamilies(
+    const std::vector<ColumnFamilyDescriptor>& column_families,
+    std::vector<ColumnFamilyHandle*>* handles) {
+  for (const auto& cf_desc : column_families) {
+    Status s = VerifyCFOptions(cf_desc.options);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  return OptimisticTransactionDB::CreateColumnFamilies(column_families,
+                                                       handles);
+}
+
+Status OptimisticTransactionDBImpl::CreateColumnFamilyWithImport(
+    const ColumnFamilyOptions& options, const std::string& column_family_name,
+    const ImportColumnFamilyOptions& import_options,
+    const std::vector<const ExportImportFilesMetaData*>& metadatas,
+    ColumnFamilyHandle** handle) {
+  Status s = VerifyCFOptions(options);
+  if (!s.ok()) {
+    return s;
+  }
+  return OptimisticTransactionDB::CreateColumnFamilyWithImport(
+      options, column_family_name, import_options, metadatas, handle);
 }
 
 void OptimisticTransactionDBImpl::ReinitializeTransaction(

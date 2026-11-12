@@ -1352,6 +1352,10 @@ DEFINE_bool(write_identity_file,
             ROCKSDB_NAMESPACE::Options().write_identity_file,
             "Write DB_ID to IDENTITY file");
 
+DEFINE_bool(prefix_seek_opt_in_only,
+            ROCKSDB_NAMESPACE::Options().prefix_seek_opt_in_only,
+            "Set DBOptions::prefix_seek_opt_in_only");
+
 DEFINE_bool(reuse_manifest_on_open,
             ROCKSDB_NAMESPACE::Options().reuse_manifest_on_open,
             "Reopen existing MANIFEST for append after recovery instead of "

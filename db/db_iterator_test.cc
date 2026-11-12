@@ -87,6 +87,147 @@ class DBIteratorBaseTest : public DBTestBase {
 };
 
 #ifdef OS_LINUX
+TEST_F(DBIteratorBaseTest, PrefixSameAsStartDirectionChange) {
+  // prefix_same_as_start uses prefix seek even with total_order_seek=true (as
+  // forced by prefix_seek_opt_in_only) or auto_prefix_mode. On Next() after
+  // Prev(), the inner iterator stands on a key with another prefix (bbbb1).
+  // DBIter must reseek it to the current key; moving it without a reseek
+  // seeks the other children to bbbb1, where a prefix filter drops the child
+  // holding kkkk1 and kkkk3.
+  struct ReadCase {
+    const char* name;
+    bool opt_in;
+    bool total_order_seek;
+    bool auto_prefix_mode;
+  };
+  const std::vector<ReadCase> read_cases = {
+      {"prefix_same_as_start", false, false, false},
+      {"+total_order_seek", false, true, false},
+      {"+auto_prefix_mode", false, false, true},
+      {"+prefix_seek_opt_in_only", true, false, false},
+  };
+  for (bool memtable_bloom : {false, true}) {
+    for (const ReadCase& rc : read_cases) {
+      SCOPED_TRACE(std::string(rc.name) +
+                   (memtable_bloom ? " memtable_bloom" : " sst_filter"));
+      Options options = CurrentOptions();
+      options.disable_auto_compactions = true;
+      options.prefix_extractor.reset(NewFixedPrefixTransform(4));
+      options.prefix_seek_opt_in_only = rc.opt_in;
+      BlockBasedTableOptions table_options;
+      if (memtable_bloom) {
+        options.memtable_prefix_bloom_size_ratio = 0.1;
+      } else {
+        table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+        table_options.whole_key_filtering = false;
+      }
+      options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+      DestroyAndReopen(options);
+      // The child that gets filtered has prefix kkkk only: the SST for the
+      // SST filter case, the memtable for the memtable bloom case.
+      const std::vector<std::string> kkkk_only = {"kkkk1", "kkkk3"};
+      const std::vector<std::string> mixed = {"bbbb1", "kkkk2"};
+      for (const std::string& key : memtable_bloom ? mixed : kkkk_only) {
+        ASSERT_OK(Put(key, "v"));
+      }
+      ASSERT_OK(Flush());
+      for (const std::string& key : memtable_bloom ? kkkk_only : mixed) {
+        ASSERT_OK(Put(key, "v"));
+      }
+
+      ReadOptions ro;
+      ro.prefix_same_as_start = true;
+      ro.total_order_seek = rc.total_order_seek;
+      ro.auto_prefix_mode = rc.auto_prefix_mode;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      iter->Seek("kkkk1");
+      std::vector<std::string> keys;
+      // Seek, Next, Prev, then Next until the end of the prefix.
+      for (int step = 0; iter->Valid(); ++step) {
+        keys.push_back(iter->key().ToString());
+        if (step == 1) {
+          iter->Prev();
+        } else {
+          iter->Next();
+        }
+      }
+      ASSERT_OK(iter->status());
+      const std::vector<std::string> expected = {"kkkk1", "kkkk2", "kkkk1",
+                                                 "kkkk2", "kkkk3"};
+      EXPECT_EQ(expected, keys);
+    }
+  }
+}
+
+TEST_F(DBIteratorBaseTest, PrefixSameAsStartWithExplicitBounds) {
+  // prefix_same_as_start implies a bound at the end of the seek prefix. With
+  // or without auto_prefix_mode, the iterator returns only keys within both
+  // that implied bound and the explicit iterate_lower_bound /
+  // iterate_upper_bound, whichever is narrower.
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.prefix_extractor.reset(NewFixedPrefixTransform(4));
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+  table_options.whole_key_filtering = false;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+  for (const char* key : {"kkkj9", "kkkk1", "kkkk5"}) {
+    ASSERT_OK(Put(key, "v"));
+  }
+  ASSERT_OK(Flush());
+  for (const char* key : {"kkkk3", "kkkl1"}) {
+    ASSERT_OK(Put(key, "v"));
+  }
+
+  struct BoundCase {
+    const char* name;
+    const char* bound;
+    std::vector<std::string> expected;
+  };
+  const std::vector<BoundCase> forward_cases = {
+      {"upper bound inside prefix", "kkkk4", {"kkkk1", "kkkk3"}},
+      {"upper bound past prefix", "kkkm", {"kkkk1", "kkkk3", "kkkk5"}},
+  };
+  const std::vector<BoundCase> backward_cases = {
+      {"lower bound inside prefix", "kkkk2", {"kkkk5", "kkkk3"}},
+      {"lower bound before prefix", "kkkj", {"kkkk5", "kkkk3", "kkkk1"}},
+  };
+  for (bool auto_prefix_mode : {false, true}) {
+    ReadOptions ro;
+    ro.prefix_same_as_start = true;
+    ro.auto_prefix_mode = auto_prefix_mode;
+    for (const BoundCase& bc : forward_cases) {
+      SCOPED_TRACE(std::string(bc.name) +
+                   (auto_prefix_mode ? " auto_prefix_mode" : ""));
+      Slice upper_bound(bc.bound);
+      ro.iterate_upper_bound = &upper_bound;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      std::vector<std::string> keys;
+      for (iter->Seek("kkkk1"); iter->Valid(); iter->Next()) {
+        keys.push_back(iter->key().ToString());
+      }
+      ASSERT_OK(iter->status());
+      EXPECT_EQ(bc.expected, keys);
+    }
+    ro.iterate_upper_bound = nullptr;
+    for (const BoundCase& bc : backward_cases) {
+      SCOPED_TRACE(std::string(bc.name) +
+                   (auto_prefix_mode ? " auto_prefix_mode" : ""));
+      Slice lower_bound(bc.bound);
+      ro.iterate_lower_bound = &lower_bound;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      std::vector<std::string> keys;
+      for (iter->SeekForPrev("kkkk5"); iter->Valid(); iter->Prev()) {
+        keys.push_back(iter->key().ToString());
+      }
+      ASSERT_OK(iter->status());
+      EXPECT_EQ(bc.expected, keys);
+    }
+    ro.iterate_lower_bound = nullptr;
+  }
+}
+
 TEST_F(DBIteratorBaseTest, PrevChecksQueryAbort) {
   ASSERT_OK(Put("a", "va"));
   ASSERT_OK(Put("b", "vb"));
@@ -8101,10 +8242,10 @@ TEST_P(ReadPathRangeTombstoneTest,
 
 TEST_P(ReadPathRangeTombstoneTest, PrefixFilterOutOfDomainSeek) {
   // With an out-of-domain seek target, prefix_same_as_start cannot establish
-  // a seek-prefix bound. The iterator therefore behaves like an unrestricted
-  // scan while still avoiding Transform() on the short seek target, so the
-  // valid run [bbbb, bbdd) should be converted even though it spans multiple
-  // distinct prefixes.
+  // a seek-prefix bound. The iterator scans past the seek prefix while the
+  // child iterators still use prefix seek, which can skip live keys, so the
+  // run [bbbb, bbdd) must not be converted. The scan must still avoid
+  // Transform() on the short seek target.
   Options options = CurrentOptions();
   options.min_tombstones_for_range_conversion = 2;
   options.statistics = CreateDBStatistics();
@@ -8144,8 +8285,7 @@ TEST_P(ReadPathRangeTombstoneTest, PrefixFilterOutOfDomainSeek) {
     }
   }
   ASSERT_OK(it->status());
-  ASSERT_EQ(attempted_insert_ranges_.size(), 1u);
-  AssertRange(0, "bbbb", "bbdd");
+  ASSERT_TRUE(attempted_insert_ranges_.empty());
 }
 
 TEST_P(ReadPathRangeTombstoneTest, TableFilterNotAllowed) {

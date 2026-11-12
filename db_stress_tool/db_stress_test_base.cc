@@ -3726,21 +3726,21 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
     expect_total_order = true;
   } else if (thread->rand.OneIn(2)) {
     ro.prefix_same_as_start = true;
+    // prefix_same_as_start takes precedence over total_order_seek, which is
+    // also how every iterator looks under prefix_seek_opt_in_only.
+    ro.total_order_seek = thread->rand.OneIn(2);
   }
-  // Run SeekToFirst() after Seek() on the same table iterator under
-  // prefix_same_as_start, without bounds. DBIter converts SeekToFirst() with a
-  // lower bound to Seek(lower_bound). An upper bound inside the first prefix
-  // ends the scan before the verifier can tell a truncated scan from a complete
-  // one. prefix_hash returns nothing from a prefix SeekToFirst().
-  const bool cover_seek_to_first_after_seek =
-      ro.prefix_same_as_start && FLAGS_memtablerep != "prefix_hash" &&
-      thread->rand.OneIn(8);
+  // Under prefix_same_as_start, SeekToFirst() and SeekToLast() return
+  // NotSupported with prefix_seek_opt_in_only. Without it they are not well
+  // supported (they can skip live keys when range tombstones cross prefix
+  // boundaries), so they are not verified.
+  const bool expect_seek_to_first_last_not_supported =
+      ro.prefix_same_as_start && FLAGS_prefix_seek_opt_in_only;
 
   std::string upper_bound_str;
   Slice upper_bound;
   // Prefer no bound with no range query filtering; prefer bound with it
-  if (!cover_seek_to_first_after_seek &&
-      (FLAGS_use_sqfc_for_range_queries ^ thread->rand.OneIn(16))) {
+  if (FLAGS_use_sqfc_for_range_queries ^ thread->rand.OneIn(16)) {
     // Note: upper_bound can be smaller than the seek key.
     const int64_t rand_upper_key = GenerateOneKey(thread, FLAGS_ops_per_thread);
     upper_bound_str = Key(rand_upper_key);
@@ -3750,8 +3750,7 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
 
   std::string lower_bound_str;
   Slice lower_bound;
-  if (!cover_seek_to_first_after_seek &&
-      (FLAGS_use_sqfc_for_range_queries ^ thread->rand.OneIn(16))) {
+  if (FLAGS_use_sqfc_for_range_queries ^ thread->rand.OneIn(16)) {
     // Note: lower_bound can be greater than the seek key.
     const int64_t rand_lower_key = GenerateOneKey(thread, FLAGS_ops_per_thread);
     lower_bound_str = Key(rand_lower_key);
@@ -3840,13 +3839,8 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
 
     Slice key(key_str);
 
-    // DBIter converts SeekToFirst() with a lower bound to Seek(lower_bound),
-    // which VerifyIterator() does not handle. SeekToLast() is only verified
-    // under total order.
     const bool support_seek_to_first =
-        (expect_total_order && FLAGS_test_backward_scan) ||
-        (ro.prefix_same_as_start && ro.iterate_lower_bound == nullptr &&
-         FLAGS_memtablerep != "prefix_hash");
+        expect_total_order && FLAGS_test_backward_scan;
     const bool support_seek_to_last =
         expect_total_order && FLAGS_test_backward_scan;
     const bool support_seek_for_prev = FLAGS_test_backward_scan;
@@ -3863,31 +3857,30 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
       op_logs += "Refresh ";
     }
 
-    LastIterateOp last_op;
-    // Under prefix_same_as_start a SeekToFirst() scan covers the prefix of the
-    // first key.
-    std::string verify_key_str;
-    Slice verify_key = key;
-    if (support_seek_to_first &&
-        thread->rand.OneIn(cover_seek_to_first_after_seek ? 4 : 100)) {
-      if (cover_seek_to_first_after_seek) {
-        // If this Seek() read the first data block, the block would be cached
-        // and SeekToFirst() would not read the file.
-        const std::string pre_seek_key =
-            Key(GenerateOneKey(thread, FLAGS_ops_per_thread));
-        iter->Seek(pre_seek_key);
-        cmp_iter->Seek(pre_seek_key);
-        op_logs += "PreS " + Slice(pre_seek_key).ToString(true) + " ";
-        thread->stats.AddSeekToFirstAfterSeek(1);
+    if (expect_seek_to_first_last_not_supported && thread->rand.OneIn(100)) {
+      const bool to_first = thread->rand.OneIn(2);
+      if (to_first) {
+        iter->SeekToFirst();
+      } else {
+        iter->SeekToLast();
       }
+      if (iter->Valid() || !iter->status().IsNotSupported()) {
+        thread->shared->SetVerificationFailure();
+        fprintf(stderr,
+                "%s under prefix_same_as_start and prefix_seek_opt_in_only "
+                "returned %s, expected NotSupported\n",
+                to_first ? "SeekToFirst()" : "SeekToLast()",
+                iter->Valid() ? "a key" : iter->status().ToString().c_str());
+        return Status::OK();
+      }
+    }
+
+    LastIterateOp last_op;
+    if (support_seek_to_first && thread->rand.OneIn(100)) {
       iter->SeekToFirst();
       cmp_iter->SeekToFirst();
       last_op = kLastOpSeekToFirst;
       op_logs += "STF ";
-      if (ro.prefix_same_as_start && cmp_iter->Valid()) {
-        verify_key_str = cmp_iter->key().ToString();
-        verify_key = verify_key_str;
-      }
     } else if (support_seek_to_last && thread->rand.OneIn(100)) {
       iter->SeekToLast();
       cmp_iter->SeekToLast();
@@ -3922,14 +3915,11 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
     }
 
     VerifyIterator(thread, cmp_cfh, ro, iter.get(), cmp_iter.get(), last_op,
-                   verify_key, rand_column_families, op_logs, verify_func,
-                   &diverged);
+                   key, rand_column_families, op_logs, verify_func, &diverged);
 
-    // Prev() resets the table iterator's readahead lookup state.
     const bool no_reverse =
         (FLAGS_memtablerep == "prefix_hash" && !expect_total_order) ||
-        !FLAGS_test_backward_scan ||
-        (cover_seek_to_first_after_seek && last_op == kLastOpSeekToFirst);
+        !FLAGS_test_backward_scan;
     for (uint64_t i = 0; i < FLAGS_num_iterations && iter->Valid(); ++i) {
       if (no_reverse || thread->rand.OneIn(2)) {
         iter->Next();
@@ -3966,7 +3956,7 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
       }
 
       VerifyIterator(thread, cmp_cfh, ro, iter.get(), cmp_iter.get(), last_op,
-                     verify_key, rand_column_families, op_logs, verify_func,
+                     key, rand_column_families, op_logs, verify_func,
                      &diverged);
     }
 
@@ -4168,8 +4158,11 @@ bool StressTest::VerifyIterator(
     return false;
   }
 
-  if (!ro.total_order_seek && options_.prefix_extractor != nullptr &&
-      ro.iterate_lower_bound != nullptr) {
+  // prefix_same_as_start takes precedence over total_order_seek.
+  const bool prefix_iteration =
+      GetIteratorPrefixMode(ro, options_.prefix_extractor != nullptr) ==
+      IteratorPrefixMode::kPrefix;
+  if (prefix_iteration && ro.iterate_lower_bound != nullptr) {
     const SliceTransform* prefix_extractor = options_.prefix_extractor.get();
     if (!prefix_extractor->InDomain(verify_key) ||
         !prefix_extractor->InDomain(*ro.iterate_lower_bound) ||
@@ -4183,9 +4176,8 @@ bool StressTest::VerifyIterator(
     }
   }
 
-  const SliceTransform* pe = (ro.total_order_seek || ro.auto_prefix_mode)
-                                 ? nullptr
-                                 : options_.prefix_extractor.get();
+  const SliceTransform* pe =
+      prefix_iteration ? options_.prefix_extractor.get() : nullptr;
   const Comparator* cmp = options_.comparator;
   std::ostringstream read_opt_oss;
   read_opt_oss << "pin_data: " << ro.pin_data
@@ -7204,6 +7196,7 @@ void InitializeOptionsFromFlags(
       FLAGS_track_options_file_number_in_manifest;
   options.optimize_manifest_for_recovery = FLAGS_optimize_manifest_for_recovery;
   options.write_identity_file = FLAGS_write_identity_file;
+  options.prefix_seek_opt_in_only = FLAGS_prefix_seek_opt_in_only;
   options.reuse_manifest_on_open = FLAGS_reuse_manifest_on_open;
   options.avoid_flush_during_recovery = FLAGS_avoid_flush_during_recovery;
   options.enforce_write_buffer_manager_during_recovery =
