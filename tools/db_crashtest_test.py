@@ -197,6 +197,17 @@ class DBCrashTestTest(unittest.TestCase):
                 params[name] = 0 if name == "enable_compaction_filter" else 1
                 finalized = db_crashtest.finalize_and_sanitize(params)
                 self.assertEqual(0, finalized["merge_before_compaction_filter"])
+        # ts_params pins use_merge=0, so merge-before-filter must not turn
+        # merges back on, even though it is itself turned off later.
+        params = db_crashtest.gen_cmd_params(
+            self.build_mode_args("whitebox", enable_ts=True)
+        )
+        params.update(
+            {"enable_compaction_filter": 1, "merge_before_compaction_filter": 1}
+        )
+        for _ in range(20):
+            finalized = db_crashtest.finalize_and_sanitize(self.build_params(params))
+            self.assertEqual(0, finalized["use_merge"])
 
     def test_stress_cmd_env_defaults_tsan_suppressions(self):
         os.environ.pop(_TSAN_OPTIONS_ENV_VAR, None)

@@ -674,6 +674,85 @@ TEST_F(DBBasicTestWithTimestamp, SimpleIterate) {
   Close();
 }
 
+TEST_F(DBBasicTestWithTimestamp,
+       CompactionKeepsMergeOperandCoveredByNewerRangeTombstone) {
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.merge_operator = std::make_shared<StringAppendTESTOperator>(',');
+  const size_t kTimestampSize = Timestamp(0, 0).size();
+  TestComparator test_cmp(kTimestampSize);
+  options.comparator = &test_cmp;
+  DestroyAndReopen(options);
+
+  WriteOptions wo;
+  // Key1(2) and Key1(3) have a base value at the same ts as their merge
+  // operand. Flush them separately so that compaction, not flush, merges them.
+  ASSERT_OK(db_->Put(wo, Key1(2), Timestamp(1, 0), "v"));
+  ASSERT_OK(db_->Put(wo, Key1(3), Timestamp(1, 0), "v"));
+  // This ts 1 tombstone hides Key1(3)'s base value from every read, but not its
+  // later merge operand.
+  ASSERT_OK(db_->DeleteRange(wo, db_->DefaultColumnFamily(), Key1(3), Key1(4),
+                             Timestamp(1, 0)));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->Merge(wo, db_->DefaultColumnFamily(), Key1(1), Timestamp(1, 0),
+                       "a"));
+  ASSERT_OK(db_->Merge(wo, db_->DefaultColumnFamily(), Key1(2), Timestamp(1, 0),
+                       "m"));
+  ASSERT_OK(db_->Merge(wo, db_->DefaultColumnFamily(), Key1(3), Timestamp(1, 0),
+                       "m"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->DeleteRange(wo, db_->DefaultColumnFamily(), Key1(0), Key1(3),
+                             Timestamp(3, 0)));
+  ASSERT_OK(Flush());
+
+  auto verify = [&]() {
+    const std::string read_ts = Timestamp(2, 0);
+    Slice read_ts_slice = read_ts;
+    ReadOptions ro;
+    ro.timestamp = &read_ts_slice;
+    std::string value;
+    std::string ts;
+    ASSERT_OK(db_->Get(ro, Key1(1), &value, &ts));
+    ASSERT_EQ("a", value);
+    ASSERT_OK(db_->Get(ro, Key1(2), &value, &ts));
+    ASSERT_EQ("v,m", value);
+    ASSERT_OK(db_->Get(ro, Key1(3), &value, &ts));
+    ASSERT_EQ("m", value);
+    std::unique_ptr<Iterator> it(db_->NewIterator(ro));
+    it->Seek(Key1(0));
+    ASSERT_TRUE(it->Valid());
+    ASSERT_EQ(Key1(1), it->key());
+    ASSERT_EQ("a", it->value());
+    it->Next();
+    ASSERT_TRUE(it->Valid());
+    ASSERT_EQ(Key1(2), it->key());
+    ASSERT_EQ("v,m", it->value());
+    it->Next();
+    ASSERT_TRUE(it->Valid());
+    ASSERT_EQ(Key1(3), it->key());
+    ASSERT_EQ("m", it->value());
+    it->Next();
+    ASSERT_FALSE(it->Valid());
+    ASSERT_OK(it->status());
+
+    // A read at or after ts 3 still sees Key1(1) and Key1(2) deleted.
+    const std::string newer_ts = Timestamp(4, 0);
+    Slice newer_ts_slice = newer_ts;
+    ro.timestamp = &newer_ts_slice;
+    ASSERT_TRUE(db_->Get(ro, Key1(1), &value, &ts).IsNotFound());
+    ASSERT_TRUE(db_->Get(ro, Key1(2), &value, &ts).IsNotFound());
+  };
+
+  verify();
+  // Without full_history_ts_low, compaction must not change what a read at
+  // ts 2 sees, even though the ts 3 tombstone covers Key1(1) and Key1(2).
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  verify();
+  Close();
+}
+
 TEST_F(DBBasicTestWithTimestamp, TrimHistoryTest) {
   Options options = CurrentOptions();
   options.env = env_;

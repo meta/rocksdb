@@ -1530,9 +1530,12 @@ def finalize_and_sanitize(src_params):
         dest_params["disable_wal"] = 0
         dest_params["manual_wal_flush_one_in"] = 0
     # Merge-before-filter is only interesting with merges, so use them in about
-    # 3/4 of those runs. Later rules can still turn merges off.
+    # 3/4 of those runs. Don't override a profile that pins use_merge (e.g.
+    # ts_params): later rules may turn merge-before-filter off for it. Later
+    # rules can still turn merges off.
     if (
-        dest_params.get("enable_compaction_filter", 0) == 1
+        callable(src_params.get("use_merge"))
+        and dest_params.get("enable_compaction_filter", 0) == 1
         and dest_params.get("merge_before_compaction_filter", 0) == 1
         and dest_params.get("use_merge", 0) == 0
     ):
