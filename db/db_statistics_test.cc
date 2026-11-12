@@ -156,6 +156,8 @@ TEST_F(DBStatisticsTest, MutexWaitStats) {
   ThreadStatusUtil::TEST_SetStateDelay(ThreadStatus::STATE_MUTEX_WAIT,
                                        kMutexWaitDelay);
   ASSERT_OK(Put("hello", "rocksdb"));
+  // A plain Put() may not lock the DB mutex; Flush() does.
+  ASSERT_OK(Flush());
   ASSERT_GE(TestGetTickerCount(options, DB_MUTEX_WAIT_MICROS), kMutexWaitDelay);
   ThreadStatusUtil::TEST_SetStateDelay(ThreadStatus::STATE_MUTEX_WAIT, 0);
 }

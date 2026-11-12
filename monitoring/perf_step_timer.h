@@ -50,13 +50,18 @@ class PerfStepTimer {
 
   void Stop() {
     if (start_) {
-      uint64_t duration = time_now() - start_;
+      const uint64_t now = time_now();
+      const uint64_t duration = now - start_;
       if (perf_counter_enabled_) {
         *metric_ += duration;
       }
 
       if (statistics_ != nullptr) {
-        RecordTick(statistics_, ticker_type_, duration);
+        // The perf metric is in nanoseconds, but timing tickers are in
+        // microseconds. Count the microsecond boundaries crossed, like a
+        // NowMicros() difference, so short waits are not always rounded
+        // down to 0.
+        RecordTick(statistics_, ticker_type_, now / 1000 - start_ / 1000);
       }
       start_ = 0;
     }

@@ -407,11 +407,15 @@ TEST_F(SlowMutexTest, PreservesConstructorStatisticsAccounting) {
   InstrumentedMutex mutex(stats.get(), SystemClock::Default().get(),
                           DB_MUTEX_WAIT_MICROS);
   Configure(&mutex, "constructor_mutex");
-#ifndef NPERF_CONTEXT
+#if !defined(NDEBUG) && !defined(NPERF_CONTEXT)
   const uint64_t before = stats->getTickerCount(DB_MUTEX_WAIT_MICROS);
+  // The ticker is in microseconds, and an uncontended lock can take less
+  // than 1 microsecond. Inject a lock wait so the ticker must grow.
+  ThreadStatusUtil::TEST_SetStateDelay(ThreadStatus::STATE_MUTEX_WAIT, 10);
 #endif
   Hold(&mutex, 200000);
-#ifndef NPERF_CONTEXT
+#if !defined(NDEBUG) && !defined(NPERF_CONTEXT)
+  ThreadStatusUtil::TEST_SetStateDelay(ThreadStatus::STATE_MUTEX_WAIT, 0);
   EXPECT_GT(stats->getTickerCount(DB_MUTEX_WAIT_MICROS), before);
 #endif
   ASSERT_EQ(logger->entries.size(), 1);
