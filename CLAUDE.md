@@ -118,6 +118,16 @@ when support is very large or unsafe, and document why.
 
 **Behavioral Compatibility:** Behavior changes are human judgment calls that must be intentional, well-documented (including release notes), and well researched for potential downstream production impact. Agents and reviewers must call out potential gaps, ambiguity, or adverse impacts in intentionality, documentation, and production impact. For an existing accepted input—including an undocumented, discouraged, or historically ignored value—the analysis should compare old and new observable behavior, including performance and resource impact, identify known direct callers and stored configurations, and add or update regression coverage as appropriate.
 
+**File Format Changes:** For formats with a version number, show a new
+feature with a version bump, not with an extra field or flag bit. Examples:
+`BlockBasedTableOptions::format_version` (`include/rocksdb/table.h`) adds
+features at each version (2..8) with no capability flags; blob files use the
+`BlobLogHeader` version. Readers reject unknown versions. MANIFEST records and
+table properties have no version: add a new tag or property key. If old
+readers must not silently ignore it, use a MANIFEST tag without
+`kTagSafeIgnoreMask` (or with `kCustomTagNonSafeIgnoreMask` for NewFile custom
+fields), so old readers fail to open the DB.
+
 **API Consistency:** New APIs should be consistent with existing patterns. Use similar naming conventions, parameter ordering, and return types. Reviewers will suggest changes to improve consistency with the broader codebase.
 
 **Documentation:** Public APIs must be thoroughly documented, without unnecessary embelishment nor dwelling on implementation details nor project planning. When non-obvious, include usage examples, parameter descriptions, known bugs or limitations, notes on thread safety, performance characteristics, and compatibility considerations. Re-read comments for ambiguous terminology and phrasing, such as ambiguously re-purposed programming jargon.
