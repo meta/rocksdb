@@ -21,6 +21,7 @@
 #include <thread>
 #include <utility>
 
+#include "db/blob/blob_constants.h"
 #include "db/db_impl/db_impl.h"
 #include "db/log_writer.h"
 #include "db/manifest_ops.h"
@@ -497,6 +498,46 @@ TEST_F(CheckpointTest, ExportColumnFamilyNegativeTest) {
   ASSERT_EQ(checkpoint->ExportColumnFamily(db_->DefaultColumnFamily(),
                                            export_path_, &metadata_),
             Status::InvalidArgument("Specified export_dir invalid"));
+  delete checkpoint;
+}
+
+TEST_F(CheckpointTest, ExportColumnFamilyWithBlobFiles) {
+  auto options = CurrentOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.min_blob_size = 1024;
+  CreateAndReopenWithCF({}, options);
+
+  Checkpoint* checkpoint;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+
+  // Blob files are enabled, but the small value stays in the SST file, so the
+  // export has no blob references and succeeds.
+  ASSERT_OK(Put("small", "v1"));
+  ASSERT_OK(checkpoint->ExportColumnFamily(db_->DefaultColumnFamily(),
+                                           export_path_, &metadata_));
+  ASSERT_NE(metadata_, nullptr);
+  ASSERT_EQ(metadata_->files.size(), 1);
+  ASSERT_EQ(metadata_->files[0].oldest_blob_file_number,
+            kInvalidBlobFileNumber);
+  ASSERT_OK(DestroyDir(env_, export_path_));
+  delete metadata_;
+  metadata_ = nullptr;
+
+  // A large value goes to a blob file. Export never copies blob files, so it
+  // is rejected and leaves no export files behind.
+  ASSERT_OK(Put("large", std::string(2048, 'x')));
+  Status s = checkpoint->ExportColumnFamily(db_->DefaultColumnFamily(),
+                                            export_path_, &metadata_);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_NE(std::string(s.getState()).find("reference blob files"),
+            std::string::npos);
+  ASSERT_EQ(metadata_, nullptr);
+  ASSERT_TRUE(env_->FileExists(export_path_).IsNotFound());
+  ASSERT_TRUE(env_->FileExists(export_path_ + ".tmp").IsNotFound());
+
+  // File deletions were enabled again on the error path.
+  ASSERT_TRUE(dbfull()->IsFileDeletionsEnabled());
   delete checkpoint;
 }
 
