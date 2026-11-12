@@ -29,6 +29,7 @@
 
 #include "db/arena_wrapped_db_iter.h"
 #include "db/attribute_group_iterator_impl.h"
+#include "db/blob/blob_constants.h"
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_index.h"
@@ -8897,6 +8898,14 @@ Status DBImpl::CreateColumnFamilyWithImport(
       return Status::InvalidArgument("Comparator name mismatch");
     }
     for (auto& file : metadatas[i]->files) {
+      // Import only brings SST files, never blob files, so a blob reference in
+      // an imported file would dangle in the new column family.
+      if (file.oldest_blob_file_number != kInvalidBlobFileNumber) {
+        return Status::NotSupported(
+            "CreateColumnFamilyWithImport does not support files that "
+            "reference blob files: " +
+            file.name);
+      }
       metadata_files[i].push_back((LiveFileMetaData*)&file);
     }
     total_file_num += metadatas[i]->files.size();

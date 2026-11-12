@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "db/blob/blob_constants.h"
 #include "db/db_impl/db_impl.h"
 #include "db/wal_manager.h"
 #include "file/file_util.h"
@@ -765,28 +766,42 @@ Status CheckpointImpl::ExportColumnFamily(
     if (s.ok()) {
       db_->GetColumnFamilyMetaData(handle, &db_metadata);
 
-      s = ExportFilesInMetaData(
-          db_options, db_metadata,
-          [&](const std::string& src_dirname, const std::string& fname) {
-            ROCKS_LOG_INFO(db_options.info_log, "[%s] HardLinking %s",
-                           cf_name.c_str(), fname.c_str());
-            return db_->GetEnv()->LinkFile(src_dirname + fname,
-                                           tmp_export_dir + fname);
-          } /*link_file_cb*/,
-          [&](const std::string& src_dirname, const std::string& fname) {
-            ROCKS_LOG_INFO(db_options.info_log, "[%s] Copying %s",
-                           cf_name.c_str(), fname.c_str());
-            // FIXME: temperature handling
-            return CopyFile(db_->GetFileSystem(), src_dirname + fname,
-                            Temperature::kUnknown, tmp_export_dir + fname,
-                            Temperature::kUnknown, 0, db_options.use_fsync,
-                            nullptr);
-          } /*copy_file_cb*/);
-
-      const auto enable_status = db_->EnableFileDeletions();
-      if (s.ok()) {
-        s = enable_status;
+      // Export only copies SST files, never blob files, so an SST that
+      // references blob files could never be imported. Reject before any
+      // file is linked or copied.
+      for (const auto& level_metadata : db_metadata.levels) {
+        for (const auto& file_metadata : level_metadata.files) {
+          if (s.ok() &&
+              file_metadata.oldest_blob_file_number != kInvalidBlobFileNumber) {
+            s = Status::NotSupported(
+                "ExportColumnFamily does not support files that reference "
+                "blob files: " +
+                file_metadata.name);
+          }
+        }
       }
+
+      if (s.ok()) {
+        s = ExportFilesInMetaData(
+            db_options, db_metadata,
+            [&](const std::string& src_dirname, const std::string& fname) {
+              ROCKS_LOG_INFO(db_options.info_log, "[%s] HardLinking %s",
+                             cf_name.c_str(), fname.c_str());
+              return db_->GetEnv()->LinkFile(src_dirname + fname,
+                                             tmp_export_dir + fname);
+            } /*link_file_cb*/,
+            [&](const std::string& src_dirname, const std::string& fname) {
+              ROCKS_LOG_INFO(db_options.info_log, "[%s] Copying %s",
+                             cf_name.c_str(), fname.c_str());
+              // FIXME: temperature handling
+              return CopyFile(db_->GetFileSystem(), src_dirname + fname,
+                              Temperature::kUnknown, tmp_export_dir + fname,
+                              Temperature::kUnknown, 0, db_options.use_fsync,
+                              nullptr);
+            } /*copy_file_cb*/);
+      }
+
+      s.UpdateIfOk(db_->EnableFileDeletions());
     }
   }
 

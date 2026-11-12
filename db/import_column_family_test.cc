@@ -7,6 +7,7 @@
 #include <functional>
 #include <utility>
 
+#include "db/blob/blob_constants.h"
 #include "db/db_test_util.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
@@ -1213,6 +1214,76 @@ TEST_F(ImportColumnFamilyTest, ImportFileTimesAndRejectTooOldFile) {
     EXPECT_EQ(ManifestTimes(dbfull(), import_cfh2_, key),
               std::make_pair(now - 10100, now - 10100));
   }
+}
+
+TEST_F(ImportColumnFamilyTest, ImportRejectsBlobFiles) {
+  Options options = CurrentOptions();
+  CreateAndReopenWithCF({"koko"}, options);
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put(1, Key(i), Key(i) + "_val"));
+  }
+  ASSERT_OK(Flush(1));
+
+  Checkpoint* checkpoint;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  ASSERT_OK(checkpoint->ExportColumnFamily(handles_[1], export_files_dir_,
+                                           &metadata_ptr_));
+  ASSERT_NE(metadata_ptr_, nullptr);
+  delete checkpoint;
+
+  ImportColumnFamilyOptions import_options;
+
+  // Files without blob references can be imported into a column family with
+  // blob files enabled.
+  Options blob_options = options;
+  blob_options.enable_blob_files = true;
+  ASSERT_OK(db_->CreateColumnFamilyWithImport(
+      blob_options, "toto", import_options, *metadata_ptr_, &import_cfh_));
+  ASSERT_NE(import_cfh_, nullptr);
+  for (int i = 0; i < 10; ++i) {
+    std::string value;
+    ASSERT_OK(db_->Get(ReadOptions(), import_cfh_, Key(i), &value));
+    ASSERT_EQ(Key(i) + "_val", value);
+  }
+
+  // Write SST files that reference blob files. Export rejects them, so take
+  // their metadata from the live DB. Import never brings the blob files, so
+  // it is rejected before any file is copied.
+  ASSERT_OK(dbfull()->SetOptions(
+      handles_[1], {{"enable_blob_files", "true"}, {"min_blob_size", "0"}}));
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put(1, Key(i), Key(i) + "_blob"));
+  }
+  ASSERT_OK(Flush(1));
+
+  ExportImportFilesMetaData blob_metadata;
+  blob_metadata.db_comparator_name = options.comparator->Name();
+  std::vector<LiveFileMetaData> live_files;
+  db_->GetLiveFilesMetaData(&live_files);
+  bool references_blob = false;
+  for (const auto& file : live_files) {
+    if (file.column_family_name != "koko") {
+      continue;
+    }
+    if (file.oldest_blob_file_number != kInvalidBlobFileNumber) {
+      references_blob = true;
+    }
+    blob_metadata.files.push_back(file);
+  }
+  ASSERT_TRUE(references_blob);
+
+  Status s = db_->CreateColumnFamilyWithImport(options, "yoyo", import_options,
+                                               blob_metadata, &import_cfh2_);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_NE(std::string(s.getState()).find("reference blob files"),
+            std::string::npos);
+  ASSERT_EQ(import_cfh2_, nullptr);
+
+  // The rejected import left no column family behind under the same name.
+  ASSERT_OK(db_->CreateColumnFamilyWithImport(options, "yoyo", import_options,
+                                              *metadata_ptr_, &import_cfh2_));
+  ASSERT_NE(import_cfh2_, nullptr);
 }
 }  // namespace ROCKSDB_NAMESPACE
 

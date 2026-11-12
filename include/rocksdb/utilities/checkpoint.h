@@ -123,7 +123,8 @@ class CheckpointEngineBase {
       const CreateCheckpointOptions& options = {}) = 0;
 
   // Exports all live SST files of the given column family into destination_dir,
-  // returning their metadata in *out_metadata.
+  // returning their metadata in *out_metadata. Returns NotSupported if any SST
+  // file references blob files (see Checkpoint::ExportColumnFamily).
   virtual IOStatus ExportColumnFamily(
       DB* source_db, ColumnFamilyHandle* handle,
       const std::string& destination_dir,
@@ -192,6 +193,9 @@ class Checkpoint {
   //   is in the same partition as the db directory, copied otherwise.
   // - export_dir should not already exist and will be created by this API.
   // - Always triggers a flush.
+  // - Blob files are not exported. Returns NotSupported, and leaves no export
+  //   files behind, if any SST file of the column family references blob
+  //   files.
   virtual Status ExportColumnFamily(ColumnFamilyHandle* handle,
                                     const std::string& export_dir,
                                     ExportImportFilesMetaData** metadata);

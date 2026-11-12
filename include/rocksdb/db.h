@@ -2778,6 +2778,10 @@ class DB {
   // On error return, column family handle returned will be nullptr.
   // ColumnFamily will be present on successful return and will not be present
   // on error return. ColumnFamily may be present on any crash during this call.
+  // Import never brings blob files, so it returns NotSupported if any file in
+  // `metadata` references blob files (oldest_blob_file_number != 0). Importing
+  // files without blob references into a column family with
+  // `enable_blob_files` is allowed.
   virtual Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& options, const std::string& column_family_name,
       const ImportColumnFamilyOptions& import_options,
