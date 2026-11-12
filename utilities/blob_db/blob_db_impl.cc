@@ -2060,7 +2060,9 @@ Status DestroyBlobDB(const std::string& dbname, const Options& options,
       uint64_t number;
       FileType type;
       if (ParseFileName(f, &number, &type) && type == kBlobFile) {
-        Status del = DeleteDBFile(&soptions, blobdir + "/" + f, blobdir, true,
+        std::string path = blobdir;
+        path.append("/").append(f);
+        Status del = DeleteDBFile(&soptions, path, blobdir, true,
                                   /*force_fg=*/false);
         if (status.ok() && !del.ok()) {
           status = del;
@@ -2097,6 +2099,7 @@ void BlobDBImpl::TEST_AddDummyBlobFile(uint64_t blob_file_number,
 std::vector<std::shared_ptr<BlobFile>> BlobDBImpl::TEST_GetBlobFiles() const {
   ReadLock l(&mutex_);
   std::vector<std::shared_ptr<BlobFile>> blob_files;
+  blob_files.reserve(blob_files_.size());
   for (auto& p : blob_files_) {
     blob_files.emplace_back(p.second);
   }
@@ -2107,6 +2110,7 @@ std::vector<std::shared_ptr<BlobFile>> BlobDBImpl::TEST_GetLiveImmNonTTLFiles()
     const {
   ReadLock l(&mutex_);
   std::vector<std::shared_ptr<BlobFile>> live_imm_non_ttl_files;
+  live_imm_non_ttl_files.reserve(live_imm_non_ttl_blob_files_.size());
   for (const auto& pair : live_imm_non_ttl_blob_files_) {
     live_imm_non_ttl_files.emplace_back(pair.second);
   }

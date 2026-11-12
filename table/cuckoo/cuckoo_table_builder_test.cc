@@ -206,6 +206,7 @@ TEST_F(CuckooBuilderTest, WriteSuccessNoCollisionFullKey) {
 
     std::vector<uint64_t> expected_locations = {0, 1, 2, 3};
     std::vector<std::string> keys;
+    keys.reserve(user_keys.size());
     for (auto& user_key : user_keys) {
       keys.push_back(GetInternalKey(user_key, false, type));
     }
@@ -254,6 +255,7 @@ TEST_F(CuckooBuilderTest, WriteSuccessWithCollisionFullKey) {
 
   std::vector<uint64_t> expected_locations = {0, 1, 2, 3};
   std::vector<std::string> keys;
+  keys.reserve(user_keys.size());
   for (auto& user_key : user_keys) {
     keys.push_back(GetInternalKey(user_key, false));
   }
@@ -301,6 +303,7 @@ TEST_F(CuckooBuilderTest, WriteSuccessWithCollisionAndCuckooBlock) {
 
   std::vector<uint64_t> expected_locations = {0, 1, 2, 3};
   std::vector<std::string> keys;
+  keys.reserve(user_keys.size());
   for (auto& user_key : user_keys) {
     keys.push_back(GetInternalKey(user_key, false));
   }
@@ -351,6 +354,7 @@ TEST_F(CuckooBuilderTest, WithCollisionPathFullKey) {
 
   std::vector<uint64_t> expected_locations = {0, 1, 3, 4, 2};
   std::vector<std::string> keys;
+  keys.reserve(user_keys.size());
   for (auto& user_key : user_keys) {
     keys.push_back(GetInternalKey(user_key, false));
   }
@@ -397,6 +401,7 @@ TEST_F(CuckooBuilderTest, WithCollisionPathFullKeyAndCuckooBlock) {
 
   std::vector<uint64_t> expected_locations = {2, 1, 3, 4, 0};
   std::vector<std::string> keys;
+  keys.reserve(user_keys.size());
   for (auto& user_key : user_keys) {
     keys.push_back(GetInternalKey(user_key, false));
   }

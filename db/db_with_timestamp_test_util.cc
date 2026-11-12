@@ -28,6 +28,7 @@ std::string DBBasicTestWithTimestampBase::KeyWithPrefix(
 std::vector<Slice> DBBasicTestWithTimestampBase::ConvertStrToSlice(
     std::vector<std::string>& strings) {
   std::vector<Slice> ret;
+  ret.reserve(strings.size());
   for (const auto& s : strings) {
     ret.emplace_back(s);
   }

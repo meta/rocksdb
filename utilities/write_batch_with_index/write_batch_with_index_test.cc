@@ -390,7 +390,7 @@ class WBWIBaseTest : public testing::Test {
         if (result.empty()) {
           result = value;
         } else {
-          result = result + "," + value;
+          result.append(",").append(value);
         }
       }
     }
@@ -1518,7 +1518,7 @@ TEST_P(WriteBatchWithIndexTest, TestGetFromBatchMerge) {
 
   for (int i = 0; i < 5; i++) {
     ASSERT_OK(batch_->Merge("x", std::to_string(i)));
-    expected = expected + "," + std::to_string(i);
+    expected.append(",").append(std::to_string(i));
 
     if (i % 2 == 0) {
       ASSERT_OK(batch_->Put("y", std::to_string(i / 2)));
@@ -2556,6 +2556,7 @@ TEST_P(WriteBatchWithIndexTest, SingleDeleteDeltaIterTest) {
 TEST_P(WriteBatchWithIndexTest, MultiGetTest) {
   // MultiGet a lot of keys in order to force std::vector reallocations
   std::vector<std::string> keys;
+  keys.reserve(100);
   for (int i = 0; i < 100; ++i) {
     keys.emplace_back(std::to_string(i));
   }
@@ -2591,6 +2592,7 @@ TEST_P(WriteBatchWithIndexTest, MultiGetTest) {
   }
 
   std::vector<Slice> key_slices;
+  key_slices.reserve(keys.size());
   for (size_t i = 0; i < keys.size(); ++i) {
     key_slices.emplace_back(keys[i]);
   }
@@ -2634,6 +2636,7 @@ TEST_P(WriteBatchWithIndexTest, MultiGetTest2) {
   const int num_keys = 700;
   const int keys_per_pass = 100;
   std::vector<std::string> keys;
+  keys.reserve(num_keys);
   for (size_t i = 0; i < num_keys; ++i) {
     keys.emplace_back(std::to_string(i));
   }

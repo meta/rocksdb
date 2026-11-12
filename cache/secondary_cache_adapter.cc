@@ -457,6 +457,7 @@ void CacheWithSecondaryAdapter::WaitAll(AsyncLookupHandle* async_handles,
   // Wait on all lookups on my secondary cache
   {
     std::vector<SecondaryCacheResultHandle*> my_secondary_handles;
+    my_secondary_handles.reserve(my_pending.size());
     for (AsyncLookupHandle* cur : my_pending) {
       my_secondary_handles.push_back(cur->pending_handle);
     }

@@ -336,6 +336,7 @@ TEST_P(DBWriteTest, IOErrorOnWALWritePropagateToWriteThreadFollower) {
         }
       });
   SyncPoint::GetInstance()->EnableProcessing();
+  threads.reserve(kNumThreads);
   for (int i = 0; i < kNumThreads; i++) {
     threads.emplace_back(
         [&](int index) {

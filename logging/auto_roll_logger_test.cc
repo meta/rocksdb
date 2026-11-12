@@ -100,8 +100,9 @@ class AutoRollLoggerTest : public testing::Test {
 
   // Delete all log files under kTestDir
   void CleanupLogFiles() {
+    const std::string dir_prefix = kTestDir + "/";
     for (const std::string& f : GetLogFiles()) {
-      ASSERT_OK(default_env->DeleteFile(kTestDir + "/" + f));
+      ASSERT_OK(default_env->DeleteFile(dir_prefix + f));
     }
   }
 
@@ -584,9 +585,10 @@ static std::vector<std::string> GetOldFileNames(const std::string& path) {
 
   // We know that the old log files are named [path]<something>
   // Return all entities that match the pattern
+  const std::string dir_prefix = dirname + "/";
   for (auto& child : children) {
     if (fname != child && child.find(fname) == 0) {
-      ret.push_back(dirname + "/" + child);
+      ret.push_back(dir_prefix + child);
     }
   }
 

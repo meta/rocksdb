@@ -1251,6 +1251,7 @@ TEST_F(DBCompactionAbortTest, AbortWithInProgressFileCleanup) {
     std::vector<uint64_t> blob_file_numbers;
     ColumnFamilyMetaData cf_meta;
     dbfull()->GetColumnFamilyMetaData(db_->DefaultColumnFamily(), &cf_meta);
+    blob_file_numbers.reserve(cf_meta.blob_files.size());
     for (const auto& blob_meta : cf_meta.blob_files) {
       blob_file_numbers.push_back(blob_meta.blob_file_number);
     }

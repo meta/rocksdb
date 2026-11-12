@@ -798,7 +798,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
             GetInternalKey(&input, &key)) {
           // Here we re-use the output format of compact pointer in LevelDB
           // to persist compact_cursors_
-          compact_cursors_.push_back(std::make_pair(level, key));
+          compact_cursors_.emplace_back(level, key);
         } else {
           if (!msg) {
             msg = "compaction cursor";
@@ -827,7 +827,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
             GetInternalKey(&input, &f.smallest) &&
             GetInternalKey(&input, &f.largest)) {
           f.fd = FileDescriptor(number, 0, file_size);
-          new_files_.push_back(std::make_pair(level, f));
+          new_files_.emplace_back(level, f);
         } else {
           if (!msg) {
             msg = "new-file entry";
@@ -848,7 +848,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
             GetVarint64(&input, &largest_seqno)) {
           f.fd = FileDescriptor(number, 0, file_size, smallest_seqno,
                                 largest_seqno);
-          new_files_.push_back(std::make_pair(level, f));
+          new_files_.emplace_back(level, f);
         } else {
           if (!msg) {
             msg = "new-file2 entry";
@@ -872,7 +872,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
             GetVarint64(&input, &largest_seqno)) {
           f.fd = FileDescriptor(number, path_id, file_size, smallest_seqno,
                                 largest_seqno);
-          new_files_.push_back(std::make_pair(level, f));
+          new_files_.emplace_back(level, f);
         } else {
           if (!msg) {
             msg = "new-file3 entry";

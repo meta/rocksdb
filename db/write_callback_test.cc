@@ -378,6 +378,7 @@ TEST_P(WriteCallbackPTest, WriteWithCallbackTest) {
 
     // do all the writes
     std::vector<port::Thread> threads;
+    threads.reserve(write_group.size());
     for (uint32_t i = 0; i < write_group.size(); i++) {
       threads.emplace_back(write_with_callback_func);
     }

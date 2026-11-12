@@ -105,6 +105,7 @@ TEST(WorkQueue, SPMC) {
   std::vector<int> results(50, -1);
   std::mutex mutex;
   std::vector<std::thread> threads;
+  threads.reserve(5);
   for (int i = 0; i < 5; ++i) {
     threads.emplace_back(Popper{&queue, results.data(), &mutex});
   }
@@ -128,6 +129,7 @@ TEST(WorkQueue, MPMC) {
   std::vector<int> results(100, -1);
   std::mutex mutex;
   std::vector<std::thread> popperThreads;
+  popperThreads.reserve(4);
   for (int i = 0; i < 4; ++i) {
     popperThreads.emplace_back(Popper{&queue, results.data(), &mutex});
   }
@@ -210,6 +212,7 @@ TEST(WorkQueue, BoundedSizeMPMC) {
   std::mutex mutex;
   std::cerr << "Creating popperThreads" << std::endl;
   std::vector<std::thread> popperThreads;
+  popperThreads.reserve(4);
   for (int i = 0; i < 4; ++i) {
     popperThreads.emplace_back(Popper{&queue, results.data(), &mutex});
   }

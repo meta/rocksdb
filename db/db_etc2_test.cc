@@ -63,8 +63,9 @@ TEST_F(DBTest2, OpenForReadOnly) {
   // There should not be any subdirectories -- this is not checked here
   std::vector<std::string> files;
   ASSERT_OK(env_->GetChildren(dbname, &files));
+  const std::string dbname_prefix = dbname + "/";
   for (auto& f : files) {
-    ASSERT_OK(env_->DeleteFile(dbname + "/" + f));
+    ASSERT_OK(env_->DeleteFile(dbname_prefix + f));
   }
   // <dbname> should be empty now and we should be able to delete it
   ASSERT_OK(env_->DeleteDir(dbname));
@@ -94,8 +95,9 @@ TEST_F(DBTest2, OpenForReadOnlyWithColumnFamilies) {
   // There should not be any subdirectories -- this is not checked here
   std::vector<std::string> files;
   ASSERT_OK(env_->GetChildren(dbname, &files));
+  const std::string dbname_prefix = dbname + "/";
   for (auto& f : files) {
-    ASSERT_OK(env_->DeleteFile(dbname + "/" + f));
+    ASSERT_OK(env_->DeleteFile(dbname_prefix + f));
   }
   // <dbname> should be empty now and we should be able to delete it
   ASSERT_OK(env_->DeleteDir(dbname));
@@ -773,12 +775,12 @@ TEST_F(DBTest2, WalFilterTest) {
   // Create 3 batches with two keys each
   std::vector<std::vector<std::string>> batch_keys(3);
 
-  batch_keys[0].push_back("key1");
-  batch_keys[0].push_back("key2");
-  batch_keys[1].push_back("key3");
-  batch_keys[1].push_back("key4");
-  batch_keys[2].push_back("key5");
-  batch_keys[2].push_back("key6");
+  batch_keys[0].emplace_back("key1");
+  batch_keys[0].emplace_back("key2");
+  batch_keys[1].emplace_back("key3");
+  batch_keys[1].emplace_back("key4");
+  batch_keys[2].emplace_back("key5");
+  batch_keys[2].emplace_back("key6");
 
   // Test with all WAL processing options
   for (int option = 0;
@@ -968,12 +970,12 @@ TEST_F(DBTest2, WalFilterTestWithChangeBatch) {
 
   std::vector<std::vector<std::string>> batch_keys(3);
 
-  batch_keys[0].push_back("key1");
-  batch_keys[0].push_back("key2");
-  batch_keys[1].push_back("key3");
-  batch_keys[1].push_back("key4");
-  batch_keys[2].push_back("key5");
-  batch_keys[2].push_back("key6");
+  batch_keys[0].emplace_back("key1");
+  batch_keys[0].emplace_back("key2");
+  batch_keys[1].emplace_back("key3");
+  batch_keys[1].emplace_back("key4");
+  batch_keys[2].emplace_back("key5");
+  batch_keys[2].emplace_back("key6");
 
   Options options = OptionsForLogIterTest();
   DestroyAndReopen(options);
@@ -1060,12 +1062,12 @@ TEST_F(DBTest2, WalFilterTestWithChangeBatchExtraKeys) {
 
   std::vector<std::vector<std::string>> batch_keys(3);
 
-  batch_keys[0].push_back("key1");
-  batch_keys[0].push_back("key2");
-  batch_keys[1].push_back("key3");
-  batch_keys[1].push_back("key4");
-  batch_keys[2].push_back("key5");
-  batch_keys[2].push_back("key6");
+  batch_keys[0].emplace_back("key1");
+  batch_keys[0].emplace_back("key2");
+  batch_keys[1].emplace_back("key3");
+  batch_keys[1].emplace_back("key4");
+  batch_keys[2].emplace_back("key5");
+  batch_keys[2].emplace_back("key6");
 
   Options options = OptionsForLogIterTest();
   DestroyAndReopen(options);
@@ -1156,8 +1158,7 @@ TEST_F(DBTest2, WalFilterTestWithColumnFamilies) {
           // (i.e. isn't flushed to SST file(s) for column_family_id)
           // add it to the cf_wal_keys_ map for verification.
           if (log_number_ >= log_number_for_cf) {
-            cf_wal_keys_[column_family_id].push_back(
-                std::string(key.data(), key.size()));
+            cf_wal_keys_[column_family_id].emplace_back(key.data(), key.size());
           }
           return Status::OK();
         }
@@ -1187,12 +1188,12 @@ TEST_F(DBTest2, WalFilterTestWithColumnFamilies) {
 
   std::vector<std::vector<std::string>> batch_keys_pre_flush(3);
 
-  batch_keys_pre_flush[0].push_back("key1");
-  batch_keys_pre_flush[0].push_back("key2");
-  batch_keys_pre_flush[1].push_back("key3");
-  batch_keys_pre_flush[1].push_back("key4");
-  batch_keys_pre_flush[2].push_back("key5");
-  batch_keys_pre_flush[2].push_back("key6");
+  batch_keys_pre_flush[0].emplace_back("key1");
+  batch_keys_pre_flush[0].emplace_back("key2");
+  batch_keys_pre_flush[1].emplace_back("key3");
+  batch_keys_pre_flush[1].emplace_back("key4");
+  batch_keys_pre_flush[2].emplace_back("key5");
+  batch_keys_pre_flush[2].emplace_back("key6");
 
   Options options = OptionsForLogIterTest();
   DestroyAndReopen(options);
@@ -1216,12 +1217,12 @@ TEST_F(DBTest2, WalFilterTestWithColumnFamilies) {
   // Do some more writes
   std::vector<std::vector<std::string>> batch_keys_post_flush(3);
 
-  batch_keys_post_flush[0].push_back("key7");
-  batch_keys_post_flush[0].push_back("key8");
-  batch_keys_post_flush[1].push_back("key9");
-  batch_keys_post_flush[1].push_back("key10");
-  batch_keys_post_flush[2].push_back("key11");
-  batch_keys_post_flush[2].push_back("key12");
+  batch_keys_post_flush[0].emplace_back("key7");
+  batch_keys_post_flush[0].emplace_back("key8");
+  batch_keys_post_flush[1].emplace_back("key9");
+  batch_keys_post_flush[1].emplace_back("key10");
+  batch_keys_post_flush[2].emplace_back("key11");
+  batch_keys_post_flush[2].emplace_back("key12");
 
   // Write given keys in given batches
   for (size_t i = 0; i < batch_keys_post_flush.size(); i++) {
@@ -6247,6 +6248,7 @@ TEST_F(DBTest2, MultiDBParallelOpenTest) {
   std::vector<std::thread> open_threads;
   std::vector<std::unique_ptr<DB>> dbs(kNumDbs);
   options.create_if_missing = true;
+  open_threads.reserve(kNumDbs);
   for (int i = 0; i < kNumDbs; ++i) {
     open_threads.emplace_back(
         [&](int dbnum) {

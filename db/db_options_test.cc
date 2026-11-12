@@ -1054,6 +1054,7 @@ TEST_F(DBOptionsTest, SetStatsDumpPeriodSecRace) {
   // state of the option and the behavior in effect for the DB, after the last
   // modification to that option (indefinite inconsistency).
   std::vector<std::thread> threads;
+  threads.reserve(12);
   for (int i = 0; i < 12; i++) {
     threads.emplace_back([this, i]() {
       ASSERT_OK(dbfull()->SetDBOptions(
@@ -1077,6 +1078,7 @@ TEST_F(DBOptionsTest, SetOptionsAndFileRace) {
   // state of the option and what is persisted in the options file, after the
   // last modification to that option (indefinite inconsistency).
   std::vector<std::thread> threads;
+  threads.reserve(12);
   for (int i = 0; i < 12; i++) {
     threads.emplace_back([this, i]() {
       ASSERT_OK(dbfull()->SetOptions({{"ttl", std::to_string(i * 100)}}));

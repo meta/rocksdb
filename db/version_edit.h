@@ -940,7 +940,7 @@ class VersionEdit {
   using CompactCursors = std::vector<std::pair<int, InternalKey>>;
   const CompactCursors& GetCompactCursors() const { return compact_cursors_; }
   void AddCompactCursor(int level, const InternalKey& cursor) {
-    compact_cursors_.push_back(std::make_pair(level, cursor));
+    compact_cursors_.emplace_back(level, cursor);
   }
   void SetCompactCursors(
       const std::vector<InternalKey>& compact_cursors_by_level) {
@@ -948,8 +948,7 @@ class VersionEdit {
     compact_cursors_.reserve(compact_cursors_by_level.size());
     for (int i = 0; i < (int)compact_cursors_by_level.size(); i++) {
       if (compact_cursors_by_level[i].Valid()) {
-        compact_cursors_.push_back(
-            std::make_pair(i, compact_cursors_by_level[i]));
+        compact_cursors_.emplace_back(i, compact_cursors_by_level[i]);
       }
     }
   }

@@ -279,7 +279,7 @@ class ReadTrackingFS : public FileSystemWrapper {
     std::lock_guard<std::mutex> lock(mutex_);
     ReadOp op;
     op.type = ReadOp::kReadAsync;
-    op.requests.push_back({offset, len});
+    op.requests.emplace_back(offset, len);
     read_ops_.push_back(std::move(op));
   }
 
@@ -437,7 +437,7 @@ IOStatus ReadTrackingRandomAccessFile::MultiRead(FSReadRequest* reqs,
   std::vector<std::pair<uint64_t, size_t>> recorded_reqs;
   recorded_reqs.reserve(num_reqs);
   for (size_t i = 0; i < num_reqs; i++) {
-    recorded_reqs.push_back({reqs[i].offset, reqs[i].len});
+    recorded_reqs.emplace_back(reqs[i].offset, reqs[i].len);
   }
   fs_->RecordMultiRead(recorded_reqs);
 

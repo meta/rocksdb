@@ -595,6 +595,7 @@ TEST_F(PrefixTest, DynamicPrefixIterator) {
     ReadOptions read_options;
 
     std::vector<uint64_t> prefixes;
+    prefixes.reserve(FLAGS_total_prefixes);
     for (uint64_t i = 0; i < FLAGS_total_prefixes; ++i) {
       prefixes.push_back(i);
     }

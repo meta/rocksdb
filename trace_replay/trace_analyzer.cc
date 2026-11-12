@@ -602,25 +602,21 @@ Status TraceAnalyzer::MakeStatisticKeyStatsOrPrefix(TraceStats& stats) {
         // make the top k statistic for the prefix
         if (static_cast<int32_t>(stats.top_k_prefix_access.size()) <
             options_.print_top_k_access) {
-          stats.top_k_prefix_access.push(
-              std::make_pair(prefix_access, prefix_out));
+          stats.top_k_prefix_access.emplace(prefix_access, prefix_out);
         } else {
           if (prefix_access > stats.top_k_prefix_access.top().first) {
             stats.top_k_prefix_access.pop();
-            stats.top_k_prefix_access.push(
-                std::make_pair(prefix_access, prefix_out));
+            stats.top_k_prefix_access.emplace(prefix_access, prefix_out);
           }
         }
 
         if (static_cast<int32_t>(stats.top_k_prefix_ave.size()) <
             options_.print_top_k_access) {
-          stats.top_k_prefix_ave.push(
-              std::make_pair(prefix_ave_access, prefix_out));
+          stats.top_k_prefix_ave.emplace(prefix_ave_access, prefix_out);
         } else {
           if (prefix_ave_access > stats.top_k_prefix_ave.top().first) {
             stats.top_k_prefix_ave.pop();
-            stats.top_k_prefix_ave.push(
-                std::make_pair(prefix_ave_access, prefix_out));
+            stats.top_k_prefix_ave.emplace(prefix_ave_access, prefix_out);
           }
         }
 
@@ -722,14 +718,12 @@ Status TraceAnalyzer::MakeStatisticQPS() {
         if (options_.output_prefix_cut > 0) {
           if (static_cast<int32_t>(stat.second.top_k_qps_sec.size()) <
               options_.print_top_k_access) {
-            stat.second.top_k_qps_sec.push(
-                std::make_pair(time_it.second, time_it.first));
+            stat.second.top_k_qps_sec.emplace(time_it.second, time_it.first);
           } else {
             if (stat.second.top_k_qps_sec.size() > 0 &&
                 stat.second.top_k_qps_sec.top().first < time_it.second) {
               stat.second.top_k_qps_sec.pop();
-              stat.second.top_k_qps_sec.push(
-                  std::make_pair(time_it.second, time_it.first));
+              stat.second.top_k_qps_sec.emplace(time_it.second, time_it.first);
             }
           }
         }
@@ -1017,13 +1011,12 @@ Status TraceAnalyzer::ReProcessing() {
         for (auto& record : stat.a_key_stats) {
           if (static_cast<int32_t>(stat.top_k_queue.size()) <
               options_.print_top_k_access) {
-            stat.top_k_queue.push(
-                std::make_pair(record.second.access_count, record.first));
+            stat.top_k_queue.emplace(record.second.access_count, record.first);
           } else {
             if (record.second.access_count > stat.top_k_queue.top().first) {
               stat.top_k_queue.pop();
-              stat.top_k_queue.push(
-                  std::make_pair(record.second.access_count, record.first));
+              stat.top_k_queue.emplace(record.second.access_count,
+                                       record.first);
             }
           }
         }

@@ -2180,6 +2180,7 @@ Status DB::OpenAndCompact(
     return s;
   }
   base_db_options = *options_parser.db_opt();
+  all_column_families.reserve(options_parser.cf_opts()->size());
   for (size_t i = 0; i < options_parser.cf_opts()->size(); ++i) {
     all_column_families.emplace_back(options_parser.cf_names()->at(i),
                                      options_parser.cf_opts()->at(i));

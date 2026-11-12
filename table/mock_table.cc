@@ -102,22 +102,22 @@ class MockTableBuilder : public TableBuilder {
   void Add(const Slice& key, const Slice& value) override {
     if (corrupt_mode_ == MockTableFactory::kCorruptValue) {
       // Corrupt the value
-      table_.push_back({key.ToString(), value.ToString() + " "});
+      table_.emplace_back(key.ToString(), value.ToString() + " ");
       corrupt_mode_ = MockTableFactory::kCorruptNone;
     } else if (corrupt_mode_ == MockTableFactory::kCorruptKey) {
-      table_.push_back({key.ToString() + " ", value.ToString()});
+      table_.emplace_back(key.ToString() + " ", value.ToString());
       corrupt_mode_ = MockTableFactory::kCorruptNone;
     } else if (corrupt_mode_ == MockTableFactory::kCorruptReorderKey) {
       if (prev_key_.empty()) {
         prev_key_ = key.ToString();
         prev_value_ = value.ToString();
       } else {
-        table_.push_back({key.ToString(), value.ToString()});
-        table_.push_back({prev_key_, prev_value_});
+        table_.emplace_back(key.ToString(), value.ToString());
+        table_.emplace_back(prev_key_, prev_value_);
         corrupt_mode_ = MockTableFactory::kCorruptNone;
       }
     } else {
-      table_.push_back({key.ToString(), value.ToString()});
+      table_.emplace_back(key.ToString(), value.ToString());
     }
   }
 

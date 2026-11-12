@@ -1890,6 +1890,7 @@ Status GetLiveFilesChecksumInfoFromVersionSet(Options options,
                                   immutable_db_options.fs.get());
   if (s.ok()) {
     std::vector<ColumnFamilyDescriptor> cf_list;
+    cf_list.reserve(cf_name_list.size());
     for (const auto& name : cf_name_list) {
       cf_list.emplace_back(name, ColumnFamilyOptions(options));
     }
@@ -3548,6 +3549,7 @@ void MultiGetCommand::DoCommand() {
   std::vector<Slice> key_slices;
   std::vector<PinnableSlice> values(num_keys);
   std::vector<Status> statuses(num_keys);
+  key_slices.reserve(keys_.size());
   for (const std::string& key : keys_) {
     key_slices.emplace_back(key);
   }
@@ -3684,6 +3686,7 @@ void MultiGetEntityCommand::DoCommand() {
   std::vector<Slice> key_slices;
   std::vector<PinnableWideColumns> results(num_keys);
   std::vector<Status> statuses(num_keys);
+  key_slices.reserve(keys_.size());
   for (const std::string& key : keys_) {
     key_slices.emplace_back(key);
   }

@@ -274,8 +274,7 @@ struct JobContext {
 
   explicit JobContext(int _job_id, bool create_superversion = false) {
     job_id = _job_id;
-    superversion_contexts.emplace_back(
-        SuperVersionContext(create_superversion));
+    superversion_contexts.emplace_back(create_superversion);
   }
 
   // Delete the default constructor

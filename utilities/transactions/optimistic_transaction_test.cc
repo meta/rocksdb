@@ -1608,6 +1608,7 @@ TEST_P(OptimisticTransactionTest, OptimisticTransactionStressTest) {
 
   // Create N threads that use RandomTransactionInserter to write
   // many transactions.
+  threads.reserve(num_threads);
   for (uint32_t i = 0; i < num_threads; i++) {
     threads.emplace_back(call_inserter);
   }

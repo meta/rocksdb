@@ -390,9 +390,11 @@ TEST_F(BlockCacheTracerTest, BlockCacheAnalyzer) {
               continue;
             }
           }
-          const std::string timeline_file = test_path_ + "/" +
-                                            user_access_only + l + unit +
-                                            "_access_timeline";
+          std::string timeline_file = test_path_ + "/";
+          timeline_file.append(user_access_only)
+              .append(l)
+              .append(unit)
+              .append("_access_timeline");
           std::ifstream infile(timeline_file);
           std::string line;
           const uint64_t expected_naccesses = 50;
@@ -439,7 +441,8 @@ TEST_F(BlockCacheTracerTest, BlockCacheAnalyzer) {
       while (ss.good()) {
         std::string l;
         ASSERT_TRUE(getline(ss, l, ','));
-        const std::string reuse_csv_file = test_path_ + "/" + l + file_suffix;
+        std::string reuse_csv_file = test_path_ + "/";
+        reuse_csv_file.append(l).append(file_suffix);
         std::ifstream infile(reuse_csv_file);
         std::string line;
         ASSERT_TRUE(getline(infile, line));
@@ -506,9 +509,9 @@ TEST_F(BlockCacheTracerTest, BlockCacheAnalyzer) {
       ASSERT_TRUE(getline(analyzing_callers, caller, ','));
       std::vector<std::string> breakdowns{"level", "bt"};
       for (const auto& breakdown : breakdowns) {
-        const std::string file_name = test_path_ + "/" + caller + "_" +
-                                      breakdown +
-                                      "_percentage_of_accesses_summary";
+        std::string file_name = test_path_ + "/";
+        file_name.append(caller).append("_").append(breakdown).append(
+            "_percentage_of_accesses_summary");
         std::ifstream infile(file_name);
         std::string line;
         ASSERT_TRUE(getline(infile, line));
@@ -533,9 +536,11 @@ TEST_F(BlockCacheTracerTest, BlockCacheAnalyzer) {
     for (auto const& access_type : access_types) {
       {
         // Validate the access count summary.
-        const std::string bt_access_count_summary = test_path_ + "/" + pre +
-                                                    "_" + access_type +
-                                                    "_access_count_summary";
+        std::string bt_access_count_summary = test_path_ + "/";
+        bt_access_count_summary.append(pre)
+            .append("_")
+            .append(access_type)
+            .append("_access_count_summary");
         std::ifstream infile(bt_access_count_summary);
         std::string line;
         ASSERT_TRUE(getline(infile, line));
@@ -557,9 +562,11 @@ TEST_F(BlockCacheTracerTest, BlockCacheAnalyzer) {
     std::vector<std::string> block_types{"Index", "Data", "Filter"};
     for (const auto& block_type : block_types) {
       // Validate reuse block timeline.
-      const std::string reuse_blocks_timeline = test_path_ + "/" + block_type +
-                                                "_" + access_type +
-                                                "_5_reuse_blocks_timeline";
+      std::string reuse_blocks_timeline = test_path_ + "/";
+      reuse_blocks_timeline.append(block_type)
+          .append("_")
+          .append(access_type)
+          .append("_5_reuse_blocks_timeline");
       std::ifstream infile(reuse_blocks_timeline);
       std::string line;
       ASSERT_TRUE(getline(infile, line)) << reuse_blocks_timeline;
@@ -592,7 +599,8 @@ TEST_F(BlockCacheTracerTest, BlockCacheAnalyzer) {
         "_percent_ref_keys", "_percent_accesses_on_ref_keys",
         "_percent_data_size_on_ref_keys"};
     for (auto const& spatial_locality_file : spatial_locality_files) {
-      const std::string filename = test_path_ + "/" + l + spatial_locality_file;
+      std::string filename = test_path_ + "/";
+      filename.append(l).append(spatial_locality_file);
       std::ifstream infile(filename);
       std::string line;
       ASSERT_TRUE(getline(infile, line));

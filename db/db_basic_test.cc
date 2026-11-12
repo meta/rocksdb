@@ -1370,7 +1370,7 @@ TEST_F(DBBasicTest, ReadOnlyDB) {
             Status::Code::kNotSupported);
 
   std::vector<ColumnFamilyDescriptor> cfds;
-  cfds.push_back({"blah", options});
+  cfds.emplace_back("blah", options);
   ASSERT_EQ(db_->CreateColumnFamilies(cfds, &cfhs).code(),
             Status::Code::kNotSupported);
 }
@@ -6275,6 +6275,7 @@ TEST_F(DBBasicTest, ConcurrentlyCloseDB) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
   std::vector<std::thread> workers;
+  workers.reserve(10);
   for (int i = 0; i < 10; i++) {
     workers.emplace_back([&]() {
       auto s = db_->Close();

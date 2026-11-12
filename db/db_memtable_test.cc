@@ -953,6 +953,7 @@ TEST_F(DBMemTableTest, SortedHashIteratorsDuringConcurrentWrites) {
   std::atomic<int> finished_writers{0};
   std::vector<Status> write_statuses(kNumWriters);
   std::vector<port::Thread> writers;
+  writers.reserve(kNumWriters);
   for (int writer = 0; writer < kNumWriters; ++writer) {
     writers.emplace_back([&, writer]() {
       for (int i = 0; i < kKeysPerWriter; ++i) {
@@ -1082,6 +1083,7 @@ TEST_F(DBMemTableTest, VectorConcurrentInsert) {
   {
     WriteOptions write_options;
     std::vector<port::Thread> threads;
+    threads.reserve(10);
     for (int i = 0; i < 10; ++i) {
       threads.emplace_back([&, i]() {
         int start = i * 100;
@@ -1115,6 +1117,7 @@ TEST_F(DBMemTableTest, VectorConcurrentInsert) {
   {
     WriteOptions write_options;
     std::vector<port::Thread> threads;
+    threads.reserve(10);
     for (int i = 0; i < 10; ++i) {
       threads.emplace_back([&, i]() {
         int start = i * 100;

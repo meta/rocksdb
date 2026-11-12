@@ -3111,6 +3111,7 @@ TEST_F(DBSecondaryTest, PrimaryDropColumnFamily) {
   Status new_iterators_status = db_secondary_->NewIterators(
       ropts, {handles_secondary_[1]}, &raw_iterators);
   std::vector<std::unique_ptr<Iterator>> iterators;
+  iterators.reserve(raw_iterators.size());
   for (Iterator* iterator : raw_iterators) {
     iterators.emplace_back(iterator);
   }
@@ -3242,6 +3243,7 @@ TEST_F(DBSecondaryTest, ReclaimsRetiredReadViewAfterLastReader) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 
   std::vector<std::unique_ptr<Iterator>> owned_iterators;
+  owned_iterators.reserve(iterators.size());
   for (Iterator* iterator : iterators) {
     owned_iterators.emplace_back(iterator);
   }

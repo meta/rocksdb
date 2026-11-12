@@ -24,6 +24,8 @@ intptr_t GetOffset(const Configurable* holder, void* field) {
 }
 
 void* ApplyOffset(const Configurable* holder, intptr_t offset) {
+  // offset can point outside *holder, into the derived object.
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
   return reinterpret_cast<void*>(
       reinterpret_cast<intptr_t>(static_cast<const void*>(holder)) + offset);
 }
@@ -574,8 +576,11 @@ Status ConfigurableHelper::SerializeOptions(const ConfigOptions& config_options,
             return s;
           } else if (!value.empty()) {
             // <prefix><opt_name>=<value><delimiter>
-            result->append(prefix + opt_name + "=" + value +
-                           config_options.delimiter);
+            result->append(prefix)
+                .append(opt_name)
+                .append("=")
+                .append(value)
+                .append(config_options.delimiter);
           }
         }
       }

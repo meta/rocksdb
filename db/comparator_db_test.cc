@@ -341,6 +341,7 @@ TEST_P(ComparatorDBTest, SimpleSuffixReverseComparator) {
     std::vector<std::string> source_strings;
     std::vector<std::string> source_prefixes;
     // Randomly generate 5 prefixes
+    source_prefixes.reserve(5);
     for (int i = 0; i < 5; i++) {
       source_prefixes.push_back(rnd.HumanReadableString(8));
     }
@@ -415,6 +416,7 @@ TEST_P(ComparatorDBTest, HashComparator) {
 
     std::vector<std::string> source_strings;
     // Randomly generate source keys
+    source_strings.reserve(100);
     for (int i = 0; i < 100; i++) {
       source_strings.push_back(test::RandomKey(&rnd, 8));
     }

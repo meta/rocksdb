@@ -4543,6 +4543,7 @@ Status StressTest::TestBackupRestore(
     // `ListColumnFamilies` to get names because it won't necessarily give
     // the same order as `column_family_names_`.
     assert(FLAGS_clear_column_family_one_in == 0);
+    cf_descriptors.reserve(column_family_names_.size());
     for (const auto& name : column_family_names_) {
       cf_descriptors.emplace_back(name, ColumnFamilyOptions(db_opt));
     }

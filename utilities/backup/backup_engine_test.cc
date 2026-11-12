@@ -364,7 +364,9 @@ class TestFs : public FileSystemWrapper {
         if (filename.find("MANIFEST") == 0) {
           size_bytes = 100;  // Match DummyDB::GetLiveFiles
         }
-        result->push_back({dir + "/" + filename, size_bytes});
+        std::string path = dir;
+        path.append("/").append(filename);
+        result->push_back({std::move(path), size_bytes});
       }
       return IOStatus::OK();
     }
@@ -847,7 +849,7 @@ class BackupEngineTest : public testing::Test {
     ASSERT_OK(
         test_backup_env_->GetChildren(backupdir_ + "/private", &child_dirs));
     for (auto& dir : child_dirs) {
-      dir = "private/" + dir;
+      dir.insert(0, "private/");
     }
     child_dirs.emplace_back("shared");           // might not exist
     child_dirs.emplace_back("shared_checksum");  // might not exist
@@ -859,7 +861,8 @@ class BackupEngineTest : public testing::Test {
       for (auto& file : children) {
         uint64_t size;
         size = UINT64_MAX;  // appease clang-analyze
-        std::string rel_file = dir + "/" + file;
+        std::string rel_file = dir;
+        rel_file.append("/").append(file);
         // fprintf(stderr, "stat %s\n", (backupdir_ + "/" + rel_file).c_str());
         ASSERT_OK(
             test_backup_env_->GetFileSize(backupdir_ + "/" + rel_file, &size));
@@ -1070,7 +1073,7 @@ class BackupEngineTest : public testing::Test {
 
 void AppendPath(const std::string& path, std::vector<std::string>& v) {
   for (auto& f : v) {
-    f = path + f;
+    f.insert(0, path);
   }
 }
 
@@ -1155,7 +1158,7 @@ TEST_F(BackupEngineTest, IncrementalRestore) {
       for (auto* f = files_begin; f != files_end; ++f) {
         std::string s = StringSplit(f->info.relative_file, '/').back();
         s = s.substr(0, s.find('_'));
-        auto filename = one_sst_file.substr(one_sst_file.find_last_of("/") + 1);
+        auto filename = one_sst_file.substr(one_sst_file.find_last_of('/') + 1);
         if (s + ".sst" == filename) {
           // Backup will include everything BUT that one very SST file.
           f->exclude_decision = true;

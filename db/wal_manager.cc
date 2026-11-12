@@ -203,11 +203,12 @@ void WalManager::PurgeObsoleteWALFiles() {
 
   size_t log_files_num = 0;
   uint64_t log_file_size = 0;
+  const std::string archival_dir_prefix = archival_dir + "/";
   for (auto& f : files) {
     uint64_t number;
     FileType type;
     if (ParseFileName(f, &number, &type) && type == kWalFile) {
-      std::string const file_path = archival_dir + "/" + f;
+      std::string const file_path = archival_dir_prefix + f;
       if (ttl_enabled) {
         uint64_t file_m_time;
         s = env_->GetFileModificationTime(file_path, &file_m_time);

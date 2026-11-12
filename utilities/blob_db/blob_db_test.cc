@@ -541,6 +541,7 @@ TEST_F(BlobDBTest, MultipleWriters) {
 
   std::vector<port::Thread> workers;
   std::vector<std::map<std::string, std::string>> data_set(10);
+  workers.reserve(10);
   for (uint32_t i = 0; i < 10; i++) {
     workers.emplace_back(
         [&](uint32_t id) {

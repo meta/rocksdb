@@ -174,9 +174,10 @@ class AlignedBuffer {
 
     size_t new_capacity = Roundup(requested_capacity, alignment_);
     char* new_buf = new char[new_capacity + alignment_];
-    char* new_bufstart = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(new_buf) + (alignment_ - 1)) &
-        ~static_cast<uintptr_t>(alignment_ - 1));
+    const size_t current_mod =
+        reinterpret_cast<uintptr_t>(new_buf) & (alignment_ - 1);
+    char* new_bufstart =
+        new_buf + (current_mod == 0 ? 0 : alignment_ - current_mod);
 
     if (copy_data) {
       assert(bufstart_ + copy_offset + copy_len <= bufstart_ + cursize_);

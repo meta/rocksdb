@@ -288,6 +288,7 @@ TEST_F(DeleteSchedulerTest, RateLimitingMultiThreaded) {
       }
     };
 
+    threads.reserve(thread_cnt);
     for (int i = 0; i < thread_cnt; i++) {
       threads.emplace_back(delete_thread);
     }
@@ -1006,6 +1007,7 @@ TEST_F(DeleteSchedulerTest, ConcurrentlyDeleteUnaccountedFilesInBuckets) {
     delete_scheduler_->WaitForEmptyTrashBucket(bucket.value());
   };
 
+  threads.reserve(thread_cnt);
   for (int i = 0; i < thread_cnt; i++) {
     threads.emplace_back(delete_thread);
   }

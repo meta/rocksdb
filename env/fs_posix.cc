@@ -705,7 +705,7 @@ class PosixFileSystem : public FileSystem {
 #endif
           );
       if (!ignore) {
-        result->push_back(entry->d_name);
+        result->emplace_back(entry->d_name);
       }
       errno = 0;  // reset errno if readdir() success
     }

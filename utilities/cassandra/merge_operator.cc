@@ -64,6 +64,7 @@ bool CassandraValueMergeOperator::PartialMergeMulti(
   new_value->clear();
 
   std::vector<RowValue> row_values;
+  row_values.reserve(operand_list.size());
   for (auto& operand : operand_list) {
     row_values.push_back(RowValue::Deserialize(operand.data(), operand.size()));
   }

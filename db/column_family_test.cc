@@ -955,6 +955,7 @@ TEST_P(ColumnFamilyTest, ReadWrite) {
 
 TEST_P(ColumnFamilyTest, IgnoreRecoveredLog) {
   std::string backup_logs = dbname_ + "/backup_logs";
+  const std::string backup_logs_prefix = backup_logs + "/";
 
   // delete old files in backup_logs directory
   ASSERT_OK(env_->CreateDirIfMissing(dbname_));
@@ -962,7 +963,7 @@ TEST_P(ColumnFamilyTest, IgnoreRecoveredLog) {
   std::vector<std::string> old_files;
   ASSERT_OK(env_->GetChildren(backup_logs, &old_files));
   for (auto& file : old_files) {
-    ASSERT_OK(env_->DeleteFile(backup_logs + "/" + file));
+    ASSERT_OK(env_->DeleteFile(backup_logs_prefix + file));
   }
 
   column_family_options_.merge_operator =
@@ -992,8 +993,9 @@ TEST_P(ColumnFamilyTest, IgnoreRecoveredLog) {
   // copy the logs to backup
   std::vector<std::string> logs;
   ASSERT_OK(env_->GetChildren(db_options_.wal_dir, &logs));
+  const std::string wal_dir_prefix = db_options_.wal_dir + "/";
   for (auto& log : logs) {
-    CopyFile(db_options_.wal_dir + "/" + log, backup_logs + "/" + log);
+    CopyFile(wal_dir_prefix + log, backup_logs_prefix + log);
   }
 
   // recover the DB
@@ -1018,7 +1020,7 @@ TEST_P(ColumnFamilyTest, IgnoreRecoveredLog) {
     if (iter == 0) {
       // copy the logs from backup back to wal dir
       for (auto& log : logs) {
-        CopyFile(backup_logs + "/" + log, db_options_.wal_dir + "/" + log);
+        CopyFile(backup_logs_prefix + log, wal_dir_prefix + log);
       }
     }
   }
@@ -3081,6 +3083,7 @@ TEST_P(ColumnFamilyTest, CreateAndDropPeriodicRace) {
       1000000;
   Open();
 
+  threads.reserve(kNumThreads);
   for (size_t i = 0; i < kNumThreads; i++) {
     threads.emplace_back([this, &other_opts, i]() {
       ColumnFamilyHandle* cfh;
@@ -4621,6 +4624,7 @@ TEST_F(ManualFlushSkipRetainUDTTest, ConcurrentManualFlushes) {
     }
   };
 
+  manual_flush_tds.reserve(10);
   for (int write_ts = 0; write_ts < 10; write_ts++) {
     manual_flush_tds.emplace_back(manual_flush, write_ts);
   }
