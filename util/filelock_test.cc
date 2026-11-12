@@ -70,7 +70,7 @@ class LockTest : public testing::Test {
       if (fd < 0) {
         // could not open file, could not check if it was locked
         fprintf(stderr, "Open on on file %s failed.\n", file_.c_str());
-        exit(exit_val);
+        exit(exit_val);  // NOLINT(concurrency-mt-unsafe)
       }
 
       struct flock f;
@@ -90,7 +90,7 @@ class LockTest : public testing::Test {
         }
       }
       close(fd);  // lock is released for child process
-      exit(exit_val);
+      exit(exit_val);  // NOLINT(concurrency-mt-unsafe)
     } else if (pid > 0) {
       // parent process
       int status;

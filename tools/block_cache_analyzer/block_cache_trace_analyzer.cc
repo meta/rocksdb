@@ -2111,13 +2111,13 @@ std::vector<CacheConfiguration> parse_cache_config_file(
     if (config_strs.size() < 4) {
       fprintf(stderr, "Invalid cache simulator configuration %s\n",
               line.c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     if (kSupportedCacheNames.find(" " + config_strs[0] + " ") ==
         std::string::npos) {
       fprintf(stderr, "Invalid cache name %s. Supported cache names are %s\n",
               line.c_str(), kSupportedCacheNames.c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     cache_config.cache_name = config_strs[0];
     cache_config.num_shard_bits = ParseUint32(config_strs[1]);
@@ -2127,7 +2127,7 @@ std::vector<CacheConfiguration> parse_cache_config_file(
       if (capacity == 0) {
         fprintf(stderr, "Invalid cache capacity %s, %s\n",
                 config_strs[i].c_str(), line.c_str());
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
       }
       cache_config.cache_capacities.push_back(capacity);
     }
@@ -2153,7 +2153,7 @@ int block_cache_trace_analyzer_tool(int argc, char** argv) {
   ParseCommandLineFlags(&argc, &argv, true);
   if (FLAGS_block_cache_trace_path.empty()) {
     fprintf(stderr, "block cache trace path is empty\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   uint64_t warmup_seconds =
       FLAGS_cache_sim_warmup_seconds > 0 ? FLAGS_cache_sim_warmup_seconds : 0;
@@ -2170,7 +2170,7 @@ int block_cache_trace_analyzer_tool(int argc, char** argv) {
     if (!s.ok()) {
       fprintf(stderr, "Cannot initialize cache simulators %s\n",
               s.ToString().c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
   }
   BlockCacheTraceAnalyzer analyzer(
@@ -2182,7 +2182,7 @@ int block_cache_trace_analyzer_tool(int argc, char** argv) {
   if (!s.IsIncomplete() && !s.ok()) {
     // Read all traces.
     fprintf(stderr, "Cannot process the trace %s\n", s.ToString().c_str());
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   fprintf(stdout, "Status: %s\n", s.ToString().c_str());
   analyzer.WriteMissRatioCurves();

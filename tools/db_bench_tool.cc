@@ -1617,13 +1617,13 @@ ROCKSDB_NAMESPACE::ToolHooks* hooks_ = nullptr;
 // for db_stress in PR #14850 and need guard-context-aware handling.
 [[noreturn]] void db_bench_exit(int status) {
   if (hooks_ == nullptr) {
-    exit(status);
+    exit(status);  // NOLINT(concurrency-mt-unsafe)
   }
 
   hooks_->Exit(status);
 
   // We should exit here but in case they don't we exit anyway.
-  exit(-1);
+  exit(-1);  // NOLINT(concurrency-mt-unsafe)
 };
 
 static enum ROCKSDB_NAMESPACE::CompressionType StringToCompressionType(
@@ -6221,7 +6221,7 @@ class Benchmark {
         } else {
           fprintf(stderr, "Unknown --optimize_key_common_prefix: %s\n",
                   FLAGS_optimize_key_common_prefix.c_str());
-          exit(1);
+          db_bench_exit(1);
         }
       }
       block_based_options.uniform_cv_threshold = FLAGS_uniform_cv_threshold;
@@ -7492,7 +7492,9 @@ class Benchmark {
           blob_db::BlobDB* blobdb =
               static_cast<blob_db::BlobDB*>(db_with_cfh->db);
           if (FLAGS_blob_db_max_ttl_range > 0) {
+            // NOLINTBEGIN(concurrency-mt-unsafe,cert-msc30-c,cert-msc50-cpp)
             int ttl = rand() % FLAGS_blob_db_max_ttl_range;
+            // NOLINTEND(concurrency-mt-unsafe,cert-msc30-c,cert-msc50-cpp)
             s = blobdb->PutWithTTL(write_options_, key, val, ttl);
           } else {
             s = blobdb->Put(write_options_, key, val);
@@ -9360,6 +9362,7 @@ class Benchmark {
       return origin;
     }
     int band_int = static_cast<int>(FLAGS_sine_a);
+    // NOLINTNEXTLINE(concurrency-mt-unsafe,cert-msc30-c,cert-msc50-cpp)
     double delta = (rand() % band_int - band_int / 2) * noise_ratio;
     if (origin + delta < 0) {
       return origin;

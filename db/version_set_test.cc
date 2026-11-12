@@ -1183,6 +1183,7 @@ class VersionSetTestBase {
         shutting_down_(false),
         table_factory_(std::make_shared<mock::MockTableFactory>()) {
     EXPECT_OK(test::CreateEnvFromSystem(ConfigOptions(), &env_, &env_guard_));
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
     if (env_ == Env::Default() && getenv("MEM_ENV")) {
       env_guard_.reset(NewMemEnv(Env::Default()));
       env_ = env_guard_.get();
@@ -1218,7 +1219,7 @@ class VersionSetTestBase {
   }
 
   virtual ~VersionSetTestBase() {
-    if (getenv("KEEP_DB")) {
+    if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
       fprintf(stdout, "DB is still at %s\n", dbname_.c_str());
     } else {
       Options options;

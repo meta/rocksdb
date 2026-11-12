@@ -46,7 +46,7 @@ class DBSecondaryTestBase : public DBBasicTestWithTimestampBase {
 
   ~DBSecondaryTestBase() override {
     CloseSecondary();
-    if (getenv("KEEP_DB") != nullptr) {
+    if (getenv("KEEP_DB") != nullptr) {  // NOLINT(concurrency-mt-unsafe)
       fprintf(stdout, "Secondary DB is still at %s\n", secondary_path_.c_str());
     } else {
       Options options;

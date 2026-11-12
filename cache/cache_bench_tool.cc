@@ -357,7 +357,7 @@ void ConfigureSecondaryCache(ShardedCacheOptions& opts) {
       fprintf(stderr,
               "No secondary cache registered matching string: %s status=%s\n",
               FLAGS_secondary_cache_uri.c_str(), s.ToString().c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     opts.secondary_cache = secondary_cache;
   }
@@ -391,7 +391,7 @@ class CacheBench {
                          kHundredthUint64 * FLAGS_erase_percent) {
     if (erase_threshold_ != 100U * kHundredthUint64) {
       fprintf(stderr, "Percentages must add to 100.\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     cache_ = MakeCache();
   }
@@ -410,7 +410,7 @@ class CacheBench {
     }
     if (FLAGS_cache_type == "clock_cache") {
       fprintf(stderr, "Old clock cache implementation has been removed.\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     } else if (EndsWith(FLAGS_cache_type, "hyper_clock_cache")) {
       HyperClockCacheOptions opts(
           FLAGS_cache_size, /*estimated_entry_charge=*/0, FLAGS_num_shard_bits);
@@ -428,7 +428,7 @@ class CacheBench {
         }
       } else {
         fprintf(stderr, "Cache type not supported.\n");
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
       }
       ConfigureSecondaryCache(opts);
       return opts.MakeSharedCache();
@@ -442,7 +442,7 @@ class CacheBench {
       return NewLRUCache(opts);
     } else {
       fprintf(stderr, "Cache type not supported.\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
   }
 
@@ -477,7 +477,7 @@ class CacheBench {
       if (!handle) {
         fprintf(stderr, "Failed to lookup key just inserted.\n");
         assert(false);
-        exit(42);
+        exit(42);  // NOLINT(concurrency-mt-unsafe)
       } else {
         cache_->Release(handle);
       }
@@ -810,7 +810,7 @@ class CacheBench {
     }
     if (FLAGS_early_exit) {
       MutexLock l(thread->shared->GetMutex());
-      exit(0);
+      exit(0);  // NOLINT(concurrency-mt-unsafe)
     }
     thread->shared->AddLookupStats(lookup_hits, lookup_misses, pinned.size());
     for (auto handle : pinned) {
@@ -820,7 +820,7 @@ class CacheBench {
     // Ensure computations on `result` are not optimized away.
     if (result == 1) {
       printf("You are extremely unlucky(2). Try again.\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     thread->duration_us = clock->NowMicros() - start_time;
   }
@@ -1231,7 +1231,7 @@ int cache_bench_tool(int argc, char** argv) {
 
   if (FLAGS_threads <= 0) {
     fprintf(stderr, "threads number <= 0\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 
   if (FLAGS_seed == 0) {

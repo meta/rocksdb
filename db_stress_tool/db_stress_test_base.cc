@@ -1479,7 +1479,7 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
       fprintf(stderr,
               "No secondary cache registered matching string: %s status=%s\n",
               FLAGS_secondary_cache_uri.c_str(), s.ToString().c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     if (FLAGS_secondary_cache_fault_one_in > 0) {
       secondary_cache = std::make_shared<FaultInjectionSecondaryCache>(
@@ -1491,7 +1491,7 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
       fprintf(stderr,
               "Cannot specify both compressed_secondary_cache_size and %s\n",
               FLAGS_cache_type.c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     CompressedSecondaryCacheOptions opts;
     opts.capacity = FLAGS_compressed_secondary_cache_size;
@@ -1502,7 +1502,7 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
     secondary_cache = NewCompressedSecondaryCache(opts);
     if (secondary_cache == nullptr) {
       fprintf(stderr, "Failed to allocate compressed secondary cache\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     compressed_secondary_cache = secondary_cache;
   }
@@ -1519,7 +1519,7 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
   }
   if (cache_type == "clock_cache") {
     fprintf(stderr, "Old clock cache implementation has been removed.\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   } else if (EndsWith(cache_type, "hyper_clock_cache")) {
     size_t estimated_entry_charge;
     if (cache_type == "fixed_hyper_clock_cache") {
@@ -1529,7 +1529,7 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
       estimated_entry_charge = 0;
     } else {
       fprintf(stderr, "Cache type not supported.");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     HyperClockCacheOptions opts(cache_size, estimated_entry_charge,
                                 num_shard_bits);
@@ -1585,7 +1585,7 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
     }
   } else {
     fprintf(stderr, "Cache type not supported.");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   return block_cache;
 }
@@ -5895,7 +5895,7 @@ void StressTest::Open(SharedState* shared, bool reopen) {
   } else {
     fprintf(stderr, "Unknown compression manager: %s\n",
             FLAGS_compression_manager.c_str());
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_use_full_external_table) {
     options_.table_factory = NewExternalTableFactory(
@@ -5904,7 +5904,7 @@ void StressTest::Open(SharedState* shared, bool reopen) {
   if (FLAGS_prefix_size == 0 && FLAGS_rep_factory == kHashSkipList) {
     fprintf(stderr,
             "prefeix_size cannot be zero if memtablerep == prefix_hash\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_prefix_size != 0 && FLAGS_rep_factory != kHashSkipList) {
     fprintf(stdout,
@@ -5929,7 +5929,7 @@ void StressTest::Open(SharedState* shared, bool reopen) {
       fprintf(stderr,
               "allow_resumption or randomize_allow_resumption requires "
               "remote_compaction_worker_threads > 0\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
   }
 
@@ -5939,7 +5939,7 @@ void StressTest::Open(SharedState* shared, bool reopen) {
     fprintf(stderr,
             "Integrated BlobDB is currently incompatible with best-effort "
             "recovery\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 
   fprintf(stdout,
@@ -6871,21 +6871,21 @@ void CheckAndSetOptionsForUserTimestamp(Options& options) {
     fprintf(stderr,
             "Only -user_timestamp_size=%d is supported in stress test.\n",
             static_cast<int>(cmp->timestamp_size()));
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_use_txn) {
     fprintf(stderr, "TransactionDB does not support timestamp yet.\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_test_cf_consistency || FLAGS_test_batches_snapshots) {
     fprintf(stderr,
             "Due to per-key ts-seq ordering constraint, only the (default) "
             "non-batched test is supported with timestamp.\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_ingest_external_file_one_in > 0) {
     fprintf(stderr, "Bulk loading may not support timestamp yet.\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   options.comparator = cmp;
   options.persist_user_defined_timestamps =
@@ -7264,7 +7264,7 @@ void InitializeOptionsFromFlags(
         fprintf(stderr,
                 "Unable to create a standalone blob cache if blob_cache_size "
                 "<= 0.\n");
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
       }
     }
     switch (FLAGS_prepopulate_blob_cache) {
@@ -7276,7 +7276,7 @@ void InitializeOptionsFromFlags(
         break;
       default:
         fprintf(stderr, "Unknown prepopulate blob cache mode\n");
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
   }
 

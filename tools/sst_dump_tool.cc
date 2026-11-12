@@ -205,7 +205,7 @@ bool ParseIntArg(const char* arg, const std::string& arg_name,
     iss >> *arg_val;
     if (iss.fail()) {
       fprintf(stderr, "%s\n", err_msg.c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     return true;
   }
@@ -661,7 +661,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
         if (iter == OptionsHelper::compression_type_string_map.end()) {
           fprintf(stderr, "%s is not a valid CompressionType\n",
                   compression_type.c_str());
-          exit(1);
+          exit(1);  // NOLINT(concurrency-mt-unsafe)
         }
         compression_types.emplace_back(iter->second);
       }
@@ -675,7 +675,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
         } catch (...) {
           fprintf(stderr, "%s is not a valid compression strategy\n",
                   strategy_str.c_str());
-          exit(1);
+          exit(1);  // NOLINT(concurrency-mt-unsafe)
         }
       }
     } else if (strncmp(argv[i], "--require_property_regex=", 25) == 0) {
@@ -693,12 +693,12 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
       if (!s.ok()) {
         fprintf(stderr, "Failed to create compression manager: %s\n",
                 s.ToString().c_str());
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
       }
       if (compression_manager == nullptr) {
         fprintf(stderr, "No compression manager created: %s\n",
                 compression_manager_str.c_str());
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
       }
       options.compression_manager = compression_manager;
       printf("Using compression manager: %s\n",
@@ -721,7 +721,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
       if (!s.ok()) {
         fprintf(stderr, "Failed to parse --block_based_table_options: %s\n",
                 s.ToString().c_str());
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
       }
     } else if (strncmp(argv[i], "--parse_internal_key=", 21) == 0) {
       std::string in_key(argv[i] + 21);
@@ -861,12 +861,12 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
     fprintf(stderr,
             "Specify both --compression_level_from and "
             "--compression_level_to.\n\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 
   if (use_from_as_prefix && has_from) {
     fprintf(stderr, "Cannot specify --prefix and --from\n\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 
   if (input_key_hex) {
@@ -881,7 +881,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
   if (dirs_or_files.empty()) {
     fprintf(stderr, "file or directory must be specified.\n\n");
     print_help(/*to_stderr*/ true);
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 
   std::shared_ptr<ROCKSDB_NAMESPACE::Env> env_guard;
@@ -896,7 +896,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
                                   &env_guard);
     if (!s.ok()) {
       fprintf(stderr, "CreateEnvFromUri: %s\n", s.ToString().c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     } else if (!json_output) {
       fprintf(stdout, "options.env is %p\n", options.env);
     }
@@ -1094,7 +1094,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
           compression_strategies, per_measurement);
       if (!st.ok()) {
         fprintf(stderr, "Failed to recompress: %s\n", st.ToString().c_str());
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
       }
       if (json_output) {
         const auto& measurements = dumper.GetRecompressMeasurements();
@@ -1178,7 +1178,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
       st = dumper.DumpTable(out_filename);
       if (!st.ok()) {
         fprintf(stderr, "%s: %s\n", filename.c_str(), st.ToString().c_str());
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
       } else {
         fprintf(stdout, "raw dump written to file %s\n", out_filename.data());
       }

@@ -107,7 +107,7 @@ class CorruptionTest : public testing::Test {
     SyncPoint::GetInstance()->LoadDependency({});
     SyncPoint::GetInstance()->ClearAllCallBacks();
     db_.reset();
-    if (getenv("KEEP_DB")) {
+    if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
       fprintf(stdout, "db is still at %s\n", dbname_.c_str());
     } else {
       Options opts;

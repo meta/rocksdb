@@ -67,7 +67,7 @@ class BlockCacheTracerTest : public testing::Test {
   }
 
   ~BlockCacheTracerTest() override {
-    if (getenv("KEEP_DB")) {
+    if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
       printf("The trace file is still at %s\n", trace_file_path_.c_str());
       return;
     }

@@ -1780,23 +1780,23 @@ void CheckAndSetOptionsForMultiOpsTxnStressTest() {
     fprintf(stderr,
             "-test_multi_ops_txns is not compatible with "
             "-test_bathces_snapshots and -test_cf_consistency\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (!FLAGS_use_txn) {
     fprintf(stderr, "-use_txn must be true if -test_multi_ops_txns\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   } else if (FLAGS_test_secondary > 0) {
     fprintf(
         stderr,
         "secondary instance does not support replaying logs (MANIFEST + WAL) "
         "of TransactionDB with write-prepared/write-unprepared policy\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_clear_column_family_one_in > 0) {
     fprintf(stderr,
             "-test_multi_ops_txns is not compatible with clearing column "
             "families\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_column_families > 1) {
     // TODO (yanqin) support separating primary index and secondary index in
@@ -1804,20 +1804,20 @@ void CheckAndSetOptionsForMultiOpsTxnStressTest() {
     fprintf(stderr,
             "-test_multi_ops_txns currently does not use more than one column "
             "family\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_writepercent > 0 || FLAGS_delpercent > 0 ||
       FLAGS_delrangepercent > 0) {
     fprintf(stderr,
             "-test_multi_ops_txns requires that -writepercent, -delpercent and "
             "-delrangepercent be 0\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_key_spaces_path.empty()) {
     fprintf(stderr,
             "Must specify a file to store ranges of A and C via "
             "-key_spaces_path\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_create_timestamped_snapshot_one_in > 0) {
     if (FLAGS_txn_write_policy !=
@@ -1825,14 +1825,14 @@ void CheckAndSetOptionsForMultiOpsTxnStressTest() {
       fprintf(stderr,
               "Timestamped snapshot is not yet supported by "
               "write-prepared/write-unprepared transactions\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
   }
   if (FLAGS_sync_fault_injection == 1) {
     fprintf(stderr,
             "Sync fault injection is currently not supported in "
             "-test_multi_ops_txns\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 }
 }  // namespace ROCKSDB_NAMESPACE

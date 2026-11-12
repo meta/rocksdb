@@ -1816,7 +1816,7 @@ TEST_F(DBErrorHandlingFSTest, MultiDBCompactionError) {
     snprintf(buf, sizeof(buf), "_%d", i);
     db[i].reset();
     fault_fs[i]->SetFilesystemActive(true);
-    if (getenv("KEEP_DB")) {
+    if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
       printf("DB is still at %s%s\n", dbname_.c_str(), buf);
     } else {
       ASSERT_OK(DestroyDB(dbname_ + std::string(buf), options[i]));
@@ -1952,7 +1952,7 @@ TEST_F(DBErrorHandlingFSTest, MultiDBVariousErrors) {
     snprintf(buf, sizeof(buf), "_%d", i);
     fault_fs[i]->SetFilesystemActive(true);
     db[i].reset();
-    if (getenv("KEEP_DB")) {
+    if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
       printf("DB is still at %s%s\n", dbname_.c_str(), buf);
     } else {
       EXPECT_OK(DestroyDB(dbname_ + std::string(buf), options[i]));

@@ -57,6 +57,7 @@ static Env* GetTestEnv() {
   static std::shared_ptr<Env> env_guard;
   static Env* custom_env = nullptr;
   if (custom_env == nullptr) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
     const char* env_uri = getenv("TEST_ENV_URI");
     if (env_uri != nullptr) {
       EXPECT_OK(Env::CreateFromUri(ConfigOptions(), env_uri, /*fs_uri=*/"",
@@ -71,6 +72,7 @@ static Env* GetTestFS() {
   static std::shared_ptr<Env> fs_env_guard;
   static Env* fs_env = nullptr;
   if (fs_env == nullptr) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
     const char* fs_uri = getenv("TEST_FS_URI");
     if (fs_uri != nullptr) {
       EXPECT_OK(Env::CreateFromUri(ConfigOptions(), /*env_uri=*/"", fs_uri,
@@ -127,11 +129,11 @@ namespace {
 // ValuesIn() will skip running tests when given an empty collection.
 std::vector<CreateEnvFunc*> GetCustomEnvs() {
   std::vector<CreateEnvFunc*> res;
-  const char* uri = getenv("TEST_ENV_URI");
+  const char* uri = getenv("TEST_ENV_URI");  // NOLINT(concurrency-mt-unsafe)
   if (uri != nullptr) {
     res.push_back(&GetTestEnv);
   }
-  uri = getenv("TEST_FS_URI");
+  uri = getenv("TEST_FS_URI");  // NOLINT(concurrency-mt-unsafe)
   if (uri != nullptr) {
     res.push_back(&GetTestFS);
   }

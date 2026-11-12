@@ -1245,12 +1245,13 @@ class IoctlFriendlyTmpdir {
     char dir_buf[100];
 
     const char* fmt = "%s/rocksdb.XXXXXX";
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
     const char* tmp = getenv("TEST_IOCTL_FRIENDLY_TMPDIR");
 
 #ifdef OS_WIN
 #define rmdir _rmdir
     if (tmp == nullptr) {
-      tmp = getenv("TMP");
+      tmp = getenv("TMP");  // NOLINT(concurrency-mt-unsafe)
     }
 
     snprintf(dir_buf, sizeof dir_buf, fmt, tmp);
@@ -3318,7 +3319,7 @@ TEST_F(CreateEnvTest, CreateEncryptedFileSystem) {
       std::string("provider=1://test; id=") + EncryptedFileSystem::kClassName();
   // Rewrite the default FileSystem URI if the "TEST_FS_URI" environment
   // variable is set. This is useful to test customer encryption plugins.
-  const char* uri = getenv("TEST_FS_URI");
+  const char* uri = getenv("TEST_FS_URI");  // NOLINT(concurrency-mt-unsafe)
   if (uri != nullptr) {
     base_opts = uri;
   }
@@ -3522,7 +3523,7 @@ TEST_F(EnvTest, GenerateRawUniqueIdTrackEnvDetailsOnly) {
 TEST_F(EnvTest, GenerateRawUniqueIdTrackRandomDeviceOnly) {
   // Temporarily skipped on GitHub Actions until 2027-02-01, when we can
   // reassess if failures recur.
-  if (getenv("GITHUB_ACTIONS")) {
+  if (getenv("GITHUB_ACTIONS")) {  // NOLINT(concurrency-mt-unsafe)
     int64_t now = 0;
     ASSERT_OK(Env::Default()->GetCurrentTime(&now));
     if (now < 1801440000) {
