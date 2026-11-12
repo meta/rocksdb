@@ -81,6 +81,41 @@ class OptimisticTransactionDBImpl : public OptimisticTransactionDB {
     return OptimisticTransactionDB::Write(write_opts, batch);
   }
 
+  using StackableDB::CreateColumnFamily;
+  Status CreateColumnFamily(const ColumnFamilyOptions& options,
+                            const std::string& column_family_name,
+                            ColumnFamilyHandle** handle) override;
+
+  Status CreateColumnFamilies(
+      const ColumnFamilyOptions& options,
+      const std::vector<std::string>& column_family_names,
+      std::vector<ColumnFamilyHandle*>* handles) override;
+
+  Status CreateColumnFamilies(
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      std::vector<ColumnFamilyHandle*>* handles) override;
+
+  using StackableDB::CreateColumnFamilyWithImport;
+  Status CreateColumnFamilyWithImport(
+      const ColumnFamilyOptions& options, const std::string& column_family_name,
+      const ImportColumnFamilyOptions& import_options,
+      const ExportImportFilesMetaData& metadata,
+      ColumnFamilyHandle** handle) override {
+    const std::vector<const ExportImportFilesMetaData*> metadatas{&metadata};
+    return CreateColumnFamilyWithImport(options, column_family_name,
+                                        import_options, metadatas, handle);
+  }
+
+  Status CreateColumnFamilyWithImport(
+      const ColumnFamilyOptions& options, const std::string& column_family_name,
+      const ImportColumnFamilyOptions& import_options,
+      const std::vector<const ExportImportFilesMetaData*>& metadatas,
+      ColumnFamilyHandle** handle) override;
+
+  // Returns non-OK for column family options that optimistic concurrency
+  // control cannot support.
+  static Status VerifyCFOptions(const ColumnFamilyOptions& cf_options);
+
   OccValidationPolicy GetValidatePolicy() const { return validate_policy_; }
 
   port::Mutex& GetLockBucket(const Slice& key, uint64_t seed) {
