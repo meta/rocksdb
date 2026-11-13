@@ -1,0 +1,1 @@
+Fixed a bug where `SetOptions()` skipped the table factory checks that `DB::Open()` runs, so it could accept options that `DB::Open()` rejects. For example, removing the `prefix_extractor` of a column family that uses a hash index (`kHashSearch`) was accepted, and the next flush crashed. `SetOptions()` now returns `InvalidArgument` for such options.
