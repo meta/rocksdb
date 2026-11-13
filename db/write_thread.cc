@@ -209,12 +209,55 @@ uint8_t WriteThread::AwaitState(Writer* w, uint8_t goal_mask,
   return state;
 }
 
+bool WriteThread::IsValidStateTransition(uint8_t old_state,
+                                         uint8_t new_state) {
+  if (new_state == STATE_INIT || new_state == STATE_LOCKED_WAITING) {
+    return false;
+  }
+
+  if (old_state == new_state) {
+    return false;
+  }
+
+  switch (old_state) {
+    case STATE_INIT:
+      return new_state == STATE_GROUP_LEADER ||
+             new_state == STATE_MEMTABLE_WRITER_LEADER ||
+             new_state == STATE_PARALLEL_MEMTABLE_CALLER ||
+             new_state == STATE_PARALLEL_MEMTABLE_WRITER ||
+             new_state == STATE_COMPLETED;
+    case STATE_GROUP_LEADER:
+      return new_state == STATE_MEMTABLE_WRITER_LEADER ||
+             new_state == STATE_PARALLEL_MEMTABLE_WRITER ||
+             new_state == STATE_COMPLETED;
+    case STATE_MEMTABLE_WRITER_LEADER:
+      return new_state == STATE_PARALLEL_MEMTABLE_CALLER ||
+             new_state == STATE_PARALLEL_MEMTABLE_WRITER ||
+             new_state == STATE_COMPLETED;
+    case STATE_PARALLEL_MEMTABLE_CALLER:
+      return new_state == STATE_PARALLEL_MEMTABLE_WRITER ||
+             new_state == STATE_COMPLETED;
+    case STATE_PARALLEL_MEMTABLE_WRITER:
+      return new_state == STATE_COMPLETED;
+    case STATE_LOCKED_WAITING:
+      return new_state == STATE_GROUP_LEADER ||
+             new_state == STATE_MEMTABLE_WRITER_LEADER ||
+             new_state == STATE_PARALLEL_MEMTABLE_CALLER ||
+             new_state == STATE_PARALLEL_MEMTABLE_WRITER ||
+             new_state == STATE_COMPLETED;
+    default:
+      return false;
+  }
+}
+
 void WriteThread::SetState(Writer* w, uint8_t new_state) {
   assert(w);
   auto state = w->state.load(std::memory_order_acquire);
+  assert(IsValidStateTransition(state, new_state));
   if (state == STATE_LOCKED_WAITING ||
       !w->state.compare_exchange_strong(state, new_state)) {
     assert(state == STATE_LOCKED_WAITING);
+    assert(IsValidStateTransition(state, new_state));
 
     std::lock_guard<std::mutex> guard(w->StateMutex());
     assert(w->state.load(std::memory_order_relaxed) != new_state);
