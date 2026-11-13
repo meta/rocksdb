@@ -138,6 +138,7 @@ JAVA_TESTS = \
 	org.rocksdb.EnvOptionsTest\
 	org.rocksdb.EventListenerTest\
 	org.rocksdb.IngestExternalFileOptionsTest\
+	org.rocksdb.IteratorClosedDBTest\
 	org.rocksdb.util.IntComparatorTest\
 	org.rocksdb.util.JNIComparatorTest\
 	org.rocksdb.FilterTest\
