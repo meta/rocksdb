@@ -1847,6 +1847,16 @@ DEFINE_double(experimental_mempurge_threshold, 0.0,
               "Maximum useful payload ratio estimate that triggers a mempurge "
               "(memtable garbage collection).");
 
+DEFINE_bool(experimental_enable_sst_view_compaction, false,
+            "Enable experimental logical SST views for eligible leveled "
+            "compactions.");
+DEFINE_uint64(experimental_sst_view_min_bytes_saved, 64ULL << 20,
+              "Minimum estimated bytes saved by an SST-view compaction.");
+DEFINE_double(experimental_sst_view_min_reuse_ratio, 0.5,
+              "Minimum source-file fraction retained as SST views.");
+DEFINE_uint64(experimental_sst_view_max_retained_dead_bytes, 1ULL << 30,
+              "Maximum retained dead bytes across live SST view backings.");
+
 DEFINE_bool(inplace_update_support,
             ROCKSDB_NAMESPACE::Options().inplace_update_support,
             "Support in-place memtable update for smaller or same-size values");
@@ -6436,6 +6446,14 @@ class Benchmark {
         FLAGS_allow_concurrent_memtable_write;
     options.experimental_mempurge_threshold =
         FLAGS_experimental_mempurge_threshold;
+    options.experimental_enable_sst_view_compaction =
+        FLAGS_experimental_enable_sst_view_compaction;
+    options.experimental_sst_view_min_bytes_saved =
+        FLAGS_experimental_sst_view_min_bytes_saved;
+    options.experimental_sst_view_min_reuse_ratio =
+        FLAGS_experimental_sst_view_min_reuse_ratio;
+    options.experimental_sst_view_max_retained_dead_bytes =
+        FLAGS_experimental_sst_view_max_retained_dead_bytes;
     options.inplace_update_support = FLAGS_inplace_update_support;
     options.inplace_update_num_locks = FLAGS_inplace_update_num_locks;
     options.enable_write_thread_adaptive_yield =

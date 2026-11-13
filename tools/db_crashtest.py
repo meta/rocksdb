@@ -991,6 +991,12 @@ def apply_liveness_remote_defaults(params, args):
 simple_default_params = {
     "allow_concurrent_memtable_write": lambda: random.randint(0, 1),
     "column_families": 1,
+    "experimental_enable_sst_view_compaction": lambda: random.choice(
+        [0] * 9 + [1]
+    ),
+    "experimental_sst_view_min_bytes_saved": 1048576,
+    "experimental_sst_view_min_reuse_ratio": 0.5,
+    "experimental_sst_view_max_retained_dead_bytes": 1073741824,
     # TODO: re-enable once internal task T124324915 is fixed.
     # "experimental_mempurge_threshold": lambda: 10.0*random.random(),
     "max_background_compactions": 1,
