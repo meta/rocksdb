@@ -1365,6 +1365,62 @@ static rocksdb_compactionservice_scheduleresponse_t* NullSchedule(
 // so it can use the test harness.
 #include "c_api_gen/c_generated_roundtrip_tests.c.inc"
 
+static const char singledelete_key[] = "singledelete\0key";
+
+static void CheckTxnSingleDeleteValue(rocksdb_transaction_t* txn,
+                                      const rocksdb_readoptions_t* roptions,
+                                      rocksdb_column_family_handle_t* cf,
+                                      const char* expected) {
+  char* err = NULL;
+  size_t len;
+  char* value =
+      cf == NULL
+          ? rocksdb_transaction_get(txn, roptions, singledelete_key,
+                                    sizeof(singledelete_key) - 1, &len, &err)
+          : rocksdb_transaction_get_cf(txn, roptions, cf, singledelete_key,
+                                       sizeof(singledelete_key) - 1, &len,
+                                       &err);
+  CheckNoError(err);
+  CheckEqual(expected, value, len);
+  Free(&value);
+}
+
+static void TestTransactionSingleDelete(rocksdb_transaction_t* txn,
+                                        const rocksdb_readoptions_t* roptions,
+                                        rocksdb_column_family_handle_t* cf) {
+  char* err = NULL;
+  rocksdb_transaction_put(txn, singledelete_key, sizeof(singledelete_key) - 1,
+                          "default", 7, &err);
+  CheckNoError(err);
+  rocksdb_transaction_put_cf(txn, cf, singledelete_key,
+                             sizeof(singledelete_key) - 1, "column", 6, &err);
+  CheckNoError(err);
+  rocksdb_transaction_set_savepoint(txn);
+
+  rocksdb_transaction_singledelete_cf(txn, cf, singledelete_key,
+                                      sizeof(singledelete_key) - 1, &err);
+  CheckNoError(err);
+  CheckTxnSingleDeleteValue(txn, roptions, cf, NULL);
+  CheckTxnSingleDeleteValue(txn, roptions, NULL, "default");
+  rocksdb_transaction_singledelete(txn, singledelete_key,
+                                   sizeof(singledelete_key) - 1, &err);
+  CheckNoError(err);
+  CheckTxnSingleDeleteValue(txn, roptions, NULL, NULL);
+
+  rocksdb_transaction_rollback_to_savepoint(txn, &err);
+  CheckNoError(err);
+  CheckTxnSingleDeleteValue(txn, roptions, NULL, "default");
+  CheckTxnSingleDeleteValue(txn, roptions, cf, "column");
+  rocksdb_transaction_singledelete(txn, singledelete_key,
+                                   sizeof(singledelete_key) - 1, &err);
+  CheckNoError(err);
+  rocksdb_transaction_singledelete_cf(txn, cf, singledelete_key,
+                                      sizeof(singledelete_key) - 1, &err);
+  CheckNoError(err);
+  rocksdb_transaction_commit(txn, &err);
+  CheckNoError(err);
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -5990,6 +6046,48 @@ int main(int argc, char** argv) {
                                                      "txn_db_cf", &err);
     CheckNoError(err);
 
+    StartPhase("transaction_singledelete");
+    {
+      rocksdb_transaction_t* delete_txn =
+          rocksdb_transaction_begin(txn_db, woptions, txn_options, NULL);
+      TestTransactionSingleDelete(delete_txn, roptions, cfh);
+      rocksdb_transaction_destroy(delete_txn);
+      delete_txn =
+          rocksdb_transaction_begin(txn_db, woptions, txn_options, NULL);
+      CheckTxnSingleDeleteValue(delete_txn, roptions, NULL, NULL);
+      CheckTxnSingleDeleteValue(delete_txn, roptions, cfh, NULL);
+      rocksdb_transaction_destroy(delete_txn);
+    }
+
+    StartPhase("transaction_singledelete_lock_conflict");
+    {
+      rocksdb_transaction_options_t* no_wait =
+          rocksdb_transaction_options_create();
+      rocksdb_transaction_options_set_lock_timeout(no_wait, 0);
+      rocksdb_transaction_t* holder =
+          rocksdb_transaction_begin(txn_db, woptions, no_wait, NULL);
+      rocksdb_transaction_t* blocked =
+          rocksdb_transaction_begin(txn_db, woptions, no_wait, NULL);
+      rocksdb_transaction_put(holder, singledelete_key,
+                              sizeof(singledelete_key) - 1, "default", 7, &err);
+      CheckNoError(err);
+      rocksdb_transaction_put_cf(holder, cfh, singledelete_key,
+                                 sizeof(singledelete_key) - 1, "column", 6,
+                                 &err);
+      CheckNoError(err);
+      rocksdb_transaction_singledelete(blocked, singledelete_key,
+                                       sizeof(singledelete_key) - 1, &err);
+      CheckCondition(err != NULL);
+      Free(&err);
+      rocksdb_transaction_singledelete_cf(blocked, cfh, singledelete_key,
+                                          sizeof(singledelete_key) - 1, &err);
+      CheckCondition(err != NULL);
+      Free(&err);
+      rocksdb_transaction_destroy(blocked);
+      rocksdb_transaction_destroy(holder);
+      rocksdb_transaction_options_destroy(no_wait);
+    }
+
     rocksdb_transactiondb_put_cf(txn_db, woptions, cfh, "cf_foo", 6, "cf_hello",
                                  8, &err);
     CheckNoError(err);
@@ -6346,6 +6444,19 @@ int main(int argc, char** argv) {
       rocksdb_transaction_multi_get_cf(txn, roptions, get_handles, 3, keys,
                                        keys_sizes, vals, vals_sizes, errs);
       CheckMultiGetValues(3, vals, vals_sizes, errs, expected);
+    }
+
+    StartPhase("optimistic_transaction_singledelete");
+    {
+      rocksdb_transaction_t* delete_txn = rocksdb_optimistictransaction_begin(
+          otxn_db, woptions, otxn_options, NULL);
+      TestTransactionSingleDelete(delete_txn, roptions, cfh1);
+      rocksdb_transaction_destroy(delete_txn);
+      delete_txn = rocksdb_optimistictransaction_begin(otxn_db, woptions,
+                                                       otxn_options, NULL);
+      CheckTxnSingleDeleteValue(delete_txn, roptions, NULL, NULL);
+      CheckTxnSingleDeleteValue(delete_txn, roptions, cfh1, NULL);
+      rocksdb_transaction_destroy(delete_txn);
     }
 
     // Check iterator with column family

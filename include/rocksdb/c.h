@@ -4338,6 +4338,11 @@ extern ROCKSDB_LIBRARY_API char* rocksdb_transaction_get_name(
 
 extern ROCKSDB_LIBRARY_API void rocksdb_transaction_prepare(
     rocksdb_transaction_t* txn, char** errptr);
+/* rocksdb_transaction_singledelete and rocksdb_transaction_singledelete_cf
+   require only one Put for a key since its previous SingleDelete. Do not mix
+   SingleDelete with Delete or Merge for the same key. Like transaction Put and
+   Delete, these operations participate in conflict checking, savepoints, and
+   commit/rollback. Errors are returned through errptr. */
 // BEGIN generated: c_generated_transaction_subset.h.inc
 // @generated
 // -----------------------------------------------------------------------------
@@ -4376,6 +4381,13 @@ extern ROCKSDB_LIBRARY_API void rocksdb_transaction_delete(
     rocksdb_transaction_t* txn, const char* key, size_t klen, char** errptr);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_transaction_delete_cf(
+    rocksdb_transaction_t* txn, rocksdb_column_family_handle_t* column_family,
+    const char* key, size_t klen, char** errptr);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_transaction_singledelete(
+    rocksdb_transaction_t* txn, const char* key, size_t klen, char** errptr);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_transaction_singledelete_cf(
     rocksdb_transaction_t* txn, rocksdb_column_family_handle_t* column_family,
     const char* key, size_t klen, char** errptr);
 
