@@ -165,6 +165,7 @@ void GenericRateLimiter::SetBytesPerSecondLocked(int64_t bytes_per_second) {
   refill_bytes_per_period_.store(
       CalculateRefillBytesPerPeriodLocked(bytes_per_second),
       std::memory_order_relaxed);
+  available_bytes_ = std::min(available_bytes_, bytes_per_second);
 }
 
 Status GenericRateLimiter::SetSingleBurstBytes(int64_t single_burst_bytes) {
