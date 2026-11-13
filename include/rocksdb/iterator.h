@@ -103,11 +103,9 @@ class Iterator : public IteratorBase {
   // scan for best results. If an upper bound is not specified, Prepare may
   // skip prefetching as it cannot accurately determine how much to prefetch.
   //
-  // Prepare should typically be followed by Seeks to the start keys in the
-  // order they're specified in scan_opts. If the user does a Seek to some
-  // other target key, the iterator should disregard the scan_opts from that
-  // point onwards and behave like a normal iterator. Its the user's
-  // responsibility to again call Prepare().
+  // Prepare should be followed by Seeks to the start keys in the order they
+  // are specified in scan_opts. Iterators returned by DB::NewIterator() report
+  // InvalidArgument if the next Seek does not match the next prepared range.
   //
   // For an iterator from DB::NewIterator(), Prepare() discards any current
   // position, and Valid() returns false until the iterator is positioned
@@ -115,6 +113,13 @@ class Iterator : public IteratorBase {
   //
   // If Prepare() is called, it overrides the iterate_upper_bound in
   // ReadOptions
+  //
+  // When MultiScanArgs::allow_unsorted_or_overlapping_ranges is true,
+  // non-canonical ranges are accepted in caller order. Forward bounded ranges
+  // use multi-range prefetch; reverse and unbounded requests use ordinary
+  // iterator reads. Direct Prepare() supports uniformly bounded or uniformly
+  // unbounded ranges; mixed bounds and non-canonical ranges with property bags
+  // are not supported.
   virtual void Prepare(const MultiScanArgs& /*scan_opts*/) {}
 };
 

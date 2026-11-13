@@ -582,6 +582,14 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
       std::vector<std::tuple<size_t, size_t>>* block_index_ranges_per_scan,
       std::vector<std::string>* data_block_boundary_keys);
 
+  Status CollectArbitraryBlockHandles(
+      const MultiScanArgs& multiscan_opts,
+      std::vector<BlockHandle>* unique_block_handles,
+      std::vector<std::vector<size_t>>* block_indices_per_scan,
+      std::vector<std::string>* data_block_boundary_keys,
+      std::vector<bool>* range_reaches_file_end,
+      std::vector<size_t>* logical_block_priorities);
+
   // *** END APIs relevant to multiscan ***
 };
 }  // namespace ROCKSDB_NAMESPACE

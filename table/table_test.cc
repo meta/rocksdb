@@ -8463,6 +8463,14 @@ class ExternalTableTest : public DBTestBase {
     bool IsTableBuilderSupported() const override { return false; }
   };
 
+  class ArbitraryMultiScanExternalTableFactory
+      : public SimpleExternalTableFactory {
+   public:
+    bool SupportsMultiScan(const MultiScanArgs& /*scan_opts*/) const override {
+      return true;
+    }
+  };
+
   // A reader that pins values from its internal buffer, exercising the
   // zero-copy path in ExternalTableReaderAdapter::Get().
   class PinnedSimpleExternalTableReader
@@ -10043,6 +10051,7 @@ TEST_F(ExternalTableTest, DBMultiScanTest) {
   MultiScanArgs scan_options(BytewiseComparator());
   scan_options.insert(key_ranges[0], key_ranges[1]);
   scan_options.insert(key_ranges[2], key_ranges[3]);
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
   std::unique_ptr<MultiScan> iter = db->NewMultiScan(ro, cfh, scan_options);
   try {
     int idx = 0;
@@ -10094,6 +10103,70 @@ TEST_F(ExternalTableTest, DBMultiScanTest) {
     abort();
   }
   iter.reset();
+
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  iter = db->NewMultiScan(ro, cfh, scan_options);
+  try {
+    auto range = iter->begin();
+    (void)range;
+    FAIL() << "Expected external table to reject arbitrary MultiScan ranges";
+  } catch (MultiScanException& ex) {
+    ASSERT_TRUE(ex.status().IsNotSupported()) << ex.what();
+  }
+  iter.reset();
+
+  Slice direct_upper_bound;
+  ReadOptions direct_read_options;
+  direct_read_options.iterate_upper_bound = &direct_upper_bound;
+  std::unique_ptr<Iterator> direct_iter(
+      db->NewIterator(direct_read_options, cfh));
+  direct_iter->Prepare(scan_options);
+  ASSERT_TRUE(direct_iter->status().IsNotSupported())
+      << direct_iter->status().ToString();
+  direct_iter.reset();
+
+  Options opt_in_options = options;
+  opt_in_options.table_factory = NewExternalTableFactory(
+      std::make_shared<ArbitraryMultiScanExternalTableFactory>());
+  ColumnFamilyHandle* opt_in_cfh = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(opt_in_options, "opt_in", &opt_in_cfh));
+  ASSERT_OK(db->IngestExternalFile(opt_in_cfh, {ingest_file}, ifo));
+
+  iter = db->NewMultiScan(ro, opt_in_cfh, scan_options);
+  std::vector<std::vector<std::string>> actual;
+  for (auto range : *iter) {
+    actual.emplace_back();
+    for (auto entry : range) {
+      actual.back().push_back(entry.first.ToString());
+    }
+  }
+  std::vector<std::vector<std::string>> expected(2);
+  for (int i = 3; i < 30; ++i) {
+    expected[0].push_back("k" + (i < 10 ? std::string("0") : "") +
+                          std::to_string(i));
+  }
+  for (int i = 25; i < 50; ++i) {
+    expected[1].push_back("k" + std::to_string(i));
+  }
+  ASSERT_EQ(actual, expected);
+  iter.reset();
+
+  direct_iter.reset(db->NewIterator(direct_read_options, opt_in_cfh));
+  direct_iter->Prepare(scan_options);
+  ASSERT_OK(direct_iter->status());
+  actual.clear();
+  for (const ScanOptions& range : scan_options.GetScanRanges()) {
+    direct_upper_bound = *range.range.limit;
+    actual.emplace_back();
+    for (direct_iter->Seek(*range.range.start); direct_iter->Valid();
+         direct_iter->Next()) {
+      actual.back().push_back(direct_iter->key().ToString());
+    }
+    ASSERT_OK(direct_iter->status());
+  }
+  ASSERT_EQ(actual, expected);
+  direct_iter.reset();
+  ASSERT_OK(db->DestroyColumnFamilyHandle(opt_in_cfh));
 
   // Test the no limit scan case
   scan_options = MultiScanArgs(BytewiseComparator());
@@ -13781,6 +13854,53 @@ TEST_P(UserDefinedIndexTest, EmptyRangeTest) {
   property_bag["count"] = std::to_string(25);
   ValidateMultiScan({{{"key75", "key991"}, 20, 20}}, property_bag, ro,
                     scan_opts, key_counts, db, cfh);
+
+  property_bag["count"] = std::to_string(5);
+  std::vector<std::pair<std::string, std::string>> arbitrary_ranges = {
+      {"key42", "key56"}, {"key38", "key49"}};
+  if (is_reverse_comparator_) {
+    for (auto& range : arbitrary_ranges) {
+      std::swap(range.first, range.second);
+    }
+  }
+  auto scan_one = [&](const auto& range) {
+    MultiScanArgs one_range(options_.comparator);
+    one_range.insert(range.first, range.second, property_bag);
+    std::unique_ptr<MultiScan> scan = db->NewMultiScan(ro, cfh, one_range);
+    std::vector<std::string> keys;
+    for (auto logical_range : *scan) {
+      for (auto entry : logical_range) {
+        keys.push_back(entry.first.ToString());
+      }
+    }
+    return keys;
+  };
+  const std::vector<std::vector<std::string>> expected = {
+      scan_one(arbitrary_ranges[0]), scan_one(arbitrary_ranges[1])};
+
+  MultiScanArgs arbitrary_scan(options_.comparator);
+  arbitrary_scan.allow_unsorted_or_overlapping_ranges = true;
+  for (const auto& range : arbitrary_ranges) {
+    arbitrary_scan.insert(range.first, range.second, property_bag);
+  }
+  std::unique_ptr<MultiScan> scan = db->NewMultiScan(ro, cfh, arbitrary_scan);
+  std::vector<std::vector<std::string>> actual;
+  for (auto logical_range : *scan) {
+    actual.emplace_back();
+    for (auto entry : logical_range) {
+      actual.back().push_back(entry.first.ToString());
+    }
+  }
+  EXPECT_EQ(actual, expected);
+
+  Slice direct_upper_bound;
+  ReadOptions direct_read_options = ro;
+  direct_read_options.iterate_upper_bound = &direct_upper_bound;
+  std::unique_ptr<Iterator> direct_iter(
+      db->NewIterator(direct_read_options, cfh));
+  direct_iter->Prepare(arbitrary_scan);
+  EXPECT_TRUE(direct_iter->status().IsNotSupported());
+  direct_iter.reset();
 
   ASSERT_OK(db->DestroyColumnFamilyHandle(cfh));
   ASSERT_OK(db->Close());

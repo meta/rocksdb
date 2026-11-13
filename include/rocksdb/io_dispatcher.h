@@ -31,8 +31,9 @@ class PrefetchScheduler;
 // Options for configuring IODispatcher behavior
 struct IODispatcherOptions {
   // Maximum memory (in bytes) for prefetching across all ReadSets.
-  // When this limit is reached, SubmitJob() blocks until memory is released.
-  // Set to 0 (default) for unlimited prefetch memory.
+  // When this limit is reached, later blocks remain queued until memory is
+  // released; SubmitJob() does not block. Set to 0 (default) for unlimited
+  // prefetch memory.
   size_t max_prefetch_memory_bytes = 0;
 
   // Optional statistics for tracking memory limiter metrics
@@ -106,7 +107,8 @@ struct IODispatcherOptions {
  * -------------------------------------
  * // Configure a memory budget for prefetching to prevent unbounded memory use.
  * // When the budget is exceeded, IODispatcher uses "partial prefetch":
- * //   - Dispatches as many blocks as fit in available memory (earlier first)
+ * //   - Dispatches as many blocks as fit in available memory (lower logical
+ * //     priority first when jobs provide one, then caller order)
  * //   - Queues remaining blocks for later dispatch when memory is released
  * //   - Never blocks on SubmitJob - remaining blocks are read on-demand
  * //
@@ -177,6 +179,10 @@ class IOJob {
  public:
   std::vector<BlockHandle> block_handles;
 
+  // Optional logical priorities parallel to block_handles. Under memory
+  // pressure, lower priorities are dispatched first across pending jobs.
+  std::vector<size_t> logical_block_priorities;
+
   // Table reader for accessing block cache and index
   BlockBasedTable* table = nullptr;
 
@@ -210,6 +216,13 @@ class ReadSet {
   //
   // Returns: Status::OK() on success, error status otherwise
   Status ReadIndex(size_t block_index, CachableEntry<Block>* out);
+
+  // Return a non-owning entry when a prefetched block is retained by this
+  // ReadSet. If the block was not admitted under the memory limit (or its
+  // prefetch failed), synchronously read it and transfer ownership to `out` so
+  // foreground progress does not exceed the prefetch memory budget.
+  Status BorrowIndex(size_t block_index, CachableEntry<Block>* out);
+
   // Read a block by offset
   // - If the block is in cache, returns it immediately
   // - If the block is being read asynchronously, polls for completion and

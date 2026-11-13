@@ -34,6 +34,7 @@
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/options.h"
 #include "rocksdb/system_clock.h"
+#include "rocksdb/table.h"
 #include "table/internal_iterator.h"
 #include "table/iterator_wrapper.h"
 #include "trace_replay/trace_replay.h"
@@ -61,6 +62,14 @@ bool HasFullTimestampVisibility(const ReadOptions& read_options) {
   return true;
 }
 
+bool CanPrepareInternalChildren(const MultiScanArgs& scan_opts) {
+  const bool arbitrary_ranges =
+      scan_opts.allow_unsorted_or_overlapping_ranges &&
+      !scan_opts.HasSortedNonOverlappingRanges();
+  return scan_opts.HasBoundedScanRanges() &&
+         (!arbitrary_ranges || !scan_opts.reverse);
+}
+
 }  // namespace
 
 DBIter::DBIter(Env* _env, const ReadOptions& read_options,
@@ -76,6 +85,7 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       clock_(ioptions.clock),
       logger_(ioptions.logger),
       user_comparator_(cmp),
+      table_factory_(mutable_cf_options.table_factory.get()),
       merge_operator_(ioptions.merge_operator.get()),
       iter_(iter),
       // Enable the direct-write blob fallback only when this CF has a
@@ -2029,21 +2039,26 @@ Status DBIter::ValidateScanOptions(const MultiScanArgs& multiscan_opts) const {
     return Status::InvalidArgument("Empty MultiScanArgs");
   }
 
+  const std::vector<ScanOptions>& scan_opts = multiscan_opts.GetScanRanges();
+  const bool arbitrary_ranges =
+      multiscan_opts.allow_unsorted_or_overlapping_ranges &&
+      !multiscan_opts.HasSortedNonOverlappingRanges();
   if (multiscan_opts.rolling_prefetch &&
       (!multiscan_opts.use_async_io || multiscan_opts.reverse ||
-       multiscan_opts.rolling_prefetch_window_size == 0)) {
+       multiscan_opts.rolling_prefetch_window_size == 0 || arbitrary_ranges)) {
     ROCKS_LOG_WARN(
         logger_,
-        "Ignoring MultiScanArgs::rolling_prefetch because its async, "
-        "forward, nonzero-window prerequisites are not satisfied");
+        "Ignoring MultiScanArgs::rolling_prefetch because it requires async "
+        "I/O, a forward scan, a nonzero window, and sorted non-overlapping "
+        "ranges");
   }
 
-  const std::vector<ScanOptions>& scan_opts = multiscan_opts.GetScanRanges();
   const bool has_limit = scan_opts.front().range.limit.has_value();
   if (multiscan_opts.reverse && !has_limit) {
     return Status::InvalidArgument("Reverse MultiScan requires limit");
   }
-  if (!has_limit && scan_opts.size() > 1) {
+  if (!multiscan_opts.allow_unsorted_or_overlapping_ranges && !has_limit &&
+      scan_opts.size() > 1) {
     return Status::InvalidArgument("Scan has no upper bound");
   }
 
@@ -2064,7 +2079,12 @@ Status DBIter::ValidateScanOptions(const MultiScanArgs& multiscan_opts) const {
       }
     }
 
-    if (i > 0) {
+    if (multiscan_opts.reverse && !scan_range.limit.has_value()) {
+      return Status::InvalidArgument(
+          "Reverse MultiScan requires limit at index " + std::to_string(i));
+    }
+
+    if (i > 0 && !multiscan_opts.allow_unsorted_or_overlapping_ranges) {
       if (!scan_range.limit.has_value()) {
         // multiple scan without limit scan ranges
         return Status::InvalidArgument("Scan has no upper bound at index " +
@@ -2080,7 +2100,45 @@ Status DBIter::ValidateScanOptions(const MultiScanArgs& multiscan_opts) const {
       }
     }
   }
+
+  if (multiscan_opts.allow_unsorted_or_overlapping_ranges) {
+    const bool has_bounded_range = std::any_of(
+        scan_opts.begin(), scan_opts.end(), [](const ScanOptions& range) {
+          return range.range.limit.has_value();
+        });
+    const bool has_unbounded_range = std::any_of(
+        scan_opts.begin(), scan_opts.end(), [](const ScanOptions& range) {
+          return !range.range.limit.has_value();
+        });
+    if (has_bounded_range && has_unbounded_range) {
+      return Status::NotSupported(
+          "Direct Prepare does not support mixed bounded and unbounded "
+          "ranges");
+    }
+  }
+  if (arbitrary_ranges) {
+    if (std::any_of(scan_opts.begin(), scan_opts.end(),
+                    [](const ScanOptions& range) {
+                      return range.property_bag.has_value();
+                    })) {
+      return Status::NotSupported(
+          "Direct Prepare does not support arbitrary ranges with property "
+          "bags");
+    }
+    if (table_factory_ != nullptr &&
+        !table_factory_->SupportsMultiScan(multiscan_opts)) {
+      return Status::NotSupported(
+          "Table factory does not support arbitrary MultiScan ranges");
+    }
+  }
   return Status::OK();
+}
+
+bool DBIter::ShouldPrepareInternalChildren() const {
+  if (!scan_opts_.has_value() || !status_.ok()) {
+    return false;
+  }
+  return CanPrepareInternalChildren(*scan_opts_);
 }
 
 Status DBIter::SetScanOptionsForPrepare(const MultiScanArgs& scan_opts) {
@@ -2095,11 +2153,16 @@ Status DBIter::SetScanOptionsForPrepare(const MultiScanArgs& scan_opts) {
   new_scan_opts.emplace(scan_opts);
   scan_opts_.swap(new_scan_opts);
   scan_index_ = 0;
+  if (scan_opts_->allow_unsorted_or_overlapping_ranges &&
+      !scan_opts_->HasSortedNonOverlappingRanges() &&
+      scan_opts_->HasBoundedScanRanges() && !scan_opts_->reverse) {
+    scan_opts_->InitializeSeekState();
+  }
 
   // Create a shared IODispatcher if not provided. This allows all
   // BlockBasedTableIterators in this scan to share a single dispatcher,
   // enabling better IO coordination and future rate limiting.
-  if (!scan_opts_.value().io_dispatcher) {
+  if (ShouldPrepareInternalChildren() && !scan_opts_->io_dispatcher) {
     scan_opts_->io_dispatcher.reset(NewIODispatcher());
   }
   return Status::OK();
@@ -2110,7 +2173,7 @@ void DBIter::PrepareInternalChildren() {
     return;
   }
 
-  if (scan_opts_.value().HasBoundedScanRanges()) {
+  if (ShouldPrepareInternalChildren()) {
     iter_.Prepare(&scan_opts_.value());
   } else {
     iter_.Prepare(nullptr);
@@ -2175,6 +2238,7 @@ void DBIter::Seek(const Slice& target) {
         return;
       }
     }
+    scan_opts_->BeginLogicalSeek(scan_index_);
     scan_index_++;
   }
 
@@ -2302,6 +2366,7 @@ void DBIter::SeekForPrev(const Slice& target) {
       return;
     }
 
+    scan_opts_->BeginLogicalSeek(scan_index_);
     scan_index_++;
   }
 

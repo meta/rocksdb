@@ -577,6 +577,15 @@ class ExternalTableFactoryBase : public Customizable {
   // PutRangeDeletionBlock() and GetRangeDeletionBlock(), respectively.
   virtual bool IsDeleteRangeSupported() const { return false; }
 
+  // Returns whether this factory supports an unsorted or overlapping
+  // MultiScan. External formats must opt in because their property bags and
+  // iterator implementations can attach meaning to logical range boundaries.
+  // Direct Iterator::Prepare() also queries this capability before accepting
+  // a non-canonical request. Canonical requests do not query it.
+  virtual bool SupportsMultiScan(const MultiScanArgs& /*scan_opts*/) const {
+    return false;
+  }
+
   // Returns whether NewTableBuilder() can write tables. A factory that only
   // reads files written elsewhere returns false; see
   // TableFactory::IsTableBuilderSupported() for what RocksDB then requires.
