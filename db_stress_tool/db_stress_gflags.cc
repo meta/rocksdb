@@ -505,6 +505,13 @@ DEFINE_int32(
 
 DEFINE_string(cache_type, "lru_cache", "Type of block cache.");
 
+DEFINE_string(cache_uri, "",
+              "Full URI for creating a custom block cache object, used instead "
+              "of --cache_type. The URI sets the capacity, including any write "
+              "buffer charge; --cache_size must still be positive for the DB "
+              "to use a block cache. Cannot be combined with a secondary "
+              "cache.");
+
 DEFINE_uint64(subcompactions, 1,
               "Maximum number of subcompactions to divide L0-L1 compactions "
               "into.");

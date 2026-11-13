@@ -175,6 +175,7 @@ DECLARE_int32(top_level_index_pinning);
 DECLARE_int32(partition_pinning);
 DECLARE_int32(unpartitioned_pinning);
 DECLARE_string(cache_type);
+DECLARE_string(cache_uri);
 DECLARE_uint64(subcompactions);
 DECLARE_uint64(periodic_compaction_seconds);
 DECLARE_string(daily_offpeak_time_utc);
