@@ -2847,7 +2847,7 @@ rocksdbjavastaticnexusbundlejar: rocksdbjavageneratepom
 jl/%.o: %.cc
 	$(AM_V_CC)mkdir -p $(@D) && $(CXX) $(CXXFLAGS) -fPIC -c $< -o $@ $(COVERAGEFLAGS)
 
-rocksdbjava: $(LIB_OBJECTS)
+rocksdbjava: $(LIB_OBJECTS) japigen
 ifeq ($(JAVA_HOME),)
 	$(error JAVA_HOME is not set)
 endif
@@ -2856,11 +2856,21 @@ endif
 	$(AM_V_at)$(CXX) $(CXXFLAGS) -I./java/. -I./java/rocksjni $(JAVA_INCLUDE) $(ROCKSDB_PLUGIN_JNI_CXX_INCLUDEFLAGS) -shared -fPIC -o ./java/target/$(ROCKSDBJNILIB) $(ALL_JNI_NATIVE_SOURCES) $(LIB_OBJECTS) $(JAVA_LDFLAGS) $(COVERAGEFLAGS)
 	$(AM_V_at)cd java; $(JAR_CMD) -cf target/$(ROCKSDB_JAR) HISTORY*.md
 	$(AM_V_at)cd java/target; $(JAR_CMD) -uf $(ROCKSDB_JAR) $(ROCKSDBJNILIB)
-	$(AM_V_at)cd java/target/classes; $(JAR_CMD) -uf ../$(ROCKSDB_JAR) org/rocksdb/*.class org/rocksdb/util/*.class
+	$(AM_V_at)@find java/target/classes/org/rocksdb -name \*.class -print > ./rocksdb_java_classes
+	$(JAR_CMD) -uf java/target/$(ROCKSDB_JAR) @./rocksdb_java_classes
 	$(AM_V_at)openssl sha1 java/target/$(ROCKSDB_JAR) | sed 's/.*= \([0-9a-f]*\)/\1/' > java/target/$(ROCKSDB_JAR).sha1
 
+japigen:
+	# Use the output of the `C` API generator to generate a derivative Java API
+	# This goal generates Java classes which get deposited in java/target/generated-sources/ffmapi
+	# (see java/japigen/japiGeneratorConfig.json)
+	# These files are picked up along with others created by `jextract` (see java/Makefile)
+	# when the Java API is finally compiled as instructed by java/Makefile.
+	$(AM_V_at)cd java/japigen; mvn package; java -jar ./target/japi-generator-1.0-SNAPSHOT.jar --config japiGeneratorConfig.json
+
 jclean:
-	cd java;$(MAKE) clean;
+	cd java;$(MAKE) clean; cd japigen; mvn clean
+	rm ./rocksdb_java_classes
 
 jtest_compile: rocksdbjava
 	cd java;$(MAKE) java_test
@@ -2870,6 +2880,9 @@ jtest_run:
 
 jtest: rocksdbjava
 	cd java;$(MAKE) sample test
+
+jffm_sample: rocksdbjava
+	cd java;$(MAKE) ffm_sample
 
 jpmd: rocksdbjavageneratepom
 	cd java;$(MAKE) java java_test pmd
