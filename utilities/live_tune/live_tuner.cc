@@ -55,6 +55,24 @@ void AddObject(JSONWriter* jw, const std::string& key, const Map& map) {
   jw->EndObject();
 }
 
+// Token counts reach millions, past the stream's default 6-digit precision, so
+// whole numbers are written as integers to keep them exact.
+void AddUsage(JSONWriter* jw, const std::map<std::string, double>& usage) {
+  *jw << "usage";
+  jw->StartObject();
+  for (const auto& entry : usage) {
+    *jw << entry.first;
+    const double value = entry.second;
+    if (std::isfinite(value) && value == std::trunc(value) &&
+        std::fabs(value) < 9.0e15) {
+      *jw << static_cast<int64_t>(value);
+    } else {
+      *jw << value;
+    }
+  }
+  jw->EndObject();
+}
+
 void AddObjectives(JSONWriter* jw,
                    const std::vector<LiveTuneObjective>& objectives) {
   *jw << "objectives";
@@ -1156,7 +1174,9 @@ void LiveTuner::Run() {
     jw << "requires_compaction"
        << (recommendation.requires_compaction ? "true" : "false") << "rationale"
        << recommendation.rationale << "prompt" << recommendation.prompt
-       << "response" << recommendation.response;
+       << "response" << recommendation.response << "model"
+       << recommendation.model;
+    AddUsage(&jw, recommendation.usage);
     LogEvent(&jw);
   }
   if (Stopping()) {

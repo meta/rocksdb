@@ -217,6 +217,12 @@ struct LiveTuneRecommendation {
   // GetRecommendation() fails.
   std::string prompt;
   std::string response;
+  // The model the advisor asked and what the call cost (e.g. input_tokens,
+  // output_tokens, seconds), as far as the advisor reports them. A value the
+  // advisor does not know is left out, never set to 0. Kept in the status and
+  // the events even when GetRecommendation() fails.
+  std::string model;
+  std::map<std::string, double> usage;
 };
 
 // An applied recommendation being watched, with its windows so far.
