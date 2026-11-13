@@ -51,6 +51,9 @@ class TestAdvisor : public LiveTuneAdvisor {
     recommendation->rationale = "test";
     recommendation->prompt = "the prompt";
     recommendation->response = "the \"answer\"";
+    recommendation->model = "test-model";
+    recommendation->usage["input_tokens"] = 1200;
+    recommendation->usage["seconds"] = 2.5;
     return Status::OK();
   }
 
@@ -502,6 +505,8 @@ TEST_F(LiveTunerTest, KeptWhenBetterAndVerdictKeeps) {
   EXPECT_EQ(status.recommendation.objectives[0].metric, "latency");
   EXPECT_EQ(status.recommendation.prompt, "the prompt");
   EXPECT_EQ(status.recommendation.response, "the \"answer\"");
+  EXPECT_EQ(status.recommendation.model, "test-model");
+  EXPECT_EQ(status.recommendation.usage.at("input_tokens"), 1200);
   // The end of the cycle, once, with the change and its evidence.
   const std::vector<LiveTuneCycleResult> results =
       verdict->listener()->Results();
@@ -518,6 +523,9 @@ TEST_F(LiveTunerTest, KeptWhenBetterAndVerdictKeeps) {
   EXPECT_EQ(results[0].baseline.at("latency"), 100);
   ASSERT_TRUE(verdict->WaitFor(
       "\"prompt\": \"the prompt\", \"response\": \"the \\\"answer\\\"\""));
+  ASSERT_TRUE(verdict->WaitFor(
+      "\"model\": \"test-model\", \"usage\": {\"input_tokens\": 1200, "
+      "\"seconds\": 2.5}"));
 
   // The next cycle's advisor sees what this one did.
   auto next =

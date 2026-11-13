@@ -1156,7 +1156,9 @@ void LiveTuner::Run() {
     jw << "requires_compaction"
        << (recommendation.requires_compaction ? "true" : "false") << "rationale"
        << recommendation.rationale << "prompt" << recommendation.prompt
-       << "response" << recommendation.response;
+       << "response" << recommendation.response << "model"
+       << recommendation.model;
+    AddObject(&jw, "usage", recommendation.usage);
     LogEvent(&jw);
   }
   if (Stopping()) {
