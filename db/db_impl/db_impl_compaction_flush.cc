@@ -4417,6 +4417,9 @@ void DBImpl::AddToCompactionQueue(ColumnFamilyData* cfd) {
   compaction_queue_.push_back(cfd);
   cfd->set_queued_for_compaction(true);
   ++unscheduled_compactions_;
+  cfd->set_compaction_queued_at_micros(
+      immutable_db_options_.clock->NowMicros());
+  TEST_SYNC_POINT("DBImpl::AddToCompactionQueue:Enqueued");
 }
 
 bool DBImpl::RestoreParkedCompaction(ColumnFamilyData* cfd) {
@@ -5486,6 +5489,7 @@ Status DBImpl::BackgroundCompaction(
     }
 
     ColumnFamilyData* cfd = nullptr;
+    uint64_t compaction_queue_wait_micros = 0;
 
     if (!need_repick) {
       auto pick_result = PickCompactionFromQueue(&task_token, log_buffer);
@@ -5500,6 +5504,14 @@ Status DBImpl::BackgroundCompaction(
       }
       cfd = std::get<CompactionQueuePicked>(pick_result).cfd;
       assert(cfd != nullptr);
+
+      if (cfd->compaction_queued_at_micros() > 0) {
+        const uint64_t now_micros = immutable_db_options_.clock->NowMicros();
+        compaction_queue_wait_micros =
+            now_micros > cfd->compaction_queued_at_micros()
+                ? now_micros - cfd->compaction_queued_at_micros()
+                : 0;
+      }
 
       // We unreference here because the following code will take a Ref() on
       // this cfd if it is going to use it (Compaction class holds a
@@ -5578,6 +5590,14 @@ Status DBImpl::BackgroundCompaction(
             num_files += each_level.files.size();
           }
           RecordInHistogram(stats_, NUM_FILES_IN_SINGLE_COMPACTION, num_files);
+
+          // Record compaction queue wait time (time from enqueue to dequeue)
+          if (compaction_queue_wait_micros > 0) {
+            cfd->internal_stats()->AddCompactionQueueWaitMicros(
+                c->output_level(), compaction_queue_wait_micros);
+            RecordInHistogram(stats_, COMPACTION_QUEUE_WAIT_TIME,
+                              compaction_queue_wait_micros);
+          }
 
           // There are three things that can change compaction score:
           // 1) When flush or compaction finish. This case is covered by
