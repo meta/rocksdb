@@ -1685,10 +1685,14 @@ bool StressTest::BuildOptionsTable() {
            keepRibbonFilterPolicyOnly ? "{filter_policy=ribbonfilter:8.9:3}"
                                       : "{filter_policy=nullptr}",
            "{block_size=" + std::to_string(FLAGS_block_size) + "}",
-           "{block_size=" +
-               std::to_string(FLAGS_block_size + (FLAGS_seed & 0xFFFU)) + "}",
        }},
   };
+  if (!FLAGS_block_align) {
+    // block_align needs a power-of-2 block size.
+    options_tbl["block_based_table_factory"].push_back(
+        "{block_size=" +
+        std::to_string(FLAGS_block_size + (FLAGS_seed & 0xFFFU)) + "}");
+  }
   if (FLAGS_use_multiscan == 0) {
     // TODO: this can fail MultiScan when consecutive data blocks share the
     // same user at boundary. MultiScan uses user key to locate the block to

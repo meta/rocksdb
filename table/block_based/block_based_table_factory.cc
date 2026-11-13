@@ -840,9 +840,10 @@ Status BlockBasedTableFactory::ValidateOptions(
     }
   }
   // See IndexFactoryOptions for why the two can't be combined. The table
-  // builder repeats this check because SstFileWriter and SetOptions never reach
-  // ValidateOptions; catching it here fails DB::Open instead of letting the DB
-  // open and take writes until the first flush stops it with a fatal error.
+  // builder repeats this check because SstFileWriter never reaches
+  // ValidateOptions; catching it here fails DB::Open, CreateColumnFamily and
+  // SetOptions instead of letting the DB take writes until the first flush
+  // stops it with a fatal error.
   if (table_options_.GetEffectiveIndexMode() !=
           BlockBasedTableOptions::IndexMode::kStandardOnly &&
       table_options_.user_defined_index_factory != nullptr &&
