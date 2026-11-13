@@ -502,7 +502,32 @@ struct BlockBasedTableOptions {
   // (iii) Compatible existing behavior:
   // Same as kDisabled.
   //
-  // (e) Other CacheEntryRole
+  // (e) CacheEntryRole::kReadaheadBuffer
+  // (i) If kEnabled:
+  // Charge memory usage of the readahead (prefetch) buffers that RocksDB
+  // allocates when reading block-based table files, e.g. for iterator and
+  // compaction readahead. Readahead done by the file system instead (e.g.
+  // compaction readahead with buffered reads on a file system that supports
+  // prefetch) allocates no such buffer and is not charged.
+  // Charging is best effort: if such memory exceeds the available space left in
+  // the block cache at some point (i.e, causing a cache full under
+  // `LRUCacheOptions::strict_capacity_limit` = true), that memory is not
+  // charged and the read continues.
+  // To keep charging cheap when many threads allocate and free buffers, the
+  // charge is not exact: it can be up to about 4/3 of the buffer memory, or
+  // the buffer memory plus 256KB, and after it grows it is not reduced for
+  // about 1 second, and after that only when a buffer is freed. So if
+  // readahead stops (e.g. a burst of scans followed by only point lookups),
+  // the charge can stay at its recent peak.
+  // Like other charged memory, charged space is not available for other cache
+  // entries, so with `strict_capacity_limit` = true it can make other block
+  // cache insertions fail with Status::MemoryLimit().
+  // (ii) If kDisabled:
+  // Does not charge the memory usage mentioned above.
+  // (iii) Compatible existing behavior:
+  // Same as kDisabled.
+  //
+  // (f) Other CacheEntryRole
   // Not supported.
   // `Status::kNotSupported` will be returned if
   // `CacheEntryRoleOptions::charged` is set to {`kEnabled`, `kDisabled`}.

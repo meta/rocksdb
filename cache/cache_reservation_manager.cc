@@ -16,7 +16,9 @@
 #include "rocksdb/cache.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
+#include "rocksdb/system_clock.h"
 #include "table/block_based/reader_common.h"
+#include "test_util/sync_point.h"
 #include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -82,6 +84,25 @@ Status CacheReservationManagerImpl<R>::UpdateCacheReservation(
       return s;
     }
   }
+}
+
+template <CacheEntryRole R>
+Status CacheReservationManagerImpl<R>::TryIncreaseCacheReservation(
+    std::size_t memory_used_delta) {
+  const std::size_t old_memory_used = memory_used_;
+  const std::size_t old_num_dummy_entries = dummy_handles_.size();
+  Status s = UpdateCacheReservation(old_memory_used + memory_used_delta);
+  if (!s.ok()) {
+    memory_used_ = old_memory_used;
+    // An increase only appends dummy entries, so the ones inserted by this
+    // call are at the end.
+    while (dummy_handles_.size() > old_num_dummy_entries) {
+      cache_.ReleaseAndEraseIfLastRef(dummy_handles_.back());
+      dummy_handles_.pop_back();
+      cache_allocated_size_ -= kSizeDummyEntry;
+    }
+  }
+  return s;
 }
 
 template <CacheEntryRole R>
@@ -181,4 +202,105 @@ template class CacheReservationManagerImpl<CacheEntryRole::kMisc>;
 template class CacheReservationManagerImpl<CacheEntryRole::kWriteBuffer>;
 template class CacheReservationManagerImpl<CacheEntryRole::kFileMetadata>;
 template class CacheReservationManagerImpl<CacheEntryRole::kBlobCache>;
+template class CacheReservationManagerImpl<CacheEntryRole::kReadaheadBuffer>;
+
+AtomicCacheReservationManager::AtomicCacheReservationManager(
+    std::shared_ptr<CacheReservationManager> cache_res_mgr, SystemClock* clock,
+    uint64_t release_delay_micros)
+    : clock_(clock),
+      release_delay_nanos_(release_delay_micros * 1000),
+      cache_res_mgr_(std::move(cache_res_mgr)) {
+  assert(cache_res_mgr_ != nullptr);
+  assert(release_delay_nanos_ == 0 || clock_ != nullptr);
+}
+
+bool AtomicCacheReservationManager::CanRelease(std::size_t used,
+                                               std::size_t reserved) {
+  constexpr std::size_t kSizeDummyEntry =
+      CacheReservationManagerImpl<CacheEntryRole::kMisc>::GetDummyEntrySize();
+  // `reserved` is a multiple of the dummy entry size, so `reserved / 4 * 3` is
+  // exact.
+  return used < reserved / 4 * 3 && used + kSizeDummyEntry <= reserved;
+}
+
+bool AtomicCacheReservationManager::ReleaseDelayPassed() const {
+  // NowNanos() is monotonic, so a wall clock step does not block releases.
+  return release_delay_nanos_ == 0 ||
+         clock_->NowNanos() >=
+             last_increase_nanos_.load(std::memory_order_relaxed) +
+                 release_delay_nanos_;
+}
+
+void AtomicCacheReservationManager::ReleaseIfUnusedLocked() {
+  const std::size_t used = memory_used_.load(std::memory_order_relaxed);
+  if (!CanRelease(used, reserved_.load(std::memory_order_relaxed)) ||
+      !ReleaseDelayPassed()) {
+    return;
+  }
+  // The new memory used is below the reservation, so this only releases dummy
+  // entries and does not fail.
+  Status s = cache_res_mgr_->UpdateCacheReservation(used);
+  s.PermitUncheckedError();
+  reserved_.store(cache_res_mgr_->GetTotalReservedCacheSize(),
+                  std::memory_order_relaxed);
+}
+
+Status AtomicCacheReservationManager::TryIncreaseCacheReservation(
+    std::size_t memory_used_delta) {
+  // Fast path: the reservation already covers the new memory used.
+  std::size_t used = memory_used_.load(std::memory_order_relaxed);
+  while (used + memory_used_delta <=
+         reserved_.load(std::memory_order_relaxed)) {
+    if (memory_used_.compare_exchange_weak(used, used + memory_used_delta,
+                                           std::memory_order_acq_rel,
+                                           std::memory_order_relaxed)) {
+      return Status::OK();
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(mu_);
+  const std::size_t new_used =
+      memory_used_.fetch_add(memory_used_delta, std::memory_order_acq_rel) +
+      memory_used_delta;
+  const std::size_t covered = cache_res_mgr_->GetTotalMemoryUsed();
+  if (new_used > covered) {
+    Status s = cache_res_mgr_->TryIncreaseCacheReservation(new_used - covered);
+    if (!s.ok()) {
+      TEST_SYNC_POINT(
+          "AtomicCacheReservationManager::TryIncreaseCacheReservation:"
+          "BeforeRollback");
+      memory_used_.fetch_sub(memory_used_delta, std::memory_order_acq_rel);
+      // A concurrent decrease may have skipped its release check because it
+      // saw this delta in the memory used, so check here instead.
+      ReleaseIfUnusedLocked();
+      return s;
+    }
+    reserved_.store(cache_res_mgr_->GetTotalReservedCacheSize(),
+                    std::memory_order_relaxed);
+    if (release_delay_nanos_ > 0) {
+      last_increase_nanos_.store(clock_->NowNanos(), std::memory_order_relaxed);
+    }
+  }
+  return Status::OK();
+}
+
+void AtomicCacheReservationManager::DecreaseCacheReservation(
+    std::size_t memory_used_delta) {
+  // acq_rel: the decrease that makes the memory used zero sees the latest
+  // reservation, so a reservation is not left behind when all memory is
+  // released and the delay has passed (see also the rollback of a failed
+  // increase).
+  const std::size_t old_used =
+      memory_used_.fetch_sub(memory_used_delta, std::memory_order_acq_rel);
+  assert(old_used >= memory_used_delta);
+  // Fast path: keep the reservation while most of it is used, or it grew
+  // recently.
+  if (!CanRelease(old_used - memory_used_delta,
+                  reserved_.load(std::memory_order_relaxed)) ||
+      !ReleaseDelayPassed()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mu_);
+  ReleaseIfUnusedLocked();
+}
 }  // namespace ROCKSDB_NAMESPACE
