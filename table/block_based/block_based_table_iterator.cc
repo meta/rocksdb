@@ -9,6 +9,7 @@
 #include "table/block_based/block_based_table_iterator.h"
 
 #include <algorithm>
+#include <unordered_map>
 
 #include "monitoring/perf_context_imp.h"
 
@@ -49,6 +50,12 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
     RecordTick(table_->GetStatistics(), MULTISCAN_SEEK_ERRORS);
     return;
   }
+  // The arbitrary-range index can retire ReadSet-owned blocks while seeking.
+  // Tear down the data-block iterator before it changes that ownership.
+  if (multi_scan_index_iter_ &&
+      multi_scan_index_iter_->RetainsPrefetchedBlocks()) {
+    ResetDataIter();
+  }
 
   bool is_first_pass = !async_read_in_progress_;
 
@@ -81,7 +88,9 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
       filter_checked =
           first_seek_prefix_check_ == FirstSeekPrefixCheck::kPassedFilter;
       first_seek_prefix_check_ = FirstSeekPrefixCheck::kNotRun;
-    } else if (!CheckPrefixMayMatch(*target, IterDirection::kForward,
+    } else if (!(multi_scan_index_iter_ &&
+                 multi_scan_index_iter_->RetainsPrefetchedBlocks()) &&
+               !CheckPrefixMayMatch(*target, IterDirection::kForward,
                                     &filter_checked)) {
       ResetDataIter();
       RecordTick(table_->GetStatistics(), is_last_level_
@@ -427,8 +436,17 @@ void BlockBasedTableIterator::InitDataBlock() {
         }
       }
       CachableEntry<Block> block_entry;
-      multi_scan_status_ =
-          multi_scan_read_set_->ReadIndex(rs_idx, &block_entry);
+      if (multi_scan_index_iter_->RetainsPrefetchedBlocks()) {
+        multi_scan_status_ =
+            multi_scan_read_set_->BorrowIndex(rs_idx, &block_entry);
+        if (multi_scan_status_.ok() &&
+            !multi_scan_read_set_->IsBlockAvailable(rs_idx)) {
+          multi_scan_index_iter_->MarkCurrentBlockUnretained();
+        }
+      } else {
+        multi_scan_status_ =
+            multi_scan_read_set_->ReadIndex(rs_idx, &block_entry);
+      }
       if (!multi_scan_status_.ok()) {
         return;
       }
@@ -1037,8 +1055,9 @@ void BlockBasedTableIterator::BlockCacheLookupForReadAheadSize(
 // - Prepare() may follow regular positioning (e.g. Seek()); the current
 // position is discarded.
 // - Iterator should not be reused for multiple multiscans.
-// - scan ranges should be non-overlapping, and have increasing start keys.
-// If a scan range's limit is not set, then there should only be one scan range.
+// - Unless allow_unsorted_or_overlapping_ranges is set, scan ranges should be
+// non-overlapping and have increasing start keys. Every prefetched range must
+// be bounded.
 // - After Prepare(), a forward scan expects Seek to be called on the start key
 // of each ScanOption in order. A reverse scan expects SeekForPrev to be called
 // on the limit key of each ScanOption in reverse order. If any other Seek is
@@ -1066,9 +1085,13 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   StopWatch sw(table_->get_rep()->ioptions.clock, table_->GetStatistics(),
                MULTISCAN_PREPARE_MICROS);
 
+  const bool arbitrary_ranges =
+      multiscan_opts->allow_unsorted_or_overlapping_ranges &&
+      !multiscan_opts->HasSortedNonOverlappingRanges() &&
+      !multiscan_opts->reverse;
   const bool rolling_prefetch =
       multiscan_opts->rolling_prefetch && multiscan_opts->use_async_io &&
-      !multiscan_opts->reverse &&
+      !multiscan_opts->reverse && !arbitrary_ranges &&
       multiscan_opts->rolling_prefetch_window_size > 0;
   const uint64_t rolling_prefetch_window_size =
       multiscan_opts->max_prefetch_size > 0
@@ -1099,10 +1122,20 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   std::vector<BlockHandle> scan_block_handles;
   std::vector<std::string> data_block_separators;
   std::vector<std::tuple<size_t, size_t>> block_index_ranges_per_scan;
+  std::vector<std::vector<size_t>> block_indices_per_scan;
+  std::vector<bool> range_reaches_file_end;
+  std::vector<size_t> logical_block_priorities;
   const std::vector<ScanOptions>& scan_opts = multiscan_opts->GetScanRanges();
-  multi_scan_status_ =
-      CollectBlockHandles(scan_opts, &scan_block_handles,
-                          &block_index_ranges_per_scan, &data_block_separators);
+  if (arbitrary_ranges) {
+    multi_scan_status_ = CollectArbitraryBlockHandles(
+        *multiscan_opts, &scan_block_handles, &block_indices_per_scan,
+        &data_block_separators, &range_reaches_file_end,
+        &logical_block_priorities);
+  } else {
+    multi_scan_status_ = CollectBlockHandles(
+        scan_opts, &scan_block_handles, &block_index_ranges_per_scan,
+        &data_block_separators);
+  }
   if (!multi_scan_status_.ok()) {
     RecordTick(table_->GetStatistics(), MULTISCAN_PREPARE_ERRORS);
     return;
@@ -1146,6 +1179,11 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   auto job = std::make_shared<IOJob>();
   job->table = const_cast<BlockBasedTable*>(table_);
   job->block_handles = std::move(blocks_to_prefetch);
+  if (arbitrary_ranges) {
+    job->logical_block_priorities.assign(
+        logical_block_priorities.begin() + prefetch_start_idx,
+        logical_block_priorities.begin() + prefetch_max_idx);
+  }
   job->job_options.io_coalesce_threshold =
       multiscan_opts->io_coalesce_threshold;
   if (rolling_prefetch) {
@@ -1160,9 +1198,9 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   job->job_options.read_options.async_io = multiscan_opts->use_async_io;
   job->job_options.use_parallel_async_io_block_decompression =
       multiscan_opts->use_parallel_async_io_block_decompression;
-  // CollectBlockHandles walks sorted scan ranges through the table index, whose
-  // key order matches data block offset order.
-  job->job_options.block_handles_are_sorted = true;
+  // Arbitrary collection orders unique handles by first logical use, which
+  // does not necessarily match file-offset order.
+  job->job_options.block_handles_are_sorted = !arbitrary_ranges;
 
   std::shared_ptr<ReadSet> read_set;
   // IODispatcher should be provided by DBIter::Prepare() to enable sharing
@@ -1187,10 +1225,21 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   // on backward operations.
   // Note: data_block_separators keeps full size for seek logic, even though
   // only blocks in [prefetch_start_idx, prefetch_max_idx) are prefetched.
-  auto multi_scan_idx_iter = std::make_unique<MultiScanIndexIterator>(
-      std::move(scan_block_handles), std::move(data_block_separators),
-      std::move(block_index_ranges_per_scan), multiscan_opts, read_set,
-      prefetch_start_idx, prefetch_max_idx, icomp_, table_->GetStatistics());
+  std::unique_ptr<MultiScanIndexIterator> multi_scan_idx_iter;
+  if (arbitrary_ranges) {
+    multi_scan_idx_iter = std::make_unique<MultiScanIndexIterator>(
+        std::move(scan_block_handles), std::move(data_block_separators),
+        std::move(block_indices_per_scan),
+        std::move(range_reaches_file_end), multiscan_opts, read_set,
+        prefetch_start_idx, prefetch_max_idx, icomp_,
+        table_->GetStatistics());
+  } else {
+    multi_scan_idx_iter = std::make_unique<MultiScanIndexIterator>(
+        std::move(scan_block_handles), std::move(data_block_separators),
+        std::move(block_index_ranges_per_scan), multiscan_opts, read_set,
+        prefetch_start_idx, prefetch_max_idx, icomp_,
+        table_->GetStatistics());
+  }
   assert(multi_scan_idx_iter->status().ok());
 
   multi_scan_read_set_ = std::move(read_set);
@@ -1291,6 +1340,97 @@ Status BlockBasedTableIterator::CollectBlockHandles(
       }
       printf("\n");
     }
+  }
+  return Status::OK();
+}
+
+Status BlockBasedTableIterator::CollectArbitraryBlockHandles(
+    const MultiScanArgs& multiscan_opts,
+    std::vector<BlockHandle>* unique_block_handles,
+    std::vector<std::vector<size_t>>* block_indices_per_scan,
+    std::vector<std::string>* data_block_separators,
+    std::vector<bool>* range_reaches_file_end,
+    std::vector<size_t>* logical_block_priorities) {
+  const auto& scan_opts = multiscan_opts.GetScanRanges();
+  std::unordered_map<uint64_t, size_t> block_index_by_offset;
+  const size_t timestamp_size =
+      user_comparator_.user_comparator()->timestamp_size();
+
+  auto add_current_block =
+      [&](size_t logical_range_index,
+          std::vector<size_t>* range_block_indices) {
+        const IndexValue index_value = index_iter_->value();
+        const uint64_t offset = index_value.handle.offset();
+        auto [it, inserted] = block_index_by_offset.emplace(
+            offset, unique_block_handles->size());
+        if (inserted) {
+          unique_block_handles->push_back(index_value.handle);
+          data_block_separators->push_back(
+              index_iter_->user_key().ToString());
+          logical_block_priorities->push_back(logical_range_index);
+        }
+        const size_t block_index = it->second;
+        if (range_block_indices->empty() ||
+            range_block_indices->back() != block_index) {
+          range_block_indices->push_back(block_index);
+        }
+      };
+
+  block_indices_per_scan->reserve(scan_opts.size());
+  range_reaches_file_end->reserve(scan_opts.size());
+  for (size_t scan_index = 0; scan_index < scan_opts.size(); ++scan_index) {
+    const ScanOptions& scan_opt = scan_opts[scan_index];
+    const size_t logical_range_index =
+        multiscan_opts.GetLogicalRangeIndex(scan_index);
+    block_indices_per_scan->emplace_back();
+    auto& range_block_indices = block_indices_per_scan->back();
+
+    InternalKey start_key;
+    if (timestamp_size == 0) {
+      start_key = InternalKey(*scan_opt.range.start, kMaxSequenceNumber,
+                              kValueTypeForSeek);
+    } else {
+      std::string seek_key;
+      AppendKeyWithMaxTimestamp(&seek_key, *scan_opt.range.start,
+                                timestamp_size);
+      start_key =
+          InternalKey(seek_key, kMaxSequenceNumber, kValueTypeForSeek);
+    }
+    index_iter_->Seek(start_key.Encode());
+    while (index_iter_->status().ok() && index_iter_->Valid() &&
+           user_comparator_.CompareWithoutTimestamp(
+               index_iter_->user_key(), /*a_has_ts=*/true,
+               *scan_opt.range.limit, /*b_has_ts=*/false) < 0) {
+      add_current_block(logical_range_index, &range_block_indices);
+      index_iter_->Next();
+    }
+    if (!index_iter_->status().ok()) {
+      return index_iter_->status();
+    }
+
+    bool reached_file_end = !index_iter_->Valid();
+    if (index_iter_->Valid()) {
+      const IndexValue index_value = index_iter_->value();
+      bool add_block = true;
+      if (!index_value.first_internal_key.empty()) {
+        add_block = user_comparator_.CompareWithoutTimestamp(
+                        ExtractUserKey(index_value.first_internal_key),
+                        /*a_has_ts=*/true, *scan_opt.range.limit,
+                        /*b_has_ts=*/false) < 0;
+      }
+      if (add_block) {
+        add_current_block(logical_range_index, &range_block_indices);
+        // An index separator can sort beyond the SST's largest key. Advance
+        // past an accepted candidate to distinguish that case from a range
+        // that actually ends before the file does.
+        index_iter_->Next();
+        if (!index_iter_->status().ok()) {
+          return index_iter_->status();
+        }
+        reached_file_end = !index_iter_->Valid();
+      }
+    }
+    range_reaches_file_end->push_back(reached_file_end);
   }
   return Status::OK();
 }

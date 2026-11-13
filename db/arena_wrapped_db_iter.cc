@@ -340,6 +340,7 @@ Status ArenaWrappedDBIter::Refresh(const Snapshot* snapshot) {
 }
 
 void ArenaWrappedDBIter::Prepare(const MultiScanArgs& scan_opts) {
+  assert(db_iter_ != nullptr);
   if (prepare_called_) {
     db_iter_->set_status(Status::InvalidArgument(
         "Prepare called more than once on the same iterator"));
@@ -354,7 +355,7 @@ void ArenaWrappedDBIter::Prepare(const MultiScanArgs& scan_opts) {
   }
 
   const MultiScanArgs* pruning_scan_opts =
-      scan_opts.HasBoundedScanRanges() ? &scan_opts : nullptr;
+      db_iter_->ShouldPrepareInternalChildren() ? &scan_opts : nullptr;
   s = EnsureInternalIteratorInitialized(pruning_scan_opts);
   if (!s.ok()) {
     return;

@@ -13,8 +13,10 @@ namespace ROCKSDB_NAMESPACE {
 
 // EXPERIMENTAL
 //
-// An iterator that returns results from multiple scan ranges. The ranges are
-// expected to be in increasing sorted order.
+// An iterator that returns results from multiple scan ranges. By default, the
+// ranges must be sorted and non-overlapping. MultiScanArgs can opt in to
+// unsorted or overlapping ranges; results still follow caller-provided range
+// order, with overlapping ranges evaluated independently.
 // The results are returned in nested container objects that can be iterated
 // using an std::input_iterator.
 //
@@ -107,13 +109,7 @@ class Scan {
     ScanIterator(ScanIterator&&) = default;
     ScanIterator& operator=(ScanIterator&&) = default;
 
-    ~ScanIterator() {
-      if (!status_.ok()) {
-        fprintf(stderr, "ScanIterator status: %s\n",
-                status_.ToString().c_str());
-        assert(false);
-      }
-    }
+    ~ScanIterator() = default;
 
     ScanIterator& operator++() {
       if (!valid_) {
@@ -198,7 +194,8 @@ class MultiScan {
     MultiScanIterator(const std::vector<ScanOptions>& scan_opts, DB* db,
                       ColumnFamilyHandle* cfh, ReadOptions& read_options,
                       Slice* lower_bound, Slice* upper_bound,
-                      std::unique_ptr<Iterator>& db_iter, bool reverse)
+                      std::unique_ptr<Iterator>& db_iter, bool reverse,
+                      bool staged_results)
         : scan_opts_(scan_opts),
           db_(db),
           cfh_(cfh),
@@ -207,6 +204,7 @@ class MultiScan {
           upper_bound_(upper_bound),
           idx_(0),
           reverse_(reverse),
+          staged_results_(staged_results),
           valid_(true),
           db_iter_(db_iter),
           scan_(db_iter_.get(), reverse_) {
@@ -224,7 +222,7 @@ class MultiScan {
       }
     }
 
-    ~MultiScanIterator() { assert(status_.ok()); }
+    ~MultiScanIterator() = default;
 
     MultiScanIterator& operator++();
 
@@ -244,6 +242,7 @@ class MultiScan {
     Slice* upper_bound_;
     size_t idx_;
     bool reverse_;
+    bool staged_results_;
     bool valid_;
     std::unique_ptr<Iterator>& db_iter_;
     Status status_;
@@ -255,7 +254,7 @@ class MultiScan {
   MultiScanIterator begin() {
     return MultiScanIterator(scan_opts_.GetScanRanges(), db_, cfh_,
                              read_options_, &lower_bound_, &upper_bound_,
-                             db_iter_, scan_opts_.reverse);
+                             db_iter_, scan_opts_.reverse, staged_results_);
   }
 
   std::nullptr_t end() { return nullptr; }
@@ -268,6 +267,7 @@ class MultiScan {
   Slice lower_bound_;
   Slice upper_bound_;
   std::unique_ptr<Iterator> db_iter_;
+  bool staged_results_ = false;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

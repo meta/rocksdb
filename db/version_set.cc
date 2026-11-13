@@ -161,13 +161,15 @@ void AddMultiScanFileIndex(std::vector<size_t>* file_indexes,
 template <typename OnOverlappingFile>
 bool NotifyMultiScanOverlappingFile(OnOverlappingFile& on_overlapping_file,
                                     size_t file_index,
+                                    size_t logical_range_index,
                                     const ScanOptions& scan_range) {
-  if constexpr (std::is_same_v<std::invoke_result_t<OnOverlappingFile, size_t,
-                                                    const ScanOptions&>,
-                               bool>) {
-    return on_overlapping_file(file_index, scan_range);
+  if constexpr (std::is_same_v<
+                    std::invoke_result_t<OnOverlappingFile, size_t, size_t,
+                                         const ScanOptions&>,
+                    bool>) {
+    return on_overlapping_file(file_index, logical_range_index, scan_range);
   } else {
-    on_overlapping_file(file_index, scan_range);
+    on_overlapping_file(file_index, logical_range_index, scan_range);
     return true;
   }
 }
@@ -184,11 +186,33 @@ void ForEachMultiScanOverlappingFile(const InternalKeyComparator& icmp,
   }
 
   if (level == 0) {
+    const auto& scan_ranges = scan_opts.GetScanRanges();
+    const bool ranges_are_sorted = scan_opts.HasSortedNonOverlappingRanges();
+    if (!ranges_are_sorted) {
+      for (size_t range_index = 0; range_index < scan_ranges.size();
+           ++range_index) {
+        const ScanOptions& scan_range = scan_ranges[range_index];
+        for (size_t i = 0; i < file_level.num_files; ++i) {
+          if (MultiScanRangeOverlapsFile(ucmp, scan_range,
+                                         file_level.files[i]) &&
+              !NotifyMultiScanOverlappingFile(
+                  on_overlapping_file, i,
+                  scan_opts.GetLogicalRangeIndex(range_index), scan_range)) {
+            return;
+          }
+        }
+      }
+      return;
+    }
+
     for (size_t i = 0; i < file_level.num_files; ++i) {
-      for (const ScanOptions& scan_range : scan_opts.GetScanRanges()) {
+      for (size_t range_index = 0; range_index < scan_ranges.size();
+           ++range_index) {
+        const ScanOptions& scan_range = scan_ranges[range_index];
         if (MultiScanRangeOverlapsFile(ucmp, scan_range, file_level.files[i])) {
-          if (!NotifyMultiScanOverlappingFile(on_overlapping_file, i,
-                                              scan_range)) {
+          if (!NotifyMultiScanOverlappingFile(
+                  on_overlapping_file, i,
+                  scan_opts.GetLogicalRangeIndex(range_index), scan_range)) {
             return;
           }
         }
@@ -204,7 +228,10 @@ void ForEachMultiScanOverlappingFile(const InternalKeyComparator& icmp,
     return;
   }
 
-  for (const ScanOptions& scan_range : scan_opts.GetScanRanges()) {
+  const auto& scan_ranges = scan_opts.GetScanRanges();
+  for (size_t range_index = 0; range_index < scan_ranges.size();
+       ++range_index) {
+    const ScanOptions& scan_range = scan_ranges[range_index];
     const InternalKey start_key = MultiScanInternalKey(
         scan_range.range.start.value(), ucmp.user_comparator());
     size_t first_file = FindFile(icmp, file_level, start_key.Encode());
@@ -221,8 +248,9 @@ void ForEachMultiScanOverlappingFile(const InternalKeyComparator& icmp,
 
     for (size_t i = first_file; i <= last_file; ++i) {
       if (MultiScanRangeOverlapsFile(ucmp, scan_range, file_level.files[i])) {
-        if (!NotifyMultiScanOverlappingFile(on_overlapping_file, i,
-                                            scan_range)) {
+        if (!NotifyMultiScanOverlappingFile(
+                on_overlapping_file, i,
+                scan_opts.GetLogicalRangeIndex(range_index), scan_range)) {
           return;
         }
       }
@@ -245,7 +273,8 @@ std::vector<size_t> GetMultiScanOverlappingFiles(
   std::vector<char> selected(file_level.num_files, false);
   ForEachMultiScanOverlappingFile(
       icmp, ucmp, file_level, level, scan_opts,
-      [&](size_t file_index, const ScanOptions& /*scan_range*/) {
+      [&](size_t file_index, size_t /*logical_range_index*/,
+          const ScanOptions& /*scan_range*/) {
         if (file_indexes.size() >= max_file_indexes) {
           return false;
         }
@@ -1241,7 +1270,7 @@ class LevelIterator final : public InternalIterator {
 
   ~LevelIterator() override {
     delete file_iter_.Set(nullptr);
-    // Clean up any prepared iterators that weren't used
+    // Clean up prepared iterators that were not active at destruction.
     for (auto& entry : prepared_iters_) {
       delete entry.second;
     }
@@ -1352,14 +1381,12 @@ class LevelIterator final : public InternalIterator {
           file_index, MultiScanArgs(user_comparator_.user_comparator()));
       multi_scan_args_it = ret.first;
       assert(ret.second);
+      files_in_prepare_order_.push_back(file_index);
     }
     return multi_scan_args_it->second;
   }
 
   void Prepare(const MultiScanArgs* so) override {
-    // We assume here that scan_opts is sorted such that
-    // scan_opts[0].range.start < scan_opts[1].range.start, and non
-    // overlapping
     if (so == nullptr) {
       return;
     }
@@ -1369,18 +1396,28 @@ class LevelIterator final : public InternalIterator {
     // Verify comparator is consistent
     assert(so->GetComparator() == user_comparator_.user_comparator());
 
+    const bool preserve_logical_range_indices = so->GetSeekState() != nullptr;
     file_to_scan_opts_ = std::make_unique<ScanOptionsMap>();
+    files_in_prepare_order_.clear();
     ForEachMultiScanOverlappingFile(
         icomparator_, user_comparator_, *flevel_, level_, *scan_opts_,
-        [&](size_t file_index, const ScanOptions& scan_range) {
+        [&](size_t file_index, size_t logical_range_index,
+            const ScanOptions& scan_range) {
           auto const metadata = flevel_->files[file_index].file_metadata;
           if (metadata->FileIsStandAloneRangeTombstone()) {
             // Skip stand alone range deletion files.
             return;
           }
           auto& args = GetMultiScanArgForFile(file_index);
-          args.insert(scan_range.range.start.value(),
-                      scan_range.range.limit.value(), scan_range.property_bag);
+          if (preserve_logical_range_indices) {
+            TEST_SYNC_POINT(
+                "LevelIterator::Prepare:InsertLogicalRangeIndex");
+            args.InsertForPrepare(scan_range, logical_range_index);
+          } else {
+            args.insert(scan_range.range.start.value(),
+                        scan_range.range.limit.value(),
+                        scan_range.property_bag);
+          }
         });
 
     StopWatch timer(clock_, db_statistics_, MULTISCAN_PREPARE_ITERATORS);
@@ -1398,8 +1435,8 @@ class LevelIterator final : public InternalIterator {
         (!range_tombstone_iter_required_ || range_tombstone_iter_ != nullptr)) {
       auto before = file_index_;
       // Pre-create and prepare only relevant file iterators
-      for (auto& file_to_arg : *file_to_scan_opts_) {
-        size_t file_index = file_to_arg.first;
+      for (const size_t file_index : files_in_prepare_order_) {
+        auto& file_arg = file_to_scan_opts_->at(file_index);
 
         file_index_ = file_index;
         // Create iterator for this file
@@ -1407,7 +1444,7 @@ class LevelIterator final : public InternalIterator {
                                     /*prefix_filtered_table=*/nullptr);
         if (iter != nullptr) {
           // If we have async enabled, lets prepare all our iterators.
-          iter->Prepare(&file_to_arg.second);
+          iter->Prepare(&file_arg);
           // Store the prepared iterator
           prepared_iters_[file_index] = iter;
         }
@@ -1542,6 +1579,7 @@ class LevelIterator final : public InternalIterator {
   // target. Points to the file's table reader so that later seeks into the
   // same file can check the filter again without the table cache.
   TableReader* prefix_filtered_table_ = nullptr;
+  size_t file_iter_index_ = std::numeric_limits<size_t>::max();
   PinnedIteratorsManager* pinned_iters_mgr_;
 
   // To be propagated to RangeDelAggregator in order to safely truncate range
@@ -1591,8 +1629,10 @@ class LevelIterator final : public InternalIterator {
 
   // Our stored scan_opts for each prefix
   std::unique_ptr<ScanOptionsMap> file_to_scan_opts_ = nullptr;
+  // First logical-use order for deterministic eager preparation.
+  std::vector<size_t> files_in_prepare_order_;
 
-  // Map to store pre-created iterators by file index
+  // Pre-created or parked prepared iterators, keyed by file index.
   std::unordered_map<size_t, InternalIterator*> prepared_iters_;
 
   // Sets flags for if we should return the sentinel key next.
@@ -1882,8 +1922,23 @@ bool LevelIterator::SkipEmptyFileForward() {
       // specified by the scan opts
 
       if (scan_opts_ && FileHasMultiScanArg(file_index_)) {
-        const ScanOptions& opts =
-            GetMultiScanArgForFile(file_index_).GetScanRanges().front();
+        MultiScanArgs& file_scan_args =
+            GetMultiScanArgForFile(file_index_);
+        const auto& file_scan_ranges = file_scan_args.GetScanRanges();
+        size_t local_range_index = 0;
+        if (const auto& seek_state = file_scan_args.GetSeekState()) {
+          while (local_range_index < file_scan_ranges.size() &&
+                 file_scan_args.GetLogicalRangeIndex(local_range_index) !=
+                     seek_state->logical_range_index) {
+            ++local_range_index;
+          }
+          if (local_range_index == file_scan_ranges.size()) {
+            SetFileIterator(nullptr);
+            ClearRangeTombstoneIter();
+            continue;
+          }
+        }
+        const ScanOptions& opts = file_scan_ranges[local_range_index];
         assert(opts.range.start.has_value());
         InternalKey target;
         const size_t ts_size =
@@ -1956,9 +2011,24 @@ void LevelIterator::SetFileIterator(InternalIterator* iter) {
   }
 
   InternalIterator* old_iter = file_iter_.Set(iter);
+  const size_t old_file_index = file_iter_index_;
+  file_iter_index_ =
+      iter == nullptr ? std::numeric_limits<size_t>::max() : file_index_;
   // Update the read pattern for PrefetchBuffer.
   if (is_next_read_sequential_) {
     file_iter_.UpdateReadaheadState(old_iter);
+  }
+
+  if (old_iter != nullptr && scan_opts_ != nullptr &&
+      scan_opts_->GetSeekState() != nullptr &&
+      (pinned_iters_mgr_ == nullptr || !pinned_iters_mgr_->PinningEnabled()) &&
+      old_file_index != std::numeric_limits<size_t>::max() &&
+      FileHasMultiScanArg(old_file_index)) {
+    const auto [unused, inserted] =
+        prepared_iters_.emplace(old_file_index, old_iter);
+    assert(inserted);
+    (void)unused;
+    return;
   }
 
   if (pinned_iters_mgr_ && pinned_iters_mgr_->PinningEnabled() &&
@@ -2005,10 +2075,14 @@ void LevelIterator::InitFileIterator(size_t new_file_index,
         }
       }
 
+      const bool has_multi_scan_arg = FileHasMultiScanArg(file_index_);
+      const bool is_arbitrary_multi_scan =
+          has_multi_scan_arg && scan_opts_->GetSeekState() != nullptr;
       TableReader* prefix_filtered_table = nullptr;
-      InternalIterator* iter =
-          NewFileIterator(seek_target, &prefix_filtered_table);
-      if (FileHasMultiScanArg(file_index_)) {
+      InternalIterator* iter = NewFileIterator(
+          is_arbitrary_multi_scan ? nullptr : seek_target,
+          is_arbitrary_multi_scan ? nullptr : &prefix_filtered_table);
+      if (has_multi_scan_arg) {
         auto& args = GetMultiScanArgForFile(file_index_);
         assert(OverlapRange(*args.GetScanRanges().begin(), file_index_) &&
                OverlapRange(*args.GetScanRanges().rbegin(), file_index_));

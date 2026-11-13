@@ -1418,10 +1418,11 @@ class DB {
       const ReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_families) = 0;
 
-  // Get an iterator that scans multiple key ranges. The scan ranges should
-  // be in increasing order of start key. See multi_scan_iterator.h for more
-  // details. For optimal performance, ensure that either all entries in
-  // scan_opts specify the range limit, or none of them do.
+  // Get an iterator that scans multiple key ranges. By default, ranges must be
+  // sorted and non-overlapping. Set
+  // MultiScanArgs::allow_unsorted_or_overlapping_ranges to opt in to arbitrary
+  // range order and overlap. Results remain grouped in caller-provided range
+  // order, and overlapping ranges return matching keys independently.
   //
   // NOTE: NOT YET SUPPORTED in DBs using user timestamp (see
   // Comparator::timestamp_size())

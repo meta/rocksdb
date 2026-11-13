@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cassert>
+#include <limits>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -36,6 +37,15 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
       std::vector<BlockHandle>&& block_handles,
       std::vector<std::string>&& data_block_separators,
       std::vector<std::tuple<size_t, size_t>>&& block_index_ranges_per_scan,
+      const MultiScanArgs* scan_opts, std::shared_ptr<ReadSet> read_set,
+      size_t prefetch_start_idx, size_t prefetch_max_idx,
+      const InternalKeyComparator& icomp, Statistics* statistics);
+
+  MultiScanIndexIterator(
+      std::vector<BlockHandle>&& block_handles,
+      std::vector<std::string>&& data_block_separators,
+      std::vector<std::vector<size_t>>&& block_indices_per_scan,
+      std::vector<bool>&& range_reaches_file_end,
       const MultiScanArgs* scan_opts, std::shared_ptr<ReadSet> read_set,
       size_t prefetch_start_idx, size_t prefetch_max_idx,
       const InternalKeyComparator& icomp, Statistics* statistics);
@@ -80,7 +90,7 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
 
   // Returns the current index into the ReadSet, or prefetch size if the
   // current block was not prefetched.
-  size_t current_read_set_index() const;
+  size_t current_read_set_index();
 
   // Returns the max_prefetch_size from scan options.
   uint64_t GetMaxPrefetchSize() const;
@@ -94,14 +104,13 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
   bool IsScanRangeExhausted() const { return scan_range_exhausted_; }
 
   // Returns true if there are more scan ranges after the current one.
-  bool HasMoreScanRanges() const {
-    // Reverse MultiScan advances ranges through SeekForPrev(), not this
-    // forward-only range transition path.
-    if (scan_opts_->reverse) {
-      return false;
-    }
-    return next_scan_idx_ < block_index_ranges_per_scan_.size();
-  }
+  bool HasMoreScanRanges() const;
+
+  bool RetainsPrefetchedBlocks() const { return arbitrary_ranges_; }
+
+  // Stop retention bookkeeping for the current block after ReadSet transfers
+  // a foreground synchronous read to the data iterator.
+  void MarkCurrentBlockUnretained();
 
  private:
   // Release blocks from from_idx (inclusive) to to_idx (exclusive),
@@ -126,9 +135,21 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
   // detection). If this is the last range, becomes invalid.
   void SetExhausted();
 
+  void SeekArbitrary(const Slice& target);
+  void NextArbitrary();
+  void ActivateArbitraryRange(size_t scan_idx, const Slice& target);
+  void PositionInArbitraryRange(const Slice& target);
+  void RetireArbitraryRange();
+  void FinishArbitraryRange();
+  void ReleaseArbitraryBlocks();
+  size_t FindLocalRange(size_t logical_range_index) const;
+  void SetArbitraryRangeExhausted();
+
   std::vector<BlockHandle> block_handles_;
   std::vector<std::string> data_block_separators_;
   std::vector<std::tuple<size_t, size_t>> block_index_ranges_per_scan_;
+  std::vector<std::vector<size_t>> block_indices_per_scan_;
+  std::vector<bool> range_reaches_file_end_;
   const MultiScanArgs* scan_opts_;
   std::shared_ptr<ReadSet> read_set_;
   size_t prefetch_start_idx_;
@@ -137,6 +158,8 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
   size_t one_past_last_unreleased_prefetch_idx_;
   std::vector<bool> released_prefetch_blocks_;
   size_t unreleased_prefetch_blocks_;
+  std::vector<size_t> remaining_range_uses_;
+  std::vector<bool> used_prefetch_blocks_;
   const InternalKeyComparator& icomp_;
   UserComparatorWrapper user_comparator_;
   Statistics* statistics_;
@@ -149,6 +172,11 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
   std::string prev_seek_key_;
   size_t wasted_blocks_count_ = 0;
   bool scan_range_exhausted_ = false;
+  bool arbitrary_ranges_ = false;
+  size_t active_scan_idx_ = std::numeric_limits<size_t>::max();
+  size_t active_scan_block_pos_ = 0;
+  bool active_range_retired_ = false;
+  uint64_t observed_seek_generation_ = 0;
   mutable std::string cur_key_buf_;
 };
 

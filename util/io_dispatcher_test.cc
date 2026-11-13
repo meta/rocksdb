@@ -2786,12 +2786,16 @@ TEST_F(IODispatcherTest, VerifyCoalescing) {
 TEST_F(IODispatcherTest, SortedBlockHandlesSkipDispatcherSorts) {
   struct SortCounters {
     int submit_job = 0;
+    int scheduler = 0;
   };
 
   auto install_callbacks = [](SortCounters* counters) {
     SyncPoint::GetInstance()->SetCallBack(
         "IODispatcherImpl::SubmitJob:SortBlockHandles",
         [counters](void*) { ++counters->submit_job; });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DefaultPrefetchScheduler::SortBlocksByOffset",
+        [counters](void*) { ++counters->scheduler; });
     SyncPoint::GetInstance()->EnableProcessing();
   };
 
@@ -2843,6 +2847,7 @@ TEST_F(IODispatcherTest, SortedBlockHandlesSkipDispatcherSorts) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 
   EXPECT_EQ(sorted_counters.submit_job, 0);
+  EXPECT_EQ(sorted_counters.scheduler, 0);
 
   std::unique_ptr<BlockBasedTable> unsorted_table;
   std::vector<BlockHandle> unsorted_handles;
@@ -2860,6 +2865,7 @@ TEST_F(IODispatcherTest, SortedBlockHandlesSkipDispatcherSorts) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 
   EXPECT_EQ(unsorted_counters.submit_job, 1);
+  EXPECT_EQ(unsorted_counters.scheduler, 1);
 }
 
 // Test that verifies the read request offsets and lengths match the
@@ -3089,6 +3095,14 @@ TEST_F(IODispatcherTest, DrainedSchedulerDoesNotStrandWaitingJob) {
   options.max_prefetch_memory_bytes = budget;
   std::unique_ptr<IODispatcher> dispatcher(NewIODispatcher(options));
 
+  size_t logical_priority_lookups = 0;
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  ScopedSyncPointCallbacks sync_point_callbacks(sync_point);
+  sync_point->SetCallBack(
+      "DefaultPrefetchScheduler::NextLogicalPriority",
+      [&](void*) { ++logical_priority_lookups; });
+  sync_point->EnableProcessing();
+
   auto first_job = std::make_shared<IOJob>();
   first_job->block_handles = {block_handles.front(),
                               block_handles[second_block]};
@@ -3113,6 +3127,113 @@ TEST_F(IODispatcherTest, DrainedSchedulerDoesNotStrandWaitingJob) {
   first_read_set->ReleaseBlock(1);
   first_read_set->ReleaseBlock(0);
   EXPECT_EQ(waiting_read_set->GetNumBlocksPrefetched(), 1);
+  EXPECT_EQ(logical_priority_lookups, 0);
+}
+
+TEST_F(IODispatcherTest, MemoryLimitPreservesLogicalBlockOrder) {
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = nullptr;
+  table_options.block_size = 16 * 1024;
+  table_options.no_block_cache = true;
+
+  std::unique_ptr<BlockBasedTable> table;
+  std::vector<BlockHandle> block_handles;
+  ASSERT_OK(CreateAndOpenSST(20, &table, &block_handles, &table_options));
+  ASSERT_GE(block_handles.size(), 3);
+
+  const std::vector<size_t> physical_indices = {2, 0, 1};
+  size_t budget = 0;
+  for (const size_t index : physical_indices) {
+    budget = std::max(
+        budget,
+        BlockBasedTable::BlockSizeWithTrailer(block_handles[index]));
+  }
+
+  IODispatcherOptions options;
+  options.max_prefetch_memory_bytes = budget;
+  std::unique_ptr<IODispatcher> dispatcher(NewIODispatcher(options));
+
+  auto job = std::make_shared<IOJob>();
+  for (const size_t index : physical_indices) {
+    job->block_handles.push_back(block_handles[index]);
+  }
+  job->table = table.get();
+  job->job_options.read_options.async_io = false;
+  job->job_options.read_options.fill_cache = false;
+  job->job_options.io_coalesce_threshold = 0;
+
+  std::shared_ptr<ReadSet> read_set;
+  ASSERT_OK(dispatcher->SubmitJob(job, &read_set));
+  ASSERT_TRUE(read_set->IsBlockAvailable(0));
+  ASSERT_FALSE(read_set->IsBlockAvailable(1));
+  ASSERT_FALSE(read_set->IsBlockAvailable(2));
+
+  read_set->ReleaseBlock(0);
+  ASSERT_TRUE(read_set->IsBlockAvailable(1));
+  ASSERT_FALSE(read_set->IsBlockAvailable(2));
+
+  read_set->ReleaseBlock(1);
+  ASSERT_TRUE(read_set->IsBlockAvailable(2));
+}
+
+TEST_F(IODispatcherTest, MemoryLimitPrioritizesLogicalRangeAcrossJobs) {
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = nullptr;
+  table_options.block_size = 16 * 1024;
+  table_options.no_block_cache = true;
+
+  std::unique_ptr<BlockBasedTable> table;
+  std::vector<BlockHandle> block_handles;
+  ASSERT_OK(CreateAndOpenSST(20, &table, &block_handles, &table_options));
+  ASSERT_GE(block_handles.size(), 3);
+
+  size_t budget = 0;
+  for (size_t i = 0; i < 3; ++i) {
+    budget = std::max(
+        budget, BlockBasedTable::BlockSizeWithTrailer(block_handles[i]));
+  }
+  IODispatcherOptions options;
+  options.max_prefetch_memory_bytes = budget;
+  std::unique_ptr<IODispatcher> dispatcher(NewIODispatcher(options));
+
+  size_t logical_priority_lookups = 0;
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  ScopedSyncPointCallbacks sync_point_callbacks(sync_point);
+  sync_point->SetCallBack(
+      "DefaultPrefetchScheduler::NextLogicalPriority",
+      [&](void*) { ++logical_priority_lookups; });
+  sync_point->EnableProcessing();
+
+  auto first_job = std::make_shared<IOJob>();
+  first_job->block_handles = {block_handles[0], block_handles[1]};
+  first_job->logical_block_priorities = {0, 2};
+  first_job->table = table.get();
+  first_job->job_options.read_options.async_io = false;
+  first_job->job_options.read_options.fill_cache = false;
+
+  std::shared_ptr<ReadSet> first_read_set;
+  ASSERT_OK(dispatcher->SubmitJob(first_job, &first_read_set));
+  ASSERT_TRUE(first_read_set->IsBlockAvailable(0));
+  ASSERT_FALSE(first_read_set->IsBlockAvailable(1));
+
+  auto second_job = std::make_shared<IOJob>();
+  second_job->block_handles = {block_handles[2]};
+  second_job->logical_block_priorities = {1};
+  second_job->table = table.get();
+  second_job->job_options.read_options.async_io = false;
+  second_job->job_options.read_options.fill_cache = false;
+
+  std::shared_ptr<ReadSet> second_read_set;
+  ASSERT_OK(dispatcher->SubmitJob(second_job, &second_read_set));
+  ASSERT_FALSE(second_read_set->IsBlockAvailable(0));
+
+  first_read_set->ReleaseBlock(0);
+  ASSERT_TRUE(second_read_set->IsBlockAvailable(0));
+  ASSERT_FALSE(first_read_set->IsBlockAvailable(1));
+
+  second_read_set->ReleaseBlock(0);
+  ASSERT_TRUE(first_read_set->IsBlockAvailable(1));
+  EXPECT_GT(logical_priority_lookups, 0);
 }
 
 // Test that multiple ReadSets share the memory budget

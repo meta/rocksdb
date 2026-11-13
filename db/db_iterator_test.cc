@@ -5914,6 +5914,804 @@ TEST_P(DBMultiScanIteratorTest, BasicTest) {
   iter.reset();
 }
 
+std::vector<std::vector<std::string>> CollectMultiScanKeys(
+    MultiScan* multi_scan) {
+  std::vector<std::vector<std::string>> result;
+  for (auto range : *multi_scan) {
+    result.emplace_back();
+    for (auto entry : range) {
+      result.back().push_back(entry.first.ToString());
+    }
+  }
+  return result;
+}
+
+std::vector<std::vector<std::string>> CollectPreparedScanKeys(
+    Iterator* iter, const MultiScanArgs& scan_options, Slice* lower_bound,
+    Slice* upper_bound) {
+  std::vector<std::vector<std::string>> result;
+  for (const ScanOptions& range : scan_options.GetScanRanges()) {
+    if (lower_bound != nullptr) {
+      *lower_bound = *range.range.start;
+    }
+    if (upper_bound != nullptr && range.range.limit.has_value()) {
+      *upper_bound = *range.range.limit;
+    }
+    if (scan_options.reverse) {
+      assert(range.range.limit.has_value());
+      iter->SeekForPrev(*range.range.limit);
+    } else {
+      iter->Seek(*range.range.start);
+    }
+
+    result.emplace_back();
+    while (iter->Valid()) {
+      result.back().push_back(iter->key().ToString());
+      if (scan_options.reverse) {
+        iter->Prev();
+      } else {
+        iter->Next();
+      }
+    }
+    EXPECT_OK(iter->status());
+  }
+  return result;
+}
+
+TEST_P(DBMultiScanIteratorTest, ArbitraryRangesRequireOptIn) {
+  auto options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.insert("k05", "k09");
+  scan_options.insert("k02", "k07");
+
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  std::unique_ptr<MultiScan> multi_scan = dbfull()->NewMultiScan(
+      read_options, dbfull()->DefaultColumnFamily(), scan_options);
+
+  try {
+    auto iter = multi_scan->begin();
+    (void)iter;
+    FAIL() << "Expected unsorted overlapping ranges to be rejected";
+  } catch (MultiScanException& ex) {
+    EXPECT_EQ(ex.status(),
+              Status::InvalidArgument("Overlapping ranges at index 1"));
+  }
+}
+
+TEST_P(DBMultiScanIteratorTest, ArbitraryRangesPreserveCallerOrder) {
+  auto options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  const PerfLevel previous_perf_level = GetPerfLevel();
+  SetPerfLevel(kEnableCount);
+  Defer restore_perf_level(
+      [previous_perf_level]() { SetPerfLevel(previous_perf_level); });
+  get_perf_context()->Reset();
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.use_async_io = true;
+  scan_options.insert("k05", "k09");
+  scan_options.insert("k02", "k07");
+
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  std::unique_ptr<MultiScan> multi_scan = dbfull()->NewMultiScan(
+      read_options, dbfull()->DefaultColumnFamily(), scan_options);
+
+  const std::vector<std::vector<std::string>> expected = {
+      {"k05", "k06", "k07", "k08"}, {"k02", "k03", "k04", "k05", "k06"}};
+  EXPECT_EQ(CollectMultiScanKeys(multi_scan.get()), expected);
+  EXPECT_GT(get_perf_context()->multiscan_prepare_count, 0);
+}
+
+TEST_P(DBMultiScanIteratorTest, PrepareSupportsArbitraryRanges) {
+  auto options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  const PerfLevel previous_perf_level = GetPerfLevel();
+  SetPerfLevel(kEnableCount);
+  Defer restore_perf_level(
+      [previous_perf_level]() { SetPerfLevel(previous_perf_level); });
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.insert("k05", "k09");
+  scan_options.insert("k02", "k07");
+
+  Slice upper_bound;
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  get_perf_context()->Reset();
+  iter->Prepare(scan_options);
+  ASSERT_OK(iter->status());
+  EXPECT_GT(get_perf_context()->multiscan_prepare_count, 0);
+
+  const std::vector<std::vector<std::string>> expected = {
+      {"k05", "k06", "k07", "k08"}, {"k02", "k03", "k04", "k05", "k06"}};
+  EXPECT_EQ(CollectPreparedScanKeys(iter.get(), scan_options,
+                                    /*lower_bound=*/nullptr, &upper_bound),
+            expected);
+}
+
+TEST_P(DBMultiScanIteratorTest, PrepareKeepsCanonicalFastPathWhenOptedIn) {
+  auto options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  const PerfLevel previous_perf_level = GetPerfLevel();
+  SetPerfLevel(kEnableCount);
+  Defer restore_perf_level(
+      [previous_perf_level]() { SetPerfLevel(previous_perf_level); });
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+
+  size_t logical_index_insertions = 0;
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "LevelIterator::Prepare:InsertLogicalRangeIndex",
+      [&](void*) { ++logical_index_insertions; });
+  sync_point->EnableProcessing();
+  Defer clear_sync_points([sync_point]() {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.insert("k02", "k04");
+  scan_options.insert("k06", "k09");
+
+  Slice upper_bound;
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  get_perf_context()->Reset();
+  iter->Prepare(scan_options);
+  ASSERT_OK(iter->status());
+  EXPECT_GT(get_perf_context()->multiscan_prepare_count, 0);
+
+  const std::vector<std::vector<std::string>> expected = {
+      {"k02", "k03"}, {"k06", "k07", "k08"}};
+  EXPECT_EQ(CollectPreparedScanKeys(iter.get(), scan_options,
+                                    /*lower_bound=*/nullptr, &upper_bound),
+            expected);
+  EXPECT_EQ(logical_index_insertions, 0);
+}
+
+TEST_P(DBMultiScanIteratorTest, PrepareSupportsEarlyRangeAbandonment) {
+  auto options = CurrentOptions();
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 1;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.insert("k02", "k09");
+  scan_options.insert("k01", "k04");
+
+  Slice upper_bound("k09");
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  iter->Prepare(scan_options);
+  ASSERT_OK(iter->status());
+  iter->Seek("k02");
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(iter->key(), "k02");
+
+  upper_bound = "k04";
+  std::vector<std::string> actual;
+  for (iter->Seek("k01"); iter->Valid(); iter->Next()) {
+    actual.push_back(iter->key().ToString());
+  }
+  EXPECT_OK(iter->status());
+  EXPECT_EQ(actual, std::vector<std::string>({"k01", "k02", "k03"}));
+}
+
+TEST_P(DBMultiScanIteratorTest, PrepareMaterializesOverlappingBlocksOnce) {
+  auto options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.compression = kSnappyCompression;
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = nullptr;
+  table_options.block_size = 128;
+  table_options.no_block_cache = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  const std::string value(1024, 'v');
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), value));
+  }
+  ASSERT_OK(Flush());
+
+  auto scan_and_get_counters = [&](size_t range_count,
+                                   uint64_t max_prefetch_size) {
+    EXPECT_OK(options.statistics->Reset());
+    auto dispatcher_statistics = CreateDBStatistics();
+    IODispatcherOptions dispatcher_options;
+    dispatcher_options.max_prefetch_memory_bytes = 1 << 30;
+    dispatcher_options.statistics = dispatcher_statistics.get();
+    MultiScanArgs scan_options(BytewiseComparator());
+    scan_options.allow_unsorted_or_overlapping_ranges = true;
+    scan_options.max_prefetch_size = max_prefetch_size;
+    scan_options.io_dispatcher.reset(NewIODispatcher(dispatcher_options));
+    for (size_t i = 0; i < range_count; ++i) {
+      scan_options.insert("k02", "k08");
+    }
+
+    Slice upper_bound;
+    ReadOptions read_options;
+    read_options.fill_cache = false;
+    read_options.iterate_upper_bound = &upper_bound;
+    std::unique_ptr<Iterator> iter(
+        dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+    iter->Prepare(scan_options);
+    EXPECT_OK(iter->status());
+    const auto results = CollectPreparedScanKeys(
+        iter.get(), scan_options, /*lower_bound=*/nullptr, &upper_bound);
+    EXPECT_EQ(results.size(), range_count);
+    iter.reset();
+
+    return std::make_tuple(
+        options.statistics->getTickerCount(MULTISCAN_BLOCKS_PREFETCHED),
+        options.statistics->getTickerCount(NUMBER_BLOCK_DECOMPRESSED),
+        dispatcher_statistics->getTickerCount(
+            PREFETCH_MEMORY_BYTES_GRANTED));
+  };
+
+  const auto single_range = scan_and_get_counters(1, 0);
+  const auto duplicate_ranges =
+      scan_and_get_counters(2, std::get<2>(single_range));
+  EXPECT_GT(std::get<0>(single_range), 0);
+  EXPECT_GT(std::get<1>(single_range), 0);
+  EXPECT_GT(std::get<2>(single_range), 0);
+  EXPECT_EQ(duplicate_ranges, single_range);
+}
+
+TEST_P(DBMultiScanIteratorTest, PrepareFallsBackForUnadmittedBlocks) {
+  auto options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.compression = kSnappyCompression;
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = nullptr;
+  table_options.block_size = 128;
+  table_options.no_block_cache = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  const std::string value(1024, 'v');
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), value));
+  }
+  ASSERT_OK(Flush());
+
+  auto dispatcher_statistics = CreateDBStatistics();
+  IODispatcherOptions dispatcher_options;
+  dispatcher_options.max_prefetch_memory_bytes = 1;
+  dispatcher_options.statistics = dispatcher_statistics.get();
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.io_dispatcher.reset(NewIODispatcher(dispatcher_options));
+  scan_options.insert("k02", "k08");
+  scan_options.insert("k02", "k08");
+
+  size_t unretained_blocks = 0;
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "MultiScanIndexIterator::MarkCurrentBlockUnretained",
+      [&](void*) { ++unretained_blocks; });
+  sync_point->EnableProcessing();
+  Defer clear_sync_points([sync_point]() {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  Slice upper_bound;
+  ReadOptions read_options;
+  read_options.fill_cache = false;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  iter->Prepare(scan_options);
+  ASSERT_OK(iter->status());
+  const std::vector<std::vector<std::string>> expected = {
+      {"k02", "k03", "k04", "k05", "k06", "k07"},
+      {"k02", "k03", "k04", "k05", "k06", "k07"}};
+  EXPECT_EQ(CollectPreparedScanKeys(iter.get(), scan_options,
+                                    /*lower_bound=*/nullptr, &upper_bound),
+            expected);
+  iter.reset();
+
+  EXPECT_GT(unretained_blocks, 0);
+  EXPECT_EQ(options.statistics->getTickerCount(MULTISCAN_BLOCKS_PREFETCHED),
+            0);
+  EXPECT_GT(options.statistics->getTickerCount(NUMBER_BLOCK_DECOMPRESSED), 0);
+  EXPECT_EQ(dispatcher_statistics->getTickerCount(
+                PREFETCH_MEMORY_BYTES_GRANTED),
+            0);
+  EXPECT_EQ(dispatcher_statistics->getTickerCount(
+                PREFETCH_MEMORY_BYTES_RELEASED),
+            0);
+}
+
+TEST_P(DBMultiScanIteratorTest, PrepareArbitraryRangesAcrossFiles) {
+  auto options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  const PerfLevel previous_perf_level = GetPerfLevel();
+  SetPerfLevel(kEnableCount);
+  Defer restore_perf_level(
+      [previous_perf_level]() { SetPerfLevel(previous_perf_level); });
+
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  for (int i = 5; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 2);
+
+  size_t logical_index_insertions = 0;
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "LevelIterator::Prepare:InsertLogicalRangeIndex",
+      [&](void*) { ++logical_index_insertions; });
+  sync_point->EnableProcessing();
+  Defer clear_sync_points([sync_point]() {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.use_async_io = true;
+  scan_options.insert("k06", "k09");
+  scan_options.insert("k01", "k09");
+
+  Slice upper_bound;
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  get_perf_context()->Reset();
+  iter->Prepare(scan_options);
+  ASSERT_OK(iter->status());
+
+  const std::vector<std::vector<std::string>> expected = {
+      {"k06", "k07", "k08"},
+      {"k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08"}};
+  EXPECT_EQ(CollectPreparedScanKeys(iter.get(), scan_options,
+                                    /*lower_bound=*/nullptr, &upper_bound),
+            expected);
+  EXPECT_EQ(get_perf_context()->multiscan_prepare_count, 2);
+  EXPECT_GT(logical_index_insertions, 0);
+}
+
+TEST_P(DBMultiScanIteratorTest,
+       PrepareOverlappingRangesAcrossFileBoundaries) {
+  auto options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 256;
+  table_options.index_shortening = BlockBasedTableOptions::IndexShorteningMode::
+      kShortenSeparatorsAndSuccessor;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  const auto binary_key = [](uint64_t value) {
+    std::string key(16, '0');
+    for (int i = 0; i < 8; ++i) {
+      key[i] = static_cast<char>(value >> ((7 - i) * 8));
+    }
+    return key;
+  };
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_OK(Put(binary_key(i), "value"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  for (int i = 1000; i < 2000; ++i) {
+    ASSERT_OK(Put(binary_key(i), "value"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 2);
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.use_async_io = true;
+  const std::vector<std::pair<std::string, std::string>> ranges = {
+      {binary_key(600), binary_key(1700)},
+      {binary_key(500), binary_key(1800)}};
+  for (const auto& range : ranges) {
+    scan_options.insert(range.first, range.second);
+  }
+
+  Slice upper_bound;
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  iter->Prepare(scan_options);
+  ASSERT_OK(iter->status());
+
+  std::vector<std::vector<std::string>> expected(2);
+  for (int i = 600; i < 1700; ++i) {
+    expected[0].push_back(binary_key(i));
+  }
+  for (int i = 500; i < 1800; ++i) {
+    expected[1].push_back(binary_key(i));
+  }
+  EXPECT_EQ(CollectPreparedScanKeys(iter.get(), scan_options,
+                                    /*lower_bound=*/nullptr, &upper_bound),
+            expected);
+}
+
+TEST_P(DBMultiScanIteratorTest, PrepareSupportsMultipleUnboundedRanges) {
+  auto options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.insert("k06");
+  scan_options.insert("k02");
+
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  iter->Prepare(scan_options);
+  ASSERT_OK(iter->status());
+
+  const std::vector<std::vector<std::string>> expected = {
+      {"k06", "k07", "k08", "k09"},
+      {"k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09"}};
+  EXPECT_EQ(CollectPreparedScanKeys(iter.get(), scan_options,
+                                    /*lower_bound=*/nullptr,
+                                    /*upper_bound=*/nullptr),
+            expected);
+}
+
+TEST_P(DBMultiScanIteratorTest, PrepareRejectsUnsupportedArbitraryRanges) {
+  auto options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  Slice upper_bound;
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+
+  MultiScanArgs mixed_bounds(BytewiseComparator());
+  mixed_bounds.allow_unsorted_or_overlapping_ranges = true;
+  mixed_bounds.insert("k02", "k04");
+  mixed_bounds.insert("k06");
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  iter->Prepare(mixed_bounds);
+  EXPECT_TRUE(iter->status().IsNotSupported());
+
+  MultiScanArgs property_bags(BytewiseComparator());
+  property_bags.allow_unsorted_or_overlapping_ranges = true;
+  property_bags.insert("k05", "k09",
+                       std::unordered_map<std::string, std::string>());
+  property_bags.insert("k02", "k07");
+  iter.reset(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  iter->Prepare(property_bags);
+  EXPECT_TRUE(iter->status().IsNotSupported());
+}
+
+TEST_P(DBMultiScanIteratorTest, PrepareSupportsArbitraryReverseRanges) {
+  auto options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.reverse = true;
+  scan_options.insert("k05", "k09");
+  scan_options.insert("k02", "k07");
+
+  Slice lower_bound;
+  Slice upper_bound;
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  read_options.iterate_lower_bound = &lower_bound;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  iter->Prepare(scan_options);
+  ASSERT_OK(iter->status());
+
+  const std::vector<std::vector<std::string>> expected = {
+      {"k08", "k07", "k06", "k05"}, {"k06", "k05", "k04", "k03", "k02"}};
+  EXPECT_EQ(CollectPreparedScanKeys(iter.get(), scan_options, &lower_bound,
+                                    &upper_bound),
+            expected);
+}
+
+TEST_P(DBMultiScanIteratorTest, ArbitraryUnboundedRangesPreserveCallerOrder) {
+  auto options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.insert("k06");
+  scan_options.insert("k02", "k05");
+  scan_options.insert("k04");
+
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  std::unique_ptr<MultiScan> multi_scan = dbfull()->NewMultiScan(
+      read_options, dbfull()->DefaultColumnFamily(), scan_options);
+
+  const std::vector<std::vector<std::string>> expected = {
+      {"k06", "k07", "k08", "k09"},
+      {"k02", "k03", "k04"},
+      {"k04", "k05", "k06", "k07", "k08", "k09"}};
+  EXPECT_EQ(CollectMultiScanKeys(multi_scan.get()), expected);
+}
+
+TEST_P(DBMultiScanIteratorTest, ArbitraryMixedBoundsUseOneStagedSnapshot) {
+  auto options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.insert("k02", "k05");
+  scan_options.insert("k06");
+  scan_options.insert("k00", "k01");
+
+  std::unique_ptr<MultiScan> multi_scan = dbfull()->NewMultiScan(
+      ReadOptions(), dbfull()->DefaultColumnFamily(), scan_options);
+  auto outer = multi_scan->begin();
+  ASSERT_NE(outer, multi_scan->end());
+  for (auto entry : *outer) {
+    (void)entry;
+  }
+
+  ASSERT_OK(Put("k10", "new"));
+  ++outer;
+  ASSERT_NE(outer, multi_scan->end());
+  std::vector<std::string> actual;
+  for (auto entry : *outer) {
+    actual.push_back(entry.first.ToString());
+  }
+
+  const std::vector<std::string> expected = {"k06", "k07", "k08", "k09"};
+  EXPECT_EQ(actual, expected);
+}
+
+TEST_P(DBMultiScanIteratorTest, ArbitraryRangesSupportReverseScans) {
+  auto options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.reverse = true;
+  scan_options.insert("k05", "k09");
+  scan_options.insert("k02", "k07");
+
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  std::unique_ptr<MultiScan> multi_scan = dbfull()->NewMultiScan(
+      read_options, dbfull()->DefaultColumnFamily(), scan_options);
+
+  const std::vector<std::vector<std::string>> expected = {
+      {"k08", "k07", "k06", "k05"}, {"k06", "k05", "k04", "k03", "k02"}};
+  EXPECT_EQ(CollectMultiScanKeys(multi_scan.get()), expected);
+}
+
+TEST_P(DBMultiScanIteratorTest, ArbitraryRangesUseColumnFamilyComparator) {
+  auto options = CurrentOptions();
+  options.comparator = ReverseBytewiseComparator();
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(ReverseBytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.insert("k05", "k01");
+  scan_options.insert("k09", "k03");
+
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  std::unique_ptr<MultiScan> multi_scan = dbfull()->NewMultiScan(
+      read_options, dbfull()->DefaultColumnFamily(), scan_options);
+
+  const std::vector<std::vector<std::string>> expected = {
+      {"k05", "k04", "k03", "k02"}, {"k09", "k08", "k07", "k06", "k05", "k04"}};
+  EXPECT_EQ(CollectMultiScanKeys(multi_scan.get()), expected);
+
+  Slice upper_bound;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  iter->Prepare(scan_options);
+  ASSERT_OK(iter->status());
+  EXPECT_EQ(CollectPreparedScanKeys(iter.get(), scan_options,
+                                    /*lower_bound=*/nullptr, &upper_bound),
+            expected);
+}
+
+TEST_P(DBMultiScanIteratorTest, ArbitraryRangesKeepEmptyAndDuplicateRanges) {
+  auto options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.insert("k02", "k04");
+  scan_options.insert("k08", "k09");
+  scan_options.insert("k02", "k04");
+
+  std::unique_ptr<MultiScan> multi_scan = dbfull()->NewMultiScan(
+      ReadOptions(), dbfull()->DefaultColumnFamily(), scan_options);
+
+  const std::vector<std::vector<std::string>> expected = {
+      {"k02", "k03"}, {}, {"k02", "k03"}};
+  EXPECT_EQ(CollectMultiScanKeys(multi_scan.get()), expected);
+
+  Slice upper_bound;
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  iter->Prepare(scan_options);
+  ASSERT_OK(iter->status());
+  EXPECT_EQ(CollectPreparedScanKeys(iter.get(), scan_options,
+                                    /*lower_bound=*/nullptr, &upper_bound),
+            expected);
+}
+
+TEST_P(DBMultiScanIteratorTest, ArbitraryRangesHonorRangeDeletions) {
+  auto options = CurrentOptions();
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("k0" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->DeleteRange(
+      WriteOptions(), dbfull()->DefaultColumnFamily(), "k04", "k07"));
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.insert("k05", "k09");
+  scan_options.insert("k02", "k08");
+
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  std::unique_ptr<MultiScan> multi_scan = dbfull()->NewMultiScan(
+      read_options, dbfull()->DefaultColumnFamily(), scan_options);
+
+  const std::vector<std::vector<std::string>> expected = {
+      {"k07", "k08"}, {"k02", "k03", "k07"}};
+  EXPECT_EQ(CollectMultiScanKeys(multi_scan.get()), expected);
+
+  Slice upper_bound;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  iter->Prepare(scan_options);
+  ASSERT_OK(iter->status());
+  EXPECT_EQ(CollectPreparedScanKeys(iter.get(), scan_options,
+                                    /*lower_bound=*/nullptr, &upper_bound),
+            expected);
+}
+
+TEST_P(DBMultiScanIteratorTest, ArbitraryRangesHonorPrefixSameAsStart) {
+  auto options = CurrentOptions();
+  options.prefix_extractor.reset(NewFixedPrefixTransform(2));
+  DestroyAndReopen(options);
+
+  for (const std::string& key : {"aa1", "aa2", "ab1", "ab2"}) {
+    ASSERT_OK(Put(key, "value"));
+  }
+  ASSERT_OK(Flush());
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.allow_unsorted_or_overlapping_ranges = true;
+  scan_options.insert("ab1", "ac0");
+  scan_options.insert("aa1", "ab2");
+
+  ReadOptions read_options;
+  read_options.fill_cache = GetParam();
+  read_options.prefix_same_as_start = true;
+  std::unique_ptr<MultiScan> multi_scan = dbfull()->NewMultiScan(
+      read_options, dbfull()->DefaultColumnFamily(), scan_options);
+
+  const std::vector<std::vector<std::string>> expected = {{"ab1", "ab2"},
+                                                          {"aa1", "aa2"}};
+  EXPECT_EQ(CollectMultiScanKeys(multi_scan.get()), expected);
+
+  Slice upper_bound;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(read_options, dbfull()->DefaultColumnFamily()));
+  iter->Prepare(scan_options);
+  ASSERT_OK(iter->status());
+  EXPECT_EQ(CollectPreparedScanKeys(iter.get(), scan_options,
+                                    /*lower_bound=*/nullptr, &upper_bound),
+            expected);
+}
+
 TEST_P(DBMultiScanIteratorTest, MixedBoundsTest) {
   auto options = CurrentOptions();
   DestroyAndReopen(options);

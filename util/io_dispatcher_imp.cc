@@ -441,6 +441,60 @@ Status ReadSet::ReadIndex(size_t block_index, CachableEntry<Block>* out) {
   return s;
 }
 
+Status ReadSet::BorrowIndex(size_t block_index, CachableEntry<Block>* out) {
+  if (block_index >= pinned_blocks_.size()) {
+    return Status::InvalidArgument("Block index out of range");
+  }
+
+  if (prefetch_scheduler_) {
+    Status scheduling_status =
+        prefetch_scheduler_->OnBlockRequired(block_index);
+    scheduling_status.PermitUncheckedError();
+  }
+
+  auto borrow_materialized_block = [&]() {
+    assert(pinned_blocks_[block_index].GetValue() != nullptr);
+    out->SetUnownedValue(pinned_blocks_[block_index].GetValue());
+    return Status::OK();
+  };
+
+  if (pinned_blocks_[block_index].GetValue()) {
+    return borrow_materialized_block();
+  }
+
+  if (job_->job_options.read_options.async_io) {
+    auto it = async_io_map_.find(block_index);
+    if (it != async_io_map_.end()) {
+      auto async_state = it->second;
+      const size_t num_blocks_in_request = async_state->block_indices.size();
+      bool poll_stalled = false;
+      if (Status s =
+              PollAndProcessAsyncIO(std::move(async_state), &poll_stalled);
+          !s.ok()) {
+        return s;
+      }
+      if (poll_stalled && prefetch_scheduler_) {
+        prefetch_scheduler_->OnForegroundStall(block_index);
+      }
+      num_async_reads_ += num_blocks_in_request;
+      if (pinned_blocks_[block_index].GetValue()) {
+        return borrow_materialized_block();
+      }
+    }
+  }
+
+  if (prefetch_scheduler_) {
+    prefetch_scheduler_->OnBlockDiscarded(block_index);
+  }
+  Status s = SyncRead(block_index);
+  if (!s.ok()) {
+    return s;
+  }
+  ++num_sync_reads_;
+  *out = std::move(pinned_blocks_[block_index]);
+  return Status::OK();
+}
+
 Status ReadSet::ReadOffset(size_t offset, CachableEntry<Block>* out) {
   if (sorted_block_indices_.empty()) {
     return Status::InvalidArgument("ReadSet not initialized");
@@ -820,6 +874,11 @@ Status IODispatcherImpl::Impl::SubmitJob(const std::shared_ptr<IOJob>& job,
   if (!read_set) {
     return Status::InvalidArgument("read_set output parameter is null");
   }
+  if (!job->logical_block_priorities.empty() &&
+      job->logical_block_priorities.size() != job->block_handles.size()) {
+    return Status::InvalidArgument(
+        "logical block priorities must match block handles");
+  }
 
   auto rs = std::make_shared<ReadSet>();
 
@@ -849,9 +908,9 @@ Status IODispatcherImpl::Impl::SubmitJob(const std::shared_ptr<IOJob>& job,
               });
   }
 
-  // Step 1: Check cache and pin cached blocks. Iterate in offset order so all
-  // downstream private helpers can assume block index vectors are already
-  // sorted.
+  // Check the cache in offset order, then preserve the caller's block order
+  // for scheduler admission. Dispatch batches are sorted by offset after the
+  // scheduler has selected them.
   std::vector<size_t> block_indices_to_read;
   block_indices_to_read.reserve(job->block_handles.size());
   const bool use_data_block_cache = ShouldUseDataBlockCacheForIterator(
@@ -859,8 +918,11 @@ Status IODispatcherImpl::Impl::SubmitJob(const std::shared_ptr<IOJob>& job,
       job->table->get_rep()->ioptions.allow_mmap_reads);
 
   if (!use_data_block_cache) {
-    block_indices_to_read = rs->sorted_block_indices_;
+    for (size_t i = 0; i < job->block_handles.size(); ++i) {
+      block_indices_to_read.push_back(i);
+    }
   } else {
+    std::vector<bool> needs_read(job->block_handles.size(), false);
     for (size_t i : rs->sorted_block_indices_) {
       const auto& data_block_handle = job->block_handles[i];
 
@@ -875,7 +937,12 @@ Status IODispatcherImpl::Impl::SubmitJob(const std::shared_ptr<IOJob>& job,
 
       if (!(rs->pinned_blocks_)[i].GetValue()) {
         // Block not in cache - needs to be read from disk
-        block_indices_to_read.emplace_back(i);
+        needs_read[i] = true;
+      }
+    }
+    for (size_t i = 0; i < needs_read.size(); ++i) {
+      if (needs_read[i]) {
+        block_indices_to_read.push_back(i);
       }
     }
   }
