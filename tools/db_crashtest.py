@@ -415,6 +415,9 @@ default_params = {
     "use_direct_io_for_flush_and_compaction": lambda: random.randint(0, 1),
     "use_sqfc_for_range_queries": lambda: random.choice([0, 1, 1, 1]),
     "mock_direct_io": False,
+    # A block cache built from this URI instead of cache_type, such as one a
+    # plugin registers. Empty uses cache_type.
+    "cache_uri": "",
     "cache_type": lambda: random.choice(
         [
             "lru_cache",
@@ -1930,6 +1933,13 @@ def finalize_and_sanitize(src_params):
         dest_params["max_write_buffer_number"] = max(
             dest_params["max_write_buffer_number"], 10
         )
+    if dest_params.get("cache_uri"):
+        # A cache built from a URI takes no secondary cache, and cache_type
+        # does not apply to it.
+        dest_params["secondary_cache_uri"] = ""
+        dest_params["compressed_secondary_cache_size"] = 0
+        dest_params["compressed_secondary_cache_ratio"] = 0.0
+        dest_params["cache_type"] = dest_params["cache_type"].replace("tiered_", "")
     if dest_params["secondary_cache_uri"].find("compressed_secondary_cache") >= 0:
         dest_params["compressed_secondary_cache_size"] = 0
         dest_params["compressed_secondary_cache_ratio"] = 0.0

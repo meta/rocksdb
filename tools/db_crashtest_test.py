@@ -963,6 +963,40 @@ class DBCrashTestTest(unittest.TestCase):
                 self.assertEqual(1, finalized["use_trie_index"])
                 self.assertEqual(4, finalized["compression_parallel_threads"])
 
+    def test_finalize_drops_secondary_cache_for_cache_uri(self):
+        db_crashtest = self.load_db_crashtest()
+        tiered = {
+            "cache_type": "tiered_lru_cache",
+            "secondary_cache_uri": "",
+            "compressed_secondary_cache_size": 1048576,
+            "compressed_secondary_cache_ratio": 0.0,
+        }
+
+        finalized = db_crashtest.finalize_and_sanitize(
+            self.build_params(db_crashtest.default_params, dict(tiered, cache_uri=""))
+        )
+        self.assertEqual("tiered_lru_cache", finalized["cache_type"])
+        self.assertGreater(finalized["compressed_secondary_cache_ratio"], 0.0)
+
+        for secondary in (
+            {"compressed_secondary_cache_size": 1048576},
+            {"compressed_secondary_cache_ratio": 0.5},
+            {"secondary_cache_uri": "compressed_secondary_cache://capacity=1M"},
+        ):
+            with self.subTest(secondary=secondary):
+                params = self.build_params(
+                    db_crashtest.default_params,
+                    dict(tiered, cache_uri="fifo_cache://capacity=1M", **secondary),
+                )
+
+                finalized = db_crashtest.finalize_and_sanitize(params)
+
+                self.assertEqual("fifo_cache://capacity=1M", finalized["cache_uri"])
+                self.assertEqual("lru_cache", finalized["cache_type"])
+                self.assertEqual("", finalized["secondary_cache_uri"])
+                self.assertEqual(0, finalized["compressed_secondary_cache_size"])
+                self.assertEqual(0.0, finalized["compressed_secondary_cache_ratio"])
+
     def test_finalize_disables_test_batches_snapshots_when_disable_wal(self):
         db_crashtest = self.load_db_crashtest()
         params = self.build_params(

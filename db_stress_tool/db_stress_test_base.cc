@@ -1466,6 +1466,26 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
     return nullptr;
   }
 
+  if (!FLAGS_cache_uri.empty()) {
+    if (!FLAGS_secondary_cache_uri.empty() ||
+        FLAGS_compressed_secondary_cache_size > 0 ||
+        FLAGS_compressed_secondary_cache_ratio > 0.0) {
+      fprintf(stderr,
+              "--cache_uri cannot be combined with a secondary cache\n");
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
+    }
+    config_options.ignore_unsupported_options = false;
+    std::shared_ptr<Cache> block_cache;
+    Status s =
+        Cache::CreateFromString(config_options, FLAGS_cache_uri, &block_cache);
+    if (!s.ok() || block_cache == nullptr) {
+      fprintf(stderr, "No cache registered matching string: %s status=%s\n",
+              FLAGS_cache_uri.c_str(), s.ToString().c_str());
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
+    }
+    return block_cache;
+  }
+
   std::shared_ptr<SecondaryCache> secondary_cache;
   if (!FLAGS_secondary_cache_uri.empty()) {
     assert(!strstr(FLAGS_secondary_cache_uri.c_str(),
