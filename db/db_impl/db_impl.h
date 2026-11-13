@@ -3225,6 +3225,13 @@ class DBImpl : public DB
   bool EnqueuePendingFlush(const FlushRequest& req);
 
   void EnqueuePendingCompaction(ColumnFamilyData* cfd);
+  // Call with the DB mutex held after a compaction released its input files
+  // without installing a new version. Picking that compaction scored `cfd`
+  // without those files, so the score can be too low to schedule any more
+  // compaction. Recomputes the score and queues `cfd` if it needs compaction
+  // and its compactions are not aborted. Resuming aborted compactions queues
+  // it later.
+  void RescoreAndEnqueuePendingCompaction(ColumnFamilyData* cfd);
   void SchedulePendingPurge(std::string fname, std::string dir_to_sync,
                             FileType type, uint64_t number, int job_id);
   static void BGWorkCompaction(void* arg);

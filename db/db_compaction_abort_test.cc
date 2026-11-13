@@ -697,6 +697,71 @@ TEST_F(DBCompactionAbortTest, ResumeRestoresParkedAutomaticCompaction) {
   ASSERT_LT(NumTableFilesAtLevel(0, 1), l0_files_before_resume);
 }
 
+// An automatic compaction aborted after it was picked releases its input
+// files. ResumeAllCompactions() must schedule the column family again without
+// a new flush, and WaitForCompact() must not wait for it while aborted.
+TEST_F(DBCompactionAbortTest, ResumeAllCompactionsRequeuesAbortedCompaction) {
+  constexpr int kCompactionTrigger = 4;
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = kCompactionTrigger;
+  options.disable_auto_compactions = false;
+  Reopen(options);
+
+  SyncPointAbortHelper helper("CompactionJob::ProcessKeyValueCompaction:Start");
+  helper.Setup(dbfull());
+
+  PopulateData(/*num_files=*/kCompactionTrigger, /*keys_per_file=*/100,
+               /*value_size=*/1000);
+  helper.CleanupAndWait();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(kCompactionTrigger, NumTableFilesAtLevel(0));
+
+  dbfull()->ResumeAllCompactions();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(0, NumTableFilesAtLevel(0));
+  VerifyDataIntegrity(/*num_keys=*/100);
+}
+
+// Same as above with AbortCompactions() and ResumeCompactions() on one column
+// family.
+TEST_F(DBCompactionAbortTest, ResumeCompactionsRequeuesAbortedCompaction) {
+  constexpr int kCompactionTrigger = 4;
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = kCompactionTrigger;
+  options.disable_auto_compactions = false;
+  CreateAndReopenWithCF({"target"}, options);
+
+  AbortSynchronizer abort_sync;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
+      {"DBImpl::AbortCompactions:FlagSet",
+       "DBCompactionAbortTest::ResumeCompactionsRequeues:WaitForAbort"},
+  });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessKeyValueCompaction:Start", [&](void* /*arg*/) {
+        abort_sync.TriggerAbort(dbfull(), handles_[1]);
+        TEST_SYNC_POINT_CALLBACK(
+            "DBCompactionAbortTest::ResumeCompactionsRequeues:WaitForAbort",
+            nullptr);
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  Random rnd(301);
+  for (int file = 0; file < kCompactionTrigger; ++file) {
+    for (int key = 0; key < 100; ++key) {
+      ASSERT_OK(Put(1, Key(key), rnd.RandomString(1000)));
+    }
+    ASSERT_OK(Flush(1));
+  }
+  abort_sync.WaitForAbortCompletion();
+  CleanupSyncPoints();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(kCompactionTrigger, NumTableFilesAtLevel(0, 1));
+
+  dbfull()->ResumeCompactions(handles_[1]);
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(0, NumTableFilesAtLevel(0, 1));
+}
+
 TEST_F(DBCompactionAbortTest, DropColumnFamilyReleasesParkedCompaction) {
   constexpr int kCompactionTrigger = 4;
   Options options = CurrentOptions();

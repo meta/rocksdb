@@ -12113,6 +12113,199 @@ TEST_F(DBCompactionTest, DisableManualCompactionThreadQueueFull) {
   ASSERT_EQ("0,1", FilesPerLevel(0));
 }
 
+// A manual compaction that is unscheduled from the thread pool releases its
+// input files. The column family must then be rescored and requeued, or its
+// L0 files can stay uncompacted with no background work left to retry them.
+TEST_F(DBCompactionTest, UnscheduledManualCompactionRequeuesColumnFamily) {
+  const int kNumL0Files = 4;
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::RunManualCompaction:Scheduled",
+        "DBCompactionTest::UnscheduledManualCompactionRequeuesColumnFamily:"
+        "PreFlush"}});
+  std::atomic<int> num_unscheduled{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::UnscheduleCompactionCallback",
+      [&](void* /*arg*/) { num_unscheduled.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = kNumL0Files;
+  Reopen(options);
+
+  // Block the compaction thread pool so the manual compaction stays queued.
+  test::SleepingBackgroundTask sleeping_task_low;
+  env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &sleeping_task_low,
+                 Env::Priority::LOW);
+
+  // Stay below the auto compaction trigger, so no automatic compaction is
+  // queued for this column family.
+  for (int i = 0; i < kNumL0Files - 1; i++) {
+    ASSERT_OK(Put(Key(1), "value1"));
+    ASSERT_OK(Put(Key(2), "value2"));
+    ASSERT_OK(Flush());
+  }
+
+  port::Thread compact_thread([&]() {
+    CompactRangeOptions cro;
+    cro.exclusive_manual_compaction = false;
+    Status s = db_->CompactRange(cro, nullptr, nullptr);
+    ASSERT_EQ(Status::Code::kIncomplete, s.code());
+    ASSERT_EQ(Status::SubCode::kManualCompactionPaused, s.subcode());
+  });
+
+  TEST_SYNC_POINT(
+      "DBCompactionTest::UnscheduledManualCompactionRequeuesColumnFamily:"
+      "PreFlush");
+
+  // The manual compaction now owns the first files. This flush reaches the
+  // trigger, but the new version's score only counts the file that is not
+  // being compacted, so the column family is not queued for compaction.
+  ASSERT_OK(Put(Key(1), "value1"));
+  ASSERT_OK(Put(Key(2), "value2"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(std::to_string(kNumL0Files), FilesPerLevel(0));
+
+  // Unschedule the queued manual compaction. Nothing else installs a new
+  // version for this column family after this point.
+  db_->DisableManualCompaction();
+  compact_thread.join();
+  ASSERT_EQ(1, num_unscheduled.load());
+  db_->EnableManualCompaction();
+
+  sleeping_task_low.WakeUp();
+  sleeping_task_low.WaitUntilDone();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ("0,1", FilesPerLevel(0));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// A manual compaction that is canceled after a compaction thread took it from
+// the queue, but before it starts, releases its input files in
+// BackgroundCompaction(). The column family must then be rescored and
+// requeued. DisableManualCompaction() with the separate remote compaction pool,
+// which has no unschedule callback, also ends on this path.
+TEST_F(DBCompactionTest, CanceledManualCompactionBeforeStartRequeuesCF) {
+  const int kNumL0Files = 4;
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::RunManualCompaction:Scheduled",
+        "DBCompactionTest::CanceledManualCompactionBeforeStartRequeuesCF:"
+        "PreFlush"},
+       {"DBCompactionTest::CanceledManualCompactionBeforeStartRequeuesCF:"
+        "Canceled",
+        "BackgroundCallCompaction:0"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = kNumL0Files;
+  Reopen(options);
+
+  // Stay below the auto compaction trigger, so no automatic compaction is
+  // queued for this column family.
+  for (int i = 0; i < kNumL0Files - 1; i++) {
+    ASSERT_OK(Put(Key(1), "value1"));
+    ASSERT_OK(Put(Key(2), "value2"));
+    ASSERT_OK(Flush());
+  }
+
+  std::atomic<bool> canceled{false};
+  port::Thread compact_thread([&]() {
+    CompactRangeOptions cro;
+    cro.exclusive_manual_compaction = false;
+    cro.canceled = &canceled;
+    Status s = db_->CompactRange(cro, nullptr, nullptr);
+    ASSERT_EQ(Status::Code::kIncomplete, s.code());
+    ASSERT_EQ(Status::SubCode::kManualCompactionPaused, s.subcode());
+  });
+
+  TEST_SYNC_POINT(
+      "DBCompactionTest::CanceledManualCompactionBeforeStartRequeuesCF:"
+      "PreFlush");
+
+  // The manual compaction now owns the first files, and its compaction thread
+  // waits before it starts. This flush reaches the trigger, but the new
+  // version's score only counts the file that is not being compacted.
+  ASSERT_OK(Put(Key(1), "value1"));
+  ASSERT_OK(Put(Key(2), "value2"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(std::to_string(kNumL0Files), FilesPerLevel(0));
+
+  canceled.store(true);
+  TEST_SYNC_POINT(
+      "DBCompactionTest::CanceledManualCompactionBeforeStartRequeuesCF:"
+      "Canceled");
+  compact_thread.join();
+
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ("0,1", FilesPerLevel(0));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// A running manual compaction that is canceled releases its input files after
+// the compaction job returns. The column family must then be rescored and
+// requeued.
+TEST_F(DBCompactionTest, CanceledRunningManualCompactionRequeuesCF) {
+  const int kNumL0Files = 4;
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BackgroundCompaction:NonTrivial",
+        "DBCompactionTest::CanceledRunningManualCompactionRequeuesCF:"
+        "PreFlush"},
+       {"DBCompactionTest::CanceledRunningManualCompactionRequeuesCF:"
+        "Canceled",
+        "DBImpl::BackgroundCompaction:NonTrivial:BeforeRun"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = kNumL0Files;
+  Reopen(options);
+
+  // Overlapping files, so the manual compaction is not a trivial move. Stay
+  // below the auto compaction trigger.
+  for (int i = 0; i < kNumL0Files - 1; i++) {
+    ASSERT_OK(Put(Key(1), "value1"));
+    ASSERT_OK(Put(Key(2), "value2"));
+    ASSERT_OK(Flush());
+  }
+
+  std::atomic<bool> canceled{false};
+  port::Thread compact_thread([&]() {
+    CompactRangeOptions cro;
+    cro.exclusive_manual_compaction = false;
+    cro.canceled = &canceled;
+    Status s = db_->CompactRange(cro, nullptr, nullptr);
+    ASSERT_EQ(Status::Code::kIncomplete, s.code());
+    ASSERT_EQ(Status::SubCode::kManualCompactionPaused, s.subcode());
+  });
+
+  TEST_SYNC_POINT(
+      "DBCompactionTest::CanceledRunningManualCompactionRequeuesCF:PreFlush");
+
+  // The manual compaction job owns the first files and waits before it runs.
+  // This flush reaches the trigger, but the new version's score only counts
+  // the file that is not being compacted.
+  ASSERT_OK(Put(Key(1), "value1"));
+  ASSERT_OK(Put(Key(2), "value2"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(std::to_string(kNumL0Files), FilesPerLevel(0));
+
+  canceled.store(true);
+  TEST_SYNC_POINT(
+      "DBCompactionTest::CanceledRunningManualCompactionRequeuesCF:Canceled");
+  compact_thread.join();
+
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ("0,1", FilesPerLevel(0));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
 TEST_F(DBCompactionTest, DisableManualCompactionThreadQueueFullDBClose) {
   const int kNumL0Files = 4;
 

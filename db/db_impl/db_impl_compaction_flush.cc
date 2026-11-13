@@ -1890,6 +1890,7 @@ Status DBImpl::CompactFilesImpl(
       if (!compaction_released) {
         c->ReleaseCompactionFiles(status);
       }
+      RescoreAndEnqueuePendingCompaction(c->column_family_data());
       ROCKS_LOG_BUFFER(log_buffer, "[%s] Trivial move failed: %s\n",
                        c->column_family_data()->GetName().c_str(),
                        status.ToString().c_str());
@@ -1973,6 +1974,8 @@ Status DBImpl::CompactFilesImpl(
     InstallSuperVersionAndScheduleWork(
         c->column_family_data(), job_context->superversion_contexts.data(),
         /*defer_snapshot_refresh=*/false);
+  } else {
+    RescoreAndEnqueuePendingCompaction(c->column_family_data());
   }
   // status above captures any error during compaction_job.Install, so its ok
   // not check compaction_job.io_status() explicitly if we're not calling
@@ -2684,11 +2687,11 @@ Status DBImpl::RunManualCompaction(
   assert(!manual.in_progress);
   assert(HasPendingManualCompaction());
   RemoveManualCompaction(&manual);
-  // if the manual job is unscheduled, try schedule other jobs in case there's
-  // any unscheduled compaction job which was blocked by exclusive manual
-  // compaction.
-  if (manual.status.IsIncomplete() &&
-      manual.status.subcode() == Status::SubCode::kManualCompactionPaused) {
+  // If the manual job did not succeed, try to schedule other jobs in case
+  // there is any unscheduled compaction job which was blocked by exclusive
+  // manual compaction, including the column family that the failed manual
+  // compaction requeued when it released its input files.
+  if (!manual.status.ok()) {
     MaybeScheduleFlushOrCompaction();
   }
   bg_cv_.SignalAll();
@@ -3634,12 +3637,8 @@ void DBImpl::ResumeCompactions(ColumnFamilyHandle* column_family) {
                  "[%s] ResumeCompactions: counter %d -> %d",
                  cfd->GetName().c_str(), before, current);
   if (current == 0) {
-    // TODO: Aborting an automatic compaction after PickCompaction()
-    // releases its inputs without recomputing the compaction score, so this
-    // EnqueuePendingCompaction() can observe a stale sub-trigger score and
-    // queue nothing, leaving the CF idle until the next flush. Pre-existing
-    // (ResumeAllCompactions() has the same gap); fix separately for both APIs
-    // by recomputing the score on the abort path.
+    // A compaction aborted after it was picked rescores the column family
+    // when it releases its inputs, but does not queue it.
     if (!RestoreParkedCompaction(cfd) && !cfd->IsDropped()) {
       EnqueuePendingCompaction(cfd);
     }
@@ -3673,7 +3672,21 @@ void DBImpl::ResumeAllCompactions() {
   // If this is the last resume call (abort counter back to 0), schedule
   // compactions that may have been waiting
   if (current == 0) {
-    // The stale-score TODO in ResumeCompactions() also applies here.
+    // A compaction aborted after it was picked rescores its column family
+    // when it releases its inputs, but does not queue it. Queue every column
+    // family that needs compaction, except those with their own abort still
+    // active: ResumeCompactions() queues them.
+    // Read-only and secondary DBs never schedule compactions, so queuing
+    // here would make WaitForCompact() wait forever.
+    if (opened_successfully_ && !read_only_ &&
+        !shutting_down_.load(std::memory_order_acquire)) {
+      for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+        if (!cfd->IsDropped() && cfd->initialized() &&
+            cfd->compaction_aborted() == 0) {
+          EnqueuePendingCompaction(cfd);
+        }
+      }
+    }
     MaybeScheduleFlushOrCompaction();
   }
 }
@@ -4584,6 +4597,23 @@ void DBImpl::EnqueuePendingCompaction(ColumnFamilyData* cfd) {
   }
 }
 
+void DBImpl::RescoreAndEnqueuePendingCompaction(ColumnFamilyData* cfd) {
+  mutex_.AssertHeld();
+  // Without this, a column family that stopped writes because of too many L0
+  // files can keep a stale low score: with writes stopped there are no
+  // flushes, so no new version is installed to fix the score, and writes stay
+  // stopped.
+  cfd->current()->storage_info()->ComputeCompactionScore(
+      cfd->ioptions(), cfd->GetLatestMutableCFOptions(),
+      cfd->GetFullHistoryTsLow());
+  // While compactions are aborted, ResumeCompactions() or
+  // ResumeAllCompactions() queues the column family instead. Queuing it here
+  // would make WaitForCompact() wait until compactions are resumed.
+  if (!IsCompactionAborted(cfd)) {
+    EnqueuePendingCompaction(cfd);
+  }
+}
+
 void DBImpl::SchedulePendingPurge(std::string fname, std::string dir_to_sync,
                                   FileType type, uint64_t number, int job_id) {
   mutex_.AssertHeld();
@@ -4656,9 +4686,14 @@ void DBImpl::UnscheduleCompactionCallback(void* arg) {
           Status::Incomplete(Status::SubCode::kManualCompactionPaused);
     }
     if (ca.prepicked_compaction->compaction != nullptr) {
-      ca.prepicked_compaction->compaction->ReleaseCompactionFiles(
+      Compaction* c = ca.prepicked_compaction->compaction;
+      // The compaction still holds a reference to its column family.
+      ColumnFamilyData* cfd = c->column_family_data();
+      c->ReleaseCompactionFiles(
           Status::Incomplete(Status::SubCode::kManualCompactionPaused));
-      delete ca.prepicked_compaction->compaction;
+      // The caller holds the DB mutex.
+      ca.db->RescoreAndEnqueuePendingCompaction(cfd);
+      delete c;
     }
     delete ca.prepicked_compaction;
   }
@@ -5271,6 +5306,18 @@ Status DBImpl::BackgroundCompaction(
       ++unscheduled_compactions_;
     }
   };
+  // Use after a compaction released its input files without installing a new
+  // version. With the separate remote pool, a new credit is deferred until
+  // this coordinator finishes, like the failed automatic compaction retry
+  // below.
+  const auto rescore_and_requeue = [&](ColumnFamilyData* cfd) {
+    const int unscheduled_before = unscheduled_compactions_;
+    RescoreAndEnqueuePendingCompaction(cfd);
+    if (separate_remote_pool && unscheduled_compactions_ > unscheduled_before) {
+      --unscheduled_compactions_;
+      restore_compaction_credit();
+    }
+  };
   TEST_SYNC_POINT("DBImpl::BackgroundCompaction:Start");
 
   const ReadOptions read_options(Env::IOActivity::kCompaction);
@@ -5361,6 +5408,7 @@ Status DBImpl::BackgroundCompaction(
     }
     if (c) {
       c->ReleaseCompactionFiles(status);
+      rescore_and_requeue(c->column_family_data());
       c.reset();
     }
     return status;
@@ -5397,6 +5445,7 @@ Status DBImpl::BackgroundCompaction(
       if (!enough_room) {
         // Then don't do the compaction
         c->ReleaseCompactionFiles(status);
+        rescore_and_requeue(c->column_family_data());
         c.reset();
         // m's vars will get set properly at the end of this function,
         // as long as status == CompactionTooLarge
@@ -5968,6 +6017,12 @@ Status DBImpl::BackgroundCompaction(
         restore_compaction_credit();
       }
     }
+  }
+  if (c != nullptr && !status.ok() &&
+      (is_manual || status.IsCompactionAborted())) {
+    // The compaction released its input files without installing a new
+    // version. A failed automatic compaction is requeued above.
+    rescore_and_requeue(c->column_family_data());
   }
   // this will unref its input_version and column_family_data
   c.reset();
