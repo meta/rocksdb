@@ -1,11 +1,12 @@
 // Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 package org.rocksdb;
 
-import java.io.*;
-import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
-
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URL;
+import java.nio.file.Path;
 import org.rocksdb.util.Environment;
+import org.rocksdb.util.SharedTempFile;
 
 /**
  * This class is used to load the RocksDB shared library from within the jar.
@@ -122,74 +123,52 @@ public class NativeLibraryLoader {
   void loadLibraryFromJar(final String tmpDir)
       throws IOException {
     if (!initialized) {
-      System.load(loadLibraryFromJarToTemp(tmpDir).getAbsolutePath());
+      System.load(loadLibraryFromJarToTemp(tmpDir).toString());
       initialized = true;
     }
   }
 
-  private File createTemp(final String tmpDir, final String libraryFileName) throws IOException {
-    // create a temporary file to copy the library to
-    final File temp;
-    if (tmpDir == null || tmpDir.isEmpty()) {
-      temp = File.createTempFile(tempFilePrefix, tempFileSuffix);
-    } else {
-      final File parentDir = new File(tmpDir);
-      if (!parentDir.exists()) {
-        throw new RuntimeException(
-            "Directory: " + parentDir.getAbsolutePath() + " does not exist!");
-      }
-      temp = new File(parentDir, libraryFileName);
-      if (temp.exists() && !temp.delete()) {
-        throw new RuntimeException(
-            "File: " + temp.getAbsolutePath() + " already exists and cannot be removed.");
-      }
-      if (!temp.createNewFile()) {
-        throw new RuntimeException("File: " + temp.getAbsolutePath() + " could not be created.");
-      }
+  @SuppressWarnings({"PMD.UseProperClassLoader", "PMD.CloseResource"})
+  private InputStream libraryFromJar() {
+    InputStream is = getClass().getClassLoader().getResourceAsStream(jniLibraryFileName);
+    if (is == null) {
+      is = getClass().getClassLoader().getResourceAsStream(fallbackJniLibraryFileName);
     }
-    if (temp.exists()) {
-      temp.deleteOnExit();
-      return temp;
-    } else {
-      throw new RuntimeException("File " + temp.getAbsolutePath() + " does not exist.");
+    if (is == null) {
+      throw new RuntimeException(jniLibraryFileName + " was not found inside JAR.");
     }
+    return is;
   }
 
-  @SuppressWarnings({"PMD.UseProperClassLoader", "PMD.UseTryWithResources", "PMD.SystemPrintln"})
-  File loadLibraryFromJarToTemp(final String tmpDir) throws IOException {
-    try (InputStream is = getClass().getClassLoader().getResourceAsStream(jniLibraryFileName)) {
-      if (is != null) {
-        final File temp = createTemp(tmpDir, jniLibraryFileName);
-        Files.copy(is, temp.toPath(), StandardCopyOption.REPLACE_EXISTING);
-        return temp;
-      } else {
-        if (DEBUG_LOADING) {
-          System.out.println("Unable to find: " + jniLibraryFileName + " on the classpath");
-        }
+  @SuppressWarnings("PMD.UseProperClassLoader")
+  private String libraryResourcePath() {
+    URL resource = getClass().getClassLoader().getResource(jniLibraryFileName);
+    if (resource == null) {
+      resource = getClass().getClassLoader().getResource(fallbackJniLibraryFileName);
+    }
+    if (resource == null) {
+      throw new RuntimeException(jniLibraryFileName + " was not found inside JAR.");
+    }
+    return resource.getFile();
+  }
+
+  @SuppressWarnings({"PMD.UseTryWithResources", "PMD.CloseResource"})
+  Path loadLibraryFromJarToTemp(final String tmpDir) throws IOException {
+    String prefix = tempFilePrefix;
+    String suffix = tempFileSuffix;
+    if (jniLibraryFileName != null) {
+      String[] split = jniLibraryFileName.split("\\.");
+      if (split.length == 2) {
+        prefix = split[0];
+        suffix = split[1];
       }
     }
-
-    if (fallbackJniLibraryFileName == null) {
-      throw new RuntimeException(
-          jniLibraryFileName + " was not found inside JAR, and there is no fallback.");
-    }
-
-    try (InputStream is =
-             getClass().getClassLoader().getResourceAsStream(fallbackJniLibraryFileName)) {
-      if (is != null) {
-        final File temp = createTemp(tmpDir, fallbackJniLibraryFileName);
-        Files.copy(is, temp.toPath(), StandardCopyOption.REPLACE_EXISTING);
-        return temp;
-      } else {
-        if (DEBUG_LOADING) {
-          System.out.println(
-              "Unable to find fallback: " + fallbackJniLibraryFileName + " on the classpath");
-        }
-      }
-    }
-
-    throw new RuntimeException("Neither " + jniLibraryFileName + " or " + fallbackJniLibraryFileName
-        + " were found inside the JAR, and there is no fallback.");
+    SharedTempFile.Instance instance =
+        new SharedTempFile.Instance(tmpDir, prefix, libraryResourcePath(), suffix);
+    SharedTempFile sharedTemp = instance.create();
+    SharedTempFile.Lock lock = sharedTemp.lock(this::libraryFromJar);
+    Runtime.getRuntime().addShutdownHook(new Thread(lock::close));
+    return sharedTemp.getContent();
   }
 
   /**

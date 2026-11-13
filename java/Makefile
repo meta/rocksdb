@@ -184,6 +184,7 @@ JAVA_TESTS = \
 	org.rocksdb.RocksMemEnvTest\
 	org.rocksdb.util.SizeUnitTest\
 	org.rocksdb.SecondaryDBTest\
+	org.rocksdb.SharedTempFileLoaderTest\
 	org.rocksdb.SliceTest\
 	org.rocksdb.SnapshotTest\
 	org.rocksdb.SstFileManagerTest\
@@ -212,6 +213,7 @@ JAVA_TESTS = \
 
 MAIN_SRC = src/main/java
 TEST_SRC = src/test/java
+TEST_RESOURCES = src/test/resources
 OUTPUT = target
 MAIN_CLASSES = $(OUTPUT)/classes
 TEST_CLASSES = $(OUTPUT)/test-classes
@@ -452,6 +454,7 @@ java_test: java resolve_test_deps
 	$(AM_V_GEN)mkdir -p $(TEST_CLASSES)
 	$(AM_V_at) $(JAVAC_CMD) $(JAVAC_ARGS) -cp $(MAIN_CLASSES):$(JAVA_TESTCLASSPATH) -h $(NATIVE_INCLUDE) -d $(TEST_CLASSES)\
 		$(TEST_SOURCES)
+	cp -v $(TEST_RESOURCES)/* $(TEST_CLASSES)
 
 test: java java_test
 	$(MAKE) run_test
