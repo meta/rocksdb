@@ -391,6 +391,38 @@ TEST_F(RangeDelAggregatorTest, SingleIterInAggregator) {
   EXPECT_FALSE(range_del_agg.IsRangeOverlapped("_", "a", true));
 }
 
+TEST_F(RangeDelAggregatorTest, IsRangeOverlappedBeforeFirstTombstone) {
+  auto range_del_iter = MakeRangeDelIter({{"c", "g", 10}, {"e", "g", 8}});
+  FragmentedRangeTombstoneList fragment_list(std::move(range_del_iter),
+                                             bytewise_icmp);
+  ReadRangeDelAggregator range_del_agg(&bytewise_icmp, kMaxSequenceNumber);
+  range_del_agg.AddTombstones(
+      std::make_unique<FragmentedRangeTombstoneIterator>(
+          &fragment_list, bytewise_icmp, kMaxSequenceNumber));
+
+  // The tombstones are fragmented into [c, e) and [e, g). A query ending
+  // exclusively at e must still find the first fragment.
+  const struct {
+    Slice start;
+    Slice end;
+    bool inclusive_overlap;
+    bool exclusive_overlap;
+  } test_cases[] = {{"a", "b", false, false}, {"a", "c", true, false},
+                    {"a", "d", true, true},   {"a", "e", true, true},
+                    {"a", "f", true, true},   {"a", "g", true, true},
+                    {"c", "e", true, true},   {"e", "g", true, true},
+                    {"g", "h", false, false}};
+  for (const auto& test_case : test_cases) {
+    SCOPED_TRACE(test_case.start.ToString() + ", " + test_case.end.ToString());
+    EXPECT_EQ(test_case.inclusive_overlap,
+              range_del_agg.IsRangeOverlapped(test_case.start, test_case.end,
+                                              /*end_exclusive=*/false));
+    EXPECT_EQ(test_case.exclusive_overlap,
+              range_del_agg.IsRangeOverlapped(test_case.start, test_case.end,
+                                              /*end_exclusive=*/true));
+  }
+}
+
 TEST_F(RangeDelAggregatorTest, MultipleItersInAggregator) {
   auto fragment_lists = MakeFragmentedTombstoneLists(
       {{{"a", "e", 10}, {"c", "g", 8}},
