@@ -3325,6 +3325,8 @@ extern ROCKSDB_LIBRARY_API void rocksdb_transaction_prepare(
 extern ROCKSDB_LIBRARY_API void rocksdb_transaction_destroy(
     rocksdb_transaction_t* txn);
 
+// The returned wrapper does not own the transaction's write batch. It can be
+// released with rocksdb_free or rocksdb_writebatch_wi_destroy.
 extern ROCKSDB_LIBRARY_API rocksdb_writebatch_wi_t*
 rocksdb_transaction_get_writebatch_wi(rocksdb_transaction_t* txn);
 
@@ -3332,7 +3334,6 @@ extern ROCKSDB_LIBRARY_API void rocksdb_transaction_rebuild_from_writebatch(
     rocksdb_transaction_t* txn, rocksdb_writebatch_t* writebatch,
     char** errptr);
 
-// This rocksdb_writebatch_wi_t should be freed with rocksdb_free
 extern ROCKSDB_LIBRARY_API void rocksdb_transaction_rebuild_from_writebatch_wi(
     rocksdb_transaction_t* txn, rocksdb_writebatch_wi_t* wi, char** errptr);
 
