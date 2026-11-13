@@ -1624,7 +1624,7 @@ IOStatus PosixMmapFile::Fsync(const IOOptions& /*opts*/,
                               IODebugContext* /*dbg*/) {
 #ifdef HAVE_FULLFSYNC
   if (::fcntl(fd_, F_FULLFSYNC) < 0) {
-    return IOError("While fcntl(F_FULLSYNC) on mmaped file", filename_, errno);
+    return IOError("While fcntl(F_FULLSYNC) on mmapped file", filename_, errno);
   }
 #else   // HAVE_FULLFSYNC
   if (fsync(fd_) < 0) {
