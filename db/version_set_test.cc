@@ -230,6 +230,89 @@ class VersionStorageInfoTest : public VersionStorageInfoTestBase {
   ~VersionStorageInfoTest() override = default;
 };
 
+class SequencePolicyTest : public VersionStorageInfoTest,
+                           public testing::WithParamInterface<int> {};
+
+TEST_P(SequencePolicyTest, SequencePoliciesFollowSortedRunMetadata) {
+  const int scenario = GetParam();
+  const int first_level =
+      scenario == 5 || scenario == 6 || scenario == 10 ? 0 : 5;
+  const int second_level = scenario == 0 ? 5
+                           : scenario == 5 || scenario == 6 || scenario == 10
+                               ? 0
+                               : 4;
+  Add(first_level, 1, "a", "m", 100);
+  FileMetaData* first = vstorage_.LevelFiles(first_level).back();
+  if (scenario != 8) {
+    const bool disjoint = scenario == 0 || scenario == 2 || scenario == 6 ||
+                          scenario == 9 || scenario == 10;
+    Add(second_level, 2, disjoint ? "n" : "h", "z", 100);
+  }
+  FileMetaData* second =
+      scenario == 8 ? first : vstorage_.LevelFiles(second_level).back();
+  if (scenario == 2) {
+    second->fd.smallest_seqno = 1;
+    second->fd.largest_seqno = 10;
+  } else if (scenario == 3) {
+    second->fd.smallest_seqno = kMaxSequenceNumber;
+    second->fd.largest_seqno = kMaxSequenceNumber;
+  } else if (scenario == 4) {
+    second->fd.smallest_seqno = 0;
+    second->fd.largest_seqno = 1;
+  } else if (scenario == 6) {
+    first->fd.smallest_seqno = 1;
+    first->fd.largest_seqno = 2;
+    second->fd.smallest_seqno = 3;
+    second->fd.largest_seqno = 4;
+  } else if (scenario == 7) {
+    first->fd.smallest_seqno = 1;
+    first->fd.largest_seqno = 10;
+    second->fd.smallest_seqno = 10;
+    second->fd.largest_seqno = 11;
+  } else if (scenario == 8) {
+    first->fd.smallest_seqno = kMaxSequenceNumber;
+    first->fd.largest_seqno = kMaxSequenceNumber;
+  }
+  UpdateVersionStorageInfo();
+  EXPECT_EQ(scenario != 0 && scenario != 2 && scenario != 6 && scenario != 9 &&
+                scenario != 10,
+            vstorage_.MayHaveEqualSequenceRuns());
+  EXPECT_EQ(scenario != 0 && scenario != 2 && scenario != 6 && scenario != 7 &&
+                scenario != 9 && scenario != 10,
+            vstorage_.MayHaveMultipleZeroSequenceRuns());
+}
+
+INSTANTIATE_TEST_CASE_P(Layouts, SequencePolicyTest, testing::Range(0, 11));
+
+TEST_F(VersionStorageInfoTest, DisjointFilesInOneRunDoNotCoverItsKeyGaps) {
+  Add(4, 1, "a", "b", 100);
+  Add(4, 2, "y", "z", 100);
+  Add(5, 3, "m", "n", 100);
+  UpdateVersionStorageInfo();
+  EXPECT_FALSE(vstorage_.MayHaveEqualSequenceRuns());
+  EXPECT_FALSE(vstorage_.MayHaveMultipleZeroSequenceRuns());
+}
+
+TEST_F(VersionStorageInfoTest, ZeroSequenceOverlapUsesOnlyZeroBearingFiles) {
+  Add(4, 1, "a", "b", 100);
+  Add(4, 2, "m", "n", 100);
+  vstorage_.LevelFiles(4).back()->fd.smallest_seqno = 1;
+  vstorage_.LevelFiles(4).back()->fd.largest_seqno = 2;
+  Add(5, 3, "m", "n", 100);
+  UpdateVersionStorageInfo();
+  EXPECT_TRUE(vstorage_.MayHaveEqualSequenceRuns());
+  EXPECT_FALSE(vstorage_.MayHaveMultipleZeroSequenceRuns());
+}
+
+TEST_F(VersionStorageInfoTest, ExclusiveRangeEndDoesNotOverlapAnotherRun) {
+  Add(4, 1, InternalKey("a", 0, kTypeValue),
+      InternalKey("m", kMaxSequenceNumber, kTypeRangeDeletion), 100);
+  Add(5, 2, "m", "z", 100);
+  UpdateVersionStorageInfo();
+  EXPECT_FALSE(vstorage_.MayHaveEqualSequenceRuns());
+  EXPECT_FALSE(vstorage_.MayHaveMultipleZeroSequenceRuns());
+}
+
 TEST_F(VersionStorageInfoTest, MaxBytesForLevelStatic) {
   ioptions_.level_compaction_dynamic_level_bytes = false;
   mutable_cf_options_.max_bytes_for_level_base = 10;

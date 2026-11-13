@@ -208,6 +208,21 @@ class VersionStorageInfo {
   // REQUIRES: PrepareForVersionAppend has been called
   void SetFinalized();
 
+  // Conservative properties of sequence ranges across sorted runs. L0 files
+  // are separate runs; each nonzero level is one run. Recomputed on recovery.
+  bool MayHaveEqualSequenceRuns() const {
+    return may_have_equal_sequence_runs_;
+  }
+  bool MayHaveMultipleZeroSequenceRuns() const {
+    return may_have_multiple_zero_sequence_runs_;
+  }
+  bool RequiresSourcePriorityForEqualSequences() const {
+    return requires_source_priority_for_equal_sequences_;
+  }
+  void SetRequiresSourcePriorityForEqualSequences(bool required) {
+    requires_source_priority_for_equal_sequences_ = required;
+  }
+
   // Update the accumulated stats from a file-meta.
   void UpdateAccumulatedStats(FileMetaData* file_meta);
 
@@ -867,6 +882,10 @@ class VersionStorageInfo {
   // If true, means that files in L0 have keys with non overlapping ranges
   bool level0_non_overlapping_;
 
+  bool may_have_equal_sequence_runs_ = true;
+  bool may_have_multiple_zero_sequence_runs_ = true;
+  bool requires_source_priority_for_equal_sequences_ = false;
+
   // An index into files_by_compaction_pri_ that specifies the first
   // file that is not yet compacted
   std::vector<int> next_file_to_compact_by_size_;
@@ -1448,6 +1467,10 @@ class VersionSet {
   void UpdatedMutableDbOptions(const MutableDBOptions& updated_options,
                                InstrumentedMutex* mu);
 
+  // Return with the MANIFEST queue drained and *mu held. Releases *mu while
+  // waiting, without writing records or appending a Version.
+  void WaitForManifestWrites(InstrumentedMutex* mu);
+
   Status LogAndApplyToDefaultColumnFamily(
       const ReadOptions& read_options, const WriteOptions& write_options,
       VersionEdit* edit, InstrumentedMutex* mu,
@@ -1618,6 +1641,8 @@ class VersionSet {
                       const std::vector<ColumnFamilyDescriptor>& cf_descs = {});
 
   const std::string& DbSessionId() const { return db_session_id_; }
+  const std::string& DbName() const { return dbname_; }
+  const std::string& DbId() const { return db_id_; }
 
   // Return the current manifest file number
   uint64_t manifest_file_number() const { return manifest_file_number_; }
@@ -2014,6 +2039,8 @@ class VersionSet {
 
  protected:
   struct ManifestWriter;
+  struct ManifestDrainWaiter;
+  void SignalManifestDrainWaiters();
 
   friend class Version;
   friend class VersionEditHandler;
@@ -2160,6 +2187,7 @@ class VersionSet {
 
   // Queue of writers to the manifest file
   std::deque<ManifestWriter*> manifest_writers_;
+  ManifestDrainWaiter* manifest_drain_waiters_ = nullptr;
 
   // Current size of manifest file
   uint64_t manifest_file_size_;

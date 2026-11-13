@@ -115,6 +115,10 @@ class DBIter final : public Iterator {
   //     just before all entries whose user key == this->key().
   enum Direction : uint8_t { kForward, kReverse };
 
+  void SetCanSkipZeroSequenceDuplicates(bool enabled) {
+    can_skip_zero_sequence_duplicates_ = enabled;
+  }
+
   // LocalStatistics contain Statistics counters that will be aggregated per
   // each iterator instance and then will be sent to the global statistics when
   // the iterator is destroyed.
@@ -759,10 +763,9 @@ class DBIter final : public Iterator {
   Direction direction_;
   bool valid_;
   bool current_entry_is_merged_;
-  // True if we know that the current entry's seqnum is 0.
-  // This information is used as that the next entry will be for another
-  // user key.
-  bool is_key_seqnum_zero_;
+  bool is_key_seqnum_zero_ = false;
+  // Zero-sequence policy of the currently referenced inner Version.
+  bool can_skip_zero_sequence_duplicates_;
   const bool prefix_same_as_start_;
   // prefix_same_as_start_ under DBOptions::prefix_seek_opt_in_only. Every scan
   // must take its prefix from an in-domain seek key: SeekToFirst() and

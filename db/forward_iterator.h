@@ -4,8 +4,11 @@
 //  (found in the LICENSE.Apache file in the root directory).
 #pragma once
 
+#include <cstddef>
+#include <functional>
 #include <queue>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "memory/arena.h"
@@ -14,6 +17,7 @@
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
 #include "table/internal_iterator.h"
+#include "util/hash_containers.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -24,18 +28,25 @@ class ColumnFamilyData;
 class ForwardLevelIterator;
 class VersionStorageInfo;
 struct FileMetaData;
+class InternalKeyComparator;
+
+using IteratorSourceRanks = UnorderedMap<const InternalIterator*, size_t>;
 
 class MinIterComparator {
  public:
-  explicit MinIterComparator(const CompareInterface* comparator)
-      : comparator_(comparator) {}
+  MinIterComparator(const InternalKeyComparator* comparator,
+                    const bool* source_priority,
+                    const IteratorSourceRanks* source_ranks)
+      : comparator_(comparator),
+        source_priority_(source_priority),
+        source_ranks_(source_ranks) {}
 
-  bool operator()(InternalIterator* a, InternalIterator* b) {
-    return comparator_->Compare(a->key(), b->key()) > 0;
-  }
+  bool operator()(InternalIterator* a, InternalIterator* b) const;
 
  private:
-  const CompareInterface* comparator_;
+  const InternalKeyComparator* comparator_;
+  const bool* source_priority_;
+  const IteratorSourceRanks* source_ranks_;
 };
 
 using MinIterHeap =
@@ -86,6 +97,13 @@ class ForwardIterator : public InternalIterator {
 
   bool TEST_CheckDeletedIters(int* deleted_iters, int* num_iters);
 
+  // Runs after rebuilding sources, including renewals of the referenced
+  // Version. Captured state must outlive this iterator.
+  void SetVersionChangeCallback(
+      std::function<void(const VersionStorageInfo&)> callback) {
+    version_change_callback_ = std::move(callback);
+  }
+
  private:
   void Cleanup(bool release_sv);
   // Unreference and, if needed, clean up the current SuperVersion. This is
@@ -105,6 +123,8 @@ class ForwardIterator : public InternalIterator {
                     bool seek_after_async_io);
 
   void UpdateCurrent();
+  void ClearImmutableHeap();
+  void UpdateSourcePriority();
   bool NeedToSeekImmutable(const Slice& internal_key);
   void DeleteCurrentIter();
   uint32_t FindFileInRange(const std::vector<FileMetaData*>& files,
@@ -127,7 +147,10 @@ class ForwardIterator : public InternalIterator {
   const SliceTransform* const prefix_extractor_;
   const Comparator* user_comparator_;
   const bool allow_unprepared_value_;
+  bool source_priority_for_equal_sequences_ = false;
+  IteratorSourceRanks source_ranks_;
   MinIterHeap immutable_min_heap_;
+  std::function<void(const VersionStorageInfo&)> version_change_callback_;
 
   SuperVersion* sv_;
   InternalIterator* mutable_iter_;

@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "env/file_system_tracer.h"
+#include "file/file_io_listener.h"
 #include "port/port.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/listener.h"
@@ -68,9 +69,8 @@ class RandomAccessFileReader final : public FSRandomAccessFile {
     info.offset = offset;
     info.length = length;
 
-    for (auto& listener : listeners_) {
-      listener->OnFileReadFinish(info);
-    }
+    ScopedDeferredFileIOListeners::Notify(
+        listeners_, &EventListener::OnFileReadFinish, info);
     info.status.PermitUncheckedError();
   }
 
@@ -82,10 +82,8 @@ class RandomAccessFileReader final : public FSRandomAccessFile {
     }
     IOErrorInfo io_error_info(io_status, operation, file_path, length, offset);
 
-    for (auto& listener : listeners_) {
-      listener->OnIOError(io_error_info);
-    }
-    io_status.PermitUncheckedError();
+    ScopedDeferredFileIOListeners::NotifyError(listeners_, io_error_info);
+    io_error_info.io_status.PermitUncheckedError();
   }
 
   bool ShouldNotifyListeners() const { return !listeners_.empty(); }

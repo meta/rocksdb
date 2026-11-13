@@ -18,6 +18,7 @@
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
+#include "file/file_io_listener.h"
 #include "file/file_util.h"
 #include "file/sst_file_manager_impl.h"
 #include "logging/logging.h"
@@ -1145,6 +1146,7 @@ void DBImpl::NotifyOnFlushBegin(ColumnFamilyData* cfd, FileMetaData* file_meta,
     info.largest_seqno = file_meta->fd.largest_seqno;
     info.flush_reason = flush_reason;
     for (const auto& listener : immutable_db_options_.listeners) {
+      const ScopedEventListenerCallback callback_scope(listener.get());
       listener->OnFlushBegin(this, info);
     }
   }
@@ -1177,6 +1179,7 @@ void DBImpl::NotifyOnFlushCompleted(
       info->triggered_writes_slowdown = triggered_writes_slowdown;
       info->triggered_writes_stop = triggered_writes_stop;
       for (const auto& listener : immutable_db_options_.listeners) {
+        const ScopedEventListenerCallback callback_scope(listener.get());
         listener->OnFlushCompleted(this, *info);
       }
       TEST_SYNC_POINT(
@@ -2107,6 +2110,7 @@ void DBImpl::NotifyOnCompactionBegin(ColumnFamilyData* cfd, Compaction* c,
     info.num_l0_files = num_l0_files;
     BuildCompactionJobInfo(cfd, c, st, job_stats, job_id, &info);
     for (const auto& listener : immutable_db_options_.listeners) {
+      const ScopedEventListenerCallback callback_scope(listener.get());
       listener->OnCompactionBegin(this, info);
     }
     info.status.PermitUncheckedError();
@@ -2138,6 +2142,7 @@ void DBImpl::NotifyOnCompactionCompleted(
     info.num_l0_files = num_l0_files;
     BuildCompactionJobInfo(cfd, c, st, compaction_job_stats, job_id, &info);
     for (const auto& listener : immutable_db_options_.listeners) {
+      const ScopedEventListenerCallback callback_scope(listener.get());
       listener->OnCompactionCompleted(this, info);
     }
   }
@@ -2179,6 +2184,7 @@ void DBImpl::NotifyOnCompactionPreCommit(
     info.num_l0_files = num_l0_files;
     BuildCompactionJobInfo(cfd, c, st, compaction_job_stats, job_id, &info);
     for (const auto& listener : immutable_db_options_.listeners) {
+      const ScopedEventListenerCallback callback_scope(listener.get());
       listener->OnCompactionPreCommit(this, info);
     }
     info.status.PermitUncheckedError();
@@ -2727,6 +2733,7 @@ void DBImpl::NotifyOnManualFlushScheduled(
     info.push_back({cfd->GetID(), cfd->GetName(), flush_reason});
   }
   for (const auto& listener : immutable_db_options_.listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnManualFlushScheduled(this, info);
   }
 }
@@ -4405,6 +4412,7 @@ void DBImpl::NotifyOnBackgroundJobPressureChanged() {
   bg_pressure_callback_in_progress_++;
   mutex_.Unlock();
   for (const auto& listener : immutable_db_options_.listeners) {
+    const ScopedEventListenerCallback callback_scope(listener.get());
     listener->OnBackgroundJobPressureChanged(this, pressure);
   }
   mutex_.Lock();
@@ -5045,6 +5053,10 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
     InstrumentedMutexLock l(&mutex_);
     assert(bg_flush_scheduled_);
     num_running_flushes_++;
+    const uint64_t cleanup_id = next_flush_cleanup_id_++;
+    if (snapshot_checker_ || use_custom_gc_) {
+      running_flush_cleanup_ids_.insert(cleanup_id);
+    }
 
     std::unique_ptr<std::list<uint64_t>::iterator>
         pending_outputs_inserted_elem(new std::list<uint64_t>::iterator(
@@ -5108,12 +5120,14 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
         PurgeObsoleteFiles(job_context);
       }
       job_context.Clean();
+      TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:SnapshotCleanedUp");
       mutex_.Lock();
     }
     TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:ContextCleanedUp");
 
     assert(num_running_flushes_ > 0);
     num_running_flushes_--;
+    running_flush_cleanup_ids_.erase(cleanup_id);
     bg_flush_scheduled_--;
     if (write_buffer_manager_->ShouldTrackFlushInitiator()) {
       RefreshFlushableMemAccounting();
@@ -5486,6 +5500,12 @@ Status DBImpl::BackgroundCompaction(
     }
 
     ColumnFamilyData* cfd = nullptr;
+    Defer release_picked_cf([this, &cfd]() {
+      mutex_.AssertHeld();
+      if (cfd != nullptr) {
+        cfd->UnrefAndTryDelete();
+      }
+    });
 
     if (!need_repick) {
       auto pick_result = PickCompactionFromQueue(&task_token, log_buffer);
@@ -5501,19 +5521,10 @@ Status DBImpl::BackgroundCompaction(
       cfd = std::get<CompactionQueuePicked>(pick_result).cfd;
       assert(cfd != nullptr);
 
-      // We unreference here because the following code will take a Ref() on
-      // this cfd if it is going to use it (Compaction class holds a
-      // reference).
-      // This will all happen under a mutex so we don't have to be afraid of
-      // somebody else deleting it.
-      if (cfd->UnrefAndTryDelete()) {
-        // This was the last reference of the column family, so no need to
-        // compact.
-        return Status::OK();
-      }
     } else {
       cfd = c->column_family_data();
       assert(cfd);
+      cfd->Ref();
       ResetBottomPriCompactionIntent(cfd, c);
       assert(c == nullptr);
     }
@@ -5536,10 +5547,13 @@ Status DBImpl::BackgroundCompaction(
         InitSnapshotContext(job_context);
         assert(is_snapshot_supported_ || snapshots_.empty());
       }
-      c.reset(cfd->PickCompaction(
-          mutable_cf_options, mutable_db_options_, job_context->snapshot_seqs,
-          job_context->snapshot_checker, log_buffer,
-          thread_pri == Env::Priority::BOTTOM /* require_max_output_level */));
+      if (!cfd->IsDropped() && !mutable_cf_options.disable_auto_compactions) {
+        c.reset(cfd->PickCompaction(
+            mutable_cf_options, mutable_db_options_, job_context->snapshot_seqs,
+            job_context->snapshot_checker, log_buffer,
+            thread_pri ==
+                Env::Priority::BOTTOM /* require_max_output_level */));
+      }
       if (c != nullptr && in_flight_cfd == nullptr) {
         in_flight_cfd = cfd;
         BeginInFlightCompaction(in_flight_cfd);
@@ -6442,7 +6456,8 @@ void DBImpl::InitSnapshotContext(JobContext* job_context) {
     // in snapshot_seqs and force compaction iterator to consider such
     // snapshots.
     const Snapshot* snapshot = GetSnapshotImpl(
-        /*is_write_conflict_boundary=*/false, SnapshotLockMode::kDBMutexHeld);
+        /*is_write_conflict_boundary=*/false, SnapshotLockMode::kDBMutexHeld,
+        SnapshotKind::kJob);
     managed_snapshot.reset(new ManagedSnapshot(this, snapshot));
   }
   // The SnapshotChecker path above already adds a managed snapshot to

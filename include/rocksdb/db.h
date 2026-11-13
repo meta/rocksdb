@@ -22,6 +22,7 @@
 #include "rocksdb/block_cache_trace_writer.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/listener.h"
+#include "rocksdb/lsm_edit.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/multi_scan.h"
 #include "rocksdb/options.h"
@@ -2760,6 +2761,52 @@ class DB {
     handles.push_back(std::move(handle));
     return CommitFileIngestionHandles(std::move(handles));
   }
+
+  // EXPERIMENTAL
+  //
+  // ApplyLsmEdit() applies a caller-declared, range-scoped arrangement of SST
+  // files in one atomic MANIFEST write covering every LsmEdit in `edits`.
+  //
+  // Where IngestExternalFile() derives placement -- it probes the LSM level by
+  // level and picks the lowest one each file fits in -- ApplyLsmEdit() takes
+  // the placement as input and validates it (see LsmEditFile::level). A caller
+  // that already knows the shape it wants, typically because the files came
+  // out of an LSM it built itself, can therefore transplant that shape instead
+  // of first flattening it into something the placement heuristic will
+  // reproduce.
+  //
+  // In LsmEditDeletionMode::kFilesInRange, every existing file wholly inside
+  // `range` is removed and its logical contents are replaced by `add_files`.
+  // Eligible sequence-zero external SSTs receive fresh global sequences; a
+  // covering tombstone hides old data in retained boundary-straddling files.
+  // Files whose sequences must be preserved instead require probing those
+  // straddlers to establish they contain nothing affecting the range.
+  // In LsmEditDeletionMode::kExplicitFiles, exactly the files named in
+  // `delete_files` are removed and unlisted files remain, including files
+  // inside the range. In both modes every added or deleted file must be wholly
+  // inside `range`. Added files use their declared levels unless
+  // LsmEditOptions::allow_replacement_file_relocation permits moving eligible
+  // sequence-zero replacement files upward.
+  //
+  // See LsmEdit::add_files for global-sequence eligibility and ordering. Other
+  // files retain their sequence numbers. The destination sequence watermark
+  // advances when needed so subsequent writes are newer than installed data.
+  // Layouts that may contain equal-key/sequence pairs persist a required
+  // MANIFEST ordering marker. Older binaries refuse to open that MANIFEST.
+  // Preserved-sequence replacements handle boundary-straddling files per
+  // LsmEditOptions::probe_straddling_files.
+  //
+  // Explicit-file sequence validation reads SSTs during preparation, without
+  // stopping writes. Commit returns TryAgain if overlapping surviving files
+  // changed meanwhile. Ambiguous sequence ranges can require scanning each
+  // overlapping file pair; pure level splits and range replacement avoid this
+  // additional survivor scan.
+  //
+  // REQUIRES: each edit corresponds to a different column family.
+  //
+  // Not supported for column families with user-defined timestamps.
+  virtual Status ApplyLsmEdit(const LsmEditOptions& options,
+                              const std::vector<LsmEdit>& edits) = 0;
 
   // CreateColumnFamilyWithImport() will create a new column family with
   // column_family_name and import external SST files specified in `metadata`

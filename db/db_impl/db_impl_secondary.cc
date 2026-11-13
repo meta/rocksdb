@@ -933,7 +933,8 @@ Status DBImplSecondary::NewIterators(
 const Snapshot* DBImplSecondary::GetSnapshot() {
   TEST_SYNC_POINT("DBImplSecondary::GetSnapshot:BeforeMutexLock");
   return GetSnapshotImpl(/*is_write_conflict_boundary=*/false,
-                         SnapshotLockMode::kAcquireDBMutex);
+                         SnapshotLockMode::kAcquireDBMutex,
+                         SnapshotKind::kUser);
 }
 
 Status DBImplSecondary::NewIteratorsImpl(

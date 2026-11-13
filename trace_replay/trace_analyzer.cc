@@ -78,21 +78,22 @@ AnalyzerOptions::AnalyzerOptions()
     : correlation_map(kTaTypeNum, std::vector<int>(kTaTypeNum, -1)) {}
 
 Status AnalyzerOptions::SparseCorrelationInput(const std::string& in_str) {
-  const Status invalid =
-      Status::InvalidArgument("Invalid correlation input: " + in_str);
+  const auto invalid = [&in_str]() {
+    return Status::InvalidArgument("Invalid correlation input: " + in_str);
+  };
   std::string cur = in_str;
   while (!cur.empty()) {
     if (cur.compare(0, 1, "[") != 0) {
-      return invalid;
+      return invalid();
     }
     std::size_t split = cur.find_first_of(',');
     if (split == std::string::npos) {
-      return invalid;
+      return invalid();
     }
     std::string opt1 = cur.substr(1, split - 1);
     std::size_t end = cur.find_first_of(']');
     if (end == std::string::npos) {
-      return invalid;
+      return invalid();
     }
     std::string opt2 = cur.substr(split + 1, end - split - 1);
     cur = cur.substr(end + 1);
@@ -100,7 +101,7 @@ Status AnalyzerOptions::SparseCorrelationInput(const std::string& in_str) {
     auto first = taOptToIndex.find(opt1);
     auto second = taOptToIndex.find(opt2);
     if (first == taOptToIndex.end() || second == taOptToIndex.end()) {
-      return invalid;
+      return invalid();
     }
     correlation_list.emplace_back(first->second, second->second);
   }
@@ -536,7 +537,6 @@ Status TraceAnalyzer::MakeStatistics() {
 // prefix of the accessed keys if required
 Status TraceAnalyzer::MakeStatisticKeyStatsOrPrefix(TraceStats& stats) {
   int ret;
-  Status s;
   std::string prefix = "0";
   uint64_t prefix_access = 0;
   uint64_t prefix_count = 0;
@@ -560,7 +560,7 @@ Status TraceAnalyzer::MakeStatisticKeyStatsOrPrefix(TraceStats& stats) {
         return Status::IOError("Format output failed");
       }
       std::string printout(buffer_);
-      s = stats.a_key_f->Append(printout);
+      const Status s = stats.a_key_f->Append(printout);
       if (!s.ok()) {
         fprintf(stderr, "Write key access file failed\n");
         return s;
@@ -592,7 +592,7 @@ Status TraceAnalyzer::MakeStatisticKeyStatsOrPrefix(TraceStats& stats) {
         }
         if (stats.a_prefix_cut_f) {
           std::string pout(buffer_);
-          s = stats.a_prefix_cut_f->Append(pout);
+          const Status s = stats.a_prefix_cut_f->Append(pout);
           if (!s.ok()) {
             fprintf(stderr, "Write accessed key prefix file failed\n");
             return s;
@@ -1609,20 +1609,19 @@ Status TraceAnalyzer::OutputAnalysisResult(TraceOperationType op_type,
   assert(cf_ids.size() == keys.size());
   assert(cf_ids.size() == value_sizes.size());
 
-  Status s;
-
   if (options_.convert_to_human_readable_trace && trace_sequence_f_) {
     if (op_type == TraceOperationType::kRangeDelete) {
       assert(cf_ids.size() == 2);
       assert(keys.size() == 2);
-      s = WriteRangeDeleteTraceSequence(cf_ids[0], keys[0], keys[1], timestamp);
+      const Status s =
+          WriteRangeDeleteTraceSequence(cf_ids[0], keys[0], keys[1], timestamp);
       if (!s.ok()) {
         return Status::Corruption("Failed to write the trace sequence to file");
       }
     } else {
       for (size_t i = 0; i < cf_ids.size(); i++) {
-        s = WriteTraceSequence(op_type, cf_ids[i], keys[i], value_sizes[i],
-                               timestamp);
+        const Status s = WriteTraceSequence(op_type, cf_ids[i], keys[i],
+                                            value_sizes[i], timestamp);
         if (!s.ok()) {
           return Status::Corruption(
               "Failed to write the trace sequence to file");
@@ -1647,7 +1646,7 @@ Status TraceAnalyzer::OutputAnalysisResult(TraceOperationType op_type,
   for (size_t i = 0; i < cf_ids.size(); i++) {
     // Get query does not have value part, just give a fixed value 10 for easy
     // calculation.
-    s = KeyStatsInsertion(
+    const Status s = KeyStatsInsertion(
         op_type, cf_ids[i], keys[i].ToString(),
         value_sizes[i] == 0 ? kShadowValueSize : value_sizes[i], timestamp);
     if (!s.ok()) {

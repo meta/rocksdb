@@ -569,6 +569,7 @@ TEST_MAIN_SOURCES =                                                     \
   db/flush_job_test.cc                                                  \
   db/listener_test.cc                                                   \
   db/log_test.cc                                                        \
+  db/lsm_edit_test.cc                                                   \
   db/manual_compaction_test.cc                                          \
   db/memtable_list_test.cc                                              \
   db/merge_helper_test.cc                                               \

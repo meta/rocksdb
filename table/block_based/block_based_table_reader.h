@@ -125,6 +125,10 @@ Status CopyBufferToReadScopedBlockContents(
 // loaded blocks in the memory.
 class BlockBasedTable : public TableReader, public SameFileBlobReader {
  public:
+  const SameFileBlobReader* GetSameFileBlobReader() const override {
+    return this;
+  }
+
   static const std::string kObsoleteFilterBlockPrefix;
   static const std::string kFullFilterBlockPrefix;
   static const std::string kPartitionedFilterBlockPrefix;
