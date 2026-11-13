@@ -1,0 +1,1 @@
+* Add `DBOptions.setWalCompression()`, `DBOptions.walCompression()`, `Options.setWalCompression()`, `Options.walCompression()` to the Java API to mirror the core RocksDB functionality.
