@@ -180,6 +180,20 @@ public class EnvironmentTest {
   }
 
   @Test
+  public void winArm64() {
+    setEnvironmentClassFields("win", "arm64");
+    assertThat(Environment.isWindows()).isTrue();
+    assertThat(Environment.isAarch64()).isTrue();
+    assertThat(Environment.getJniLibraryExtension()).
+      isEqualTo(".dll");
+    assertThat(Environment.getJniLibraryFileName("rocksdb")).
+      isEqualTo("librocksdbjni-win-arm64.dll");
+    assertThat(Environment.getFallbackJniLibraryFileName("rocksdb")).isNull();
+    assertThat(Environment.getSharedLibraryFileName("rocksdb")).
+      isEqualTo("librocksdbjni.dll");
+  }
+
+  @Test
   public void ppc64le() {
     setEnvironmentClassField(MUSL_LIBC_FIELD_NAME, false);
     setEnvironmentClassFields("Linux", "ppc64le");
