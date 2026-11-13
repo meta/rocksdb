@@ -40,7 +40,7 @@ public enum Priority {
    *     value is provided.
    */
   static Priority getPriority(final byte value) {
-    for (final Priority priority : Priority.values()) {
+    for (final Priority priority : values()) {
       if (priority.getValue() == value){
         return priority;
       }

@@ -50,7 +50,7 @@ public enum PerfLevel {
   }
 
   public static PerfLevel getPerfLevel(byte level) {
-    for (PerfLevel l : PerfLevel.values()) {
+    for (PerfLevel l : values()) {
       if (l.getValue() == level) {
         return l;
       }

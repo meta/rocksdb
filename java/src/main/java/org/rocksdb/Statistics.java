@@ -21,11 +21,14 @@ public class Statistics extends RocksObject {
     super(newStatistics(otherStatistics.nativeHandle_));
   }
 
+  @SuppressWarnings("PMD.LooseCoupling")
   public Statistics(final EnumSet<HistogramType> ignoreHistograms) {
     super(newStatisticsInstance(toArrayValues(ignoreHistograms)));
   }
 
-  public Statistics(final EnumSet<HistogramType> ignoreHistograms, final Statistics otherStatistics) {
+  @SuppressWarnings("PMD.LooseCoupling")
+  public Statistics(
+      final EnumSet<HistogramType> ignoreHistograms, final Statistics otherStatistics) {
     super(newStatistics(toArrayValues(ignoreHistograms), otherStatistics.nativeHandle_));
   }
 
@@ -40,6 +43,7 @@ public class Statistics extends RocksObject {
     super(existingStatisticsHandle);
   }
 
+  @SuppressWarnings({"PMD.LooseCoupling", "PMD.AssignmentInOperand"})
   private static byte[] toArrayValues(final EnumSet<HistogramType> histogramTypes) {
     final byte[] values = new byte[histogramTypes.size()];
     int i = 0;

@@ -3,6 +3,8 @@ package org.rocksdb;
 
 import static org.rocksdb.AbstractMutableOptions.INT_ARRAY_INT_SEPARATOR;
 
+import java.util.Arrays;
+
 public abstract class MutableOptionValue<T> {
 
   abstract double asDouble() throws NumberFormatException;
@@ -152,7 +154,7 @@ public abstract class MutableOptionValue<T> {
 
     @Override
     double asDouble() {
-      return Long.valueOf(value).doubleValue();
+      return value;
     }
 
     @Override
@@ -205,7 +207,7 @@ public abstract class MutableOptionValue<T> {
 
     @Override
     double asDouble() {
-      return Integer.valueOf(value).doubleValue();
+      return value;
     }
 
     @Override
@@ -311,7 +313,7 @@ public abstract class MutableOptionValue<T> {
 
     @Override
     int[] asIntArray() throws IllegalStateException {
-      return value;
+      return Arrays.copyOf(value, value.length);
     }
 
     @Override

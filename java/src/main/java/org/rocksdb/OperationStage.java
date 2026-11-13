@@ -48,7 +48,7 @@ public enum OperationStage {
    */
   static OperationStage fromValue(final byte value)
       throws IllegalArgumentException {
-    for (final OperationStage threadType : OperationStage.values()) {
+    for (final OperationStage threadType : values()) {
       if (threadType.value == value) {
         return threadType;
       }

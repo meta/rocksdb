@@ -50,7 +50,7 @@ public enum TxnDBWritePolicy {
    *     the provided byteIdentifier
    */
   public static TxnDBWritePolicy getTxnDBWritePolicy(final byte byteIdentifier) {
-    for (final TxnDBWritePolicy txnDBWritePolicy : TxnDBWritePolicy.values()) {
+    for (final TxnDBWritePolicy txnDBWritePolicy : values()) {
       if (txnDBWritePolicy.getValue() == byteIdentifier) {
         return txnDBWritePolicy;
       }

@@ -196,7 +196,7 @@ public class RocksDB extends RocksObject {
    * @see Options#setCreateIfMissing(boolean)
    */
   public static RocksDB open(final String path) throws RocksDBException {
-    RocksDB.loadLibrary();
+    loadLibrary();
     try (Options options = new Options()) {
       options.setCreateIfMissing(true);
       return open(options, path);
@@ -323,7 +323,7 @@ public class RocksDB extends RocksObject {
           .get(i);
       cfNames[i] = cfDescriptor.getName();
       cfOptionHandles[i] = cfDescriptor.getOptions().nativeHandle_;
-      if (Arrays.equals(cfDescriptor.getName(), RocksDB.DEFAULT_COLUMN_FAMILY)) {
+      if (Arrays.equals(cfDescriptor.getName(), DEFAULT_COLUMN_FAMILY)) {
         defaultColumnFamilyIndex = i;
       }
     }
@@ -362,7 +362,7 @@ public class RocksDB extends RocksObject {
    */
   public static RocksDB openReadOnly(final String path)
       throws RocksDBException {
-    RocksDB.loadLibrary();
+    loadLibrary();
     // This allows to use the rocksjni default Options instead of
     // the c++ one.
     try (Options options = new Options()) {
@@ -516,7 +516,7 @@ public class RocksDB extends RocksObject {
           .get(i);
       cfNames[i] = cfDescriptor.getName();
       cfOptionHandles[i] = cfDescriptor.getOptions().nativeHandle_;
-      if (Arrays.equals(cfDescriptor.getName(), RocksDB.DEFAULT_COLUMN_FAMILY)) {
+      if (Arrays.equals(cfDescriptor.getName(), DEFAULT_COLUMN_FAMILY)) {
         defaultColumnFamilyIndex = i;
       }
     }
@@ -714,8 +714,7 @@ public class RocksDB extends RocksObject {
    */
   public static List<byte[]> listColumnFamilies(final Options options,
       final String path) throws RocksDBException {
-    return Arrays.asList(RocksDB.listColumnFamilies(options.nativeHandle_,
-        path));
+    return Arrays.asList(listColumnFamilies(options.nativeHandle_, path));
   }
 
   /**
@@ -4885,13 +4884,13 @@ public class RocksDB extends RocksObject {
     return handleList;
   }
 
-  @SuppressWarnings({"PMD.ForLoopVariableCount", "PMD.AvoidReassigningLoopVariables"})
+  @SuppressWarnings("PMD.AssignmentInOperand")
   private static long[] toRangeSliceHandles(final List<Range> ranges) {
     final long[] rangeSliceHandles = new long[ranges.size() * 2];
-    for (int i = 0, j = 0; i < ranges.size(); i++) {
-      final Range range = ranges.get(i);
-      rangeSliceHandles[j++] = range.start.getNativeHandle();
-      rangeSliceHandles[j++] = range.limit.getNativeHandle();
+    int rangeSliceIndex = 0;
+    for (final Range range : ranges) {
+      rangeSliceHandles[rangeSliceIndex++] = range.start.getNativeHandle();
+      rangeSliceHandles[rangeSliceIndex++] = range.limit.getNativeHandle();
     }
     return rangeSliceHandles;
   }

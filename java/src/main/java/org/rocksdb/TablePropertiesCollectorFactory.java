@@ -18,7 +18,7 @@ public abstract class TablePropertiesCollectorFactory extends RocksObject {
     return new TablePropertiesCollectorFactory(handle) {
       @Override
       protected void disposeInternal(long handle) {
-        TablePropertiesCollectorFactory.deleteCompactOnDeletionCollectorFactory(handle);
+        deleteCompactOnDeletionCollectorFactory(handle);
       }
     };
   }
@@ -32,7 +32,7 @@ public abstract class TablePropertiesCollectorFactory extends RocksObject {
     return new TablePropertiesCollectorFactory(nativeHandle) {
       @Override
       protected void disposeInternal(long handle) {
-        TablePropertiesCollectorFactory.deleteCompactOnDeletionCollectorFactory(handle);
+        deleteCompactOnDeletionCollectorFactory(handle);
       }
     };
   }

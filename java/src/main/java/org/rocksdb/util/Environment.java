@@ -73,6 +73,9 @@ public class Environment {
     return MUSL_LIBC;
   }
 
+  private static final String TRUE = "true";
+  private static final String FALSE = "false";
+
   /**
    * Determine if the environment has a musl libc.
    *
@@ -85,10 +88,10 @@ public class Environment {
   @SuppressWarnings("PMD.EmptyCatchBlock")
   static boolean initIsMuslLibc() {
     // consider explicit user setting from environment first
-    if ("true".equalsIgnoreCase(MUSL_ENVIRONMENT)) {
+    if (TRUE.equalsIgnoreCase(MUSL_ENVIRONMENT)) {
       return true;
     }
-    if ("false".equalsIgnoreCase(MUSL_ENVIRONMENT)) {
+    if (FALSE.equalsIgnoreCase(MUSL_ENVIRONMENT)) {
       return false;
     }
 

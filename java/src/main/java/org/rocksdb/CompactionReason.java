@@ -129,7 +129,7 @@ public enum CompactionReason {
    * @throws IllegalArgumentException if the value is unknown.
    */
   static CompactionReason fromValue(final byte value) {
-    for (final CompactionReason compactionReason : CompactionReason.values()) {
+    for (final CompactionReason compactionReason : values()) {
       if(compactionReason.value == value) {
         return compactionReason;
       }
