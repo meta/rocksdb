@@ -11,7 +11,8 @@ package org.rocksdb;
  */
 public enum LoggerType {
   JAVA_IMPLEMENTATION((byte) 0x1),
-  STDERR_IMPLEMENTATION((byte) 0x2);
+  STDERR_IMPLEMENTATION((byte) 0x2),
+  FROM_OPTIONS_IMPLEMENTATION((byte) 0x3);
 
   private final byte value;
 

@@ -753,6 +753,7 @@ JNI_NATIVE_SOURCES =                                          \
   java/rocksjni/jni_multiget_helpers.cc                       \
   java/rocksjni/jnicallback.cc                                \
   java/rocksjni/loggerjnicallback.cc                          \
+  java/rocksjni/logger_from_options.cc                        \
   java/rocksjni/lru_cache.cc                                  \
   java/rocksjni/memtablejni.cc                                \
   java/rocksjni/memory_util.cc                                \
