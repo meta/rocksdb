@@ -1,0 +1,1 @@
+Fixed two issues when a LevelDB database is opened in place: a segfault in compaction stats on table files without a properties block (written by LevelDB), and obsolete `.ldb` table files never being deleted after compaction because `PurgeObsoleteFiles` only tried the `.sst` name.
