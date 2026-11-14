@@ -5469,16 +5469,32 @@ Env::WriteLifeTimeHint VersionStorageInfo::CalculateSSTWriteHint(
         return Env::WLTH_MEDIUM;
       }
 
-      // L1: medium, L2: long, ...
-      if (level - base_level_ >= 2) {
-        return Env::WLTH_EXTREME;
-      } else if (level < base_level_) {
-        // There is no restriction which prevents level passed in to be smaller
-        // than base_level.
-        return Env::WLTH_MEDIUM;
-      }
-      return static_cast<Env::WriteLifeTimeHint>(
+      // num_levels is less than 6
+      if (num_levels() <= 5) {
+        // L1: medium, L2: long, ...
+        if (level - base_level_ >= 2) {
+          return Env::WLTH_EXTREME;
+        } else if (level < base_level_) {
+          // There is no restriction which prevents level passed in to be smaller
+          // than base_level.
+          return Env::WLTH_MEDIUM;
+        }
+        return static_cast<Env::WriteLifeTimeHint>(
           level - base_level_ + static_cast<int>(Env::WLTH_MEDIUM));
+      }
+      // num_levels is greater than 5
+      else {
+        // L0-L3: medium, L4: long, ...
+        if (level - base_level_ >= 4) {
+          return Env::WLTH_EXTREME;
+        } else if (level - base_level_ < 3) {
+          return Env::WLTH_MEDIUM;
+        } else {
+          return static_cast<Env::WriteLifeTimeHint>(
+            level - base_level_ + static_cast<int>(Env::WLTH_NONE));
+        }
+      }
+
     case kCompactionStyleUniversal:
       if (level == 0) {
         return Env::WLTH_SHORT;
