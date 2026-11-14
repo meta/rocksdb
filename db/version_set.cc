@@ -3412,11 +3412,12 @@ void VersionStorageInfo::GenerateLevelFilesBrief() {
 
 void VersionStorageInfo::PrepareForVersionAppend(
     const ImmutableOptions& immutable_options,
-    const MutableCFOptions& mutable_cf_options) {
+    const MutableCFOptions& mutable_cf_options, uint32_t max_compation_job) {
   ComputeCompensatedSizes();
   UpdateNumNonEmptyLevels();
   CalculateBaseBytes(immutable_options, mutable_cf_options);
-  UpdateFilesByCompactionPri(immutable_options, mutable_cf_options);
+  UpdateFilesByCompactionPri(immutable_options, mutable_cf_options,
+                             max_compation_job);
   GenerateFileIndexer();
   GenerateLevelFilesBrief();
   GenerateLevel0NonOverlapping();
@@ -3434,7 +3435,9 @@ void Version::PrepareAppend(const ReadOptions& read_options,
     UpdateAccumulatedStats(read_options);
   }
 
-  storage_info_.PrepareForVersionAppend(cfd_->ioptions(), mutable_cf_options_);
+  int max_compation_job = env_->GetBackgroundThreads(Env::Priority::LOW);
+  storage_info_.PrepareForVersionAppend(cfd_->ioptions(), mutable_cf_options_,
+                                        max_compation_job);
 }
 
 bool Version::MaybeInitializeFileMetaData(const ReadOptions& read_options,
@@ -4431,8 +4434,8 @@ namespace {
 void SortFileByOverlappingRatio(
     const InternalKeyComparator& icmp, const std::vector<FileMetaData*>& files,
     const std::vector<FileMetaData*>& next_level_files, SystemClock* clock,
-    int level, int num_non_empty_levels, uint64_t ttl,
-    std::vector<Fsize>* temp) {
+    int level, int num_non_empty_levels, uint64_t ttl, std::vector<Fsize>* temp,
+    uint32_t max_compaction_job) {
   std::unordered_map<uint64_t, uint64_t> file_to_order;
   auto next_level_it = next_level_files.begin();
 
@@ -4473,9 +4476,10 @@ void SortFileByOverlappingRatio(
                                           ttl_boost_score;
   }
 
-  size_t num_to_sort = temp->size() > VersionStorageInfo::kNumberFilesToSort
-                           ? VersionStorageInfo::kNumberFilesToSort
-                           : temp->size();
+  size_t num_to_sort =
+      (max_compaction_job > temp->size() || max_compaction_job == 0)
+          ? temp->size()
+          : max_compaction_job;
 
   std::partial_sort(
       temp->begin(), temp->begin() + num_to_sort, temp->end(),
@@ -4555,7 +4559,8 @@ void SortFileByRoundRobin(const InternalKeyComparator& icmp,
 }  // anonymous namespace
 
 void VersionStorageInfo::UpdateFilesByCompactionPri(
-    const ImmutableOptions& ioptions, const MutableCFOptions& options) {
+    const ImmutableOptions& ioptions, const MutableCFOptions& options,
+    uint32_t max_compaction_job) {
   if (compaction_style_ == kCompactionStyleNone ||
       compaction_style_ == kCompactionStyleFIFO ||
       compaction_style_ == kCompactionStyleUniversal) {
@@ -4602,7 +4607,8 @@ void VersionStorageInfo::UpdateFilesByCompactionPri(
       case kMinOverlappingRatio:
         SortFileByOverlappingRatio(*internal_comparator_, files_[level],
                                    files_[level + 1], ioptions.clock, level,
-                                   num_non_empty_levels_, options.ttl, &temp);
+                                   num_non_empty_levels_, options.ttl, &temp,
+                                   max_compaction_job);
         break;
       case kRoundRobin:
         SortFileByRoundRobin(*internal_comparator_, &compact_cursor_,
