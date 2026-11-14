@@ -172,6 +172,8 @@ static inline void AsmVolatilePause() {
   asm volatile("or 27,27,27");
 #elif defined(__loongarch64)
   asm volatile("dbar 0");
+#elif defined(__e2k__)
+  asm volatile("nop" : : );
 #endif
   // it's okay for other platforms to be no-ops
 }
