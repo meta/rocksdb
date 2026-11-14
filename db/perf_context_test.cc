@@ -185,6 +185,60 @@ TEST_F(PerfContextTest, CoroutineStatsContextScopeCollectsStats) {
       }()));
 }
 
+TEST_F(PerfContextTest, CapturedCoroutineStatsContextOutlivesEnv) {
+  std::unique_ptr<Env> env = NewCompositeEnv(FileSystem::Default());
+  std::shared_ptr<folly::RequestContext> captured;
+  {
+    CoroutineStatsContextScope scope(CaptureCoroutineStatsConfig(), env.get());
+    captured = folly::RequestContext::saveContext();
+  }
+  env.reset();
+
+  folly::RequestContextScopeGuard restore(std::move(captured));
+}
+
+TEST_F(PerfContextTest, CapturedCoroutineStatsContextLeavesThreadStatsAlone) {
+  std::shared_ptr<folly::RequestContext> captured;
+  {
+    CoroutineStatsContextScope scope(CaptureCoroutineStatsConfig(),
+                                     Env::Default());
+    captured = folly::RequestContext::saveContext();
+  }
+  SetPerfLevel(PerfLevel::kEnableCount);
+  get_perf_context()->block_read_count = 42;
+
+  {
+    folly::RequestContextScopeGuard restore(std::move(captured));
+    EXPECT_EQ(42, get_perf_context()->block_read_count);
+  }
+  EXPECT_EQ(42, get_perf_context()->block_read_count);
+  EXPECT_EQ(PerfLevel::kEnableCount, GetPerfLevel());
+}
+
+TEST_F(PerfContextTest, ForeignRestoreOfCoroutineStatsContextNeverCallsEnv) {
+  class CountingEnv : public EnvWrapper {
+   public:
+    using EnvWrapper::EnvWrapper;
+    const char* Name() const override { return "CountingEnv"; }
+    uint64_t GetThreadID() const override {
+      calls.fetch_add(1);
+      return EnvWrapper::GetThreadID();
+    }
+    mutable std::atomic<int> calls{0};
+  };
+  CountingEnv env(Env::Default());
+  CoroutineStatsContextScope scope(CaptureCoroutineStatsConfig(), &env);
+  env.calls = 0;
+  std::shared_ptr<folly::RequestContext> captured =
+      folly::RequestContext::saveContext();
+
+  std::thread foreign(
+      [captured] { folly::RequestContextScopeGuard restore(captured); });
+  foreign.join();
+
+  EXPECT_EQ(0, env.calls.load());
+}
+
 TEST_F(PerfContextTest, CoroutineStatsContextsRemainIsolatedWhenInterleaved) {
   CoroutineStatsConfig first_stats_config = CaptureCoroutineStatsConfig();
 
