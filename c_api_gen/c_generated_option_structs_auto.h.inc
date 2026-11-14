@@ -197,6 +197,12 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_two_write_queues(
 extern ROCKSDB_LIBRARY_API unsigned char rocksdb_options_get_two_write_queues(
     rocksdb_options_t* opt);
 
+extern ROCKSDB_LIBRARY_API void rocksdb_options_set_partition_wal_usage(
+    rocksdb_options_t* opt, int v);
+
+extern ROCKSDB_LIBRARY_API int rocksdb_options_get_partition_wal_usage(
+    rocksdb_options_t* opt);
+
 extern ROCKSDB_LIBRARY_API void
 rocksdb_options_set_background_close_inactive_wals(rocksdb_options_t* opt,
                                                    unsigned char v);
