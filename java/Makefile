@@ -33,6 +33,7 @@ NATIVE_JAVA_CLASSES = \
 	org.rocksdb.Env\
 	org.rocksdb.EnvOptions\
 	org.rocksdb.FlushOptions\
+	org.rocksdb.FlushWALOptions\
 	org.rocksdb.Filter\
 	org.rocksdb.IngestExternalFileOptions\
 	org.rocksdb.HashLinkedListMemTableConfig\
