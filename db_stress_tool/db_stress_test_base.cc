@@ -1611,7 +1611,10 @@ bool StressTest::BuildOptionsTable() {
     return true;
   }
 
-  bool keepRibbonFilterPolicyOnly = FLAGS_bloom_before_level != INT_MAX;
+  const bool is_block_based_table = options_.table_factory->IsInstanceOf(
+      TableFactory::kBlockBasedTableName());
+  const bool keepRibbonFilterPolicyOnly =
+      is_block_based_table && FLAGS_bloom_before_level != INT_MAX;
 
   std::unordered_map<std::string, std::vector<std::string>> options_tbl = {
       {"write_buffer_size",
@@ -1677,18 +1680,21 @@ bool StressTest::BuildOptionsTable() {
            "1",
            "2",
        }},
-      {"block_based_table_factory",
-       {
-           keepRibbonFilterPolicyOnly ? "{filter_policy=ribbonfilter:2.35}"
-                                      : "{filter_policy=bloomfilter:2.34}",
-           "{filter_policy=ribbonfilter:5.67:-1}",
-           keepRibbonFilterPolicyOnly ? "{filter_policy=ribbonfilter:8.9:3}"
-                                      : "{filter_policy=nullptr}",
-           "{block_size=" + std::to_string(FLAGS_block_size) + "}",
-           "{block_size=" +
-               std::to_string(FLAGS_block_size + (FLAGS_seed & 0xFFFU)) + "}",
-       }},
   };
+  if (is_block_based_table) {
+    options_tbl.emplace(
+        "block_based_table_factory",
+        std::vector<std::string>{
+            keepRibbonFilterPolicyOnly ? "{filter_policy=ribbonfilter:2.35}"
+                                       : "{filter_policy=bloomfilter:2.34}",
+            "{filter_policy=ribbonfilter:5.67:-1}",
+            keepRibbonFilterPolicyOnly ? "{filter_policy=ribbonfilter:8.9:3}"
+                                       : "{filter_policy=nullptr}",
+            "{block_size=" + std::to_string(FLAGS_block_size) + "}",
+            "{block_size=" +
+                std::to_string(FLAGS_block_size + (FLAGS_seed & 0xFFFU)) + "}",
+        });
+  }
   if (FLAGS_use_multiscan == 0) {
     // TODO: this can fail MultiScan when consecutive data blocks share the
     // same user at boundary. MultiScan uses user key to locate the block to
@@ -5720,6 +5726,10 @@ void StressTest::PrintEnv() const {
           FLAGS_use_multiget ? "true" : "false");
   fprintf(stdout, "Use full external table   : %s\n",
           FLAGS_use_full_external_table ? "true" : "false");
+  fprintf(stdout, "Table factory URI         : %s\n",
+          FLAGS_table_factory_uri.c_str());
+  fprintf(stdout, "Structured key-value      : %s\n",
+          FLAGS_structured_key_value ? "true" : "false");
   fprintf(stdout, "Use async DB API          : %s\n",
           FLAGS_use_async_db_api ? "true" : "false");
   fprintf(stdout, "Use GetEntity             : %s\n",
@@ -5894,6 +5904,31 @@ void StressTest::Open(SharedState* shared, bool reopen) {
   if (FLAGS_use_full_external_table) {
     options_.table_factory = NewExternalTableFactory(
         std::make_shared<SimpleFullExternalTableFactory>());
+  }
+  if (!FLAGS_table_factory_uri.empty()) {
+    ConfigOptions config_options;
+    config_options.ignore_unknown_options = false;
+    config_options.ignore_unsupported_options = false;
+    Status s = TableFactory::CreateFromString(
+        config_options, FLAGS_table_factory_uri, &options_.table_factory);
+    if (!s.ok()) {
+      fprintf(stderr, "Failed to create table factory from URI '%s': %s\n",
+              FLAGS_table_factory_uri.c_str(), s.ToString().c_str());
+      // Open() runs during single-threaded startup, before worker threads.
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
+      exit(1);
+    }
+    assert(options_.table_factory != nullptr);
+    if (!options_.table_factory->IsInstanceOf(
+            TableFactory::kBlockBasedTableName()) &&
+        (FLAGS_compaction_ttl != 0 || FLAGS_periodic_compaction_seconds != 0)) {
+      fprintf(stderr,
+              "A non-block-based table_factory_uri requires "
+              "--compaction_ttl=0 and --periodic_compaction_seconds=0\n");
+      // Open() runs during single-threaded startup, before worker threads.
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
+      exit(1);
+    }
   }
   if (FLAGS_prefix_size == 0 && FLAGS_rep_factory == kHashSkipList) {
     fprintf(stderr,
