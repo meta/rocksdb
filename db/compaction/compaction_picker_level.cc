@@ -815,6 +815,13 @@ bool LevelCompactionBuilder::PickFileToCompact() {
   // than one concurrent compactions at this level. This
   // could be made better by looking at key-ranges that are
   // being compacted at level 0.
+  
+  // TODO(Wang Qian) Should we use level0_to_lbase_compactions_in_progress() 
+  // instead of level0_compactions_in_progress()? Because a running 
+  // intra0compaction should not prevent l0->lbase compaction from 
+  // happening. But if such logic is allowed, it should be noted 
+  // that an sst in level0 which is older than any ssts that are 
+  // running intra0compaction cannot be compactioned to lbase.
   if (start_level_ == 0 &&
       !compaction_picker_->level0_compactions_in_progress()->empty()) {
     if (PickSizeBasedIntraL0Compaction()) {
@@ -928,10 +935,14 @@ bool LevelCompactionBuilder::PickIntraL0Compaction() {
   start_level_inputs_.clear();
   const std::vector<FileMetaData*>& level_files =
       vstorage_->LevelFiles(0 /* level */);
-  if (level_files.size() <
+  if (!compaction_picker_->level0_to_lbase_compactions_in_progress() || level_files.size() <
           static_cast<size_t>(
               mutable_cf_options_.level0_file_num_compaction_trigger + 2) ||
       level_files[0]->being_compacted) {
+    // In fact, We hope intra-level0 compaction only occurs when L0->base_level 
+    // compactions is running. So we check level0_to_lbase_compactions_in_progress()
+    // to avoid running Intra-level0 compaction cause a new Intra-level0 compaction.
+    // Which would cause a selection loop and make a big write pause.
     // If L0 isn't accumulating much files beyond the regular trigger, don't
     // resort to L0->L0 compaction yet.
     return false;
