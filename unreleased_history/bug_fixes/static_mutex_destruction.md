@@ -1,0 +1,1 @@
+Fixed a crash (`pthread lock: Invalid argument` abort) when a DB is closed on another thread while the process exits, caused by the static mutexes in `PeriodicTaskScheduler` and `PosixFileSystem` file locking being destroyed first.

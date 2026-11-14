@@ -6,6 +6,7 @@
 
 #include "db/periodic_task_scheduler.h"
 
+#include "port/lang.h"
 #include "rocksdb/system_clock.h"
 #include "test_util/sync_point.h"
 
@@ -20,7 +21,7 @@ namespace ROCKSDB_NAMESPACE {
 // Note: It's not efficient to have a static global mutex, for
 // PeriodicTaskScheduler it should be okay, as the operations are called
 // infrequently.
-static port::Mutex timer_mutex;
+STATIC_AVOID_DESTRUCTION(port::Mutex, timer_mutex);
 
 static const std::map<PeriodicTaskType, uint64_t> kDefaultPeriodSeconds = {
     {PeriodicTaskType::kDumpStats, kInvalidPeriodSec},
