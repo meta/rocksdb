@@ -139,6 +139,7 @@ struct ReadIOExecutorState {
         } catch (const std::exception&) {
         }
       }
+      StartThreads(executor);
       return;
     }
     try {
@@ -164,6 +165,29 @@ struct ReadIOExecutorState {
       executor_.Store(new_executor.release());
     } catch (const std::exception&) {
       return;
+    }
+    StartThreads(executor_.Load());
+  }
+
+  // A new thread inherits its creator's scheduling policy, and an
+  // unprivileged thread can't leave SCHED_IDLE. Create every executor thread
+  // here, on the thread sizing the pool, rather than lazily on a reader's
+  // first getEventBase(), so an idle background reader can't put all later
+  // reads on an idle thread.
+  static void StartThreads(folly::IOThreadPoolExecutor* executor) {
+    try {
+      bool fail_for_test = false;
+      TEST_SYNC_POINT_CALLBACK("ReadIOExecutorState::StartThreads:Fail",
+                               &fail_for_test);
+      if (fail_for_test) {
+        throw std::runtime_error("injected failure");
+      }
+      executor->getAllEventBases();
+    } catch (const std::exception& e) {
+      fprintf(stderr,
+              "Failed to start async read threads; they will start on the "
+              "first async read instead: %s\n",
+              e.what());
     }
   }
 
