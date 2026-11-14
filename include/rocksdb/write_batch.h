@@ -546,4 +546,23 @@ class WriteBatch : public WriteBatchBase {
   std::string rep_;  // See comment in write_batch.cc for the format of rep_
 };
 
+// Appends the entries of `write_batch_to_append` to the end of `write_batch`,
+// in order. The serialized entries and their per-key checksums, if any, are
+// copied without being re-encoded. `write_batch_to_append` is not modified,
+// and its save points and WAL termination point are not copied.
+//
+// If `wal_only` is true and `write_batch_to_append` has a WAL termination
+// point (see WriteBatch::MarkWalTerminationPoint()), only the entries added
+// before that point are appended. Otherwise, all entries are appended.
+//
+// Returns InvalidArgument if both arguments are the same WriteBatch or if the
+// two batches have different GetProtectionBytesPerKey(). Returns NotSupported
+// if either batch contains an entry for a column family with user-defined
+// timestamps enabled. Returns Corruption if either batch's per-key checksums
+// are inconsistent with its entry count. On error, `write_batch` is not
+// modified. The appended entries are not checked against the size limit of
+// `write_batch` (see WriteBatch::SetMaxBytes()).
+Status AppendWriteBatch(WriteBatch& write_batch,
+                        const WriteBatch& write_batch_to_append, bool wal_only);
+
 }  // namespace ROCKSDB_NAMESPACE
