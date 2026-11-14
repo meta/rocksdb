@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 #include "rocksdb/attribute_groups.h"
 #include "rocksdb/rocksdb_namespace.h"
