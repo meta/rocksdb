@@ -2282,13 +2282,9 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           s = Status::Corruption(msg);
         }
       }
-      // Only verify on table with format collects table properties
       const auto& mutable_cf_options = cfd->GetLatestMutableCFOptions();
       if (s.ok() &&
-          (mutable_cf_options.table_factory->IsInstanceOf(
-               TableFactory::kBlockBasedTableName()) ||
-           mutable_cf_options.table_factory->IsInstanceOf(
-               TableFactory::kPlainTableName())) &&
+          mutable_cf_options.table_factory->IsRecordCountSupported() &&
           flush_stats.num_output_records != temp_table_proerties.num_entries) {
         std::string msg =
             "Number of keys in flush output SST files does not match "

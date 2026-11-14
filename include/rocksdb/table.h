@@ -37,6 +37,8 @@ class FilterPolicy;
 class FlushBlockPolicyFactory;
 class PersistentCache;
 class RandomAccessFile;
+class FSRandomAccessFile;
+struct IOOptions;
 struct TableReaderOptions;
 struct TableBuilderOptions;
 class TableBuilder;
@@ -1248,6 +1250,9 @@ TableFactory* NewCuckooTableFactory(
 
 class RandomAccessFileReader;
 
+// Returns a non-owning public view of the file passed to NewTableReader().
+FSRandomAccessFile* AsFSRandomAccessFile(RandomAccessFileReader* reader);
+
 // A base class for table factories.
 class TableFactory : public Customizable {
  public:
@@ -1262,6 +1267,15 @@ class TableFactory : public Customizable {
                                  std::shared_ptr<TableFactory>* factory);
 
   static const char* Type() { return "TableFactory"; }
+
+  // Recognizes this factory's table format without taking ownership of file.
+  // On OK, matches reports recognition. I/O failures are returned as Status.
+  virtual Status FileIsValidTable(const IOOptions& /*io_options*/,
+                                  FSRandomAccessFile& /*file*/,
+                                  uint64_t /*file_size*/,
+                                  bool* /*matches*/) const {
+    return Status::NotSupported("Table format probing is unsupported");
+  }
 
   // Returns a Table object table that can fetch data from file specified
   // in parameter file. It's the caller's responsibility to make sure
@@ -1333,6 +1347,15 @@ class TableFactory : public Customizable {
   // set disallow_memtable_writes, automatic compactions are not scheduled for
   // it, and CompactRange() and CompactFiles() on it return NotSupported.
   virtual bool IsTableBuilderSupported() const { return true; }
+
+  // Returns whether builders report accurate logical record counts in
+  // TableProperties::num_entries and num_range_deletions, so flush, recovery,
+  // and compaction can verify output counts. num_entries includes range
+  // deletions. Custom table factories can opt in by overriding this method.
+  virtual bool IsRecordCountSupported() const {
+    return IsInstanceOf(kBlockBasedTableName()) ||
+           IsInstanceOf(kPlainTableName());
+  }
 };
 
 // Create a special table factory that can open either of the supported

@@ -1118,6 +1118,8 @@ class ExternalTableFactoryAdapter : public TableFactory {
     return supports_table_builder_;
   }
 
+  bool IsRecordCountSupported() const override { return true; }
+
   bool IsInstanceOf(const std::string& name) const override {
     return name == kClassName() || TableFactory::IsInstanceOf(name);
   }
@@ -1214,6 +1216,11 @@ class ExternalTableFactoryAdapter : public TableFactory {
                                                    supports_range_deletions_);
     }
     return nullptr;
+  }
+
+  Status FileIsValidTable(const IOOptions& io_options, FSRandomAccessFile& file,
+                          uint64_t file_size, bool* matches) const override {
+    return inner_->FileIsValidTable(io_options, file, file_size, matches);
   }
 
   std::unique_ptr<TableFactory> Clone() const override { return nullptr; }

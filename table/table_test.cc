@@ -8629,6 +8629,65 @@ class ExternalTablePointReadTest : public ExternalTableTest,
   const bool use_coroutine_;
 };
 
+TEST(TableFactoryTest, FileIsValidTable) {
+  class DirectIOSource : public test::StringSource {
+   public:
+    using test::StringSource::StringSource;
+    bool use_direct_io() const override { return true; }
+    IOStatus Read(uint64_t offset, size_t n, const IOOptions& options,
+                  Slice* result, char* scratch,
+                  IODebugContext* dbg) const override {
+      if (fail_read) {
+        return IOStatus::IOError("Injected read failure");
+      }
+      const size_t alignment = GetRequiredBufferAlignment();
+      if (offset % alignment != 0 || n % alignment != 0 ||
+          !AlignedBuffer::isAligned(scratch, alignment)) {
+        return IOStatus::InvalidArgument("Unaligned direct read");
+      }
+      return test::StringSource::Read(offset, n, options, result, scratch, dbg);
+    }
+    bool fail_read = false;
+  };
+
+  std::unique_ptr<TableFactory> block(NewBlockBasedTableFactory());
+  std::unique_ptr<TableFactory> plain(NewPlainTableFactory());
+  std::unique_ptr<TableFactory> cuckoo(NewCuckooTableFactory());
+  const std::pair<uint64_t, TableFactory*> formats[] = {
+      {kBlockBasedTableMagicNumber, block.get()},
+      {kPlainTableMagicNumber, plain.get()},
+      {kLegacyPlainTableMagicNumber, plain.get()},
+      {kCuckooTableMagicNumber, cuckoo.get()}};
+  for (const auto& format : formats) {
+    std::string contents(4093, 'x');
+    PutFixed64(&contents, format.first);
+    DirectIOSource file(contents);
+    bool matches = false;
+    ASSERT_OK(format.second->FileIsValidTable(IOOptions(), file, file.Size(),
+                                              &matches));
+    ASSERT_TRUE(matches);
+    ASSERT_EQ(file.total_reads(), 1);
+  }
+
+  test::StringSource unknown(std::string(8, '\0'));
+  bool matches = true;
+  ASSERT_OK(
+      block->FileIsValidTable(IOOptions(), unknown, unknown.Size(), &matches));
+  ASSERT_FALSE(matches);
+  ASSERT_EQ(unknown.total_reads(), 1);
+  ASSERT_TRUE(
+      block
+          ->FileIsValidTable(IOOptions(), unknown, unknown.Size() + 1, &matches)
+          .IsCorruption());
+  DirectIOSource failed(std::string(8, '\0'));
+  failed.fail_read = true;
+  matches = true;
+  ASSERT_TRUE(
+      block->FileIsValidTable(IOOptions(), failed, failed.Size(), &matches)
+          .IsIOError());
+  ASSERT_FALSE(matches);
+}
+
 TEST_F(ExternalTableTest, BootstrapConfig) {
   RegisterConfigurableSimpleExternalTableFactory();
 
@@ -9200,6 +9259,8 @@ TEST_P(ExternalTablePointReadTest, FullModeLiveWritesAndCompaction) {
 
   Options options = GetDefaultOptions();
   options.disable_auto_compactions = true;
+  options.flush_verify_memtable_count = true;
+  options.compaction_verify_record_count = true;
   options.merge_operator = MergeOperators::CreateStringAppendOperator();
   options.table_factory = NewExternalTableFactory(
       std::make_shared<SimpleFullExternalTableFactory>());

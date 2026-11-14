@@ -111,6 +111,9 @@ class SimpleExternalTableFactoryBase : public ExternalTableFactoryBase<Mode> {
   ~SimpleExternalTableFactoryBase() override;
 
   const char* Name() const override;
+  Status FileIsValidTable(const IOOptions& io_options, FSRandomAccessFile& file,
+                          uint64_t file_size, bool* matches) const override;
+
   Status NewTableReader(const ReadOptions& read_options,
                         const std::string& file_path,
                         const ExternalTableOptions& table_options,
