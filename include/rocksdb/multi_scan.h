@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <exception>
+
 #include "rocksdb/db.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
@@ -108,7 +110,10 @@ class Scan {
     ScanIterator& operator=(ScanIterator&&) = default;
 
     ~ScanIterator() {
-      if (!status_.ok()) {
+      // operator++ reports errors by throwing MultiScanException after setting
+      // status_. When that exception unwinds through this destructor, status_
+      // is non-ok by design, so only assert when no exception is in flight.
+      if (!status_.ok() && std::uncaught_exceptions() == 0) {
         fprintf(stderr, "ScanIterator status: %s\n",
                 status_.ToString().c_str());
         assert(false);
@@ -224,7 +229,11 @@ class MultiScan {
       }
     }
 
-    ~MultiScanIterator() { assert(status_.ok()); }
+    ~MultiScanIterator() {
+      // See ScanIterator::~ScanIterator: a non-ok status_ is expected while a
+      // MultiScanException thrown by operator++ is unwinding.
+      assert(status_.ok() || std::uncaught_exceptions() > 0);
+    }
 
     MultiScanIterator& operator++();
 
