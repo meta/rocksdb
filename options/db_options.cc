@@ -35,6 +35,22 @@ static std::unordered_map<std::string, WALRecoveryMode>
         {"kSkipAnyCorruptedRecords",
          WALRecoveryMode::kSkipAnyCorruptedRecords}};
 
+// Construct-on-first-use accessor (CERT ERR58-CPP). A namespace-scope static
+// unordered_map may throw during dynamic initialization before main(), where
+// the exception cannot be caught. A function-local static is initialized on
+// first use, so any exception propagates to the caller.
+static const std::unordered_map<std::string, PartitionWALUsage>&
+GetPartitionWALUsageStringMap() {
+  static const std::unordered_map<std::string, PartitionWALUsage> kMap = {
+      {"none", PartitionWALUsage::kNone},
+      {"kNone", PartitionWALUsage::kNone},
+      {"partition_by_column_family",
+       PartitionWALUsage::kPartitionByColumnFamily},
+      {"kPartitionByColumnFamily",
+       PartitionWALUsage::kPartitionByColumnFamily}};
+  return kMap;
+}
+
 static std::unordered_map<std::string, CacheTier> cache_tier_string_map = {
     {"kVolatileTier", CacheTier::kVolatileTier},
     {"kVolatileCompressedTier", CacheTier::kVolatileCompressedTier},
@@ -451,6 +467,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, wal_compression),
           OptionType::kCompressionType, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"partition_wal_usage",
+         OptionTypeInfo::Enum<PartitionWALUsage>(
+             offsetof(struct ImmutableDBOptions, partition_wal_usage),
+             &GetPartitionWALUsageStringMap())},
         {"background_close_inactive_wals",
          {offsetof(struct ImmutableDBOptions, background_close_inactive_wals),
           OptionType::kBoolean, OptionVerificationType::kNormal,
@@ -862,6 +882,7 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       two_write_queues(options.two_write_queues),
       manual_wal_flush(options.manual_wal_flush),
       wal_compression(options.wal_compression),
+      partition_wal_usage(options.partition_wal_usage),
       background_close_inactive_wals(options.background_close_inactive_wals),
       atomic_flush(options.atomic_flush),
       avoid_unnecessary_blocking_io(options.avoid_unnecessary_blocking_io),
@@ -1047,6 +1068,8 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    manual_wal_flush);
   ROCKS_LOG_HEADER(log, "            Options.wal_compression: %d",
                    wal_compression);
+  ROCKS_LOG_HEADER(log, "            Options.partition_wal_usage: %d",
+                   static_cast<int>(partition_wal_usage));
   ROCKS_LOG_HEADER(log,
                    "            Options.background_close_inactive_wals: %d",
                    background_close_inactive_wals);
