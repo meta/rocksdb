@@ -1082,8 +1082,37 @@ WinMemoryMappedBuffer::~WinMemoryMappedBuffer() {
 //////////////////////////////////////////////////////////////////////////
 /// WinDirectory
 
+// The directory entry of a newly created file only becomes durable when
+// the parent directory handle is flushed. FlushFileBuffers requires the
+// handle to carry GENERIC_WRITE: a metadata-only (access=0) or read-only
+// handle fails with ERROR_ACCESS_DENIED, which is why opening the
+// directory once and flushing the held handle cannot work here. Open our
+// own handle for the duration of the call instead, mirroring what the
+// POSIX side does with fsync() on its directory fd.
 IOStatus WinDirectory::Fsync(const IOOptions& /*options*/,
                              IODebugContext* /*dbg*/) {
+  HANDLE handle = RX_CreateFile(
+      RX_FN(filename_).c_str(), GENERIC_WRITE,
+      FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+      OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS,  // make opening folders possible
+      NULL);
+  if (INVALID_HANDLE_VALUE == handle) {
+    auto lastError = GetLastError();
+    return IOErrorFromWindowsError("fsync folder: " + filename_,
+                                   lastError);
+  }
+  BOOL flushed = ::FlushFileBuffers(handle);
+  auto lastError = GetLastError();
+  BOOL closed = ::CloseHandle(handle);
+  if (!flushed) {
+    return IOErrorFromWindowsError("fsync folder: " + filename_,
+                                   lastError);
+  }
+  if (!closed) {
+    return IOErrorFromWindowsError("close folder: " + filename_,
+                                   GetLastError());
+  }
   return IOStatus::OK();
 }
 
