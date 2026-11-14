@@ -367,11 +367,8 @@ class CompactionJobTestBase : public testing::Test {
     SequenceNumber smallest_seqno = kMaxSequenceNumber;
     SequenceNumber largest_seqno = 0;
     uint64_t oldest_blob_file_number = kInvalidBlobFileNumber;
-    for (const auto& kv : contents) {
+    for (const auto& [skey, value] : contents) {
       ParsedInternalKey key;
-      std::string skey;
-      std::string value;
-      std::tie(skey, value) = kv;
       const Status pik_status =
           ParseInternalKey(skey, &key, true /* log_err_key */);
 
