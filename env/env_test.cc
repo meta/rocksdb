@@ -5094,6 +5094,26 @@ TEST_F(EnvTest, WriteStringToFileCloseFailureDeletesFile) {
   ASSERT_TRUE(exists.IsNotFound()) << exists.ToString();
 }
 
+TEST_F(EnvTest, DirectoryFsync) {
+  // Directory fsync used to be a no-op on Windows (the POSIX side has
+  // always really fsynced its directory fds). Exercise the API on the
+  // real filesystem through both entry points the callers use.
+  Env* env = Env::Default();
+  const std::string dir = test_directory_ + "/dir_fsync_test";
+  ASSERT_OK(env->CreateDirIfMissing(dir));
+  std::unique_ptr<FSDirectory> d;
+  ASSERT_OK(env->GetFileSystem()->NewDirectory(dir, IOOptions(), &d,
+                                               /*dbg=*/nullptr));
+  ASSERT_OK(d->Fsync(IOOptions(), /*dbg=*/nullptr));
+  ASSERT_OK(d->FsyncWithDirOptions(IOOptions(), /*dbg=*/nullptr,
+                                   DirFsyncOptions(
+                                       DirFsyncOptions::kNewFileSynced)));
+  ASSERT_OK(d->FsyncWithDirOptions(IOOptions(), /*dbg=*/nullptr,
+                                   DirFsyncOptions(dir)));
+  d.reset();
+  ASSERT_OK(env->DeleteDir(dir));
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
