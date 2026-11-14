@@ -203,6 +203,7 @@ JAVA_TESTS = \
 	org.rocksdb.VerifyChecksumsTest\
 	org.rocksdb.WalFilterTest\
 	org.rocksdb.WALRecoveryModeTest\
+	org.rocksdb.WideColumnTest\
 	org.rocksdb.WriteBatchHandlerTest\
 	org.rocksdb.WriteBatchTest\
 	org.rocksdb.WriteBatchThreadedTest\
