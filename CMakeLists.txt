@@ -104,6 +104,7 @@ if (WITH_WINDOWS_UTF8_FILENAMES)
   add_definitions(-DROCKSDB_WINDOWS_UTF8_FILENAMES)
 endif()
 option(ROCKSDB_BUILD_SHARED "Build shared versions of the RocksDB libraries" ON)
+option(ROCKSDB_BUILD_STATIC "Build static versions of the RocksDB libraries" ON)
 
 if( NOT DEFINED CMAKE_CXX_STANDARD )
   set(CMAKE_CXX_STANDARD 20)
@@ -1314,11 +1315,13 @@ string(REGEX REPLACE "[^0-9: /-]+" "" GIT_DATE "${GIT_DATE}")
 set(BUILD_VERSION_CC ${CMAKE_BINARY_DIR}/build_version.cc)
 configure_file(util/build_version.cc.in ${BUILD_VERSION_CC} @ONLY)
 
-add_library(${ROCKSDB_STATIC_LIB} STATIC ${SOURCES} ${BUILD_VERSION_CC})
-target_include_directories(${ROCKSDB_STATIC_LIB} PUBLIC
-  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
-target_link_libraries(${ROCKSDB_STATIC_LIB} PRIVATE
-  ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+if(ROCKSDB_BUILD_STATIC)
+  add_library(${ROCKSDB_STATIC_LIB} STATIC ${SOURCES} ${BUILD_VERSION_CC})
+  target_include_directories(${ROCKSDB_STATIC_LIB} PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
+  target_link_libraries(${ROCKSDB_STATIC_LIB} PRIVATE
+    ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+endif()
 
 if(ROCKSDB_BUILD_SHARED)
   add_library(${ROCKSDB_SHARED_LIB} SHARED ${SOURCES} ${BUILD_VERSION_CC})
@@ -1413,13 +1416,15 @@ if(NOT WIN32 OR ROCKSDB_INSTALL_ON_WINDOWS)
 
   install(DIRECTORY "${PROJECT_SOURCE_DIR}/cmake/modules" COMPONENT devel DESTINATION ${package_config_destination})
 
-  install(
-    TARGETS ${ROCKSDB_STATIC_LIB}
-    EXPORT RocksDBTargets
-    COMPONENT devel
-    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
-  )
+  if(ROCKSDB_BUILD_STATIC)
+    install(
+      TARGETS ${ROCKSDB_STATIC_LIB}
+      EXPORT RocksDBTargets
+      COMPONENT devel
+      ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+      INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+    )
+  endif()
 
   if(ROCKSDB_BUILD_SHARED)
     install(
