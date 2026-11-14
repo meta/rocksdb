@@ -77,6 +77,28 @@ void SetupSyncPointsToMockDirectIO() {
         *val &= ~O_DIRECT;
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+#elif !defined(NDEBUG) && defined(OS_WIN)
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "NewWritableFile:FILE_FLAG_NO_BUFFERING", [&](void* arg) {
+        DWORD* val = static_cast<DWORD*>(arg);
+        *val &= ~FILE_FLAG_NO_BUFFERING;
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "NewRandomAccessFile:FILE_FLAG_NO_BUFFERING", [&](void* arg) {
+        DWORD* val = static_cast<DWORD*>(arg);
+        *val &= ~FILE_FLAG_NO_BUFFERING;
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "NewSequentialFile:FILE_FLAG_NO_BUFFERING", [&](void* arg) {
+        DWORD* val = static_cast<DWORD*>(arg);
+        *val &= ~FILE_FLAG_NO_BUFFERING;
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "NewRandomRWFile:FILE_FLAG_NO_BUFFERING", [&](void* arg) {
+        DWORD* val = static_cast<DWORD*>(arg);
+        *val &= ~FILE_FLAG_NO_BUFFERING;
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 #endif
 }
 

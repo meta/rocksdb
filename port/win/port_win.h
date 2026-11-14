@@ -349,6 +349,7 @@ bool GenerateRfcUuid(std::string* output);
 #define RX_GetCurrentDirectory GetCurrentDirectoryW
 #define RX_GetDiskFreeSpaceEx GetDiskFreeSpaceExW
 #define RX_PathIsDirectory PathIsDirectoryW
+#define RX_CreateEvent CreateEventW
 
 #else
 
@@ -375,6 +376,7 @@ bool GenerateRfcUuid(std::string* output);
 #define RX_GetCurrentDirectory GetCurrentDirectoryA
 #define RX_GetDiskFreeSpaceEx GetDiskFreeSpaceExA
 #define RX_PathIsDirectory PathIsDirectoryA
+#define RX_CreateEvent CreateEventA
 
 #endif
 

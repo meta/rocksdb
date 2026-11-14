@@ -2388,6 +2388,7 @@ TEST_P(PrefetchTest, AvoidBlockCacheLookupTwice) {
   Close();
 }
 
+#ifndef OS_WIN
 TEST_P(PrefetchTest, DBIterAsyncIONoIOUring) {
   if (mem_env_ || encrypted_env_) {
     ROCKSDB_GTEST_SKIP("Test requires non-mem or non-encrypted environment");
@@ -2488,6 +2489,7 @@ TEST_P(PrefetchTest, DBIterAsyncIONoIOUring) {
 
   enable_io_uring = true;
 }
+#endif
 
 class PrefetchTest1 : public DBTestBase,
                       public ::testing::WithParamInterface<bool> {
