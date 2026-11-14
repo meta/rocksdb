@@ -172,6 +172,12 @@ public class TtlDB extends RocksDB {
    */
   @Override
   public void closeE() throws RocksDBException {
+    for (final ColumnFamilyHandle columnFamilyHandle : // NOPMD - CloseResource
+        ownedColumnFamilyHandles) {
+      columnFamilyHandle.close();
+    }
+    ownedColumnFamilyHandles.clear();
+
     if (owningHandle_.compareAndSet(true, false)) {
       try {
         closeDatabase(nativeHandle_);
