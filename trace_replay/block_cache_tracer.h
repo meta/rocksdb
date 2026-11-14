@@ -27,10 +27,10 @@ struct BlockCacheTraceRecord;
 
 class BlockCacheTraceHelper {
  public:
-  static bool IsGetOrMultiGetOnDataBlock(TraceType block_type,
-                                         TableReaderCaller caller);
-  static bool IsGetOrMultiGet(TableReaderCaller caller);
-  static bool IsUserAccess(TableReaderCaller caller);
+  static bool IsGetOrMultiGetOnDataBlock(const TraceType& block_type,
+                                         const TableReaderCaller& caller);
+  static bool IsGetOrMultiGet(const TableReaderCaller& caller);
+  static bool IsUserAccess(const TableReaderCaller& caller);
   // Row key is a concatenation of the access's fd_number and the referenced
   // user key.
   static std::string ComputeRowKey(const BlockCacheTraceRecord& access);
