@@ -542,6 +542,27 @@ set(JAVA_TEST_RUNNING_CLASSES
   org.rocksdb.util.StdErrLoggerTest
 )
 
+set(PLUGINS_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../plugin/)
+set(JAVADOC_ROOTS "${PROJECT_SOURCE_DIR}/java/src/main/java")
+
+if(ROCKSDB_PLUGINS)
+    foreach (plugin ${PLUGINS})
+        foreach (source ${${plugin}_JNI_NATIVE_SOURCES})
+            list(APPEND JNI_NATIVE_SOURCES ${PLUGINS_ROOT}/${plugin}/${source})
+        endforeach()
+
+        foreach (class ${${plugin}_JAVA_MAIN_CLASSES})
+            list(APPEND JAVA_MAIN_CLASSES ${PLUGINS_ROOT}/${plugin}/java/${class})
+        endforeach()
+
+        foreach (test ${${plugin}_JAVA_TESTS})
+            list(APPEND JAVA_TESTS ${PLUGINS_ROOT}/${plugin}/java/${test})
+        endforeach()
+
+        list(APPEND JAVADOC_ROOTS "${PLUGINS_ROOT}/${plugin}/java/src/main/java")
+    endforeach()
+endif()
+
 include(FindJava)
 include(UseJava)
 find_package(JNI)
@@ -823,7 +844,7 @@ endif()
 set(ROCKSDB_JAVADOC_JAR rocksdbjni-${CMAKE_PROJECT_VERSION}-javadoc.jar)
 create_javadoc(rocksdb
         PACKAGES org.rocksdb org.rocksdb.util
-        SOURCEPATH "${PROJECT_SOURCE_DIR}/java/src/main/java"
+        SOURCEPATH "${JAVADOC_ROOTS}"
         WINDOWTITLE "RocksDB Java API JavaDoc"
         AUTHOR FALSE
         USE FALSE
