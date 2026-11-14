@@ -530,7 +530,7 @@ jlong Java_org_rocksdb_RocksDB_createColumnFamilyWithImport(
   std::vector<const ROCKSDB_NAMESPACE::ExportImportFilesMetaData*> metadatas;
   jlong* ptr_metadata_handle_array =
       env->GetLongArrayElements(j_metadata_handle_array, nullptr);
-  if (j_metadata_handle_array == nullptr) {
+  if (ptr_metadata_handle_array == nullptr) {
     // exception thrown: OutOfMemoryError
     return 0;
   }
