@@ -2371,6 +2371,13 @@ Status CompactionJob::FinishCompactionOutputFile(
 
   // Check for iterator errors
   Status s = input_status;
+  if (!s.ok()) {
+    ROCKS_LOG_WARN(
+        db_options_.info_log,
+        "[%s] [JOB %d] CompactionJob::FinishCompactionOutputFile() failure"
+        " - iterator error found - %s" PRIu64,
+        cfd->GetName().c_str(), job_id_, s.ToString().c_str());
+  }
 
   // Add range tombstones
   if (s.ok()) {
@@ -2416,6 +2423,14 @@ Status CompactionJob::FinishCompactionOutputFile(
   const uint64_t current_entries = outputs.NumEntries();
 
   s = outputs.Finish(s, seqno_to_time_mapping_);
+  if (!s.ok()) {
+    ROCKS_LOG_WARN(
+        db_options_.info_log,
+        "[%s] [JOB %d] CompactionJob::FinishCompactionOutputFile() "
+        "failure due to error from CompactionOutputs::Finish() - %s" PRIu64,
+        cfd->GetName().c_str(), job_id_, s.ToString().c_str());
+  }
+
   TEST_SYNC_POINT_CALLBACK(
       "CompactionJob::FinishCompactionOutputFile()::AfterFinish", &s);
 
@@ -2443,6 +2458,13 @@ Status CompactionJob::FinishCompactionOutputFile(
   // Finish and check for file errors
   IOStatus io_s = outputs.WriterSyncClose(s, db_options_.clock, stats_,
                                           db_options_.use_fsync);
+  if (!io_s.ok()) {
+    ROCKS_LOG_WARN(db_options_.info_log,
+                   "[%s] [JOB %d] CompactionJob::FinishCompactionOutputFile() "
+                   "failure due to error from "
+                   "CompactionOutputs::WriterSyncClose() - %s" PRIu64,
+                   cfd->GetName().c_str(), job_id_, s.ToString().c_str());
+  }
 
   if (s.ok() && io_s.ok()) {
     file_checksum = meta->file_checksum;
