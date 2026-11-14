@@ -1,0 +1,1 @@
+Fixed single-column-family `DB::MultiGetEntity()` and `Transaction::MultiGet()` not returning `InvalidArgument` when `ReadOptions::timestamp` does not match the column family's timestamp setting or is below `full_history_ts_low`.

@@ -4719,9 +4719,28 @@ void DBImpl::MultiGetWithCallbackImpl(
   if (num_keys == 0) {
     return;
   }
+  const auto fail_all_keys = [sorted_keys](const Status& status) {
+    for (KeyContext* key : *sorted_keys) {
+      if (key->s->ok()) {
+        *key->s = status;
+      }
+    }
+  };
+
+  // Validate the read timestamp against the column family before
+  // MultiCFSnapshot, whose collapsed-history check assumes a correctly-sized
+  // timestamp. Mirrors the per-key check in GetImpl.
+  Status s = read_options.timestamp
+                 ? FailIfTsMismatchCf(column_family, *(read_options.timestamp))
+                 : FailIfCfHasTs(column_family);
+  if (!s.ok()) {
+    fail_all_keys(s);
+    return;
+  }
+
   SequenceNumber consistent_seqnum = kMaxSequenceNumber;
   bool sv_from_thread_local = false;
-  Status s = MultiCFSnapshot<std::array<ColumnFamilySuperVersionPair, 1>>(
+  s = MultiCFSnapshot<std::array<ColumnFamilySuperVersionPair, 1>>(
       read_options, callback,
       [](std::array<ColumnFamilySuperVersionPair, 1>::iterator& cf_iter) {
         return &(*cf_iter);
@@ -4729,6 +4748,7 @@ void DBImpl::MultiGetWithCallbackImpl(
       &cf_sv_pairs,
       /* extra_sv_ref */ false, &consistent_seqnum, &sv_from_thread_local);
   if (!s.ok()) {
+    fail_all_keys(s);
     return;
   }
 #ifndef NDEBUG
