@@ -5105,7 +5105,10 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
       // It also applies to access other states that DB owns.
       log_buffer.FlushBufferToLog();
       if (job_context.HaveSomethingToDelete()) {
-        PurgeObsoleteFiles(job_context);
+        // The Flush thread dedicated solely to Flush, don't perform Purge
+        // tasks.
+        bool schedule_only = thread_pri == Env::HIGH;
+        PurgeObsoleteFiles(job_context, schedule_only);
       }
       job_context.Clean();
       mutex_.Lock();

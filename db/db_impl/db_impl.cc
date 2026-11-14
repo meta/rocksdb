@@ -3050,9 +3050,13 @@ void DBImpl::SchedulePurge() {
   mutex_.AssertHeld();
   assert(opened_successfully_);
 
-  // Purge operations are put into High priority queue
+  // Purge operations are put into Low priority queue
   bg_purge_scheduled_++;
-  env_->Schedule(&DBImpl::BGWorkPurge, this, Env::Priority::HIGH, nullptr);
+  // Running both Flush and Purge operations in the HIGH Priority thread pool
+  // poses a risk. Compared to Purge, if Flush becomes slow, it can lead to
+  // Write Stop, which is an extremely severe issue. Therefore, Purge operations
+  // must use the LOW Priority thread pool.
+  env_->Schedule(&DBImpl::BGWorkPurge, this, Env::Priority::LOW, nullptr);
 }
 
 void DBImpl::BackgroundCallPurge() {
