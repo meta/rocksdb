@@ -65,6 +65,31 @@ void Java_org_rocksdb_IngestExternalFileOptions_setMoveFiles(
 
 /*
  * Class:     org_rocksdb_IngestExternalFileOptions
+ * Method:    failedMoveFallBackToCopy
+ * Signature: (J)Z
+ */
+jboolean Java_org_rocksdb_IngestExternalFileOptions_failedMoveFallBackToCopy(
+    JNIEnv*, jclass, jlong jhandle) {
+  auto* options =
+      reinterpret_cast<ROCKSDB_NAMESPACE::IngestExternalFileOptions*>(jhandle);
+  return static_cast<jboolean>(options->failed_move_fall_back_to_copy);
+}
+
+/*
+ * Class:     org_rocksdb_IngestExternalFileOptions
+ * Method:    setFailedMoveFallBackToCopy
+ * Signature: (JZ)V
+ */
+void Java_org_rocksdb_IngestExternalFileOptions_setFailedMoveFallBackToCopy(
+    JNIEnv*, jclass, jlong jhandle, jboolean jfailed_move_fall_back_to_copy) {
+  auto* options =
+      reinterpret_cast<ROCKSDB_NAMESPACE::IngestExternalFileOptions*>(jhandle);
+  options->failed_move_fall_back_to_copy =
+      static_cast<bool>(jfailed_move_fall_back_to_copy);
+}
+
+/*
+ * Class:     org_rocksdb_IngestExternalFileOptions
  * Method:    snapshotConsistency
  * Signature: (J)Z
  */
