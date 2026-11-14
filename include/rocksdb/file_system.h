@@ -816,15 +816,15 @@ class FileSystem : public Customizable {
 
   virtual IOStatus IsDirectory(const std::string& /*path*/,
                                const IOOptions& options, bool* is_dir,
-                               IODebugContext* /*dgb*/) = 0;
+                               IODebugContext* /*dbg*/) = 0;
 
   // Poll for completion of read IO requests. The Poll() method should call the
   // callback functions to indicate completion of read requests.
   // Underlying FS is required to support Poll API. Poll implementation should
   // ensure that the callback gets called at IO completion, and return only
   // after the callback has been called.
-  // If Poll returns partial results for any reads, its caller reponsibility to
-  // call Read or ReadAsync in order to get the remaining bytes.
+  // If Poll returns partial results for any reads, it's caller's responsibility
+  // to call Read or ReadAsync in order to get the remaining bytes.
   virtual IOStatus Poll(std::vector<void*>& /*io_handles*/,
                         size_t /*min_completions*/) {
     return IOStatus::OK();
@@ -843,7 +843,7 @@ class FileSystem : public Customizable {
   // directory and its descendants. Useful for distributed file systems
   // where the local cache may be out of sync with the actual directory state.
   //
-  // The implementation is not required to be thread safe. Its the caller's
+  // The implementation is not required to be thread safe. It's the caller's
   // responsibility to ensure that no directory operations happen
   // concurrently.
   virtual void DiscardCacheForDirectory(const std::string& /*path*/) {}
