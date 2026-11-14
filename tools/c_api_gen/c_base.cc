@@ -7190,6 +7190,15 @@ rocksdb_slicetransform_t* rocksdb_slicetransform_create_fixed_prefix(
   return wrapper;
 }
 
+rocksdb_slicetransform_t* rocksdb_slicetransform_create_capped_prefix(
+    size_t cap_len) {
+  SliceTransformWrapper* wrapper = new SliceTransformWrapper;
+  wrapper->rep_ = ROCKSDB_NAMESPACE::NewCappedPrefixTransform(cap_len);
+  wrapper->state_ = nullptr;
+  wrapper->destructor_ = &SliceTransformWrapper::DoNothing;
+  return wrapper;
+}
+
 rocksdb_slicetransform_t* rocksdb_slicetransform_create_noop() {
   SliceTransformWrapper* wrapper = new SliceTransformWrapper;
   wrapper->rep_ = ROCKSDB_NAMESPACE::NewNoopTransform();
