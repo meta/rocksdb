@@ -83,7 +83,31 @@ def tokenize(text: str) -> list[str]:
 
 
 def map_identifiers(tokens: list[str], mapping: dict[str, str]) -> list[str]:
-    return [mapping.get(tok, tok) for tok in tokens]
+    # Rename parameters only. A token right after `.`, `->` or `::` is a member
+    # or qualified name (e.g. the field in `opt->rep.move_files = move_files`),
+    # never a parameter, so it must keep its spelling.
+    return [
+        tok if i > 0 and tokens[i - 1] in (".", "->", "::") else mapping.get(tok, tok)
+        for i, tok in enumerate(tokens)
+    ]
+
+
+_DECLTYPE_ASSIGN_RE = re.compile(
+    r"(?P<lhs>[A-Za-z_][\w.>\-]*)\s*=\s*static_cast\s*<\s*decltype\s*\(\s*"
+    r"(?P=lhs)\s*\)\s*>\s*\((?P<rhs>[^;]*)\)\s*;"
+)
+
+
+def normalize_decltype_assignments(body: str) -> str:
+    """Rewrite `x = static_cast<decltype(x)>(e);` as `x = e;`.
+
+    Converting to the assignment target's own type is the conversion the
+    assignment performs anyway, so the two spellings are equivalent whenever
+    the plain assignment compiles.
+    """
+    return _DECLTYPE_ASSIGN_RE.sub(
+        lambda m: f"{m.group('lhs')} = {m.group('rhs')};", body
+    )
 
 
 def normalize_return_casts(body: str, return_type: str) -> str:
@@ -93,6 +117,267 @@ def normalize_return_casts(body: str, return_type: str) -> str:
         re.S,
     )
     return pattern.sub(lambda m: f"return {m.group(1).strip()};", body)
+
+
+_LOSSLESS_CAST_RE = re.compile(
+    r"\b(?:ROCKSDB_NAMESPACE\s*::\s*)?lossless_cast\s*<(?P<to>[^<>*]+)>"
+)
+
+
+def normalize_lossless_casts(body: str) -> str:
+    """Rewrite `lossless_cast<T>(e)` as `static_cast<T>(e)` for non-pointer T.
+
+    For a non-pointer target, lossless_cast (util/cast_util.h) is static_cast
+    plus compile-time size checks, so the runtime behavior is the same.
+    """
+    return _LOSSLESS_CAST_RE.sub(lambda m: f"static_cast<{m.group('to')}>", body)
+
+
+_SOLE_RETURN_RE = re.compile(r"\{\s*return\s+(?P<expr>[^;{}]+);\s*\}")
+
+
+def normalize_void_returns(body: str, return_type: str) -> str:
+    """In a void function, a body of just `return e;` is `e;`.
+
+    C++ only accepts `return e;` in a void function when e is itself void.
+    Only a whole one-statement body is rewritten, so a `return` inside a
+    lambda is never touched.
+    """
+    if normalize_space(return_type) != "void":
+        return body
+    m = _SOLE_RETURN_RE.fullmatch(body.strip())
+    return f"{{ {m.group('expr')}; }}" if m else body
+
+
+_GUARDED_DELETE_RE = re.compile(
+    r"\bif\s*\(\s*(?P<p>[A-Za-z_][\w.>\-]*)\s*\)\s*"
+    r"(?:\{\s*delete\s+(?P=p)\s*;\s*\}|delete\s+(?P=p)\s*;)"
+    r"(?!\s*else\b)"
+)
+
+
+def normalize_guarded_deletes(body: str) -> str:
+    """Rewrite `if (p) { delete p; }` as `delete p;`.
+
+    Deleting a null pointer does nothing, so the guard never changes what
+    happens. An `if` with an `else` branch is left alone.
+    """
+    return _GUARDED_DELETE_RE.sub(lambda m: f"delete {m.group('p')};", body)
+
+
+_RETURN_LOCAL_RE = re.compile(
+    r"\{\s*[A-Za-z_][\w:]*\s*\*\s*(?P<v>[A-Za-z_]\w*)\s*=\s*(?P<expr>[^;{}]+);"
+    r"\s*return\s+(?P=v)\s*;\s*\}"
+)
+
+
+def normalize_returned_locals(body: str) -> str:
+    """A body of just `T* v = e; return v;` is `return e;`.
+
+    Only a whole two-statement body is rewritten, so v cannot be used
+    anywhere else.
+    """
+    m = _RETURN_LOCAL_RE.fullmatch(body.strip())
+    return f"{{ return {m.group('expr').strip()}; }}" if m else body
+
+
+_OPTIONAL_SLICE_RE = re.compile(
+    r"\(\s*(?P<p>[A-Za-z_]\w*)\s*\?\s*\(\s*(?P<v>[A-Za-z_]\w*)\s*=\s*Slice\s*"
+    r"\(\s*(?P=p)\s*,\s*(?P<n>[A-Za-z_]\w*)\s*\)\s*,\s*&\s*(?P=v)\s*\)\s*:\s*"
+    r"nullptr\s*\)"
+)
+
+
+def _may_write(name: str, body: str) -> bool:
+    """Whether body assigns name, increments it or takes its address."""
+    n = re.escape(name)
+    return bool(
+        re.search(
+            rf"(?:\+\+|--)\s*\b{n}\b"
+            rf"|\b{n}\s*(?:\+\+|--|(?:<<|>>|[-+*/%&|^])?=(?!=))"
+            rf"|(?:^|[({{;,=]|\breturn)\s*&\s*{n}\b",
+            body,
+        )
+    )
+
+
+def normalize_optional_slices(body: str) -> str:
+    """Rewrite `Slice v; ... (p ? (v = Slice(p, n), &v) : nullptr)` as
+    `Slice v(p, n); ... p ? &v : nullptr`.
+
+    Slice's constructor only stores the pointer and the length, so building v
+    before the null check passes the same pointer to the same contents. The
+    rewrite only applies when v is declared once and used nowhere else, and
+    nothing in the body writes p or n.
+    """
+    for m in list(_OPTIONAL_SLICE_RE.finditer(body)):
+        p, v, n = m.group("p", "v", "n")
+        decl = re.compile(rf"\bSlice\s+{v}\s*;")
+        # Three tokens: the declaration, the assignment and the address.
+        if (
+            decl.search(body) is None
+            or tokenize(body).count(v) != 3
+            or _may_write(p, body)
+            or _may_write(n, body)
+        ):
+            continue
+        body = decl.sub(f"Slice {v}({p}, {n});", body, count=1)
+        body = body.replace(m.group(0), f"{p} ? &{v} : nullptr", 1)
+    return body
+
+
+def normalized_body_tokens(
+    body: str,
+    return_type: str,
+    mapping: dict[str, str] | None = None,
+    pointers: frozenset[str] = frozenset(),
+) -> list[str]:
+    body = normalize_lossless_casts(body)
+    body = normalize_optional_slices(body)
+    body = normalize_guarded_deletes(body)
+    body = normalize_returned_locals(body)
+    body = normalize_void_returns(body, return_type)
+    body = normalize_decltype_assignments(normalize_return_casts(body, return_type))
+    tokens = drop_redundant_parens(
+        normalize_pointer_conditions(tokenize(body), pointers)
+    )
+    return map_identifiers(tokens, mapping) if mapping else tokens
+
+
+# The tokens that can come right before and right after a whole operand of
+# `&&`, `||` or the condition of `?:`.
+_OPERAND_BEFORE = {"(", "=", "return", ",", "?", ":", "&&", "||", "{", ";"}
+_OPERAND_AFTER = {")", ";", ",", "?", ":", "&&", "||"}
+
+
+def normalize_pointer_conditions(
+    tokens: list[str], pointers: frozenset[str]
+) -> list[str]:
+    """Rewrite a pointer parameter `p` used as a condition as `p != nullptr`.
+
+    A pointer converts to bool by comparing it with nullptr. Only a whole
+    operand of `&&` or `||`, the whole condition of `?:`, or the whole
+    condition of an `if` or `while` is rewritten, so `!p`, `f(p)` and `x = p`
+    keep their spelling.
+    """
+    out = []
+    for i, tok in enumerate(tokens):
+        out.append(tok)
+        if tok not in pointers:
+            continue
+        # A member `t->p` never matches: `.`, `->` and `::` are not in
+        # _OPERAND_BEFORE.
+        before = tokens[i - 1] if i > 0 else ";"
+        after = tokens[i + 1] if i + 1 < len(tokens) else ";"
+        if before not in _OPERAND_BEFORE or after not in _OPERAND_AFTER:
+            continue
+        logical = before in ("&&", "||") or after in ("&&", "||", "?")
+        sole = (
+            before == "("
+            and after == ")"
+            and i > 1
+            and tokens[i - 2] in ("if", "while")
+        )
+        if logical or sole:
+            out += ["!=", "nullptr"]
+    return out
+
+
+def drop_redundant_parens(tokens: list[str]) -> list[str]:
+    """Rewrite `= (e);` and `return (e);` as `= e;` and `return e;`.
+
+    Parentheses around a whole right-hand side or return value change
+    nothing, unless e has a top-level comma, which would then become the
+    comma operator; those are kept.
+    """
+    out = list(tokens)
+    i = 0
+    while i + 1 < len(out):
+        if out[i] in ("=", "return") and out[i + 1] == "(":
+            depth, j, comma = 0, i + 1, False
+            while j < len(out):
+                if out[j] in ("(", "[", "{"):
+                    depth += 1
+                elif out[j] in (")", "]", "}"):
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif out[j] == "," and depth == 1:
+                    comma = True
+                j += 1
+            if j + 1 < len(out) and out[j] == ")" and out[j + 1] == ";" and not comma:
+                del out[j]
+                del out[i + 1]
+                continue
+        i += 1
+    return out
+
+
+# A local declared at the start of a statement: `T v;`, `const T& v = ...`,
+# `T* v = new T`, `Slice v(p, n);`.
+_LOCAL_DECL_RE = re.compile(
+    r"(?:^|(?<=[;{}]))\s*"
+    r"(?P<t>(?!(?:return|delete|throw|else|goto|case|new)\b)"
+    r"(?:const\s+)?[A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?"
+    r"(?:\s*[*&]+\s*(?:const\s+)?|\s+))"
+    r"(?P<v>[A-Za-z_]\w*)(?=\s*[=;({])"
+)
+
+
+def local_renames(ref_body: str, gen_body: str) -> dict[str, str]:
+    """Pair the locals both bodies declare, by declared type and then order.
+
+    The generated body names its new handle `result`, where a hand-written
+    one may have said `meta` or `c`.
+    Renaming a local never changes what a body does, so a wrong pairing can
+    only make two equivalent bodies compare unequal; bodies_equivalent
+    rejects the one unsafe case, a new name that is already taken.
+    """
+    gen: dict[str, list[str]] = {}
+    for m in _LOCAL_DECL_RE.finditer(strip_comments(gen_body)):
+        gen.setdefault(" ".join(m.group("t").split()), []).append(m.group("v"))
+    renames = {}
+    for m in _LOCAL_DECL_RE.finditer(strip_comments(ref_body)):
+        names = gen.get(" ".join(m.group("t").split()))
+        if names:
+            g = names.pop(0)
+            if g != m.group("v"):
+                renames[m.group("v")] = g
+    return renames
+
+
+def bodies_equivalent(ref_def: "FunctionDef", gen_def: "FunctionDef") -> bool:
+    """Token-equal bodies after parameter and local renames and the
+    normalizations above."""
+    mapping = local_renames(ref_def.body, gen_def.body)
+    mapping.update(
+        (ref_name, gen_name)
+        for ref_name, gen_name in zip(ref_def.param_names, gen_def.param_names)
+        if ref_name and gen_name
+    )
+    # A rename into a name the reference body already uses for something
+    # else would merge two variables.
+    ref_tokens = tokenize(ref_def.body)
+    free = {
+        tok
+        for i, tok in enumerate(ref_tokens)
+        if not (i > 0 and ref_tokens[i - 1] in (".", "->", "::"))
+    }
+    if (free - mapping.keys()) & set(mapping.values()):
+        return False
+    return normalized_body_tokens(
+        ref_def.body, gen_def.return_type, mapping, pointer_params(ref_def)
+    ) == normalized_body_tokens(
+        gen_def.body, gen_def.return_type, pointers=pointer_params(gen_def)
+    )
+
+
+def pointer_params(fn: "FunctionDef") -> frozenset[str]:
+    return frozenset(
+        name
+        for name, type_ in zip(fn.param_names, fn.param_types)
+        if name and normalize_space(type_).endswith("*")
+    )
 
 
 def find_matching(text: str, start: int, open_ch: str, close_ch: str) -> int:
@@ -138,7 +423,11 @@ def find_signature_start(text: str, pos: int) -> int:
             break
         if prev_line.startswith("//"):
             break
-        if prev_line.endswith(";") or prev_line.endswith("}") or prev_line.endswith("{"):
+        if (
+            prev_line.endswith(";")
+            or prev_line.endswith("}")
+            or prev_line.endswith("{")
+        ):
             break
         start = prev_start
     return start
@@ -292,7 +581,7 @@ def extract_function_defs(text: str) -> dict[str, FunctionDef]:
             pos = m.end(1)
             continue
         sig_start = find_signature_start(text, m.start(1))
-        signature = text[sig_start:paren_end + 1]
+        signature = text[sig_start : paren_end + 1]
         body_end = find_matching(text, body_start, "{", "}")
         body = text[body_start : body_end + 1]
         try:
@@ -392,16 +681,7 @@ def compare_sources(
                     f"({', '.join(ref_def.param_types)})"
                 )
                 continue
-            mapping = {
-                ref_name: gen_name
-                for ref_name, gen_name in zip(ref_def.param_names, generated.param_names)
-                if ref_name and gen_name
-            }
-            ref_body = normalize_return_casts(ref_def.body, generated.return_type)
-            gen_body = normalize_return_casts(generated.body, generated.return_type)
-            ref_tokens = map_identifiers(tokenize(ref_body), mapping)
-            gen_tokens = tokenize(gen_body)
-            if ref_tokens != gen_tokens:
+            if not bodies_equivalent(ref_def, generated):
                 failures.append(f"[source body mismatch] {name}")
     return failures
 

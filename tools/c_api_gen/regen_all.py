@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 GEN = ROOT / "tools/c_api_gen/generate_c_api.py"
 AUTO_GEN = ROOT / "tools/c_api_gen/auto_simple_bindings.py"
+HANDLE_GEN = ROOT / "tools/c_api_gen/handle_bindings.py"
 ROUNDTRIP_GEN = ROOT / "tools/c_api_gen/gen_roundtrip_tests.py"
 SPEC = ROOT / "tools/c_api_gen/spec.json"
 GENERATED_ROOT = ROOT / "c_api_gen"
@@ -25,29 +26,9 @@ CLANG_FORMAT_STYLE_FILE = ROOT / ".clang-format"
 
 JOBS = [
     (
-        ["DB data operations", "WriteBatch", "Transaction", "TransactionDB simple"],
-        GENERATED_ROOT / "c_generated_subset.h.inc",
-        GENERATED_ROOT / "c_generated_subset.cc.inc",
-    ),
-    (
         ["DB data operations"],
         GENERATED_ROOT / "c_generated_db_simple_subset.h.inc",
         GENERATED_ROOT / "c_generated_db_simple_subset.cc.inc",
-    ),
-    (
-        ["WriteBatch"],
-        GENERATED_ROOT / "c_generated_writebatch_subset.h.inc",
-        GENERATED_ROOT / "c_generated_writebatch_subset.cc.inc",
-    ),
-    (
-        ["Transaction"],
-        GENERATED_ROOT / "c_generated_transaction_subset.h.inc",
-        GENERATED_ROOT / "c_generated_transaction_subset.cc.inc",
-    ),
-    (
-        ["TransactionDB simple"],
-        GENERATED_ROOT / "c_generated_transactiondb_subset.h.inc",
-        GENERATED_ROOT / "c_generated_transactiondb_subset.cc.inc",
     ),
     (
         ["BlockBasedOptions simple"],
@@ -301,6 +282,9 @@ def main() -> int:
         run_job(sections, header_out, source_out)
     subprocess.run(
         [sys.executable, str(AUTO_GEN), "--clang", clang], cwd=ROOT, check=True
+    )
+    subprocess.run(
+        [sys.executable, str(HANDLE_GEN), "--clang", clang], cwd=ROOT, check=True
     )
     format_generated_outputs(args.clang_format)
     generate_c_h()

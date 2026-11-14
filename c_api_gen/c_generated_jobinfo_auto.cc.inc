@@ -74,12 +74,13 @@ uint64_t rocksdb_flushjobinfo_largest_seqno(
 }
 
 uint32_t rocksdb_flushjobinfo_flush_reason(const rocksdb_flushjobinfo_t* info) {
-  return static_cast<uint32_t>(info->rep.flush_reason);
+  return ROCKSDB_NAMESPACE::lossless_cast<uint32_t>(info->rep.flush_reason);
 }
 
 uint32_t rocksdb_flushjobinfo_blob_compression_type(
     const rocksdb_flushjobinfo_t* info) {
-  return static_cast<uint32_t>(info->rep.blob_compression_type);
+  return ROCKSDB_NAMESPACE::lossless_cast<uint32_t>(
+      info->rep.blob_compression_type);
 }
 
 /* CompactionJobInfo */
@@ -132,17 +133,19 @@ int rocksdb_compactionjobinfo_output_level(
 
 uint32_t rocksdb_compactionjobinfo_compaction_reason(
     const rocksdb_compactionjobinfo_t* info) {
-  return static_cast<uint32_t>(info->rep.compaction_reason);
+  return ROCKSDB_NAMESPACE::lossless_cast<uint32_t>(
+      info->rep.compaction_reason);
 }
 
 uint32_t rocksdb_compactionjobinfo_compression(
     const rocksdb_compactionjobinfo_t* info) {
-  return static_cast<uint32_t>(info->rep.compression);
+  return ROCKSDB_NAMESPACE::lossless_cast<uint32_t>(info->rep.compression);
 }
 
 uint32_t rocksdb_compactionjobinfo_blob_compression_type(
     const rocksdb_compactionjobinfo_t* info) {
-  return static_cast<uint32_t>(info->rep.blob_compression_type);
+  return ROCKSDB_NAMESPACE::lossless_cast<uint32_t>(
+      info->rep.blob_compression_type);
 }
 
 unsigned char rocksdb_compactionjobinfo_aborted(
@@ -201,17 +204,19 @@ int rocksdb_subcompactionjobinfo_output_level(
 
 uint32_t rocksdb_subcompactionjobinfo_compaction_reason(
     const rocksdb_subcompactionjobinfo_t* info) {
-  return static_cast<uint32_t>(info->rep.compaction_reason);
+  return ROCKSDB_NAMESPACE::lossless_cast<uint32_t>(
+      info->rep.compaction_reason);
 }
 
 uint32_t rocksdb_subcompactionjobinfo_compression(
     const rocksdb_subcompactionjobinfo_t* info) {
-  return static_cast<uint32_t>(info->rep.compression);
+  return ROCKSDB_NAMESPACE::lossless_cast<uint32_t>(info->rep.compression);
 }
 
 uint32_t rocksdb_subcompactionjobinfo_blob_compression_type(
     const rocksdb_subcompactionjobinfo_t* info) {
-  return static_cast<uint32_t>(info->rep.blob_compression_type);
+  return ROCKSDB_NAMESPACE::lossless_cast<uint32_t>(
+      info->rep.blob_compression_type);
 }
 
 /* ExternalFileIngestionInfo */
