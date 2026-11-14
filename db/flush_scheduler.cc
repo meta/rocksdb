@@ -23,7 +23,7 @@ void FlushScheduler::ScheduleWork(ColumnFamilyData* cfd) {
 // Suppress false positive clang analyzer warnings.
 #ifndef __clang_analyzer__
   Node* node = new Node{cfd, head_.load(std::memory_order_relaxed)};
-  while (!head_.compare_exchange_strong(
+  while (!head_.compare_exchange_weak(
       node->next, node, std::memory_order_relaxed, std::memory_order_relaxed)) {
     // failing CAS updates the first param, so we are already set for
     // retry.  TakeNextColumnFamily won't happen until after another
