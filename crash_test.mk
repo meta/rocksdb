@@ -16,6 +16,7 @@ endif
 
 CRASHTEST_MAKE=$(MAKE) -f crash_test.mk
 CRASHTEST_PY=$(PYTHON) -u tools/db_crashtest.py --stress_cmd=$(DB_STRESS_CMD) --cleanup_cmd='$(DB_CLEANUP_CMD)' --destroy_db_initially=1
+export CRASH_TEST_EXT_ARGS
 
 .PHONY: crash_test crash_test_with_atomic_flush crash_test_with_txn \
 	crash_test_with_wc_txn crash_test_with_wp_txn crash_test_with_wup_txn \
@@ -27,6 +28,8 @@ CRASHTEST_PY=$(PYTHON) -u tools/db_crashtest.py --stress_cmd=$(DB_STRESS_CMD) --
 	crash_test_with_tiered_storage \
 	crash_test_with_full_external_table \
 	liveness_crash_test \
+	simple_blackbox_crash_test std_blackbox_crash_test \
+	simple_whitebox_crash_test std_whitebox_crash_test \
 	blackbox_crash_test blackbox_crash_test_with_atomic_flush \
 	blackbox_crash_test_with_wc_txn blackbox_crash_test_with_wp_txn \
 	blackbox_crash_test_with_wup_txn \
@@ -102,9 +105,19 @@ crash_test_with_multiops_wup_txn: $(DB_STRESS_CMD)
 liveness_crash_test: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) liveness $(CRASH_TEST_EXT_ARGS)
 
-blackbox_crash_test: $(DB_STRESS_CMD)
+# Leaf targets: exactly one db_crashtest.py invocation each, so a CI system can
+# schedule them as separate jobs. blackbox_crash_test remains the aggregate for
+# open source CI and local runs.
+simple_blackbox_crash_test: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --simple blackbox $(CRASH_TEST_EXT_ARGS)
+
+std_blackbox_crash_test: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) blackbox $(CRASH_TEST_EXT_ARGS)
+
+blackbox_crash_test: $(DB_STRESS_CMD)
+# Do not parallelize
+	$(CRASHTEST_MAKE) simple_blackbox_crash_test
+	$(CRASHTEST_MAKE) std_blackbox_crash_test
 
 blackbox_crash_test_with_atomic_flush: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --cf_consistency blackbox $(CRASH_TEST_EXT_ARGS)
@@ -146,11 +159,21 @@ ifeq ($(CRASH_TEST_KILL_ODD),)
   CRASH_TEST_KILL_ODD=888887
 endif
 
-whitebox_crash_test: $(DB_STRESS_CMD)
+# Leaf targets: exactly one db_crashtest.py invocation each, so a CI system can
+# schedule them as separate jobs. whitebox_crash_test remains the aggregate for
+# open source CI and local runs.
+simple_whitebox_crash_test: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --simple whitebox --random_kill_odd \
       $(CRASH_TEST_KILL_ODD) $(CRASH_TEST_EXT_ARGS)
+
+std_whitebox_crash_test: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) whitebox  --random_kill_odd \
       $(CRASH_TEST_KILL_ODD) $(CRASH_TEST_EXT_ARGS)
+
+whitebox_crash_test: $(DB_STRESS_CMD)
+# Do not parallelize
+	$(CRASHTEST_MAKE) simple_whitebox_crash_test
+	$(CRASHTEST_MAKE) std_whitebox_crash_test
 
 whitebox_crash_test_with_atomic_flush: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --cf_consistency whitebox  --random_kill_odd \
