@@ -247,6 +247,11 @@ early_argument_parsing_before_main()
 #   for full external table:
 #       default_params < blackbox_default_params <
 #       full_external_table_params < args
+#   for structured key-value:
+#       default_params < {blackbox,whitebox}_default_params <
+#       structured_key_value_params < args
+#   with --table_factory_uri:
+#       ... < custom_table_factory_params < args
 # Liveness mode reapplies liveness_fault_injection_params after args so the
 # base liveness profile cannot accidentally turn fault injection back on.
 
@@ -1059,6 +1064,54 @@ full_external_table_params = {
     "use_timed_put_one_in": 0,
     # External tables reject user-defined timestamps in keys and comparators.
     "user_timestamp_size": 0,
+}
+
+structured_key_value_params = {
+    "structured_key_value": 1,
+    "structured_keys_per_key_space": lambda: random.choice([16, 256, 4096, 65536]),
+    "structured_key_fanout": lambda: random.choice([1, 3, 16, 1024]),
+    "structured_key_space_type_weights": lambda: random.choice(
+        ["2,3,2", "1,1,1,1,1,1,1,1", "1,4", "0,1,1"]
+    ),
+    "structured_value_version_weights": lambda: random.choice(
+        [
+            "1:30,2:30,3:20,4:3,5:8,6:4,7:3,128:2",
+            "1:1,2:1,3:1",
+            "2:10,6:10,10:10,12:1,201:1",
+        ]
+    ),
+    # Structured keys are at least 12 bytes.
+    "prefix_size": lambda: random.choice([-1, 4, 8, 12]),
+    # The batched-ops test generates its own keys.
+    "test_batches_snapshots": 0,
+}
+
+# Applied when --table_factory_uri selects a table factory other than the
+# default block-based one.
+custom_table_factory_params = {
+    # Backup verification and remote compaction workers recreate the table
+    # factory from its name, without the rest of the URI.
+    "backup_one_in": 0,
+    "remote_compaction_worker_threads": 0,
+    "column_families": 1,
+    # RocksDB permits TTL and periodic compaction only for block-based
+    # factories.
+    "compaction_ttl": 0,
+    "periodic_compaction_seconds": 0,
+    # Aggregated table properties need block-based tables.
+    "get_property_one_in": 0,
+    "get_properties_of_all_tables_one_in": 0,
+    # Embedded-blob SST writing requires direct block-based table options.
+    "ingest_external_file_with_embedded_blobs": 0,
+    # The randomized option table includes a block_based_table_factory update.
+    "set_options_one_in": 0,
+    # External tables support neither backward iteration, nor timestamps, nor
+    # sequence-number-to-time mappings.
+    "test_backward_scan": 0,
+    "use_timed_put_one_in": 0,
+    "user_timestamp_size": 0,
+    "preclude_last_level_data_seconds": 0,
+    "preserve_internal_time_seconds": 0,
 }
 
 cf_consistency_params = {
@@ -2299,6 +2352,8 @@ def finalize_and_sanitize(src_params):
 
 def gen_cmd_params(args, unknown_params=None):
     params = {}
+    test_structured_key_value = getattr(args, "test_structured_key_value", False)
+    table_factory_uri = getattr(args, "table_factory_uri", None)
 
     params.update(default_params)
     if args.test_type == "blackbox":
@@ -2331,6 +2386,10 @@ def gen_cmd_params(args, unknown_params=None):
         params.update(tiered_params)
     if args.test_full_external_table:
         params.update(full_external_table_params)
+    if test_structured_key_value:
+        params.update(structured_key_value_params)
+    if table_factory_uri:
+        params.update(custom_table_factory_params)
 
     # These specialized profiles use fixed table configurations. Otherwise,
     # apply a blob feature override with a 10% chance.
@@ -2338,6 +2397,7 @@ def gen_cmd_params(args, unknown_params=None):
         not args.test_best_efforts_recovery
         and not args.test_tiered_storage
         and not args.test_full_external_table
+        and not table_factory_uri
         and args.test_type != "liveness"
         and not args.cf_lifecycle
         and params.get("test_secondary", 0) == 0
@@ -2500,6 +2560,7 @@ def gen_cmd(params, unknown_params):
                 "stress_cmd",
                 "test_tiered_storage",
                 "test_full_external_table",
+                "test_structured_key_value",
                 "cleanup_cmd",
                 "print_stderr_separately",
                 "verify_timeout",
@@ -3389,6 +3450,8 @@ def main():
     parser.add_argument("--stress_cmd")
     parser.add_argument("--test_tiered_storage", action="store_true")
     parser.add_argument("--test_full_external_table", action="store_true")
+    parser.add_argument("--test_structured_key_value", action="store_true")
+    parser.add_argument("--table_factory_uri", type=str)
     parser.add_argument("--cleanup_cmd")  # ignore old option for now
     parser.add_argument("--print_stderr_separately", action="store_true", default=False)
     parser.add_argument(
@@ -3416,6 +3479,8 @@ def main():
         + list(cf_lifecycle_params.items())
         + list(tiered_params.items())
         + list(full_external_table_params.items())
+        + list(structured_key_value_params.items())
+        + list(custom_table_factory_params.items())
         + list(txn_params.items())
         + list(optimistic_txn_params.items())
     )
