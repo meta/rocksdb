@@ -71,7 +71,6 @@ TEST_F(CompactFilesTest, L0ConflictsFiles) {
   // Small slowdown and stop trigger for experimental purpose.
   options.level0_slowdown_writes_trigger = 20;
   options.level0_stop_writes_trigger = 20;
-  options.level0_stop_writes_trigger = 20;
   options.write_buffer_size = kWriteBufferSize;
   options.level0_file_num_compaction_trigger = kLevel0Trigger;
   options.compression = kNoCompression;
