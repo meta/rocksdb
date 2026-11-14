@@ -158,12 +158,9 @@ Status BlobDBImpl::Open(std::vector<ColumnFamilyHandle*>* handles) {
 
   // Temporarily disable compactions in the base DB during open; save the user
   // defined value beforehand so we can restore it once BlobDB is initialized.
-  // Note: this is only needed if garbage collection is enabled.
+  // Compaction listeners access db_, which is not set until DB::Open returns.
   const bool disable_auto_compactions = cf_options_.disable_auto_compactions;
-
-  if (bdb_options_.enable_garbage_collection) {
-    cf_options_.disable_auto_compactions = true;
-  }
+  cf_options_.disable_auto_compactions = true;
 
   // Create info log.
   if (db_options_.info_log == nullptr) {
@@ -224,6 +221,7 @@ Status BlobDBImpl::Open(std::vector<ColumnFamilyHandle*>* handles) {
   std::unique_ptr<DB> db;
   s = DB::Open(db_options_, dbname_, {cf_descriptor}, handles, &db);
   if (s.ok()) {
+    TEST_SYNC_POINT_CALLBACK("BlobDBImpl::Open:BaseDBOpened", db.get());
     shared_db_ptr_ = std::move(db);
     db_ = shared_db_ptr_.get();
   }
@@ -266,17 +264,6 @@ Status BlobDBImpl::Open(std::vector<ColumnFamilyHandle*>* handles) {
     InitializeBlobFileToSstMapping(live_files);
 
     MarkUnreferencedBlobFilesObsoleteDuringOpen();
-
-    if (!disable_auto_compactions) {
-      s = db_->EnableAutoCompaction(*handles);
-      if (!s.ok()) {
-        ROCKS_LOG_ERROR(
-            db_options_.info_log,
-            "Failed to enable automatic compactions during open, status: %s",
-            s.ToString().c_str());
-        return s;
-      }
-    }
   }
 
   // Add trash files in blob dir to file delete scheduler.
@@ -291,6 +278,17 @@ Status BlobDBImpl::Open(std::vector<ColumnFamilyHandle*>* handles) {
   }
 
   UpdateLiveSSTSize();
+
+  if (!disable_auto_compactions) {
+    s = db_->EnableAutoCompaction(*handles);
+    if (!s.ok()) {
+      ROCKS_LOG_ERROR(
+          db_options_.info_log,
+          "Failed to enable automatic compactions during open, status: %s",
+          s.ToString().c_str());
+      return s;
+    }
+  }
 
   // Start background jobs.
   if (!bdb_options_.disable_background_tasks) {
