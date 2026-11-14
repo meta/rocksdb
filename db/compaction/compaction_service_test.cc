@@ -4339,6 +4339,65 @@ TEST_F(CompactionServiceTest, CorruptedOutput) {
   ASSERT_TRUE(result.stats.is_remote_compaction);
 }
 
+TEST_F(CompactionServiceTest, CorruptedOutputChecksumOnly) {
+  // File Content is not corrupted, but when the file level checksum mismatches
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionServiceCompactionJob::Run:0", [&](void* arg) {
+        CompactionServiceResult* compaction_result =
+            *(static_cast<CompactionServiceResult**>(arg));
+        ASSERT_TRUE(compaction_result != nullptr &&
+                    !compaction_result->output_files.empty());
+        // Corrupt file checksum here
+        for (auto& output_file : compaction_result->output_files) {
+          std::string file_name =
+              compaction_result->output_path + "/" + output_file.file_name;
+
+          // Before corrupting checksum, make sure SST files are good
+          ASSERT_TRUE(output_file.file_checksum.length() > 0);
+          ASSERT_OK(VerifySstFileChecksum(options, EnvOptions{}, file_name));
+
+          // Corrupt the checksum
+          output_file.file_checksum = std::string("C0rrupted");
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // TODO - CompactRange() should fail, but currently doesn't
+  Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
+  if (s.ok()) {
+    // DB now contains SST file(s) with mismatching checksum
+    ASSERT_NOK(db_->VerifyFileChecksums(ReadOptions()));
+  }
+
+  // TODO - uncomment these after file checksum verification is added
+  // ASSERT_NOK(s);
+  // ASSERT_TRUE(s.IsCorruption());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // On the worker side, the compaction is considered success
+  // Verification is done on the primary side
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+}
+
 TEST_F(CompactionServiceTest, CorruptedOutputParanoidFileCheck) {
   for (bool paranoid_file_check_enabled : {false, true}) {
     SCOPED_TRACE("paranoid_file_check_enabled=" +
