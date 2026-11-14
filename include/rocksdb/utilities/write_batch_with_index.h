@@ -49,6 +49,7 @@ struct WriteEntry {
   WriteType type = kUnknownRecord;
   Slice key;
   Slice value;
+  Slice timestamp;
 };
 
 // Iterator of one column family out of a WriteBatchWithIndex.
@@ -116,10 +117,30 @@ class WriteBatchWithIndex : public WriteBatchBase {
   //                show two entries with the same key.
   //                Note that for Merge, it's added as a new update instead
   //                of overwriting the existing one.
+  // require_timestamps: If true, then WriteBatchWithIndex will require
+  //                     timestamps be specified for mutations to column
+  //                     families that have timestamps. In other words, when
+  //                     true, it is invalid to call Put() without a timestamp
+  //                     on a column family that has timestamps enabled.
+  //                     Likewise, when false, it is an error to call Put() with
+  //                     a timestamp on a column family that has timestamps
+  //                     enabled.
+  //
+  //                     Note that regardless of whether require_timestamps is
+  //                     true or false, read semantics are RYOW. In other words,
+  //                     its as-if your read timesstamp is the max written
+  //                     timestamp in the batch. A timestamp specified in
+  //                     read_options affects visibility of records in the DB,
+  //                     but not in the batch.
+  //
+  //                     IMPORTANT: UpdateTimestamps() need not be called with
+  //                     require_timestamps=true and will overwrite any
+  //                     timestamps supplied at mutation time.
   explicit WriteBatchWithIndex(
       const Comparator* backup_index_comparator = BytewiseComparator(),
       size_t reserved_bytes = 0, bool overwrite_key = false,
-      size_t max_bytes = 0, size_t protection_bytes_per_key = 0);
+      size_t max_bytes = 0, size_t protection_bytes_per_key = 0,
+      bool require_timestamps = false);
 
   ~WriteBatchWithIndex() override;
   WriteBatchWithIndex(WriteBatchWithIndex&&);
