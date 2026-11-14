@@ -158,6 +158,9 @@ jobjectArray MultiGetJNIValues::byteArrays(
       }
 
       env->DeleteLocalRef(jentry_value);
+    } else if (s[i].code() == ROCKSDB_NAMESPACE::Status::Code::kCorruption) {
+      ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s[i]);
+      return nullptr;
     } else if (s[i].code() != ROCKSDB_NAMESPACE::Status::Code::kNotFound) {
       // The only way to return an error for a single key is to exception the
       // entire multiGet() Previous behaviour was to return a nullptr value for
