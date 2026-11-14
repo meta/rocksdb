@@ -24,6 +24,8 @@ public class KeyMayExistTest {
   @Rule
   public TemporaryFolder dbFolder = new TemporaryFolder();
 
+  @Rule public TemporaryFolder dbFolder2 = new TemporaryFolder();
+
   @Rule public ExpectedException exceptionRule = ExpectedException.none();
 
   List<ColumnFamilyDescriptor> cfDescriptors;
@@ -540,5 +542,41 @@ public class KeyMayExistTest {
 
     exists = db.keyMayExist("key".getBytes(UTF_8), null);
     assertThat(exists).isTrue();
+  }
+
+  /*
+    This test was created to verify bug with keyMaye exist and value_found.
+    It's probabilistic and expect that SST files are not loaded immediately to memory
+    after database opening.
+   */
+  @Test
+  public void keyMayExistNoCache() throws RocksDBException {
+    byte[] key = "key".getBytes(UTF_8);
+    byte[] value = "value".getBytes(UTF_8);
+
+    try (RocksDB db2 = RocksDB.open(dbFolder2.getRoot().getAbsolutePath())) {
+      db2.put(key, value);
+      db2.compactRange();
+    }
+
+    try (RocksDB db2 = RocksDB.open(dbFolder2.getRoot().getAbsolutePath())) {
+      Holder<byte[]> holder = new Holder<>();
+
+      boolean exists = db2.keyMayExist("key".getBytes(UTF_8), holder);
+
+      assertThat(exists).isTrue();
+
+      // keys is not in cache, so returned value must be null;
+      assertThat(holder.getValue()).isNull();
+
+      byte[] returned_value = db2.get(key);
+
+      assertThat(returned_value).isEqualTo(value);
+
+      exists = db2.keyMayExist("key".getBytes(UTF_8), holder);
+      assertThat(exists).isTrue();
+      // key is in cache, it should return value
+      assertThat(holder.getValue()).isEqualTo(value);
+    }
   }
 }

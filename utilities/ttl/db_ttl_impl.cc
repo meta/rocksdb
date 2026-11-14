@@ -6,6 +6,7 @@
 #include "utilities/ttl/db_ttl_impl.h"
 
 #include <array>
+#include <iostream>
 #include <memory>
 #include <utility>
 
