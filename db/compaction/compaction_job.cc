@@ -61,6 +61,7 @@
 #include "table/meta_blocks.h"
 #include "table/table_builder.h"
 #include "table/unique_id_impl.h"
+#include "table/block_based/block_based_table_reader.h"
 #include "test_util/sync_point.h"
 #include "util/defer.h"
 #include "util/hash_containers.h"
@@ -3138,10 +3139,34 @@ bool CompactionJob::UpdateInternalStatsFromInputFiles(
       }
       internal_stats_.output_level_stats.num_input_records +=
           file_input_entries;
-      if (num_input_range_del) {
-        *num_input_range_del += file_num_range_del;
+      if (file_num_range_del == 0 &&
+          compaction->mutable_cf_options().table_factory->Name() ==
+              TableFactory::kBlockBasedTableName()) {
+        std::shared_ptr<const FragmentedRangeTombstoneList> range_del;
+        bool has_range_del = false;
+        if (file_meta->fd.table_reader != nullptr) {
+          BlockBasedTable* table_reader =
+              static_cast<BlockBasedTable*>(file_meta->fd.table_reader);
+          has_range_del =
+              nullptr != table_reader->get_rep()->fragmented_range_dels;
+        } else {
+          has_range_del = HasTableFragmentedRangeDels(
+              compact_->compaction->immutable_options(),
+              compact_->compaction->mutable_cf_options(), file_meta,
+              ReadOptions(Env::IOActivity::kCompaction));
+        }
+        if (has_range_del) {
+          has_error = true;
+          ROCKS_LOG_WARN(
+              db_options_.info_log,
+              " table #%lu has range delete, but num_range_deletions is 0",
+              file_meta->fd.GetNumber());
+        }
       }
-    }
+        if (num_input_range_del) {
+          *num_input_range_del += file_num_range_del;
+        }
+      }
 
     const std::vector<FileMetaData*>& filtered_flevel =
         compaction->filtered_input_levels(input_level);
@@ -3462,6 +3487,49 @@ Status CompactionJob::ReadOutputFilesTableProperties(
     output_files_table_properties.push_back(tp);
   }
   return s;
+}
+
+bool CompactionJob::HasTableFragmentedRangeDels(
+    const ImmutableOptions& ioptions, const MutableCFOptions& moptions,
+    const FileMetaData* file_meta, const ReadOptions& read_options) {
+  std::unique_ptr<FSRandomAccessFile> file;
+  std::string file_name = GetTableFileName(file_meta->fd.GetNumber());
+  Status s = ioptions.fs->NewRandomAccessFile(file_name, file_options_, &file,
+                                              nullptr /* dbg */);
+  if (!s.ok()) {
+    return false;
+  }
+
+  std::unique_ptr<RandomAccessFileReader> file_reader(
+      new RandomAccessFileReader(
+          std::move(file), file_name, ioptions.clock, io_tracer_,
+          ioptions.stats, Histograms::SST_READ_MICROS /* hist_type */,
+          nullptr /* file_read_hist */, ioptions.rate_limiter.get(),
+          ioptions.listeners));
+
+  std::unique_ptr<FragmentedRangeTombstoneList> fragmented_range_tombstone;
+
+  uint64_t magic_number = kBlockBasedTableMagicNumber;
+
+  const auto* table_factory = moptions.table_factory.get();
+  if (table_factory == nullptr) {
+    return false;
+  } else {
+    const auto& table_factory_name = table_factory->Name();
+    if (table_factory_name == TableFactory::kPlainTableName()) {
+      magic_number = kPlainTableMagicNumber;
+    } else if (table_factory_name == TableFactory::kCuckooTableName()) {
+      magic_number = kCuckooTableMagicNumber;
+    }
+  }
+  BlockHandle range_del_handle;
+  s = FindMetaBlockInFile(file_reader.get(), file_meta->fd.GetFileSize(),
+                          magic_number, ioptions, read_options,
+                          kRangeDelBlockName, &range_del_handle);
+  if (!s.ok()) {
+    return false;
+  }
+  return true;
 }
 
 void CompactionJob::RestoreCompactionOutputs(
