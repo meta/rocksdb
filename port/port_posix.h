@@ -63,15 +63,8 @@
 #define fflush_unlocked fflush
 #endif
 
-#if defined(OS_MACOSX) || defined(OS_FREEBSD) || defined(OS_OPENBSD) || \
-    defined(OS_DRAGONFLYBSD)
+#if defined(OS_MACOSX)
 // Use fsync() on platforms without fdatasync()
-#define fdatasync fsync
-#endif
-
-#if defined(OS_ANDROID) && __ANDROID_API__ < 9
-// fdatasync() was only introduced in API level 9 on Android. Use fsync()
-// when targeting older platforms.
 #define fdatasync fsync
 #endif
 
