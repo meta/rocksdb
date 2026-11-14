@@ -7,3 +7,4 @@ This is the list of all known third-party plugins for RocksDB. If something is m
 * [PMEM](https://github.com/pmem/pmem-rocksdb-plugin): a collection of plugins to enable Persistent Memory on RocksDB.
 * [IPPCP](https://github.com/intel/ippcp-plugin-rocksdb): a plugin to enable encryption on RocksDB based on Intel optimized open source IPP-Crypto library.
 * [encfs](https://github.com/pegasus-kv/encfs): a plugin to enable encryption on RocksDB based on OpenSSL library.
+* [UFROP](https://github.com/kioxiaamerica/ufrop): a plugin to enable NVM Express® Flexible Data Placement (FDP) support on RocksDB.
