@@ -1170,7 +1170,9 @@ endif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(powerpc|ppc)64")
 
 if(HAS_ARMV8_CRC)
   list(APPEND SOURCES
-    util/crc32c_arm64.cc)
+    util/crc32c_arm64.cc
+    util/crc32_iscsi_sve2.S
+    util/crc32_iscsi_crc_ext.S)
 endif(HAS_ARMV8_CRC)
 
 if(WIN32)
