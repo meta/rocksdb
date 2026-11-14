@@ -4582,7 +4582,7 @@ RepairCommand::RepairCommand(const std::vector<std::string>& /*params*/,
 void RepairCommand::Help(std::string& ret) {
   ret.append("  ");
   ret.append(RepairCommand::Name());
-  ret.append(" [--" + ARG_VERBOSE + "]");
+  ret.append(" [--" + ARG_VERBOSE + "] (Not supported on BlobDB)");
   ret.append("\n");
 }
 

@@ -99,3 +99,4 @@ There are a few remaining features that are not yet supported by the new BlobDB.
 
 We also have further plans when it comes to performance. These include optimizing garbage collection, introducing a dedicated cache for blobs, improving iterator and `MultiGet` performance, and evolving the blob file format amongst others.
 
+See the [BlobDB](https://github.com/facebook/rocksdb/wiki/BlobDB) wiki for the latest work.

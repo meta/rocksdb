@@ -3073,6 +3073,7 @@ Status DestroyDB(const std::string& name, const Options& options,
 // resurrect as much of the contents of the database as possible.
 // Some data may be lost, so be careful when calling this function
 // on a database that contains important information.
+// Not supported when using BlobDB.
 //
 // With this API, we will warn and skip data associated with column families not
 // specified in column_families.

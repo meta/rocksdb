@@ -602,6 +602,20 @@ TEST_F(RepairTest, DbNameContainsTrailingSlash) {
   ReopenWithSstIdVerify();
   ASSERT_EQ(Get("key"), "val");
 }
+
+TEST_F(RepairTest, BlobDBNotSupported) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("key", "val"));
+  ASSERT_OK(Flush());
+  Close();
+
+  ASSERT_EQ(RepairDB(dbname_, options), Status::NotSupported());
+  ReopenWithSstIdVerify();
+  ASSERT_EQ(Get("key"), "val");
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
