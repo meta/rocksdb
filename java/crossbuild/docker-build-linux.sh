@@ -36,7 +36,7 @@ if hash scl 2>/dev/null; then
   fi
 else
   make clean-not-downloaded
-  PORTABLE=1 make -j$J rocksdbjavastatic
+  PORTABLE=1 J=$J make -j$J rocksdbjavastatic
 fi
 
 cp java/target/librocksdbjni-linux*.so java/target/rocksdbjni-*-linux*.jar java/target/rocksdbjni-*-linux*.jar.sha1 /rocksdb-java-target

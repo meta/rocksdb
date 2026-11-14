@@ -15,6 +15,11 @@ CFLAGS += ${EXTRA_CFLAGS}
 CXXFLAGS += ${EXTRA_CXXFLAGS}
 LDFLAGS += $(EXTRA_LDFLAGS)
 MACHINE ?= $(shell uname -m)
+ifeq ($(PLATFORM),OS_MACOSX)
+	NPROC ?= $(shell sysctl -n hw.logicalcpu)
+else
+	NPROC ?= $(shell nproc)
+endif
 ARFLAGS = ${EXTRA_ARFLAGS} rs
 STRIPFLAGS = -S -x
 
@@ -1071,11 +1076,13 @@ suggest-slow-tests:
 	  }' | (read header; echo "$$header"; sort -k2,2gr)
 
 # "make check" uses
-# Run with "make J=1 check" to disable parallelism in "make check".
-# Run with "make J=200% check" to run two parallel jobs per core.
-# The default is to run one job per core (J=100%).
-# See "man parallel" for its "-j ..." option.
-J ?= 100%
+# Run with "make J=1 check" to disable parallelism in "make check" or (Docker) container builds.
+# Run with "make J=$((`nproc`*2)) check" to run two parallel jobs per core.
+# The default is to run one job per core, but leave one core free for the OS, i.e.: J=$((`nproc`-1)).
+# This is used both to inform GNU `parrallel` of the number of parallel jobs to execute,
+# and also as the number of jobs for Make when executed in (Docker) containers
+# See "man parallel" and "man make" for their "-j ..." option syntax.
+J ?= $(shell expr $(NPROC) - 1)
 
 # Use this regexp to select the subset of tests whose names match.
 tests-regexp = .
