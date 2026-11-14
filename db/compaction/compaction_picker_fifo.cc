@@ -33,6 +33,22 @@ uint64_t GetTotalFilesSize(const std::vector<FileMetaData*>& files) {
   return total_size;
 }
 
+// Keep SST bytes exact and estimate the remaining blob bytes in proportion to
+// the remaining SST bytes, as in TTL picking. The reference covers all levels.
+uint64_t EstimateRemainingDataSize(uint64_t remaining_sst_size,
+                                   uint64_t total_sst_size,
+                                   uint64_t total_blob_size) {
+  if (total_blob_size == 0) {
+    return remaining_sst_size;
+  }
+  if (remaining_sst_size == total_sst_size) {
+    return remaining_sst_size + total_blob_size;
+  }
+  return remaining_sst_size +
+         static_cast<uint64_t>(static_cast<double>(remaining_sst_size) /
+                               total_sst_size * total_blob_size);
+}
+
 // Compute effective data size and capacity limit for FIFO compaction.
 // When max_data_files_size > 0 (blob-aware mode), the effective size includes
 // both SST and blob file sizes, and the limit is max_data_files_size.
@@ -233,10 +249,13 @@ Compaction* FIFOCompactionPicker::PickSizeCompaction(
       vstorage->LevelFiles(last_level);
 
   // Compute effective size and limit for comparison.
+  const uint64_t total_blob_size =
+      fifo_opts.max_data_files_size > 0
+          ? vstorage->GetBlobStats().total_file_size
+          : 0;
   uint64_t effective_size;
   uint64_t effective_max;
-  GetEffectiveSizeAndLimit(fifo_opts, total_size,
-                           vstorage->GetBlobStats().total_file_size,
+  GetEffectiveSizeAndLimit(fifo_opts, total_size, total_blob_size,
                            &effective_size, &effective_max);
 
   if (last_level == 0 && effective_size <= effective_max) {
@@ -255,31 +274,18 @@ Compaction* FIFOCompactionPicker::PickSizeCompaction(
   std::vector<CompactionInputFiles> inputs;
   inputs.emplace_back();
   inputs[0].level = last_level;
+  uint64_t remaining_sst_size = total_size;
 
   if (last_level == 0) {
-    // When using blob-aware sizing, use proportional estimation (same
-    // principle as EstimateTotalDataForSST): each SST "owns"
-    // effective_size / num_files of total data. This is an approximation
-    // -- individual SSTs may reference different amounts of blob data,
-    // but uniform distribution is a reasonable estimate for FIFO dropping.
     uint64_t remaining_size = effective_size;
-    const uint64_t num_files = last_level_files.size();
-    // Proportional estimate of data per file (SST + blob).
-    // Use max(1) to prevent stalling when effective_size < num_files.
-    const uint64_t data_per_file =
-        (fifo_opts.max_data_files_size > 0 && num_files > 0)
-            ? std::max(effective_size / num_files, uint64_t{1})
-            : 0;
 
     // In L0, right-most files are the oldest files.
     for (auto ritr = last_level_files.rbegin(); ritr != last_level_files.rend();
          ++ritr) {
       auto f = *ritr;
-      if (fifo_opts.max_data_files_size > 0) {
-        remaining_size -= std::min(remaining_size, data_per_file);
-      } else {
-        remaining_size -= std::min(remaining_size, f->fd.file_size);
-      }
+      remaining_sst_size -= std::min(remaining_sst_size, f->fd.file_size);
+      remaining_size = EstimateRemainingDataSize(remaining_sst_size, total_size,
+                                                 total_blob_size);
       inputs[0].files.push_back(f);
       char tmp_fsize[16];
       AppendHumanBytes(f->fd.GetFileSize(), tmp_fsize, sizeof(tmp_fsize));
@@ -301,21 +307,13 @@ Compaction* FIFOCompactionPicker::PickSizeCompaction(
     // file with the smallest key will be deleted first.  This design decision
     // better serves a major type of FIFO use cases where smaller keys are
     // associated with older data.
-    const uint64_t num_files = last_level_files.size();
-    // Proportional estimate of data per file (SST + blob), same as L0 path.
-    const uint64_t data_per_file =
-        (fifo_opts.max_data_files_size > 0 && num_files > 0)
-            ? std::max(effective_size / num_files, uint64_t{1})
-            : 0;
     for (const auto& f : last_level_files) {
       if (f->being_compacted) {
         continue;
       }
-      if (fifo_opts.max_data_files_size > 0) {
-        effective_size -= std::min(effective_size, data_per_file);
-      } else {
-        effective_size -= std::min(effective_size, f->fd.file_size);
-      }
+      remaining_sst_size -= std::min(remaining_sst_size, f->fd.file_size);
+      effective_size = EstimateRemainingDataSize(remaining_sst_size, total_size,
+                                                 total_blob_size);
       inputs[0].files.push_back(f);
       char tmp_fsize[16];
       AppendHumanBytes(f->fd.GetFileSize(), tmp_fsize, sizeof(tmp_fsize));

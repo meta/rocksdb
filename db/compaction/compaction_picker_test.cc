@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "db/blob/blob_file_meta.h"
+#include "db/blob/blob_log_format.h"
 #include "db/column_family.h"
 #include "db/compaction/compaction.h"
 #include "db/compaction/compaction_picker_fifo.h"
@@ -264,6 +265,19 @@ class CompactionPickerTestBase : public testing::Test {
         cf_name_, mutable_cf_options_, mutable_db_options_,
         /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr,
         vstorage_.get(), &log_buffer_, /*full_history_ts_low=*/""));
+  }
+
+  void AddFIFOFiles(int level, uint64_t oldest_size, uint64_t middle_size,
+                    uint64_t newest_size) {
+    const uint64_t sizes[] = {oldest_size, middle_size, newest_size};
+    for (uint32_t index : {1U, 2U, 3U}) {
+      // L0 stores newest first; higher levels are ordered by key.
+      const uint32_t number = level == 0 ? 4 - index : index;
+      const std::string smallest = std::to_string(100 * number);
+      const std::string largest = std::to_string(100 * number + 99);
+      Add(level, number, smallest.c_str(), largest.c_str(), sizes[number - 1]);
+      file_map_[number].first->epoch_number = number;
+    }
   }
 
  private:
@@ -5829,6 +5843,102 @@ TEST_F(CompactionPickerTest, FIFOTTLBlobEstimationMultiLevel) {
     ASSERT_NE(CompactionReason::kFIFOTtl, compaction->compaction_reason())
         << "Multi-level FIFO: TTL should not fire when correct all-levels "
            "blob estimation shows data still exceeds limit";
+  }
+}
+
+TEST_F(CompactionPickerTest, FIFOSizeDroppingUsesActualSstSizes) {
+  for (int level : {0, 2}) {
+    for (bool large_oldest : {false, true}) {
+      for (bool use_data_limit : {false, true}) {
+        SCOPED_TRACE("level=" + std::to_string(level) +
+                     " large_oldest=" + std::to_string(large_oldest) +
+                     " use_data_limit=" + std::to_string(use_data_limit));
+        // With no blobs the two limits must select the same files, even
+        // when their sizes differ. Account for the untouched L0 file during
+        // migration, too.
+        const uint64_t upper_level_size = level == 0 ? 0 : 50;
+        const uint64_t limit = (large_oldest ? 100 : 900) + upper_level_size;
+        SetupFIFORatioBased(/*max_table_files_size=*/limit,
+                            /*max_data_files_size=*/use_data_limit ? limit : 0,
+                            /*trigger=*/4,
+                            /*allow_compaction=*/false,
+                            /*use_kv_ratio=*/false,
+                            /*num_levels=*/level + 1);
+        FIFOCompactionPicker picker(ioptions_, &icmp_);
+        if (level > 0) {
+          Add(0, 4U, "400", "499", upper_level_size);
+        }
+        AddFIFOFiles(level, large_oldest ? 900 : 40, 40,
+                     large_oldest ? 40 : 900);
+
+        std::unique_ptr<Compaction> compaction = PickFIFOCompaction(picker);
+        ASSERT_NE(nullptr, compaction);
+        EXPECT_EQ(CompactionReason::kFIFOMaxSize,
+                  compaction->compaction_reason());
+        EXPECT_EQ(level, compaction->start_level());
+        std::vector<uint64_t> selected;
+        for (const FileMetaData* file : (*compaction->inputs())[0].files) {
+          selected.push_back(file->fd.GetNumber());
+        }
+        const std::vector<uint64_t> expected =
+            large_oldest ? std::vector<uint64_t>{1}
+                         : std::vector<uint64_t>{1, 2};
+        EXPECT_EQ(expected, selected);
+      }
+    }
+  }
+}
+
+TEST_F(CompactionPickerTest, FIFOBlobSizeDroppingUsesActualSstSizes) {
+  for (int level : {0, 2}) {
+    for (bool below_boundary : {false, true}) {
+      for (uint64_t scale : {uint64_t{1}, uint64_t{1} << 30}) {
+        SCOPED_TRACE("level=" + std::to_string(level) +
+                     " below_boundary=" + std::to_string(below_boundary) +
+                     " scale=" + std::to_string(scale));
+        const uint64_t upper_level_size = level == 0 ? 0 : 50 * scale;
+        const uint64_t total_sst = 1000 * scale + upper_level_size;
+        // Blob bytes equal SST bytes across the whole column family. With
+        // these chosen values, the proportional estimate after dropping the
+        // oldest SST is at the limit, or one byte above it. Blob accounting
+        // remains approximate; this does not assert general rounding accuracy.
+        const uint64_t limit =
+            2 * (100 * scale + upper_level_size) - below_boundary;
+        SetupFIFORatioBased(/*max_table_files_size=*/limit,
+                            /*max_data_files_size=*/limit,
+                            /*trigger=*/4,
+                            /*allow_compaction=*/false,
+                            /*use_kv_ratio=*/false,
+                            /*num_levels=*/level + 1);
+        FIFOCompactionPicker picker(ioptions_, &icmp_);
+        if (level > 0) {
+          Add(0, 4U, "400", "499", upper_level_size);
+        }
+        AddFIFOFiles(level, 900 * scale, 50 * scale, 50 * scale);
+        if (level > 0) {
+          // A busy SST still belongs to the estimation's reference scope.
+          file_map_[2].first->being_compacted = true;
+        }
+        // AddBlobFile takes payload bytes; account for its on-disk envelope.
+        AddBlobFile(100,
+                    total_sst - BlobLogHeader::kSize - BlobLogFooter::kSize);
+
+        std::unique_ptr<Compaction> compaction = PickFIFOCompaction(picker);
+        ASSERT_EQ(total_sst, vstorage_->GetBlobStats().total_file_size);
+        ASSERT_NE(nullptr, compaction);
+        EXPECT_EQ(CompactionReason::kFIFOMaxSize,
+                  compaction->compaction_reason());
+        EXPECT_EQ(level, compaction->start_level());
+        std::vector<uint64_t> selected;
+        for (const FileMetaData* file : *compaction->inputs(0)) {
+          selected.push_back(file->fd.GetNumber());
+        }
+        const std::vector<uint64_t> expected =
+            below_boundary ? std::vector<uint64_t>{1, level == 0 ? 2U : 3U}
+                           : std::vector<uint64_t>{1};
+        EXPECT_EQ(expected, selected);
+      }
+    }
   }
 }
 
