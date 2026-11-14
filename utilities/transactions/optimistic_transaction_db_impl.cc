@@ -72,6 +72,15 @@ Status OptimisticTransactionDB::Open(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     std::vector<ColumnFamilyHandle*>* handles,
     OptimisticTransactionDB** dbptr) {
+  switch (occ_options.validate_policy) {
+    case OccValidationPolicy::kValidateParallel:
+    case OccValidationPolicy::kValidateSerial:
+      break;
+    default:
+      return Status::InvalidArgument(
+          "Unknown optimistic transaction validation policy");
+  }
+
   Status s;
   std::unique_ptr<DB> db;
 

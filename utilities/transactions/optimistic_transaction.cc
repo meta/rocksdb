@@ -67,10 +67,9 @@ Status OptimisticTransaction::Commit() {
     case OccValidationPolicy::kValidateSerial:
       return CommitWithSerialValidate();
     default:
-      assert(0);
+      return Status::InvalidArgument(
+          "Unknown optimistic transaction validation policy");
   }
-  // unreachable, just void compiler complain
-  return Status::OK();
 }
 
 Status OptimisticTransaction::CommitWithSerialValidate() {
