@@ -37,7 +37,10 @@ if(@WITH_LZ4@)
 endif()
 
 if(@WITH_ZSTD@)
-  find_dependency(zstd)
+  find_package(zstd CONFIG QUIET)
+  if(NOT zstd_FOUND)
+    find_dependency(zstd)
+  endif()
 endif()
 
 if(@WITH_NUMA@)

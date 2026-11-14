@@ -9,8 +9,9 @@ find_path(ZSTD_INCLUDE_DIRS
   NAMES zstd.h
   HINTS ${zstd_ROOT_DIR}/include)
 
+# `_static` suffix is used by zstd on Windows.
 find_library(ZSTD_LIBRARIES
-  NAMES zstd
+  NAMES zstd zstd_static
   HINTS ${zstd_ROOT_DIR}/lib)
 
 include(FindPackageHandleStandardArgs)
