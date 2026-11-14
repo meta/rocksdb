@@ -408,6 +408,13 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
       if (range_del_agg &&
           range_del_agg->ShouldDelete(
               ikey, RangeDelPositioningMode::kForwardTraversal)) {
+        if (ts_sz > 0 && cmp_with_full_history_ts_low >= 0) {
+          // With user-defined timestamps, the tombstone may hide the base value
+          // from some reads but not others, so neither drop it nor merge it in.
+          // Output only the operands and leave iter at the base value, as for
+          // kMustMerge below.
+          return Status::MergeInProgress();
+        }
         s = TimedFullMerge(user_merge_operator_, ikey.user_key, kNoBaseValue,
                            merge_context_.GetOperands(), logger_, stats_,
                            clock_, /* update_num_ops_stats */ false,
@@ -537,8 +544,14 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
               ? CompactionFilter::Decision::kKeep
               : FilterMerge(orig_ikey.user_key, value_slice);
       // FIXME: should also check for kRemove here
+      // With user-defined timestamps, only an operand below
+      // full_history_ts_low may be dropped for being covered by a range
+      // tombstone, matching CompactionIterator's point-key rule. Otherwise a
+      // read at a timestamp between the operand and the tombstone still sees
+      // the operand.
       if (filter != CompactionFilter::Decision::kRemoveAndSkipUntil &&
           range_del_agg != nullptr &&
+          (ts_sz == 0 || cmp_with_full_history_ts_low < 0) &&
           range_del_agg->ShouldDelete(
               iter->key(), RangeDelPositioningMode::kForwardTraversal)) {
         filter = CompactionFilter::Decision::kRemove;
