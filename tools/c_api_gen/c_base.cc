@@ -1315,6 +1315,15 @@ unsigned char rocksdb_compactionservice_jobinfo_t_is_bottommost_level(
   return info->rep.bottommost_level;
 }
 
+static_assert(rocksdb_compactionservice_jobstatus_success ==
+              static_cast<int>(CompactionServiceJobStatus::kSuccess));
+static_assert(rocksdb_compactionservice_jobstatus_failure ==
+              static_cast<int>(CompactionServiceJobStatus::kFailure));
+static_assert(rocksdb_compactionservice_jobstatus_aborted ==
+              static_cast<int>(CompactionServiceJobStatus::kAborted));
+static_assert(rocksdb_compactionservice_jobstatus_use_local ==
+              static_cast<int>(CompactionServiceJobStatus::kUseLocal));
+
 // Helper function to validate compaction service job status
 static inline bool IsValidCompactionServiceJobStatus(int status) {
   return status >= rocksdb_compactionservice_jobstatus_success &&
@@ -3177,6 +3186,11 @@ rocksdb_writebatch_t* rocksdb_wal_iter_get_batch(
   return result;
 }
 
+static_assert(rocksdb_wal_file_type_archived_log ==
+              static_cast<int>(ROCKSDB_NAMESPACE::kArchivedLogFile));
+static_assert(rocksdb_wal_file_type_alive_log ==
+              static_cast<int>(ROCKSDB_NAMESPACE::kAliveLogFile));
+
 uint64_t rocksdb_get_latest_sequence_number(rocksdb_t* db) {
   return db->rep->GetLatestSequenceNumber();
 }
@@ -3297,6 +3311,15 @@ void rocksdb_approximate_sizes_cf(
     SaveError(errptr, s);
   }
 }
+
+static_assert(rocksdb_size_approximation_flags_none ==
+              static_cast<int>(DB::SizeApproximationFlags::NONE));
+static_assert(rocksdb_size_approximation_flags_include_memtable ==
+              static_cast<int>(DB::SizeApproximationFlags::INCLUDE_MEMTABLES));
+static_assert(rocksdb_size_approximation_flags_include_files ==
+              static_cast<int>(DB::SizeApproximationFlags::INCLUDE_FILES));
+static_assert(rocksdb_size_approximation_flags_include_blob_files ==
+              static_cast<int>(DB::SizeApproximationFlags::INCLUDE_BLOB_FILES));
 
 extern ROCKSDB_LIBRARY_API void rocksdb_approximate_sizes_cf_with_flags(
     rocksdb_t* db, rocksdb_column_family_handle_t* column_family,
@@ -4530,6 +4553,38 @@ int rocksdb_block_based_options_get_index_mode(
       opt->rep.GetEffectiveIndexMode());
 }
 
+static_assert(
+    rocksdb_block_based_table_index_mode_standard_only ==
+    static_cast<int>(BlockBasedTableOptions::IndexMode::kStandardOnly));
+static_assert(
+    rocksdb_block_based_table_index_mode_standard_default ==
+    static_cast<int>(BlockBasedTableOptions::IndexMode::kStandardDefault));
+static_assert(
+    rocksdb_block_based_table_index_mode_custom_default ==
+    static_cast<int>(BlockBasedTableOptions::IndexMode::kCustomDefault));
+static_assert(rocksdb_block_based_table_index_mode_custom_only ==
+              static_cast<int>(BlockBasedTableOptions::IndexMode::kCustomOnly));
+static_assert(
+    rocksdb_block_based_table_index_mode_standard_required ==
+    static_cast<int>(BlockBasedTableOptions::IndexMode::kStandardRequired));
+static_assert(rocksdb_block_based_table_index_type_binary_search ==
+              static_cast<int>(BlockBasedTableOptions::kBinarySearch));
+static_assert(rocksdb_block_based_table_index_type_hash_search ==
+              static_cast<int>(BlockBasedTableOptions::kHashSearch));
+static_assert(rocksdb_block_based_table_index_type_two_level_index_search ==
+              static_cast<int>(BlockBasedTableOptions::kTwoLevelIndexSearch));
+static_assert(rocksdb_block_based_table_data_block_index_type_binary_search ==
+              static_cast<int>(BlockBasedTableOptions::kDataBlockBinarySearch));
+static_assert(
+    rocksdb_block_based_table_data_block_index_type_binary_search_and_hash ==
+    static_cast<int>(BlockBasedTableOptions::kDataBlockBinaryAndHash));
+static_assert(rocksdb_block_based_table_index_block_search_type_binary ==
+              static_cast<int>(BlockBasedTableOptions::kBinary));
+static_assert(rocksdb_block_based_table_index_block_search_type_interpolation ==
+              static_cast<int>(BlockBasedTableOptions::kInterpolation));
+static_assert(rocksdb_block_based_table_index_block_search_type_auto ==
+              static_cast<int>(BlockBasedTableOptions::kAuto));
+
 void rocksdb_options_set_block_based_table_factory(
     rocksdb_options_t* opt,
     rocksdb_block_based_table_options_t* table_options) {
@@ -4550,6 +4605,16 @@ void rocksdb_options_set_block_based_table_factory(
     }
   }
 }
+
+static_assert(rocksdb_block_based_k_fallback_pinning_tier ==
+              static_cast<int>(ROCKSDB_NAMESPACE::PinningTier::kFallback));
+static_assert(rocksdb_block_based_k_none_pinning_tier ==
+              static_cast<int>(ROCKSDB_NAMESPACE::PinningTier::kNone));
+static_assert(
+    rocksdb_block_based_k_flush_and_similar_pinning_tier ==
+    static_cast<int>(ROCKSDB_NAMESPACE::PinningTier::kFlushedAndSimilar));
+static_assert(rocksdb_block_based_k_all_pinning_tier ==
+              static_cast<int>(ROCKSDB_NAMESPACE::PinningTier::kAll));
 
 /* FlushJobInfo */
 
@@ -5327,6 +5392,24 @@ void rocksdb_options_enable_statistics(rocksdb_options_t* opt) {
   opt->rep.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
 }
 
+static_assert(rocksdb_statistics_level_disable_all ==
+              static_cast<int>(ROCKSDB_NAMESPACE::StatsLevel::kDisableAll));
+static_assert(rocksdb_statistics_level_except_tickers ==
+              static_cast<int>(ROCKSDB_NAMESPACE::StatsLevel::kExceptTickers));
+static_assert(
+    rocksdb_statistics_level_except_histogram_or_timers ==
+    static_cast<int>(ROCKSDB_NAMESPACE::StatsLevel::kExceptHistogramOrTimers));
+static_assert(rocksdb_statistics_level_except_timers ==
+              static_cast<int>(ROCKSDB_NAMESPACE::StatsLevel::kExceptTimers));
+static_assert(
+    rocksdb_statistics_level_except_detailed_timers ==
+    static_cast<int>(ROCKSDB_NAMESPACE::StatsLevel::kExceptDetailedTimers));
+static_assert(
+    rocksdb_statistics_level_except_time_for_mutex ==
+    static_cast<int>(ROCKSDB_NAMESPACE::StatsLevel::kExceptTimeForMutex));
+static_assert(rocksdb_statistics_level_all ==
+              static_cast<int>(ROCKSDB_NAMESPACE::StatsLevel::kAll));
+
 void rocksdb_options_set_statistics_level(rocksdb_options_t* opt, int level) {
   if (!opt->rep.statistics) {
     return;
@@ -5354,6 +5437,11 @@ void rocksdb_options_set_blob_cache(rocksdb_options_t* opt,
                                     rocksdb_cache_t* blob_cache) {
   opt->rep.blob_cache = blob_cache->rep;
 }
+
+static_assert(rocksdb_prepopulate_blob_disable ==
+              static_cast<int>(PrepopulateBlobCache::kDisable));
+static_assert(rocksdb_prepopulate_blob_flush_only ==
+              static_cast<int>(PrepopulateBlobCache::kFlushOnly));
 
 void rocksdb_options_set_prefix_extractor(
     rocksdb_options_t* opt, rocksdb_slicetransform_t* prefix_extractor) {
@@ -5406,6 +5494,37 @@ void rocksdb_options_set_plain_table_factory(
   opt->rep.table_factory.reset(factory);
 }
 
+static_assert(rocksdb_tolerate_corrupted_tail_records_recovery ==
+              static_cast<int>(WALRecoveryMode::kTolerateCorruptedTailRecords));
+static_assert(rocksdb_absolute_consistency_recovery ==
+              static_cast<int>(WALRecoveryMode::kAbsoluteConsistency));
+static_assert(rocksdb_point_in_time_recovery ==
+              static_cast<int>(WALRecoveryMode::kPointInTimeRecovery));
+static_assert(rocksdb_skip_any_corrupted_records_recovery ==
+              static_cast<int>(WALRecoveryMode::kSkipAnyCorruptedRecords));
+static_assert(rocksdb_no_compression ==
+              static_cast<int>(CompressionType::kNoCompression));
+static_assert(rocksdb_snappy_compression ==
+              static_cast<int>(CompressionType::kSnappyCompression));
+static_assert(rocksdb_zlib_compression ==
+              static_cast<int>(CompressionType::kZlibCompression));
+static_assert(rocksdb_bz2_compression ==
+              static_cast<int>(CompressionType::kBZip2Compression));
+static_assert(rocksdb_lz4_compression ==
+              static_cast<int>(CompressionType::kLZ4Compression));
+static_assert(rocksdb_lz4hc_compression ==
+              static_cast<int>(CompressionType::kLZ4HCCompression));
+static_assert(rocksdb_xpress_compression ==
+              static_cast<int>(CompressionType::kXpressCompression));
+static_assert(rocksdb_zstd_compression ==
+              static_cast<int>(CompressionType::kZSTD));
+static_assert(rocksdb_level_compaction ==
+              static_cast<int>(CompactionStyle::kCompactionStyleLevel));
+static_assert(rocksdb_universal_compaction ==
+              static_cast<int>(CompactionStyle::kCompactionStyleUniversal));
+static_assert(rocksdb_fifo_compaction ==
+              static_cast<int>(CompactionStyle::kCompactionStyleFIFO));
+
 void rocksdb_options_set_universal_compaction_options(
     rocksdb_options_t* opt, rocksdb_universal_compaction_options_t* uco) {
   opt->rep.compaction_options_universal = *(uco->rep);
@@ -5450,6 +5569,17 @@ void rocksdb_options_set_ratelimiter(rocksdb_options_t* opt,
     opt->rep.rate_limiter = limiter->rep;
   }
 }
+
+static_assert(rocksdb_k_by_compensated_size_compaction_pri ==
+              static_cast<int>(ROCKSDB_NAMESPACE::kByCompensatedSize));
+static_assert(rocksdb_k_oldest_largest_seq_first_compaction_pri ==
+              static_cast<int>(ROCKSDB_NAMESPACE::kOldestLargestSeqFirst));
+static_assert(rocksdb_k_oldest_smallest_seq_first_compaction_pri ==
+              static_cast<int>(ROCKSDB_NAMESPACE::kOldestSmallestSeqFirst));
+static_assert(rocksdb_k_min_overlapping_ratio_compaction_pri ==
+              static_cast<int>(ROCKSDB_NAMESPACE::kMinOverlappingRatio));
+static_assert(rocksdb_k_round_robin_compaction_pri ==
+              static_cast<int>(ROCKSDB_NAMESPACE::kRoundRobin));
 
 rocksdb_ratelimiter_t* rocksdb_ratelimiter_create(int64_t rate_bytes_per_sec,
                                                   int64_t refill_period_us,
@@ -5516,6 +5646,20 @@ void rocksdb_options_add_compact_on_deletion_collector_factory_min_file_size(
           window_size, num_dels_trigger, deletion_ratio, min_file_size);
   opt->rep.table_properties_collector_factories.emplace_back(compact_on_del);
 }
+
+static_assert(rocksdb_uninitialized ==
+              static_cast<int>(PerfLevel::kUninitialized));
+static_assert(rocksdb_disable == static_cast<int>(PerfLevel::kDisable));
+static_assert(rocksdb_enable_count ==
+              static_cast<int>(PerfLevel::kEnableCount));
+static_assert(rocksdb_enable_wait == static_cast<int>(PerfLevel::kEnableWait));
+static_assert(rocksdb_enable_time_except_for_mutex ==
+              static_cast<int>(PerfLevel::kEnableTimeExceptForMutex));
+static_assert(rocksdb_enable_time_and_cpu_time_except_for_mutex ==
+              static_cast<int>(PerfLevel::kEnableTimeAndCPUTimeExceptForMutex));
+static_assert(rocksdb_enable_time == static_cast<int>(PerfLevel::kEnableTime));
+static_assert(rocksdb_out_of_bounds ==
+              static_cast<int>(PerfLevel::kOutOfBounds));
 
 void rocksdb_set_perf_level(int v) {
   PerfLevel level = static_cast<PerfLevel>(v);
@@ -5683,6 +5827,8 @@ uint64_t rocksdb_perfcontext_metric(rocksdb_perfcontext_t* context,
       return rep->number_async_seek;
     case rocksdb_blob_cache_hit_count:
       return rep->blob_cache_hit_count;
+    case rocksdb_blob_cache_read_byte:
+      return rep->blob_cache_read_byte;
     case rocksdb_blob_read_count:
       return rep->blob_read_count;
     case rocksdb_blob_read_byte:
@@ -5751,6 +5897,18 @@ void rocksdb_compactionfilter_set_ignore_snapshots(
 void rocksdb_compactionfilter_destroy(rocksdb_compactionfilter_t* filter) {
   delete filter;
 }
+
+static_assert(
+    rocksdb_wal_filter_continue_processing ==
+    static_cast<int>(WalFilter::WalProcessingOption::kContinueProcessing));
+static_assert(
+    rocksdb_wal_filter_ignore_current_record ==
+    static_cast<int>(WalFilter::WalProcessingOption::kIgnoreCurrentRecord));
+static_assert(rocksdb_wal_filter_stop_replay ==
+              static_cast<int>(WalFilter::WalProcessingOption::kStopReplay));
+static_assert(
+    rocksdb_wal_filter_corrupted_record ==
+    static_cast<int>(WalFilter::WalProcessingOption::kCorruptedRecord));
 
 rocksdb_walfilter_t* rocksdb_walfilter_create(
     void* state, void (*destructor)(void*),
@@ -6138,6 +6296,13 @@ const char* rocksdb_readoptions_get_table_index_factory_name(
   return name;
 }
 
+static_assert(rocksdb_readoptions_read_index_default ==
+              static_cast<int>(ReadOptions::ReadIndex::kDefault));
+static_assert(rocksdb_readoptions_read_index_builtin ==
+              static_cast<int>(ReadOptions::ReadIndex::kBuiltin));
+static_assert(rocksdb_readoptions_read_index_prefer_custom ==
+              static_cast<int>(ReadOptions::ReadIndex::kPreferCustom));
+
 rocksdb_writeoptions_t* rocksdb_writeoptions_create() {
   return new rocksdb_writeoptions_t;
 }
@@ -6419,6 +6584,13 @@ size_t rocksdb_cache_get_table_address_count(const rocksdb_cache_t* cache) {
 size_t rocksdb_cache_get_occupancy_count(const rocksdb_cache_t* cache) {
   return cache->rep->GetOccupancyCount();
 }
+
+static_assert(rocksdb_write_buffer_manager_flush_policy_oldest ==
+              static_cast<int>(WriteBufferFlushPolicy::kFlushOldest));
+static_assert(rocksdb_write_buffer_manager_flush_policy_largest ==
+              static_cast<int>(WriteBufferFlushPolicy::kFlushLargest));
+static_assert(rocksdb_write_buffer_manager_flush_policy_largest_across_dbs ==
+              static_cast<int>(WriteBufferFlushPolicy::kFlushLargestAcrossDBs));
 
 rocksdb_write_buffer_manager_t* rocksdb_write_buffer_manager_create(
     size_t buffer_size, bool allow_stall) {
@@ -6866,6 +7038,20 @@ void rocksdb_replayer_replay(rocksdb_replayer_t* replayer,
 
 void rocksdb_replayer_destroy(rocksdb_replayer_t* replayer) { delete replayer; }
 
+static_assert(rocksdb_trace_filter_none ==
+              static_cast<int>(ROCKSDB_NAMESPACE::kTraceFilterNone));
+static_assert(rocksdb_trace_filter_get ==
+              static_cast<int>(ROCKSDB_NAMESPACE::kTraceFilterGet));
+static_assert(rocksdb_trace_filter_write ==
+              static_cast<int>(ROCKSDB_NAMESPACE::kTraceFilterWrite));
+static_assert(rocksdb_trace_filter_iterator_seek ==
+              static_cast<int>(ROCKSDB_NAMESPACE::kTraceFilterIteratorSeek));
+static_assert(
+    rocksdb_trace_filter_iterator_seek_for_prev ==
+    static_cast<int>(ROCKSDB_NAMESPACE::kTraceFilterIteratorSeekForPrev));
+static_assert(rocksdb_trace_filter_multi_get ==
+              static_cast<int>(ROCKSDB_NAMESPACE::kTraceFilterMultiGet));
+
 rocksdb_block_cache_trace_options_t*
 rocksdb_block_cache_trace_options_create() {
   return new rocksdb_block_cache_trace_options_t;
@@ -7197,6 +7383,13 @@ rocksdb_slicetransform_t* rocksdb_slicetransform_create_noop() {
   wrapper->destructor_ = &SliceTransformWrapper::DoNothing;
   return wrapper;
 }
+
+static_assert(
+    rocksdb_similar_size_compaction_stop_style ==
+    static_cast<int>(ROCKSDB_NAMESPACE::kCompactionStopStyleSimilarSize));
+static_assert(
+    rocksdb_total_size_compaction_stop_style ==
+    static_cast<int>(ROCKSDB_NAMESPACE::kCompactionStopStyleTotalSize));
 
 rocksdb_universal_compaction_options_t*
 rocksdb_universal_compaction_options_create() {
@@ -7854,6 +8047,16 @@ void rocksdb_export_import_files_metadata_destroy(
 }
 
 /* Transactions */
+
+static_assert(
+    rocksdb_txndb_write_policy_write_committed ==
+    static_cast<int>(ROCKSDB_NAMESPACE::TxnDBWritePolicy::WRITE_COMMITTED));
+static_assert(
+    rocksdb_txndb_write_policy_write_prepared ==
+    static_cast<int>(ROCKSDB_NAMESPACE::TxnDBWritePolicy::WRITE_PREPARED));
+static_assert(
+    rocksdb_txndb_write_policy_write_unprepared ==
+    static_cast<int>(ROCKSDB_NAMESPACE::TxnDBWritePolicy::WRITE_UNPREPARED));
 
 rocksdb_transactiondb_options_t* rocksdb_transactiondb_options_create() {
   return new rocksdb_transactiondb_options_t;
