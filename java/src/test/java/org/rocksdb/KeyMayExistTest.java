@@ -62,6 +62,9 @@ public class KeyMayExistTest {
     for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandleList) {
       columnFamilyHandle.close();
     }
+    for (final ColumnFamilyDescriptor descriptor : cfDescriptors) {
+      descriptor.close();
+    }
     db.close();
   }
 

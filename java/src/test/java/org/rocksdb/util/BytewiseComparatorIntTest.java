@@ -259,6 +259,7 @@ public class BytewiseComparatorIntTest {
           cfHandles.clear();
           for (final ColumnFamilyDescriptor cfDescriptor : cfDescriptors) {
             cfDescriptor.getOptions().close();
+            cfDescriptor.close();
           }
         }
       }

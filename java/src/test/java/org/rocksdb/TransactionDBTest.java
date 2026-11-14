@@ -33,11 +33,12 @@ public class TransactionDBTest {
   public void open_columnFamilies() throws RocksDBException {
     try (final DBOptions dbOptions =
              new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
-         final ColumnFamilyOptions myCfOpts = new ColumnFamilyOptions()) {
-      final List<ColumnFamilyDescriptor> columnFamilyDescriptors =
-          Arrays.asList(
-              new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY),
-              new ColumnFamilyDescriptor("myCf".getBytes(), myCfOpts));
+        final ColumnFamilyOptions myCfOpts = new ColumnFamilyOptions();
+        final ColumnFamilyDescriptor defaultCF =
+            new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY);
+        final ColumnFamilyDescriptor myCF =
+            new ColumnFamilyDescriptor("myCf".getBytes(), myCfOpts)) {
+      final List<ColumnFamilyDescriptor> columnFamilyDescriptors = Arrays.asList(defaultCF, myCF);
 
       final List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>();
 
@@ -60,9 +61,10 @@ public class TransactionDBTest {
   public void open_columnFamilies_no_default() throws RocksDBException {
     try (final DBOptions dbOptions =
              new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
-         final ColumnFamilyOptions myCfOpts = new ColumnFamilyOptions()) {
-      final List<ColumnFamilyDescriptor> columnFamilyDescriptors =
-          Collections.singletonList(new ColumnFamilyDescriptor("myCf".getBytes(), myCfOpts));
+        final ColumnFamilyOptions myCfOpts = new ColumnFamilyOptions();
+        final ColumnFamilyDescriptor mtCF =
+            new ColumnFamilyDescriptor("myCf".getBytes(), myCfOpts)) {
+      final List<ColumnFamilyDescriptor> columnFamilyDescriptors = Collections.singletonList(mtCF);
 
       final List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>();
 

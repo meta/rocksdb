@@ -435,32 +435,34 @@ public class RocksIteratorTest {
       }
 
       // Test case: release iterator after custom CF close
-      final ColumnFamilyDescriptor cfd1 = new ColumnFamilyDescriptor("cf1".getBytes());
-      final ColumnFamilyHandle cfHandle1 = db.createColumnFamily(cfd1);
-      db.put(cfHandle1, "key1".getBytes(), "value1".getBytes());
+      try (final ColumnFamilyDescriptor cfd1 = new ColumnFamilyDescriptor("cf1".getBytes())) {
+        final ColumnFamilyHandle cfHandle1 = db.createColumnFamily(cfd1);
+        db.put(cfHandle1, "key1".getBytes(), "value1".getBytes());
 
-      try (final RocksIterator iterator = db.newIterator(cfHandle1)) {
-        cfHandle1.close();
+        try (final RocksIterator iterator = db.newIterator(cfHandle1)) {
+          cfHandle1.close();
 
-        iterator.seekToFirst();
-        assertThat(iterator.isValid()).isTrue();
-        assertThat(iterator.key()).isEqualTo("key1".getBytes());
-        assertThat(iterator.value()).isEqualTo("value1".getBytes());
+          iterator.seekToFirst();
+          assertThat(iterator.isValid()).isTrue();
+          assertThat(iterator.key()).isEqualTo("key1".getBytes());
+          assertThat(iterator.value()).isEqualTo("value1".getBytes());
+        }
       }
 
       // Test case: release iterator after custom CF drop & close
-      final ColumnFamilyDescriptor cfd2 = new ColumnFamilyDescriptor("cf2".getBytes());
-      final ColumnFamilyHandle cfHandle2 = db.createColumnFamily(cfd2);
-      db.put(cfHandle2, "key2".getBytes(), "value2".getBytes());
+      try (final ColumnFamilyDescriptor cfd2 = new ColumnFamilyDescriptor("cf2".getBytes())) {
+        final ColumnFamilyHandle cfHandle2 = db.createColumnFamily(cfd2);
+        db.put(cfHandle2, "key2".getBytes(), "value2".getBytes());
 
-      try (final RocksIterator iterator = db.newIterator(cfHandle2)) {
-        db.dropColumnFamily(cfHandle2);
-        cfHandle2.close();
+        try (final RocksIterator iterator = db.newIterator(cfHandle2)) {
+          db.dropColumnFamily(cfHandle2);
+          cfHandle2.close();
 
-        iterator.seekToFirst();
-        assertThat(iterator.isValid()).isTrue();
-        assertThat(iterator.key()).isEqualTo("key2".getBytes());
-        assertThat(iterator.value()).isEqualTo("value2".getBytes());
+          iterator.seekToFirst();
+          assertThat(iterator.isValid()).isTrue();
+          assertThat(iterator.key()).isEqualTo("key2".getBytes());
+          assertThat(iterator.value()).isEqualTo("value2".getBytes());
+        }
       }
     }
   }

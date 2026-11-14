@@ -19,19 +19,15 @@ public class TableFilterTest {
 
   @Test
   public void readOptions() throws RocksDBException {
-    try (final DBOptions opt = new DBOptions().
-            setCreateIfMissing(true).
-            setCreateMissingColumnFamilies(true);
-         final ColumnFamilyOptions new_cf_opts = new ColumnFamilyOptions()
-    ) {
-      final List<ColumnFamilyDescriptor> columnFamilyDescriptors =
-          Arrays.asList(
-              new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY),
-              new ColumnFamilyDescriptor("new_cf".getBytes(), new_cf_opts)
-          );
-
+    try (final DBOptions opt =
+             new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
+        final ColumnFamilyOptions new_cf_opts = new ColumnFamilyOptions();
+        final ColumnFamilyDescriptor defaultCF =
+            new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY);
+        final ColumnFamilyDescriptor newCF =
+            new ColumnFamilyDescriptor("new_cf".getBytes(), new_cf_opts);) {
+      final List<ColumnFamilyDescriptor> columnFamilyDescriptors = Arrays.asList(defaultCF, newCF);
       final List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>();
-
       // open database
       try (final RocksDB db = RocksDB.open(opt,
           dbFolder.getRoot().getAbsolutePath(),

@@ -397,8 +397,8 @@ public class OptimisticTransactionTest extends AbstractTransactionTest {
     final OptimisticTransactionOptions optimisticTxnOptions =
              new OptimisticTransactionOptions();
 
-    return new OptimisticTransactionDBContainer(optimisticTxnOptions,
-        writeOptions, columnFamilyHandles, optimisticTxnDb, columnFamilyOptions,
+    return new OptimisticTransactionDBContainer(optimisticTxnOptions, writeOptions,
+        columnFamilyHandles, columnFamilyDescriptors, optimisticTxnDb, columnFamilyOptions,
         options);
   }
 
@@ -408,15 +408,13 @@ public class OptimisticTransactionTest extends AbstractTransactionTest {
     private final OptimisticTransactionOptions optimisticTxnOptions;
     private final OptimisticTransactionDB optimisticTxnDb;
 
-    public OptimisticTransactionDBContainer(
-        final OptimisticTransactionOptions optimisticTxnOptions,
-        final WriteOptions writeOptions,
-        final List<ColumnFamilyHandle> columnFamilyHandles,
+    public OptimisticTransactionDBContainer(final OptimisticTransactionOptions optimisticTxnOptions,
+        final WriteOptions writeOptions, final List<ColumnFamilyHandle> columnFamilyHandles,
+        final List<ColumnFamilyDescriptor> columnFamilyDescriptors,
         final OptimisticTransactionDB optimisticTxnDb,
-        final ColumnFamilyOptions columnFamilyOptions,
-        final DBOptions options) {
-      super(writeOptions, columnFamilyHandles, columnFamilyOptions,
-          options);
+        final ColumnFamilyOptions columnFamilyOptions, final DBOptions options) {
+      super(
+          writeOptions, columnFamilyDescriptors, columnFamilyHandles, columnFamilyOptions, options);
       this.optimisticTxnOptions = optimisticTxnOptions;
       this.optimisticTxnDb = optimisticTxnDb;
     }
@@ -437,6 +435,9 @@ public class OptimisticTransactionTest extends AbstractTransactionTest {
     public void close() {
       optimisticTxnOptions.close();
       writeOptions.close();
+      for (ColumnFamilyDescriptor columnFamilyDescriptor : columnFamilyDescriptors) {
+        columnFamilyDescriptor.close();
+      }
       for(final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandles) {
         columnFamilyHandle.close();
       }
