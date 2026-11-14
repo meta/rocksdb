@@ -1616,6 +1616,12 @@ extern ROCKSDB_LIBRARY_API uint64_t
 rocksdb_options_get_compression_options_max_dict_buffer_bytes(
     rocksdb_options_t* opt);
 extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_compression_options_max_compressed_bytes_per_kb(
+    rocksdb_options_t*, int);
+extern ROCKSDB_LIBRARY_API int
+rocksdb_options_get_compression_options_max_compressed_bytes_per_kb(
+    rocksdb_options_t* opt);
+extern ROCKSDB_LIBRARY_API void
 rocksdb_options_set_bottommost_compression_options(rocksdb_options_t*, int, int,
                                                    int, int, unsigned char);
 extern ROCKSDB_LIBRARY_API void

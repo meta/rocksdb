@@ -59,6 +59,17 @@ uint64_t rocksdb_options_get_compression_options_max_dict_buffer_bytes(
   return opt->rep.compression_opts.max_dict_buffer_bytes;
 }
 
+void rocksdb_options_set_compression_options_max_compressed_bytes_per_kb(
+    rocksdb_options_t* opt, int max_compressed_bytes_per_kb) {
+  opt->rep.compression_opts.max_compressed_bytes_per_kb =
+      max_compressed_bytes_per_kb;
+}
+
+int rocksdb_options_get_compression_options_max_compressed_bytes_per_kb(
+    rocksdb_options_t* opt) {
+  return opt->rep.compression_opts.max_compressed_bytes_per_kb;
+}
+
 unsigned char
 rocksdb_options_get_bottommost_compression_options_use_zstd_dict_trainer(
     rocksdb_options_t* opt) {
