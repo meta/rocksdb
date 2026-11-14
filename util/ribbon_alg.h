@@ -206,6 +206,24 @@ namespace ribbon {
 // out the leading 1s, so starts (at least) one column later and only
 // needs (at most) r - 1 coefficients.
 //
+// For implementation, the content of matrix is more like a lower-triangular
+// matrix as follows, but the "start column" counts bottom up, so it also fits
+// the upper-triangular solution mentioned above.
+//
+// [100000000000000000000000] start: m - 1
+// [#10000000000000000000000] start: m - 2
+// ...
+// [00000000000###1000000000] start: 9
+// [000000000000###100000000] start: 8
+// [0000000000000###10000000] start: 7
+// [000000000000000000000000] start: 6
+// [000000000000000###100000] start: 5
+// [000000000000000000000000] start: 4
+// [00000000000000000###1000] start: 3
+// [000000000000000000000000] start: 2
+// [0000000000000000000###10] start: 1
+// [00000000000000000000###1] start: 0
+//
 // ######################################################################
 // ###################### Ribbon PHSF scalability #######################
 //
