@@ -149,18 +149,10 @@ class DbStressCompactionFilter : public CompactionFilter {
     if (value.size() < sizeof(uint32_t)) {
       return false;
     }
-    const uint32_t value_base = GetValueBase(value);
+    char expected[kValueMaxLen];
     const size_t expected_size =
-        ((value_base % kRandomValueMaxFactor) + 1) * FLAGS_value_size_mult;
-    if (value.size() != expected_size) {
-      return false;
-    }
-    for (size_t i = sizeof(uint32_t); i < value.size(); ++i) {
-      if (value[i] != static_cast<char>(value_base ^ i)) {
-        return false;
-      }
-    }
-    return true;
+        GenerateValue(GetValueBase(value), expected, sizeof(expected));
+    return value == Slice(expected, expected_size);
   }
 
   Decision FilterMergeBeforeFilter(const Slice& key, ValueType value_type,

@@ -42,6 +42,7 @@
 #include "db_stress_tool/db_stress_listener.h"
 #include "db_stress_tool/db_stress_shared_state.h"
 #include "db_stress_tool/db_stress_status.h"
+#include "db_stress_tool/db_stress_structured_key_value.h"
 #include "db_stress_tool/db_stress_test_base.h"
 #include "logging/logging.h"
 #include "monitoring/histogram.h"
@@ -202,6 +203,12 @@ DECLARE_int32(index_block_search_type);
 DECLARE_double(uniform_cv_threshold);
 DECLARE_bool(use_trie_index);
 DECLARE_bool(use_full_external_table);
+DECLARE_string(table_factory_uri);
+DECLARE_bool(structured_key_value);
+DECLARE_uint64(structured_keys_per_key_space);
+DECLARE_uint64(structured_key_fanout);
+DECLARE_string(structured_key_space_type_weights);
+DECLARE_string(structured_value_version_weights);
 DECLARE_int32(index_mode);
 DECLARE_int32(read_index);
 DECLARE_bool(test_backward_scan);
@@ -705,9 +712,10 @@ struct KeyGenContext {
 };
 extern KeyGenContext key_gen_ctx;
 
-// Generate a variable length key string from the given int64 val. The
-// order of the keys is preserved. The key could be anywhere from 8 to
-// max_key_len * 8 bytes.
+// Generate a key string from the given int64 val. With
+// --structured_key_value, StructuredKey() returns a 12- or 20-byte key (see
+// db_stress_structured_key_value.h). Otherwise, the order of the keys is
+// preserved and the key can be anywhere from 8 to max_key_len * 8 bytes.
 // The algorithm picks the length based on the
 // offset of the val within a configured window and the distribution of the
 // number of keys of various lengths in that window. For example, if x, y, x are
@@ -716,6 +724,9 @@ extern KeyGenContext key_gen_ctx;
 // {(x-1),0}..{(x-1),(y-1)},{(x-1),(y-1),0}..{(x-1),(y-1),(z-1)} and so on.
 // Additionally, a trailer of 0-7 bytes could be appended.
 inline std::string Key(int64_t val) {
+  if (FLAGS_structured_key_value) {
+    return StructuredKey(static_cast<uint64_t>(val));
+  }
   uint64_t window = key_gen_ctx.window;
   size_t levels = key_gen_ctx.weights.size();
   std::string key;
@@ -754,6 +765,9 @@ inline std::string Key(int64_t val) {
 
 // Given a string key, map it to an index into the expected values buffer
 inline bool GetIntVal(std::string big_endian_key, uint64_t* key_p) {
+  if (FLAGS_structured_key_value) {
+    return StructuredKeyToIndex(big_endian_key, key_p);
+  }
   size_t size_key = big_endian_key.size();
   std::vector<uint64_t> prefixes;
 
@@ -796,6 +810,10 @@ inline bool GetIntVal(std::string big_endian_key, uint64_t* key_p) {
 // expected values buffer.
 inline bool GetFirstIntValInPrefix(std::string big_endian_prefix,
                                    uint64_t* key_p) {
+  if (FLAGS_structured_key_value) {
+    *key_p = StructuredKeyLowerBound(big_endian_prefix);
+    return true;
+  }
   size_t size_key = big_endian_prefix.size();
   // Pad with zeros to make it a multiple of 8. This function may be called
   // with a prefix, in which case we return the first index that falls
