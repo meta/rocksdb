@@ -1811,7 +1811,10 @@ DEFINE_int64(report_interval_seconds, 0,
 
 DEFINE_string(report_file, "report.csv",
               "Filename where some simple stats are reported to (if "
-              "--report_interval_seconds is bigger than 0)");
+              "--report_interval_seconds is bigger than 0). Rows from all "
+              "benchmark runs of one invocation, excluding warm-up runs, are "
+              "written to this file, with secs_elapsed measured from the "
+              "start of the first run.");
 
 DEFINE_int32(thread_status_per_interval, 0,
              "Takes and report a snapshot of the current status of each thread"
@@ -2687,26 +2690,35 @@ struct DBWithColumnFamilies {
 // A class that reports stats to CSV file.
 class ReporterAgent {
  public:
-  ReporterAgent(Env* env, const std::string& fname,
-                uint64_t report_interval_secs)
-      : env_(env),
-        total_ops_done_(0),
-        last_report_(0),
-        report_interval_secs_(report_interval_secs),
-        stop_(false) {
-    auto s = env_->NewWritableFile(fname, &report_file_, EnvOptions());
+  // Truncates `fname` and writes the header; aborts on failure.
+  static std::unique_ptr<WritableFile> CreateReportFile(
+      Env* env, const std::string& fname) {
+    std::unique_ptr<WritableFile> report_file;
+    Status s = env->NewWritableFile(fname, &report_file, EnvOptions());
     if (s.ok()) {
-      s = report_file_->Append(Header() + "\n");
+      s = report_file->Append(Header() + "\n");
     }
     if (s.ok()) {
-      s = report_file_->Flush();
+      s = report_file->Flush();
     }
     if (!s.ok()) {
       fprintf(stderr, "Can't open %s: %s\n", fname.c_str(),
               s.ToString().c_str());
       abort();
     }
+    return report_file;
+  }
 
+  // `report_file` must outlive this object.
+  ReporterAgent(Env* env, WritableFile* report_file, uint64_t start_micros,
+                uint64_t report_interval_secs)
+      : env_(env),
+        report_file_(report_file),
+        start_micros_(start_micros),
+        total_ops_done_(0),
+        last_report_(0),
+        report_interval_secs_(report_interval_secs),
+        stop_(false) {
     reporting_thread_ = port::Thread([&]() { SleepAndReport(); });
   }
 
@@ -2731,10 +2743,9 @@ class ReporterAgent {
   }
 
  private:
-  std::string Header() const { return "secs_elapsed,interval_qps"; }
+  static std::string Header() { return "secs_elapsed,interval_qps"; }
   void SleepAndReport() {
     auto* clock = env_->GetSystemClock().get();
-    auto time_started = clock->NowMicros();
     while (true) {
       {
         std::unique_lock<std::mutex> lk(mutex_);
@@ -2749,7 +2760,7 @@ class ReporterAgent {
       auto total_ops_done_snapshot = total_ops_done_.load();
       // round the seconds elapsed
       auto secs_elapsed =
-          (clock->NowMicros() - time_started + kMicrosInSecond / 2) /
+          (clock->NowMicros() - start_micros_ + kMicrosInSecond / 2) /
           kMicrosInSecond;
       std::string report =
           std::to_string(secs_elapsed) + "," +
@@ -2769,7 +2780,8 @@ class ReporterAgent {
   }
 
   Env* env_;
-  std::unique_ptr<WritableFile> report_file_;
+  UnownedPtr<WritableFile> report_file_;
+  const uint64_t start_micros_;
   std::atomic<int64_t> total_ops_done_;
   int64_t last_report_;
   const uint64_t report_interval_secs_;
@@ -3858,6 +3870,8 @@ class Benchmark {
   Options open_options_;  // keep options around to properly destroy db later
   TraceOptions trace_options_;
   TraceOptions block_cache_trace_options_;
+  std::unique_ptr<WritableFile> report_file_;
+  uint64_t report_start_micros_ = 0;
   int64_t reads_;
   int64_t deletes_;
   double read_random_exp_range_;
@@ -5277,7 +5291,8 @@ class Benchmark {
         }
 
         for (int i = 0; i < num_warmup; i++) {
-          RunBenchmark(num_threads, name, method);
+          RunBenchmark(num_threads, name, method,
+                       /*write_report_file=*/false);
         }
 
         if (num_repeat > 1) {
@@ -5286,7 +5301,8 @@ class Benchmark {
 
         CombinedStats combined_stats;
         for (int i = 0; i < num_repeat; i++) {
-          Stats stats = RunBenchmark(num_threads, name, method);
+          Stats stats = RunBenchmark(num_threads, name, method,
+                                     /*write_report_file=*/true);
           combined_stats.AddStats(stats);
           if (FLAGS_confidence_interval_only) {
             combined_stats.ReportWithConfidenceIntervals(name);
@@ -5467,8 +5483,8 @@ class Benchmark {
     }
   }
 
-  Stats RunBenchmark(int n, Slice name,
-                     void (Benchmark::*method)(ThreadState*)) {
+  Stats RunBenchmark(int n, Slice name, void (Benchmark::*method)(ThreadState*),
+                     bool write_report_file) {
     SharedState shared;
     shared.total = n;
     shared.num_initialized = 0;
@@ -5485,8 +5501,14 @@ class Benchmark {
     }
 
     std::unique_ptr<ReporterAgent> reporter_agent;
-    if (FLAGS_report_interval_seconds > 0) {
-      reporter_agent.reset(new ReporterAgent(FLAGS_env, FLAGS_report_file,
+    if (FLAGS_report_interval_seconds > 0 && write_report_file) {
+      if (report_file_ == nullptr) {
+        report_file_ =
+            ReporterAgent::CreateReportFile(FLAGS_env, FLAGS_report_file);
+        report_start_micros_ = FLAGS_env->GetSystemClock()->NowMicros();
+      }
+      reporter_agent.reset(new ReporterAgent(FLAGS_env, report_file_.get(),
+                                             report_start_micros_,
                                              FLAGS_report_interval_seconds));
     }
     std::unique_ptr<IntervalStatsReporter> interval_stats_reporter;
