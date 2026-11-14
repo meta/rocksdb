@@ -234,6 +234,7 @@ class PessimisticTransactionDB : public TransactionDB {
   friend class TransactionTest_PersistentTwoPhaseTransactionTest_Test;
   friend class TransactionTest_TwoPhaseDoubleRecoveryTest_Test;
   friend class TransactionTest_TwoPhaseOutOfOrderDelete_Test;
+  friend class TransactionTest_TwoPhasePreparedWriteToDroppedColumnFamily_Test;
   friend class TransactionStressTest_TwoPhaseLongPrepareTest_Test;
   friend class WriteUnpreparedTransactionTest_RecoveryTest_Test;
   friend class WriteUnpreparedTransactionTest_MarkLogWithPrepSection_Test;
