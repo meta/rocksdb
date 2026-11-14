@@ -547,6 +547,11 @@ class ReadOnlyMemTable {
 
  protected:
   friend class MemTableList;
+  // Exposed only so unit tests can directly construct memtables with a
+  // specific `flush_completed_`/`file_number_`/`edit_should_be_written_`
+  // state, to test `MemTableList::CollectEditsToWrite()` in isolation (see
+  // MempurgeLeaderDoesNotDropSiblingEdit in memtable_list_test.cc).
+  friend class MemTableListTest;
 
   int refs_{0};
 
@@ -554,6 +559,18 @@ class ReadOnlyMemTable {
   bool flush_in_progress_{false};  // started the flush
   bool flush_completed_{false};    // finished the flush
   uint64_t file_number_{0};
+
+  // Whether this memtable's own `edit_` should be written to the MANIFEST
+  // once its flush is installed. This is normally true, but is set to false
+  // when the flush that produced this memtable's result was a successful
+  // mempurge: in that case `edit_` carries no new SST file and its log
+  // number is stale (the mempurged data still depends on the WAL), so it
+  // must not be written. `TryInstallMemtableFlushResults` can batch several
+  // concurrently-completed flushes' edits into a single MANIFEST write; this
+  // flag lets each memtable's flush decide the fate of its OWN edit,
+  // independent of what any other memtable in the same batch decides. See
+  // https://github.com/facebook/rocksdb/issues/9022.
+  bool edit_should_be_written_{true};
 
   // The updates to be applied to the transaction log when this
   // memtable is flushed to storage.

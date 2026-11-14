@@ -547,6 +547,10 @@ class MemTableList {
       LogsWithPrepTracker* prep_tracker) const;
 
  private:
+  // Exposed only so unit tests can call `CollectEditsToWrite()` directly
+  // (see MempurgeLeaderDoesNotDropSiblingEdit in memtable_list_test.cc).
+  friend class MemTableListTest;
+
   friend Status InstallMemtableAtomicFlushResults(
       const autovector<MemTableList*>* imm_lists,
       const autovector<ColumnFamilyData*>& cfds,
@@ -557,6 +561,27 @@ class MemTableList {
           committed_flush_jobs_info,
       autovector<ReadOnlyMemTable*>* to_delete, FSDirectory* db_directory,
       LogBuffer* log_buffer);
+
+  // Scans `memlist` from the oldest not-yet-committed memtable, gathering
+  // the run of consecutive completed flush-job batches (grouped by
+  // `file_number_`) into `*memtables_to_flush`. Each batch's own `edit_` is
+  // added to `*edit_list`, but only if that batch's own
+  // `edit_should_be_written_` is true; `*any_write_edits` is set if at
+  // least one batch's edit was added. A batch that opted out (e.g. a
+  // successful mempurge) still contributes its memtables to
+  // `*memtables_to_flush` -- they still need to be retired from `memlist`
+  // -- but never its edit, and this must never suppress a DIFFERENT
+  // (sibling) batch's edit in the same run. See
+  // https://github.com/facebook/rocksdb/issues/9022.
+  //
+  // Pure in-memory bookkeeping over already-completed flush jobs: performs
+  // no I/O and never touches VersionSet/LogAndApply, which lets it be unit
+  // tested directly without a real MANIFEST or SST files.
+  static void CollectEditsToWrite(
+      const std::list<ReadOnlyMemTable*>& memlist, const std::string& cfd_name,
+      LogBuffer* log_buffer, autovector<VersionEdit*>* edit_list,
+      autovector<ReadOnlyMemTable*>* memtables_to_flush, bool* any_write_edits,
+      std::list<std::unique_ptr<FlushJobInfo>>* committed_flush_jobs_info);
 
   // DB mutex held
   void InstallNewVersion();
