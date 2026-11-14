@@ -1573,7 +1573,7 @@ void FixedHyperClockCache::ReportProblems(
   // First, if the average load factor is within spec, we aren't going to
   // complain about a few shards being out of spec.
   // NOTE: this is only the average among cache shards operating "at limit,"
-  // which should be representative of what we care about. It it normal, even
+  // which should be representative of what we care about. It is normal, even
   // desirable, for a cache to operate "at limit" so this should not create
   // selection bias. See AddShardEvaluation().
   // TODO: Consider detecting cases where decreasing the number of shards
