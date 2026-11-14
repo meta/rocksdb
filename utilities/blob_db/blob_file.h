@@ -130,10 +130,14 @@ class BlobFile {
   }
 
   // Unlink an SST file whose oldest blob file reference points to this file.
-  void UnlinkSstFile(uint64_t sst_file_number) {
+  // Returns true if the SST was found and unlinked, false otherwise.
+  bool UnlinkSstFile(uint64_t sst_file_number) {
     auto it = linked_sst_files_.find(sst_file_number);
-    assert(it != linked_sst_files_.end());
+    if (it == linked_sst_files_.end()) {
+      return false;
+    }
     linked_sst_files_.erase(it);
+    return true;
   }
 
   // the following functions are atomic, and don't need

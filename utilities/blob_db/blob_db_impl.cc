@@ -480,14 +480,22 @@ void BlobDBImpl::UnlinkSstFromBlobFile(uint64_t sst_file_number,
   BlobFile* const blob_file = it->second.get();
   assert(blob_file);
 
+  bool unlinked;
   {
     WriteLock file_lock(&blob_file->mutex_);
-    blob_file->UnlinkSstFile(sst_file_number);
+    unlinked = blob_file->UnlinkSstFile(sst_file_number);
   }
 
-  ROCKS_LOG_INFO(db_options_.info_log,
-                 "Blob file %" PRIu64 " unlinked from SST file %" PRIu64,
-                 blob_file_number, sst_file_number);
+  if (unlinked) {
+    ROCKS_LOG_INFO(db_options_.info_log,
+                   "Blob file %" PRIu64 " unlinked from SST file %" PRIu64,
+                   blob_file_number, sst_file_number);
+  } else {
+    ROCKS_LOG_WARN(db_options_.info_log,
+                   "SST file %" PRIu64 " not found in blob file %" PRIu64
+                   " while trying to unlink",
+                   sst_file_number, blob_file_number);
+  }
 }
 
 void BlobDBImpl::InitializeBlobFileToSstMapping(
@@ -1204,6 +1212,7 @@ void BlobDBImpl::GetCompactionContext(BlobCompactionContext* context,
 }
 
 void BlobDBImpl::UpdateLiveSSTSize() {
+  TEST_SYNC_POINT("BlobDBImpl::UpdateLiveSSTSize:Begin");
   uint64_t live_sst_size = 0;
   bool ok = GetIntProperty(DB::Properties::kLiveSstFilesSize, &live_sst_size);
   if (ok) {
