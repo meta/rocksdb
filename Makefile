@@ -1420,8 +1420,8 @@ unity.cc: Makefile util/build_version.cc.in
 	mv $@-t $@
 
 unity.a: $(OBJ_DIR)/unity.o
-	$(AM_V_AR)rm -f $@
-	$(AM_V_at)$(AR) $(ARFLAGS) $@ $(OBJ_DIR)/unity.o
+	$(AM_V_at)rm -f $@
+	$(AM_V_AR)$(AR) $(ARFLAGS) $@ $(OBJ_DIR)/unity.o
 
 
 # try compiling db_test with unity
@@ -1548,36 +1548,36 @@ package:
 # 	Unit tests and tools
 # ---------------------------------------------------------------------------
 $(STATIC_LIBRARY): $(LIB_OBJECTS)
-	$(AM_V_AR)rm -f $@ $(SHARED1) $(SHARED2) $(SHARED3) $(SHARED4)
-	$(AM_V_at)$(AR) $(ARFLAGS) $@ $(LIB_OBJECTS)
+	$(AM_V_at)rm -f $@ $(SHARED1) $(SHARED2) $(SHARED3) $(SHARED4)
+	$(AM_V_AR)$(AR) $(ARFLAGS) $@ $(LIB_OBJECTS)
 
 $(STATIC_TEST_LIBRARY): $(TEST_OBJECTS)
-	$(AM_V_AR)rm -f $@ $(SHARED_TEST_LIBRARY)
-	$(AM_V_at)$(AR) $(ARFLAGS) $@ $^
+	$(AM_V_at)rm -f $@ $(SHARED_TEST_LIBRARY)
+	$(AM_V_AR)$(AR) $(ARFLAGS) $@ $^
 
 $(STATIC_TOOLS_LIBRARY): $(TOOL_OBJECTS)
-	$(AM_V_AR)rm -f $@ $(SHARED_TOOLS_LIBRARY)
-	$(AM_V_at)$(AR) $(ARFLAGS) $@ $^
+	$(AM_V_at)rm -f $@ $(SHARED_TOOLS_LIBRARY)
+	$(AM_V_AR)$(AR) $(ARFLAGS) $@ $^
 
 $(STATIC_STRESS_LIBRARY): $(ANALYZE_OBJECTS) $(STRESS_OBJECTS) $(TESTUTIL)
-	$(AM_V_AR)rm -f $@ $(SHARED_STRESS_LIBRARY)
-	$(AM_V_at)$(AR) $(ARFLAGS) $@ $^
+	$(AM_V_at)rm -f $@ $(SHARED_STRESS_LIBRARY)
+	$(AM_V_AR)$(AR) $(ARFLAGS) $@ $^
 
 $(SHARED_TEST_LIBRARY): $(TEST_OBJECTS) $(SHARED1)
-	$(AM_V_AR)rm -f $@ $(STATIC_TEST_LIBRARY)
+	$(AM_V_at)rm -f $@ $(STATIC_TEST_LIBRARY)
 	$(AM_SHARE)
 
 $(SHARED_TOOLS_LIBRARY): $(TOOL_OBJECTS) $(SHARED1)
-	$(AM_V_AR)rm -f $@ $(STATIC_TOOLS_LIBRARY)
+	$(AM_V_at)rm -f $@ $(STATIC_TOOLS_LIBRARY)
 	$(AM_SHARE)
 
 $(SHARED_STRESS_LIBRARY): $(ANALYZE_OBJECTS) $(STRESS_OBJECTS) $(TESTUTIL) $(SHARED_TOOLS_LIBRARY) $(SHARED1)
-	$(AM_V_AR)rm -f $@ $(STATIC_STRESS_LIBRARY)
+	$(AM_V_at)rm -f $@ $(STATIC_STRESS_LIBRARY)
 	$(AM_SHARE)
 
 librocksdb_env_basic_test.a: $(OBJ_DIR)/env/env_basic_test.o $(LIB_OBJECTS) $(TESTHARNESS)
-	$(AM_V_AR)rm -f $@
-	$(AM_V_at)$(AR) $(ARFLAGS) $@ $^
+	$(AM_V_at)rm -f $@
+	$(AM_V_AR)$(AR) $(ARFLAGS) $@ $^
 
 db_bench: $(OBJ_DIR)/tools/db_bench.o $(BENCH_OBJECTS) $(TESTUTIL) $(LIBRARY)
 	$(AM_LINK)
