@@ -9057,6 +9057,15 @@ ReactiveVersionSet::ReactiveVersionSet(
 
 ReactiveVersionSet::~ReactiveVersionSet() = default;
 
+Status ReactiveVersionSet::TryGetManifestSize(log::Reader* reader,
+                                              uint64_t* size) const {
+  assert(reader != nullptr);
+  assert(size != nullptr);
+  SequentialFileReader* seq_reader = reader->file();
+  assert(seq_reader != nullptr);
+  return fs_->GetFileSize(seq_reader->file_name(), IOOptions(), size, nullptr);
+}
+
 Status ReactiveVersionSet::Recover(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
@@ -9087,6 +9096,10 @@ Status ReactiveVersionSet::Recover(
   s = manifest_tailer_->status();
   if (s.ok()) {
     RecoverEpochNumbers();
+    uint64_t manifest_size = 0;
+    if (TryGetManifestSize(reader, &manifest_size).ok()) {
+      manifest_file_size_ = manifest_size;
+    }
   }
   return s;
 }
@@ -9108,6 +9121,15 @@ Status ReactiveVersionSet::ReadAndApply(
   if (!s.ok()) {
     return s;
   }
+  reader = manifest_reader->get();
+  assert(reader);
+  uint64_t manifest_size = 0;
+  s = TryGetManifestSize(reader, &manifest_size);
+  if (s.ok() && manifest_size <= manifest_file_size_) {
+    cfds_changed->clear();
+    return Status::OK();
+  }
+
   manifest_tailer_->Iterate(*(manifest_reader->get()), manifest_read_status);
   s = manifest_tailer_->status();
   if (s.ok()) {
@@ -9179,6 +9201,7 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
     if (manifest_tailer_) {
       manifest_tailer_->PrepareToReadNewManifest();
     }
+    manifest_file_size_ = 0;
   } else if (s.IsPathNotFound()) {
     // This can happen if the primary switches to a new MANIFEST after the
     // secondary reads the CURRENT file but before the secondary actually
