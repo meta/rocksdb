@@ -23,7 +23,7 @@ namespace ROCKSDB_NAMESPACE {
 // Our test skip list stores 8-byte unsigned integers
 using Key = uint64_t;
 
-static const char* Encode(const uint64_t* key) {
+static const char* Encode(const Key* key) {
   return reinterpret_cast<const char*>(key);
 }
 
@@ -153,12 +153,12 @@ TEST_F(InlineSkipTest, InsertAndLookup) {
     InlineSkipList<TestComparator>::Iterator iter(&list);
     ASSERT_TRUE(!iter.Valid());
 
-    uint64_t zero = 0;
+    Key zero = 0;
     iter.Seek(Encode(&zero));
     ASSERT_TRUE(iter.Valid());
     ASSERT_EQ(*(keys.begin()), Decode(iter.key()));
 
-    uint64_t max_key = R - 1;
+    Key max_key = R - 1;
     iter.SeekForPrev(Encode(&max_key));
     ASSERT_TRUE(iter.Valid());
     ASSERT_EQ(*(keys.rbegin()), Decode(iter.key()));
@@ -614,11 +614,13 @@ TEST_F(InlineSkipTest, MultiGetDuplicateKeysWithCallbackWalk) {
 #if !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 // We want to make sure that with a single writer and multiple
 // concurrent readers (with no synchronization other than when a
-// reader's iterator is created), the reader always observes all the
+// reader's iterator is created), the reader will always observes all the
 // data that was present in the skip list when the iterator was
-// constructor.  Because insertions are happening concurrently, we may
-// also observe new values that were inserted since the iterator was
-// constructed, but we should never miss any values that were present
+// constructed.  With multiple writers, insertions can also happen
+// concurrently so we should also observe new values that were inserted
+// since the iterator was constructed.
+//
+// We should NEVER miss any values that were present
 // at iterator construction time.
 //
 // We generate multi-part keys:
@@ -641,17 +643,17 @@ class ConcurrentTest {
   static const uint32_t K = 8;
 
  private:
-  static uint64_t key(Key key) { return (key >> 40); }
-  static uint64_t gen(Key key) { return (key >> 8) & 0xffffffffu; }
-  static uint64_t hash(Key key) { return key & 0xff; }
+  static Key key(Key key) { return (key >> 40); }
+  static Key gen(Key key) { return (key >> 8) & 0xffffffffu; }
+  static Key hash(Key key) { return key & 0xff; }
 
-  static uint64_t HashNumbers(uint64_t k, uint64_t g) {
-    uint64_t data[2] = {k, g};
+  static Key HashNumbers(Key k, Key g) {
+    Key data[2] = {k, g};
     return Hash(reinterpret_cast<char*>(data), sizeof(data), 0);
   }
 
-  static Key MakeKey(uint64_t k, uint64_t g) {
-    assert(sizeof(Key) == sizeof(uint64_t));
+  static Key MakeKey(Key k, Key g) {
+    assert(sizeof(Key) == sizeof(Key));
     assert(k <= K);  // We sometimes pass K to seek to the end of the skiplist
     assert(g <= 0xffffffffu);
     return ((k << 40) | (g << 8) | (HashNumbers(k, g) & 0xff));
@@ -758,7 +760,7 @@ class ConcurrentTest {
         // Note that generation 0 is never inserted, so it is ok if
         // <*,0,*> is missing.
         ASSERT_TRUE((gen(pos) == 0U) ||
-                    (gen(pos) > static_cast<uint64_t>(initial_state.Get(
+                    (gen(pos) > static_cast<Key>(initial_state.Get(
                                     static_cast<int>(key(pos))))))
             << "key: " << key(pos) << "; gen: " << gen(pos)
             << "; initgen: " << initial_state.Get(static_cast<int>(key(pos)));

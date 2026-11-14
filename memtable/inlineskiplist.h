@@ -757,7 +757,7 @@ uint64_t InlineSkipList<Comparator>::ApproximateNumEntries(
   // That has stddev sqrt(x) where x is the expected number of entries (mean)
   // at this level, and the best predictor of x is the number of observed
   // entries (at this level). To predict the number of entries on level 0 we use
-  // x * kBranchinng ^ level. From the standard deviation, the P99+ relative
+  // x * kBranching ^ level. From the standard deviation, the P99+ relative
   // error is roughly 3 * sqrt(x) / x. Thus, a reasonable approach would be to
   // find the smallest level with at least some moderate constant number entries
   // in range. E.g. with at least ~40 entries, we expect P99+ relative error
