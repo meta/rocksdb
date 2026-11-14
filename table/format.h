@@ -20,12 +20,14 @@
 #include "file/random_access_file_reader.h"
 #include "memory/memory_allocator_impl.h"
 #include "options/cf_options.h"
+#include "port/likely.h"
 #include "port/malloc.h"
 #include "port/port.h"  // noexcept
 #include "rocksdb/cleanable.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
+#include "util/cast_util.h"
 #include "util/hash.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -615,6 +617,53 @@ Status DecompressBlockData(Decompressor::Args& args, Decompressor& decompressor,
                            BlockContents* out_contents,
                            const ImmutableOptions& ioptions,
                            MemoryAllocator* allocator = nullptr);
+
+// Pointer overloads for read paths where the decompressor may be absent: it is
+// null for a file whose blocks are all uncompressed, and during table open for
+// the metaindex/properties blocks that are read before the file's decompressor
+// is constructed. Those blocks are always written with kNoCompression, so a
+// compressed block reaching one of these overloads with no decompressor means
+// the file's per-block compression byte is corrupt or tampered; report it as
+// corruption instead of dereferencing null.
+inline Status DecompressSerializedBlock(
+    const char* data, size_t size, CompressionType type,
+    UnownedPtr<Decompressor> decompressor, BlockContents* out_contents,
+    const ImmutableOptions& ioptions, MemoryAllocator* allocator = nullptr,
+    ReadScopedBlockBufferProviderRef block_buffer_provider = std::nullopt) {
+  if (UNLIKELY(!decompressor)) {
+    return Status::Corruption(
+        "Block claims compression but no decompressor is available");
+  }
+  return DecompressSerializedBlock(data, size, type, *decompressor,
+                                   out_contents, ioptions, allocator,
+                                   block_buffer_provider);
+}
+
+inline Status DecompressSerializedBlock(
+    Decompressor::Args& args, UnownedPtr<Decompressor> decompressor,
+    BlockContents* out_contents, const ImmutableOptions& ioptions,
+    MemoryAllocator* allocator = nullptr,
+    ReadScopedBlockBufferProviderRef block_buffer_provider = std::nullopt) {
+  if (UNLIKELY(!decompressor)) {
+    return Status::Corruption(
+        "Block claims compression but no decompressor is available");
+  }
+  return DecompressSerializedBlock(args, *decompressor, out_contents, ioptions,
+                                   allocator, block_buffer_provider);
+}
+
+inline Status DecompressBlockData(
+    const char* data, size_t size, CompressionType type,
+    UnownedPtr<Decompressor> decompressor, BlockContents* out_contents,
+    const ImmutableOptions& ioptions, MemoryAllocator* allocator = nullptr,
+    Decompressor::ManagedWorkingArea* working_area = nullptr) {
+  if (UNLIKELY(!decompressor)) {
+    return Status::Corruption(
+        "Block claims compression but no decompressor is available");
+  }
+  return DecompressBlockData(data, size, type, *decompressor, out_contents,
+                             ioptions, allocator, working_area);
+}
 
 // Replace db_host_id contents with the real hostname if necessary
 Status ReifyDbHostIdProperty(Env* env, std::string* db_host_id);
