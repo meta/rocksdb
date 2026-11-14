@@ -66,6 +66,7 @@ set(JNI_NATIVE_SOURCES
         rocksjni/rocks_callback_object.cc
         rocksjni/rocksdb_exception_test.cc
         rocksjni/rocksjni.cc
+        rocksjni/secondary_cache.cc
         rocksjni/slice.cc
         rocksjni/snapshot.cc
         rocksjni/sst_file_manager.cc
