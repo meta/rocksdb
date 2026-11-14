@@ -550,6 +550,15 @@ static unsigned char CFilterFilter(void* arg, int level, const char* key,
   return 0;
 }
 
+static void CFilterDeleteValue(void* arg, const char* value,
+                               size_t value_length) {
+  (void)arg;
+  (void)value;
+  (void)value_length;
+  assert(value_length == 11);
+  assert(memcmp(value, "newbazvalue", value_length) == 0);
+}
+
 static void CFilterFactoryDestroy(void* arg) { (void)arg; }
 static const char* CFilterFactoryName(void* arg) {
   (void)arg;
@@ -2784,8 +2793,8 @@ int main(int argc, char** argv) {
     rocksdb_options_t* options_with_filter = rocksdb_options_create();
     rocksdb_options_set_create_if_missing(options_with_filter, 1);
     rocksdb_compactionfilter_t* cfilter;
-    cfilter = rocksdb_compactionfilter_create(NULL, CFilterDestroy,
-                                              CFilterFilter, CFilterName);
+    cfilter = rocksdb_compactionfilter_create_with_delete_value(
+        NULL, CFilterDestroy, CFilterFilter, CFilterDeleteValue, CFilterName);
     // Create new database
     rocksdb_close(db);
     rocksdb_destroy_db(options_with_filter, dbname, &err);
