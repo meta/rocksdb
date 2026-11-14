@@ -354,4 +354,10 @@ PinnableSlice& PinnableSlice::operator=(PinnableSlice&& other) {
   return *this;
 }
 
+Slice var_symbol(const char* s) {
+  const char* e = s;
+  while (*e && ('_' == *e || isalnum((unsigned char)*e))) e++;
+  return Slice(s, e - s);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
