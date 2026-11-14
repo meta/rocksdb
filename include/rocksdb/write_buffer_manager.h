@@ -160,7 +160,7 @@ class WriteBufferManager final {
   }
 
   // Returns true if total memory usage exceeded buffer_size.
-  // We stall the writes untill memory_usage drops below buffer_size. When the
+  // We stall the writes until memory_usage drops below buffer_size. When the
   // function returns true, all writer threads (including one checking this
   // condition) across all DBs will be stalled. Stall is allowed only if user
   // pass allow_stall = true during WriteBufferManager instance creation.

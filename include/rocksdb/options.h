@@ -1379,7 +1379,7 @@ struct DBOptions {
   uint64_t bytes_per_sync = 0;
 
   // Same as bytes_per_sync, but applies to WAL files
-  // This does not gaurantee the WALs are synced in the order of creation. New
+  // This does not guarantee the WALs are synced in the order of creation. New
   // WAL can be synced while an older WAL doesn't. Therefore upon system crash,
   // this hole in the WAL data can create partial data loss.
   //
