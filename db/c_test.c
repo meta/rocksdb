@@ -179,6 +179,44 @@ static void CheckPinGetCF(rocksdb_t* db, const rocksdb_readoptions_t* options,
   rocksdb_pinnableslice_destroy(p);
 }
 
+// Computes the file checksum that FileChecksumGenCrc32c produces for `path`:
+// the CRC32C of the file contents, stored as 4 big-endian bytes.
+static void FileChecksumCrc32c(const char* path, char checksum[4]) {
+  FILE* f = fopen(path, "rb");
+  CheckCondition(f != NULL);
+  uint32_t crc = 0xFFFFFFFFu;
+  int c;
+  while ((c = fgetc(f)) != EOF) {
+    crc ^= (uint32_t)c;
+    for (int bit = 0; bit < 8; bit++) {
+      crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1u)));
+    }
+  }
+  fclose(f);
+  crc = ~crc;
+  checksum[0] = (char)(crc >> 24);
+  checksum[1] = (char)(crc >> 16);
+  checksum[2] = (char)(crc >> 8);
+  checksum[3] = (char)crc;
+}
+
+static void WriteSstFile(const rocksdb_options_t* options, const char* path,
+                         const char* key, const char* val) {
+  char* err = NULL;
+  rocksdb_envoptions_t* env_opt = rocksdb_envoptions_create();
+  rocksdb_sstfilewriter_t* writer =
+      rocksdb_sstfilewriter_create(env_opt, options);
+  remove(path);
+  rocksdb_sstfilewriter_open(writer, path, &err);
+  CheckNoError(err);
+  rocksdb_sstfilewriter_put(writer, key, strlen(key), val, strlen(val), &err);
+  CheckNoError(err);
+  rocksdb_sstfilewriter_finish(writer, &err);
+  CheckNoError(err);
+  rocksdb_sstfilewriter_destroy(writer);
+  rocksdb_envoptions_destroy(env_opt);
+}
+
 static void CheckMultiGetValues(size_t num_keys, char** values,
                                 size_t* values_sizes, char** errs,
                                 const char** expected) {
@@ -5232,6 +5270,220 @@ int main(int argc, char** argv) {
     CheckCondition(0 == rocksdb_ingestexternalfileoptions_get_fill_cache(io));
 
     rocksdb_ingestexternalfileoptions_destroy(io);
+  }
+
+  StartPhase("ingest_external_files");
+  {
+    char ingest_dbname[256];
+    char sst_default[256];
+    char sst_cf[256];
+    char sst_checksum[256];
+    char sst_wrong_checksum[256];
+    snprintf(ingest_dbname, sizeof(ingest_dbname),
+             "%s/rocksdb_c_test-%" PRIu64 "-ingest", GetTempDir(), GetTestId());
+    snprintf(sst_default, sizeof(sst_default), "%s-default.sst", ingest_dbname);
+    snprintf(sst_cf, sizeof(sst_cf), "%s-cf.sst", ingest_dbname);
+    snprintf(sst_checksum, sizeof(sst_checksum), "%s-checksum.sst",
+             ingest_dbname);
+    snprintf(sst_wrong_checksum, sizeof(sst_wrong_checksum),
+             "%s-wrong-checksum.sst", ingest_dbname);
+
+    rocksdb_options_t* ingest_db_options = rocksdb_options_create();
+    rocksdb_options_set_create_if_missing(ingest_db_options, 1);
+    rocksdb_options_set_env(ingest_db_options, env);
+    rocksdb_file_checksum_gen_factory_t* checksum_factory =
+        rocksdb_file_checksum_gen_crc32c_factory_create();
+    rocksdb_options_set_file_checksum_gen_factory(ingest_db_options,
+                                                  checksum_factory);
+    rocksdb_destroy_db(ingest_db_options, ingest_dbname, &err);
+    CheckNoError(err);
+    rocksdb_t* ingest_db = rocksdb_open(ingest_db_options, ingest_dbname, &err);
+    CheckNoError(err);
+    rocksdb_column_family_handle_t* default_cf =
+        rocksdb_get_default_column_family_handle(ingest_db);
+    rocksdb_column_family_handle_t* cf = rocksdb_create_column_family(
+        ingest_db, ingest_db_options, "ingest_cf", &err);
+    CheckNoError(err);
+    rocksdb_ingestexternalfileoptions_t* ing_opt =
+        rocksdb_ingestexternalfileoptions_create();
+
+    // Atomically ingest one file into each of two column families.
+    WriteSstFile(ingest_db_options, sst_default, "ingest_default", "v1");
+    WriteSstFile(ingest_db_options, sst_cf, "ingest_cf_key", "v2");
+    rocksdb_ingestexternalfilearg_t* default_arg =
+        rocksdb_ingestexternalfilearg_create();
+    rocksdb_ingestexternalfilearg_set_column_family(default_arg, default_cf);
+    const char* default_files[1] = {sst_default};
+    rocksdb_ingestexternalfilearg_set_external_files(default_arg, default_files,
+                                                     1);
+    rocksdb_ingestexternalfilearg_set_options(default_arg, ing_opt);
+    rocksdb_ingestexternalfilearg_t* cf_arg =
+        rocksdb_ingestexternalfilearg_create();
+    rocksdb_ingestexternalfilearg_set_column_family(cf_arg, cf);
+    const char* cf_files[1] = {sst_cf};
+    rocksdb_ingestexternalfilearg_set_external_files(cf_arg, cf_files, 1);
+    rocksdb_ingestexternalfilearg_set_options(cf_arg, ing_opt);
+    const rocksdb_ingestexternalfilearg_t* args[2] = {default_arg, cf_arg};
+    rocksdb_ingest_external_files(ingest_db, args, 2, &err);
+    CheckNoError(err);
+    CheckGetCF(ingest_db, roptions, default_cf, "ingest_default", "v1");
+    CheckGetCF(ingest_db, roptions, default_cf, "ingest_cf_key", NULL);
+    CheckGetCF(ingest_db, roptions, cf, "ingest_cf_key", "v2");
+    CheckGetCF(ingest_db, roptions, cf, "ingest_default", NULL);
+    rocksdb_ingestexternalfilearg_destroy(default_arg);
+    rocksdb_ingestexternalfilearg_destroy(cf_arg);
+
+    // Supply a precomputed checksum so the DB does not have to read the file
+    // to generate one.
+    WriteSstFile(ingest_db_options, sst_checksum, "ingest_checksum", "v3");
+    char checksum[4];
+    FileChecksumCrc32c(sst_checksum, checksum);
+    char wrong_checksum[4];
+    memcpy(wrong_checksum, checksum, sizeof(checksum));
+    wrong_checksum[0] ^= 0x1;
+    const char* checksums[1] = {checksum};
+    const char* wrong_checksums[1] = {wrong_checksum};
+    const size_t checksums_lens[1] = {sizeof(checksum)};
+    const char* func_names[1] = {"FileChecksumCrc32c"};
+    const char* checksum_files[1] = {sst_checksum};
+    rocksdb_ingestexternalfilearg_t* checksum_arg =
+        rocksdb_ingestexternalfilearg_create();
+    rocksdb_ingestexternalfilearg_set_column_family(checksum_arg, cf);
+    rocksdb_ingestexternalfilearg_set_external_files(checksum_arg,
+                                                     checksum_files, 1);
+    rocksdb_ingestexternalfilearg_set_files_checksum_func_names(checksum_arg,
+                                                                func_names, 1);
+    const rocksdb_ingestexternalfilearg_t* checksum_args[1] = {checksum_arg};
+
+    // With verification on, a checksum that does not match the file is
+    // rejected.
+    rocksdb_ingestexternalfileoptions_set_verify_file_checksum(ing_opt, 1);
+    rocksdb_ingestexternalfilearg_set_options(checksum_arg, ing_opt);
+    rocksdb_ingestexternalfilearg_set_files_checksums(
+        checksum_arg, wrong_checksums, checksums_lens, 1);
+    rocksdb_ingest_external_files(ingest_db, checksum_args, 1, &err);
+    CheckCondition(err != NULL);
+    Free(&err);
+    CheckGetCF(ingest_db, roptions, cf, "ingest_checksum", NULL);
+
+    // With verification off, the supplied checksum is trusted and recorded,
+    // and it matches what the DB computes when verifying the live files.
+    rocksdb_ingestexternalfileoptions_set_verify_file_checksum(ing_opt, 0);
+    rocksdb_ingestexternalfilearg_set_options(checksum_arg, ing_opt);
+    rocksdb_ingestexternalfilearg_set_files_checksums(checksum_arg, checksums,
+                                                      checksums_lens, 1);
+    rocksdb_ingest_external_files(ingest_db, checksum_args, 1, &err);
+    CheckNoError(err);
+    CheckGetCF(ingest_db, roptions, cf, "ingest_checksum", "v3");
+    rocksdb_verify_file_checksums(ingest_db, &err);
+    CheckNoError(err);
+
+    // A wrong checksum is also trusted as-is when verification is off, which
+    // shows that the supplied bytes reach the MANIFEST unmodified.
+    WriteSstFile(ingest_db_options, sst_wrong_checksum, "ingest_wrong", "v4");
+    checksum_files[0] = sst_wrong_checksum;
+    rocksdb_ingestexternalfilearg_set_external_files(checksum_arg,
+                                                     checksum_files, 1);
+    rocksdb_ingestexternalfilearg_set_files_checksums(
+        checksum_arg, wrong_checksums, checksums_lens, 1);
+    rocksdb_ingest_external_files(ingest_db, checksum_args, 1, &err);
+    CheckNoError(err);
+    CheckGetCF(ingest_db, roptions, cf, "ingest_wrong", "v4");
+    rocksdb_verify_file_checksums(ingest_db, &err);
+    CheckCondition(err != NULL);
+    Free(&err);
+    rocksdb_ingestexternalfilearg_destroy(checksum_arg);
+
+    rocksdb_ingestexternalfileoptions_destroy(ing_opt);
+    rocksdb_column_family_handle_destroy(cf);
+    rocksdb_column_family_handle_destroy(default_cf);
+    rocksdb_close(ingest_db);
+    rocksdb_destroy_db(ingest_db_options, ingest_dbname, &err);
+    CheckNoError(err);
+    rocksdb_options_destroy(ingest_db_options);
+    rocksdb_file_checksum_gen_factory_destroy(checksum_factory);
+    remove(sst_default);
+    remove(sst_cf);
+    remove(sst_checksum);
+    remove(sst_wrong_checksum);
+  }
+
+  StartPhase("sstfilereader");
+  {
+    char reader_sst[256];
+    char reader_garbage[256];
+    char reader_missing[256];
+    snprintf(reader_sst, sizeof(reader_sst),
+             "%s/rocksdb_c_test-%" PRIu64 "-reader.sst", GetTempDir(),
+             GetTestId());
+    snprintf(reader_garbage, sizeof(reader_garbage), "%s-garbage", reader_sst);
+    snprintf(reader_missing, sizeof(reader_missing), "%s-missing", reader_sst);
+    rocksdb_options_t* reader_options = rocksdb_options_create();
+    rocksdb_options_set_env(reader_options, env);
+
+    rocksdb_envoptions_t* env_opt = rocksdb_envoptions_create();
+    rocksdb_sstfilewriter_t* writer =
+        rocksdb_sstfilewriter_create(env_opt, reader_options);
+    remove(reader_sst);
+    rocksdb_sstfilewriter_open(writer, reader_sst, &err);
+    CheckNoError(err);
+    rocksdb_sstfilewriter_put(writer, "reader_a", 8, "v1", 2, &err);
+    CheckNoError(err);
+    rocksdb_sstfilewriter_put(writer, "reader_b", 8, "v2", 2, &err);
+    CheckNoError(err);
+    rocksdb_sstfilewriter_put(writer, "reader_c", 8, "v3", 2, &err);
+    CheckNoError(err);
+    rocksdb_sstfilewriter_finish(writer, &err);
+    CheckNoError(err);
+    rocksdb_sstfilewriter_destroy(writer);
+    rocksdb_envoptions_destroy(env_opt);
+
+    rocksdb_sstfilereader_t* reader =
+        rocksdb_sstfilereader_create(reader_options);
+    rocksdb_sstfilereader_open(reader, reader_sst, &err);
+    CheckNoError(err);
+    rocksdb_iterator_t* iter =
+        rocksdb_sstfilereader_new_iterator(reader, roptions);
+    rocksdb_iter_seek_to_first(iter);
+    CheckCondition(rocksdb_iter_valid(iter));
+    CheckIter(iter, "reader_a", "v1");
+    rocksdb_iter_next(iter);
+    CheckIter(iter, "reader_b", "v2");
+    rocksdb_iter_seek_to_last(iter);
+    CheckCondition(rocksdb_iter_valid(iter));
+    CheckIter(iter, "reader_c", "v3");
+    rocksdb_iter_next(iter);
+    CheckCondition(!rocksdb_iter_valid(iter));
+    rocksdb_iter_get_error(iter, &err);
+    CheckNoError(err);
+    rocksdb_iter_destroy(iter);
+    rocksdb_sstfilereader_verify_checksum(reader, roptions, &err);
+    CheckNoError(err);
+    rocksdb_sstfilereader_destroy(reader);
+
+    // Opening a missing file or a file that is not an SST fails.
+    reader = rocksdb_sstfilereader_create(reader_options);
+    remove(reader_missing);
+    rocksdb_sstfilereader_open(reader, reader_missing, &err);
+    CheckCondition(err != NULL);
+    Free(&err);
+    rocksdb_sstfilereader_destroy(reader);
+
+    FILE* garbage = fopen(reader_garbage, "wb");
+    CheckCondition(garbage != NULL);
+    for (int i = 0; i < 128; i++) {
+      fputs("not an sst file ", garbage);
+    }
+    fclose(garbage);
+    reader = rocksdb_sstfilereader_create(reader_options);
+    rocksdb_sstfilereader_open(reader, reader_garbage, &err);
+    CheckCondition(err != NULL);
+    Free(&err);
+    rocksdb_sstfilereader_destroy(reader);
+
+    rocksdb_options_destroy(reader_options);
+    remove(reader_sst);
+    remove(reader_garbage);
   }
 
   StartPhase("cache_options");
