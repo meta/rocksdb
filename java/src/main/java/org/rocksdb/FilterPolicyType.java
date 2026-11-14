@@ -28,6 +28,8 @@ public enum FilterPolicyType {
   public Filter createFilter(final long handle, final double param) {
     if (this == kBloomFilterPolicy) {
       return new BloomFilter(handle, param);
+    } else if (this == kRibbonFilterPolicy) {
+      return new RibbonFilter(handle, param);
     }
     return null;
   }
