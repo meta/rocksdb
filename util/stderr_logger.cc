@@ -4,6 +4,8 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <stdlib.h>
+
 #include "util/stderr_logger.h"
 
 #include "port/malloc.h"
