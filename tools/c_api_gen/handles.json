@@ -1,0 +1,2169 @@
+{
+  "schema_version": 1,
+  "description": [
+    "C handle types: the C++ type each one wraps, trivial lifecycle functions, and C functions that forward to one C++ member function. See tools/c_api_gen/handle_bindings.py for the schema and the C API conventions it applies."
+  ],
+  "headers": [
+    "rocksdb/advanced_cache.h",
+    "rocksdb/compaction_filter.h",
+    "rocksdb/comparator.h",
+    "rocksdb/convenience.h",
+    "rocksdb/db.h",
+    "rocksdb/env.h",
+    "rocksdb/experimental.h",
+    "rocksdb/filter_policy.h",
+    "rocksdb/iterator.h",
+    "rocksdb/listener.h",
+    "rocksdb/memtablerep.h",
+    "rocksdb/merge_operator.h",
+    "rocksdb/options.h",
+    "rocksdb/perf_context.h",
+    "rocksdb/rate_limiter.h",
+    "rocksdb/slice_transform.h",
+    "rocksdb/sst_file_manager.h",
+    "rocksdb/statistics.h",
+    "rocksdb/status.h",
+    "rocksdb/table.h",
+    "rocksdb/trace_reader_writer.h",
+    "rocksdb/universal_compaction.h",
+    "rocksdb/user_defined_index.h",
+    "rocksdb/utilities/backup_engine.h",
+    "rocksdb/utilities/checkpoint.h",
+    "rocksdb/utilities/db_ttl.h",
+    "rocksdb/utilities/memory_util.h",
+    "rocksdb/utilities/optimistic_transaction_db.h",
+    "rocksdb/utilities/options_util.h",
+    "rocksdb/utilities/replayer.h",
+    "rocksdb/utilities/table_properties_collectors.h",
+    "rocksdb/utilities/transaction.h",
+    "rocksdb/utilities/transaction_db.h",
+    "rocksdb/utilities/write_batch_with_index.h",
+    "rocksdb/wal_filter.h",
+    "rocksdb/write_batch.h",
+    "rocksdb/write_buffer_manager.h"
+  ],
+  "handles": [
+    {
+      "c_type": "rocksdb_t",
+      "rep": "DB*",
+      "struct": "generated",
+      "var": "db",
+      "methods": [
+        {
+          "name": "rocksdb_drop_column_family",
+          "method": "DropColumnFamily"
+        },
+        {
+          "name": "rocksdb_get_latest_sequence_number",
+          "method": "GetLatestSequenceNumber",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_end_trace",
+          "method": "EndTrace"
+        },
+        {
+          "name": "rocksdb_end_io_trace",
+          "method": "EndIOTrace"
+        },
+        {
+          "name": "rocksdb_end_block_cache_trace",
+          "method": "EndBlockCacheTrace"
+        },
+        {
+          "name": "rocksdb_try_catch_up_with_primary",
+          "method": "TryCatchUpWithPrimary"
+        },
+        {
+          "name": "rocksdb_disable_manual_compaction",
+          "method": "DisableManualCompaction"
+        },
+        {
+          "name": "rocksdb_enable_manual_compaction",
+          "method": "EnableManualCompaction"
+        },
+        {
+          "name": "rocksdb_continue_background_work",
+          "method": "ContinueBackgroundWork"
+        },
+        {
+          "name": "rocksdb_delete",
+          "method": "Delete",
+          "overload": [
+            "const WriteOptions &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_delete_cf",
+          "method": "Delete",
+          "overload": [
+            "const WriteOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_delete_cf_with_ts",
+          "method": "Delete",
+          "overload": [
+            "const WriteOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_delete_range_cf",
+          "method": "DeleteRange",
+          "overload": [
+            "const WriteOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_delete_with_ts",
+          "method": "Delete",
+          "overload": [
+            "const WriteOptions &",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_disable_file_deletions",
+          "method": "DisableFileDeletions"
+        },
+        {
+          "name": "rocksdb_enable_file_deletions",
+          "method": "EnableFileDeletions"
+        },
+        {
+          "name": "rocksdb_flush",
+          "method": "Flush",
+          "overload": [
+            "const FlushOptions &"
+          ]
+        },
+        {
+          "name": "rocksdb_flush_cf",
+          "method": "Flush",
+          "overload": [
+            "const FlushOptions &",
+            "ColumnFamilyHandle *"
+          ]
+        },
+        {
+          "name": "rocksdb_flush_wal",
+          "method": "FlushWAL",
+          "overload": [
+            "bool"
+          ],
+          "param_names": {
+            "0": "sync"
+          }
+        },
+        {
+          "name": "rocksdb_merge",
+          "method": "Merge",
+          "overload": [
+            "const WriteOptions &",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_merge_cf",
+          "method": "Merge",
+          "overload": [
+            "const WriteOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_pause_background_work",
+          "method": "PauseBackgroundWork"
+        },
+        {
+          "name": "rocksdb_put",
+          "method": "Put",
+          "overload": [
+            "const WriteOptions &",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_put_cf",
+          "method": "Put",
+          "overload": [
+            "const WriteOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_put_cf_with_ts",
+          "method": "Put",
+          "overload": [
+            "const WriteOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_put_with_ts",
+          "method": "Put",
+          "overload": [
+            "const WriteOptions &",
+            "const Slice &",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_singledelete",
+          "method": "SingleDelete",
+          "overload": [
+            "const WriteOptions &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_singledelete_cf",
+          "method": "SingleDelete",
+          "overload": [
+            "const WriteOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_singledelete_cf_with_ts",
+          "method": "SingleDelete",
+          "overload": [
+            "const WriteOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_singledelete_with_ts",
+          "method": "SingleDelete",
+          "overload": [
+            "const WriteOptions &",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_verify_checksum",
+          "method": "VerifyChecksum",
+          "overload": []
+        },
+        {
+          "name": "rocksdb_verify_file_checksums",
+          "method": "VerifyFileChecksums",
+          "bind": {
+            "0": "ReadOptions()"
+          }
+        },
+        {
+          "name": "rocksdb_write",
+          "method": "Write"
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_status_ptr_t",
+      "rep": "Status*",
+      "struct": "generated",
+      "var": "status"
+    },
+    {
+      "c_type": "rocksdb_backup_engine_t",
+      "rep": "BackupEngine*",
+      "struct": "generated",
+      "var": "be",
+      "methods": [
+        {
+          "name": "rocksdb_backup_engine_create_new_backup",
+          "method": "CreateNewBackup",
+          "overload": [
+            "DB *",
+            "bool",
+            "std::function<void ()>"
+          ],
+          "arity": 1
+        },
+        {
+          "name": "rocksdb_backup_engine_create_new_backup_flush",
+          "method": "CreateNewBackup",
+          "overload": [
+            "DB *",
+            "bool",
+            "std::function<void ()>"
+          ],
+          "arity": 2
+        },
+        {
+          "name": "rocksdb_backup_engine_purge_old_backups",
+          "method": "PurgeOldBackups"
+        },
+        {
+          "name": "rocksdb_backup_engine_restore_db_from_latest_backup",
+          "method": "RestoreDBFromLatestBackup",
+          "overload": [
+            "const std::string &",
+            "const std::string &",
+            "const RestoreOptions &"
+          ],
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_backup_engine_stop_backup",
+          "method": "StopBackup"
+        },
+        {
+          "name": "rocksdb_backup_engine_verify_backup",
+          "method": "VerifyBackup",
+          "overload": [
+            "BackupID",
+            "bool"
+          ],
+          "arity": 1,
+          "receiver_const": false
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_backup_engine_info_t",
+      "rep": "std::vector<BackupInfo>",
+      "struct": "generated",
+      "var": "info",
+      "destroy": {
+        "name": "rocksdb_backup_engine_info_destroy",
+        "owns_rep": false,
+        "receiver_const": true
+      }
+    },
+    {
+      "c_type": "rocksdb_create_backup_options_t",
+      "rep": "CreateBackupOptions",
+      "struct": "manual",
+      "var": "options",
+      "create": "rocksdb_create_backup_options_create",
+      "destroy": {
+        "name": "rocksdb_create_backup_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_restore_options_t",
+      "rep": "RestoreOptions",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_restore_options_create",
+      "destroy": {
+        "name": "rocksdb_restore_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_iterator_t",
+      "rep": "Iterator*",
+      "struct": "generated",
+      "var": "iter",
+      "destroy": {
+        "name": "rocksdb_iter_destroy",
+        "owns_rep": true
+      },
+      "methods": [
+        {
+          "name": "rocksdb_iter_valid",
+          "method": "Valid"
+        },
+        {
+          "name": "rocksdb_iter_seek_to_first",
+          "method": "SeekToFirst"
+        },
+        {
+          "name": "rocksdb_iter_seek_to_last",
+          "method": "SeekToLast"
+        },
+        {
+          "name": "rocksdb_iter_seek",
+          "method": "Seek"
+        },
+        {
+          "name": "rocksdb_iter_seek_for_prev",
+          "method": "SeekForPrev"
+        },
+        {
+          "name": "rocksdb_iter_next",
+          "method": "Next"
+        },
+        {
+          "name": "rocksdb_iter_prev",
+          "method": "Prev"
+        },
+        {
+          "name": "rocksdb_iter_key",
+          "method": "key",
+          "result": "borrow"
+        },
+        {
+          "name": "rocksdb_iter_value",
+          "method": "value",
+          "result": "borrow"
+        },
+        {
+          "name": "rocksdb_iter_timestamp",
+          "method": "timestamp",
+          "result": "borrow"
+        },
+        {
+          "name": "rocksdb_iter_get_error",
+          "method": "status"
+        },
+        {
+          "name": "rocksdb_iter_key_slice",
+          "method": "key",
+          "result": "slice",
+          "doc": [
+            "/* Slice iterator functions: Return rocksdb_slice_t directly for better",
+            " * performance. These functions avoid the overhead of passing output parameters",
+            " * and provide zero-copy access to key/value/timestamp data. faster than",
+            " * traditional rocksdb_iter_key/value/timestamp functions. */"
+          ]
+        },
+        {
+          "name": "rocksdb_iter_value_slice",
+          "method": "value",
+          "result": "slice"
+        },
+        {
+          "name": "rocksdb_iter_timestamp_slice",
+          "method": "timestamp",
+          "result": "slice"
+        },
+        {
+          "name": "rocksdb_iter_refresh",
+          "method": "Refresh",
+          "overload": [],
+          "receiver_const": true
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_writebatch_t",
+      "rep": "WriteBatch",
+      "struct": "generated",
+      "var": "b",
+      "create": "rocksdb_writebatch_create",
+      "destroy": {
+        "name": "rocksdb_writebatch_destroy",
+        "owns_rep": false
+      },
+      "methods": [
+        {
+          "name": "rocksdb_writebatch_count",
+          "method": "Count",
+          "receiver_const": false,
+          "c_types": {
+            "return": "int"
+          }
+        },
+        {
+          "name": "rocksdb_writebatch_put_cf_with_ts",
+          "method": "Put",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_merge",
+          "method": "Merge",
+          "overload": [
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_merge_cf",
+          "method": "Merge",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_singledelete",
+          "method": "SingleDelete",
+          "overload": [
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_delete_cf",
+          "method": "Delete",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_delete_cf_with_ts",
+          "method": "Delete",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_singledelete_cf",
+          "method": "SingleDelete",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_singledelete_cf_with_ts",
+          "method": "SingleDelete",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_delete_range",
+          "method": "DeleteRange",
+          "overload": [
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_delete_range_cf",
+          "method": "DeleteRange",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_clear",
+          "method": "Clear"
+        },
+        {
+          "name": "rocksdb_writebatch_delete",
+          "method": "Delete",
+          "overload": [
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_pop_save_point",
+          "method": "PopSavePoint"
+        },
+        {
+          "name": "rocksdb_writebatch_put",
+          "method": "Put",
+          "overload": [
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_put_cf",
+          "method": "Put",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_put_log_data",
+          "method": "PutLogData",
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_rollback_to_save_point",
+          "method": "RollbackToSavePoint"
+        },
+        {
+          "name": "rocksdb_writebatch_set_save_point",
+          "method": "SetSavePoint"
+        },
+        {
+          "name": "rocksdb_writebatch_verify_checksum",
+          "method": "VerifyChecksum",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_writebatch_data",
+          "method": "Data",
+          "result": "borrow",
+          "receiver_const": false
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_writebatch_wi_t",
+      "rep": "WriteBatchWithIndex*",
+      "struct": "generated",
+      "var": "b",
+      "destroy": {
+        "name": "rocksdb_writebatch_wi_destroy",
+        "owns_rep": true
+      },
+      "methods": [
+        {
+          "name": "rocksdb_writebatch_wi_clear",
+          "method": "Clear"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_put",
+          "method": "Put",
+          "overload": [
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_put_cf",
+          "method": "Put",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_merge",
+          "method": "Merge",
+          "overload": [
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_merge_cf",
+          "method": "Merge",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_delete",
+          "method": "Delete",
+          "overload": [
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_singledelete",
+          "method": "SingleDelete",
+          "overload": [
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_delete_cf",
+          "method": "Delete",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_singledelete_cf",
+          "method": "SingleDelete",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &"
+          ],
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_delete_range",
+          "method": "DeleteRange",
+          "overload": [
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard",
+          "doc": [
+            "// DO NOT USE - rocksdb_writebatch_wi_delete_range is not yet supported"
+          ]
+        },
+        {
+          "name": "rocksdb_writebatch_wi_delete_range_cf",
+          "method": "DeleteRange",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ],
+          "result": "discard",
+          "doc": [
+            "// DO NOT USE - rocksdb_writebatch_wi_delete_range_cf is not yet supported"
+          ]
+        },
+        {
+          "name": "rocksdb_writebatch_wi_put_log_data",
+          "method": "PutLogData",
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_set_save_point",
+          "method": "SetSavePoint"
+        },
+        {
+          "name": "rocksdb_writebatch_wi_rollback_to_save_point",
+          "method": "RollbackToSavePoint"
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_table_properties_t",
+      "rep": "TableProperties",
+      "struct": "generated",
+      "var": "props",
+      "methods": [
+        {
+          "name": "rocksdb_table_properties_has_key_largest_seqno",
+          "method": "HasKeyLargestSeqno"
+        },
+        {
+          "name": "rocksdb_table_properties_has_key_smallest_seqno",
+          "method": "HasKeySmallestSeqno"
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_compaction_job_stats_t",
+      "rep": "CompactionJobStats",
+      "struct": "generated",
+      "var": "h"
+    },
+    {
+      "c_type": "rocksdb_compaction_file_info_t",
+      "rep": "CompactionFileInfo",
+      "struct": "generated",
+      "var": "h"
+    },
+    {
+      "c_type": "rocksdb_blob_file_addition_info_t",
+      "rep": "BlobFileAdditionInfo",
+      "struct": "generated",
+      "var": "h"
+    },
+    {
+      "c_type": "rocksdb_blob_file_garbage_info_t",
+      "rep": "BlobFileGarbageInfo",
+      "struct": "generated",
+      "var": "h"
+    },
+    {
+      "c_type": "rocksdb_snapshot_t",
+      "rep": "const Snapshot*",
+      "struct": "generated",
+      "var": "snapshot",
+      "methods": [
+        {
+          "name": "rocksdb_snapshot_get_sequence_number",
+          "method": "GetSequenceNumber"
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_flushoptions_t",
+      "rep": "FlushOptions",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_flushoptions_create",
+      "destroy": {
+        "name": "rocksdb_flushoptions_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_flushwaloptions_t",
+      "rep": "FlushWALOptions",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_flushwaloptions_create",
+      "destroy": {
+        "name": "rocksdb_flushwaloptions_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_fifo_compaction_options_t",
+      "rep": "CompactionOptionsFIFO",
+      "struct": "generated",
+      "var": "fifo_opts",
+      "destroy": {
+        "name": "rocksdb_fifo_compaction_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_readoptions_t",
+      "rep": "ReadOptions",
+      "struct": "manual",
+      "var": "opt",
+      "create": "rocksdb_readoptions_create",
+      "destroy": {
+        "name": "rocksdb_readoptions_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_writeoptions_t",
+      "rep": "WriteOptions",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_writeoptions_create",
+      "destroy": {
+        "name": "rocksdb_writeoptions_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_options_t",
+      "rep": "Options",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_options_create",
+      "destroy": {
+        "name": "rocksdb_options_destroy",
+        "owns_rep": false
+      },
+      "methods": [
+        {
+          "name": "rocksdb_options_increase_parallelism",
+          "method": "IncreaseParallelism",
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_options_optimize_for_point_lookup",
+          "method": "OptimizeForPointLookup",
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_options_optimize_level_style_compaction",
+          "method": "OptimizeLevelStyleCompaction",
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_options_optimize_universal_style_compaction",
+          "method": "OptimizeUniversalStyleCompaction",
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_options_prepare_for_bulk_load",
+          "method": "PrepareForBulkLoad",
+          "result": "discard"
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_compaction_options_t",
+      "rep": "CompactionOptions",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_compaction_options_create",
+      "destroy": {
+        "name": "rocksdb_compaction_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_compactoptions_t",
+      "rep": "CompactRangeOptions",
+      "struct": "manual",
+      "var": "opt",
+      "create": "rocksdb_compactoptions_create",
+      "destroy": {
+        "name": "rocksdb_compactoptions_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_block_based_table_options_t",
+      "rep": "BlockBasedTableOptions",
+      "struct": "manual",
+      "var": "options",
+      "create": "rocksdb_block_based_options_create",
+      "destroy": {
+        "name": "rocksdb_block_based_options_destroy",
+        "owns_rep": false
+      },
+      "methods": [
+        {
+          "name": "rocksdb_block_based_options_get_index_mode",
+          "method": "GetEffectiveIndexMode",
+          "receiver_const": false
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_block_cache_trace_options_t",
+      "rep": "BlockCacheTraceOptions",
+      "struct": "generated",
+      "var": "options",
+      "create": "rocksdb_block_cache_trace_options_create",
+      "destroy": {
+        "name": "rocksdb_block_cache_trace_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_block_cache_trace_writer_options_t",
+      "rep": "BlockCacheTraceWriterOptions",
+      "struct": "generated",
+      "var": "options",
+      "create": "rocksdb_block_cache_trace_writer_options_create",
+      "destroy": {
+        "name": "rocksdb_block_cache_trace_writer_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_cuckoo_table_options_t",
+      "rep": "CuckooTableOptions",
+      "struct": "generated",
+      "var": "options",
+      "create": "rocksdb_cuckoo_options_create",
+      "destroy": {
+        "name": "rocksdb_cuckoo_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_seqfile_t",
+      "rep": "SequentialFile*",
+      "struct": "generated",
+      "var": "h"
+    },
+    {
+      "c_type": "rocksdb_randomfile_t",
+      "rep": "RandomAccessFile*",
+      "struct": "generated",
+      "var": "h"
+    },
+    {
+      "c_type": "rocksdb_writablefile_t",
+      "rep": "WritableFile*",
+      "struct": "generated",
+      "var": "h"
+    },
+    {
+      "c_type": "rocksdb_wal_iterator_t",
+      "rep": "WalIterator*",
+      "struct": "generated",
+      "var": "iter",
+      "destroy": {
+        "name": "rocksdb_wal_iter_destroy",
+        "owns_rep": true,
+        "receiver_const": true
+      },
+      "methods": [
+        {
+          "name": "rocksdb_wal_iter_next",
+          "method": "Next"
+        },
+        {
+          "name": "rocksdb_wal_iter_valid",
+          "method": "Valid",
+          "receiver_const": true
+        },
+        {
+          "name": "rocksdb_wal_iter_status",
+          "method": "status",
+          "receiver_const": true
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_wal_readoptions_t",
+      "rep": "WalIterator::ReadOptions",
+      "struct": "generated",
+      "var": "options",
+      "create": "rocksdb_wal_readoptions_create",
+      "destroy": {
+        "name": "rocksdb_wal_readoptions_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_wal_files_t",
+      "rep": "std::vector<rocksdb_wal_file_t>",
+      "struct": "generated",
+      "var": "files",
+      "destroy": {
+        "name": "rocksdb_wal_files_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_filelock_t",
+      "rep": "FileLock*",
+      "struct": "generated",
+      "var": "h"
+    },
+    {
+      "c_type": "rocksdb_logger_t",
+      "rep": "std::shared_ptr<Logger>",
+      "struct": "generated",
+      "var": "logger",
+      "destroy": {
+        "name": "rocksdb_logger_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_file_checksum_gen_factory_t",
+      "rep": "std::shared_ptr<FileChecksumGenFactory>",
+      "struct": "generated",
+      "var": "factory",
+      "destroy": {
+        "name": "rocksdb_file_checksum_gen_factory_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_sst_partitioner_factory_t",
+      "rep": "std::shared_ptr<SstPartitionerFactory>",
+      "struct": "generated",
+      "var": "factory",
+      "destroy": {
+        "name": "rocksdb_sst_partitioner_factory_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_table_properties_collector_factory_t",
+      "rep": "std::shared_ptr<TablePropertiesCollectorFactory>",
+      "struct": "generated",
+      "var": "factory",
+      "destroy": {
+        "name": "rocksdb_table_properties_collector_factory_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_lru_cache_options_t",
+      "rep": "LRUCacheOptions",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_lru_cache_options_create",
+      "destroy": {
+        "name": "rocksdb_lru_cache_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_hyper_clock_cache_options_t",
+      "rep": "HyperClockCacheOptions",
+      "struct": "generated",
+      "var": "opts",
+      "destroy": {
+        "name": "rocksdb_hyper_clock_cache_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_memory_allocator_t",
+      "rep": "std::shared_ptr<MemoryAllocator>",
+      "struct": "generated",
+      "var": "allocator",
+      "destroy": {
+        "name": "rocksdb_memory_allocator_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_cache_t",
+      "rep": "std::shared_ptr<Cache>",
+      "struct": "generated",
+      "var": "cache",
+      "destroy": {
+        "name": "rocksdb_cache_destroy",
+        "owns_rep": false
+      },
+      "methods": [
+        {
+          "name": "rocksdb_cache_disown_data",
+          "method": "DisownData"
+        },
+        {
+          "name": "rocksdb_cache_set_capacity",
+          "method": "SetCapacity"
+        },
+        {
+          "name": "rocksdb_cache_get_capacity",
+          "method": "GetCapacity"
+        },
+        {
+          "name": "rocksdb_cache_get_usage",
+          "method": "GetUsage",
+          "overload": []
+        },
+        {
+          "name": "rocksdb_cache_get_pinned_usage",
+          "method": "GetPinnedUsage"
+        },
+        {
+          "name": "rocksdb_cache_get_table_address_count",
+          "method": "GetTableAddressCount"
+        },
+        {
+          "name": "rocksdb_cache_get_occupancy_count",
+          "method": "GetOccupancyCount"
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_write_buffer_manager_t",
+      "rep": "std::shared_ptr<WriteBufferManager>",
+      "struct": "generated",
+      "var": "wbm",
+      "destroy": {
+        "name": "rocksdb_write_buffer_manager_destroy",
+        "owns_rep": false
+      },
+      "methods": [
+        {
+          "name": "rocksdb_write_buffer_manager_enabled",
+          "method": "enabled",
+          "receiver_const": false,
+          "c_types": {
+            "return": "bool"
+          }
+        },
+        {
+          "name": "rocksdb_write_buffer_manager_cost_to_cache",
+          "method": "cost_to_cache",
+          "receiver_const": false,
+          "c_types": {
+            "return": "bool"
+          }
+        },
+        {
+          "name": "rocksdb_write_buffer_manager_memory_usage",
+          "method": "memory_usage",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_write_buffer_manager_mutable_memtable_memory_usage",
+          "method": "mutable_memtable_memory_usage",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_write_buffer_manager_dummy_entries_in_cache_usage",
+          "method": "dummy_entries_in_cache_usage",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_write_buffer_manager_buffer_size",
+          "method": "buffer_size",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_write_buffer_manager_set_buffer_size",
+          "method": "SetBufferSize"
+        },
+        {
+          "name": "rocksdb_write_buffer_manager_set_allow_stall",
+          "method": "SetAllowStall",
+          "c_types": {
+            "new_allow_stall": "bool"
+          }
+        },
+        {
+          "name": "rocksdb_write_buffer_manager_flush_policy",
+          "method": "flush_policy",
+          "receiver_const": false
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_sst_file_manager_t",
+      "rep": "std::shared_ptr<SstFileManager>",
+      "struct": "generated",
+      "var": "sfm",
+      "destroy": {
+        "name": "rocksdb_sst_file_manager_destroy",
+        "owns_rep": false
+      },
+      "methods": [
+        {
+          "name": "rocksdb_sst_file_manager_set_max_allowed_space_usage",
+          "method": "SetMaxAllowedSpaceUsage"
+        },
+        {
+          "name": "rocksdb_sst_file_manager_set_compaction_buffer_size",
+          "method": "SetCompactionBufferSize"
+        },
+        {
+          "name": "rocksdb_sst_file_manager_is_max_allowed_space_reached",
+          "method": "IsMaxAllowedSpaceReached",
+          "c_types": {
+            "return": "bool"
+          }
+        },
+        {
+          "name": "rocksdb_sst_file_manager_is_max_allowed_space_reached_including_compactions",
+          "method": "IsMaxAllowedSpaceReachedIncludingCompactions",
+          "c_types": {
+            "return": "bool"
+          }
+        },
+        {
+          "name": "rocksdb_sst_file_manager_get_total_size",
+          "method": "GetTotalSize"
+        },
+        {
+          "name": "rocksdb_sst_file_manager_get_delete_rate_bytes_per_second",
+          "method": "GetDeleteRateBytesPerSecond"
+        },
+        {
+          "name": "rocksdb_sst_file_manager_set_delete_rate_bytes_per_second",
+          "method": "SetDeleteRateBytesPerSecond"
+        },
+        {
+          "name": "rocksdb_sst_file_manager_get_max_trash_db_ratio",
+          "method": "GetMaxTrashDBRatio"
+        },
+        {
+          "name": "rocksdb_sst_file_manager_set_max_trash_db_ratio",
+          "method": "SetMaxTrashDBRatio"
+        },
+        {
+          "name": "rocksdb_sst_file_manager_get_total_trash_size",
+          "method": "GetTotalTrashSize"
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_livefile_t",
+      "rep": "LiveFileMetaData",
+      "struct": "generated",
+      "var": "lf",
+      "create": "rocksdb_livefile_create",
+      "destroy": {
+        "name": "rocksdb_livefile_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_livefiles_t",
+      "rep": "std::vector<LiveFileMetaData>",
+      "struct": "generated",
+      "var": "lf",
+      "create": "rocksdb_livefiles_create",
+      "destroy": {
+        "name": "rocksdb_livefiles_destroy",
+        "owns_rep": false,
+        "receiver_const": true
+      }
+    },
+    {
+      "c_type": "rocksdb_column_family_handle_t",
+      "rep": "ColumnFamilyHandle*",
+      "struct": "manual",
+      "var": "handle",
+      "methods": [
+        {
+          "name": "rocksdb_column_family_handle_get_id",
+          "method": "GetID",
+          "receiver_const": false
+        },
+        {
+          "name": "rocksdb_column_family_handle_get_name",
+          "method": "GetName",
+          "result": "copy",
+          "receiver_const": false
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_column_family_metadata_t",
+      "rep": "ColumnFamilyMetaData",
+      "struct": "generated",
+      "var": "cf_meta",
+      "destroy": {
+        "name": "rocksdb_column_family_metadata_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_column_family_metadata_options_t",
+      "rep": "GetColumnFamilyMetaDataOptions",
+      "struct": "manual",
+      "var": "options",
+      "destroy": {
+        "name": "rocksdb_column_family_metadata_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_export_import_files_metadata_t",
+      "rep": "ExportImportFilesMetaData*",
+      "struct": "generated",
+      "var": "metadata",
+      "destroy": {
+        "name": "rocksdb_export_import_files_metadata_destroy",
+        "owns_rep": true
+      }
+    },
+    {
+      "c_type": "rocksdb_import_column_family_options_t",
+      "rep": "ImportColumnFamilyOptions",
+      "struct": "generated",
+      "var": "metadata",
+      "create": "rocksdb_import_column_family_options_create",
+      "destroy": {
+        "name": "rocksdb_import_column_family_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_level_metadata_t",
+      "rep": "const LevelMetaData*",
+      "struct": "generated",
+      "var": "level_meta"
+    },
+    {
+      "c_type": "rocksdb_sst_file_metadata_t",
+      "rep": "const SstFileMetaData*",
+      "struct": "generated",
+      "var": "file_meta"
+    },
+    {
+      "c_type": "rocksdb_envoptions_t",
+      "rep": "EnvOptions",
+      "struct": "manual",
+      "var": "opt",
+      "create": "rocksdb_envoptions_create",
+      "destroy": {
+        "name": "rocksdb_envoptions_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_ingestexternalfileoptions_t",
+      "rep": "IngestExternalFileOptions",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_ingestexternalfileoptions_create",
+      "destroy": {
+        "name": "rocksdb_ingestexternalfileoptions_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_trace_options_t",
+      "rep": "TraceOptions",
+      "struct": "generated",
+      "var": "options",
+      "create": "rocksdb_trace_options_create",
+      "destroy": {
+        "name": "rocksdb_trace_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_trace_reader_t",
+      "rep": "std::unique_ptr<TraceReader>",
+      "struct": "generated",
+      "var": "reader",
+      "destroy": {
+        "name": "rocksdb_trace_reader_destroy",
+        "owns_rep": false
+      },
+      "methods": [
+        {
+          "name": "rocksdb_trace_reader_reset",
+          "method": "Reset"
+        },
+        {
+          "name": "rocksdb_trace_reader_close",
+          "method": "Close"
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_replay_options_t",
+      "rep": "ReplayOptions",
+      "struct": "generated",
+      "var": "options",
+      "create": "rocksdb_replay_options_create",
+      "destroy": {
+        "name": "rocksdb_replay_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_replayer_t",
+      "rep": "std::unique_ptr<Replayer>",
+      "struct": "generated",
+      "var": "replayer",
+      "destroy": {
+        "name": "rocksdb_replayer_destroy",
+        "owns_rep": false
+      },
+      "methods": [
+        {
+          "name": "rocksdb_replayer_prepare",
+          "method": "Prepare"
+        },
+        {
+          "name": "rocksdb_replayer_get_header_timestamp",
+          "method": "GetHeaderTimestamp"
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_size_approximation_options_t",
+      "rep": "SizeApproximationOptions",
+      "struct": "generated",
+      "var": "options",
+      "create": "rocksdb_size_approximation_options_create",
+      "destroy": {
+        "name": "rocksdb_size_approximation_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_livefiles_storage_info_options_t",
+      "rep": "LiveFilesStorageInfoOptions",
+      "struct": "generated",
+      "var": "options",
+      "create": "rocksdb_livefiles_storage_info_options_create",
+      "destroy": {
+        "name": "rocksdb_livefiles_storage_info_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_livefiles_storage_info_t",
+      "rep": "std::vector<LiveFileStorageInfo>",
+      "struct": "generated",
+      "var": "info",
+      "destroy": {
+        "name": "rocksdb_livefiles_storage_info_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_sstfilewriter_t",
+      "rep": "SstFileWriter*",
+      "struct": "generated",
+      "var": "writer",
+      "destroy": {
+        "name": "rocksdb_sstfilewriter_destroy",
+        "owns_rep": true
+      },
+      "methods": [
+        {
+          "name": "rocksdb_sstfilewriter_open",
+          "method": "Open",
+          "arity": 1
+        },
+        {
+          "name": "rocksdb_sstfilewriter_add",
+          "method": "Put",
+          "overload": [
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_sstfilewriter_put",
+          "method": "Put",
+          "overload": [
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_sstfilewriter_put_with_ts",
+          "method": "Put",
+          "overload": [
+            "const Slice &",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_sstfilewriter_merge",
+          "method": "Merge"
+        },
+        {
+          "name": "rocksdb_sstfilewriter_delete",
+          "method": "Delete",
+          "overload": [
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_sstfilewriter_delete_with_ts",
+          "method": "Delete",
+          "overload": [
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_sstfilewriter_delete_range",
+          "method": "DeleteRange",
+          "overload": [
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_sstfilewriter_finish",
+          "method": "Finish",
+          "bind": {
+            "file_info": "nullptr"
+          }
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_ratelimiter_t",
+      "rep": "std::shared_ptr<RateLimiter>",
+      "struct": "generated",
+      "var": "limiter",
+      "destroy": {
+        "name": "rocksdb_ratelimiter_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_perfcontext_t",
+      "rep": "PerfContext*",
+      "struct": "generated",
+      "var": "context",
+      "destroy": {
+        "name": "rocksdb_perfcontext_destroy",
+        "owns_rep": false
+      },
+      "methods": [
+        {
+          "name": "rocksdb_perfcontext_reset",
+          "method": "Reset"
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_pinnableslice_t",
+      "rep": "PinnableSlice",
+      "struct": "generated",
+      "var": "v",
+      "destroy": {
+        "name": "rocksdb_pinnableslice_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_transactiondb_options_t",
+      "rep": "TransactionDBOptions",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_transactiondb_options_create",
+      "destroy": {
+        "name": "rocksdb_transactiondb_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_transactiondb_t",
+      "rep": "TransactionDB*",
+      "struct": "generated",
+      "var": "txn_db",
+      "methods": [
+        {
+          "name": "rocksdb_transactiondb_delete",
+          "method": "Delete",
+          "overload": [
+            "const WriteOptions &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_transactiondb_delete_cf",
+          "method": "Delete",
+          "overload": [
+            "const WriteOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_transactiondb_flush",
+          "method": "Flush",
+          "overload": [
+            "const FlushOptions &"
+          ]
+        },
+        {
+          "name": "rocksdb_transactiondb_flush_cf",
+          "method": "Flush",
+          "overload": [
+            "const FlushOptions &",
+            "ColumnFamilyHandle *"
+          ]
+        },
+        {
+          "name": "rocksdb_transactiondb_flush_wal",
+          "method": "FlushWAL",
+          "overload": [
+            "bool"
+          ]
+        },
+        {
+          "name": "rocksdb_transactiondb_merge",
+          "method": "Merge",
+          "overload": [
+            "const WriteOptions &",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_transactiondb_merge_cf",
+          "method": "Merge",
+          "overload": [
+            "const WriteOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_transactiondb_put",
+          "method": "Put",
+          "overload": [
+            "const WriteOptions &",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_transactiondb_put_cf",
+          "method": "Put",
+          "overload": [
+            "const WriteOptions &",
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_transactiondb_write",
+          "method": "Write",
+          "overload": [
+            "const WriteOptions &",
+            "WriteBatch *"
+          ]
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_transaction_options_t",
+      "rep": "TransactionOptions",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_transaction_options_create",
+      "destroy": {
+        "name": "rocksdb_transaction_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_transaction_t",
+      "rep": "Transaction*",
+      "struct": "generated",
+      "var": "txn",
+      "destroy": {
+        "name": "rocksdb_transaction_destroy",
+        "owns_rep": true
+      },
+      "methods": [
+        {
+          "name": "rocksdb_transaction_prepare",
+          "method": "Prepare"
+        },
+        {
+          "name": "rocksdb_transaction_rebuild_from_writebatch",
+          "method": "RebuildFromWriteBatch"
+        },
+        {
+          "name": "rocksdb_transaction_set_commit_timestamp",
+          "method": "SetCommitTimestamp",
+          "param_names": {
+            "0": "commit_timestamp"
+          },
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_transaction_set_read_timestamp_for_validation",
+          "method": "SetReadTimestampForValidation",
+          "param_names": {
+            "0": "read_timestamp"
+          },
+          "result": "discard"
+        },
+        {
+          "name": "rocksdb_transaction_commit",
+          "method": "Commit"
+        },
+        {
+          "name": "rocksdb_transaction_delete",
+          "method": "Delete",
+          "overload": [
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_transaction_delete_cf",
+          "method": "Delete",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const bool"
+          ],
+          "arity": 2
+        },
+        {
+          "name": "rocksdb_transaction_merge",
+          "method": "Merge",
+          "overload": [
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_transaction_merge_cf",
+          "method": "Merge",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &",
+            "const bool"
+          ],
+          "arity": 3
+        },
+        {
+          "name": "rocksdb_transaction_put",
+          "method": "Put",
+          "overload": [
+            "const Slice &",
+            "const Slice &"
+          ]
+        },
+        {
+          "name": "rocksdb_transaction_put_cf",
+          "method": "Put",
+          "overload": [
+            "ColumnFamilyHandle *",
+            "const Slice &",
+            "const Slice &",
+            "const bool"
+          ],
+          "arity": 3
+        },
+        {
+          "name": "rocksdb_transaction_put_log_data",
+          "method": "PutLogData"
+        },
+        {
+          "name": "rocksdb_transaction_rollback",
+          "method": "Rollback"
+        },
+        {
+          "name": "rocksdb_transaction_rollback_to_savepoint",
+          "method": "RollbackToSavePoint"
+        },
+        {
+          "name": "rocksdb_transaction_set_savepoint",
+          "method": "SetSavePoint"
+        },
+        {
+          "name": "rocksdb_transaction_get_name",
+          "method": "GetName",
+          "result": "copy",
+          "receiver_const": false
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_backup_engine_options_t",
+      "rep": "BackupEngineOptions",
+      "struct": "generated",
+      "var": "options",
+      "destroy": {
+        "name": "rocksdb_backup_engine_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_checkpoint_t",
+      "rep": "Checkpoint*",
+      "struct": "generated",
+      "var": "checkpoint",
+      "destroy": {
+        "name": "rocksdb_checkpoint_object_destroy",
+        "owns_rep": true
+      },
+      "methods": [
+        {
+          "name": "rocksdb_checkpoint_create",
+          "method": "CreateCheckpoint",
+          "overload": [
+            "const std::string &",
+            "uint64_t",
+            "uint64_t *"
+          ],
+          "arity": 2
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_optimistictransactiondb_t",
+      "rep": "OptimisticTransactionDB*",
+      "struct": "generated",
+      "var": "otxn_db",
+      "methods": [
+        {
+          "name": "rocksdb_optimistictransactiondb_write",
+          "method": "Write"
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_optimistictransactiondb_options_t",
+      "rep": "OptimisticTransactionDBOptions",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_optimistictransactiondb_options_create",
+      "destroy": {
+        "name": "rocksdb_optimistictransactiondb_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_optimistictransactiondb_lock_buckets_t",
+      "rep": "std::shared_ptr<OccLockBuckets>",
+      "struct": "generated",
+      "var": "lock_buckets",
+      "destroy": {
+        "name": "rocksdb_optimistictransactiondb_lock_buckets_destroy",
+        "owns_rep": false
+      },
+      "methods": [
+        {
+          "name": "rocksdb_optimistictransactiondb_lock_buckets_approximate_memory_usage",
+          "method": "ApproximateMemoryUsage",
+          "receiver_const": false
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_optimistictransaction_options_t",
+      "rep": "OptimisticTransactionOptions",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_optimistictransaction_options_create",
+      "destroy": {
+        "name": "rocksdb_optimistictransaction_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_wait_for_compact_options_t",
+      "rep": "WaitForCompactOptions",
+      "struct": "generated",
+      "var": "opt",
+      "create": "rocksdb_wait_for_compact_options_create",
+      "destroy": {
+        "name": "rocksdb_wait_for_compact_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_compactionfiltercontext_t",
+      "rep": "CompactionFilter::Context",
+      "struct": "generated",
+      "var": "context"
+    },
+    {
+      "c_type": "rocksdb_flushjobinfo_t",
+      "rep": "FlushJobInfo",
+      "struct": "generated",
+      "var": "info"
+    },
+    {
+      "c_type": "rocksdb_writestallcondition_t",
+      "rep": "WriteStallCondition",
+      "struct": "generated",
+      "var": "h"
+    },
+    {
+      "c_type": "rocksdb_writestallinfo_t",
+      "rep": "WriteStallInfo",
+      "struct": "generated",
+      "var": "h"
+    },
+    {
+      "c_type": "rocksdb_memtableinfo_t",
+      "rep": "MemTableInfo",
+      "struct": "generated",
+      "var": "h"
+    },
+    {
+      "c_type": "rocksdb_compactionjobinfo_t",
+      "rep": "CompactionJobInfo",
+      "struct": "generated",
+      "var": "info",
+      "create": "rocksdb_compactionjobinfo_create",
+      "destroy": {
+        "name": "rocksdb_compactionjobinfo_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_subcompactionjobinfo_t",
+      "rep": "SubcompactionJobInfo",
+      "struct": "generated",
+      "var": "info"
+    },
+    {
+      "c_type": "rocksdb_externalfileingestioninfo_t",
+      "rep": "ExternalFileIngestionInfo",
+      "struct": "generated",
+      "var": "info"
+    },
+    {
+      "c_type": "rocksdb_statistics_histogram_data_t",
+      "rep": "HistogramData",
+      "struct": "manual",
+      "var": "data",
+      "destroy": {
+        "name": "rocksdb_statistics_histogram_data_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_compactionservice_scheduleresponse_t",
+      "rep": "CompactionServiceScheduleResponse",
+      "struct": "generated",
+      "var": "response",
+      "destroy": {
+        "name": "rocksdb_compactionservice_scheduleresponse_t_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_compactionservice_jobinfo_t",
+      "rep": "CompactionServiceJobInfo",
+      "struct": "generated",
+      "var": "info"
+    },
+    {
+      "c_type": "rocksdb_compaction_service_options_override_t",
+      "rep": "CompactionServiceOptionsOverride",
+      "struct": "generated",
+      "var": "override_options",
+      "create": "rocksdb_compaction_service_options_override_create",
+      "destroy": {
+        "name": "rocksdb_compaction_service_options_override_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_open_and_compact_options_t",
+      "rep": "OpenAndCompactOptions",
+      "struct": "generated",
+      "var": "options",
+      "create": "rocksdb_open_and_compact_options_create",
+      "destroy": {
+        "name": "rocksdb_open_and_compact_options_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_dbpath_t",
+      "rep": "DbPath",
+      "struct": "generated",
+      "var": "dbpath",
+      "destroy": {
+        "name": "rocksdb_dbpath_destroy",
+        "owns_rep": false
+      }
+    },
+    {
+      "c_type": "rocksdb_env_t",
+      "rep": "Env*",
+      "struct": "manual",
+      "var": "env",
+      "methods": [
+        {
+          "name": "rocksdb_env_set_background_threads",
+          "method": "SetBackgroundThreads",
+          "arity": 1
+        },
+        {
+          "name": "rocksdb_env_get_background_threads",
+          "method": "GetBackgroundThreads",
+          "arity": 0
+        },
+        {
+          "name": "rocksdb_env_set_bottom_priority_background_threads",
+          "method": "SetBackgroundThreads",
+          "bind": {
+            "pri": "Env::BOTTOM"
+          }
+        },
+        {
+          "name": "rocksdb_env_get_bottom_priority_background_threads",
+          "method": "GetBackgroundThreads",
+          "bind": {
+            "pri": "Env::BOTTOM"
+          }
+        },
+        {
+          "name": "rocksdb_env_set_high_priority_background_threads",
+          "method": "SetBackgroundThreads",
+          "bind": {
+            "pri": "Env::HIGH"
+          }
+        },
+        {
+          "name": "rocksdb_env_get_high_priority_background_threads",
+          "method": "GetBackgroundThreads",
+          "bind": {
+            "pri": "Env::HIGH"
+          }
+        },
+        {
+          "name": "rocksdb_env_set_low_priority_background_threads",
+          "method": "SetBackgroundThreads",
+          "bind": {
+            "pri": "Env::LOW"
+          }
+        },
+        {
+          "name": "rocksdb_env_get_low_priority_background_threads",
+          "method": "GetBackgroundThreads",
+          "bind": {
+            "pri": "Env::LOW"
+          }
+        },
+        {
+          "name": "rocksdb_env_join_all_threads",
+          "method": "WaitForJoin"
+        },
+        {
+          "name": "rocksdb_env_lower_thread_pool_io_priority",
+          "method": "LowerThreadPoolIOPriority",
+          "arity": 0
+        },
+        {
+          "name": "rocksdb_env_lower_high_priority_thread_pool_io_priority",
+          "method": "LowerThreadPoolIOPriority",
+          "bind": {
+            "0": "Env::HIGH"
+          }
+        },
+        {
+          "name": "rocksdb_env_lower_thread_pool_cpu_priority",
+          "method": "LowerThreadPoolCPUPriority",
+          "overload": [
+            "Priority"
+          ],
+          "arity": 0
+        },
+        {
+          "name": "rocksdb_env_lower_high_priority_thread_pool_cpu_priority",
+          "method": "LowerThreadPoolCPUPriority",
+          "overload": [
+            "Priority"
+          ],
+          "bind": {
+            "0": "Env::HIGH"
+          }
+        },
+        {
+          "name": "rocksdb_create_dir_if_missing",
+          "method": "CreateDirIfMissing"
+        }
+      ]
+    },
+    {
+      "c_type": "rocksdb_universal_compaction_options_t",
+      "rep": "ROCKSDB_NAMESPACE::CompactionOptionsUniversal*",
+      "struct": "generated",
+      "var": "uco",
+      "destroy": {
+        "name": "rocksdb_universal_compaction_options_destroy",
+        "owns_rep": true
+      }
+    },
+    {
+      "c_type": "rocksdb_pinnable_handle_t",
+      "rep": "PinnableSlice",
+      "struct": "generated",
+      "var": "handle",
+      "destroy": {
+        "name": "rocksdb_pinnable_handle_destroy",
+        "owns_rep": false
+      }
+    }
+  ]
+}
