@@ -8930,6 +8930,16 @@ uint64_t rocksdb_livefiles_deletions(const rocksdb_livefiles_t* lf, int index) {
   return lf->rep[index].num_deletions;
 }
 
+const char* rocksdb_livefiles_file_checksum(const rocksdb_livefiles_t* lf,
+                                            int index) {
+  return lf->rep[index].file_checksum.c_str();
+}
+
+const char* rocksdb_livefiles_file_checksum_func_name(
+    const rocksdb_livefiles_t* lf, int index) {
+  return lf->rep[index].file_checksum_func_name.c_str();
+}
+
 void rocksdb_livefiles_destroy(const rocksdb_livefiles_t* lf) { delete lf; }
 
 rocksdb_livefiles_storage_info_options_t*
@@ -9073,6 +9083,16 @@ void rocksdb_livefile_set_num_entries(rocksdb_livefile_t* lf,
 void rocksdb_livefile_set_num_deletions(rocksdb_livefile_t* lf,
                                         uint64_t num_deletions) {
   lf->rep.num_deletions = num_deletions;
+}
+
+void rocksdb_livefile_set_file_checksum(rocksdb_livefile_t* lf,
+                                        const char* file_checksum) {
+  lf->rep.file_checksum = std::string(file_checksum);
+}
+
+void rocksdb_livefile_set_file_checksum_func_name(
+    rocksdb_livefile_t* lf, const char* file_checksum_func_name) {
+  lf->rep.file_checksum_func_name = std::string(file_checksum_func_name);
 }
 
 void rocksdb_livefile_destroy(rocksdb_livefile_t* lf) { delete lf; }
