@@ -166,6 +166,10 @@ void rocksdb_continue_background_work(rocksdb_t* db, char** errptr) {
   SaveError(errptr, db->rep->ContinueBackgroundWork());
 }
 
+void rocksdb_resume(rocksdb_t* db, char** errptr) {
+  SaveError(errptr, db->rep->Resume());
+}
+
 void rocksdb_disable_file_deletions(rocksdb_t* db, char** errptr) {
   SaveError(errptr, db->rep->DisableFileDeletions());
 }

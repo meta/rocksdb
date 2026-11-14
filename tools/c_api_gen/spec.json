@@ -639,6 +639,19 @@
         },
         {
           "kind": "status_method",
+          "name": "rocksdb_resume",
+          "call_expr": "db->rep->Resume",
+          "params": [
+            {
+              "kind": "scalar",
+              "c_type": "rocksdb_t*",
+              "name": "db"
+            }
+          ],
+          "method_args": []
+        },
+        {
+          "kind": "status_method",
           "name": "rocksdb_disable_file_deletions",
           "call_expr": "db->rep->DisableFileDeletions",
           "params": [
@@ -1434,6 +1447,19 @@
             "options->rep",
             "column_family->rep"
           ]
+        },
+        {
+          "kind": "status_method",
+          "name": "rocksdb_transactiondb_resume",
+          "call_expr": "txn_db->rep->Resume",
+          "params": [
+            {
+              "kind": "scalar",
+              "c_type": "rocksdb_transactiondb_t*",
+              "name": "txn_db"
+            }
+          ],
+          "method_args": []
         }
       ]
     },
