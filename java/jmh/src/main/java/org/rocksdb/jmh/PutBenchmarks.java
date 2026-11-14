@@ -8,6 +8,8 @@ package org.rocksdb.jmh;
 
 import static org.rocksdb.util.KVUtils.ba;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
@@ -49,6 +51,9 @@ public class PutBenchmarks {
   List<byte[]> valueBuffers = new ArrayList<>(bufferListSize);
   List<ByteBuffer> keyBuffersBB = new ArrayList<>(bufferListSize);
   List<ByteBuffer> valueBuffersBB = new ArrayList<>(bufferListSize);
+  RocksDBBuf dbBuf;
+  List<ByteBuf> keyBuffersNetty = new ArrayList<>(bufferListSize);
+  List<ByteBuf> valueBuffersNetty = new ArrayList<>(bufferListSize);
 
   @Setup(Level.Trial)
   public void setup() throws IOException, RocksDBException {
@@ -81,6 +86,7 @@ public class PutBenchmarks {
     final List<ColumnFamilyHandle> cfHandlesList = new ArrayList<>(cfDescriptors.size());
     db = RocksDB.open(options, dbDir.toAbsolutePath().toString(), cfDescriptors, cfHandlesList);
     cfHandles = cfHandlesList.toArray(new ColumnFamilyHandle[0]);
+    dbBuf = new RocksDBBuf(db);
 
     for (int i = 0; i < bufferListSize; i++) {
       final byte[] keyArr = new byte[keySize];
@@ -109,6 +115,22 @@ public class PutBenchmarks {
       valueBB.put(valueArr);
       valueBuffersBB.add(valueBB);
     }
+
+    for (int i = 0; i < bufferListSize; i++) {
+      final ByteBuf keyBuf = PooledByteBufAllocator.DEFAULT.directBuffer(keySize);
+      byte[] keyArr = new byte[keySize];
+      Arrays.fill(keyArr, (byte) 0x30);
+      keyBuf.writeBytes(keyArr);
+      keyBuffersNetty.add(keyBuf);
+    }
+
+    for (int i = 0; i < bufferListSize; i++) {
+      final ByteBuf valueBuf = PooledByteBufAllocator.DEFAULT.directBuffer(valueSize);
+      byte[] valueArr = new byte[valueSize];
+      Arrays.fill(valueArr, (byte) 0x30);
+      valueBuf.writeBytes(valueArr);
+      valueBuffersNetty.add(valueBuf);
+    }
   }
 
   @TearDown(Level.Trial)
@@ -119,6 +141,9 @@ public class PutBenchmarks {
     db.close();
     options.close();
     FileUtils.delete(dbDir);
+
+    keyBuffersNetty.forEach(ByteBuf::release);
+    valueBuffersNetty.forEach(ByteBuf::release);
   }
 
   private ColumnFamilyHandle getColumnFamily() {
@@ -219,5 +244,21 @@ public class PutBenchmarks {
 
     repay(keyBuffersBB, keyBuf);
     repay(valueBuffersBB, valueBuf);
+  }
+
+  @Benchmark
+  public void putWithMemoryAddr(final Counter counter) throws RocksDBException {
+    ByteBuf keyBuf = borrow(keyBuffersNetty);
+    ByteBuf valueBuf = borrow(valueBuffersNetty);
+
+    final int i = counter.next();
+    final byte[] keyPrefix = ba("key" + i);
+    final byte[] valuePrefix = ba("value" + i);
+    keyBuf.setBytes(0, keyPrefix);
+    valueBuf.setBytes(0, valuePrefix);
+    dbBuf.put(getColumnFamily(), keyBuf, valueBuf);
+
+    repay(keyBuffersNetty, keyBuf);
+    repay(valueBuffersNetty, valueBuf);
   }
 }

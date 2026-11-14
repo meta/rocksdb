@@ -1115,6 +1115,50 @@ public class RocksDB extends RocksObject {
     value.position(value.limit());
   }
 
+  // Variants of put(), get() and delete() taking the raw native memory address and length of
+  // the key and value. They are not public: applications reach them by subclassing
+  // RocksDBAddr, which documents the contract.
+
+  void putAddr(final ColumnFamilyHandle columnFamilyHandle, final WriteOptions writeOpts,
+      final long keyAddr, final int keyLen, final long valueAddr, final int valueLen)
+      throws RocksDBException {
+    putAddr(nativeHandle_, writeOpts.nativeHandle_, keyAddr, keyLen, valueAddr, valueLen,
+        columnFamilyHandle.nativeHandle_);
+  }
+
+  void putAddr(final ColumnFamilyHandle columnFamilyHandle, final long keyAddr, final int keyLen,
+      final long valueAddr, final int valueLen) throws RocksDBException {
+    putAddr(nativeHandle_, keyAddr, keyLen, valueAddr, valueLen, columnFamilyHandle.nativeHandle_);
+  }
+
+  void putAddr(final WriteOptions writeOpts, final long keyAddr, final int keyLen,
+      final long valueAddr, final int valueLen) throws RocksDBException {
+    putAddr(nativeHandle_, writeOpts.nativeHandle_, keyAddr, keyLen, valueAddr, valueLen, 0);
+  }
+
+  int getAddr(final ReadOptions opt, final long keyAddr, final int keyLen, final long valueAddr,
+      final int valueLen) throws RocksDBException {
+    return getAddr(nativeHandle_, opt.nativeHandle_, keyAddr, keyLen, valueAddr, valueLen, 0);
+  }
+
+  int getAddr(final ColumnFamilyHandle columnFamilyHandle, final ReadOptions opt,
+      final long keyAddr, final int keyLen, final long valueAddr, final int valueLen)
+      throws RocksDBException {
+    return getAddr(nativeHandle_, opt.nativeHandle_, keyAddr, keyLen, valueAddr, valueLen,
+        columnFamilyHandle.nativeHandle_);
+  }
+
+  void deleteAddr(final WriteOptions writeOpts, final long keyAddr, final int keyLen)
+      throws RocksDBException {
+    deleteAddr(nativeHandle_, writeOpts.nativeHandle_, keyAddr, keyLen, 0);
+  }
+
+  void deleteAddr(final ColumnFamilyHandle columnFamilyHandle, final WriteOptions writeOpts,
+      final long keyAddr, final int keyLen) throws RocksDBException {
+    deleteAddr(
+        nativeHandle_, writeOpts.nativeHandle_, keyAddr, keyLen, columnFamilyHandle.nativeHandle_);
+  }
+
   /**
    * Set the database entry for "key" to "value" for the specified
    * column family.
@@ -5098,6 +5142,10 @@ public class RocksDB extends RocksObject {
   private static native void putDirect(long handle, long writeOptHandle, ByteBuffer key,
       int keyOffset, int keyLength, ByteBuffer value, int valueOffset, int valueLength,
       long cfHandle) throws RocksDBException;
+  private static native void putAddr(long handle, long writeOptHandle, long keyAddr, int keyLength,
+      long valueAddr, int valueLength, long cfHandle) throws RocksDBException;
+  private static native void putAddr(long handle, long keyAddr, int keyLength, long valueAddr,
+      int valueLength, long cfHandle) throws RocksDBException;
   private static native long iterator(
       final long handle, final long cfHandle, final long readOptHandle);
   private static native long[] iterators(final long handle, final long[] columnFamilyHandles,
@@ -5112,6 +5160,8 @@ public class RocksDB extends RocksObject {
   private static native int getDirect(long handle, long readOptHandle, ByteBuffer key,
       int keyOffset, int keyLength, ByteBuffer value, int valueOffset, int valueLength,
       long cfHandle) throws RocksDBException;
+  private static native int getAddr(long handle, long readOptHandle, long keyAddr, int keyLength,
+      long valueAddr, int valueLength, long cfHandle) throws RocksDBException;
   private static native boolean keyMayExistDirect(final long handle, final long cfHhandle,
       final long readOptHandle, final ByteBuffer key, final int keyOffset, final int keyLength);
   private static native int[] keyMayExistDirectFoundValue(final long handle, final long cfHhandle,
@@ -5119,6 +5169,8 @@ public class RocksDB extends RocksObject {
       final ByteBuffer value, final int valueOffset, final int valueLength);
   private static native void deleteDirect(long handle, long optHandle, ByteBuffer key,
       int keyOffset, int keyLength, long cfHandle) throws RocksDBException;
+  private static native void deleteAddr(long handle, long writeOptHandle, long keyAddr,
+      int keyLength, long cfHandle) throws RocksDBException;
   private static native long getLongProperty(final long nativeHandle, final long cfHandle,
       final String property, final int propertyLength) throws RocksDBException;
   private static native void resetStats(final long nativeHandle) throws RocksDBException;

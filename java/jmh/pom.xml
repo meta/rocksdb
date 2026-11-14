@@ -42,7 +42,10 @@
         <project.build.target>17</project.build.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-        <jmh.version>1.22</jmh.version>
+        <!-- A locally built rocksdbjni; see README.md -->
+        <rocksdbjni.version>11.13.0-SNAPSHOT</rocksdbjni.version>
+        <jmh.version>1.37</jmh.version>
+        <netty.version>4.1.138.Final</netty.version>
         <uberjar.name>benchmarks</uberjar.name>
     </properties>
 
@@ -50,7 +53,7 @@
         <dependency>
             <groupId>org.rocksdb</groupId>
             <artifactId>rocksdbjni</artifactId>
-            <version>9.0.0</version>
+            <version>${rocksdbjni.version}</version>
         </dependency>
 
         <dependency>
@@ -64,6 +67,11 @@
             <version>${jmh.version}</version>
             <scope>provided</scope>
         </dependency>
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-buffer</artifactId>
+            <version>${netty.version}</version>
+        </dependency>
     </dependencies>
 
     <build>
@@ -76,6 +84,14 @@
                     <source>${project.build.source}</source>
                     <target>${project.build.target}</target>
                     <encoding>${project.build.sourceEncoding}</encoding>
+                    <!-- Java 23+ only runs annotation processors that are declared explicitly -->
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.openjdk.jmh</groupId>
+                            <artifactId>jmh-generator-annprocess</artifactId>
+                            <version>${jmh.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
                 </configuration>
             </plugin>
 

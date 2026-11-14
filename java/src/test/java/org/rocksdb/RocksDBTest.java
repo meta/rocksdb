@@ -4,16 +4,18 @@
 //  (found in the LICENSE.Apache file in the root directory).
 package org.rocksdb;
 
-import org.junit.*;
-import org.junit.rules.ExpectedException;
-import org.junit.rules.TemporaryFolder;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.Assert.fail;
+import static org.rocksdb.util.DirectByteBufferAddress.address;
+import static org.rocksdb.util.DirectByteBufferAddress.directBuffer;
 
 import java.nio.ByteBuffer;
 import java.util.*;
-
-import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.Assert.fail;
+import org.junit.*;
+import org.junit.rules.ExpectedException;
+import org.junit.rules.TemporaryFolder;
 
 public class RocksDBTest {
 
@@ -321,6 +323,97 @@ public class RocksDBTest {
       // compare
       Assert.assertTrue(value0.isSamePayload(db.get(key3.data, key3.offset, key3.len)));
       Assert.assertTrue(value1.isSamePayload(db.get(key4.data, key4.offset, key4.len)));
+    }
+  }
+
+  @Test
+  public void putGetDeleteWithAddress() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
+        final WriteOptions writeOpts = new WriteOptions();
+        final ReadOptions readOpts = new ReadOptions()) {
+      final RocksDBAddr addrDb = new RocksDBAddr(db) {};
+      final ByteBuffer key = directBuffer("key1");
+      final ByteBuffer value = directBuffer("value1");
+      addrDb.put(writeOpts, address(key), key.remaining(), address(value), value.remaining());
+      assertThat(db.get("key1".getBytes(UTF_8))).isEqualTo("value1".getBytes(UTF_8));
+
+      final ByteBuffer result = ByteBuffer.allocateDirect(16);
+      assertThat(addrDb.get(readOpts, address(key), key.remaining(), address(result), 16))
+          .isEqualTo(6);
+      result.limit(6);
+      assertThat(UTF_8.decode(result).toString()).isEqualTo("value1");
+
+      // A buffer that is too small receives a prefix of the value, and the full length is
+      // returned.
+      final ByteBuffer small = ByteBuffer.allocateDirect(3);
+      assertThat(addrDb.get(readOpts, address(key), key.remaining(), address(small), 3))
+          .isEqualTo(6);
+      assertThat(UTF_8.decode(small).toString()).isEqualTo("val");
+
+      addrDb.delete(writeOpts, address(key), key.remaining());
+      assertThat(db.get("key1".getBytes(UTF_8))).isNull();
+      result.clear();
+      assertThat(addrDb.get(readOpts, address(key), key.remaining(), address(result), 16))
+          .isEqualTo(RocksDB.NOT_FOUND);
+    }
+  }
+
+  @Test
+  public void putGetDeleteWithAddressInColumnFamily() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
+        final ColumnFamilyHandle cf =
+            db.createColumnFamily(new ColumnFamilyDescriptor("cf".getBytes(UTF_8)));
+        final WriteOptions writeOpts = new WriteOptions();
+        final ReadOptions readOpts = new ReadOptions()) {
+      final RocksDBAddr addrDb = new RocksDBAddr(db) {};
+      final ByteBuffer key1 = directBuffer("key1");
+      final ByteBuffer key2 = directBuffer("key2");
+      final ByteBuffer value = directBuffer("value");
+      addrDb.put(cf, writeOpts, address(key1), key1.remaining(), address(value), value.remaining());
+      addrDb.put(cf, address(key2), key2.remaining(), address(value), value.remaining());
+      assertThat(db.get(cf, "key1".getBytes(UTF_8))).isEqualTo("value".getBytes(UTF_8));
+      assertThat(db.get(cf, "key2".getBytes(UTF_8))).isEqualTo("value".getBytes(UTF_8));
+      assertThat(db.get("key1".getBytes(UTF_8))).isNull();
+
+      final ByteBuffer result = ByteBuffer.allocateDirect(16);
+      assertThat(addrDb.get(cf, readOpts, address(key1), key1.remaining(), address(result), 16))
+          .isEqualTo(5);
+      result.limit(5);
+      assertThat(UTF_8.decode(result).toString()).isEqualTo("value");
+
+      addrDb.delete(cf, writeOpts, address(key1), key1.remaining());
+      assertThat(db.get(cf, "key1".getBytes(UTF_8))).isNull();
+      result.clear();
+      assertThat(addrDb.get(cf, readOpts, address(key1), key1.remaining(), address(result), 16))
+          .isEqualTo(RocksDB.NOT_FOUND);
+    }
+  }
+
+  @Test
+  public void invalidAddressIsRejected() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
+        final WriteOptions writeOpts = new WriteOptions();
+        final ReadOptions readOpts = new ReadOptions()) {
+      final RocksDBAddr addrDb = new RocksDBAddr(db) {};
+      final ByteBuffer buffer = directBuffer("key1");
+      final long addr = address(buffer);
+      assertThatThrownBy(() -> addrDb.put(writeOpts, 0, 4, addr, 4))
+          .isInstanceOf(RocksDBException.class);
+      assertThatThrownBy(() -> addrDb.put(writeOpts, addr, 4, 0, 4))
+          .isInstanceOf(RocksDBException.class);
+      assertThatThrownBy(() -> addrDb.put(writeOpts, addr, -1, addr, 4))
+          .isInstanceOf(RocksDBException.class);
+      assertThatThrownBy(() -> addrDb.get(readOpts, 0, 4, addr, 4))
+          .isInstanceOf(RocksDBException.class);
+      assertThatThrownBy(() -> addrDb.get(readOpts, addr, 4, 0, 4))
+          .isInstanceOf(RocksDBException.class);
+      assertThatThrownBy(() -> addrDb.delete(writeOpts, 0, 4)).isInstanceOf(RocksDBException.class);
+
+      // A rejected call must not write anything
+      try (final RocksIterator iterator = db.newIterator()) {
+        iterator.seekToFirst();
+        assertThat(iterator.isValid()).isFalse();
+      }
     }
   }
 
