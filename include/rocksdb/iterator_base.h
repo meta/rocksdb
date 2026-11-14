@@ -6,12 +6,13 @@
 #pragma once
 
 #include "rocksdb/cleanable.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-class IteratorBase : public Cleanable {
+class ROCKSDB_API IteratorBase : public Cleanable {
  public:
   IteratorBase() {}
   // No copying allowed

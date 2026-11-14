@@ -16,6 +16,7 @@
 
 #include "rocksdb/comparator.h"
 #include "rocksdb/iterator.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "rocksdb/write_batch.h"
@@ -52,7 +53,7 @@ struct WriteEntry {
 };
 
 // Iterator of one column family out of a WriteBatchWithIndex.
-class WBWIIterator {
+class ROCKSDB_API WBWIIterator {
  public:
   virtual ~WBWIIterator() = default;
 
@@ -103,7 +104,7 @@ class WBWIIterator {
 // user can call NewIterator() to create an iterator.
 // If there are multiple updates to the same key, the most recent update is
 // ordered first (i.e. the iterator will return the most recent update first).
-class WriteBatchWithIndex : public WriteBatchBase {
+class ROCKSDB_API WriteBatchWithIndex : public WriteBatchBase {
  public:
   // backup_index_comparator: the backup comparator used to compare keys
   // within the same column family, if column family is not given in the

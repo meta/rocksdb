@@ -84,7 +84,7 @@ struct OptimisticTransactionDBOptions {
 
 // Range deletions (including those in `WriteBatch`es passed to `Write()`) are
 // incompatible with `OptimisticTransactionDB` and will return a non-OK `Status`
-class OptimisticTransactionDB : public StackableDB {
+class ROCKSDB_API OptimisticTransactionDB : public StackableDB {
  public:
   // Open an OptimisticTransactionDB similar to DB::Open().
   static Status Open(const Options& options, const std::string& dbname,

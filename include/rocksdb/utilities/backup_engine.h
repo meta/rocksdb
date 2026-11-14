@@ -22,6 +22,7 @@
 #include "rocksdb/io_status.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/options.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/status.h"
 #include "rocksdb/utilities/checkpoint.h"
 
@@ -675,8 +676,8 @@ class BackupEngineAppendOnlyBase {
 // unspec = Behavior is unspecified, including possibly trashing the
 //   backup_dir, but is "memory safe" (no C++ undefined behavior)
 //
-class BackupEngine : public BackupEngineReadOnlyBase,
-                     public BackupEngineAppendOnlyBase {
+class ROCKSDB_API BackupEngine : public BackupEngineReadOnlyBase,
+                                 public BackupEngineAppendOnlyBase {
  public:
   ~BackupEngine() override = default;
 

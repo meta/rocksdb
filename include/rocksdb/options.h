@@ -27,6 +27,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/listener.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/sst_partitioner.h"
 #include "rocksdb/types.h"
 #include "rocksdb/universal_compaction.h"
@@ -70,7 +71,7 @@ using FileTypeSet = SmallEnumSet<FileType, FileType::kBlobFile>;
 using CompactionStyleSet =
     SmallEnumSet<CompactionStyle, CompactionStyle::kCompactionStyleNone>;
 
-struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
+struct ROCKSDB_API ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // The function recovers options to a previous version. Only 4.6 or later
   // versions are supported.
   // NOT MAINTAINED: This function has not been and is not maintained.
@@ -598,7 +599,7 @@ class CompactionService : public Customizable {
 // the remote compaction output root when enabled.
 inline constexpr char kSessionTmpDirName[] = "session_tmp";
 
-struct DBOptions {
+struct ROCKSDB_API DBOptions {
   // The function recovers options to the option as in version 4.6.
   // NOT MAINTAINED: This function has not been and is not maintained.
   // DEPRECATED: This function might be removed in a future release.
@@ -2157,7 +2158,7 @@ struct DBOptions {
 };
 
 // Options to control the behavior of a database (passed to DB::Open)
-struct Options : public DBOptions, public ColumnFamilyOptions {
+struct ROCKSDB_API Options : public DBOptions, public ColumnFamilyOptions {
   // Create an Options object with default values for all fields.
   Options() : DBOptions(), ColumnFamilyOptions() {}
 
@@ -2452,7 +2453,7 @@ class MultiScanArgs {
 };
 
 // Options that control read operations
-struct ReadOptions {
+struct ROCKSDB_API ReadOptions {
   // NOTE: for all pointer members of ReadOptions (e.g. snapshot, timestamp,
   // iterate_lower_bound, iterate_upper_bound, table_filter, ...), when the
   // pointer is non-nullptr the caller retains ownership of the pointed-to
@@ -2891,7 +2892,7 @@ struct ReadOptions {
 };
 
 // Options that control write operations
-struct WriteOptions {
+struct ROCKSDB_API WriteOptions {
   // If true, the write will be flushed from the operating system
   // buffer cache (by calling WritableFile::Sync()) before the write
   // is considered complete.  If this flag is true, writes will be

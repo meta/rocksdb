@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "rocksdb/customizable.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/wide_columns.h"
 
@@ -50,7 +51,7 @@ class Logger;
 // Exceptions MUST NOT propagate out of overridden functions into RocksDB,
 // because RocksDB is not exception-safe. This could cause undefined behavior
 // including data loss, unreported corruption, deadlocks, and more.
-class MergeOperator : public Customizable {
+class ROCKSDB_API MergeOperator : public Customizable {
  public:
   ~MergeOperator() override = default;
   static const char* Type() { return "MergeOperator"; }

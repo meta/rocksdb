@@ -10,6 +10,31 @@
 
 #include "rocksdb/rocksdb_namespace.h"
 
+// Add symbol visibiity macros for shared library exports
+//
+// Introduce ROCKSDB_API macro to control which symbols get exported in shared
+// libs. Helps keep the ABI cleaner by hiding internal stuff.
+//
+#ifndef ROCKSDB_API
+#if defined(ROCKSDB_DLL)
+#if defined(_WIN32)
+#if defined(ROCKSDB_LIBRARY_EXPORTS)
+#define ROCKSDB_API __declspec(dllexport)
+#else
+#define ROCKSDB_API __declspec(dllimport)
+#endif
+#else
+#if defined(ROCKSDB_LIBRARY_EXPORTS)
+#define ROCKSDB_API __attribute__((visibility("default")))
+#else
+#define ROCKSDB_API
+#endif
+#endif
+#else
+#define ROCKSDB_API
+#endif
+#endif
+
 namespace ROCKSDB_NAMESPACE {
 
 namespace port {
