@@ -147,12 +147,6 @@ class WritePreparedTxn : public PessimisticTransaction {
              ColumnFamilyHandle* column_family, const Slice& key,
              PinnableSlice* value) override;
 
-  using Transaction::MultiGet;
-  void MultiGet(const ReadOptions& _read_options,
-                ColumnFamilyHandle* column_family, const size_t num_keys,
-                const Slice* keys, PinnableSlice* values, Status* statuses,
-                const bool sorted_input = false) override;
-
   // Note: The behavior is undefined in presence of interleaved writes to the
   // same transaction.
   // To make WAL commit markers visible, the snapshot will be
@@ -188,6 +182,11 @@ class WritePreparedTxn : public PessimisticTransaction {
   using Transaction::GetImpl;
   Status GetImpl(const ReadOptions& options, ColumnFamilyHandle* column_family,
                  const Slice& key, PinnableSlice* value) override;
+
+  void MultiGetImpl(const ReadOptions& options,
+                    ColumnFamilyHandle* column_family, size_t num_keys,
+                    const Slice* keys, PinnableSlice* values, Status* statuses,
+                    bool sorted_input) override;
 
   Status GetEntityImpl(const ReadOptions& options,
                        ColumnFamilyHandle* column_family, const Slice& key,
