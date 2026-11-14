@@ -794,6 +794,39 @@ DEFINE_int32(read_index, -1,
 DEFINE_bool(use_full_external_table, false,
             "Use the simple full external table test factory.");
 
+DEFINE_string(table_factory_uri, "",
+              "URI of a TableFactory to create with "
+              "TableFactory::CreateFromString(), such as one registered with "
+              "ObjectLibrary. Replaces the block-based table factory, so the "
+              "block-based table flags, the shared block cache and the filter "
+              "policy do not apply to it. A non-block-based factory requires "
+              "--compaction_ttl=0 and --periodic_compaction_seconds=0. Empty "
+              "means none.");
+
+DEFINE_bool(structured_key_value, false,
+            "Generate schema-like keys and versioned row values instead of "
+            "the default keys and values. See "
+            "db_stress_structured_key_value.h for the formats.");
+
+DEFINE_uint64(structured_keys_per_key_space, 4096,
+              "Number of consecutive key indexes in each key space of "
+              "structured_key_value.");
+
+DEFINE_uint64(structured_key_fanout, 16,
+              "Number of keys that share the first 8-byte field of a two-field "
+              "structured_key_value key.");
+
+DEFINE_string(structured_key_space_type_weights, "2,3,2",
+              "Comma-separated weights of the key-space types of "
+              "structured_key_value, at most 8. Type 0 key spaces have "
+              "single-field keys, the other types two-field keys.");
+
+DEFINE_string(structured_value_version_weights,
+              "1:30,2:30,3:20,4:3,5:8,6:4,7:3,128:2",
+              "Comma-separated version:weight pairs of the row versions of "
+              "structured_key_value values. Versions are in [1, 255], and a "
+              "version that is a multiple of 4 has an opaque layout.");
+
 DEFINE_bool(test_backward_scan, true,
             "Test backward iteration (Prev, SeekForPrev) in stress tests.");
 
@@ -1300,10 +1333,16 @@ DEFINE_bool(in_place_update, false, "On true, does inplace update in memtable");
 
 DEFINE_string(memtablerep, "skip_list", "");
 
+// db_stress_tool.cc further limits the prefix size to the shortest key of the
+// configured key generator.
 inline static bool ValidatePrefixSize(const char* flagname, int32_t value) {
-  if (value < -1 || value > 8) {
-    fprintf(stderr, "Invalid value for --%s: %d. -1 <= PrefixSize <= 8\n",
-            flagname, value);
+  if (value < -1 ||
+      value > static_cast<int32_t>(
+                  ROCKSDB_NAMESPACE::kStructuredSingleFieldKeySize)) {
+    fprintf(
+        stderr, "Invalid value for --%s: %d. -1 <= PrefixSize <= %d\n",
+        flagname, value,
+        static_cast<int32_t>(ROCKSDB_NAMESPACE::kStructuredSingleFieldKeySize));
     return false;
   }
   return true;

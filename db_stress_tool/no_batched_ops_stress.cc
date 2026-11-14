@@ -2719,14 +2719,17 @@ class NonBatchedOpsStressTest : public StressTest {
     }
 
     std::vector<ExternalSstFileInfo> file_infos(data_file_count);
-    // Embedded blobs are only supported by block-based table format_version >=
-    // 7 (the default db_stress table factory is block-based).
+    const auto* block_based_table_options =
+        options_.table_factory->GetOptions<BlockBasedTableOptions>();
+    // Embedded blobs are supported only by a block-based table whose active
+    // format version is at least 7.
     const bool use_embedded_blobs =
         FLAGS_ingest_external_file_with_embedded_blobs &&
-        FLAGS_format_version >= 7;
-    // Set the embedded-blob threshold so that only the largest values generated
-    // by GenerateValue() (size kRandomValueMaxFactor * value_size_mult) are
-    // written as same-file blob records; smaller values stay inline.
+        block_based_table_options != nullptr &&
+        block_based_table_options->format_version >= 7;
+    // This threshold is the largest value size of the default value format.
+    // Structured values have other sizes, so any of them at least this large
+    // is written as a same-file blob record.
     SstFileWriterEmbeddedBlobOptions embedded_blob_options;
     embedded_blob_options.min_blob_size =
         static_cast<uint64_t>(kRandomValueMaxFactor) * FLAGS_value_size_mult;

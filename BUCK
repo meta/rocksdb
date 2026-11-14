@@ -501,6 +501,7 @@ rocks_cpp_library_wrapper(name="rocksdb_stress_lib", srcs=[
         "db_stress_tool/db_stress_gflags.cc",
         "db_stress_tool/db_stress_listener.cc",
         "db_stress_tool/db_stress_shared_state.cc",
+        "db_stress_tool/db_stress_structured_key_value.cc",
         "db_stress_tool/db_stress_test_base.cc",
         "db_stress_tool/db_stress_tool.cc",
         "db_stress_tool/db_stress_wide_merge_operator.cc",
@@ -520,6 +521,7 @@ rocks_cpp_library_wrapper(name="rocksdb_stress_lib", srcs=[
         "db_stress_tool/db_stress_filters.h",
         "db_stress_tool/db_stress_listener.h",
         "db_stress_tool/db_stress_shared_state.h",
+        "db_stress_tool/db_stress_structured_key_value.h",
         "db_stress_tool/db_stress_test_base.h",
         "db_stress_tool/db_stress_wide_merge_operator.h",
         "db_stress_tool/expected_state.h",
@@ -531,6 +533,8 @@ rocks_cpp_library_wrapper(name="rocksdb_stress_lib", srcs=[
         "tools/trace_analyzer_tool.h",
     ])
 
+
+cpp_library_wrapper(name="rocksdb_stress_structured_key_value_lib", srcs=["db_stress_tool/db_stress_structured_key_value.cc"], deps=[":rocksdb_lib"], headers=["db_stress_tool/db_stress_structured_key_value.h"], link_whole=False, extra_test_libs=False)
 
 cpp_binary_wrapper(name="ldb", srcs=["tools/ldb.cc"], deps=[":rocksdb_tools_lib"], extra_preprocessor_flags=[], extra_bench_libs=False)
 
@@ -5111,6 +5115,12 @@ cpp_unittest_wrapper(name="db_sst_test",
 cpp_unittest_wrapper(name="db_statistics_test",
             srcs=["db/db_statistics_test.cc"],
             deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="db_stress_structured_key_value_test",
+            srcs=["db_stress_tool/db_stress_structured_key_value_test.cc"],
+            deps=[":rocksdb_stress_structured_key_value_lib", ":rocksdb_test_lib"],
             extra_compiler_flags=[])
 
 

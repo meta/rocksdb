@@ -59,6 +59,13 @@ _TEST_HEADERS = {
     "transaction_test": ["utilities/transactions/transaction_test.h"],
 }
 
+# Libraries that tests need in addition to rocksdb_test_lib
+_TEST_EXTRA_DEPS = {
+    "db_stress_structured_key_value_test": [
+        ":rocksdb_stress_structured_key_value_lib",
+    ],
+}
+
 _STRESS_LIB_HEADERS = [
     "db_stress_tool/db_stress_common.h",
     "db_stress_tool/db_stress_compaction_service.h",
@@ -67,6 +74,7 @@ _STRESS_LIB_HEADERS = [
     "db_stress_tool/db_stress_filters.h",
     "db_stress_tool/db_stress_listener.h",
     "db_stress_tool/db_stress_shared_state.h",
+    "db_stress_tool/db_stress_structured_key_value.h",
     "db_stress_tool/db_stress_test_base.h",
     "db_stress_tool/db_stress_wide_merge_operator.h",
     "db_stress_tool/expected_state.h",
@@ -295,6 +303,14 @@ def generate_buck(repo_path, deps_map):
             if header[:-2] + ".cc" in stress_sources
         ],
     )
+    # The structured key-value codec of db_stress, which its unit test links
+    # without the rest of rocksdb_stress_lib
+    BUCK.add_library(
+        "rocksdb_stress_structured_key_value_lib",
+        ["db_stress_tool/db_stress_structured_key_value.cc"],
+        [":rocksdb_lib"],
+        headers=["db_stress_tool/db_stress_structured_key_value.h"],
+    )
     # ldb binary
     BUCK.add_binary(
         "ldb", ["tools/ldb.cc"], [":rocksdb_tools_lib"]
@@ -434,7 +450,11 @@ def generate_buck(repo_path, deps_map):
                     BUCK.register_test(
                         test_target_name,
                         test_src,
-                        deps=json.dumps(deps["extra_deps"] + [":rocksdb_test_lib"]),
+                        deps=json.dumps(
+                            deps["extra_deps"]
+                            + _TEST_EXTRA_DEPS.get(test, [])
+                            + [":rocksdb_test_lib"]
+                        ),
                         extra_compiler_flags=json.dumps(deps["extra_compiler_flags"]),
                         source_headers=_TEST_HEADERS.get(test, []),
                     )

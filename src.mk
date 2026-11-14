@@ -427,6 +427,7 @@ STRESS_LIB_SOURCES =                                           \
   db_stress_tool/db_stress_gflags.cc                           \
   db_stress_tool/db_stress_listener.cc                         \
   db_stress_tool/db_stress_shared_state.cc                     \
+  db_stress_tool/db_stress_structured_key_value.cc             \
   db_stress_tool/db_stress_test_base.cc                        \
   db_stress_tool/db_stress_tool.cc                             \
   db_stress_tool/db_stress_wide_merge_operator.cc              \
@@ -597,6 +598,7 @@ TEST_MAIN_SOURCES =                                                     \
   db/write_batch_test.cc                                                \
   db/write_callback_test.cc                                             \
   db/write_controller_test.cc                                           \
+  db_stress_tool/db_stress_structured_key_value_test.cc                 \
   env/env_basic_test.cc                                                 \
   env/env_test.cc                                                       \
   env/io_posix_test.cc                                                  \

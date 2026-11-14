@@ -2208,6 +2208,9 @@ repair_test: $(OBJ_DIR)/db/repair_test.o $(TEST_LIBRARY) $(LIBRARY)
 ldb_cmd_test: $(OBJ_DIR)/tools/ldb_cmd_test.o $(TOOLS_LIBRARY) $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+db_stress_structured_key_value_test: $(OBJ_DIR)/db_stress_tool/db_stress_structured_key_value_test.o $(OBJ_DIR)/db_stress_tool/db_stress_structured_key_value.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 ldb: $(OBJ_DIR)/tools/ldb.o $(TOOLS_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
