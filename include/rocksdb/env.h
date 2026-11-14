@@ -718,8 +718,18 @@ class Env : public Customizable {
   virtual Status GetAbsolutePath(const std::string& db_path,
                                  std::string* output_path) = 0;
 
-  // The number of background worker threads of a specific thread pool
+  // Set the number of background worker threads of a specific thread pool
   // for this environment. 'LOW' is the default pool.
+  //
+  // The sizes of the thread pools are independent of max_background_jobs,
+  // which only limits the number of concurrent flush/compaction jobs, not
+  // the number of threads in the pools. See the comment on
+  // max_background_jobs in options.h for how that option relates to the
+  // pools. Consider calling this when the Env is shared by multiple DB
+  // instances or when you want more (or fewer) threads in a pool than the
+  // default sizing provides. Calling this with a smaller number can shrink
+  // an existing pool.
+  //
   // default number: 1
   virtual void SetBackgroundThreads(int number, Priority pri = LOW) = 0;
   virtual int GetBackgroundThreads(Priority pri = LOW) = 0;
