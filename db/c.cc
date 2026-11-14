@@ -8611,6 +8611,11 @@ void rocksdb_ingestexternalfileoptions_set_move_files(
   opt->rep.move_files = move_files;
 }
 
+void rocksdb_ingestexternalfileoptions_set_link_files(
+    rocksdb_ingestexternalfileoptions_t* opt, unsigned char link_files) {
+  opt->rep.link_files = link_files;
+}
+
 void rocksdb_ingestexternalfileoptions_set_snapshot_consistency(
     rocksdb_ingestexternalfileoptions_t* opt,
     unsigned char snapshot_consistency) {
