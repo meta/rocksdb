@@ -937,6 +937,21 @@ struct DBOptions {
 
   // Maximum number of concurrent background jobs (compactions and flushes).
   //
+  // This option limits the number of jobs running at the same time; it does
+  // not directly determine the number of threads in the background thread
+  // pools (see Env::SetBackgroundThreads). Unless max_background_flushes or
+  // max_background_compactions (both deprecated) is set, this limit is split
+  // between flushes and compactions as
+  // max(1, max_background_jobs / 4) concurrent flushes and
+  // max(1, max_background_jobs - flushes) concurrent compactions.
+  // At DB open, the thread pools are grown if necessary to accommodate
+  // that many concurrent jobs (by default, flushes are submitted to the
+  // HIGH priority pool and compactions to the LOW priority pool). If the
+  // pools are larger than these limits, the extra threads simply stay
+  // idle, so there is generally no benefit in calling
+  // Env::SetBackgroundThreads with the same value for the HIGH and LOW
+  // pools and for max_background_jobs.
+  //
   // Default: 2
   //
   // Dynamically changeable through SetDBOptions() API.
