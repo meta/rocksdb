@@ -1306,6 +1306,37 @@ public class ColumnFamilyOptions
   }
 
   /**
+   * Set the number of bytes per key-value checksum for memtables.
+   * Enables per-KV checksum protection in memtables to detect silent data corruption.
+   * <p>
+   * Default: 0 (disabled)
+   * <p>
+   * Supported values: 0, 1, 2, 4, 8 - 8 bytes per key
+   *
+   * @param memtableProtectionBytesPerKey number of checksum bytes per key-value
+   *
+   * @return the reference to the current options.
+   */
+  @Override
+  public ColumnFamilyOptions setMemtableProtectionBytesPerKey(
+      final int memtableProtectionBytesPerKey) {
+    setMemtableProtectionBytesPerKey(nativeHandle_, memtableProtectionBytesPerKey);
+    return this;
+  }
+
+  /**
+   * Get the number of bytes per key-value checksum for memtables
+   * <p>
+   * Default: 0
+   *
+   * @return the number of checksum bytes per key-value
+   */
+  @Override
+  public int memtableProtectionBytesPerKey() {
+    return memtableProtectionBytesPerKey(nativeHandle_);
+  }
+
+  /**
    * Set a certain prepopulate blob cache option.
    * <p>
    * Default: 0
@@ -1532,6 +1563,9 @@ public class ColumnFamilyOptions
   private static native void setBlobFileStartingLevel(
       final long nativeHandle_, final int blobFileStartingLevel);
   private static native int blobFileStartingLevel(final long nativeHandle_);
+  private static native void setMemtableProtectionBytesPerKey(
+      final long nativeHandle_, final int memtableProtectionBytesPerKey);
+  private static native int memtableProtectionBytesPerKey(final long nativeHandle_);
   private static native void setPrepopulateBlobCache(
       final long nativeHandle_, final byte prepopulateBlobCache);
   private static native byte prepopulateBlobCache(final long nativeHandle_);

@@ -841,6 +841,29 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
   int blobFileStartingLevel();
 
   /**
+   * Set the number of bytes per key-value checksum for memtables.
+   * Enables per-KV checksum protection in memtables to detect silent data corruption
+   * <p>
+   * Default: 0 (disabled)
+   * <p>
+   * Supported values: 0, 1, 2, 4, 8 - 8 bytes per key
+   *
+   * @param memtableProtectionBytesPerKey number of checksum bytes per key-value
+   *
+   * @return the reference to the current options
+   */
+  T setMemtableProtectionBytesPerKey(final int memtableProtectionBytesPerKey);
+
+  /**
+   * Get the number of bytes per key-value checksum for memtables
+   * <p>
+   * Default: 0
+   *
+   * @return the number of checksum bytes per key-value
+   */
+  int memtableProtectionBytesPerKey();
+
+  /**
    * Set a certain prepopulate blob cache option.
    * <p>
    * Default: 0
