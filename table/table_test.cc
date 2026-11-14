@@ -15106,6 +15106,36 @@ TEST_P(UserDefinedIndexStressTest, DeleteRange) {
   ASSERT_NO_FATAL_FAILURE(ValidateQueryResult());
 }
 
+TEST_P(BlockBasedTableTest, SingleEntryExceeding4GBBlockRejected) {
+  // A single entry that alone would exceed the 2^32-byte block addressable
+  // limit must fail loudly instead of emitting an unreadable block.
+  Options options;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options = GetBlockBasedTableOptions();
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  ImmutableOptions ioptions(options);
+  MutableCFOptions moptions(options);
+
+  std::unique_ptr<FSWritableFile> sink(new test::StringSink());
+  std::unique_ptr<WritableFileWriter> file_writer(new WritableFileWriter(
+      std::move(sink), "" /* don't care */, FileOptions()));
+  InternalTblPropCollFactories prop_factories;
+  std::unique_ptr<TableBuilder> builder(moptions.table_factory->NewTableBuilder(
+      TableBuilderOptions(
+          ioptions, moptions, ReadOptions(), WriteOptions(),
+          GetPlainInternalComparator(options.comparator), &prop_factories,
+          options.compression, options.compression_opts, kUnknownColumnFamily,
+          "" /* column_family_name */, -1 /* level */, kUnknownNewestKeyTime),
+      file_writer.get()));
+
+  ParsedInternalKey ikey("k", kMaxSequenceNumber, kTypeValue);
+  std::string encoded;
+  AppendInternalKey(&encoded, ikey);
+  builder->Add(encoded, std::string(4294967280ULL, 'x'));  // 2^32 - 16
+  Status s = builder->Finish();
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+}
+
 TEST_P(UserDefinedIndexStressTest, AtomicReplaceBulkLoad) {
   // Create 2 column families. One use normal put/del, the other uses SST
   // ingest. The SST ingest uses atomic range replace.
