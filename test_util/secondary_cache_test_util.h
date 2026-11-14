@@ -42,6 +42,7 @@ class WithCacheType : public TestCreateContext {
   };
 
   static constexpr auto kLRU = "lru";
+  static constexpr auto kFIFO = "fifo";
   static constexpr auto kFixedHyperClock = "fixed_hyper_clock";
   static constexpr auto kAutoHyperClock = "auto_hyper_clock";
 
@@ -68,6 +69,15 @@ class WithCacheType : public TestCreateContext {
         modify_opts_fn(lru_opts);
       }
       return lru_opts.MakeSharedCache();
+    }
+    if (type == kFIFO) {
+      FIFOCacheOptions fifo_opts;
+      fifo_opts.capacity = capacity;
+      fifo_opts.hash_seed = 0;  // deterministic tests
+      if (modify_opts_fn) {
+        modify_opts_fn(fifo_opts);
+      }
+      return fifo_opts.MakeSharedCache();
     }
     if (IsHyperClock(type)) {
       HyperClockCacheOptions hc_opts{
@@ -119,11 +129,13 @@ class WithCacheTypeParam : public WithCacheType,
 };
 
 constexpr auto kLRU = WithCacheType::kLRU;
+constexpr auto kFIFO = WithCacheType::kFIFO;
 constexpr auto kFixedHyperClock = WithCacheType::kFixedHyperClock;
 constexpr auto kAutoHyperClock = WithCacheType::kAutoHyperClock;
 
 inline auto GetTestingCacheTypes() {
-  return testing::Values(std::string(kLRU), std::string(kFixedHyperClock),
+  return testing::Values(std::string(kLRU), std::string(kFIFO),
+                         std::string(kFixedHyperClock),
                          std::string(kAutoHyperClock));
 }
 
