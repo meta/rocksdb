@@ -15,7 +15,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// Helper methods to estimate memroy usage by std containers.
+// Helper methods to estimate memory usage by std containers.
 
 template <class Key, class Value, class Hash>
 size_t ApproximateMemoryUsage(
