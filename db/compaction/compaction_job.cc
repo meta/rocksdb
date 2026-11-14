@@ -794,13 +794,13 @@ void CompactionJob::GenSubcompactionBoundaries() {
     return;
   }
 
-  uint64_t next_threshold = target_range_size;
+  uint64_t cut_threshold = 2 * target_range_size / 5 * 4;
   uint64_t cumulative_size = 0;
   uint64_t num_actual_subcompactions = 1U;
   for (TableReader::Anchor& anchor : all_anchors) {
     cumulative_size += anchor.range_size;
-    if (cumulative_size > next_threshold) {
-      next_threshold += target_range_size;
+    if (cumulative_size >= cut_threshold) {
+      cumulative_size = 0;
       num_actual_subcompactions++;
       boundaries_.push_back(anchor.user_key);
     }
