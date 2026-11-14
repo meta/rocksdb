@@ -530,6 +530,9 @@ LRUHandle* LRUCacheShard::CreateHandle(const Slice& key, uint32_t hash,
   // It shouldn't happen very often though.
   LRUHandle* e =
       static_cast<LRUHandle*>(malloc(sizeof(LRUHandle) - 1 + key.size()));
+  if (e == nullptr) {
+    return nullptr;
+  }
 
   e->value = value;
   e->m_flags = 0;
@@ -551,6 +554,12 @@ Status LRUCacheShard::Insert(const Slice& key, uint32_t hash,
                              size_t charge, LRUHandle** handle,
                              Cache::Priority priority) {
   LRUHandle* e = CreateHandle(key, hash, value, helper, charge);
+  if (e == nullptr) {
+    if (handle != nullptr) {
+      *handle = nullptr;
+    }
+    return Status::MemoryLimit("Insert failed due to malloc failure.");
+  }
   e->SetPriority(priority);
   e->SetInCache(true);
   return InsertItem(e, handle);
@@ -562,6 +571,9 @@ LRUHandle* LRUCacheShard::CreateStandalone(const Slice& key, uint32_t hash,
                                            size_t charge,
                                            bool allow_uncharged) {
   LRUHandle* e = CreateHandle(key, hash, value, helper, charge);
+  if (e == nullptr) {
+    return nullptr;
+  }
   e->SetIsStandalone(true);
   e->Ref();
 
