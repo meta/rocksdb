@@ -267,9 +267,11 @@ void Java_org_rocksdb_Slice_disposeInternalBuf(JNIEnv* /*env*/, jclass /*jcls*/,
 jlong Java_org_rocksdb_DirectSlice_createNewDirectSlice0(JNIEnv* env,
                                                          jclass /*jcls*/,
                                                          jobject data,
+                                                         jint offset,
                                                          jint length) {
   assert(data != nullptr);
   void* data_addr = env->GetDirectBufferAddress(data);
+  jlong capacity = env->GetDirectBufferCapacity(data);
   if (data_addr == nullptr) {
     // error: memory region is undefined, given object is not a direct
     // java.nio.Buffer, or JNI access to direct buffers is not supported by JVM
@@ -278,9 +280,17 @@ jlong Java_org_rocksdb_DirectSlice_createNewDirectSlice0(JNIEnv* env,
                  "Could not access DirectBuffer"));
     return 0;
   }
+  if ((jlong)length > capacity - offset) {
+    // error: memory region is undefined, given object is not a direct
+    // java.nio.Buffer, or JNI access to direct buffers is not supported by JVM
+    ROCKSDB_NAMESPACE::IllegalArgumentExceptionJni::ThrowNew(
+            env, ROCKSDB_NAMESPACE::Status::InvalidArgument(
+                    "Invalid Offset and Length passed"));
+    return 0;
+  }
 
   const auto* ptrData = reinterpret_cast<char*>(data_addr);
-  const auto* slice = new ROCKSDB_NAMESPACE::Slice(ptrData, length);
+  const ROCKSDB_NAMESPACE::Slice* slice = new ROCKSDB_NAMESPACE::Slice(ptrData + offset, length);
   return GET_CPLUSPLUS_POINTER(slice);
 }
 
