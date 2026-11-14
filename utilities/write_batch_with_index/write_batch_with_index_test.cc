@@ -1978,6 +1978,44 @@ TEST_P(WriteBatchWithIndexTest, TestNewIteratorWithBaseFromWbwi) {
   ASSERT_OK(iter->status());
 }
 
+TEST_P(WriteBatchWithIndexTest,
+       NewIteratorWithBasePrefixSameAsStartAppliesOnlyToBase) {
+  options_.prefix_extractor.reset(NewFixedPrefixTransform(4));
+  ASSERT_OK(OpenDB());
+
+  ASSERT_OK(db_->Put(write_opts_, "foo:base", "db_value"));
+  ASSERT_OK(db_->Put(write_opts_, "goo:base", "db_value"));
+
+  ASSERT_OK(batch_->Put("foo:key1", "v1"));
+  ASSERT_OK(batch_->Put("foo:key2", "v2"));
+  ASSERT_OK(batch_->Put("goo:key1", "v3"));
+
+  ReadOptions ro;
+  ro.prefix_same_as_start = true;
+
+  std::unique_ptr<Iterator> db_iter(db_->NewIterator(ro));
+  db_iter->Seek("foo:");
+  ASSERT_TRUE(db_iter->Valid());
+  ASSERT_EQ(db_iter->key(), "foo:base");
+  db_iter->Next();
+  ASSERT_FALSE(db_iter->Valid());
+  ASSERT_OK(db_iter->status());
+
+  // NewIteratorWithBase cannot infer prefix_same_as_start or the prefix
+  // extractor from base_iterator, so the write batch portion is not
+  // prefix-bounded by the base iterator's ReadOptions.
+  std::unique_ptr<Iterator> iter(
+      batch_->NewIteratorWithBase(db_->NewIterator(ro)));
+  std::vector<std::string> keys;
+  for (iter->Seek("foo:"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(keys,
+            (std::vector<std::string>{"foo:base", "foo:key1", "foo:key2",
+                                      "goo:key1"}));
+}
+
 TEST_P(WriteBatchWithIndexTest, NewIteratorWithBasePrepareValue) {
   // BaseDeltaIterator by default should call PrepareValue if it lands on the
   // base iterator in case it was created with allow_unprepared_value=true.
