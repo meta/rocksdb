@@ -312,6 +312,11 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
         "atomic_flush is incompatible with enable_pipelined_write");
   }
 
+  if (db_options.two_write_queues && db_options.enable_pipelined_write) {
+    return Status::InvalidArgument(
+        "two_write_queues is incompatible with enable_pipelined_write");
+  }
+
   if (db_options.use_direct_io_for_flush_and_compaction &&
       0 == db_options.writable_file_max_buffer_size) {
     return Status::InvalidArgument(
@@ -2715,6 +2720,11 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   s = ValidateOptions(db_options, column_families);
   if (!s.ok()) {
     return s;
+  }
+  if (seq_per_batch && db_options.enable_pipelined_write) {
+    return Status::NotSupported(
+        "enable_pipelined_write is incompatible with seq_per_batch "
+        "(WritePrepared and WriteUnprepared transactions)");
   }
 
   *dbptr = nullptr;

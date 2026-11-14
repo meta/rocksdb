@@ -1,0 +1,1 @@
+DB open now fails when `enable_pipelined_write` is combined with `two_write_queues` (`InvalidArgument`) or with WritePrepared/WriteUnprepared transactions (`NotSupported`). Previously the DB opened but every write failed with `NotSupported`.
