@@ -13,6 +13,7 @@
 #include <string>
 
 #include "include/org_rocksdb_BloomFilter.h"
+#include "include/org_rocksdb_RibbonFilter.h"
 #include "include/org_rocksdb_Filter.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksjni/cplusplus_to_java_convert.h"
@@ -29,6 +30,20 @@ jlong Java_org_rocksdb_BloomFilter_createNewBloomFilter(JNIEnv* /*env*/,
   auto* sptr_filter =
       new std::shared_ptr<const ROCKSDB_NAMESPACE::FilterPolicy>(
           ROCKSDB_NAMESPACE::NewBloomFilterPolicy(bits_per_key));
+  return GET_CPLUSPLUS_POINTER(sptr_filter);
+}
+
+/*
+ * Class:     org_rocksdb_RibbonFilter
+ * Method:    createRibbonFilter
+ * Signature: (DZ)J
+ */
+jlong Java_org_rocksdb_RibbonFilter_createNewRibbonFilter(JNIEnv* /*env*/,
+                                                        jclass /*jcls*/,
+                                                        jdouble bits_per_key) {
+  auto* sptr_filter =
+      new std::shared_ptr<const ROCKSDB_NAMESPACE::FilterPolicy>(
+          ROCKSDB_NAMESPACE::NewRibbonFilterPolicy(bits_per_key));
   return GET_CPLUSPLUS_POINTER(sptr_filter);
 }
 
