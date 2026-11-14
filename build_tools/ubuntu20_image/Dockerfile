@@ -30,7 +30,7 @@ RUN add-apt-repository -y ppa:ubuntu-toolchain-r/test
 RUN apt-get install -y gcc-11 g++-11
 # install apt-get install -y valgrind
 RUN apt-get install -y valgrind
-# install folly depencencies
+# install folly dependencies
 RUN apt-get install -y libgoogle-glog-dev
 # install openjdk 8
 RUN apt-get install -y openjdk-8-jdk
