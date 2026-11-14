@@ -52,9 +52,7 @@ inline void GetTimeOfDay(TimeVal* tv, struct timezone* tz) {
   gettimeofday(tv, tz);
 }
 
-inline struct tm* LocalTimeR(const time_t* timep, struct tm* result) {
-  return localtime_r(timep, result);
-}
+struct tm* LocalTimeR(const time_t* timep, struct tm* result);
 
 }  // namespace port
 
