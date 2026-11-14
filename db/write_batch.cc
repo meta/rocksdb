@@ -507,8 +507,10 @@ Status ReadRecordFromWriteBatch(Slice* input, char* tag,
       FALLTHROUGH_INTENDED;
     case kTypeValuePreferredSeqno: {
       Slice packed_value;
+      // The packed value ends with a fixed size write time trailer.
       if (!GetLengthPrefixedSlice(input, key) ||
-          !GetLengthPrefixedSlice(input, &packed_value)) {
+          !GetLengthPrefixedSlice(input, &packed_value) ||
+          packed_value.size() < sizeof(uint64_t)) {
         return Status::Corruption("bad WriteBatch TimedPut");
       }
       if (write_unix_time) {
