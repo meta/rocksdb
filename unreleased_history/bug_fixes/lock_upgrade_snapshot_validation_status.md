@@ -1,0 +1,1 @@
+Fixed a bug where a pessimistic transaction could silently overwrite a newer committed value. If it first took a shared lock on a key with `GetForUpdate(..., exclusive=false, do_validate=false)` after setting a snapshot, a later write to that key now correctly returns `Busy` when the key was modified after the snapshot, instead of returning OK.
