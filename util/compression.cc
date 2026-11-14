@@ -1576,7 +1576,7 @@ class BuiltinDecompressorV2SnappyOnly final : public BuiltinDecompressorV2 {
     return "BuiltinDecompressorV2SnappyOnly";
   }
 
-  Status ExtractUncompressedSize(Args& args) override {
+  Status ExtractUncompressedSize([[maybe_unused]] Args& args) override {
     assert(args.compression_type == kSnappyCompression);
 #ifdef SNAPPY
     size_t uncompressed_length = 0;
