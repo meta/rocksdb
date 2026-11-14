@@ -3634,6 +3634,11 @@ struct CompactionServiceOptionsOverride {
 
   // All other options to override. Unknown options will be ignored.
   std::unordered_map<std::string, std::string> options_map;
+
+  // Enables TTL table feature when set to a non-nullopt value.
+  // When enabled, `DBWithTTLImpl::SanitizeOptions` will be invoked
+  // to reset compaction_filter and merge_operator.
+  std::optional<int32_t> ttl = std::nullopt;
 };
 
 struct OpenAndCompactOptions {

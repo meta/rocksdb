@@ -29,6 +29,7 @@
 #include "util/cast_util.h"
 #include "util/string_util.h"
 #include "util/write_batch_util.h"
+#include "utilities/ttl/db_ttl_impl.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -2266,6 +2267,15 @@ Status DB::OpenAndCompact(
           override_options.sst_partitioner_factory;
       cf.options.table_properties_collector_factories =
           override_options.table_properties_collector_factories;
+      if (override_options.ttl.has_value()) {
+        SystemClock* clock = (db_options.env == nullptr)
+                                 ? SystemClock::Default().get()
+                                 : db_options.env->GetSystemClock().get();
+        // We will reset the compaction_filter and merge_operator in
+        // `SanitizeOptions`
+        DBWithTTLImpl::SanitizeOptions(override_options.ttl.value(),
+                                       &cf.options, clock);
+      }
 
       column_families.emplace_back(cf);
     } else if (cf.name == kDefaultColumnFamilyName) {
