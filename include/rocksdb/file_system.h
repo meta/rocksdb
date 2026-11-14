@@ -304,7 +304,7 @@ struct IODebugContext {
   const std::string* request_id = nullptr;
 
   // In order to log required information in IO tracing for different
-  // operations, Each bit in trace_data stores which corresponding info from
+  // operations, each bit in trace_data stores which corresponding info from
   // IODebugContext will be added in the trace. Foreg, if trace_data = 1, it
   // means bit at position 0 is set so TraceData::kRequestID (request_id) will
   // be logged in the trace record.
