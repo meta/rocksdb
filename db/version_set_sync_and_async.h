@@ -293,16 +293,18 @@ DEFINE_SYNC_AND_ASYNC(Status, Version::MultiGetFromSST)
         get_context.State() != GetContext::kMerge &&
         db_statistics_ != nullptr) {
       get_context.ReportCounters();
-    } else {
-      if (iter->max_covering_tombstone_seq > 0) {
-        // The remaining files we look at will only contain covered keys, so
-        // we stop here for this key
-        file_range.SkipKey(iter);
-      }
     }
     switch (get_context.State()) {
       case GetContext::kNotFound:
-        // Keep searching in other files
+        if (iter->max_covering_tombstone_seq > 0) {
+          // The remaining files only contain keys covered by the range
+          // tombstone, so this NotFound result is final.
+          if (db_statistics_ != nullptr) {
+            get_context.ReportCounters();
+          }
+          *status = Status::NotFound();
+          file_range.MarkKeyDone(iter);
+        }
         break;
       case GetContext::kMerge:
         // TODO: update per-level perfcontext user_key_return_count for kMerge
