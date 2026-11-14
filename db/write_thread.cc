@@ -420,9 +420,9 @@ void WriteThread::JoinBatchGroup(Writer* w) {
     /**
      * Wait util:
      * 1) An existing leader pick us as the new leader when it finishes
-     * 2) An existing leader pick us as its follewer and
+     * 2) An existing leader pick us as its follower and
      * 2.1) finishes the memtable writes on our behalf
-     * 2.2) Or tell us to finish the memtable writes in pralallel
+     * 2.2) Or tell us to finish the memtable writes in parallel
      * 3) (pipelined write) An existing leader pick us as its follower and
      *    finish book-keeping and WAL write for us, enqueue us as pending
      *    memtable writer, and
