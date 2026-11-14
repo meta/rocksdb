@@ -95,6 +95,10 @@
 #       Default: 10.
 #   SEED:  random seed that controls the randomness of the benchmark.
 #       Default: $( date +%s )
+#   MULTIREAD_BATCH_SIZE:  Batch size for multiread
+#       Default: 128.
+#   MULTIREAD_BATCHED:  Use the new MultiGet API
+#       Default: true.
 
 #==============================================================================
 #  CONSTANT
@@ -210,6 +214,7 @@ function init_arguments {
   SEEK_NEXTS=${SEEK_NEXTS:-10}
   SEED=${SEED:-$( date +%s )}
   MULTIREAD_BATCH_SIZE=${MULTIREAD_BATCH_SIZE:-128}
+  MULTIREAD_BATCHED=${MULTIREAD_BATCHED:-true}
   MULTIREAD_STRIDE=${MULTIREAD_STRIDE:-12}
   PERF_LEVEL=${PERF_LEVEL:-1}
 }
@@ -300,7 +305,7 @@ function run_db_bench {
       --num_high_pri_threads=$NUM_HIGH_PRI_THREADS \
       --num_low_pri_threads=$NUM_LOW_PRI_THREADS \
       --seed=$SEED \
-      --multiread_batched=true \
+      --multiread_batched=$MULTIREAD_BATCHED \
       --batch_size=$MULTIREAD_BATCH_SIZE \
       --multiread_stride=$MULTIREAD_STRIDE \
       --async_io=$async_io"
