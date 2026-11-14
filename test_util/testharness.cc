@@ -74,6 +74,30 @@ std::string GetPidStr() { return std::to_string(getpid()); }
   }
 }
 
+// If suggested is empty, the name will be <test case>-<test name>
+// Replaces all of the "/" in the test case/name with "_", so that they will not
+// appear as directories
+std::string GetTestNameForDB(const std::string& suggested) {
+  const testing::TestInfo* const test_info =
+      testing::UnitTest::GetInstance()->current_test_info();
+  std::string test_name = test_info->name();
+  std::string test_case = test_info->test_case_name();
+  auto pos = test_case.find("/");
+  if (pos != test_case.npos && !suggested.empty()) {
+    test_case = suggested;
+  } else {
+    while (pos != test_case.npos) {
+      test_case[pos] = '_';
+      pos = test_case.find("/", pos);
+    }
+  }
+  for (pos = test_name.find("/"); pos != test_name.npos;
+       pos = test_name.find("/", pos)) {
+    test_name[pos] = '_';
+  }
+  return test_case + "-" + test_name;
+}
+
 std::string TmpDir(Env* env) {
   std::string dir;
   Status s = env->GetTestDirectory(&dir);
