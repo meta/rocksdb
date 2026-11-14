@@ -24,6 +24,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "db/dbformat.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/filter_policy.h"
@@ -2477,6 +2478,42 @@ class JniUtil {
     return op(key_slice);
   }
 
+  /*
+   * Helper for operations on a key on java byte array
+   * Copies values from jbyte array to slice and performs op on the slice.
+   * for example WriteBatch->Delete
+   *
+   * from `op` and used for RocksDB->Delete etc.
+   */
+  static void k_op_indirect(std::function<bool(ROCKSDB_NAMESPACE::Slice&)> op,
+                            JNIEnv* env, jbyteArray jkey, jint jkey_off,
+                            jint jkey_len) {
+    if (jkey == nullptr || env->GetArrayLength(jkey) < (jkey_off + jkey_len)) {
+      ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env,
+                                                       "Invalid key argument");
+      return;
+    }
+    char* target = new char[jkey_len];
+    if (target == nullptr) {
+      ROCKSDB_NAMESPACE::OutOfMemoryErrorJni::ThrowNew(env,
+           "Memory allocation failed in RocksDB JNI function");
+      return;
+    }
+    env->GetByteArrayRegion(jkey, jkey_off, jkey_len,
+                            reinterpret_cast<jbyte*>(target));
+    if (env->ExceptionCheck()) {
+      // exception thrown: ArrayIndexOutOfBoundsException
+      ROCKSDB_NAMESPACE::IllegalArgumentExceptionJni::ThrowNew(env,
+           "Failed to get byte array region: Out of bounds or invalid array.");
+      return;
+    }
+    ROCKSDB_NAMESPACE::Slice target_slice(target, jkey_len);
+    bool release_copy = op(target_slice);
+    if (release_copy) {
+      delete[] target;
+    }
+  }
+
   template <class T>
   static jint copyToDirect(JNIEnv* env, T& source, jobject jtarget,
                            jint jtarget_off, jint jtarget_len) {
@@ -2496,6 +2533,31 @@ class JniUtil {
 
     memcpy(target, source.data(), length);
 
+    return cvalue_len;
+  }
+
+  /* Helper for copying value in source into a byte array.
+   */
+  template <class T>
+  static jint copyBytes(JNIEnv* env, T& source, jbyteArray jtarget,
+                        jint jtarget_off, jint jtarget_len) {
+    if (jtarget == nullptr ||
+        env->GetArrayLength(jtarget) < (jtarget_off + jtarget_len)) {
+      ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(
+          env, "Invalid target argument");
+      return 0;
+    }
+
+    const jint cvalue_len = static_cast<jint>(source.size());
+    const jint length = std::min(jtarget_len, cvalue_len);
+    env->SetByteArrayRegion(
+        jtarget, jtarget_off, length,
+        const_cast<jbyte*>(reinterpret_cast<const jbyte*>(source.data())));
+    if (env->ExceptionCheck()) {
+      ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(
+          env, "Failed to copy data to byte array.");
+      return 0;
+    }
     return cvalue_len;
   }
 };
@@ -6649,6 +6711,35 @@ class TxnDBWritePolicyJni {
       default:
         // undefined/default
         return ROCKSDB_NAMESPACE::TxnDBWritePolicy::WRITE_COMMITTED;
+    }
+  }
+};
+
+// The portal class for org.rocksdb.EntryType
+class EntryTypeJni {
+ public:
+  static jbyte toJavaEntryType(const ROCKSDB_NAMESPACE::EntryType& entry_type) {
+    switch (entry_type) {
+      case ROCKSDB_NAMESPACE::EntryType::kEntryPut:
+        return 0x0;
+      case ROCKSDB_NAMESPACE::EntryType::kEntryDelete:
+        return 0x1;
+      case ROCKSDB_NAMESPACE::EntryType::kEntrySingleDelete:
+        return 0x2;
+      case ROCKSDB_NAMESPACE::EntryType::kEntryMerge:
+        return 0x3;
+      case ROCKSDB_NAMESPACE::EntryType::kEntryRangeDeletion:
+        return 0x4;
+      case ROCKSDB_NAMESPACE::EntryType::kEntryBlobIndex:
+        return 0x5;
+      case ROCKSDB_NAMESPACE::EntryType::kEntryDeleteWithTimestamp:
+        return 0x6;
+      case ROCKSDB_NAMESPACE::EntryType::kEntryWideColumnEntity:
+        return 0x7;
+      case ROCKSDB_NAMESPACE::EntryType::kEntryOther:
+        return 0x8;
+      default:
+        return 0x9;
     }
   }
 };
