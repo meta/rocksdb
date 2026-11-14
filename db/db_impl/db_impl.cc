@@ -1746,8 +1746,11 @@ void DBImpl::PersistStats() {
           int length =
               EncodePersistentStatsKey(now_seconds, stat.first, 100, key);
           // calculate the delta from last time
-          if (stats_slice_.find(stat.first) != stats_slice_.end()) {
-            uint64_t delta = stat.second - stats_slice_[stat.first];
+          auto it = stats_slice_.find(stat.first);
+          if (it != stats_slice_.end()) {
+            uint64_t prev = it->second;
+            uint64_t delta =
+                stat.second >= prev ? stat.second - prev : stat.second;
             s = batch.Put(persist_stats_cf_handle_,
                           Slice(key, std::min(100, length)),
                           std::to_string(delta));
@@ -1782,8 +1785,11 @@ void DBImpl::PersistStats() {
     if (stats_slice_initialized_) {
       std::map<std::string, uint64_t> stats_delta;
       for (const auto& stat : stats_map) {
-        if (stats_slice_.find(stat.first) != stats_slice_.end()) {
-          stats_delta[stat.first] = stat.second - stats_slice_[stat.first];
+        auto it = stats_slice_.find(stat.first);
+        if (it != stats_slice_.end()) {
+          uint64_t prev = it->second;
+          stats_delta[stat.first] =
+              stat.second >= prev ? stat.second - prev : stat.second;
         }
       }
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
