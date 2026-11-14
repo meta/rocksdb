@@ -85,6 +85,7 @@ ComparatorJniCallback::ComparatorJniCallback(
           _env->DeleteGlobalRef(tlb->jbuf);
           JniUtil::releaseJniEnv(tlb->jvm, attached_thread);
         }
+        delete tlb;
       };
 
       m_tl_buf_a = new ThreadLocalPtr(unref);
