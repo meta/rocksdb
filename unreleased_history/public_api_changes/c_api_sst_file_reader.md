@@ -1,0 +1,1 @@
+Added a subset of `SstFileReader` to the C API: `rocksdb_sstfilereader_create()`, `rocksdb_sstfilereader_open()`, `rocksdb_sstfilereader_new_iterator()` (which returns a regular `rocksdb_iterator_t`), `rocksdb_sstfilereader_verify_checksum()` and `rocksdb_sstfilereader_destroy()`.
