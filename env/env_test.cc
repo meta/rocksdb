@@ -27,9 +27,11 @@
 #ifdef OS_LINUX
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <linux/stat.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -1356,6 +1358,40 @@ TEST_F(EnvPosixTest, PositionedAppend) {
   ASSERT_EQ('a', result[kBlockSize - 1]);
   ASSERT_EQ('b', result[kBlockSize]);
 }
+
+#if defined(OS_LINUX) && defined(__NR_statx) && defined(STATX_DIOALIGN) && \
+    !defined(NDEBUG)
+TEST_F(EnvPosixTest, GetLogicalBlockSizeUsesStatx) {
+  std::string fname = test::PerThreadDBPath(
+      env_, "logical_block_size_uses_statx_dio_offset_align");
+  int fd = open(fname.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+  ASSERT_GE(fd, 0);
+
+  const size_t unmocked_alignment = PosixHelper::GetLogicalBlockSizeOfFd(fd);
+  // Use a value distinct from the host alignment so old sysfs-only behavior
+  // fails the assertion below.
+  const size_t filesystem_dio_offset_align =
+      unmocked_alignment == 16 * 1024 ? 32 * 1024 : 16 * 1024;
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "PosixHelper::GetLogicalBlockSizeOfFd:StatxDioAlign", [&](void* arg) {
+        auto* dio_align_info =
+            static_cast<PosixHelper::StatxDioAlignInfo*>(arg);
+        dio_align_info->statx_result = 0;
+        dio_align_info->has_dio_offset_align = true;
+        dio_align_info->dio_offset_align = filesystem_dio_offset_align;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_EQ(filesystem_dio_offset_align,
+            PosixHelper::GetLogicalBlockSizeOfFd(fd));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  close(fd);
+  ASSERT_OK(env_->DeleteFile(fname));
+}
+#endif
 
 // `GetUniqueId()` temporarily returns zero on Windows. `BlockBasedTable` can
 // handle a return value of zero but this test case cannot.

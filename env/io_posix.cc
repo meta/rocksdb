@@ -24,11 +24,15 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(OS_LINUX)
+#include <linux/stat.h>
+#endif
 #if defined(OS_LINUX) || defined(OS_ANDROID)
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
@@ -515,6 +519,23 @@ Status PosixHelper::GetQueueSysfsFileValueofDirectory(
 }
 
 size_t PosixHelper::GetLogicalBlockSizeOfFd(int fd) {
+#if defined(OS_LINUX) && defined(__NR_statx) && defined(STATX_DIOALIGN)
+  // Prefer the filesystem's DIO alignment when the kernel reports it. The
+  // sysfs fallback only reports the underlying block device's sector size,
+  // which can be too small for the file's filesystem.
+  struct statx stx{};
+  long statx_result =
+      syscall(__NR_statx, fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx);
+  PosixHelper::StatxDioAlignInfo dio_align_info{
+      statx_result, statx_result == 0 && (stx.stx_mask & STATX_DIOALIGN),
+      stx.stx_dio_offset_align};
+  TEST_SYNC_POINT_CALLBACK("PosixHelper::GetLogicalBlockSizeOfFd:StatxDioAlign",
+                           &dio_align_info);
+  if (dio_align_info.statx_result == 0 && dio_align_info.has_dio_offset_align &&
+      dio_align_info.dio_offset_align != 0) {
+    return dio_align_info.dio_offset_align;
+  }
+#endif
   return GetQueueSysfsFileValueOfFd(fd, GetLogicalBlockSizeFileName(),
                                     kDefaultPageSize);
 }
