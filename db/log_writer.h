@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -18,6 +19,7 @@
 #include "rocksdb/compression_type.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
+#include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "util/compression.h"
@@ -28,6 +30,32 @@ namespace ROCKSDB_NAMESPACE {
 class WritableFileWriter;
 
 namespace log {
+
+// First wal_index handed out. Zero is reserved to mean "no wal_index".
+//
+// The counter never wraps: wal_index has to stay monotonic for merge ordering
+// and gap detection to mean anything, and wrapping would break both silently.
+// Reaching UINT64_MAX is unreachable at any real write rate, so it can only
+// indicate that something else already went wrong -- AddRecord fails the write
+// rather than continuing on a broken invariant.
+constexpr uint64_t kWALIndexStartNumber = 1;
+
+// True when `usage` prefixes each WAL record with a wal_index.
+//
+// Deliberately an allowlist rather than `!= kNone`. The enum names a WAL
+// layout as well as the index, so a future partitioning mode need not carry
+// one, and every `!= kNone` site would then quietly mean the wrong thing. The
+// switch has no default, so adding a value fails the build until it has been
+// classified here instead of inheriting "indexed" by omission.
+inline constexpr bool WALIndexEnabled(PartitionWALUsage usage) {
+  switch (usage) {
+    case PartitionWALUsage::kPartitionByColumnFamily:
+      return true;
+    case PartitionWALUsage::kNone:
+      return false;
+  }
+  return false;
+}
 
 /**
  * Writer is a general purpose log stream writer. It provides an append-only
@@ -97,8 +125,10 @@ class Writer {
 
   ~Writer();
 
+  // Appends one logical record. `wal_index` is the DB-assigned ordering number
+  // when WAL index is enabled, and zero otherwise.
   IOStatus AddRecord(const WriteOptions& write_options, const Slice& slice,
-                     const SequenceNumber& seqno = 0);
+                     const SequenceNumber& seqno = 0, uint64_t wal_index = 0);
   IOStatus AddCompressionTypeRecord(const WriteOptions& write_options);
   IOStatus MaybeAddPredecessorWALInfo(const WriteOptions& write_options,
                                       const PredecessorWALInfo& info);
@@ -111,6 +141,22 @@ class Writer {
   IOStatus MaybeAddUserDefinedTimestampSizeRecord(
       const WriteOptions& write_options,
       const UnorderedMap<uint32_t, size_t>& cf_to_ts_sz);
+
+  // When WAL index is enabled, emits the leading marker record that identifies
+  // this file as carrying per-record ordering numbers (wal_index / LSN). The
+  // marker does not consume a wal_index. No-op when WAL index is disabled.
+  IOStatus MaybeAddWALIndexMarkerRecord(const WriteOptions& write_options);
+
+  // Enables WAL indexing for this writer.
+  // Must be called before the first record is written and never changed
+  // afterwards. A file's records are either all indexed or none are.
+  void SetPartitionWALUsage(PartitionWALUsage usage) {
+    assert(partition_wal_usage_ == PartitionWALUsage::kNone);
+    partition_wal_usage_ = usage;
+  }
+  bool WALIndexEnabled() const {
+    return log::WALIndexEnabled(partition_wal_usage_);
+  }
 
   WritableFileWriter* file() { return dest_.get(); }
   const WritableFileWriter* file() const { return dest_.get(); }
@@ -144,8 +190,13 @@ class Writer {
   // record type stored in the header.
   uint32_t type_crc_[kMaxRecordType + 1];
 
+  // Picks the physical record type for one fragment of a logical record, from
+  // its position in that record and this writer's recycling / WAL index modes.
+  RecordType SelectRecordType(bool begin, bool end) const;
+
   IOStatus EmitPhysicalRecord(const WriteOptions& write_options,
-                              RecordType type, const char* ptr, size_t length);
+                              RecordType type, const Slice& prefix,
+                              const char* ptr, size_t payload_size);
 
   IOStatus MaybeHandleSeenFileWriterError();
 
@@ -171,6 +222,10 @@ class Writer {
   bool track_and_verify_wals_;
 
   SequenceNumber last_seqno_recorded_;
+
+  // See `DBOptions::partition_wal_usage`.
+  PartitionWALUsage partition_wal_usage_ = PartitionWALUsage::kNone;
+  uint64_t last_wal_index_recorded_ = 0;
 };
 
 }  // namespace log
