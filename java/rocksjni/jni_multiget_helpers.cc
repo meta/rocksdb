@@ -186,12 +186,17 @@ void MultiGetJNIValues::fillByteBuffersAndStatusObjects(
     jintArray jvalue_sizes, jobjectArray jstatuses) {
   std::vector<jint> value_size;
   for (int i = 0; i < static_cast<jint>(values.size()); i++) {
-    auto jstatus = ROCKSDB_NAMESPACE::StatusJni::construct(env, s[i]);
+    jobject jstatus = ROCKSDB_NAMESPACE::StatusJni::construct(env, s[i]);
     if (jstatus == nullptr) {
       // exception in context
       return;
     }
     env->SetObjectArrayElement(jstatuses, i, jstatus);
+    env->DeleteLocalRef(jstatus);
+    if (env->ExceptionCheck()) {
+      // ArrayIndexOutOfBoundsException is thrown
+      return;
+    }
 
     if (s[i].ok()) {
       jobject jvalue_bytebuf = env->GetObjectArrayElement(jvalues, i);
@@ -205,6 +210,7 @@ void MultiGetJNIValues::fillByteBuffersAndStatusObjects(
             env,
             "Invalid value(s) argument (argument is not a valid direct "
             "ByteBuffer)");
+        env->DeleteLocalRef(jvalue_bytebuf);
         return;
       }
       void* jvalue_address = env->GetDirectBufferAddress(jvalue_bytebuf);
@@ -213,6 +219,7 @@ void MultiGetJNIValues::fillByteBuffersAndStatusObjects(
             env,
             "Invalid value(s) argument (argument is not a valid direct "
             "ByteBuffer)");
+        env->DeleteLocalRef(jvalue_bytebuf);
         return;
       }
 
@@ -223,10 +230,15 @@ void MultiGetJNIValues::fillByteBuffersAndStatusObjects(
       if (values[i].size() > INTEGER_MAX_VALUE) {
         // Indicate that the result size is bigger than can be represented in a
         // java integer by setting the status to incomplete and the size to -1
-        env->SetObjectArrayElement(
-            jstatuses, i,
-            ROCKSDB_NAMESPACE::StatusJni::construct(
-                env, Status::Incomplete("result too large to represent")));
+        jobject jincomplete_status = ROCKSDB_NAMESPACE::StatusJni::construct(
+            env, Status::Incomplete("result too large to represent"));
+        if (jincomplete_status == nullptr) {
+          // exception in context
+          env->DeleteLocalRef(jvalue_bytebuf);
+          return;
+        }
+        env->SetObjectArrayElement(jstatuses, i, jincomplete_status);
+        env->DeleteLocalRef(jincomplete_status);
         value_size.push_back(-1);
       } else {
         value_size.push_back(static_cast<jint>(values[i].size()));
@@ -234,6 +246,7 @@ void MultiGetJNIValues::fillByteBuffersAndStatusObjects(
       auto copy_bytes =
           std::min(static_cast<jlong>(values[i].size()), jvalue_capacity);
       memcpy(jvalue_address, values[i].data(), copy_bytes);
+      env->DeleteLocalRef(jvalue_bytebuf);
     } else {
       // bad status for this
       value_size.push_back(0);
