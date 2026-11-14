@@ -796,6 +796,83 @@ TEST_F(SSTDumpToolTest, PlainTableMmapReopenFailure) {
   cleanup(opts, file_path);
 }
 
+// Counts the key/value lines a scan printed.
+static size_t CountScannedEntries(const std::string& output) {
+  size_t entries = 0;
+  size_t pos = 0;
+  while ((pos = output.find(" => ", pos)) != std::string::npos) {
+    ++entries;
+    pos += 4;
+  }
+  return entries;
+}
+
+TEST_F(SSTDumpToolTest, ReadNumLimitAcrossFiles) {
+  Options opts;
+  opts.env = env();
+  const std::string first = MakeFilePath("read_num_first.sst");
+  const std::string second = MakeFilePath("read_num_second.sst");
+  createSST(opts, first);
+  createSST(opts, second);
+  Defer remove_files([&]() {
+    cleanup(opts, first);
+    cleanup(opts, second);
+  });
+
+  for (int limit : {5, kNumKey, kNumKey + 5, 0}) {
+    SCOPED_TRACE(limit);
+    const std::string limit_arg = "--read_num=" + std::to_string(limit);
+    const char* args[] = {"./sst_dump",  "--command=scan", limit_arg.c_str(),
+                          first.c_str(), second.c_str(),   "--show_summary"};
+    SSTDumpTool tool;
+    testing::internal::CaptureStdout();
+    const int result = tool.Run(6, args, opts);
+    const std::string output = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(0, result);
+
+    const size_t entries = CountScannedEntries(output);
+    EXPECT_EQ(static_cast<size_t>(limit == 0 ? 2 * kNumKey : limit), entries);
+    const int files_read = limit == 0 || limit > kNumKey ? 2 : 1;
+    EXPECT_NE(std::string::npos,
+              output.find("total number of files: " +
+                          std::to_string(files_read) + "\n"));
+  }
+}
+
+TEST_F(SSTDumpToolTest, ReadNumLimitAcrossFilesWithRangeEnd) {
+  Options opts;
+  opts.env = env();
+  const std::string first = MakeFilePath("read_num_range_first.sst");
+  const std::string second = MakeFilePath("read_num_range_second.sst");
+  createSST(opts, first);
+  createSST(opts, second);
+  Defer remove_files([&]() {
+    cleanup(opts, first);
+    cleanup(opts, second);
+  });
+
+  // Each file holds k_0000..k_1023. The key that ends the range in the first
+  // file must not use up the limit, so the rest comes from the second file.
+  struct Case {
+    const char* range_arg;
+    int limit;
+  };
+  for (const Case& c : {Case{"--to=k_0003", 5}, Case{"--prefix=k_000", 12}}) {
+    SCOPED_TRACE(c.range_arg);
+    const std::string limit_arg = "--read_num=" + std::to_string(c.limit);
+    const char* args[] = {"./sst_dump", "--command=scan", limit_arg.c_str(),
+                          c.range_arg,  first.c_str(),    second.c_str()};
+    SSTDumpTool tool;
+    testing::internal::CaptureStdout();
+    const int result = tool.Run(6, args, opts);
+    const std::string output = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(0, result);
+
+    const size_t entries = CountScannedEntries(output);
+    EXPECT_EQ(static_cast<size_t>(c.limit), entries);
+  }
+}
+
 TEST_F(SSTDumpToolTest, ReadSequentialCountsOnlyTheKeysItRead) {
   Options opts;
   opts.env = env();
