@@ -390,6 +390,7 @@ const char* DeserializeFilterInput(const char* p, const char* limit,
       *out = SelectKeySegment{BitwiseAnd(b, 0xf)};
       return p;
     case 2:
+      b = BitwiseAnd(b, 0xf);
       // First 16 cases of SelectKeySegmentRange
       // that are not a single key segment
       // 0: 0-1
