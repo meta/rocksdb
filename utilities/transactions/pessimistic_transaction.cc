@@ -509,12 +509,14 @@ Status WriteCommittedTxn::Operate(ColumnFamilyHandle* column_family,
   const Comparator* const ucmp = column_family->GetComparator();
   assert(ucmp);
   size_t ts_sz = ucmp->timestamp_size();
+
   if (ts_sz > 0) {
     assert(ts_sz == sizeof(TxnTimestamp));
-    if (!IndexingEnabled()) {
-      cfs_with_ts_tracked_when_indexing_disabled_.insert(
-          column_family->GetID());
-    }
+  }
+
+  if (!IndexingEnabled()) {
+    cf_timestamp_sizes_tracked_when_indexing_disabled_[
+        column_family->GetID()] = ts_sz;
   }
   return std::forward<TOperation>(operation)();
 }
@@ -792,9 +794,10 @@ Status WriteCommittedTxn::CommitWithoutPrepareInternal() {
             size_t ts_sz = iter->second;
             return ts_sz;
           }
-          auto cf_iter = cfs_with_ts_tracked_when_indexing_disabled_.find(cf);
-          if (cf_iter != cfs_with_ts_tracked_when_indexing_disabled_.end()) {
-            return sizeof(kMaxTxnTimestamp);
+        auto cf_iter = cf_timestamp_sizes_tracked_when_indexing_disabled_.find(cf);
+
+        if (cf_iter != cf_timestamp_sizes_tracked_when_indexing_disabled_.end()) {
+            return cf_iter->second;
           }
           const Comparator* ucmp =
               WriteBatchWithIndexInternal::GetUserComparator(*wbwi, cf);
@@ -878,9 +881,11 @@ Status WriteCommittedTxn::CommitInternal() {
             if (iter != cf_id_to_ts_sz.end()) {
               return iter->second;
             }
-            if (cfs_with_ts_tracked_when_indexing_disabled_.find(cf) !=
-                cfs_with_ts_tracked_when_indexing_disabled_.end()) {
-              return sizeof(kMaxTxnTimestamp);
+            auto cf_iter = cf_timestamp_sizes_tracked_when_indexing_disabled_.find(cf);
+
+            if (cf_iter !=
+                cf_timestamp_sizes_tracked_when_indexing_disabled_.end()) {
+              return cf_iter->second;
             }
             const Comparator* ucmp =
                 WriteBatchWithIndexInternal::GetUserComparator(*wbwi, cf);

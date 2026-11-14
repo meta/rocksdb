@@ -369,11 +369,10 @@ class WriteCommittedTxn : public PessimisticTransaction {
   // TransactionDBOptions make sense together.
   Status SanityCheckReadTimestamp(bool do_validate);
 
-  // Column families that enable timestamps and whose data are written when
-  // indexing_enabled_ is false. If a key is written when indexing_enabled_ is
-  // true, then the corresponding column family is not added to cfs_with_ts
-  // even if it enables timestamp.
-  std::unordered_set<uint32_t> cfs_with_ts_tracked_when_indexing_disabled_;
+// Column families and their timestamp sizes when data are written while
+// indexing_enabled_ is false.
+  std::unordered_map<uint32_t, size_t>
+     cf_timestamp_sizes_tracked_when_indexing_disabled_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
