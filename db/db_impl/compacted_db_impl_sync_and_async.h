@@ -57,12 +57,12 @@ DEFINE_SYNC_AND_ASYNC(Status, CompactedDBImpl::Get)
   std::string* ts =
       user_comparator_->timestamp_size() > 0 ? timestamp : nullptr;
   LookupKey lkey(key, kMaxSequenceNumber, read_options.timestamp);
-  GetContext get_context(user_comparator_, nullptr, nullptr, nullptr,
-                         GetContext::kNotFound, lkey.user_key(), value,
-                         /*columns=*/nullptr, ts, nullptr, nullptr, true,
-                         nullptr, nullptr, nullptr, nullptr, &read_cb,
-                         nullptr /* is_blob_index */, 0 /* tracing_get_id */,
-                         &blob_fetcher);
+  GetContext get_context(
+      user_comparator_, nullptr, immutable_db_options_.logger,
+      immutable_db_options_.stats, GetContext::kNotFound, lkey.user_key(),
+      value, /*columns=*/nullptr, ts, nullptr, nullptr, true, nullptr,
+      immutable_db_options_.clock, nullptr, nullptr, &read_cb,
+      nullptr /* is_blob_index */, 0 /* tracing_get_id */, &blob_fetcher);
 
   const FdWithKeyRange& f = files_.files[FindFile(lkey.user_key())];
   if (user_comparator_->CompareWithoutTimestamp(
@@ -163,11 +163,13 @@ DEFINE_SYNC_AND_ASYNC(void, CompactedDBImpl::MultiGet)
     PinnableSlice& pinnable_val = values[i];
     std::string* timestamp = timestamps ? &timestamps[i] : nullptr;
     GetContext get_context(
-        user_comparator_, nullptr, nullptr, nullptr, GetContext::kNotFound,
+        user_comparator_, nullptr, immutable_db_options_.logger,
+        immutable_db_options_.stats, GetContext::kNotFound,
         lkey.user_key(), &pinnable_val, /*columns=*/nullptr,
         user_comparator_->timestamp_size() > 0 ? timestamp : nullptr, nullptr,
-        nullptr, true, nullptr, nullptr, nullptr, nullptr, &read_cb,
-        nullptr /* is_blob_index */, 0 /* tracing_get_id */, &blob_fetcher);
+        nullptr, true, nullptr, immutable_db_options_.clock, nullptr, nullptr,
+        &read_cb, nullptr /* is_blob_index */, 0 /* tracing_get_id */,
+        &blob_fetcher);
     TableReader* t = nullptr;
     TableCache::TypedHandle* handle = nullptr;
     Status status = cfd_->table_cache()->FindTable(
