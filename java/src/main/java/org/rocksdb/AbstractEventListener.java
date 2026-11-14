@@ -5,10 +5,12 @@
 
 package org.rocksdb;
 
+import static org.rocksdb.AbstractEventListener.EnabledEventCallback.*; //NOPMD
+
 /**
  * Base class for Event Listeners.
  */
-@SuppressWarnings("PMD.AvoidDuplicateLiterals")
+@SuppressWarnings({"PMD.AvoidDuplicateLiterals", "PMD.UnnecessaryImport"})
 public abstract class AbstractEventListener extends RocksCallbackObject implements EventListener {
   public enum EnabledEventCallback {
     ON_FLUSH_COMPLETED((byte) 0x0),
@@ -77,20 +79,13 @@ public abstract class AbstractEventListener extends RocksCallbackObject implemen
    * {@link #AbstractEventListener(EnabledEventCallback...)} instead.
    */
   protected AbstractEventListener() {
-    this(EnabledEventCallback.ON_FLUSH_COMPLETED, EnabledEventCallback.ON_FLUSH_BEGIN,
-        EnabledEventCallback.ON_TABLE_FILE_DELETED, EnabledEventCallback.ON_COMPACTION_BEGIN,
-        EnabledEventCallback.ON_COMPACTION_COMPLETED, EnabledEventCallback.ON_TABLE_FILE_CREATED,
-        EnabledEventCallback.ON_TABLE_FILE_CREATION_STARTED,
-        EnabledEventCallback.ON_MEMTABLE_SEALED,
-        EnabledEventCallback.ON_COLUMN_FAMILY_HANDLE_DELETION_STARTED,
-        EnabledEventCallback.ON_EXTERNAL_FILE_INGESTED, EnabledEventCallback.ON_BACKGROUND_ERROR,
-        EnabledEventCallback.ON_STALL_CONDITIONS_CHANGED, EnabledEventCallback.ON_FILE_READ_FINISH,
-        EnabledEventCallback.ON_FILE_WRITE_FINISH, EnabledEventCallback.ON_FILE_FLUSH_FINISH,
-        EnabledEventCallback.ON_FILE_SYNC_FINISH, EnabledEventCallback.ON_FILE_RANGE_SYNC_FINISH,
-        EnabledEventCallback.ON_FILE_TRUNCATE_FINISH, EnabledEventCallback.ON_FILE_CLOSE_FINISH,
-        EnabledEventCallback.SHOULD_BE_NOTIFIED_ON_FILE_IO,
-        EnabledEventCallback.ON_ERROR_RECOVERY_BEGIN,
-        EnabledEventCallback.ON_ERROR_RECOVERY_COMPLETED);
+    this(ON_FLUSH_COMPLETED, ON_FLUSH_BEGIN, ON_TABLE_FILE_DELETED, ON_COMPACTION_BEGIN,
+        ON_COMPACTION_COMPLETED, ON_TABLE_FILE_CREATED, ON_TABLE_FILE_CREATION_STARTED,
+        ON_MEMTABLE_SEALED, ON_COLUMN_FAMILY_HANDLE_DELETION_STARTED, ON_EXTERNAL_FILE_INGESTED,
+        ON_BACKGROUND_ERROR, ON_STALL_CONDITIONS_CHANGED, ON_FILE_READ_FINISH, ON_FILE_WRITE_FINISH,
+        ON_FILE_FLUSH_FINISH, ON_FILE_SYNC_FINISH, ON_FILE_RANGE_SYNC_FINISH,
+        ON_FILE_TRUNCATE_FINISH, ON_FILE_CLOSE_FINISH, SHOULD_BE_NOTIFIED_ON_FILE_IO,
+        ON_ERROR_RECOVERY_BEGIN, ON_ERROR_RECOVERY_COMPLETED);
   }
 
   /**

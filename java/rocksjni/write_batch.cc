@@ -200,6 +200,31 @@ void Java_org_rocksdb_WriteBatch_putJni__J_3BI_3BIJ(
 
 /*
  * Class:     org_rocksdb_WriteBatch
+ * Method:    putEntityJni
+ * Signature: (J[BII[[B[[BJ)V
+ */
+
+JNIEXPORT void JNICALL Java_org_rocksdb_WriteBatch_putEntityJni(
+    JNIEnv* env, jclass, jlong jwb_handle, jbyteArray jkey, jint keyOffset,
+    jint keyLen, jobjectArray jnames, jobjectArray jvalues, jlong jcf_handle) {
+  auto* wb = reinterpret_cast<ROCKSDB_NAMESPACE::WriteBatch*>(jwb_handle);
+  assert(wb != nullptr);
+
+  auto* cf_handle =
+      reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>(jcf_handle);
+  assert(cf_handle != nullptr);
+
+  auto putEntity = [&wb, &cf_handle](ROCKSDB_NAMESPACE::Slice key,
+                                     ROCKSDB_NAMESPACE::WideColumns columns) {
+    wb->PutEntity(cf_handle, key, columns);
+  };
+
+  ROCKSDB_NAMESPACE::WideColumnJni::convertWideColumns(
+      putEntity, env, jkey, keyOffset, keyLen, jnames, jvalues);
+}
+
+/*
+ * Class:     org_rocksdb_WriteBatch
  * Method:    putDirect
  * Signature: (JLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIJ)V
  */
@@ -222,6 +247,34 @@ void Java_org_rocksdb_WriteBatch_putDirectJni(JNIEnv* env, jclass /*jobj*/,
   };
   ROCKSDB_NAMESPACE::JniUtil::kv_op_direct(
       put, env, jkey, jkey_offset, jkey_len, jval, jval_offset, jval_len);
+}
+
+/*
+ * Class:     org_rocksdb_WriteBatch
+ * Method:    putEntityDirectJni
+ * Signature:
+ * (JLjava/nio/ByteBuffer;II[Ljava/nio/ByteBuffer;[I[I[Ljava/nio/ByteBuffer;[I[IJ)V
+ */
+void JNICALL Java_org_rocksdb_WriteBatch_putEntityDirectJni(
+    JNIEnv* env, jclass, jlong jwb_handle, jobject jKey, jint jKeyOffset,
+    jint jKeyLen, jobjectArray jNames, jintArray jNamesOffset,
+    jintArray jNamesLen, jobjectArray jValues, jintArray jvaluesOffset,
+    jintArray jValuesLen, jlong jcf_handle) {
+  auto* wb = reinterpret_cast<ROCKSDB_NAMESPACE::WriteBatch*>(jwb_handle);
+  assert(wb != nullptr);
+
+  auto* cf_handle =
+      reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>(jcf_handle);
+  assert(cf_handle != nullptr);
+
+  auto putEntity = [&wb, &cf_handle](ROCKSDB_NAMESPACE::Slice key,
+                                     ROCKSDB_NAMESPACE::WideColumns columns) {
+    wb->PutEntity(cf_handle, key, columns);
+  };
+
+  ROCKSDB_NAMESPACE::WideColumnJni::convertWideColumnsDirect(
+      putEntity, env, jKey, jKeyOffset, jKeyLen, jNames, jNamesOffset,
+      jNamesLen, jValues, jvaluesOffset, jValuesLen);
 }
 
 /*
