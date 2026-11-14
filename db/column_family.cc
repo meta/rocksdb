@@ -1757,6 +1757,12 @@ Status ColumnFamilyData::SetOptions(
     s = ValidateOptions(db_opts, cf_opts);
   }
   if (s.ok()) {
+    // Run the table factory and other configurable checks of DB::Open, so
+    // that options which could not be reopened are not installed. For
+    // example, a hash index requires a prefix extractor.
+    s = ROCKSDB_NAMESPACE::ValidateOptions(db_opts, cf_opts);
+  }
+  if (s.ok()) {
     mutable_cf_options_ = MutableCFOptions(cf_opts);
     mutable_cf_options_.RefreshDerivedOptions(ioptions_);
     options_install_pending_ = true;
@@ -1769,9 +1775,13 @@ bool ColumnFamilyData::SetOptionsIsNoOp(
     const std::unordered_map<std::string, std::string>& options_map) const {
   // SetOptions() validates the resulting options, so a request that changes
   // nothing must pass the same check to return the same status.
-  return !IsDropped() && !options_install_pending_ &&
-         MutableCFOptionsUnchangedByMap(mutable_cf_options_, options_map) &&
-         ValidateOptions(db_opts, GetLatestCFOptions()).ok();
+  if (IsDropped() || options_install_pending_ ||
+      !MutableCFOptionsUnchangedByMap(mutable_cf_options_, options_map)) {
+    return false;
+  }
+  const ColumnFamilyOptions cf_opts = GetLatestCFOptions();
+  return ValidateOptions(db_opts, cf_opts).ok() &&
+         ROCKSDB_NAMESPACE::ValidateOptions(db_opts, cf_opts).ok();
 }
 
 Status ColumnFamilyData::AddDirectories(

@@ -908,6 +908,28 @@ TEST_F(DBOptionsTest, SetOptionsMayTriggerCompaction) {
   ASSERT_EQ("0,1", FilesPerLevel());
 }
 
+TEST_F(DBOptionsTest, SetOptionsRejectsHashIndexWithoutPrefixExtractor) {
+  // A hash index needs a prefix extractor. DB::Open rejects the combination,
+  // and SetOptions must not allow removing the prefix extractor afterward,
+  // or the next flush would build a hash index with no extractor.
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+  BlockBasedTableOptions table_options;
+  table_options.index_type = BlockBasedTableOptions::kHashSearch;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  Reopen(options);
+
+  Status s = dbfull()->SetOptions({{"prefix_extractor", "nullptr"}});
+  ASSERT_EQ(s.code(), Status::Code::kInvalidArgument);
+  ASSERT_EQ(dbfull()->GetOptions().prefix_extractor.get() != nullptr, true);
+
+  // The DB still works with its original options.
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ("v1", Get("foo"));
+}
+
 TEST_F(DBOptionsTest, SetBackgroundCompactionThreads) {
   Options options;
   options.create_if_missing = true;
