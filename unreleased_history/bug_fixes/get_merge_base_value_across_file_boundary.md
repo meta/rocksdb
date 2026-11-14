@@ -1,0 +1,1 @@
+Fixed `DB::Get()` returning a merge result without its base value when the versions of a user key span two adjacent SST files of a nonzero level and the first file holds a range tombstone that is older than those versions. `MultiGet()` and iterators were not affected.
