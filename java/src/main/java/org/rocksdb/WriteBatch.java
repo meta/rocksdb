@@ -232,21 +232,22 @@ public class WriteBatch extends AbstractWriteBatch {
   private static native int count0Jni(final long handle);
 
   @Override
-  final void put(final long handle, final byte[] key, final int keyLen, final byte[] value,
-      final int valueLen) {
-    putJni(handle, key, keyLen, value, valueLen);
+  final void put(final long handle, final byte[] key, final int ketOffset, final int keyLen,
+      final byte[] value, final int valueOffset, final int valueLen) {
+    putJni(handle, key, ketOffset, keyLen, value, valueOffset, valueLen);
   }
-  private static native void putJni(final long handle, final byte[] key, final int keyLen,
-      final byte[] value, final int valueLen);
+  private static native void putJni(final long handle, final byte[] key, final int keyOffset,
+      final int keyLen, final byte[] value, final int valueOffset, final int valueLen);
 
   @Override
-  final void put(final long handle, final byte[] key, final int keyLen, final byte[] value,
-      final int valueLen, final long cfHandle) {
-    putJni(handle, key, keyLen, value, valueLen, cfHandle);
+  final void put(final long handle, final byte[] key, final int ketOffset, final int keyLen,
+      final byte[] value, final int valueOffset, final int valueLen, final long cfHandle) {
+    putJni(handle, key, ketOffset, keyLen, value, valueOffset, valueLen, cfHandle);
   }
 
-  private static native void putJni(final long handle, final byte[] key, final int keyLen,
-      final byte[] value, final int valueLen, final long cfHandle);
+  private static native void putJni(final long handle, final byte[] key, final int keyOffset,
+      final int keyLen, final byte[] value, final int valueOffset, final int valueLen,
+      final long cfHandle);
 
   @Override
   final void putDirect(final long handle, final ByteBuffer key, final int keyOffset,
