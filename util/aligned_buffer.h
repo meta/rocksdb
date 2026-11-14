@@ -152,7 +152,7 @@ class AlignedBuffer {
   //     rounded up based on alignment.
   // copy_data: Copy data from old buffer to new buffer. If copy_offset and
   //     copy_len are not passed in and the new requested capacity is bigger
-  //     than the existing buffer's capacity, the data in the exising buffer is
+  //     than the existing buffer's capacity, the data in the existing buffer is
   //     fully copied over to the new buffer.
   // copy_offset: Copy data from this offset in old buffer.
   // copy_len: Number of bytes to copy.
