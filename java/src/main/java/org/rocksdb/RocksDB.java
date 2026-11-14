@@ -158,6 +158,10 @@ public class RocksDB extends RocksObject {
               "Exceeded timeout whilst trying to load the RocksDB shared library");
         }
       }
+
+      if (libraryLoaded.get() != LibraryState.LOADED) {
+        throw new RuntimeException("RocksDB shared library failed to load due to error on another thread");
+      }
     } catch (final InterruptedException e) {
       // restore interrupted status
       Thread.currentThread().interrupt();
