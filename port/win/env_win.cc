@@ -1232,7 +1232,7 @@ size_t WinFileSystem::GetSectorSize(const std::string& fname) {
     // many devices do not support StorageProcessAlignmentProperty. Any failure
     // here and we fall back to logical alignment
 
-    DISK_GEOMETRY_EX geometry = {0};
+    DISK_GEOMETRY_EX geometry = {};
     ret = DeviceIoControl(hDevice, IOCTL_DISK_GET_DRIVE_GEOMETRY, nullptr, 0,
                           &geometry, sizeof(geometry), &output_bytes, nullptr);
     if (ret) {

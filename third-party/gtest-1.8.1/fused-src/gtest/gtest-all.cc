@@ -9763,7 +9763,7 @@ class MemoryIsNotDeallocated
   }
 
  private:
-  int old_crtdbg_flag_;
+  [[maybe_unused]] int old_crtdbg_flag_;
 
   GTEST_DISALLOW_COPY_AND_ASSIGN_(MemoryIsNotDeallocated);
 };
