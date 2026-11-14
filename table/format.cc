@@ -30,6 +30,7 @@
 #include "table/persistent_cache_helper.h"
 #include "test_util/sync_point.h"
 #include "unique_id_impl.h"
+#include "util/aligned_buffer.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/compression.h"
@@ -46,6 +47,42 @@ const char* const kHostnameForDbHostId = "__hostname__";
 bool ShouldReportDetailedTime(Env* env, Statistics* stats) {
   return env != nullptr && stats != nullptr &&
          stats->get_stats_level() > kExceptDetailedTimers;
+}
+
+Status ReadTableMagicNumber(const IOOptions& io_options,
+                            FSRandomAccessFile& file, uint64_t file_size,
+                            uint64_t* magic_number) {
+  *magic_number = 0;
+  if (file_size < kMagicNumberLengthByte) {
+    return Status::OK();
+  }
+  char scratch[kMagicNumberLengthByte];
+  char* read_scratch = scratch;
+  uint64_t read_offset = file_size - kMagicNumberLengthByte;
+  size_t prefix_size = 0;
+  size_t read_size = kMagicNumberLengthByte;
+  AlignedBuffer aligned_buffer;
+  if (file.use_direct_io()) {
+    const size_t alignment = file.GetRequiredBufferAlignment();
+    const uint64_t aligned_offset = read_offset & ~(uint64_t{alignment} - 1);
+    prefix_size = static_cast<size_t>(read_offset - aligned_offset);
+    read_offset = aligned_offset;
+    read_size = Roundup(prefix_size + kMagicNumberLengthByte, alignment);
+    aligned_buffer.Alignment(alignment);
+    aligned_buffer.AllocateNewBuffer(read_size);
+    read_scratch = aligned_buffer.BufferStart();
+  }
+  Slice result;
+  Status status = file.Read(read_offset, read_size, io_options, &result,
+                            read_scratch, nullptr);
+  if (!status.ok()) {
+    return status;
+  }
+  if (result.size() < prefix_size + kMagicNumberLengthByte) {
+    return Status::Corruption("Truncated table format signature");
+  }
+  *magic_number = DecodeFixed64(result.data() + prefix_size);
+  return Status::OK();
 }
 
 void BlockHandle::EncodeTo(std::string* dst) const {
