@@ -6220,13 +6220,21 @@ TEST_F(DBTest2, TestCancelCompactFiles) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
   db_->EnableManualCompaction();
 
-  // Test cancelation after the check to cancel compaction - compaction should
-  // occur, leaving only 1 file
+  // Test cancellation after the entry check - the in-progress compaction
+  // should abort with kManualCompactionPaused and install nothing
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "CompactFilesImpl:0", [&](void* /*arg*/) {
         compaction_options.canceled->store(true, std::memory_order_release);
       });
 
+  compaction_options.canceled->store(false, std::memory_order_release);
+  ASSERT_TRUE(db_->CompactFiles(compaction_options, handle, files, 1)
+                  .IsManualCompactionPaused());
+  ASSERT_EQ(NumTableFilesAtLevel(1, 0), num_files);
+
+  // Without cancellation, the same compaction should succeed, leaving only 1
+  // file
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
   compaction_options.canceled->store(false, std::memory_order_release);
   ASSERT_OK(db_->CompactFiles(compaction_options, handle, files, 1));
   ASSERT_EQ(NumTableFilesAtLevel(1, 0), 1);

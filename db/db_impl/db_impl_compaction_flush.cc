@@ -1927,7 +1927,9 @@ Status DBImpl::CompactFilesImpl(
       c->mutable_cf_options().paranoid_file_checks,
       c->mutable_cf_options().report_bg_io_stats, dbname_,
       &compaction_job_stats, Env::Priority::USER, io_tracer_,
-      kManualCompactionCanceledFalse_, compaction_aborted_, db_id_,
+      compact_options.canceled ? *compact_options.canceled
+                               : kManualCompactionCanceledFalse_,
+      compaction_aborted_, db_id_,
       db_session_id_, c->column_family_data()->GetFullHistoryTsLow(),
       c->trim_ts(), &blob_callback_, &bg_compaction_scheduled_,
       &bg_bottom_compaction_scheduled_, &num_running_remote_compactions_);
