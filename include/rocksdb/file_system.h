@@ -385,7 +385,7 @@ struct IODebugContext {
 using IOHandleDeleter = std::function<void(void*)>;
 
 // The FileSystem, FSSequentialFile, FSRandomAccessFile, FSWritableFile,
-// FSRandomRWFileclass, and FSDIrectory classes define the interface between
+// FSRandomRWFileclass, and FSDirectory classes define the interface between
 // RocksDB and storage systems, such as Posix filesystems,
 // remote filesystems etc.
 // The interface allows for fine grained control of individual IO operations,
