@@ -965,6 +965,33 @@ public class WriteBatchWithIndexTest {
   }
 
   @Test
+  public void deleteRangeWithByteBuffer() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
+         final WriteBatch batch = new WriteBatch();
+         final WriteOptions wOpt = new WriteOptions()) {
+      db.put("key1".getBytes(), "value".getBytes());
+      db.put("key2".getBytes(), "12345678".getBytes());
+      db.put("key3".getBytes(), "abcdefg".getBytes());
+      db.put("key4".getBytes(), "xyz".getBytes());
+      assertThat(db.get("key1".getBytes())).isEqualTo("value".getBytes());
+      assertThat(db.get("key2".getBytes())).isEqualTo("12345678".getBytes());
+      assertThat(db.get("key3".getBytes())).isEqualTo("abcdefg".getBytes());
+      assertThat(db.get("key4".getBytes())).isEqualTo("xyz".getBytes());
+      ByteBuffer beginKey = ByteBuffer.allocateDirect(128);
+      beginKey.put("key2".getBytes()).flip();
+      ByteBuffer endKey = ByteBuffer.allocateDirect(128);
+      endKey.put("key4".getBytes()).flip();
+      batch.deleteRange(beginKey, endKey);
+      db.write(wOpt, batch);
+
+      assertThat(db.get("key1".getBytes())).isEqualTo("value".getBytes());
+      assertThat(db.get("key2".getBytes())).isNull();
+      assertThat(db.get("key3".getBytes())).isNull();
+      assertThat(db.get("key4".getBytes())).isEqualTo("xyz".getBytes());
+    }
+  }
+
+  @Test
   public void iteratorWithBaseOverwriteTrue() throws RocksDBException {
     try (final Options options = new Options().setCreateIfMissing(true);
          final RocksDB db = RocksDB.open(options, dbFolder.getRoot().getAbsolutePath())) {
