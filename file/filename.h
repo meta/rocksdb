@@ -201,10 +201,14 @@ IOStatus SyncManifest(const ImmutableDBOptions* db_options,
 // The list only contains file name. The parent directory name is stored
 // in `parent_dir`.
 // `db_log_dir` should be the one as in options.db_log_dir
+// `db_absolute_path` is the absolute path of dbname, used for generating
+// the correct log file prefix when db_log_dir is set.
 Status GetInfoLogFiles(const std::shared_ptr<FileSystem>& fs,
-                       const std::string& db_log_dir, const std::string& dbname,
-                       std::string* parent_dir,
-                       std::vector<std::string>* file_names);
+                              const std::string& db_log_dir,
+                              const std::string& dbname,
+                              const std::string& db_absolute_path,
+                              std::string* parent_dir,
+                              std::vector<std::string>* file_names);
 
 std::string NormalizePath(const std::string& path);
 }  // namespace ROCKSDB_NAMESPACE
