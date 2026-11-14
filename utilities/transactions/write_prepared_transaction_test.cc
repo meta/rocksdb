@@ -4096,7 +4096,7 @@ TEST_P(WritePreparedTransactionTest, CommitOfDelayedPrepared) {
         SequenceNumber prep_seq = *((SequenceNumber*)param);
         if (prep_seq == exp_prepare.load()) {  // only for write_thread
           // We need to spawn a thread to avoid deadlock since getting a
-          // snpashot might end up calling AdvanceSeqByOne which needs joining
+          // snapshot might end up calling AdvanceSeqByOne which needs joining
           // the write queue.
           callback_thread = ROCKSDB_NAMESPACE::port::Thread(snap_callback);
           TEST_SYNC_POINT("callback:end");
