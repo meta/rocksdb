@@ -3908,6 +3908,53 @@ TEST_F(ExternalSSTFileTest, SnapshotInconsistencyBug) {
   db_->ReleaseSnapshot(snap);
 }
 
+TEST_P(ExternalSSTFileTest, IngestBehindPreservesRangeDeletions) {
+  for (bool cf_option : {true, false}) {
+    SCOPED_TRACE("cf_option = " + std::to_string(cf_option));
+    for (bool compact_before_ingest : {false, true}) {
+      SCOPED_TRACE("compact_before_ingest = " +
+                   std::to_string(compact_before_ingest));
+      Options options = CurrentOptions();
+      options.compaction_style = kCompactionStyleUniversal;
+      options.num_levels = 4;
+      options.disable_auto_compactions = true;
+      options.cf_allow_ingest_behind = cf_option;
+      options.allow_ingest_behind = !cf_option;
+      DestroyAndReopen(options);
+
+      ASSERT_OK(Put("a", "new"));
+      ASSERT_OK(Delete("b"));
+      ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                                 "c", "d"));
+      ASSERT_OK(Flush());
+      if (compact_before_ingest) {
+        CompactRangeOptions compact_options;
+        compact_options.bottommost_level_compaction =
+            BottommostLevelCompaction::kForce;
+        ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+      }
+
+      ASSERT_EQ("new", Get("a"));
+      ASSERT_EQ("NOT_FOUND", Get("b"));
+      ASSERT_EQ("NOT_FOUND", Get("c"));
+      ASSERT_EQ("NOT_FOUND", Get("c2"));
+
+      const std::vector<std::pair<std::string, std::string>> historical_data = {
+          {"a", "old"},  {"b", "old"}, {"c", "old"},
+          {"c2", "old"}, {"d", "old"}, {"e", "old"}};
+      ASSERT_OK(GenerateAndAddExternalFile(options, historical_data, -1, true,
+                                           std::get<0>(GetParam()), true));
+
+      EXPECT_EQ("new", Get("a"));
+      EXPECT_EQ("NOT_FOUND", Get("b"));
+      EXPECT_EQ("NOT_FOUND", Get("c"));
+      EXPECT_EQ("NOT_FOUND", Get("c2"));
+      EXPECT_EQ("old", Get("d"));
+      EXPECT_EQ("old", Get("e"));
+    }
+  }
+}
+
 TEST_P(ExternalSSTFileTest, IngestBehind) {
   for (bool cf_option : {false, true}) {
     SCOPED_TRACE("cf_option = " + std::to_string(cf_option));
