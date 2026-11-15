@@ -416,6 +416,50 @@ TEST_P(DBTestTailingIterator, TailingIteratorPrefixSeek) {
   Close();
 }
 
+TEST_P(DBTestTailingIterator, TailingIteratorTotalOrderReseek) {
+  struct SeekMode {
+    const char* name;
+    bool total_order_seek;
+    bool auto_prefix_mode;
+    bool prefix_seek_opt_in_only;
+  };
+  const SeekMode cases[] = {
+      {"total_order_seek", true, false, false},
+      {"auto_prefix_mode", false, true, false},
+      {"prefix_seek_opt_in_only", false, false, true},
+  };
+
+  for (const SeekMode& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    Options options = CurrentOptions();
+    options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+    options.prefix_seek_opt_in_only = test_case.prefix_seek_opt_in_only;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("a1", "value"));
+    ASSERT_OK(Put("b1", "value"));
+    ASSERT_OK(Put("c1", "value"));
+    ASSERT_OK(Flush());
+
+    ReadOptions read_options;
+    read_options.tailing = true;
+    read_options.async_io = GetParam();
+    read_options.total_order_seek = test_case.total_order_seek;
+    read_options.auto_prefix_mode = test_case.auto_prefix_mode;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+
+    iter->Seek("a0");
+    ASSERT_EQ(IterStatus(iter.get()), "a1->value");
+    iter->Next();
+    ASSERT_EQ(IterStatus(iter.get()), "b1->value");
+    iter->Next();
+    ASSERT_EQ(IterStatus(iter.get()), "c1->value");
+
+    iter->Seek("a2");
+    EXPECT_EQ(IterStatus(iter.get()), "b1->value");
+    ASSERT_OK(iter->status());
+  }
+}
+
 TEST_P(DBTestTailingIterator, TailingIteratorIncomplete) {
   if (mem_env_ || encrypted_env_) {
     ROCKSDB_GTEST_BYPASS("Test requires non-mem or non-encrypted environment");
