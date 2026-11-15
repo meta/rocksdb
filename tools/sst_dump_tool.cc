@@ -532,7 +532,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
   std::string command;
 
   char junk;
-  uint64_t n;
+  uint64_t parsed_read_num;
   bool verify_checksum = false;
   bool output_hex = false;
   bool json_output = false;
@@ -622,9 +622,9 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
       show_sequence_number_type = true;
     } else if (strcmp(argv[i], "--input_key_hex") == 0) {
       input_key_hex = true;
-    } else if (sscanf(argv[i], "--read_num=%lu%c", (unsigned long*)&n, &junk) ==
-               1) {
-      read_num = n;
+    } else if (sscanf(argv[i], "--read_num=%" SCNu64 "%c", &parsed_read_num,
+                      &junk) == 1) {
+      read_num = parsed_read_num;
     } else if (strcmp(argv[i], "--verify_checksum") == 0) {
       verify_checksum = true;
     } else if (strncmp(argv[i], "--command=", 10) == 0) {
