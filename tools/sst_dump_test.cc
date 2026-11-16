@@ -377,6 +377,51 @@ TEST_F(SSTDumpToolTest, RecompressJson) {
   cleanup(opts, file_path);
 }
 
+TEST_F(SSTDumpToolTest, RecompressWholeInput) {
+  // Also with timestamps that are not persisted, which the input's raw key
+  // size leaves out but its keys get back when read
+  for (bool timestamps_not_persisted : {false, true}) {
+    SCOPED_TRACE("timestamps_not_persisted=" +
+                 std::to_string(timestamps_not_persisted));
+    Options opts;
+    opts.env = env();
+    if (timestamps_not_persisted) {
+      opts.comparator = test::BytewiseComparatorWithU64TsWrapper();
+      opts.persist_user_defined_timestamps = false;
+    }
+    std::string file_path = MakeFilePath("rocksdb_sst_test.sst");
+    // Without timestamps, some wide-column entities for values of varying
+    // sizes
+    createSST(opts, file_path, /*wide_column_one_in=*/3);
+
+    SstFileDumper dumper(opts, file_path, Temperature::kUnknown,
+                         1024 /*readahead_size*/, true /*verify_checksum*/,
+                         false /*output_hex*/, false /*decode_blob_index*/,
+                         EnvOptions(), /*silent=*/true);
+    ASSERT_OK(dumper.getStatus());
+    const TableProperties* input_props = dumper.GetInitTableProperties();
+    ASSERT_NE(input_props, nullptr);
+    // Twice, the second run replacing the first run's input
+    for (int run = 0; run < 2; ++run) {
+      ASSERT_OK(dumper.ShowAllCompressionSizes(
+          {CompressionType::kNoCompression},
+          /*compress_level_from=*/CompressionOptions().level,
+          /*compress_level_to=*/CompressionOptions().level,
+          /*compression_strategies=*/{},
+          /*per_measurement=*/{}));
+      // Every input entry is recompressed, with all its key and value bytes
+      const TableProperties* output_props =
+          dumper.GetRecompressOutputProperties();
+      ASSERT_NE(output_props, nullptr);
+      ASSERT_EQ(output_props->num_entries, input_props->num_entries);
+      ASSERT_EQ(output_props->raw_key_size, input_props->raw_key_size);
+      ASSERT_EQ(output_props->raw_value_size, input_props->raw_value_size);
+    }
+
+    cleanup(opts, file_path);
+  }
+}
+
 TEST_F(SSTDumpToolTest, ListMetaBlocks) {
   Options opts;
   SSTDumpToolTestCase(opts, /*filter=*/true, /*wide_column_one_in=*/0,
