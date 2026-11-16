@@ -1710,6 +1710,13 @@ if(WITH_TESTS)
       utilities/cassandra/test_utils.cc
   )
   enable_testing()
+  # Time limit, in seconds, for each test that ctest runs from the test
+  # binaries: one gtest case, or the whole c_test program. Without a limit, one
+  # hung test blocks ctest until the CI job is canceled (6 hours on GitHub
+  # Actions). The slowest case seen in recent nightly runs took about 68
+  # seconds (ExternalSSTFileTest.IngestFileWithGlobalSeqnoRandomized), so 600
+  # seconds leaves about 9 times margin for slower or busy hosts.
+  set(ROCKSDB_CTEST_TIMEOUT_SECONDS 600)
   add_custom_target(rocksdb_check COMMAND ${CMAKE_CTEST_COMMAND})
   set(TESTUTILLIB testutillib${ARTIFACT_SUFFIX})
   add_library(${TESTUTILLIB} STATIC ${TESTUTIL_SOURCE})
@@ -1745,9 +1752,11 @@ if(WITH_TESTS)
           # longer fails the build.
           gtest_discover_tests(${exename}
                                DISCOVERY_TIMEOUT 120
-                               DISCOVERY_MODE PRE_TEST)
+                               DISCOVERY_MODE PRE_TEST
+                               PROPERTIES TIMEOUT ${ROCKSDB_CTEST_TIMEOUT_SECONDS})
         else()
-          gtest_discover_tests(${exename} DISCOVERY_TIMEOUT 120)
+          gtest_discover_tests(${exename} DISCOVERY_TIMEOUT 120
+                               PROPERTIES TIMEOUT ${ROCKSDB_CTEST_TIMEOUT_SECONDS})
         endif()
         add_dependencies(rocksdb_check ${exename}${ARTIFACT_SUFFIX})
       endif()
@@ -1772,6 +1781,8 @@ if(WITH_TESTS)
     add_executable(c_test db/c_test.c)
     target_link_libraries(c_test ${ROCKSDB_LIB_FOR_C} testharness)
     add_test(NAME c_test COMMAND c_test${ARTIFACT_SUFFIX})
+    set_tests_properties(c_test PROPERTIES
+                         TIMEOUT ${ROCKSDB_CTEST_TIMEOUT_SECONDS})
     add_dependencies(rocksdb_check c_test)
   endif()
 endif()

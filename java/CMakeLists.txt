@@ -904,4 +904,10 @@ foreach (CLAZZ ${JAVA_TEST_RUNNING_CLASSES})
             COMMAND ${Java_JAVA_EXECUTABLE} ${JVMARGS} -ea -Xcheck:jni -Djava.library.path=${PROJECT_BINARY_DIR}/java -classpath ${JAVA_RUN_TESTCLASSPATH}:${ROCKSDBJNI_CLASSES_TEST_JAR_FILE}:${CMAKE_CURRENT_BINARY_DIR}/${ROCKSDB_JAR} org.rocksdb.test.RocksJunitRunner ${CLAZZ}
     )
   endif()
+  # Time limit in seconds. Each ctest entry runs a whole Java test class, so the
+  # limit is larger than the per-case limit of the C++ tests. Without a limit,
+  # one hung test blocks ctest until the CI job is canceled. The slowest class
+  # seen in a recent Windows nightly run took about 189 seconds
+  # (MultiGetManyKeysTest), so 900 seconds leaves more than 4 times margin.
+  set_tests_properties(jtest_${CLAZZ} PROPERTIES TIMEOUT 900)
 endforeach(CLAZZ)

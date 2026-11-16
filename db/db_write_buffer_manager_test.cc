@@ -1760,21 +1760,41 @@ TEST_F(DBWriteBufferManagerTest, WaitForCompactDrainsReservedWBMFlushHandoff) {
   std::unique_ptr<DB> other_db;
   ASSERT_OK(DB::Open(options, other_dbname, &other_db));
 
-  ASSERT_OK(other_db->Put(WriteOptions(), Key(1), DummyString(400 << 10)));
-  ASSERT_OK(Put(Key(1), DummyString(300 << 10), WriteOptions()));
+  // SetBufferSize(768 KB) below sets the mutable limit of the shared
+  // WriteBufferManager (WBM) to 7/8 of that, which is 672 KB. The WBM picks one
+  // DB at a time and hands it a flush (a "handoff"). other_db holds about 700
+  // KB of memtable data, so it stays above the limit by itself. If the WBM
+  // picks db_ (about 100 KB) first, memory stays above the limit and other_db
+  // is picked next.
+  ASSERT_OK(other_db->Put(WriteOptions(), Key(1), DummyString(700 << 10)));
+  ASSERT_OK(Put(Key(1), DummyString(100 << 10), WriteOptions()));
   options.write_buffer_manager->TEST_RefreshFlushInitiatorCandidate();
 
+  // Upper bound for each wait on another thread in this test. The waits
+  // normally end in milliseconds. 10 seconds leaves a wide margin for a loaded
+  // CI host and still turns a lost wakeup into a fast test failure instead of
+  // a hang.
+  constexpr auto kWaitLimit = std::chrono::seconds(10);
+  auto* const other_dbimpl = static_cast_with_check<DBImpl>(other_db.get());
   std::mutex handoff_mu;
   std::condition_variable handoff_cv;
   bool handoff_reserved = false;
   bool release_handoff = false;
+  // Block other_db's handoff on the WBM flush handoff executor thread until the
+  // main thread releases it. At this sync point the WBM has already reserved
+  // other_db (its handoff is pending), and this thread holds no
+  // WriteBufferManager lock or DB mutex. Blocking while a WBM lock is held
+  // would deadlock with the WBM calls of the main thread, such as
+  // SetBufferSize().
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "WriteBufferManager::GetNextCandidateForHandoff:CandidateSelected",
-      [&](void*) {
+      "DBImpl::BackgroundCallWBMFlush:AfterPick", [&](void* arg) {
+        if (arg != other_dbimpl) {
+          return;
+        }
         std::unique_lock<std::mutex> lock(handoff_mu);
         handoff_reserved = true;
         handoff_cv.notify_all();
-        handoff_cv.wait(lock, [&] { return release_handoff; });
+        handoff_cv.wait_for(lock, kWaitLimit, [&] { return release_handoff; });
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
   Defer cleanup_sync_points([&] {
@@ -1790,15 +1810,23 @@ TEST_F(DBWriteBufferManagerTest, WaitForCompactDrainsReservedWBMFlushHandoff) {
   options.write_buffer_manager->SetBufferSize(768 << 10);
   {
     std::unique_lock<std::mutex> lock(handoff_mu);
-    handoff_cv.wait(lock, [&] { return handoff_reserved; });
+    ASSERT_TRUE(handoff_cv.wait_for(lock, kWaitLimit, [&] {
+      return handoff_reserved;
+    })) << "no WBM handoff reached other_db";
   }
 
   std::mutex wait_mu;
   std::condition_variable wait_cv;
   bool wait_finished = false;
   Status wait_status;
+  WaitForCompactOptions wait_options;
+  // If WaitForCompact() does not finish within kWaitLimit, it returns TimedOut
+  // and ASSERT_OK(wait_status) below fails.
+  wait_options.timeout = kWaitLimit;
+  // No ASSERT may run between starting this thread and joining it, because an
+  // early return would destroy a joinable thread.
   port::Thread waiter([&] {
-    wait_status = other_db->WaitForCompact(WaitForCompactOptions());
+    wait_status = other_db->WaitForCompact(wait_options);
     std::lock_guard<std::mutex> lock(wait_mu);
     wait_finished = true;
     wait_cv.notify_all();
