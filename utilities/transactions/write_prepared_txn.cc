@@ -433,8 +433,10 @@ Status WritePreparedTxn::RollbackInternal() {
       get_impl_options.value = &pinnable_val;
       get_impl_options.value_found = &not_used;
       get_impl_options.callback = &callback_;
+      // The lookup can fail with an IO error (e.g. a retryable read error);
+      // such errors are returned to the caller, which keeps the transaction
+      // PREPARED so the rollback can be retried.
       s = db_->GetImpl(roptions_, key, get_impl_options);
-      assert(s.ok() || s.IsNotFound());
       if (s.ok()) {
         s = rollback_batch_->Put(cf_handle, key, pinnable_val);
         assert(s.ok());

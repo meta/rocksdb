@@ -107,8 +107,8 @@ Status WriteUnpreparedTxnDB::RollbackRecoveredTransaction(
         get_impl_options.value = &pinnable_val;
         get_impl_options.value_found = &not_used;
         get_impl_options.callback = &callback;
+        // The lookup can fail with an IO error; return it to the caller.
         s = db_->GetImpl(roptions, key, get_impl_options);
-        assert(s.ok() || s.IsNotFound());
         if (s.ok()) {
           s = rollback_batch_->Put(cf_handle, key, pinnable_val);
           assert(s.ok());
