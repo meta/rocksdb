@@ -260,7 +260,8 @@ Status OpenForReadOnlyCheckExistence(const DBOptions& db_options,
     std::string manifest_path;
     uint64_t manifest_file_number;
     s = GetCurrentManifestPath(dbname, fs.get(), /*is_retry=*/false,
-                               &manifest_path, &manifest_file_number);
+                               &manifest_path, &manifest_file_number,
+                               Env::IOActivity::kDBOpen);
   } else {
     // Historic behavior that doesn't necessarily make sense
     s = db_options.env->CreateDirIfMissing(dbname);
