@@ -611,6 +611,42 @@ class LDBTestCase(unittest.TestCase):
         self.assertRunOK("scan", "a1 ==> b1\na2 ==> b2\na4 ==> b4")
         self.assertRunOK("checkconsistency", "OK")
 
+    def testScanSeekForPrev(self):
+        print("Running testScanSeekForPrev...")
+        self.assertRunOK("put --create_if_missing x1 y1", "OK")
+        self.assertRunOK("batchput x2 y2 x3 y3 x4 y4 x5 y5", "OK")
+        self.assertRunOK("deleterange x2 x4", "OK")
+
+        # x2 and x3 are covered by the range tombstone [x2, x4).
+        self.assertRunOK("scan --from=x3 --seek_for_prev --max_keys=1", "x1 ==> y1")
+        self.assertRunOK("scan --from=x3 --max_keys=1", "x4 ==> y4")
+        self.assertRunOK("scan --from=x4 --seek_for_prev --max_keys=1", "x4 ==> y4")
+        self.assertRunOK(
+            "scan --from=x3 --seek_for_prev --to=x5", "x1 ==> y1\nx4 ==> y4"
+        )
+        self.assertRunOK(
+            "scan --from=x4 --seek_for_prev --reverse", "x4 ==> y4\nx1 ==> y1"
+        )
+        self.assertRunOK("scan --reverse", "x5 ==> y5\nx4 ==> y4\nx1 ==> y1")
+        self.assertRunOK("scan --reverse --max_keys=2 --no_value", "x5\nx4")
+        self.assertRunFAIL("scan --from=x0 --seek_for_prev")  # No results => FAIL
+        self.assertRunOK(
+            "scan --hex --from=0x7833 --seek_for_prev --max_keys=1",
+            "0x7831 ==> 0x7931",
+        )
+        self.assertRunError("scan --seek_for_prev")
+        self.assertRunError("scan --reverse --to=x3")
+
+        self.assertRunOK("create_column_family two", "OK")
+        self.assertRunOK("batchput --column_family=two z1 w1 z3 w3", "OK")
+        self.assertRunOK(
+            "scan --column_family=two --from=z2 --seek_for_prev --max_keys=1",
+            "z1 ==> w1",
+        )
+        self.assertRunOK(
+            "scan --column_family=two --reverse", "z3 ==> w3\nz1 ==> w1"
+        )
+
     def testTtlPutGet(self):
         print("Running testTtlPutGet...")
         self.assertRunOK("put a1 b1 --ttl --create_if_missing", "OK")

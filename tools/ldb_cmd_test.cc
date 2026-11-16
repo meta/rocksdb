@@ -22,6 +22,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/sst_partitioner.h"
 #include "rocksdb/utilities/options_util.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
@@ -1252,6 +1253,185 @@ TEST_F(LdbCmdTest, CustomComparator) {
 
   ASSERT_EQ(0,
             LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), &cfds));
+}
+
+namespace {
+// Runs ldb with `args` and collects the entries printed by the scan command.
+int RunScanCommand(const Options& opts, const std::vector<std::string>& args,
+                   std::vector<std::string>* printed) {
+  std::vector<const char*> argv = {"./ldb"};
+  for (const std::string& arg : args) {
+    argv.push_back(arg.c_str());
+  }
+  printed->clear();
+  SyncPoint::GetInstance()->SetCallBack(
+      "ScanCommand::DoCommand:BeforePrint",
+      [&](void* arg) { printed->push_back(*static_cast<std::string*>(arg)); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  int ret = LDBCommandRunner::RunCommand(
+      static_cast<int>(argv.size()), argv.data(), opts, LDBOptions(), nullptr);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  return ret;
+}
+}  // namespace
+
+TEST_F(LdbCmdTest, ScanSeekForPrev) {
+  Env* base_env = TryLoadCustomOrDefaultEnv();
+  std::unique_ptr<Env> env(NewMemEnv(base_env));
+  Options opts;
+  opts.env = env.get();
+  opts.create_if_missing = true;
+  opts.create_missing_column_families = true;
+  // Cut output files at each 2-byte key prefix so that the range tombstone
+  // below spans several bottommost files.
+  opts.sst_partitioner_factory = NewSstPartitionerFixedPrefixFactory(2);
+
+  const std::string dbname = test::PerThreadDBPath(env.get(), "ldb_cmd_test");
+  const std::vector<std::string> cf_names = {kDefaultColumnFamilyName, "cf1"};
+  {
+    std::vector<ColumnFamilyDescriptor> cfds;
+    cfds.reserve(cf_names.size());
+    for (const std::string& cf_name : cf_names) {
+      cfds.emplace_back(cf_name, opts);
+    }
+    std::vector<ColumnFamilyHandle*> handles;
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(opts, dbname, cfds, &handles, &db));
+    for (ColumnFamilyHandle* cfh : handles) {
+      for (const char* key : {"ka1", "ka2", "kb1", "kc1", "kc2"}) {
+        ASSERT_OK(
+            db->Put(WriteOptions(), cfh, key, cfh->GetName() + "_" + key));
+      }
+      ASSERT_OK(db->Flush(FlushOptions(), cfh));
+      ASSERT_OK(db->CompactRange(CompactRangeOptions(), cfh, nullptr, nullptr));
+      // The snapshot keeps the covered keys through the compaction below, so
+      // they stay in the bottommost files next to the range tombstone.
+      const Snapshot* snapshot = db->GetSnapshot();
+      ASSERT_OK(db->DeleteRange(WriteOptions(), cfh, "ka2", "kc2"));
+      ASSERT_OK(db->Flush(FlushOptions(), cfh));
+      ASSERT_OK(db->CompactRange(CompactRangeOptions(), cfh, nullptr, nullptr));
+      db->ReleaseSnapshot(snapshot);
+
+      ColumnFamilyMetaData cf_meta;
+      db->GetColumnFamilyMetaData(cfh, &cf_meta);
+      ASSERT_GT(cf_meta.file_count, size_t{1});
+    }
+    for (ColumnFamilyHandle* cfh : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(cfh));
+    }
+  }
+
+  struct ScanCase {
+    std::vector<std::string> args;
+    std::vector<std::string> expected_keys;
+  };
+  // ka2, kb1 and kc1 are covered by the range tombstone [ka2, kc2).
+  const std::vector<ScanCase> cases = {
+      // SeekForPrev()
+      {{"--from=kb1", "--seek_for_prev", "--max_keys=1"}, {"ka1"}},
+      {{"--from=kc1", "--seek_for_prev", "--max_keys=1"}, {"ka1"}},
+      {{"--from=kc2", "--seek_for_prev", "--max_keys=1"}, {"kc2"}},
+      {{"--from=ka0", "--seek_for_prev"}, {}},
+      // SeekForPrev() then Next()
+      {{"--from=kb1", "--seek_for_prev"}, {"ka1", "kc2"}},
+      {{"--from=kb1", "--seek_for_prev", "--to=kc2"}, {"ka1"}},
+      // SeekForPrev() then Prev()
+      {{"--from=kz", "--seek_for_prev", "--reverse"}, {"kc2", "ka1"}},
+      {{"--from=kc1", "--seek_for_prev", "--reverse"}, {"ka1"}},
+      // Seek() then Next() or Prev()
+      {{"--from=kb1", "--max_keys=1"}, {"kc2"}},
+      {{"--from=kb1", "--reverse"}, {"kc2", "ka1"}},
+      // SeekToLast() then Prev()
+      {{"--reverse"}, {"kc2", "ka1"}},
+      {{"--reverse", "--max_keys=1"}, {"kc2"}},
+  };
+  std::vector<std::string> printed;
+  for (const std::string& cf_name : cf_names) {
+    for (const ScanCase& scan_case : cases) {
+      std::vector<std::string> args = {"--db=" + dbname, "scan",
+                                       "--column_family=" + cf_name};
+      args.insert(args.end(), scan_case.args.begin(), scan_case.args.end());
+      std::string trace;
+      for (const std::string& arg : args) {
+        trace += " " + arg;
+      }
+      SCOPED_TRACE(trace);
+      std::vector<std::string> expected;
+      expected.reserve(scan_case.expected_keys.size());
+      for (const std::string& key : scan_case.expected_keys) {
+        expected.push_back(key + " ==> " + cf_name + "_" + key);
+      }
+      ASSERT_EQ(0, RunScanCommand(opts, args, &printed));
+      ASSERT_EQ(expected, printed);
+    }
+  }
+
+  // Hex keys and values
+  ASSERT_EQ(
+      0, RunScanCommand(opts,
+                        {"--db=" + dbname, "scan", "--key_hex",
+                         "--from=0x6B6331", "--seek_for_prev", "--max_keys=1"},
+                        &printed));
+  ASSERT_EQ(std::vector<std::string>({"0x6B6131 ==> default_ka1"}), printed);
+  ASSERT_EQ(
+      0, RunScanCommand(opts,
+                        {"--db=" + dbname, "scan", "--hex", "--from=0x6B6332",
+                         "--seek_for_prev", "--reverse"},
+                        &printed));
+  ASSERT_EQ(std::vector<std::string>({"0x6B6332 ==> 0x64656661756C745F6B6332",
+                                      "0x6B6131 ==> 0x64656661756C745F6B6131"}),
+            printed);
+
+  // Invalid flag combinations
+  ASSERT_EQ(1,
+            RunScanCommand(opts, {"--db=" + dbname, "scan", "--seek_for_prev"},
+                           &printed));
+  ASSERT_EQ(1, RunScanCommand(
+                   opts, {"--db=" + dbname, "scan", "--reverse", "--to=kc2"},
+                   &printed));
+  ASSERT_TRUE(printed.empty());
+}
+
+TEST_F(LdbCmdTest, ScanSeekForPrevWithTimestamp) {
+  Env* base_env = TryLoadCustomOrDefaultEnv();
+  std::unique_ptr<Env> env(NewMemEnv(base_env));
+  Options opts;
+  opts.env = env.get();
+  opts.create_if_missing = true;
+  opts.comparator = BytewiseComparatorWithU64Ts();
+
+  const std::string dbname = test::PerThreadDBPath(env.get(), "ldb_cmd_test");
+  {
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(opts, dbname, &db));
+    std::string ts;
+    ASSERT_OK(db->Put(WriteOptions(), "a", EncodeU64Ts(10, &ts), "a@10"));
+    ASSERT_OK(db->Put(WriteOptions(), "b", EncodeU64Ts(10, &ts), "b@10"));
+    ASSERT_OK(db->Put(WriteOptions(), "b", EncodeU64Ts(20, &ts), "b@20"));
+    ASSERT_OK(db->Put(WriteOptions(), "c", EncodeU64Ts(20, &ts), "c@20"));
+  }
+
+  std::vector<std::string> printed;
+  // c@20 is not visible at timestamp 15.
+  ASSERT_EQ(0, RunScanCommand(opts,
+                              {"--db=" + dbname, "scan", "--read_timestamp=15",
+                               "--from=c", "--seek_for_prev"},
+                              &printed));
+  ASSERT_EQ(std::vector<std::string>({"b|timestamp:10 ==> b@10"}), printed);
+  ASSERT_EQ(0, RunScanCommand(opts,
+                              {"--db=" + dbname, "scan", "--read_timestamp=25",
+                               "--from=c", "--seek_for_prev", "--reverse"},
+                              &printed));
+  ASSERT_EQ(std::vector<std::string>({"c|timestamp:20 ==> c@20",
+                                      "b|timestamp:20 ==> b@20",
+                                      "a|timestamp:10 ==> a@10"}),
+            printed);
+  // A column family with user-defined timestamps requires --read_timestamp.
+  ASSERT_EQ(1,
+            RunScanCommand(
+                opts, {"--db=" + dbname, "scan", "--from=c", "--seek_for_prev"},
+                &printed));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

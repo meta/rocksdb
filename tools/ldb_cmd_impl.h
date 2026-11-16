@@ -518,6 +518,11 @@ class ScanCommand : public LDBCommand {
   int max_keys_scanned_;
   bool no_value_;
   bool get_write_unix_time_;
+  bool seek_for_prev_;
+  bool reverse_;
+
+  static const std::string ARG_SEEK_FOR_PREV;
+  static const std::string ARG_REVERSE;
 };
 
 class DeleteCommand : public LDBCommand {
