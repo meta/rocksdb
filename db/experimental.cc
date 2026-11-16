@@ -13,9 +13,12 @@
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
+#include "db/log_reader.h"
 #include "db/manifest_ops.h"
+#include "db/version_edit.h"
 #include "db/version_edit_handler.h"
 #include "db/version_util.h"
+#include "file/sequence_file_reader.h"
 #include "logging/logging.h"
 #include "util/atomic.h"
 
@@ -41,6 +44,39 @@ Status SuggestCompactRange(DB* db, const Slice* begin, const Slice* end) {
   return SuggestCompactRange(db, db->DefaultColumnFamily(), begin, end);
 }
 
+namespace {
+// Keeps the first error that a log::Reader of a MANIFEST file reports, for
+// example a read error or a record that fails its checksum. Later reports do
+// not change it. The caller sets status_ptr before the first read.
+struct ManifestReporter : public log::Reader::Reporter {
+  Status* status_ptr = nullptr;
+  void Corruption(size_t /*bytes*/, const Status& st,
+                  uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+    status_ptr->UpdateIfOk(st);
+  }
+};
+
+// Opens the MANIFEST file at manifest_path for reading with a log::Reader that
+// verifies record checksums. reporter must outlive *reader.
+Status NewManifestReader(FileSystem* fs, const std::string& manifest_path,
+                         ManifestReporter* reporter,
+                         std::unique_ptr<log::Reader>* reader) {
+  std::unique_ptr<FSSequentialFile> file;
+  Status s = fs->NewSequentialFile(manifest_path,
+                                   fs->OptimizeForManifestRead(FileOptions()),
+                                   &file, nullptr /* dbg */);
+  if (!s.ok()) {
+    return s;
+  }
+  std::unique_ptr<SequentialFileReader> file_reader =
+      std::make_unique<SequentialFileReader>(std::move(file), manifest_path);
+  *reader =
+      std::make_unique<log::Reader>(nullptr, std::move(file_reader), reporter,
+                                    true /* checksum */, 0 /* log_number */);
+  return Status::OK();
+}
+}  // namespace
+
 Status GetFileChecksumsFromCurrentManifest(FileSystem* fs,
                                            const std::string& dbname,
                                            FileChecksumList* checksum_list) {
@@ -61,39 +97,62 @@ Status GetFileChecksumsFromCurrentManifest(FileSystem* fs,
       Env::IOActivity::kGetFileChecksumsFromCurrentManifest);
   checksum_list->reset();
 
-  std::unique_ptr<SequentialFileReader> file_reader;
-  {
-    std::unique_ptr<FSSequentialFile> file;
-    s = fs->NewSequentialFile(manifest_path,
-                              fs->OptimizeForManifestRead(FileOptions()), &file,
-                              nullptr /* dbg */);
-    if (!s.ok()) {
-      return s;
-    }
-    file_reader.reset(new SequentialFileReader(std::move(file), manifest_path));
-  }
-
-  struct LogReporter : public log::Reader::Reporter {
-    Status* status_ptr;
-    void Corruption(size_t /*bytes*/, const Status& st,
-                    uint64_t /*log_number*/ = kMaxSequenceNumber) override {
-      if (status_ptr->ok()) {
-        *status_ptr = st;
-      }
-    }
-  } reporter;
+  ManifestReporter reporter;
   reporter.status_ptr = &s;
-  log::Reader reader(nullptr, std::move(file_reader), &reporter,
-                     true /* checksum */, 0 /* log_number */);
+  std::unique_ptr<log::Reader> reader;
+  s = NewManifestReader(fs, manifest_path, &reporter, &reader);
+  if (!s.ok()) {
+    return s;
+  }
 
   // Read all records from the manifest file...
   uint64_t manifest_file_size = std::numeric_limits<uint64_t>::max();
   FileChecksumRetriever retriever(read_options, manifest_file_size);
-  retriever.Iterate(reader, &s);
+  retriever.Iterate(*reader, &s);
   if (!retriever.status().ok()) {
     return retriever.status();
   }
   return retriever.FetchFileChecksumList(*checksum_list);
+}
+
+Status GetDbIdentityFromManifest(FileSystem* fs,
+                                 const std::string& manifest_path,
+                                 std::string* db_id) {
+  if (fs == nullptr) {
+    return Status::InvalidArgument("fs is nullptr");
+  }
+  if (db_id == nullptr) {
+    return Status::InvalidArgument("db_id is nullptr");
+  }
+  Status s;
+  ManifestReporter reporter;
+  reporter.status_ptr = &s;
+  std::unique_ptr<log::Reader> reader;
+  s = NewManifestReader(fs, manifest_path, &reporter, &reader);
+  if (!s.ok()) {
+    return s;
+  }
+
+  Slice record;
+  std::string scratch;
+  // log::Reader can report a damaged block to the reporter, which sets s, and
+  // then return a later intact record. Checking s after each ReadRecord() makes
+  // sure that a DB ID after damaged data is never returned.
+  while (reader->ReadRecord(&record, &scratch) && s.ok()) {
+    VersionEdit edit;
+    s = edit.DecodeFrom(record);
+    if (!s.ok()) {
+      return s;
+    }
+    if (edit.HasDbId()) {
+      *db_id = edit.GetDbId();
+      return Status::OK();
+    }
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  return Status::NotFound("MANIFEST file records no DB ID", manifest_path);
 }
 
 Status UpdateManifestForFilesState(

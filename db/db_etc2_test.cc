@@ -14,9 +14,12 @@
 #include <memory>
 
 #include "db/db_test_util.h"
+#include "db/log_format.h"
+#include "db/log_writer.h"
 #include "db/read_callback.h"
 #include "db/version_edit.h"
 #include "env/fs_readonly.h"
+#include "file/writable_file_writer.h"
 #include "options/options_helper.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
@@ -9116,6 +9119,163 @@ TEST_F(DBTest2, GetFileChecksumsFromCurrentManifestCRC32) {
     ASSERT_EQ(live_files[i].file_checksum, stored_checksum);
     ASSERT_EQ(live_files[i].file_checksum_func_name, stored_func_name);
   }
+}
+
+// The DB ID is read from the MANIFEST file of an open DB, from the new MANIFEST
+// file that a reopen writes, and from a MANIFEST file of a closed DB.
+TEST_F(DBTest2, GetDbIdentityFromManifest) {
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  std::string db_id;
+  ASSERT_OK(db_->GetDbIdentity(db_id));
+  ASSERT_FALSE(db_id.empty());
+  // The function does not write, so it works on a read-only file system.
+  std::shared_ptr<FileSystem> read_only_fs =
+      std::make_shared<ReadOnlyFileSystem>(env_->GetFileSystem());
+  const auto expect_db_id = [&](uint64_t manifest_number) {
+    std::string read_db_id;
+    ASSERT_OK(experimental::GetDbIdentityFromManifest(
+        read_only_fs.get(), DescriptorFileName(dbname_, manifest_number),
+        &read_db_id));
+    ASSERT_EQ(db_id, read_db_id);
+  };
+
+  const uint64_t first_manifest = dbfull()->TEST_Current_Manifest_FileNo();
+  expect_db_id(first_manifest);
+
+  Reopen(options);
+  const uint64_t second_manifest = dbfull()->TEST_Current_Manifest_FileNo();
+  ASSERT_NE(first_manifest, second_manifest);
+  expect_db_id(second_manifest);
+
+  Close();
+  expect_db_id(second_manifest);
+}
+
+// A MANIFEST file with no DB ID gives NotFound, a record that fails its
+// checksum gives Corruption, and a missing file gives the file system error.
+TEST_F(DBTest2, GetDbIdentityFromManifestErrors) {
+  Options options = CurrentOptions();
+  options.write_dbid_to_manifest = false;
+  DestroyAndReopen(options);
+  const std::string manifest_path =
+      DescriptorFileName(dbname_, dbfull()->TEST_Current_Manifest_FileNo());
+  Close();
+  FileSystem* fs = env_->GetFileSystem().get();
+  std::string db_id;
+
+  Status s = experimental::GetDbIdentityFromManifest(fs, manifest_path, &db_id);
+  ASSERT_EQ(Status::Code::kNotFound, s.code());
+  ASSERT_TRUE(db_id.empty());
+
+  std::string contents;
+  ASSERT_OK(ReadFileToString(fs, manifest_path, &contents));
+  ASSERT_GT(contents.size(), size_t{log::kHeaderSize});
+  contents[log::kHeaderSize] ^= 1;
+  const std::string damaged_path = manifest_path + ".damaged";
+  ASSERT_OK(WriteStringToFile(fs, contents, damaged_path));
+  s = experimental::GetDbIdentityFromManifest(fs, damaged_path, &db_id);
+  ASSERT_EQ(Status::Code::kCorruption, s.code());
+
+  s = experimental::GetDbIdentityFromManifest(
+      fs, DescriptorFileName(dbname_, 999999), &db_id);
+  ASSERT_EQ(Status::Code::kIOError, s.code());
+  ASSERT_EQ(Status::SubCode::kPathNotFound, s.subcode());
+}
+
+namespace {
+// Returns the contents of a log file in the MANIFEST file format with the given
+// records.
+std::string LogFileWithRecords(const std::vector<std::string>& records) {
+  test::StringSink* sink = new test::StringSink();
+  std::unique_ptr<FSWritableFile> sink_holder(sink);
+  log::Writer writer(std::make_unique<WritableFileWriter>(
+                         std::move(sink_holder), "manifest", FileOptions()),
+                     0 /* log_number */, false /* recycle_log_files */);
+  for (const std::string& record : records) {
+    EXPECT_OK(writer.AddRecord(WriteOptions(), record));
+  }
+  EXPECT_OK(writer.WriteBuffer(WriteOptions()));
+  return sink->contents_;
+}
+
+std::string EncodeVersionEdit(const VersionEdit& edit) {
+  std::string record;
+  EXPECT_TRUE(edit.EncodeTo(&record));
+  return record;
+}
+}  // namespace
+
+// The DB ID can be in a later record than the first. When a record in an
+// earlier log block fails its checksum, the function returns Corruption, not
+// the DB ID of the later record: it does not skip damaged data.
+TEST_F(DBTest2, GetDbIdentityFromManifestInLaterRecord) {
+  const std::string kDbId = "db-id-in-a-later-record";
+  // log::Reader drops the rest of a log block after a checksum failure and
+  // continues with the next block. The record with the DB ID must start in a
+  // block after the damaged one, so that the reader would return it if the
+  // function ignored the error. The first record has a column family name of
+  // 2 * log::kBlockSize bytes, so it fills blocks 0 and 1 and ends in block 2,
+  // where the record with the DB ID follows. The test changes the first payload
+  // byte of block 0.
+  VersionEdit first;
+  first.AddColumnFamily(std::string(2 * log::kBlockSize, 'c'));
+  VersionEdit second;
+  second.SetDBId(kDbId);
+  std::string contents =
+      LogFileWithRecords({EncodeVersionEdit(first), EncodeVersionEdit(second)});
+  FileSystem* fs = env_->GetFileSystem().get();
+  ASSERT_OK(env_->CreateDirIfMissing(dbname_));
+  const std::string path = dbname_ + "/manifest_with_later_db_id";
+  std::string db_id;
+
+  ASSERT_OK(WriteStringToFile(fs, contents, path));
+  ASSERT_OK(experimental::GetDbIdentityFromManifest(fs, path, &db_id));
+  ASSERT_EQ(kDbId, db_id);
+
+  // One changed byte in the payload of the first record.
+  contents[log::kHeaderSize] ^= 1;
+  ASSERT_OK(WriteStringToFile(fs, contents, path));
+  db_id.clear();
+  Status s = experimental::GetDbIdentityFromManifest(fs, path, &db_id);
+  ASSERT_EQ(Status::Code::kCorruption, s.code());
+  ASSERT_TRUE(db_id.empty());
+}
+
+// An empty file, and a file truncated inside the header or the body of the
+// record with the DB ID, give NotFound: a truncated record at the end of the
+// file counts as the end of the file. A record that passes its checksum but
+// cannot be decoded gives Corruption.
+TEST_F(DBTest2, GetDbIdentityFromManifestTruncatedOrUndecodable) {
+  const std::string kDbId = "db-id";
+  VersionEdit edit;
+  edit.SetDBId(kDbId);
+  const std::string contents = LogFileWithRecords({EncodeVersionEdit(edit)});
+  ASSERT_GT(contents.size(), size_t{log::kHeaderSize});
+  FileSystem* fs = env_->GetFileSystem().get();
+  ASSERT_OK(env_->CreateDirIfMissing(dbname_));
+  const std::string path = dbname_ + "/manifest_copy";
+  std::string db_id;
+
+  ASSERT_OK(WriteStringToFile(fs, contents, path));
+  ASSERT_OK(experimental::GetDbIdentityFromManifest(fs, path, &db_id));
+  ASSERT_EQ(kDbId, db_id);
+
+  for (size_t size :
+       {size_t{0}, size_t{log::kHeaderSize - 1}, contents.size() - 1}) {
+    SCOPED_TRACE("size=" + std::to_string(size));
+    ASSERT_OK(WriteStringToFile(fs, contents.substr(0, size), path));
+    db_id.clear();
+    Status s = experimental::GetDbIdentityFromManifest(fs, path, &db_id);
+    ASSERT_EQ(Status::Code::kNotFound, s.code());
+    ASSERT_TRUE(db_id.empty());
+  }
+
+  // Tag 0 is not a VersionEdit tag.
+  ASSERT_OK(
+      WriteStringToFile(fs, LogFileWithRecords({std::string(1, '\0')}), path));
+  Status s = experimental::GetDbIdentityFromManifest(fs, path, &db_id);
+  ASSERT_EQ(Status::Code::kCorruption, s.code());
 }
 
 // Parameterized by (allow_concurrent_memtable_write,
