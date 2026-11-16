@@ -337,6 +337,28 @@ TEST_F(DBOptionsTest, SanitizeAsyncWalPrecreateWithWalRecycle) {
   ASSERT_TRUE(sanitized_options.async_wal_precreate);
 }
 
+TEST_F(DBOptionsTest, PipelinedWriteIncompatibleOptions) {
+  // Each option opens on its own but is rejected at open together with
+  // enable_pipelined_write, rather than failing every write after open.
+  const std::vector<std::pair<std::string, std::function<void(Options*)>>>
+      cases = {
+          {"unordered_write", [](Options* o) { o->unordered_write = true; }},
+          {"atomic_flush", [](Options* o) { o->atomic_flush = true; }},
+          {"two_write_queues", [](Options* o) { o->two_write_queues = true; }},
+      };
+  for (const auto& [name, set_option] : cases) {
+    SCOPED_TRACE(name);
+    Options options;
+    options.env = env_;
+    set_option(&options);
+    Reopen(options);
+    ASSERT_OK(Put("key", "value"));
+
+    options.enable_pipelined_write = true;
+    ASSERT_EQ(TryReopen(options).code(), Status::Code::kInvalidArgument);
+  }
+}
+
 TEST_F(DBOptionsTest, ImmutableVerifySstUniqueIdInManifest) {
   Options options;
   options.env = env_;
