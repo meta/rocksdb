@@ -1077,9 +1077,10 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   is_index_at_curr_block_ = false;
   is_at_first_key_from_index_ = false;
 
+  // The index iterator needs the scan ranges only while CollectBlockHandles()
+  // walks it. After that it is idle until ResetMultiScan() makes it a normal
+  // iterator again, so discard the ranges whatever the outcome.
   index_iter_->Prepare(multiscan_opts);
-  index_iter_has_scan_ranges_ = true;
-
   std::vector<BlockHandle> scan_block_handles;
   std::vector<std::string> data_block_separators;
   std::vector<std::tuple<size_t, size_t>> block_index_ranges_per_scan;
@@ -1087,6 +1088,7 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   multi_scan_status_ =
       CollectBlockHandles(scan_opts, &scan_block_handles,
                           &block_index_ranges_per_scan, &data_block_separators);
+  index_iter_->Prepare(nullptr);
   if (!multi_scan_status_.ok()) {
     RecordTick(table_->GetStatistics(), MULTISCAN_PREPARE_ERRORS);
     return;

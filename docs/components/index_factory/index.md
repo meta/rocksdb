@@ -158,6 +158,11 @@ at the first table build.
   the block can override `MemoryUsageIncludesIndexBlock()` to return true; the
   wrapper then subtracts the block size from that estimate. `TrieIndexReader`
   reads the block in place, so it reports only its own object.
+- A table reader holds its custom index block for its whole life. With
+  `cache_index_and_filter_blocks=true` the block stays pinned in the block
+  cache until the table reader closes, whatever the pinning options say,
+  while a standard index block can be evicted unless it is pinned. With
+  `max_open_files=-1`, that is every SST's custom index block.
 
 ## Parallel compression
 

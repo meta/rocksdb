@@ -420,9 +420,6 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   // *** END States used by both regular scan and multiscan
 
   // *** BEGIN MultiScan related states ***
-  // Whether Prepare() passed the scan ranges to the index iterator.
-  // ResetMultiScan() discards them.
-  bool index_iter_has_scan_ranges_ = false;
   Status multi_scan_status_;
   // ReadSet from IODispatcher, set during Prepare(). When non-null, MultiScan
   // is active and index_iter_ points to a MultiScanIndexIterator.
@@ -446,12 +443,6 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
     multi_scan_status_ = Status::OK();
     if (original_index_iter_) {
       index_iter_ = std::move(original_index_iter_);
-    }
-    // The index iterator is a normal one again, and the caller may free the
-    // scan ranges.
-    if (index_iter_has_scan_ranges_) {
-      index_iter_->Prepare(nullptr);
-      index_iter_has_scan_ranges_ = false;
     }
   }
 
