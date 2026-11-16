@@ -1559,6 +1559,12 @@ def finalize_and_sanitize(src_params):
         and dest_params.get("use_merge", 0) == 0
     ):
         dest_params["use_merge"] = random.randint(0, 1)
+    # Merges with user-defined timestamps can hit the assertion in
+    # MergeHelper::MergeUntil() that merge operands with different timestamps
+    # are never combined, so keep merges off for them. This must come after
+    # every rule that can turn merges on.
+    if dest_params.get("user_timestamp_size", 0) > 0:
+        dest_params["use_merge"] = 0
     if is_release_mode():
         dest_params["read_fault_one_in"] = 0
     if dest_params.get("compression_max_dict_bytes") == 0:
