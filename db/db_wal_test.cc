@@ -22,6 +22,7 @@
 #include "test_util/sync_point.h"
 #include "util/coding.h"
 #include "util/defer.h"
+#include "util/string_util.h"
 #include "util/udt_util.h"
 #include "utilities/fault_injection_env.h"
 #include "utilities/fault_injection_fs.h"
@@ -1203,6 +1204,59 @@ TEST_F(DBWALTest, RecoveryWithEmptyLog) {
     ReopenWithColumnFamilies({"default", "pikachu"}, CurrentOptions());
     ASSERT_EQ("v3", Get(1, "foo"));
   } while (ChangeWalOptions());
+}
+
+TEST_F(DBWALTest, RecoveryWithUnopenableWal) {
+  class FailWalOpenFileSystem : public FileSystemWrapper {
+   public:
+    explicit FailWalOpenFileSystem(const std::shared_ptr<FileSystem>& base)
+        : FileSystemWrapper(base) {}
+    static const char* kClassName() { return "FailWalOpenFileSystem"; }
+    const char* Name() const override { return kClassName(); }
+    IOStatus NewSequentialFile(const std::string& fname,
+                               const FileOptions& file_opts,
+                               std::unique_ptr<FSSequentialFile>* result,
+                               IODebugContext* dbg) override {
+      if (!wal_to_fail_.empty() && EndsWith(fname, wal_to_fail_)) {
+        return IOStatus::IOError("Injected WAL open failure");
+      }
+      return target()->NewSequentialFile(fname, file_opts, result, dbg);
+    }
+    // Only modified while the DB is closed
+    std::string wal_to_fail_;
+  };
+
+  auto fs = std::make_shared<FailWalOpenFileSystem>(env_->GetFileSystem());
+  std::unique_ptr<Env> fs_env(NewCompositeEnv(fs));
+  Options options = CurrentOptions();
+  options.env = fs_env.get();
+  CreateAndReopenWithCF({"pikachu"}, options);
+  Defer closer([this]() { Close(); });
+
+  // "key1" stays unflushed in the first WAL. Flushing "pikachu" switches to a
+  // second WAL, which receives "key2".
+  ASSERT_OK(Put(0, "key1", "val1"));
+  ASSERT_OK(Put(1, "foo", "bar"));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(Put(0, "key2", "val2"));
+  VectorLogPtr wals;
+  ASSERT_OK(db_->GetSortedWalFiles(wals));
+  ASSERT_EQ(2U, wals.size());
+  Close();
+  fs->wal_to_fail_ = LogFileName("", wals[0]->LogNumber());
+
+  // With paranoid checks, failing to open a WAL fails the recovery
+  options.paranoid_checks = true;
+  Status s = TryReopenWithColumnFamilies({"default", "pikachu"}, options);
+  ASSERT_EQ(Status::Code::kIOError, s.code());
+
+  // Without paranoid checks, the unopenable WAL is skipped and recovery
+  // continues with the next WAL
+  options.paranoid_checks = false;
+  ReopenWithColumnFamilies({"default", "pikachu"}, options);
+  ASSERT_EQ("NOT_FOUND", Get(0, "key1"));
+  ASSERT_EQ("val2", Get(0, "key2"));
+  ASSERT_EQ("bar", Get(1, "foo"));
 }
 
 #if !(defined NDEBUG) || !defined(OS_WIN)
