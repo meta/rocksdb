@@ -7,10 +7,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <algorithm>
 #include <iomanip>
 #include <memory>
+#include <set>
 
 #include "db/db_test_util.h"
+#include "db/manifest_ops.h"
 #include "port/stack_trace.h"
 #include "test_util/testutil.h"
 #include "util/random.h"
@@ -245,6 +248,59 @@ class DBIOFailureTest : public DBTestBase {
  public:
   DBIOFailureTest() : DBTestBase("db_io_failure_test", /*env_do_fsync=*/true) {}
 };
+
+TEST_F(DBIOFailureTest, CurrentReadsHaveDbOpenActivity) {
+  std::set<Env::IOActivity> activities;
+  class CurrentFile : public FSSequentialFile {
+   public:
+    explicit CurrentFile(std::set<Env::IOActivity>& activity)
+        : activity_(activity) {}
+    IOStatus Read(size_t len, const IOOptions& opts, Slice* result,
+                  char*, IODebugContext*) override {
+      activity_.insert(opts.io_activity);
+      const size_t read = std::min(len, contents_.size() - offset_);
+      *result = Slice(contents_.data() + offset_, read);
+      offset_ += read;
+      return IOStatus::OK();
+    }
+    IOStatus Skip(uint64_t) override {
+      return IOStatus::NotSupported("Skip");
+    }
+   private:
+    std::set<Env::IOActivity>& activity_;
+    std::string contents_ = "MANIFEST-000123\n";
+    size_t offset_ = 0;
+  };
+  class CurrentFS : public FileSystemWrapper {
+   public:
+    explicit CurrentFS(std::set<Env::IOActivity>& activity)
+        : FileSystemWrapper(FileSystem::Default()), activity_(activity) {}
+    const char* Name() const override { return "CurrentActivityFS"; }
+    IOStatus NewSequentialFile(const std::string&, const FileOptions&,
+                               std::unique_ptr<FSSequentialFile>* result,
+                               IODebugContext*) override {
+      *result = std::make_unique<CurrentFile>(activity_);
+      return IOStatus::OK();
+    }
+   private:
+    std::set<Env::IOActivity>& activity_;
+  } fs(activities);
+  std::string path;
+  uint64_t number = 0;
+  ASSERT_OK(GetCurrentManifestPath("db", &fs, false, &path, &number,
+                                   Env::IOActivity::kDBOpen));
+  ASSERT_OK(GetCurrentManifestPath("db", &fs, true, &path, &number,
+                                   Env::IOActivity::kDBOpen));
+  ASSERT_EQ(path, "db/MANIFEST-000123");
+  ASSERT_EQ(number, 123);
+  const std::set<Env::IOActivity> expected{Env::IOActivity::kDBOpen};
+  ASSERT_EQ(activities, expected);
+
+  activities.clear();
+  ASSERT_OK(GetCurrentManifestPath("db", &fs, false, &path, &number));
+  const std::set<Env::IOActivity> legacy{Env::IOActivity::kUnknown};
+  ASSERT_EQ(activities, legacy);
+}
 
 // Check that number of files does not grow when writes are dropped
 TEST_F(DBIOFailureTest, DropWrites) {

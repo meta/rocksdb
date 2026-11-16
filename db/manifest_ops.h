@@ -17,4 +17,11 @@ namespace ROCKSDB_NAMESPACE {
 Status GetCurrentManifestPath(const std::string& dbname, FileSystem* fs,
                               bool is_retry, std::string* manifest_path,
                               uint64_t* manifest_file_number);
+
+// The caller supplies the activity for CURRENT reads. The overload above
+// retains kUnknown for callers that are not opening a DB.
+Status GetCurrentManifestPath(const std::string& dbname, FileSystem* fs,
+                              bool is_retry, std::string* manifest_path,
+                              uint64_t* manifest_file_number,
+                              Env::IOActivity io_activity);
 }  // namespace ROCKSDB_NAMESPACE

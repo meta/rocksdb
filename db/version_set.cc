@@ -7263,7 +7263,8 @@ Status VersionSet::Recover(
   // file
   std::string manifest_path;
   Status s = GetCurrentManifestPath(dbname_, fs_.get(), is_retry,
-                                    &manifest_path, &manifest_file_number_);
+                                    &manifest_path, &manifest_file_number_,
+                                    read_options.io_activity);
   if (!s.ok()) {
     return s;
   }

@@ -13,11 +13,20 @@ namespace ROCKSDB_NAMESPACE {
 Status GetCurrentManifestPath(const std::string& dbname, FileSystem* fs,
                               bool is_retry, std::string* manifest_path,
                               uint64_t* manifest_file_number) {
+  return GetCurrentManifestPath(dbname, fs, is_retry, manifest_path,
+                                manifest_file_number, Env::IOActivity::kUnknown);
+}
+
+Status GetCurrentManifestPath(const std::string& dbname, FileSystem* fs,
+                              bool is_retry, std::string* manifest_path,
+                              uint64_t* manifest_file_number,
+                              Env::IOActivity io_activity) {
   assert(fs != nullptr);
   assert(manifest_path != nullptr);
   assert(manifest_file_number != nullptr);
 
   IOOptions opts;
+  opts.io_activity = io_activity;
   std::string fname;
   if (is_retry) {
     opts.verify_and_reconstruct_read = true;
