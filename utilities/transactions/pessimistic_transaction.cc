@@ -190,23 +190,13 @@ inline Status WriteCommittedTxn::GetForUpdateImpl(
   column_family =
       column_family ? column_family : db_impl_->DefaultColumnFamily();
   assert(column_family);
-  if (!read_options.timestamp) {
-    const Comparator* const ucmp = column_family->GetComparator();
-    assert(ucmp);
-    size_t ts_sz = ucmp->timestamp_size();
-    if (0 == ts_sz) {
-      return TransactionBaseImpl::GetForUpdate(read_options, column_family, key,
-                                               value, exclusive, do_validate);
-    }
-  } else {
-    Status s =
-        db_impl_->FailIfTsMismatchCf(column_family, *(read_options.timestamp));
-    if (!s.ok()) {
-      return s;
-    }
+  if (!read_options.timestamp &&
+      column_family->GetComparator()->timestamp_size() == 0) {
+    return TransactionBaseImpl::GetForUpdate(read_options, column_family, key,
+                                             value, exclusive, do_validate);
   }
 
-  Status s = SanityCheckReadTimestamp(do_validate);
+  Status s = ValidateReadTimestamp(read_options, column_family, do_validate);
   if (!s.ok()) {
     return s;
   }
@@ -220,15 +210,75 @@ inline Status WriteCommittedTxn::GetForUpdateImpl(
     return TransactionBaseImpl::GetForUpdate(read_opts_copy, column_family, key,
                                              value, exclusive, do_validate);
   }
-  assert(read_options.timestamp);
-  const char* const ts_buf = read_options.timestamp->data();
-  assert(read_options.timestamp->size() == sizeof(kMaxTxnTimestamp));
-  TxnTimestamp ts = DecodeFixed64(ts_buf);
-  if (ts != read_timestamp_) {
-    return Status::InvalidArgument("Must read from the same read_timestamp");
-  }
   return TransactionBaseImpl::GetForUpdate(read_options, column_family, key,
                                            value, exclusive, do_validate);
+}
+
+Status WriteCommittedTxn::ValidateReadTimestamp(
+    const ReadOptions& read_options, ColumnFamilyHandle* column_family,
+    bool do_validate) {
+  if (read_options.timestamp) {
+    Status s =
+        db_impl_->FailIfTsMismatchCf(column_family, *read_options.timestamp);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  Status s = SanityCheckReadTimestamp(do_validate);
+  if (!s.ok()) {
+    return s;
+  }
+  if (read_options.timestamp) {
+    assert(read_options.timestamp->size() == sizeof(kMaxTxnTimestamp));
+    if (DecodeFixed64(read_options.timestamp->data()) != read_timestamp_) {
+      return Status::InvalidArgument("Must read from the same read_timestamp");
+    }
+  }
+  return Status::OK();
+}
+
+void WriteCommittedTxn::MultiGetForUpdate(const ReadOptions& read_options,
+                                          ColumnFamilyHandle* column_family,
+                                          size_t num_keys, const Slice* keys,
+                                          PinnableSlice* values,
+                                          Status* statuses, bool sorted_input) {
+  if (num_keys == 0) {
+    return;
+  }
+  if (read_options.io_activity != Env::IOActivity::kUnknown &&
+      read_options.io_activity != Env::IOActivity::kMultiGet) {
+    TransactionBaseImpl::MultiGetForUpdate(read_options, column_family,
+                                           num_keys, keys, values, statuses,
+                                           sorted_input);
+    return;
+  }
+  column_family =
+      column_family ? column_family : db_impl_->DefaultColumnFamily();
+  if (!read_options.timestamp &&
+      column_family->GetComparator()->timestamp_size() == 0) {
+    TransactionBaseImpl::MultiGetForUpdate(read_options, column_family,
+                                           num_keys, keys, values, statuses,
+                                           sorted_input);
+    return;
+  }
+
+  const Status s = ValidateReadTimestamp(read_options, column_family,
+                                         /*do_validate=*/true);
+  if (!s.ok()) {
+    for (size_t i = 0; i < num_keys; ++i) {
+      statuses[i] = s;
+    }
+    return;
+  }
+
+  ReadOptions read_opts_copy = read_options;
+  char ts_buf[sizeof(kMaxTxnTimestamp)];
+  EncodeFixed64(ts_buf, read_timestamp_);
+  Slice ts(ts_buf, sizeof(ts_buf));
+  read_opts_copy.timestamp = &ts;
+  TransactionBaseImpl::MultiGetForUpdate(read_opts_copy, column_family,
+                                         num_keys, keys, values, statuses,
+                                         sorted_input);
 }
 
 Status WriteCommittedTxn::GetEntityForUpdate(const ReadOptions& read_options,

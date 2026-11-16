@@ -3,6 +3,8 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <array>
+
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
@@ -20,6 +22,92 @@ INSTANTIATE_TEST_CASE_P(
                        /*enable_indexing=*/::testing::Bool(),
                        /*use_per_key_point_lock_mgr=*/::testing::Bool(),
                        /*deadlock_timeout_us=*/::testing::Values(0, 1000)));
+
+TEST_P(WriteCommittedTxnWithTsTest, BatchedMultiGetForUpdateTimestamp) {
+  ColumnFamilyOptions cf_options;
+  cf_options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  ColumnFamilyHandle* cf = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(cf_options, "timestamped", &cf));
+  delete cf;
+  std::vector<ColumnFamilyDescriptor> cf_descs;
+  cf_descs.emplace_back(kDefaultColumnFamilyName, options);
+  cf_descs.emplace_back("timestamped", cf_options);
+  ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
+
+  struct TestCase {
+    bool enable_validation;
+    TxnTimestamp validation_timestamp;
+    TxnTimestamp read_timestamp;  // Zero means no ReadOptions timestamp.
+    bool truncate_timestamp;
+    Status::Code expected;
+  };
+  const TestCase cases[] = {
+      {true, 25, 0, false, Status::Code::kOk},
+      {true, 25, 25, false, Status::Code::kOk},
+      {true, 25, 23, false, Status::Code::kInvalidArgument},
+      {true, kMaxTxnTimestamp, 25, false, Status::Code::kInvalidArgument},
+      {true, 25, 25, true, Status::Code::kInvalidArgument},
+      {true, 23, 23, false, Status::Code::kBusy},
+      {false, kMaxTxnTimestamp, 0, false, Status::Code::kOk},
+      {false, kMaxTxnTimestamp, kMaxTxnTimestamp, false, Status::Code::kOk},
+      {false, 25, 25, false, Status::Code::kInvalidArgument},
+  };
+  for (const TestCase& test_case : cases) {
+    SCOPED_TRACE(test_case.enable_validation);
+    SCOPED_TRACE(test_case.validation_timestamp);
+    SCOPED_TRACE(test_case.read_timestamp);
+    txn_db_options.enable_udt_validation = test_case.enable_validation;
+    ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
+    {
+      std::unique_ptr<Transaction> writer(
+          NewTxn(WriteOptions(), TransactionOptions()));
+      ASSERT_OK(writer->Put(handles_[1], "key", "value"));
+      ASSERT_OK(writer->SetCommitTimestamp(24));
+      ASSERT_OK(writer->Commit());
+    }
+    for (bool sorted : {false, true}) {
+      SCOPED_TRACE(sorted);
+      std::unique_ptr<Transaction> txn(
+          NewTxn(WriteOptions(), TransactionOptions()));
+      if (test_case.validation_timestamp != kMaxTxnTimestamp) {
+        ASSERT_OK(
+            txn->SetReadTimestampForValidation(test_case.validation_timestamp));
+      }
+      ReadOptions read_options;
+      read_options.io_activity = Env::IOActivity::kMultiGet;
+      std::string ts_buf;
+      PutFixed64(&ts_buf, test_case.read_timestamp);
+      if (test_case.truncate_timestamp) {
+        ts_buf.pop_back();
+      }
+      Slice timestamp(ts_buf);
+      if (test_case.read_timestamp != 0) {
+        read_options.timestamp = &timestamp;
+      }
+      const std::array<Slice, 2> keys{{"key", "missing"}};
+      std::array<PinnableSlice, 2> values;
+      std::array<Status, 2> statuses;
+      txn->MultiGetForUpdate(read_options, handles_[1], keys.size(),
+                             keys.data(), values.data(), statuses.data(),
+                             sorted);
+      ASSERT_EQ(statuses[0].code(), test_case.expected);
+      if (test_case.expected == Status::Code::kOk) {
+        ASSERT_EQ(values[0].ToString(), "value");
+        ASSERT_EQ(statuses[1].code(), Status::Code::kNotFound);
+      } else {
+        ASSERT_EQ(statuses[1].code(), test_case.expected);
+        if (test_case.expected == Status::Code::kInvalidArgument) {
+          // Invalid timestamps must fail before acquiring any locks.
+          std::unique_ptr<Transaction> other(
+              NewTxn(WriteOptions(), TransactionOptions()));
+          ASSERT_OK(other->Put(handles_[1], "key", "other"));
+          ASSERT_OK(other->Rollback());
+        }
+      }
+      ASSERT_OK(txn->Rollback());
+    }
+  }
+}
 
 TEST_P(WriteCommittedTxnWithTsTest, SanityChecks) {
   ASSERT_OK(ReOpenNoDelete());

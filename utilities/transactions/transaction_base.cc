@@ -471,6 +471,40 @@ std::vector<Status> TransactionBaseImpl::MultiGetForUpdate(
   return stat_list;
 }
 
+void TransactionBaseImpl::MultiGetForUpdate(const ReadOptions& read_options,
+                                            ColumnFamilyHandle* column_family,
+                                            size_t num_keys, const Slice* keys,
+                                            PinnableSlice* values,
+                                            Status* statuses,
+                                            bool sorted_input) {
+  if (num_keys == 0) {
+    return;
+  }
+  Status s;
+  if (read_options.io_activity != Env::IOActivity::kUnknown &&
+      read_options.io_activity != Env::IOActivity::kMultiGet) {
+    s = Status::InvalidArgument(
+        "MultiGetForUpdate requires io_activity kUnknown or kMultiGet");
+  } else {
+    for (size_t i = 0; i < num_keys; ++i) {
+      s = TryLock(column_family, keys[i], true /* read_only */,
+                  true /* exclusive */);
+      if (!s.ok()) {
+        break;
+      }
+    }
+  }
+  if (!s.ok()) {
+    for (size_t i = 0; i < num_keys; ++i) {
+      statuses[i] = s;
+    }
+    return;
+  }
+
+  MultiGet(read_options, column_family, num_keys, keys, values, statuses,
+           sorted_input);
+}
+
 Iterator* TransactionBaseImpl::GetIterator(const ReadOptions& read_options) {
   Iterator* db_iter = db_->NewIterator(read_options);
   assert(db_iter);

@@ -13572,6 +13572,62 @@ void rocksdb_transactiondb_multi_get_cf(
   }
 }
 
+static void TransactionBatchedMultiGetForUpdate(
+    rocksdb_transaction_t* txn, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const Slice* keys, rocksdb_pinnableslice_t** values, char** errs,
+    bool sorted_input) {
+  std::vector<PinnableSlice> value_slices(num_keys);
+  std::vector<Status> statuses(num_keys);
+  txn->rep->MultiGetForUpdate(options->rep, column_family->rep, num_keys, keys,
+                              value_slices.data(), statuses.data(),
+                              sorted_input);
+  for (size_t i = 0; i < num_keys; ++i) {
+    if (statuses[i].ok()) {
+      values[i] = new rocksdb_pinnableslice_t;
+      values[i]->rep = std::move(value_slices[i]);
+      errs[i] = nullptr;
+    } else {
+      values[i] = nullptr;
+      errs[i] = statuses[i].IsNotFound()
+                    ? nullptr
+                    : strdup(statuses[i].ToString().c_str());
+    }
+  }
+}
+
+void rocksdb_transaction_batched_multi_get_for_update_cf(
+    rocksdb_transaction_t* txn, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const char* const* keys_list, const size_t* keys_list_sizes,
+    rocksdb_pinnableslice_t** values, char** errs, const bool sorted_input) {
+  if (num_keys == 0) {
+    return;
+  }
+  std::vector<Slice> keys(num_keys);
+  for (size_t i = 0; i < num_keys; ++i) {
+    keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
+  }
+  TransactionBatchedMultiGetForUpdate(txn, options, column_family, num_keys,
+                                      keys.data(), values, errs, sorted_input);
+}
+
+void rocksdb_transaction_batched_multi_get_for_update_cf_slice(
+    rocksdb_transaction_t* txn, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const rocksdb_slice_t* keys_list, rocksdb_pinnableslice_t** values,
+    char** errs, const bool sorted_input) {
+  if (num_keys == 0) {
+    return;
+  }
+  std::vector<Slice> keys(num_keys);
+  for (size_t i = 0; i < num_keys; ++i) {
+    keys[i] = Slice(keys_list[i].data, keys_list[i].size);
+  }
+  TransactionBatchedMultiGetForUpdate(txn, options, column_family, num_keys,
+                                      keys.data(), values, errs, sorted_input);
+}
+
 void rocksdb_transactiondb_batched_multi_get_cf(
     rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
     rocksdb_column_family_handle_t* column_family, size_t num_keys,
