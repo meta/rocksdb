@@ -639,13 +639,13 @@ struct rocksdb_pinnable_multi_get_t {
     errors.reserve(error_count);
   }
 
-  void StoreResults(std::vector<PinnableSlice>* multi_get_values,
+  void StoreResults(PinnableSlice* multi_get_values,
                     const std::vector<Status>& statuses) {
     ReservePayloads(statuses);
     for (size_t i = 0; i < statuses.size(); ++i) {
       if (statuses[i].ok()) {
         result_indexes[i] = values.size();
-        values.emplace_back(std::move((*multi_get_values)[i]));
+        values.emplace_back(std::move(multi_get_values[i]));
       } else if (!statuses[i].IsNotFound()) {
         result_indexes[i] = kNotFound - errors.size() - 1;
         errors.emplace_back(statuses[i].ToString());
@@ -2972,11 +2972,11 @@ rocksdb_pinnable_multi_get_t* rocksdb_batched_multi_get_pinned_cf(
     return results.release();
   }
   const Slice* key_slices = reinterpret_cast<const Slice*>(keys);
-  std::vector<PinnableSlice> values(num_keys);
+  std::unique_ptr<PinnableSlice[]> values(new PinnableSlice[num_keys]);
   std::vector<Status> statuses(num_keys);
   db->rep->MultiGet(options->rep, column_family->rep, num_keys, key_slices,
-                    values.data(), statuses.data(), sorted_input != 0);
-  results->StoreResults(&values, statuses);
+                    values.get(), statuses.data(), sorted_input != 0);
+  results->StoreResults(values.get(), statuses);
   return results.release();
 }
 
