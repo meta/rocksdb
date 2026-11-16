@@ -26,7 +26,8 @@
 //    ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
 //    auto iter = db->NewIterator(ro);
 //
-//  In kCustomDefault/kCustomOnly mode, all reads use the trie automatically.
+//  In kCustomDefault and kCustomOnly mode, reads use the trie unless they set
+//  ReadOptions::read_index to kBuiltin.
 
 #pragma once
 
@@ -68,7 +69,9 @@ class TrieIndexBuilder final : public IndexFactoryBuilder {
 
   // Called at each data block boundary. Computes a short separator between
   // last_key_in_current_block and first_key_in_next_block, adds it to the
-  // trie with the block's handle, and returns it.
+  // trie with the block's handle, and returns it. For the last block,
+  // first_key_in_next_block is null and the separator is
+  // last_key_in_current_block itself.
   //
   // A block gets the real tag of its last key when that user key continues
   // into the next block, when its separator equals the previous block's, or
@@ -87,20 +90,19 @@ class TrieIndexBuilder final : public IndexFactoryBuilder {
   // Finalize the trie and return the serialized index data.
   Status Finish(Slice* index_contents) override;
 
-  // Returns an estimate of the current serialized index size. Separator
-  // statistics are updated only by emit-thread callbacks and block statistics
-  // are relaxed atomics, so concurrent FinishAddEntry calls do not require
-  // synchronization.
+  // Returns an estimate of the current serialized index size. With parallel
+  // compression it runs on the emit thread while FinishAddEntry() runs on the
+  // BG writer thread. Separator statistics are written only on the emit
+  // thread and block statistics are relaxed atomics, so no lock is needed.
   uint64_t EstimatedSize() const override;
 
   // --- Parallel compression protocol ---
   //
-  // The trie builder participates in the parallel pipeline by splitting
-  // AddIndexEntry into Prepare (emit thread, computes the separator) and
-  // Finish (write thread, attaches the now-known block handle and adds the
-  // block to trie_builder_). Because FinishAddEntry runs serially on the BG
-  // worker thread (the table builder commits blocks in order), trie_builder_
-  // needs no locking.
+  // AddIndexEntry() is split in two: PrepareAddEntry() computes the
+  // separator on the emit thread, and FinishAddEntry() adds the block, whose
+  // handle is known only once the block is written, on the BG writer thread.
+  // The table builder calls FinishAddEntry() serially and in block order, so
+  // trie_builder_ needs no lock.
   bool SupportsParallelAddEntry() const override { return true; }
   std::unique_ptr<PreparedAddEntry> CreatePreparedAddEntry() override;
   void PrepareAddEntry(const Slice& last_key_in_current_block,
@@ -119,8 +121,9 @@ class TrieIndexBuilder final : public IndexFactoryBuilder {
   // Set when FinishAddEntry receives an entry with nothing prepared in it, so
   // Finish() fails instead of writing an index that omits that data block.
   bool has_unprepared_entry_ = false;
-  // Whether the gaps between blocks differ, so that sizes are stored. One of
-  // the block statistics described below; kept here to avoid padding.
+  // Whether TrieBuilder::Finish() must store block sizes (see
+  // SizeStats::irregular_gaps in trie.h). One of the block statistics
+  // described below; kept here to avoid padding.
   RelaxedAtomic<bool> irregular_block_gaps_{false};
 
   // Blocks added so far. Owned by the thread that adds blocks (the BG writer
@@ -144,7 +147,10 @@ class TrieIndexBuilder final : public IndexFactoryBuilder {
   // parallel builds) and read by EstimatedSize() on the emit thread. They
   // bound the widths of the offset and size columns. Blocks still being
   // compressed in a parallel build are charged like the largest block so far,
-  // so the estimate can fall short until their handles arrive.
+  // so the estimate can fall short until their handles arrive. The table
+  // builder takes its last estimate in Finish(), after the last
+  // FinishAddEntry(), so that one is an upper bound, as index_factory.h
+  // requires.
   RelaxedAtomic<uint64_t> max_block_step_{0};
   RelaxedAtomic<uint64_t> max_block_size_{0};
   // Owned by the thread that adds handles.
@@ -156,22 +162,21 @@ class TrieIndexBuilder final : public IndexFactoryBuilder {
   bool SharesPreviousSeparator(const Slice& separator) const;
 
   // Staged data for the parallel AddIndexEntry protocol. Populated by
-  // PrepareAddEntry on the emit thread, consumed by FinishAddEntry on
-  // the BG worker thread. The block handle is unknown when Prepare
-  // runs and is filled in by Finish.
+  // PrepareAddEntry() on the emit thread, consumed by FinishAddEntry() on the
+  // BG writer thread, which also receives the block handle.
   struct PreparedTrieEntry : public IndexFactoryBuilder::PreparedAddEntry {
     std::string separator_key;
-    // Real tag of last_key_in_current_block, for last blocks and for blocks
-    // sharing a separator with the previous one.
+    // Real tag of last_key_in_current_block. BlockTag() uses it for the last
+    // block, and when this block's last user key continues into the next
+    // block or its separator equals the previous block's.
     uint64_t last_key_tag = 0;
     // True if first_key_in_next_block was non-null at Prepare time.
     bool has_next_block = false;
-    // True if last_key and first_key_in_next_block share the same user
-    // key (computed from inputs alone). Finish may upgrade this to true
-    // if FindShortestSeparator failed to shorten and the result matches
-    // the previous block's separator, which only the thread adding blocks
-    // can check.
-    bool same_user_key_initial = false;
+    // True if last_key_in_current_block and first_key_in_next_block have the
+    // same user key, computed from the inputs alone. FinishAddEntry() also
+    // tags the block when its separator equals the previous block's, which
+    // only the BG writer thread can check.
+    bool same_user_key = false;
     // Set by PrepareAddEntry and cleared by FinishAddEntry. Finishing an
     // entry while this is false fails the build.
     bool valid = false;
@@ -206,8 +211,7 @@ class TrieIndexIterator final : public IndexFactoryIterator {
   // reference_key is the key to compare against the limit: for Seek this is
   // the seek target, for Next this is the previous separator key. Separators
   // are upper bounds on block contents, not first-in-block keys, so the
-  // current separator cannot be compared against the limit directly -- see
-  // the UDI API contract in user_defined_index.h.
+  // current separator cannot be compared against the limit directly.
   IterBoundCheck CheckBounds(const Slice& reference_key) const;
 
   // Fills *result from the iterator position after a call that returned s.

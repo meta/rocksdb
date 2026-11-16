@@ -17,9 +17,9 @@ namespace ROCKSDB_NAMESPACE {
 namespace trie_index {
 
 namespace {
-// Separators per bucket. Larger buckets make the index smaller and Seek
-// slower; 8 was the best tradeoff on the key sets measured. The value is
-// stored in each index, so it can change without a format change.
+// Separators per bucket. Larger buckets make the index smaller and make a Seek
+// decode more separators; 8 balances the two. The value is stored in each
+// index, so it can change without a format change.
 constexpr uint32_t kTrieBucketSize = 8;
 
 // The trie orders separators byte by byte, so it requires a bytewise
@@ -35,16 +35,18 @@ Status RequireBytewiseComparator(const Comparator* comparator) {
 
 // A block's tag is 0 when the block can be found by user key alone, and the
 // real tag of its last key otherwise:
-// - when it shares its separator with the previous block, the tags tell the
-//   blocks of that user key apart;
+// - when its separator is a user key that also appears in a neighbor block,
+//   because its last user key continues into the next block or its separator
+//   equals the previous block's, the tags tell the blocks of that user key
+//   apart;
 // - for the last block, whose separator is the last user key itself, the tag
 //   lets a Seek for that user key with a smaller sequence number move past it,
 //   as the standard index does with its full internal key.
 // A separator between different user keys needs no tag: the standard index
 // with index_key_is_user_key also compares user keys only there.
-uint64_t BlockTag(bool shares_previous_separator, bool has_next_block,
+uint64_t BlockTag(bool shares_user_key_with_neighbor, bool has_next_block,
                   uint64_t last_key_tag) {
-  return shares_previous_separator || !has_next_block ? last_key_tag : 0;
+  return shares_user_key_with_neighbor || !has_next_block ? last_key_tag : 0;
 }
 }  // namespace
 
@@ -81,12 +83,12 @@ Slice TrieIndexBuilder::AddIndexEntry(const Slice& last_key_in_current_block,
   // comparator. FindShortestSeparator takes `*start` as both input and output:
   //   input:  *start == last_key_in_current_block
   //   output: *start modified to shortest string in [start, limit)
-  // If first_key_in_next_block is nullptr, this is the last block -- use a
-  // short successor of the last key.
+  // If first_key_in_next_block is nullptr, this is the last block, and the
+  // separator is the last key itself (see below).
   Slice separator;
-  // True when last_key and first_key_in_next_block are the same user key: the
-  // separator is then that user key for both blocks, so this block needs its
-  // real tag.
+  // True when last_key and first_key_in_next_block are the same user key. This
+  // block's separator is then that user key, and the next block holds it too,
+  // so this block needs its real tag.
   bool same_user_key = false;
   if (first_key_in_next_block != nullptr) {
     same_user_key = comparator_->Compare(last_key_in_current_block,
@@ -100,7 +102,7 @@ Slice TrieIndexBuilder::AddIndexEntry(const Slice& last_key_in_current_block,
   } else {
     // Last block: use the last key itself as the separator, NOT a shortened
     // successor. This matches the standard ShortenedIndexBuilder behavior
-    // (see index_builder.h GetSeparatorWithSeq lines 278-286): it only calls
+    // (see GetSeparatorWithSeq() in index_builder.h): it only calls
     // FindShortInternalKeySuccessor when shortening_mode is
     // kShortenSeparatorsAndSuccessor, which is not the default. With the
     // default kShortenSeparators, the last block's separator is simply
@@ -239,17 +241,16 @@ void TrieIndexBuilder::PrepareAddEntry(const Slice& last_key_in_current_block,
                                        PreparedAddEntry* out) {
   auto* p = static_cast_with_check<PreparedTrieEntry>(out);
   p->valid = false;
-  p->same_user_key_initial = false;
+  p->same_user_key = false;
   p->has_next_block = (first_key_in_next_block != nullptr);
   p->last_key_tag = context.last_key_tag;
 
   if (first_key_in_next_block != nullptr) {
-    // Same-user-key boundary detection from inputs alone. The buffer-
-    // state-dependent half of the check runs in FinishAddEntry, where
-    // back() is the immediately preceding committed entry.
-    p->same_user_key_initial =
-        comparator_->Compare(last_key_in_current_block,
-                             *first_key_in_next_block) == 0;
+    // Same-user-key boundary detection from the inputs alone. The half that
+    // needs the previous block's separator runs in FinishAddEntry(), where
+    // trie_builder_ holds every earlier block.
+    p->same_user_key = comparator_->Compare(last_key_in_current_block,
+                                            *first_key_in_next_block) == 0;
 
     p->separator_key.assign(last_key_in_current_block.data(),
                             last_key_in_current_block.size());
@@ -266,7 +267,7 @@ void TrieIndexBuilder::PrepareAddEntry(const Slice& last_key_in_current_block,
   // UpdateSizeEstimate detects.
   const size_t shared_prefix =
       UpdateSizeEstimate(p->separator_key, previous_prepared_separator_,
-                         p->same_user_key_initial || !p->has_next_block);
+                         p->same_user_key || !p->has_next_block);
   // The writer can move the prepared key as soon as this callback returns.
   // Keep one emit-owned copy, reusing the prefix bytes already stored here.
   previous_prepared_separator_.replace(shared_prefix, std::string::npos,
@@ -292,7 +293,7 @@ void TrieIndexBuilder::FinishAddEntry(const BlockHandle& block_handle,
   // before this one. It is the same code as the serial AddIndexEntry().
   const Slice separator(p->separator_key);
   const uint64_t tag =
-      BlockTag(p->same_user_key_initial || SharesPreviousSeparator(separator),
+      BlockTag(p->same_user_key || SharesPreviousSeparator(separator),
                p->has_next_block, p->last_key_tag);
   const TrieBlockHandle handle{block_handle.offset, block_handle.size};
   TrackHandle(handle);
@@ -354,8 +355,11 @@ Status TrieIndexIterator::SeekAndGetResult(const Slice& target,
       }
     }
   }
+  // Before the Seek, which overwrites target when it points into the current
+  // key, such as an earlier result->key.
+  const IterBoundCheck bounds = CheckBounds(target);
   Status s = iter_.Seek(target, context.target_tag);
-  return SetResult(s, CheckBounds(target), result);
+  return SetResult(s, bounds, result);
 }
 
 Status TrieIndexIterator::NextAndGetResult(IterateResult* result) {

@@ -22,9 +22,12 @@
 //    bucket head) routes a Seek to one bucket. Trie nodes are typed (leaf,
 //    sparse or bitmap), hold their compressed path bytes inline, and point to
 //    children through narrow backward-relative offsets.
-//  - Block offsets are stored as a linear frame-of-reference column, so
-//    there is no file size limit. Block sizes are derived from consecutive
-//    offsets when the gaps between blocks are uniform.
+//  - Block offsets are 64-bit values in a column (see "Column" below), so
+//    there is no 32-bit limit; Finish() rejects only extreme layouts (see
+//    AppendColumn() in trie.cc). The gap after a block is the number of bytes
+//    from its end to the start of the next block, normally the block trailer.
+//    When every gap is the same, block sizes are not stored: a size is the
+//    next offset minus the offset minus size_gap.
 //  - Blocks that share a separator (one user key spanning several blocks)
 //    and nonzero tags are stored in small sparse side tables.
 //
@@ -32,7 +35,7 @@
 //  loads, so the index is used in place at any alignment and on any host.
 //
 //    Header (kTrieHeaderSize bytes):
-//      u32 magic        "TRIE"
+//      u32 magic        0x54524945, stored as the bytes "EIRT"
 //      u32 version      2. Version 1 was an earlier layout that readers
 //                       reject.
 //      u32 flags        0; readers reject any other value
@@ -82,8 +85,9 @@
 //      bits 3-4 child pointer width - 1, bits 5-7 zero. A leaf is terminal.
 //    Path length: u8, or 255 followed by a varint32.
 //    Path bytes: the compressed edge leading into this node's labels.
-//    Terminal nodes: bucket id (id_width bytes). The node's path spells that
-//      bucket's head.
+//    Terminal nodes: bucket id (id_width bytes). The paths and labels from
+//      the root to this node spell that bucket's head, without the shared
+//      prefix.
 //    Sparse nodes: u8 child count - 1, then the child labels in ascending
 //      order.
 //    Bitmap nodes: 256-bit label bitmap as four u64 words.
@@ -163,7 +167,9 @@ class TrieBuilder {
     uint64_t duplicates = 0;
     uint64_t tagged = 0;
     // Largest distance between consecutive block offsets, largest block
-    // size, and whether the gaps between blocks differ.
+    // size, and whether Finish() must store block sizes: two gaps between
+    // blocks differ, two blocks overlap, a block ends past 2^64 - 1, or the
+    // offset where a next block would start does not fit 64 bits.
     uint64_t max_block_step = 0;
     uint64_t max_block_size = 0;
     bool irregular_gaps = false;
@@ -195,10 +201,11 @@ class TrieBuilder {
 
 // Read-only view of a serialized trie index. Init() validates the header,
 // section and column layouts, side tables and trie. It does not visit every
-// bucket position, block offset or separator; the iterator keeps reads of
-// them inside the index and returns Corruption for a separator out of bounds
-// or a block size that would wrap around. Other wrong bytes give a wrong key
-// or handle, as the index has no checksum of its own.
+// bucket position, block offset or separator, or check that the tags of one
+// separator descend; the iterator keeps reads of them inside the index and
+// returns Corruption for a separator out of bounds or a block size that would
+// wrap around. Other wrong bytes give a wrong key or handle, as the index has
+// no checksum of its own.
 class Trie {
  public:
   Trie() = default;
@@ -261,8 +268,8 @@ class Trie {
 };
 
 // Iterates the blocks of a Trie in order. Positioning methods return
-// Corruption if a separator or block handle they read is malformed, and leave
-// the iterator invalid.
+// Corruption, and leave the iterator invalid, if a separator or block handle
+// they read is malformed or the trie leads to an unexpected bucket.
 class TrieIterator {
  public:
   explicit TrieIterator(const Trie* index);
@@ -277,7 +284,8 @@ class TrieIterator {
   Status Prev();
 
   bool Valid() const { return block_ < index_->num_blocks_; }
-  // The current block's separator. Valid until the next positioning call.
+  // The current block's separator. Valid until the next positioning call; it
+  // may be passed to Seek().
   Slice key() const { return Slice(key_); }
   TrieBlockHandle value() const { return handle_; }
 
@@ -286,7 +294,9 @@ class TrieIterator {
   // terminal node itself, or the smallest or largest head below a node.
   enum class Spell : uint8_t { kNone, kTerminal, kSmallest, kLargest };
   struct Candidate {
-    // Number of target bytes (after the shared prefix) that lead to node.
+    // Number of target bytes (after the shared prefix) that start the head:
+    // the bytes before node's path, or before the label when has_label. For
+    // kTerminal they include node's path and are the whole head.
     size_t depth = 0;
     uint32_t node = 0;
     Spell spell = Spell::kNone;
@@ -340,6 +350,8 @@ class TrieIterator {
   const Trie* index_;
   std::string key_;
   std::string scratch_;
+  // Copy of a Seek target that points into key_.
+  std::string target_;
   const char* bucket_pos_ = nullptr;
   const char* bucket_end_ = nullptr;
   uint64_t bucket_ = 0;

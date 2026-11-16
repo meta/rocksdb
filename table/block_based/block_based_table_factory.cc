@@ -422,8 +422,10 @@ static struct BlockBasedTableTypeInfo {
              offsetof(struct BlockBasedTableOptions,
                       user_defined_index_factory),
              OptionVerificationType::kByNameAllowFromNull)
-             // BlockBasedTableFactory::ValidateOptions() validates the factory
-             // only in the index modes that use it.
+             // Without this, the generic Configurable validation would run the
+             // factory's ValidateOptions() in every index mode.
+             // BlockBasedTableFactory::ValidateOptions() runs it instead,
+             // except in kStandardOnly, which ignores the factory.
              .SetValidateFunc(
                  [](const DBOptions& /*db_opts*/,
                     const ColumnFamilyOptions& /*cf_opts*/,

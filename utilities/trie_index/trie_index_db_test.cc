@@ -4832,12 +4832,14 @@ TEST_P(TrieIndexDBTest, MmapReads) {
 
 // A trie block of another format version, such as one written by an earlier
 // release, cannot be read. kStandardDefault falls back to the standard index;
-// modes that need the trie fail with NotSupported.
+// modes that need the trie fail with NotSupported. An SST written in
+// kCustomOnly has only a stub standard index, so no mode can open it.
 TEST_F(TrieIndexDBTest, OtherTrieVersionFallsBackOrFails) {
   // Writes the trie's blocks with version 1 in the header.
   class OldVersionFactory : public TrieIndexFactory {
    public:
     using TrieIndexFactory::NewBuilder;
+    using TrieIndexFactory::NewReader;
     Status NewBuilder(
         const IndexFactoryOptions& options,
         std::unique_ptr<IndexFactoryBuilder>& builder) const override {
@@ -4849,7 +4851,38 @@ TEST_F(TrieIndexDBTest, OtherTrieVersionFallsBackOrFails) {
       return s;
     }
 
+    // Reads its own blocks, as the earlier release did, so that a flush in
+    // kCustomOnly can open its output.
+    Status NewReader(
+        const IndexFactoryOptions& options, Slice& index_block,
+        std::unique_ptr<IndexFactoryReader>& reader) const override {
+      auto own = std::make_unique<Reader>(index_block);
+      Status s = TrieIndexFactory::NewReader(options, own->contents, own->trie);
+      if (s.ok()) {
+        reader = std::move(own);
+      }
+      return s;
+    }
+
    private:
+    // A trie reader over a copy of the block with the current version.
+    struct Reader : public IndexFactoryReader {
+      explicit Reader(const Slice& block)
+          : data(block.ToString()), contents(data) {
+        EncodeFixed32(&data[4], 2);
+      }
+      std::unique_ptr<IndexFactoryIterator> NewIterator(
+          const ReadOptions& read_options) override {
+        return trie->NewIterator(read_options);
+      }
+      size_t ApproximateMemoryUsage() const override {
+        return sizeof(*this) + data.size();
+      }
+      std::string data;
+      Slice contents;
+      std::unique_ptr<IndexFactoryReader> trie;
+    };
+
     class Builder : public IndexFactoryBuilder {
      public:
       explicit Builder(std::unique_ptr<IndexFactoryBuilder> trie)
@@ -4910,6 +4943,24 @@ TEST_F(TrieIndexDBTest, OtherTrieVersionFallsBackOrFails) {
     ASSERT_EQ(OpenDBImpl(/*block_size=*/128, mode).code(),
               Status::Code::kNotSupported);
   }
+
+  ASSERT_OK(DestroyDB(dbname_, options_));
+  trie_factory_ = std::make_shared<OldVersionFactory>();
+  ASSERT_OK(OpenDBImpl(/*block_size=*/128, IndexMode::kCustomOnly));
+  WriteSequentialKeys(0, 30);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_OK(db_->Close());
+  db_.reset();
+
+  trie_factory_ = std::make_shared<TrieIndexFactory>();
+  for (IndexMode mode : {IndexMode::kStandardDefault, IndexMode::kCustomOnly}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    ASSERT_EQ(OpenDBImpl(/*block_size=*/128, mode).code(),
+              Status::Code::kNotSupported);
+  }
+  // kStandardOnly does not load the trie, so it rejects the stub.
+  ASSERT_EQ(OpenDBImpl(/*block_size=*/128, IndexMode::kStandardOnly).code(),
+            Status::Code::kInvalidArgument);
 }
 
 TEST_P(TrieIndexDBTest, RollbackFromPrimaryWithoutCompactSucceeds) {

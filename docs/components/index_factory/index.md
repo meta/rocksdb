@@ -45,6 +45,11 @@ tiers an SST is written with and which one reads use by default.
 | `kCustomDefault` | full | yes | custom | hard error at open |
 | `kCustomOnly` | stub only | yes | custom | hard error at open |
 
+The last column applies to SSTs that carry a full standard index. An SST
+written in `kCustomOnly` has only the stub, so it needs a usable custom block in
+every mode: opening it fails even in `kStandardDefault` when the block is
+missing or the factory cannot read it, and `kStandardOnly` cannot open it.
+
 `ReadOptions::read_index` overrides the target for a single read:
 
 - `kDefault` -- follow the effective mode. In primary/custom-only mode, the

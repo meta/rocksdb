@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <functional>
 #include <limits>
 
+#include "port/likely.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/math.h"
@@ -19,7 +21,7 @@ namespace trie_index {
 
 namespace {
 
-constexpr uint32_t kMagic = 0x54524945;  // "TRIE"
+constexpr uint32_t kMagic = 0x54524945;  // Stored as the bytes "EIRT".
 constexpr uint32_t kVersion = 2;
 constexpr uint64_t kExplicitSizes = ~uint64_t{0};
 
@@ -137,6 +139,13 @@ void PutLE(std::string* dst, uint64_t v, uint32_t width) {
   for (uint32_t i = 0; i < width; i++) {
     dst->push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
   }
+}
+
+// Whether p points into the bytes of s. std::less also orders pointers into
+// different objects.
+bool PointsInto(const char* p, const std::string& s) {
+  const std::less<const char*> less;
+  return !less(p, s.data()) && less(p, s.data() + s.size());
 }
 
 // Length of the common prefix of a and b, looking at most n bytes.
@@ -1398,6 +1407,12 @@ Status TrieIterator::Seek(const Slice& key, uint64_t tag) {
   }
   const char* target = key.data();
   size_t target_len = key.size();
+  // Spelling a separator overwrites key_, so copy a target that points into
+  // it, such as key().
+  if (UNLIKELY(PointsInto(target, key_))) {
+    target_.assign(target, target_len);
+    target = target_.data();
+  }
   const size_t prefix_len = index_->prefix_len_;
   if (prefix_len > 0) {
     const int cmp =

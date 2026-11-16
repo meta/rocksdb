@@ -2110,6 +2110,52 @@ TEST_F(TrieIndexFactoryTest, ReSeekAfterRun) {
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
 }
 
+// A caller may seek to the key the iterator just returned, or to bytes inside
+// it. That target points into the iterator's own buffer, which the Seek
+// overwrites. The key, handle and bound check must match a Seek to a copy.
+TEST_F(TrieIndexFactoryTest, SeekToResultKey) {
+  // Separators "a", "bz" (one user key over two blocks) and "xb".
+  TrieTestContext ctx = BuildTrieAndGetIterator({
+      {"a", "a0", 0, 100, 5, 5},
+      {"bz", "bz", 105, 100, 9, 8},
+      {"bz", "bz0", 210, 100, 7, 7},
+      {"xb", "", 315, 100, 3, 0},
+  });
+  IndexFactoryIterator* iter = ctx.iter.get();
+  // Seeks to copies of the targets.
+  std::unique_ptr<IndexFactoryIterator> copy_iter =
+      ctx.reader->NewIterator(ReadOptions());
+  // "xb" holds "b". A Seek to it lands on "bz", whose "z" is past the limit.
+  ScanOptions scan(Slice("a"), Slice("c"));
+  for (const std::string key : {"a", "bz", "xb"}) {
+    for (SequenceNumber seq : {kMaxSequenceNumber, SequenceNumber{8}}) {
+      for (size_t off = 0; off <= key.size(); off++) {
+        for (size_t len = 0; off + len <= key.size(); len++) {
+          SCOPED_TRACE(key + " seq " + std::to_string(seq) + " bytes [" +
+                       std::to_string(off) + ", " + std::to_string(off + len) +
+                       ")");
+          IterateResult result;
+          ASSERT_OK(iter->SeekAndGetResult(key, &result,
+                                           SeekCtx(kMaxSequenceNumber)));
+          ASSERT_EQ(result.key, key);
+          const Slice target(result.key.data() + off, len);
+          IterateResult expected;
+          copy_iter->Prepare(&scan, 1);
+          ASSERT_OK(copy_iter->SeekAndGetResult(target.ToString(), &expected,
+                                                SeekCtx(seq)));
+          iter->Prepare(&scan, 1);
+          ASSERT_OK(iter->SeekAndGetResult(target, &result, SeekCtx(seq)));
+          ASSERT_EQ(result.key, expected.key);
+          ASSERT_EQ(result.bound_check_result, expected.bound_check_result);
+          if (!expected.key.empty()) {
+            ASSERT_EQ(iter->value().offset, copy_iter->value().offset);
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST_F(TrieIndexFactoryTest, AllFfLastKeyWithSameKeyBoundary) {
   // Validates that an all-0xFF last key with same-user-key boundary preceding
   // it. The last block uses "\xff\xff" as its separator (no shortening), which
@@ -4008,8 +4054,9 @@ class TrieTest : public testing::Test {
     }
   }
 
-  // Seeks to random (target, tag) pairs, then walks Next and Prev at random
-  // across runs and bucket boundaries, checking every position.
+  // Seeks to random (target, tag) pairs, then walks at random across runs and
+  // bucket boundaries, checking every position. A step is Next, Prev, or a
+  // Seek to the current key or to bytes inside it, passed through key().
   static void VerifyWalks(const std::vector<Block>& blocks,
                           uint32_t bucket_size,
                           const std::vector<std::string>& targets,
@@ -4029,7 +4076,22 @@ class TrieTest : public testing::Test {
       size_t pos = ExpectedSeek(blocks, target, tag);
       ASSERT_NO_FATAL_FAILURE(ExpectAt(it, blocks, pos));
       for (int step = 0; step < 30 && pos < blocks.size(); step++) {
-        if (rnd->OneIn(2)) {
+        const uint32_t action = rnd->Uniform(5);
+        if (action == 0) {
+          // Seek to the current key, or to bytes inside it, through key().
+          const std::string& sep = blocks[pos].separator;
+          size_t off = 0;
+          size_t len = sep.size();
+          if (rnd->OneIn(2)) {
+            off = rnd->Uniform(static_cast<int>(sep.size()) + 1);
+            len = rnd->Uniform(static_cast<int>(sep.size() - off) + 1);
+          }
+          const uint64_t seek_tag =
+              tags[rnd->Uniform(static_cast<int>(tags.size()))];
+          const std::string copy = sep.substr(off, len);
+          ASSERT_OK(it.Seek(Slice(it.key().data() + off, len), seek_tag));
+          pos = ExpectedSeek(blocks, copy, seek_tag);
+        } else if (action % 2 == 1) {
           ASSERT_OK(it.Next());
           pos++;
         } else {
@@ -4578,6 +4640,43 @@ TEST_F(TrieTest, RandomizedRunsTagsAndSizes) {
       ASSERT_NO_FATAL_FAILURE(Verify(blocks, bucket_size, targets, tags));
       ASSERT_NO_FATAL_FAILURE(
           VerifyWalks(blocks, bucket_size, targets, tags, &rnd));
+    }
+  }
+}
+
+// Seek() may be given the iterator's own key(), or bytes inside it. Spelling
+// the new separator overwrites them, so each Seek must land where a Seek to a
+// copy lands. Bucket size 1 makes every separator a bucket head; 8 puts all of
+// them in one bucket.
+TEST_F(TrieTest, SeekToOwnKey) {
+  Random rnd(301);
+  for (const std::string prefix : {"", "pfx/"}) {
+    std::vector<std::string> keys;
+    for (const char* k : {"apq", "b", "bb", "c", "d", "date"}) {
+      keys.push_back(prefix + k);
+    }
+    const std::vector<Block> blocks = ContiguousBlocks(keys, &rnd);
+    for (uint32_t bucket_size : {1u, 2u, 8u}) {
+      std::string data = Build(blocks, bucket_size);
+      Trie index;
+      ASSERT_OK(index.Init(data));
+      TrieIterator it(&index);
+      for (size_t i = 0; i < blocks.size(); i++) {
+        const std::string& sep = blocks[i].separator;
+        for (size_t off = 0; off <= sep.size(); off++) {
+          for (size_t len = 0; off + len <= sep.size(); len++) {
+            SCOPED_TRACE(sep + " bucket_size " + std::to_string(bucket_size) +
+                         " bytes [" + std::to_string(off) + ", " +
+                         std::to_string(off + len) + ")");
+            ASSERT_OK(it.Seek(sep, kSeekTag));
+            ASSERT_NO_FATAL_FAILURE(ExpectAt(it, blocks, i));
+            ASSERT_OK(it.Seek(Slice(it.key().data() + off, len), kSeekTag));
+            ASSERT_NO_FATAL_FAILURE(
+                ExpectAt(it, blocks,
+                         ExpectedSeek(blocks, sep.substr(off, len), kSeekTag)));
+          }
+        }
+      }
     }
   }
 }
