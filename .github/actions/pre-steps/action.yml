@@ -27,7 +27,6 @@ runs:
       echo "SKIP_FORMAT_BUCK_CHECKS=1" >> "$GITHUB_ENV"
       echo "GTEST_COLOR=1" >> "$GITHUB_ENV"
       echo "CTEST_OUTPUT_ON_FAILURE=1" >> "$GITHUB_ENV"
-      echo "CTEST_TEST_TIMEOUT=300" >> "$GITHUB_ENV"
       # These third-party sources are mirrored on the "third-party-deps" GitHub
       # release. To add one, upload the asset here (intentionally hidden):
       # https://github.com/meta/rocksdb/releases/edit/third-party-deps
