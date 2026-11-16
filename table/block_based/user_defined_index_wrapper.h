@@ -111,6 +111,8 @@ class IndexFactoryIteratorWrapper : public InternalIteratorBase<IndexValue> {
     if (scan_opts) {
       udi_iter_->Prepare(scan_opts->GetScanRanges().data(),
                          scan_opts->GetScanRanges().size());
+    } else {
+      udi_iter_->Prepare(nullptr, 0);
     }
   }
 

@@ -272,13 +272,9 @@ TrieIndexIterator::TrieIndexIterator(const Trie* trie,
 
 void TrieIndexIterator::Prepare(const ScanOptions scan_opts[],
                                 size_t num_opts) {
-  scan_opts_.clear();
-  scan_opts_.reserve(num_opts);
-  for (size_t i = 0; i < num_opts; i++) {
-    scan_opts_.push_back(scan_opts[i]);
-  }
+  // num_opts == 0 (scan_opts may be null) discards the earlier ranges.
+  scan_opts_.assign(scan_opts, scan_opts + num_opts);
   current_scan_idx_ = 0;
-  prepared_ = true;
 }
 
 Status TrieIndexIterator::SetResult(const Status& s, IterBoundCheck bounds,
@@ -302,15 +298,13 @@ Status TrieIndexIterator::SeekAndGetResult(const Slice& target,
   // Advance current_scan_idx_ past any scans whose limit <= target.
   // This handles the multi-scan case where the caller seeks into a later
   // scan range after the previous scan returned kOutOfBound.
-  if (prepared_) {
-    while (current_scan_idx_ < scan_opts_.size()) {
-      const auto& opts = scan_opts_[current_scan_idx_];
-      if (opts.range.limit.has_value() &&
-          comparator_->Compare(target, opts.range.limit.value()) >= 0) {
-        current_scan_idx_++;
-      } else {
-        break;
-      }
+  while (current_scan_idx_ < scan_opts_.size()) {
+    const auto& opts = scan_opts_[current_scan_idx_];
+    if (opts.range.limit.has_value() &&
+        comparator_->Compare(target, opts.range.limit.value()) >= 0) {
+      current_scan_idx_++;
+    } else {
+      break;
     }
   }
   // Before the Seek, which overwrites target when it points into the current

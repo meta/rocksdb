@@ -4772,6 +4772,34 @@ TEST_F(TrieIndexDBTest, CustomOnlySSTsSurviveLoweredIndexMode) {
   ASSERT_TRUE(iter->status().IsInvalidArgument());
 }
 
+// An iterator that leaves a MultiScan, here with SeekToLast(), reads like a
+// normal iterator, so the scan's limit no longer bounds the trie's Next().
+// (DBIter rejects SeekForPrev() on a forward MultiScan, and a Seek() there
+// needs iterate_upper_bound set to the limit, which would bound this scan
+// anyway.)
+TEST_P(TrieIndexDBTest, IteratorAfterMultiScanIgnoresScanRanges) {
+  ASSERT_OK(OpenDB(/*block_size=*/128));
+  const std::vector<std::string> keys = PutNumberedKeys(200, "value");
+  ASSERT_OK(db_->Flush(FlushOptions()));
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(TrieIndexReadOptions()));
+  // The scan keys outlive the iterator, so a kept limit would still apply.
+  MultiScanArgs scans(BytewiseComparator());
+  scans.insert(Slice(keys[10]), Slice(keys[20]));
+  iter->Prepare(scans);
+  iter->SeekToLast();
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key().ToString(), keys.back());
+
+  std::vector<std::string> all;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    all.push_back(iter->key().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(all, keys);
+}
+
 // The trie reads its block in place. With mmap reads, a block that is not in
 // the block cache points into the table file's mapping, which lives as long as
 // the table reader; a cached block is a heap copy. Table readers are evicted

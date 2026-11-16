@@ -224,7 +224,8 @@ class TrieIndexIterator final : public IndexFactoryIterator {
  public:
   TrieIndexIterator(const Trie* trie, const Comparator* comparator);
 
-  // Prepare for a batch of scans. Stores scan bounds for later use.
+  // Prepare for a batch of scans. Stores the scan bounds, or discards them
+  // when num_opts is 0.
   void Prepare(const ScanOptions scan_opts[], size_t num_opts) override;
   Status SeekAndGetResult(const Slice& target, IterateResult* result,
                           const SeekContext& context) override;
@@ -236,7 +237,7 @@ class TrieIndexIterator final : public IndexFactoryIterator {
 
  private:
   // Whether CheckBounds() can return anything but kInbound.
-  bool HasBounds() const { return prepared_ && !scan_opts_.empty(); }
+  bool HasBounds() const { return !scan_opts_.empty(); }
 
   // Checks whether the current block may hold keys in the current scan.
   // reference_key is the key to compare against the limit: for Seek this is
@@ -254,7 +255,6 @@ class TrieIndexIterator final : public IndexFactoryIterator {
   TrieIterator iter_;
   std::vector<ScanOptions> scan_opts_;
   size_t current_scan_idx_ = 0;
-  bool prepared_ = false;
 };
 
 // ============================================================================

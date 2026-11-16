@@ -1,0 +1,1 @@
+Fixed an iterator reading through a custom index (`user_defined_index_factory`) that could return too few keys after it left a MultiScan, for example with `SeekToLast()`. A custom `IndexFactoryIterator` now gets `Prepare(nullptr, 0)` when the table iterator discards the scan ranges.

@@ -10466,6 +10466,14 @@ class UserDefinedIndexTestBase : public BlockBasedTableTestBase {
         }
 
         void Prepare(const ScanOptions scan_opts[], size_t num_opts) override {
+          if (num_opts == 0) {
+            // The table iterator discards the ranges when it leaves the
+            // MultiScan.
+            scan_opts_ = nullptr;
+            num_opts_ = 0;
+            scan_idx_ = 0;
+            return;
+          }
           // Prepare should only be called once
           EXPECT_EQ(scan_opts_, nullptr);
           scan_opts_ = scan_opts;

@@ -291,8 +291,10 @@ TEST_F(TrieIndexFactoryTest, EstimatedSizeBoundsSerializedTrie) {
 // estimate must still bound its output.
 TEST_F(TrieIndexFactoryTest, EstimatedSizeBoundsExtremeHandles) {
   constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
+  constexpr int kNumKeys = 63;
   std::vector<std::string> keys;
-  for (int i = 0; i < 63; ++i) {
+  keys.reserve(kNumKeys);
+  for (int i = 0; i < kNumKeys; ++i) {
     keys.push_back("k" + std::to_string(100 + i));
   }
   // Blocks alternating between a size of 1 and `large`, the last one large,
@@ -300,6 +302,7 @@ TEST_F(TrieIndexFactoryTest, EstimatedSizeBoundsExtremeHandles) {
   // 2^64.
   auto evenly_spaced = [&](uint64_t large, uint64_t gap, uint64_t end) {
     std::vector<IndexFactoryBuilder::BlockHandle> handles;
+    handles.reserve(keys.size());
     uint64_t offset = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
       const uint64_t size = (keys.size() - 1 - i) % 2 == 0 ? large : 1;
@@ -317,6 +320,7 @@ TEST_F(TrieIndexFactoryTest, EstimatedSizeBoundsExtremeHandles) {
   constexpr uint64_t kStep = uint64_t{1} << 55;
   constexpr uint64_t kLarge = (uint64_t{1} << 58) - kStep;
   std::vector<IndexFactoryBuilder::BlockHandle> wide_residuals;
+  wide_residuals.reserve(keys.size());
   for (size_t i = 0; i < keys.size(); ++i) {
     wide_residuals.push_back(
         {i == 0 ? 0 : kStep + i - 1, i % 2 == 0 ? kLarge : kLarge - kStep});
@@ -4051,6 +4055,13 @@ class TrieTest : public testing::Test {
         ASSERT_OK(it.Next());
         ASSERT_NO_FATAL_FAILURE(ExpectAt(it, blocks, expected));
       }
+    }
+    // An empty target with a null data pointer, which UBSAN on glibc reports
+    // if it reaches memcmp.
+    for (uint64_t tag : tags) {
+      ASSERT_OK(it.Seek(Slice(nullptr, 0), tag));
+      ASSERT_NO_FATAL_FAILURE(
+          ExpectAt(it, blocks, ExpectedSeek(blocks, "", tag)));
     }
   }
 

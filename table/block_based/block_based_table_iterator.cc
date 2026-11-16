@@ -1078,6 +1078,7 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   is_at_first_key_from_index_ = false;
 
   index_iter_->Prepare(multiscan_opts);
+  index_iter_has_scan_ranges_ = true;
 
   std::vector<BlockHandle> scan_block_handles;
   std::vector<std::string> data_block_separators;

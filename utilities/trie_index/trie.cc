@@ -702,6 +702,7 @@ Status Trie::Column::Init(const char* begin, const char* end,
 }
 
 uint64_t Trie::Column::Get(uint64_t i) const {
+  assert(i < count);
   const char* group = groups + (i >> kGroupBits) * kGroupHeaderSize;
   const uint64_t j = i & (kGroupSize - 1);
   const uint32_t layout = DecodeFixed32(group + 12);
@@ -1513,6 +1514,11 @@ Status TrieIterator::Seek(const Slice& target, uint64_t tag) {
   // target.
   const size_t prefix_len = index_->prefix_len_;
   if (prefix_len > 0) {
+    // Checked first so that an empty target, whose data() may be null, never
+    // reaches memcmp.
+    if (rest_len == 0) {
+      return SeekToFirst();
+    }
     const int cmp =
         memcmp(rest, index_->prefix_, std::min(prefix_len, rest_len));
     if (cmp > 0) {
