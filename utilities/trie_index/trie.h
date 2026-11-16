@@ -35,26 +35,28 @@
 //  loads, so the index is used in place at any alignment and on any host.
 //
 //    Header (kTrieHeaderSize bytes):
-//      u32 magic        0x54524945, stored as the bytes "EIRT"
-//      u32 version      2. Version 1 was an earlier layout that readers
-//                       reject.
-//      u32 flags        0; readers reject any other value
-//      u32 bucket_size  separators per bucket, at least 1
-//      u64 num_blocks   data blocks indexed
-//      u64 num_keys     distinct separators, at most num_blocks
-//      u32 prefix_len   length of the prefix shared by every separator
-//      u32 max_key_len  length of the longest separator
-//      u32 id_width     bytes per bucket id in trie nodes, 1 to 4
-//      u32 trie_root    position of the root node within the trie section
-//      u64 size_gap     block size = next block offset - offset - size_gap,
-//                       or all ones when sizes are stored explicitly
+//      u32 magic              0x54524945, stored as the bytes "EIRT"
+//      u32 version            2. Version 1 was an earlier layout that readers
+//                             reject.
+//      u32 flags              0; readers reject any other value
+//      u32 bucket_size        separators per bucket, at least 1
+//      u64 num_blocks         data blocks indexed
+//      u64 num_separators     distinct separators, at most num_blocks
+//      u32 prefix_len         length of the prefix shared by every separator
+//      u32 max_separator_len  length of the longest separator
+//      u32 id_width           bytes per bucket id in trie nodes, 1 to 4
+//      u32 trie_root          position of the root node within the trie
+//                             section
+//      u64 size_gap           block size = next block offset - offset -
+//                             size_gap, or all ones when sizes are stored
+//                             explicitly
 //      u64 trie_offset, bucket_table_offset, bucket_data_offset,
 //          offset_table_offset, size_table_offset, run_table_offset,
 //          tag_table_offset, end_offset
-//                       section boundaries from the start of the index.
-//                       Sections are contiguous and in this order;
-//                       size_table_offset is 0 when sizes are derived, and
-//                       end_offset is the size of the index.
+//                             section boundaries from the start of the index.
+//                             Sections are contiguous and in this order;
+//                             size_table_offset is 0 when sizes are derived,
+//                             and end_offset is the size of the index.
 //    Shared prefix bytes
 //    Trie section
 //    Bucket table: column of num_buckets + 1 positions in the bucket data
@@ -64,21 +66,28 @@
 //      otherwise it repeats the last block's offset
 //    Size table (only when sizes are explicit): column of num_blocks sizes
 //    Run table: u64 count, then count entries of
-//      {u64 key_index, u64 extra_blocks_through}. One entry per separator
-//      shared by more than one block, in key order. extra_blocks_through is
-//      the total number of extra blocks of this run and all earlier runs.
+//      {u64 separator_index, u64 cumulative_extra_blocks}. One entry per
+//      separator shared by more than one block, in separator order.
+//      cumulative_extra_blocks counts the blocks after the first of this run
+//      and all earlier runs. For example, if separator 3 spans 2 blocks and
+//      separator 7 spans 4, the entries are {3, 1} and {7, 4}, and separator
+//      7's blocks start at block 7 + 1 = 8.
 //    Tag table: u64 count, then count entries of {u64 block_index, u64 tag}
 //      for every block with a nonzero tag, in block order. It ends the index.
 //
 //  Column (linear frame of reference, groups of 64 values):
 //    u64 count, then per group {u64 base, u32 slope, u32 layout}, then the
-//    groups' residuals back to back, then 8 zero bytes. layout is
-//    words << 6 | width: the group's residuals are `width` bits each (at most
-//    56), packed little-endian from 8-byte word `words` of the residuals,
-//    which is the total size of the earlier groups' residuals. A group of n
-//    values takes ceil(n * width / 64) words.
+//    groups' residuals back to back, then 8 zero bytes.
 //    Value i is base + slope * (i % 64) + residual(i) in 64-bit unsigned
-//    arithmetic, where base, slope and width belong to group i / 64.
+//    arithmetic, where base, slope and layout belong to group i / 64: each
+//    group's values are a straight line plus a small residual per value.
+//    layout = (start_word << 6) | width. width is the number of bits per
+//    residual in the group, at most 56, so one unaligned 8-byte load and a
+//    shift of up to 7 bits read any residual. start_word is where the
+//    group's residuals begin, in 8-byte words from the first group's, and
+//    equals the total size of the earlier groups' residuals. A group of n
+//    values takes ceil(n * width / 64) words, its residuals packed
+//    little-endian.
 //
 //  Trie node:
 //    u8 header: bits 0-1 kind (0 leaf, 1 sparse, 2 bitmap), bit 2 terminal,
@@ -161,7 +170,7 @@ class TrieBuilder {
     // one, and the EntrySize() of every separator.
     uint64_t suffix_bytes = 0;
     uint64_t entry_bytes = 0;
-    uint64_t max_key_len = 0;
+    uint64_t max_separator_len = 0;
     // Separators equal to the previous one, and blocks that may get a
     // nonzero tag.
     uint64_t duplicates = 0;
@@ -180,11 +189,11 @@ class TrieBuilder {
  private:
   const uint32_t bucket_size_;
   // Distinct separators, concatenated, and the end of each one.
-  std::string key_bytes_;
-  std::vector<size_t> key_ends_;
+  std::string separator_bytes_;
+  std::vector<size_t> separator_ends_;
   // A distinct separator shared by more than one block.
   struct Run {
-    uint64_t key_index;
+    uint64_t separator_index;
     // Number of blocks sharing the separator, minus one.
     uint64_t extra_blocks;
   };
@@ -206,6 +215,12 @@ class TrieBuilder {
 // returns Corruption for a separator out of bounds or a block size that would
 // wrap around. Other wrong bytes give a wrong key or handle, as the index has
 // no checksum of its own.
+//
+// Init() proves that the trie is a tree whose terminal nodes, in pre-order,
+// hold bucket ids 0, 1, 2, ..., so the iterator parses trie nodes without
+// bounds checks. As the buckets themselves are not validated, the iterator
+// checks that a walk reaches the bucket it must (the next or previous one, the
+// first or the last).
 class Trie {
  public:
   Trie() = default;
@@ -237,15 +252,15 @@ class Trie {
   // field is at least value.
   static uint64_t SideTableLowerBound(const char* table, uint64_t count,
                                       uint64_t value);
-  uint64_t RunKey(uint64_t r) const;
-  uint64_t RunExtraThrough(uint64_t r) const;
+  uint64_t RunSeparator(uint64_t r) const;
+  uint64_t RunCumulativeExtraBlocks(uint64_t r) const;
   uint64_t TagBlock(uint64_t t) const;
   uint64_t TagValue(uint64_t t) const;
   Status Parse(const Slice& data);
   Status ValidateTrie(uint64_t trie_size);
 
   uint64_t num_blocks_ = 0;
-  uint64_t num_keys_ = 0;
+  uint64_t num_separators_ = 0;
   uint64_t num_buckets_ = 0;
   uint64_t size_gap_ = 0;
   const char* prefix_ = nullptr;
@@ -261,7 +276,7 @@ class Trie {
   Column size_table_;
   uint32_t bucket_size_ = 0;
   uint32_t prefix_len_ = 0;
-  uint32_t max_key_len_ = 0;
+  uint32_t max_separator_len_ = 0;
   uint32_t id_width_ = 0;
   uint32_t trie_root_ = 0;
   bool explicit_sizes_ = false;
@@ -270,17 +285,49 @@ class Trie {
 // Iterates the blocks of a Trie in order. Positioning methods return
 // Corruption, and leave the iterator invalid, if a separator or block handle
 // they read is malformed or the trie leads to an unexpected bucket.
+//
+// Position: key_ holds the current separator, with the shared prefix.
+// separator_index_ is its index among the distinct separators and bucket_ is
+// its bucket. block_ is the current block, in [run_begin_, run_end_), the
+// blocks that share the separator.
+//
+// Seek(target, tag):
+// 1. Compare target with the shared prefix. If target is past every
+//    separator the iterator becomes invalid, and if it is before every
+//    separator Seek moves to the first block.
+// 2. Descend() walks the trie with the rest of target and returns the floor
+//    (the largest bucket head below it) and the ceiling (the smallest head at
+//    or above it).
+// 3. If the ceiling equals target, enter its bucket at the head and go to
+//    step 5. If there is no floor, every head is after target, and Seek
+//    moves to the first block.
+// 4. SpellHead() writes the floor's head into key_, and ScanBucket() decodes
+//    the floor's bucket up to the first separator at or after target. If
+//    there is none, the answer is the next bucket's head, the ceiling, or
+//    the iterator becomes invalid when there is no next bucket.
+// 5. EnterSeparator() finds the separator's blocks in the run table. If the
+//    separator equals target, ApplyTag() skips its blocks whose tag is
+//    greater than tag, and moves to the next separator if it skips them all.
+//
+// Next() moves to the next block of the separator, or with NextSeparator()
+// to the next separator. Prev() moves to the previous block of the
+// separator, or finds the previous separator's bucket head with Descend()
+// and decodes forward from it.
 class TrieIterator {
  public:
   explicit TrieIterator(const Trie* index);
 
   Status SeekToFirst();
   Status SeekToLast();
-  // Positions at the first block whose separator is at or after (key, tag)
-  // in internal key order: by key ascending, then by tag descending, where a
-  // block without a tag sorts after every tag of its key.
-  Status Seek(const Slice& key, uint64_t tag);
+  // Positions at the first block whose separator is at or after
+  // (target, tag) in internal key order: by separator ascending, then by tag
+  // descending, where a block without a tag sorts after every tag of its
+  // separator.
+  Status Seek(const Slice& target, uint64_t tag);
   Status Next();
+  // Moving to the previous separator costs a Descend() and up to
+  // bucket_size - 1 decodes, because front coding only decodes forward from a
+  // bucket head.
   Status Prev();
 
   bool Valid() const { return block_ < index_->num_blocks_; }
@@ -333,19 +380,25 @@ class TrieIterator {
   // whether the separator found equals target.
   Status ScanBucket(const char* target, size_t target_len, bool* found,
                     bool* equal);
-  // Sets the block range of the current key index.
-  void EnterKey();
+  // Sets the block range of the current separator index.
+  void EnterSeparator();
   // Positions on block and reads its handle.
   Status EnterBlock(uint64_t block);
   // After positioning on a separator equal to the Seek target, moves past its
   // blocks whose tags are greater than tag.
   Status ApplyTag(uint64_t tag);
-  Status NextKey();
-  // Decodes forward in the current bucket until the current key index is
-  // key_index.
-  Status AdvanceTo(uint64_t key_index);
-  // Positions on the last block of the current key.
-  Status EnterKeyFromEnd();
+  // Moves to the first block of the next separator, or makes the iterator
+  // invalid after the last one. At the end of a bucket it needs the next
+  // bucket's head, and the trie has no map from bucket id to node, so it
+  // calls Descend() with the current separator (without the shared prefix)
+  // plus a 0 byte. That is the smallest string greater than the separator,
+  // so its ceiling is the next bucket's head.
+  Status NextSeparator();
+  // Decodes forward in the current bucket until the current separator index is
+  // separator_index.
+  Status AdvanceTo(uint64_t separator_index);
+  // Positions on the last block of the current separator.
+  Status EnterSeparatorFromEnd();
 
   const Trie* index_;
   std::string key_;
@@ -355,7 +408,7 @@ class TrieIterator {
   const char* bucket_pos_ = nullptr;
   const char* bucket_end_ = nullptr;
   uint64_t bucket_ = 0;
-  uint64_t key_index_ = 0;
+  uint64_t separator_index_ = 0;
   // Blocks [run_begin_, run_end_) share the current separator.
   uint64_t run_begin_ = 0;
   uint64_t run_end_ = 0;

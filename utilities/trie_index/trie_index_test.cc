@@ -4266,18 +4266,18 @@ TEST_F(TrieTest, RejectsOtherVersions) {
   }
 }
 
-// Init() rejects a max_key_len that the separator bytes stored in the index
-// cannot reach.
-TEST_F(TrieTest, RejectsMaxKeyLenBeyondContent) {
+// Init() rejects a max_separator_len that the separator bytes stored in the
+// index cannot reach.
+TEST_F(TrieTest, RejectsMaxSeparatorLenBeyondContent) {
   const std::string data =
       Build({{"apple", {0, 100}, 0}, {"apricot", {105, 100}, 0}}, 8);
   Trie index;
   ASSERT_OK(index.Init(data));
-  for (uint32_t max_key_len : {uint32_t{1} << 20, uint32_t{0xFFFFFFFF}}) {
-    SCOPED_TRACE(max_key_len);
+  for (uint32_t max_separator_len : {uint32_t{1} << 20, uint32_t{0xFFFFFFFF}}) {
+    SCOPED_TRACE(max_separator_len);
     std::string mutated = data;
-    // Header field max_key_len.
-    EncodeFixed32(&mutated[36], max_key_len);
+    // Header field max_separator_len.
+    EncodeFixed32(&mutated[36], max_separator_len);
     ASSERT_EQ(index.Init(mutated).code(), Status::Code::kCorruption);
   }
 }
@@ -4402,10 +4402,10 @@ TEST_F(TrieTest, GoldenBytes) {
                   "02000000"
                   "00000000"
                   "08000000"
-                  // num_blocks, num_keys
+                  // num_blocks, num_separators
                   "0200000000000000"
                   "0200000000000000"
-                  // prefix_len, max_key_len, id_width, trie_root
+                  // prefix_len, max_separator_len, id_width, trie_root
                   "01000000"
                   "02000000"
                   "01000000"

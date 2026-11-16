@@ -68,66 +68,23 @@ int RegisterBuiltinTrieIndexFactory(ObjectLibrary& library,
 // ============================================================================
 
 TrieIndexBuilder::TrieIndexBuilder(const Comparator* comparator)
-    : comparator_(comparator),
-      finished_(false),
-      trie_builder_(kTrieBucketSize) {}
+    : comparator_(comparator), trie_builder_(kTrieBucketSize) {}
 
 Slice TrieIndexBuilder::AddIndexEntry(const Slice& last_key_in_current_block,
                                       const Slice* first_key_in_next_block,
                                       const BlockHandle& block_handle,
                                       std::string* separator_scratch,
                                       const IndexEntryContext& context) {
-  uint64_t last_key_tag = context.last_key_tag;
-
-  // Compute a short separator between the two user keys using the
-  // comparator. FindShortestSeparator takes `*start` as both input and output:
-  //   input:  *start == last_key_in_current_block
-  //   output: *start modified to shortest string in [start, limit)
-  // If first_key_in_next_block is nullptr, this is the last block, and the
-  // separator is the last key itself (see below).
-  Slice separator;
-  // True when last_key and first_key_in_next_block are the same user key. This
-  // block's separator is then that user key, and the next block holds it too,
-  // so this block needs its real tag.
-  bool same_user_key = false;
-  if (first_key_in_next_block != nullptr) {
-    same_user_key = comparator_->Compare(last_key_in_current_block,
-                                         *first_key_in_next_block) == 0;
-
-    separator_scratch->assign(last_key_in_current_block.data(),
-                              last_key_in_current_block.size());
-    comparator_->FindShortestSeparator(separator_scratch,
-                                       *first_key_in_next_block);
-    separator = Slice(*separator_scratch);
-  } else {
-    // Last block: use the last key itself as the separator, NOT a shortened
-    // successor. This matches the standard ShortenedIndexBuilder behavior
-    // (see GetSeparatorWithSeq() in index_builder.h): it only calls
-    // FindShortInternalKeySuccessor when shortening_mode is
-    // kShortenSeparatorsAndSuccessor, which is not the default. With the
-    // default kShortenSeparators, the last block's separator is simply
-    // last_key_in_current_block.
-    //
-    // Why this matters: FindShortSuccessor can widen the key range. For
-    // example, if the actual last key is "9\xff\xff", FindShortSuccessor
-    // produces ":" (0x3A). The trie would then claim to cover keys up to
-    // ":", but the data block only contains keys up to "9\xff\xff". A seek
-    // targeting a key in that gap (e.g., "9\xff\xff\x01") would find a
-    // block via the trie that contains no matching data, causing iterator
-    // desynchronization -- the trie index returns a valid block while the
-    // standard index correctly reports no match.
-    separator = last_key_in_current_block;
-  }
-
-  const uint64_t tag =
-      BlockTag(same_user_key || SharesPreviousSeparator(separator),
-               first_key_in_next_block != nullptr, last_key_tag);
-  const TrieBlockHandle handle{block_handle.offset, block_handle.size};
-  TrackHandle(handle);
-  // Before AddBlock(), which may move the bytes LastSeparator() points to.
-  UpdateSizeEstimate(separator, trie_builder_.LastSeparator(), tag != 0);
-  trie_builder_.AddBlock(separator, handle, tag);
-  return separator;
+  // The parallel protocol with nothing in between, so serial and parallel
+  // builds run the same code and write the same index.
+  PrepareAddEntry(last_key_in_current_block, first_key_in_next_block, context,
+                  &serial_entry_);
+  FinishAddEntry(block_handle, &serial_entry_, separator_scratch,
+                 /*skip_delta_encoding=*/false);
+  // Return the separator in the scratch string, and keep the scratch string's
+  // buffer for the next entry.
+  separator_scratch->swap(serial_entry_.separator_key);
+  return Slice(*separator_scratch);
 }
 
 bool TrieIndexBuilder::SharesPreviousSeparator(const Slice& separator) const {
@@ -186,8 +143,8 @@ size_t TrieIndexBuilder::UpdateSizeEstimate(const Slice& separator,
   // heads are charged too, which only overestimates.
   estimate_.suffix_bytes += add;
   estimate_.entry_bytes += TrieBuilder::EntrySize(drop, add);
-  estimate_.max_key_len =
-      std::max<uint64_t>(estimate_.max_key_len, separator.size());
+  estimate_.max_separator_len =
+      std::max<uint64_t>(estimate_.max_separator_len, separator.size());
   if (estimate_.num_blocks > 0 && drop == 0 && add == 0) {
     ++estimate_.duplicates;
     may_have_tag = true;
@@ -240,36 +197,38 @@ void TrieIndexBuilder::PrepareAddEntry(const Slice& last_key_in_current_block,
                                        const IndexEntryContext& context,
                                        PreparedAddEntry* out) {
   auto* p = static_cast_with_check<PreparedTrieEntry>(out);
-  p->valid = false;
-  p->same_user_key = false;
-  p->has_next_block = (first_key_in_next_block != nullptr);
+  p->has_next_block = first_key_in_next_block != nullptr;
   p->last_key_tag = context.last_key_tag;
-
+  p->separator_key.assign(last_key_in_current_block.data(),
+                          last_key_in_current_block.size());
   if (first_key_in_next_block != nullptr) {
-    // Same-user-key boundary detection from the inputs alone. The half that
-    // needs the previous block's separator runs in FinishAddEntry(), where
-    // trie_builder_ holds every earlier block.
+    // The half of the same-user-key check that needs only these keys. The
+    // half that needs the previous block's separator runs in FinishAddEntry().
     p->same_user_key = comparator_->Compare(last_key_in_current_block,
                                             *first_key_in_next_block) == 0;
-
-    p->separator_key.assign(last_key_in_current_block.data(),
-                            last_key_in_current_block.size());
+    // Shortens the separator when it can, keeping it at or after the last key
+    // and at or before the next block's first key.
     comparator_->FindShortestSeparator(&p->separator_key,
                                        *first_key_in_next_block);
   } else {
-    // Last block: store the last key itself (no shortening).
-    p->separator_key.assign(last_key_in_current_block.data(),
-                            last_key_in_current_block.size());
+    // The last block's separator is its last key, not a short successor, as
+    // in the standard index unless shortening_mode is
+    // kShortenSeparatorsAndSuccessor. A successor can be larger than every
+    // key in the SST: for the last key "9\xff\xff", FindShortSuccessor()
+    // gives ":", so a Seek to "9\xff\xff\x01" would find this block through
+    // the trie and none through the standard index.
+    p->same_user_key = false;
   }
-
   p->valid = true;
-  // A separator equal to the previous one gets a tag in FinishAddEntry, which
-  // UpdateSizeEstimate detects.
+
+  // A separator equal to the previous one gets a tag in FinishAddEntry(),
+  // which UpdateSizeEstimate() detects.
   const size_t shared_prefix =
       UpdateSizeEstimate(p->separator_key, previous_prepared_separator_,
                          p->same_user_key || !p->has_next_block);
-  // The writer can move the prepared key as soon as this callback returns.
-  // Keep one emit-owned copy, reusing the prefix bytes already stored here.
+  // Once this returns the entry belongs to the BG writer thread, which may
+  // finish and reuse it, so the emit thread keeps its own copy for the next
+  // call, rewriting only the bytes past the shared prefix.
   previous_prepared_separator_.replace(shared_prefix, std::string::npos,
                                        p->separator_key.data() + shared_prefix,
                                        p->separator_key.size() - shared_prefix);
@@ -288,9 +247,8 @@ void TrieIndexBuilder::FinishAddEntry(const BlockHandle& block_handle,
     return;
   }
 
-  // The half of the tag decision that depends on the previous block runs here:
-  // on the BG writer thread, in commit order, trie_builder_ holds every block
-  // before this one. It is the same code as the serial AddIndexEntry().
+  // The half of the tag decision that depends on the previous block runs here,
+  // where trie_builder_ holds every block before this one.
   const Slice separator(p->separator_key);
   const uint64_t tag =
       BlockTag(p->same_user_key || SharesPreviousSeparator(separator),

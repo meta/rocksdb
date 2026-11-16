@@ -25,7 +25,8 @@ constexpr uint32_t kMagic = 0x54524945;  // Stored as the bytes "EIRT".
 constexpr uint32_t kVersion = 2;
 constexpr uint64_t kExplicitSizes = ~uint64_t{0};
 
-// Columns.
+// Columns. A group holds 64 values, so Get() finds a value's group with a
+// shift, and the 16-byte group header costs 2 bits per value.
 constexpr uint32_t kGroupBits = 6;
 constexpr uint64_t kGroupSize = uint64_t{1} << kGroupBits;
 constexpr size_t kColumnHeaderSize = 8;
@@ -57,7 +58,8 @@ constexpr uint8_t kReservedNodeBits = 0xE0;
 constexpr uint8_t kLongPathMarker = 255;
 constexpr size_t kBitmapBytes = 32;
 // Nodes with at least this many children use a bitmap instead of a label
-// list.
+// list. From 32 children the 32-byte bitmap is smaller than the list (a count
+// byte and the labels), and finding a child is a popcount, not a scan.
 constexpr size_t kMinBitmapChildren = 32;
 
 // Bucket entry header.
@@ -75,9 +77,9 @@ constexpr size_t kVersionPos = 4;
 constexpr size_t kFlagsPos = 8;
 constexpr size_t kBucketSizePos = 12;
 constexpr size_t kNumBlocksPos = 16;
-constexpr size_t kNumKeysPos = 24;
+constexpr size_t kNumSeparatorsPos = 24;
 constexpr size_t kPrefixLenPos = 32;
-constexpr size_t kMaxKeyLenPos = 36;
+constexpr size_t kMaxSeparatorLenPos = 36;
 constexpr size_t kIdWidthPos = 40;
 constexpr size_t kTrieRootPos = 44;
 constexpr size_t kSizeGapPos = 48;
@@ -164,7 +166,19 @@ size_t CommonPrefix(const char* a, const char* b, size_t n) {
   return i;
 }
 
-// Appends values as a column.
+// Appends values as a column (layout in trie.h). With similar bucket and
+// block sizes, bucket positions and block offsets grow at a steady rate and
+// block sizes stay close to each other, so a straight line fits each group of
+// 64 and leaves small residuals. For a group of n values v[0..n-1]:
+// - When n >= 2, the group never decreases, v[n - 1] < kMaxLinearValue and
+//   slope = (v[n - 1] - v[0]) / (n - 1) fits 32 bits, base is the smallest
+//   v[j] - slope * j, so no residual is negative. base can be below 0; Get()
+//   is still exact, as uint64_t arithmetic wraps.
+// - Otherwise slope is 0 and base is the smallest value.
+// The width is the bit length of the largest residual. Fails with
+// NotSupported when a group needs more than kMaxColumnWidth bits, or its
+// residuals would start at word kMaxResidualWords or later, which the 26
+// bits of layout above the width cannot hold.
 Status AppendColumn(const std::vector<uint64_t>& values, std::string* out) {
   const uint64_t count = values.size();
   const uint64_t num_groups = (count + kGroupSize - 1) >> kGroupBits;
@@ -232,8 +246,20 @@ Status AppendColumn(const std::vector<uint64_t>& values, std::string* out) {
   return Status::OK();
 }
 
-// Writes a path-compressed trie over sorted, distinct heads, children before
-// parents, without recursion so that deep tries cannot exhaust the stack.
+// Writes a path-compressed trie over sorted, distinct heads (the bucket heads
+// without the shared prefix). A head's bucket id is its index in heads.
+//
+// A node covers the heads that share their first `depth` bytes. Its path is
+// the common prefix of the first and last of them after those bytes. The node
+// is terminal, holding the first head's bucket id, when the first head ends
+// at the path. The other heads are split by their next byte, the label, and
+// each label gets a child one byte deeper.
+//
+// Nodes are written children first, so every child pointer is a positive
+// distance back from its parent, and each node uses the smallest pointer
+// width, 1 to 4 bytes, that reaches its farthest child. The writer keeps its
+// own stack instead of recursing, so deep tries cannot exhaust the thread's
+// stack.
 class TrieWriter {
  public:
   TrieWriter(const std::vector<Slice>& heads, uint32_t id_width)
@@ -367,27 +393,28 @@ class TrieWriter {
 TrieBuilder::TrieBuilder(uint32_t bucket_size) : bucket_size_(bucket_size) {}
 
 Slice TrieBuilder::LastSeparator() const {
-  const size_t num_keys = key_ends_.size();
-  if (num_keys == 0) {
+  const size_t num_separators = separator_ends_.size();
+  if (num_separators == 0) {
     return Slice();
   }
-  const size_t begin = num_keys > 1 ? key_ends_[num_keys - 2] : 0;
-  return Slice(key_bytes_.data() + begin, key_ends_.back() - begin);
+  const size_t begin =
+      num_separators > 1 ? separator_ends_[num_separators - 2] : 0;
+  return Slice(separator_bytes_.data() + begin, separator_ends_.back() - begin);
 }
 
 void TrieBuilder::AddBlock(const Slice& separator,
                            const TrieBlockHandle& handle, uint64_t tag) {
-  const uint64_t num_keys = key_ends_.size();
-  const int cmp = num_keys > 0 ? separator.compare(LastSeparator()) : 1;
+  const uint64_t num_separators = separator_ends_.size();
+  const int cmp = num_separators > 0 ? separator.compare(LastSeparator()) : 1;
   if (cmp > 0) {
-    key_bytes_.append(separator.data(), separator.size());
-    key_ends_.push_back(key_bytes_.size());
+    separator_bytes_.append(separator.data(), separator.size());
+    separator_ends_.push_back(separator_bytes_.size());
   } else {
     out_of_order_ |= cmp < 0;
-    if (!runs_.empty() && runs_.back().key_index == num_keys - 1) {
+    if (!runs_.empty() && runs_.back().separator_index == num_separators - 1) {
       runs_.back().extra_blocks++;
     } else {
-      runs_.push_back({num_keys - 1, 1});
+      runs_.push_back({num_separators - 1, 1});
     }
   }
   if (tag != 0) {
@@ -404,28 +431,29 @@ Status TrieBuilder::Finish(std::string* output) {
     return Status::InvalidArgument("Trie index: bucket size must be > 0");
   }
   const uint64_t num_blocks = handles_.size();
-  const uint64_t num_keys = key_ends_.size();
-  const uint64_t num_buckets = (num_keys + bucket_size_ - 1) / bucket_size_;
+  const uint64_t num_separators = separator_ends_.size();
+  const uint64_t num_buckets =
+      (num_separators + bucket_size_ - 1) / bucket_size_;
   if (num_buckets > uint64_t{std::numeric_limits<uint32_t>::max()} + 1) {
     return Status::NotSupported("Trie index: too many buckets");
   }
-  auto key = [&](uint64_t i) {
-    const size_t begin = i > 0 ? key_ends_[i - 1] : 0;
-    return Slice(key_bytes_.data() + begin, key_ends_[i] - begin);
+  auto separator = [&](uint64_t i) {
+    const size_t begin = i > 0 ? separator_ends_[i - 1] : 0;
+    return Slice(separator_bytes_.data() + begin, separator_ends_[i] - begin);
   };
 
   size_t prefix_len = 0;
-  size_t max_key_len = 0;
-  if (num_keys > 0) {
-    const Slice first = key(0);
-    const Slice last = key(num_keys - 1);
+  size_t max_separator_len = 0;
+  if (num_separators > 0) {
+    const Slice first = separator(0);
+    const Slice last = separator(num_separators - 1);
     prefix_len = CommonPrefix(first.data(), last.data(),
                               std::min(first.size(), last.size()));
-    for (uint64_t i = 0; i < num_keys; i++) {
-      max_key_len = std::max(max_key_len, key(i).size());
+    for (uint64_t i = 0; i < num_separators; i++) {
+      max_separator_len = std::max(max_separator_len, separator(i).size());
     }
   }
-  if (max_key_len > std::numeric_limits<uint32_t>::max()) {
+  if (max_separator_len > std::numeric_limits<uint32_t>::max()) {
     return Status::NotSupported("Trie index: separator too long");
   }
 
@@ -433,11 +461,11 @@ Status TrieBuilder::Finish(std::string* output) {
   const uint32_t id_width = BytesFor(num_buckets > 0 ? num_buckets - 1 : 0);
   std::string trie;
   uint32_t trie_root = 0;
-  if (num_keys > 0) {
+  if (num_separators > 0) {
     std::vector<Slice> heads;
     heads.reserve(num_buckets);
     for (uint64_t b = 0; b < num_buckets; b++) {
-      Slice head = key(b * bucket_size_);
+      Slice head = separator(b * bucket_size_);
       head.remove_prefix(prefix_len);
       heads.push_back(head);
     }
@@ -454,10 +482,10 @@ Status TrieBuilder::Finish(std::string* output) {
   for (uint64_t b = 0; b < num_buckets; b++) {
     bucket_positions.push_back(bucket_data.size());
     const uint64_t begin = b * bucket_size_;
-    const uint64_t end = std::min(num_keys, begin + bucket_size_);
+    const uint64_t end = std::min(num_separators, begin + bucket_size_);
     for (uint64_t i = begin + 1; i < end; i++) {
-      const Slice prev = key(i - 1);
-      const Slice cur = key(i);
+      const Slice prev = separator(i - 1);
+      const Slice cur = separator(i);
       const size_t shared = CommonPrefix(prev.data(), cur.data(),
                                          std::min(prev.size(), cur.size()));
       const size_t drop = prev.size() - shared;
@@ -515,8 +543,8 @@ Status TrieBuilder::Finish(std::string* output) {
   std::string out;
   out.resize(kTrieHeaderSize);
   uint64_t sections[kNumSectionOffsets] = {};
-  if (num_keys > 0) {
-    out.append(key(0).data(), prefix_len);
+  if (num_separators > 0) {
+    out.append(separator(0).data(), prefix_len);
   }
   sections[kTrieSection] = out.size();
   out.append(trie);
@@ -548,7 +576,7 @@ Status TrieBuilder::Finish(std::string* output) {
   uint64_t extra_blocks = 0;
   for (const Run& run : runs_) {
     extra_blocks += run.extra_blocks;
-    PutFixed64(&out, run.key_index);
+    PutFixed64(&out, run.separator_index);
     PutFixed64(&out, extra_blocks);
   }
   sections[kTagTableSection] = out.size();
@@ -565,9 +593,10 @@ Status TrieBuilder::Finish(std::string* output) {
   EncodeFixed32(h + kFlagsPos, 0);
   EncodeFixed32(h + kBucketSizePos, bucket_size_);
   EncodeFixed64(h + kNumBlocksPos, num_blocks);
-  EncodeFixed64(h + kNumKeysPos, num_keys);
+  EncodeFixed64(h + kNumSeparatorsPos, num_separators);
   EncodeFixed32(h + kPrefixLenPos, static_cast<uint32_t>(prefix_len));
-  EncodeFixed32(h + kMaxKeyLenPos, static_cast<uint32_t>(max_key_len));
+  EncodeFixed32(h + kMaxSeparatorLenPos,
+                static_cast<uint32_t>(max_separator_len));
   EncodeFixed32(h + kIdWidthPos, id_width);
   EncodeFixed32(h + kTrieRootPos, trie_root);
   EncodeFixed64(h + kSizeGapPos, derived ? size_gap : kExplicitSizes);
@@ -584,9 +613,34 @@ uint64_t TrieBuilder::EntrySize(uint64_t drop, uint64_t add) {
                     : 1 + VarintLength(drop) + VarintLength(add));
 }
 
+// Bounds the size Finish() produces, term by term. Buckets are counted from
+// blocks, not distinct separators, which only overcounts.
+// - Header and shared prefix: kTrieHeaderSize + max_separator_len.
+// - Trie paths and labels: one byte per distinct prefix of the heads, which
+//   are a subset of the separators, so at most suffix_bytes.
+// - Other trie bytes: one terminal node per bucket, and every node that is
+//   not terminal has at least 2 children, so fewer than 2 * num_buckets
+//   nodes. Each costs at most 17 bytes besides its path: header 1, path
+//   length 6 (the 255 marker and a varint32), bucket id 4, child count 1, the
+//   pointer to it 4, and 1 for its share of a bitmap (32 bytes over at least
+//   32 children).
+// - Bucket table and bucket data: entry_bytes charges every separator, and
+//   the bucket data holds every separator but the heads, so entry_bytes
+//   bounds the bucket data and every position in it.
+// - Offsets: a step between blocks is at most max_block_step, and the step to
+//   the sentinel after the last block is a size plus a gap, so no step is
+//   larger than max_block_step + max_block_size. A group of 64 offsets spans
+//   at most 64 steps.
+// - Sizes, stored only when irregular_gaps: at most max_block_size.
+// - Side tables: two 8-byte counts, at most one run entry per duplicate and
+//   one tag entry per tagged block.
+// A group's residuals never exceed the range of its values, because a fitted
+// slope is at most range / (n - 1). Finish() fails for residuals wider than
+// kMaxColumnWidth bits, so clamping max_block_step and max_block_size to
+// 2^kMaxColumnWidth keeps the products from wrapping and still bounds every
+// index Finish() accepts.
 uint64_t TrieBuilder::SizeBound(const SizeStats& stats, uint32_t bucket_size) {
   assert(bucket_size > 0);
-  // A group's residuals never exceed the range of its values.
   auto column = [](uint64_t count, uint64_t max_range) {
     const uint64_t num_groups = (count + kGroupSize - 1) >> kGroupBits;
     return kColumnHeaderSize + num_groups * kGroupHeaderSize +
@@ -594,19 +648,11 @@ uint64_t TrieBuilder::SizeBound(const SizeStats& stats, uint32_t bucket_size) {
   };
   const uint64_t n = stats.num_blocks;
   const uint64_t num_buckets = (n + bucket_size - 1) / bucket_size;
-  // Path and label bytes never exceed the suffix bytes. A trie with b
-  // terminal nodes has fewer than 2b nodes, each costing at most 17 bytes
-  // besides its path: header, path length, bucket id, child count, the
-  // pointer to it, and its share of a bitmap.
   const uint64_t trie = stats.suffix_bytes + 17 * 2 * num_buckets;
-  // Offsets come in block order, so a group of 64 offsets spans at most 64
-  // steps (the last one to the sentinel), and a size is at most the largest.
-  // Finish() fails for residuals wider than kMaxColumnWidth bits, so clamping
-  // each term there keeps the product from wrapping and still bounds them.
   constexpr uint64_t kMaxRange = uint64_t{1} << kMaxColumnWidth;
   const uint64_t max_step = std::min(stats.max_block_step, kMaxRange) +
                             std::min(stats.max_block_size, kMaxRange);
-  uint64_t size = kTrieHeaderSize + stats.max_key_len + trie +
+  uint64_t size = kTrieHeaderSize + stats.max_separator_len + trie +
                   column(num_buckets + 1, stats.entry_bytes) +
                   stats.entry_bytes + column(n + 1, kGroupSize * max_step) +
                   2 * 8 +
@@ -721,6 +767,87 @@ struct TrieIterator::Node {
     return pos - LoadLE(pointers + index * pointer_width, pointer_width);
   }
 
+  // Where label c falls among the children of a sparse or bitmap node.
+  struct LabelSearch {
+    // Number of child labels below c. When present, c is child rank's label.
+    uint32_t rank = 0;
+    bool present = false;
+    // Whether some child label is below or above c, and the nearest one on
+    // each side.
+    bool has_below = false;
+    bool has_above = false;
+    uint8_t below = 0;
+    uint8_t above = 0;
+  };
+  LabelSearch FindLabel(uint8_t c) const {
+    return kind == kKindSparse ? FindSparseLabel(c) : FindBitmapLabel(c);
+  }
+
+  // A linear scan. Finish() writes a sparse node only when it has fewer than
+  // kMinBitmapChildren labels.
+  LabelSearch FindSparseLabel(uint8_t c) const {
+    LabelSearch r;
+    while (r.rank < child_count && labels[r.rank] < c) {
+      r.rank++;
+    }
+    r.present = r.rank < child_count && labels[r.rank] == c;
+    if (r.rank > 0) {
+      r.has_below = true;
+      r.below = labels[r.rank - 1];
+    }
+    const uint32_t next = r.present ? r.rank + 1 : r.rank;
+    if (next < child_count) {
+      r.has_above = true;
+      r.above = labels[next];
+    }
+    return r;
+  }
+
+  // Bit c of the 256-bit bitmap is set when c is a label, so rank is the
+  // number of set bits below bit c.
+  LabelSearch FindBitmapLabel(uint8_t c) const {
+    uint64_t words[4];
+    for (int i = 0; i < 4; i++) {
+      words[i] = DecodeFixed64(bitmap + 8 * i);
+    }
+    const int wi = c / 64;
+    const int bi = c % 64;
+    LabelSearch r;
+    for (int i = 0; i < wi; i++) {
+      r.rank += BitsSetToOne(words[i]);
+    }
+    const uint64_t lower = words[wi] & ((uint64_t{1} << bi) - 1);
+    r.rank += BitsSetToOne(lower);
+    r.present = ((words[wi] >> bi) & 1) != 0;
+    if (lower != 0) {
+      r.has_below = true;
+      r.below = BitmapLabel(wi, FloorLog2(lower));
+    } else {
+      for (int i = wi - 1; i >= 0; i--) {
+        if (words[i] != 0) {
+          r.has_below = true;
+          r.below = BitmapLabel(i, FloorLog2(words[i]));
+          break;
+        }
+      }
+    }
+    const uint64_t higher =
+        bi == 63 ? 0 : (words[wi] & ~((uint64_t{2} << bi) - 1));
+    if (higher != 0) {
+      r.has_above = true;
+      r.above = BitmapLabel(wi, CountTrailingZeroBits(higher));
+    } else {
+      for (int i = wi + 1; i < 4; i++) {
+        if (words[i] != 0) {
+          r.has_above = true;
+          r.above = BitmapLabel(i, CountTrailingZeroBits(words[i]));
+          break;
+        }
+      }
+    }
+    return r;
+  }
+
   // Labels of the first and last child.
   uint8_t FirstLabel() const {
     if (kind == kKindSparse) {
@@ -777,21 +904,23 @@ Status Trie::Parse(const Slice& data) {
   }
   bucket_size_ = DecodeFixed32(p + kBucketSizePos);
   num_blocks_ = DecodeFixed64(p + kNumBlocksPos);
-  num_keys_ = DecodeFixed64(p + kNumKeysPos);
+  num_separators_ = DecodeFixed64(p + kNumSeparatorsPos);
   prefix_len_ = DecodeFixed32(p + kPrefixLenPos);
-  max_key_len_ = DecodeFixed32(p + kMaxKeyLenPos);
+  max_separator_len_ = DecodeFixed32(p + kMaxSeparatorLenPos);
   id_width_ = DecodeFixed32(p + kIdWidthPos);
   trie_root_ = DecodeFixed32(p + kTrieRootPos);
   size_gap_ = DecodeFixed64(p + kSizeGapPos);
   explicit_sizes_ = size_gap_ == kExplicitSizes;
   // Every block takes at least a quarter byte of the offset column, which
   // also keeps the arithmetic below from overflowing.
-  if (bucket_size_ == 0 || num_keys_ > num_blocks_ ||
-      (num_blocks_ == 0) != (num_keys_ == 0) || num_blocks_ / 4 > data.size() ||
-      prefix_len_ > max_key_len_ || id_width_ < 1 || id_width_ > 4) {
+  if (bucket_size_ == 0 || num_separators_ > num_blocks_ ||
+      (num_blocks_ == 0) != (num_separators_ == 0) ||
+      num_blocks_ / 4 > data.size() || prefix_len_ > max_separator_len_ ||
+      id_width_ < 1 || id_width_ > 4) {
     return Corrupt("bad header");
   }
-  num_buckets_ = num_keys_ == 0 ? 0 : (num_keys_ - 1) / bucket_size_ + 1;
+  num_buckets_ =
+      num_separators_ == 0 ? 0 : (num_separators_ - 1) / bucket_size_ + 1;
   if (num_buckets_ > 0 && num_buckets_ - 1 >= uint64_t{1} << (8 * id_width_)) {
     return Corrupt("bucket id width too small");
   }
@@ -834,9 +963,9 @@ Status Trie::Parse(const Slice& data) {
       sections[kOffsetTableSection] - sections[kBucketDataSection];
   // A separator is the shared prefix, a bucket head spelled by the trie and
   // suffixes from its bucket, so those bytes bound its length. A larger
-  // max_key_len is corrupt, and would loosen the length checks below and in
-  // the iterator.
-  if (max_key_len_ - prefix_len_ > trie_size + bucket_data_size) {
+  // max_separator_len is corrupt, and would loosen the length checks below and
+  // in the iterator.
+  if (max_separator_len_ - prefix_len_ > trie_size + bucket_data_size) {
     return Corrupt("max key length exceeds index contents");
   }
   bucket_data_size_ = bucket_data_size;
@@ -877,20 +1006,20 @@ Status Trie::ValidateSideTables(uint64_t run_table_size,
       tag_table_size != 8 + num_tags_ * kSideTableEntrySize) {
     return Corrupt("bad side table size");
   }
-  uint64_t prev_key = 0;
+  uint64_t prev_separator = 0;
   uint64_t prev_extra = 0;
   for (uint64_t r = 0; r < num_runs_; r++) {
     const char* e = runs_ + 8 + r * kSideTableEntrySize;
-    const uint64_t key_index = DecodeFixed64(e);
+    const uint64_t separator_index = DecodeFixed64(e);
     const uint64_t extra = DecodeFixed64(e + 8);
-    if (key_index >= num_keys_ || (r > 0 && key_index <= prev_key) ||
-        extra <= prev_extra) {
+    if (separator_index >= num_separators_ ||
+        (r > 0 && separator_index <= prev_separator) || extra <= prev_extra) {
       return Corrupt("bad run table");
     }
-    prev_key = key_index;
+    prev_separator = separator_index;
     prev_extra = extra;
   }
-  if (prev_extra != num_blocks_ - num_keys_) {
+  if (prev_extra != num_blocks_ - num_separators_) {
     return Corrupt("run table does not match block count");
   }
   uint64_t prev_block = 0;
@@ -921,11 +1050,11 @@ uint64_t Trie::SideTableLowerBound(const char* table, uint64_t count,
   return lo;
 }
 
-uint64_t Trie::RunKey(uint64_t r) const {
+uint64_t Trie::RunSeparator(uint64_t r) const {
   return DecodeFixed64(runs_ + 8 + r * kSideTableEntrySize);
 }
 
-uint64_t Trie::RunExtraThrough(uint64_t r) const {
+uint64_t Trie::RunCumulativeExtraBlocks(uint64_t r) const {
   return DecodeFixed64(runs_ + 16 + r * kSideTableEntrySize);
 }
 
@@ -937,15 +1066,29 @@ uint64_t Trie::TagValue(uint64_t t) const {
   return DecodeFixed64(tags_ + 16 + t * kSideTableEntrySize);
 }
 
+// Walks the trie in pre-order and checks what Node::Parse(), Descend() and
+// SpellHead() rely on without checking again:
+// - Every node and its fields lie inside the trie section, and the paths and
+//   labels on the way to a node never make a head longer than
+//   max_separator_len allows.
+// - Every child pointer is nonzero and at most the parent's position, so a
+//   child lies before its parent, and every walk down the trie ends.
+// - Terminal nodes come in pre-order with bucket ids 0, 1, 2, ..., and
+//   labels ascend.
+// - Every leaf is terminal, so every subtree holds a bucket id, and a subtree
+//   reached from two parents would repeat its ids. So the nodes form a tree.
+// - The walk fails after trie_size / 2 nodes, which bounds the work on a
+//   corrupt trie. A valid trie has no more, as each node takes at least 2
+//   bytes.
 Status Trie::ValidateTrie(uint64_t trie_size) {
-  if (num_keys_ == 0) {
+  if (num_separators_ == 0) {
     return trie_size == 0 && trie_root_ == 0 ? Status::OK()
                                              : Corrupt("unexpected trie");
   }
   if (trie_root_ >= trie_size) {
     return Corrupt("bad trie root");
   }
-  const uint64_t max_head_len = max_key_len_ - prefix_len_;
+  const uint64_t max_head_len = max_separator_len_ - prefix_len_;
   // Pre-order walk. A valid trie spells the bucket heads in bucket order.
   struct Visit {
     uint32_t pos;
@@ -1050,7 +1193,7 @@ TrieIterator::TrieIterator(const Trie* index)
     : index_(index), block_(index->num_blocks_) {
   key_.reserve(std::max<size_t>(
       index_->prefix_len_,
-      std::min<size_t>(index_->max_key_len_, kInitialKeyCapacity)));
+      std::min<size_t>(index_->max_separator_len_, kInitialKeyCapacity)));
   key_.assign(index_->prefix_, index_->prefix_len_);
 }
 
@@ -1077,6 +1220,17 @@ Status TrieIterator::EnterBlock(uint64_t block) {
   return Status::OK();
 }
 
+// At each node, compares the node's path with target, then looks for target's
+// next byte among the node's labels:
+// - The child with the largest label below that byte gives a floor
+//   candidate, the largest head under it, and the child with the smallest
+//   label above gives a ceiling candidate, the smallest head under it.
+// - A terminal node whose head is a proper prefix of target is a floor
+//   candidate, and one whose head equals target is the ceiling.
+// A candidate found deeper shares more bytes with target, so it replaces an
+// earlier one. When target leaves the trie inside a node's path, or ends at a
+// node that is not terminal, every head below that node is on one side of
+// target: the smallest becomes the ceiling or the largest the floor.
 void TrieIterator::Descend(const char* target, size_t target_len,
                            Candidate* floor, Candidate* ceiling) const {
   floor->spell = Spell::kNone;
@@ -1116,81 +1270,20 @@ void TrieIterator::Descend(const char* target, size_t target_len,
     if (node.child_count == 0) {
       return;
     }
-    const uint8_t c = Byte(target, label_depth);
-    uint32_t rank;
-    bool present;
-    bool has_below = false;
-    bool has_above = false;
-    uint8_t below = 0;
-    uint8_t above = 0;
-    if (node.kind == kKindSparse) {
-      rank = 0;
-      while (rank < node.child_count && node.labels[rank] < c) {
-        rank++;
-      }
-      present = rank < node.child_count && node.labels[rank] == c;
-      if (rank > 0) {
-        has_below = true;
-        below = node.labels[rank - 1];
-      }
-      const uint32_t next = present ? rank + 1 : rank;
-      if (next < node.child_count) {
-        has_above = true;
-        above = node.labels[next];
-      }
-    } else {
-      uint64_t words[4];
-      for (int i = 0; i < 4; i++) {
-        words[i] = DecodeFixed64(node.bitmap + 8 * i);
-      }
-      const int wi = c / 64;
-      const int bi = c % 64;
-      rank = 0;
-      for (int i = 0; i < wi; i++) {
-        rank += BitsSetToOne(words[i]);
-      }
-      const uint64_t lower = words[wi] & ((uint64_t{1} << bi) - 1);
-      rank += BitsSetToOne(lower);
-      present = ((words[wi] >> bi) & 1) != 0;
-      if (lower != 0) {
-        has_below = true;
-        below = BitmapLabel(wi, FloorLog2(lower));
-      } else {
-        for (int i = wi - 1; i >= 0; i--) {
-          if (words[i] != 0) {
-            has_below = true;
-            below = BitmapLabel(i, FloorLog2(words[i]));
-            break;
-          }
-        }
-      }
-      const uint64_t higher =
-          bi == 63 ? 0 : (words[wi] & ~((uint64_t{2} << bi) - 1));
-      if (higher != 0) {
-        has_above = true;
-        above = BitmapLabel(wi, CountTrailingZeroBits(higher));
-      } else {
-        for (int i = wi + 1; i < 4; i++) {
-          if (words[i] != 0) {
-            has_above = true;
-            above = BitmapLabel(i, CountTrailingZeroBits(words[i]));
-            break;
-          }
-        }
-      }
+    const Node::LabelSearch found = node.FindLabel(Byte(target, label_depth));
+    if (found.has_below) {
+      *floor = Candidate{label_depth, node.Child(found.rank - 1),
+                         Spell::kLargest, true, found.below};
     }
-    if (has_below) {
-      *floor = Candidate{label_depth, node.Child(rank - 1), Spell::kLargest,
-                         true, below};
+    if (found.has_above) {
+      const uint32_t next = found.present ? found.rank + 1 : found.rank;
+      *ceiling = Candidate{label_depth, node.Child(next), Spell::kSmallest,
+                           true, found.above};
     }
-    if (has_above) {
-      *ceiling = Candidate{label_depth, node.Child(present ? rank + 1 : rank),
-                           Spell::kSmallest, true, above};
-    }
-    if (!present) {
+    if (!found.present) {
       return;
     }
-    pos = node.Child(rank);
+    pos = node.Child(found.rank);
     depth = label_depth + 1;
   }
 }
@@ -1229,7 +1322,7 @@ uint64_t TrieIterator::SpellHead(const Candidate& candidate,
 
 void TrieIterator::EnterBucket(uint64_t bucket) {
   bucket_ = bucket;
-  key_index_ = bucket * index_->bucket_size_;
+  separator_index_ = bucket * index_->bucket_size_;
   // Init() does not check bucket positions. Clamping keeps a corrupt one
   // inside the bucket data, where DecodeNext() bounds-checks every separator.
   const uint64_t size = index_->bucket_data_size_;
@@ -1250,22 +1343,22 @@ bool TrieIterator::EnterBucketAt(const Candidate& candidate, const char* target,
   return true;
 }
 
-void TrieIterator::EnterKey() {
+void TrieIterator::EnterSeparator() {
   uint64_t extra_before = 0;
   uint64_t extra = 0;
   const uint64_t num_runs = index_->num_runs_;
   if (num_runs > 0) {
-    // First run at or after the current key.
+    // First run at or after the current separator.
     const uint64_t lo =
-        Trie::SideTableLowerBound(index_->runs_, num_runs, key_index_);
+        Trie::SideTableLowerBound(index_->runs_, num_runs, separator_index_);
     if (lo > 0) {
-      extra_before = index_->RunExtraThrough(lo - 1);
+      extra_before = index_->RunCumulativeExtraBlocks(lo - 1);
     }
-    if (lo < num_runs && index_->RunKey(lo) == key_index_) {
-      extra = index_->RunExtraThrough(lo) - extra_before;
+    if (lo < num_runs && index_->RunSeparator(lo) == separator_index_) {
+      extra = index_->RunCumulativeExtraBlocks(lo) - extra_before;
     }
   }
-  run_begin_ = key_index_ + extra_before;
+  run_begin_ = separator_index_ + extra_before;
   run_end_ = run_begin_ + 1 + extra;
 }
 
@@ -1276,7 +1369,7 @@ Status TrieIterator::ApplyTag(uint64_t tag) {
   }
   // First tagged block at or after the current one.
   uint64_t lo = Trie::SideTableLowerBound(index_->tags_, num_tags, run_begin_);
-  // A block without a tag sorts after every tag of its key.
+  // A block without a tag sorts after every tag of its separator.
   if (lo == num_tags || index_->TagBlock(lo) != run_begin_) {
     return EnterBlock(run_begin_);
   }
@@ -1290,8 +1383,8 @@ Status TrieIterator::ApplyTag(uint64_t tag) {
       return EnterBlock(b);
     }
   }
-  // Every block of this key precedes the target.
-  return NextKey();
+  // Every block of this separator precedes the target.
+  return NextSeparator();
 }
 
 Status TrieIterator::DecodeNext(size_t* shared, const char** suffix,
@@ -1315,7 +1408,7 @@ Status TrieIterator::DecodeNext(size_t* shared, const char** suffix,
   const size_t prefix_len = index_->prefix_len_;
   const size_t len = key_.size() - prefix_len;
   if (drop > len || add > lossless_cast<size_t>(bucket_end_ - bucket_pos_) ||
-      len - drop + add > index_->max_key_len_ - prefix_len) {
+      len - drop + add > index_->max_separator_len_ - prefix_len) {
     return Corrupt("bad bucket entry");
   }
   *shared = len - drop;
@@ -1324,7 +1417,7 @@ Status TrieIterator::DecodeNext(size_t* shared, const char** suffix,
   *suffix = bucket_pos_;
   *suffix_len = add;
   bucket_pos_ += add;
-  key_index_++;
+  separator_index_++;
   return Status::OK();
 }
 
@@ -1338,13 +1431,13 @@ Status TrieIterator::DecodeNext() {
 Status TrieIterator::ScanBucket(const char* target, size_t target_len,
                                 bool* found, bool* equal) {
   const size_t prefix_len = index_->prefix_len_;
-  const uint64_t end =
-      std::min(index_->num_keys_, key_index_ + index_->bucket_size_);
+  const uint64_t end = std::min(index_->num_separators_,
+                                separator_index_ + index_->bucket_size_);
   // Length of the prefix the current separator shares with target. The
   // current separator is always below target.
   size_t matched = CommonPrefix(key_.data() + prefix_len, target,
                                 std::min(key_.size() - prefix_len, target_len));
-  while (key_index_ + 1 < end) {
+  while (separator_index_ + 1 < end) {
     size_t shared;
     const char* suffix;
     size_t suffix_len;
@@ -1386,7 +1479,7 @@ Status TrieIterator::ScanBucket(const char* target, size_t target_len,
 }
 
 Status TrieIterator::SeekToFirst() {
-  if (index_->num_keys_ == 0) {
+  if (index_->num_separators_ == 0) {
     Invalidate();
     return Status::OK();
   }
@@ -1396,55 +1489,60 @@ Status TrieIterator::SeekToFirst() {
     return Corrupt("first bucket head not found");
   }
   EnterBucket(0);
-  EnterKey();
+  EnterSeparator();
   return EnterBlock(run_begin_);
 }
 
-Status TrieIterator::Seek(const Slice& key, uint64_t tag) {
-  if (index_->num_keys_ == 0) {
+Status TrieIterator::Seek(const Slice& target, uint64_t tag) {
+  if (index_->num_separators_ == 0) {
     Invalidate();
     return Status::OK();
   }
-  const char* target = key.data();
-  size_t target_len = key.size();
+  // The target bytes after the shared prefix, once it has been compared.
+  const char* rest = target.data();
+  size_t rest_len = target.size();
   // Spelling a separator overwrites key_, so copy a target that points into
   // it, such as key().
-  if (UNLIKELY(PointsInto(target, key_))) {
-    target_.assign(target, target_len);
-    target = target_.data();
+  if (UNLIKELY(PointsInto(rest, key_))) {
+    target_.assign(rest, rest_len);
+    rest = target_.data();
   }
+  // Every separator starts with the shared prefix. If target's first bytes
+  // are larger, every separator is below target. If they are smaller, or
+  // equal but target is shorter than the prefix, every separator is above
+  // target.
   const size_t prefix_len = index_->prefix_len_;
   if (prefix_len > 0) {
     const int cmp =
-        memcmp(target, index_->prefix_, std::min(prefix_len, target_len));
+        memcmp(rest, index_->prefix_, std::min(prefix_len, rest_len));
     if (cmp > 0) {
       Invalidate();
       return Status::OK();
     }
-    if (cmp < 0 || target_len < prefix_len) {
+    if (cmp < 0 || rest_len < prefix_len) {
       return SeekToFirst();
     }
-    target += prefix_len;
-    target_len -= prefix_len;
+    rest += prefix_len;
+    rest_len -= prefix_len;
   }
   Candidate floor;
   Candidate ceiling;
-  Descend(target, target_len, &floor, &ceiling);
+  Descend(rest, rest_len, &floor, &ceiling);
   if (ceiling.spell == Spell::kTerminal) {
     // Target is a bucket head, so the floor's bucket holds only smaller keys.
-    EnterBucket(SpellHead(ceiling, target));
-    EnterKey();
+    EnterBucket(SpellHead(ceiling, rest));
+    EnterSeparator();
     return ApplyTag(tag);
   }
   if (floor.spell == Spell::kNone) {
     // Every head is greater than target, so tags do not matter.
     return SeekToFirst();
   }
-  const uint64_t bucket = SpellHead(floor, target);
+  const uint64_t bucket = SpellHead(floor, rest);
   EnterBucket(bucket);
   bool found;
   bool equal = false;
-  Status s = ScanBucket(target, target_len, &found, &equal);
+  Status s = ScanBucket(rest, rest_len, &found, &equal);
   if (!s.ok()) {
     Invalidate();
     return s;
@@ -1455,29 +1553,29 @@ Status TrieIterator::Seek(const Slice& key, uint64_t tag) {
       return Status::OK();
     }
     // The next head is greater than target, so tags do not matter.
-    if (!EnterBucketAt(ceiling, target, bucket + 1)) {
+    if (!EnterBucketAt(ceiling, rest, bucket + 1)) {
       return Corrupt("bucket head out of order");
     }
   }
-  EnterKey();
+  EnterSeparator();
   return equal ? ApplyTag(tag) : EnterBlock(run_begin_);
 }
 
-Status TrieIterator::NextKey() {
-  if (key_index_ + 1 >= index_->num_keys_) {
+Status TrieIterator::NextSeparator() {
+  if (separator_index_ + 1 >= index_->num_separators_) {
     Invalidate();
     return Status::OK();
   }
   const uint64_t bucket_end =
-      std::min(index_->num_keys_, (bucket_ + 1) * index_->bucket_size_);
-  if (key_index_ + 1 < bucket_end) {
+      std::min(index_->num_separators_, (bucket_ + 1) * index_->bucket_size_);
+  if (separator_index_ + 1 < bucket_end) {
     Status s = DecodeNext();
     if (!s.ok()) {
       Invalidate();
       return s;
     }
   } else {
-    // The next bucket's head is the smallest head after the current key.
+    // The next bucket's head is the smallest head after the current separator.
     const size_t prefix_len = index_->prefix_len_;
     scratch_.assign(key_.data() + prefix_len, key_.size() - prefix_len);
     scratch_.push_back('\0');
@@ -1488,12 +1586,12 @@ Status TrieIterator::NextKey() {
       return Corrupt("bucket head out of order");
     }
   }
-  EnterKey();
+  EnterSeparator();
   return EnterBlock(run_begin_);
 }
 
-Status TrieIterator::AdvanceTo(uint64_t key_index) {
-  while (key_index_ < key_index) {
+Status TrieIterator::AdvanceTo(uint64_t separator_index) {
+  while (separator_index_ < separator_index) {
     Status s = DecodeNext();
     if (!s.ok()) {
       Invalidate();
@@ -1503,13 +1601,13 @@ Status TrieIterator::AdvanceTo(uint64_t key_index) {
   return Status::OK();
 }
 
-Status TrieIterator::EnterKeyFromEnd() {
-  EnterKey();
+Status TrieIterator::EnterSeparatorFromEnd() {
+  EnterSeparator();
   return EnterBlock(run_end_ - 1);
 }
 
 Status TrieIterator::SeekToLast() {
-  if (index_->num_keys_ == 0) {
+  if (index_->num_separators_ == 0) {
     Invalidate();
     return Status::OK();
   }
@@ -1520,8 +1618,8 @@ Status TrieIterator::SeekToLast() {
     return Corrupt("last bucket head not found");
   }
   EnterBucket(last_bucket);
-  Status s = AdvanceTo(index_->num_keys_ - 1);
-  return s.ok() ? EnterKeyFromEnd() : s;
+  Status s = AdvanceTo(index_->num_separators_ - 1);
+  return s.ok() ? EnterSeparatorFromEnd() : s;
 }
 
 Status TrieIterator::Prev() {
@@ -1531,23 +1629,25 @@ Status TrieIterator::Prev() {
   if (block_ > run_begin_) {
     return EnterBlock(block_ - 1);
   }
-  if (key_index_ == 0) {
+  if (separator_index_ == 0) {
     Invalidate();
     return Status::OK();
   }
-  // The previous key's bucket starts with the largest head below the current
-  // key. Front coding only decodes forward, so decode from that head.
-  const uint64_t prev_key = key_index_ - 1;
+  // The previous separator's bucket starts with the largest head below the
+  // current separator. Front coding only decodes forward, so decode from that
+  // head.
+  const uint64_t prev_separator = separator_index_ - 1;
   const size_t prefix_len = index_->prefix_len_;
   scratch_.assign(key_.data() + prefix_len, key_.size() - prefix_len);
   Candidate floor;
   Candidate ceiling;
   Descend(scratch_.data(), scratch_.size(), &floor, &ceiling);
-  if (!EnterBucketAt(floor, scratch_.data(), prev_key / index_->bucket_size_)) {
+  if (!EnterBucketAt(floor, scratch_.data(),
+                     prev_separator / index_->bucket_size_)) {
     return Corrupt("bucket head out of order");
   }
-  Status s = AdvanceTo(prev_key);
-  return s.ok() ? EnterKeyFromEnd() : s;
+  Status s = AdvanceTo(prev_separator);
+  return s.ok() ? EnterSeparatorFromEnd() : s;
 }
 
 Status TrieIterator::Next() {
@@ -1557,7 +1657,7 @@ Status TrieIterator::Next() {
   if (block_ + 1 < run_end_) {
     return EnterBlock(block_ + 1);
   }
-  return NextKey();
+  return NextSeparator();
 }
 
 }  // namespace trie_index

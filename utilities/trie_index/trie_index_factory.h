@@ -28,6 +28,24 @@
 //
 //  In kCustomDefault and kCustomOnly mode, reads use the trie unless they set
 //  ReadOptions::read_index to kBuiltin.
+//
+//  A block's separator is a user key at or after every user key in the block
+//  and at or before the first user key of the next block. A block's tag is
+//  the packed sequence number and type of its last key, or 0 when the block
+//  can be found by user key alone (see BlockTag() in trie_index_factory.cc).
+//
+//  In every index_mode but kStandardOnly, the table builder creates a
+//  TrieIndexBuilder for each SST and passes it each data block's boundary
+//  keys and handle. TrieIndexBuilder adds the block's separator, handle and
+//  tag to a TrieBuilder (format in trie.h), whose output becomes the meta
+//  block "rocksdb.user_defined_index.trie_index". TrieIndexReader views that
+//  block in place through a Trie, and each TrieIndexIterator wraps a
+//  TrieIterator and checks the bounds given in ScanOptions. A Seek finds the
+//  first block whose (separator, tag) is at or after the target's (user key,
+//  tag), by separator ascending and then tag descending.
+//
+//  The trie orders separators byte by byte, so it requires
+//  BytewiseComparator.
 
 #pragma once
 
@@ -56,7 +74,8 @@ int RegisterBuiltinTrieIndexFactory(ObjectLibrary& library,
 //
 // During SST file construction, RocksDB calls:
 //   1. OnKeyAdded() for each key-value pair.
-//   2. AddIndexEntry() at each data block boundary.
+//   2. At each data block boundary, AddIndexEntry(), or with parallel
+//      compression PrepareAddEntry() and later FinishAddEntry().
 //   3. Finish() to serialize the index.
 //
 // The separator of each data block goes straight into a TrieBuilder, which
@@ -76,6 +95,9 @@ class TrieIndexBuilder final : public IndexFactoryBuilder {
   // A block gets the real tag of its last key when that user key continues
   // into the next block, when its separator equals the previous block's, or
   // when it is the last block; other blocks get the 0 tag.
+  //
+  // Runs PrepareAddEntry() and then FinishAddEntry(), and returns the
+  // separator in *separator_scratch.
   Slice AddIndexEntry(const Slice& last_key_in_current_block,
                       const Slice* first_key_in_next_block,
                       const BlockHandle& block_handle,
@@ -114,56 +136,18 @@ class TrieIndexBuilder final : public IndexFactoryBuilder {
                       bool skip_delta_encoding) override;
 
  private:
-  const Comparator* comparator_;
-  // Serialized index.
-  std::string data_;
-  bool finished_;
-  // Set when FinishAddEntry receives an entry with nothing prepared in it, so
-  // Finish() fails instead of writing an index that omits that data block.
-  bool has_unprepared_entry_ = false;
-  // Whether TrieBuilder::Finish() must store block sizes (see
-  // SizeStats::irregular_gaps in trie.h). One of the block statistics
-  // described below; kept here to avoid padding.
-  RelaxedAtomic<bool> irregular_block_gaps_{false};
-
-  // Blocks added so far. Owned by the thread that adds blocks (the BG writer
-  // during parallel builds).
-  TrieBuilder trie_builder_;
-
-  // EstimatedSize() is called on the emit thread. Keep its state disjoint from
-  // trie_builder_, which the BG writer mutates during parallel builds.
-  // Separator statistics of the entries prepared so far. Its block statistics
-  // are unused; the atomics below hold them.
-  TrieBuilder::SizeStats estimate_;
-  std::string previous_prepared_separator_;
-  // Adds a separator to estimate_ and returns its shared prefix length with
-  // the previous one, for reusing emit-owned separator bytes. may_have_tag is
-  // whether the entry may get a nonzero tag.
-  size_t UpdateSizeEstimate(const Slice& separator,
-                            const Slice& previous_separator, bool may_have_tag);
-
-  // Statistics of the block handles added so far, with irregular_block_gaps_
-  // above. Written by the thread that adds handles (the BG writer during
-  // parallel builds) and read by EstimatedSize() on the emit thread. They
-  // bound the widths of the offset and size columns. Blocks still being
-  // compressed in a parallel build are charged like the largest block so far,
-  // so the estimate can fall short until their handles arrive. The table
-  // builder takes its last estimate in Finish(), after the last
-  // FinishAddEntry(), so that one is an upper bound, as index_factory.h
-  // requires.
-  RelaxedAtomic<uint64_t> max_block_step_{0};
-  RelaxedAtomic<uint64_t> max_block_size_{0};
-  // Owned by the thread that adds handles.
-  TrieBlockHandle previous_handle_;
-  uint64_t block_gap_ = 0;
-  // Records the next block's handle in the statistics above.
-  void TrackHandle(const TrieBlockHandle& handle);
   // Whether separator equals the separator of the block added last.
   bool SharesPreviousSeparator(const Slice& separator) const;
+  // Adds a separator to estimate_ and returns its shared prefix length with
+  // previous_separator. may_have_tag is whether the entry may get a nonzero
+  // tag.
+  size_t UpdateSizeEstimate(const Slice& separator,
+                            const Slice& previous_separator, bool may_have_tag);
+  // Records the next block's handle in the block statistics.
+  void TrackHandle(const TrieBlockHandle& handle);
 
-  // Staged data for the parallel AddIndexEntry protocol. Populated by
-  // PrepareAddEntry() on the emit thread, consumed by FinishAddEntry() on the
-  // BG writer thread, which also receives the block handle.
+  // A data block's separator and what decides its tag, from PrepareAddEntry()
+  // until FinishAddEntry() receives the block's handle.
   struct PreparedTrieEntry : public IndexFactoryBuilder::PreparedAddEntry {
     std::string separator_key;
     // Real tag of last_key_in_current_block. BlockTag() uses it for the last
@@ -175,12 +159,59 @@ class TrieIndexBuilder final : public IndexFactoryBuilder {
     // True if last_key_in_current_block and first_key_in_next_block have the
     // same user key, computed from the inputs alone. FinishAddEntry() also
     // tags the block when its separator equals the previous block's, which
-    // only the BG writer thread can check.
+    // only the thread that adds blocks can check.
     bool same_user_key = false;
     // Set by PrepareAddEntry and cleared by FinishAddEntry. Finishing an
     // entry while this is false fails the build.
     bool valid = false;
   };
+
+  // Members are grouped by the thread that writes them. With parallel
+  // compression, PrepareAddEntry() and EstimatedSize() run on the emit thread
+  // while FinishAddEntry() runs on the BG writer thread; otherwise everything
+  // runs on the emit thread. Finish() runs after the last FinishAddEntry().
+
+  const Comparator* comparator_;
+
+  // Emit thread. Kept apart from trie_builder_ so that EstimatedSize() does
+  // not read what the BG writer thread is changing.
+  //
+  // Separator statistics of the entries prepared so far. Its block statistics
+  // are unused; the atomics below hold them.
+  TrieBuilder::SizeStats estimate_;
+  // Separator of the entry prepared last.
+  std::string previous_prepared_separator_;
+  // The entry AddIndexEntry() prepares and finishes.
+  PreparedTrieEntry serial_entry_;
+
+  // The thread that adds blocks, in FinishAddEntry() (the BG writer thread in
+  // parallel builds).
+  //
+  // Blocks added so far.
+  TrieBuilder trie_builder_;
+  // The previous block's handle and the gap after it, for TrackHandle().
+  TrieBlockHandle previous_handle_;
+  uint64_t block_gap_ = 0;
+  // Statistics of the block handles added so far, which EstimatedSize() reads
+  // on the emit thread. They bound the widths of the offset and size columns.
+  // Blocks still being compressed in a parallel build are charged like the
+  // largest block so far, so the estimate can fall short until their handles
+  // arrive. The table builder takes its last estimate in Finish(), after the
+  // last FinishAddEntry(), so that one is an upper bound, as index_factory.h
+  // requires.
+  RelaxedAtomic<uint64_t> max_block_step_{0};
+  RelaxedAtomic<uint64_t> max_block_size_{0};
+  // Whether TrieBuilder::Finish() must store block sizes (see
+  // SizeStats::irregular_gaps in trie.h).
+  RelaxedAtomic<bool> irregular_block_gaps_{false};
+  // Set when FinishAddEntry() receives an entry with nothing prepared in it,
+  // so Finish() fails instead of writing an index that omits that data block.
+  bool has_unprepared_entry_ = false;
+
+  // Finish().
+  bool finished_ = false;
+  // Serialized index.
+  std::string data_;
 };
 
 // ============================================================================
