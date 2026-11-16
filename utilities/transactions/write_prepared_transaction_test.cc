@@ -2566,6 +2566,56 @@ TEST_P(WritePreparedTransactionTest, RollbackPreparedAfterCommitWriteFailure) {
   ASSERT_OK(ReOpenNoDelete());
 }
 
+TEST_P(WritePreparedTransactionTest, RollbackPreparedWithReadError) {
+  // Rolling back a prepared transaction reads the pre-transaction value of
+  // each written key. A retryable read IO error during that lookup must be
+  // returned to the caller with the transaction still PREPARED so that
+  // rollback can be retried.
+  BlockBasedTableOptions bbto;
+  bbto.no_block_cache = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+  ASSERT_OK(ReOpen());
+  fault_fs->SetFileTypesExcludedFromFaultInjection({FileType::kInfoLogFile});
+
+  ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  ASSERT_OK(db->Flush(FlushOptions()));
+
+  TransactionOptions txn_options;
+  std::unique_ptr<Transaction> txn(
+      db->BeginTransaction(WriteOptions(), txn_options));
+  ASSERT_NE(nullptr, txn);
+  ASSERT_OK(txn->SetName("rollback_read_error"));
+  ASSERT_OK(txn->Delete("key"));
+  ASSERT_OK(txn->Prepare());
+
+  fault_fs->SetThreadLocalErrorContext(FaultInjectionIOType::kRead,
+                                       /*seed=*/0, /*one_in=*/1,
+                                       /*retryable=*/true,
+                                       /*has_data_loss=*/false);
+  fault_fs->EnableThreadLocalErrorInjection(FaultInjectionIOType::kRead);
+  const Status rollback_s = txn->Rollback();
+  fault_fs->DisableThreadLocalErrorInjection(FaultInjectionIOType::kRead);
+
+  ASSERT_NOK(rollback_s);
+  ASSERT_TRUE(rollback_s.IsIOError()) << rollback_s.ToString();
+  ASSERT_TRUE(FaultInjectionTestFS::IsInjectedError(rollback_s))
+      << rollback_s.ToString();
+  ASSERT_GE(fault_fs->GetAndResetInjectedThreadLocalErrorCount(
+                FaultInjectionIOType::kRead),
+            1);
+
+  ASSERT_OK(txn->Rollback());
+  txn.reset();
+
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ("value", value);
+
+  ASSERT_OK(ReOpenNoDelete());
+  ASSERT_OK(db->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ("value", value);
+}
+
 TEST_P(WritePreparedTransactionTest, DisableGCDuringRecovery) {
   // Use large buffer to avoid memtable flush after 1024 insertions
   options.write_buffer_size = 1024 * 1024;
