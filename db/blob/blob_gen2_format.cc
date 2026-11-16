@@ -232,7 +232,7 @@ void MultiReadGen2(const ReadOptions& read_options,
   std::vector<FSReadRequest> read_reqs;
   read_reqs.reserve(num);
   for (size_t i = 0; i < num; ++i) {
-    FSReadRequest read_req;
+    FSReadRequest read_req{};
     read_req.offset = slots[i].offset;
     read_req.len = slots[i].len;
     read_reqs.emplace_back(std::move(read_req));
