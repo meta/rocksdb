@@ -986,6 +986,27 @@ def apply_liveness_remote_defaults(params, args):
             DEFAULT_LIVENESS_NO_PROGRESS_TIMEOUT_SEC
             * REMOTE_DB_LIVENESS_TIMEOUT_MULTIPLIER
         )
+    # Run fewer CompactRange calls, so that queued manual compactions do not
+    # starve automatic compaction for longer than the no-progress timeout.
+    #
+    # Background: while an exclusive manual compaction waits in the queue,
+    # RocksDB schedules no automatic compaction for any column family. About
+    # half of the db_stress CompactRange calls are exclusive. On a remote DB,
+    # manual compactions are slow. In one observed run, each one took about 40
+    # to 100 seconds. By default, default_params picks compact_range_one_in
+    # from 1000 and 1000000. At 1000, CompactRange calls arrive about 10 times
+    # faster than the exclusive ones can run one at a time (an estimate from
+    # the same run). The queue then never empties, the number of L0 files
+    # reaches level0_stop_writes_trigger, and writes stay blocked until the
+    # liveness watchdog aborts the test.
+    #
+    # 20000 makes CompactRange 20 times less frequent than 1000. By the same
+    # estimate, exclusive manual compactions then keep their one-at-a-time
+    # queue busy about half of the time, so the queue drains and CompactRange
+    # still gets coverage. The other value, 1000000, is the same as in
+    # default_params.
+    if getattr(args, "compact_range_one_in", None) is None:
+        params["compact_range_one_in"] = lambda: random.choice([20000, 1000000])
 
 
 simple_default_params = {
