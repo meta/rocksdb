@@ -272,7 +272,10 @@ class IndexFactoryIterator {
   //                   of an earlier Prepare(), so the iterator is unbounded
   //                   again.
   // The caller keeps scan_opts and the keys it points to alive until the
-  // ranges are discarded or replaced by another Prepare().
+  // ranges are discarded or replaced by another Prepare(). While the ranges
+  // are set, RocksDB positions the iterator only with SeekAndGetResult() to
+  // each range's start key, in range order, and NextAndGetResult(). It
+  // discards the ranges before positioning the iterator any other way.
   virtual void Prepare(const ScanOptions scan_opts[], size_t num_opts) = 0;
 
   // Context for Seek, carrying the packed sequence+type tag of the

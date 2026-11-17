@@ -822,25 +822,23 @@ Status BlockBasedTableFactory::ValidateOptions(
           "Interpolation search requires BytewiseComparator");
     }
   }
-  // See IndexFactoryOptions for why the two can't be combined. The table
-  // builder repeats this check because SstFileWriter and SetOptions never reach
-  // ValidateOptions; catching it here fails DB::Open instead of letting the DB
-  // open and take writes until the first flush stops it with a fatal error.
-  if (table_options_.GetEffectiveIndexMode() !=
-          BlockBasedTableOptions::IndexMode::kStandardOnly &&
-      table_options_.user_defined_index_factory != nullptr &&
-      cf_opts.comparator != nullptr &&
-      cf_opts.comparator->timestamp_size() > 0) {
-    return Status::InvalidArgument(
-        "user_defined_index_factory is incompatible with user-defined "
-        "timestamps");
-  }
   // kStandardOnly ignores the factory, so only the other modes are bound by
   // its requirements. The user_defined_index_factory option's validate func
   // skips the generic Configurable check so that this one decides.
   if (table_options_.GetEffectiveIndexMode() !=
           BlockBasedTableOptions::IndexMode::kStandardOnly &&
       table_options_.user_defined_index_factory != nullptr) {
+    // See IndexFactoryOptions for why the two can't be combined. The table
+    // builder repeats this check because SstFileWriter and SetOptions never
+    // reach ValidateOptions; catching it here fails DB::Open instead of
+    // letting the DB open and take writes until the first flush stops it with
+    // a fatal error.
+    if (cf_opts.comparator != nullptr &&
+        cf_opts.comparator->timestamp_size() > 0) {
+      return Status::InvalidArgument(
+          "user_defined_index_factory is incompatible with user-defined "
+          "timestamps");
+    }
     Status s = table_options_.user_defined_index_factory->ValidateOptions(
         db_opts, cf_opts);
     if (!s.ok()) {

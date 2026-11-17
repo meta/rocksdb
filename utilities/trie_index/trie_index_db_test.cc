@@ -4800,14 +4800,25 @@ TEST_P(TrieIndexDBTest, IteratorAfterMultiScanIgnoresScanRanges) {
   ASSERT_EQ(all, keys);
 }
 
-// The trie reads its block in place. With mmap reads, a block that is not in
-// the block cache points into the table file's mapping, which lives as long as
-// the table reader; a cached block is a heap copy. Table readers are evicted
-// and reopened here, with and without the index in the block cache.
+// The trie reads its block in place. With mmap reads, a block read from the
+// file points into the table file's mapping, which lives as long as the table
+// reader, and never goes into the block cache. The block cache holds a trie
+// block only when a flush put it there (prepopulate_block_cache), and then it
+// is a heap copy. The cases cover a trie block the table reader reads itself,
+// one looked up in the block cache but never inserted, and one warmed into the
+// cache by flush. 16 SSTs share a 10-reader table cache, so table readers are
+// evicted and reopened.
 TEST_P(TrieIndexDBTest, MmapReads) {
-  for (bool cache_index : {false, true}) {
-    SCOPED_TRACE(cache_index);
+  struct Case {
+    bool cache_index;
+    bool warm_on_flush;
+  };
+  for (const Case c :
+       {Case{false, false}, Case{true, false}, Case{true, true}}) {
+    SCOPED_TRACE(std::to_string(c.cache_index) +
+                 std::to_string(c.warm_on_flush));
     options_.allow_mmap_reads = true;
+    options_.statistics = CreateDBStatistics();
     // The smallest table cache, 10 readers, for 16 SSTs.
     options_.max_open_files = 20;
     options_.disable_auto_compactions = true;
@@ -4816,20 +4827,31 @@ TEST_P(TrieIndexDBTest, MmapReads) {
     table_options.user_defined_index_factory = trie_factory_;
     table_options.index_mode = GetIndexMode();
     table_options.block_size = 256;
-    table_options.cache_index_and_filter_blocks = cache_index;
+    table_options.cache_index_and_filter_blocks = c.cache_index;
+    if (c.warm_on_flush) {
+      table_options.prepopulate_block_cache =
+          BlockBasedTableOptions::PrepopulateBlockCache::kFlushOnly;
+    }
     options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
     last_options_ = options_;
     ASSERT_OK(DB::Open(options_, dbname_, &db_));
 
+    constexpr int kNumSsts = 16;
     std::vector<std::string> keys;
-    for (int sst = 0; sst < 16; sst++) {
-      for (int i = sst; i < 800; i += 16) {
+    for (int sst = 0; sst < kNumSsts; sst++) {
+      for (int i = sst; i < 800; i += kNumSsts) {
         char key[16];
         snprintf(key, sizeof(key), "key_%04d", i);
         ASSERT_OK(db_->Put(WriteOptions(), key,
                            std::string(40, static_cast<char>('a' + sst))));
       }
       ASSERT_OK(db_->Flush(FlushOptions()));
+    }
+    if (c.warm_on_flush) {
+      // Each flush warms its standard index (a stub in kCustomOnly) and its
+      // trie block.
+      ASSERT_EQ(options_.statistics->getTickerCount(BLOCK_CACHE_INDEX_ADD),
+                2 * kNumSsts);
     }
     for (int i = 0; i < 800; i++) {
       char key[16];
@@ -4848,9 +4870,18 @@ TEST_P(TrieIndexDBTest, MmapReads) {
       std::string value;
       for (size_t i = 0; i < keys.size(); i++) {
         ASSERT_OK(db_->Get(TrieIndexReadOptions(), keys[i], &value));
-        ASSERT_EQ(value, std::string(40, static_cast<char>('a' + i % 16)));
+        ASSERT_EQ(value,
+                  std::string(40, static_cast<char>('a' + i % kNumSsts)));
       }
       VerifyScanBothIndexes(keys);
+      if (round == 0 && c.warm_on_flush) {
+        // Every table reader open looks up both index blocks, and each found
+        // the copy its flush warmed.
+        ASSERT_GT(options_.statistics->getTickerCount(BLOCK_CACHE_INDEX_HIT),
+                  0);
+        ASSERT_EQ(options_.statistics->getTickerCount(BLOCK_CACHE_INDEX_MISS),
+                  0);
+      }
     }
     ASSERT_OK(db_->Close());
     db_.reset();

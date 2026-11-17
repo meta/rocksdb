@@ -443,14 +443,15 @@ Status TrieBuilder::Finish(std::string* output) {
   };
 
   size_t prefix_len = 0;
-  size_t max_separator_len = 0;
+  uint64_t max_separator_len = 0;
   if (num_separators > 0) {
     const Slice first = separator(0);
     const Slice last = separator(num_separators - 1);
     prefix_len = CommonPrefix(first.data(), last.data(),
                               std::min(first.size(), last.size()));
     for (uint64_t i = 0; i < num_separators; i++) {
-      max_separator_len = std::max(max_separator_len, separator(i).size());
+      max_separator_len =
+          std::max<uint64_t>(max_separator_len, separator(i).size());
     }
   }
   if (max_separator_len > std::numeric_limits<uint32_t>::max()) {
@@ -765,6 +766,7 @@ struct TrieIterator::Node {
   }
 
   uint32_t Child(uint32_t index) const {
+    assert(index < child_count);
     return pos - LoadLE(pointers + index * pointer_width, pointer_width);
   }
 
@@ -1052,18 +1054,22 @@ uint64_t Trie::SideTableLowerBound(const char* table, uint64_t count,
 }
 
 uint64_t Trie::RunSeparator(uint64_t r) const {
+  assert(r < num_runs_);
   return DecodeFixed64(runs_ + 8 + r * kSideTableEntrySize);
 }
 
 uint64_t Trie::RunCumulativeExtraBlocks(uint64_t r) const {
+  assert(r < num_runs_);
   return DecodeFixed64(runs_ + 16 + r * kSideTableEntrySize);
 }
 
 uint64_t Trie::TagBlock(uint64_t t) const {
+  assert(t < num_tags_);
   return DecodeFixed64(tags_ + 8 + t * kSideTableEntrySize);
 }
 
 uint64_t Trie::TagValue(uint64_t t) const {
+  assert(t < num_tags_);
   return DecodeFixed64(tags_ + 16 + t * kSideTableEntrySize);
 }
 
@@ -1641,16 +1647,24 @@ Status TrieIterator::Prev() {
   }
   // The previous separator's bucket starts with the largest head below the
   // current separator. Front coding only decodes forward, so decode from that
-  // head.
+  // head. A reverse walk enters each bucket once per separator in it, so keep
+  // the head rather than descend the trie for it every time.
   const uint64_t prev_separator = separator_index_ - 1;
-  const size_t prefix_len = index_->prefix_len_;
-  scratch_.assign(key_.data() + prefix_len, key_.size() - prefix_len);
-  Candidate floor;
-  Candidate ceiling;
-  Descend(scratch_.data(), scratch_.size(), &floor, &ceiling);
-  if (!EnterBucketAt(floor, scratch_.data(),
-                     prev_separator / index_->bucket_size_)) {
-    return Corrupt("bucket head out of order");
+  const uint64_t bucket = prev_separator / index_->bucket_size_;
+  if (bucket == prev_head_bucket_) {
+    key_.assign(prev_head_);
+    EnterBucket(bucket);
+  } else {
+    const size_t prefix_len = index_->prefix_len_;
+    scratch_.assign(key_.data() + prefix_len, key_.size() - prefix_len);
+    Candidate floor;
+    Candidate ceiling;
+    Descend(scratch_.data(), scratch_.size(), &floor, &ceiling);
+    if (!EnterBucketAt(floor, scratch_.data(), bucket)) {
+      return Corrupt("bucket head out of order");
+    }
+    prev_head_.assign(key_);
+    prev_head_bucket_ = bucket;
   }
   Status s = AdvanceTo(prev_separator);
   return s.ok() ? EnterSeparatorFromEnd() : s;

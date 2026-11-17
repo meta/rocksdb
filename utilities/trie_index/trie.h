@@ -400,11 +400,17 @@ class TrieIterator {
   // Positions on the last block of the current separator.
   Status EnterSeparatorFromEnd();
 
+  static constexpr uint64_t kNoBucket = ~uint64_t{0};
   const Trie* index_;
   std::string key_;
   std::string scratch_;
   // Copy of a Seek target that points into key_.
   std::string target_;
+  // The head, with the shared prefix, of bucket prev_head_bucket_, which is
+  // the bucket Prev() last found by descending the trie. The trie does not
+  // change, so the copy stays valid for the iterator's life.
+  std::string prev_head_;
+  uint64_t prev_head_bucket_ = kNoBucket;
   const char* bucket_pos_ = nullptr;
   const char* bucket_end_ = nullptr;
   uint64_t bucket_ = 0;

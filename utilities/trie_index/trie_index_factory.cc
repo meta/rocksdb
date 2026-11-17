@@ -272,8 +272,10 @@ TrieIndexIterator::TrieIndexIterator(const Trie* trie,
 
 void TrieIndexIterator::Prepare(const ScanOptions scan_opts[],
                                 size_t num_opts) {
-  // num_opts == 0 (scan_opts may be null) discards the earlier ranges.
-  scan_opts_.assign(scan_opts, scan_opts + num_opts);
+  // num_opts == 0 (scan_opts may be null) discards the earlier ranges. The
+  // caller keeps scan_opts alive until then.
+  scan_opts_ = scan_opts;
+  num_scan_opts_ = num_opts;
   current_scan_idx_ = 0;
 }
 
@@ -298,7 +300,7 @@ Status TrieIndexIterator::SeekAndGetResult(const Slice& target,
   // Advance current_scan_idx_ past any scans whose limit <= target.
   // This handles the multi-scan case where the caller seeks into a later
   // scan range after the previous scan returned kOutOfBound.
-  while (current_scan_idx_ < scan_opts_.size()) {
+  while (current_scan_idx_ < num_scan_opts_) {
     const auto& opts = scan_opts_[current_scan_idx_];
     if (opts.range.limit.has_value() &&
         comparator_->Compare(target, opts.range.limit.value()) >= 0) {
@@ -346,7 +348,7 @@ IterBoundCheck TrieIndexIterator::CheckBounds(
     return IterBoundCheck::kInbound;
   }
 
-  if (current_scan_idx_ >= scan_opts_.size()) {
+  if (current_scan_idx_ >= num_scan_opts_) {
     return IterBoundCheck::kOutOfBound;
   }
 
@@ -430,7 +432,8 @@ Status TrieIndexFactory::NewReader(
   }
   const Comparator* cmp =
       option.comparator ? option.comparator : BytewiseComparator();
-  auto trie_reader = std::make_unique<TrieIndexReader>(cmp);
+  std::unique_ptr<TrieIndexReader> trie_reader =
+      std::make_unique<TrieIndexReader>(cmp);
   s = trie_reader->InitFromSlice(index_block);
   if (!s.ok()) {
     return s;
