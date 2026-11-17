@@ -1,0 +1,1 @@
+Greatly reduced cases of redundant reads of SST file metadata blocks for operations like `GetPropertiesOfAllTables()` while files are still being opened under `max_open_files = -1` and `open_files_async = true`.

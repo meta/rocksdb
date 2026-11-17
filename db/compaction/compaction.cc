@@ -257,7 +257,8 @@ Status Compaction::InitInputTableProperties() {
       std::string file_name =
           TableFileName(immutable_options_.cf_paths, fmd->fd.GetNumber(),
                         fmd->fd.GetPathId());
-      s = input_version_->GetTableProperties(read_options, &tp, fmd,
+      s = input_version_->GetTableProperties(read_options, &tp, fmd, level(i),
+                                             /*allow_table_open=*/true,
                                              &file_name);
       if (s.ok()) {
         input_table_properties_[file_name] = tp;

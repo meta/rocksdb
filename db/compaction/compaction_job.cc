@@ -406,8 +406,11 @@ void CompactionJob::Prepare(
     for (const auto& each_level : *c->inputs()) {
       for (const auto& fmd : each_level.files) {
         std::shared_ptr<const TableProperties> tp;
-        Status s = c->input_version()->GetTableProperties(read_options, &tp,
-                                                          fmd, nullptr);
+        // The DB mutex is held, so this reads only the properties block of a
+        // file that is not open yet. Run() opens it later, without the mutex.
+        Status s = c->input_version()->GetTableProperties(
+            read_options, &tp, fmd, each_level.level,
+            /*allow_table_open=*/false, nullptr);
         if (s.ok()) {
           s = seqno_to_time_mapping_.DecodeFrom(tp->seqno_to_time_mapping);
         }

@@ -1207,31 +1207,45 @@ class Version {
   // Returns the version number of this version
   uint64_t GetVersionNumber() const { return version_number_; }
 
-  // REQUIRES: lock is held
   // On success, "tp" will contains the table properties of the file
-  // specified in "file_meta".  If the file name of "file_meta" is
-  // known ahead, passing it by a non-null "fname" can save a
-  // file-name conversion.
+  // specified in "file_meta", which is at "level" of this version (-1 if
+  // unknown, only with !allow_table_open). If the file name of "file_meta" is
+  // known ahead, passing it by a non-null "fname" can save a file-name
+  // conversion.
+  //
+  // The properties come from the file's TableReader if it is in the table
+  // cache. Otherwise, if allow_table_open and the table cache is unbounded
+  // (max_open_files == -1), this opens the file's TableReader into the table
+  // cache, where it stays. Such files are normally opened anyway: during
+  // DB::Open or LogAndApply, or by the open_files_async background opener.
+  // Otherwise, or if that open fails, the properties block is read directly
+  // from the file. A table open does more I/O than reading the properties
+  // block, so callers holding the DB mutex should pass
+  // allow_table_open = false.
   Status GetTableProperties(const ReadOptions& read_options,
                             std::shared_ptr<const TableProperties>* tp,
-                            const FileMetaData* file_meta,
+                            const FileMetaData* file_meta, int level,
+                            bool allow_table_open,
                             const std::string* fname = nullptr) const;
 
   // On success, *props will be populated with all SSTables' table properties.
   // The keys of `props` are the sst file name, the values of `props` are the
-  // tables' properties, represented as std::shared_ptr.
-  Status GetPropertiesOfAllTables(const ReadOptions& read_options,
-                                  TablePropertiesCollection* props) const;
+  // tables' properties, represented as std::shared_ptr. allow_table_open is
+  // as for GetTableProperties().
   Status GetPropertiesOfAllTables(const ReadOptions& read_options,
                                   TablePropertiesCollection* props,
-                                  int level) const;
+                                  bool allow_table_open) const;
+  Status GetPropertiesOfAllTables(const ReadOptions& read_options,
+                                  TablePropertiesCollection* props, int level,
+                                  bool allow_table_open) const;
   Status GetPropertiesOfTablesInRange(const ReadOptions& read_options,
                                       const autovector<UserKeyRange>& ranges,
-                                      TablePropertiesCollection* props) const;
+                                      TablePropertiesCollection* props,
+                                      bool allow_table_open) const;
   Status GetPropertiesOfTablesByLevel(
       const ReadOptions& read_options,
-      std::vector<std::unique_ptr<TablePropertiesCollection>>* props_by_level)
-      const;
+      std::vector<std::unique_ptr<TablePropertiesCollection>>* props_by_level,
+      bool allow_table_open) const;
 
   // Print summary of range delete tombstones in SST files into out_str,
   // with maximum max_entries_to_print entries printed out.
@@ -2316,7 +2330,7 @@ class ReactiveVersionSet : public VersionSet {
   // or blob files. Only used by the DB::OpenAndCompact remote-compaction path.
   void SetTrustManifestRecovery(bool v) { trust_manifest_recovery_ = v; }
 
-  // Returns the column family's log number as of the Version currently
+  // Returns the column family's log number
   // installed for it, i.e. the log number that the MANIFEST records that
   // Version was built from had put in effect. Data written to WALs older than
   // the returned number has been flushed by the primary into files the
