@@ -2412,6 +2412,29 @@ Status StressTest::CommitTxn(Transaction& txn, ThreadState* thread) {
                 txn.GetName().c_str(), s.ToString().c_str(),
                 rollback_s.ToString().c_str(), rollback_recovery_retries,
                 resume_busy_count, last_resume_status.c_str());
+        // The transaction stays prepared in the DB, and the caller resets the
+        // expected values of its keys to their old values. The test cannot
+        // keep those expected values correct:
+        // - When the transaction object is destroyed, its locks are released,
+        //   so other threads can write and commit the same keys.
+        // - When db_stress starts again, ProcessRecoveredPreparedTxns()
+        //   commits or rolls back the recovered transaction at random. A
+        //   commit makes the writes of the failed transaction visible, for
+        //   example a Delete of a key that the expected state marks as a
+        //   pending Put. In WriteCommitted these writes also win over later
+        //   writes to the same key.
+        // - A DB reopen in the same process does not resolve the transaction
+        //   either. It stays prepared until db_stress starts again, and then
+        //   the case above applies.
+        // Stop now, so that this message is the first and only error, instead
+        // of a later verification failure that looks like data loss.
+        if (thread != nullptr) {
+          thread->shared->SafeTerminate();
+        }
+        // Without a thread state (DB preload), no worker thread of this DB has
+        // started yet, so no other thread can print an error for this DB at
+        // the same time.
+        std::terminate();
       }
     }
     if (thread && FLAGS_create_timestamped_snapshot_one_in > 0 &&
