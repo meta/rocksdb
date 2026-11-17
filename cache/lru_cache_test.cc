@@ -5,6 +5,8 @@
 
 #include "cache/lru_cache.h"
 
+#include <atomic>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
@@ -414,6 +416,14 @@ class ClockCacheTest : public testing::Test {
     return Insert(TestHashedKey(key), priority);
   }
 
+  // Inserts key, returning a reference to it in *handle
+  Status InsertReferenced(char key, typename Shard::HandleImpl** handle) {
+    const UniqueId64x2 hashed_key = TestHashedKey(key);
+    return shard_->Insert(TestKey(hashed_key), hashed_key, nullptr /*value*/,
+                          &kNoopCacheItemHelper, 1 /*charge*/, handle,
+                          Cache::Priority::LOW);
+  }
+
   Status InsertWithLen(char key, size_t len) {
     std::string skey(len, key);
     return shard_->Insert(skey, TestHashedKey(key), nullptr /*value*/,
@@ -461,6 +471,37 @@ class ClockCacheTest : public testing::Test {
     return {static_cast<uint64_t>(i) * uint64_t{0x85EBCA77C2B2AE63},
             static_cast<uint64_t>(i) * uint64_t{0xC2B2AE3D27D4EB4F}};
   }
+
+#ifndef NDEBUG
+  // Runs release_fn in another thread and holds it at sync_point (the first
+  // time any thread reaches it) while this thread runs meanwhile_fn. Returns
+  // what release_fn returned.
+  template <typename ReleaseFn, typename MeanwhileFn>
+  static bool ReleaseHeldAt(const std::string& sync_point,
+                            const ReleaseFn& release_fn,
+                            const MeanwhileFn& meanwhile_fn) {
+    std::promise<void> reached;
+    std::promise<void> resume;
+    std::shared_future<void> resumed = resume.get_future().share();
+    std::atomic<bool> held{false};
+    SyncPoint::GetInstance()->SetCallBack(sync_point, [&](void*) {
+      if (!held.exchange(true)) {
+        reached.set_value();
+        resumed.wait();
+      }
+    });
+    SyncPoint::GetInstance()->EnableProcessing();
+    bool result = false;
+    port::Thread release_thread([&] { result = release_fn(); });
+    reached.get_future().wait();
+    meanwhile_fn();
+    resume.set_value();
+    release_thread.join();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    return result;
+  }
+#endif  // !NDEBUG
 
   Shard* shard_ = nullptr;
 
@@ -779,6 +820,14 @@ TYPED_TEST(ClockCacheTest, ClockCounterOverflowTest) {
     shard.TEST_RefN(h, 1234567);
     shard.TEST_ReleaseN(h, 1234567);
   }
+  // And more, with the last release of each batch using erase_if_last_ref (not
+  // the last ref, so it only drops it). That release is the only one in these
+  // batches that corrects for overflow.
+  for (int i = 0; i < 10000; ++i) {
+    shard.TEST_RefN(h, 1234567);
+    shard.TEST_ReleaseNMinus1(h, 1234567);
+    ASSERT_FALSE(shard.Release(h, /*useful=*/true, /*erase_if_last_ref=*/true));
+  }
   // Free all but last 1
   shard.TEST_ReleaseN(h, 123456789);
   // Still alive
@@ -788,6 +837,152 @@ TYPED_TEST(ClockCacheTest, ClockCounterOverflowTest) {
   // Deleted
   ASSERT_EQ(val.deleted, 1);
 }
+
+// A release with erase_if_last_ref that isn't of the last reference drops it
+// like any other release: a useful one counts as a use (one more acquire and
+// one more release than before the reference was taken), and one not useful
+// returns the counters to their state before the reference was taken.
+TYPED_TEST(ClockCacheTest, ReleaseEraseIfLastRefOfNotLastRef) {
+  using HandleImpl = typename TypeParam::Shard::HandleImpl;
+  using SlotMeta = ClockHandle::SlotMeta;
+  this->NewShard(10, /*strict_capacity_limit=*/false);
+  auto& shard = *this->shard_;
+  HandleImpl* handle = nullptr;
+  ASSERT_OK(this->InsertReferenced('a', &handle));
+  for (bool useful : {true, false}) {
+    SCOPED_TRACE("useful=" + std::to_string(useful));
+    const SlotMeta before = handle->meta.Load();
+    ASSERT_TRUE(shard.Ref(handle));
+    EXPECT_FALSE(shard.Release(handle, useful, /*erase_if_last_ref=*/true));
+    const SlotMeta after = handle->meta.Load();
+    const uint32_t added = useful ? 1 : 0;
+    EXPECT_EQ(before.GetAcquireCounter() + added, after.GetAcquireCounter());
+    EXPECT_EQ(before.GetReleaseCounter() + added, after.GetReleaseCounter());
+  }
+  EXPECT_TRUE(shard.Release(handle, /*useful=*/true,
+                            /*erase_if_last_ref=*/true));
+  EXPECT_FALSE(this->Lookup('a'));
+  EXPECT_EQ(0U, shard.GetUsage());
+}
+
+#ifndef NDEBUG
+// Releasing the last reference with erase_if_last_ref erases the entry it
+// referenced. Here the release is held after loading the entry's state while
+// the entry is erased and another key with the same home is inserted: had the
+// release dropped its reference first, it would take the new key's entry in
+// the freed slot.
+TYPED_TEST(ClockCacheTest, ReleaseEraseIfLastRefErasesOnlyItsOwnEntry) {
+  using HandleImpl = typename TypeParam::Shard::HandleImpl;
+  this->NewShard(10, /*strict_capacity_limit=*/false);
+  auto& shard = *this->shard_;
+  HandleImpl* handle = nullptr;
+  ASSERT_OK(this->InsertReferenced('a', &handle));
+  bool erased = this->ReleaseHeldAt(
+      "ClockCache::Release:EraseIfLastRef",
+      [&] {
+        return shard.Release(handle, /*useful=*/true,
+                             /*erase_if_last_ref=*/true);
+      },
+      [&] {
+        this->Erase('a');
+        ASSERT_OK(this->Insert('b'));
+      });
+  EXPECT_TRUE(erased);
+  EXPECT_FALSE(this->Lookup('a'));
+  EXPECT_TRUE(this->Lookup('b'));
+  EXPECT_EQ(1U, shard.GetUsage());
+}
+
+// A release with erase_if_last_ref that starts with another reference
+// outstanding erases the entry if the other reference is released before it
+// drops its own.
+TYPED_TEST(ClockCacheTest, ReleaseEraseIfLastRefAfterOtherRelease) {
+  using HandleImpl = typename TypeParam::Shard::HandleImpl;
+  for (bool useful : {true, false}) {
+    SCOPED_TRACE("useful=" + std::to_string(useful));
+    this->NewShard(10, /*strict_capacity_limit=*/false);
+    auto& shard = *this->shard_;
+    HandleImpl* handle = nullptr;
+    ASSERT_OK(this->InsertReferenced('a', &handle));
+    ASSERT_TRUE(shard.Ref(handle));
+    bool other_erased = true;
+    bool erased = this->ReleaseHeldAt(
+        "ClockCache::Release:EraseIfLastRef",
+        [&] {
+          return shard.Release(handle, useful, /*erase_if_last_ref=*/true);
+        },
+        [&] {
+          other_erased = shard.Release(handle, /*useful=*/true,
+                                       /*erase_if_last_ref=*/false);
+        });
+    EXPECT_FALSE(other_erased);
+    EXPECT_TRUE(erased);
+    EXPECT_FALSE(this->Lookup('a'));
+    EXPECT_EQ(0U, shard.GetUsage());
+  }
+}
+
+// Releasing the last reference to an erased entry frees it, but not a new
+// entry that another thread put in the slot after freeing the erased one:
+// here an insert evicts the erased entry once the release has dropped its
+// reference, and takes its slot.
+TYPED_TEST(ClockCacheTest, ReleaseOfErasedEntryLeavesItsSlotsNextEntry) {
+  using HandleImpl = typename TypeParam::Shard::HandleImpl;
+  this->NewShard(1, /*strict_capacity_limit=*/false);
+  auto& shard = *this->shard_;
+  HandleImpl* handle = nullptr;
+  ASSERT_OK(this->InsertReferenced('a', &handle));
+  // Only marked invisible, as the handle holds it.
+  this->Erase('a');
+  bool erased = this->ReleaseHeldAt(
+      "ClockCache::Release:EraseInvisible",
+      [&] {
+        return shard.Release(handle, /*useful=*/true,
+                             /*erase_if_last_ref=*/false);
+      },
+      [&] {
+        // Evicts a, now unreferenced, and takes its slot.
+        ASSERT_OK(this->Insert('b'));
+      });
+  // a was freed by the eviction, not by the release
+  EXPECT_FALSE(erased);
+  EXPECT_FALSE(this->Lookup('a'));
+  EXPECT_TRUE(this->Lookup('b'));
+  EXPECT_EQ(1U, shard.GetUsage());
+}
+
+// A standalone handle is born invisible. With two references to one, the
+// release that isn't the last must not read the handle after dropping its
+// reference, as the last release deletes it meanwhile. (ASAN reports such a
+// read.)
+TYPED_TEST(ClockCacheTest, ReleaseOfStandaloneHandleRacingLastRelease) {
+  using HandleImpl = typename TypeParam::Shard::HandleImpl;
+  this->NewShard(1, /*strict_capacity_limit=*/false);
+  auto& shard = *this->shard_;
+  const UniqueId64x2 hkey = this->TestHashedKey('a');
+  HandleImpl* handle =
+      shard.CreateStandalone(this->TestKey(hkey), hkey, nullptr /*value*/,
+                             &kNoopCacheItemHelper, 1 /*charge*/,
+                             /*allow_uncharged=*/false);
+  ASSERT_NE(nullptr, handle);
+  ASSERT_TRUE(shard.Ref(handle));
+  bool last_erased = false;
+  bool erased = this->ReleaseHeldAt(
+      "ClockCache::Release:EraseInvisible",
+      [&] {
+        return shard.Release(handle, /*useful=*/true,
+                             /*erase_if_last_ref=*/false);
+      },
+      [&] {
+        last_erased = shard.Release(handle, /*useful=*/true,
+                                    /*erase_if_last_ref=*/false);
+      });
+  EXPECT_TRUE(last_erased);
+  EXPECT_FALSE(erased);
+  EXPECT_EQ(0U, shard.GetUsage());
+  EXPECT_EQ(0U, shard.GetStandaloneUsage());
+}
+#endif  // !NDEBUG
 
 TYPED_TEST(ClockCacheTest, ClockTableFull) {
   // Force clock cache table to fill up (not usually allowed) in order
