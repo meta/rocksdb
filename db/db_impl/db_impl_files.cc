@@ -1161,9 +1161,12 @@ Status DBImpl::SetupDBId(const WriteOptions& write_options, bool read_only,
     // Check for the IDENTITY file and create it if not there or
     // broken or not matching manifest
     std::string db_id_in_file;
-    s = fs_->FileExists(IdentityFileName(dbname_), IOOptions(), nullptr);
+    IOOptions exists_opts;
+    exists_opts.type = IOType::kMetadata;
+    s = fs_->FileExists(IdentityFileName(dbname_), exists_opts, nullptr);
     if (s.ok()) {
       IOOptions opts;
+      opts.type = IOType::kMetadata;
       if (is_retry) {
         opts.verify_and_reconstruct_read = true;
       }

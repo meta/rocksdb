@@ -58,6 +58,9 @@ class LineFileReader {
   // permanent and no retry or recovery is attempted with the same
   // LineFileReader.
   const IOStatus& GetStatus() const { return io_status_; }
+
+  // See SequentialFileReader::SetIOType()
+  void SetIOType(IOType io_type) { sfr_.SetIOType(io_type); }
 };
 
 }  // namespace ROCKSDB_NAMESPACE

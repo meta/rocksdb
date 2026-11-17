@@ -5745,7 +5745,10 @@ Status VersionSet::Close(FSDirectory* db_dir, InstrumentedMutex* mu) {
   descriptor_log_.reset();
   TEST_SYNC_POINT("VersionSet::Close:AfterClose");
   if (io_s.ok()) {
-    io_s = fs_->GetFileSize(manifest_file_name, IOOptions(), &size, nullptr);
+    IOOptions manifest_io_opts;
+    manifest_io_opts.type = IOType::kManifest;
+    io_s =
+        fs_->GetFileSize(manifest_file_name, manifest_io_opts, &size, nullptr);
   }
   if (!io_s.ok() || size != manifest_file_size_) {
     if (io_s.ok()) {
@@ -5788,7 +5791,7 @@ Status VersionSet::Close(FSDirectory* db_dir, InstrumentedMutex* mu) {
           DescriptorFileName(dbname_, manifest_file_number_);
       std::unique_ptr<FSSequentialFile> manifest_file;
       IOStatus content_io_s = fs_->NewSequentialFile(
-          content_manifest_name, fs_->OptimizeForManifestRead(file_options_),
+          content_manifest_name, GetFileOptionsForManifestRead(),
           &manifest_file, nullptr);
       if (!content_io_s.ok()) {
         // Surface I/O errors to the caller -- users who call DB::Close() and
@@ -5806,6 +5809,7 @@ Status VersionSet::Close(FSDirectory* db_dir, InstrumentedMutex* mu) {
                                    content_manifest_name,
                                    db_options_->log_readahead_size, io_tracer_,
                                    db_options_->listeners));
+      manifest_file_reader->SetIOType(IOType::kManifest);
       LogReporter reporter;
       Status log_read_status;
       reporter.status = &log_read_status;
@@ -6958,6 +6962,13 @@ FileOptions VersionSet::GetFileOptionsForManifestWrite() const {
   if (file_options_.temperature != Temperature::kUnknown) {
     opt_file_opts.temperature = file_options_.temperature;
   }
+  opt_file_opts.io_options.type = IOType::kManifest;
+  return opt_file_opts;
+}
+
+FileOptions VersionSet::GetFileOptionsForManifestRead() const {
+  FileOptions opt_file_opts = fs_->OptimizeForManifestRead(file_options_);
+  opt_file_opts.io_options.type = IOType::kManifest;
   return opt_file_opts;
 }
 
@@ -7017,8 +7028,8 @@ Status VersionSet::ReopenManifestForAppend(const std::string& manifest_path) {
   // consumed -- likely a torn tail from a prior crash; mid-block append
   // would mis-frame the record stream.
   uint64_t physical_size = 0;
-  IOStatus stat_s = fs_->GetFileSize(manifest_path, IOOptions(), &physical_size,
-                                     /*dbg=*/nullptr);
+  IOStatus stat_s = fs_->GetFileSize(manifest_path, opt_file_opts.io_options,
+                                     &physical_size, /*dbg=*/nullptr);
   if (!stat_s.ok() ||
       physical_size != manifest_recovery_last_valid_record_end_) {
     ROCKS_LOG_WARN(db_options_->info_log,
@@ -7098,23 +7109,25 @@ Status VersionSet::AppendColumnFamilyDropsToManifest(
   // memory (which can reach ~1GB depending on configuration).
   const std::string tmp_path = manifest_path + ".tmp";
 
+  FileOptions opt_file_opts = GetFileOptionsForManifestWrite();
+  // Buffered writes only: direct writes would need alignment / tail-pad
+  // reasoning that isn't worth the complexity for a checkpoint MANIFEST.
+  opt_file_opts.use_direct_writes = false;
+
   // Best-effort cleanup of any stale .tmp left by a prior aborted run.
-  fs_->DeleteFile(tmp_path, IOOptions(), /*dbg=*/nullptr)
+  fs_->DeleteFile(tmp_path, opt_file_opts.io_options, /*dbg=*/nullptr)
       .PermitUncheckedError();
 
   std::unique_ptr<FSSequentialFile> src_file;
   {
-    IOStatus io_s = fs_->NewSequentialFile(manifest_path, FileOptions(),
+    FileOptions src_file_opts;
+    src_file_opts.io_options.type = IOType::kManifest;
+    IOStatus io_s = fs_->NewSequentialFile(manifest_path, src_file_opts,
                                            &src_file, /*dbg=*/nullptr);
     if (!io_s.ok()) {
       return io_s;
     }
   }
-
-  FileOptions opt_file_opts = GetFileOptionsForManifestWrite();
-  // Buffered writes only: direct writes would need alignment / tail-pad
-  // reasoning that isn't worth the complexity for a checkpoint MANIFEST.
-  opt_file_opts.use_direct_writes = false;
 
   std::unique_ptr<FSWritableFile> dst_file;
   {
@@ -7233,7 +7246,8 @@ Status VersionSet::AppendColumnFamilyDropsToManifest(
 
   // Replace the original with the rewritten .tmp.
   IOStatus rename_s =
-      fs_->RenameFile(tmp_path, manifest_path, IOOptions(), /*dbg=*/nullptr);
+      fs_->RenameFile(tmp_path, manifest_path, opt_file_opts.io_options,
+                      /*dbg=*/nullptr);
   if (!rename_s.ok()) {
     return rename_s;
   }
@@ -7241,12 +7255,13 @@ Status VersionSet::AppendColumnFamilyDropsToManifest(
   const std::string manifest_dir =
       slash == std::string::npos ? "." : manifest_path.substr(0, slash);
   std::unique_ptr<FSDirectory> dir;
-  IOStatus dir_s = fs_->NewDirectory(manifest_dir, IOOptions(), &dir, nullptr);
+  IOStatus dir_s =
+      fs_->NewDirectory(manifest_dir, opt_file_opts.io_options, &dir, nullptr);
   if (!dir_s.ok()) {
     return dir_s;
   }
   assert(dir != nullptr);
-  dir_s = dir->FsyncWithDirOptions(IOOptions(), nullptr,
+  dir_s = dir->FsyncWithDirOptions(opt_file_opts.io_options, nullptr,
                                    DirFsyncOptions(manifest_path));
   if (!dir_s.ok()) {
     return dir_s;
@@ -7274,8 +7289,7 @@ Status VersionSet::Recover(
   std::unique_ptr<SequentialFileReader> manifest_file_reader;
   {
     std::unique_ptr<FSSequentialFile> manifest_file;
-    s = fs_->NewSequentialFile(manifest_path,
-                               fs_->OptimizeForManifestRead(file_options_),
+    s = fs_->NewSequentialFile(manifest_path, GetFileOptionsForManifestRead(),
                                &manifest_file, nullptr);
     if (!s.ok()) {
       return s;
@@ -7284,6 +7298,7 @@ Status VersionSet::Recover(
         std::move(manifest_file), manifest_path,
         db_options_->log_readahead_size, io_tracer_, db_options_->listeners,
         /*rate_limiter=*/nullptr, is_retry));
+    manifest_file_reader->SetIOType(IOType::kManifest);
   }
   TEST_SYNC_POINT("VersionSet::Recover:StartManifestRead");
 
@@ -7464,8 +7479,7 @@ Status VersionSet::TryRecoverFromOneManifest(
   Status s;
   {
     std::unique_ptr<FSSequentialFile> manifest_file;
-    s = fs_->NewSequentialFile(manifest_path,
-                               fs_->OptimizeForManifestRead(file_options_),
+    s = fs_->NewSequentialFile(manifest_path, GetFileOptionsForManifestRead(),
                                &manifest_file, nullptr);
     if (!s.ok()) {
       return s;
@@ -7473,6 +7487,7 @@ Status VersionSet::TryRecoverFromOneManifest(
     manifest_file_reader.reset(new SequentialFileReader(
         std::move(manifest_file), manifest_path,
         db_options_->log_readahead_size, io_tracer_, db_options_->listeners));
+    manifest_file_reader->SetIOType(IOType::kManifest);
   }
 
   assert(s.ok());
@@ -7565,12 +7580,15 @@ Status VersionSet::ListColumnFamiliesFromManifest(
     std::unique_ptr<FSSequentialFile> file;
     // these are just for performance reasons, not correctness,
     // so we're fine using the defaults
-    s = fs->NewSequentialFile(manifest_path, FileOptions(), &file, nullptr);
+    FileOptions file_opts;
+    file_opts.io_options.type = IOType::kManifest;
+    s = fs->NewSequentialFile(manifest_path, file_opts, &file, nullptr);
     if (!s.ok()) {
       return s;
     }
     file_reader = std::make_unique<SequentialFileReader>(
         std::move(file), manifest_path, /*io_tracer=*/nullptr);
+    file_reader->SetIOType(IOType::kManifest);
   }
 
   VersionSet::LogReporter reporter;
@@ -7631,7 +7649,9 @@ Status VersionSet::GetOptionsFileManifestState(
     }
 
     std::unique_ptr<FSSequentialFile> file;
-    s = fs->NewSequentialFile(manifest_path, FileOptions(), &file, nullptr);
+    FileOptions file_opts;
+    file_opts.io_options.type = IOType::kManifest;
+    s = fs->NewSequentialFile(manifest_path, file_opts, &file, nullptr);
     if (s.IsNotFound() || s.IsPathNotFound()) {
       if (attempt + 1 == kMaxAttempts) {
         return s;
@@ -7643,6 +7663,7 @@ Status VersionSet::GetOptionsFileManifestState(
     }
     auto file_reader = std::make_unique<SequentialFileReader>(
         std::move(file), manifest_path, /*io_tracer=*/nullptr);
+    file_reader->SetIOType(IOType::kManifest);
     LogReporter reporter;
     reporter.status = &s;
     log::Reader reader(nullptr, std::move(file_reader), &reporter,
@@ -7744,13 +7765,16 @@ Status VersionSet::ResolveOptionsFileNumber(
     TEST_SYNC_POINT(
         "VersionSet::ResolveOptionsFileNumber:InspectTrackingMarker");
     std::unique_ptr<FSSequentialFile> file;
-    Status s = fs->NewSequentialFile(path, FileOptions(), &file, nullptr);
+    FileOptions file_opts;
+    file_opts.io_options.type = IOType::kMetadata;
+    Status s = fs->NewSequentialFile(path, file_opts, &file, nullptr);
     if (!s.ok()) {
       return s;
     }
     LineFileReader reader(std::move(file), path, /*io_tracer=*/nullptr,
                           std::vector<std::shared_ptr<EventListener>>{},
                           /*rate_limiter=*/nullptr);
+    reader.SetIOType(IOType::kMetadata);
     bool in_db_options = false;
     std::string line;
     while (reader.ReadLine(&line, Env::IO_TOTAL)) {
@@ -8029,13 +8053,15 @@ Status VersionSet::DumpManifest(
   {
     std::unique_ptr<FSSequentialFile> file;
     const std::shared_ptr<FileSystem>& fs = options.env->GetFileSystem();
-    s = fs->NewSequentialFile(
-        dscname, fs->OptimizeForManifestRead(file_options_), &file, nullptr);
+    FileOptions file_opts = fs->OptimizeForManifestRead(file_options_);
+    file_opts.io_options.type = IOType::kManifest;
+    s = fs->NewSequentialFile(dscname, file_opts, &file, nullptr);
     if (!s.ok()) {
       return s;
     }
     file_reader = std::make_unique<SequentialFileReader>(
         std::move(file), dscname, db_options_->log_readahead_size, io_tracer_);
+    file_reader->SetIOType(IOType::kManifest);
   }
 
   std::map<std::string, const ColumnFamilyDescriptor*> cf_name_to_desc;
@@ -9146,7 +9172,9 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
   }
   assert(nullptr == manifest_reader->get() ||
          manifest_reader->get()->file()->file_name() != manifest_path);
-  s = fs_->FileExists(manifest_path, IOOptions(), nullptr);
+  IOOptions manifest_io_opts;
+  manifest_io_opts.type = IOType::kManifest;
+  s = fs_->FileExists(manifest_path, manifest_io_opts, nullptr);
   if (s.IsNotFound()) {
     return Status::TryAgain(
         "The primary may have switched to a new MANIFEST and deleted the old "
@@ -9163,14 +9191,14 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
   // The primary can also delete the MANIFEST while the secondary is reading
   // it. This is OK on POSIX. For other file systems, maybe create a hard link
   // to MANIFEST. The hard link should be cleaned up later by the secondary.
-  s = fs_->NewSequentialFile(manifest_path,
-                             fs_->OptimizeForManifestRead(file_options_),
+  s = fs_->NewSequentialFile(manifest_path, GetFileOptionsForManifestRead(),
                              &manifest_file, nullptr);
   std::unique_ptr<SequentialFileReader> manifest_file_reader;
   if (s.ok()) {
     manifest_file_reader.reset(new SequentialFileReader(
         std::move(manifest_file), manifest_path,
         db_options_->log_readahead_size, io_tracer_, db_options_->listeners));
+    manifest_file_reader->SetIOType(IOType::kManifest);
     manifest_reader->reset(new log::FragmentBufferedReader(
         nullptr, std::move(manifest_file_reader), reporter, true /* checksum */,
         0 /* log_number */));

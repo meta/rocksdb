@@ -236,6 +236,7 @@ IOStatus ReadFileToString(FileSystem* fs, const std::string& fname,
 IOStatus ReadFileToString(FileSystem* fs, const std::string& fname,
                           const IOOptions& opts, std::string* data) {
   FileOptions soptions;
+  soptions.io_options.type = opts.type;
   data->clear();
   std::unique_ptr<FSSequentialFile> file;
   IOStatus s = status_to_io_status(

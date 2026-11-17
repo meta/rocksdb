@@ -115,7 +115,14 @@ struct IOOptions {
   // rate_limiter_priority
   Env::IOPriority rate_limiter_priority;
 
-  // Type of data being read/written
+  // Type of data being read/written. This is a hint that a FileSystem may
+  // use, e.g. to give small metadata IO priority over bulk data IO. RocksDB
+  // sets IOType::kManifest for IO on MANIFEST files and IOType::kMetadata for
+  // IO on CURRENT, IDENTITY and OPTIONS files and their temporary files, both
+  // in FileOptions::io_options when opening such a file and in the IOOptions
+  // of later IO on it. Other IO, such as WAL, SST and blob file IO, and calls
+  // made through Env APIs (which take no IOOptions) may carry
+  // IOType::kUnknown.
   IOType type;
 
   // EXPERIMENTAL
@@ -2202,7 +2209,8 @@ IOStatus WriteStringToFile(FileSystem* fs, const Slice& data,
 IOStatus ReadFileToString(FileSystem* fs, const std::string& fname,
                           std::string* data);
 
-// A utility routine: read contents of named file into *data
+// A utility routine: read contents of named file into *data. `opts.type` is
+// also used for opening the file.
 IOStatus ReadFileToString(FileSystem* fs, const std::string& fname,
                           const IOOptions& opts, std::string* data);
 

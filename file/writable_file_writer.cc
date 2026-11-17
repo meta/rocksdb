@@ -1139,6 +1139,9 @@ IOOptions WritableFileWriter::FinalizeIOOptions(const IOOptions& opts) const {
         WritableFileWriter::DecideRateLimiterPriority(
             writable_file_->GetIOPriority(), op_rate_limiter_priority);
   }
+  if (io_options.type == IOType::kUnknown) {
+    io_options.type = io_type_;
+  }
   return io_options;
 }
 }  // namespace ROCKSDB_NAMESPACE

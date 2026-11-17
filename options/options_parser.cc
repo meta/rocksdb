@@ -72,13 +72,19 @@ Status PersistRocksDBOptions(const WriteOptions& write_options,
 
   FileOptions file_options;
   file_options.temperature = db_opt.metadata_write_temperature;
+  file_options.io_options.type = IOType::kMetadata;
   Status s = fs->NewWritableFile(file_name, file_options, &wf, nullptr);
   if (!s.ok()) {
     return s;
   }
+  // The writer keeps its default settings and only adds the IO type. Reusing
+  // file_options would also pass its temperature to the writer, which reports
+  // it to listeners.
+  FileOptions writer_options;
+  writer_options.io_options.type = IOType::kMetadata;
   std::unique_ptr<WritableFileWriter> writable;
-  writable.reset(new WritableFileWriter(std::move(wf), file_name, EnvOptions(),
-                                        nullptr /* statistics */));
+  writable.reset(new WritableFileWriter(
+      std::move(wf), file_name, writer_options, nullptr /* statistics */));
   TEST_SYNC_POINT("PersistRocksDBOptions:create");
 
   std::string options_file_content;
@@ -276,7 +282,9 @@ Status RocksDBOptionsParser::Parse(const ConfigOptions& config_options_in,
   bool retry = false;
   do {
     std::unique_ptr<FSSequentialFile> seq_file;
-    s = fs->NewSequentialFile(file_name, FileOptions(), &seq_file, nullptr);
+    FileOptions file_options;
+    file_options.io_options.type = IOType::kMetadata;
+    s = fs->NewSequentialFile(file_name, file_options, &seq_file, nullptr);
     if (!s.ok()) {
       return s;
     }
@@ -284,6 +292,7 @@ Status RocksDBOptionsParser::Parse(const ConfigOptions& config_options_in,
     LineFileReader lf_reader(
         std::move(seq_file), file_name, config_options.file_readahead_size,
         nullptr, std::vector<std::shared_ptr<EventListener>>{}, nullptr, retry);
+    lf_reader.SetIOType(IOType::kMetadata);
 
     OptionSection section = kOptionSectionUnknown;
     std::string title;

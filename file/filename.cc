@@ -467,8 +467,10 @@ IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
   std::string tmp = TempFileName(dbname, descriptor_number);
   IOOptions opts;
   IOStatus s = PrepareIOFromWriteOptions(write_options, opts);
+  opts.type = IOType::kMetadata;
   FileOptions file_opts;
   file_opts.temperature = temp;
+  file_opts.io_options.type = IOType::kMetadata;
   if (s.ok()) {
     s = WriteStringToFile(fs, contents.ToString() + "\n", tmp, true, opts,
                           file_opts);
@@ -511,13 +513,17 @@ Status SetIdentityFile(const WriteOptions& write_options, Env* env,
   Status s;
   IOOptions opts;
   s = PrepareIOFromWriteOptions(write_options, opts);
+  opts.type = IOType::kMetadata;
   FileOptions file_opts;
   file_opts.temperature = temp;
+  file_opts.io_options.type = IOType::kMetadata;
   if (s.ok()) {
     s = WriteStringToFile(env->GetFileSystem().get(), id, tmp,
                           /*should_sync=*/true, opts, file_opts);
   }
   if (s.ok()) {
+    // Env::RenameFile() takes no IOOptions, so this rename is not tagged with
+    // IOType::kMetadata. It stays on Env so that Env overrides still apply.
     s = env->RenameFile(tmp, identify_file_name);
   }
   std::unique_ptr<FSDirectory> dir_obj;
