@@ -709,11 +709,32 @@ bool ForwardIterator::IsValuePinned() const {
 }
 
 void ForwardIterator::RebuildIterators(bool refresh_sv) {
-  // Clean up
+  // The iterator can outlive its column family: the user can drop the column
+  // family and destroy its handle. Then a SuperVersion can hold the last
+  // reference to cfd_. Two cases:
+  //   1. sv_ is the column family's current SuperVersion. Destroying the
+  //      handle leaves the column family with only that SuperVersion's
+  //      reference, so ColumnFamilyData::UnrefAndTryDelete() releases the
+  //      current SuperVersion and its thread-local cache. The column family
+  //      has no SuperVersion to give out any more, and sv_ holds the last
+  //      reference to cfd_. So keep sv_ when it is still current. This also
+  //      saves a SuperVersion reference for a live column family, where
+  //      GetReferencedSuperVersion() would return the same SuperVersion. A
+  //      dropped column family never installs a new SuperVersion, so it always
+  //      takes this path.
+  //   2. sv_ is older. Then sv_ and the current SuperVersion each hold a
+  //      reference, so the current SuperVersion is still there. Take the new
+  //      SuperVersion before Cleanup() releases sv_, as RenewIterators() does,
+  //      so that releasing sv_ cannot free cfd_ first.
+  if (refresh_sv && sv_ != nullptr &&
+      sv_->version_number == cfd_->GetSuperVersionNumber()) {
+    refresh_sv = false;
+  }
+  SuperVersion* const new_sv =
+      refresh_sv ? cfd_->GetReferencedSuperVersion(db_) : nullptr;
   Cleanup(refresh_sv);
   if (refresh_sv) {
-    // New
-    sv_ = cfd_->GetReferencedSuperVersion(db_);
+    sv_ = new_sv;
   }
   ReadRangeDelAggregator range_del_agg(&cfd_->internal_comparator(),
                                        kMaxSequenceNumber /* upper_bound */);
