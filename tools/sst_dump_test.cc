@@ -18,6 +18,8 @@
 #include "rocksdb/file_system.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/sst_dump_tool.h"
+#include "rocksdb/sst_file_writer.h"
+#include "rocksdb/statistics.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "table/block_based/block_based_table_factory.h"
 #include "table/sst_file_dumper.h"
@@ -403,6 +405,9 @@ TEST_F(SSTDumpToolTest, RecompressWholeInput) {
     ASSERT_NE(input_props, nullptr);
     // Twice, the second run replacing the first run's input
     for (int run = 0; run < 2; ++run) {
+      SstFileDumper::InputPrefix prefix;
+      ASSERT_OK(dumper.MaterializeInputKVs(/*max_kv_bytes=*/0, &prefix));
+      ASSERT_FALSE(prefix.truncated);
       ASSERT_OK(dumper.ShowAllCompressionSizes(
           {CompressionType::kNoCompression},
           /*compress_level_from=*/CompressionOptions().level,
@@ -809,6 +814,188 @@ TEST_F(SSTDumpToolTest, RecompressReturnsSourceReadError) {
       /*compress_level_to=*/CompressionOptions().level,
       /*compression_strategies=*/{},
       /*per_measurement=*/{}));
+
+  cleanup(opts, file_path);
+}
+
+TEST_F(SSTDumpToolTest, RecompressInputPrefix) {
+  Options opts;
+  opts.env = env();
+  // Data blocks are compressed by default when Snappy is available, which
+  // covers inferring the uncompressed size of a prefix. That inference is
+  // exact only with an uncompressed index.
+  BlockBasedTableOptions table_opts;
+  table_opts.enable_index_compression = false;
+  opts.table_factory = std::make_shared<BlockBasedTableFactory>(table_opts);
+  const std::string file_path = MakeFilePath("rocksdb_sst_test.sst");
+  constexpr uint64_t kNumEntries = 2000;
+  // 9-byte user key, 8-byte internal key footer, 100-byte value
+  constexpr uint64_t kEntryKVBytes = 9 + 8 + 100;
+  {
+    SstFileWriter writer(EnvOptions(), opts);
+    ASSERT_OK(writer.Open(file_path));
+    for (uint64_t i = 0; i < kNumEntries; ++i) {
+      char key[16];
+      snprintf(key, sizeof(key), "key%06d", static_cast<int>(i));
+      ASSERT_OK(
+          writer.Put(key, std::string(100, static_cast<char>('a' + i % 26))));
+    }
+    ASSERT_OK(writer.Finish());
+  }
+
+  struct Result {
+    SstFileDumper::InputPrefix prefix;
+    SstFileDumper::RecompressionMeasurement input;
+    SstFileDumper::RecompressionMeasurement output;
+    // Entries and their key and value bytes in the recompressed output
+    uint64_t output_entries = 0;
+    uint64_t output_kv_bytes = 0;
+  };
+  // Measures the input (prefix) for `max_kv_bytes` and recompresses it
+  // uncompressed, with a fresh block cache so that the input is read cold
+  auto measure = [&](uint64_t max_kv_bytes, Result* result) {
+    Options dumper_opts = opts;
+    dumper_opts.statistics = CreateDBStatistics();
+    dumper_opts.table_factory = std::make_shared<BlockBasedTableFactory>();
+    SstFileDumper dumper(dumper_opts, file_path, Temperature::kUnknown,
+                         1024 /*readahead_size*/, true /*verify_checksum*/,
+                         false /*output_hex*/, false /*decode_blob_index*/,
+                         EnvOptions(), /*silent=*/true);
+    ASSERT_OK(dumper.getStatus());
+    ASSERT_OK(dumper.MaterializeInputKVs(max_kv_bytes, &result->prefix));
+    ASSERT_OK(
+        dumper.GetInputBenchmarkMeasurement(result->prefix, &result->input));
+    ASSERT_OK(dumper.ShowAllCompressionSizes(
+        {CompressionType::kNoCompression},
+        /*compress_level_from=*/CompressionOptions().level,
+        /*compress_level_to=*/CompressionOptions().level,
+        /*compression_strategies=*/{},
+        /*per_measurement=*/{}));
+    ASSERT_EQ(dumper.GetRecompressMeasurements().size(), 1U);
+    result->output = dumper.GetRecompressMeasurements()[0];
+    const TableProperties* output_props =
+        dumper.GetRecompressOutputProperties();
+    ASSERT_NE(output_props, nullptr);
+    result->output_entries = output_props->num_entries;
+    result->output_kv_bytes =
+        output_props->raw_key_size + output_props->raw_value_size;
+  };
+  // Checks a prefix of `num_data_blocks` blocks against the input file and
+  // its uncompressed recompression
+  auto check_prefix = [&](const Result& r, uint64_t num_data_blocks) {
+    ASSERT_TRUE(r.prefix.truncated);
+    ASSERT_EQ(r.prefix.num_data_blocks, num_data_blocks);
+    ASSERT_GT(r.prefix.num_entries, 0U);
+    ASSERT_LT(r.prefix.num_entries, kNumEntries);
+    ASSERT_EQ(r.prefix.kv_bytes, r.prefix.num_entries * kEntryKVBytes);
+    // Exactly the prefix's entries are recompressed
+    ASSERT_EQ(r.output_entries, r.prefix.num_entries);
+    ASSERT_EQ(r.output_kv_bytes, r.prefix.kv_bytes);
+    ASSERT_TRUE(r.input.is_input_prefix);
+    ASSERT_EQ(r.input.num_data_blocks, num_data_blocks);
+    ASSERT_EQ(r.input.compressed_data_payload, r.prefix.data_on_disk_payload);
+    ASSERT_EQ(r.input.uncompressed_index_payload, 0U);
+    ASSERT_GE(r.input.read_usec, 0);
+    // Recompressing the same entries can split them into blocks a bit
+    // differently, but the uncompressed size is about the same.
+    ASSERT_NEAR(static_cast<double>(r.output.uncompressed_data_payload),
+                static_cast<double>(r.input.uncompressed_data_payload),
+                r.input.uncompressed_data_payload / 100.0);
+  };
+
+  Result whole;
+  ASSERT_NO_FATAL_FAILURE(measure(/*max_kv_bytes=*/0, &whole));
+  ASSERT_FALSE(whole.prefix.truncated);
+  ASSERT_FALSE(whole.input.is_input_prefix);
+  ASSERT_GT(whole.input.num_data_blocks, 3U);
+  ASSERT_EQ(whole.output_entries, kNumEntries);
+  ASSERT_EQ(whole.output_kv_bytes, kNumEntries * kEntryKVBytes);
+
+  // A limit of all the input's keys and values keeps all of it
+  constexpr uint64_t kInputKVBytes = kNumEntries * kEntryKVBytes;
+  Result all;
+  ASSERT_NO_FATAL_FAILURE(measure(kInputKVBytes, &all));
+  ASSERT_FALSE(all.prefix.truncated);
+  ASSERT_FALSE(all.input.is_input_prefix);
+  ASSERT_EQ(all.input.num_data_blocks, whole.input.num_data_blocks);
+  ASSERT_EQ(all.input.compressed_data_payload,
+            whole.input.compressed_data_payload);
+  ASSERT_EQ(all.output.uncompressed_data_payload,
+            whole.output.uncompressed_data_payload);
+  ASSERT_EQ(all.output_entries, kNumEntries);
+  ASSERT_EQ(all.output_kv_bytes, kInputKVBytes);
+
+  // One byte less drops just the last data block
+  Result most;
+  ASSERT_NO_FATAL_FAILURE(measure(kInputKVBytes - 1, &most));
+  ASSERT_NO_FATAL_FAILURE(check_prefix(most, whole.input.num_data_blocks - 1));
+
+  // A smaller limit keeps the whole data blocks that fit within it
+  Result half;
+  ASSERT_NO_FATAL_FAILURE(measure(kInputKVBytes / 2, &half));
+  ASSERT_NO_FATAL_FAILURE(check_prefix(half, half.prefix.num_data_blocks));
+  ASSERT_LE(half.prefix.kv_bytes, kInputKVBytes / 2);
+
+  // Also when they fit exactly
+  Result exact;
+  ASSERT_NO_FATAL_FAILURE(measure(half.prefix.kv_bytes, &exact));
+  ASSERT_NO_FATAL_FAILURE(check_prefix(exact, half.prefix.num_data_blocks));
+  ASSERT_EQ(exact.prefix.num_entries, half.prefix.num_entries);
+
+  // And one byte less drops the last of them
+  Result fewer;
+  ASSERT_NO_FATAL_FAILURE(measure(half.prefix.kv_bytes - 1, &fewer));
+  ASSERT_NO_FATAL_FAILURE(check_prefix(fewer, half.prefix.num_data_blocks - 1));
+  ASSERT_LT(fewer.prefix.num_entries, half.prefix.num_entries);
+  ASSERT_LT(fewer.input.compressed_data_payload,
+            half.input.compressed_data_payload);
+
+  // The first data block must fit
+  {
+    SstFileDumper dumper(opts, file_path, Temperature::kUnknown,
+                         1024 /*readahead_size*/, true /*verify_checksum*/,
+                         false /*output_hex*/, false /*decode_blob_index*/,
+                         EnvOptions(), /*silent=*/true);
+    ASSERT_OK(dumper.getStatus());
+    SstFileDumper::InputPrefix prefix;
+    ASSERT_EQ(dumper.MaterializeInputKVs(/*max_kv_bytes=*/1, &prefix).code(),
+              Status::Code::kInvalidArgument);
+  }
+
+  char* usage[5];
+  auto cleanup_usage = CleanupUsage{usage};
+  PopulateCommandArgs(file_path, "--command=recompress", usage);
+  snprintf(usage[3], kOptLength, "--recompress_max_kv_bytes=10000");
+  SSTDumpTool tool;
+  ASSERT_TOOL_PASS(tool.Run(4, usage, opts));
+  snprintf(usage[4], kOptLength, "--json");
+  ASSERT_TOOL_PASS(tool.Run(5, usage, opts));
+
+  cleanup(opts, file_path);
+}
+
+TEST_F(SSTDumpToolTest, RecompressInputPrefixRequiresBlockBasedTable) {
+  PlainTableOptions plain_table_options;
+  plain_table_options.user_key_len = kPlainTableVariableLength;
+  plain_table_options.bloom_bits_per_key = 0;
+  plain_table_options.hash_table_ratio = 0;
+
+  Options opts;
+  opts.env = env();
+  opts.table_factory.reset(NewPlainTableFactory(plain_table_options));
+  std::string file_path = MakeFilePath("rocksdb_sst_test_plain.sst");
+  createSST(opts, file_path);
+
+  SstFileDumper dumper(opts, file_path, Temperature::kUnknown,
+                       1024 /*readahead_size*/, true /*verify_checksum*/,
+                       false /*output_hex*/, false /*decode_blob_index*/,
+                       EnvOptions(), /*silent=*/true);
+  ASSERT_OK(dumper.getStatus());
+  SstFileDumper::InputPrefix prefix;
+  ASSERT_EQ(dumper.MaterializeInputKVs(/*max_kv_bytes=*/1, &prefix).code(),
+            Status::Code::kNotSupported);
+  ASSERT_OK(dumper.MaterializeInputKVs(/*max_kv_bytes=*/0, &prefix));
+  ASSERT_FALSE(prefix.truncated);
 
   cleanup(opts, file_path);
 }

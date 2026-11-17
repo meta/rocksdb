@@ -187,6 +187,14 @@ void print_help(bool to_stderr) {
     --compression_zstd_max_train_bytes=<uint32_t>
       Maximum size of training data passed to zstd's dictionary trainer
 
+    --recompress_max_kv_bytes=<uint64_t>
+      Used with --command=recompress to limit the input's keys and values held
+      in memory for the benchmark: only the whole data blocks from the start of
+      the file whose key and value bytes fit within the limit are recompressed,
+      and the input file row describes just those blocks (its index sizes are
+      N/A). Fails if the first data block does not fit. 0 (default) means no
+      limit. Requires a block-based table.
+
     --list_meta_blocks
       Print the list of all meta blocks in the file
 )",
@@ -340,8 +348,12 @@ void PrintRecompressionMeasurement(
   fprintf(stdout, " Cx size: %10" PRIu64, m.compressed_data_payload);
   fprintf(stdout, " Uncx size: %10" PRIu64, m.uncompressed_data_payload);
   fprintf(stdout, " Ratio: %10s", std::to_string(ratio).c_str());
-  fprintf(stdout, " Uncx index: %8" PRIu64, m.uncompressed_index_payload);
-  fprintf(stdout, " Cx index: %8" PRIu64, m.compressed_index_payload);
+  if (m.is_input_prefix) {
+    fprintf(stdout, " Uncx index:      N/A Cx index:      N/A");
+  } else {
+    fprintf(stdout, " Uncx index: %8" PRIu64, m.uncompressed_index_payload);
+    fprintf(stdout, " Cx index: %8" PRIu64, m.compressed_index_payload);
+  }
   if (m.write_usec < 0) {
     fprintf(stdout, " Write usec:        N/A cpu:        N/A");
   } else if (m.write_cpu_usec < 0) {
@@ -480,10 +492,13 @@ void AppendMeasurementJson(
 // Appends a JSON object describing the input file as a recompression baseline.
 // Only the fields meaningful for the input (as stored) are included; the
 // build-time fields (level, write time, per-block compression counts) are
-// omitted rather than reported as sentinel values.
+// omitted rather than reported as sentinel values. When the input is limited
+// to a prefix, it is described in "input_prefix" and the unknown index sizes
+// are null.
 void AppendBaselineJson(
     std::string* out, const std::string& file,
-    const ROCKSDB_NAMESPACE::SstFileDumper::RecompressionMeasurement& m) {
+    const ROCKSDB_NAMESPACE::SstFileDumper::RecompressionMeasurement& m,
+    const ROCKSDB_NAMESPACE::SstFileDumper::InputPrefix& input_prefix) {
   const double ratio = m.compressed_data_payload == 0
                            ? 0.0
                            : static_cast<double>(m.uncompressed_data_payload) /
@@ -504,8 +519,27 @@ void AppendBaselineJson(
   add_u64("num_data_blocks", m.num_data_blocks);
   add_u64("compressed_data_payload", m.compressed_data_payload);
   add_u64("uncompressed_data_payload", m.uncompressed_data_payload);
-  add_u64("uncompressed_index_payload", m.uncompressed_index_payload);
-  add_u64("compressed_index_payload", m.compressed_index_payload);
+  if (m.is_input_prefix) {
+    out->push_back(',');
+    AppendJsonString(out, "uncompressed_index_payload");
+    out->append(":null,");
+    AppendJsonString(out, "compressed_index_payload");
+    out->append(":null");
+  } else {
+    add_u64("uncompressed_index_payload", m.uncompressed_index_payload);
+    add_u64("compressed_index_payload", m.compressed_index_payload);
+  }
+  if (input_prefix.truncated) {
+    out->push_back(',');
+    AppendJsonString(out, "input_prefix");
+    out->append(":{");
+    AppendJsonString(out, "num_data_blocks");
+    out->append(":" + std::to_string(input_prefix.num_data_blocks) + ",");
+    AppendJsonString(out, "num_entries");
+    out->append(":" + std::to_string(input_prefix.num_entries) + ",");
+    AppendJsonString(out, "kv_bytes");
+    out->append(":" + std::to_string(input_prefix.kv_bytes) + "}");
+  }
   out->push_back(',');
   AppendJsonString(out, "ratio");
   out->append(":" + std::to_string(ratio));
@@ -583,6 +617,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
       ROCKSDB_NAMESPACE::CompressionOptions().auto_skip_min_sample_every;
   int compression_max_compressed_bytes_per_kb =
       ROCKSDB_NAMESPACE::CompressionOptions().max_compressed_bytes_per_kb;
+  uint64_t recompress_max_kv_bytes = 0;
 
   int64_t tmp_val;
 
@@ -801,6 +836,16 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
         return 1;
       }
       compression_max_dict_buffer_bytes = static_cast<uint64_t>(tmp_val);
+    } else if (ParseIntArg(argv[i], "--recompress_max_kv_bytes=",
+                           "recompress_max_kv_bytes must be numeric",
+                           &tmp_val)) {
+      if (tmp_val < 0) {
+        fprintf(stderr, "recompress_max_kv_bytes must not be negative: '%s'\n",
+                argv[i]);
+        print_help(/*to_stderr*/ true);
+        return 1;
+      }
+      recompress_max_kv_bytes = static_cast<uint64_t>(tmp_val);
     } else if (strncmp(argv[i], "--compression_auto_skip=", 24) == 0) {
       if (strlen(argv[i]) > 24) {
         compression_auto_skip =
@@ -1036,17 +1081,23 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
           compression_types = GetSupportedCompressions();
         }
       }
-      // Measure the input file's benchmark entry before
-      // ShowAllCompressionSizes. This ordering is required:
+      // Materialize the input (or its prefix) before measuring the input
+      // file's benchmark entry, which must cover the same entries.
       // GetInputBenchmarkMeasurement infers the input's uncompressed size and
       // read time from before/after decompression ticker deltas on the shared
-      // options.statistics, and it must run first so those tickers reflect a
-      // single cold read of the input (before the block cache is warmed).
-      // ShowAllCompressionSizes does not perturb this: it creates its own
-      // per-recompression Statistics and its MaterializeInputKVs pre-read
-      // happens inside that call, after this measurement.
+      // options.statistics, so those must reflect a single cold read.
+      // MaterializeInputKVs does not fill the block cache, and
+      // ShowAllCompressionSizes creates its own per-recompression Statistics.
+      ROCKSDB_NAMESPACE::SstFileDumper::InputPrefix input_prefix;
+      st = dumper.MaterializeInputKVs(recompress_max_kv_bytes, &input_prefix);
+      if (!st.ok()) {
+        fprintf(stderr, "Failed to read the recompress input: %s\n",
+                st.ToString().c_str());
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
+      }
       ROCKSDB_NAMESPACE::SstFileDumper::RecompressionMeasurement input_m;
-      bool have_input_m = dumper.GetInputBenchmarkMeasurement(&input_m).ok();
+      bool have_input_m =
+          dumper.GetInputBenchmarkMeasurement(input_prefix, &input_m).ok();
 
       // In text mode, print the input entry now and stream each recompression
       // entry as it is measured (measurements can be slow), flushing so output
@@ -1066,6 +1117,13 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
                 "WARNING: Assertions are enabled; benchmarks unnecessarily "
                 "slow\n");
 #endif
+        if (input_prefix.truncated) {
+          fprintf(stdout,
+                  "Input limited to its first %" PRIu64 " data blocks (%" PRIu64
+                  " entries, %" PRIu64 " key+value bytes)\n",
+                  input_prefix.num_data_blocks, input_prefix.num_entries,
+                  input_prefix.kv_bytes);
+        }
         if (have_input_m) {
           fprintf(stdout, "Input file %s   Compression: %s\n", filename.c_str(),
                   input_m.compression_name.empty()
@@ -1102,7 +1160,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
           if (!json_baselines.empty()) {
             json_baselines.push_back(',');
           }
-          AppendBaselineJson(&json_baselines, filename, input_m);
+          AppendBaselineJson(&json_baselines, filename, input_m, input_prefix);
         }
         for (const auto& m : measurements) {
           if (!json_measurements.empty()) {
@@ -1131,7 +1189,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
             AppendJsonString(&json_properties, "input_properties");
             json_properties.push_back(':');
             AppendTablePropertiesJson(&json_properties, *in_tp,
-                                      have_input_m
+                                      have_input_m && !input_m.is_input_prefix
                                           ? input_m.uncompressed_data_payload
                                           : in_tp->uncompressed_data_size,
                                       trailer, output_hex);
