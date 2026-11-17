@@ -246,11 +246,34 @@ status of an operation, we need to wrap it into the helpers that do this. The sm
 which receive the pointer to error message can just go in an `Arena.ofAuto()`. 
 11. General disposal of large `malloc()`-ed results. One idea is to have a `Lifetime implements AutoClosable` object to which these results are added. Then we just need to implement a small stub in the `C` API to do the disposal of
 a list of pointers supplied to it.
+12. Review what is in `c_base.h` and `c_base.cc` - for example, all the `rocksdb_multi_get_X(...)` method variants.
+There are other functions also (we should list them) and consider whether they can be treated analogously to how
+we decide to treat `rocksdb_multi_get_X(...)`. As you would expect, these methods are all exposed to Java via the
+`jextract` processing we do, but this produces a very low-level API (raw `MemorySegment`s) which still demands a wrapper, in the spirit of our experimental fluent API for simple `get()` and `put()`.
+13. Restrict `jextract` output to a defined set of methods, and/or generate the equivalent entirely ourselves.
+The current process of running `jextract` over `c.h` generates a vast quantity of Java API that we don't need,
+and which is arguably a risk. `jextract` can be configured to produce a restricted set of output, but an alternative
+technique would be for our code generator to simply create the equivalent stubs for exactly the methods it uses.
+That's not hard to do.
+14. Generator loose ends. There are no constructors for `RocksdbFlushwaloptions` and many others; we have not yet
+worked out how to hook these classes up. It will not be difficult, it is just something that is left to do.
 
-There's a blended approach which is:
-1. We will use a subset of the `C` API for our purposes; probably fetched using `jextract` and restricted to the methods that we need, but maybe generated.
-2. We will need to enhance the `C` API in some ways, for some core, performance-critical operations
-3. We will build a lot of the boilerplate API in a highly-automated fashion. When we are processing options,
+### Blended Prototype
+
+The current (17/11/2026) [prototype branch](https://github.com/evolvedbinary/rocksdb/tree/ffm-jextract-proto)
+uses a combination of techniques.
+1. It exposes the current `C` API directly at low-level by simply processing it with `jextract`.
+2. The `C` API is wrapped by a small fluent API for `open()`, `get()` and `put()` to a RocksDB database.
+3. A Java API generator is implemented which uses configuration output from the `C` API generator to create Java class
+equivalents of the _generated_ `C` classes; these objects and methods make tasks like configuring database options
+in Java straightforward and intuitive.
+
+Next, we need to enhance the `C` API in some ways, for some core, performance-critical operations.
+- How could/should a `multiGet()` which can make use of the underlying `io_uring`-supporting operations be implemented ?
+- How could/should we make use of FFM to efficiently access the *write batch* feature of RocksDB ?
+- Can we automate, or systematize, things like the transactional API versus timestamp API versus the base API ?
+- Can we automate or systematize thisgs like the column family API ? For this case, column family access should
+probably be the standard case, and we may slightly ease the selection of the default column family.
 
 ### How to assess new API
 - Does it flow nicely ? UX of the programmer.
