@@ -35,22 +35,22 @@ TEST_P(WriteCommittedTxnWithTsTest, BatchedMultiGetForUpdateTimestamp) {
   ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
 
   struct TestCase {
-    bool enable_validation;
     TxnTimestamp validation_timestamp;
     TxnTimestamp read_timestamp;  // Zero means no ReadOptions timestamp.
+    bool enable_validation;
     bool truncate_timestamp;
     Status::Code expected;
   };
   const TestCase cases[] = {
-      {true, 25, 0, false, Status::Code::kOk},
-      {true, 25, 25, false, Status::Code::kOk},
-      {true, 25, 23, false, Status::Code::kInvalidArgument},
-      {true, kMaxTxnTimestamp, 25, false, Status::Code::kInvalidArgument},
-      {true, 25, 25, true, Status::Code::kInvalidArgument},
-      {true, 23, 23, false, Status::Code::kBusy},
-      {false, kMaxTxnTimestamp, 0, false, Status::Code::kOk},
-      {false, kMaxTxnTimestamp, kMaxTxnTimestamp, false, Status::Code::kOk},
-      {false, 25, 25, false, Status::Code::kInvalidArgument},
+      {25, 0, true, false, Status::Code::kOk},
+      {25, 25, true, false, Status::Code::kOk},
+      {25, 23, true, false, Status::Code::kInvalidArgument},
+      {kMaxTxnTimestamp, 25, true, false, Status::Code::kInvalidArgument},
+      {25, 25, true, true, Status::Code::kInvalidArgument},
+      {23, 23, true, false, Status::Code::kBusy},
+      {kMaxTxnTimestamp, 0, false, false, Status::Code::kOk},
+      {kMaxTxnTimestamp, kMaxTxnTimestamp, false, false, Status::Code::kOk},
+      {25, 25, false, false, Status::Code::kInvalidArgument},
   };
   for (const TestCase& test_case : cases) {
     SCOPED_TRACE(test_case.enable_validation);

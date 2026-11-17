@@ -83,7 +83,6 @@
 #include "rocksdb/utilities/transaction_db.h"
 #include "rocksdb/wide_columns.h"
 #include "rocksdb/write_batch.h"
-#include "test_util/sync_point.h"
 #include "test_util/testutil.h"
 #include "test_util/transaction_test_util.h"
 #include "tools/simulated_hybrid_file_system.h"
@@ -8649,8 +8648,6 @@ class Benchmark {
           txn->MultiGetForUpdate(
               options, db->DefaultColumnFamily(), keys.size(), keys.data(),
               pin_values, stat_list.data(), FLAGS_multiread_sorted_input);
-          TEST_SYNC_POINT_CALLBACK(
-              "Benchmark::MultiReadRandom:MultiGetForUpdate", &stat_list);
           const Status s = txn->Rollback();
           if (!s.ok()) {
             fprintf(stderr, "Transaction rollback failed: %s\n",
