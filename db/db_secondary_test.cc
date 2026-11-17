@@ -2684,7 +2684,12 @@ TEST_F(DBSecondaryTest, CatchUpAfterInitialRecoveryFindsOnlyMissingFiles) {
         compact_options.bottommost_level_compaction =
             BottommostLevelCompaction::kForce;
         ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
-        ASSERT_OK(dbfull()->TEST_WaitForPurge());
+        // CompactRange() can return before the compaction thread purges
+        // the obsolete files, and TEST_WaitForPurge() only waits for the
+        // separate purge thread. Wait for both.
+        WaitForCompactOptions wait_options;
+        wait_options.wait_for_purge = true;
+        ASSERT_OK(dbfull()->WaitForCompact(wait_options));
         const Status old_table_status = env_->FileExists(old_table);
         ASSERT_TRUE(old_table_status.IsNotFound())
             << old_table_status.ToString();
