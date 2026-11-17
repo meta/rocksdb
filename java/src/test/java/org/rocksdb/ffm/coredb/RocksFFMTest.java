@@ -16,6 +16,7 @@ import org.junit.rules.TemporaryFolder;
 import org.rocksdb.ffm.RocksFFM;
 import org.rocksdb.ffm.RocksFFMException;
 import org.rocksdb.ffm.RocksdbOptions;
+import org.rocksdb.ffm.RocksdbTableProperties;
 
 public class RocksFFMTest {
   @Rule public TemporaryFolder dbFolder = new TemporaryFolder();
@@ -76,6 +77,16 @@ public class RocksFFMTest {
           MemorySegment value4_2 = get4_2.invoke();
           assertThat(stringOf(value4_2)).isEqualTo("wroteValue4");
         }
+      }
+    }
+  }
+
+  @Test
+  public void walDir() {
+    try (Arena arena = Arena.ofConfined()) {
+      try (RocksdbOptions rocksdbOptions = new RocksdbOptions()) {
+        String walDir = rocksdbOptions.getWalDir();
+        assertThat(walDir).isEqualTo("");
       }
     }
   }

@@ -15,37 +15,14 @@ public class AnalysedFunction {
   }
 
   public static AnalysedFunction of(String source, CFunction cFunction) {
-    switch (cFunction.kind()) {
-      case null -> {
-        return new Empty(source, cFunction);
-      }
-      default -> {
-        switch (cFunction.kind()) {
-          case null -> throw new RuntimeException(String.format("Null receiver: %s", cFunction.kind()));
-          case "field_getter" -> {
-            return new Receiver.Getter(source, cFunction);
-          }
-          case "string_field_getter" -> {
-            return new Receiver.StringGetter(source, cFunction);
-          }
-          case "status_getter" -> {
-            return new Receiver.StatusGetter(source, cFunction);
-          }
-          case "field_setter" -> {
-            return new Receiver.Setter(source, cFunction);
-          }
-          case "string_field_setter" -> {
-            return new Receiver.StringSetter(source, cFunction);
-          }
-          case "status_setter" -> {
-            return new Receiver.StatusSetter(source, cFunction);
-          }
-          default -> {
-            return new Receiver(source, cFunction);
-          }
-        }
-      }
-    }
+    return switch (cFunction.kind()) {
+      case "field_getter" -> new Receiver.Getter(source, cFunction);
+      case "string_field_getter" -> new Receiver.StringGetter(source, cFunction);
+      case "status_getter" -> new Receiver.StatusGetter(source, cFunction);
+      case "field_setter" -> new Receiver.Setter(source, cFunction);
+      case null -> new Empty(source, cFunction);
+      default -> new Receiver(source, cFunction);
+    };
   }
 
   /**

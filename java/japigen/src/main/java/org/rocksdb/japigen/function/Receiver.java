@@ -87,7 +87,12 @@ public class Receiver extends AnalysedFunction {
     }
 
     public List<String> imports() {
-      return List.of("java.lang.foreign.Arena", "java.lang.foreign.ValueLayout", "java.nio.charset.StandardCharsets");
+      return List.of(
+        "java.lang.foreign.Arena",
+        "java.lang.foreign.ValueLayout",
+        "java.nio.charset.StandardCharsets",
+        "org.rocksdb.ffm.util.FFMSegment",
+        "org.rocksdb.ffm.util.FFMArena");
     }
 
     @Override
@@ -96,17 +101,12 @@ public class Receiver extends AnalysedFunction {
       sb.append(String.format("// TODO STRING_GET() %s\n", cFunction));
       sb.append(String.format("""
         public String %s() {
-        MemorySegment sizeSegment = Arena.ofAuto().allocate(ValueLayout.JAVA_LONG, 0L);
+        MemorySegment sizeSegment = FFMArena.smallAuto().allocate(ValueLayout.JAVA_LONG, 1L);
         MemorySegment stringSegment = %s(%s, sizeSegment);
         if (stringSegment == null) {
           return null;
         }
-        // THIS stuff is standard, and should be a helper
-        long size = sizeSegment.get(ValueLayout.JAVA_LONG, 0);
-        byte[] bytes = new byte[Math.toIntExact(size)];
-        MemorySegment result = MemorySegment.ofArray(bytes);
-        MemorySegment.copy(stringSegment, ValueLayout.JAVA_BYTE, 0, result, ValueLayout.JAVA_BYTE, 0, bytes.length);
-        return new String(bytes, 0, (int)size, StandardCharsets.UTF_8);
+        return FFMSegment.ofStringOfSize(stringSegment, sizeSegment);
         }
         """,
         methodName,
@@ -122,7 +122,9 @@ public class Receiver extends AnalysedFunction {
 
     @Override
     public void formatReceiver(StringBuilder sb) {
-      sb.append("// STATUS GETTER\n");
+      // There are only 2? of these.
+      // Emit a comment, but do not emit a method.
+      sb.append("// STATUS GETTER is not currently implemented\n");
       sb.append(String.format("// TODO STATUS_GET() %s\n", cFunction));
     }
   }
@@ -143,32 +145,6 @@ public class Receiver extends AnalysedFunction {
         """,
         methodName, javaTypeOf(cFunction.value_type()), cFunction.value_name(),
         cFunction.name(), cFunction.receiver_name(), cFunction.value_name()));
-    }
-  }
-
-  static class StringSetter extends Receiver {
-
-    StringSetter(String source, CFunction cFunction) {
-      super(source, cFunction);
-    }
-
-    @Override
-    public void formatReceiver(StringBuilder sb) {
-      sb.append("// STRING SETTER\n");
-      sb.append(String.format("// TODO STRING_SET() %s\n", cFunction));
-    }
-  }
-
-  static class StatusSetter extends Receiver {
-
-    StatusSetter(String source, CFunction cFunction) {
-      super(source, cFunction);
-    }
-
-    @Override
-    public void formatReceiver(StringBuilder sb) {
-      sb.append("// STATUS SETTER\n");
-      sb.append(String.format("// TODO STATUS_SET() %s\n", cFunction));
     }
   }
 }

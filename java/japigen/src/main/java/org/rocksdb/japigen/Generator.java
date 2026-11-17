@@ -35,6 +35,7 @@ public class Generator {
     for (AnalysedClass analysedClass : classes.all()) {
       boolean createConstructor = !config.noConstructor().contains(analysedClass.canonicalType);
       StringBuilder sb = new StringBuilder();
+      sb.append(String.format("// %s\n", config.banner()));
       analysedClass.formatClass(sb, config.jextractClass(), config.targetPackage(), createConstructor);
       JAPIFiles.writeJAPIFile(Path.of(config.targetSrcDir()), config.targetPackage(), analysedClass.canonicalType, sb);
     }
