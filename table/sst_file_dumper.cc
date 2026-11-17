@@ -8,8 +8,10 @@
 
 #include <chrono>
 #include <cinttypes>
+#include <cstring>
 #include <ctime>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -40,6 +42,7 @@
 #include "table/meta_blocks.h"
 #include "table/plain/plain_table_factory.h"
 #include "table/table_reader.h"
+#include "util/coding.h"
 #include "util/compression.h"
 #include "util/random.h"
 #include "util/udt_util.h"
@@ -325,7 +328,25 @@ Status GetOnDiskIndexSize(TableFactory* factory, TableReader* reader,
   *size = total;
   return Status::OK();
 }
+
+// The key and value sizes before each materialized entry
+constexpr size_t kInputKVHeaderSize = 2 * sizeof(uint32_t);
 }  // namespace
+
+template <typename Fn>
+void SstFileDumper::ForEachInputKV(const Fn& fn) const {
+  const char* kv = input_kvs_.Get();
+  const char* const end = kv + input_kvs_used_;
+  while (kv < end) {
+    const uint32_t key_size = DecodeFixed32(kv);
+    const uint32_t value_size = DecodeFixed32(kv + sizeof(uint32_t));
+    kv += kInputKVHeaderSize;
+    if (!fn(Slice(kv, key_size), Slice(kv + key_size, value_size))) {
+      return;
+    }
+    kv += key_size + value_size;
+  }
+}
 
 Status SstFileDumper::CalculateCompressedTableSize(
     const TableBuilderOptions& tb_options, TableProperties* props,
@@ -350,9 +371,10 @@ Status SstFileDumper::CalculateCompressedTableSize(
   // rather than iterating the input reader, so the write benchmark measures the
   // build + compression cost only -- not reading/decompressing the input -- and
   // is independent of block-cache warmth.
-  for (const auto& kv : input_kvs_) {
-    table_builder->Add(kv.first, kv.second);
-  }
+  ForEachInputKV([&](const Slice& key, const Slice& value) {
+    table_builder->Add(key, value);
+    return true;
+  });
   s = table_builder->Finish();
   *write_time = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now() - start);
@@ -481,13 +503,11 @@ Status SstFileDumper::PrimeCompression(CompressionType compress_type,
   // timed build trains the dictionary when one is configured.
   const uint64_t payload_limit = block_size + block_size / 2;
   uint64_t payload = 0;
-  for (const auto& kv : input_kvs_) {
-    if (payload >= payload_limit) {
-      break;
-    }
-    table_builder->Add(kv.first, kv.second);
-    payload += kv.first.size() + kv.second.size();
-  }
+  ForEachInputKV([&](const Slice& key, const Slice& value) {
+    table_builder->Add(key, value);
+    payload += key.size() + value.size();
+    return payload < payload_limit;
+  });
   s = table_builder->Finish();
   // Discard the warm-up output regardless of outcome.
   dest_writer->Close({}).PermitUncheckedError();
@@ -496,14 +516,58 @@ Status SstFileDumper::PrimeCompression(CompressionType compress_type,
 }
 
 Status SstFileDumper::MaterializeInputKVs() {
-  input_kvs_.clear();
+  input_kvs_used_ = 0;
+  // Room for every entry's sizes, key and value. Keys can be longer than the
+  // raw key size counts: a timestamp that is not persisted is padded back, and
+  // a cuckoo table's last-level keys get back their internal key footer.
+  const TableProperties& tp = *table_properties_;
+  uint64_t uncounted_key_bytes = 0;
+  if (!tp.user_defined_timestamps_persisted) {
+    uncounted_key_bytes +=
+        internal_comparator_.user_comparator()->timestamp_size();
+  }
+  if (options_.table_factory->IsInstanceOf(TableFactory::kCuckooTableName())) {
+    uncounted_key_bytes += kNumInternalBytes;
+  }
+  const uint64_t capacity =
+      tp.raw_key_size + tp.raw_value_size +
+      tp.num_entries * (kInputKVHeaderSize + uncounted_key_bytes);
+  if (capacity > std::numeric_limits<size_t>::max()) {
+    return Status::MemoryLimit("Input too large to hold in memory");
+  }
+  input_kvs_ = MemMapping::AllocateLazyZeroed(static_cast<size_t>(capacity));
+  if (capacity > 0 && input_kvs_.Get() == nullptr) {
+    return Status::MemoryLimit("Failed to map memory for the input");
+  }
   std::unique_ptr<InternalIterator> iter(table_reader_->NewIterator(
       read_options_, moptions_.prefix_extractor.get(), /*arena=*/nullptr,
       /*skip_filters=*/false, TableReaderCaller::kSSTDumpTool));
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-    input_kvs_.emplace_back(iter->key().ToString(), iter->value().ToString());
+    Status s = AppendInputKV(iter->key(), iter->value());
+    if (!s.ok()) {
+      return s;
+    }
   }
   return iter->status();
+}
+
+Status SstFileDumper::AppendInputKV(const Slice& key, const Slice& value) {
+  if (key.size() > std::numeric_limits<uint32_t>::max() ||
+      value.size() > std::numeric_limits<uint32_t>::max()) {
+    return Status::NotSupported("Key or value too large to hold in memory");
+  }
+  const size_t size = kInputKVHeaderSize + key.size() + value.size();
+  if (input_kvs_.Count() - input_kvs_used_ < size) {
+    return Status::Corruption(
+        "Input keys and values exceed their sizes in the table properties");
+  }
+  char* const kv = input_kvs_.Get() + input_kvs_used_;
+  EncodeFixed32(kv, static_cast<uint32_t>(key.size()));
+  EncodeFixed32(kv + sizeof(uint32_t), static_cast<uint32_t>(value.size()));
+  memcpy(kv + kInputKVHeaderSize, key.data(), key.size());
+  memcpy(kv + kInputKVHeaderSize + key.size(), value.data(), value.size());
+  input_kvs_used_ += size;
+  return Status::OK();
 }
 
 Status SstFileDumper::ShowAllCompressionSizes(
