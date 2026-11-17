@@ -501,6 +501,20 @@ class ClockCacheTest : public testing::Test {
     SyncPoint::GetInstance()->ClearAllCallBacks();
     return result;
   }
+
+  // Top bit of the acquire and release counters, which overflow correction
+  // clears in both
+  static constexpr uint32_t kCounterTopBit =
+      uint32_t{1} << (ClockHandle::SlotMeta::kCounterNumBits - 1);
+
+  // Takes and releases references to h with plain counter updates, which don't
+  // correct for overflow, until its release counter is past the threshold for
+  // correction. Takes no references to h on net.
+  void TakeAndReleaseRefsToNearOverflow(typename Shard::HandleImpl* h) {
+    const uint32_t n = kCounterTopBit + ClockHandle::kMaxCountdown + 1;
+    shard_->TEST_RefN(h, n);
+    shard_->TEST_ReleaseNMinus1(h, n + 1);
+  }
 #endif  // !NDEBUG
 
   Shard* shard_ = nullptr;
@@ -793,7 +807,7 @@ const Cache::CacheItemHelper kDeleteCounterHelper{
     }};
 }  // namespace
 
-// Testing calls to CorrectNearOverflow in Release
+// Testing calls to CorrectNearOverflow in Release and Ref
 TYPED_TEST(ClockCacheTest, ClockCounterOverflowTest) {
   this->NewShard(6, /*strict_capacity_limit*/ false);
   auto& shard = *this->shard_;
@@ -812,14 +826,6 @@ TYPED_TEST(ClockCacheTest, ClockCounterOverflowTest) {
     shard.TEST_RefN(h, 1234567);
     shard.TEST_ReleaseN(h, 1234567);
   }
-  // Mark it invisible (to reach a different CorrectNearOverflow() in Release)
-  shard.Erase(this->TestKey(hkey), hkey);
-  // Simulate many more lookup/ref + release (one-by-one would be too
-  // expensive for unit test)
-  for (int i = 0; i < 10000; ++i) {
-    shard.TEST_RefN(h, 1234567);
-    shard.TEST_ReleaseN(h, 1234567);
-  }
   // And more, with the last release of each batch using erase_if_last_ref (not
   // the last ref, so it only drops it). That release is the only one in these
   // batches that corrects for overflow.
@@ -827,6 +833,15 @@ TYPED_TEST(ClockCacheTest, ClockCounterOverflowTest) {
     shard.TEST_RefN(h, 1234567);
     shard.TEST_ReleaseNMinus1(h, 1234567);
     ASSERT_FALSE(shard.Release(h, /*useful=*/true, /*erase_if_last_ref=*/true));
+  }
+  // Mark it invisible. Its releases then don't correct for overflow, but its
+  // refs do.
+  shard.Erase(this->TestKey(hkey), hkey);
+  // Simulate many more ref + release (one-by-one would be too
+  // expensive for unit test)
+  for (int i = 0; i < 10000; ++i) {
+    shard.TEST_RefN(h, 1234567);
+    shard.TEST_ReleaseN(h, 1234567);
   }
   // Free all but last 1
   shard.TEST_ReleaseN(h, 123456789);
@@ -885,7 +900,7 @@ TYPED_TEST(ClockCacheTest, ReleaseEraseIfLastRefErasesOnlyItsOwnEntry) {
       },
       [&] {
         this->Erase('a');
-        ASSERT_OK(this->Insert('b'));
+        EXPECT_OK(this->Insert('b'));
       });
   EXPECT_TRUE(erased);
   EXPECT_FALSE(this->Lookup('a'));
@@ -942,7 +957,7 @@ TYPED_TEST(ClockCacheTest, ReleaseOfErasedEntryLeavesItsSlotsNextEntry) {
       },
       [&] {
         // Evicts a, now unreferenced, and takes its slot.
-        ASSERT_OK(this->Insert('b'));
+        EXPECT_OK(this->Insert('b'));
       });
   // a was freed by the eviction, not by the release
   EXPECT_FALSE(erased);
@@ -952,35 +967,76 @@ TYPED_TEST(ClockCacheTest, ReleaseOfErasedEntryLeavesItsSlotsNextEntry) {
 }
 
 // A standalone handle is born invisible. With two references to one, the
-// release that isn't the last must not read the handle after dropping its
-// reference, as the last release deletes it meanwhile. (ASAN reports such a
-// read.)
+// release that isn't the last must not touch the handle after dropping its
+// reference, as the last release deletes it meanwhile. That includes
+// correcting its counters for overflow, so this also runs with them past the
+// threshold for correction. (ASAN reports a read or write of the deleted
+// handle.)
 TYPED_TEST(ClockCacheTest, ReleaseOfStandaloneHandleRacingLastRelease) {
   using HandleImpl = typename TypeParam::Shard::HandleImpl;
-  this->NewShard(1, /*strict_capacity_limit=*/false);
+  for (bool near_overflow : {false, true}) {
+    SCOPED_TRACE("near_overflow=" + std::to_string(near_overflow));
+    this->NewShard(1, /*strict_capacity_limit=*/false);
+    auto& shard = *this->shard_;
+    const UniqueId64x2 hkey = this->TestHashedKey('a');
+    HandleImpl* handle =
+        shard.CreateStandalone(this->TestKey(hkey), hkey, nullptr /*value*/,
+                               &kNoopCacheItemHelper, 1 /*charge*/,
+                               /*allow_uncharged=*/false);
+    ASSERT_NE(nullptr, handle);
+    ASSERT_TRUE(shard.Ref(handle));
+    if (near_overflow) {
+      this->TakeAndReleaseRefsToNearOverflow(handle);
+      ASSERT_GT(handle->meta.Load().GetReleaseCounter(),
+                this->kCounterTopBit + ClockHandle::kMaxCountdown);
+    }
+    bool last_erased = false;
+    bool erased = this->ReleaseHeldAt(
+        "ClockCache::Release:EraseInvisible",
+        [&] {
+          return shard.Release(handle, /*useful=*/true,
+                               /*erase_if_last_ref=*/false);
+        },
+        [&] {
+          last_erased = shard.Release(handle, /*useful=*/true,
+                                      /*erase_if_last_ref=*/false);
+        });
+    EXPECT_TRUE(last_erased);
+    EXPECT_FALSE(erased);
+    EXPECT_EQ(0U, shard.GetUsage());
+    EXPECT_EQ(0U, shard.GetStandaloneUsage());
+  }
+}
+
+// Releases of an invisible entry don't correct its counters for overflow, as
+// the entry can be a standalone handle, which the release of its last
+// reference deletes while another release finishes. Ref corrects them
+// instead, clearing the top bit of both counters, which keeps the reference
+// count.
+TYPED_TEST(ClockCacheTest, RefCorrectsOverflowOfErasedEntry) {
+  using HandleImpl = typename TypeParam::Shard::HandleImpl;
+  using SlotMeta = ClockHandle::SlotMeta;
+  this->NewShard(10, /*strict_capacity_limit=*/false);
   auto& shard = *this->shard_;
-  const UniqueId64x2 hkey = this->TestHashedKey('a');
-  HandleImpl* handle =
-      shard.CreateStandalone(this->TestKey(hkey), hkey, nullptr /*value*/,
-                             &kNoopCacheItemHelper, 1 /*charge*/,
-                             /*allow_uncharged=*/false);
-  ASSERT_NE(nullptr, handle);
+  HandleImpl* handle = nullptr;
+  ASSERT_OK(this->InsertReferenced('a', &handle));
+  // Only marked invisible, as the handle holds it.
+  this->Erase('a');
+  this->TakeAndReleaseRefsToNearOverflow(handle);
+  const SlotMeta before = handle->meta.Load();
+  ASSERT_GT(before.GetReleaseCounter(),
+            this->kCounterTopBit + ClockHandle::kMaxCountdown);
   ASSERT_TRUE(shard.Ref(handle));
-  bool last_erased = false;
-  bool erased = this->ReleaseHeldAt(
-      "ClockCache::Release:EraseInvisible",
-      [&] {
-        return shard.Release(handle, /*useful=*/true,
-                             /*erase_if_last_ref=*/false);
-      },
-      [&] {
-        last_erased = shard.Release(handle, /*useful=*/true,
-                                    /*erase_if_last_ref=*/false);
-      });
-  EXPECT_TRUE(last_erased);
-  EXPECT_FALSE(erased);
+  const SlotMeta after = handle->meta.Load();
+  EXPECT_EQ(before.GetAcquireCounter() + 1 - this->kCounterTopBit,
+            after.GetAcquireCounter());
+  EXPECT_EQ(before.GetReleaseCounter() - this->kCounterTopBit,
+            after.GetReleaseCounter());
+  EXPECT_FALSE(shard.Release(handle, /*useful=*/true,
+                             /*erase_if_last_ref=*/false));
+  EXPECT_TRUE(shard.Release(handle, /*useful=*/true,
+                            /*erase_if_last_ref=*/false));
   EXPECT_EQ(0U, shard.GetUsage());
-  EXPECT_EQ(0U, shard.GetStandaloneUsage());
 }
 #endif  // !NDEBUG
 

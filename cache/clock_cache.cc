@@ -211,6 +211,10 @@ inline bool ClockUpdate(ClockHandle& h, BaseClockTable::EvictionData* data,
 // motivates only checking for release counter in high state, not both in high
 // state.)
 //
+// That tolerance covers only a slot in the table, which stays allocated. A
+// standalone handle can be deleted as soon as a reference to it is dropped,
+// so nothing corrects one after dropping its reference (see ReleaseRef).
+//
 // We clear both top-most counter bits at the same time.
 constexpr uint32_t kCounterTopBit = uint32_t{1}
                                     << (SlotMeta::kCounterNumBits - 1);
@@ -292,7 +296,9 @@ inline bool ReleaseRefOrTakeOwnership(ClockHandle& h, bool useful) {
 // and has no references can't be told apart from this one, as SlotMeta has no
 // bits left for a generation count. It is freed here then, which was due
 // anyway, but this Release returns true for it and the release of its last
-// reference returns false.
+// reference returns false. A caller that acts on the result, such as by
+// adjusting accounting by the charge of the handle it released, is then off by
+// the difference between the two entries' charges.
 inline bool TakeOwnershipIfLastRefToErased(ClockHandle& h, SlotMeta meta) {
   SlotMeta construction_meta;
   construction_meta.SetUnderConstruction();
@@ -311,6 +317,62 @@ inline bool TakeOwnershipIfLastRefToErased(ClockHandle& h, SlotMeta meta) {
     }
   } while (!h.meta.CasWeak(meta, construction_meta));
   return true;
+}
+
+// The part of Release that both tables share. Releases the reference to h and
+// returns true if this release is to free the entry, having taken ownership of
+// it, for the caller to free it.
+inline bool ReleaseRef(ClockHandle& h, bool useful, bool erase_if_last_ref) {
+  if (erase_if_last_ref) {
+    return ReleaseRefOrTakeOwnership(h, useful);
+  }
+
+  SlotMeta old_meta;
+  if (useful) {
+    // Increment release counter to indicate was used
+    h.meta.Apply(ReleaseCounter::PlusTransformPromiseNoOverflow(1), &old_meta);
+  } else {
+    // Decrement acquire counter to pretend it never happened
+    h.meta.Apply(AcquireCounter::MinusTransformPromiseNoUnderflow(1),
+                 &old_meta);
+  }
+
+  assert(old_meta.IsShareable());
+  // No underflow
+  assert(old_meta.GetAcquireCounter() != old_meta.GetReleaseCounter());
+
+  if (UNLIKELY(old_meta.IsInvisible())) {
+    TEST_SYNC_POINT("ClockCache::Release:EraseInvisible");
+    // Update for last Apply op
+    if (useful) {
+      old_meta.SetReleaseCounter(old_meta.GetReleaseCounter() + 1);
+    } else {
+      old_meta.SetAcquireCounter(old_meta.GetAcquireCounter() - 1);
+    }
+    // No overflow correction here, as h can be a standalone handle, which the
+    // release of its last reference can delete once ours is dropped. Ref
+    // corrects invisible entries instead (CorrectNearOverflowIfInvisible).
+    return TakeOwnershipIfLastRefToErased(h, old_meta);
+  }
+  // Visible, so h is a slot in the table (a standalone handle is never
+  // visible), which stays allocated once our reference is dropped.
+  // Correct for possible (but rare) overflow
+  CorrectNearOverflow(old_meta, h.meta);
+  return false;
+}
+
+// For Ref, with `old_meta` the entry's state before Ref's atomic update.
+// Releases of an invisible entry don't correct its counters for overflow (see
+// ReleaseRef), so Ref does. Its caller holds a reference, so the entry can't
+// be freed meanwhile. That suffices: Lookup never returns an invisible entry,
+// so a reference to one was either held when it became invisible, and those
+// are few, or taken by Ref. Between two Refs, the counters can then grow only
+// by the number of references outstanding.
+inline void CorrectNearOverflowIfInvisible(SlotMeta old_meta,
+                                           BitFieldsAtomic<SlotMeta>& meta) {
+  if (UNLIKELY(old_meta.IsInvisible())) {
+    CorrectNearOverflow(old_meta, meta);
+  }
 }
 
 inline bool BeginSlotInsert(const ClockHandleBasicData& proto, ClockHandle& h,
@@ -773,7 +835,7 @@ void BaseClockTable::Ref(ClockHandle& h) {
   assert(old_meta.IsShareable());
   // Must have already had a reference
   assert(old_meta.GetRefcount() > 0);
-  (void)old_meta;
+  CorrectNearOverflowIfInvisible(old_meta, h.meta);
 }
 
 #ifndef NDEBUG
@@ -783,7 +845,7 @@ void BaseClockTable::TEST_RefN(ClockHandle& h, uint32_t n) {
   h.meta.Apply(AcquireCounter::PlusTransformPromiseNoOverflow(n), &old_meta);
 
   assert(old_meta.IsShareable());
-  (void)old_meta;
+  CorrectNearOverflowIfInvisible(old_meta, h.meta);
 }
 
 void BaseClockTable::TEST_ReleaseNMinus1(ClockHandle* h, uint32_t n) {
@@ -991,55 +1053,11 @@ bool FixedHyperClockTable::Release(HandleImpl* h, bool useful,
   // when the cache is above capacity and the reference is the last one. Space
   // is only freed up by EvictFromClock (called by Insert when space is needed)
   // and Erase. We do this to avoid an extra atomic read of the variable usage_.
-
-  if (erase_if_last_ref) {
-    if (ReleaseRefOrTakeOwnership(*h, useful)) {
-      FreeOwnedEntry(h);
-      return true;
-    }
-    return false;
+  if (ReleaseRef(*h, useful, erase_if_last_ref)) {
+    FreeOwnedEntry(h);
+    return true;
   }
-
-  SlotMeta old_meta;
-  if (useful) {
-    // Increment release counter to indicate was used
-    auto add_release = ReleaseCounter::PlusTransformPromiseNoOverflow(1);
-    h->meta.Apply(add_release, &old_meta);
-  } else {
-    // Decrement acquire counter to pretend it never happened
-    auto sub_acquire = AcquireCounter::MinusTransformPromiseNoUnderflow(1);
-    h->meta.Apply(sub_acquire, &old_meta);
-  }
-
-  assert(old_meta.IsShareable());
-  // No underflow
-  assert(old_meta.GetAcquireCounter() != old_meta.GetReleaseCounter());
-
-  if (UNLIKELY(old_meta.IsInvisible())) {
-    TEST_SYNC_POINT("ClockCache::Release:EraseInvisible");
-    // Update for last Apply op
-    if (useful) {
-      old_meta.SetReleaseCounter(old_meta.GetReleaseCounter() + 1);
-    } else {
-      old_meta.SetAcquireCounter(old_meta.GetAcquireCounter() - 1);
-    }
-    if (old_meta.GetRefcount() != 0) {
-      // Not last ref at some point in time during this Release call
-      // Correct for possible (but rare) overflow
-      CorrectNearOverflow(old_meta, h->meta);
-      return false;
-    }
-    // Take ownership if still no refs
-    if (TakeOwnershipIfLastRefToErased(*h, old_meta)) {
-      FreeOwnedEntry(h);
-      return true;
-    }
-    return false;
-  } else {
-    // Correct for possible (but rare) overflow
-    CorrectNearOverflow(old_meta, h->meta);
-    return false;
-  }
+  return false;
 }
 
 #ifndef NDEBUG
@@ -3443,45 +3461,9 @@ bool AutoHyperClockTable::Release(HandleImpl* h, bool useful,
   // is only freed up by Evict/PurgeImpl (called by Insert when space
   // is needed) and Erase. We do this to avoid an extra atomic read of the
   // variable usage_.
-
-  if (erase_if_last_ref) {
-    if (ReleaseRefOrTakeOwnership(*h, useful)) {
-      FreeOwnedEntry(h);
-      return true;
-    }
-    return false;
-  }
-
-  SlotMeta old_meta;
-  if (useful) {
-    // Increment release counter to indicate was used
-    auto add_release = ReleaseCounter::PlusTransformPromiseNoOverflow(1);
-    h->meta.Apply(add_release, &old_meta);
-    // Correct for possible (but rare) overflow
-    CorrectNearOverflow(old_meta, h->meta);
-  } else {
-    // Decrement acquire counter to pretend it never happened
-    auto sub_acquire = AcquireCounter::MinusTransformPromiseNoUnderflow(1);
-    h->meta.Apply(sub_acquire, &old_meta);
-  }
-
-  assert(old_meta.IsShareable());
-  // No underflow
-  assert(old_meta.GetAcquireCounter() != old_meta.GetReleaseCounter());
-
-  if (UNLIKELY(old_meta.IsInvisible())) {
-    TEST_SYNC_POINT("ClockCache::Release:EraseInvisible");
-    // Update for last Apply op
-    if (useful) {
-      old_meta.SetReleaseCounter(old_meta.GetReleaseCounter() + 1);
-    } else {
-      old_meta.SetAcquireCounter(old_meta.GetAcquireCounter() - 1);
-    }
-    // Take ownership if no refs
-    if (TakeOwnershipIfLastRefToErased(*h, old_meta)) {
-      FreeOwnedEntry(h);
-      return true;
-    }
+  if (ReleaseRef(*h, useful, erase_if_last_ref)) {
+    FreeOwnedEntry(h);
+    return true;
   }
   return false;
 }

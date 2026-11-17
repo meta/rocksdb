@@ -37,7 +37,10 @@ class ClockCacheTest;
 // Benefits
 // --------
 // * Lock/wait free (no waits or spins) for efficiency under high concurrency
-//   * Fixed version (estimated_entry_charge > 0) is fully lock/wait free
+//   * Fixed version (estimated_entry_charge > 0) is fully lock free and has no
+//     waits. A few operations, such as Erase() and Release() with
+//     erase_if_last_ref, retry a compare-exchange when another thread updates
+//     the same entry meanwhile.
 //   * Automatic version (estimated_entry_charge = 0) has rare waits among
 //     certain insertion or erase operations that involve the same very small
 //     set of entries.
@@ -132,7 +135,11 @@ class ClockCacheTest;
 // refcount never reaches to many millions, we only have to correct for
 // overflow in both counters in Release, not in Lookup. The overflow check
 // should be only 1-2 CPU cycles per Release because it is a predictable
-// branch on a simple condition on data already in registers.
+// branch on a simple condition on data already in registers. For an entry
+// that is invisible (erased while referenced), Ref does the check instead of
+// Release, as the entry can be a standalone handle, which the release of its
+// last reference deletes, so a Release must not touch it after dropping its
+// reference.
 //
 // Slot states
 // -----------
@@ -771,9 +778,10 @@ class FixedHyperClockTable : public BaseClockTable {
 // FixedHCC there is essentially an entry-level read-write lock implemented
 // with atomics, but our relaxed atomicity/consistency guarantees (e.g.
 // duplicate inserts are possible) mean we do not need to wait for entry
-// locking. Lookups, non-erasing Releases, and non-evicting non-growing Inserts
-// are all fully wait-free. Of course, these waits are not dependent on any
-// external factors such as I/O.
+// locking. Lookups, Releases without erase_if_last_ref that don't free an
+// erased entry, and non-evicting non-growing Inserts are all fully wait-free.
+// Of course, these waits are not dependent on any external factors such as
+// I/O.
 //
 // For operations that remove entries from a chain or grow the table by
 // splitting a chain, there is a chain-level locking mechanism that we call a
