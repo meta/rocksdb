@@ -4640,6 +4640,37 @@ TEST_F(TrieTest, MalformedBucketEntryFailsOnPrev) {
   ASSERT_FALSE(it.Valid());
 }
 
+// Prev keeps the bounds of the bucket it last descended to. Coming back to
+// that bucket from a later one, it decodes within those bounds rather than
+// the later bucket's.
+TEST_F(TrieTest, MalformedBucketEntryFailsOnCachedPrev) {
+  std::vector<Block> blocks;
+  blocks.reserve(8);
+  for (uint64_t i = 0; i < 8; i++) {
+    blocks.push_back(
+        {"k" + std::to_string(i) + (i == 7 ? "long" : ""), {i * 105, 100}, 0});
+  }
+  // Buckets {k0, k1, k2, k3} and {k4, k5, k6, k7long}, where each entry of
+  // bucket 0 takes 2 bytes. k3's now adds 3 bytes, which run past bucket 0
+  // into bucket 1, and k7long keeps that length within max_separator_len.
+  std::string data = Build(blocks, 4);
+  const uint64_t bucket_data = DecodeFixed64(&data[56 + 8 * 2]);
+  ASSERT_EQ(data[bucket_data + 4], '\x11');
+  data[bucket_data + 4] = '\x13';
+  Trie index;
+  ASSERT_OK(index.Init(data));
+  TrieIterator it(&index);
+  // The Seek decodes up to k2, and Prev descends to bucket 0 and keeps it.
+  ASSERT_OK(it.Seek("k2", kSeekTag));
+  ASSERT_OK(it.Prev());
+  ASSERT_EQ(it.key(), "k1");
+  // k4 is a bucket head, so the Seek decodes no entry.
+  ASSERT_OK(it.Seek("k4", kSeekTag));
+  ASSERT_EQ(it.key(), "k4");
+  ASSERT_EQ(it.Prev().code(), Status::Code::kCorruption);
+  ASSERT_FALSE(it.Valid());
+}
+
 // Malformed indexes must be rejected by Init() or iterate without crashing.
 // Run under ASAN to catch out-of-bounds reads.
 TEST_F(TrieTest, MalformedData) {

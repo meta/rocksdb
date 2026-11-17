@@ -301,10 +301,11 @@ class Trie {
 // 3. If the ceiling equals target, enter its bucket at the head and go to
 //    step 5. If there is no floor, every head is after target, and Seek
 //    moves to the first block.
-// 4. SpellHead() writes the floor's head into key_, and ScanBucket() decodes
-//    the floor's bucket up to the first separator at or after target. If
-//    there is none, the answer is the next bucket's head, the ceiling, or
-//    the iterator becomes invalid when there is no next bucket.
+// 4. MeasureFloor() finds the floor's bucket and the length of its head, and
+//    ScanBucket() decodes the bucket up to the first separator at or after
+//    target, which is the only one it writes into key_. If there is none,
+//    the answer is the next bucket's head, the ceiling, or the iterator
+//    becomes invalid when there is no next bucket.
 // 5. EnterSeparator() finds the separator's blocks in the run table. If the
 //    separator equals target, ApplyTag() skips its blocks whose tag is
 //    greater than tag, and moves to the next separator if it skips them all.
@@ -312,8 +313,8 @@ class Trie {
 // Next() moves to the next block of the separator, or with NextSeparator()
 // to the next separator. Prev() moves to the previous block of the
 // separator, or decodes forward from the previous separator's bucket head.
-// Prev() keeps the last head it found, so it calls Descend() only for a
-// bucket other than that one.
+// Prev() keeps the last head it found and that bucket's bounds, so it calls
+// Descend() only for a bucket other than that one.
 class TrieIterator {
  public:
   explicit TrieIterator(const Trie* index);
@@ -353,6 +354,11 @@ class TrieIterator {
     // bytes, rather than being included in them.
     bool has_label = false;
     uint8_t label = 0;
+    // For a floor found where target leaves node's path, the number of path
+    // bytes that match target before it does, and 0 for other candidates. A
+    // floor's head starts with depth + path_matched bytes of target, then
+    // ends or continues with a smaller byte.
+    size_t path_matched = 0;
   };
   struct Node;
 
@@ -364,6 +370,9 @@ class TrieIterator {
   // Writes the head that candidate leads to into key_ and returns its bucket
   // id. target holds at least candidate.depth bytes.
   uint64_t SpellHead(const Candidate& candidate, const char* target);
+  // Returns the bucket id of the head a floor leads to, and through *len its
+  // length without the shared prefix, without writing it.
+  uint64_t MeasureFloor(const Candidate& floor, size_t* len) const;
   // Positions on the head of bucket, whose key is already in key_.
   void EnterBucket(uint64_t bucket);
   // Spells the head candidate leads to, which must be bucket's, and positions
@@ -371,17 +380,28 @@ class TrieIterator {
   // elsewhere, which means it is corrupt.
   bool EnterBucketAt(const Candidate& candidate, const char* target,
                      uint64_t bucket);
-  // Decodes the next separator in the bucket into key_. Returns the length
-  // shared with the previous separator, excluding the shared prefix, and the
-  // suffix through *suffix and *suffix_len.
-  Status DecodeNext(size_t* shared, const char** suffix, size_t* suffix_len);
-  // The same, for callers that only need key_.
+  // A separator in front coding: it starts with the first `shared` bytes of
+  // the previous separator, excluding the shared prefix, and continues with
+  // the suffix_len bytes at suffix.
+  struct Entry {
+    size_t shared = 0;
+    const char* suffix = nullptr;
+    size_t suffix_len = 0;
+  };
+  // Moves to the next separator in the bucket without writing it into key_.
+  // len is the current separator's length, excluding the shared prefix.
+  // Returns false if the entry is corrupt.
+  bool ReadEntry(size_t len, Entry* entry);
+  // Moves to the next separator in the bucket and writes it into key_.
   Status DecodeNext();
-  // Moves from the bucket head to the first separator >= target in this
-  // bucket. Sets *found to false if every separator is smaller, and *equal to
-  // whether the separator found equals target.
-  Status ScanBucket(const char* target, size_t target_len, bool* found,
-                    bool* equal);
+  // Moves from the bucket head, which is below target, to the first
+  // separator >= target in this bucket. head_len is the head's length and
+  // matched the number of target bytes it starts with, both without the
+  // shared prefix. Sets *found to false if every separator is smaller, and
+  // *equal to whether the separator found equals target. Writes the
+  // separator found into key_, and leaves key_ as it was when none is.
+  Status ScanBucket(const char* target, size_t target_len, size_t head_len,
+                    size_t matched, bool* found, bool* equal);
   // Sets the block range of the current separator index.
   void EnterSeparator();
   // Positions on block and reads its handle.
@@ -409,10 +429,13 @@ class TrieIterator {
   // Copy of a Seek target that points into key_.
   std::string target_;
   // The head, with the shared prefix, of bucket prev_head_bucket_, which is
-  // the bucket Prev() last found by descending the trie. The trie does not
-  // change, so the copy stays valid for the iterator's life.
+  // the bucket Prev() last found by descending the trie, and the bucket's
+  // bounds in the bucket data. The trie does not change, so they stay valid
+  // for the iterator's life.
   std::string prev_head_;
   uint64_t prev_head_bucket_ = kNoBucket;
+  const char* prev_bucket_pos_ = nullptr;
+  const char* prev_bucket_end_ = nullptr;
   const char* bucket_pos_ = nullptr;
   const char* bucket_end_ = nullptr;
   uint64_t bucket_ = 0;

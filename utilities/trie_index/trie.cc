@@ -725,7 +725,10 @@ struct TrieIterator::Node {
   uint32_t pos = 0;
   uint32_t path_len = 0;
   uint32_t bucket_id = 0;
-  uint32_t child_count = 0;
+  // Children of a sparse node. Parse() leaves it 0 for other kinds: a bitmap
+  // node's count takes 4 popcounts that Descend() does not need, so
+  // ChildCount() computes it.
+  uint32_t sparse_count = 0;
   uint32_t pointer_width = 0;
   uint8_t kind = 0;
   bool terminal = false;
@@ -749,24 +752,35 @@ struct TrieIterator::Node {
       p += id_width;
     }
     if (kind == kKindSparse) {
-      child_count = Byte(p, 0) + 1u;
+      sparse_count = Byte(p, 0) + 1u;
       labels = lossless_cast<const uint8_t*>(p + 1);
-      p += 1 + child_count;
-    } else if (kind == kKindBitmap) {
-      bitmap = p;
-      child_count = 0;
-      for (int i = 0; i < 4; i++) {
-        child_count += BitsSetToOne(DecodeFixed64(p + 8 * i));
-      }
-      p += kBitmapBytes;
+      p += 1 + sparse_count;
     } else {
-      child_count = 0;
+      sparse_count = 0;
+      if (kind == kKindBitmap) {
+        bitmap = p;
+        p += kBitmapBytes;
+      }
     }
     pointers = p;
   }
 
+  // Init() rejects a bitmap with no bits set, and only leaves have no
+  // children.
+  bool HasChildren() const { return kind != kKindLeaf; }
+  uint32_t ChildCount() const {
+    if (kind != kKindBitmap) {
+      return sparse_count;
+    }
+    uint32_t count = 0;
+    for (int i = 0; i < 4; i++) {
+      count += BitsSetToOne(DecodeFixed64(bitmap + 8 * i));
+    }
+    return count;
+  }
+
   uint32_t Child(uint32_t index) const {
-    assert(index < child_count);
+    assert(index < ChildCount());
     return pos - LoadLE(pointers + index * pointer_width, pointer_width);
   }
 
@@ -790,16 +804,16 @@ struct TrieIterator::Node {
   // kMinBitmapChildren labels.
   LabelSearch FindSparseLabel(uint8_t c) const {
     LabelSearch r;
-    while (r.rank < child_count && labels[r.rank] < c) {
+    while (r.rank < sparse_count && labels[r.rank] < c) {
       r.rank++;
     }
-    r.present = r.rank < child_count && labels[r.rank] == c;
+    r.present = r.rank < sparse_count && labels[r.rank] == c;
     if (r.rank > 0) {
       r.has_below = true;
       r.below = labels[r.rank - 1];
     }
     const uint32_t next = r.present ? r.rank + 1 : r.rank;
-    if (next < child_count) {
+    if (next < sparse_count) {
       r.has_above = true;
       r.above = labels[next];
     }
@@ -866,7 +880,7 @@ struct TrieIterator::Node {
   }
   uint8_t LastLabel() const {
     if (kind == kKindSparse) {
-      return labels[child_count - 1];
+      return labels[sparse_count - 1];
     }
     for (int i = 3; i >= 0; i--) {
       const uint64_t w = DecodeFixed64(bitmap + 8 * i);
@@ -1254,7 +1268,7 @@ void TrieIterator::Descend(const char* target, size_t target_len,
       if (Byte(target, depth + matched) < Byte(node.path, matched)) {
         *ceiling = Candidate{depth, pos, Spell::kSmallest};
       } else {
-        *floor = Candidate{depth, pos, Spell::kLargest};
+        *floor = Candidate{depth, pos, Spell::kLargest, false, 0, matched};
       }
       return;
     }
@@ -1274,7 +1288,7 @@ void TrieIterator::Descend(const char* target, size_t target_len,
       *ceiling = Candidate{depth, pos, Spell::kSmallest};
       return;
     }
-    if (node.child_count == 0) {
+    if (!node.HasChildren()) {
       return;
     }
     const Node::LabelSearch found = node.FindLabel(Byte(target, label_depth));
@@ -1318,12 +1332,38 @@ uint64_t TrieIterator::SpellHead(const Candidate& candidate,
       key_.push_back(lossless_cast<char>(node.FirstLabel()));
       pos = node.Child(0);
     } else {
-      if (node.child_count == 0) {
+      if (!node.HasChildren()) {
         return node.bucket_id;
       }
       key_.push_back(lossless_cast<char>(node.LastLabel()));
-      pos = node.Child(node.child_count - 1);
+      pos = node.Child(node.ChildCount() - 1);
     }
+  }
+}
+
+uint64_t TrieIterator::MeasureFloor(const Candidate& floor, size_t* len) const {
+  assert(floor.spell == Spell::kTerminal || floor.spell == Spell::kLargest);
+  Node node;
+  size_t n = floor.depth;
+  if (floor.spell == Spell::kTerminal) {
+    node.Parse(index_->trie_, floor.node, index_->id_width_);
+    *len = n;
+    return node.bucket_id;
+  }
+  if (floor.has_label) {
+    n++;
+  }
+  uint32_t pos = floor.node;
+  for (;;) {
+    node.Parse(index_->trie_, pos, index_->id_width_);
+    n += node.path_len;
+    if (!node.HasChildren()) {
+      *len = n;
+      return node.bucket_id;
+    }
+    // The last child's label.
+    n++;
+    pos = node.Child(node.ChildCount() - 1);
   }
 }
 
@@ -1331,7 +1371,7 @@ void TrieIterator::EnterBucket(uint64_t bucket) {
   bucket_ = bucket;
   separator_index_ = bucket * index_->bucket_size_;
   // Init() does not check bucket positions. Clamping keeps a corrupt one
-  // inside the bucket data, where DecodeNext() bounds-checks every separator.
+  // inside the bucket data, where ReadEntry() bounds-checks every separator.
   const uint64_t size = index_->bucket_data_size_;
   bucket_pos_ =
       index_->bucket_data_ + std::min(index_->bucket_table_.Get(bucket), size);
@@ -1394,10 +1434,9 @@ Status TrieIterator::ApplyTag(uint64_t tag) {
   return NextSeparator();
 }
 
-Status TrieIterator::DecodeNext(size_t* shared, const char** suffix,
-                                size_t* suffix_len) {
+inline bool TrieIterator::ReadEntry(size_t len, Entry* entry) {
   if (bucket_pos_ >= bucket_end_) {
-    return Corrupt("truncated bucket");
+    return false;
   }
   const uint8_t header = Byte(bucket_pos_++, 0);
   uint32_t drop = header >> 4;
@@ -1408,78 +1447,79 @@ Status TrieIterator::DecodeNext(size_t* shared, const char** suffix,
       p = GetVarint32Ptr(p, bucket_end_, &add);
     }
     if (p == nullptr) {
-      return Corrupt("bad bucket entry");
+      return false;
     }
     bucket_pos_ = p;
   }
-  const size_t prefix_len = index_->prefix_len_;
-  const size_t len = key_.size() - prefix_len;
   if (drop > len || add > lossless_cast<size_t>(bucket_end_ - bucket_pos_) ||
-      len - drop + add > index_->max_separator_len_ - prefix_len) {
-    return Corrupt("bad bucket entry");
+      len - drop + add > index_->max_separator_len_ - index_->prefix_len_) {
+    return false;
   }
-  *shared = len - drop;
-  key_.resize(prefix_len + *shared);
-  key_.append(bucket_pos_, add);
-  *suffix = bucket_pos_;
-  *suffix_len = add;
+  entry->shared = len - drop;
+  entry->suffix = bucket_pos_;
+  entry->suffix_len = add;
   bucket_pos_ += add;
   separator_index_++;
-  return Status::OK();
+  return true;
 }
 
 Status TrieIterator::DecodeNext() {
-  size_t shared;
-  const char* suffix;
-  size_t suffix_len;
-  return DecodeNext(&shared, &suffix, &suffix_len);
+  const size_t prefix_len = index_->prefix_len_;
+  Entry e;
+  if (!ReadEntry(key_.size() - prefix_len, &e)) {
+    return Corrupt("bad bucket entry");
+  }
+  key_.resize(prefix_len + e.shared);
+  key_.append(e.suffix, e.suffix_len);
+  return Status::OK();
 }
 
+// Only the separator found is written into key_. Every separator decoded
+// before it is below target, so the one found shares at most `matched` bytes
+// with its predecessor, and those bytes are target's: it is target's first
+// `shared` bytes followed by its suffix.
 Status TrieIterator::ScanBucket(const char* target, size_t target_len,
-                                bool* found, bool* equal) {
-  const size_t prefix_len = index_->prefix_len_;
+                                size_t head_len, size_t matched, bool* found,
+                                bool* equal) {
+  assert(matched <= head_len && matched <= target_len);
   const uint64_t end = std::min(index_->num_separators_,
                                 separator_index_ + index_->bucket_size_);
-  // Length of the prefix the current separator shares with target. The
-  // current separator is always below target.
-  size_t matched = CommonPrefix(key_.data() + prefix_len, target,
-                                std::min(key_.size() - prefix_len, target_len));
+  // The current separator, which is below target, is len bytes long and
+  // starts with `matched` bytes of target.
+  size_t len = head_len;
   while (separator_index_ + 1 < end) {
-    size_t shared;
-    const char* suffix;
-    size_t suffix_len;
-    Status s = DecodeNext(&shared, &suffix, &suffix_len);
-    if (!s.ok()) {
-      return s;
+    Entry e;
+    if (!ReadEntry(len, &e)) {
+      return Corrupt("bad bucket entry");
     }
-    if (shared > matched) {
+    len = e.shared + e.suffix_len;
+    if (e.shared > matched) {
       // Same byte as the previous separator where it fell below target.
       continue;
     }
-    if (shared < matched) {
-      // Larger than the previous separator where it matched target.
-      *found = true;
-      *equal = false;
-      return Status::OK();
-    }
-    const size_t rest = target_len - matched;
-    const size_t n = std::min(suffix_len, rest);
-    const size_t common = CommonPrefix(suffix, target + matched, n);
-    if (common < n) {
-      if (Byte(suffix, common) > Byte(target, matched + common)) {
-        *found = true;
-        *equal = false;
-        return Status::OK();
+    // When e.shared < matched, this separator first differs from the
+    // previous one at a byte where that one matched target, and is larger
+    // there, so it is above target.
+    bool is_equal = false;
+    if (e.shared == matched) {
+      const size_t rest = target_len - matched;
+      const size_t n = std::min(e.suffix_len, rest);
+      const size_t common = CommonPrefix(e.suffix, target + matched, n);
+      const bool below =
+          common < n ? Byte(e.suffix, common) < Byte(target, matched + common)
+                     : e.suffix_len < rest;
+      if (below) {
+        matched += common;
+        continue;
       }
-      matched += common;
-    } else if (rest <= suffix_len) {
-      // Target is a prefix of this separator, or equal to it.
-      *found = true;
-      *equal = rest == suffix_len;
-      return Status::OK();
-    } else {
-      matched += suffix_len;
+      is_equal = common == n && e.suffix_len == rest;
     }
+    *found = true;
+    *equal = is_equal;
+    key_.resize(index_->prefix_len_);
+    key_.append(target, e.shared);
+    key_.append(e.suffix, e.suffix_len);
+    return Status::OK();
   }
   *found = false;
   return Status::OK();
@@ -1550,11 +1590,15 @@ Status TrieIterator::Seek(const Slice& target, uint64_t tag) {
     // Every head is greater than target, so tags do not matter.
     return SeekToFirst();
   }
-  const uint64_t bucket = SpellHead(floor, rest);
+  // The floor's head is below target, so the answer is not the head and it
+  // need not be written.
+  size_t head_len;
+  const uint64_t bucket = MeasureFloor(floor, &head_len);
   EnterBucket(bucket);
   bool found;
   bool equal = false;
-  Status s = ScanBucket(rest, rest_len, &found, &equal);
+  Status s = ScanBucket(rest, rest_len, head_len,
+                        floor.depth + floor.path_matched, &found, &equal);
   if (!s.ok()) {
     Invalidate();
     return s;
@@ -1648,12 +1692,17 @@ Status TrieIterator::Prev() {
   // The previous separator's bucket starts with the largest head below the
   // current separator. Front coding only decodes forward, so decode from that
   // head. A reverse walk enters each bucket once per separator in it, so keep
-  // the head rather than descend the trie for it every time.
+  // the head and its bucket's bounds rather than descend the trie and read
+  // the bucket table for them every time.
   const uint64_t prev_separator = separator_index_ - 1;
   const uint64_t bucket = prev_separator / index_->bucket_size_;
   if (bucket == prev_head_bucket_) {
+    // EnterBucket() without reading the bucket table again.
     key_.assign(prev_head_);
-    EnterBucket(bucket);
+    bucket_ = bucket;
+    separator_index_ = bucket * index_->bucket_size_;
+    bucket_pos_ = prev_bucket_pos_;
+    bucket_end_ = prev_bucket_end_;
   } else {
     const size_t prefix_len = index_->prefix_len_;
     scratch_.assign(key_.data() + prefix_len, key_.size() - prefix_len);
@@ -1665,6 +1714,8 @@ Status TrieIterator::Prev() {
     }
     prev_head_.assign(key_);
     prev_head_bucket_ = bucket;
+    prev_bucket_pos_ = bucket_pos_;
+    prev_bucket_end_ = bucket_end_;
   }
   Status s = AdvanceTo(prev_separator);
   return s.ok() ? EnterSeparatorFromEnd() : s;
