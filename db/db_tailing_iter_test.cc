@@ -702,6 +702,70 @@ TEST_P(DBTestTailingIterator, SeekToFirstWithUpperBoundBug) {
   ASSERT_EQ(iter->key().ToString(), "aa");
 }
 
+// A tailing iterator can outlive its column family. After the user drops the
+// column family and destroys its handle, a SuperVersion of the iterator holds
+// the last reference to the column family. Here a seek past the L0 file trims
+// the iterator, so the next SeekToFirst() rebuilds all child iterators. That
+// rebuild must keep the column family alive, and it must not ask the column
+// family for a new SuperVersion, because the column family has none left.
+// With `stale_sv`, a flush installs a newer SuperVersion before the drop, so
+// the first seek also moves the iterator to the newer SuperVersion
+// (ForwardIterator::RenewIterators()) and releases the older one.
+TEST_P(DBTestTailingIterator, SeekAfterColumnFamilyDroppedAndHandleDestroyed) {
+  for (const bool pin_data : {false, true}) {
+    for (const bool stale_sv : {false, true}) {
+      SCOPED_TRACE("pin_data=" + std::to_string(pin_data) +
+                   " stale_sv=" + std::to_string(stale_sv));
+      Options options = CurrentOptions();
+      options.disable_auto_compactions = true;
+      CreateColumnFamilies({"dropped"}, options);
+      ColumnFamilyHandle* const cf = handles_.back();
+
+      // Key "a" in an L0 file and key "c" in the memtable.
+      ASSERT_OK(db_->Put(WriteOptions(), cf, "a", "in_sst"));
+      ASSERT_OK(db_->Flush(FlushOptions(), cf));
+      ASSERT_OK(db_->Put(WriteOptions(), cf, "c", "in_memtable"));
+
+      ReadOptions read_options;
+      read_options.tailing = true;
+      read_options.async_io = GetParam();
+      read_options.pin_data = pin_data;
+      // The rebuild below happens only when the iterator has an upper bound.
+      const Slice upper_bound("m");
+      read_options.iterate_upper_bound = &upper_bound;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(read_options, cf));
+      ASSERT_OK(iter->status());
+
+      if (stale_sv) {
+        ASSERT_OK(db_->Flush(FlushOptions(), cf));
+      }
+      ASSERT_OK(db_->DropColumnFamily(cf));
+      ASSERT_OK(db_->DestroyColumnFamilyHandle(cf));
+      handles_.pop_back();
+
+      // "b" is above the largest key "a" of the first L0 file, so this seek
+      // trims that file's iterator.
+      iter->Seek("b");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key().ToString(), "c");
+      ASSERT_OK(iter->status());
+
+      // Seeking back to the start of a trimmed iterator rebuilds it.
+      iter->SeekToFirst();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key().ToString(), "a");
+      ASSERT_EQ(iter->value().ToString(), "in_sst");
+      iter->Next();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key().ToString(), "c");
+      ASSERT_EQ(iter->value().ToString(), "in_memtable");
+      iter->Next();
+      ASSERT_FALSE(iter->Valid());
+      ASSERT_OK(iter->status());
+    }
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
