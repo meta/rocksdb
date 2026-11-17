@@ -11,6 +11,7 @@
 #include <string>
 
 #include "rocksdb/customizable.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -19,7 +20,7 @@ class Slice;
 
 // The general interface for comparing two Slices are defined for both of
 // Comparator and some internal data structures.
-class CompareInterface {
+class ROCKSDB_API CompareInterface {
  public:
   CompareInterface() = default;
   CompareInterface(const CompareInterface&) = default;
@@ -46,7 +47,7 @@ class CompareInterface {
 // Exceptions MUST NOT propagate out of overridden functions into RocksDB,
 // because RocksDB is not exception-safe. This could cause undefined behavior
 // including data loss, unreported corruption, deadlocks, and more.
-class Comparator : public Customizable, public CompareInterface {
+class ROCKSDB_API Comparator : public Customizable, public CompareInterface {
  public:
   Comparator() : timestamp_size_(0) {}
 

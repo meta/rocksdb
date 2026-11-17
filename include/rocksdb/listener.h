@@ -18,6 +18,7 @@
 #include "rocksdb/compression_type.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/io_status.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table_properties.h"
 #include "rocksdb/types.h"
@@ -630,7 +631,7 @@ struct BackgroundJobPressure {
 // [Exceptions] Exceptions MUST NOT propagate out of overridden functions into
 // RocksDB, because RocksDB is not exception-safe. This could cause undefined
 // behavior including data loss, unreported corruption, deadlocks, and more.
-class EventListener : public Customizable {
+class ROCKSDB_API EventListener : public Customizable {
  public:
   static const char* Type() { return "EventListener"; }
   static Status CreateFromString(const ConfigOptions& options,

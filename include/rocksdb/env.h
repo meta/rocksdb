@@ -148,7 +148,7 @@ struct EnvOptions {
 // 1) File system operations, like creating a file, writing to a file, etc.
 // 2) Thread management.
 // 3) Misc functions, like getting the current time.
-class Env : public Customizable {
+class ROCKSDB_API Env : public Customizable {
  public:
   static const char* kDefaultName() { return "DefaultEnv"; }
   struct FileAttributes {
@@ -859,7 +859,7 @@ class Env : public Customizable {
 ThreadStatusUpdater* CreateThreadStatusUpdater();
 
 // A file abstraction for reading sequentially through a file
-class SequentialFile {
+class ROCKSDB_API SequentialFile {
  public:
   SequentialFile() {}
   virtual ~SequentialFile();
@@ -937,7 +937,7 @@ struct ReadRequest {
 };
 
 // A file abstraction for randomly reading the contents of a file.
-class RandomAccessFile {
+class ROCKSDB_API RandomAccessFile {
  public:
   RandomAccessFile() {}
   virtual ~RandomAccessFile();
@@ -1034,7 +1034,7 @@ class RandomAccessFile {
 // A file abstraction for sequential writing.  The implementation
 // must provide buffering since callers may append small fragments
 // at a time to the file.
-class WritableFile {
+class ROCKSDB_API WritableFile {
  public:
   WritableFile()
       : last_preallocated_block_(0),
@@ -1283,7 +1283,7 @@ class WritableFile {
 };
 
 // A file abstraction for random reading and writing.
-class RandomRWFile {
+class ROCKSDB_API RandomRWFile {
  public:
   RandomRWFile() {}
   // No copying allowed
@@ -1398,7 +1398,7 @@ enum InfoLogLevel : unsigned char {
 // Exceptions MUST NOT propagate out of overridden functions into RocksDB,
 // because RocksDB is not exception-safe. This could cause undefined behavior
 // including data loss, unreported corruption, deadlocks, and more.
-class Logger {
+class ROCKSDB_API Logger {
  public:
   static constexpr size_t kDoNotSupportGetLogFileSize = SIZE_MAX;
 

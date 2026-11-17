@@ -123,7 +123,7 @@ class WideColumnBlobResolver {
 // * Exceptions MUST NOT propagate out of overridden functions into RocksDB,
 // because RocksDB is not exception-safe. This could cause undefined behavior
 // including data loss, unreported corruption, deadlocks, and more.
-class CompactionFilter : public Customizable {
+class ROCKSDB_API CompactionFilter : public Customizable {
  public:
   // Determines how the compaction filter interacts with the merge operator
   // during compaction.
@@ -531,7 +531,7 @@ class CompactionFilter : public Customizable {
 // Exceptions MUST NOT propagate out of overridden functions into RocksDB,
 // because RocksDB is not exception-safe. This could cause undefined behavior
 // including data loss, unreported corruption, deadlocks, and more.
-class CompactionFilterFactory : public Customizable {
+class ROCKSDB_API CompactionFilterFactory : public Customizable {
  public:
   // Returns the merge order of filters created by this factory. Every
   // non-null filter it creates must return the same value from

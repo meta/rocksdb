@@ -199,6 +199,15 @@ EOF
     fi
 fi
 
+# hide internal symbols in shared libraries
+# When enabled, only export functions marked as public API
+if [ "$HIDE_PRIVATE_SYMBOLS" = "1" ]; then
+  PLATFORM_SHARED_CFLAGS="$PLATFORM_SHARED_CFLAGS -fvisibility=hidden -fvisibility-inlines-hidden"
+  echo "Symbol visibility: hidden (ABI-stable mode enabled)"
+else
+  echo "Symbol visibility: default (all symbols exported)"
+fi
+
 # generic port files (working on all platform by #ifdef) go directly in /port
 GENERIC_PORT_FILES=`cd "$ROCKSDB_ROOT"; find port -name '*.cc' | tr "\n" " "`
 

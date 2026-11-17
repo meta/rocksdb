@@ -22,11 +22,12 @@
 
 #include "rocksdb/iterator_base.h"
 #include "rocksdb/options.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/wide_columns.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-class Iterator : public IteratorBase {
+class ROCKSDB_API Iterator : public IteratorBase {
  public:
   Iterator() {}
   // No copying allowed

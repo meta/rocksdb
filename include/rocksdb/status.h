@@ -28,11 +28,12 @@
 #include "port/stack_trace.h"
 #endif
 
+#include "rocksdb/port_defs.h"
 #include "rocksdb/slice.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-class Status {
+class ROCKSDB_API Status {
  public:
   // Create a success status.
   Status()

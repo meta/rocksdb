@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "rocksdb/port_defs.h"
 #include "rocksdb/types.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -17,7 +18,7 @@ class DB;
 //
 // To Create a Snapshot, call DB::GetSnapshot().
 // To Destroy a Snapshot, call DB::ReleaseSnapshot(snapshot).
-class Snapshot {
+class ROCKSDB_API Snapshot {
  public:
   virtual SequenceNumber GetSequenceNumber() const = 0;
 

@@ -27,10 +27,11 @@
 #include <string_view>
 
 #include "rocksdb/cleanable.h"
+#include "rocksdb/port_defs.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-class Slice {
+class ROCKSDB_API Slice {
  public:
   // Create an empty slice.
   Slice() : data_(""), size_(0) {}

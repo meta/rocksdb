@@ -21,11 +21,12 @@
 #endif
 #include <cstring>
 
+#include "rocksdb/port_defs.h"
 #include "status.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-class IOStatus : public Status {
+class ROCKSDB_API IOStatus : public Status {
  public:
   using Code = Status::Code;
   using SubCode = Status::SubCode;
