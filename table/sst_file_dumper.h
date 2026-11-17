@@ -96,7 +96,36 @@ class SstFileDumper {
     // fields that don't apply (write time, block counts, compression_opts) are
     // -1 / 0 / default and should be rendered as N/A.
     bool is_input = false;
+    // True for an input entry describing only a prefix of the input (see
+    // InputPrefix). Its index sizes are then unknown (0) and should be rendered
+    // as N/A.
+    bool is_input_prefix = false;
   };
+
+  // The part of the input used by recompression benchmarks: the whole input,
+  // or (when `truncated`) whole data blocks from the start of the file. See
+  // MaterializeInputKVs().
+  struct InputPrefix {
+    // The fields below describe the prefix only when `truncated`.
+    uint64_t num_data_blocks = 0;
+    uint64_t num_entries = 0;
+    // Total size of the entries' (internal) keys and values
+    uint64_t kv_bytes = 0;
+    // On-disk payload of the data blocks, excluding block trailers
+    uint64_t data_on_disk_payload = 0;
+    // Whether this is only a prefix rather than the whole input
+    bool truncated = false;
+  };
+
+  // Reads the input file once into memory so that ShowAllCompressionSizes()
+  // can feed its builds from memory (excluding input read/decompression from
+  // their timing) and be independent of block-cache state. With a positive
+  // `max_kv_bytes`, reads only a prefix, described in *prefix: the whole data
+  // blocks from the start of the file whose keys and values fit within
+  // `max_kv_bytes`. That requires a block-based table, and fails if the first
+  // data block does not fit. Does not fill the block cache,
+  // so a following GetInputBenchmarkMeasurement() still reads the input cold.
+  Status MaterializeInputKVs(uint64_t max_kv_bytes, InputPrefix* prefix);
 
   // Measures the recompressed size for each combination of compression type,
   // strategy, and level, collecting them for retrieval via
@@ -107,6 +136,8 @@ class SstFileDumper {
   // is collected, so callers can stream output incrementally (measurements can
   // be slow). Does not print anything itself. An empty `compression_strategies`
   // means "use the strategy already in Options::compression_opts".
+  // Recompresses the input held by MaterializeInputKVs(), first materializing
+  // the whole input if none is held.
   Status ShowAllCompressionSizes(
       const std::vector<CompressionType>& compression_types,
       int32_t compress_level_from, int32_t compress_level_to,
@@ -137,7 +168,13 @@ class SstFileDumper {
   // Exact when the file's index blocks are stored uncompressed (the default);
   // if the file was written with enable_index_compression, the uncompressed
   // data size may be overstated by the index's decompression delta.
-  Status GetInputBenchmarkMeasurement(RecompressionMeasurement* measurement);
+  //
+  // When `input_prefix` is truncated, the data sizes, block count and read
+  // time describe only the prefix, and the index sizes are unknown (see
+  // RecompressionMeasurement::is_input_prefix), as is the uncompressed data
+  // size without a Statistics object.
+  Status GetInputBenchmarkMeasurement(const InputPrefix& input_prefix,
+                                      RecompressionMeasurement* measurement);
 
   BlockContents& GetMetaIndexContents() { return meta_index_contents_; }
 
@@ -166,11 +203,6 @@ class SstFileDumper {
                           const CompressionOptions& compress_opt,
                           uint64_t block_size);
 
-  // Reads the whole input file once into memory (see input_kvs_) so the
-  // write benchmark can feed the builder from memory (excluding input
-  // read/decompression from the timing) and be independent of block-cache
-  // state.
-  Status MaterializeInputKVs();
   Status AppendInputKV(const Slice& key, const Slice& value);
   // Calls fn(key, value) for each materialized input entry in order, until it
   // returns false
@@ -210,15 +242,16 @@ class SstFileDumper {
   ReadOptions read_options_;
   InternalKeyComparator internal_comparator_;
   std::unique_ptr<TableProperties> table_properties_;
-  // Whole input file materialized in memory so write benchmarks feed the
+  // Input (prefix) materialized in memory so write benchmarks feed the
   // builder without re-reading/decompressing the input. Each entry is its
   // (internal) key's and value's sizes as two 32-bit integers, then the key
   // and value, back to back in the first input_kvs_used_ bytes of one
   // anonymous memory mapping, which avoids heap overhead and fragmentation.
-  // The mapping is sized from the table properties, so it never needs to grow,
-  // and only the pages written become resident.
+  // The mapping is sized from the table properties and the limit, so it never
+  // needs to grow, and only the pages written become resident.
   TypedMemMapping<char> input_kvs_ = MemMapping::AllocateLazyZeroed(0);
   size_t input_kvs_used_ = 0;
+  bool have_input_kvs_ = false;
   // Properties of the last table file built by ShowCompressionSize.
   TableProperties recompress_output_props_;
   bool have_recompress_output_props_ = false;

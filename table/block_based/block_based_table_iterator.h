@@ -266,6 +266,18 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
 
   void Prepare(const MultiScanArgs* scan_opts) override;
 
+  // The handle of the data block holding the current entry. REQUIRES: Valid(),
+  // the block is loaded (not at a first key from the index; see
+  // PrepareValue()), and neither readahead size auto-tuning (block cache
+  // lookup) nor MultiScan is in use, as they can move the index iterator ahead
+  // of the current block.
+  BlockHandle GetCurrentDataBlockHandle() const {
+    assert(Valid());
+    assert(block_iter_points_to_real_block_);
+    assert(IsIndexAtCurr());
+    return index_iter_->value().handle;
+  }
+
   FilePrefetchBuffer* prefetch_buffer() {
     return block_prefetcher_.prefetch_buffer();
   }

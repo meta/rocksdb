@@ -35,6 +35,7 @@
 #include "table/block_based/block.h"
 #include "table/block_based/block_based_table_builder.h"
 #include "table/block_based/block_based_table_factory.h"
+#include "table/block_based/block_based_table_iterator.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/block_builder.h"
 #include "table/block_fetcher.h"
@@ -42,6 +43,7 @@
 #include "table/meta_blocks.h"
 #include "table/plain/plain_table_factory.h"
 #include "table/table_reader.h"
+#include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/compression.h"
 #include "util/random.h"
@@ -515,8 +517,17 @@ Status SstFileDumper::PrimeCompression(CompressionType compress_type,
   return s;
 }
 
-Status SstFileDumper::MaterializeInputKVs() {
+Status SstFileDumper::MaterializeInputKVs(uint64_t max_kv_bytes,
+                                          InputPrefix* prefix) {
+  assert(prefix);
+  *prefix = InputPrefix();
   input_kvs_used_ = 0;
+  have_input_kvs_ = false;
+  if (max_kv_bytes > 0 && !options_.table_factory->IsInstanceOf(
+                              TableFactory::kBlockBasedTableName())) {
+    return Status::NotSupported(
+        "Limiting the input requires a block-based table");
+  }
   // Room for every entry's sizes, key and value. Keys can be longer than the
   // raw key size counts: a timestamp that is not persisted is padded back, and
   // a cuckoo table's last-level keys get back their internal key footer.
@@ -529,9 +540,14 @@ Status SstFileDumper::MaterializeInputKVs() {
   if (options_.table_factory->IsInstanceOf(TableFactory::kCuckooTableName())) {
     uncounted_key_bytes += kNumInternalBytes;
   }
-  const uint64_t capacity =
+  uint64_t capacity =
       tp.raw_key_size + tp.raw_value_size +
       tp.num_entries * (kInputKVHeaderSize + uncounted_key_bytes);
+  // A limited input holds at most max_kv_bytes of keys and values, and no more
+  // bytes of entry sizes, as every key has its 8-byte internal key footer
+  if (max_kv_bytes > 0 && max_kv_bytes < capacity / 2) {
+    capacity = 2 * max_kv_bytes;
+  }
   if (capacity > std::numeric_limits<size_t>::max()) {
     return Status::MemoryLimit("Input too large to hold in memory");
   }
@@ -539,16 +555,63 @@ Status SstFileDumper::MaterializeInputKVs() {
   if (capacity > 0 && input_kvs_.Get() == nullptr) {
     return Status::MemoryLimit("Failed to map memory for the input");
   }
+  ReadOptions read_options = read_options_;
+  read_options.fill_cache = false;
+  // GetCurrentDataBlockHandle() requires no readahead auto-tuning, whose block
+  // cache lookups can move the index iterator ahead of the current block
+  read_options.auto_readahead_size = false;
   std::unique_ptr<InternalIterator> iter(table_reader_->NewIterator(
-      read_options_, moptions_.prefix_extractor.get(), /*arena=*/nullptr,
+      read_options, moptions_.prefix_extractor.get(), /*arena=*/nullptr,
       /*skip_filters=*/false, TableReaderCaller::kSSTDumpTool));
+  const BlockBasedTableIterator* block_iter =
+      max_kv_bytes > 0
+          ? static_cast_with_check<BlockBasedTableIterator>(iter.get())
+          : nullptr;
+  InputPrefix found;
+  // What was held when the current data block started
+  InputPrefix whole_blocks;
+  size_t whole_blocks_used = 0;
+  uint64_t block_offset = std::numeric_limits<uint64_t>::max();
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-    Status s = AppendInputKV(iter->key(), iter->value());
+    const Slice key = iter->key();
+    const Slice value = iter->value();
+    if (block_iter != nullptr) {
+      const BlockHandle handle = block_iter->GetCurrentDataBlockHandle();
+      if (handle.offset() != block_offset) {
+        block_offset = handle.offset();
+        whole_blocks = found;
+        whole_blocks_used = input_kvs_used_;
+        ++found.num_data_blocks;
+        found.data_on_disk_payload += handle.size();
+      }
+      if (found.kv_bytes + key.size() + value.size() > max_kv_bytes) {
+        // This data block does not fit, so keep only the ones before it
+        found = whole_blocks;
+        input_kvs_used_ = whole_blocks_used;
+        found.truncated = true;
+        break;
+      }
+    }
+    Status s = AppendInputKV(key, value);
     if (!s.ok()) {
       return s;
     }
+    ++found.num_entries;
+    found.kv_bytes += key.size() + value.size();
   }
-  return iter->status();
+  Status s = iter->status();
+  if (!s.ok()) {
+    return s;
+  }
+  if (found.truncated && found.num_data_blocks == 0) {
+    return Status::InvalidArgument(
+        "The first data block's keys and values exceed the limit");
+  }
+  have_input_kvs_ = true;
+  if (found.truncated) {
+    *prefix = found;
+  }
+  return s;
 }
 
 Status SstFileDumper::AppendInputKV(const Slice& key, const Slice& value) {
@@ -578,9 +641,12 @@ Status SstFileDumper::ShowAllCompressionSizes(
         per_measurement) {
   recompress_measurements_.clear();
   // Materialize the input once so the timed write builds feed from memory.
-  Status ms = MaterializeInputKVs();
-  if (!ms.ok()) {
-    return ms;
+  if (!have_input_kvs_) {
+    InputPrefix whole;
+    Status ms = MaterializeInputKVs(/*max_kv_bytes=*/0, &whole);
+    if (!ms.ok()) {
+      return ms;
+    }
   }
   BlockBasedTableOptions bbto;
   if (options_.table_factory->IsInstanceOf(
@@ -753,7 +819,7 @@ Status SstFileDumper::ShowCompressionSize(
 }
 
 Status SstFileDumper::GetInputBenchmarkMeasurement(
-    RecompressionMeasurement* measurement) {
+    const InputPrefix& input_prefix, RecompressionMeasurement* measurement) {
   assert(measurement);
   *measurement = RecompressionMeasurement();
   measurement->is_input = true;
@@ -766,50 +832,59 @@ Status SstFileDumper::GetInputBenchmarkMeasurement(
   }
   const TableProperties& tp = *table_properties_;
   measurement->compression_name = tp.compression_name;
-  measurement->num_data_blocks = tp.num_data_blocks;
-
-  // On-disk data-block payload (excluding per-block trailers). tp.data_size is
-  // the data section size including one trailer per data block.
-  const uint64_t data_trailers = tp.num_data_blocks * block_trailer_size_;
-  const uint64_t data_on_disk_payload = tp.data_size > data_trailers
-                                            ? tp.data_size - data_trailers
-                                            : tp.data_size;
-  measurement->compressed_data_payload = data_on_disk_payload;
-  // tp.index_size (persisted) follows the same convention as the builder
-  // output: uncompressed index content plus exactly one block trailer,
-  // regardless of how many index partitions exist (NOTE the per-partition block
-  // trailers are not counted; see the fuller explanation in ShowCompressionSize
-  // and block_based_table_builder.cc). So subtract a single trailer to get the
-  // trailer-free index content size.
-  measurement->uncompressed_index_payload =
-      tp.index_size > block_trailer_size_ ? tp.index_size - block_trailer_size_
-                                          : tp.index_size;
-
-  // On-disk (compressed) index size. Only block-based inputs have a
-  // BlockBasedTable reader (and an index in this sense); for a plain- or
-  // cuckoo-table input, GetOnDiskIndexSize returns NotSupported and we fall
-  // back to the uncompressed index size. options_.table_factory is the factory
-  // that produced table_reader_ (see SetTableOptionsByMagicNumber), so it
-  // correctly identifies the reader's type.
-  uint64_t on_disk_index = 0;
-  if (GetOnDiskIndexSize(options_.table_factory.get(), table_reader_.get(),
-                         &on_disk_index)
-          .ok()) {
-    measurement->compressed_index_payload = on_disk_index;
+  uint64_t data_on_disk_payload = 0;
+  if (input_prefix.truncated) {
+    measurement->is_input_prefix = true;
+    measurement->num_data_blocks = input_prefix.num_data_blocks;
+    data_on_disk_payload = input_prefix.data_on_disk_payload;
   } else {
-    measurement->compressed_index_payload =
-        measurement->uncompressed_index_payload;
+    measurement->num_data_blocks = tp.num_data_blocks;
+    // On-disk data-block payload (excluding per-block trailers). tp.data_size
+    // is the data section size including one trailer per data block.
+    const uint64_t data_trailers = tp.num_data_blocks * block_trailer_size_;
+    data_on_disk_payload = tp.data_size > data_trailers
+                               ? tp.data_size - data_trailers
+                               : tp.data_size;
+    // tp.index_size (persisted) follows the same convention as the builder
+    // output: uncompressed index content plus exactly one block trailer,
+    // regardless of how many index partitions exist (NOTE the per-partition
+    // block trailers are not counted; see the fuller explanation in
+    // ShowCompressionSize and block_based_table_builder.cc). So subtract a
+    // single trailer to get the trailer-free index content size.
+    measurement->uncompressed_index_payload =
+        tp.index_size > block_trailer_size_
+            ? tp.index_size - block_trailer_size_
+            : tp.index_size;
+
+    // On-disk (compressed) index size. Only block-based inputs have a
+    // BlockBasedTable reader (and an index in this sense); for a plain- or
+    // cuckoo-table input, GetOnDiskIndexSize returns NotSupported and we fall
+    // back to the uncompressed index size. options_.table_factory is the
+    // factory that produced table_reader_ (see SetTableOptionsByMagicNumber),
+    // so it correctly identifies the reader's type.
+    uint64_t on_disk_index = 0;
+    if (GetOnDiskIndexSize(options_.table_factory.get(), table_reader_.get(),
+                           &on_disk_index)
+            .ok()) {
+      measurement->compressed_index_payload = on_disk_index;
+    } else {
+      measurement->compressed_index_payload =
+          measurement->uncompressed_index_payload;
+    }
   }
+  measurement->compressed_data_payload = data_on_disk_payload;
 
   // Uncompressed data size and a benchmarked read time from a single (cold)
-  // read pass over the file. Read-side decompression tickers are recorded only
-  // for blocks stored compressed; blocks stored uncompressed are recovered via
-  // data_on_disk_payload - decompressed_from.
+  // read pass over the file (prefix). Read-side decompression tickers are
+  // recorded only for blocks stored compressed; blocks stored uncompressed are
+  // recovered via data_on_disk_payload - decompressed_from.
   Statistics* stats = ioptions_.stats;
   if (stats == nullptr) {
-    // Statistics not enabled: fall back to the persisted value (may be 0) and
-    // leave read time unknown.
-    measurement->uncompressed_data_payload = tp.uncompressed_data_size;
+    // Statistics not enabled: fall back to the persisted value (may be 0;
+    // unknown for a prefix) and leave read time unknown.
+    if (!input_prefix.truncated) {
+      measurement->uncompressed_data_payload = tp.uncompressed_data_size;
+    }
     return Status::OK();
   }
   const uint64_t from_before = stats->getTickerCount(BYTES_DECOMPRESSED_FROM);
@@ -820,7 +895,12 @@ Status SstFileDumper::GetInputBenchmarkMeasurement(
   std::unique_ptr<InternalIterator> iter(table_reader_->NewIterator(
       read_options_, moptions_.prefix_extractor.get(), /*arena=*/nullptr,
       /*skip_filters=*/false, TableReaderCaller::kSSTDumpTool));
+  uint64_t num_entries = 0;
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    // Stop at the last entry of a prefix, without loading the next block
+    if (input_prefix.truncated && ++num_entries >= input_prefix.num_entries) {
+      break;
+    }
   }
   Status s = iter->status();
   const std::chrono::microseconds read_time =
