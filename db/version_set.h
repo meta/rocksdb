@@ -2072,8 +2072,17 @@ class VersionSet {
 
   // FileOptions for MANIFEST writes -- applies the FS's
   // OptimizeForManifestWrite tuning, then re-applies the user-configured
-  // temperature so a custom FS can't override it.
+  // temperature so a custom FS can't override it. Sets
+  // io_options.type = IOType::kManifest, which WritableFileWriter applies to
+  // each IO it issues.
   FileOptions GetFileOptionsForManifestWrite() const;
+
+  // FileOptions for opening a MANIFEST to read it -- applies the FS's
+  // OptimizeForManifestRead tuning and sets io_options.type =
+  // IOType::kManifest. That type applies only to the open; call
+  // SequentialFileReader::SetIOType(IOType::kManifest) on the reader so that
+  // each read carries it too.
+  FileOptions GetFileOptionsForManifestRead() const;
 
   // Create a log::Writer over the given FSWritableFile with all standard
   // MANIFEST setup applied (preallocation block size, checksum-handoff

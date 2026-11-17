@@ -7911,17 +7911,21 @@ Status DBImpl::RenameTempFileToOptionsFile(const std::string& file_name,
   s = env->GetFileSize(file_name, options_file_size);
   if (s.ok()) {
     // Retry if the file name happen to conflict with an existing one.
+    // Env::RenameFile() takes no IOOptions, so this rename is not tagged with
+    // IOType::kMetadata. It stays on Env so that Env overrides still apply.
     s = env->RenameFile(file_name, options_file_name);
+    IOOptions dir_opts;
+    dir_opts.type = IOType::kMetadata;
     std::unique_ptr<FSDirectory> dir_obj;
     if (s.ok()) {
-      s = fs_->NewDirectory(GetName(), IOOptions(), &dir_obj, nullptr);
+      s = fs_->NewDirectory(GetName(), dir_opts, &dir_obj, nullptr);
     }
     if (s.ok()) {
-      s = dir_obj->FsyncWithDirOptions(IOOptions(), nullptr,
+      s = dir_obj->FsyncWithDirOptions(dir_opts, nullptr,
                                        DirFsyncOptions(options_file_name));
     }
     if (s.ok()) {
-      Status temp_s = dir_obj->Close(IOOptions(), nullptr);
+      Status temp_s = dir_obj->Close(dir_opts, nullptr);
       // The default Close() could return "NotSupproted" and we bypass it
       // if it is not impelmented. Detailed explanations can be found in
       // db/db_impl/db_impl.h

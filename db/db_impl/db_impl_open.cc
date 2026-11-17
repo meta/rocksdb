@@ -358,9 +358,12 @@ Status DBImpl::NewDB(std::vector<std::string>* new_filenames) {
 
   ROCKS_LOG_INFO(immutable_db_options_.info_log, "Creating manifest 1 \n");
   const std::string manifest = DescriptorFileName(dbname_, 1);
+  IOOptions manifest_io_opts;
+  manifest_io_opts.type = IOType::kManifest;
   {
-    if (fs_->FileExists(manifest, IOOptions(), nullptr).ok()) {
-      fs_->DeleteFile(manifest, IOOptions(), nullptr).PermitUncheckedError();
+    if (fs_->FileExists(manifest, manifest_io_opts, nullptr).ok()) {
+      fs_->DeleteFile(manifest, manifest_io_opts, nullptr)
+          .PermitUncheckedError();
     }
     std::unique_ptr<FSWritableFile> file;
     FileOptions file_options = fs_->OptimizeForManifestWrite(file_options_);
@@ -370,6 +373,7 @@ Status DBImpl::NewDB(std::vector<std::string>* new_filenames) {
       file_options.temperature =
           immutable_db_options_.metadata_write_temperature;
     }
+    file_options.io_options.type = IOType::kManifest;
     s = NewWritableFile(fs_.get(), manifest, &file, file_options);
     if (!s.ok()) {
       return s;
@@ -402,7 +406,7 @@ Status DBImpl::NewDB(std::vector<std::string>* new_filenames) {
           manifest.substr(manifest.find_last_of("/\\") + 1));
     }
   } else {
-    fs_->DeleteFile(manifest, IOOptions(), nullptr).PermitUncheckedError();
+    fs_->DeleteFile(manifest, manifest_io_opts, nullptr).PermitUncheckedError();
   }
   return s;
 }
@@ -544,6 +548,10 @@ Status DBImpl::Recover(
           immutable_db_options_.use_direct_io_for_compaction_reads;
       const std::string& fname =
           manifest_path.empty() ? current_fname : manifest_path;
+      // This probe opens CURRENT, or under best-efforts recovery the MANIFEST
+      // in manifest_path; tag the open with the type of the file it opens.
+      customized_fs.io_options.type =
+          manifest_path.empty() ? IOType::kMetadata : IOType::kManifest;
       s = fs_->NewRandomAccessFile(fname, customized_fs, &idfile, nullptr);
       if (!s.ok()) {
         std::string error_str = s.ToString();

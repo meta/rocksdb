@@ -62,14 +62,16 @@ Status NewManifestReader(FileSystem* fs, const std::string& manifest_path,
                          ManifestReporter* reporter,
                          std::unique_ptr<log::Reader>* reader) {
   std::unique_ptr<FSSequentialFile> file;
-  Status s = fs->NewSequentialFile(manifest_path,
-                                   fs->OptimizeForManifestRead(FileOptions()),
-                                   &file, nullptr /* dbg */);
+  FileOptions file_opts = fs->OptimizeForManifestRead(FileOptions());
+  file_opts.io_options.type = IOType::kManifest;
+  Status s =
+      fs->NewSequentialFile(manifest_path, file_opts, &file, nullptr /* dbg */);
   if (!s.ok()) {
     return s;
   }
   std::unique_ptr<SequentialFileReader> file_reader =
       std::make_unique<SequentialFileReader>(std::move(file), manifest_path);
+  file_reader->SetIOType(IOType::kManifest);
   *reader =
       std::make_unique<log::Reader>(nullptr, std::move(file_reader), reporter,
                                     true /* checksum */, 0 /* log_number */);

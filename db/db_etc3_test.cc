@@ -3,9 +3,14 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <mutex>
+#include <set>
+
 #include "db/db_test_util.h"
+#include "file/filename.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/experimental.h"
+#include "rocksdb/file_checksum.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/sst_file_writer.h"
 #include "util/defer.h"
@@ -827,6 +832,455 @@ TEST_F(DBEtc3Test, AutoTuneManifestSize) {
   // Wrap up
   while (!handles.empty()) {
     DropCfFn(/*include_background_manifest_write=*/false);
+  }
+}
+
+namespace {
+// A FileSystem wrapper that records one Op (file name, operation, IOType) for
+// each open, each IO on an opened file and each RenameFile(). The open itself
+// is recorded as operation "open". TakeOps() returns the recorded ops and
+// clears them.
+class IOTypeRecordingFS : public FileSystemWrapper {
+ public:
+  struct Op {
+    std::string fname;
+    std::string op;
+    IOType type;
+  };
+
+  explicit IOTypeRecordingFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+
+  static const char* kClassName() { return "IOTypeRecordingFS"; }
+  const char* Name() const override { return kClassName(); }
+
+  IOStatus NewSequentialFile(const std::string& fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSSequentialFile>* result,
+                             IODebugContext* dbg) override {
+    Record(fname, "open", file_opts.io_options);
+    IOStatus s = target()->NewSequentialFile(fname, file_opts, result, dbg);
+    if (s.ok()) {
+      result->reset(
+          new RecordingSequentialFile(this, fname, std::move(*result)));
+    }
+    return s;
+  }
+
+  IOStatus NewRandomAccessFile(const std::string& fname,
+                               const FileOptions& file_opts,
+                               std::unique_ptr<FSRandomAccessFile>* result,
+                               IODebugContext* dbg) override {
+    Record(fname, "open", file_opts.io_options);
+    IOStatus s = target()->NewRandomAccessFile(fname, file_opts, result, dbg);
+    if (s.ok()) {
+      result->reset(
+          new RecordingRandomAccessFile(this, fname, std::move(*result)));
+    }
+    return s;
+  }
+
+  IOStatus NewWritableFile(const std::string& fname,
+                           const FileOptions& file_opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override {
+    Record(fname, "open", file_opts.io_options);
+    IOStatus s = target()->NewWritableFile(fname, file_opts, result, dbg);
+    WrapWritableFile(s, fname, result);
+    return s;
+  }
+
+  IOStatus ReopenWritableFile(const std::string& fname,
+                              const FileOptions& file_opts,
+                              std::unique_ptr<FSWritableFile>* result,
+                              IODebugContext* dbg) override {
+    Record(fname, "open", file_opts.io_options);
+    IOStatus s = target()->ReopenWritableFile(fname, file_opts, result, dbg);
+    WrapWritableFile(s, fname, result);
+    return s;
+  }
+
+  IOStatus ReuseWritableFile(const std::string& fname,
+                             const std::string& old_fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSWritableFile>* result,
+                             IODebugContext* dbg) override {
+    Record(fname, "open", file_opts.io_options);
+    IOStatus s =
+        target()->ReuseWritableFile(fname, old_fname, file_opts, result, dbg);
+    WrapWritableFile(s, fname, result);
+    return s;
+  }
+
+  IOStatus RenameFile(const std::string& src, const std::string& dst,
+                      const IOOptions& options, IODebugContext* dbg) override {
+    Record(dst, "rename", options);
+    return target()->RenameFile(src, dst, options, dbg);
+  }
+
+  // Returns and forgets the IO recorded so far
+  std::vector<Op> TakeOps() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<Op> ops;
+    ops.swap(ops_);
+    return ops;
+  }
+
+ private:
+  class RecordingSequentialFile : public FSSequentialFileOwnerWrapper {
+   public:
+    RecordingSequentialFile(IOTypeRecordingFS* fs, const std::string& fname,
+                            std::unique_ptr<FSSequentialFile>&& file)
+        : FSSequentialFileOwnerWrapper(std::move(file)),
+          fs_(fs),
+          fname_(fname) {}
+
+    IOStatus Read(size_t n, const IOOptions& options, Slice* result,
+                  char* scratch, IODebugContext* dbg) override {
+      fs_->Record(fname_, "read", options);
+      return FSSequentialFileOwnerWrapper::Read(n, options, result, scratch,
+                                                dbg);
+    }
+
+    IOStatus PositionedRead(uint64_t offset, size_t n, const IOOptions& options,
+                            Slice* result, char* scratch,
+                            IODebugContext* dbg) override {
+      fs_->Record(fname_, "read", options);
+      return FSSequentialFileOwnerWrapper::PositionedRead(offset, n, options,
+                                                          result, scratch, dbg);
+    }
+
+   private:
+    IOTypeRecordingFS* fs_;
+    std::string fname_;
+  };
+
+  class RecordingRandomAccessFile : public FSRandomAccessFileOwnerWrapper {
+   public:
+    RecordingRandomAccessFile(IOTypeRecordingFS* fs, const std::string& fname,
+                              std::unique_ptr<FSRandomAccessFile>&& file)
+        : FSRandomAccessFileOwnerWrapper(std::move(file)),
+          fs_(fs),
+          fname_(fname) {}
+
+    IOStatus Read(uint64_t offset, size_t n, const IOOptions& options,
+                  Slice* result, char* scratch,
+                  IODebugContext* dbg) const override {
+      fs_->Record(fname_, "read", options);
+      return FSRandomAccessFileOwnerWrapper::Read(offset, n, options, result,
+                                                  scratch, dbg);
+    }
+
+    IOStatus MultiRead(FSReadRequest* reqs, size_t num_reqs,
+                       const IOOptions& options, IODebugContext* dbg) override {
+      fs_->Record(fname_, "read", options);
+      return FSRandomAccessFileOwnerWrapper::MultiRead(reqs, num_reqs, options,
+                                                       dbg);
+    }
+
+    IOStatus Prefetch(uint64_t offset, size_t n, const IOOptions& options,
+                      IODebugContext* dbg) override {
+      fs_->Record(fname_, "read", options);
+      return FSRandomAccessFileOwnerWrapper::Prefetch(offset, n, options, dbg);
+    }
+
+   private:
+    IOTypeRecordingFS* fs_;
+    std::string fname_;
+  };
+
+  class RecordingWritableFile : public FSWritableFileOwnerWrapper {
+   public:
+    RecordingWritableFile(IOTypeRecordingFS* fs, const std::string& fname,
+                          std::unique_ptr<FSWritableFile>&& file)
+        : FSWritableFileOwnerWrapper(std::move(file)), fs_(fs), fname_(fname) {}
+
+    IOStatus Append(const Slice& data, const IOOptions& options,
+                    IODebugContext* dbg) override {
+      fs_->Record(fname_, "append", options);
+      return FSWritableFileOwnerWrapper::Append(data, options, dbg);
+    }
+
+    IOStatus Append(const Slice& data, const IOOptions& options,
+                    const DataVerificationInfo& verification_info,
+                    IODebugContext* dbg) override {
+      fs_->Record(fname_, "append", options);
+      return FSWritableFileOwnerWrapper::Append(data, options,
+                                                verification_info, dbg);
+    }
+
+    IOStatus PositionedAppend(const Slice& data, uint64_t offset,
+                              const IOOptions& options,
+                              IODebugContext* dbg) override {
+      fs_->Record(fname_, "append", options);
+      return FSWritableFileOwnerWrapper::PositionedAppend(data, offset, options,
+                                                          dbg);
+    }
+
+    IOStatus PositionedAppend(const Slice& data, uint64_t offset,
+                              const IOOptions& options,
+                              const DataVerificationInfo& verification_info,
+                              IODebugContext* dbg) override {
+      fs_->Record(fname_, "append", options);
+      return FSWritableFileOwnerWrapper::PositionedAppend(
+          data, offset, options, verification_info, dbg);
+    }
+
+    IOStatus Truncate(uint64_t size, const IOOptions& options,
+                      IODebugContext* dbg) override {
+      fs_->Record(fname_, "truncate", options);
+      return FSWritableFileOwnerWrapper::Truncate(size, options, dbg);
+    }
+
+    IOStatus Close(const IOOptions& options, IODebugContext* dbg) override {
+      fs_->Record(fname_, "close", options);
+      return FSWritableFileOwnerWrapper::Close(options, dbg);
+    }
+
+    IOStatus Flush(const IOOptions& options, IODebugContext* dbg) override {
+      fs_->Record(fname_, "flush", options);
+      return FSWritableFileOwnerWrapper::Flush(options, dbg);
+    }
+
+    IOStatus Sync(const IOOptions& options, IODebugContext* dbg) override {
+      fs_->Record(fname_, "sync", options);
+      return FSWritableFileOwnerWrapper::Sync(options, dbg);
+    }
+
+    IOStatus Fsync(const IOOptions& options, IODebugContext* dbg) override {
+      fs_->Record(fname_, "sync", options);
+      return FSWritableFileOwnerWrapper::Fsync(options, dbg);
+    }
+
+    IOStatus RangeSync(uint64_t offset, uint64_t nbytes,
+                       const IOOptions& options, IODebugContext* dbg) override {
+      fs_->Record(fname_, "sync", options);
+      return FSWritableFileOwnerWrapper::RangeSync(offset, nbytes, options,
+                                                   dbg);
+    }
+
+    void PrepareWrite(size_t offset, size_t len, const IOOptions& options,
+                      IODebugContext* dbg) override {
+      fs_->Record(fname_, "prepare_write", options);
+      FSWritableFileOwnerWrapper::PrepareWrite(offset, len, options, dbg);
+    }
+
+    IOStatus Allocate(uint64_t offset, uint64_t len, const IOOptions& options,
+                      IODebugContext* dbg) override {
+      fs_->Record(fname_, "allocate", options);
+      return FSWritableFileOwnerWrapper::Allocate(offset, len, options, dbg);
+    }
+
+   private:
+    IOTypeRecordingFS* fs_;
+    std::string fname_;
+  };
+
+  void Record(const std::string& fname, const char* op,
+              const IOOptions& options) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ops_.push_back({fname, op, options.type});
+  }
+
+  void WrapWritableFile(const IOStatus& s, const std::string& fname,
+                        std::unique_ptr<FSWritableFile>* result) {
+    if (s.ok()) {
+      result->reset(new RecordingWritableFile(this, fname, std::move(*result)));
+    }
+  }
+
+  std::mutex mutex_;
+  std::vector<Op> ops_;
+};
+
+// The kind of DB file at `path`, with temporary files for OPTIONS counted as
+// OPTIONS and other temporary files (for CURRENT and IDENTITY) as TEMP
+std::string DBFileKind(const std::string& path) {
+  const std::string base = path.substr(path.find_last_of('/') + 1);
+  uint64_t number = 0;
+  FileType type = kTempFile;
+  if (!ParseFileName(base, &number, &type)) {
+    return "other";
+  }
+  switch (type) {
+    case kDescriptorFile:
+      return "MANIFEST";
+    case kCurrentFile:
+      return "CURRENT";
+    case kIdentityFile:
+      return "IDENTITY";
+    case kOptionsFile:
+      return "OPTIONS";
+    case kTempFile:
+      return Slice(base).starts_with(kOptionsFileNamePrefix) ? "OPTIONS"
+                                                             : "TEMP";
+    case kTableFile:
+      return "SST";
+    case kWalFile:
+      return "WAL";
+    case kBlobFile:
+      return "BLOB";
+    case kDBLockFile:
+    case kInfoLogFile:
+    case kMetaDatabase:
+    case kCompactionProgressFile:
+      break;
+  }
+  return "other";
+}
+
+// Checks the IOType of each IO recorded by `fs` since the last call and that
+// the recorded IO includes each "<file kind> <op>" in `expected`
+void CheckIOTypes(IOTypeRecordingFS* fs,
+                  const std::set<std::string>& expected) {
+  std::set<std::string> seen;
+  for (const IOTypeRecordingFS::Op& op : fs->TakeOps()) {
+    const std::string kind = DBFileKind(op.fname);
+    if (op.op == "rename" && (kind == "IDENTITY" || kind == "OPTIONS")) {
+      // Renamed into place through Env::RenameFile, which takes no IOOptions
+      continue;
+    }
+    SCOPED_TRACE(op.fname + " " + op.op);
+    if (kind == "MANIFEST") {
+      EXPECT_EQ(op.type, IOType::kManifest);
+    } else if (kind == "CURRENT" || kind == "IDENTITY" || kind == "OPTIONS" ||
+               kind == "TEMP") {
+      EXPECT_EQ(op.type, IOType::kMetadata);
+    } else {
+      EXPECT_NE(op.type, IOType::kManifest);
+      EXPECT_NE(op.type, IOType::kMetadata);
+    }
+    seen.insert(kind + " " + op.op);
+  }
+  for (const std::string& e : expected) {
+    EXPECT_EQ(seen.count(e), 1U) << e;
+  }
+}
+}  // namespace
+
+TEST_F(DBEtc3Test, MetadataFileIOType) {
+  auto fs = std::make_shared<IOTypeRecordingFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, fs));
+  // Close the DB before `env` goes away, even if an assertion fails
+  Defer close_db([&]() { Close(); });
+  for (bool non_default_manifest_options : {false, true}) {
+    SCOPED_TRACE("non_default_manifest_options=" +
+                 std::to_string(non_default_manifest_options));
+    Options options = CurrentOptions();
+    options.env = env.get();
+    options.create_if_missing = true;
+    options.disable_auto_compactions = true;
+    options.enable_blob_files = true;
+    options.min_blob_size = 0;
+    // Exercise MANIFEST reopen-for-append, MANIFEST read-back on close, and
+    // OPTIONS file tracking in the MANIFEST
+    options.reuse_manifest_on_open = non_default_manifest_options;
+    options.verify_manifest_content_on_close = non_default_manifest_options;
+    options.track_options_file_number_in_manifest =
+        non_default_manifest_options;
+
+    DestroyAndReopen(options);
+    {
+      SCOPED_TRACE("Open new DB");
+      CheckIOTypes(
+          fs.get(),
+          {"TEMP open", "TEMP append", "TEMP sync", "TEMP close",
+           "CURRENT rename", "CURRENT open", "CURRENT read", "MANIFEST open",
+           "MANIFEST append", "MANIFEST sync", "MANIFEST close",
+           "MANIFEST read", "OPTIONS open", "OPTIONS append", "OPTIONS sync",
+           "OPTIONS close", "OPTIONS read", "WAL open"});
+    }
+
+    ASSERT_OK(Put("a", "1"));
+    ASSERT_OK(Put("b", "1"));
+    ASSERT_OK(Flush());
+    {
+      SCOPED_TRACE("Flush");
+      CheckIOTypes(
+          fs.get(),
+          {"WAL append", "SST open", "SST append", "SST close", "BLOB open",
+           "BLOB append", "BLOB close", "MANIFEST append", "MANIFEST sync"});
+    }
+
+    ASSERT_OK(Put("a", "2"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    {
+      SCOPED_TRACE("CompactRange");
+      CheckIOTypes(fs.get(), {"SST read", "SST append", "MANIFEST append",
+                              "MANIFEST sync"});
+    }
+
+    ASSERT_OK(
+        dbfull()->SetOptions({{"level0_file_num_compaction_trigger", "10"}}));
+    {
+      SCOPED_TRACE("SetOptions");
+      CheckIOTypes(fs.get(), {"OPTIONS open", "OPTIONS append", "OPTIONS sync",
+                              "OPTIONS close", "OPTIONS read"});
+    }
+
+    Reopen(options);
+    {
+      SCOPED_TRACE("Reopen");
+      CheckIOTypes(fs.get(), {"MANIFEST close", "CURRENT open", "CURRENT read",
+                              "MANIFEST open", "MANIFEST read", "IDENTITY open",
+                              "IDENTITY read", "MANIFEST append",
+                              "OPTIONS append", "OPTIONS read"});
+    }
+    ASSERT_EQ(Get("a"), "2");
+
+    {
+      Options secondary_options = options;
+      secondary_options.max_open_files = -1;
+      const std::string secondary_path = dbname_ + "_secondary";
+      std::unique_ptr<DB> secondary;
+      ASSERT_OK(DB::OpenAsSecondary(secondary_options, dbname_, secondary_path,
+                                    &secondary));
+      ASSERT_OK(secondary->TryCatchUpWithPrimary());
+      ASSERT_OK(secondary->Close());
+      secondary.reset();
+      ASSERT_OK(DestroyDB(secondary_path, secondary_options));
+      SCOPED_TRACE("Secondary instance");
+      CheckIOTypes(fs.get(), {"CURRENT open", "CURRENT read", "MANIFEST open",
+                              "MANIFEST read"});
+    }
+
+    std::string expected_db_id;
+    ASSERT_OK(db_->GetDbIdentity(expected_db_id));
+    const std::string manifest_path =
+        DescriptorFileName(dbname_, dbfull()->TEST_Current_Manifest_FileNo());
+    Close();
+    std::vector<std::string> column_families;
+    ASSERT_OK(DB::ListColumnFamilies(options, dbname_, &column_families));
+    std::unique_ptr<FileChecksumList> checksums(NewFileChecksumList());
+    ASSERT_OK(experimental::GetFileChecksumsFromCurrentManifest(
+        fs.get(), dbname_, checksums.get()));
+    {
+      SCOPED_TRACE(
+          "Close, ListColumnFamilies and GetFileChecksumsFromCurrentManifest");
+      CheckIOTypes(fs.get(), {"MANIFEST close", "CURRENT read", "MANIFEST open",
+                              "MANIFEST read"});
+    }
+
+    {
+      SCOPED_TRACE("GetDbIdentityFromManifest");
+      std::string db_id;
+      ASSERT_OK(experimental::GetDbIdentityFromManifest(fs.get(), manifest_path,
+                                                        &db_id));
+      ASSERT_EQ(db_id, expected_db_id);
+      CheckIOTypes(fs.get(), {"MANIFEST open", "MANIFEST read"});
+    }
+
+    // Best-efforts recovery finds the MANIFEST without reading CURRENT
+    options.best_efforts_recovery = true;
+    Reopen(options);
+    {
+      SCOPED_TRACE("Reopen with best_efforts_recovery");
+      CheckIOTypes(fs.get(), {"MANIFEST open", "MANIFEST read",
+                              "MANIFEST append", "CURRENT rename"});
+    }
+    ASSERT_EQ(Get("a"), "2");
+    Close();
   }
 }
 
