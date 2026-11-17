@@ -129,8 +129,21 @@ TEST_P(TransactionTest, BatchedMultiGetForUpdate) {
 
   for (bool sorted : {false, true}) {
     SCOPED_TRACE(sorted);
-    // Flush keys restored by WRITE_UNPREPARED rollback before testing pinning.
+    // Flush keys restored by rollback before testing pinning.
     ASSERT_OK(db->Flush(FlushOptions(), cf));
+    std::unique_ptr<Transaction> prepared_txn;
+    if (txn_db_options.write_policy == WRITE_PREPARED ||
+        txn_db_options.write_policy == WRITE_UNPREPARED) {
+      // Bypass the writer's locks so MultiGetForUpdate exercises visibility
+      // filtering rather than failing to lock the prepared transaction's keys.
+      TransactionOptions txn_options;
+      txn_options.skip_concurrency_control = true;
+      prepared_txn.reset(db->BeginTransaction(WriteOptions(), txn_options));
+      ASSERT_OK(prepared_txn->SetName("batched_multiget_prepared"));
+      ASSERT_OK(prepared_txn->Put(cf, "z", "uncommitted"));
+      ASSERT_OK(prepared_txn->Put(cf, "missing", "uncommitted"));
+      ASSERT_OK(prepared_txn->Prepare());
+    }
     std::unique_ptr<Transaction> txn(db->BeginTransaction(WriteOptions()));
     ASSERT_OK(txn->Put(cf, "a", "local"));
     std::array<Slice, 4> keys{{"z", "a", "missing", "z"}};
@@ -155,6 +168,9 @@ TEST_P(TransactionTest, BatchedMultiGetForUpdate) {
       }
     }
     ASSERT_OK(txn->Rollback());
+    if (prepared_txn) {
+      ASSERT_OK(prepared_txn->Rollback());
+    }
   }
   ASSERT_OK(db->DropColumnFamily(cf));
 }
