@@ -250,7 +250,15 @@ inline void CorrectNearOverflowBeforeStore(SlotMeta& meta) {
 // is made while the reference still holds the entry: once it is dropped,
 // another thread can free the entry and put a different one in the slot.
 inline bool ReleaseRefOrTakeOwnership(ClockHandle& h, bool useful) {
-  SlotMeta meta = h.meta.Load();
+  // How to drop ours if it isn't the last: a useful release counts a use, and
+  // one not useful undoes the acquire
+  const AddTransformer<SlotMeta> drop =
+      useful ? ReleaseCounter::PlusTransformPromiseNoOverflow(1)
+             : AcquireCounter::MinusTransformPromiseNoUnderflow(1);
+  SlotMeta construction_meta;
+  construction_meta.SetUnderConstruction();
+  // Relaxed, as the compare-exchange below acts only on the state it finds
+  SlotMeta meta = h.meta.LoadRelaxed();
   TEST_SYNC_POINT("ClockCache::Release:EraseIfLastRef");
   for (;;) {
     assert(meta.IsShareable());
@@ -258,8 +266,6 @@ inline bool ReleaseRefOrTakeOwnership(ClockHandle& h, bool useful) {
     assert(meta.GetAcquireCounter() != meta.GetReleaseCounter());
     if (meta.GetRefcount() == 1) {
       // Only ours
-      SlotMeta construction_meta;
-      construction_meta.SetUnderConstruction();
       if (h.meta.CasWeak(meta, construction_meta)) {
         return true;
       }
@@ -267,11 +273,7 @@ inline bool ReleaseRefOrTakeOwnership(ClockHandle& h, bool useful) {
       // Not the last: drop ours, unless the counters changed meanwhile, as
       // another release might have made ours the last
       SlotMeta dropped = meta;
-      if (useful) {
-        dropped.SetReleaseCounter(meta.GetReleaseCounter() + 1);
-      } else {
-        dropped.SetAcquireCounter(meta.GetAcquireCounter() - 1);
-      }
+      drop.ApplyTo(dropped);
       // Correct for possible (but rare) overflow in the same update, as h can
       // be freed, and a standalone handle deleted, once ours is dropped
       CorrectNearOverflowBeforeStore(dropped);

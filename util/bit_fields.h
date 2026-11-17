@@ -176,6 +176,12 @@ struct AddTransformer {
     }
 #endif  // NDEBUG
   }
+  // Apply to a value that isn't atomic, with the same checks as an atomic
+  // Apply
+  void ApplyTo(BitFieldsT& bf) const {
+    AssertPreconditions(bf.underlying);
+    bf.underlying += to_add;
+  }
   // + for general combine
   AddTransformer<BitFieldsT> operator+(
       const AddTransformer<BitFieldsT>& other) const {
