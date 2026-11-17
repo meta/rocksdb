@@ -80,32 +80,37 @@ class OptimisticTransactionTest
 
 TEST_P(OptimisticTransactionTest, BatchedMultiGetForUpdate) {
   ASSERT_OK(txn_db->Put(WriteOptions(), "b", "db"));
-  for (bool sorted : {false, true}) {
-    std::unique_ptr<Transaction> txn(txn_db->BeginTransaction(WriteOptions()));
-    ASSERT_OK(txn->Put("a", "local"));
-    std::vector<Slice> keys{"b", "a", "missing"};
-    if (sorted) {
-      std::sort(keys.begin(), keys.end(), [](const Slice& a, const Slice& b) {
-        return a.compare(b) < 0;
-      });
-    }
-    std::vector<PinnableSlice> values(keys.size());
-    std::vector<Status> statuses(keys.size());
-    txn->MultiGetForUpdate(ReadOptions(), txn_db->DefaultColumnFamily(),
-                           keys.size(), keys.data(), values.data(),
-                           statuses.data(), sorted);
-    for (size_t i = 0; i < keys.size(); ++i) {
-      if (keys[i] == "missing") {
-        ASSERT_EQ(statuses[i].code(), Status::Code::kNotFound);
-      } else {
-        ASSERT_OK(statuses[i]);
-        ASSERT_EQ(values[i].ToString(), keys[i] == "a" ? "local" : "db");
+  for (bool null_cf : {false, true}) {
+    SCOPED_TRACE(null_cf);
+    ColumnFamilyHandle* cf = null_cf ? nullptr : txn_db->DefaultColumnFamily();
+    for (bool sorted : {false, true}) {
+      SCOPED_TRACE(sorted);
+      std::unique_ptr<Transaction> txn(
+          txn_db->BeginTransaction(WriteOptions()));
+      ASSERT_OK(txn->Put("a", "local"));
+      std::vector<Slice> keys{"b", "a", "missing"};
+      if (sorted) {
+        std::sort(keys.begin(), keys.end(), [](const Slice& a, const Slice& b) {
+          return a.compare(b) < 0;
+        });
       }
+      std::vector<PinnableSlice> values(keys.size());
+      std::vector<Status> statuses(keys.size());
+      txn->MultiGetForUpdate(ReadOptions(), cf, keys.size(), keys.data(),
+                             values.data(), statuses.data(), sorted);
+      for (size_t i = 0; i < keys.size(); ++i) {
+        if (keys[i] == "missing") {
+          ASSERT_EQ(statuses[i].code(), Status::Code::kNotFound);
+        } else {
+          ASSERT_OK(statuses[i]);
+          ASSERT_EQ(values[i].ToString(), keys[i] == "a" ? "local" : "db");
+        }
+      }
+      ASSERT_OK(txn_db->Put(WriteOptions(), "missing", "changed"));
+      ASSERT_EQ(txn->Commit().code(), Status::Code::kBusy);
+      ASSERT_OK(txn->Rollback());
+      ASSERT_OK(txn_db->Delete(WriteOptions(), "missing"));
     }
-    ASSERT_OK(txn_db->Put(WriteOptions(), "missing", "changed"));
-    ASSERT_EQ(txn->Commit().code(), Status::Code::kBusy);
-    ASSERT_OK(txn->Rollback());
-    ASSERT_OK(txn_db->Delete(WriteOptions(), "missing"));
   }
 }
 

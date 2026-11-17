@@ -479,6 +479,7 @@ class Transaction {
   // results. Tracks keys for conflict validation and acquires exclusive locks
   // for pessimistic transactions before reading, including missing keys. A lock
   // or validation failure sets all statuses; acquired locks remain held.
+  // A null column_family selects the default column family.
   //
   // Results preserve input order. keys, values, and statuses each have num_keys
   // entries. sorted_input requires keys sorted by the column family's
