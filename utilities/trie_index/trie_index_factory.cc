@@ -297,18 +297,9 @@ Status TrieIndexIterator::SetResult(const Status& s, IterBoundCheck bounds,
 Status TrieIndexIterator::SeekAndGetResult(const Slice& target,
                                            IterateResult* result,
                                            const SeekContext& context) {
-  // Advance current_scan_idx_ past any scans whose limit <= target.
-  // This handles the multi-scan case where the caller seeks into a later
-  // scan range after the previous scan returned kOutOfBound.
-  while (current_scan_idx_ < num_scan_opts_) {
-    const auto& opts = scan_opts_[current_scan_idx_];
-    if (opts.range.limit.has_value() &&
-        comparator_->Compare(target, opts.range.limit.value()) >= 0) {
-      current_scan_idx_++;
-    } else {
-      break;
-    }
-  }
+  // A forward MultiScan only moves the current range forward, into the range
+  // it seeks to after the previous one returned kOutOfBound.
+  SelectScan(target);
   // Before the Seek, which overwrites target when it points into the current
   // key, such as an earlier result->key.
   const IterBoundCheck bounds = CheckBounds(target);
@@ -318,15 +309,22 @@ Status TrieIndexIterator::SeekAndGetResult(const Slice& target,
 
 Status TrieIndexIterator::NextAndGetResult(IterateResult* result) {
   // The bound check uses the separator before the step, so run it first.
+  RewindScan(iter_.key());
   const IterBoundCheck bounds = CheckBounds(iter_.key());
   return SetResult(iter_.Next(), bounds, result);
 }
 
 Status TrieIndexIterator::SeekToFirstAndGetResult(IterateResult* result) {
-  return SetResult(iter_.SeekToFirst(), IterBoundCheck::kInbound, result);
+  // As a Seek to the empty key, below every other key.
+  SelectScan(Slice());
+  const IterBoundCheck bounds = CheckBounds(Slice());
+  return SetResult(iter_.SeekToFirst(), bounds, result);
 }
 
 Status TrieIndexIterator::SeekToLastAndGetResult(IterateResult* result) {
+  // The last block can be in any range, so a NextAndGetResult() after Prev()
+  // moves back from past the last one.
+  current_scan_idx_ = num_scan_opts_;
   return SetResult(iter_.SeekToLast(), IterBoundCheck::kInbound, result);
 }
 
@@ -339,6 +337,25 @@ Status TrieIndexIterator::PrevAndGetResult(IterateResult* result) {
 IndexFactoryBuilder::BlockHandle TrieIndexIterator::value() {
   const TrieBlockHandle handle = iter_.value();
   return IndexFactoryBuilder::BlockHandle{handle.offset, handle.size};
+}
+
+bool TrieIndexIterator::BelowLimit(const Slice& key, size_t i) const {
+  const OptSlice& limit = scan_opts_[i].range.limit;
+  return !limit.has_value() || comparator_->Compare(key, limit.value()) < 0;
+}
+
+void TrieIndexIterator::RewindScan(const Slice& key) {
+  while (current_scan_idx_ > 0 && BelowLimit(key, current_scan_idx_ - 1)) {
+    current_scan_idx_--;
+  }
+}
+
+void TrieIndexIterator::SelectScan(const Slice& key) {
+  RewindScan(key);
+  while (current_scan_idx_ < num_scan_opts_ &&
+         !BelowLimit(key, current_scan_idx_)) {
+    current_scan_idx_++;
+  }
 }
 
 IterBoundCheck TrieIndexIterator::CheckBounds(

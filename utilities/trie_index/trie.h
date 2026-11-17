@@ -311,8 +311,9 @@ class Trie {
 //
 // Next() moves to the next block of the separator, or with NextSeparator()
 // to the next separator. Prev() moves to the previous block of the
-// separator, or finds the previous separator's bucket head with Descend()
-// and decodes forward from it.
+// separator, or decodes forward from the previous separator's bucket head.
+// Prev() keeps the last head it found, so it calls Descend() only for a
+// bucket other than that one.
 class TrieIterator {
  public:
   explicit TrieIterator(const Trie* index);
@@ -325,9 +326,10 @@ class TrieIterator {
   // separator.
   Status Seek(const Slice& target, uint64_t tag);
   Status Next();
-  // Moving to the previous separator costs a Descend() and up to
-  // bucket_size - 1 decodes, because front coding only decodes forward from a
-  // bucket head.
+  // Moving to the previous separator costs up to bucket_size - 1 decodes,
+  // because front coding only decodes forward from a bucket head, plus a
+  // Descend() to find that head when it is in another bucket than the one
+  // Prev() last found.
   Status Prev();
 
   bool Valid() const { return block_ < index_->num_blocks_; }

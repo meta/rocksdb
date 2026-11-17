@@ -219,6 +219,15 @@ class TrieIndexBuilder final : public IndexFactoryBuilder {
 //
 // Wraps TrieIterator and adapts it to the UDI iterator interface, handling
 // bounds checking against ScanOptions.
+//
+// The ranges are sorted and do not overlap, so their limits ascend. The
+// current range is the first one whose limit is above the last Seek target,
+// where SeekToFirst() counts as a Seek to the empty key. NextAndGetResult()
+// reports kOutOfBound once the block it leaves reaches the current range's
+// limit, which tells a forward MultiScan to seek to the next range's start.
+// It never moves to a later range, but moves back to an earlier one after
+// Prev() or SeekToLast() reached it. Moving backward reports kInbound: DBIter
+// checks the lower bound itself.
 // ============================================================================
 class TrieIndexIterator final : public IndexFactoryIterator {
  public:
@@ -245,6 +254,15 @@ class TrieIndexIterator final : public IndexFactoryIterator {
   // are upper bounds on block contents, not first-in-block keys, so the
   // current separator cannot be compared against the limit directly.
   IterBoundCheck CheckBounds(const Slice& reference_key) const;
+
+  // Whether key is below the limit of range i, or range i has no limit.
+  bool BelowLimit(const Slice& key, size_t i) const;
+  // Moves current_scan_idx_ back while the range before it has a limit above
+  // key.
+  void RewindScan(const Slice& key);
+  // Makes current_scan_idx_ the first range whose limit is above key, or
+  // num_scan_opts_ when there is none.
+  void SelectScan(const Slice& key);
 
   // Fills *result from the iterator position after a call that returned s.
   // bounds is the bound check result to report when positioned.

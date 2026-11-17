@@ -2953,6 +2953,19 @@ TEST_F(TrieIndexFactoryTest, WrapperNextAndGetResultReturnsInternalKey) {
   // One more advance -- past end.
   valid = wrapper.NextAndGetResult(&result);
   EXPECT_FALSE(valid);
+
+  // key() is built when first asked for, so it is right after moves that
+  // never asked for it. user_key() is the separator itself.
+  wrapper.SeekToFirst();
+  ASSERT_TRUE(wrapper.Valid());
+  EXPECT_EQ(wrapper.user_key(), "a");
+  wrapper.Next();
+  ASSERT_TRUE(wrapper.Valid());
+  EXPECT_EQ(wrapper.user_key(), "b");
+  ASSERT_OK(ParseInternalKey(wrapper.key(), &parsed, /*log_err_key=*/false));
+  EXPECT_EQ(parsed.user_key.ToString(), "b");
+  EXPECT_EQ(parsed.sequence, 0u);
+  EXPECT_EQ(parsed.type, ValueType::kTypeValue);
 }
 
 // Runs on separators of different lengths ("ab" and "b") map every block to
@@ -3526,6 +3539,90 @@ TEST_F(TrieIndexFactoryTest, AllScansExhaustedThenSeek) {
   ASSERT_OK(ctx.iter->SeekAndGetResult(Slice("e"), &result,
                                        SeekCtx(kMaxSequenceNumber)));
   ASSERT_EQ(result.bound_check_result, IterBoundCheck::kOutOfBound);
+}
+
+// The bounds follow the iterator wherever it is positioned while ranges are
+// set, not only through a forward MultiScan: an earlier range counts again
+// after a Seek or SeekToFirst() before it, or after Prev() moves back into it.
+TEST_F(TrieIndexFactoryTest, ScanBoundsAfterAnyPositioning) {
+  // Blocks hold keys up to "b", in ("b", "e"] and in ("e", "h"]; the last
+  // separator is "i".
+  auto ctx = BuildTrieAndGetIterator({
+      {"b", "c", 0, 500, 0, 0},
+      {"e", "f", 1000, 500, 0, 0},
+      {"h", "", 2000, 500, 0, 0},
+  });
+  ScanOptions scans[2] = {
+      ScanOptions(Slice("a"), Slice("d")),
+      ScanOptions(Slice("f"), Slice("g")),
+  };
+  enum class Op { kSeek, kSeekToFirst, kSeekToLast, kNext, kPrev };
+  struct Step {
+    Op op;
+    const char* target;
+    uint64_t offset;
+    IterBoundCheck expected;
+  };
+  constexpr IterBoundCheck kIn = IterBoundCheck::kInbound;
+  constexpr IterBoundCheck kOut = IterBoundCheck::kOutOfBound;
+  const std::vector<std::vector<Step>> sequences = {
+      // "g" is past both ranges. The first block holds "a", and the second
+      // may hold "c", below the first limit; the third holds only keys after
+      // "e", past it.
+      {{Op::kSeek, "g", 2000, kOut},
+       {Op::kSeekToFirst, nullptr, 0, kIn},
+       {Op::kNext, nullptr, 1000, kIn},
+       {Op::kNext, nullptr, 2000, kOut}},
+      {{Op::kSeek, "g", 2000, kOut}, {Op::kSeek, "a", 0, kIn}},
+      // Back in the first block, the next one may hold "c".
+      {{Op::kSeek, "g", 2000, kOut},
+       {Op::kPrev, nullptr, 1000, kIn},
+       {Op::kPrev, nullptr, 0, kIn},
+       {Op::kNext, nullptr, 1000, kIn}},
+      // The last block may hold "f", in the second range.
+      {{Op::kSeekToLast, nullptr, 2000, kIn},
+       {Op::kPrev, nullptr, 1000, kIn},
+       {Op::kNext, nullptr, 2000, kIn}},
+  };
+  for (size_t i = 0; i < sequences.size(); i++) {
+    SCOPED_TRACE("sequence " + std::to_string(i));
+    ctx.iter->Prepare(scans, 2);
+    for (size_t j = 0; j < sequences[i].size(); j++) {
+      SCOPED_TRACE("step " + std::to_string(j));
+      const Step& step = sequences[i][j];
+      IterateResult result;
+      switch (step.op) {
+        case Op::kSeek:
+          ASSERT_OK(ctx.iter->SeekAndGetResult(Slice(step.target), &result,
+                                               SeekCtx(kMaxSequenceNumber)));
+          break;
+        case Op::kSeekToFirst:
+          ASSERT_OK(ctx.iter->SeekToFirstAndGetResult(&result));
+          break;
+        case Op::kSeekToLast:
+          ASSERT_OK(ctx.iter->SeekToLastAndGetResult(&result));
+          break;
+        case Op::kNext:
+          ASSERT_OK(ctx.iter->NextAndGetResult(&result));
+          break;
+        case Op::kPrev:
+          ASSERT_OK(ctx.iter->PrevAndGetResult(&result));
+          break;
+      }
+      ASSERT_EQ(result.bound_check_result, step.expected);
+      ASSERT_EQ(ctx.iter->value().offset, step.offset);
+    }
+  }
+  // SeekToFirst() checks the bounds as a Seek to the empty key does: no key is
+  // below an empty limit.
+  ScanOptions empty(Slice(""), Slice(""));
+  ctx.iter->Prepare(&empty, 1);
+  IterateResult result;
+  ASSERT_OK(ctx.iter->SeekToFirstAndGetResult(&result));
+  ASSERT_EQ(result.bound_check_result, kOut);
+  ASSERT_OK(ctx.iter->SeekAndGetResult(Slice(), &result,
+                                       SeekCtx(kMaxSequenceNumber)));
+  ASSERT_EQ(result.bound_check_result, kOut);
 }
 
 // ============================================================================

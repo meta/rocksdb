@@ -265,17 +265,14 @@ class IndexFactoryIterator {
   virtual ~IndexFactoryIterator() = default;
 
   // Hint for upcoming scan ranges. Implementations may use this for
-  // prefetching or bounding.
+  // prefetching or bounding. The ranges are sorted and do not overlap.
   // @param scan_opts  Array of scan range descriptors. May be null when
   //                   num_opts is 0.
   // @param num_opts   Number of elements in scan_opts. 0 discards the ranges
   //                   of an earlier Prepare(), so the iterator is unbounded
   //                   again.
   // The caller keeps scan_opts and the keys it points to alive until the
-  // ranges are discarded or replaced by another Prepare(). While the ranges
-  // are set, RocksDB positions the iterator only with SeekAndGetResult() to
-  // each range's start key, in range order, and NextAndGetResult(). It
-  // discards the ranges before positioning the iterator any other way.
+  // ranges are discarded or replaced by another Prepare().
   virtual void Prepare(const ScanOptions scan_opts[], size_t num_opts) = 0;
 
   // Context for Seek, carrying the packed sequence+type tag of the
