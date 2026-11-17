@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <cinttypes>
+#include <limits>
+#include <type_traits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -320,6 +322,23 @@ int32_t ParseInt32(const std::string& value) {
   }
 }
 
+// Apply a k/m/g/t unit suffix as a left shift, or throw if it would overflow.
+template <typename T>
+T ApplyUnitShiftOrThrow(T num, int shift, const std::string& value) {
+  if constexpr (std::is_signed_v<T>) {
+    if (num < 0) {
+      if (num < (std::numeric_limits<T>::min() >> shift)) {
+        throw std::out_of_range(value);
+      }
+      return static_cast<T>(num << shift);
+    }
+  }
+  if (num > (std::numeric_limits<T>::max() >> shift)) {
+    throw std::out_of_range(value);
+  }
+  return static_cast<T>(num << shift);
+}
+
 uint64_t ParseUint64(const std::string& value) {
   size_t endchar;
 #ifndef CYGWIN
@@ -333,13 +352,13 @@ uint64_t ParseUint64(const std::string& value) {
   if (endchar < value.length()) {
     char c = value[endchar];
     if (c == 'k' || c == 'K') {
-      num <<= 10LL;
+      num = ApplyUnitShiftOrThrow(num, 10, value);
     } else if (c == 'm' || c == 'M') {
-      num <<= 20LL;
+      num = ApplyUnitShiftOrThrow(num, 20, value);
     } else if (c == 'g' || c == 'G') {
-      num <<= 30LL;
+      num = ApplyUnitShiftOrThrow(num, 30, value);
     } else if (c == 't' || c == 'T') {
-      num <<= 40LL;
+      num = ApplyUnitShiftOrThrow(num, 40, value);
     }
   }
 
@@ -359,13 +378,13 @@ int64_t ParseInt64(const std::string& value) {
   if (endchar < value.length()) {
     char c = value[endchar];
     if (c == 'k' || c == 'K') {
-      num <<= 10LL;
+      num = ApplyUnitShiftOrThrow(num, 10, value);
     } else if (c == 'm' || c == 'M') {
-      num <<= 20LL;
+      num = ApplyUnitShiftOrThrow(num, 20, value);
     } else if (c == 'g' || c == 'G') {
-      num <<= 30LL;
+      num = ApplyUnitShiftOrThrow(num, 30, value);
     } else if (c == 't' || c == 'T') {
-      num <<= 40LL;
+      num = ApplyUnitShiftOrThrow(num, 40, value);
     }
   }
 
@@ -385,11 +404,11 @@ int ParseInt(const std::string& value) {
   if (endchar < value.length()) {
     char c = value[endchar];
     if (c == 'k' || c == 'K') {
-      num <<= 10;
+      num = ApplyUnitShiftOrThrow(num, 10, value);
     } else if (c == 'm' || c == 'M') {
-      num <<= 20;
+      num = ApplyUnitShiftOrThrow(num, 20, value);
     } else if (c == 'g' || c == 'G') {
-      num <<= 30;
+      num = ApplyUnitShiftOrThrow(num, 30, value);
     }
   }
 
