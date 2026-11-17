@@ -276,6 +276,7 @@ inline bool ReleaseRefOrTakeOwnership(ClockHandle& h, bool useful) {
       // be freed, and a standalone handle deleted, once ours is dropped
       CorrectNearOverflowBeforeStore(dropped);
       if (h.meta.CasWeak(meta, dropped)) {
+        TEST_SYNC_POINT("ClockCache::Release:EraseIfLastRefDropped");
         return false;
       }
     }
@@ -3415,20 +3416,17 @@ void AutoHyperClockTable::Remove(HandleImpl* h) {
 
 bool AutoHyperClockTable::TryEraseHandle(HandleImpl* h) {
   SlotMeta meta = h->meta.Load();
-  assert(meta.IsShareable());
 
   // Take ownership if no other refs, or set invisible if other refs exist.
   SlotMeta construction_meta;
   construction_meta.SetUnderConstruction();
   do {
+    // The caller's reference keeps the entry shareable
+    assert(meta.IsShareable());
     if (meta.GetRefcount() != 1) {
       // Not last ref at some point in time during this call
       // Set invisible
       h->meta.Apply(SlotMeta::VisibleFlag::ClearTransform());
-      return false;
-    }
-    if (!meta.IsShareable()) {
-      // Someone else took ownership
       return false;
     }
   } while (!h->meta.CasWeak(meta, construction_meta));

@@ -970,41 +970,45 @@ TYPED_TEST(ClockCacheTest, ReleaseOfErasedEntryLeavesItsSlotsNextEntry) {
 // release that isn't the last must not touch the handle after dropping its
 // reference, as the last release deletes it meanwhile. That includes
 // correcting its counters for overflow, so this also runs with them past the
-// threshold for correction. (ASAN reports a read or write of the deleted
-// handle.)
+// threshold for correction. It runs with and without erase_if_last_ref, as
+// the two drop a reference differently. (ASAN reports a read or write of the
+// deleted handle.)
 TYPED_TEST(ClockCacheTest, ReleaseOfStandaloneHandleRacingLastRelease) {
   using HandleImpl = typename TypeParam::Shard::HandleImpl;
-  for (bool near_overflow : {false, true}) {
-    SCOPED_TRACE("near_overflow=" + std::to_string(near_overflow));
-    this->NewShard(1, /*strict_capacity_limit=*/false);
-    auto& shard = *this->shard_;
-    const UniqueId64x2 hkey = this->TestHashedKey('a');
-    HandleImpl* handle =
-        shard.CreateStandalone(this->TestKey(hkey), hkey, nullptr /*value*/,
-                               &kNoopCacheItemHelper, 1 /*charge*/,
-                               /*allow_uncharged=*/false);
-    ASSERT_NE(nullptr, handle);
-    ASSERT_TRUE(shard.Ref(handle));
-    if (near_overflow) {
-      this->TakeAndReleaseRefsToNearOverflow(handle);
-      ASSERT_GT(handle->meta.Load().GetReleaseCounter(),
-                this->kCounterTopBit + ClockHandle::kMaxCountdown);
+  for (bool erase_if_last_ref : {false, true}) {
+    for (bool near_overflow : {false, true}) {
+      SCOPED_TRACE("erase_if_last_ref=" + std::to_string(erase_if_last_ref) +
+                   " near_overflow=" + std::to_string(near_overflow));
+      this->NewShard(1, /*strict_capacity_limit=*/false);
+      auto& shard = *this->shard_;
+      const UniqueId64x2 hkey = this->TestHashedKey('a');
+      HandleImpl* handle =
+          shard.CreateStandalone(this->TestKey(hkey), hkey, nullptr /*value*/,
+                                 &kNoopCacheItemHelper, 1 /*charge*/,
+                                 /*allow_uncharged=*/false);
+      ASSERT_NE(nullptr, handle);
+      ASSERT_TRUE(shard.Ref(handle));
+      if (near_overflow) {
+        this->TakeAndReleaseRefsToNearOverflow(handle);
+        ASSERT_GT(handle->meta.Load().GetReleaseCounter(),
+                  this->kCounterTopBit + ClockHandle::kMaxCountdown);
+      }
+      bool last_erased = false;
+      bool erased = this->ReleaseHeldAt(
+          erase_if_last_ref ? "ClockCache::Release:EraseIfLastRefDropped"
+                            : "ClockCache::Release:EraseInvisible",
+          [&] {
+            return shard.Release(handle, /*useful=*/true, erase_if_last_ref);
+          },
+          [&] {
+            last_erased = shard.Release(handle, /*useful=*/true,
+                                        /*erase_if_last_ref=*/false);
+          });
+      EXPECT_TRUE(last_erased);
+      EXPECT_FALSE(erased);
+      EXPECT_EQ(0U, shard.GetUsage());
+      EXPECT_EQ(0U, shard.GetStandaloneUsage());
     }
-    bool last_erased = false;
-    bool erased = this->ReleaseHeldAt(
-        "ClockCache::Release:EraseInvisible",
-        [&] {
-          return shard.Release(handle, /*useful=*/true,
-                               /*erase_if_last_ref=*/false);
-        },
-        [&] {
-          last_erased = shard.Release(handle, /*useful=*/true,
-                                      /*erase_if_last_ref=*/false);
-        });
-    EXPECT_TRUE(last_erased);
-    EXPECT_FALSE(erased);
-    EXPECT_EQ(0U, shard.GetUsage());
-    EXPECT_EQ(0U, shard.GetStandaloneUsage());
   }
 }
 
