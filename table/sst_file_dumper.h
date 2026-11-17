@@ -13,6 +13,7 @@
 #include "db/dbformat.h"
 #include "file/writable_file_writer.h"
 #include "options/cf_options.h"
+#include "port/mmap.h"
 #include "rocksdb/advanced_options.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -165,11 +166,16 @@ class SstFileDumper {
                           const CompressionOptions& compress_opt,
                           uint64_t block_size);
 
-  // Reads the whole input file once into input_kvs_ so the write benchmark can
-  // feed the builder from memory (excluding input read/decompression from the
-  // timing) and be independent of block-cache state. Memory use is O(input
-  // uncompressed size).
+  // Reads the whole input file once into memory (see input_kvs_) so the
+  // write benchmark can feed the builder from memory (excluding input
+  // read/decompression from the timing) and be independent of block-cache
+  // state.
   Status MaterializeInputKVs();
+  Status AppendInputKV(const Slice& key, const Slice& value);
+  // Calls fn(key, value) for each materialized input entry in order, until it
+  // returns false
+  template <typename Fn>
+  void ForEachInputKV(const Fn& fn) const;
 
   Status SetTableOptionsByMagicNumber(uint64_t table_magic_number);
 
@@ -204,9 +210,15 @@ class SstFileDumper {
   ReadOptions read_options_;
   InternalKeyComparator internal_comparator_;
   std::unique_ptr<TableProperties> table_properties_;
-  // Whole input file materialized in memory (internal key, value) so write
-  // benchmarks feed the builder without re-reading/decompressing the input.
-  std::vector<std::pair<std::string, std::string>> input_kvs_;
+  // Whole input file materialized in memory so write benchmarks feed the
+  // builder without re-reading/decompressing the input. Each entry is its
+  // (internal) key's and value's sizes as two 32-bit integers, then the key
+  // and value, back to back in the first input_kvs_used_ bytes of one
+  // anonymous memory mapping, which avoids heap overhead and fragmentation.
+  // The mapping is sized from the table properties, so it never needs to grow,
+  // and only the pages written become resident.
+  TypedMemMapping<char> input_kvs_ = MemMapping::AllocateLazyZeroed(0);
+  size_t input_kvs_used_ = 0;
   // Properties of the last table file built by ShowCompressionSize.
   TableProperties recompress_output_props_;
   bool have_recompress_output_props_ = false;
