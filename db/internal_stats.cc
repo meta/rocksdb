@@ -1578,7 +1578,9 @@ bool InternalStats::HandleEstimateOldestKeyTime(uint64_t* value, DBImpl* /*db*/,
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
   TablePropertiesCollection collection;
-  auto s = cfd_->current()->GetPropertiesOfAllTables(read_options, &collection);
+  // The DB mutex is held.
+  auto s = cfd_->current()->GetPropertiesOfAllTables(
+      read_options, &collection, /*allow_table_open=*/false);
   if (!s.ok()) {
     return false;
   }

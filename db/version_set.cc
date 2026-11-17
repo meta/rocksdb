@@ -2053,20 +2053,33 @@ void LevelIterator::RetryPrefixFilteredFile(const Slice* seek_target) {
 
 Status Version::GetTableProperties(const ReadOptions& read_options,
                                    std::shared_ptr<const TableProperties>* tp,
-                                   const FileMetaData* file_meta,
+                                   const FileMetaData* file_meta, int level,
+                                   bool allow_table_open,
                                    const std::string* fname) const {
   auto* table_cache = cfd_->table_cache();
   const auto& ioptions = cfd_->ioptions();
+  // With an unbounded table cache, files are normally opened anyway, so open
+  // this one now (coalesced with any concurrent open) rather than reading its
+  // metadata an extra time.
+  const bool open_table =
+      allow_table_open &&
+      vset_->GetColumnFamilySet()->get_table_cache()->GetCapacity() ==
+          TableCache::kInfiniteCapacity;
+  assert(level >= 0 || !allow_table_open);
   Status s = table_cache->GetTableProperties(
       file_options_, read_options, cfd_->internal_comparator(), *file_meta, tp,
-      mutable_cf_options_, true /* no io */);
+      mutable_cf_options_, /*no_io=*/!open_table, level,
+      open_table ? cfd_->internal_stats()->GetFileReadHist(level) : nullptr,
+      /*prefetch_index_and_filter_in_cache=*/false);
   if (s.ok()) {
     return s;
   }
 
   // We only ignore error type `Incomplete` since it's by design that we
-  // disallow table when it's not in table cache.
-  if (!s.IsIncomplete()) {
+  // disallow table when it's not in table cache. A failed open also falls
+  // through, because the properties block might still be readable, as when
+  // the same open failed during DB::Open with paranoid_checks = false.
+  if (!open_table && !s.IsIncomplete()) {
     return s;
   }
 
@@ -2110,11 +2123,12 @@ Status Version::GetTableProperties(const ReadOptions& read_options,
   return s;
 }
 
-Status Version::GetPropertiesOfAllTables(
-    const ReadOptions& read_options, TablePropertiesCollection* props) const {
+Status Version::GetPropertiesOfAllTables(const ReadOptions& read_options,
+                                         TablePropertiesCollection* props,
+                                         bool allow_table_open) const {
   Status s;
   for (int level = 0; level < storage_info_.num_levels_; level++) {
-    s = GetPropertiesOfAllTables(read_options, props, level);
+    s = GetPropertiesOfAllTables(read_options, props, level, allow_table_open);
     if (!s.ok()) {
       return s;
     }
@@ -2182,7 +2196,8 @@ Status Version::TablesRangeTombstoneSummary(int max_entries_to_print,
 
 Status Version::GetPropertiesOfAllTables(const ReadOptions& read_options,
                                          TablePropertiesCollection* props,
-                                         int level) const {
+                                         int level,
+                                         bool allow_table_open) const {
   for (const auto& file_meta : storage_info_.files_[level]) {
     auto fname =
         TableFileName(cfd_->ioptions().cf_paths, file_meta->fd.GetNumber(),
@@ -2190,8 +2205,8 @@ Status Version::GetPropertiesOfAllTables(const ReadOptions& read_options,
     // 1. If the table is already present in table cache, load table
     // properties from there.
     std::shared_ptr<const TableProperties> table_properties;
-    Status s =
-        GetTableProperties(read_options, &table_properties, file_meta, &fname);
+    Status s = GetTableProperties(read_options, &table_properties, file_meta,
+                                  level, allow_table_open, &fname);
     if (s.ok()) {
       props->insert({fname, table_properties});
     } else {
@@ -2204,7 +2219,7 @@ Status Version::GetPropertiesOfAllTables(const ReadOptions& read_options,
 
 Status Version::GetPropertiesOfTablesInRange(
     const ReadOptions& read_options, const autovector<UserKeyRange>& ranges,
-    TablePropertiesCollection* props) const {
+    TablePropertiesCollection* props, bool allow_table_open) const {
   for (int level = 0; level < storage_info_.num_non_empty_levels(); level++) {
     for (const auto& range : ranges) {
       // Convert user_key into a corresponding internal key.
@@ -2221,8 +2236,9 @@ Status Version::GetPropertiesOfTablesInRange(
           // 1. If the table is already present in table cache, load table
           // properties from there.
           std::shared_ptr<const TableProperties> table_properties;
-          Status s = GetTableProperties(read_options, &table_properties,
-                                        file_meta, &fname);
+          Status s =
+              GetTableProperties(read_options, &table_properties, file_meta,
+                                 level, allow_table_open, &fname);
           if (s.ok()) {
             props->insert({fname, table_properties});
           } else {
@@ -2238,15 +2254,15 @@ Status Version::GetPropertiesOfTablesInRange(
 
 Status Version::GetPropertiesOfTablesByLevel(
     const ReadOptions& read_options,
-    std::vector<std::unique_ptr<TablePropertiesCollection>>* props_by_level)
-    const {
+    std::vector<std::unique_ptr<TablePropertiesCollection>>* props_by_level,
+    bool allow_table_open) const {
   Status s;
 
   props_by_level->reserve(storage_info_.num_levels_);
   for (int level = 0; level < storage_info_.num_levels_; level++) {
     props_by_level->push_back(std::make_unique<TablePropertiesCollection>());
     s = GetPropertiesOfAllTables(read_options, props_by_level->back().get(),
-                                 level);
+                                 level, allow_table_open);
     if (!s.ok()) {
       return s;
     }
@@ -2259,10 +2275,12 @@ Status Version::GetAggregatedTableProperties(
     int level) {
   TablePropertiesCollection props;
   Status s;
+  // The DB mutex is held.
+  constexpr bool kAllowTableOpen = false;
   if (level < 0) {
-    s = GetPropertiesOfAllTables(read_options, &props);
+    s = GetPropertiesOfAllTables(read_options, &props, kAllowTableOpen);
   } else {
-    s = GetPropertiesOfAllTables(read_options, &props, level);
+    s = GetPropertiesOfAllTables(read_options, &props, level, kAllowTableOpen);
   }
   if (!s.ok()) {
     return s;
@@ -3444,7 +3462,12 @@ bool Version::MaybeInitializeFileMetaData(const ReadOptions& read_options,
     return false;
   }
   std::shared_ptr<const TableProperties> tp;
-  Status s = GetTableProperties(read_options, &tp, file_meta);
+  // PrepareAppend() can run with the DB mutex held. With an unbounded table
+  // cache, files reaching here are normally already open: files recovered at
+  // DB open have compensated_file_size set, and files added later are opened
+  // when added.
+  Status s = GetTableProperties(read_options, &tp, file_meta, /*level=*/-1,
+                                /*allow_table_open=*/false);
   file_meta->init_stats_from_file = true;
   if (!s.ok()) {
     ROCKS_LOG_ERROR(vset_->db_options_->info_log,

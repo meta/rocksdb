@@ -6389,7 +6389,8 @@ Status DBImpl::GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
 
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
-  auto s = version->GetPropertiesOfAllTables(read_options, props);
+  auto s = version->GetPropertiesOfAllTables(read_options, props,
+                                             /*allow_table_open=*/true);
 
   // Decrement the ref count
   mutex_.Lock();
@@ -6431,7 +6432,8 @@ Status DBImpl::GetPropertiesOfTablesInRange(ColumnFamilyHandle* column_family,
     ukey_ranges.emplace_back(start.value(), limit.value());
   }
   auto s =
-      version->GetPropertiesOfTablesInRange(read_options, ukey_ranges, props);
+      version->GetPropertiesOfTablesInRange(read_options, ukey_ranges, props,
+                                            /*allow_table_open=*/true);
 
   // Decrement the ref count
   mutex_.Lock();
@@ -6454,7 +6456,8 @@ Status DBImpl::GetPropertiesOfTablesByLevel(
   mutex_.Unlock();
 
   const ReadOptions read_options;
-  auto s = version->GetPropertiesOfTablesByLevel(read_options, props_by_level);
+  auto s = version->GetPropertiesOfTablesByLevel(read_options, props_by_level,
+                                                 /*allow_table_open=*/true);
 
   // Decrement the ref count
   mutex_.Lock();
@@ -6866,7 +6869,8 @@ Status DBImpl::GetApproximateSizes(const SizeApproximationOptions& options,
             if (!file->referenced_blob_bytes.has_value()) {
               std::shared_ptr<const TableProperties> table_properties;
               Status properties_status = v->GetTableProperties(
-                  read_options, &table_properties, file, nullptr);
+                  read_options, &table_properties, file, level,
+                  /*allow_table_open=*/true, nullptr);
               TEST_SYNC_POINT_CALLBACK(
                   "DBImpl::GetApproximateSizes:TablePropertiesStatus",
                   &properties_status);
@@ -7230,7 +7234,9 @@ Status DBImpl::GetPreparedFileInfoForExternalSstIngestion(
   Status s = file_cfd->table_cache()->GetTableProperties(
       file_options_, read_options, file_cfd->internal_comparator(), *file_meta,
       &table_properties, file_version->GetMutableCFOptions(),
-      false /* no_io */);
+      /*no_io=*/false, file_level,
+      file_cfd->internal_stats()->GetFileReadHist(file_level),
+      /*prefetch_index_and_filter_in_cache=*/true);
   if (!s.ok()) {
     return s;
   }
