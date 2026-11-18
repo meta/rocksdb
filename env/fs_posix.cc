@@ -127,6 +127,11 @@ struct ReadIOExecutorState {
     return event_base_manager_.Load();
   }
 
+  // A new thread inherits its creator's scheduling policy, and an
+  // unprivileged thread can't leave SCHED_IDLE. Start every thread this
+  // creates or adds here, on the thread sizing the pool, rather than lazily on
+  // a reader's first getEventBase(), so an idle background reader can't put
+  // all later reads on an idle thread.
   void SetThreads(int num) {
     assert(num > 0);
     MutexLock lock(&mutex_);
@@ -136,6 +141,15 @@ struct ReadIOExecutorState {
       if (requested_threads > executor->numThreads()) {
         try {
           executor->setNumThreads(requested_threads);
+#ifndef NDEBUG
+          bool fail_for_test = false;
+          TEST_SYNC_POINT_CALLBACK(
+              "ReadIOExecutorState::SetThreads:BeforeStart", &fail_for_test);
+          if (fail_for_test) {
+            throw std::runtime_error("injected failure");
+          }
+#endif  // NDEBUG
+          executor->getAllEventBases();
         } catch (const std::exception&) {
         }
       }
@@ -157,7 +171,7 @@ struct ReadIOExecutorState {
       auto event_base_manager =
           std::make_unique<folly::EventBaseManager>(event_base_options);
       auto new_executor = std::make_unique<folly::IOThreadPoolExecutor>(
-          requested_threads, 0,
+          requested_threads, requested_threads,
           std::make_shared<folly::NamedThreadFactory>("RocksDBAsyncRead"),
           event_base_manager.get());
       event_base_manager_.Store(event_base_manager.release());
