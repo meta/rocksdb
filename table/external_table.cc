@@ -1216,6 +1216,11 @@ class ExternalTableFactoryAdapter : public TableFactory {
     return nullptr;
   }
 
+  Status FileIsValidTable(const IOOptions& io_options, FSRandomAccessFile& file,
+                          uint64_t file_size, bool* matches) const override {
+    return inner_->FileIsValidTable(io_options, file, file_size, matches);
+  }
+
   std::unique_ptr<TableFactory> Clone() const override { return nullptr; }
 
   // Lets the wrapped factory reject column families it cannot serve.

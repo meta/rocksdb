@@ -8629,6 +8629,104 @@ class ExternalTablePointReadTest : public ExternalTableTest,
   const bool use_coroutine_;
 };
 
+TEST(TableFactoryTest, FileIsValidTable) {
+  class DirectIOSource : public test::StringSource {
+   public:
+    using test::StringSource::StringSource;
+    bool use_direct_io() const override { return true; }
+    IOStatus Read(uint64_t offset, size_t n, const IOOptions& options,
+                  Slice* result, char* scratch,
+                  IODebugContext* dbg) const override {
+      if (fail_read) {
+        return IOStatus::IOError("Injected read failure");
+      }
+      const size_t alignment = GetRequiredBufferAlignment();
+      if (offset % alignment != 0 || n % alignment != 0 ||
+          !AlignedBuffer::isAligned(scratch, alignment)) {
+        return IOStatus::InvalidArgument("Unaligned direct read");
+      }
+      return test::StringSource::Read(offset, n, options, result, scratch, dbg);
+    }
+    bool fail_read = false;
+  };
+
+  std::unique_ptr<TableFactory> block(NewBlockBasedTableFactory());
+  std::unique_ptr<TableFactory> plain(NewPlainTableFactory());
+  std::unique_ptr<TableFactory> cuckoo(NewCuckooTableFactory());
+  std::unique_ptr<TableFactory> adaptive(NewAdaptiveTableFactory());
+  std::shared_ptr<ExternalTableFactory> inner =
+      std::make_shared<SimpleExternalTableFactory>();
+  std::unique_ptr<TableFactory> external = NewExternalTableFactory(inner);
+
+  // An empty SimpleExternal table consists of only its footer.
+  test::StringSink sink;
+  std::unique_ptr<ExternalTableBuilder> builder(inner->NewTableBuilder(
+      ExternalTableBuilderOptions(
+          ReadOptions(), WriteOptions(),
+          std::shared_ptr<const SliceTransform>(), BytewiseComparator(),
+          "default", TableFileCreationReason::kMisc, FileSystem::Default()),
+      "", &sink));
+  ASSERT_OK(builder->Finish());
+
+  auto magic = [](uint64_t magic_number) {
+    std::string signature;
+    PutFixed64(&signature, magic_number);
+    return signature;
+  };
+  // Each signature should be recognized by exactly the listed factories.
+  const std::pair<std::string, std::vector<TableFactory*>> signatures[] = {
+      {magic(kBlockBasedTableMagicNumber), {block.get(), adaptive.get()}},
+      {magic(kPlainTableMagicNumber), {plain.get(), adaptive.get()}},
+      {magic(kLegacyPlainTableMagicNumber), {plain.get(), adaptive.get()}},
+      {magic(kCuckooTableMagicNumber), {cuckoo.get(), adaptive.get()}},
+      {sink.contents(), {external.get()}}};
+  for (const auto& [signature, recognizers] : signatures) {
+    for (TableFactory* factory : {block.get(), plain.get(), cuckoo.get(),
+                                  adaptive.get(), external.get()}) {
+      SCOPED_TRACE(std::string(factory->Name()) + " probing " +
+                   Slice(signature).ToString(/*hex=*/true));
+      // Native magic numbers straddle a direct I/O alignment boundary.
+      DirectIOSource file(std::string(4093, 'x') + signature);
+      const bool expected = std::find(recognizers.begin(), recognizers.end(),
+                                      factory) != recognizers.end();
+      bool matches = !expected;
+      ASSERT_OK(
+          factory->FileIsValidTable(IOOptions(), file, file.Size(), &matches));
+      ASSERT_EQ(matches, expected);
+      ASSERT_EQ(file.total_reads(), 1);
+    }
+  }
+
+  // Probes the reader passed to NewTableReader() without taking ownership.
+  auto* source = new DirectIOSource(std::string(4093, 'x') +
+                                    magic(kBlockBasedTableMagicNumber));
+  RandomAccessFileReader reader(std::unique_ptr<FSRandomAccessFile>(source),
+                                "");
+  bool matches = false;
+  ASSERT_OK(block->FileIsValidTable(IOOptions(), *AsFSRandomAccessFile(&reader),
+                                    source->Size(), &matches));
+  ASSERT_TRUE(matches);
+  ASSERT_EQ(source->total_reads(), 1);
+
+  test::StringSource unknown(std::string(8, '\0'));
+  matches = true;
+  ASSERT_OK(
+      block->FileIsValidTable(IOOptions(), unknown, unknown.Size(), &matches));
+  ASSERT_FALSE(matches);
+  ASSERT_EQ(unknown.total_reads(), 1);
+  ASSERT_TRUE(
+      block
+          ->FileIsValidTable(IOOptions(), unknown, unknown.Size() + 1, &matches)
+          .IsCorruption());
+  DirectIOSource failed(std::string(8, '\0'));
+  failed.fail_read = true;
+  matches = true;
+  ASSERT_TRUE(
+      block->FileIsValidTable(IOOptions(), failed, failed.Size(), &matches)
+          .IsIOError());
+  ASSERT_FALSE(matches);
+}
+
 TEST_F(ExternalTableTest, BootstrapConfig) {
   RegisterConfigurableSimpleExternalTableFactory();
 

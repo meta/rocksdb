@@ -5,6 +5,7 @@
 
 #include <mutex>
 
+#include "file/random_access_file_reader.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/customizable_util.h"
@@ -14,6 +15,10 @@
 #include "table/plain/plain_table_factory.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+FSRandomAccessFile* AsFSRandomAccessFile(RandomAccessFileReader* reader) {
+  return reader;
+}
 
 static void RegisterTableFactories(const std::string& /*arg*/) {
   static std::once_flag loaded;

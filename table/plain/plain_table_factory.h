@@ -158,6 +158,9 @@ class PlainTableFactory : public TableFactory {
   // Method to allow CheckedCast to work for this class
   static const char* kClassName() { return kPlainTableName(); }
   const char* Name() const override { return kPlainTableName(); }
+  Status FileIsValidTable(const IOOptions& io_options, FSRandomAccessFile& file,
+                          uint64_t file_size, bool* matches) const override;
+
   using TableFactory::NewTableReader;
   Status NewTableReader(const ReadOptions& ro,
                         const TableReaderOptions& table_reader_options,
