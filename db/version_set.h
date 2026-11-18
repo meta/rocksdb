@@ -2365,6 +2365,21 @@ class ReactiveVersionSet : public VersionSet {
       log::Reader::Reporter* reporter,
       std::unique_ptr<log::FragmentBufferedReader>* manifest_reader);
 
+  // Opens the MANIFEST at `manifest_path` with a new reader that reports to
+  // `reporter`.
+  Status NewManifestReader(
+      const std::string& manifest_path, log::Reader::Reporter* reporter,
+      std::unique_ptr<log::FragmentBufferedReader>* manifest_reader);
+
+  // Replaces `*manifest_reader`, which a failed read stopped, with a new reader
+  // of the same MANIFEST that starts at
+  // ManifestTailer::GetLastValidRecordEnd(). Returns Corruption if the file
+  // now belongs to another DB. On any failure, keeps the old reader, so that
+  // the next call tries again.
+  Status ReopenManifestAfterReadError(
+      std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+      Status* manifest_read_status);
+
  private:
   std::unique_ptr<ManifestTailer> manifest_tailer_;
   // When true, MANIFEST recovery trusts the manifest and does not stat/open SST
@@ -2372,6 +2387,20 @@ class ReactiveVersionSet : public VersionSet {
   // VersionEditHandlerPointInTime::trust_manifest_recovery_). Set only for the
   // DB::OpenAndCompact remote-compaction path.
   bool trust_manifest_recovery_ = false;
+  // Resume after a failed MANIFEST read. A log reader never reads again after
+  // a failed read, so:
+  // 1. A catch-up that started without a tailer error and stopped at a failed
+  //    read sets this flag and returns IOError. The tailer has applied every
+  //    record and every complete atomic group before
+  //    ManifestTailer::GetLastValidRecordEnd(), and none of an atomic group
+  //    that the failed read cut.
+  // 2. The next catch-up uses the reader from MaybeSwitchManifest() if CURRENT
+  //    names another MANIFEST. Otherwise ReopenManifestAfterReadError() makes
+  //    a new reader that starts at that offset. If that fails, the call returns
+  //    the error and keeps this flag.
+  // 3. ManifestTailer::PrepareToResumeAfterReadError() clears the read error
+  //    and the cut atomic group, which the new reader reads again.
+  bool resume_after_manifest_read_error_ = false;
   // Defers initial SecondaryDB SST validation and opening until after
   // OpenAsSecondary returns. Catch-up remains synchronous.
   const bool defer_sst_file_opening_;
