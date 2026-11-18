@@ -2710,6 +2710,15 @@ class DBImpl : public DB
 
   // Delete any unneeded files and stale in-memory entries.
   void DeleteObsoleteFiles();
+  friend class CheckpointImpl;
+
+  // Reads the SST metadata for ExportColumnFamily(). It checks the CF under
+  // the same DB mutex hold: it returns NotSupported if enable_blob_indirection
+  // is on, an activation is pending, or the format fence is set. One lock hold
+  // means that no flush or compaction can activate the CF between the check
+  // and the read.
+  Status GetColumnFamilyMetaDataForExport(ColumnFamilyHandle* column_family,
+                                          ColumnFamilyMetaData* metadata);
   // Delete obsolete files and log status and information of file deletion
   void DeleteObsoleteFileImpl(int job_id, const std::string& fname,
                               const std::string& path_to_sync, FileType type,
@@ -3461,6 +3470,10 @@ class DBImpl : public DB
   //   can be null.
   // - `job_id` names the job in the logs and in the blob file listener calls.
   //
+  // `empty_files_only`: the job runs because normal GC cannot (see
+  // BackgroundCompaction()), so it only removes files with no live value from
+  // the Version and copies nothing.
+  //
   // Return codes:
   // - OK: the edit is installed, or no input was collected because every
   //   input was suppressed or deferred, or another GC job or an earlier
@@ -3478,7 +3491,8 @@ class DBImpl : public DB
       ColumnFamilyData* cfd,
       const std::vector<uint64_t>& candidate_physical_file_numbers,
       bool* made_progress, uint64_t* sfm_reserved_bytes,
-      bool* retryable_stale_input, LogBuffer* log_buffer, int job_id);
+      bool* retryable_stale_input, LogBuffer* log_buffer, int job_id,
+      bool empty_files_only);
 
   // The job of RunIndirectBlobGCBatch(), with one method per phase. It is
   // defined in db_impl_compaction_flush.cc.

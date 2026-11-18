@@ -2823,9 +2823,15 @@ class DB {
   // ColumnFamily will be present on successful return and will not be present
   // on error return. ColumnFamily may be present on any crash during this call.
   // Import never brings blob files, so it returns NotSupported if any file in
-  // `metadata` references blob files (oldest_blob_file_number != 0). Importing
-  // files without blob references into a column family with
-  // `enable_blob_files` is allowed.
+  // `metadata` references blob files (oldest_blob_file_number != 0). It also
+  // returns NotSupported if the table properties of a file show that the file
+  // can hold blob indirection references. Such a file can have
+  // oldest_blob_file_number 0, so the first check does not catch it. The
+  // exported `metadata` cannot carry the blob indirection state that such a
+  // file needs (see Checkpoint::ExportColumnFamily in utilities/checkpoint.h).
+  // A column family that uses or has used enable_blob_indirection can write
+  // such files, also after the option is turned off. Importing other files
+  // into a column family with `enable_blob_files` is allowed.
   virtual Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& options, const std::string& column_family_name,
       const ImportColumnFamilyOptions& import_options,

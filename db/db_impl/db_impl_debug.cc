@@ -260,7 +260,8 @@ Status DBImpl::TEST_RunIndirectBlobGCBatch(
   Status status = RunIndirectBlobGCBatch(cfd, candidate_physical_file_numbers,
                                          &made_progress, &sfm_reserved_bytes,
                                          &retryable_stale_input, &log_buffer,
-                                         /*job_id=*/0);
+                                         /*job_id=*/0,
+                                         /*empty_files_only=*/false);
   if (sfm_reserved_bytes != 0) {
     auto* const sfm = static_cast<SstFileManagerImpl*>(
         immutable_db_options_.sst_file_manager.get());

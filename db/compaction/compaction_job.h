@@ -425,9 +425,9 @@ class CompactionJob {
   //     A route target is always a live relocation file (one hop).
   //   - Route retirement skips the inputs of the running GC job
   //     (BlobReferenceCensus::IsGcInputFile()).
-  //   - Ingestion and import are assumed to add no indirect references (diff 12
-  //     rejects them). A flush references only the new blob files of its own
-  //     edit. A coarse SST holds no routed or flattened numbers.
+  //   - Ingestion and import reject indirect references. A flush references
+  //     only the new blob files of its own edit. A coarse SST holds no routed
+  //     or flattened numbers.
   //   - Flattening uses only the job's input Version. A remote worker runs a
   //     job only when its relocation state fingerprint matches the input
   //     Version of the primary, and the primary accepts only remote output

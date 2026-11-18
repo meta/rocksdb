@@ -390,6 +390,14 @@ class ColumnFamilyData {
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
 
+  // Runs only when the DB is opened for writing (not read-only), after
+  // MANIFEST recovery. If enable_blob_indirection is on, an activation is
+  // pending (see HasPendingBlobIndirectionOutput()), or the CF has the format
+  // fence, it checks that the compaction style is supported. If the CF has the
+  // fence, it also checks that blob direct write is off and that the table
+  // factory can write Block-Based Tables. REQUIRES: DB mutex held.
+  Status ValidateBlobIndirectionOptionsAfterRecovery() const;
+
   // Test-only, not public API. Until the indirect blob GC stack is complete,
   // ValidateOptions rejects enable_blob_indirection unless a test allows it.
   static void TEST_SetAllowBlobIndirection(bool allow);
@@ -644,6 +652,60 @@ class ColumnFamilyData {
   int num_in_flight_compactions(InstrumentedMutex* db_mutex) const {
     db_mutex->AssertHeld();
     return num_in_flight_compactions_;
+  }
+
+  // Pending activation
+  //
+  // Background: activation is the first MANIFEST edit that sets the per-CF
+  // format fence. A flush or compaction that copied or picked its options with
+  // enable_blob_indirection on can still write that edit when it installs its
+  // output, even if SetOptions turned the option off in the meantime. Such a
+  // job is a "pending activation". Two counters and a per-memtable mark track
+  // it:
+  // 1. pending_blob_indirection_compactions_ (see
+  //    BeginBlobIndirectionCompaction()).
+  // 2. pending_blob_indirection_flushes_ (see BeginBlobIndirectionFlush()).
+  // 3. The per-memtable mark, pending_blob_indirection_activation_ in
+  //    ReadOnlyMemTable: FlushJob marks the first memtable that such a flush
+  //    picked (MemTableList::BeginBlobIndirectionActivation()). The mark
+  //    stays until the memtable is installed or rolled back. MemTableList
+  //    counts the marked memtables.
+  // HasPendingBlobIndirectionOutput() is true while any count or mark is set.
+
+  // A compaction picked with enable_blob_indirection on calls Begin when it
+  // takes its input Version and End when it releases it. While the count is
+  // not zero, the CF may still get its first format fence, even if the option
+  // was turned off. REQUIRES: DB mutex held.
+  void BeginBlobIndirectionCompaction() {
+    ++pending_blob_indirection_compactions_;
+  }
+  void EndBlobIndirectionCompaction() {
+    assert(pending_blob_indirection_compactions_ > 0);
+    --pending_blob_indirection_compactions_;
+  }
+
+  // A flush copies the options before it releases the DB mutex (for example
+  // to sync closed WALs) and picks its memtables later. A flush whose copy has
+  // enable_blob_indirection on calls Begin when it copies the options and End
+  // when it returns. The memtable activation (MemTableList) covers the time
+  // after the pick. So SetOptions sees the flush as pending during the whole
+  // window. REQUIRES: DB mutex held.
+  void BeginBlobIndirectionFlush() { ++pending_blob_indirection_flushes_; }
+  void EndBlobIndirectionFlush() {
+    assert(pending_blob_indirection_flushes_ > 0);
+    --pending_blob_indirection_flushes_;
+  }
+
+  // True while a pending activation exists (see "Pending activation" above).
+  // The CF may then get its first format fence. So SetOptions()
+  // (PrepareMutableCFOptions()), ingestion and export treat the CF like a
+  // fenced CF. DB open (ValidateBlobIndirectionOptionsAfterRecovery()) and the
+  // MANIFEST writer use it only for the compaction style check.
+  // REQUIRES: DB mutex held.
+  bool HasPendingBlobIndirectionOutput() const {
+    return pending_blob_indirection_compactions_ != 0 ||
+           pending_blob_indirection_flushes_ != 0 ||
+           imm_.HasPendingBlobIndirectionActivation();
   }
   void inc_num_in_flight_compactions(InstrumentedMutex* db_mutex) {
     db_mutex->AssertHeld();
@@ -905,6 +967,8 @@ class ColumnFamilyData {
   // worker invocations, backs the public rocksdb.num-running-compactions
   // property, and excludes CompactFiles). Protected by the DB mutex.
   int num_in_flight_compactions_{0};
+  size_t pending_blob_indirection_compactions_ = 0;
+  size_t pending_blob_indirection_flushes_ = 0;
 
   uint64_t prev_compaction_needed_bytes_;
 

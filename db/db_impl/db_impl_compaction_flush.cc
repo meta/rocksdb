@@ -456,7 +456,7 @@ class DBImpl::IndirectBlobGCJob {
       const std::vector<uint64_t>& candidate_physical_file_numbers_arg,
       bool* made_progress_arg, uint64_t* sfm_reserved_bytes_arg,
       bool* retryable_stale_input_arg, LogBuffer* log_buffer_arg,
-      int job_id_arg)
+      int job_id_arg, bool empty_files_only_arg)
       : db_(db),
         cfd(cfd_arg),
         candidate_physical_file_numbers(candidate_physical_file_numbers_arg),
@@ -464,6 +464,7 @@ class DBImpl::IndirectBlobGCJob {
         sfm_reserved_bytes(sfm_reserved_bytes_arg),
         log_buffer(log_buffer_arg),
         job_id(job_id_arg),
+        empty_files_only(empty_files_only_arg),
         column_family(*cfd_arg),
         stale_input_is_retryable(*retryable_stale_input_arg) {}
 
@@ -700,6 +701,7 @@ class DBImpl::IndirectBlobGCJob {
   uint64_t* const sfm_reserved_bytes;
   LogBuffer* const log_buffer;
   const int job_id;
+  const bool empty_files_only;
 
   // column_family is *cfd, and stale_input_is_retryable is the
   // retryable_stale_input argument of RunIndirectBlobGCBatch().
@@ -840,7 +842,8 @@ Status DBImpl::RunIndirectBlobGCBatch(
     ColumnFamilyData* cfd,
     const std::vector<uint64_t>& candidate_physical_file_numbers,
     bool* made_progress, uint64_t* sfm_reserved_bytes,
-    bool* retryable_stale_input, LogBuffer* log_buffer, int job_id) {
+    bool* retryable_stale_input, LogBuffer* log_buffer, int job_id,
+    bool empty_files_only) {
   mutex_.AssertHeld();
   if (cfd == nullptr || made_progress == nullptr ||
       sfm_reserved_bytes == nullptr || retryable_stale_input == nullptr) {
@@ -852,7 +855,8 @@ Status DBImpl::RunIndirectBlobGCBatch(
   }
   IndirectBlobGCJob job(this, cfd, candidate_physical_file_numbers,
                         made_progress, sfm_reserved_bytes,
-                        retryable_stale_input, log_buffer, job_id);
+                        retryable_stale_input, log_buffer, job_id,
+                        empty_files_only);
   return job.Run();
 }
 
@@ -911,7 +915,10 @@ Status DBImpl::IndirectBlobGCJob::Start() {
   inputs.reserve(candidate_physical_file_numbers.size());
   mutable_cf_options = input_version->GetMutableCFOptions();
   const MutableCFOptions& latest_options = cfd->GetLatestMutableCFOptions();
-  allow_value_relocation = latest_options.enable_blob_files &&
+  // A job that runs only to remove files with no live value from the Version
+  // copies no value, even if the options would allow it.
+  allow_value_relocation = !empty_files_only &&
+                           latest_options.enable_blob_files &&
                            latest_options.enable_blob_indirection &&
                            latest_options.enable_blob_garbage_collection;
   table_cache = cfd->table_cache();
@@ -2698,8 +2705,10 @@ void DBImpl::IndirectBlobGCJob::Install() {
   //      generation number. A compaction keeps or drops the references of its
   //      input SSTs, which the snapshot already counts. A flush writes
   //      indirect references only to the new blob files that it creates, which
-  //      are never inputs of this job. Ingestion and import are assumed to
-  //      write no indirect reference; this code does not check it.
+  //      are never inputs of this job. Ingestion rejects files with indirect
+  //      references (the blob indirection checks of
+  //      ExternalSstFileIngestionJob), and import rejects files with blob
+  //      indirection table properties (RejectBlobIndirectionTableProperties()).
   //   2. Flattening can add a holder that the snapshot does not count. A
   //      compaction rewrites a generation number to its route target in the
   //      compaction's own input Version (see
@@ -3529,12 +3538,23 @@ Status DBImpl::FlushMemTablesToOutputFiles(
   // intentional infrequent copy for each flush
   const MutableCFOptions mutable_cf_options_copy =
       cfd->GetLatestMutableCFOptions();
+  // Keep the flush pending for SetOptions from this copy on (see
+  // ColumnFamilyData::BeginBlobIndirectionFlush()).
+  const bool blob_indirection_flush =
+      mutable_cf_options_copy.enable_blob_indirection;
+  if (blob_indirection_flush) {
+    cfd->BeginBlobIndirectionFlush();
+  }
   SuperVersionContext* superversion_context =
       bg_flush_arg.superversion_context_;
   FlushReason flush_reason = bg_flush_arg.flush_reason_;
   Status s = FlushMemTableToOutputFile(
       cfd, mutable_cf_options_copy, made_progress, job_context, flush_reason,
       superversion_context, log_buffer, thread_pri);
+  mutex_.AssertHeld();
+  if (blob_indirection_flush) {
+    cfd->EndBlobIndirectionFlush();
+  }
   return s;
 }
 
@@ -3576,6 +3596,16 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
   std::vector<MutableCFOptions> all_mutable_cf_options;
   int num_cfs = static_cast<int>(cfds.size());
   all_mutable_cf_options.reserve(num_cfs);
+  // The column families whose options copy has enable_blob_indirection on.
+  // They stay pending for SetOptions until this function returns (see
+  // ColumnFamilyData::BeginBlobIndirectionFlush()).
+  autovector<ColumnFamilyData*> blob_indirection_flush_cfds;
+  const auto end_blob_indirection_flushes = Defer([&]() {
+    mutex_.AssertHeld();
+    for (ColumnFamilyData* flush_cfd : blob_indirection_flush_cfds) {
+      flush_cfd->EndBlobIndirectionFlush();
+    }
+  });
   for (int i = 0; i < num_cfs; ++i) {
     auto cfd = cfds[i];
     FSDirectory* data_dir = GetDataDir(cfd, 0U);
@@ -3598,6 +3628,10 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
 
     all_mutable_cf_options.emplace_back(cfd->GetLatestMutableCFOptions());
     const MutableCFOptions& mutable_cf_options = all_mutable_cf_options.back();
+    if (mutable_cf_options.enable_blob_indirection) {
+      cfd->BeginBlobIndirectionFlush();
+      blob_indirection_flush_cfds.push_back(cfd);
+    }
     uint64_t max_memtable_id = bg_flush_args[i].max_memtable_id_;
     FlushReason flush_reason = bg_flush_args[i].flush_reason_;
     jobs.emplace_back(new FlushJob(
@@ -7216,6 +7250,13 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
         in_file->blob_reference_descriptor;
     out_file_metadata.blob_reference_legacy_metadata =
         in_file->blob_reference_legacy_metadata;
+    out_file_metadata.oldest_coarse_indirect_origin_file_number =
+        in_file->oldest_coarse_indirect_origin_file_number;
+    out_file_metadata.blob_reference_output_predates_indirection =
+        in_file->blob_reference_descriptor.empty() &&
+        !in_file->blob_reference_legacy_metadata &&
+        in_file->oldest_coarse_indirect_origin_file_number ==
+            kInvalidBlobFileNumber;
 
     if (out_table_properties) {
       c->SetOutputTableProperties(out_fname, out_table_properties);
@@ -8571,7 +8612,13 @@ Status DBImpl::BackgroundCompaction(
     // throughout the compaction procedure to make sure consistency. It will
     // eventually be installed into SuperVersion
     const auto& mutable_cf_options = cfd->GetLatestMutableCFOptions();
-    if (!mutable_cf_options.disable_auto_compactions && !cfd->IsDropped()) {
+    // A CF with automatic compactions disabled still enters here when it has a
+    // file with no live value. It picks no LSM compaction. If the census is
+    // ready, the indirect blob GC block below writes the MANIFEST record that
+    // removes the file (empty_files_only).
+    if ((!mutable_cf_options.disable_auto_compactions ||
+         cfd->current()->storage_info()->HasEmptyBlobGcCandidate()) &&
+        !cfd->IsDropped()) {
       // NOTE: try to avoid unnecessary copy of MutableCFOptions if
       // compaction is not necessary. Need to make sure mutex is held
       // until we make a copy in the following code
@@ -8583,10 +8630,13 @@ Status DBImpl::BackgroundCompaction(
         InitSnapshotContext(job_context);
         assert(is_snapshot_supported_ || snapshots_.empty());
       }
-      c.reset(cfd->PickCompaction(
-          mutable_cf_options, mutable_db_options_, job_context->snapshot_seqs,
-          job_context->snapshot_checker, log_buffer,
-          thread_pri == Env::Priority::BOTTOM /* require_max_output_level */));
+      if (!mutable_cf_options.disable_auto_compactions) {
+        c.reset(cfd->PickCompaction(
+            mutable_cf_options, mutable_db_options_, job_context->snapshot_seqs,
+            job_context->snapshot_checker, log_buffer,
+            thread_pri ==
+                Env::Priority::BOTTOM /* require_max_output_level */));
+      }
       if (c != nullptr && in_flight_cfd == nullptr) {
         in_flight_cfd = cfd;
         BeginInFlightCompaction(in_flight_cfd);
@@ -8653,27 +8703,41 @@ Status DBImpl::BackgroundCompaction(
 
       // Normal LSM compaction comes first. Indirect blob GC runs only on a
       // LOW-pool worker that has no pre-picked compaction and found no LSM
-      // compaction. Blob files, blob GC and blob indirection must be on, and
-      // the census must be ready. GC takes up to kIndirectBlobGCMaxInputs (8)
-      // candidates in the Version's rank order
+      // compaction, and only when the census is ready. When blob files, blob GC
+      // and blob indirection are on and automatic compactions are enabled, GC
+      // takes up to kIndirectBlobGCMaxInputs (8) candidates in the order of
+      // the census ranking that the Version stores
       // (GetBlobPhysicalFilesForIndirectBlobGC()), and RunIndirectBlobGCBatch()
-      // checks them again in full. Only one GC job runs per column family at a
-      // time (indirect_blob_gc_cfs_in_progress_).
+      // checks them again in full. Otherwise GC only removes files that hold no
+      // live value from the Version (empty_files_only below). Only one GC job
+      // runs per column family at a time (indirect_blob_gc_cfs_in_progress_).
       BlobReferenceCensus* const blob_reference_census =
           cfd == nullptr ? nullptr : cfd->blob_reference_census();
       Version* const current_version =
           cfd == nullptr ? nullptr : cfd->current();
       if (status.ok() && c == nullptr && !is_prepicked && cfd != nullptr &&
           job_context != nullptr && thread_pri == Env::Priority::LOW &&
-          mutable_cf_options.enable_blob_files &&
-          mutable_cf_options.enable_blob_garbage_collection &&
-          mutable_cf_options.enable_blob_indirection &&
           blob_reference_census != nullptr && current_version != nullptr &&
           blob_reference_census->IsReady(current_version->GetVersionNumber())) {
         VersionStorageInfo* const storage = current_version->storage_info();
         std::vector<uint64_t> candidates;
-        storage->GetBlobPhysicalFilesForIndirectBlobGC(kIndirectBlobGCMaxInputs,
-                                                       &candidates);
+        const bool empty_files_only =
+            !mutable_cf_options.enable_blob_files ||
+            !mutable_cf_options.enable_blob_garbage_collection ||
+            !mutable_cf_options.enable_blob_indirection ||
+            mutable_cf_options.disable_auto_compactions;
+        if (!empty_files_only) {
+          storage->GetBlobPhysicalFilesForIndirectBlobGC(
+              kIndirectBlobGCMaxInputs, &candidates);
+        } else {
+          // When indirect blob GC cannot run normally (enable_blob_files,
+          // enable_blob_garbage_collection or enable_blob_indirection off, or
+          // automatic compactions disabled), GC removes only files that hold no
+          // live value from the Version. No SST uses a value in such a file, so
+          // GC copies no value and rewrites no SST.
+          storage->GetEmptyBlobGcCandidates(kIndirectBlobGCMaxInputs,
+                                            &candidates);
+        }
         if (!candidates.empty() &&
             indirect_blob_gc_cfs_in_progress_.insert(cfd->GetID()).second) {
           indirect_blob_gc_cfd = cfd;
@@ -8714,7 +8778,8 @@ Status DBImpl::BackgroundCompaction(
           status = run_indirect_blob_gc_job([&]() {
             return RunIndirectBlobGCBatch(
                 cfd, candidates, made_progress, &sfm_reserved_blob_gc_bytes,
-                &indirect_blob_gc_stale_input, log_buffer, job_context->job_id);
+                &indirect_blob_gc_stale_input, log_buffer, job_context->job_id,
+                empty_files_only);
           });
           io_s = versions_->io_status();
           indirect_blob_gc_cfs_in_progress_.erase(cfd->GetID());

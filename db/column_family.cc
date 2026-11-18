@@ -1309,11 +1309,20 @@ void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
 }
 
 bool ColumnFamilyData::NeedsCompaction() const {
+  Version* const current = current_;
+  // Removing blob files and relocation files that hold no live value from the
+  // Version is not an LSM compaction and copies no value. So it runs even when
+  // disable_auto_compactions is set or blob GC or blob indirection is off.
+  const BlobReferenceCensus* const census = blob_reference_census();
+  if (current != nullptr && census != nullptr &&
+      census->IsReady(current->GetVersionNumber()) &&
+      current->storage_info()->HasEmptyBlobGcCandidate()) {
+    return true;
+  }
   if (!is_table_builder_supported_ ||
       mutable_cf_options_.disable_auto_compactions) {
     return false;
   }
-  Version* const current = current_;
   if (current == nullptr) {
     return false;
   }
@@ -1325,8 +1334,7 @@ bool ColumnFamilyData::NeedsCompaction() const {
          mutable_cf_options_.enable_blob_indirection &&
          current->storage_info()->BlobPhysicalFileForIndirectBlobGC() !=
              kInvalidBlobFileNumber &&
-         blob_reference_census() != nullptr &&
-         blob_reference_census()->IsReady(current->GetVersionNumber());
+         census != nullptr && census->IsReady(current->GetVersionNumber());
 }
 
 Compaction* ColumnFamilyData::PickCompaction(
@@ -1842,6 +1850,34 @@ Status ColumnFamilyData::ValidateOptions(
   return s;
 }
 
+Status ColumnFamilyData::ValidateBlobIndirectionOptionsAfterRecovery() const {
+  Status s = CheckBlobIndirectionCompactionStyle(
+      ioptions_.compaction_style,
+      GetLatestMutableCFOptions().enable_blob_indirection ||
+          HasPendingBlobIndirectionOutput() ||
+          (current_ != nullptr &&
+           current_->storage_info()->HasBlobIndirectionFormat()));
+  if (!s.ok()) {
+    return s;
+  }
+  if (current_ == nullptr ||
+      !current_->storage_info()->HasBlobIndirectionFormat()) {
+    return Status::OK();
+  }
+  if (ioptions_.enable_blob_direct_write) {
+    return Status::NotSupported(
+        "Blob direct write cannot open a column family with blob indirection "
+        "state");
+  }
+
+  if (GetBlockBasedTableWriterOptions(
+          initial_cf_options_.table_factory.get()) == nullptr) {
+    return Status::NotSupported(
+        "Blob indirection state requires a Block-Based Table writer");
+  }
+  return Status::OK();
+}
+
 Status ColumnFamilyData::PrepareMutableCFOptions(
     const DBOptions& db_opts,
     const std::unordered_map<std::string, std::string>& options_map,
@@ -1862,6 +1898,26 @@ Status ColumnFamilyData::PrepareMutableCFOptions(
     // FIXME: we should call SanitizeOptions() too or consolidate it with
     // ValidateOptions().
     s = ValidateOptions(db_opts, cf_opts);
+  }
+  if (s.ok() && ((current_ != nullptr &&
+                  current_->storage_info()->HasBlobIndirectionFormat()) ||
+                 HasPendingBlobIndirectionOutput())) {
+    s = CheckBlobIndirectionCompactionStyle(cf_opts.compaction_style, true);
+  }
+  if (s.ok() &&
+      ((current_ != nullptr &&
+        current_->storage_info()->HasBlobIndirectionFormat()) ||
+       HasPendingBlobIndirectionOutput()) &&
+      GetBlockBasedTableWriterOptions(cf_opts.table_factory.get()) == nullptr) {
+    // A CF with the format fence, or with a flush or compaction that was picked
+    // with the option on, needs a Block-Based Table writer: its later flush and
+    // compaction outputs must store blob reference metadata (exact metadata or
+    // the coarse classification), which only the Block-Based Table writes, and
+    // relocation files must stay readable. Turning enable_blob_indirection off
+    // does not cancel such a job, which may still set the first fence, and does
+    // not remove the fence. The pending check is O(1).
+    s = Status::NotSupported(
+        "Blob indirection state requires a Block-Based Table writer");
   }
   if (s.ok()) {
     *mutable_cf_options = MutableCFOptions(cf_opts);

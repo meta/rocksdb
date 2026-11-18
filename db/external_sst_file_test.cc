@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <functional>
+#include <future>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -101,6 +102,129 @@ class ExternSSTFileLinkFailFallbackTest
   std::shared_ptr<ExternalSSTTestFS> fs_;
   std::unique_ptr<Env> test_env_;
 };
+
+TEST_F(ExternalSSTFileTestBase, PlainIngestionIntoFencedBlobColumnFamily) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_manifest_file_size = 1;
+  Reopen(options);
+  ASSERT_OK(Put("fence", "blob"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "false"}}));
+
+  const std::string external_path = sst_files_dir_ + "plain.sst";
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(external_path));
+  ASSERT_OK(writer.Put("plain", "plain-value"));
+  ASSERT_OK(writer.Finish());
+  ASSERT_OK(
+      db_->IngestExternalFile({external_path}, IngestExternalFileOptions()));
+  ASSERT_EQ(Get("plain"), "plain-value");
+
+  options.enable_blob_indirection = false;
+  const uint64_t manifest_before = dbfull()->TEST_Current_Manifest_FileNo();
+  VersionEdit snapshot_edit;
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  dbfull()->TEST_LockMutex();
+  Status snapshot_status = dbfull()->GetVersionSet()->LogAndApply(
+      cfd, ReadOptions(), WriteOptions(), &snapshot_edit,
+      dbfull()->TEST_Mutex(), nullptr, /*new_descriptor_log=*/true,
+      /*column_family_options=*/nullptr, /*manifest_wcb=*/{}, /*pre_cb=*/{});
+  dbfull()->TEST_UnlockMutex();
+  ASSERT_OK(snapshot_status);
+  ASSERT_GT(dbfull()->TEST_Current_Manifest_FileNo(), manifest_before);
+  Reopen(options);
+  ASSERT_EQ(Get("plain"), "plain-value");
+  ASSERT_EQ(Get("fence"), "blob");
+}
+
+TEST_F(ExternalSSTFileTestBase, RejectForeignBlobReferencesBeforeCopy) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("fence", "blob"));
+  ASSERT_OK(Flush());
+
+  Options donor_options = options;
+  donor_options.create_if_missing = true;
+  donor_options.enable_blob_indirection = false;
+  const std::string donor_path = sst_files_dir_ + "donor";
+  std::unique_ptr<DB> donor;
+  ASSERT_OK(DB::Open(donor_options, donor_path, &donor));
+  ASSERT_OK(donor->Put(WriteOptions(), "foreign", "foreign-blob"));
+  ASSERT_OK(donor->Flush(FlushOptions()));
+  std::vector<std::string> files;
+  uint64_t manifest_size = 0;
+  ASSERT_OK(donor->GetLiveFiles(files, &manifest_size));
+  std::string external_path;
+  for (const std::string& file : files) {
+    uint64_t number;
+    FileType type;
+    if (ParseFileName(file, &number, &type) && type == kTableFile) {
+      external_path = donor_path + file;
+    }
+  }
+  ASSERT_FALSE(external_path.empty());
+  donor.reset();
+
+  size_t copies = 0;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("ExternalSstFileIngestionJob::Prepare:CopyFile",
+                          [&](void*) { ++copies; });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    EXPECT_OK(DestroyDB(donor_path, donor_options));
+  });
+  IngestExternalFileOptions ingestion_options;
+  ingestion_options.allow_db_generated_files = true;
+  ASSERT_TRUE(db_->IngestExternalFile({external_path}, ingestion_options)
+                  .IsNotSupported());
+  ASSERT_EQ(copies, 0U);
+  ASSERT_OK(env_->FileExists(external_path));
+  ASSERT_EQ(Get("fence"), "blob");
+}
+
+TEST_F(ExternalSSTFileTestBase, ActivationDuringIngestionRequiresRevalidation) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  const std::string external_path = sst_files_dir_ + "plain.sst";
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(external_path));
+  ASSERT_OK(writer.Put("plain", "plain-value"));
+  ASSERT_OK(writer.Finish());
+
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "DBImpl::IngestExternalFiles:BeforeJobsRun:0", [&](void*) {
+        ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                                  {{"enable_blob_indirection", "true"}}));
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_TRUE(
+      db_->IngestExternalFile({external_path}, IngestExternalFileOptions())
+          .IsTryAgain());
+  sync_point->DisableProcessing();
+  ASSERT_OK(
+      db_->IngestExternalFile({external_path}, IngestExternalFileOptions()));
+  ASSERT_EQ(Get("plain"), "plain-value");
+}
 
 class ExternalSSTFileTest
     : public ExternalSSTFileTestBase,
@@ -383,6 +507,123 @@ class ExternalSSTFileTest
                                      IngestExternalFileOptions(), handle);
   }
 
+  // Queues a prepared ingestion behind a paused flush MANIFEST leader. With
+  // `activate`, the flush output sets the blob indirection fence. With
+  // `queue_plain_writer`, an ordinary MANIFEST writer is queued after the
+  // ingestion. Reports how often the leader ran the ingestion's joinable
+  // precondition and how many writers were committed inside an earlier
+  // writer's batch.
+  void CommitPreparedIngestionBehindFlushLeader(
+      bool activate, bool queue_plain_writer, Status* ingestion_status,
+      Status* plain_writer_status, int* join_attempts, int* grouped_writers,
+      bool queued_writer_publishes_options = false) {
+    Options options = CurrentOptions();
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = false;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+
+    // Prepared with the option off, so the file has no blob validation.
+    std::unique_ptr<FileIngestionHandle> handle;
+    ASSERT_OK(
+        GenerateAndPrepareExternalFile(options, {{"k", "ingested"}}, &handle));
+    if (activate) {
+      ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                                {{"enable_blob_indirection", "true"}}));
+    }
+    ASSERT_OK(Put("f", "flushed"));
+
+    SyncPoint* const sync = SyncPoint::GetInstance();
+    bool first_writer = true;
+    std::atomic<int> attempts{0};
+    std::atomic<int> done_wakeups{0};
+    std::atomic<int> enqueued{0};
+    const int expected_followers = queue_plain_writer ? 2 : 1;
+    std::promise<void> ingestion_enqueued;
+    sync->LoadDependency({{"JoinablePrecondition:LeaderPaused",
+                           "JoinablePrecondition:StartCommit"},
+                          {"JoinablePrecondition:Enqueued",
+                           "JoinablePrecondition:ResumeLeader"}});
+    sync->SetCallBack("VersionSet::LogAndApply:WakeUpAndNotDone",
+                      [&](void* arg) {
+                        if (first_writer) {
+                          first_writer = false;
+                          auto* mutex = static_cast<InstrumentedMutex*>(arg);
+                          mutex->Unlock();
+                          TEST_SYNC_POINT("JoinablePrecondition:LeaderPaused");
+                          TEST_SYNC_POINT("JoinablePrecondition:ResumeLeader");
+                          mutex->Lock();
+                        }
+                      });
+    sync->SetCallBack("VersionSet::ProcessManifestWrites:JoinPrecondition",
+                      [&](void*) { attempts.fetch_add(1); });
+    sync->SetCallBack("VersionSet::LogAndApply:WakeUpAndDone",
+                      [&](void*) { done_wakeups.fetch_add(1); });
+    sync->EnableProcessing();
+
+    Status flush_status;
+    port::Thread flush_thread(
+        [&] { flush_status = db_->Flush(FlushOptions()); });
+    TEST_SYNC_POINT("JoinablePrecondition:StartCommit");
+    sync->SetCallBack("VersionSet::LogAndApply:BeforeWriterWaiting",
+                      [&](void*) {
+                        const int count = enqueued.fetch_add(1) + 1;
+                        if (count == 1) {
+                          ingestion_enqueued.set_value();
+                        }
+                        if (count == expected_followers) {
+                          TEST_SYNC_POINT("JoinablePrecondition:Enqueued");
+                        }
+                      });
+    port::Thread ingestion_thread([&] {
+      *ingestion_status = db_->CommitFileIngestionHandle(std::move(handle));
+    });
+    *plain_writer_status = Status::OK();
+    std::unique_ptr<port::Thread> plain_writer_thread;
+    if (queue_plain_writer) {
+      ingestion_enqueued.get_future().wait();
+      auto* const cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                            db_->DefaultColumnFamily())
+                            ->cfd();
+      plain_writer_thread = std::make_unique<port::Thread>([&, cfd] {
+        VersionEdit edit;
+        InstrumentedMutexLock lock(dbfull()->mutex());
+        if (!queued_writer_publishes_options) {
+          *plain_writer_status = dbfull()->GetVersionSet()->LogAndApply(
+              cfd, ReadOptions(), WriteOptions(), &edit, dbfull()->mutex(),
+              nullptr);
+          return;
+        }
+        // Republish the current options, as SetOptions() does.
+        MutableCFOptionsPublication options_publication;
+        options_publication.new_mutable_cf_options.push_back(
+            cfd->GetLatestMutableCFOptions());
+        autovector<ColumnFamilyData*> cfds{cfd};
+        autovector<autovector<VersionEdit*>> edit_lists{{&edit}};
+        *plain_writer_status = dbfull()->GetVersionSet()->LogAndApply(
+            cfds, ReadOptions(), WriteOptions(), edit_lists, dbfull()->mutex(),
+            nullptr, /*new_descriptor_log=*/false, /*new_cf_options=*/nullptr,
+            /*manifest_wcbs=*/{}, /*pre_cb=*/{}, /*max_file_opening_threads=*/1,
+            &options_publication);
+      });
+    }
+    ingestion_thread.join();
+    if (plain_writer_thread != nullptr) {
+      plain_writer_thread->join();
+    }
+    flush_thread.join();
+    sync->DisableProcessing();
+    sync->ClearAllCallBacks();
+    sync->LoadDependency({});
+
+    ASSERT_OK(flush_status);
+    *join_attempts = attempts.load();
+    // Only a writer committed by an earlier leader is woken with its batch
+    // already done.
+    *grouped_writers = done_wakeups.load();
+  }
+
  protected:
   int last_file_id_ = 0;
   bool two_phase_ingest_ = false;
@@ -592,6 +833,133 @@ TEST_F(ExternalSSTFileTest,
   ASSERT_EQ("new", Get("k"));
   ASSERT_EQ(1, CountLiveFiles());
   ASSERT_EQ(1, GetSstFileCount(dbname_));
+}
+
+TEST_F(ExternalSSTFileTest, PreparedIngestionJoinsNonActivatingBatch) {
+  Status ingestion_status;
+  Status plain_writer_status;
+  int join_attempts = 0;
+  int grouped_writers = 0;
+  CommitPreparedIngestionBehindFlushLeader(
+      /*activate=*/false, /*queue_plain_writer=*/false, &ingestion_status,
+      &plain_writer_status, &join_attempts, &grouped_writers);
+  ASSERT_OK(plain_writer_status);
+  ASSERT_OK(ingestion_status);
+  ASSERT_EQ(join_attempts, 1);
+  ASSERT_EQ(grouped_writers, 1);
+  ColumnFamilyData* const cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(db_->DefaultColumnFamily())
+          ->cfd();
+  ASSERT_FALSE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_EQ("ingested", Get("k"));
+  ASSERT_EQ("flushed", Get("f"));
+}
+
+TEST_F(ExternalSSTFileTest, UnvalidatedIngestionDoesNotJoinActivatingBatch) {
+  Status ingestion_status;
+  Status plain_writer_status;
+  int join_attempts = 0;
+  int grouped_writers = 0;
+  CommitPreparedIngestionBehindFlushLeader(
+      /*activate=*/true, /*queue_plain_writer=*/false, &ingestion_status,
+      &plain_writer_status, &join_attempts, &grouped_writers);
+  ASSERT_OK(plain_writer_status);
+  // The activating flush ends its batch before a caller whose output is
+  // marked as made before activation (every ingested file is), so the join is
+  // never tried. The fence rule would also refuse it. The ingestion reaches
+  // the queue head, where its precondition asks for a retry.
+  ASSERT_TRUE(ingestion_status.IsTryAgain()) << ingestion_status.ToString();
+  ASSERT_EQ(join_attempts, 0);
+  ASSERT_EQ(grouped_writers, 0);
+  ColumnFamilyData* const cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(db_->DefaultColumnFamily())
+          ->cfd();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  // The fenced Version holds only the flush output, not the unchecked file.
+  int table_files = 0;
+  for (int level = 0; level < cfd->NumberLevels(); ++level) {
+    table_files += NumTableFilesAtLevel(level);
+  }
+  ASSERT_EQ(1, table_files);
+  ASSERT_EQ("NOT_FOUND", Get("k"));
+
+  // A retry validates the file against the fenced DB and succeeds.
+  ASSERT_OK(GenerateAndAddExternalFile(CurrentOptions(), {{"k", "ingested"}}));
+  ASSERT_EQ("ingested", Get("k"));
+  ASSERT_EQ("flushed", Get("f"));
+}
+
+TEST_F(ExternalSSTFileTest, JoinedIngestionLetsPlainWriterJoin) {
+  // Ingestion holds the write thread until its MANIFEST write ends, so a
+  // second ingestion cannot queue behind it. An ordinary writer queued after a
+  // joined ingestion cannot change what the ingestion's precondition read, so
+  // it joins the same batch.
+  Status ingestion_status;
+  Status plain_writer_status;
+  int join_attempts = 0;
+  int grouped_writers = 0;
+  CommitPreparedIngestionBehindFlushLeader(
+      /*activate=*/false, /*queue_plain_writer=*/true, &ingestion_status,
+      &plain_writer_status, &join_attempts, &grouped_writers);
+  ASSERT_OK(ingestion_status);
+  ASSERT_OK(plain_writer_status);
+  ASSERT_EQ(join_attempts, 1);
+  // The ingestion and the plain writer were committed in the flush leader's
+  // batch.
+  ASSERT_EQ(grouped_writers, 2);
+  ASSERT_EQ("ingested", Get("k"));
+  ASSERT_EQ("flushed", Get("f"));
+}
+
+TEST_F(ExternalSSTFileTest, JoinedIngestionEndsBatchBeforeOptionPublisher) {
+  // A writer that publishes new options could change the
+  // enable_blob_indirection value the joined ingestion's precondition read,
+  // so it must start its own batch.
+  Status ingestion_status;
+  Status plain_writer_status;
+  int join_attempts = 0;
+  int grouped_writers = 0;
+  CommitPreparedIngestionBehindFlushLeader(
+      /*activate=*/false, /*queue_plain_writer=*/true, &ingestion_status,
+      &plain_writer_status, &join_attempts, &grouped_writers,
+      /*queued_writer_publishes_options=*/true);
+  ASSERT_OK(ingestion_status);
+  ASSERT_OK(plain_writer_status);
+  ASSERT_EQ(join_attempts, 1);
+  // Only the ingestion was committed in the flush leader's batch.
+  ASSERT_EQ(grouped_writers, 1);
+  ASSERT_EQ("ingested", Get("k"));
+  ASSERT_EQ("flushed", Get("f"));
+}
+
+TEST_F(ExternalSSTFileTest, IngestionLeaderAppliesWithMutexHeld) {
+  // A file ingestion that leads its MANIFEST batch applies its edit with the DB
+  // mutex held. Its precondition passed under that lock and is not run again,
+  // so it cannot fail after other callers joined the batch, which would make
+  // them fail with a status that is not their own.
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  std::unique_ptr<FileIngestionHandle> handle;
+  ASSERT_OK(
+      GenerateAndPrepareExternalFile(options, {{"k", "ingested"}}, &handle));
+
+  std::atomic<int> unlocked_applies{0};
+  SyncPoint* const sync = SyncPoint::GetInstance();
+  sync->SetCallBack("VersionSet::LogAndApplyHelper:ApplyUnlocked",
+                    [&](void*) { unlocked_applies.fetch_add(1); });
+  sync->EnableProcessing();
+  const Status ingestion_status =
+      db_->CommitFileIngestionHandle(std::move(handle));
+  sync->DisableProcessing();
+  sync->ClearAllCallBacks();
+
+  ASSERT_OK(ingestion_status);
+  ASSERT_EQ(unlocked_applies.load(), 0);
+  ASSERT_EQ("ingested", Get("k"));
 }
 
 TEST_F(ExternalSSTFileTest, PreparedIngestionsSurvivePurgeAcrossCommit) {

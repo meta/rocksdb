@@ -2383,6 +2383,24 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
   }
 }
 
+void Version::AppendBlobRelocationFileMetaData(
+    ColumnFamilyMetaData* cf_meta) const {
+  assert(cf_meta != nullptr);
+  assert(cfd_ != nullptr);
+  const auto& ioptions = cfd_->ioptions();
+  for (const auto& meta : storage_info_.GetBlobRelocationFiles()) {
+    assert(meta != nullptr);
+    cf_meta->blob_files.emplace_back(
+        meta->GetFileNumber(), BlobFileName("", meta->GetFileNumber()),
+        ioptions.cf_paths.front().path, meta->GetFileSize(),
+        meta->GetTotalEntries(), meta->GetTotalRecordBytes(),
+        /*garbage_blob_count=*/0, /*garbage_blob_bytes=*/0,
+        meta->GetChecksumMethod(), meta->GetChecksumValue());
+    ++cf_meta->blob_file_count;
+    cf_meta->blob_file_size += meta->GetFileSize();
+  }
+}
+
 void Version::GetColumnFamilyMetaData(
     const GetColumnFamilyMetaDataOptions& options,
     ColumnFamilyMetaData* cf_meta) {
@@ -6173,25 +6191,59 @@ struct VersionSet::ManifestWriter {
   // True for the first writer of a LogAndApply() call that passed a
   // precondition callback (pre_cb). Such a writer is called a precondition
   // writer. pre_cb checks that the caller's edit is still valid. For example,
-  // indirect blob GC checks that its input is still installable. pre_cb runs
-  // only when this writer is at the queue head. Only the first writer of the
-  // call gets the flag, because the writers of one call are queued together
-  // and only the first one waits for the queue head. ProcessManifestWrites()
-  // uses the flag in three ways:
-  // - An earlier leader stops its batch before this writer, so this writer
-  //   reaches the queue head and its pre_cb runs.
-  // - When this writer leads, its batch takes no writer of a later call.
+  // indirect blob GC checks that its input is still installable. Only the
+  // first writer of the call gets the flag, because the writers of one call
+  // are queued together and only the first one waits for the queue head.
+  //
+  // By default (precondition_may_join_batch false), pre_cb runs only when this
+  // writer is at the queue head, and ProcessManifestWrites() uses the flag in
+  // three ways:
+  // - An earlier leader stops its batch before this writer (rule 6 of
+  //   ManifestBatchEndsBefore()), so this writer reaches the queue head and
+  //   its pre_cb runs.
+  // - When this writer leads, its batch takes no writer of a later call (rule
+  //   1 of ManifestBatchEndsBefore()).
   // - When this writer leads a batch that writes a MANIFEST record, its edits
   //   that change a Version are applied without the DB mutex (see
   //   LogAndApplyHelper()).
+  // A file ingestion sets precondition_may_join_batch. Then an earlier leader
+  // may run pre_cb and take this writer into its batch (rule 6). When this
+  // writer leads, its batch may take later callers (rule 2 limits which). In
+  // both cases its edits are applied with the DB mutex held.
   bool requires_precondition;
+  // The caller's precondition, owned by the waiting caller. Set only on the
+  // caller's first writer.
+  const std::function<Status()>* precondition;
+
+  // True if an earlier group commit leader may take this caller into its batch
+  // and run the precondition itself. Only file ingestion sets it, through
+  // LogAndApplyWithJoinablePrecondition().
+  bool precondition_may_join_batch;
+
+  // Blob indirection batching state. A caller (one LogAndApply() call) queues
+  // one writer for each entry of its column family list. starts_caller is
+  // true on the caller's first writer. has_predating_blob_reference_output is
+  // true if an edit of this writer adds an SST marked
+  // blob_reference_output_predates_indirection. activates_blob_indirection is
+  // true if an edit of this writer sets the format fence on a CF whose current
+  // Version does not have it. The two caller_* fields are the OR of these flags
+  // over all writers of the caller. They are set only on the caller's first
+  // writer, so the group commit leader can apply its batch rules to the whole
+  // caller at once.
+  bool starts_caller;
+  bool has_predating_blob_reference_output;
+  bool activates_blob_indirection = false;
+  bool caller_has_predating_blob_reference_output;
+  bool caller_activates_blob_indirection;
   int max_file_opening_threads;
 
   explicit ManifestWriter(
       InstrumentedMutex* mu, ColumnFamilyData* _cfd,
       const autovector<VersionEdit*>& e,
       const std::function<void(const Status&)>& manifest_wcb,
-      bool _requires_precondition,
+      bool _requires_precondition, const std::function<Status()>* _precondition,
+      bool _precondition_may_join_batch, bool _starts_caller,
+      bool _has_predating_blob_reference_output,
       const MutableCFOptions* _new_mutable_cf_options,
       std::optional<uint64_t> _compaction_phase_anchor_time,
       int _max_file_opening_threads = 1)
@@ -6203,6 +6255,13 @@ struct VersionSet::ManifestWriter {
         new_mutable_cf_options(_new_mutable_cf_options),
         compaction_phase_anchor_time(_compaction_phase_anchor_time),
         requires_precondition(_requires_precondition),
+        precondition(_precondition),
+        precondition_may_join_batch(_precondition_may_join_batch),
+        starts_caller(_starts_caller),
+        has_predating_blob_reference_output(
+            _has_predating_blob_reference_output),
+        caller_has_predating_blob_reference_output(false),
+        caller_activates_blob_indirection(false),
         max_file_opening_threads(_max_file_opening_threads) {}
   // No copying allowed
   ManifestWriter(const ManifestWriter&) = delete;
@@ -6686,11 +6745,13 @@ struct VersionSet::BlobReferenceCensusInstallBatch {
   BlobReferenceCensusGarbage dropped_garbage;
 };
 
-void VersionSet::ReserveBlobReferenceCensusInstalls(
+bool VersionSet::ReserveBlobReferenceCensusInstalls(
+    const autovector<VersionEdit*>& batch_edits,
     const autovector<Version*>& versions, uint32_t pending_format_version,
     BlobReferenceCensusInstallBatch* batch) const {
   assert(batch != nullptr);
-  const auto needs_census_for_version =
+  std::vector<uint32_t> activating_census_column_families;
+  const auto needs_census_without_batch_activation =
       [pending_format_version](Version* version) {
         return version->cfd()
                    ->current()
@@ -6699,18 +6760,51 @@ void VersionSet::ReserveBlobReferenceCensusInstalls(
                (pending_format_version != 0 &&
                 version->GetMutableCFOptions().enable_blob_indirection);
       };
-  bool needs_census_install = false;
+  bool activates_blob_indirection = false;
+  for (const VersionEdit* edit : batch_edits) {
+    if (!edit->HasBlobIndirectionFormatVersion()) {
+      continue;
+    }
+    ColumnFamilyData* const cfd =
+        column_family_set_->GetColumnFamily(edit->GetColumnFamily());
+    if (cfd != nullptr &&
+        !cfd->current()->storage_info()->HasBlobIndirectionFormat()) {
+      activates_blob_indirection = true;
+      break;
+    }
+  }
+  const auto needs_census_for_version = [&](Version* version) {
+    return needs_census_without_batch_activation(version) ||
+           std::binary_search(activating_census_column_families.begin(),
+                              activating_census_column_families.end(),
+                              version->cfd()->GetID());
+  };
+  bool needs_census_install = activates_blob_indirection;
   if (pending_format_version != 0) {
     for (Version* version : versions) {
-      if (needs_census_for_version(version)) {
+      if (needs_census_without_batch_activation(version)) {
         needs_census_install = true;
-        break;
       }
     }
   }
   if (needs_census_install) {
-    // Reserve a census install for each new Version that needs one
-    // (BeginInstallPreparation() is O(1)). Other Versions get reservation 0.
+    // Collect the column families whose format fence an edit of this batch
+    // sets. Each of them gets a census install, because the fence makes the CF
+    // track blob references. needs_census_for_version reads this list.
+    activating_census_column_families.reserve(batch_edits.size());
+    for (const VersionEdit* edit : batch_edits) {
+      if (edit->HasBlobIndirectionFormatVersion()) {
+        activating_census_column_families.push_back(edit->GetColumnFamily());
+      }
+    }
+    std::sort(activating_census_column_families.begin(),
+              activating_census_column_families.end());
+    activating_census_column_families.erase(
+        std::unique(activating_census_column_families.begin(),
+                    activating_census_column_families.end()),
+        activating_census_column_families.end());
+    // Reserve one census install for each new Version that needs one.
+    // BeginInstallPreparation() is O(1). Other Versions get reservation 0.
     batch->reservations.reserve(versions.size());
     batch->reservation_cfds.reserve(versions.size());
     for (Version* version : versions) {
@@ -6724,6 +6818,7 @@ void VersionSet::ReserveBlobReferenceCensusInstalls(
       }
     }
   }
+  return activates_blob_indirection;
 }
 
 Status VersionSet::BuildBlobReferenceCensusDelta(
@@ -6968,6 +7063,140 @@ Status VersionSet::PrepareBlobReferenceCensusInstalls(
   return Status::OK();
 }
 
+struct VersionSet::ManifestBatchState {
+  // The OR of the caller_* flags of the callers in the batch (see
+  // ManifestWriter).
+  bool has_predating_blob_reference_output = false;
+  bool activates_blob_indirection = false;
+  // True when an accepted edit of this batch sets a per-CF or DB-wide blob
+  // indirection fence. A joinable precondition was checked against the current
+  // Versions only, so it must not join a batch whose candidate Versions are
+  // fenced.
+  bool sets_blob_indirection_fence = false;
+  // True when a caller joined this batch after its precondition passed. The
+  // batch then ends before a later caller that activates the fence or
+  // publishes new CF options, because only those callers can change what the
+  // precondition read (see rule 2 in ManifestBatchEndsBefore()).
+  bool has_joined_precondition = false;
+  // True once the batch holds every writer of the leader's caller.
+  bool past_leader_caller = false;
+};
+
+bool VersionSet::ManifestBatchEndsBefore(
+    const ManifestWriter& first_writer, const ManifestWriter& last_writer,
+    const std::deque<ManifestWriter>& writers,
+    const ManifestWriter& next_writer, bool skip_manifest_write,
+    ManifestBatchState* batch) const {
+  if (last_writer.starts_caller) {
+    batch->has_predating_blob_reference_output |=
+        last_writer.caller_has_predating_blob_reference_output;
+    batch->activates_blob_indirection |=
+        last_writer.caller_activates_blob_indirection;
+  }
+  // 1. A non-joinable precondition leader ends the batch at its caller.
+  if (first_writer.requires_precondition &&
+      !first_writer.precondition_may_join_batch &&
+      &last_writer == &writers.back()) {
+    // A caller whose precondition cannot join (for example indirect blob GC,
+    // route retirement or SetOptions) is a batch barrier. Absorbing a later
+    // caller could invalidate the state that the precondition checked. A file
+    // ingestion leader may take later callers; rule 2 and the later rules
+    // decide which ones.
+    return true;
+  }
+  // 2. A joinable precondition in the batch: stop before a caller that
+  //    activates the fence or publishes new options.
+  if ((batch->has_joined_precondition ||
+       (first_writer.requires_precondition &&
+        first_writer.precondition_may_join_batch)) &&
+      next_writer.starts_caller &&
+      (next_writer.caller_activates_blob_indirection ||
+       next_writer.new_mutable_cf_options != nullptr)) {
+    // A joinable precondition (file ingestion, see
+    // ExternalSstFileIngestionJob::ValidateBlobIndirectionPublication())
+    // reads only the format fence, the latest enable_blob_indirection, the
+    // three pending counters of
+    // ColumnFamilyData::HasPendingBlobIndirectionOutput() (compactions and
+    // flushes that run with the option on, and memtable activations), and
+    // two flags of its own files (blob_indirection_ingestion_validated and
+    // generated_for_ingestion). Within one batch, only a caller that
+    // activates the fence or publishes new options can change what it
+    // read. Any other caller may still join.
+    return true;
+  }
+  // 3. Outputs made before activation and an activation of the fence do not
+  //    share a batch.
+  if (next_writer.starts_caller &&
+      ((batch->has_predating_blob_reference_output &&
+        next_writer.caller_activates_blob_indirection) ||
+       (batch->activates_blob_indirection &&
+        next_writer.caller_has_predating_blob_reference_output))) {
+    // An output made before activation may share a batch with other work. It
+    // needs a batch end only when an activation in the same batch could change
+    // how the output is classified in the candidate Version.
+    return true;
+  }
+  // 4. A batch that writes no MANIFEST record holds exactly one caller.
+  if (skip_manifest_write) {
+    // A batch that writes nothing to the MANIFEST (from SetOptions) holds
+    // all the writers of its one caller, and ends at that caller's last
+    // writer. It never takes a writer of a later caller, whose edits can
+    // need a MANIFEST write or can name a column family that is already in
+    // this batch.
+    return &last_writer == &writers.back();
+  }
+  // 5. A writer with prepared options never shares a batch with another
+  //    caller.
+  //
+  // Grouping rule for prepared options: once the batch holds all writers
+  // of the leader's caller, stop if the leader has prepared options, or
+  // before a next writer that has prepared options. The writers of one
+  // caller are queued together, so every writer after writers.back()
+  // belongs to another caller. The rule matters only on the test-only
+  // MANIFEST path of SetOptions; see step 2 in the
+  // MutableCFOptionsPublication comment in version_set.h.
+  if (&last_writer == &writers.back()) {
+    batch->past_leader_caller = true;
+  }
+  if (batch->past_leader_caller &&
+      (first_writer.new_mutable_cf_options != nullptr ||
+       next_writer.new_mutable_cf_options != nullptr)) {
+    return true;
+  }
+  // 6. A next writer with a precondition joins only if it may and its
+  //    precondition passes now.
+  if (next_writer.requires_precondition) {
+    // By default, stop the group here. This writer becomes the queue head
+    // later, and its caller checks the precondition against all Versions
+    // committed before it. A caller that opted in may instead join now:
+    // the batch is a normal MANIFEST batch (checked above), no accepted
+    // edit sets a format fence, and its precondition passes now under the
+    // DB mutex. A failed join is not an error; the caller runs the
+    // precondition again at the queue head.
+    if (!next_writer.precondition_may_join_batch ||
+        batch->sets_blob_indirection_fence) {
+      return true;
+    }
+    assert(next_writer.precondition != nullptr);
+    Status join_status = (*next_writer.precondition)();
+    TEST_SYNC_POINT_CALLBACK(
+        "VersionSet::ProcessManifestWrites:JoinPrecondition", &join_status);
+    if (!join_status.ok()) {
+      join_status.PermitUncheckedError();
+      return true;
+    }
+    batch->has_joined_precondition = true;
+  }
+  // 7. A column family add or drop, and a dummy edit, have their own batch.
+  const auto* next = next_writer.edit_list.front();
+  if (next->IsColumnFamilyManipulation() || next->IsNoManifestWriteDummy()) {
+    // no group commits for column family add or drop
+    // nor for dummy skipping manifest write
+    return true;
+  }
+  return false;
+}
+
 Status VersionSet::ProcessManifestWrites(
     std::deque<ManifestWriter>& writers, InstrumentedMutex* mu,
     FSDirectory* dir_contains_current_file, bool new_descriptor_log,
@@ -6978,6 +7207,9 @@ Status VersionSet::ProcessManifestWrites(
   assert(!writers.empty());
   ManifestWriter& first_writer = writers.front();
   ManifestWriter* last_writer = &first_writer;
+  // What the writers taken into the batch hold. The batch-end rules
+  // (ManifestBatchEndsBefore()) read and update it.
+  ManifestBatchState batch;
 
   const auto publish_batch_callbacks = [&](const Status& status) {
     mu->AssertHeld();
@@ -7097,8 +7329,6 @@ Status VersionSet::ProcessManifestWrites(
     // stay valid, because no writer is removed from the queue during the
     // batch.
     size_t writer_index = 0;
-    // True once the batch holds every writer of the leader's caller.
-    bool past_leader_caller = false;
     size_t group_start = std::numeric_limits<size_t>::max();
     Status batch_apply_status;
     for (;;) {
@@ -7155,6 +7385,64 @@ Status VersionSet::ProcessManifestWrites(
           }
         }
       } else {
+        if (last_writer->has_predating_blob_reference_output &&
+            (writer_cfd->current()
+                 ->storage_info()
+                 ->HasBlobIndirectionFormat() ||
+             last_writer->activates_blob_indirection)) {
+          const uint64_t base_version_number =
+              writer_cfd->current()->GetVersionNumber();
+          const bool base_has_format =
+              writer_cfd->current()->storage_info()->HasBlobIndirectionFormat();
+          mu->Unlock();
+          // The queue head prevents another MANIFEST install while the
+          // classification runs without the DB mutex. Its cost grows with the
+          // number of output files. One caller can hold both edits whose
+          // outputs were made before activation and an edit that activates
+          // the fence (parallel flushes that complete in reverse order).
+          // Classify only the outputs made before activation, and do not split
+          // the atomic install group.
+          TEST_SYNC_POINT_CALLBACK(
+              "VersionSet::ProcessManifestWrites:"
+              "MarkPredatingBlobReferenceOutputsUnlocked",
+              mu);
+          if (last_writer->activates_blob_indirection) {
+            // Recovery accepts a legacy SST only after the fence of its CF
+            // was replayed, or in the edit that sets the fence. An earlier
+            // edit of this writer can add a legacy SST, while a later edit
+            // sets the fence. So the first edit of this writer also sets the
+            // fence. The edits are not reordered or split. If the MANIFEST
+            // ends inside this writer's edits, recovery still sees the fence
+            // before any legacy SST. See
+            // FileMetaData::blob_reference_output_predates_indirection.
+            last_writer->edit_list.front()->SetBlobIndirectionFormatVersion(
+                kBlobIndirectionManifestFormatVersion);
+          }
+          for (VersionEdit* edit : last_writer->edit_list) {
+            edit->MarkBlobReferenceOutputsPredatingIndirectionLegacy();
+          }
+          mu->Lock();
+          if (manifest_writers_.empty() ||
+              manifest_writers_.front() != &first_writer ||
+              writer_cfd->IsDropped() ||
+              writer_cfd->current()->GetVersionNumber() !=
+                  base_version_number ||
+              writer_cfd->current()
+                      ->storage_info()
+                      ->HasBlobIndirectionFormat() != base_has_format) {
+            // This should not happen while this writer is the queue head,
+            // because CF drops and Version installs go through the same
+            // queue. The check returns Corruption, so the batch never goes on
+            // with a changed state.
+            const Status ownership_changed = Status::Corruption(
+                "MANIFEST queue or blob indirection fence changed while "
+                "classifying preactivation outputs");
+            discard_candidate_versions();
+            release_builder_guards();
+            finish_batch(ownership_changed);
+            return ownership_changed;
+          }
+        }
         Version* version = nullptr;
         VersionBuilder* builder = nullptr;
         for (int i = 0; i != static_cast<int>(versions.size()); ++i) {
@@ -7208,6 +7496,37 @@ Status VersionSet::ProcessManifestWrites(
           } else if (group_start != std::numeric_limits<size_t>::max()) {
             group_start = std::numeric_limits<size_t>::max();
           }
+          // SetOptions may check the options before another queued writer
+          // sets the format fence. A flush or compaction picked with
+          // enable_blob_indirection on may also set the fence after SetOptions
+          // turned the option off. So check the compaction style again here.
+          // The check is O(1) and does no I/O.
+          batch_apply_status = CheckBlobIndirectionCompactionStyle(
+              writer_cfd->ioptions().compaction_style,
+              writer_cfd->GetLatestMutableCFOptions().enable_blob_indirection ||
+                  writer_cfd->HasPendingBlobIndirectionOutput() ||
+                  writer_cfd->current()
+                      ->storage_info()
+                      ->HasBlobIndirectionFormat() ||
+                  e->HasBlobIndirectionFormatVersion());
+          if (!batch_apply_status.ok()) {
+            break;
+          }
+          if ((writer_cfd->current()
+                   ->storage_info()
+                   ->HasBlobIndirectionFormat() ||
+               e->HasBlobIndirectionFormatVersion()) &&
+              (GetBlockBasedTableWriterOptions(
+                   writer_cfd->GetLatestMutableCFOptions()
+                       .table_factory.get()) == nullptr ||
+               (last_writer->new_mutable_cf_options != nullptr &&
+                GetBlockBasedTableWriterOptions(
+                    last_writer->new_mutable_cf_options->table_factory.get()) ==
+                    nullptr))) {
+            batch_apply_status = Status::NotSupported(
+                "Blob indirection state requires a Block-Based Table writer");
+            break;
+          }
           // The re-add check runs once the batch has the format fence: the DB
           // already has it, an earlier edit of this batch set it, or this edit
           // sets blob indirection state (see
@@ -7218,15 +7537,34 @@ Status VersionSet::ProcessManifestWrites(
               e->SetsBlobIndirectionState()) {
             batch_apply_status = RejectReaddedBlobRelocationState(*e);
           }
-          // Only the leader can be a precondition writer in this batch,
-          // because the loop stops before any other precondition writer (see
-          // the stop rules below). So pre_cb is this writer's own callback. A
-          // batch that writes no MANIFEST record (skip_manifest_write) applies
-          // its edits under the DB mutex, so its pre_cb runs only once.
           if (batch_apply_status.ok()) {
+            // Only a queue head whose precondition cannot join a batch (for
+            // example indirect blob GC) applies its edit without the DB mutex.
+            // It runs the precondition again after it locks the mutex (see
+            // LogAndApplyHelper()). A file ingestion (joinable precondition)
+            // applies with the mutex held, as the queue head or as a joined
+            // follower, and its precondition is not run again. An ingestion
+            // edit is small, so the lock hold is short.
+            //
+            // The classification of outputs made before activation above
+            // (MarkBlobReferenceOutputsPredatingIndirectionLegacy()) can
+            // release the mutex after a joinable precondition passed, and so
+            // can the MANIFEST write. The precondition lets unvalidated files
+            // pass only when the column family has no fence, the latest options
+            // have enable_blob_indirection off, and no indirection output is
+            // pending. A joinable precondition is not run again, and its result
+            // cannot change before this batch installs. The fence and the
+            // options of a column family change only through LogAndApply(),
+            // which waits behind this batch. A flush or compaction begins a
+            // pending indirection output only when the latest options have
+            // enable_blob_indirection on. So no new fence, enabled option or
+            // new pending output can appear that the precondition did not see.
             batch_apply_status = LogAndApplyHelper(
                 writer_cfd, builder, e, &max_last_sequence, mu,
-                last_writer->requires_precondition && !skip_manifest_write,
+                last_writer == &first_writer &&
+                    last_writer->requires_precondition &&
+                    !last_writer->precondition_may_join_batch &&
+                    !skip_manifest_write,
                 pre_cb);
           }
           if (!batch_apply_status.ok()) {
@@ -7234,6 +7572,9 @@ Status VersionSet::ProcessManifestWrites(
           }
           batch_edits.push_back(e);
           batch_edits_ts_sz.push_back(edit_ts_sz);
+          batch.sets_blob_indirection_fence |=
+              e->HasBlobIndirectionFormatVersion() ||
+              e->HasDbBlobIndirectionFormatVersion();
           if (e->HasBlobIndirectionFormatVersion()) {
             pending_blob_indirection_format_version =
                 e->GetBlobIndirectionFormatVersion();
@@ -7243,77 +7584,15 @@ Status VersionSet::ProcessManifestWrites(
           }
         }
       }
-      // Loop increment/conditions. The batch ends at the first of these stop
-      // rules, in this order:
-      // 1. The queue has no more writers.
-      // 2. A batch that writes no MANIFEST record reaches its caller's last
-      //    writer.
-      // 3. The batch holds all writers of the leader's caller, and the leader
-      //    or the next writer has prepared options.
-      // 4. The batch holds all writers of the leader's caller, and the leader
-      //    is a precondition writer.
-      // 5. The next writer is a precondition writer.
-      // 6. The next writer adds or drops a column family, or is a dummy edit
-      //    that writes no MANIFEST record.
-      // A batch that writes no MANIFEST record checks only rules 1 and 2.
+      // Loop increment/conditions. ManifestBatchEndsBefore() holds the rules
+      // that end the batch.
       ++writer_index;
       if (writer_index == manifest_writers_.size()) {
         break;
       }
-      if (skip_manifest_write) {
-        // A batch that writes nothing to the MANIFEST (from SetOptions) holds
-        // all the writers of its one caller, and ends at that caller's last
-        // writer. It never takes a writer of a later caller, whose edits can
-        // need a MANIFEST write or can name a column family that is already in
-        // this batch.
-        if (last_writer == &writers.back()) {
-          break;
-        }
-        continue;
-      }
-      // Grouping rule for prepared options: once the batch holds all writers
-      // of the leader's caller, stop if the leader has prepared options, or
-      // before a next writer that has prepared options. The writers of one
-      // caller are queued together, so every writer after writers.back()
-      // belongs to another caller. The rule matters only on the test-only
-      // MANIFEST path of SetOptions; see step 2 in the
-      // MutableCFOptionsPublication comment in version_set.h.
-      if (last_writer == &writers.back()) {
-        past_leader_caller = true;
-      }
-      if (past_leader_caller &&
-          (first_writer.new_mutable_cf_options != nullptr ||
-           manifest_writers_[writer_index]->new_mutable_cf_options !=
-               nullptr)) {
-        break;
-      }
-      if (past_leader_caller && first_writer.requires_precondition) {
-        // A leader that is a precondition writer is a batch barrier: the batch
-        // ends after the writers of the leader's caller. Absorbing a later
-        // caller could invalidate the state that the precondition checked.
-        // Also, if the precondition fails after the unlocked apply (see
-        // LogAndApplyHelper()), its error must fail only its own caller, not
-        // the writers queued after it (also ones that joined while the DB mutex
-        // was released). Precondition writers are indirect blob GC installs,
-        // route retirement, and compaction installs whose exact outputs have
-        // indirect references (see CompactionJob::InstallCompactionResults()).
-        // SetOptions() also passes a precondition, but its dummy edits normally
-        // form their own batch. So in a column family with blob indirection,
-        // most compaction installs (an estimate) get no group commit with other
-        // callers. This cost is not measured.
-        break;
-      }
-      if (manifest_writers_[writer_index]->requires_precondition) {
-        // Stop the group here. This writer becomes the queue head later, and
-        // its caller checks the precondition against all Versions committed
-        // before it.
-        break;
-      }
-      const auto* next = manifest_writers_[writer_index]->edit_list.front();
-      if (next->IsColumnFamilyManipulation() ||
-          next->IsNoManifestWriteDummy()) {
-        // no group commits for column family add or drop
-        // nor for dummy skipping manifest write
+      if (ManifestBatchEndsBefore(first_writer, *last_writer, writers,
+                                  *manifest_writers_[writer_index],
+                                  skip_manifest_write, &batch)) {
         break;
       }
     }
@@ -7452,8 +7731,10 @@ Status VersionSet::ProcessManifestWrites(
   // Save before releasing mu
   uint64_t manifest_preallocation_size = manifest_preallocation_size_;
   // Step 1 of the census install (see BlobReferenceCensusInstallBatch).
-  ReserveBlobReferenceCensusInstalls(
-      versions, pending_blob_indirection_format_version, &census_batch);
+  [[maybe_unused]] const bool activates_blob_indirection =
+      ReserveBlobReferenceCensusInstalls(
+          batch_edits, versions, pending_blob_indirection_format_version,
+          &census_batch);
   // Calls VersionBuilder::SaveBlobFilesAndCheckTo() for every new Version, with
   // the DB mutex released. A column family add or drop builds no new Version,
   // so for that batch this does nothing. This is safe in both the MANIFEST path
@@ -7469,6 +7750,14 @@ Status VersionSet::ProcessManifestWrites(
       status = builder_guards[i]->version_builder()->SaveBlobFilesAndCheckTo(
           versions[i]->storage_info());
     }
+#ifndef NDEBUG
+    if (activates_blob_indirection) {
+      TEST_SYNC_POINT(
+          "VersionSet::ProcessManifestWrites:BlobIndirectionActivationReady");
+      TEST_SYNC_POINT(
+          "VersionSet::ProcessManifestWrites:BlobIndirectionActivationWait");
+    }
+#endif
     TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:AfterBlobFinalization");
     blob_finalization_failed = !status.ok();
     return status;
@@ -7774,9 +8063,9 @@ Status VersionSet::ProcessManifestWrites(
       }
 
 #ifndef NDEBUG
-      // Only the first caller's writers can carry prepared options (see the
-      // grouping rule for prepared options in the loop above). The first
-      // caller's writers are the first writers.size() writers of the queue.
+      // Only the first caller's writers can carry prepared options (see rule 5
+      // in ManifestBatchEndsBefore()). The first caller's writers are the first
+      // writers.size() writers of the queue.
       {
         size_t position = 0;
         for (ManifestWriter* writer : manifest_writers_) {
@@ -8040,11 +8329,28 @@ Status VersionSet::LogAndApply(
     const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
     const std::function<Status()>& pre_cb, int max_file_opening_threads,
     const MutableCFOptionsPublication* options_publication) {
-  return LogAndApplyImpl(column_family_datas, read_options, write_options,
-                         edit_lists, mu, dir_contains_current_file,
-                         new_descriptor_log, new_cf_options,
-                         /*new_cf_options_are_sanitized=*/false, manifest_wcbs,
-                         pre_cb, max_file_opening_threads, options_publication);
+  return LogAndApplyImpl(
+      column_family_datas, read_options, write_options, edit_lists, mu,
+      dir_contains_current_file, new_descriptor_log, new_cf_options,
+      /*new_cf_options_are_sanitized=*/false, manifest_wcbs, pre_cb,
+      /*precondition_may_join_batch=*/false, max_file_opening_threads,
+      options_publication);
+}
+
+Status VersionSet::LogAndApplyWithJoinablePrecondition(
+    const autovector<ColumnFamilyData*>& column_family_datas,
+    const ReadOptions& read_options, const WriteOptions& write_options,
+    const autovector<autovector<VersionEdit*>>& edit_lists,
+    InstrumentedMutex* mu, FSDirectory* dir_contains_current_file,
+    const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
+    const std::function<Status()>& pre_cb, int max_file_opening_threads) {
+  assert(pre_cb);
+  return LogAndApplyImpl(
+      column_family_datas, read_options, write_options, edit_lists, mu,
+      dir_contains_current_file, /*new_descriptor_log=*/false,
+      /*new_cf_options=*/nullptr, /*new_cf_options_are_sanitized=*/false,
+      manifest_wcbs, pre_cb, /*precondition_may_join_batch=*/true,
+      max_file_opening_threads, /*options_publication=*/nullptr);
 }
 
 Status VersionSet::LogAndApplyColumnFamilyAddWithSanitizedOptions(
@@ -8062,6 +8368,7 @@ Status VersionSet::LogAndApplyColumnFamilyAddWithSanitizedOptions(
                          /*new_descriptor_log=*/false, &sanitized_options,
                          /*new_cf_options_are_sanitized=*/true,
                          /*manifest_wcbs=*/{}, /*pre_cb=*/{},
+                         /*precondition_may_join_batch=*/false,
                          /*max_file_opening_threads=*/1,
                          /*options_publication=*/nullptr);
 }
@@ -8074,7 +8381,8 @@ Status VersionSet::LogAndApplyImpl(
     bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
     bool new_cf_options_are_sanitized,
     const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
-    const std::function<Status()>& pre_cb, int max_file_opening_threads,
+    const std::function<Status()>& pre_cb, bool precondition_may_join_batch,
+    int max_file_opening_threads,
     const MutableCFOptionsPublication* options_publication) {
   mu->AssertHeld();
   int num_edits = 0;
@@ -8122,12 +8430,35 @@ Status VersionSet::LogAndApplyImpl(
            static_cast<size_t>(num_cfds) ==
                options_publication->new_mutable_cf_options.size());
   }
+  bool caller_has_predating_blob_reference_output = false;
+  bool caller_activates_blob_indirection = false;
   for (int i = 0; i < num_cfds; ++i) {
     const auto wcb =
         manifest_wcbs.empty() ? [](const Status&) {} : manifest_wcbs[i];
+    bool writer_has_predating_blob_reference_output = false;
+    bool writer_activates_blob_indirection = false;
+    for (const VersionEdit* edit : edit_lists[i]) {
+      writer_has_predating_blob_reference_output |=
+          edit->HasBlobReferenceOutputPredatingIndirection();
+      if (column_family_datas[i] != nullptr &&
+          edit->HasBlobIndirectionFormatVersion() &&
+          !column_family_datas[i]
+               ->current()
+               ->storage_info()
+               ->HasBlobIndirectionFormat()) {
+        writer_activates_blob_indirection = true;
+      }
+    }
+    caller_has_predating_blob_reference_output |=
+        writer_has_predating_blob_reference_output;
+    caller_activates_blob_indirection |= writer_activates_blob_indirection;
     writers.emplace_back(
         mu, column_family_datas[i], edit_lists[i], wcb,
         /*requires_precondition=*/i == 0 && !!pre_cb,
+        /*precondition=*/i == 0 && pre_cb ? &pre_cb : nullptr,
+        /*precondition_may_join_batch=*/i == 0 && !!pre_cb &&
+            precondition_may_join_batch,
+        /*starts_caller=*/i == 0, writer_has_predating_blob_reference_output,
         options_publication == nullptr
             ? nullptr
             : &options_publication->new_mutable_cf_options[i],
@@ -8135,13 +8466,22 @@ Status VersionSet::LogAndApplyImpl(
             ? std::nullopt
             : options_publication->compaction_phase_anchor_time,
         max_file_opening_threads);
-    manifest_writers_.push_back(&writers[i]);
+    writers.back().activates_blob_indirection =
+        writer_activates_blob_indirection;
   }
   assert(!writers.empty());
   ManifestWriter& first_writer = writers.front();
+  first_writer.caller_has_predating_blob_reference_output =
+      caller_has_predating_blob_reference_output;
+  first_writer.caller_activates_blob_indirection =
+      caller_activates_blob_indirection;
+  for (ManifestWriter& writer : writers) {
+    manifest_writers_.push_back(&writer);
+  }
   TEST_SYNC_POINT_CALLBACK("VersionSet::LogAndApply:BeforeWriterWaiting",
                            nullptr);
   while (!first_writer.done && &first_writer != manifest_writers_.front()) {
+    TEST_SYNC_POINT("VersionSet::LogAndApply:WriterWaiting");
     first_writer.cv.Wait();
   }
   if (first_writer.done) {
@@ -8299,10 +8639,13 @@ Status VersionSet::LogAndApplyHelper(ColumnFamilyData* cfd,
     return builder->Apply(edit);
   }
 
-  // Unlocked apply: a precondition writer (see
-  // ManifestWriter::requires_precondition) applies the edit without the DB
-  // mutex, because the edit can be large (an indirect blob GC install has one
-  // change per route). This is safe for these reasons:
+  // Unlocked apply: only a queue head whose precondition cannot join a batch
+  // gets here (see ManifestWriter::requires_precondition). It checked its
+  // precondition first. A file ingestion (joinable precondition) applies with
+  // the DB mutex held, as the queue head or after it joined an earlier
+  // writer's batch, and does not get here. This writer applies the edit
+  // without the DB mutex, because the edit can be large (an indirect blob GC
+  // install has one change per route). This is safe for these reasons:
   // - The edit and the builder belong to this writer. The builder holds a
   //   reference to its base Version, so that Version stays alive.
   // - The writer stays at the queue head, so no other Version is installed

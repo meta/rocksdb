@@ -325,6 +325,16 @@ void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
       f.oldest_coarse_indirect_origin_file_number;
 }
 
+void VersionEdit::MarkBlobReferenceOutputsPredatingIndirectionLegacy() {
+  for (auto& addition : new_files_) {
+    FileMetaData& file = addition.second;
+    if (file.blob_reference_output_predates_indirection &&
+        file.blob_reference_descriptor.empty()) {
+      file.blob_reference_legacy_metadata = true;
+    }
+  }
+}
+
 bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
     uint64_t current_log_number) const {
   return (HasLogNumber() && GetLogNumber() > current_log_number) ||

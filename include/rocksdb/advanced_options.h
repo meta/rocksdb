@@ -1111,6 +1111,25 @@ struct AdvancedColumnFamilyOptions {
   // Turning the option off stops new values from using kIndirectBlob. The
   // SSTs and blob files that were already written keep their format.
   //
+  // Indirect blob GC writes moved values into relocation files. Blob files and
+  // relocation files that hold no live value are removed from the MANIFEST by
+  // background edits and then deleted. This also happens when
+  // disable_auto_compactions is true, or when this option, enable_blob_files or
+  // enable_blob_garbage_collection is off. The cleanup copies no value and
+  // rewrites no SST.
+  //
+  // This is a change from base RocksDB behavior. A blob file written without
+  // this option is dropped from the column family's file list, and then
+  // deleted, as soon as no SST links it and all its values count as garbage. A
+  // blob file written with this option on is not dropped by that rule, because
+  // SSTs can still find moved values through its file number. It stays until
+  // the cleanup above removes it. After the option is turned off, the same
+  // cleanup still removes such a file later. The cleanup runs on a compaction
+  // thread (Env::Priority::LOW pool) only when that thread finds no compaction
+  // to run, so under constant compaction work such files stay longer. Read-only
+  // and secondary instances never run the cleanup. They see a removal only when
+  // they read the MANIFEST that the primary wrote.
+  //
   // Default: false
   //
   // Dynamically changeable through the SetOptions() API

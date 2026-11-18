@@ -64,6 +64,7 @@
 #include "test_util/sync_point.h"
 #include "trace_replay/block_cache_tracer.h"
 #include "util/compression.h"
+#include "util/crc32c.h"
 #include "util/defer.h"
 #include "util/file_checksum_helper.h"
 #include "util/thread_guard.h"
@@ -86,7 +87,8 @@ void WriteRelocationFileForDBTest(
     const MutableCFOptions& mutable_cf_options,
     const BlockBasedTableOptions& table_options, uint32_t column_family_id,
     uint64_t blob_file_number, const std::vector<RelocationTestRecord>& records,
-    BlobRelocationFileMetadata* metadata, uint64_t* file_size) {
+    BlobRelocationFileMetadata* metadata, uint64_t* file_size,
+    const std::vector<uint64_t>& extra_served_files = {}) {
   assert(metadata != nullptr);
   assert(file_size != nullptr);
   const std::string file_path =
@@ -118,6 +120,12 @@ void WriteRelocationFileForDBTest(
   // number that a route may send to this file.
   for (const RelocationTestRecord& record : records) {
     ASSERT_OK(builder->AddBlobRelocationServedFile(record.origin_file_number));
+  }
+  // Other generation numbers that route to this file. Example: an old
+  // relocation file that indirect blob GC packed into this file while some
+  // references still use the old file number as their generation number.
+  for (uint64_t file_number : extra_served_files) {
+    ASSERT_OK(builder->AddBlobRelocationServedFile(file_number));
   }
   ASSERT_OK(builder->Finish());
   ASSERT_OK(builder->GetBlobRelocationFileMetadata(metadata));
@@ -478,6 +486,42 @@ class DBBlobBasicTest : public DBTestBase {
         cfd->current()->GetVersionNumber());
   }
 
+  // Waits until indirect blob GC removes relocation file `file_number` from the
+  // current Version of `cfd`. The caller enables SyncPoints. Census readiness
+  // and compaction completion can hand work to each other, so wait for the
+  // actual lifecycle event rather than driving another SST compaction or a
+  // fixed number of retry cycles.
+  void WaitForBlobRelocationRetirement(ColumnFamilyData* cfd,
+                                       uint64_t file_number) {
+    std::mutex completion_mutex;
+    std::condition_variable completion_cv;
+    bool retired = false;
+    const auto observe = [&](void* argument) {
+      if (argument != cfd ||
+          cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+              file_number) != nullptr) {
+        return;
+      }
+      std::lock_guard<std::mutex> lock(completion_mutex);
+      retired = true;
+      completion_cv.notify_all();
+    };
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    constexpr char point[] = "DBImpl::RunIndirectBlobGC:AfterMetadataInstall";
+    sync_point->SetCallBack(point, observe);
+    const Defer cleanup([&] { sync_point->ClearCallBack(point); });
+    // Check once under the DB mutex, in case indirect blob GC already deleted
+    // the relocation file before the callback was set.
+    dbfull()->TEST_LockMutex();
+    observe(cfd);
+    dbfull()->TEST_UnlockMutex();
+    // Run the census work that is ready now, without waiting for the retry
+    // timer and without writing unrelated SSTs.
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    std::unique_lock<std::mutex> lock(completion_mutex);
+    completion_cv.wait(lock, [&] { return retired; });
+  }
+
   // The number of SSTs in the current Version of the default CF that have
   // exact blob reference metadata (a reference descriptor).
   size_t CountExactSsts() {
@@ -793,6 +837,32 @@ class DBBlobBasicTest : public DBTestBase {
       sync_point->ClearAllCallBacks();
     });
     return Flush();
+  }
+
+  // Stops the census worker of `cfd` until the returned lock is released.
+  //
+  // Background: indirect blob GC also runs when the GC options are off. Then
+  // it removes only blob files and relocation files that no SST uses
+  // (empty_files_only in DBImpl::BackgroundCompaction()). GC starts only on a
+  // census that is ready at the current Version. Some tests build relocation
+  // state by hand: they install a relocation file or a blob file before the
+  // SST that uses it, so for a short time no SST uses the file. (A real
+  // compaction has no such window: its input SSTs hold its generation numbers
+  // until its install.) While the census worker is stopped, the census does
+  // not become ready for a new Version, so GC cannot remove the file in that
+  // window.
+  //
+  // The caller must release the lock before it waits for the census and
+  // before Close(). The census job waits for the lock on a LOW pool thread, so
+  // a compaction in the window needs another LOW pool thread.
+  std::unique_lock<std::mutex> StopCensusWorker(ColumnFamilyData* cfd) {
+    BlobReferenceCensus* census = nullptr;
+    {
+      InstrumentedMutexLock lock(dbfull()->mutex());
+      census = cfd->GetOrCreateBlobReferenceCensus();
+    }
+    EXPECT_NE(census, nullptr);
+    return std::unique_lock<std::mutex>(census->worker_run_mutex());
   }
 
   // Registers an indirect blob GC job on the census of `cfd` at its current
@@ -2938,8 +3008,8 @@ TEST_F(DBBlobBasicTest,
   ColumnFamilyData* const cfd =
       dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
   // GC copies a live value only with enable_blob_garbage_collection on.
-  // Automatic compactions stay off, so no background GC job runs. The test
-  // runs GC itself in step 2.
+  // Automatic compactions stay off, so background GC removes only files with
+  // no live value.
   ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
                             {{"enable_blob_garbage_collection", "true"}}));
   dbfull()->TEST_WaitForBlobReferenceCensus();
@@ -3340,9 +3410,6 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusShutdownAfterDispatch) {
   options.min_blob_size = 0;
   Reopen(options);
 
-  ASSERT_OK(Put("key", "value"));
-  ASSERT_OK(Flush());
-  Close();
   SyncPoint* const sync_point = SyncPoint::GetInstance();
   sync_point->LoadDependency(
       {{"DBImpl::BGWorkBlobReferenceCensus:BeforeBuildReady",
@@ -3360,7 +3427,8 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusShutdownAfterDispatch) {
     sync_point->DisableProcessing();
     sync_point->ClearAllCallBacks();
   });
-  Reopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
   TEST_SYNC_POINT("DBBlobBasicTest::CensusShutdownWorkerDispatched");
   // The worker has taken a live CF from the queue, but shutdown starts before
   // the build sets up its state, so the build returns at once. In
@@ -4525,7 +4593,11 @@ TEST_F(DBBlobBasicTest, IndirectBlobGCRetiresFileWithNoLiveValue) {
   ASSERT_OK(Put("other", std::string(4096, 'o')));
   ASSERT_OK(Flush());
   const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/0);
-  ASSERT_TRUE(HasBlobFile(file_number));
+  // A background job can remove the file before indirect blob GC is turned on,
+  // because a file with no live value is removed even with
+  // enable_blob_garbage_collection off (see BackgroundCompaction()). So the
+  // test checks only the end state: the file is gone with no output and no
+  // route.
   const std::set<uint64_t> before = BlobFilesOnDisk();
 
   ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
@@ -9020,6 +9092,43 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusOverflowRestartsBuildOnce) {
   EXPECT_EQ(cfd->blob_reference_census()->overflow_restart_count(), 1U);
 }
 
+TEST_F(DBBlobBasicTest, BlobReferenceCensusRebuildsAfterReplaceRangeIngestion) {
+  // Ingestion with a replace range deletes SSTs without giving the census
+  // their reference summaries, so the census is rebuilt.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "blob_a"));
+  ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(CompactEachL0FileTo(/*level=*/6));
+  ASSERT_OK(Put("m", "blob_m"));
+  ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(CompactEachL0FileTo(/*level=*/6));
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+
+  const std::string external = dbname_ + "/replacement.sst";
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(external));
+  ASSERT_OK(writer.Put("a", "new_a"));
+  ASSERT_OK(writer.Finish());
+  CensusEventCounter counter;
+  counter.Start();
+  IngestExternalFileArg arg;
+  arg.column_family = db_->DefaultColumnFamily();
+  arg.external_files = {external};
+  arg.options.snapshot_consistency = false;
+  arg.atomic_replace_range = {{"a", "b"}};
+  ASSERT_OK(db_->IngestExternalFiles({arg}));
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  EXPECT_EQ(counter.rebuilds.load(), 1);
+  ASSERT_EQ(Get("a"), "new_a");
+  ASSERT_EQ(Get("m"), "blob_m");
+}
+
 TEST_F(DBBlobBasicTest, BlobReferenceCensusSelfCheckRunsAfterPublish) {
   // After a publish, debug builds can compare the census with a census built
   // from the SSTs of the Version (DBImpl::CheckBlobReferenceCensus()). This
@@ -10155,6 +10264,11 @@ TEST_F(DBBlobBasicTest, FlattenedReferenceReadChecksOriginInReader) {
       relocation_file_number, relocation_file_size,
       /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
       metadata.encoded_directory, metadata.tail_size));
+  // The relocation file is installed by hand, and no SST holds it until the
+  // flush below (the flattened references are in the memtable). Stop the
+  // census worker until then, so that indirect blob GC does not remove the
+  // file as unused.
+  std::unique_lock<std::mutex> census_worker = StopCensusWorker(cfd);
   ASSERT_OK(ApplyVersionEdit(&install, /*new_descriptor_log=*/false));
 
   const auto put_flattened = [&](const std::string& flattened_key,
@@ -10184,6 +10298,7 @@ TEST_F(DBBlobBasicTest, FlattenedReferenceReadChecksOriginInReader) {
   // A coarse SST cannot hold a flattened reference, so the flush writes exact
   // metadata (see FlushInjectedBlobIndexesWithExactMetadata()).
   ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+  census_worker.unlock();
   ASSERT_EQ(Get("flattened"), expected);
   PinnableSlice result;
   const Status status =
@@ -10705,6 +10820,11 @@ TEST_F(DBBlobBasicTest, BlobRelocationRouteSurvivesReplayAndManifestSnapshot) {
       metadata.encoded_directory, metadata.tail_size));
   install.SetBlobRelocationRoute(
       BlobRelocationRoute(routed_generation, relocation_file_number));
+  // Until the flush below installs the SST that references the routed
+  // generation number, the relocation file (relocation_file_number) holds no
+  // live value. Stop the census worker in that window, so indirect blob GC
+  // does not delete the file as an empty relocation file.
+  std::unique_lock<std::mutex> census_stopped = StopCensusWorker(cfd);
   ASSERT_OK(ApplyVersionEdit(&install, /*new_descriptor_log=*/false));
   {
     std::string blob_index;
@@ -10725,6 +10845,8 @@ TEST_F(DBBlobBasicTest, BlobRelocationRouteSurvivesReplayAndManifestSnapshot) {
     ASSERT_OK(db_->Write(WriteOptions(), &batch));
     ASSERT_OK(Flush());
   }
+  // The coarse flush output now pins the routed generation number.
+  census_stopped.unlock();
   const std::string key_through_route = "routed";
 
   // Reopen once from incremental records, then rewrite the MANIFEST and reopen
@@ -10789,6 +10911,10 @@ TEST_F(DBBlobBasicTest, BlobFileRetirementSurvivesReplayAndManifestSnapshot) {
   options.enable_blob_indirection = true;
   options.min_blob_size = 0;
   options.disable_auto_compactions = true;
+  // The census job can wait on a LOW pool thread while the test stops the
+  // census worker (see StopCensusWorker()), so the compaction below needs
+  // another one. max_background_jobs = 4 gives the LOW pool 3 threads.
+  options.max_background_jobs = 4;
 
   Reopen(options);
   const std::string key = "key";
@@ -10801,6 +10927,11 @@ TEST_F(DBBlobBasicTest, BlobFileRetirementSurvivesReplayAndManifestSnapshot) {
   // blob file retirement record removes it.
   ASSERT_OK(Put("doomed", "doomed-value"));
   ASSERT_OK(Flush());
+  // The test itself removes the empty file below by blob file retirement.
+  // Stop the census worker until then, so indirect blob GC does not remove the
+  // file first as an empty file.
+  std::unique_lock<std::mutex> census_stopped = StopCensusWorker(
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault());
   ASSERT_OK(Delete("doomed"));
   ASSERT_OK(Flush());
   {
@@ -10859,8 +10990,8 @@ TEST_F(DBBlobBasicTest, BlobFileRetirementSurvivesReplayAndManifestSnapshot) {
   install.RetireBlobFile(origin_file_number);
   install.RetireBlobFile(empty_file_number);
   ASSERT_OK(ApplyVersionEdit(&install, /*new_descriptor_log=*/false));
-  // After its blob file retirement, this MANIFEST rejects adding the collected
-  // file back.
+  census_stopped.unlock();
+  // This MANIFEST rejects adding the retired file back.
   {
     VersionEdit readd;
     readd.SetColumnFamily(cfd->GetID());
@@ -11812,6 +11943,1288 @@ TEST_F(DBBlobBasicTest, BlobIndirectionCanBeEnabledDynamically) {
   ASSERT_EQ(storage->GetBlobFiles().size(), 1U);
   ASSERT_TRUE(storage->GetBlobFiles().front()->IsIndirectOrigin());
   ASSERT_EQ(Get("key"), "blob_value");
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_NE(GetCensusSnapshot(cfd), nullptr);
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(GetCensusSnapshot(cfd), nullptr);
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "false"}}));
+  ASSERT_OK(Put("disabled", "legacy_blob_value"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get("disabled"), "legacy_blob_value");
+
+  properties.clear();
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 2U);
+  for (const auto& property : properties) {
+    EXPECT_EQ(property.second->user_collected_properties.count(
+                  kBlobReferenceDescriptorPropertyName),
+              0U);
+    EXPECT_EQ(property.second->user_collected_properties.count(
+                  kBlobReferenceClassificationPropertyName),
+              1U);
+  }
+}
+
+TEST_F(DBBlobBasicTest,
+       OverlappingDynamicEnableQueuesOnlyRequestedColumnFamilies) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+  Reopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+  ColumnFamilyHandle* other = handles_[1];
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  ASSERT_OK(db_->SetOptions(other, {{"enable_blob_indirection", "true"}}));
+  ASSERT_OK(Put("default", "default_blob"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->Put(WriteOptions(), other, "other", "other_blob"));
+  ASSERT_OK(db_->Flush(FlushOptions(), other));
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "false"}}));
+  ASSERT_OK(db_->SetOptions(other, {{"enable_blob_indirection", "false"}}));
+  Close();
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "other"}, options);
+  other = handles_[1];
+
+  std::atomic<size_t> all_cf_schedules{0};
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->LoadDependency(
+      {{"DBImpl::BuildBlobReferenceCensus:BeforeCatchUpReady",
+        "DBBlobBasicTest::FirstDynamicCensusReady"},
+       {"DBBlobBasicTest::ReleaseFirstDynamicCensus",
+        "DBImpl::BuildBlobReferenceCensus:BeforeCatchUpWait"}});
+  sync_point->SetCallBack(
+      "DBImpl::ScheduleBlobReferenceCensus:AllColumnFamilies",
+      [&](void*) { all_cf_schedules.fetch_add(1); });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  TEST_SYNC_POINT("DBBlobBasicTest::FirstDynamicCensusReady");
+  ASSERT_OK(db_->SetOptions(other, {{"enable_blob_indirection", "true"}}));
+  TEST_SYNC_POINT("DBBlobBasicTest::ReleaseFirstDynamicCensus");
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+
+  ASSERT_EQ(all_cf_schedules.load(), 0U);
+  ColumnFamilySet* const column_families =
+      dbfull()->GetVersionSet()->GetColumnFamilySet();
+  ColumnFamilyData* const default_cfd = column_families->GetDefault();
+  ColumnFamilyData* const other_cfd =
+      column_families->GetColumnFamily(other->GetID());
+  ASSERT_NE(other_cfd, nullptr);
+  ASSERT_NE(GetCensusSnapshot(default_cfd), nullptr);
+  ASSERT_NE(GetCensusSnapshot(other_cfd), nullptr);
+}
+
+TEST_F(DBBlobBasicTest, DisabledBlobIndirectionMaterializesRelocatedValues) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  // Run route retirement as soon as no SST uses the generation number of a
+  // route. The SyncPoint sets the route retirement batch size to 1, so routes
+  // are not batched.
+  sync_point->SetCallBack("DBImpl::RetireBlobRelocationRoutes:BatchSize",
+                          [](void* arg) { *static_cast<uint64_t*>(arg) = 1; });
+  sync_point->EnableProcessing();
+  const Defer cleanup([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  Reopen(options);
+  const std::array<std::string, 4> keys{{"key0", "key1", "key2", "key3"}};
+  const std::array<std::string, 4> values{
+      {std::string(4096, 'a'), std::string(4096, 'b'), std::string(4096, 'c'),
+       std::string(4096, 'd')}};
+  for (size_t i = 0; i < keys.size(); ++i) {
+    ASSERT_OK(Put(keys[i], values[i]));
+  }
+  ASSERT_OK(Flush());
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 1U);
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .front()
+                                          ->GetBlobFileNumber();
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  const uint64_t relocation_file_number =
+      storage->GetBlobRelocationRouteTarget(origin_file_number);
+  ASSERT_NE(relocation_file_number, kInvalidBlobFileNumber);
+  ASSERT_NE(storage->GetBlobRelocationFileMetaData(relocation_file_number),
+            nullptr);
+  ASSERT_EQ(Get(keys.back()), values.back());
+
+  uint64_t manifest_size = 0;
+  std::vector<std::string> live_files;
+  ASSERT_OK(dbfull()->GetLiveFiles(live_files, &manifest_size));
+  EXPECT_NE(std::find(live_files.begin(), live_files.end(),
+                      BlobFileName("", relocation_file_number)),
+            live_files.end());
+
+  LiveFilesStorageInfoOptions storage_info_options;
+  storage_info_options.include_checksum_info = true;
+  std::vector<LiveFileStorageInfo> live_storage_info;
+  ASSERT_OK(
+      db_->GetLiveFilesStorageInfo(storage_info_options, &live_storage_info));
+  EXPECT_NE(std::find_if(live_storage_info.begin(), live_storage_info.end(),
+                         [&](const LiveFileStorageInfo& info) {
+                           return info.file_type == kBlobFile &&
+                                  info.file_number == relocation_file_number;
+                         }),
+            live_storage_info.end());
+
+  ColumnFamilyMetaData column_family_metadata;
+  db_->GetColumnFamilyMetaData(&column_family_metadata);
+  EXPECT_NE(std::find_if(column_family_metadata.blob_files.begin(),
+                         column_family_metadata.blob_files.end(),
+                         [&](const BlobMetaData& metadata) {
+                           return metadata.blob_file_number ==
+                                  relocation_file_number;
+                         }),
+            column_family_metadata.blob_files.end());
+
+  ASSERT_OK(db_->VerifyFileChecksums(ReadOptions()));
+  const std::string relocation_path =
+      BlobFileName(dbname_, relocation_file_number);
+  const std::string hidden_relocation_path = relocation_path + ".hidden";
+  ASSERT_OK(options.env->RenameFile(relocation_path, hidden_relocation_path));
+  const Status missing_relocation_status =
+      db_->VerifyFileChecksums(ReadOptions());
+  EXPECT_TRUE(missing_relocation_status.IsNotFound() ||
+              missing_relocation_status.IsIOError())
+      << missing_relocation_status.ToString();
+  ASSERT_OK(options.env->RenameFile(hidden_relocation_path, relocation_path));
+
+  // Flatten the reference to the relocation file while the option is on. Route
+  // retirement (DBImpl::RetireBlobRelocationRoutes(), which the census worker
+  // runs after each publish) can then remove the route of the old file that the
+  // reference used before, separately from the compaction-time blob GC (option
+  // off) that later rewrites this value into a legacy blob file.
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  compact_options.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kDisable;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  storage = cfd->current()->storage_info();
+  ASSERT_EQ(storage->GetBlobRelocationRouteTarget(origin_file_number),
+            kInvalidBlobFileNumber);
+  const std::shared_ptr<const BlobReferenceCensusState> flattened_census =
+      GetCensusSnapshot(cfd);
+  ASSERT_NE(flattened_census, nullptr);
+  EXPECT_EQ(flattened_census->GetSstCount(origin_file_number), 0U);
+  EXPECT_GT(flattened_census->GetSstCount(relocation_file_number), 0U);
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "true"},
+                             {"enable_blob_indirection", "false"}}));
+  // Keep an unrelated normal blob file live, so that legacy blob GC keeps
+  // counting garbage bytes while the last reference to the relocation file is
+  // rewritten into a legacy blob.
+  const std::string unrelated_value(4096, 'u');
+  ASSERT_OK(Put("unrelated", unrelated_value));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get("unrelated"), unrelated_value);
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  storage = cfd->current()->storage_info();
+  ASSERT_FALSE(storage->GetBlobFiles().empty());
+  const uint64_t unrelated_blob_file_number =
+      storage->GetBlobFiles().back()->GetBlobFileNumber();
+  ASSERT_NE(storage->GetBlobFileMetaData(unrelated_blob_file_number), nullptr);
+  ASSERT_LT(storage->GetBlobFileMetaData(unrelated_blob_file_number)
+                ->GetGarbageBlobCount(),
+            storage->GetBlobFileMetaData(unrelated_blob_file_number)
+                ->GetTotalBlobCount());
+  compact_options.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kDisable;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  storage = cfd->current()->storage_info();
+  EXPECT_EQ(storage->GetBlobRelocationRouteTarget(origin_file_number),
+            kInvalidBlobFileNumber);
+  EXPECT_NE(storage->GetBlobRelocationFileMetaData(relocation_file_number),
+            nullptr);
+  ASSERT_EQ(Get(keys.back()), values.back());
+  ASSERT_NE(storage->GetBlobFileMetaData(unrelated_blob_file_number), nullptr);
+  ASSERT_EQ(Get("unrelated"), unrelated_value);
+
+  compact_options.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  WaitForBlobRelocationRetirement(cfd, relocation_file_number);
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  storage = cfd->current()->storage_info();
+  EXPECT_EQ(storage->GetBlobRelocationRouteTarget(origin_file_number),
+            kInvalidBlobFileNumber);
+  EXPECT_EQ(storage->GetBlobRelocationFileMetaData(relocation_file_number),
+            nullptr);
+  ASSERT_FALSE(storage->GetBlobFiles().empty());
+  EXPECT_TRUE(std::any_of(
+      storage->GetBlobFiles().begin(), storage->GetBlobFiles().end(),
+      [](const std::shared_ptr<BlobFileMetaData>& metadata) {
+        return !metadata->IsIndirectOrigin();
+      }));
+  ASSERT_EQ(Get(keys.back()), values.back());
+  ASSERT_EQ(Get("unrelated"), unrelated_value);
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_FALSE(properties.empty());
+  for (const auto& property : properties) {
+    EXPECT_EQ(property.second->user_collected_properties.count(
+                  kBlobReferenceDescriptorPropertyName),
+              1U);
+  }
+
+  options.enable_blob_indirection = false;
+  Reopen(options);
+  ASSERT_EQ(Get(keys.back()), values.back());
+  ASSERT_EQ(Get("unrelated"), unrelated_value);
+}
+
+TEST_F(DBBlobBasicTest,
+       DisabledReopenWaitsForCensusBeforeRetiringRelocationRoute) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+  Reopen(options);
+
+  const std::array<std::string, 4> keys{{"key0", "key1", "key2", "key3"}};
+  const std::string live_value(4096, 'v');
+  for (const std::string& key : keys) {
+    ASSERT_OK(Put(key, live_value));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 1U);
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .front()
+                                          ->GetBlobFileNumber();
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t relocation_file_number =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(
+          origin_file_number);
+  ASSERT_NE(relocation_file_number, kInvalidBlobFileNumber);
+  ASSERT_EQ(Get(keys.back()), live_value);
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "true"},
+                             {"enable_blob_garbage_collection", "false"}}));
+  Close();
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->LoadDependency(
+      {{"DBImpl::BuildBlobReferenceCensus:BeforeReadFileReady",
+        "DBBlobBasicTest::DisabledReopenCensusPaused"},
+       {"DBBlobBasicTest::ReleaseDisabledReopenCensus",
+        "DBImpl::BuildBlobReferenceCensus:BeforeReadFileWait"}});
+  sync_point->EnableProcessing();
+  bool census_released = false;
+  auto cleanup = Defer([&] {
+    if (!census_released) {
+      TEST_SYNC_POINT("DBBlobBasicTest::ReleaseDisabledReopenCensus");
+    }
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  options.enable_blob_indirection = false;
+  Reopen(options);
+  TEST_SYNC_POINT("DBBlobBasicTest::DisabledReopenCensusPaused");
+  CompactRangeOptions materialize_options;
+  materialize_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  materialize_options.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kForce;
+  ASSERT_OK(db_->CompactRange(materialize_options, nullptr, nullptr));
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  EXPECT_NE(cfd->current()->storage_info()->GetBlobRelocationRouteTarget(
+                origin_file_number),
+            kInvalidBlobFileNumber);
+  EXPECT_NE(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+                relocation_file_number),
+            nullptr);
+  ASSERT_EQ(Get(keys.back()), live_value);
+
+  TEST_SYNC_POINT("DBBlobBasicTest::ReleaseDisabledReopenCensus");
+  census_released = true;
+  WaitForBlobRelocationRetirement(cfd, relocation_file_number);
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  EXPECT_EQ(cfd->current()->storage_info()->GetBlobRelocationRouteTarget(
+                origin_file_number),
+            kInvalidBlobFileNumber);
+  EXPECT_EQ(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+                relocation_file_number),
+            nullptr);
+  ASSERT_EQ(Get(keys.back()), live_value);
+}
+
+TEST_F(DBBlobBasicTest,
+       BlobIndirectionActivationAcceptsPreactivationCompaction) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+
+  ASSERT_OK(Put("before", "legacy_value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("before", "legacy_value_newer"));
+  ASSERT_OK(Flush());
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->LoadDependency(
+      {{"DBImpl::BackgroundCompaction:NonTrivial:AfterRun",
+        "DBBlobBasicTest::PreactivationCompactionReady"},
+       {"DBBlobBasicTest::ReleasePreactivationCompaction",
+        "DBImpl::BackgroundCompaction:NonTrivial:AfterRun:WaitForRelocation"},
+       {"VersionSet::ProcessManifestWrites:BlobIndirectionActivationReady",
+        "DBBlobBasicTest::ActivationWriterUnlocked"},
+       {"DBBlobBasicTest::ReleaseActivationWriter",
+        "VersionSet::ProcessManifestWrites:BlobIndirectionActivationWait"},
+       {"VersionSet::LogAndApply:WriterWaiting",
+        "DBBlobBasicTest::PreactivationCompactionQueued"}});
+  std::atomic<size_t> unlocked_legacy_classifications{0};
+  sync_point->SetCallBack(
+      "VersionSet::ProcessManifestWrites:"
+      "MarkPredatingBlobReferenceOutputsUnlocked",
+      [&](void* arg) {
+        auto* db_mutex = static_cast<InstrumentedMutex*>(arg);
+        ASSERT_NE(db_mutex, nullptr);
+        // This thread must not hold the DB mutex here. Another thread can
+        // hold it for a short time, so retry: if this thread held it, every
+        // try would fail.
+        bool locked = false;
+        for (int attempt = 0; attempt < 100000 && !locked; ++attempt) {
+          locked = db_mutex->TryLock();
+          if (!locked) {
+            std::this_thread::yield();
+          }
+        }
+        ASSERT_TRUE(locked);
+        db_mutex->Unlock();
+        unlocked_legacy_classifications.fetch_add(1);
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  Status compaction_status;
+  port::Thread compaction_thread([&] {
+    compaction_status = dbfull()->TEST_CompactRange(
+        /*level=*/0, /*begin=*/nullptr, /*end=*/nullptr,
+        /*column_family=*/nullptr, /*disallow_trivial_move=*/true);
+  });
+  TEST_SYNC_POINT("DBBlobBasicTest::PreactivationCompactionReady");
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  ASSERT_OK(Put("after", "feature_value"));
+  Status activation_flush_status;
+  port::Thread activation_flush_thread(
+      [&] { activation_flush_status = Flush(); });
+  TEST_SYNC_POINT("DBBlobBasicTest::ActivationWriterUnlocked");
+  TEST_SYNC_POINT("DBBlobBasicTest::ReleasePreactivationCompaction");
+  TEST_SYNC_POINT("DBBlobBasicTest::PreactivationCompactionQueued");
+  TEST_SYNC_POINT("DBBlobBasicTest::ReleaseActivationWriter");
+  activation_flush_thread.join();
+  ASSERT_OK(activation_flush_status);
+  compaction_thread.join();
+  ASSERT_OK(compaction_status);
+  ASSERT_GT(unlocked_legacy_classifications.load(), 0U);
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  bool found_legacy_output = false;
+  for (int level = 0; level < cfd->NumberLevels(); ++level) {
+    for (const FileMetaData* file :
+         cfd->current()->storage_info()->LevelFiles(level)) {
+      ASSERT_NE(file, nullptr);
+      EXPECT_TRUE(file->blob_reference_legacy_metadata ||
+                  file->oldest_coarse_indirect_origin_file_number !=
+                      kInvalidBlobFileNumber ||
+                  !file->blob_reference_descriptor.empty())
+          << "level=" << level << " file=" << file->fd.GetNumber();
+      found_legacy_output |= file->blob_reference_legacy_metadata;
+    }
+  }
+  ASSERT_TRUE(found_legacy_output);
+  ASSERT_EQ(Get("before"), "legacy_value_newer");
+  ASSERT_EQ(Get("after"), "feature_value");
+}
+
+TEST_F(DBBlobBasicTest,
+       BlobIndirectionActivationRejectsPreactivationFifoTemperatureCopy) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  options.compaction_style = kCompactionStyleFIFO;
+  options.num_levels = 1;
+  options.max_open_files = -1;
+  options.level0_file_num_compaction_trigger = 2;
+  options.default_write_temperature = Temperature::kWarm;
+  options.compaction_options_fifo.file_temperature_age_thresholds = {
+      {Temperature::kCold, 1000}};
+  options.compaction_options_fifo.max_table_files_size = 100000000;
+  options.compaction_options_fifo.allow_trivial_copy_when_change_temperature =
+      true;
+  options.compaction_options_fifo.trivial_copy_buffer_size = 4096;
+  options.env->SetBackgroundThreads(1, Env::Priority::LOW);
+  options.env->SetBackgroundThreads(2, Env::Priority::HIGH);
+  env_->SetMockSleep();
+  Reopen(options);
+
+  test::SleepingBackgroundTask sleeping_compaction;
+  env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask,
+                 &sleeping_compaction, Env::Priority::LOW);
+  sleeping_compaction.WaitUntilSleeping();
+  bool sleeping_compaction_done = false;
+  auto cleanup_sleeping_compaction = Defer([&] {
+    if (!sleeping_compaction_done) {
+      sleeping_compaction.WakeUp();
+      sleeping_compaction.WaitUntilDone();
+    }
+  });
+
+  ASSERT_OK(Put("legacy0", "legacy_value0"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("legacy1", "legacy_value1"));
+  ASSERT_OK(Flush());
+  env_->MockSleepForSeconds(1200);
+
+  ASSERT_TRUE(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"enable_blob_indirection", "true"}})
+                  .IsNotSupported());
+
+  std::atomic<size_t> trivial_copy_count{0};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "DBImpl::BackgroundCompaction:TriviaCopyAfterCompaction",
+      [&](void*) { trivial_copy_count.fetch_add(1); });
+  sync_point->EnableProcessing();
+  auto cleanup_sync_point = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(Put("after_rejection", "legacy_value"));
+  ASSERT_OK(Flush());
+  sleeping_compaction.WakeUp();
+  sleeping_compaction.WaitUntilDone();
+  sleeping_compaction_done = true;
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_GT(trivial_copy_count.load(), 0U);
+
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_FALSE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  bool found_copied_legacy_output = false;
+  for (const FileMetaData* file :
+       cfd->current()->storage_info()->LevelFiles(0)) {
+    ASSERT_NE(file, nullptr);
+    EXPECT_TRUE(file->blob_reference_descriptor.empty());
+    EXPECT_EQ(file->oldest_coarse_indirect_origin_file_number,
+              kInvalidBlobFileNumber)
+        << "file=" << file->fd.GetNumber();
+    found_copied_legacy_output |= file->temperature == Temperature::kCold;
+  }
+  ASSERT_TRUE(found_copied_legacy_output);
+  ASSERT_EQ(Get("legacy0"), "legacy_value0");
+  ASSERT_EQ(Get("legacy1"), "legacy_value1");
+  ASSERT_EQ(Get("after_rejection"), "legacy_value");
+}
+
+TEST_F(DBBlobBasicTest,
+       DisabledNeverActivatedFlushesRetainManifestGroupCommit) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_background_flushes = 4;
+  options.env->SetBackgroundThreads(4, Env::Priority::HIGH);
+  Reopen(options);
+
+  ColumnFamilyHandle* first = nullptr;
+  ColumnFamilyHandle* second = nullptr;
+  ASSERT_OK(
+      db_->CreateColumnFamily(ColumnFamilyOptions(options), "first", &first));
+  ASSERT_OK(
+      db_->CreateColumnFamily(ColumnFamilyOptions(options), "second", &second));
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+  auto cleanup_handles = Defer([&] {
+    if (first != nullptr) {
+      db_->DestroyColumnFamilyHandle(first).PermitUncheckedError();
+    }
+    if (second != nullptr) {
+      db_->DestroyColumnFamilyHandle(second).PermitUncheckedError();
+    }
+  });
+  ASSERT_OK(Put("default", "default_value"));
+  ASSERT_OK(db_->Put(WriteOptions(), first, "first", "first_value"));
+  ASSERT_OK(db_->Put(WriteOptions(), second, "second", "second_value"));
+
+  std::mutex pause_mutex;
+  std::condition_variable pause_cv;
+  bool first_batch_blocked = false;
+  bool release_first_batch = false;
+  bool expect_followers = false;
+  size_t queued_followers = 0;
+  size_t finalization_batches = 0;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeBlobFinalization", [&](void*) {
+        std::unique_lock<std::mutex> lock(pause_mutex);
+        ++finalization_batches;
+        if (finalization_batches != 1) {
+          return;
+        }
+        first_batch_blocked = true;
+        pause_cv.notify_all();
+        pause_cv.wait(lock, [&] { return release_first_batch; });
+      });
+  sync_point->SetCallBack("VersionSet::LogAndApply:BeforeWriterWaiting",
+                          [&](void*) {
+                            std::lock_guard<std::mutex> lock(pause_mutex);
+                            if (expect_followers) {
+                              ++queued_followers;
+                              pause_cv.notify_all();
+                            }
+                          });
+  sync_point->EnableProcessing();
+  auto cleanup_sync_point = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  Status blocker_status;
+  Status first_status;
+  Status second_status;
+  port::Thread blocker([&] { blocker_status = Flush(); });
+  bool blocker_joined = false;
+  std::unique_ptr<port::Thread> first_flush;
+  std::unique_ptr<port::Thread> second_flush;
+  auto cleanup_threads = Defer([&] {
+    {
+      std::lock_guard<std::mutex> lock(pause_mutex);
+      release_first_batch = true;
+    }
+    pause_cv.notify_all();
+    if (!blocker_joined) {
+      blocker.join();
+    }
+    if (first_flush != nullptr) {
+      first_flush->join();
+    }
+    if (second_flush != nullptr) {
+      second_flush->join();
+    }
+  });
+  {
+    std::unique_lock<std::mutex> lock(pause_mutex);
+    ASSERT_TRUE(pause_cv.wait_for(lock, std::chrono::seconds(30),
+                                  [&] { return first_batch_blocked; }));
+    expect_followers = true;
+  }
+
+  first_flush.reset(new port::Thread(
+      [&] { first_status = db_->Flush(FlushOptions(), first); }));
+  second_flush.reset(new port::Thread(
+      [&] { second_status = db_->Flush(FlushOptions(), second); }));
+  {
+    std::unique_lock<std::mutex> lock(pause_mutex);
+    ASSERT_TRUE(pause_cv.wait_for(lock, std::chrono::seconds(30), [&] {
+      return queued_followers == 2;
+    })) << queued_followers;
+    release_first_batch = true;
+  }
+  pause_cv.notify_all();
+
+  blocker.join();
+  blocker_joined = true;
+  first_flush->join();
+  first_flush.reset();
+  second_flush->join();
+  second_flush.reset();
+  ASSERT_OK(blocker_status);
+  ASSERT_OK(first_status);
+  ASSERT_OK(second_status);
+  ASSERT_EQ(finalization_batches, 2U);
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(first));
+  first = nullptr;
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(second));
+  second = nullptr;
+}
+
+TEST_F(DBBlobBasicTest,
+       BlobIndirectionActivationAcceptsPreactivationAtomicFlush) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  options.atomic_flush = true;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+
+  // Leave two installed legacy L0 files. A compaction picked with the option
+  // on can use them to set the fence while the older atomic flush is paused.
+  ASSERT_OK(Put("baseline", "legacy_baseline_value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("baseline", "newer_legacy_baseline_value"));
+  ASSERT_OK(Flush());
+
+  ColumnFamilyHandle* other = nullptr;
+  ASSERT_OK(
+      db_->CreateColumnFamily(ColumnFamilyOptions(options), "other", &other));
+  ASSERT_NE(other, nullptr);
+  ASSERT_OK(Put("legacy", "legacy_default_value"));
+  ASSERT_OK(db_->Put(WriteOptions(), other, "legacy", "legacy_other_value"));
+
+  std::mutex pause_mutex;
+  std::condition_variable pause_cv;
+  size_t completed_outputs = 0;
+  bool old_outputs_ready = false;
+  bool release_old_flush = false;
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("FlushJob::WriteLevel0Table", [&](void*) {
+    std::unique_lock<std::mutex> lock(pause_mutex);
+    ++completed_outputs;
+    if (completed_outputs != 2) {
+      return;
+    }
+    old_outputs_ready = true;
+    pause_cv.notify_all();
+    pause_cv.wait(lock, [&] { return release_old_flush; });
+  });
+  sync_point->EnableProcessing();
+  auto cleanup_sync_point = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  Status old_flush_status;
+  port::Thread old_flush_thread([&] {
+    FlushOptions flush_options;
+    old_flush_status =
+        db_->Flush(flush_options, {db_->DefaultColumnFamily(), other});
+  });
+  bool old_flush_joined = false;
+  auto cleanup_old_flush = Defer([&] {
+    {
+      std::lock_guard<std::mutex> lock(pause_mutex);
+      release_old_flush = true;
+    }
+    pause_cv.notify_all();
+    if (!old_flush_joined) {
+      old_flush_thread.join();
+    }
+  });
+  {
+    std::unique_lock<std::mutex> lock(pause_mutex);
+    pause_cv.wait(lock, [&] { return old_outputs_ready; });
+  }
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  ASSERT_OK(dbfull()->TEST_CompactRange(
+      /*level=*/0, /*begin=*/nullptr, /*end=*/nullptr,
+      /*column_family=*/nullptr, /*disallow_trivial_move=*/true));
+
+  {
+    std::lock_guard<std::mutex> lock(pause_mutex);
+    release_old_flush = true;
+  }
+  pause_cv.notify_all();
+  old_flush_thread.join();
+  old_flush_joined = true;
+  ASSERT_OK(old_flush_status);
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  bool found_legacy_output = false;
+  for (int level = 0; level < cfd->NumberLevels(); ++level) {
+    for (const FileMetaData* file :
+         cfd->current()->storage_info()->LevelFiles(level)) {
+      ASSERT_NE(file, nullptr);
+      EXPECT_TRUE(file->blob_reference_legacy_metadata ||
+                  !file->blob_reference_descriptor.empty());
+      found_legacy_output |= file->blob_reference_legacy_metadata;
+    }
+  }
+  ASSERT_TRUE(found_legacy_output);
+  ASSERT_EQ(Get("legacy"), "legacy_default_value");
+  ASSERT_EQ(Get("baseline"), "newer_legacy_baseline_value");
+  std::string other_value;
+  ASSERT_OK(db_->Get(ReadOptions(), other, "legacy", &other_value));
+  ASSERT_EQ(other_value, "legacy_other_value");
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(other));
+}
+
+TEST_F(DBBlobBasicTest, ParallelFlushMixedActivationInstallsOneCaller) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_background_flushes = 2;
+  options.max_write_buffer_number = 4;
+  options.env->SetBackgroundThreads(2, Env::Priority::HIGH);
+  Reopen(options);
+
+  std::mutex pause_mutex;
+  std::condition_variable pause_cv;
+  bool old_output_ready = false;
+  bool release_old_output = false;
+  bool newer_flush_completed = false;
+  size_t outputs = 0;
+  size_t legacy_classifications = 0;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("FlushJob::WriteLevel0Table", [&](void*) {
+    std::unique_lock<std::mutex> lock(pause_mutex);
+    if (++outputs == 1) {
+      old_output_ready = true;
+      pause_cv.notify_all();
+      pause_cv.wait(lock, [&] { return release_old_output; });
+    }
+  });
+  sync_point->SetCallBack(
+      "MemTableList::TryInstallMemtableFlushResults:Completed", [&](void*) {
+        std::lock_guard<std::mutex> lock(pause_mutex);
+        newer_flush_completed = true;
+        pause_cv.notify_all();
+      });
+  sync_point->SetCallBack(
+      "VersionSet::ProcessManifestWrites:"
+      "MarkPredatingBlobReferenceOutputsUnlocked",
+      [&](void* arg) {
+        InstrumentedMutex* const db_mutex =
+            static_cast<InstrumentedMutex*>(arg);
+        // Another background thread may briefly own this mutex. Acquiring it
+        // here proves that the classification callback itself runs unlocked.
+        InstrumentedMutexLock lock(db_mutex);
+        ++legacy_classifications;
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    {
+      std::lock_guard<std::mutex> lock(pause_mutex);
+      release_old_output = true;
+    }
+    pause_cv.notify_all();
+    EXPECT_OK(dbfull()->TEST_WaitForFlushMemTable());
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(Put("old", "legacy"));
+  FlushOptions flush_options;
+  flush_options.wait = false;
+  flush_options.allow_write_stall = true;
+  ASSERT_OK(db_->Flush(flush_options));
+  {
+    std::unique_lock<std::mutex> lock(pause_mutex);
+    ASSERT_TRUE(pause_cv.wait_for(lock, std::chrono::seconds(30),
+                                  [&] { return old_output_ready; }));
+  }
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  ASSERT_OK(Put("new", "identity"));
+  ASSERT_OK(db_->Flush(flush_options));
+  {
+    std::unique_lock<std::mutex> lock(pause_mutex);
+    ASSERT_TRUE(pause_cv.wait_for(lock, std::chrono::seconds(30),
+                                  [&] { return newer_flush_completed; }));
+  }
+  // The newer enabled FlushJob has completed, but cannot publish past the
+  // older flush. Its activation intent must survive that job's destruction.
+  ASSERT_OK(db_->SetOptions({{"enable_blob_indirection", "false"}}));
+  ColumnFamilyData* const pending_cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  {
+    InstrumentedMutexLock lock(dbfull()->TEST_Mutex());
+    EXPECT_FALSE(
+        pending_cfd->current()->storage_info()->HasBlobIndirectionFormat());
+    EXPECT_TRUE(pending_cfd->HasPendingBlobIndirectionOutput());
+  }
+  {
+    std::lock_guard<std::mutex> lock(pause_mutex);
+    release_old_output = true;
+  }
+  pause_cv.notify_all();
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_EQ(legacy_classifications, 1U);
+  const VersionStorageInfo* const storage = dbfull()
+                                                ->GetVersionSet()
+                                                ->GetColumnFamilySet()
+                                                ->GetDefault()
+                                                ->current()
+                                                ->storage_info();
+  ASSERT_TRUE(storage->HasBlobIndirectionFormat());
+  ASSERT_EQ(storage->LevelFiles(0).size(), 2U);
+  size_t legacy_files = 0;
+  size_t coarse_files = 0;
+  for (const FileMetaData* file : storage->LevelFiles(0)) {
+    legacy_files += file->blob_reference_legacy_metadata;
+    coarse_files += file->oldest_coarse_indirect_origin_file_number != 0;
+  }
+  ASSERT_EQ(legacy_files, 1U);
+  ASSERT_EQ(coarse_files, 1U);
+  ASSERT_EQ(Get("old"), "legacy");
+  ASSERT_EQ(Get("new"), "identity");
+}
+
+TEST_F(DBBlobBasicTest, DisabledPolicyStillInitializesFlushActivationCensus) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  ASSERT_OK(Put("feature", "feature_value"));
+
+  std::mutex pause_mutex;
+  std::condition_variable pause_cv;
+  bool output_ready = false;
+  bool release_flush = false;
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("FlushJob::WriteLevel0Table", [&](void*) {
+    std::unique_lock<std::mutex> lock(pause_mutex);
+    output_ready = true;
+    pause_cv.notify_all();
+    pause_cv.wait(lock, [&] { return release_flush; });
+  });
+  sync_point->EnableProcessing();
+  auto cleanup_sync_point = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  Status flush_status;
+  port::Thread flush_thread([&] { flush_status = Flush(); });
+  bool flush_joined = false;
+  auto cleanup_flush = Defer([&] {
+    {
+      std::lock_guard<std::mutex> lock(pause_mutex);
+      release_flush = true;
+    }
+    pause_cv.notify_all();
+    if (!flush_joined) {
+      flush_thread.join();
+    }
+  });
+  {
+    std::unique_lock<std::mutex> lock(pause_mutex);
+    pause_cv.wait(lock, [&] { return output_ready; });
+  }
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "false"}}));
+  {
+    std::lock_guard<std::mutex> lock(pause_mutex);
+    release_flush = true;
+  }
+  pause_cv.notify_all();
+  flush_thread.join();
+  flush_joined = true;
+  ASSERT_OK(flush_status);
+
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_NE(GetCensusSnapshot(cfd), nullptr);
+  ASSERT_EQ(Get("feature"), "feature_value");
+}
+
+TEST_F(DBBlobBasicTest,
+       DisabledPolicyStillInitializesCompactionActivationCensus) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("key", "legacy_value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key", "newer_legacy_value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->LoadDependency(
+      {{"DBImpl::BackgroundCompaction:NonTrivial:AfterRun",
+        "DBBlobBasicTest::FeatureCompactionReady"},
+       {"DBBlobBasicTest::ReleaseFeatureCompaction",
+        "DBImpl::BackgroundCompaction:NonTrivial:AfterRun:WaitForRelocation"}});
+  sync_point->EnableProcessing();
+  bool compaction_released = false;
+  auto cleanup_sync_point = Defer([&] {
+    if (!compaction_released) {
+      TEST_SYNC_POINT("DBBlobBasicTest::ReleaseFeatureCompaction");
+    }
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  Status compaction_status;
+  port::Thread compaction_thread([&] {
+    compaction_status = dbfull()->TEST_CompactRange(
+        /*level=*/0, /*begin=*/nullptr, /*end=*/nullptr,
+        /*column_family=*/nullptr, /*disallow_trivial_move=*/true);
+  });
+  bool compaction_joined = false;
+  auto cleanup_compaction = Defer([&] {
+    if (!compaction_released) {
+      TEST_SYNC_POINT("DBBlobBasicTest::ReleaseFeatureCompaction");
+      compaction_released = true;
+    }
+    if (!compaction_joined) {
+      compaction_thread.join();
+    }
+  });
+  TEST_SYNC_POINT("DBBlobBasicTest::FeatureCompactionReady");
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "false"}}));
+  TEST_SYNC_POINT("DBBlobBasicTest::ReleaseFeatureCompaction");
+  compaction_released = true;
+  compaction_thread.join();
+  compaction_joined = true;
+  ASSERT_OK(compaction_status);
+
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_NE(GetCensusSnapshot(cfd), nullptr);
+  ASSERT_EQ(Get("key"), "newer_legacy_value");
+}
+
+TEST_F(DBBlobBasicTest,
+       DisabledMaterializationRetiresAllAliasesForRelocationTarget) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+
+  VersionSet* version_set = dbfull()->GetVersionSet();
+  ColumnFamilyData* cfd = version_set->GetColumnFamilySet()->GetDefault();
+  dbfull()->TEST_LockMutex();
+  const uint64_t origin_file_number = version_set->NewFileNumber();
+  const uint64_t stale_origin_file_number = version_set->NewFileNumber();
+  const uint64_t direct_generation_file_number = version_set->NewFileNumber();
+  const uint64_t relocation_file_number = version_set->NewFileNumber();
+  dbfull()->TEST_UnlockMutex();
+
+  const std::string expected(4096, 'v');
+  constexpr uint64_t original_value_offset = 17;
+  const uint32_t stable_checksum =
+      crc32c::Value(expected.data(), expected.size());
+  Options relocation_options = options;
+  relocation_options.cf_paths.clear();
+  relocation_options.cf_paths.emplace_back(dbname_, /*target_size=*/0);
+  BlockBasedTableOptions table_options;
+  relocation_options.table_factory.reset(
+      NewBlockBasedTableFactory(table_options));
+  const ImmutableOptions immutable_options(relocation_options);
+  const MutableCFOptions mutable_options(relocation_options);
+  BlobRelocationFileMetadata metadata;
+  uint64_t relocation_file_size = 0;
+  WriteRelocationFileForDBTest(
+      immutable_options, mutable_options, table_options, cfd->GetID(),
+      relocation_file_number,
+      {{origin_file_number, original_value_offset, expected, kNoCompression},
+       {stale_origin_file_number, original_value_offset, expected,
+        kNoCompression}},
+      &metadata, &relocation_file_size, {direct_generation_file_number});
+
+  VersionEdit install;
+  install.SetColumnFamily(cfd->GetID());
+  install.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  install.AddBlobRelocationFile(BlobRelocationFileAddition(
+      relocation_file_number, relocation_file_size,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      metadata.encoded_directory, metadata.tail_size));
+  install.SetBlobRelocationRoute(
+      BlobRelocationRoute(origin_file_number, relocation_file_number));
+  install.SetBlobRelocationRoute(BlobRelocationRoute(
+      direct_generation_file_number, relocation_file_number));
+  install.SetBlobRelocationRoute(
+      BlobRelocationRoute(stale_origin_file_number, relocation_file_number));
+  // Until the flush below installs the SST that references the relocation
+  // file, no SST uses it. Stop the census worker in that window, so indirect
+  // blob GC does not delete it as an empty relocation file.
+  std::unique_lock<std::mutex> census_stopped = StopCensusWorker(cfd);
+  ASSERT_OK(ApplyVersionEdit(&install, /*new_descriptor_log=*/false));
+
+  std::string blob_index;
+  BlobIndex::EncodeIndirectBlob(
+      &blob_index, direct_generation_file_number,
+      {.origin_file_number = origin_file_number,
+       .original_value_offset = original_value_offset,
+       .stored_value_size = expected.size(),
+       .compression = kNoCompression,
+       .stable_checksum = stable_checksum,
+       .stored_checksum = BlobIndex::ExtendChecksumWithCompression(
+           stable_checksum, kNoCompression)});
+  WriteBatch batch;
+  ASSERT_OK(WriteBatchInternal::PutBlobIndex(
+      &batch, db_->DefaultColumnFamily()->GetID(), "key", blob_index));
+  ASSERT_OK(db_->Write(WriteOptions(), &batch));
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+  census_stopped.unlock();
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+
+  cfd = version_set->GetColumnFamilySet()->GetDefault();
+  auto census = GetCensusSnapshot(cfd);
+  ASSERT_NE(census, nullptr);
+  ASSERT_EQ(census->GetSstCount(origin_file_number), 0U);
+  ASSERT_GT(census->GetSstCount(direct_generation_file_number), 0U);
+  ASSERT_EQ(census->GetSstCount(stale_origin_file_number), 0U);
+  ASSERT_EQ(Get("key"), expected);
+
+  const auto reports_relocation_file = [&](const ColumnFamilyMetaData& meta) {
+    return std::any_of(meta.blob_files.begin(), meta.blob_files.end(),
+                       [&](const BlobMetaData& blob) {
+                         return blob.blob_file_number == relocation_file_number;
+                       });
+  };
+  ColumnFamilyMetaData column_family_metadata;
+  db_->GetColumnFamilyMetaData(&column_family_metadata);
+  EXPECT_TRUE(reports_relocation_file(column_family_metadata));
+  std::vector<ColumnFamilyMetaData> all_column_family_metadata;
+  db_->GetAllColumnFamilyMetaData(&all_column_family_metadata);
+  ASSERT_EQ(all_column_family_metadata.size(), 1U);
+  EXPECT_TRUE(reports_relocation_file(all_column_family_metadata.front()));
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "false"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  compact_options.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  cfd = version_set->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  EXPECT_EQ(storage->GetBlobRelocationRouteTarget(origin_file_number),
+            kInvalidBlobFileNumber);
+  EXPECT_EQ(
+      storage->GetBlobRelocationRouteTarget(direct_generation_file_number),
+      kInvalidBlobFileNumber);
+  EXPECT_EQ(storage->GetBlobRelocationRouteTarget(stale_origin_file_number),
+            kInvalidBlobFileNumber);
+  EXPECT_EQ(storage->GetBlobRelocationFileMetaData(relocation_file_number),
+            nullptr);
+  ASSERT_EQ(Get("key"), expected);
+}
+
+TEST_F(DBBlobBasicTest, DisabledMaterializationRetiresRouteFreeRelocationFile) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+
+  VersionSet* const version_set = dbfull()->GetVersionSet();
+  ColumnFamilyData* cfd = version_set->GetColumnFamilySet()->GetDefault();
+  dbfull()->TEST_LockMutex();
+  const uint64_t origin_file_number = version_set->NewFileNumber();
+  const uint64_t relocation_file_number = version_set->NewFileNumber();
+  dbfull()->TEST_UnlockMutex();
+
+  const std::string expected(4096, 'r');
+  constexpr uint64_t original_value_offset = 29;
+  const uint32_t stable_checksum =
+      crc32c::Value(expected.data(), expected.size());
+  Options relocation_options = options;
+  relocation_options.cf_paths.clear();
+  relocation_options.cf_paths.emplace_back(dbname_, /*target_size=*/0);
+  BlockBasedTableOptions table_options;
+  relocation_options.table_factory.reset(
+      NewBlockBasedTableFactory(table_options));
+  const ImmutableOptions immutable_options(relocation_options);
+  const MutableCFOptions mutable_options(relocation_options);
+  BlobRelocationFileMetadata metadata;
+  uint64_t relocation_file_size = 0;
+  WriteRelocationFileForDBTest(
+      immutable_options, mutable_options, table_options, cfd->GetID(),
+      relocation_file_number,
+      {{origin_file_number, original_value_offset, expected, kNoCompression}},
+      &metadata, &relocation_file_size);
+
+  VersionEdit install;
+  install.SetColumnFamily(cfd->GetID());
+  install.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  install.AddBlobRelocationFile(BlobRelocationFileAddition(
+      relocation_file_number, relocation_file_size,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      metadata.encoded_directory, metadata.tail_size));
+  install.SetBlobRelocationRoute(
+      BlobRelocationRoute(origin_file_number, relocation_file_number));
+  // Until the flushes below install the SSTs that reference the relocation
+  // file, no SST uses it. Stop the census worker in that window, so indirect
+  // blob GC does not delete it as an empty relocation file.
+  std::unique_lock<std::mutex> census_stopped = StopCensusWorker(cfd);
+  ASSERT_OK(ApplyVersionEdit(&install, /*new_descriptor_log=*/false));
+
+  const auto put_indirect_blob = [&](const std::string& key,
+                                     uint64_t generation_file_number) {
+    std::string blob_index;
+    BlobIndex::EncodeIndirectBlob(
+        &blob_index, generation_file_number,
+        {.origin_file_number = origin_file_number,
+         .original_value_offset = original_value_offset,
+         .stored_value_size = expected.size(),
+         .compression = kNoCompression,
+         .stable_checksum = stable_checksum,
+         .stored_checksum = BlobIndex::ExtendChecksumWithCompression(
+             stable_checksum, kNoCompression)});
+    WriteBatch batch;
+    Status status = WriteBatchInternal::PutBlobIndex(
+        &batch, db_->DefaultColumnFamily()->GetID(), key, blob_index);
+    if (!status.ok()) {
+      return status;
+    }
+    return db_->Write(WriteOptions(), &batch);
+  };
+  ASSERT_OK(put_indirect_blob("a_routed", origin_file_number));
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+  ASSERT_OK(put_indirect_blob("z_direct", relocation_file_number));
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+  census_stopped.unlock();
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(Get("a_routed"), expected);
+  ASSERT_EQ(Get("z_direct"), expected);
+
+  // Run route retirement as soon as no SST uses the generation number of a
+  // route. The SyncPoint sets the route retirement batch size to 1, so routes
+  // are not batched. The flush helper above clears all callbacks, so this comes
+  // after it.
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::RetireBlobRelocationRoutes:BatchSize",
+                          [](void* arg) { *static_cast<uint64_t*>(arg) = 1; });
+  sync_point->EnableProcessing();
+  const Defer cleanup_sync_point([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "false"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  compact_options.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kForce;
+  Slice routed_begin("a");
+  Slice routed_end("b");
+  ASSERT_OK(db_->CompactRange(compact_options, &routed_begin, &routed_end));
+
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  cfd = version_set->GetColumnFamilySet()->GetDefault();
+  EXPECT_EQ(cfd->current()->storage_info()->GetBlobRelocationRouteTarget(
+                origin_file_number),
+            kInvalidBlobFileNumber);
+  EXPECT_NE(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+                relocation_file_number),
+            nullptr);
+  ASSERT_EQ(Get("a_routed"), expected);
+  ASSERT_EQ(Get("z_direct"), expected);
+
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  Slice direct_begin("z");
+  Slice direct_end("zz");
+  ASSERT_OK(db_->CompactRange(compact_options, &direct_begin, &direct_end));
+
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  cfd = version_set->GetColumnFamilySet()->GetDefault();
+  EXPECT_EQ(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+                relocation_file_number),
+            nullptr);
+  ASSERT_EQ(Get("a_routed"), expected);
+  ASSERT_EQ(Get("z_direct"), expected);
 }
 
 TEST_F(DBBlobBasicTest, BlobIndirectionFormatFenceSurvivesActivatedCfDrop) {
@@ -12688,6 +14101,337 @@ TEST_F(DBBlobBasicTest,
   ASSERT_TRUE(db_->SetOptions(db_->DefaultColumnFamily(),
                               {{"enable_blob_indirection", "true"}})
                   .IsNotSupported());
+}
+
+TEST_F(DBBlobBasicTest,
+       ActivatedBlobIndirectionRejectsIncompatibleReopenWriter) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("wal_only", "unreplayed"));
+  Close();
+
+  std::atomic<bool> wal_recovery_started{false};
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::RecoverLogFiles:BeforeReadWal",
+                          [&](void*) { wal_recovery_started.store(true); });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  options.enable_blob_indirection = false;
+  options.table_factory.reset(NewAdaptiveTableFactory(
+      std::shared_ptr<TableFactory>(NewPlainTableFactory()), nullptr, nullptr,
+      nullptr));
+  ASSERT_TRUE(TryReopen(options).IsNotSupported());
+  ASSERT_FALSE(wal_recovery_started.load());
+}
+
+TEST_F(DBBlobBasicTest, DisabledStickyFormatRejectsIncompatiblePreparedWriter) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "false"}}));
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  options.enable_blob_indirection = false;
+  options.table_factory.reset(NewPlainTableFactory());
+  options.prefix_extractor.reset(NewNoopTransform());
+  MutableCFOptions prepared(options);
+  ASSERT_TRUE(cfd->PrepareMutableCFOptions(DBOptions(options), {}, &prepared)
+                  .IsNotSupported());
+  ASSERT_EQ(Get("key"), "value");
+}
+
+TEST_F(DBBlobBasicTest, FlushIsPendingFromItsOptionsCopy) {
+  // A flush copies the options before it releases the DB mutex to sync closed
+  // WALs (the DB has two column families), and picks its memtables later. A
+  // flush whose copy has enable_blob_indirection on is pending from the copy
+  // on, so a SetOptions call in that window that would switch to a table
+  // format without blob indirection support is rejected.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+  ASSERT_OK(Put(0, "key", std::string(4096, 'v')));
+
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool entered = false;
+  bool released = false;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::SyncClosedWals:Start", [&](void*) {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    if (entered) {
+      return;
+    }
+    entered = true;
+    gate_cv.notify_all();
+    gate_cv.wait(lock, [&] { return released; });
+  });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    {
+      std::lock_guard<std::mutex> lock(gate_mutex);
+      released = true;
+    }
+    gate_cv.notify_all();
+    EXPECT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[0]));
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  FlushOptions flush_options;
+  flush_options.wait = false;
+  ASSERT_OK(db_->Flush(flush_options, handles_[0]));
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds(30),
+                                 [&] { return entered; }));
+  }
+  ColumnFamilyData* const cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(handles_[0])->cfd();
+  Options plain_options = options;
+  plain_options.enable_blob_indirection = false;
+  plain_options.table_factory.reset(NewPlainTableFactory());
+  plain_options.prefix_extractor.reset(NewNoopTransform());
+  plain_options.ttl = 0;
+  plain_options.periodic_compaction_seconds = 0;
+  MutableCFOptions prepared(plain_options);
+  {
+    InstrumentedMutexLock lock(dbfull()->TEST_Mutex());
+    // The flush has not picked its memtables yet.
+    EXPECT_TRUE(cfd->HasPendingBlobIndirectionOutput());
+    EXPECT_TRUE(
+        cfd->PrepareMutableCFOptions(DBOptions(plain_options), {}, &prepared)
+            .IsNotSupported());
+  }
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    released = true;
+  }
+  gate_cv.notify_all();
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[0]));
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_EQ(Get(0, "key"), std::string(4096, 'v'));
+}
+
+TEST_F(DBBlobBasicTest, PendingFirstActivationRejectsIncompatibleWriter) {
+  // A disabled policy does not cancel enabled output already being built.
+  // Cover normal flush, atomic flush, and first activation through compaction.
+  // SetOptions calls that change the table format or compaction style must see
+  // this pending intent, and an ingestion scans its files while it is
+  // pending.
+  for (int operation = 0; operation != 3; ++operation) {
+    SCOPED_TRACE(operation);
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = operation != 2;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    options.atomic_flush = operation == 1;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key", std::string(4096, 'v')));
+    if (operation == 2) {
+      ASSERT_OK(Flush());
+      ASSERT_OK(db_->SetOptions({{"enable_blob_indirection", "true"}}));
+    }
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool entered = false;
+    bool released = false;
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    sync_point->SetCallBack(
+        operation == 2 ? "CompactionJob::Run():Start"
+                       : "FlushJob::WriteLevel0Table:TableBuilderOptions",
+        [&](void*) {
+          std::unique_lock<std::mutex> lock(gate_mutex);
+          entered = true;
+          gate_cv.notify_all();
+          gate_cv.wait(lock, [&] { return released; });
+        });
+    sync_point->EnableProcessing();
+    Status compaction_status;
+    compaction_status.PermitUncheckedOk();  // Unused by the two flush cases.
+    std::unique_ptr<port::Thread> compaction_thread;
+    auto cleanup = Defer([&] {
+      {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        released = true;
+      }
+      gate_cv.notify_all();
+      if (compaction_thread != nullptr) {
+        compaction_thread->join();
+        compaction_thread.reset();
+        EXPECT_OK(compaction_status);
+      } else {
+        EXPECT_OK(dbfull()->TEST_WaitForFlushMemTable());
+      }
+      sync_point->DisableProcessing();
+      sync_point->ClearAllCallBacks();
+    });
+    if (operation == 2) {
+      compaction_thread = std::make_unique<port::Thread>([&] {
+        compaction_status = dbfull()->TEST_CompactRange(
+            0, nullptr, nullptr, nullptr, /*disallow_trivial_move=*/true);
+      });
+    } else {
+      FlushOptions flush_options;
+      flush_options.wait = false;
+      ASSERT_OK(db_->Flush(flush_options));
+    }
+    {
+      std::unique_lock<std::mutex> lock(gate_mutex);
+      ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds(30),
+                                   [&] { return entered; }));
+    }
+    ASSERT_OK(db_->SetOptions({{"enable_blob_indirection", "false"}}));
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    Options plain_options = options;
+    plain_options.enable_blob_indirection = false;
+    plain_options.table_factory.reset(NewPlainTableFactory());
+    plain_options.prefix_extractor.reset(NewNoopTransform());
+    plain_options.ttl = 0;
+    plain_options.periodic_compaction_seconds = 0;
+    MutableCFOptions prepared(plain_options);
+    {
+      InstrumentedMutexLock lock(dbfull()->TEST_Mutex());
+      EXPECT_FALSE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+      EXPECT_TRUE(cfd->HasPendingBlobIndirectionOutput());
+      EXPECT_TRUE(
+          cfd->PrepareMutableCFOptions(DBOptions(plain_options), {}, &prepared)
+              .IsNotSupported());
+    }
+    const std::string external_path = dbname_ + "/unvalidated.sst";
+    SstFileWriter external_writer(EnvOptions(), options);
+    ASSERT_OK(external_writer.Open(external_path));
+    ASSERT_OK(external_writer.Put("ingested", "plain-value"));
+    ASSERT_OK(external_writer.Finish());
+    // Preparation sees a disabled, unfenced Version, but an activation is
+    // pending. So it scans the file for blob references, and publication,
+    // which needs that scan while the earlier enabled output is held, passes.
+    ASSERT_OK(
+        db_->IngestExternalFile({external_path}, IngestExternalFileOptions()));
+    ASSERT_EQ(Get("ingested"), "plain-value");
+    {
+      std::lock_guard<std::mutex> lock(gate_mutex);
+      released = true;
+    }
+    gate_cv.notify_all();
+    if (compaction_thread != nullptr) {
+      compaction_thread->join();
+      compaction_thread.reset();
+      ASSERT_OK(compaction_status);
+    } else {
+      ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+    }
+    {
+      InstrumentedMutexLock lock(dbfull()->TEST_Mutex());
+      EXPECT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+      EXPECT_FALSE(cfd->HasPendingBlobIndirectionOutput());
+    }
+    // The retry now observes the fence and validates the plain input.
+    ASSERT_OK(
+        db_->IngestExternalFile({external_path}, IngestExternalFileOptions()));
+    ASSERT_EQ(Get("ingested"), "plain-value");
+    ASSERT_OK(Put("next", std::string(4096, 'n')));
+    ASSERT_OK(Flush());
+    ASSERT_EQ(Get("key"), std::string(4096, 'v'));
+    ASSERT_EQ(Get("next"), std::string(4096, 'n'));
+  }
+}
+
+TEST_F(DBBlobBasicTest, FeatureSstIsRejectedByImportAndLegacyIngestion) {
+  // An SST written by a feature CF carries blob indirection properties. Import
+  // and ingestion into a legacy CF refuse it from the properties alone.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "blob_value"));
+  ASSERT_OK(Flush());
+  std::vector<LiveFileMetaData> live_files;
+  db_->GetLiveFilesMetaData(&live_files);
+  ASSERT_EQ(live_files.size(), 1U);
+  // Copy the SST out, so that its owner DB is not involved.
+  const std::string copy_dir = dbname_ + "_feature_sst";
+  ASSERT_OK(env_->CreateDirIfMissing(copy_dir));
+  const std::string copy_path =
+      copy_dir + "/" + live_files[0].relative_filename;
+  CopyFile(live_files[0].directory + "/" + live_files[0].relative_filename,
+           copy_path);
+
+  Options legacy = GetDefaultOptions();
+  legacy.create_if_missing = true;
+  DestroyAndReopen(legacy);
+  ExportImportFilesMetaData metadata;
+  metadata.db_comparator_name = legacy.comparator->Name();
+  LiveFileMetaData file = live_files[0];
+  file.directory = copy_dir;
+  file.db_path = copy_dir;
+  metadata.files.push_back(file);
+  ColumnFamilyHandle* imported = nullptr;
+  // The base import check rejects every SST whose metadata references blob
+  // files.
+  Status status = db_->CreateColumnFamilyWithImport(
+      ColumnFamilyOptions(legacy), "imported", ImportColumnFamilyOptions(),
+      metadata, &imported);
+  ASSERT_TRUE(status.IsNotSupported()) << status.ToString();
+  ASSERT_EQ(imported, nullptr);
+  // With the blob reference cleared from the metadata, the import still reads
+  // the SST's blob indirection properties and rejects it.
+  metadata.files[0].oldest_blob_file_number = kInvalidBlobFileNumber;
+  status = db_->CreateColumnFamilyWithImport(
+      ColumnFamilyOptions(legacy), "imported", ImportColumnFamilyOptions(),
+      metadata, &imported);
+  ASSERT_TRUE(status.IsNotSupported()) << status.ToString();
+  ASSERT_NE(status.ToString().find("blob indirection"), std::string::npos)
+      << status.ToString();
+  ASSERT_EQ(imported, nullptr);
+
+  IngestExternalFileOptions ingest_options;
+  ingest_options.allow_db_generated_files = true;
+  ingest_options.move_files = false;
+  status = db_->IngestExternalFile({copy_path}, ingest_options);
+  ASSERT_TRUE(status.IsNotSupported()) << status.ToString();
+  ASSERT_NE(status.ToString().find("blob indirection"), std::string::npos)
+      << status.ToString();
+  ASSERT_TRUE(Get("key").empty() || Get("key") == "NOT_FOUND");
+  ASSERT_OK(DestroyDir(env_, copy_dir));
+}
+
+TEST_F(DBBlobBasicTest, ActivatedBlobIndirectionRejectsDirectWriteReopen) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  Close();
+
+  options.enable_blob_indirection = false;
+  options.enable_blob_direct_write = true;
+  options.allow_concurrent_memtable_write = false;
+  ASSERT_TRUE(TryReopen(options).IsNotSupported());
 }
 
 TEST_F(DBBlobBasicTest,
@@ -17970,6 +19714,58 @@ TEST_F(DBBlobBasicTest, RelocatingOldestRootPreservesUnlinkedIndirectOrigins) {
   Reopen(options);
   ASSERT_EQ(Get("old3"), value);
   ASSERT_EQ(Get("new"), value);
+}
+
+TEST_F(DBBlobBasicTest,
+       EmptyIndirectOriginCleanupIgnoresRelocationPolicyKnobs) {
+  for (bool disable_indirection : {false, true}) {
+    SCOPED_TRACE(disable_indirection);
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.enable_blob_garbage_collection = false;
+    options.disable_auto_compactions = true;
+    options.min_blob_size = 0;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("older", std::string(4096, 'o')));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("newer", std::string(4096, 'n')));
+    ASSERT_OK(Flush());
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    const auto& files = cfd->current()->storage_info()->GetBlobFiles();
+    ASSERT_EQ(files.size(), 2U);
+    const uint64_t older = files.front()->GetBlobFileNumber();
+    const uint64_t newer = files.back()->GetBlobFileNumber();
+    const std::string newer_path = BlobFileName(dbname_, newer);
+    ASSERT_OK(BuildExactSstAtLevel1());
+    if (disable_indirection) {
+      ASSERT_OK(db_->SetOptions({{"enable_blob_indirection", "false"}}));
+    }
+    ASSERT_OK(Delete("newer"));
+    ASSERT_OK(Flush());
+    CompactRangeOptions compact_options;
+    compact_options.blob_garbage_collection_policy =
+        BlobGarbageCollectionPolicy::kDisable;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    const VersionStorageInfo* const storage = cfd->current()->storage_info();
+    ASSERT_NE(storage->GetBlobFileMetaData(older), nullptr);
+    ASSERT_EQ(storage->GetBlobFileMetaData(newer), nullptr);
+    ASSERT_TRUE(storage->GetBlobRelocationFiles().empty());
+    dbfull()->TEST_DeleteObsoleteFiles();
+    ASSERT_TRUE(options.env->FileExists(newer_path).IsNotFound());
+    ASSERT_EQ(Get("older"), std::string(4096, 'o'));
+    ASSERT_EQ(Get("newer"), "NOT_FOUND");
+    options.enable_blob_indirection = !disable_indirection;
+    Reopen(options);
+    ASSERT_EQ(Get("older"), std::string(4096, 'o'));
+    ASSERT_EQ(Get("newer"), "NOT_FOUND");
+  }
 }
 
 TEST_F(DBBlobBasicTest, IndirectBlobGCStreamsLargeValuesTwice) {

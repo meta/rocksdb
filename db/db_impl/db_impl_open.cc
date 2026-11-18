@@ -644,7 +644,17 @@ Status DBImpl::Recover(
   if (!s.ok()) {
     return s;
   }
-
+  if (!read_only) {
+    for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+      if (cfd == nullptr || cfd->IsDropped()) {
+        continue;
+      }
+      s = cfd->ValidateBlobIndirectionOptionsAfterRecovery();
+      if (!s.ok()) {
+        return s;
+      }
+    }
+  }
   if (s.ok() && !read_only) {
     for (auto cfd : *versions_->GetColumnFamilySet()) {
       const auto& moptions = cfd->GetLatestMutableCFOptions();
@@ -2904,7 +2914,6 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   if (s.ok()) {
     s = impl->LogAndApplyForRecovery(recovery_ctx);
   }
-
   if (s.ok() && !impl->immutable_db_options_.write_identity_file) {
     // On successful recovery, delete an obsolete IDENTITY file to avoid DB ID
     // inconsistency

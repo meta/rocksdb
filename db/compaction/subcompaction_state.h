@@ -178,12 +178,20 @@ class SubcompactionState {
 
   ~SubcompactionState() = default;
 
-  // Add all the new files from this compaction to version_edit
-  void AddOutputsEdit(VersionEdit* out_edit) const {
-    for (const auto& file : proximal_level_outputs_.outputs_) {
+  // Adds all new files of this compaction to version_edit. It also sets
+  // blob_reference_output_predates_indirection on each output in the same
+  // loop, so install does not visit every output twice while it holds the DB
+  // mutex.
+  void AddOutputsEdit(VersionEdit* out_edit,
+                      bool output_predates_blob_indirection) {
+    for (auto& file : proximal_level_outputs_.outputs_) {
+      file.meta.blob_reference_output_predates_indirection |=
+          output_predates_blob_indirection;
       out_edit->AddFile(compaction->GetProximalLevel(), file.meta);
     }
-    for (const auto& file : compaction_outputs_.outputs_) {
+    for (auto& file : compaction_outputs_.outputs_) {
+      file.meta.blob_reference_output_predates_indirection |=
+          output_predates_blob_indirection;
       out_edit->AddFile(compaction->output_level(), file.meta);
     }
   }
