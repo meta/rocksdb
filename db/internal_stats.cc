@@ -339,6 +339,8 @@ static const std::string live_blob_file_garbage_size =
 static const std::string blob_cache_capacity = "blob-cache-capacity";
 static const std::string blob_cache_usage = "blob-cache-usage";
 static const std::string blob_cache_pinned_usage = "blob-cache-pinned-usage";
+static const std::string indirect_blob_gc_idle_micros_with_candidates =
+    "indirect-blob-gc-idle-micros-with-candidates";
 static const std::string indirect_blob_gc_stats = "indirect-blob-gc-stats";
 static const std::string blob_reference_census_unready_micros =
     "blob-reference-census-unready-micros";
@@ -472,6 +474,8 @@ const std::string DB::Properties::kBlobCacheUsage =
     rocksdb_prefix + blob_cache_usage;
 const std::string DB::Properties::kBlobCachePinnedUsage =
     rocksdb_prefix + blob_cache_pinned_usage;
+const std::string DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates =
+    rocksdb_prefix + indirect_blob_gc_idle_micros_with_candidates;
 const std::string DB::Properties::kIndirectBlobGcStats =
     rocksdb_prefix + indirect_blob_gc_stats;
 const std::string DB::Properties::kBlobReferenceCensusUnreadyMicros =
@@ -684,6 +688,10 @@ const UnorderedMap<std::string, DBPropertyInfo>
           nullptr}},
         {DB::Properties::kBlobCachePinnedUsage,
          {false, nullptr, &InternalStats::HandleBlobCachePinnedUsage, nullptr,
+          nullptr}},
+        {DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates,
+         {false, nullptr,
+          &InternalStats::HandleIndirectBlobGcIdleMicrosWithCandidates, nullptr,
           nullptr}},
         {DB::Properties::kIndirectBlobGcStats,
          {false, &InternalStats::HandleIndirectBlobGcStatsString, nullptr,
@@ -1116,6 +1124,8 @@ bool InternalStats::HandleIndirectBlobGcStats(
       census != nullptr ? census->PublishedTotals()
                         : BlobGcCandidateHeap::Totals{};
   (*values)["tracked-files"] = std::to_string(totals.candidate_count);
+  (*values)["idle-micros-with-candidates"] =
+      std::to_string(IndirectBlobGcIdleMicrosWithCandidates());
   (*values)["garbage-bytes-collectable"] =
       std::to_string(totals.collectable_garbage_bytes);
   (*values)["garbage-bytes-suppressed"] =
@@ -1126,6 +1136,20 @@ bool InternalStats::HandleIndirectBlobGcStats(
       std::to_string(totals.coarse_pinned_garbage_bytes);
   (*values)["relocation-garbage-bytes"] = std::to_string(
       census != nullptr ? census->PublishedRelocationGarbageBytes() : 0);
+  return true;
+}
+
+uint64_t InternalStats::IndirectBlobGcIdleMicrosWithCandidates() const {
+  assert(cfd_);
+  const uint64_t since = cfd_->IndirectBlobGcCandidatesSinceMicros();
+  const uint64_t now = clock_->NowMicros();
+  return since == 0 || now < since ? 0 : now - since;
+}
+
+bool InternalStats::HandleIndirectBlobGcIdleMicrosWithCandidates(
+    uint64_t* value, DBImpl* /*db*/, Version* /*version*/) {
+  assert(value);
+  *value = IndirectBlobGcIdleMicrosWithCandidates();
   return true;
 }
 

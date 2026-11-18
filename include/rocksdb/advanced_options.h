@@ -1273,6 +1273,18 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through the SetOptions() API
   double blob_garbage_collection_force_threshold = 1.0;
 
+  // Experimental. Used by indirect blob GC with enable_blob_indirection. GC
+  // reads the live values of an input file in offset order. Two neighbor values
+  // are read with one I/O when the bytes between them (dead values, and in a
+  // normal blob file also the next record's header and key) are at most this
+  // many; a larger gap starts a new read, so dead regions are skipped. One read
+  // is at most 1 MB. 0 reads each value on its own.
+  //
+  // Default: 4096 (one page; buffered I/O reads the whole page anyway)
+  //
+  // Dynamically changeable through the SetOptions() API
+  uint64_t indirect_blob_gc_read_coalesce_bytes = 4096;
+
   // Compaction readahead for blob files.
   //
   // Default: 0

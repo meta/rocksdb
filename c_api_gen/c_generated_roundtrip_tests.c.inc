@@ -807,6 +807,12 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_force_consistency_checks(obj) == 1);
   rocksdb_options_set_force_consistency_checks(obj, 0);
   CheckCondition(rocksdb_options_get_force_consistency_checks(obj) == 0);
+  rocksdb_options_set_indirect_blob_gc_read_coalesce_bytes(obj, 1);
+  CheckCondition(
+      rocksdb_options_get_indirect_blob_gc_read_coalesce_bytes(obj) == 1);
+  rocksdb_options_set_indirect_blob_gc_read_coalesce_bytes(obj, 0);
+  CheckCondition(
+      rocksdb_options_get_indirect_blob_gc_read_coalesce_bytes(obj) == 0);
   rocksdb_options_set_last_level_temperature(obj, 1);
   CheckCondition(rocksdb_options_get_last_level_temperature(obj) == 1);
   rocksdb_options_set_last_level_temperature(obj, 0);

@@ -82,12 +82,169 @@ class CacheReservationManager;
 // They give the size of the live set before any SST is read. LiveSet is short
 // for BlobRelocationLiveSet. Origin runs are described at
 // BlobRelocationOriginRun below.
+//
+// Indirect blob GC job
+//
+// Background: compaction-time blob GC (enable_blob_garbage_collection) moves a
+// value only when compaction rewrites the SST that references it. So a blob
+// file that is mostly garbage can stay as long as its SSTs are not compacted.
+// Indirect blob GC is a background job that is not part of any compaction. It
+// runs on the same LOW-pool workers as compaction (see "Job steps").
+//
+// One job has 1 to kIndirectBlobGCMaxInputs (8) inputs of one column family,
+// and writes at most kIndirectBlobGCMaxOutputs (8) outputs.
+//
+// Job terms (the terms above also apply):
+// - Stale job: the job found that an input or the census changed while it ran.
+//   The causes are: the census was not ready or was invalidated before the
+//   job took its census snapshot, a normal input left the Version or its
+//   metadata changed, an input became pinned by an SST without exact
+//   reference metadata (a coarse SST), the census disagrees with the SSTs,
+//   the column family was dropped, or the job's census registration ended.
+//   The coarse pin can appear during a job: a flush takes its blob file
+//   number before GC selects the input, and installs its coarse SST after.
+//   A stale job installs nothing. It returns TryAgain, and
+//   BackgroundCompaction() turns that into Busy and enqueues the column
+//   family again. Two states that the GC rules exclude are invariant checks
+//   instead (an assert in debug builds, a WARN line and a stale job in
+//   release builds): a relocation input that changed, and a live input
+//   without an output.
+//   (A coarse SST pins every indirect-origin file number at or above its
+//   frontier: GC must treat each such file number as used. See "Coarse SST"
+//   in db/blob/blob_reference_metadata.h.)
+// - Input Version: the Version that the job holds a reference to when it
+//   starts. GC reads the inputs, their routes and the SST list from it.
+// - Candidate-local failure: a failure that affects only one input, such as
+//   Corruption in the input's records or in the exact SST metadata. GC then
+//   suppresses that input and sets no DB-wide background error.
+// - Deferred input: an input that this job leaves for a later job because it
+//   does not fit. When the inputs need more than 8 outputs or the disk space
+//   check fails, the largest input waits first. When the GC memory budget is
+//   used by earlier inputs, the input that does not fit and all later inputs
+//   wait.
+// - Census entry: the SSTs that hold references with one generation number,
+//   and their totals. See db/blob/blob_reference_census.h.
+// - Census snapshot: GC's copy of the census entries of the inputs'
+//   generation numbers at the input Version (BlobReferenceCensusState). The
+//   job does not update it with the Version changes made while it runs (see
+//   "Install protocol" in DBImpl::IndirectBlobGCJob::Install()).
+// - Census heap: the per-column-family list of GC candidates that the census
+//   ranks by garbage ratio (BlobGcCandidateHeap in
+//   db/blob/blob_reference_census.h).
+// - Blob file retirement (kBlobFileRetirement): a MANIFEST record that removes
+//   a collected normal blob file (see db/blob/blob_relocation_manifest.h).
+//
+// Job steps (step 1 is in BackgroundCompaction(); steps 2-8 are in
+// DBImpl::IndirectBlobGCJob, which DBImpl::RunIndirectBlobGCBatch() runs):
+// 1. BackgroundCompaction() takes up to 8 candidates that the census publishes
+//    to the Version
+//    (VersionStorageInfo::GetBlobPhysicalFilesForIndirectBlobGC()), on a
+//    LOW-pool worker that found no LSM compaction.
+// 2. Plan. GC takes the census snapshot
+//    (BlobReferenceCensus::SnapshotSelected()) and reserves each live set from
+//    the census reference counts.
+// 3. Read. GC reads the needed SSTs one at a time. For each SST it gets a
+//    reader with TableCache::GetBlobReferenceReader() (the SST's table cache
+//    reader, or an ephemeral reader on a miss) and reads all needed generation
+//    numbers in one batch (TableReader::ReadBlobReferences()) into the live
+//    sets.
+// 4. Check. GC compares the SSTs and totals that it found with the census
+//    snapshot. On a mismatch, the census rebuilds once
+//    (BlobReferenceCensus::ReportMismatch()).
+// 5. Decide. Each input is relocated, gets only its removal (it has no live
+//    value), or is suppressed. GC relocates an input only if its exact garbage
+//    is at least 50% of its record bytes. The 50% threshold is a fixed choice,
+//    not measured.
+// 6. Pack. GC puts whole inputs into outputs, largest first
+//    (PlanBlobRelocationPacking()).
+// 7. Copy. GC copies the stored bytes of each live value into its output and
+//    checks each value with its stored CRC.
+// 8. Install. GC builds one MANIFEST edit from its census snapshot and
+//    installs it with one LogAndApply() call. When the edit is first in the
+//    MANIFEST writer queue, GC checks under the DB mutex that the job is still
+//    registered with the census, that each input is unchanged, and that no
+//    coarse SST pins an input (see "Stale job"). The edit adds the
+//    outputs and routes each live generation number of an input to the
+//    input's output. It re-points the routes into a relocation input to the
+//    output, deletes the routes that no SST uses, writes the blob file
+//    retirement of each normal input, and deletes each relocation input.
+//
+// Suppression: GC skips an input that it cannot or should not collect. It
+// suppresses the input at two levels:
+// - In the census heap (BlobReferenceCensus::SuppressWorkerCandidates()), so
+//   that later Versions do not select it again. A normal suppression lasts
+//   until the file changes (its total bytes, its live bytes, its
+//   is_indirect_origin or is_lost flag, or its coarse pin) or until the next
+//   census rebuild (see BlobGcCandidateHeap::Suppress()). A rise of the coarse
+//   frontier also brings back every suppressed relocation file above the old
+//   frontier, whatever the reason for its suppression, because the heap does
+//   not store the reason (see
+//   BlobGcCandidateHeap::SetCoarseIndirectOriginFrontier()). A transient
+//   suppression lasts until a retry delay passes. The delay starts at 1 s and
+//   doubles after each failure, up to 32 s (fixed choices, not measured): a
+//   short failure retries soon, and a lasting failure costs at most one attempt
+//   every 32 s (see BlobGcCandidateHeap::SuppressTransient()). Each census
+//   suppression carries a stamp (BlobGcCandidateStamp) taken at the input
+//   Version. The census ignores a stamp from an older census worker, or from an
+//   older revision of the file. A file gets a new revision when it changes.
+// - In the current Version
+//   (VersionStorageInfo::SuppressBlobFileForIndirectBlobGC()), so that the next
+//   pick in this Version takes other candidates. When the job ends without
+//   error and no input is left to install, GC does this at once. When the job
+//   installs, GC does this only if no other Version was installed during the
+//   job, because a newer Version can hold SST metadata that makes the input
+//   eligible. A stale or failed job does not suppress anything in the Version.
+//   When a job fails with CompactionTooLarge and the Version did not change,
+//   the deferred inputs move to the end of the Version's candidate list
+//   (VersionStorageInfo::DeferBlobFilesForIndirectBlobGC()).
+//
+// The main reasons, and the kind of census suppression for each (see
+// DBImpl::IndirectBlobGCJob for the full list):
+//
+//   Reason                                           Census suppression
+//   -----------------------------------------------  ------------------
+//   invalid input metadata                           normal
+//   table format is not block-based                  normal
+//   a coarse SST pins a generation number of the     normal
+//     input
+//   census mismatch remains after a rebuild          normal
+//   corrupt exact SST metadata                       normal
+//   exact live bytes above the input's record bytes  normal
+//   a lost relocation file that SSTs still           normal
+//     reference
+//   enable_blob_files, enable_blob_indirection or    normal
+//     enable_blob_garbage_collection is off in the
+//     latest options of the column family, and the
+//     input has live values
+//   exact garbage below 50%                          normal
+//   the output size estimate overflows               normal
+//   outputs would not be smaller than the inputs     normal, for every
+//                                                      eligible input
+//   an output file is larger than its inputs         normal, for the first
+//                                                      input of that output
+//   the input cannot be opened for relocation        normal
+//     (Corruption, MemoryLimit or NotSupported), or
+//     a source value is corrupt
+//   live set over the 64 MB GC memory budget, and    transient
+//     no earlier input holds a share
+//   census snapshot cannot be charged to the block   transient, for every
+//     cache, or the GC read and write buffers        input of the job
+//     cannot be charged
+//   not enough disk space even for one input (the    transient, for every
+//     job returns CompactionTooLarge)                input the job deferred
+//
+// 64 MB is BlobRelocationMemoryTracker::kMaxBytes. Output, I/O and MANIFEST
+// errors are not candidate-local. They use the normal background-error
+// handling.
 
 // Bounds the memory of one indirect blob GC job, so that many inputs together
 // cannot use more than kMaxBytes (64 MB, an estimate). The budget is charged to
 // the block cache. Each user (for example, the live set of one input) keeps its
 // own capacity, but updates this total reservation before it grows and when it
 // releases its memory.
+//
+// In a GC job, the live sets of all inputs and the GC buffers (I/O workspace,
+// SST readers, group reads) share one tracker (see DBImpl::IndirectBlobGCJob).
 class BlobRelocationMemoryTracker {
  public:
   explicit BlobRelocationMemoryTracker(
@@ -155,7 +312,7 @@ class BlobRelocationLiveSet : public BlobReferenceSink {
       std::vector<uint64_t> generation_numbers);
 
   // Uses a shared memory tracker, so that several live sets share one 64 MB
-  // budget.
+  // budget. A GC job uses this constructor for all its live sets.
   BlobRelocationLiveSet(
       std::shared_ptr<BlobRelocationMemoryTracker> memory_tracker,
       std::vector<uint64_t> generation_numbers);
@@ -228,8 +385,10 @@ struct BlobRelocationPackingItem {
   uint64_t input_file_number = 0;
 
   // The expected size of the input's values in an output. The planner only
-  // compares and adds these values. The caller chooses how to estimate them,
-  // for example from live_record_bytes() of the input's live set.
+  // compares and adds these values. The indirect blob GC job estimates them
+  // from the live record bytes and the live value count of the input (see
+  // EstimateIndirectBlobGCPartitionBytes() in
+  // db/db_impl/db_impl_compaction_flush.cc).
   uint64_t estimated_bytes = 0;
 
   // The origins of the input's live values, sorted and unique: the origin of
@@ -253,7 +412,8 @@ struct BlobRelocationPackingBin {
 // share an output, since an output holds one entry per (origin, original
 // offset). Returns MemoryLimit if the inputs need more than `max_outputs`
 // outputs. Here MemoryLimit means "over a resource limit", not a memory error.
-// The caller can then plan again with fewer inputs.
+// The indirect blob GC job then defers the largest input and plans again (see
+// "Deferred input" above).
 Status PlanBlobRelocationPacking(
     const std::vector<BlobRelocationPackingItem>& items,
     uint64_t target_output_bytes, size_t max_outputs,

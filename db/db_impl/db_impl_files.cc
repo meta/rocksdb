@@ -87,10 +87,6 @@ bool ShouldKeepFooterlessBlobFile(FileSystem* fs,
     return !io_s.IsPathNotFound();
   }
 
-  if (file_size < BlobLogHeader::kSize + BlobLogFooter::kSize) {
-    return true;
-  }
-
   FileOptions read_file_options = file_options;
   read_file_options.use_direct_reads = false;
 
@@ -99,39 +95,48 @@ bool ShouldKeepFooterlessBlobFile(FileSystem* fs,
   if (!io_s.ok()) {
     return !io_s.IsPathNotFound();
   }
-
-  // A blob relocation file starts with kBlobRelocationFilePrefix ("RDBRLC01")
-  // and has no blob log footer, so the footer rule below would keep it
-  // forever. A relocation file reaches this check only after no Version owns
-  // it, so the purge deletes it.
-  std::array<char, kBlobRelocationFilePrefixSize> prefix_scratch{};
-  Slice prefix_slice;
-  io_s = file->Read(0, kBlobRelocationFilePrefixSize, io_options, &prefix_slice,
-                    prefix_scratch.data(), dbg);
-  // Lets a test fail the prefix read.
-  TEST_SYNC_POINT_CALLBACK("ShouldKeepFooterlessBlobFile:PrefixRead", &io_s);
-  if (!io_s.ok()) {
-    return !io_s.IsPathNotFound();
-  }
-  if (prefix_slice ==
-      Slice(kBlobRelocationFilePrefix, kBlobRelocationFilePrefixSize)) {
-    return false;
-  }
-
-  std::array<char, BlobLogFooter::kSize> scratch{};
-  Slice footer_slice;
-  io_s = file->Read(file_size - BlobLogFooter::kSize, BlobLogFooter::kSize,
-                    io_options, &footer_slice, scratch.data(), dbg);
-  if (!io_s.ok()) {
-    return !io_s.IsPathNotFound();
-  }
-
-  if (footer_slice.size() != BlobLogFooter::kSize) {
+  if (file == nullptr) {
     return true;
   }
 
-  BlobLogFooter footer;
-  return !footer.DecodeFrom(footer_slice).ok();
+  if (file_size >= BlobLogHeader::kSize + BlobLogFooter::kSize) {
+    std::array<char, BlobLogFooter::kSize> scratch{};
+    Slice footer_slice;
+    io_s = file->Read(file_size - BlobLogFooter::kSize, BlobLogFooter::kSize,
+                      io_options, &footer_slice, scratch.data(), dbg);
+    if (!io_s.ok()) {
+      return !io_s.IsPathNotFound();
+    }
+    BlobLogFooter footer;
+    if (footer_slice.size() == BlobLogFooter::kSize &&
+        footer.DecodeFrom(footer_slice).ok()) {
+      return false;
+    }
+  }
+
+  // The file has no valid blob log footer. Only such a file gets the
+  // relocation-prefix read; a blob file with a valid footer costs no extra
+  // read.
+  if (file_size >= kBlobRelocationFilePrefixSize) {
+    std::array<char, kBlobRelocationFilePrefixSize> prefix_scratch{};
+    Slice prefix_slice;
+    io_s = file->Read(/*offset=*/0, kBlobRelocationFilePrefixSize, io_options,
+                      &prefix_slice, prefix_scratch.data(), dbg);
+    // Lets a test fail the prefix read.
+    TEST_SYNC_POINT_CALLBACK("ShouldKeepFooterlessBlobFile:PrefixRead", &io_s);
+    if (!io_s.ok()) {
+      return !io_s.IsPathNotFound();
+    }
+    if (prefix_slice ==
+        Slice(kBlobRelocationFilePrefix, kBlobRelocationFilePrefixSize)) {
+      // Relocation files are always built under a temp name and protected by
+      // pending_outputs_ across rename and publication. They are never written
+      // by blob direct write, whose in-flight files have no footer yet, so an
+      // obsolete one is safe to delete although it has no blob log footer.
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -790,7 +795,12 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
         //
         // TODO(yhchiang): carefully modify the third condition to safely
         //                 remove the temp options files.
-        keep = (sst_live_set.find(number) != sst_live_set.end()) ||
+        //
+        // Indirect blob GC writes its output as a temp file and renames it to
+        // its blob file name before the install. Like other in-progress
+        // outputs, pending_outputs_ protects its number.
+        keep = number >= state.min_pending_output ||
+               (sst_live_set.find(number) != sst_live_set.end()) ||
                (blob_live_set.find(number) != blob_live_set.end()) ||
                (number == state.pending_manifest_file_number) ||
                (to_delete.find(kOptionsFileNamePrefix) != std::string::npos);

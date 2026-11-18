@@ -1989,6 +1989,10 @@ void DBImpl::DumpStats() {
     property_info = GetPropertyInfo(*property);
     assert(property_info != nullptr);
     assert(!property_info->need_out_of_mutex);
+    // Indirect blob GC that stays idle while it has candidates for longer than
+    // one stats period is starved, for example by LSM compactions.
+    const uint64_t period_micros =
+        uint64_t{mutable_db_options_.stats_dump_period_sec} * 1000 * 1000;
     for (auto cfd : *versions_->GetColumnFamilySet()) {
       if (cfd->initialized()) {
         cfd->internal_stats()->GetStringProperty(*property_info, *property,
@@ -2012,6 +2016,17 @@ void DBImpl::DumpStats() {
                 ", failed builds in a row: " +
                 std::to_string(cfd->blob_reference_census_failures()) +
                 "); the work that needs the census waits");
+          }
+        }
+        if (period_micros != 0 && cfd->blob_reference_census() != nullptr) {
+          const uint64_t idle_micros =
+              cfd->internal_stats()->IndirectBlobGcIdleMicrosWithCandidates();
+          if (idle_micros > period_micros) {
+            blob_gc_warnings.push_back("[" + cfd->GetName() +
+                                       "] Indirect blob GC has had candidates "
+                                       "for " +
+                                       std::to_string(idle_micros / 1000000) +
+                                       " s without starting a job");
           }
         }
       }

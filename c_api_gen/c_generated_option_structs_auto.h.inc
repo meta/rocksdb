@@ -460,6 +460,14 @@ extern ROCKSDB_LIBRARY_API uint64_t
 rocksdb_options_get_blob_file_writable_file_max_buffer_size(
     rocksdb_options_t* opt);
 
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_indirect_blob_gc_read_coalesce_bytes(rocksdb_options_t* opt,
+                                                         uint64_t v);
+
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_options_get_indirect_blob_gc_read_coalesce_bytes(
+    rocksdb_options_t* opt);
+
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_enable_blob_direct_write(
     rocksdb_options_t* opt, unsigned char v);
 

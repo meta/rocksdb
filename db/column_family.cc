@@ -1309,9 +1309,24 @@ void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
 }
 
 bool ColumnFamilyData::NeedsCompaction() const {
-  return is_table_builder_supported_ &&
-         !mutable_cf_options_.disable_auto_compactions &&
-         compaction_picker_->NeedsCompaction(current_->storage_info());
+  if (!is_table_builder_supported_ ||
+      mutable_cf_options_.disable_auto_compactions) {
+    return false;
+  }
+  Version* const current = current_;
+  if (current == nullptr) {
+    return false;
+  }
+  if (compaction_picker_->NeedsCompaction(current->storage_info())) {
+    return true;
+  }
+  return mutable_cf_options_.enable_blob_files &&
+         mutable_cf_options_.enable_blob_garbage_collection &&
+         mutable_cf_options_.enable_blob_indirection &&
+         current->storage_info()->BlobPhysicalFileForIndirectBlobGC() !=
+             kInvalidBlobFileNumber &&
+         blob_reference_census() != nullptr &&
+         blob_reference_census()->IsReady(current->GetVersionNumber());
 }
 
 Compaction* ColumnFamilyData::PickCompaction(

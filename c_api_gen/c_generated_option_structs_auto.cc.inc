@@ -1440,6 +1440,16 @@ double rocksdb_options_get_blob_gc_force_threshold(rocksdb_options_t* opt) {
   return opt->rep.blob_garbage_collection_force_threshold;
 }
 
+void rocksdb_options_set_indirect_blob_gc_read_coalesce_bytes(
+    rocksdb_options_t* opt, uint64_t v) {
+  opt->rep.indirect_blob_gc_read_coalesce_bytes = v;
+}
+
+uint64_t rocksdb_options_get_indirect_blob_gc_read_coalesce_bytes(
+    rocksdb_options_t* opt) {
+  return opt->rep.indirect_blob_gc_read_coalesce_bytes;
+}
+
 void rocksdb_options_set_blob_compaction_readahead_size(rocksdb_options_t* opt,
                                                         uint64_t v) {
   opt->rep.blob_compaction_readahead_size = v;

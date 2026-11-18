@@ -3428,6 +3428,15 @@ Status DBImpl::BuildBlobReferenceCensus(ColumnFamilyData* cfd, bool* incomplete,
     }
   }
   BlobReferenceCensus& census = *cfd->blob_reference_census();
+  if (census.TakeMismatchReport()) {
+    // Indirect blob GC reported a census mismatch. Fail this build.
+    // ReportMismatch() also set RebuildRequested(), so a new build starts at
+    // once from the current Version. This status fails only the build slice. It
+    // is not a background error. Any non-OK status would do: the slice caller
+    // (BGWorkBlobReferenceCensus) normally sees RebuildRequested() and restarts
+    // at once. Corruption names the cause: the census does not match the SSTs.
+    return Status::Corruption("Blob GC found a census mismatch");
+  }
   std::shared_ptr<BlobReferenceCensusBuildContext> context =
       census.GetBuildContext();
   Status status;
@@ -3726,6 +3735,16 @@ Status DBImpl::PublishBlobReferenceCensusWorker(
   if (result == BlobReferenceCensus::PublishResult::kPublished) {
     census.NoteReady();
     census.SetPublishedTotals(candidate_totals, relocation_garbage);
+    if (candidates[0] != kInvalidBlobFileNumber) {
+      // A running GC job keeps the idle time at 0. The job's end starts it
+      // again if candidates remain.
+      if (!census.HasGcJob()) {
+        cfd->NoteIndirectBlobGcCandidates(
+            immutable_db_options_.clock->NowMicros());
+      }
+    } else {
+      cfd->ClearIndirectBlobGcCandidates();
+    }
     const uint64_t build_start_micros = census.TakeBuildStartMicros();
     if (build_start_micros != 0) {
       const uint64_t now_micros = immutable_db_options_.clock->NowMicros();

@@ -659,6 +659,13 @@ class InternalStats {
   // key of rocksdb.indirect-blob-gc-stats read it. REQUIRES: DB mutex held.
   uint64_t BlobReferenceCensusUnreadyMicros() const;
 
+  // How long this column family has had indirect blob GC candidates while no
+  // GC job began, in microseconds; 0 when it has none or a job began since.
+  // Both
+  // rocksdb.indirect-blob-gc-idle-micros-with-candidates and the
+  // idle-micros-with-candidates key of rocksdb.indirect-blob-gc-stats read it.
+  uint64_t IndirectBlobGcIdleMicrosWithCandidates() const;
+
   const uint64_t* TEST_GetCFStatsValue() const { return cf_stats_value_; }
 
   const std::vector<CompactionStats>& TEST_GetCompactionStats() const {
@@ -943,6 +950,8 @@ class InternalStats {
   bool HandleIndirectBlobGcStatsString(std::string* value, Slice suffix);
   bool HandleIndirectBlobGcStats(std::map<std::string, std::string>* values,
                                  Slice suffix);
+  bool HandleIndirectBlobGcIdleMicrosWithCandidates(uint64_t* value, DBImpl* db,
+                                                    Version* version);
   bool HandleBlobCachePinnedUsage(uint64_t* value, DBImpl* db,
                                   Version* version);
 

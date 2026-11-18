@@ -103,13 +103,14 @@ void BlobGcCandidateHeap::Activate(uint64_t file_number, Candidate* candidate) {
   }
   candidate->retry_micros = 0;
   candidate->suppressed = false;
-  // A file pinned by the lowest coarse frontier of the Version stays out of the
-  // heap. The coarse frontier of an SST is the oldest indirect-origin file
-  // number a coarse SST may reference (see "Coarse SST" in
-  // db/blob/blob_reference_metadata.h). A lost relocation file has no readable
-  // values, so indirect blob GC cannot copy from it. It stays out of the heap
-  // while references to it remain (live bytes > 0). When none remain, it enters
-  // the heap so that the empty-file cleanup can pick it (see SelectEmpty()).
+  // These files stay out of the heap:
+  // - A file pinned by the lowest coarse frontier of the Version. The coarse
+  //   frontier of an SST is the oldest indirect-origin file number a coarse SST
+  //   may reference (see "Coarse SST" in db/blob/blob_reference_metadata.h).
+  // - A lost relocation file while references to it remain (live bytes > 0).
+  //   It has no readable values, so indirect blob GC cannot copy from it. When
+  //   no references remain, it enters the heap so that the empty-file cleanup
+  //   can pick it (see SelectEmpty()).
   if (candidate->coarse_pinned ||
       (candidate->is_lost && candidate->live_bytes != 0)) {
     Remove(candidate);
@@ -240,6 +241,31 @@ void BlobGcCandidateHeap::SetCoarseIndirectOriginFrontier(uint64_t frontier) {
     }
     Activate(entry->first, &candidate);
     AccountTotals(candidate, /*add=*/true);
+  }
+  // Indirect blob GC skips (suppresses) a relocation file while a coarse SST
+  // pins one of the old file numbers routed to it. A routed file number is
+  // older than its relocation file, so a higher frontier can unpin only the
+  // routed file numbers of relocation files above old_boundary (the old
+  // frontier, or UINT64_MAX when there was none). The heap does not store why a
+  // file was suppressed, so it retries every suppressed relocation file above
+  // old_boundary. The frontier is expected to change rarely (assumed, not
+  // measured), so this loop is cheap.
+  if (new_boundary > old_boundary) {
+    for (std::map<uint64_t, Candidate>::iterator entry =
+             candidates_.upper_bound(old_boundary);
+         entry != candidates_.end(); ++entry) {
+      Candidate& candidate = entry->second;
+      if (candidate.is_indirect_origin || !candidate.suppressed) {
+        continue;
+      }
+      AccountTotals(candidate, /*add=*/false);
+      candidate.revision = next_revision_++;
+      if (next_revision_ == 0) {
+        ++next_revision_;
+      }
+      Activate(entry->first, &candidate);
+      AccountTotals(candidate, /*add=*/true);
+    }
   }
 }
 
@@ -1414,6 +1440,14 @@ BlobReferenceCensus::PublishResult BlobReferenceCensus::TryPublishWorker(
       build_cursor_.overflowed) {
     return PublishResult::kStale;
   }
+  // Indirect blob GC found that the census does not match the SSTs
+  // (ReportMismatch()), or a rebuild was requested. The census must not become
+  // ready again before the census job fails this build and rebuilds it. Without
+  // this check, the apply after an install could publish the mismatching census
+  // first.
+  if (mismatch_reported_ || rebuild_requested_) {
+    return PublishResult::kStale;
+  }
   if (HasPending(build_cursor_) || build_cursor_.outstanding_bytes != 0) {
     return PublishResult::kQueueNotEmpty;
   }
@@ -1459,6 +1493,7 @@ bool BlobReferenceCensus::TrySetBuildContext(
 Status BlobReferenceCensus::SnapshotSelected(
     uint64_t token, uint64_t version_number,
     const std::set<uint64_t>& generation_numbers,
+    const std::shared_ptr<Cache>& gc_block_cache,
     std::shared_ptr<BlobReferenceCensusState>* state) {
   if (state == nullptr) {
     return Status::InvalidArgument("Null selected census snapshot");
@@ -1480,8 +1515,8 @@ Status BlobReferenceCensus::SnapshotSelected(
       return Status::TryAgain("Selected census snapshot epoch changed");
     }
   }
-  Status status =
-      CopyWorkerSnapshot(*worker, version_number, generation_numbers, state);
+  Status status = CopyWorkerSnapshot(*worker, version_number,
+                                     generation_numbers, gc_block_cache, state);
   {
     std::lock_guard<std::mutex> log_lock(mutex_);
     snapshot_pending_ = false;
@@ -1491,6 +1526,7 @@ Status BlobReferenceCensus::SnapshotSelected(
 
 Status BlobReferenceCensus::ReadSelectedSnapshot(
     uint64_t version_number, const std::set<uint64_t>& generation_numbers,
+    const std::shared_ptr<Cache>& gc_block_cache,
     std::shared_ptr<BlobReferenceCensusState>* state) const {
   if (state == nullptr) {
     return Status::InvalidArgument("Null selected census snapshot");
@@ -1504,8 +1540,8 @@ Status BlobReferenceCensus::ReadSelectedSnapshot(
     return Status::TryAgain("Selected census snapshot epoch changed");
   }
   std::shared_ptr<BlobReferenceCensusState> copy;
-  Status status =
-      CopyWorkerSnapshot(*worker, version_number, generation_numbers, &copy);
+  Status status = CopyWorkerSnapshot(*worker, version_number,
+                                     generation_numbers, gc_block_cache, &copy);
   if (status.ok()) {
     *state = std::move(copy);
   }
@@ -1526,7 +1562,8 @@ BlobReferenceCensus::TEST_GetReadyState(uint64_t version_number) const {
   }
   std::shared_ptr<BlobReferenceCensusState> result;
   const Status status =
-      CopyWorkerSnapshot(*worker, version_number, generation_numbers, &result);
+      CopyWorkerSnapshot(*worker, version_number, generation_numbers,
+                         /*gc_block_cache=*/nullptr, &result);
   assert(status.ok());
   status.PermitUncheckedError();
   return result;
@@ -1535,6 +1572,7 @@ BlobReferenceCensus::TEST_GetReadyState(uint64_t version_number) const {
 Status BlobReferenceCensus::CopyWorkerSnapshot(
     const WorkerState& worker, uint64_t version_number,
     const std::set<uint64_t>& generation_numbers,
+    const std::shared_ptr<Cache>& gc_block_cache,
     std::shared_ptr<BlobReferenceCensusState>* state) const {
   if (!worker.finalized) {
     return Status::TryAgain("Census build has not finished");
@@ -1563,10 +1601,9 @@ Status BlobReferenceCensus::CopyWorkerSnapshot(
     bytes += found->second.holders.count() * sizeof(uint64_t);
   }
   std::shared_ptr<CacheReservationManager> reservation_manager;
-  if (worker.block_cache != nullptr) {
-    reservation_manager = std::make_shared<
-        CacheReservationManagerImpl<CacheEntryRole::kBlobReferenceCensus>>(
-        worker.block_cache);
+  if (gc_block_cache != nullptr) {
+    reservation_manager = std::make_shared<CacheReservationManagerImpl<
+        CacheEntryRole::kIndirectBlobGcWorkingMemory>>(gc_block_cache);
     const Status status = reservation_manager->UpdateCacheReservation(bytes);
     if (!status.ok()) {
       return status;
@@ -2149,6 +2186,31 @@ bool BlobReferenceCensus::RebuildRequested() const {
   return rebuild_requested_;
 }
 
+bool BlobReferenceCensus::ReportMismatch(uint64_t file_number) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (file_number != 0 && unresolved_mismatch_file_ == file_number) {
+    gc_mismatch_suppress_count_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  unresolved_mismatch_file_ = file_number;
+  worker_ready_version_.store(0, std::memory_order_release);
+  rebuild_requested_ = true;
+  mismatch_reported_ = true;
+  return false;
+}
+
+void BlobReferenceCensus::ClearMismatch(uint64_t file_number) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (unresolved_mismatch_file_ == file_number) {
+    unresolved_mismatch_file_ = 0;
+  }
+}
+
+bool BlobReferenceCensus::TakeMismatchReport() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return std::exchange(mismatch_reported_, false);
+}
+
 std::vector<std::shared_ptr<const BlobReferenceSstSummary>>
 BlobReferenceCensus::TakeRebuildSeeds() {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -2333,6 +2395,14 @@ Status BlobReferenceCensus::BeginGcJob(uint64_t version_number,
   if (token == nullptr || version_number == 0) {
     return Status::InvalidArgument("Invalid blob GC job start");
   }
+  {
+    // Return TryAgain early, without mutex_, when a metadata commit is in
+    // progress. The check is repeated under mutex_ below.
+    std::lock_guard<std::mutex> commit_lock(metadata_commit_mutex_);
+    if (metadata_commit_pending_) {
+      return Status::TryAgain("A blob metadata commit is in progress");
+    }
+  }
   std::lock_guard<std::mutex> lock(mutex_);
   if (canceled_) {
     return Status::Aborted("Blob reference census is canceled");
@@ -2369,6 +2439,11 @@ Status BlobReferenceCensus::BeginGcJob(uint64_t version_number,
 bool BlobReferenceCensus::IsGcJobActive(uint64_t token) const {
   std::lock_guard<std::mutex> lock(mutex_);
   return token != 0 && token == gc_job_token_ && !canceled_;
+}
+
+bool BlobReferenceCensus::HasGcJob() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return gc_job_token_ != 0;
 }
 
 void BlobReferenceCensus::EndGcJob(uint64_t token) {

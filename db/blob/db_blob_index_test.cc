@@ -42,6 +42,8 @@
 #include "table/table_builder.h"
 #include "test_util/mock_time_env.h"
 #include "test_util/testutil.h"
+#include "util/coding.h"
+#include "util/crc32c.h"
 #include "util/defer.h"
 #include "util/random.h"
 #include "util/string_util.h"
@@ -2938,7 +2940,8 @@ TEST(BlobReferenceCensusTest, MutableWorkerPublishesOnlyCaughtUpEpoch) {
   {
     ASSERT_OK(census.BeginGcJob(9, &gc_token));
     std::shared_ptr<BlobReferenceCensusState> selected;
-    ASSERT_OK(census.SnapshotSelected(gc_token, 9, {10, 20}, &selected));
+    ASSERT_OK(census.SnapshotSelected(gc_token, 9, {10, 20},
+                                      /*gc_block_cache=*/nullptr, &selected));
     ASSERT_EQ(selected->GetSstCount(10), 0U);
     ASSERT_EQ(selected->GetSstCount(20), 1U);
     census.EndGcJob(gc_token);
@@ -3199,6 +3202,92 @@ TEST(BlobReferenceCensusTest, AmbiguousMetadataCommitBlocksNextCommit) {
   ASSERT_TRUE(census.BeginMetadataCommit().IsColumnFamilyDropped());
 }
 
+TEST(BlobReferenceCensusTest, RepeatedMismatchIsTrackedPerFile) {
+  BlobReferenceCensus census;
+  // A first report for a file requests a rebuild.
+  ASSERT_FALSE(census.ReportMismatch(10));
+  // A report for another file is not a repeat: it requests a rebuild too.
+  ASSERT_FALSE(census.ReportMismatch(20));
+  // The same file again, with no match in between, is a repeat.
+  ASSERT_TRUE(census.ReportMismatch(20));
+  ASSERT_EQ(census.gc_mismatch_suppress_count(), 1U);
+  // A matching indirect blob GC check clears it.
+  census.ClearMismatch(20);
+  ASSERT_FALSE(census.ReportMismatch(20));
+}
+
+TEST(BlobReferenceCensusTest, ClearMismatchForgetsOnlyItsOwnFile) {
+  // Indirect blob GC calls ClearMismatch() for each checked input of a job when
+  // no input of that job mismatched. A match of another file must keep the
+  // remembered mismatch, so that a match of one file does not hide a repeat
+  // mismatch of a different file. A match of the same file forgets it, so its
+  // next mismatch requests a rebuild again.
+  BlobReferenceCensus census;
+  ASSERT_FALSE(census.ReportMismatch(20));
+  // A match of file 30 keeps the mismatch of file 20: the next mismatch of
+  // file 20 is a repeat.
+  census.ClearMismatch(30);
+  ASSERT_TRUE(census.ReportMismatch(20));
+  ASSERT_EQ(census.gc_mismatch_suppress_count(), 1U);
+  // A match of file 20 forgets it: the next mismatch of file 20 requests a
+  // rebuild and is not counted as suppressed.
+  census.ClearMismatch(20);
+  ASSERT_FALSE(census.ReportMismatch(20));
+  ASSERT_EQ(census.gc_mismatch_suppress_count(), 1U);
+}
+
+TEST(BlobReferenceCensusTest, MismatchReportBlocksPublish) {
+  // After indirect blob GC reports a mismatch, the census is not ready, and the
+  // worker of the same build cannot publish it again (for example from the
+  // apply after an install) before the census job rebuilds it.
+  BlobReferenceCensus census;
+  const uint64_t token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(token, 3, nullptr, nullptr));
+  ASSERT_OK(census.FinalizeWorkerBuild(token));
+  ASSERT_EQ(census.TryPublishWorker(token, 3, 3),
+            BlobReferenceCensus::PublishResult::kPublished);
+  ASSERT_TRUE(census.IsReady(3));
+  ASSERT_FALSE(census.ReportMismatch(10));
+  ASSERT_FALSE(census.IsReady(3));
+  ASSERT_EQ(census.TryPublishWorker(token, 3, 3),
+            BlobReferenceCensus::PublishResult::kStale);
+  ASSERT_FALSE(census.IsReady(3));
+  // The census job takes the report and fails the build. The next build can
+  // publish again.
+  ASSERT_TRUE(census.TakeMismatchReport());
+  auto garbage = census.FailBuild(token);
+  const uint64_t next_token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(next_token, 3, nullptr, nullptr));
+  ASSERT_OK(census.FinalizeWorkerBuild(next_token));
+  ASSERT_EQ(census.TryPublishWorker(next_token, 3, 3),
+            BlobReferenceCensus::PublishResult::kPublished);
+}
+
+TEST(BlobGcCandidateHeapTest, FrontierRiseRetriesSuppressedRelocationFiles) {
+  // Indirect blob GC suppressed relocation files 15, 30 and 50, for example
+  // because a coarse SST pinned a generation number routed to them. When the
+  // lowest coarse frontier of the Version rises from 20 to 40 (the coarse
+  // frontier of an SST is the oldest indirect-origin file number a coarse SST
+  // may reference), the heap retries every suppressed relocation file above the
+  // old frontier (30 and 50). File 15 stays suppressed.
+  BlobGcCandidateHeap heap;
+  heap.SetCoarseIndirectOriginFrontier(20);
+  heap.SetPhysicalFile({15, 1000, false});
+  heap.SetPhysicalFile({30, 1000, false});
+  heap.SetPhysicalFile({50, 1000, false});
+  heap.Suppress(15, /*retry_micros=*/0);
+  heap.Suppress(30, /*retry_micros=*/0);
+  heap.Suppress(50, /*retry_micros=*/0);
+  ASSERT_EQ(heap.Select()[0], 0U);
+  heap.SetCoarseIndirectOriginFrontier(40);
+  const BlobGcCandidateHeap::Selection selected = heap.Select();
+  ASSERT_NE(selected[0], 0U);
+  ASSERT_NE(selected[1], 0U);
+  ASSERT_EQ(selected[2], 0U);
+  ASSERT_NE(selected[0], 15U);
+  ASSERT_NE(selected[1], 15U);
+}
+
 TEST(BlobGcCandidateHeapTest, SuppressionIsRelevantAndRetryable) {
   BlobGcCandidateHeap heap;
   heap.SetPhysicalFile({10, 1000, false});
@@ -3306,7 +3395,7 @@ TEST(BlobReferenceCensusTest, SelectedSnapshotOwnsItsCacheReservation) {
   const size_t worker_charge = cache->GetPinnedUsage();
   ASSERT_GT(worker_charge, 0U);
   std::shared_ptr<BlobReferenceCensusState> selected;
-  ASSERT_OK(census.ReadSelectedSnapshot(7, {10}, &selected));
+  ASSERT_OK(census.ReadSelectedSnapshot(7, {10}, cache, &selected));
   ASSERT_GT(cache->GetPinnedUsage(), worker_charge);
   selected.reset();
   ASSERT_EQ(cache->GetPinnedUsage(), worker_charge);
@@ -3326,7 +3415,8 @@ TEST(BlobReferenceCensusTest, SelectedSnapshotRejectsUnchargedAllocation) {
   ASSERT_EQ(census.TryPublishWorker(token, 7, 7),
             BlobReferenceCensus::PublishResult::kPublished);
   std::shared_ptr<BlobReferenceCensusState> selected;
-  ASSERT_TRUE(census.ReadSelectedSnapshot(7, {10}, &selected).IsMemoryLimit());
+  ASSERT_TRUE(
+      census.ReadSelectedSnapshot(7, {10}, cache, &selected).IsMemoryLimit());
   ASSERT_EQ(selected, nullptr);
   ASSERT_TRUE(census.IsReady(7));
 }
@@ -3417,7 +3507,8 @@ TEST(BlobReferenceCensusTest, GcJobPausesWorkerUntilSnapshot) {
   ASSERT_EQ(census.WorkerVersionNumber(), 3U);
 
   std::shared_ptr<BlobReferenceCensusState> selected;
-  ASSERT_OK(census.SnapshotSelected(gc_token, 3, {10}, &selected));
+  ASSERT_OK(census.SnapshotSelected(gc_token, 3, {10},
+                                    /*gc_block_cache=*/nullptr, &selected));
   ASSERT_EQ(selected->GetSstCount(10), 1U);
   ASSERT_FALSE(census.IsSnapshotPending());
   ASSERT_OK(census.ApplyWorkerDelta(token, delta));

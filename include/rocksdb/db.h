@@ -1952,6 +1952,14 @@ class DB {
     //      entries being pinned in blob cache.
     static const std::string kBlobCachePinnedUsage;
 
+    // "rocksdb.indirect-blob-gc-idle-micros-with-candidates" - returns how long
+    // the column family has had indirect blob GC candidates while no GC job
+    // began, in microseconds (a duration). A large value means that GC is
+    // starved, for example by LSM compactions. 0 means no candidates, or a GC
+    // job began since the candidates appeared. The LOG warning comes from the
+    // periodic stats dump; with stats_dump_period_sec = 0, use this property.
+    static const std::string kIndirectBlobGcIdleMicrosWithCandidates;
+
     // "rocksdb.indirect-blob-gc-stats" - returns a map of the indirect blob GC
     // state of the column family. Keys: census-state (ready, building, failed,
     // or none without blob indirection), census-unready-micros (0 when ready),
@@ -1963,8 +1971,8 @@ class DB {
     // the census tracks for GC, including files below the garbage threshold),
     // garbage-bytes-collectable, garbage-bytes-suppressed, coarse-pinned-files,
     // coarse-pinned-bytes, coarse-pinned-garbage-bytes, coarse-sst-count,
-    // lowest-coarse-frontier. Every *-micros key is a duration, never a
-    // timestamp.
+    // lowest-coarse-frontier, idle-micros-with-candidates. Every *-micros key
+    // is a duration, never a timestamp.
     static const std::string kIndirectBlobGcStats;
 
     // "rocksdb.blob-reference-census-unready-micros" - returns how long the

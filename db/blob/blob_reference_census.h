@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -407,7 +408,10 @@ namespace ROCKSDB_NAMESPACE {
 // CacheEntryRole::kBlobReferenceCensus, unless that role is disabled in
 // cache_usage_options, so the memory counts against the block cache capacity.
 // The charged memory is the worker state, the build state, the summaries that
-// a build or a compaction reads, the change log entries and the GC copies.
+// a build or a compaction reads, and the change log entries. An indirect blob
+// GC copy of the selected generation numbers (BlobReferenceCensusState) belongs
+// to the GC job. It is charged to CacheEntryRole::kIndirectBlobGcWorkingMemory
+// in the GC job's block cache instead (see SnapshotSelected()).
 //
 // Errors and rebuild: a change that the census cannot apply as a delta makes
 // it unready, and a new build starts. The GC API waits until the build
@@ -511,7 +515,9 @@ class BlobGcCandidateHeap {
   // GC reports a file it could not use, and the heap takes the file out
   // (suppresses it). The suppression stays across Version changes that do not
   // touch the file. A change of the file's total bytes, live bytes, flags
-  // (is_indirect_origin, is_lost) or coarse pin ends it at once.
+  // (is_indirect_origin, is_lost) or coarse pin ends it at once. A rise of the
+  // coarse frontier ends it for every suppressed relocation file above the old
+  // frontier (see SetCoarseIndirectOriginFrontier()).
   // SuppressTransient() is for transient failures: the file comes back after a
   // retry delay (1 s, doubled per failure, at most 32 s). Suppress(file, 0) is
   // for a corrupt file: it comes back only after a change to the file or a
@@ -771,9 +777,10 @@ class BlobReferenceCensusState {
   SstFilesByGeneration generations_;
   // The generation numbers in this copy; null means every generation number.
   std::shared_ptr<const std::set<uint64_t>> selected_generations_;
-  // The block cache charge of this copy (CacheEntryRole::kBlobReferenceCensus),
-  // or null when the copy is not charged. The charge is the real size of the
-  // copy (SnapshotMemoryBound()).
+  // The block cache charge of this copy
+  // (CacheEntryRole::kIndirectBlobGcWorkingMemory, because the indirect blob GC
+  // job owns the copy), or null when the copy is not charged. The charge is the
+  // real size of the copy (SnapshotMemoryBound()).
   std::shared_ptr<CacheReservationManager> reservation_manager_;
   size_t snapshot_memory_bound_ = 0;
 };
@@ -1039,6 +1046,9 @@ class BlobReferenceCensus {
   // canceled.
   bool IsGcJobActive(uint64_t token) const;
 
+  // True while any GC job is registered (see BeginGcJob()).
+  bool HasGcJob() const;
+
   // REQUIRES: DB mutex held. Ends the GC job `token` (no-op for another
   // token). O(1), no allocation.
   void EndGcJob(uint64_t token);
@@ -1056,6 +1066,57 @@ class BlobReferenceCensus {
   // True from a rebuild install until the next BeginBuild(). A build slice that
   // fails because of that install restarts at once, without backoff.
   bool RebuildRequested() const;
+
+  // Before indirect blob GC copies a blob file, it reads the references of that
+  // file from the SSTs and checks them against the census. GC calls
+  // ReportMismatch() when the SSTs or the totals differ from the census for
+  // blob file `file_number`.
+  //
+  // Census mismatch state: ReportMismatch(), ClearMismatch() and
+  // TakeMismatchReport() share the file of the last mismatch report ("last
+  // file", unresolved_mismatch_file_, 0 means none) and two flags,
+  // mismatch_reported_ and rebuild_requested_. TryPublishWorker() returns
+  // kStale while either flag is set, so a mismatching census cannot become
+  // ready again. BeginBuild() clears rebuild_requested_. In the table, f is the
+  // file number that GC passes.
+  //
+  //   Call                  Condition          Action                 Returns
+  //   --------------------  -----------------  ---------------------  -------
+  //   ReportMismatch(f)     f == last file     count a suppression    true
+  //                         and f != 0
+  //   ReportMismatch(f)     otherwise          last file = f; census  false
+  //                                            not ready; set both
+  //                                            flags
+  //   ClearMismatch(f)      f == last file     last file = 0          -
+  //   ClearMismatch(f)      f != last file     nothing                -
+  //   TakeMismatchReport()  -                  clear                  the old
+  //                                            mismatch_reported_     flag
+  //
+  // After a first report, the next build slice rebuilds the census from the
+  // current Version. A repeat report (true in the table) means that the rebuild
+  // did not clear the mismatch. GC then suppresses that file until the file
+  // changes or until the next census rebuild (see
+  // BlobGcCandidateHeap::Suppress()). The census remembers only the last file,
+  // so reports for two files that alternate both request a rebuild each time.
+  bool ReportMismatch(uint64_t file_number);
+
+  // GC calls this for each checked input of a job when no input of that job
+  // mismatched the SSTs. When `file_number` is the file of the last mismatch
+  // report, the census forgets that report, so a later mismatch of the file
+  // requests a rebuild again. A match of another file keeps the report, so a
+  // match of one file does not hide a repeat mismatch of a different file.
+  void ClearMismatch(uint64_t file_number);
+
+  // Returns how many times GC suppressed a candidate because a census rebuild
+  // did not clear its mismatch.
+  uint64_t gc_mismatch_suppress_count() const {
+    return gc_mismatch_suppress_count_.load(std::memory_order_relaxed);
+  }
+
+  // Returns true if a ReportMismatch() requested a rebuild since the last call,
+  // and clears the flag. The census build slice calls it to fail the running
+  // build.
+  bool TakeMismatchReport();
 
   // After a change log overflow, the build restarts at once, one time only.
   // From then until a build publishes, each build has the larger limit
@@ -1227,14 +1288,17 @@ class BlobReferenceCensus {
 
   // Call without the DB mutex, after BeginGcJob() registered the job at
   // `version_number`. Copies the holders of `generation_numbers` only. The copy
-  // does not block an install.
+  // does not block an install. A non-null `gc_block_cache` is charged for the
+  // copy under CacheEntryRole::kIndirectBlobGcWorkingMemory.
   Status SnapshotSelected(uint64_t token, uint64_t version_number,
                           const std::set<uint64_t>& generation_numbers,
+                          const std::shared_ptr<Cache>& gc_block_cache,
                           std::shared_ptr<BlobReferenceCensusState>* state);
 
   // Same copy as SnapshotSelected(), without the GC job checks.
   Status ReadSelectedSnapshot(
       uint64_t version_number, const std::set<uint64_t>& generation_numbers,
+      const std::shared_ptr<Cache>& gc_block_cache,
       std::shared_ptr<BlobReferenceCensusState>* state) const;
 
   // Test only: builds a full copy of every generation number. Call without the
@@ -1262,6 +1326,7 @@ class BlobReferenceCensus {
   Status CopyWorkerSnapshot(
       const WorkerState& worker, uint64_t version_number,
       const std::set<uint64_t>& generation_numbers,
+      const std::shared_ptr<Cache>& gc_block_cache,
       std::shared_ptr<BlobReferenceCensusState>* state) const;
   static size_t SnapshotMemoryBound(const BlobReferenceCensusState& state);
 
@@ -1397,6 +1462,11 @@ class BlobReferenceCensus {
   bool canceled_ = false;
   std::vector<std::shared_ptr<const BlobReferenceSstSummary>> rebuild_seeds_;
   bool rebuild_requested_ = false;
+  bool mismatch_reported_ = false;
+  // The file of the last mismatch report. ClearMismatch() of this file resets
+  // it to 0 (none).
+  uint64_t unresolved_mismatch_file_ = 0;
+  std::atomic<uint64_t> gc_mismatch_suppress_count_{0};
   // An overflow restart ran and no build has published since. While it is set,
   // BeginBuild() gives the build cursor the restart limit
   // (kMaxRestartLogMemory).
