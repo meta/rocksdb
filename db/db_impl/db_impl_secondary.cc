@@ -27,6 +27,7 @@
 #include "rocksdb/table.h"
 #include "util/atomic.h"
 #include "util/cast_util.h"
+#include "util/defer.h"
 #include "util/string_util.h"
 #include "util/write_batch_util.h"
 
@@ -1260,6 +1261,15 @@ Status DBImplSecondary::OpenAsSecondaryImpl(
   }
 
   DBOptions tmp_opts(db_options);
+  Status unresolved_catalog;
+  // Early returns do not reach CheckUnresolvedRepairCatalog() below.
+  Defer permit_unresolved_catalog(
+      [&unresolved_catalog]() { unresolved_catalog.PermitUncheckedError(); });
+  Status catalog_status = CheckRepairCatalogForOpen(tmp_opts.env, dbname, true,
+                                                    &unresolved_catalog);
+  if (!catalog_status.ok()) {
+    return catalog_status;
+  }
   Status s;
   if (nullptr == tmp_opts.info_log) {
     s = CreateLoggerFromOptions(secondary_path, tmp_opts, &tmp_opts.info_log);
@@ -1316,6 +1326,9 @@ Status DBImplSecondary::OpenAsSecondaryImpl(
   impl->mutex_.Lock();
   JobContext job_context(0);
   s = impl->Recover(column_families, true, false, false);
+  if (s.ok()) {
+    s = impl->CheckUnresolvedRepairCatalog(unresolved_catalog);
+  }
   // WAL recovery is optional: DB::OpenAsSecondary() needs it to replay
   // memtable data, while DB::OpenAndCompact() skips it since remote
   // compaction only needs LSM state from MANIFEST.

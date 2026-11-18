@@ -118,6 +118,13 @@ struct TableReaderOptions {
   // Metadata reads should avoid shared block and persistent caches.
   bool avoid_shared_metadata_cache;
 
+  // RepairDB reads files that may be damaged, and must not share any cache
+  // entry with a running DB. When set, the reader uses no block cache, no
+  // persistent cache and no table reader cache reservation. Other readers leave
+  // it unset. Ephemeral readers, for example those of compaction, set only
+  // avoid_shared_metadata_cache and keep their data caches.
+  bool isolate_repair_caches = false;
+
   // Column family that owns this table. Empty outside DB-owned table opens.
   std::string column_family_name;
 

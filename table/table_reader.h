@@ -28,6 +28,8 @@ namespace ROCKSDB_NAMESPACE {
 
 struct BlobReference;
 struct BlobReferenceGroup;
+class BlobReferenceIterator;
+class CacheReservationManager;
 
 // Receives the references of requested groups in a form the caller chooses, for
 // example a compact copy (see BlobReferenceGroupRead::sink).
@@ -306,6 +308,20 @@ class TableReader {
     (void)expected_descriptor;
     return Status::NotSupported(
         "Exact blob reference metadata is not supported");
+  }
+
+  // Creates a cursor over the exact blob references of this SST (see
+  // BlobReferenceIterator). The Slice argument is the SST's expected
+  // descriptor, FileMetaData::blob_reference_descriptor. If the
+  // CacheReservationManager is not null, the cursor charges its memory there;
+  // if it is null, the memory is not charged. A table format that does not
+  // support exact reference metadata returns NotSupported (this default).
+  virtual Status NewBlobReferenceIterator(
+      const ReadOptions&, const Slice&,
+      std::shared_ptr<CacheReservationManager>,
+      std::unique_ptr<BlobReferenceIterator>*) const {
+    return Status::NotSupported(
+        "Exact blob reference iteration is not supported");
   }
 
   // Prepare work that can be done before the real Get()

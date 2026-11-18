@@ -31,6 +31,7 @@
 #include "rocksdb/file_system.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
+#include "table/block_based/block_based_table_factory.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/embedded_blob_sst.h"
 #include "table/format.h"
@@ -88,6 +89,34 @@ Status BlobFileReader::Create(
     HistogramImpl* blob_file_read_hist, uint64_t blob_file_number,
     const std::shared_ptr<IOTracer>& io_tracer, bool skip_footer_validation,
     std::unique_ptr<BlobFileReader>* blob_file_reader) {
+  const auto& cf_paths = immutable_options.cf_paths;
+  assert(!cf_paths.empty());
+  return CreateFileImpl(immutable_options, read_options, file_options,
+                        column_family_id, blob_file_read_hist, blob_file_number,
+                        BlobFileName(cf_paths.front().path, blob_file_number),
+                        io_tracer, skip_footer_validation, blob_file_reader);
+}
+
+Status BlobFileReader::CreateFromPathForRepair(
+    const ImmutableOptions& immutable_options, const ReadOptions& read_options,
+    const FileOptions& file_options, uint32_t column_family_id,
+    HistogramImpl* blob_file_read_hist, uint64_t blob_file_number,
+    const std::string& blob_file_path,
+    const std::shared_ptr<IOTracer>& io_tracer,
+    std::unique_ptr<BlobFileReader>* blob_file_reader) {
+  return CreateFileImpl(immutable_options, read_options, file_options,
+                        column_family_id, blob_file_read_hist, blob_file_number,
+                        blob_file_path, io_tracer,
+                        /*skip_footer_validation=*/false, blob_file_reader);
+}
+
+Status BlobFileReader::CreateFileImpl(
+    const ImmutableOptions& immutable_options, const ReadOptions& read_options,
+    const FileOptions& file_options, uint32_t column_family_id,
+    HistogramImpl* blob_file_read_hist, uint64_t blob_file_number,
+    const std::string& blob_file_path,
+    const std::shared_ptr<IOTracer>& io_tracer, bool skip_footer_validation,
+    std::unique_ptr<BlobFileReader>* blob_file_reader) {
   assert(blob_file_reader);
   assert(!*blob_file_reader);
 
@@ -97,7 +126,7 @@ Status BlobFileReader::Create(
   {
     const Status s =
         OpenFile(immutable_options, file_options, blob_file_read_hist,
-                 blob_file_number, io_tracer, &file_size, &file_reader,
+                 blob_file_path, io_tracer, &file_size, &file_reader,
                  /*skip_footer_size_check=*/skip_footer_validation,
                  /*is_relocation_file=*/false);
     if (!s.ok()) {
@@ -148,18 +177,12 @@ Status BlobFileReader::Create(
 
 Status BlobFileReader::OpenFile(
     const ImmutableOptions& immutable_options, const FileOptions& file_opts,
-    HistogramImpl* blob_file_read_hist, uint64_t blob_file_number,
+    HistogramImpl* blob_file_read_hist, const std::string& blob_file_path,
     const std::shared_ptr<IOTracer>& io_tracer, uint64_t* file_size,
     std::unique_ptr<RandomAccessFileReader>* file_reader,
     bool skip_footer_size_check, bool is_relocation_file) {
   assert(file_size);
   assert(file_reader);
-
-  const auto& cf_paths = immutable_options.cf_paths;
-  assert(!cf_paths.empty());
-
-  const std::string blob_file_path =
-      BlobFileName(cf_paths.front().path, blob_file_number);
 
   FileSystem* const fs = immutable_options.fs.get();
   assert(fs);
@@ -401,6 +424,7 @@ BlobFileReader::BlobFileReader(
       statistics_(statistics),
       has_footer_(has_footer) {
   assert(file_reader_);
+  TEST_SYNC_POINT("BlobFileReader::BlobFileReader:Opened");
 }
 
 BlobFileReader::BlobFileReader(
@@ -410,9 +434,13 @@ BlobFileReader::BlobFileReader(
       clock_(nullptr),
       statistics_(nullptr),
       has_footer_(true),
-      relocation_(std::move(relocation)) {}
+      relocation_(std::move(relocation)) {
+  TEST_SYNC_POINT("BlobFileReader::BlobFileReader:Opened");
+}
 
-BlobFileReader::~BlobFileReader() = default;
+BlobFileReader::~BlobFileReader() {
+  TEST_SYNC_POINT("BlobFileReader::~BlobFileReader:Closed");
+}
 
 Status BlobFileReader::GetBlob(
     const ReadOptions& read_options, const Slice& user_key, uint64_t offset,
@@ -1185,18 +1213,66 @@ Status BlobRelocationFileReader::Open(
     const std::shared_ptr<IOTracer>& io_tracer,
     BlockCacheTracer* block_cache_tracer,
     std::unique_ptr<BlobRelocationFileReader>* reader) {
+  const auto& cf_paths = immutable_options.cf_paths;
+  assert(!cf_paths.empty());
+  return OpenImpl(
+      immutable_options, read_options, file_options, blob_file_read_hist,
+      column_family_id, file,
+      BlobFileName(cf_paths.front().path, file.open_info.file_number),
+      db_session_id, factory, compression_manager,
+      block_protection_bytes_per_key, pin_location_blocks, io_tracer,
+      block_cache_tracer, /*repair_discovery=*/false, reader,
+      /*repair_directory=*/nullptr);
+}
+
+Status BlobRelocationFileReader::OpenForRepair(
+    const ImmutableOptions& immutable_options, const ReadOptions& read_options,
+    const FileOptions& file_options, HistogramImpl* blob_file_read_hist,
+    uint64_t blob_file_number, uint64_t expected_file_size,
+    const std::string& blob_file_path, const std::string& repair_session_id,
+    const BlockBasedTableOptions& source_table_options,
+    CompressionManager* compression_manager,
+    uint8_t block_protection_bytes_per_key,
+    const std::shared_ptr<IOTracer>& io_tracer,
+    std::unique_ptr<BlobRelocationFileReader>* reader,
+    BlobRelocationDirectory* directory) {
+  const BlockBasedTableFactory factory(
+      MakeBlobRelocationTableOptions(source_table_options));
+  return OpenImpl(
+      immutable_options, read_options, file_options, blob_file_read_hist,
+      /*column_family_id=*/0,
+      BlobPhysicalFile{BlobFileOpenInfo{blob_file_number, Slice(), Slice()},
+                       expected_file_size, /*is_relocation=*/true},
+      blob_file_path, repair_session_id, factory, compression_manager,
+      block_protection_bytes_per_key, /*pin_location_blocks=*/false, io_tracer,
+      /*block_cache_tracer=*/nullptr, /*repair_discovery=*/true, reader,
+      directory);
+}
+
+Status BlobRelocationFileReader::OpenImpl(
+    const ImmutableOptions& immutable_options, const ReadOptions& read_options,
+    const FileOptions& file_options, HistogramImpl* blob_file_read_hist,
+    uint32_t column_family_id, const BlobPhysicalFile& file,
+    const std::string& blob_file_path, const std::string& db_session_id,
+    const TableFactory& factory, CompressionManager* compression_manager,
+    uint8_t block_protection_bytes_per_key, bool pin_location_blocks,
+    const std::shared_ptr<IOTracer>& io_tracer,
+    BlockCacheTracer* block_cache_tracer, bool repair_discovery,
+    std::unique_ptr<BlobRelocationFileReader>* reader,
+    BlobRelocationDirectory* repair_directory) {
   assert(reader != nullptr);
   if (!file.is_relocation || file.open_info.file_number == 0 ||
-      file.file_size == 0 || db_session_id.empty() || file.tail_size == 0 ||
-      file.tail_size > file.file_size) {
+      file.file_size == 0 || db_session_id.empty() ||
+      file.tail_size > file.file_size ||
+      (!repair_discovery && file.tail_size == 0)) {
     return Status::InvalidArgument("Invalid blob relocation file metadata");
   }
 
   uint64_t file_size = 0;
   std::unique_ptr<RandomAccessFileReader> file_reader;
   Status status = BlobFileReader::OpenFile(
-      immutable_options, file_options, blob_file_read_hist,
-      file.open_info.file_number, io_tracer, &file_size, &file_reader,
+      immutable_options, file_options, blob_file_read_hist, blob_file_path,
+      io_tracer, &file_size, &file_reader,
       /*skip_footer_size_check=*/false, /*is_relocation_file=*/true);
   if (!status.ok()) {
     return status;
@@ -1219,10 +1295,12 @@ Status BlobRelocationFileReader::Open(
   table_reader_options.cur_file_num = file.open_info.file_number;
   table_reader_options.cur_db_session_id = db_session_id;
   table_reader_options.tail_size = file.tail_size;
-  status = factory.NewTableReader(read_options, table_reader_options,
-                                  std::move(file_reader), file_size,
-                                  &relocation->table_reader_,
-                                  /*prefetch_index_and_filter_in_cache=*/true);
+  table_reader_options.avoid_shared_metadata_cache = repair_discovery;
+  table_reader_options.isolate_repair_caches = repair_discovery;
+  status = factory.NewTableReader(
+      read_options, table_reader_options, std::move(file_reader), file_size,
+      &relocation->table_reader_,
+      /*prefetch_index_and_filter_in_cache=*/!repair_discovery);
   if (!status.ok()) {
     return status;
   }
@@ -1234,10 +1312,11 @@ Status BlobRelocationFileReader::Open(
   }
   relocation->tail_size_ =
       FileMetaData::CalculateTailSize(file_size, *properties);
-  if (relocation->tail_size_ != file.tail_size) {
+  if (relocation->tail_size_ == 0 || relocation->tail_size_ > file_size ||
+      (!repair_discovery && relocation->tail_size_ != file.tail_size)) {
     return Status::Corruption("Blob relocation metadata tail size mismatch");
   }
-  if (properties->column_family_id != column_family_id) {
+  if (!repair_discovery && properties->column_family_id != column_family_id) {
     return Status::Corruption("Blob relocation column family mismatch");
   }
   if (properties->orig_file_number != file.open_info.file_number ||
@@ -1275,16 +1354,21 @@ Status BlobRelocationFileReader::Open(
     return Status::Corruption(
         "Blob relocation directory names a file that is not older");
   }
-  if (directory.encoded_size() > file.tail_size ||
-      file_size - file.tail_size < kBlobRelocationFilePrefixSize ||
+  // This check uses the tail size computed from the file. For a normal open it
+  // equals the MANIFEST tail size (checked above). RepairDB has no MANIFEST
+  // tail size, so the file is the only source.
+  const uint64_t tail_size = relocation->tail_size_;
+  if (directory.encoded_size() > tail_size ||
+      file_size - tail_size < kBlobRelocationFilePrefixSize ||
       directory.total_record_bytes() >
-          file_size - file.tail_size - kBlobRelocationFilePrefixSize) {
+          file_size - tail_size - kBlobRelocationFilePrefixSize) {
     return Status::Corruption("Blob relocation directory exceeds its region");
   }
   relocation->total_entries_ = directory.total_entries();
   relocation->total_record_bytes_ = directory.total_record_bytes();
   relocation->directory_digest_ = directory.directory_digest();
-  if (relocation->directory_digest_ != file.directory_digest) {
+  if (!repair_discovery &&
+      relocation->directory_digest_ != file.directory_digest) {
     return Status::Corruption("Blob relocation directory digest mismatch");
   }
   EmbeddedBlobStats stats;
@@ -1315,10 +1399,19 @@ Status BlobRelocationFileReader::Open(
       stats.payload_bytes + trailer_bytes != relocation->total_record_bytes_) {
     return Status::Corruption("Blob relocation file entry totals mismatch");
   }
+  if (properties->column_family_id > std::numeric_limits<uint32_t>::max()) {
+    return Status::Corruption("Blob relocation column family is invalid");
+  }
+  relocation->column_family_id_ =
+      static_cast<uint32_t>(properties->column_family_id);
 
   // The encoded directory in the table properties is not needed after open.
   relocation->table()->DropUserCollectedProperty(
       kBlobRelocationDirectoryPropertyName);
+  if (repair_directory != nullptr) {
+    assert(repair_discovery);
+    *repair_directory = std::move(directory);
+  }
 
   if (pin_location_blocks) {
     TEST_SYNC_POINT("BlobRelocationFileReader::Open:PinLocationBlocks");

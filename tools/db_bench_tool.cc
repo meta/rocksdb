@@ -1239,6 +1239,29 @@ DEFINE_bool(
     "[Integrated BlobDB] Enable writing large values to separate blob files.");
 
 DEFINE_bool(
+    enable_blob_indirection,
+    ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions().enable_blob_indirection,
+    "[Integrated BlobDB] Write new blob values with a stable identity, so "
+    "indirect blob GC can move them without rewriting SSTs. Most compaction "
+    "outputs keep exact blob reference metadata; flush outputs and some L0 "
+    "compaction outputs keep a coarse classification (see "
+    "enable_blob_indirection in include/rocksdb/advanced_options.h).");
+
+DEFINE_uint64(blob_indirection_max_references_per_sst,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .blob_indirection_max_references_per_sst,
+              "[Integrated BlobDB] With enable_blob_indirection, the most "
+              "blob references one compaction output SST takes before a new "
+              "output starts at the next user key.");
+
+DEFINE_uint64(indirect_blob_gc_read_coalesce_bytes,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .indirect_blob_gc_read_coalesce_bytes,
+              "[Integrated BlobDB] Largest dead gap between two live values "
+              "that indirect blob GC merges into one read; 0 reads each "
+              "value on its own.");
+
+DEFINE_bool(
     enable_blob_direct_write,
     ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions().enable_blob_direct_write,
     "[Integrated BlobDB] Enable direct-write blob file creation on "
@@ -6538,6 +6561,11 @@ class Benchmark {
 
     // Integrated BlobDB
     options.enable_blob_files = FLAGS_enable_blob_files;
+    options.enable_blob_indirection = FLAGS_enable_blob_indirection;
+    options.blob_indirection_max_references_per_sst =
+        FLAGS_blob_indirection_max_references_per_sst;
+    options.indirect_blob_gc_read_coalesce_bytes =
+        FLAGS_indirect_blob_gc_read_coalesce_bytes;
     options.enable_blob_direct_write = FLAGS_enable_blob_direct_write;
     options.blob_direct_write_partitions =
         static_cast<uint32_t>(FLAGS_blob_direct_write_partitions);

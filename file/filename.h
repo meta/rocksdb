@@ -12,6 +12,7 @@
 #pragma once
 #include <stdint.h>
 
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 class Env;
+struct ColumnFamilyDescriptor;
 class Directory;
 class SystemClock;
 class WritableFileWriter;
@@ -94,6 +96,202 @@ extern const std::string kCurrentFileName;  // = "CURRENT"
 // of the current manifest file.  The result will be prefixed with
 // "dbname".
 std::string CurrentFileName(const std::string& dbname);
+
+// Path of the repair catalog (REPAIR-IN-PROGRESS) that feature RepairDB
+// writes (see RepairCatalogRecordType). An open reads and resolves the catalog
+// before it looks for CURRENT or a MANIFEST (see CheckRepairCatalogForOpen()).
+// So while the catalog exists, an unfinished repair does not look like a new
+// DB, and best-efforts recovery does not pick a MANIFEST that the repair has
+// not published. RepairDB deletes the catalog when it finishes. If a catalog is
+// left behind, a later RepairDB run or a read-write open resolves and deletes
+// it. DestroyDB() also deletes it. Read-only and secondary opens only check it.
+std::string RepairInProgressFileName(const std::string& dbname);
+// True for a file name RepairDB uses while it runs (its staged MANIFEST and
+// reference scratch files): REPAIR-<number>-...dbtmp. Such a file is not
+// needed once no repair catalog exists.
+bool IsRepairStagingFileName(const std::string& file_name);
+
+// The repair catalog (REPAIR-IN-PROGRESS) is a private log that feature
+// RepairDB writes, so that a crash or a retry can tell which files belong to
+// the attempt. Each record is one checksummed log record with an ordinal. The
+// ordinals are 1, 2, 3 and so on, with no gap. Record types:
+// - kHeader: the owner session ID, and the original CURRENT content or the
+//   fact that CURRENT was absent.
+// - kInput: an original file. kIntent: an output file the attempt may create.
+// - kSeal: the final size and CRC32C checksum of an output file.
+// - kArchive: an input file that the attempt moves to the lost/ directory.
+// - kCoverage: the WAL number below which every WAL is converted, and the
+//   last sequence so far (see the table at RepairCatalogRecord).
+// - kCandidate: the sealed new MANIFEST that CURRENT will name.
+// - kPolicy: per CF, its name, comparator, timestamp size and original
+//   floor.
+// - kSyncMarker: written before each catalog sync (see below).
+enum class RepairCatalogRecordType : uint32_t {
+  kHeader,
+  kInput,
+  kIntent,
+  kSeal,
+  kArchive,
+  kCoverage,
+  kCandidate,
+  kPolicy,
+  // Written just before each catalog sync: every record before it is
+  // durable. Damage after the last marker is a torn unsynced tail.
+  kSyncMarker
+};
+
+// One catalog record. All record types share these fields, and each type uses
+// them as the table below shows. A field that a type does not list is 0 or
+// empty.
+//
+//   type         field          meaning
+//   -----------  -------------  ----------------------------------------------
+//   kHeader      path           content of the original CURRENT, or empty
+//                identity       session ID of the repair attempt (the owner)
+//                number         next file number when the attempt started
+//                column_family  kOriginalCurrentAbsent (1) if the original
+//                               CURRENT was absent, else 0
+//                source_wal     kHeaderTwoWriteQueues (bit 0),
+//                               kHeaderUnorderedWrite (bit 1),
+//                               kHeaderCreateUnknownCfs (bit 2)
+//   kInput       path           the original file
+//                number         file number parsed from the file name
+//                size           file size when repair recorded the input
+//                source_wal     the WAL number, for a WAL input only
+//                identity       kOriginalManifest for the MANIFEST that the
+//                               original CURRENT names (checksum is set), or
+//                               kOriginalManifestAbsent if that MANIFEST is
+//                               missing
+//   kIntent      path           an output that the attempt may create
+//                number         file number of the output
+//                column_family  CF ID of an SST or blob file, else 0
+//                source_wal     the WAL that an SST is converted from, else 0
+//   kSeal        (intent fields) plus:
+//                size           final size of the output
+//                checksum       CRC32C checksum of the output
+//                identity       kUnusedOutput when the new MANIFEST does not
+//                               use the output (the seal is written again)
+//   kArchive     path           an input to move to the lost/ directory
+//                identity       session ID of the attempt
+//                size           size of the input
+//                checksum       CRC32C checksum of the input
+//   kCoverage    number         certified floor: every WAL below it is
+//                               converted
+//                size           last sequence so far: the original
+//                               MANIFEST's last sequence, raised by each
+//                               converted WAL
+//   kCandidate   (seal fields of the new MANIFEST) plus:
+//                source_wal     the certified floor
+//   kPolicy      column_family  CF ID
+//                path           CF name
+//                identity       comparator name
+//                number         timestamp size of the comparator
+//                source_wal     the original floor (see "WAL coverage" in
+//                               db/repair.cc)
+//   kSyncMarker  (no fields)
+struct RepairCatalogRecord {
+  // Values of `identity` that have a fixed meaning (see the table above).
+  static constexpr char kOriginalManifest[] = "original-manifest";
+  static constexpr char kOriginalManifestAbsent[] = "original-manifest-absent";
+  static constexpr char kUnusedOutput[] = "unused";
+  // Value of `column_family` in a kHeader record when the original CURRENT was
+  // absent. It is 0 when CURRENT was present.
+  static constexpr uint32_t kOriginalCurrentAbsent = 1;
+  // Bits of `source_wal` in a kHeader record. They record the options that the
+  // repair attempt ran with.
+  static constexpr uint64_t kHeaderTwoWriteQueues = uint64_t{1} << 0;
+  static constexpr uint64_t kHeaderUnorderedWrite = uint64_t{1} << 1;
+  static constexpr uint64_t kHeaderCreateUnknownCfs = uint64_t{1} << 2;
+
+  RepairCatalogRecordType type = RepairCatalogRecordType::kHeader;
+  uint64_t ordinal = 0;
+  std::string path;
+  std::string identity;
+  uint64_t number = 0;
+  uint64_t size = 0;
+  uint32_t checksum = 0;
+  uint32_t column_family = 0;
+  uint64_t source_wal = 0;
+  void EncodeTo(std::string* output) const;
+};
+
+// The records of one catalog after ReadRepairCatalog(). Inputs, outputs (the
+// latest intent or seal of each output) and archives are keyed by path, and
+// policies by CF ID.
+struct RepairCatalog {
+  RepairCatalogRecord header;
+  std::map<std::string, RepairCatalogRecord> inputs;
+  std::map<std::string, RepairCatalogRecord> outputs;
+  std::map<std::string, RepairCatalogRecord> archives;
+  std::map<uint32_t, RepairCatalogRecord> policies;
+  RepairCatalogRecord candidate;
+  uint64_t coverage_floor = 0;
+  uint64_t coverage_max_sequence = 0;
+  uint64_t last_ordinal = 0;
+};
+
+// Reads REPAIR-IN-PROGRESS into `catalog`. An absent file is OK, and
+// `*recognized` is false. `*recognized` is true when the first 128 bytes of the
+// file contain the catalog magic prefix ("rocksdb.blob-gc.repair."). Then any
+// error is about a real catalog, and callers must not ignore it. An existing
+// file without the magic prefix returns Corruption with `*recognized` false.
+// An I/O error before the magic check is returned as is, with `*recognized`
+// false.
+Status ReadRepairCatalog(Env* env, const std::string& dbname,
+                         RepairCatalog* catalog, bool* recognized);
+
+// Sets `*checksum` to the CRC32C of the first `prefix_size` bytes of `path`.
+// A seal stores the size it saw, so a later check reads only those bytes.
+Status GetRepairFileChecksum(Env* env, const std::string& path,
+                             uint64_t prefix_size, uint32_t* checksum);
+// Decides whether the repair attempt in `catalog` committed (CURRENT names
+// its candidate MANIFEST) and finishes or rolls back its files. If CURRENT
+// names neither the original nor the candidate MANIFEST, it returns
+// Corruption and keeps both.
+// - RepairDB retry (`repair_retry`, under the DB LOCK): rolls back an
+//   uncommitted attempt, or finishes the cleanup of a committed one.
+// - Read-write open: finishes the cleanup of a committed attempt before it
+//   allocates file numbers, replays or purges files. An uncommitted attempt
+//   fails the open with "retry RepairDB".
+// - Read-only and secondary opens (`read_only`): check the seals of a
+//   committed attempt and never delete or move files. An uncommitted attempt
+//   also fails them.
+// `seals_verified` is true only for the RepairDB call that sealed every
+// output and archive itself, under the same DB LOCK. It skips the seal check
+// of the kept outputs, the candidate and the archives. It still checks the
+// seal of an unused output before it deletes it, and it reads the candidate
+// MANIFEST to check the log floors and the last sequence.
+Status ResolveRepairCatalog(Env* env, const std::string& dbname,
+                            const RepairCatalog& catalog, bool read_only,
+                            bool repair_retry, bool* committed,
+                            bool seals_verified);
+// Reads and resolves the repair catalog for an open. An absent catalog is OK.
+// A recognized catalog is resolved now: if it is damaged, not committed or
+// ambiguous, the open fails with that error. A file that cannot be opened,
+// whose first bytes cannot be read, or that is not a recognized catalog is not
+// an error by itself: it is returned in *unresolved_catalog. The caller fails
+// the open with it only if the replayed MANIFEST shows blob indirection state,
+// or, when there is nothing to replay, if HasBlobIndirectionFileEvidence()
+// finds any.
+Status CheckRepairCatalogForOpen(Env* env, const std::string& dbname,
+                                 bool read_only, Status* unresolved_catalog);
+
+// Persisted blob indirection evidence. Configuration is never evidence. Open
+// and RepairDB use the same rules.
+class VersionEdit;
+struct FileMetaData;
+bool IsBlobIndirectionManifestEvidence(const VersionEdit& edit);
+// `prefix` is the first BlobLogHeader::kSize bytes of a blob file.
+bool IsBlobIndirectionBlobFileEvidence(const Slice& prefix);
+// `meta` holds the decoded descriptor and classification table properties.
+bool IsBlobIndirectionTableEvidence(const FileMetaData& meta);
+
+// Scans every MANIFEST in `dbname` and the metadata of every SST and blob file
+// in the DB and CF paths for blob indirection evidence. Used only when there
+// is no MANIFEST to replay. Unreadable files are skipped.
+bool HasBlobIndirectionFileEvidence(
+    Env* env, const std::string& dbname, const std::vector<DbPath>& db_paths,
+    const std::vector<ColumnFamilyDescriptor>& cfs);
 
 // Return the name of the lock file for the db named by
 // "dbname".  The result will be prefixed with "dbname".

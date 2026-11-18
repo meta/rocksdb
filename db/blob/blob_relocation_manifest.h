@@ -170,7 +170,8 @@
 //   treat its values as deleted. An open with best_efforts_blob_db_repair
 //   marks a missing or corrupt relocation file lost; tests can also create a
 //   loss. WriteCurrentStateToManifest() writes the record again for each file
-//   that is marked lost. See "Lost relocation files" below.
+//   that is marked lost. RepairDB writes it again only for a lost file that a
+//   kept SST still references. See "Lost relocation files" below.
 // - The DB-global fence stays set even after the last fenced column family is
 //   dropped.
 //

@@ -3134,6 +3134,18 @@ Status DestroyDB(const std::string& name, const Options& options,
 // specified in column_families.
 //
 // @param column_families Descriptors for known column families
+//
+// Blob indirection (enable_blob_indirection): if the DB has persisted blob
+// indirection data, RepairDB rebuilds the blob state and writes a repair
+// catalog (REPAIR-IN-PROGRESS). CURRENT changes only after the new MANIFEST and
+// the recovered WAL data are durable. If RepairDB fails or crashes, run it
+// again: the retry rolls back or finishes the earlier attempt. If RepairDB
+// cannot tell which MANIFEST is valid, it keeps both and returns Corruption.
+// RepairDB can return an error from cleanup after the new MANIFEST is already
+// in use. RepairDB repairs a DB without persisted blob indirection data with
+// the legacy steps, and writes no repair catalog. RepairDB does not recover to
+// a consistent point in time. It also does not make the DB safe to open with an
+// older RocksDB release.
 Status RepairDB(const std::string& dbname, const DBOptions& db_options,
                 const std::vector<ColumnFamilyDescriptor>& column_families);
 

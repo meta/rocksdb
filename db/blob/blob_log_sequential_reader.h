@@ -6,6 +6,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "db/blob/blob_log_format.h"
 #include "rocksdb/slice.h"
@@ -58,6 +59,33 @@ class BlobLogSequentialReader {
   Status ReadRecord(BlobLogRecord* record, ReadLevel level = kReadHeader,
                     uint64_t* blob_offset = nullptr);
 
+  // Reads one record. The record's key and value must end at or before file
+  // offset read_limit, or the read returns Corruption. It checks the record
+  // sizes against read_limit before it allocates buffers.
+  Status ReadRecord(BlobLogRecord* record, ReadLevel level,
+                    uint64_t* blob_offset, uint64_t read_limit);
+
+  // ReadRecord() in two steps: ReadRecordHeader() reads and checks the record
+  // header, and ReadRecordPayload() reads or skips the key and value. So repair
+  // can skip the payloads it does not need without allocating them.
+  Status ReadRecordHeader(BlobLogRecord* record, uint64_t* blob_offset,
+                          uint64_t read_limit);
+  Status ReadRecordPayload(BlobLogRecord* record, ReadLevel level);
+
+  // Read the key and value through a fixed-size buffer and check the record
+  // checksum. ReadAndVerifyRecordPayload(record, expected_key) also checks that
+  // the key equals `expected_key`. ReadAndVerifyRecordPayloadAndGetKey() also
+  // returns the key in `*key`.
+  Status ReadAndVerifyRecordPayload(const BlobLogRecord& record);
+  Status ReadAndVerifyRecordPayload(const BlobLogRecord& record,
+                                    const Slice& expected_key);
+  Status ReadAndVerifyRecordPayloadAndGetKey(const BlobLogRecord& record,
+                                             std::string* key);
+  // Same as above, and also returns the crc32c of the value bytes alone in
+  // `*value_checksum`. `key` may be null.
+  Status ReadAndVerifyRecordPayloadAndGetValueChecksum(
+      const BlobLogRecord& record, std::string* key, uint32_t* value_checksum);
+
   Status ReadFooter(BlobLogFooter* footer);
 
   void ResetNextByte() { next_byte_ = 0; }
@@ -66,6 +94,10 @@ class BlobLogSequentialReader {
 
  private:
   Status ReadSlice(uint64_t size, Slice* slice, char* buf);
+  Status ReadAndVerifyRecordPayloadImpl(const BlobLogRecord& record,
+                                        const Slice* expected_key,
+                                        std::string* copied_key,
+                                        uint32_t* value_checksum = nullptr);
 
   const std::unique_ptr<RandomAccessFileReader> file_;
   SystemClock* clock_;

@@ -118,6 +118,17 @@ class BlobFileReader {
       uint64_t blob_file_number, const std::shared_ptr<IOTracer>& io_tracer,
       bool skip_footer_validation, std::unique_ptr<BlobFileReader>* reader);
 
+  // Opens the blob file at `blob_file_path`, found by offline RepairDB. Files
+  // with the same number can exist in other DB paths; this opens only the one
+  // at the given path.
+  static Status CreateFromPathForRepair(
+      const ImmutableOptions& immutable_options,
+      const ReadOptions& read_options, const FileOptions& file_options,
+      uint32_t column_family_id, HistogramImpl* blob_file_read_hist,
+      uint64_t blob_file_number, const std::string& blob_file_path,
+      const std::shared_ptr<IOTracer>& io_tracer,
+      std::unique_ptr<BlobFileReader>* reader);
+
   // Wraps an open relocation file; see BlobRelocationFileReader.
   explicit BlobFileReader(std::unique_ptr<BlobRelocationFileReader> relocation);
 
@@ -218,6 +229,14 @@ class BlobFileReader {
   uint64_t GetFileSize() const { return file_size_; }
 
  private:
+  static Status CreateFileImpl(
+      const ImmutableOptions& immutable_options,
+      const ReadOptions& read_options, const FileOptions& file_options,
+      uint32_t column_family_id, HistogramImpl* blob_file_read_hist,
+      uint64_t blob_file_number, const std::string& blob_file_path,
+      const std::shared_ptr<IOTracer>& io_tracer, bool skip_footer_validation,
+      std::unique_ptr<BlobFileReader>* blob_file_reader);
+
   // `has_footer` tracks whether offset validation should reserve footer space.
   BlobFileReader(std::unique_ptr<RandomAccessFileReader>&& file_reader,
                  uint64_t file_size, CompressionType compression_type,
@@ -232,7 +251,7 @@ class BlobFileReader {
   static Status OpenFile(const ImmutableOptions& immutable_options,
                          const FileOptions& file_opts,
                          HistogramImpl* blob_file_read_hist,
-                         uint64_t blob_file_number,
+                         const std::string& blob_file_path,
                          const std::shared_ptr<IOTracer>& io_tracer,
                          uint64_t* file_size,
                          std::unique_ptr<RandomAccessFileReader>* file_reader,
@@ -339,6 +358,26 @@ class BlobRelocationFileReader {
       BlockCacheTracer* block_cache_tracer,
       std::unique_ptr<BlobRelocationFileReader>* reader);
 
+  // Opens the relocation file at `blob_file_path` for offline RepairDB. The
+  // column family, tail size and directory come from the file, not from the
+  // MANIFEST. It uses no block cache and no persistent cache. If `directory`
+  // is not null, it gets the checked directory of the file: RepairDB needs its
+  // origins and served files to choose route targets.
+  static Status OpenForRepair(const ImmutableOptions& immutable_options,
+                              const ReadOptions& read_options,
+                              const FileOptions& file_options,
+                              HistogramImpl* blob_file_read_hist,
+                              uint64_t blob_file_number,
+                              uint64_t expected_file_size,
+                              const std::string& blob_file_path,
+                              const std::string& repair_session_id,
+                              const BlockBasedTableOptions& table_options,
+                              CompressionManager* compression_manager,
+                              uint8_t block_protection_bytes_per_key,
+                              const std::shared_ptr<IOTracer>& io_tracer,
+                              std::unique_ptr<BlobRelocationFileReader>* reader,
+                              BlobRelocationDirectory* directory = nullptr);
+
   BlobRelocationFileReader(const BlobRelocationFileReader&) = delete;
   BlobRelocationFileReader& operator=(const BlobRelocationFileReader&) = delete;
 
@@ -420,6 +459,23 @@ class BlobRelocationFileReader {
   // The location blocks that Open() keeps; defined in the .cc file.
   struct PinnedLocationBlocks;
 
+  // Shared by Open and OpenForRepair. With `repair_discovery`, the file's own
+  // column family, tail size and directory are accepted. OpenForRepair passes
+  // `pin_location_blocks` = false, so a repair open never keeps the location
+  // blocks.
+  static Status OpenImpl(
+      const ImmutableOptions& immutable_options,
+      const ReadOptions& read_options, const FileOptions& file_options,
+      HistogramImpl* blob_file_read_hist, uint32_t column_family_id,
+      const BlobPhysicalFile& file, const std::string& blob_file_path,
+      const std::string& db_session_id, const TableFactory& factory,
+      CompressionManager* compression_manager,
+      uint8_t block_protection_bytes_per_key, bool pin_location_blocks,
+      const std::shared_ptr<IOTracer>& io_tracer,
+      BlockCacheTracer* block_cache_tracer, bool repair_discovery,
+      std::unique_ptr<BlobRelocationFileReader>* reader,
+      BlobRelocationDirectory* repair_directory);
+
   // Returns an iterator over the table that yields the raw location entries
   // (packed groups, see db/blob/blob_relocation_file.h). Adjusts
   // `*lookup_options` (no bounds, no readahead, no async I/O).
@@ -480,7 +536,8 @@ class BlobRelocationFileReader {
                            BlobIndex* same_file_blob_index,
                            DecodedGroupCache* cache);
 
-  const uint32_t column_family_id_;
+  // From the MANIFEST; for a repair open, from the file.
+  uint32_t column_family_id_;
   const uint64_t file_size_;
   uint64_t tail_size_ = 0;
   // Must outlive table_reader_.

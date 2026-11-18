@@ -343,13 +343,13 @@
 // for a relocation file at or above the frontier. The census heap applies the
 // pin only to indirect-origin blob files. Indirect blob GC skips a normal
 // input whose file number is pinned, and a relocation input with a pinned
-// routed generation number. In normal operation a coarse SST never references
-// a relocation file or a routed number (a flush references only its own new
-// blob files, and a coarse L0 compaction has only coarse inputs and does not
-// flatten), so the relocation check is a safety margin. Route retirement still
-// skips any route source at or above the frontier. That is more conservative
-// than needed, because a coarse SST never holds a routed number, but it only
-// delays a retirement.
+// routed generation number. A flush references only its own new blob files,
+// and a coarse L0 compaction has only coarse inputs and does not flatten. But
+// RepairDB can add back an obsolete coarse SST that is still on disk and
+// rebuild the route of the missing old file it references, so a coarse SST
+// can reference a routed number, and GC must keep that pin. Route retirement
+// also skips any route source at or above the frontier, so it keeps the route
+// that such a coarse SST reads through.
 //
 // Coarse classification property
 //
@@ -586,6 +586,42 @@ struct BlobReferenceRunHeader {
   uint64_t reference_count = 0;
   uint64_t first_offset = 0;
   CompressionType default_compression = kNoCompression;
+};
+
+// Cursor over the exact references of one SST (see the top of this file).
+//
+// Background: some readers walk the same group in many SSTs and merge the SSTs'
+// references by original offset. If each SST returned whole groups as vectors,
+// such a reader would hold every reference of every SST at once. The cursor
+// holds only the SST's reference index and one run at a time, so the reader
+// never builds per-SST vectors or a DB-wide map of references.
+// TableReader::NewBlobReferenceIterator() creates it. RepairDB uses it to merge
+// the SSTs of one group.
+//
+// Use: SeekGroup() finds the group with a binary search of the reference index
+// and loads the group's first run. Next() moves through the run and then loads
+// the group's run in the next data block. The table reader must outlive the
+// cursor. The cursor's memory is charged to the cache reservation manager given
+// at creation.
+class BlobReferenceIterator {
+ public:
+  virtual ~BlobReferenceIterator() = default;
+
+  // Moves to the first reference of the group with key `key`. If the SST has
+  // no such group, Valid() is false. A non-OK Status means a read or decode
+  // error, or MemoryLimit when the cursor's memory cannot be charged.
+  virtual Status SeekGroup(const BlobReferenceGroupKey& key) = 0;
+
+  // True if the cursor is on a reference. Only meaningful after the last
+  // SeekGroup() or Next() returned OK.
+  virtual bool Valid() const = 0;
+
+  // The current reference. Requires Valid().
+  virtual const BlobReference& reference() const = 0;
+
+  // Moves to the next reference. Requires Valid(). A non-OK Status means a read
+  // or decode error, or MemoryLimit when the cursor's memory cannot be charged.
+  virtual Status Next() = 0;
 };
 
 // Top-level record of the exact reference metadata, stored as a table

@@ -4233,28 +4233,6 @@ TEST_F(DBBlobIndexTest, EmptyBlobIndexFailsFlushWithCorruption) {
 // Note: the following test case pertains to the StackableDB-based BlobDB
 // implementation. We should be able to write kTypeBlobIndex to memtables and
 // SST files.
-TEST_F(DBBlobIndexTest, PrefixGateRejectsBlobIndirection) {
-  Options options = CurrentOptions();
-  options.enable_blob_files = true;
-  DestroyAndReopen(options);
-  ColumnFamilyData::TEST_SetAllowBlobIndirection(false);
-  struct RestoreGate {
-    ~RestoreGate() { ColumnFamilyData::TEST_SetAllowBlobIndirection(true); }
-  } restore_gate;
-
-  ASSERT_TRUE(dbfull()
-                  ->SetOptions({{"enable_blob_indirection", "true"}})
-                  .IsNotSupported());
-  Options gated = options;
-  gated.enable_blob_indirection = true;
-  ColumnFamilyHandle* handle = nullptr;
-  ASSERT_TRUE(
-      db_->CreateColumnFamily(gated, "gated", &handle).IsNotSupported());
-  ASSERT_EQ(handle, nullptr);
-  Close();
-  ASSERT_TRUE(TryReopen(gated).IsNotSupported());
-}
-
 TEST_F(DBBlobIndexTest, SstFileWriterOutputStaysLegacy) {
   Options options = CurrentOptions();
   options.enable_blob_files = true;

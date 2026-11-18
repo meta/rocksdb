@@ -546,6 +546,11 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
       const ReadOptions& read_options,
       const Slice& expected_descriptor) const override;
 
+  Status NewBlobReferenceIterator(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      std::shared_ptr<CacheReservationManager> reservation_manager,
+      std::unique_ptr<BlobReferenceIterator>* iterator) const override;
+
   const SeqnoToTimeMapping& GetSeqnoToTimeMapping() const;
 
   size_t ApproximateMemoryUsage() const override;

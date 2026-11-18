@@ -1087,8 +1087,7 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through the SetOptions() API
   bool enable_blob_files = false;
 
-  // Experimental, and not complete yet. Option validation returns NotSupported
-  // for this option until the rest of the feature is in place.
+  // Experimental.
   //
   // Purpose: let indirect blob GC move the live values out of a blob file that
   // is mostly garbage without rewriting the SSTs that point to them. When this
@@ -1101,8 +1100,7 @@ struct AdvancedColumnFamilyOptions {
   // and a later compaction rewrites them with the exact list. See
   // db/blob/blob_reference_metadata.h for how it works.
   //
-  // Requirements and limits (option validation checks these after the
-  // NotSupported check above):
+  // Requirements and limits (option validation checks these):
   //   - enable_blob_files must be true (else InvalidArgument).
   //   - The table format must be block-based (else NotSupported).
   //   - enable_blob_direct_write must be false (else NotSupported).

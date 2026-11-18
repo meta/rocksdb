@@ -1088,12 +1088,12 @@ void DBImpl::IndirectBlobGCJob::SelectInputs() {
     // blob_reference_metadata.h), so indirect blob GC skips a pinned input:
     // a normal input whose file number is pinned, or a relocation input with
     // a pinned routed generation number (an old indirect-origin file number
-    // that routes to it). In normal operation a coarse SST does not reference
-    // a routed number, but GC keeps this pin so that it never collects a file
-    // that a coarse SST may still read. When the pin goes away, the heap
-    // gives the input a new revision and GC can pick it again. Suppressing
-    // the input also removes it from the Version's GC candidate list, so a
-    // job with no output does not reschedule itself.
+    // that routes to it). A coarse SST can reference a routed number after
+    // RepairDB: it adds back an obsolete coarse SST that is still on disk and
+    // rebuilds the route of the missing old file it references. When the pin
+    // goes away, the heap gives the input a new revision and GC can pick it
+    // again. Suppressing the input also removes it from the Version's GC
+    // candidate list, so a job with no output does not reschedule itself.
     const bool coarse_pinned =
         input.normal_metadata != nullptr
             ? input_storage->IsCoarseIndirectOriginBlobPinned(file_number)

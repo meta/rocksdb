@@ -7749,6 +7749,32 @@ Status DestroyDB(const std::string& dbname, const Options& options,
                       /*IODebugContext*=*/nullptr)
         .PermitUncheckedError();
 
+    if (std::find(filenames.begin(), filenames.end(), "REPAIR-IN-PROGRESS") !=
+        filenames.end()) {
+      RepairCatalog catalog;
+      bool recognized = false;
+      Status catalog_status =
+          ReadRepairCatalog(env, dbname, &catalog, &recognized);
+      const bool catalog_valid = catalog_status.ok();
+      if (recognized) {
+        // Explicit owner destruction, unlike generic obsolete-file purge,
+        // can remove a catalog with a verified ownership header even when
+        // its later records are incomplete. Do not delete an unrelated file
+        // or an unsupported guard whose ownership cannot be established.
+        if (catalog.header.number != 0 && !catalog.header.identity.empty()) {
+          result = env->DeleteFile(RepairInProgressFileName(dbname));
+        } else {
+          result = catalog_valid
+                       ? Status::Corruption("Repair catalog lacks ownership")
+                       : catalog_status;
+        }
+        if (!result.ok()) {
+          env->UnlockFile(lock).PermitUncheckedError();
+          return result;
+        }
+      }
+    }
+
     uint64_t number;
     FileType type;
     InfoLogPrefix info_log_prefix(!soptions.db_log_dir.empty(), dbname);
@@ -7779,6 +7805,12 @@ Status DestroyDB(const std::string& dbname, const Options& options,
         } else {
           del = env->DeleteFile(path_to_delete);
         }
+        if (!del.ok() && result.ok()) {
+          result = del;
+        }
+      } else if (IsRepairStagingFileName(fname)) {
+        // A file of a repair attempt; its catalog is gone or being destroyed.
+        Status del = env->DeleteFile(dbname + "/" + fname);
         if (!del.ok() && result.ok()) {
           result = del;
         }

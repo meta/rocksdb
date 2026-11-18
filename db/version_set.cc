@@ -6409,6 +6409,7 @@ VersionSet::VersionSet(
       manifest_last_valid_record_end_(0),
       manifest_last_valid_record_end_file_number_(0),
       force_new_manifest_on_open_(false),
+      repair_manifest_staging_(false),
       last_compacted_manifest_file_size_(0),
       file_options_(storage_options),
       block_cache_tracer_(block_cache_tracer),
@@ -6653,6 +6654,7 @@ void VersionSet::Reset() {
   manifest_last_valid_record_end_ = 0;
   manifest_last_valid_record_end_file_number_ = 0;
   force_new_manifest_on_open_ = false;
+  repair_manifest_staging_ = false;
   last_compacted_manifest_file_size_ = 0;
   TuneMaxManifestFileSize();
   obsolete_files_.clear();
@@ -7024,11 +7026,12 @@ Status VersionSet::BuildBlobReferenceCensusDelta(
     }
     if (file.blob_reference_summary == nullptr) {
       // Flush and compaction prepare the summary of a new exact SST before they
-      // queue the edit. Recovered SSTs do not come here, ingestion into a
-      // fenced CF is rejected, and RepairDB rejects a DB that uses the format.
-      // So a missing summary is a bug. The SST has its reference metadata on
-      // disk, so the commit goes ahead and the census is rebuilt from disk.
-      // Indirect blob GC waits for the rebuild.
+      // queue the edit. Recovered SSTs do not come here, and ingestion into a
+      // fenced CF is rejected. RepairDB reads the summary of each exact SST
+      // when it scans the SST and puts it on its edit; a failed read fails the
+      // repair. So a missing summary is a bug. The SST has its reference
+      // metadata on disk, so the commit goes ahead and the census is rebuilt
+      // from disk. Indirect blob GC waits for the rebuild.
 #ifndef NDEBUG
       // Debug builds stop here; a test sets `expected` to check the
       // release behavior below.
@@ -7729,8 +7732,19 @@ Status VersionSet::ProcessManifestWrites(
     // don't keep in case of overflow
     enforced_limit = std::max(enforced_limit, new_limit);
   }
-  if (!skip_manifest_write &&
-      (!descriptor_log_ || prev_manifest_file_size >= enforced_limit)) {
+  // RepairDB writes a staged MANIFEST: a private MANIFEST that CURRENT does not
+  // name yet. It appends every edit to this MANIFEST and never starts a new
+  // one.
+  Status repair_staging_status;
+  if (repair_manifest_staging_) {
+    if (descriptor_log_ == nullptr || new_descriptor_log) {
+      repair_staging_status =
+          Status::Corruption("Repair has no valid staged MANIFEST writer");
+    }
+    new_descriptor_log = false;
+    pending_manifest_file_number_ = manifest_file_number_;
+  } else if (!skip_manifest_write &&
+             (!descriptor_log_ || prev_manifest_file_size >= enforced_limit)) {
     TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:BeforeNewManifest");
     new_descriptor_log = true;
   } else {
@@ -7767,7 +7781,7 @@ Status VersionSet::ProcessManifestWrites(
   }
 
   uint64_t new_manifest_file_size = 0;
-  Status s;
+  Status s = repair_staging_status;
   // True if blob finalization failed. That failure happens before any MANIFEST
   // record is written, so the error path below keeps the current MANIFEST
   // writer.
@@ -9219,6 +9233,43 @@ Status VersionSet::TryRecover(
     const std::vector<ColumnFamilyDescriptor>& column_families, bool read_only,
     const std::vector<std::string>& files_in_dbname, std::string* db_id,
     bool* has_missing_table_file) {
+  RepairCatalog repair_catalog;
+  bool catalog_recognized = false;
+  Status catalog_status = ReadRepairCatalog(
+      db_options_->env, dbname_, &repair_catalog, &catalog_recognized);
+  if (catalog_recognized) {
+    if (!catalog_status.ok()) {
+      return catalog_status;
+    }
+    bool committed = false;
+    Status resolved = ResolveRepairCatalog(
+        db_options_->env, dbname_, repair_catalog, /*read_only=*/true,
+        /*repair_retry=*/false, &committed, /*seals_verified=*/false);
+    if (!resolved.ok()) {
+      return resolved;
+    }
+    // A repair catalog exists. RepairDB writes its new MANIFEST under a
+    // temporary name, renames it, and writes CURRENT last. It may have
+    // renamed the MANIFEST and then failed before it wrote CURRENT, so a
+    // MANIFEST with a higher number may not be published. Recovery without a
+    // catalog tries the highest-numbered MANIFEST first (ManifestPicker), so
+    // here it must not. Recover only from the MANIFEST that CURRENT names. If
+    // CURRENT is missing or unreadable, fail; do not guess or create a DB.
+    std::string manifest_path;
+    Status status =
+        GetCurrentManifestPath(dbname_, fs_.get(), /*is_retry=*/false,
+                               &manifest_path, &manifest_file_number_);
+    if (!status.ok()) {
+      return status;
+    }
+    TEST_SYNC_POINT_CALLBACK("VersionSet::TryRecover:CatalogManifest",
+                             &manifest_path);
+    return TryRecoverFromOneManifest(manifest_path, column_families, read_only,
+                                     db_id, has_missing_table_file);
+  }
+  // An unreadable or unknown catalog is checked by the caller against the
+  // replayed state (DBImpl::CheckUnresolvedRepairCatalog).
+  catalog_status.PermitUncheckedError();
   ManifestPicker manifest_picker(dbname_, files_in_dbname);
   if (!manifest_picker.Valid()) {
     return Status::Corruption("Cannot locate MANIFEST file in " + dbname_);
@@ -9372,6 +9423,72 @@ void VersionSet::LogDroppedBlobFiles() const {
                    cfd->GetName().c_str(), dropped_blob_files.size(),
                    numbers.c_str());
   }
+}
+
+Status VersionSet::RecoverForRepair(
+    const std::string& manifest_path, uint64_t manifest_file_number,
+    const std::vector<ColumnFamilyDescriptor>& column_families) {
+  if (manifest_file_number == 0 ||
+      manifest_file_number == std::numeric_limits<uint64_t>::max()) {
+    return Status::Corruption("Invalid staged repair MANIFEST number");
+  }
+  // Keep this fresh writer open throughout repair. ReopenWritableFile and
+  // append-boundary support are optional FileSystem capabilities; repair does
+  // not need either. The caller supplies a non-MANIFEST temporary path, so an
+  // incomplete candidate can never be selected by best-efforts recovery.
+  const FileOptions options = GetFileOptionsForManifestWrite();
+  std::unique_ptr<FSWritableFile> file;
+  Status status = NewWritableFile(fs_.get(), manifest_path, &file, options);
+  if (!status.ok()) {
+    return status;
+  }
+  std::unique_ptr<log::Writer> writer = CreateManifestWriter(
+      std::move(file), manifest_path, options, manifest_preallocation_size_);
+  VersionEdit initial;
+  initial.SetLogNumber(0);
+  initial.SetNextFile(manifest_file_number + 1);
+  initial.SetLastSequence(0);
+  std::string record;
+  if (!initial.EncodeTo(&record)) {
+    return Status::Corruption("Cannot encode initial repair MANIFEST");
+  }
+  const WriteOptions write_options(Env::IOActivity::kDBOpen);
+  status = writer->AddRecord(write_options, record);
+  if (status.ok()) {
+    status = SyncManifest(db_options_, write_options, writer->file());
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  manifest_file_number_ = manifest_file_number;
+  bool has_missing_table_file = false;
+  status = TryRecoverFromOneManifest(
+      manifest_path, column_families, /*read_only=*/false,
+      /*db_id=*/nullptr, &has_missing_table_file);
+  if (status.ok() && has_missing_table_file) {
+    status = Status::Corruption(
+        "Initial repair MANIFEST unexpectedly references missing files");
+  }
+  if (status.ok()) {
+    descriptor_log_ = std::move(writer);
+    repair_manifest_staging_ = true;
+  }
+  return status;
+}
+
+Status VersionSet::SyncAndCloseRepairManifest() {
+  if (!repair_manifest_staging_ || descriptor_log_ == nullptr) {
+    return Status::Corruption("Repair has no complete staged MANIFEST");
+  }
+  const WriteOptions write_options(Env::IOActivity::kDBOpen);
+  Status status =
+      SyncManifest(db_options_, write_options, descriptor_log_->file());
+  if (status.ok()) {
+    // Close the log, not just its file: log::Writer's destructor otherwise
+    // tries to flush the already-closed destination.
+    status = descriptor_log_->Close(write_options);
+  }
+  return status;
 }
 
 void VersionSet::RecoverEpochNumbers() {

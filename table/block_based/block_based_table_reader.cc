@@ -847,6 +847,12 @@ Status BlockBasedTable::Open(
   Rep* rep = new BlockBasedTable::Rep(
       ioptions, env_options, table_options, internal_comparator, skip_filters,
       file_size, level, immortal_table, user_defined_timestamps_persisted);
+#ifndef NDEBUG
+  std::pair<bool, bool> shared_block_cache_context = {
+      avoid_shared_metadata_cache, rep->table_options.block_cache != nullptr};
+  TEST_SYNC_POINT_CALLBACK("BlockBasedTable::Open:SharedBlockCache",
+                           &shared_block_cache_context);
+#endif
   rep->file = std::move(file);
   rep->footer = footer;
   rep->blob_source_ = blob_source;
@@ -2720,8 +2726,8 @@ std::shared_ptr<const TableProperties> BlockBasedTable::GetTableProperties()
 
 namespace {
 
-// Readahead for walks over every reference data block (verify). It starts at
-// 256 KB and grows to 1 MB (estimates).
+// Readahead for walks over every reference data block (repair and verify). It
+// starts at 256 KB and grows to 1 MB (estimates).
 constexpr size_t kBlobReferenceWalkInitialReadahead = 256 * 1024;
 constexpr size_t kBlobReferenceWalkMaxReadahead = 1024 * 1024;
 
@@ -2960,7 +2966,186 @@ BlobReferenceBlockReader DataBlockReader(const BlockBasedTable::Rep& rep,
   };
 }
 
+class BlockBasedBlobReferenceIterator : public BlobReferenceIterator {
+ public:
+  BlockBasedBlobReferenceIterator(
+      const BlockBasedTable::Rep& rep, const ReadOptions& read_options,
+      std::shared_ptr<CacheReservationManager> reservation_manager)
+      : rep_(rep),
+        read_options_(read_options),
+        reservation_manager_(std::move(reservation_manager)) {}
+
+  ~BlockBasedBlobReferenceIterator() override {
+    if (reservation_manager_ != nullptr) {
+      reservation_manager_->UpdateCacheReservation(0).PermitUncheckedError();
+    }
+  }
+
+  Status Initialize(const Slice& expected_descriptor) {
+    Status status = BlobReferenceMetadataDescriptor::DecodeFrom(
+        expected_descriptor, &descriptor_);
+    if (!status.ok()) {
+      return status;
+    }
+    // Charge before the index is parsed and its vectors are allocated. The
+    // charge assumes (index size / 2) entries, each with one BlockHandle and
+    // one BlobReferenceIndexEntry, capped at 2^20 like the decoder's count
+    // limits. No index of this size needs more memory. A block table entry
+    // takes at least one byte but needs only one 16-byte BlockHandle, and a
+    // group entry takes at least seven bytes. The final charge uses the real
+    // capacities.
+    constexpr uint64_t kMaxIndexEntries = uint64_t{1} << 20;
+    const uint64_t entries =
+        std::min(kMaxIndexEntries, descriptor_.index_handle.size() / 2);
+    const uint64_t charge =
+        sizeof(*this) + descriptor_.index_handle.size() +
+        entries * (sizeof(BlockHandle) + sizeof(BlobReferenceIndexEntry));
+    if (charge > std::numeric_limits<size_t>::max()) {
+      return Status::MemoryLimit(
+          "Blob reference cursor metadata memory overflow");
+    }
+    if (reservation_manager_ != nullptr) {
+      status = reservation_manager_->UpdateCacheReservation(
+          lossless_cast<size_t>(charge));
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    status = ReadBlobReferenceIndex(rep_, read_options_, expected_descriptor,
+                                    &descriptor_, &index_);
+    return status.ok() ? Reserve(0, 0) : status;
+  }
+
+  Status SeekGroup(const BlobReferenceGroupKey& key) override {
+    valid_ = false;
+    references_.clear();
+    reference_index_ = 0;
+    decoder_.reset();
+    const size_t group = FindBlobReferenceGroup(index_, key);
+    if (group == index_.groups.size()) {
+      return Reserve(0, 0);
+    }
+    decoder_.emplace(index_, group);
+    return LoadRun();
+  }
+
+  bool Valid() const override { return valid_; }
+  const BlobReference& reference() const override {
+    assert(valid_);
+    return references_[reference_index_];
+  }
+  Status Next() override {
+    if (!valid_) {
+      return Status::InvalidArgument(
+          "Advancing an invalid blob reference cursor");
+    }
+    ++reference_index_;
+    if (reference_index_ < references_.size()) {
+      return Status::OK();
+    }
+    return LoadRun();
+  }
+
+ private:
+  Status Reserve(size_t encoded_bytes, size_t decoded_count) {
+    const size_t base =
+        sizeof(*this) + index_.blocks.capacity() * sizeof(BlockHandle) +
+        index_.groups.capacity() * sizeof(BlobReferenceIndexEntry);
+    const size_t capacity = std::max(references_.capacity(), decoded_count);
+    if (encoded_bytes > std::numeric_limits<size_t>::max() - base ||
+        capacity > (std::numeric_limits<size_t>::max() - base - encoded_bytes) /
+                       sizeof(BlobReference)) {
+      return Status::MemoryLimit("Blob reference cursor memory overflow");
+    }
+    return reservation_manager_ == nullptr
+               ? Status::OK()
+               : reservation_manager_->UpdateCacheReservation(
+                     base + encoded_bytes + capacity * sizeof(BlobReference));
+  }
+
+  // Loads the next run of the group: the run at the group's start, or the run
+  // at the start of the next block. Becomes invalid after the last run.
+  Status LoadRun() {
+    valid_ = false;
+    references_.clear();
+    reference_index_ = 0;
+    if (!decoder_.has_value() || decoder_->done()) {
+      return Reserve(0, 0);
+    }
+    const size_t block_ordinal = decoder_->next_block();
+    // The index decoder has checked that the block's on-disk size is at most 64
+    // KB (kMaxDataBlockSize in blob_reference_metadata.cc). The reservation is
+    // raised to the decompressed size after the read.
+    Status status =
+        Reserve(lossless_cast<size_t>(index_.blocks[block_ordinal].size()),
+                /*count=*/0);
+    if (!status.ok()) {
+      return status;
+    }
+    BlockContents contents;
+    status = ReadBlobReferenceMetadataBlock(
+        rep_, read_options_, index_.blocks[block_ordinal],
+        /*maybe_compressed=*/true, /*prefetch_buffer=*/nullptr, &contents);
+    if (!status.ok()) {
+      return status;
+    }
+    const Slice block = contents.data;
+    uint64_t run_count = 0;
+    status = decoder_->DecodeRunHeader(block, &run_count);
+    if (!status.ok()) {
+      return status;
+    }
+    // Each entry takes at least one byte, so the count is at most the block
+    // size. This bounds the count before it sizes the reservation.
+    if (run_count > block.size()) {
+      return Status::Corruption("Blob reference run does not match index");
+    }
+    status = Reserve(block.size(), lossless_cast<size_t>(run_count));
+    if (!status.ok()) {
+      return status;
+    }
+    references_.reserve(lossless_cast<size_t>(run_count));
+    // The decoder does all checks of the group walk.
+    status = decoder_->DecodeRunEntries([this](const BlobReference& reference) {
+      references_.push_back(reference);
+      return Status::OK();
+    });
+    if (!status.ok()) {
+      return status;
+    }
+    valid_ = true;
+    return Reserve(0, 0);
+  }
+
+  const BlockBasedTable::Rep& rep_;
+  const ReadOptions read_options_;
+  std::shared_ptr<CacheReservationManager> reservation_manager_;
+  BlobReferenceMetadataDescriptor descriptor_;
+  BlobReferenceIndex index_;
+  std::vector<BlobReference> references_;
+  std::optional<BlobReferenceGroupDecoder> decoder_;
+  size_t reference_index_ = 0;
+  bool valid_ = false;
+};
+
 }  // namespace
+
+Status BlockBasedTable::NewBlobReferenceIterator(
+    const ReadOptions& read_options, const Slice& expected_descriptor,
+    std::shared_ptr<CacheReservationManager> reservation_manager,
+    std::unique_ptr<BlobReferenceIterator>* iterator) const {
+  if (rep_ == nullptr || iterator == nullptr) {
+    return Status::InvalidArgument("Missing blob reference iterator state");
+  }
+  std::unique_ptr<BlockBasedBlobReferenceIterator> result =
+      std::make_unique<BlockBasedBlobReferenceIterator>(
+          *rep_, read_options, std::move(reservation_manager));
+  Status status = result->Initialize(expected_descriptor);
+  if (status.ok()) {
+    *iterator = std::move(result);
+  }
+  return status;
+}
 
 Status BlockBasedTable::ReadBlobReferenceGroups(
     const ReadOptions& read_options, const Slice& expected_descriptor,

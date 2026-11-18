@@ -3531,33 +3531,6 @@ TEST_F(DBBlobBasicTest, IndirectBlobGCRunsAfterAmbiguityResolves) {
             IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
 }
 
-TEST_F(DBBlobBasicTest, PrefixRepairRejectsValidatedRelocationFile) {
-  Options options = GetDefaultOptions();
-  options.create_if_missing = true;
-  options.disable_auto_compactions = true;
-  DestroyAndReopen(options);
-  ASSERT_OK(Put("legacy", "value"));
-  ASSERT_OK(Flush());
-  ColumnFamilyData* const cfd =
-      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
-  const ImmutableOptions immutable_options = cfd->ioptions();
-  const MutableCFOptions mutable_options = cfd->GetLatestMutableCFOptions();
-  Close();
-  const std::string payload = "stored";
-  BlobRelocationFileMetadata metadata;
-  uint64_t size = 0;
-  constexpr uint64_t number = 1000000;
-  WriteRelocationFileForDBTest(
-      immutable_options, mutable_options, BlockBasedTableOptions(), 0, number,
-      {{1, 42, payload, kNoCompression}}, &metadata, &size);
-  const std::string path = BlobFileName(dbname_, number);
-  std::string before;
-  ASSERT_OK(ReadFileToString(env_, path, &before));
-  ASSERT_TRUE(RepairDB(dbname_, options).IsNotSupported());
-  std::string after;
-  ASSERT_OK(ReadFileToString(env_, path, &after));
-  ASSERT_EQ(before, after);
-}
 TEST_F(DBBlobBasicTest, CompactionInstallsWhileMetadataCommitResultUnknown) {
   // An indirect blob GC install fails its MANIFEST write with an I/O error, so
   // the result of its metadata commit is unknown: the edit may or may not be
@@ -10339,10 +10312,77 @@ TEST_F(DBBlobBasicTest, BlobReferenceReadReportsDecodedIndexSize) {
   ASSERT_TRUE(references.empty());
 }
 
+TEST_F(DBBlobBasicTest, BlobReferenceIteratorSeeksEachGroup) {
+  // Run with and without compressed reference data blocks.
+  std::vector<CompressionType> compressions = {kNoCompression};
+  if (LZ4_Supported()) {
+    compressions.push_back(kLZ4Compression);
+  }
+  for (CompressionType compression : compressions) {
+    SCOPED_TRACE(static_cast<int>(compression));
+    FlushManyBlobReferenceGroups(compression);
+    ColumnFamilyData* cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    const FileMetaData* const sst = OnlySstForTest(cfd);
+    ASSERT_NE(sst, nullptr);
+    const FileMetaData& file = *sst;
+    std::vector<BlobReferenceGroup> groups;
+    for (const BlobReferenceIndexEntry& entry :
+         ReadBlobReferenceIndexForTest(file).groups) {
+      groups.push_back(entry.group);
+    }
+    ASSERT_GE(groups.size(), 3U);
+
+    std::unique_ptr<TableReader> reader;
+    ASSERT_OK(OpenFreshTableReaderForTest(cfd, file, &reader));
+    std::unique_ptr<BlobReferenceIterator> iterator;
+    ASSERT_OK(reader->NewBlobReferenceIterator(
+        ReadOptions(), file.blob_reference_descriptor,
+        /*reservation_manager=*/nullptr, &iterator));
+    const auto count_group = [&](const BlobReferenceGroup& group,
+                                 uint64_t* count) {
+      *count = 0;
+      Status status = iterator->SeekGroup(group.group_key());
+      uint64_t previous_offset = 0;
+      while (status.ok() && iterator->Valid()) {
+        const BlobReference& reference = iterator->reference();
+        EXPECT_EQ(reference.generation_file_number,
+                  group.generation_file_number);
+        EXPECT_EQ(reference.origin_file_number, group.origin_file_number);
+        EXPECT_TRUE(*count == 0 ||
+                    reference.original_value_offset > previous_offset);
+        previous_offset = reference.original_value_offset;
+        ++*count;
+        status = iterator->Next();
+      }
+      return status;
+    };
+    // Seek the groups from last to first, so each seek goes back in the SST.
+    for (auto group = groups.rbegin(); group != groups.rend(); ++group) {
+      uint64_t count = 0;
+      ASSERT_OK(count_group(*group, &count));
+      ASSERT_EQ(count, group->reference_count);
+    }
+    // Groups the SST does not have: before, between and after its groups.
+    for (uint64_t origin : {uint64_t{1}, groups.front().origin_file_number + 1,
+                            groups.back().origin_file_number + 1000}) {
+      if (std::any_of(groups.begin(), groups.end(),
+                      [&](const BlobReferenceGroup& group) {
+                        return group.origin_file_number == origin;
+                      })) {
+        continue;
+      }
+      ASSERT_OK(iterator->SeekGroup(
+          {BlobReferenceEncodingClass::kIndirectUnflattened, origin, origin}));
+      ASSERT_FALSE(iterator->Valid());
+    }
+  }
+}
+
 TEST_F(DBBlobBasicTest, BlobReferenceBlockChecksumMismatchIsCorruption) {
   // A flipped bit in a group's start block fails the block checksum.
-  // ReadBlobReferences fails the request with Corruption.
-  // VerifyBlobReferenceMetadata returns Corruption. ReadBlobReferenceGroups
+  // ReadBlobReferences fails the request with Corruption. BlobReferenceIterator
+  // and VerifyBlobReferenceMetadata return Corruption. ReadBlobReferenceGroups
   // (the census read, which reads only the index block) still succeeds. A
   // flipped bit in the index block makes ReadBlobReferenceGroups fail too.
   FlushManyBlobReferenceGroups();
@@ -10379,6 +10419,15 @@ TEST_F(DBBlobBasicTest, BlobReferenceBlockChecksumMismatchIsCorruption) {
                                  /*after_index_read=*/nullptr, &requests));
   ASSERT_TRUE(requests[0].status.IsCorruption());
   ASSERT_TRUE(references.empty());
+  std::unique_ptr<BlobReferenceIterator> iterator;
+  ASSERT_OK(reader->NewBlobReferenceIterator(
+      ReadOptions(), file.blob_reference_descriptor,
+      /*reservation_manager=*/nullptr, &iterator));
+  Status status = iterator->SeekGroup(group.group_key());
+  while (status.ok() && iterator->Valid()) {
+    status = iterator->Next();
+  }
+  ASSERT_TRUE(status.IsCorruption());
   ASSERT_TRUE(reader
                   ->VerifyBlobReferenceMetadata(ReadOptions(),
                                                 file.blob_reference_descriptor)
@@ -11067,6 +11116,171 @@ TEST_F(DBBlobBasicTest, IndirectBlobGCNormalInputPinnedByCoarseFlushIsStale) {
     ASSERT_EQ(Get(IndirectBlobGCKey(i)), IndirectBlobGCValue(i));
   }
   ASSERT_EQ(Get(flush_key), flush_value);
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCKeepsRelocationFileOfRepairedCoarseSst) {
+  // Background: RepairDB adds back every SST that it finds on disk, including
+  // an obsolete SST that a crash left behind. If that SST is coarse, it can
+  // reference an old indirect-origin blob file that indirect blob GC already
+  // relocated. RepairDB then rebuilds the route of the missing old file. The
+  // coarse SST has no exact reference metadata, so indirect blob GC must not
+  // rewrite the relocation file while the coarse SST may read it. GC sees the
+  // pin through the routed generation number of the relocation file.
+  //
+  // The test builds this state. The file numbers are examples:
+  //   1. Two flushes and an L0 to L0 compaction write coarse SST S (file 20).
+  //      S references keys 0..3 in blob file A (file 12) and keys 4..7 in blob
+  //      file B. Half of A is garbage. An L1 SST below S makes the compaction
+  //      not bottommost, because a bottommost compaction writes exact output.
+  //      The test saves a copy of S.
+  //   2. A compaction writes S into an exact L1 SST and deletes S.
+  //   3. Indirect blob GC relocates A into relocation file R (file 30) and
+  //      adds route 12 -> 30. A is deleted.
+  //   4. Keys 0..2 are deleted and compacted, so 3 of the 4 values in R are
+  //      garbage for the exact SSTs.
+  //   5. The test puts S back on disk, as after a crash before the obsolete
+  //      file was deleted, and runs RepairDB.
+  // After repair, S is a coarse L0 SST again, route 12 -> 30 exists, and R is
+  // live. GC with R as candidate must keep R, because S reads keys 0..3 from
+  // R through the route.
+  Options options = IndirectBlobGCOptions();
+  DestroyAndReopen(options);
+  // The L1 SST covers the key range of S: "key" sorts before "key0", and
+  // "key9" sorts after "key7".
+  ASSERT_OK(Put("key", "low"));
+  ASSERT_OK(Put("key9", "high"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  constexpr size_t kKeyCount = 8;
+  constexpr size_t kOverwrittenKey = 4;
+  const auto overwritten_value = [](size_t i) {
+    return std::string(4096, static_cast<char>('A' + i));
+  };
+  for (size_t i = 0; i < kKeyCount; ++i) {
+    ASSERT_OK(Put(IndirectBlobGCKey(i), IndirectBlobGCValue(i)));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .back()
+                              ->GetBlobFileNumber();
+  for (size_t i = kOverwrittenKey; i < kKeyCount; ++i) {
+    ASSERT_OK(Put(IndirectBlobGCKey(i), overwritten_value(i)));
+  }
+  ASSERT_OK(Flush());
+
+  // Step 1: an L0 to L0 compaction that is not bottommost and has only coarse
+  // inputs writes coarse output S. Its frontier is A, the smallest origin that
+  // S references.
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  std::vector<std::string> flushed_ssts;
+  for (const auto& file : metadata.levels[0].files) {
+    flushed_ssts.push_back(file.name);
+  }
+  ASSERT_EQ(flushed_ssts.size(), 2U);
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), flushed_ssts, /*level=*/0));
+  ASSERT_EQ(GetLevelFileMetadatas(/*level=*/0).size(), 1U);
+  const FileMetaData* coarse_sst = GetLevelFileMetadatas(/*level=*/0).front();
+  const uint64_t coarse_sst_number = coarse_sst->fd.GetNumber();
+  ASSERT_EQ(coarse_sst->oldest_coarse_indirect_origin_file_number, origin);
+  ASSERT_TRUE(IsCoarsePinned(origin));
+  const std::string coarse_sst_path =
+      MakeTableFileName(dbname_, coarse_sst_number);
+  std::string coarse_sst_contents;
+  ASSERT_OK(ReadFileToString(env_, coarse_sst_path, &coarse_sst_contents));
+
+  // Step 2.
+  ASSERT_OK(BuildExactSstAtLevel1());
+  ASSERT_EQ(
+      cfd->current()->storage_info()->OldestCoarseIndirectOriginFileNumber(),
+      kInvalidBlobFileNumber);
+  ASSERT_EQ(env_->FileExists(coarse_sst_path).code(), Status::Code::kNotFound);
+
+  // Step 3. Indirect blob GC relocates live values only when blob GC is on.
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  const uint64_t relocation_file = RouteTarget(origin);
+  ASSERT_NE(relocation_file, kInvalidBlobFileNumber);
+  ASSERT_FALSE(HasBlobFile(origin));
+
+  // Step 4.
+  for (size_t i = 0; i + 1 < kOverwrittenKey; ++i) {
+    ASSERT_OK(Delete(IndirectBlobGCKey(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  ASSERT_EQ(RouteTarget(origin), relocation_file);
+  ASSERT_EQ(Get(IndirectBlobGCKey(0)), "NOT_FOUND");
+  Close();
+  ASSERT_EQ(BlobFilesOnDisk().count(origin), 0U);
+
+  // Step 5.
+  ASSERT_OK(WriteStringToFile(env_, coarse_sst_contents, coarse_sst_path,
+                              /*should_sync=*/true));
+  ASSERT_OK(RepairDB(dbname_, options));
+  Reopen(options);
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+
+  // Checks the repaired state: S is a coarse L0 SST with frontier A, route
+  // A -> R exists, and R is live. RepairDB brings back the deleted keys 0..2
+  // from S (base RepairDB behavior), and S reads keys 0..3 from R.
+  const auto check_repaired_state = [&]() {
+    const VersionStorageInfo* const storage = cfd->current()->storage_info();
+    const FileMetaData* const revived =
+        storage->GetFileMetaDataByNumber(coarse_sst_number);
+    ASSERT_NE(revived, nullptr);
+    EXPECT_EQ(revived->oldest_coarse_indirect_origin_file_number, origin);
+    EXPECT_EQ(storage->OldestCoarseIndirectOriginFileNumber(), origin);
+    EXPECT_TRUE(IsCoarsePinned(origin));
+    EXPECT_EQ(storage->GetBlobRelocationRouteTarget(origin), relocation_file);
+    EXPECT_NE(storage->GetBlobRelocationFileMetaData(relocation_file), nullptr);
+    EXPECT_EQ(BlobFilesOnDisk().count(relocation_file), 1U);
+    for (size_t i = 0; i < kKeyCount; ++i) {
+      EXPECT_EQ(Get(IndirectBlobGCKey(i)), i < kOverwrittenKey
+                                               ? IndirectBlobGCValue(i)
+                                               : overwritten_value(i));
+    }
+    EXPECT_EQ(Get("key"), "low");
+    EXPECT_EQ(Get("key9"), "high");
+  };
+  ASSERT_NO_FATAL_FAILURE(check_repaired_state());
+
+  // R is a GC candidate: the exact SSTs reference only key 3 in R. GC must
+  // skip R, because generation number A routes to R and A is at or above the
+  // coarse frontier. R keeps all 4 values, and S reads them back.
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {relocation_file}));
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_NO_FATAL_FAILURE(check_repaired_state());
+
+  // A later GC, after a reopen rebuilds the census, still keeps R while S
+  // exists.
+  Reopen(options);
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {relocation_file}));
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_NO_FATAL_FAILURE(check_repaired_state());
+
+  // A compaction writes S into an exact SST, which ends the pin. The exact
+  // SST now references keys 0..3 in R, so every value still reads back.
+  ASSERT_OK(BuildExactSstAtLevel1());
+  ASSERT_FALSE(IsCoarsePinned(origin));
+  for (size_t i = 0; i < kKeyCount; ++i) {
+    EXPECT_EQ(Get(IndirectBlobGCKey(i)), i < kOverwrittenKey
+                                             ? IndirectBlobGCValue(i)
+                                             : overwritten_value(i));
+  }
 }
 
 TEST_F(DBBlobBasicTest, BlobRelocationRouteSurvivesReplayAndManifestSnapshot) {
@@ -12014,6 +12228,96 @@ TEST_F(DBBlobBasicTest, BestEffortsRecoveryMissingRoutedRelocationFile) {
   });
   EXPECT_EQ(Get("keep"), "NOT_FOUND");
   EXPECT_EQ(Get("later"), "NOT_FOUND");
+}
+
+TEST_F(DBBlobBasicTest, RepairWithLostFlattenedFileNeedsCompleteTables) {
+  // Relocation file P is marked lost, and only flattened references use it as
+  // their generation number: no route points to it. A kept WAL could hold an
+  // older copy of a key whose value in P is lost. When an SST is missing,
+  // RepairDB cannot prove which WAL records the original MANIFEST already
+  // covers, so it fails instead of bringing lost data back.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 1024;
+  options.avoid_flush_during_recovery = true;
+  options.avoid_flush_during_shutdown = true;
+  DestroyAndReopen(options);
+  const std::string large(4096, 'v');
+  ASSERT_OK(Put("keep", large));
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("dead" + std::to_string(i), large));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .back()
+                              ->GetBlobFileNumber();
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Delete("dead" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  const uint64_t relocation =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(relocation, kInvalidBlobFileNumber);
+  // Flatten the reference to P, then let route retirement remove the route at
+  // once.
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::RetireBlobRelocationRoutes:MaxPending",
+                          [](void* arg) { *static_cast<uint64_t*>(arg) = 0; });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(Put("other", "value"));
+  ASSERT_OK(Flush());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin),
+      kInvalidBlobFileNumber);
+  ASSERT_NE(
+      cfd->current()->storage_info()->GetBlobRelocationFileMetaData(relocation),
+      nullptr);
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, relocation)));
+  ASSERT_OK(TryReopenWithLostBlobFiles(options, {relocation}));
+  // This write stays only in the WAL.
+  ASSERT_OK(Put("keep", "wal-copy"));
+  std::vector<std::string> ssts;
+  {
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    for (const LiveFileMetaData& file : files) {
+      ssts.push_back(file.directory + "/" + file.relative_filename);
+    }
+  }
+  ASSERT_FALSE(ssts.empty());
+  Close();
+  ASSERT_OK(env_->DeleteFile(ssts.front()));
+  const Status status = RepairDB(dbname_, options);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(status.ToString().find("cannot certify WAL coverage"),
+            std::string::npos)
+      << status.ToString();
 }
 
 TEST_F(DBBlobBasicTest, BlobRelocationDeletionIsElidedFromManifestSnapshot) {
@@ -14725,8 +15029,9 @@ TEST_F(DBBlobBasicTest, PendingFirstActivationRejectsIncompatibleWriter) {
 }
 
 TEST_F(DBBlobBasicTest, FeatureSstIsRejectedByImportAndLegacyIngestion) {
-  // An SST written by a feature CF carries blob indirection properties. Import
-  // and ingestion into a legacy CF refuse it from the properties alone.
+  // An SST written by a column family with the blob indirection format fence
+  // carries blob indirection properties. Import and ingestion into a column
+  // family without the fence refuse it from the properties alone.
   Options options = GetDefaultOptions();
   options.create_if_missing = true;
   options.enable_blob_files = true;
@@ -20598,6 +20903,10 @@ TEST_F(DBBlobBasicTest, RelocationLossIsStickyPointDeletion) {
   ASSERT_EQ(value, large);
   checkpoint_db.reset();
   ASSERT_OK(DestroyDB(checkpoint_path, options));
+  Close();
+  ASSERT_OK(RepairDB(dbname_, options));
+  Reopen(options);
+  check_reads();
   CompactRangeOptions compact_options;
   compact_options.bottommost_level_compaction =
       BottommostLevelCompaction::kForce;

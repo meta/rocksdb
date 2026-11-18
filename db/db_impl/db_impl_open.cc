@@ -466,6 +466,19 @@ IOStatus Directories::SetDirectories(FileSystem* fs, const std::string& dbname,
   return IOStatus::OK();
 }
 
+Status DBImpl::CheckUnresolvedRepairCatalog(const Status& unresolved_catalog) {
+  if (unresolved_catalog.ok()) {
+    return Status::OK();
+  }
+  bool feature_state = versions_->HasDbBlobIndirectionFormat();
+  for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+    const VersionStorageInfo* const vsi = cfd->current()->storage_info();
+    feature_state |= vsi->HasBlobIndirectionFormat() ||
+                     !vsi->GetBlobRelocationFiles().empty();
+  }
+  return feature_state ? unresolved_catalog : Status::OK();
+}
+
 Status DBImpl::CheckRelocationFilesExist(
     UnorderedMap<std::string, UnorderedSet<uint64_t>>*
         blob_file_numbers_by_path) {
@@ -533,6 +546,13 @@ Status DBImpl::Recover(
   bool& is_new_db = recovery_ctx ? recovery_ctx->is_new_db_ : tmp_is_new_db;
   assert(db_lock_ == nullptr);
   std::vector<std::string> files_in_dbname;
+  // An existing repair catalog that could not be read or recognized.
+  Status unresolved_catalog;
+  // Early returns do not reach CheckUnresolvedRepairCatalog() below, which
+  // checks `unresolved_catalog`. So this marks it as checked on every return,
+  // as ASSERT_STATUS_CHECKED builds require.
+  Defer permit_unresolved_catalog(
+      [&unresolved_catalog]() { unresolved_catalog.PermitUncheckedError(); });
   if (read_only) {
     // Read-only opens (DBImplReadOnly and CompactedDBImpl) do not call
     // ValidateOptions(), so the blob indirection FIFO check runs here, once per
@@ -540,6 +560,13 @@ Status DBImpl::Recover(
     Status s = CheckBlobIndirectionCompactionStyle(column_families);
     if (!s.ok()) {
       return s;
+    }
+    mutex_.Unlock();
+    Status catalog_status = CheckRepairCatalogForOpen(
+        env_, dbname_, /*read_only=*/true, &unresolved_catalog);
+    mutex_.Lock();
+    if (!catalog_status.ok()) {
+      return catalog_status;
     }
   }
   if (!read_only) {
@@ -551,6 +578,25 @@ Status DBImpl::Recover(
     }
 
     s = env_->LockFile(LockFileName(dbname_), &db_lock_);
+    if (!s.ok()) {
+      return s;
+    }
+    mutex_.Unlock();
+    s = CheckRepairCatalogForOpen(env_, dbname_, /*read_only=*/false,
+                                  &unresolved_catalog);
+    if (s.ok() && unresolved_catalog.ok()) {
+      // No catalog is left, so files of an earlier repair attempt are not
+      // needed (the DB lock excludes a running RepairDB).
+      std::vector<std::string> names;
+      if (env_->GetChildren(dbname_, &names).ok()) {
+        for (const std::string& name : names) {
+          if (IsRepairStagingFileName(name)) {
+            env_->DeleteFile(dbname_ + "/" + name).PermitUncheckedError();
+          }
+        }
+      }
+    }
+    mutex_.Lock();
     if (!s.ok()) {
       return s;
     }
@@ -589,7 +635,23 @@ Status DBImpl::Recover(
       }
     }
     if (s.IsNotFound()) {
+      // CheckRepairCatalogForOpen() above already handled a recognized catalog.
+      // Here CURRENT is missing (with best-efforts recovery: no non-empty
+      // MANIFEST exists). A REPAIR-IN-PROGRESS file that could not be read or
+      // is not a catalog (unresolved_catalog is not OK) fails the open only
+      // when blob indirection files exist (HasBlobIndirectionFileEvidence()),
+      // because a legacy DB never writes a catalog. Otherwise the open creates
+      // a new DB as usual.
       if (immutable_db_options_.create_if_missing) {
+        if (!unresolved_catalog.ok()) {
+          mutex_.Unlock();
+          const bool evidence = HasBlobIndirectionFileEvidence(
+              env_, dbname_, immutable_db_options_.db_paths, column_families);
+          mutex_.Lock();
+          if (evidence) {
+            return unresolved_catalog;
+          }
+        }
         s = NewDB(&files_in_dbname);
         is_new_db = true;
         if (!s.ok()) {
@@ -696,6 +758,10 @@ Status DBImpl::Recover(
           new ColumnFamilyMemTablesImpl(versions_->GetColumnFamilySet()));
     }
   }
+  if (!s.ok()) {
+    return s;
+  }
+  s = CheckUnresolvedRepairCatalog(unresolved_catalog);
   if (!s.ok()) {
     return s;
   }

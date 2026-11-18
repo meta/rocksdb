@@ -2140,6 +2140,19 @@ class VersionSet {
                  bool no_error_if_files_missing = false, bool is_retry = false,
                  Status* log_status = nullptr);
 
+  // Used only by RepairDB. Creates a new MANIFEST at `manifest_path`, a
+  // temporary name that is not a MANIFEST name, writes a first edit (log number
+  // 0, next file number, last sequence 0) and recovers from it. It keeps the
+  // writer open, so later edits go to this file and CURRENT is not changed (see
+  // "Feature repair" in db/repair.cc).
+  Status RecoverForRepair(
+      const std::string& manifest_path, uint64_t manifest_file_number,
+      const std::vector<ColumnFamilyDescriptor>& column_families);
+
+  // Syncs and closes the MANIFEST that RecoverForRepair() created. RepairDB
+  // calls it before it renames the file to its MANIFEST name.
+  Status SyncAndCloseRepairManifest();
+
   // Do a best-efforts recovery (Options.best_efforts_recovery=true) from all
   // available MANIFEST files. Similar to `Recover` with these differences:
   // 1) not only the latest MANIFEST can be used, if it's not available or
@@ -2662,6 +2675,9 @@ class VersionSet {
   uint32_t TEST_GetDbBlobIndirectionFormatVersion() const {
     return blob_indirection_format_version_;
   }
+  bool HasDbBlobIndirectionFormat() const {
+    return blob_indirection_format_version_ != 0;
+  }
 
   // Appends a kColumnFamilyDrop record for each id in cf_ids to the MANIFEST
   // file at manifest_path, whose valid content length is manifest_size bytes.
@@ -2890,6 +2906,11 @@ class VersionSet {
   // MANIFEST before returning so normal writable operation never appends to
   // the old tail.
   bool force_new_manifest_on_open_;
+
+  // A repair MANIFEST is private until RepairDB finishes validation and
+  // publishes CURRENT. It must keep appending to the staged descriptor rather
+  // than rotating through the normal SetCurrentFile path.
+  bool repair_manifest_staging_;
 
   // Size of the populated manifest file last time it was re-written from
   // scratch.

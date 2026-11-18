@@ -2232,6 +2232,12 @@ class DBImpl : public DB
       UnorderedMap<std::string, UnorderedSet<uint64_t>>*
           blob_file_numbers_by_path);
 
+  // Called right after MANIFEST replay, before WAL replay and before any open
+  // step writes or deletes a file. Returns `unresolved_catalog` (from
+  // CheckRepairCatalogForOpen) if it is an error and the replayed state has
+  // the blob indirection format fence or relocation files; else OK.
+  Status CheckUnresolvedRepairCatalog(const Status& unresolved_catalog);
+
   // Track existing data files, including both referenced and unreferenced SST
   // and Blob files in SstFileManager. This is only called during DB::Open and
   // it's called before any file deletion start so that their deletion can be
