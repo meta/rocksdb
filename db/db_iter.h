@@ -31,6 +31,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 class BlobFileCache;
+class TableFactory;
 class Version;
 namespace port {
 class RWMutex;
@@ -265,6 +266,7 @@ class DBIter final : public Iterator {
   void Prepare(const MultiScanArgs& scan_opts) override;
   Status ValidateScanOptions(const MultiScanArgs& multiscan_opts) const;
   Status SetScanOptionsForPrepare(const MultiScanArgs& scan_opts);
+  bool ShouldPrepareInternalChildren() const;
   void PrepareInternalChildren();
 
  private:
@@ -678,6 +680,7 @@ class DBIter final : public Iterator {
   SystemClock* clock_;
   Logger* logger_;
   UserComparatorWrapper user_comparator_;
+  const TableFactory* table_factory_;
   const MergeOperator* const merge_operator_;
   IteratorWrapper iter_;
   // TODO: blob_state_'s BlobReader (whole-value blob reads + the merge entity

@@ -11,10 +11,14 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+class ManagedSnapshot;
+
 // EXPERIMENTAL
 //
-// An iterator that returns results from multiple scan ranges. The ranges are
-// expected to be in increasing sorted order.
+// An iterator that returns results from multiple scan ranges. By default, the
+// ranges must be sorted and non-overlapping. MultiScanArgs can opt in to
+// unsorted or overlapping ranges; results still follow caller-provided range
+// order, with overlapping ranges evaluated independently.
 // The results are returned in nested container objects that can be iterated
 // using an std::input_iterator.
 //
@@ -176,6 +180,7 @@ class MultiScan {
  public:
   MultiScan(const ReadOptions& read_options, const MultiScanArgs& scan_opts,
             DB* db, ColumnFamilyHandle* cfh);
+  ~MultiScan();
 
   explicit MultiScan(const Comparator* comp,
                      std::unique_ptr<Iterator>&& db_iter)
@@ -195,11 +200,13 @@ class MultiScan {
     using difference_type = int;
     using iterator_category = std::input_iterator_tag;
 
-    MultiScanIterator(const std::vector<ScanOptions>& scan_opts, DB* db,
+    MultiScanIterator(const MultiScanArgs& all_scan_opts, DB* db,
                       ColumnFamilyHandle* cfh, ReadOptions& read_options,
                       Slice* lower_bound, Slice* upper_bound,
-                      std::unique_ptr<Iterator>& db_iter, bool reverse)
-        : scan_opts_(scan_opts),
+                      std::unique_ptr<Iterator>& db_iter, bool reverse,
+                      bool prepare_each_range, bool noncanonical)
+        : all_scan_opts_(all_scan_opts),
+          scan_opts_(all_scan_opts.GetScanRanges()),
           db_(db),
           cfh_(cfh),
           read_options_(read_options),
@@ -207,6 +214,8 @@ class MultiScan {
           upper_bound_(upper_bound),
           idx_(0),
           reverse_(reverse),
+          prepare_each_range_(prepare_each_range),
+          noncanonical_(noncanonical),
           valid_(true),
           db_iter_(db_iter),
           scan_(db_iter_.get(), reverse_) {
@@ -236,6 +245,7 @@ class MultiScan {
     reference operator->() { return scan_; }
 
    private:
+    const MultiScanArgs& all_scan_opts_;
     const std::vector<ScanOptions>& scan_opts_;
     DB* db_;
     ColumnFamilyHandle* cfh_;
@@ -244,18 +254,21 @@ class MultiScan {
     Slice* upper_bound_;
     size_t idx_;
     bool reverse_;
+    bool prepare_each_range_;
+    bool noncanonical_;
     bool valid_;
     std::unique_ptr<Iterator>& db_iter_;
     Status status_;
     Scan scan_;
 
     void SeekCurrentRange();
+    void PrepareCurrentRange();
   };
 
   MultiScanIterator begin() {
-    return MultiScanIterator(scan_opts_.GetScanRanges(), db_, cfh_,
-                             read_options_, &lower_bound_, &upper_bound_,
-                             db_iter_, scan_opts_.reverse);
+    return MultiScanIterator(
+        scan_opts_, db_, cfh_, read_options_, &lower_bound_, &upper_bound_,
+        db_iter_, scan_opts_.reverse, prepare_each_range_, noncanonical_);
   }
 
   std::nullptr_t end() { return nullptr; }
@@ -267,7 +280,10 @@ class MultiScan {
   ColumnFamilyHandle* cfh_{};
   Slice lower_bound_;
   Slice upper_bound_;
+  std::unique_ptr<ManagedSnapshot> owned_snapshot_;
   std::unique_ptr<Iterator> db_iter_;
+  bool prepare_each_range_ = false;
+  bool noncanonical_ = false;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

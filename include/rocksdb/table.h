@@ -1328,6 +1328,15 @@ class TableFactory : public Customizable {
   // Return is delete range supported
   virtual bool IsDeleteRangeSupported() const { return false; }
 
+  // Returns whether this table format supports MultiScan requests that opt in
+  // to unsorted or overlapping ranges. Adapters whose iterator contract cannot
+  // safely preserve logical range boundaries should return false. Both
+  // DB::NewMultiScan() and direct Iterator::Prepare() query this capability;
+  // canonical requests do not.
+  virtual bool SupportsMultiScan(const MultiScanArgs& /*scan_opts*/) const {
+    return true;
+  }
+
   // Returns whether NewTableBuilder() can write tables. A column family whose
   // table factory returns false holds only ingested or imported files: it must
   // set disallow_memtable_writes, automatic compactions are not scheduled for

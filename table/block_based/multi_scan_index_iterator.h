@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cassert>
+#include <limits>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -21,14 +22,17 @@ namespace ROCKSDB_NAMESPACE {
 class MultiScanArgs;
 class Statistics;
 
-// MultiScanIndexIterator wraps the block handle list produced by
-// Prepare()/CollectBlockHandles() and presents it as an
-// InternalIteratorBase<IndexValue>. This allows BlockBasedTableIterator
-// to use the same SeekImpl()/FindBlockForward() code path for both
-// regular iteration and MultiScan.
+// MultiScanIndexIterator presents prepared data-block handles through the
+// ordinary table-index interface. Canonical ranges use contiguous subranges of
+// a physical handle vector. Non-canonical ranges instead map caller ranges to
+// a deduplicated vector:
 //
-// The iterator supports forward Seek()/Next() or reverse SeekForPrev()/Prev()
-// depending on MultiScanArgs::reverse.
+//   range 0: [0, 1] --+
+//   range 1: [1, 2] --+--> unique blocks [A, B, C]
+//
+// A shared seek generation separates caller range transitions from internal
+// reseeks. Blocks are retained by ReadSet until the final referencing range is
+// retired; foreground fallbacks transfer ownership to the table iterator.
 class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
  public:
   // scan_opts and icomp must outlive this iterator. read_set is shared.
@@ -36,6 +40,15 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
       std::vector<BlockHandle>&& block_handles,
       std::vector<std::string>&& data_block_separators,
       std::vector<std::tuple<size_t, size_t>>&& block_index_ranges_per_scan,
+      const MultiScanArgs* scan_opts, std::shared_ptr<ReadSet> read_set,
+      size_t prefetch_start_idx, size_t prefetch_max_idx,
+      const InternalKeyComparator& icomp, Statistics* statistics);
+
+  MultiScanIndexIterator(
+      std::vector<BlockHandle>&& block_handles,
+      std::vector<std::string>&& data_block_separators,
+      std::vector<std::vector<size_t>>&& block_indices_per_scan,
+      std::vector<bool>&& range_reaches_file_end,
       const MultiScanArgs* scan_opts, std::shared_ptr<ReadSet> read_set,
       size_t prefetch_start_idx, size_t prefetch_max_idx,
       const InternalKeyComparator& icomp, Statistics* statistics);
@@ -48,7 +61,9 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
   MultiScanIndexIterator(MultiScanIndexIterator&&) = delete;
   MultiScanIndexIterator& operator=(MultiScanIndexIterator&&) = delete;
 
-  // Forward-only seek. target must be >= prev_seek_key_.
+  // Canonical mode accepts monotonically increasing targets. Non-canonical
+  // mode can activate caller ranges in any order and reposition within the
+  // active range for internal reseeks.
   void Seek(const Slice& target) override;
 
   // Move to the next block. Handles scan range boundaries.
@@ -80,7 +95,7 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
 
   // Returns the current index into the ReadSet, or prefetch size if the
   // current block was not prefetched.
-  size_t current_read_set_index() const;
+  size_t current_read_set_index();
 
   // Returns the max_prefetch_size from scan options.
   uint64_t GetMaxPrefetchSize() const;
@@ -89,19 +104,20 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
     return prefetch_max_idx_ - prefetch_start_idx_;
   }
 
-  // Returns true if the last Next() crossed a scan range boundary.
-  // Only valid immediately after Next(); reset to false on the next Seek().
+  // True when the active logical range has exhausted its blocks in this file.
+  // Canonical mode discovers this in Next(); non-canonical mode can discover
+  // it in Seek() or Next(). The next Seek() clears it.
   bool IsScanRangeExhausted() const { return scan_range_exhausted_; }
 
-  // Returns true if there are more scan ranges after the current one.
-  bool HasMoreScanRanges() const {
-    // Reverse MultiScan advances ranges through SeekForPrev(), not this
-    // forward-only range transition path.
-    if (scan_opts_->reverse) {
-      return false;
-    }
-    return next_scan_idx_ < block_index_ranges_per_scan_.size();
-  }
+  // After IsScanRangeExhausted(), returns true when the caller range ends in
+  // this file and LevelIterator must not advance to the next file.
+  bool CurrentRangeEndsInThisFile() const;
+
+  bool RetainsPrefetchedBlocks() const { return noncanonical_ranges_; }
+
+  // Stop retention bookkeeping after BorrowIndex() reports that its fallback
+  // transferred current-block ownership to the data iterator.
+  void MarkCurrentBlockUnretained();
 
  private:
   // Release blocks from from_idx (inclusive) to to_idx (exclusive),
@@ -126,9 +142,21 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
   // detection). If this is the last range, becomes invalid.
   void SetExhausted();
 
+  void SeekNonCanonical(const Slice& target);
+  void NextNonCanonical();
+  void ActivateNonCanonicalRange(size_t scan_idx, const Slice& target);
+  void PositionInNonCanonicalRange(const Slice& target);
+  void RetireNonCanonicalRange();
+  void FinishNonCanonicalRange();
+  void ReleaseNonCanonicalBlocks();
+  size_t FindLocalRange(size_t logical_range_index) const;
+  void SetNonCanonicalRangeExhausted();
+
   std::vector<BlockHandle> block_handles_;
   std::vector<std::string> data_block_separators_;
   std::vector<std::tuple<size_t, size_t>> block_index_ranges_per_scan_;
+  std::vector<std::vector<size_t>> block_indices_per_scan_;
+  std::vector<bool> range_reaches_file_end_;
   const MultiScanArgs* scan_opts_;
   std::shared_ptr<ReadSet> read_set_;
   size_t prefetch_start_idx_;
@@ -137,6 +165,8 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
   size_t one_past_last_unreleased_prefetch_idx_;
   std::vector<bool> released_prefetch_blocks_;
   size_t unreleased_prefetch_blocks_;
+  std::vector<size_t> remaining_range_uses_;
+  std::vector<bool> used_prefetch_blocks_;
   const InternalKeyComparator& icomp_;
   UserComparatorWrapper user_comparator_;
   Statistics* statistics_;
@@ -149,6 +179,14 @@ class MultiScanIndexIterator : public InternalIteratorBase<IndexValue> {
   std::string prev_seek_key_;
   size_t wasted_blocks_count_ = 0;
   bool scan_range_exhausted_ = false;
+  bool noncanonical_ranges_ = false;
+  // Non-canonical mode tracks the active local range independently from the
+  // physical block position because consecutive caller ranges can move in
+  // either direction and can share blocks.
+  size_t active_scan_idx_ = std::numeric_limits<size_t>::max();
+  size_t active_scan_block_pos_ = 0;
+  bool active_range_retired_ = false;
+  uint64_t observed_seek_generation_ = 0;
   mutable std::string cur_key_buf_;
 };
 

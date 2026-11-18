@@ -1114,6 +1114,10 @@ class ExternalTableFactoryAdapter : public TableFactory {
     return Mode == ExternalTableMode::kFull && supports_range_deletions_;
   }
 
+  bool SupportsMultiScan(const MultiScanArgs& scan_opts) const override {
+    return inner_->SupportsMultiScan(scan_opts);
+  }
+
   bool IsTableBuilderSupported() const override {
     return supports_table_builder_;
   }
