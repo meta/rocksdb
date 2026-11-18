@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #include "db/blob/blob_index.h"
@@ -3983,6 +3984,66 @@ TEST_F(DBSecondaryTest, SwitchManifestTwice) {
 
   ASSERT_OK(db_secondary_->Get(ropts, "0", &value));
   ASSERT_EQ("value1", value);
+}
+
+// A new DB created at the primary's path writes a MANIFEST with another DB ID.
+// Catch-up must not replay that MANIFEST on top of the Versions of the old DB,
+// in the call that finds the DB ID or in a later one.
+TEST_F(DBSecondaryTest, CatchUpRejectsManifestOfAnotherDb) {
+  Options options;
+  options.env = env_;
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Flush());
+  std::string first_db_id;
+  ASSERT_OK(db_->GetDbIdentity(first_db_id));
+  const uint64_t first_manifest_number =
+      dbfull()->TEST_Current_Manifest_FileNo();
+
+  // With max_open_files = -1, the secondary keeps the table file of the old DB
+  // open, so it can still read it after the primary DB is destroyed.
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  VerifySecondaryValue("foo", "v1");
+  const auto live_file_numbers = [this]() {
+    std::vector<LiveFileMetaData> live_files;
+    db_secondary_->GetLiveFilesMetaData(&live_files);
+    std::set<uint64_t> numbers;
+    for (const auto& file : live_files) {
+      numbers.insert(file.file_number);
+    }
+    return numbers;
+  };
+  const std::set<uint64_t> old_live_file_numbers = live_file_numbers();
+  const SequenceNumber old_last_sequence =
+      db_secondary_->GetLatestSequenceNumber();
+
+  // A new DB numbers its files from the start, so its MANIFEST can get the
+  // number of the MANIFEST of the old DB. Each open writes a MANIFEST with a
+  // higher number. Reopen until the name differs, because catch-up reads a new
+  // MANIFEST only when CURRENT names another file.
+  DestroyAndReopen(options);
+  while (dbfull()->TEST_Current_Manifest_FileNo() == first_manifest_number) {
+    Reopen(options);
+  }
+  ASSERT_OK(Put("foo", "other_db"));
+  ASSERT_OK(Flush());
+  std::string second_db_id;
+  ASSERT_OK(db_->GetDbIdentity(second_db_id));
+  ASSERT_NE(first_db_id, second_db_id);
+
+  // Only the first record of the new MANIFEST has a DB ID. The second call
+  // must not read the records after it.
+  for (int call = 0; call < 2; ++call) {
+    const Status s = db_secondary_->TryCatchUpWithPrimary();
+    ASSERT_EQ(Status::Code::kCorruption, s.code()) << s.ToString();
+    VerifySecondaryValue("foo", "v1");
+    ASSERT_EQ(old_live_file_numbers, live_file_numbers());
+    ASSERT_EQ(old_last_sequence, db_secondary_->GetLatestSequenceNumber());
+  }
 }
 
 TEST_F(DBSecondaryTest, DISABLED_SwitchWAL) {

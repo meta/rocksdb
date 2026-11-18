@@ -442,6 +442,10 @@ class DB {
   // tries to keep up with the leader by periodically tailing the leader's
   // MANIFEST, and (in the future) memtable updates, rather than relying on
   // the user to manually call TryCatchupWithPrimary().
+  // If the leader's MANIFEST belongs to another DB (another DB ID), for example
+  // after the leader DB is destroyed and created again at the same path, the
+  // follower stops catching up and keeps serving its current data. Reopen the
+  // follower to read the new DB.
 
   // Open as a follower with the default column family
   static Status OpenAsFollower(const Options& options, const std::string& name,
@@ -2961,10 +2965,14 @@ class DB {
   // If a read of the MANIFEST fails, this call returns the error. The next
   // call opens the MANIFEST again and continues after the last record that
   // this instance applied. If that fails, the call returns the error, and the
-  // call after it tries again. If the MANIFEST now belongs to another DB
-  // (another DB ID), the call returns Corruption. Other errors persist until
-  // this instance is reopened, for example a corrupted MANIFEST record, or an
-  // I/O error while applying a record, such as from opening a table file.
+  // call after it tries again.
+  // If CURRENT names a MANIFEST of another DB (another DB ID), for example
+  // after the primary DB is destroyed and created again at the same path, this
+  // call returns Corruption. Reopen the instance to read the new DB.
+  // Any other error persists: every later call returns it and reads no more of
+  // the MANIFEST, until this instance is reopened. Examples are a corrupted
+  // MANIFEST record and an I/O error while applying a record, such as from
+  // opening a table file.
   virtual Status TryCatchUpWithPrimary() {
     return Status::NotSupported("Supported only by secondary instance");
   }

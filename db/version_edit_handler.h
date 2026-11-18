@@ -457,11 +457,10 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
 
   // ReactiveVersionSet::ReadAndApply() calls this before it reads with a new
   // reader that starts at GetLastValidRecordEnd(), after a failed MANIFEST read
-  // stopped the last Iterate(). It calls this only when status_ was OK before
-  // that Iterate(), so status_ holds at most the read error, and clearing it is
-  // safe. The read buffer can hold the first records of an atomic group that
-  // the failed read cut. This clears them, and the new reader reads the group
-  // again.
+  // stopped the last Iterate(). Any other error stops all later reads, so
+  // status_ holds at most the read error, and clearing it is safe. The read
+  // buffer can hold the first records of an atomic group that the failed read
+  // cut. This clears them, and the new reader reads the group again.
   void PrepareToResumeAfterReadError() {
     status_ = Status::OK();
     GetReadBuffer().Clear();
