@@ -747,6 +747,10 @@ class VersionStorageInfo {
   size_t GetBlobRelocationRouteCount() const {
     return BlobRelocationStateForRead().route_count();
   }
+  // The number of relocation files marked lost.
+  size_t GetLostBlobRelocationFileCount() const {
+    return BlobRelocationStateForRead().LostFileCount();
+  }
   // The total size of the live relocation files.
   uint64_t GetBlobRelocationFileBytes() const {
     return BlobRelocationStateForRead().PhysicalFileBytes();
@@ -763,9 +767,15 @@ class VersionStorageInfo {
   const BlobFileTable& GetBlobFileTable() const {
     return BlobRelocationStateForRead().table();
   }
+  // True if a loss record (kBlobPhysicalFileLoss) marks a relocation file of
+  // this Version lost. Only relocation files can be lost.
   bool HasLostBlobRelocationFiles() const {
     return BlobRelocationStateForRead().HasLostFiles();
   }
+
+  // True if `index` resolves to a physical file marked lost: the file whose
+  // number is its generation number, or the target of the route of that
+  // generation number.
   bool IsBlobReferenceLost(const BlobIndex& index) const;
 
   std::shared_ptr<BlobRelocationFileMetaData> GetBlobRelocationFileMetaData(
@@ -1472,6 +1482,15 @@ class Version {
                  FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
                  uint64_t* bytes_read) const;
 
+  // True `*lost` means this entry is a same-sequence point deletion. Callers
+  // must call this before any lazy column or cache lookup. It checks every
+  // column of an entity, including columns the caller did not request. An
+  // entity is lost only when every column is a lost blob column. If it loses
+  // only some columns and `repaired_entity` is not null, `*repaired_entity`
+  // holds the entity without them; otherwise it is empty.
+  Status IsBlobValueLost(ValueType type, const Slice& value, bool* lost,
+                         std::string* repaired_entity) const;
+
   // Retrieves a byte sub-range [range_offset, range_offset + range_length) of
   // an *uncompressed*, separate-file blob's value into *value, reading only
   // those bytes on a cache miss (see BlobSource::GetBlobRange). The blob file
@@ -1546,6 +1565,14 @@ class Version {
   // *live_blob_files.
   void AddLiveFiles(std::vector<uint64_t>* live_table_files,
                     std::vector<uint64_t>* live_blob_files) const;
+
+  // Like AddLiveFiles() above, but with `skip_marked_lost` it leaves out the
+  // relocation files that are marked lost. Their metadata stays in the Version
+  // for reads, but they have no bytes to copy. DB::GetLiveFiles() uses this
+  // form.
+  void AddLiveFiles(std::vector<uint64_t>* live_table_files,
+                    std::vector<uint64_t>* live_blob_files,
+                    bool skip_marked_lost) const;
 
   // Remove live files that are in the delete candidate lists.
   void RemoveLiveFiles(
@@ -1650,11 +1677,12 @@ class Version {
 
   const MutableCFOptions& GetMutableCFOptions() { return mutable_cf_options_; }
 
-  // Checks that a reference with generation number `generation` can still be
-  // read in this Version, with the same file table rules as an indirect read,
-  // without opening a file: `generation` is a live indirect-origin blob file, a
-  // live relocation file, or a route to a live relocation file. Returns
-  // NotFound for a relocation file marked lost and Corruption otherwise.
+  // Checks that a reference with generation number `generation` is legal in
+  // this Version, without opening a file. It uses the same file table rules as
+  // an indirect read: `generation` is a live indirect-origin blob file, a live
+  // relocation file, or a route to a live relocation file. One case differs: a
+  // relocation file marked lost returns OK here, because loss repair turns the
+  // references to it into deletions. Returns Corruption otherwise.
   // Compaction uses it to check the generation numbers that its output SSTs
   // write.
   Status ValidateBlobReferenceGeneration(uint64_t generation) const;
@@ -2138,7 +2166,8 @@ class VersionSet {
   void RecoverEpochNumbers();
 
   // Logs the dropped blob files (see VersionStorageInfo::GetDroppedBlobFiles())
-  // of each column family's current Version.
+  // of each column family's current Version (WARN), and each relocation file
+  // marked lost (ERROR).
   void LogDroppedBlobFiles() const;
 
   // Reads a manifest file and returns a list of column families in
@@ -2772,6 +2801,10 @@ class VersionSet {
   // and is qualified for being deleted.
   std::atomic<uint64_t> min_log_number_to_keep_ = {0};
   uint64_t manifest_file_number_;
+  // Set by VersionEditHandlerPointInTime::CheckRepairFallbackAgainstGc() when a
+  // fallback in time crosses an indirect blob GC edit. TryRecover() then stops
+  // and does not try an older MANIFEST file.
+  bool repair_fallback_crossed_gc_ = false;
   uint64_t options_file_number_;
   uint64_t options_file_size_;
   bool has_committed_options_file_number_;

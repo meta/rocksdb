@@ -436,8 +436,11 @@ class CompactionJob {
   //
   // Checks at install:
   //   1. Before the run, ValidateBlobRelocationInputGenerations() checks each
-  //      number in the job's own input Version. A number that cannot be read
-  //      there (a lost or dropped file) fails the job with Corruption.
+  //      number in the job's own input Version. A number that cannot be
+  //      resolved there fails the job with Corruption. A lost file and a
+  //      dropped origin pass: the compaction turns their references into
+  //      deletions (MissingBlobRepairIterator), so the output never writes
+  //      them.
   //   2. After the run, PrepareBlobRelocationOutputDependencies() records the
   //      physical file that each output number resolves to in the input
   //      Version (the output dependencies).
@@ -493,11 +496,11 @@ class CompactionJob {
   // checksums and every indirect group of the output. When a check fails, it
   // returns Corruption, or the status of the step that failed: the descriptor
   // decode, the metadata read, the build of the allowed generation numbers (an
-  // input summary read or its memory charge), or a group check (for example
-  // NotFound for a relocation file marked lost). The caller then deletes the
-  // imported files and runs the compaction locally. If that cleanup fails, the
-  // job fails instead. On success it sets `meta->blob_reference_descriptor` and
-  // `meta->blob_reference_summary`. The steps are numbered in the function.
+  // input summary read or its memory charge), or a group check. The caller then
+  // deletes the imported files and runs the compaction locally. If that cleanup
+  // fails, the job fails instead. On success it sets
+  // `meta->blob_reference_descriptor` and `meta->blob_reference_summary`. The
+  // steps are numbered in the function.
   // Called without the DB mutex.
   Status ValidateRemoteExactBlobMetadata(
       const CompactionServiceOutputFile& file,

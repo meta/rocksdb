@@ -468,6 +468,30 @@ class DBIter final : public Iterator {
   bool FindNextUserEntry(bool skipping_saved_key);
   // Internal implementation of FindNextUserEntry().
   bool FindNextUserEntryInternal(bool skipping_saved_key);
+
+  // The current entry's value, or the entity ParseKey() repaired. Valid until
+  // the next ParseKey().
+  //
+  // Which accessor to use: ParseKey() turns a lost blob index into a
+  // deletion, so only a wide-column entity can have a repaired value. Code
+  // that reads an entity value must use CurrentValue(), or SaveCurrentValue()
+  // if the value must stay valid after the next ParseKey(). Code that reads
+  // any other value type can use iter_.value().
+  Slice CurrentValue() const {
+    return current_entry_repaired_entity_.empty()
+               ? iter_.value()
+               : Slice(current_entry_repaired_entity_);
+  }
+
+  // Like CurrentValue(), but a repaired entity stays valid after later
+  // ParseKey() calls, until the next visible entry is saved.
+  Slice SaveCurrentValue() {
+    if (current_entry_repaired_entity_.empty()) {
+      return iter_.value();
+    }
+    visible_repaired_entity_ = current_entry_repaired_entity_;
+    return visible_repaired_entity_;
+  }
   bool ParseKey(ParsedInternalKey* key);
   bool MergeValuesNewToOld();
 
@@ -792,5 +816,25 @@ class DBIter final : public Iterator {
 
   IterKey range_tomb_first_key_;
   IterKey range_tomb_end_key_;
+
+  // These fields track blob values that are lost (see
+  // BlobFetcher::IsBlobValueLost()). A lost entry reads as a deletion. Range
+  // tombstone conversion (min_tombstones_for_range_conversion) is the only
+  // user of current_entry_lost_ and current_key_deleted_by_loss_. Forward
+  // iteration checks current_entry_lost_ for each entry. Reverse iteration
+  // reads several entries of one key before it finds the visible one, so it
+  // keeps current_key_deleted_by_loss_ for that visible deletion.
+
+  // ParseKey() turned the current entry into a deletion because its blob
+  // value is lost (a loss record marks its file lost).
+  bool current_entry_lost_ = false;
+  // FindValueForCurrentKey*() found a visible deletion that is a lost key.
+  bool current_key_deleted_by_loss_ = false;
+  // ParseKey() set this to the current entity without its lost blob columns.
+  // Empty if the current entry is not a partially lost entity.
+  std::string current_entry_repaired_entity_;
+  // Copy of a repaired entity used as the visible value. Later ParseKey()
+  // calls do not change it.
+  std::string visible_repaired_entity_;
 };
 }  // namespace ROCKSDB_NAMESPACE

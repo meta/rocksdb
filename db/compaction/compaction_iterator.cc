@@ -1065,7 +1065,8 @@ void CompactionIterator::NextFromInput() {
     if ((ikey_.type == kTypeBlobIndex || ikey_.type == kTypeWideColumnEntity) &&
         blob_fetcher_ != nullptr && blob_fetcher_->HasBlobValueLoss()) {
       bool lost = false;
-      status_ = blob_fetcher_->IsBlobValueLost(ikey_.type, value_, &lost);
+      status_ = blob_fetcher_->IsBlobValueLost(ikey_.type, value_, &lost,
+                                               /*repaired_entity=*/nullptr);
       if (!status_.ok()) {
         return;
       }

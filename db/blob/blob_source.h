@@ -179,9 +179,13 @@ class BlobSource {
   // - A blob file never changes after it is written, and the DB never reuses
   //   a file number. So (origin, original offset) names the same bytes for the
   //   life of the DB.
-  // - Outside tests, a relocation file is marked lost only when the open
-  //   replays a loss record, so no entry of this session can belong to a lost
-  //   file.
+  // - A primary marks a relocation file lost only while the DB opens: the open
+  //   replays a loss record, or best_efforts_blob_db_repair finds the file
+  //   missing or corrupt (tests can also mark one). A secondary or follower can
+  //   also apply a loss record while it catches up with the primary's MANIFEST,
+  //   so the cache can then hold entries of a lost file. A reader whose Version
+  //   marks the file lost checks for loss before any cache lookup
+  //   (Version::IsBlobValueLost()), so it never gets such an entry.
   Status GetIndirectBlobFromCache(const BlobIndex& blob_index,
                                   uint64_t range_offset, size_t range_length,
                                   PinnableSlice* value) const;

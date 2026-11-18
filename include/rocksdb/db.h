@@ -1952,6 +1952,12 @@ class DB {
     //      entries being pinned in blob cache.
     static const std::string kBlobCachePinnedUsage;
 
+    // "rocksdb.blob-relocation-lost-files" - returns the number of relocation
+    // files of the column family that are marked lost (their values read as
+    // deleted). The lost-relocation-files key of rocksdb.indirect-blob-gc-stats
+    // has the same value.
+    static const std::string kBlobRelocationLostFiles;
+
     // "rocksdb.indirect-blob-gc-idle-micros-with-candidates" - returns how long
     // the column family has had indirect blob GC candidates while no GC job
     // began, in microseconds (a duration). A large value means that GC is
@@ -1972,8 +1978,8 @@ class DB {
     // garbage-bytes-collectable, garbage-bytes-suppressed, coarse-pinned-files,
     // coarse-pinned-bytes, coarse-pinned-garbage-bytes, coarse-sst-count,
     // lowest-coarse-frontier, idle-micros-with-candidates,
-    // retirement-pending-micros. Every *-micros key is a duration, never a
-    // timestamp.
+    // retirement-pending-micros, lost-relocation-files. Every *-micros key is a
+    // duration, never a timestamp.
     static const std::string kIndirectBlobGcStats;
 
     // "rocksdb.blob-reference-census-unready-micros" - returns how long the

@@ -910,13 +910,16 @@ void VersionEditHandlerPointInTime::ResetAtomicUpdateState() {
 void VersionEditHandlerPointInTime::CheckIterationResult(
     const log::Reader& reader, Status* s) {
   if (s->ok() && read_only_ && allow_incomplete_valid_version_) {
-    // Best-efforts recovery never marks a relocation file lost. When the
-    // current state needs a missing relocation file, a read-write open falls
-    // back to an older complete Version. It then writes a new MANIFEST, so the
-    // DB stays at that point and every later open sees the same state. A
-    // read-only open cannot write the MANIFEST. Its fallback would show old
-    // values of keys that later edits overwrote or deleted, while the MANIFEST
-    // still holds the later state. So the read-only open fails instead.
+    // Plain best_efforts_recovery (without best_efforts_blob_db_repair) never
+    // marks a relocation file lost. When the current state needs a missing
+    // relocation file, a read-write open falls back to an older complete
+    // Version. It then writes a new MANIFEST, so the DB stays at that point and
+    // every later open sees the same state. A read-only open cannot write the
+    // MANIFEST. Its fallback would show old values of keys that later edits
+    // overwrote or deleted, while the MANIFEST still holds the later state. So
+    // the read-only open fails instead. This check covers only the MANIFEST
+    // file being read. If an older MANIFEST file exists, a read-only open can
+    // still fall back to it (VersionSet::TryRecover()), as in base RocksDB.
     // Secondary and follower catch-up keep their usual rule of complete
     // Versions only. Only the final builder state counts: a file that an old
     // edit added and a later edit deleted is ignored.
@@ -930,6 +933,9 @@ void VersionEditHandlerPointInTime::CheckIterationResult(
   }
   VersionEditHandler::CheckIterationResult(reader, s);
   assert(s != nullptr);
+  if (s->ok()) {
+    *s = CheckRepairFallbackAgainstGc();
+  }
   if (s->ok()) {
     for (auto* cfd : *(version_set_->column_family_set_)) {
       if (cfd->IsDropped()) {
@@ -955,6 +961,90 @@ void VersionEditHandlerPointInTime::CheckIterationResult(
   } else {
     DiscardVersions(&versions_);
   }
+}
+
+Status VersionEditHandlerPointInTime::CheckRepairFallbackAgainstGc() {
+  // Problem: with best_efforts_blob_db_repair, a missing non-L0 SST can still
+  // make the open fall back to an older point in the MANIFEST. In a column
+  // family with blob indirection, that point can be older than an indirect blob
+  // GC edit: GC moved the values of some origin files into a relocation file
+  // and then removed the origins. The old point still names those origins, and
+  // they are gone from disk. The base best_efforts_blob_db_repair rule drops a
+  // blob file only when its data is gone from disk. A fallback past a GC edit
+  // would drop old origin files whose values are still on disk in a relocation
+  // file, and the purge at open would then delete that relocation file.
+  //
+  // Rule: the open fails instead, so it never loses a value whose data is
+  // still on disk.
+  //
+  // Two states: versions_ holds the chosen fallback point, which the open
+  // would install. builders_ hold the state after the last edit of this
+  // MANIFEST file, so they know every GC removal in this file that comes after
+  // the fallback point. A file that is dropped (or marked lost) in the
+  // fallback Version, but that a later edit retired or deleted, was removed by
+  // indirect blob GC on purpose. In this example, edit 40 is the fallback
+  // point, origin file 12 is dropped there, and a later GC edit retired file
+  // 12 and added relocation file 20:
+  //
+  //   MANIFEST: edit 1 ... edit 40 .......... GC edit ............ last edit
+  //                        (fallback point)   (retire 12, add 20)
+  //                        ^ versions_                             ^ builders_
+  //
+  //   File 12 is dropped in versions_, and builders_ say that GC retired it,
+  //   so the open fails.
+  //
+  // Scope: the check uses only this MANIFEST file. When this check fails, it
+  // sets VersionSet::repair_fallback_crossed_gc_, and VersionSet::TryRecover()
+  // does not try an older MANIFEST file (see the comments there). Only the
+  // builders of a repair open record dropped files. For a secondary or
+  // follower (ManifestTailer), this check therefore skips every column family.
+  for (const auto& entry : versions_) {
+    const VersionStorageInfo* const storage =
+        entry.second.version->storage_info();
+    if (!storage->HasBlobIndirectionFormat()) {
+      continue;
+    }
+    const auto builder = builders_.find(entry.first);
+    if (builder == builders_.end()) {
+      continue;
+    }
+    const VersionBuilder* const version_builder =
+        builder->second->version_builder();
+    if (!version_builder->RecordsMissingBlobFilesAsDropped()) {
+      continue;
+    }
+    std::vector<uint64_t> removed_by_gc;
+    for (uint64_t file_number : storage->GetDroppedBlobFiles()) {
+      if (version_builder->IsBlobFileRemovedByGc(file_number)) {
+        removed_by_gc.push_back(file_number);
+      }
+    }
+    for (const std::shared_ptr<BlobRelocationFileMetaData>& file :
+         storage->GetBlobRelocationFiles()) {
+      if (file->IsMarkedLost() &&
+          version_builder->IsBlobFileRemovedByGc(file->GetFileNumber())) {
+        removed_by_gc.push_back(file->GetFileNumber());
+      }
+    }
+    if (!removed_by_gc.empty()) {
+      std::string numbers;
+      for (uint64_t file_number : removed_by_gc) {
+        numbers.append(" #");
+        AppendNumberTo(&numbers, file_number);
+      }
+      // An older MANIFEST file never saw these indirect blob GC edits, so
+      // TryRecover() must not try it next.
+      version_set_->repair_fallback_crossed_gc_ = true;
+      return Status::Corruption(
+          "best_efforts_blob_db_repair would fall back to a MANIFEST point "
+          "older than a blob GC edit in column family " +
+          std::to_string(entry.first) +
+          "; restore the missing SST files. Blob files that GC removed "
+          "after that point:" +
+          numbers);
+    }
+  }
+  return Status::OK();
 }
 
 ColumnFamilyData* VersionEditHandlerPointInTime::DestroyCfAndCleanup(
@@ -1506,11 +1596,12 @@ Status ManifestTailer::VerifyFile(ColumnFamilyData* cfd,
 
 namespace {
 // Prints the blob indirection state of a column family for "ldb
-// manifest_dump": the per-CF format fence, the relocation files and the routes
-// (see "MANIFEST records" in db/blob/blob_relocation_manifest.h), then the
-// kind of reference metadata of its SSTs. A column family without the fence,
-// relocation files or routes prints nothing, so the dump of a DB that does not
-// use blob indirection does not change.
+// manifest_dump": the per-CF format fence, the relocation files, the routes
+// and the lost relocation files (see "MANIFEST records" in
+// db/blob/blob_relocation_manifest.h), then the kind of reference metadata of
+// its SSTs. A column family without the fence, relocation files or routes
+// prints nothing, so the dump of a DB that does not use blob indirection does
+// not change.
 void PrintBlobIndirectionSummary(const VersionStorageInfo& vstorage) {
   const VersionStorageInfo::BlobRelocationFiles& files =
       vstorage.GetBlobRelocationFiles();
@@ -1528,9 +1619,9 @@ void PrintBlobIndirectionSummary(const VersionStorageInfo& vstorage) {
   fprintf(stdout,
           "--- blob indirection --- format version: %" PRIu32
           ", relocation files: %zu (%" PRIu64 " bytes, %" PRIu64
-          " values), routes: %zu\n",
+          " values), routes: %zu, lost relocation files: %zu\n",
           vstorage.GetBlobIndirectionFormatVersion(), files.size(), file_bytes,
-          values, route_count);
+          values, route_count, vstorage.GetLostBlobRelocationFileCount());
   // The kind of blob reference metadata of each SST (see
   // db/blob/blob_reference_metadata.h). Indirect blob GC does not collect a
   // blob file numbered at or above the lowest frontier of the coarse SSTs. The

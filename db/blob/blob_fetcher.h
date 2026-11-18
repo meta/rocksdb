@@ -31,18 +31,6 @@ class BlobFetcher {
  public:
   virtual ~BlobFetcher() = default;
 
-  // Hook for compaction to skip blob values whose files are known to be lost.
-  // The base class reports no loss, and no override exists yet.
-  // CompactionIterator calls it before it fetches any column or cache entry.
-  // For a wide-column entity, an override reports lost only when every blob
-  // column is lost.
-  virtual Status IsBlobValueLost(ValueType /*type*/, const Slice& /*value*/,
-                                 bool* lost) const {
-    *lost = false;
-    return Status::OK();
-  }
-  virtual bool HasBlobValueLoss() const { return false; }
-
   // Convenience overload: decodes `blob_index_slice` into a BlobIndex and
   // dispatches to the virtual overload below. Non-virtual; shared by all
   // implementations.
@@ -59,6 +47,28 @@ class BlobFetcher {
   // EmbeddedAwareBlobFetcher decorator) to resolve same-file blob references,
   // which need the current read_tier.
   virtual const ReadOptions& read_options() const = 0;
+
+  // Tells whether a value is lost because a loss record (kBlobPhysicalFileLoss)
+  // marks its physical file lost. Readers call it before they fetch any column
+  // or cache entry. An indirect BlobIndex is lost when the file of its
+  // generation number, or the target of its route, is marked lost. A legacy
+  // BlobIndex is never lost. A wide-column entity is lost only when every
+  // column is a lost blob column. Otherwise the entity keeps its other
+  // columns, as with skip_missing_blob_files. If some, but not all, columns
+  // are lost and `repaired_entity` is not null, `*repaired_entity` gets the
+  // entity without the lost columns. In every other case `*repaired_entity` is
+  // cleared. A fetcher that is not backed by a Version has no loss state and
+  // always reports no loss.
+  virtual Status IsBlobValueLost(ValueType /*type*/, const Slice& /*value*/,
+                                 bool* lost,
+                                 std::string* repaired_entity) const {
+    *lost = false;
+    if (repaired_entity != nullptr) {
+      repaired_entity->clear();
+    }
+    return Status::OK();
+  }
+  virtual bool HasBlobValueLoss() const { return false; }
 
   // The storage of the Version this fetcher reads through if that Version has
   // dropped blob files (see VersionStorageInfo::GetDroppedBlobFiles()), or
@@ -88,6 +98,9 @@ class VersionBlobFetcherBase : public BlobFetcher {
                    FilePrefetchBuffer* prefetch_buffer,
                    PinnableSlice* blob_value,
                    uint64_t* bytes_read) const override;
+  Status IsBlobValueLost(ValueType type, const Slice& value, bool* lost,
+                         std::string* repaired_entity) const override;
+  bool HasBlobValueLoss() const override;
 
   // Fetches the value of a separate-file blob reference into *blob_value,
   // applying `verify_policy` (see BlobVerifyPolicy). range_length ==
@@ -139,6 +152,17 @@ class VersionBlobFetcherBase : public BlobFetcher {
   const Version* version_;
   BlobFileCache* blob_file_cache_;
   bool allow_write_path_fallback_;
+
+ private:
+  static bool VersionHasLostBlobRelocationFiles(const Version* version);
+  // Whether `version_` had lost relocation files when the fetcher was made. A
+  // Version never changes its loss state, so HasBlobValueLoss() returns this
+  // and never reads the Version. A tailing iterator keeps a fetcher for an
+  // older Version that a flush may free; in normal operation (no loss) it then
+  // never touches that Version. With a lost file, IsBlobValueLost() still reads
+  // that Version, which a flush may have freed. This is a known limitation;
+  // base blob fetches have the same problem.
+  bool has_lost_blob_relocation_files_;
 };
 
 // The default BlobFetcher for transient/stack use: holds a reference to a
@@ -235,6 +259,17 @@ class EmbeddedAwareBlobFetcher : public BlobFetcher {
     // no base (e.g. SstFileReader) a default (kReadAllTier) suffices.
     static const ReadOptions kDefaultReadOptions;
     return base_ != nullptr ? base_->read_options() : kDefaultReadOptions;
+  }
+
+  Status IsBlobValueLost(ValueType type, const Slice& value, bool* lost,
+                         std::string* repaired_entity) const override {
+    if (base_ != nullptr) {
+      return base_->IsBlobValueLost(type, value, lost, repaired_entity);
+    }
+    return BlobFetcher::IsBlobValueLost(type, value, lost, repaired_entity);
+  }
+  bool HasBlobValueLoss() const override {
+    return base_ != nullptr && base_->HasBlobValueLoss();
   }
 
  private:

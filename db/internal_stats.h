@@ -952,6 +952,8 @@ class InternalStats {
                                  Slice suffix);
   bool HandleIndirectBlobGcIdleMicrosWithCandidates(uint64_t* value, DBImpl* db,
                                                     Version* version);
+  bool HandleBlobRelocationLostFiles(uint64_t* value, DBImpl* db,
+                                     Version* version);
   bool HandleBlobCachePinnedUsage(uint64_t* value, DBImpl* db,
                                   Version* version);
 

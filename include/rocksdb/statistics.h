@@ -795,6 +795,12 @@ enum Tickers : uint32_t {
   // worker.
   REMOTE_COMPACT_COARSE_FALLBACK_COUNT,
 
+  // Used only by DBs that use or have used enable_blob_indirection. Number of
+  // entries that reads treated as deleted, or as wide-column entities missing
+  // some columns, because their values are in a relocation file marked lost. An
+  // iterator can count an entry again when it moves back to it.
+  BLOB_DB_LOST_BLOB_READ_COUNT,
+
   TICKER_ENUM_MAX
 };
 

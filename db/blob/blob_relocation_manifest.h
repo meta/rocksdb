@@ -167,9 +167,10 @@
 //   relocation file are gone. It never names a normal or indirect-origin blob
 //   file; a missing one uses the base dropped-file record (kDroppedBlobFile).
 //   VersionBuilder keeps the file in the Version and marks it lost, and reads
-//   of its values return NotFound. Only tests create a loss.
-//   WriteCurrentStateToManifest() writes the record again for each file that
-//   is marked lost.
+//   treat its values as deleted. An open with best_efforts_blob_db_repair
+//   marks a missing or corrupt relocation file lost; tests can also create a
+//   loss. WriteCurrentStateToManifest() writes the record again for each file
+//   that is marked lost. See "Lost relocation files" below.
 // - The DB-global fence stays set even after the last fenced column family is
 //   dropped.
 //
@@ -196,6 +197,47 @@
 //   returns Corruption on a mismatch. Each read in a relocation file also
 //   checks the value's key (origin, original offset), so a wrong route cannot
 //   return another value.
+//
+// Lost relocation files
+// ---------------------
+// A loss record (kBlobPhysicalFileLoss, above) marks a relocation file lost
+// when its bytes are gone (missing or corrupt). This is the life of a lost
+// file:
+// 1. Mark. VersionBuilder marks the file lost (see "Accepted loss" above),
+//    and the open writes the loss record into its new MANIFEST.
+// 2. Read. A reference whose generation number, or the target of its route,
+//    is a lost file reads as a same-sequence point deletion
+//    (VersionStorageInfo::IsBlobReferenceLost()). A wide-column entity whose
+//    columns are all lost blob columns reads as a deletion. Any other entity
+//    loses only its lost blob columns (Version::IsBlobValueLost()).
+// 3. Repair. A compaction whose input Version has a lost file turns such
+//    references into deletions (Compaction::RepairsLostBlobReferences()).
+//    Its output has exact reference metadata, also at L0
+//    (Compaction::CollectExactBlobReferences()). The reason: a coarse SST pins
+//    every generation number at or above its frontier (see "Coarse SST" in
+//    db/blob/blob_reference_metadata.h). A lost relocation file stays pinned
+//    while an old number routed to it is at or above that frontier, so a coarse
+//    output could keep the lost file pinned, and the lost file would not be
+//    removed.
+// 4. Remove. The census (db/blob/blob_reference_census.h) tracks which SSTs
+//    use each blob file. When it finds no SST that uses the lost file,
+//    indirect blob GC deletes the file without reading it. The loss record
+//    goes away with the file record.
+//
+// Safety: an open with best_efforts_blob_db_repair fails instead of falling
+// back to an older point in the MANIFEST, or to an older MANIFEST file, when
+// that would drop files whose values are still on disk in a relocation file
+// (VersionEditHandlerPointInTime::CheckRepairFallbackAgainstGc() and
+// VersionSet::TryRecover()).
+//
+// Why a relocation file is marked lost and not dropped: the base dropped-file
+// record (kDroppedBlobFile) removes a file from the Version, and the base
+// dropped list keeps the file only while some SST has an
+// oldest_blob_file_number at or below it. Flattened and routed references do
+// not set oldest_blob_file_number, so the dropped list would forget a
+// relocation file while SSTs still use it. Also, a route target must be a
+// relocation file in the Version. So a lost relocation file stays in the
+// Version until indirect blob GC removes it.
 
 #pragma once
 
@@ -747,6 +789,7 @@ class BlobRelocationState {
   bool AggregateOverflow() const { return aggregate_overflow_; }
   // True when at least one relocation file is marked lost (an accepted loss).
   bool HasLostFiles() const { return lost_file_count_ != 0; }
+  size_t LostFileCount() const { return lost_file_count_; }
   std::shared_ptr<BlobRelocationFileMetaData> FindFile(
       uint64_t file_number) const;
   // Like FindFile(), without copying the shared pointer (read path).

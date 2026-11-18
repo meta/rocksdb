@@ -323,8 +323,7 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
     InternalIterator* input = iter_.get();
     if (repair_enabled_) {
       repair_iter_ = std::make_unique<MissingBlobRepairIterator>(
-          input, repair_storage_.get(), cmp_->timestamp_size(),
-          repair_only_dropped_blob_files_);
+          input, repair_storage_.get(), cmp_->timestamp_size(), repair_mode_);
       input = repair_iter_.get();
     }
     c_iter_.reset(new CompactionIterator(
@@ -348,7 +347,7 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
                                std::vector<uint64_t> dropped_files) {
     EnableMissingBlobRepair(healthy_files);
     repair_storage_->SetDroppedBlobFiles(std::move(dropped_files));
-    repair_only_dropped_blob_files_ = true;
+    repair_mode_ = MissingBlobRepairIterator::Mode::kDroppedOrLostFiles;
   }
 
   void EnableMissingBlobRepair(const std::vector<uint64_t>& healthy_files) {
@@ -428,7 +427,8 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
   const std::atomic<bool> kManualCompactionCanceledFalse_{false};
   FakeCompaction* compaction_proxy_;
   bool repair_enabled_ = false;
-  bool repair_only_dropped_blob_files_ = false;
+  MissingBlobRepairIterator::Mode repair_mode_ =
+      MissingBlobRepairIterator::Mode::kMissingFiles;
 };
 
 TEST_P(CompactionIteratorTest, MergeBeforeFilterFullOrder) {
@@ -1101,9 +1101,9 @@ TEST_P(CompactionIteratorTest, MissingBlobRepairPreservesInputErrors) {
   EnableMissingBlobRepair({20});
   std::unique_ptr<InternalIterator> failed_input(
       NewErrorInternalIterator(Status::IOError("Failed SST read")));
-  MissingBlobRepairIterator failed_repair(failed_input.get(),
-                                          repair_storage_.get(), 0,
-                                          /*only_dropped_blob_files=*/false);
+  MissingBlobRepairIterator failed_repair(
+      failed_input.get(), repair_storage_.get(), 0,
+      MissingBlobRepairIterator::Mode::kMissingFiles);
   failed_repair.SeekToFirst();
   ASSERT_FALSE(failed_repair.Valid());
   ASSERT_EQ(failed_repair.status().code(), Status::Code::kIOError);
@@ -1144,8 +1144,9 @@ TEST_P(CompactionIteratorTest, MissingBlobRepairPreservesInputErrors) {
 
   FailingNextIterator input({test::KeyStr("a", 5, kTypeBlobIndex)},
                             {BlobIndexForFile(20)}, &icmp_);
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0,
-                                   /*only_dropped_blob_files=*/false);
+  MissingBlobRepairIterator repair(
+      &input, repair_storage_.get(), 0,
+      MissingBlobRepairIterator::Mode::kMissingFiles);
   repair.SeekToFirst();
   ASSERT_OK(repair.status());
   ASSERT_TRUE(repair.Valid());
@@ -1168,8 +1169,9 @@ TEST_P(CompactionIteratorTest, MissingBlobRepairOnlyDroppedBlobFiles) {
        test::KeyStr("c", 3, kTypeBlobIndex)},
       {BlobIndexForFile(10), BlobIndexForFile(20), BlobIndexForFile(30)},
       &icmp_);
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0,
-                                   /*only_dropped_blob_files=*/true);
+  MissingBlobRepairIterator repair(
+      &input, repair_storage_.get(), 0,
+      MissingBlobRepairIterator::Mode::kDroppedOrLostFiles);
   repair.SeekToFirst();
   ASSERT_TRUE(repair.Valid());
   ASSERT_EQ(repair.key(), test::KeyStr("a", 5, kTypeBlobIndex));
@@ -1233,8 +1235,9 @@ TEST_P(CompactionIteratorTest, MissingBlobRepairSeekAndNextUseRewrittenKeys) {
   VectorIterator input(
       {test::KeyStr("a", 5, kTypeBlobIndex), test::KeyStr("b", 4, kTypeValue)},
       {BlobIndexForFile(10), "healthy"}, &icmp_);
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0,
-                                   /*only_dropped_blob_files=*/false);
+  MissingBlobRepairIterator repair(
+      &input, repair_storage_.get(), 0,
+      MissingBlobRepairIterator::Mode::kMissingFiles);
   const std::string deletion = test::KeyStr("a", 5, kTypeDeletion);
   repair.Seek(deletion);
   ASSERT_OK(repair.status());
@@ -1261,16 +1264,18 @@ TEST_P(CompactionIteratorTest,
   {
     std::unique_ptr<InternalIterator> input(
         NewErrorInternalIterator(Status::IOError("Failed SST read")));
-    MissingBlobRepairIterator repair(input.get(), repair_storage_.get(), 0,
-                                     /*only_dropped_blob_files=*/false);
+    MissingBlobRepairIterator repair(
+        input.get(), repair_storage_.get(), 0,
+        MissingBlobRepairIterator::Mode::kMissingFiles);
     ASSERT_FALSE(repair.Valid());
   }
   VectorIterator input({test::KeyStr("a", 5, kTypeWideColumnEntity)},
                        {"invalid entity"});
   input.SeekToFirst();
   ASSERT_TRUE(input.Valid());
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0,
-                                   /*only_dropped_blob_files=*/false);
+  MissingBlobRepairIterator repair(
+      &input, repair_storage_.get(), 0,
+      MissingBlobRepairIterator::Mode::kMissingFiles);
 }
 
 // It is possible that the output of the compaction iterator is empty even if
@@ -2410,9 +2415,9 @@ TEST_P(CompactionIteratorTsGcTest,
                        {BlobIndexForFile(10)});
   input.SeekToFirst();
   ASSERT_TRUE(input.Valid());
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(),
-                                   cmp_->timestamp_size(),
-                                   /*only_dropped_blob_files=*/false);
+  MissingBlobRepairIterator repair(
+      &input, repair_storage_.get(), cmp_->timestamp_size(),
+      MissingBlobRepairIterator::Mode::kMissingFiles);
 }
 
 TEST_P(CompactionIteratorTsGcTest, MissingBlobRepairRespectsHistoryTrimming) {
@@ -2426,9 +2431,9 @@ TEST_P(CompactionIteratorTsGcTest, MissingBlobRepairRespectsHistoryTrimming) {
   std::string trim_timestamp;
   PutFixed64(&trim_timestamp, 103);
   HistoryTrimmingIterator trimmed(&input, cmp_, trim_timestamp);
-  MissingBlobRepairIterator repair(&trimmed, repair_storage_.get(),
-                                   cmp_->timestamp_size(),
-                                   /*only_dropped_blob_files=*/false);
+  MissingBlobRepairIterator repair(
+      &trimmed, repair_storage_.get(), cmp_->timestamp_size(),
+      MissingBlobRepairIterator::Mode::kMissingFiles);
   repair.SeekToFirst();
   ASSERT_OK(repair.status());
   ASSERT_TRUE(repair.Valid());

@@ -59,7 +59,8 @@ Status DBImpl::GetLiveFiles(std::vector<std::string>& ret,
     if (cfd->IsDropped()) {
       continue;
     }
-    cfd->current()->AddLiveFiles(&live_table_files, &live_blob_files);
+    cfd->current()->AddLiveFiles(&live_table_files, &live_blob_files,
+                                 /*skip_marked_lost=*/true);
   }
 
   ret.clear();
@@ -435,6 +436,9 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     // Relocation files live in the first cf_path, like normal blob files.
     for (const auto& meta : vsi.GetBlobRelocationFiles()) {
       assert(meta != nullptr);
+      if (meta->IsMarkedLost()) {
+        continue;
+      }
       AddBlobFile(meta->GetFileNumber(), meta->GetFileSize(),
                   meta->GetChecksumMethod(), meta->GetChecksumValue());
     }

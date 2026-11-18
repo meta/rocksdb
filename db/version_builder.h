@@ -120,6 +120,11 @@ class VersionBuilder {
   // are true, and no edit has been applied yet.
   void RecordMissingBlobFilesAsDropped();
 
+  // Returns true after RecordMissingBlobFilesAsDropped() was called.
+  // VersionEditHandlerPointInTime::CheckRepairFallbackAgainstGc() uses it to
+  // skip the builders that do not record dropped blob files.
+  bool RecordsMissingBlobFilesAsDropped() const;
+
   // Moves out the staged relocation file and route changes, which can be large
   // after a long replay, so that they can be freed without the DB mutex while
   // the builder itself is destroyed under it (see
@@ -132,6 +137,11 @@ class VersionBuilder {
   // later edit deleted does not count. Requires tracking of found and missing
   // files.
   bool HasMissingBlobRelocationFiles() const;
+
+  // True if an edit applied to this builder removed blob file `file_number` on
+  // purpose: a blob file retirement (indirect blob GC moved its values) or a
+  // relocation file deletion.
+  bool IsBlobFileRemovedByGc(uint64_t file_number) const;
 
   // When applying a sequence of VersionEdits, intermediate files are the ones
   // that are added and then deleted. Returns the tracked files and clears them
