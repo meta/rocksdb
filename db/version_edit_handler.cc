@@ -1175,6 +1175,9 @@ Status ManifestTailer::ApplyVersionEdit(VersionEdit& edit,
         cfs_awaiting_file_list_.erase(cf_id);
       }
       cfs_awaiting_from_previous_manifest_.clear();
+      cfs_left_out_of_manifest_.insert(cfs_not_yet_in_manifest_.begin(),
+                                       cfs_not_yet_in_manifest_.end());
+      cfs_not_yet_in_manifest_.clear();
     }
   }
   return s;
@@ -1217,6 +1220,17 @@ Status ManifestTailer::OnColumnFamilyAdd(VersionEdit& edit,
 void ManifestTailer::AwaitFileList(uint32_t cf_id) {
   cfs_awaiting_file_list_.insert(cf_id);
   cfs_awaiting_from_previous_manifest_.erase(cf_id);
+  cfs_not_yet_in_manifest_.erase(cf_id);
+}
+
+bool ManifestTailer::NewestStateHasMissingFiles() {
+  for (const auto& builder : builders_) {
+    if (cfs_left_out_of_manifest_.count(builder.first) == 0 &&
+        !builder.second->version_builder()->ValidVersionAvailable()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void ManifestTailer::CheckIterationResult(const log::Reader& reader,

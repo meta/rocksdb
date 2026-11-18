@@ -2349,6 +2349,13 @@ class ReactiveVersionSet : public VersionSet {
   // REQUIRES: db mutex
   uint64_t GetInstalledVersionLogNumber(uint32_t cf_id) const;
 
+  // Returns whether the newest state that the MANIFEST records read so far
+  // describe lists, for any column family, a file that could not be found or
+  // verified, so that no Version of that state can be installed.
+  //
+  // REQUIRES: db mutex
+  bool NewestStateHasMissingFiles();
+
 #ifndef NDEBUG
   uint64_t TEST_read_edits_in_atomic_group() const;
 #endif  //! NDEBUG

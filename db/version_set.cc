@@ -9303,6 +9303,11 @@ uint64_t ReactiveVersionSet::GetInstalledVersionLogNumber(
   return manifest_tailer_->GetInstalledVersionLogNumber(cf_id);
 }
 
+bool ReactiveVersionSet::NewestStateHasMissingFiles() {
+  assert(manifest_tailer_ != nullptr);
+  return manifest_tailer_->NewestStateHasMissingFiles();
+}
+
 Status ReactiveVersionSet::MaybeSwitchManifest(
     log::Reader::Reporter* reporter,
     std::unique_ptr<log::FragmentBufferedReader>* manifest_reader) {
