@@ -1900,9 +1900,6 @@ class DBImpl : public DB
   // The following two functions can only be called when:
   // 1. WriteThread::Writer::EnterUnbatched() is used.
   // 2. db_mutex is NOT held
-  Status RenameTempFileToOptionsFile(const std::string& file_name,
-                                     uint64_t options_file_number,
-                                     uint64_t* options_file_size);
   void MaybeDeleteObsoleteOptionsFiles();
   Status DeleteObsoleteOptionsFiles(bool schedule_only);
 

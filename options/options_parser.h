@@ -34,6 +34,22 @@ enum OptionSection : char {
 static const std::string opt_section_titles[] = {
     "Version", "DBOptions", "CFOptions", "TableOptions/", "Unknown"};
 
+// Returns the ConfigOptions that RocksDB uses to write and verify the OPTIONS
+// file of a DB with options `db_opt`.
+ConfigOptions OptionsFileConfigOptions(const DBOptions& db_opt);
+
+// Clears `contents`, then writes the text of an OPTIONS file with the given
+// options into it. `config_options` controls the serialization, except for
+// the delimiter, which is always a new line followed by two spaces, because
+// the OPTIONS file has one option per indented line. Returns InvalidArgument
+// if `cf_names` and `cf_opts` differ in size. On an error, `contents` may hold
+// partial text, and the caller must not write it.
+Status SerializeRocksDBOptions(const ConfigOptions& config_options,
+                               const DBOptions& db_opt,
+                               const std::vector<std::string>& cf_names,
+                               const std::vector<ColumnFamilyOptions>& cf_opts,
+                               std::string* contents);
+
 Status PersistRocksDBOptions(const WriteOptions& write_options,
                              const DBOptions& db_opt,
                              const std::vector<std::string>& cf_names,
