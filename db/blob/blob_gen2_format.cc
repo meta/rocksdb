@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -16,6 +18,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "table/format.h"
+#include "test_util/sync_point.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
@@ -34,17 +37,33 @@ namespace {
 // format, since a SimpleGen2Blob record's trailer uses the same
 // builtin-checksum scheme; shared by the scalar and batched readers so both
 // report the same diagnostics.
+//
+// With kCRC32c and a non-null `payload_crc32c`, a passing check also sets
+// *payload_crc32c to the CRC32C of the payload alone. It is computed in the
+// same pass, so a caller that checks the logical CRC of an uncompressed value
+// does not read the bytes again.
 Status VerifySimpleGen2BlobChecksum(ChecksumType checksum_type,
                                     uint32_t base_context_checksum,
                                     const char* record, size_t payload_size,
                                     uint64_t record_offset,
-                                    const std::string& file_name) {
+                                    const std::string& file_name,
+                                    std::optional<uint32_t>* payload_crc32c) {
   uint32_t stored = DecodeFixed32(record + payload_size + 1);
   const uint32_t modifier =
       ChecksumModifierForContext(base_context_checksum, record_offset);
   stored -= modifier;
-  const uint32_t computed = ComputeBuiltinChecksumWithLastByte(
-      checksum_type, record, payload_size, record[payload_size]);
+  uint32_t computed = 0;
+  if (checksum_type == kCRC32c && payload_crc32c != nullptr) {
+    const uint32_t payload_crc = crc32c::Value(record, payload_size);
+    computed = crc32c::Mask(
+        crc32c::Extend(payload_crc, &record[payload_size], /*size=*/1));
+    if (stored == computed) {
+      *payload_crc32c = payload_crc;
+    }
+  } else {
+    computed = ComputeBuiltinChecksumWithLastByte(
+        checksum_type, record, payload_size, record[payload_size]);
+  }
   if (stored == computed) {
     return Status::OK();
   }
@@ -115,24 +134,12 @@ Status ReadAndVerifySimpleGen2BlobRecord(
   if (read_options.verify_checksums) {
     const Status checksum_status = VerifySimpleGen2BlobChecksum(
         checksum_type, base_context_checksum, record, payload_size,
-        record_offset, file->file_name());
+        record_offset, file->file_name(), /*payload_crc32c=*/nullptr);
     if (!checksum_status.ok()) {
       return checksum_status;
     }
   }
 
-  // The compression marker matched the blob index above, but SimpleGen2Blob
-  // payloads are currently written uncompressed only (see
-  // WriteSimpleGen2BlobRecord), so a record that actually carries a compression
-  // type is not readable here. This guards a corrupt or forward-incompatible
-  // record whose (compressed) marker happened to agree with a (compressed)
-  // index.
-  if (compression != kNoCompression) {
-    return Status::Corruption("Blob record compression " +
-                              std::to_string(static_cast<int>(compression)) +
-                              " is not supported in " + file->file_name() +
-                              " at offset " + std::to_string(record_offset));
-  }
   return Status::OK();
 }
 
@@ -204,91 +211,172 @@ struct Gen2ReadSlot {
   size_t len = 0;
   char* buf = nullptr;
   Status* status = nullptr;
+  bool* copied = nullptr;
 };
 
-// Issues a single MultiRead for the records described by `slots` and copies
-// each result into its buf, setting *slots[i].status. Shared by the
-// whole-record and range batch readers; per-record format checks (compression
-// marker / checksum) are done by the whole-record caller afterwards from the
-// (now populated) buf.
+// Reads the ranges described by `slots` and copies each result into its buf,
+// setting *slots[i].status. Shared by the whole-record and range batch readers;
+// the whole-record caller checks each record's format afterwards from the
+// filled buffers.
+// 1. Sort the slots by (offset, length).
+// 2. Read an exact duplicate range once. The duplicate slot gets a copy of the
+//    bytes and the status, and *copied is set.
+// 3. Put each range into the first batch whose last range ends at or before its
+//    offset, or into a new batch. Partly overlapping ranges thus go to
+//    different batches, because FileSystem::MultiRead requires non-overlapping
+//    requests.
+// 4. Issue each batch as one MultiRead, or as one plain Read when the batch has
+//    a single range.
 void MultiReadGen2(const ReadOptions& read_options,
                    RandomAccessFileReader* file,
                    std::vector<Gen2ReadSlot>& slots) {
   assert(file != nullptr);
   assert(!slots.empty());
 
-  // RandomAccessFileReader::MultiRead requires the requests sorted ascending by
-  // file offset -- it asserts this, and in direct-I/O mode it aligns and merges
-  // only consecutive requests, so unsorted input reads the wrong bytes. The
-  // callers group records by SST but not by offset, so sort here. Each slot
-  // carries its own output buf/status pointer, so sorting does not disturb
-  // result routing.
+  // Sort by (offset, length). Each batch is then in ascending offset order, as
+  // RandomAccessFileReader::MultiRead requires, and exact duplicates are next
+  // to each other.
   std::sort(slots.begin(), slots.end(),
             [](const Gen2ReadSlot& a, const Gen2ReadSlot& b) {
-              return a.offset < b.offset;
+              return std::make_pair(a.offset, a.len) <
+                     std::make_pair(b.offset, b.len);
             });
 
-  const size_t num = slots.size();
-  std::vector<FSReadRequest> read_reqs;
-  read_reqs.reserve(num);
-  for (size_t i = 0; i < num; ++i) {
-    FSReadRequest read_req{};
-    read_req.offset = slots[i].offset;
-    read_req.len = slots[i].len;
-    read_reqs.emplace_back(std::move(read_req));
-  }
-
-  AlignedBuffer direct_io_buffer;
-  const bool direct_io = file->use_direct_io();
-  if (direct_io) {
-    for (size_t i = 0; i < num; ++i) {
-      read_reqs[i].scratch = nullptr;
-    }
-  } else {
-    for (size_t i = 0; i < num; ++i) {
-      read_reqs[i].scratch = slots[i].buf;
-    }
-  }
-
-  IOOptions opts;
-  IODebugContext dbg;
-  Status s = file->PrepareIOOptions(read_options, opts, &dbg);
-  if (s.ok()) {
-    AlignedBufferAllocationContext direct_io_context{&direct_io_buffer};
-    s = file->MultiRead(opts, read_reqs.data(), read_reqs.size(),
-                        &direct_io_context, &dbg);
-  }
-  if (!s.ok()) {
-    // Batch read failed; s is written to every slot's status below, so these
-    // per-request FS statuses carry nothing extra.
-    for (auto& read_req : read_reqs) {
-      read_req.status.PermitUncheckedError();
-    }
-    for (size_t i = 0; i < num; ++i) {
-      *slots[i].status = s;
-    }
-    return;
-  }
-
-  for (size_t i = 0; i < num; ++i) {
-    FSReadRequest& read_req = read_reqs[i];
-    if (read_req.status.ok() && read_req.result.size() != read_req.len) {
-      read_req.status = IOStatus::Corruption(
-          "Incomplete blob record read from " + file->file_name() +
-          " at offset " + std::to_string(read_req.offset) + ": expected " +
-          std::to_string(read_req.len) + " bytes, got " +
-          std::to_string(read_req.result.size()));
-    }
-    *slots[i].status = read_req.status;
-    if (!slots[i].status->ok()) {
+  struct PhysicalRead {
+    uint64_t offset;
+    size_t len;
+    size_t slot_index;
+  };
+  std::vector<PhysicalRead> physical_reads;
+  physical_reads.reserve(slots.size());
+  // Exact duplicates, as pairs of (duplicate slot, slot whose read it copies).
+  std::vector<std::pair<size_t, size_t>> duplicates;
+  for (size_t i = 0; i < slots.size(); ++i) {
+    if (slots[i].len == 0) {
+      *slots[i].status = Status::OK();
       continue;
     }
-    // With mmap/direct reads the data lands outside the caller's buf; copy it
-    // in so the caller can rely on buf owning the bytes.
-    if (read_req.result.data() != slots[i].buf) {
-      memcpy(slots[i].buf, read_req.result.data(), read_req.len);
+    if (slots[i].offset > std::numeric_limits<uint64_t>::max() - slots[i].len) {
+      *slots[i].status = Status::Corruption("Blob read range overflow");
+      continue;
+    }
+    if (!physical_reads.empty() &&
+        physical_reads.back().offset == slots[i].offset &&
+        physical_reads.back().len == slots[i].len) {
+      duplicates.emplace_back(i, physical_reads.back().slot_index);
+      continue;
+    }
+    physical_reads.push_back(PhysicalRead{slots[i].offset, slots[i].len, i});
+  }
+  if (physical_reads.empty()) {
+    return;
+  }
+  const auto copy_duplicates = [&]() {
+    for (const auto& [duplicate, source] : duplicates) {
+      if (slots[duplicate].copied != nullptr) {
+        *slots[duplicate].copied = true;
+      }
+      *slots[duplicate].status = *slots[source].status;
+      if (slots[duplicate].status->ok()) {
+        memcpy(slots[duplicate].buf, slots[source].buf, slots[duplicate].len);
+      }
+    }
+  };
+
+  struct ReadBatch {
+    uint64_t end_offset;
+    std::vector<size_t> read_indexes;
+  };
+  std::vector<ReadBatch> batches;
+  for (size_t i = 0; i < physical_reads.size(); ++i) {
+    const PhysicalRead& read = physical_reads[i];
+    size_t batch_index = batches.size();
+    for (size_t j = 0; j < batches.size(); ++j) {
+      if (batches[j].end_offset <= read.offset) {
+        batch_index = j;
+        break;
+      }
+    }
+    const uint64_t end_offset = read.offset + read.len;
+    if (batch_index == batches.size()) {
+      batches.push_back(ReadBatch{end_offset, {i}});
+    } else {
+      batches[batch_index].end_offset = end_offset;
+      batches[batch_index].read_indexes.push_back(i);
     }
   }
+
+  const bool direct_io = file->use_direct_io();
+  for (size_t batch_index = 0; batch_index < batches.size(); ++batch_index) {
+    const ReadBatch& batch = batches[batch_index];
+    IOOptions opts;
+    IODebugContext dbg;
+    Status s = file->PrepareIOOptions(read_options, opts, &dbg);
+    if (!s.ok()) {
+      for (size_t unissued = batch_index; unissued < batches.size();
+           ++unissued) {
+        for (size_t read_index : batches[unissued].read_indexes) {
+          const PhysicalRead& read = physical_reads[read_index];
+          *slots[read.slot_index].status = s;
+        }
+      }
+      copy_duplicates();
+      return;
+    }
+
+    std::vector<FSReadRequest> read_reqs;
+    read_reqs.reserve(batch.read_indexes.size());
+    for (size_t read_index : batch.read_indexes) {
+      const PhysicalRead& read = physical_reads[read_index];
+      FSReadRequest read_req{};
+      read_req.offset = read.offset;
+      read_req.len = read.len;
+      read_req.scratch = direct_io ? nullptr : slots[read.slot_index].buf;
+      read_reqs.emplace_back(std::move(read_req));
+    }
+
+    AlignedBuffer direct_io_buffer;
+    AlignedBufferAllocationContext direct_io_context{&direct_io_buffer};
+    TEST_SYNC_POINT_CALLBACK("MultiReadGen2:Requests", &read_reqs);
+    if (read_reqs.size() == 1) {
+      // A batch with one range (for example, a Get of one relocated value) uses
+      // a plain positional read, without the MultiRead submit and wait.
+      TEST_SYNC_POINT("MultiReadGen2:SingleRead");
+      file->Read(opts, &read_reqs[0], &direct_io_context, &dbg);
+      s = Status::OK();
+    } else {
+      s = file->MultiRead(opts, read_reqs.data(), read_reqs.size(),
+                          &direct_io_context, &dbg);
+    }
+    if (!s.ok()) {
+      for (FSReadRequest& read_req : read_reqs) {
+        read_req.status.PermitUncheckedError();
+      }
+      for (size_t read_index : batch.read_indexes) {
+        const PhysicalRead& read = physical_reads[read_index];
+        *slots[read.slot_index].status = s;
+      }
+      continue;
+    }
+
+    for (size_t i = 0; i < read_reqs.size(); ++i) {
+      FSReadRequest& read_req = read_reqs[i];
+      if (read_req.status.ok() && read_req.result.size() != read_req.len) {
+        read_req.status = IOStatus::Corruption(
+            "Incomplete blob record read from " + file->file_name() +
+            " at offset " + std::to_string(read_req.offset) + ": expected " +
+            std::to_string(read_req.len) + " bytes, got " +
+            std::to_string(read_req.result.size()));
+      }
+      const PhysicalRead& read = physical_reads[batch.read_indexes[i]];
+      Gen2ReadSlot& slot = slots[read.slot_index];
+      *slot.status = read_req.status;
+      if (slot.status->ok() && read_req.result.data() != slot.buf) {
+        memcpy(slot.buf, read_req.result.data(), read_req.len);
+      }
+    }
+  }
+  copy_duplicates();
 }
 
 }  // namespace
@@ -309,8 +397,10 @@ void ReadAndVerifySimpleGen2BlobRecords(const ReadOptions& read_options,
     assert(reqs[i].status != nullptr);
     assert(reqs[i].record_size ==
            reqs[i].payload_size + kSimpleGen2BlobTrailerSize);
-    slots.push_back({reqs[i].record_offset, reqs[i].record_size, reqs[i].buf,
-                     reqs[i].status});
+    slots.push_back(
+        {reqs[i].record_offset, reqs[i].record_size, reqs[i].buf,
+         reqs[i].status,
+         reqs[i].extras != nullptr ? &reqs[i].extras->copied : nullptr});
   }
 
   MultiReadGen2(read_options, file, slots);
@@ -335,20 +425,12 @@ void ReadAndVerifySimpleGen2BlobRecords(const ReadOptions& read_options,
     if (read_options.verify_checksums) {
       *reqs[i].status = VerifySimpleGen2BlobChecksum(
           checksum_type, base_context_checksum, record, payload_size,
-          reqs[i].record_offset, file->file_name());
+          reqs[i].record_offset, file->file_name(),
+          reqs[i].extras != nullptr ? &reqs[i].extras->payload_crc32c
+                                    : nullptr);
       if (!reqs[i].status->ok()) {
         continue;
       }
-    }
-    // See ReadAndVerifySimpleGen2BlobRecord: the marker matched the index, but
-    // only uncompressed SimpleGen2Blob payloads are currently supported.
-    if (compression != kNoCompression) {
-      *reqs[i].status = Status::Corruption(
-          "Blob record compression " +
-          std::to_string(static_cast<int>(compression)) +
-          " is not supported in " + file->file_name() + " at offset " +
-          std::to_string(reqs[i].record_offset));
-      continue;
     }
   }
 }
@@ -386,8 +468,10 @@ void ReadSimpleGen2BlobRanges(const ReadOptions& read_options,
           " at offset " + std::to_string(reqs[i].record_offset));
       continue;
     }
-    slots.push_back({reqs[i].record_offset + reqs[i].range_offset,
-                     reqs[i].range_length, reqs[i].buf, reqs[i].status});
+    slots.push_back(
+        {reqs[i].record_offset + reqs[i].range_offset, reqs[i].range_length,
+         reqs[i].buf, reqs[i].status,
+         reqs[i].extras != nullptr ? &reqs[i].extras->copied : nullptr});
   }
 
   if (slots.empty()) {
@@ -406,9 +490,6 @@ IOStatus WriteSimpleGen2BlobRecord(WritableFileWriter* file,
                                    uint64_t record_offset, const Slice& payload,
                                    CompressionType compression) {
   assert(file != nullptr);
-  // Placeholder for future embedded blob compression support; only
-  // uncompressed payloads are currently written.
-  assert(compression == kNoCompression);
 
   std::array<char, kSimpleGen2BlobTrailerSize> trailer;
   trailer[0] = lossless_cast<char>(compression);

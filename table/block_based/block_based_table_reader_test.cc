@@ -10,6 +10,7 @@
 #include <string>
 
 #include "cache/cache_reservation_manager.h"
+#include "db/blob/blob_index.h"
 #include "db/db_test_util.h"
 #include "db/table_properties_collector.h"
 #include "file/file_util.h"
@@ -265,6 +266,119 @@ class BlockBasedTableReaderFormatVersion8Test
     options_.table_factory.reset(NewBlockBasedTableFactory(opts));
   }
 };
+
+// Fixture with the default table options.
+class BlockBasedTableReaderDefaultOptionsTest
+    : public BlockBasedTableReaderBaseTest {
+ protected:
+  void ConfigureTableFactory() override {
+    options_.table_factory.reset(
+        NewBlockBasedTableFactory(BlockBasedTableOptions()));
+  }
+};
+
+TEST_F(BlockBasedTableReaderDefaultOptionsTest, DropOnlyBeforeFirstRead) {
+  // DropUserCollectedProperty() replaces the table properties that readers
+  // share, so it may run only before the first read. This test checks that a
+  // drop right after open is fine and that reads then work. Debug builds
+  // assert when a drop comes after a read. A death test does not check that
+  // assert: it forks a process that has background threads, and the child
+  // can hang.
+  Options options;
+  const ImmutableOptions ioptions(options);
+  const InternalKeyComparator comparator(options.comparator);
+  CreateTable("DropOnlyBeforeFirstRead", ioptions, kNoCompression,
+              GenerateKVMap(/*num_block=*/2));
+  std::unique_ptr<BlockBasedTable> table;
+  NewBlockBasedTableReader(FileOptions(), ioptions, comparator,
+                           "DropOnlyBeforeFirstRead", &table);
+  table->DropUserCollectedProperty("not-present");
+  // The iterator keeps a reference to the ReadOptions, so it must outlive the
+  // iterator.
+  const ReadOptions read_options;
+  std::unique_ptr<InternalIterator> iter(table->NewIterator(
+      read_options, /*prefix_extractor=*/nullptr, /*arena=*/nullptr,
+      /*skip_filters=*/false, TableReaderCaller::kUncategorized));
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+}
+
+TEST_F(BlockBasedTableReaderDefaultOptionsTest, RawLookupDictFailureFailsKeys) {
+  // When the compression dictionary cannot be read, every key of a raw lookup
+  // gets that error, also keys in different data blocks. A sync point injects
+  // the failure, because a test table has no dictionary to break.
+  Options options;
+  const ImmutableOptions ioptions(options);
+  const InternalKeyComparator comparator(options.comparator);
+  const std::vector<std::pair<std::string, std::string>> kv =
+      GenerateKVMap(/*num_block=*/2);
+  CreateTable("RawLookupDictFailure", ioptions, kNoCompression, kv);
+  std::unique_ptr<BlockBasedTable> table;
+  NewBlockBasedTableReader(FileOptions(), ioptions, comparator,
+                           "RawLookupDictFailure", &table);
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTable::MultiGetRawEntries:DictStatus", [](void* arg) {
+        *static_cast<Status*>(arg) = Status::IOError("injected");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  // The first key of each of the two blocks.
+  const std::array<Slice, 2> keys{
+      {kv.front().first, kv[kEntriesPerBlock].first}};
+  std::array<Status, 2> statuses;
+  table->MultiGetRawEntries(ReadOptions(), keys.size(), keys.data(),
+                            [&](size_t i, const Status& status, const Slice&,
+                                const Slice&) { statuses[i] = status; });
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  for (const Status& status : statuses) {
+    EXPECT_TRUE(status.IsIOError()) << status.ToString();
+  }
+}
+
+TEST_F(BlockBasedTableReaderDefaultOptionsTest,
+       CompressedSameFileRangeIsRejectedFirst) {
+  // As in base RocksDB, a range of a compressed value is not supported. A table
+  // without a BlobSource (a standalone reader) returns Corruption for one,
+  // from the scalar and the batched read, before any other check, so a
+  // kBlockCacheTier read gets Corruption too, not Incomplete. The check needs
+  // no blob record in the table, so the test uses a made-up same-file index.
+  Options options;
+  const ImmutableOptions ioptions(options);
+  const InternalKeyComparator comparator(options.comparator);
+  CreateTable("CompressedSameFileRange", ioptions, kNoCompression,
+              GenerateKVMap(/*num_block=*/1));
+  std::unique_ptr<BlockBasedTable> table;
+  NewBlockBasedTableReader(FileOptions(), ioptions, comparator,
+                           "CompressedSameFileRange", &table);
+  std::string encoded;
+  BlobIndex::EncodeBlob(&encoded, kCurrentFileBlobIndexFileNumber,
+                        /*offset=*/0, /*size=*/16, kSnappyCompression);
+  BlobIndex index;
+  ASSERT_OK(index.DecodeFrom(encoded));
+  ASSERT_TRUE(index.IsSameFile());
+
+  for (const ReadTier read_tier : {kReadAllTier, kBlockCacheTier}) {
+    ReadOptions read_options;
+    read_options.read_tier = read_tier;
+    PinnableSlice value;
+    EXPECT_TRUE(table
+                    ->GetSameFileBlob(
+                        read_options, index, /*range_offset=*/1,
+                        /*range_length=*/4,
+                        BlobVerifyPolicy::kVerifyIfNoAmplification, &value)
+                    .IsCorruption());
+    PinnableSlice batch_value;
+    Status batch_status;
+    SameFileBlobReadRequest request;
+    request.blob_index = &index;
+    request.range_offset = 1;
+    request.range_length = 4;
+    request.result = &batch_value;
+    request.status = &batch_status;
+    table->MultiGetSameFileBlob(read_options, /*num_reads=*/1, &request);
+    EXPECT_TRUE(batch_status.IsCorruption()) << batch_status.ToString();
+  }
+}
 
 // format_version 8 records, in the footer, the gap (in bytes) between the end
 // of the metaindex block and the start of the footer, so the metaindex can be

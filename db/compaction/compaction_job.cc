@@ -1835,7 +1835,9 @@ void CompactionJob::CreateBlobFileBuilder(
         cfd->GetID(), cfd->GetName(), write_hint_, io_tracer_, blob_callback_,
         BlobFileCreationReason::kCompaction, GetBlobOutputPath(),
         sub_compact->Current().GetOutputFilePathsPtr(),
-        sub_compact->Current().GetBlobFileAdditionsPtr());
+        sub_compact->Current().GetBlobFileAdditionsPtr(),
+        // Compaction output never prepopulates the blob cache (flush only).
+        /*blob_source=*/nullptr);
   } else {
     blob_file_builder = nullptr;
   }

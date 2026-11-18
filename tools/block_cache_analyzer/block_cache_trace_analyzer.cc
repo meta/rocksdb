@@ -252,6 +252,8 @@ std::string caller_to_string(TableReaderCaller caller) {
       return "SSTFileReader";
     case kUncategorized:
       return "Uncategorized";
+    case kBlobRelocationFileRead:
+      return "BlobRelocationFileRead";
     case kMaxBlockCacheLookupCaller:
     default:
       break;
@@ -289,6 +291,8 @@ TableReaderCaller string_to_caller(const std::string& caller_str) {
     return kSSTFileReader;
   } else if (caller_str == "Uncategorized") {
     return kUncategorized;
+  } else if (caller_str == "BlobRelocationFileRead") {
+    return kBlobRelocationFileRead;
   }
   return TableReaderCaller::kMaxBlockCacheLookupCaller;
 }
@@ -310,6 +314,10 @@ bool is_user_access(TableReaderCaller caller) {
     case kFlush:
     case kSSTFileReader:
     case kUncategorized:
+    // A relocation file read has this caller whether a user Get, an iterator,
+    // a compaction or indirect blob GC caused it, so it cannot count as a user
+    // access.
+    case kBlobRelocationFileRead:
     case kMaxBlockCacheLookupCaller:
     default:
       break;

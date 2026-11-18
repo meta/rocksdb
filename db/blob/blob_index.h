@@ -16,6 +16,28 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// The fields of an indirect BlobIndex that describe its value bytes: the stored
+// size, the compression type, the logical CRC (stable_checksum) and the stored
+// CRC (stored_checksum). They never change, even when indirect blob GC moves
+// the value. The stable blob cache keeps the fingerprint with each cached value
+// (see StableBlobContents), so that a value saved to a secondary cache can be
+// checked when it comes back. A cache hit does not compare the cached
+// fingerprint with the fingerprint of the BlobIndex (see
+// BlobSource::GetIndirectBlobFromCache()).
+struct StableBlobFingerprint {
+  uint64_t stored_value_size = 0;
+  CompressionType compression = kNoCompression;
+  uint32_t stable_checksum = 0;
+  uint32_t stored_checksum = 0;
+
+  bool operator==(const StableBlobFingerprint& other) const {
+    return stored_value_size == other.stored_value_size &&
+           compression == other.compression &&
+           stable_checksum == other.stable_checksum &&
+           stored_checksum == other.stored_checksum;
+  }
+};
+
 // BlobIndex is a pointer to the blob and metadata of the blob. The index is
 // stored in base DB as ValueType::kTypeBlobIndex.
 // There are five types of blob index. The fields of the two indirect types
@@ -151,6 +173,14 @@ class BlobIndex {
   // checksums, uses new type values and a new value here.
   static constexpr uint32_t kIndirectBlobFormatVersion = 1;
 
+  // The largest valid file number, 2^62 - 1. It equals kFileNumberMask in
+  // db/version_edit.h, which this header does not include (blob_source.cc
+  // checks that the two are equal). DecodeFrom() rejects an indirect index
+  // with a larger file number, so the stable cache key (see
+  // GetStableBlobCacheKey() in db/blob/blob_source.cc) can use the top two
+  // bits of a file number for other data.
+  static constexpr uint64_t kMaxFileNumber = 0x3FFFFFFFFFFFFFFFULL;
+
   // True for a built-in or custom compression type that a blob may be stored
   // with.
   static bool IsValidCompression(CompressionType compression) {
@@ -273,6 +303,12 @@ class BlobIndex {
                : stored_checksum_;
   }
 
+  StableBlobFingerprint fingerprint() const {
+    assert(IsIndirect());
+    return StableBlobFingerprint{size_, compression_, stable_checksum_,
+                                 stored_checksum()};
+  }
+
   // Checks the decoded fields. The type must be known, and then an inlined
   // index always passes. Other types need a nonzero file number (except a
   // same-file index) and a valid compression type, and an indirect index also
@@ -343,6 +379,11 @@ class BlobIndex {
         return Status::Corruption(kErrorMessage,
                                   "Flattened blob generation is not above its "
                                   "origin");
+      }
+      // The generation is at least the origin, so this also bounds the origin.
+      if (file_number_ > kMaxFileNumber) {
+        return Status::Corruption(kErrorMessage,
+                                  "Indirect blob file number is too large");
       }
       if (slice.empty()) {
         return Status::Corruption(kErrorMessage,

@@ -17,6 +17,7 @@ int main() {
 #include <map>
 #include <vector>
 
+#include "file/file_util.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/status.h"
@@ -788,6 +789,132 @@ TEST_F(BlockCacheTracerTest, MultiGetWithNullReferenceKey) {
 
     ASSERT_OK(env_->DeleteFile(human_readable_trace_file_path));
   }
+}
+
+TEST_F(BlockCacheTracerTest, BlobRelocationFileReadCaller) {
+  // Reads of blob relocation files use the caller kBlobRelocationFileRead.
+  // This test checks that the analyzer knows the caller:
+  // - caller_to_string names it "BlobRelocationFileRead" in the outputs.
+  // - string_to_caller accepts "BlobRelocationFileRead" in -analyze_callers.
+  // - is_user_access is false for it, because GC and compaction read
+  //   relocation files too, so it is left out of the user-access-only outputs.
+  // Blocks 0 to 9 are read by Get and blocks 10 to 19 by the relocation reader.
+  const std::string result_dir = test_path_ + "/relocation_caller";
+  // A failed earlier run can leave the folder behind.
+  DestroyDir(env_, result_dir).PermitUncheckedError();
+  ASSERT_OK(env_->CreateDirIfMissing(result_dir));
+  {
+    std::unique_ptr<TraceWriter> trace_writer;
+    ASSERT_OK(NewFileTraceWriter(env_, env_options_, trace_file_path_,
+                                 &trace_writer));
+    std::unique_ptr<BlockCacheTraceWriter> writer = NewBlockCacheTraceWriter(
+        env_->GetSystemClock().get(), BlockCacheTraceWriterOptions(),
+        std::move(trace_writer));
+    ASSERT_NE(writer, nullptr);
+    ASSERT_OK(writer->WriteHeader());
+    for (uint32_t key_id = 0; key_id < 20; key_id++) {
+      BlockCacheTraceRecord record;
+      record.block_type = TraceType::kBlockTraceDataBlock;
+      record.block_size = kBlockSize;
+      record.block_key = kBlockKeyPrefix + std::to_string(key_id);
+      record.access_timestamp = (key_id + 1) * kMicrosInSecond;
+      record.cf_id = kCFId;
+      record.cf_name = kDefaultColumnFamilyName;
+      record.caller = key_id < 10 ? TableReaderCaller::kUserGet
+                                  : TableReaderCaller::kBlobRelocationFileRead;
+      record.level = kLevel;
+      record.sst_fd_number = kSSTStoringEvenKeys;
+      record.referenced_key =
+          kRefKeyPrefix + std::to_string(key_id) + std::string(8, 0);
+      record.referenced_key_exist_in_block = true;
+      record.num_keys_in_block = kNumKeysInBlock;
+      ASSERT_OK(writer->WriteBlockAccess(
+          record, record.block_key, record.cf_name, record.referenced_key));
+    }
+  }
+  // Returns the first column of each row after the header of `file_name` in
+  // result_dir, or an empty set if the file does not exist.
+  const auto read_first_column = [&](const std::string& file_name) {
+    std::set<std::string> values;
+    std::ifstream infile(result_dir + "/" + file_name);
+    std::string line;
+    if (!getline(infile, line)) {
+      return values;
+    }
+    while (getline(infile, line)) {
+      values.insert(line.substr(0, line.find(',')));
+    }
+    return values;
+  };
+
+  // Run the tool. Every flag is given, so values left by earlier tests in this
+  // process do not change the run.
+  {
+    std::vector<std::string> params = {
+        "./block_cache_trace_analyzer",
+        "-block_cache_trace_path=" + trace_file_path_,
+        "-block_cache_sim_config_path=",
+        "-block_cache_analysis_result_dir=" + result_dir,
+        "-print_block_size_stats=false",
+        "-print_access_count_stats=false",
+        "-print_data_block_access_count_stats=false",
+        "-cache_sim_warmup_seconds=0",
+        "-analyze_bottom_k_access_count_blocks=0",
+        "-analyze_top_k_access_count_blocks=0",
+        "-analyze_blocks_reuse_k_reuse_window=0",
+        "-timeline_labels=",
+        "-reuse_distance_labels=",
+        "-reuse_distance_buckets=",
+        "-reuse_interval_labels=",
+        "-reuse_interval_buckets=",
+        "-reuse_lifetime_labels=",
+        "-reuse_lifetime_buckets=",
+        "-analyze_callers=BlobRelocationFileRead",
+        "-access_count_buckets=",
+        "-analyze_get_spatial_locality_labels=",
+        "-analyze_get_spatial_locality_buckets=",
+        "-analyze_correlation_coefficients_labels=",
+        "-skew_labels=",
+        "-skew_buckets=",
+        "-mrc_only=false",
+        "-human_readable_trace_file_path="};
+    std::vector<char*> argv;
+    for (auto& param : params) {
+      argv.push_back(&param[0]);
+    }
+    ASSERT_EQ(0, ROCKSDB_NAMESPACE::block_cache_trace_analyzer_tool(
+                     static_cast<int>(argv.size()), argv.data()));
+  }
+  ASSERT_EQ(read_first_column("percentage_of_accesses_summary"),
+            (std::set<std::string>{"Get", "BlobRelocationFileRead"}));
+  // The per-caller file has the name of the parsed caller. An unknown caller
+  // name would give "InvalidCaller".
+  ASSERT_EQ(read_first_column(
+                "BlobRelocationFileRead_level_percentage_of_accesses_summary"),
+            (std::set<std::string>{std::to_string(kLevel)}));
+
+  // The caller timeline of all accesses has both callers. The timeline of user
+  // accesses only has Get.
+  {
+    BlockCacheTraceAnalyzer analyzer(trace_file_path_, result_dir,
+                                     /*human_readable_trace_file_path=*/"",
+                                     /*compute_reuse_distance=*/false,
+                                     /*mrc_only=*/false,
+                                     /*is_human_readable_trace_file=*/false,
+                                     /*cache_simulator=*/nullptr);
+    // Analyze() returns Incomplete when it reaches the end of the trace.
+    const Status s = analyzer.Analyze();
+    ASSERT_TRUE(s.ok() || s.IsIncomplete()) << s.ToString();
+    analyzer.WriteAccessTimeline("caller", /*time_unit=*/1,
+                                 /*user_access_only=*/false);
+    analyzer.WriteAccessTimeline("caller", /*time_unit=*/1,
+                                 /*user_access_only=*/true);
+  }
+  ASSERT_EQ(read_first_column("all_access_caller_1_access_timeline"),
+            (std::set<std::string>{"Get", "BlobRelocationFileRead"}));
+  ASSERT_EQ(read_first_column("user_access_only_caller_1_access_timeline"),
+            (std::set<std::string>{"Get"}));
+  ASSERT_OK(DestroyDir(env_, result_dir));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -44,27 +44,27 @@ BlobFileBuilder::BlobFileBuilder(
     BlobFileCompletionCallback* blob_callback,
     BlobFileCreationReason creation_reason, std::string blob_output_path,
     std::vector<std::string>* output_file_paths,
-    std::vector<BlobFileAddition>* blob_file_additions)
+    std::vector<BlobFileAddition>* blob_file_additions, BlobSource* blob_source)
     : BlobFileBuilder([versions]() { return versions->NewFileNumber(); }, fs,
                       immutable_options, mutable_cf_options, file_options,
                       write_options, std::move(db_id), std::move(db_session_id),
                       job_id, column_family_id, column_family_name, write_hint,
                       io_tracer, blob_callback, creation_reason,
                       std::move(blob_output_path), output_file_paths,
-                      blob_file_additions) {}
+                      blob_file_additions, blob_source) {}
 
 BlobFileBuilder::BlobFileBuilder(
     std::function<uint64_t()> file_number_generator, FileSystem* fs,
     const ImmutableOptions* immutable_options,
     const MutableCFOptions* mutable_cf_options, const FileOptions* file_options,
-    const WriteOptions* write_options, std::string db_id,
-    std::string db_session_id, int job_id, uint32_t column_family_id,
+    const WriteOptions* write_options, std::string /*db_id*/,
+    std::string /*db_session_id*/, int job_id, uint32_t column_family_id,
     const std::string& column_family_name, Env::WriteLifeTimeHint write_hint,
     const std::shared_ptr<IOTracer>& io_tracer,
     BlobFileCompletionCallback* blob_callback,
     BlobFileCreationReason creation_reason, std::string blob_output_path,
     std::vector<std::string>* output_file_paths,
-    std::vector<BlobFileAddition>* blob_file_additions)
+    std::vector<BlobFileAddition>* blob_file_additions, BlobSource* blob_source)
     : file_number_generator_(std::move(file_number_generator)),
       fs_(fs),
       immutable_options_(immutable_options),
@@ -85,8 +85,6 @@ BlobFileBuilder::BlobFileBuilder(
       enable_blob_indirection_(mutable_cf_options->enable_blob_indirection),
       file_options_(file_options),
       write_options_(write_options),
-      db_id_(std::move(db_id)),
-      db_session_id_(std::move(db_session_id)),
       job_id_(job_id),
       column_family_id_(column_family_id),
       column_family_name_(column_family_name),
@@ -97,6 +95,7 @@ BlobFileBuilder::BlobFileBuilder(
       blob_output_path_(std::move(blob_output_path)),
       output_file_paths_(output_file_paths),
       blob_file_additions_(blob_file_additions),
+      blob_source_(blob_source),
       blob_count_(0),
       blob_bytes_(0) {
   assert(file_number_generator_);
@@ -175,9 +174,19 @@ Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
     }
   }
 
+  const StableBlobFingerprint fingerprint{
+      blob.size(), blob_compression_type_,
+      !enable_blob_indirection_ ? 0
+      : blob_compression_type_ == kNoCompression
+          ? stored_bytes_crc
+          : crc32c::Value(value.data(), value.size()),
+      enable_blob_indirection_ ? BlobIndex::ExtendChecksumWithCompression(
+                                     stored_bytes_crc, blob_compression_type_)
+                               : 0};
   {
-    const Status s =
-        PutBlobIntoCacheIfNeeded(value, blob_file_number, blob_offset);
+    const Status s = PutBlobIntoCacheIfNeeded(
+        value, blob_file_number, blob_offset,
+        enable_blob_indirection_ ? &fingerprint : nullptr);
     if (!s.ok()) {
       ROCKS_LOG_WARN(immutable_options_->info_log,
                      "Failed to pre-populate the blob into blob cache: %s",
@@ -186,19 +195,13 @@ Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
   }
 
   if (enable_blob_indirection_) {
-    const uint32_t stable_checksum =
-        blob_compression_type_ == kNoCompression
-            ? stored_bytes_crc
-            : crc32c::Value(value.data(), value.size());
-    const uint32_t stored_checksum = BlobIndex::ExtendChecksumWithCompression(
-        stored_bytes_crc, blob_compression_type_);
     BlobIndex::EncodeUnflattenedIndirectBlob(
         blob_index, {.origin_file_number = blob_file_number,
                      .original_value_offset = blob_offset,
                      .stored_value_size = blob.size(),
                      .compression = blob_compression_type_,
-                     .stable_checksum = stable_checksum,
-                     .stored_checksum = stored_checksum});
+                     .stable_checksum = fingerprint.stable_checksum,
+                     .stored_checksum = fingerprint.stored_checksum});
   } else {
     BlobIndex::EncodeBlob(blob_index, blob_file_number, blob_offset,
                           blob.size(), blob_compression_type_);
@@ -450,37 +453,17 @@ void BlobFileBuilder::Abandon(const Status& s) {
   blob_bytes_ = 0;
 }
 
-Status BlobFileBuilder::PutBlobIntoCacheIfNeeded(const Slice& blob,
-                                                 uint64_t blob_file_number,
-                                                 uint64_t blob_offset) const {
-  Status s = Status::OK();
-
-  BlobSource::SharedCacheInterface blob_cache{immutable_options_->blob_cache};
-  auto statistics = immutable_options_->statistics.get();
-  bool warm_cache =
+Status BlobFileBuilder::PutBlobIntoCacheIfNeeded(
+    const Slice& blob, uint64_t blob_file_number, uint64_t blob_offset,
+    const StableBlobFingerprint* fingerprint) const {
+  const bool warm_cache =
       prepopulate_blob_cache_ == PrepopulateBlobCache::kFlushOnly &&
       creation_reason_ == BlobFileCreationReason::kFlush;
-
-  if (blob_cache && warm_cache) {
-    const OffsetableCacheKey base_cache_key(db_id_, db_session_id_,
-                                            blob_file_number);
-    const CacheKey cache_key = base_cache_key.WithOffset(blob_offset);
-    const Slice key = cache_key.AsSlice();
-
-    const Cache::Priority priority = Cache::Priority::BOTTOM;
-
-    s = blob_cache.InsertSaved(key, blob, nullptr /*context*/, priority,
-                               immutable_options_->lowest_used_cache_tier);
-
-    if (s.ok()) {
-      RecordTick(statistics, BLOB_DB_CACHE_ADD);
-      RecordTick(statistics, BLOB_DB_CACHE_BYTES_WRITE, blob.size());
-    } else {
-      RecordTick(statistics, BLOB_DB_CACHE_ADD_FAILURES);
-    }
+  if (blob_source_ == nullptr || !warm_cache) {
+    return Status::OK();
   }
-
-  return s;
+  return blob_source_->PrepopulateFlushBlob(blob, blob_file_number, blob_offset,
+                                            fingerprint);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

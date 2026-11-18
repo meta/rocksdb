@@ -3042,7 +3042,8 @@ class WideColumnEntityBlobExtractionTest : public testing::Test {
         write_hint, nullptr /*IOTracer*/,
         nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
         immutable_options.cf_paths.front().path, &blob_file_paths_,
-        &blob_file_additions_);
+        &blob_file_additions_,
+        /*blob_source=*/nullptr);
 
     // Set up the input iterator
     const Comparator* cmp = BytewiseComparator();
@@ -3485,7 +3486,8 @@ class WideColumnEntityBlobGCTest : public testing::Test {
           nullptr /*BlobFileCompletionCallback*/,
           BlobFileCreationReason::kCompaction,
           immutable_options.cf_paths.front().path, &blob_file_paths_,
-          &blob_file_additions_);
+          &blob_file_additions_,
+          /*blob_source=*/nullptr);
     }
 
     // Set up the input iterator
