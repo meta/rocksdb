@@ -554,8 +554,8 @@ class SeqStringSource : public FSSequentialFile {
 // FileSystem for tests that sets FSSupportedOps::kAtomicReplaceOnClose and
 // keeps its contract for the small files that RocksDB writes with
 // AtomicFileWriter (file/file_util.h): CURRENT, IDENTITY, OPTIONS-* and
-// *.dbtmp. RocksDB writes OPTIONS files through a temp file and a rename even
-// with the bit, and this file system handles that path too. For such a file,
+// *.dbtmp. Without the bit, RocksDB writes these files through a temp file and
+// a rename, and this file system handles that path too. For such a file,
 // appended data stays in memory, and nothing is visible under the file name
 // until Close() returns OK. Close() then writes the content to the target file
 // system. A file that is destroyed before Close() returns OK publishes nothing.
@@ -568,7 +568,7 @@ class SeqStringSource : public FSSequentialFile {
 // "create <name>" for a new temp file (*.dbtmp), "rename <src> <dst>",
 // "publish <name>" for a Close() that makes a file visible, and
 // "dirsync <name>" for a directory sync whose DirFsyncOptions name a file. It
-// can also fail one step of writing such a file.
+// can also fail one step of writing or reading such a file.
 class AtomicReplaceOnCloseFS : public FileSystemWrapper {
  public:
   explicit AtomicReplaceOnCloseFS(const std::shared_ptr<FileSystem>& target)
@@ -584,11 +584,12 @@ class AtomicReplaceOnCloseFS : public FileSystemWrapper {
   void SetBitInSupportedOps(bool set_bit);
 
   // Makes `step` fail with an IOError for each file whose base name starts
-  // with `file_name_prefix`, for example "CURRENT". The steps are "open",
-  // "append", "sync" (Sync() or Fsync()) and "close" of a writable file, and
-  // "close after publish": Close() publishes the file and then returns an
-  // IOError, like a Close() whose result is lost. An empty
-  // `file_name_prefix` makes no step fail.
+  // with `file_name_prefix`, for example "CURRENT" or "OPTIONS-". The steps
+  // are "open", "append", "sync" (Sync() or Fsync()) and "close" of a
+  // writable file; "close after publish": Close() publishes the file and then
+  // returns an IOError, like a Close() whose result is lost; and "read"
+  // (opening the file with NewSequentialFile()). An empty `file_name_prefix`
+  // makes no step fail.
   void SetFailure(const std::string& file_name_prefix, const std::string& step);
 
   // Returns the events since the last call.
@@ -598,6 +599,10 @@ class AtomicReplaceOnCloseFS : public FileSystemWrapper {
                            const FileOptions& file_opts,
                            std::unique_ptr<FSWritableFile>* result,
                            IODebugContext* dbg) override;
+  IOStatus NewSequentialFile(const std::string& fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSSequentialFile>* result,
+                             IODebugContext* dbg) override;
   IOStatus RenameFile(const std::string& src, const std::string& dst,
                       const IOOptions& options, IODebugContext* dbg) override;
   IOStatus NewDirectory(const std::string& name, const IOOptions& io_opts,

@@ -3,6 +3,7 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <algorithm>
 #include <mutex>
 #include <set>
 
@@ -13,6 +14,7 @@
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/sst_file_writer.h"
+#include "rocksdb/utilities/options_util.h"
 #include "util/defer.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -1691,6 +1693,145 @@ TEST_F(DBEtc3Test, AtomicReplaceOnCloseCurrentWriteFailure) {
     ASSERT_EQ("value2", Get("key2"));
   }
 }
+
+// Returns the sorted names of the OPTIONS files (OPTIONS-<number>, without
+// temp files) in `dbname`.
+std::vector<std::string> ListOptionsFiles(Env* env, const std::string& dbname) {
+  std::vector<std::string> children;
+  EXPECT_OK(env->GetChildren(dbname, &children));
+  std::vector<std::string> options_files;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kOptionsFile) {
+      options_files.push_back(child);
+    }
+  }
+  std::sort(options_files.begin(), options_files.end());
+  return options_files;
+}
+
+// With kAtomicReplaceOnClose, DB open and SetOptions() write OPTIONS files
+// directly, with no temp file and no rename, each followed by its directory
+// sync, and the new file is the live OPTIONS file. Without the bit, the same
+// steps use temp files and renames.
+TEST_F(DBEtc3Test, AtomicReplaceOnCloseWritesOptionsDirectly) {
+  for (bool set_bit : {true, false}) {
+    SCOPED_TRACE("set_bit=" + std::to_string(set_bit));
+    auto fs =
+        std::make_shared<test::AtomicReplaceOnCloseFS>(env_->GetFileSystem());
+    fs->SetBitInSupportedOps(set_bit);
+    std::unique_ptr<Env> env = NewCompositeEnv(fs);
+    // Close the DB before env is destroyed, also when an assertion fails.
+    Defer close_db([this]() { Close(); });
+    Options options = CurrentOptions();
+    options.env = env.get();
+    DestroyAndReopen(options);
+    ASSERT_OK(db_->SetOptions({{"write_buffer_size", "1048576"}}));
+
+    // The events for OPTIONS files: temp files, renames, publishes and
+    // directory syncs.
+    std::vector<std::string> events;
+    for (const std::string& event : fs->TakeEvents()) {
+      if (event.find(" OPTIONS-") != std::string::npos) {
+        events.push_back(event);
+      }
+    }
+    size_t temp_steps = 0;
+    size_t publishes = 0;
+    for (size_t i = 0; i < events.size(); ++i) {
+      SCOPED_TRACE(events[i]);
+      const Slice event(events[i]);
+      if (event.starts_with("create ") || event.starts_with("rename ")) {
+        ++temp_steps;
+      } else if (set_bit && event.starts_with("publish ")) {
+        // Each direct write is followed by its directory sync.
+        const std::string name = events[i].substr(events[i].find(' ') + 1);
+        ASSERT_LT(i + 1, events.size());
+        ASSERT_EQ("dirsync " + name, events[i + 1]);
+        ++publishes;
+      }
+    }
+    if (set_bit) {
+      ASSERT_EQ(size_t{0}, temp_steps);
+      // DB open and SetOptions() each write an OPTIONS file.
+      ASSERT_GE(publishes, size_t{2});
+    } else {
+      ASSERT_GT(temp_steps, size_t{0});
+    }
+
+    // The live OPTIONS file is the latest one and has the new value.
+    const std::vector<std::string> options_files =
+        ListOptionsFiles(env_, dbname_);
+    ASSERT_FALSE(options_files.empty());
+    std::vector<std::string> live_files;
+    uint64_t manifest_size = 0;
+    ASSERT_OK(db_->GetLiveFiles(live_files, &manifest_size,
+                                /*flush_memtable=*/false));
+    ASSERT_NE(std::find(live_files.begin(), live_files.end(),
+                        "/" + options_files.back()),
+              live_files.end());
+    DBOptions db_options;
+    std::vector<ColumnFamilyDescriptor> cf_descs;
+    ConfigOptions config_options;
+    config_options.env = env_;
+    ASSERT_OK(
+        LoadLatestOptions(config_options, dbname_, &db_options, &cf_descs));
+    ASSERT_EQ(size_t{1048576}, cf_descs[0].options.write_buffer_size);
+  }
+}
+
+// With kAtomicReplaceOnClose, a failure at any step of writing an OPTIONS
+// file, including the verify that reads it back, fails SetOptions() and
+// leaves the OPTIONS files as they were. The next SetOptions() succeeds.
+TEST_F(DBEtc3Test, AtomicReplaceOnCloseOptionsWriteFailure) {
+  auto fs =
+      std::make_shared<test::AtomicReplaceOnCloseFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env = NewCompositeEnv(fs);
+  // Close the DB before env is destroyed, also when an assertion fails.
+  Defer close_db([this]() { Close(); });
+  Options options = CurrentOptions();
+  options.env = env.get();
+  DestroyAndReopen(options);
+
+  size_t write_buffer_size = 1 << 20;
+  for (const char* step :
+       {"open", "append", "sync", "close", "close after publish", "read"}) {
+    SCOPED_TRACE(step);
+    const std::vector<std::string> files_before =
+        ListOptionsFiles(env_, dbname_);
+    write_buffer_size += 1024;
+    fs->SetFailure("OPTIONS-", step);
+    const Status s = db_->SetOptions(
+        {{"write_buffer_size", std::to_string(write_buffer_size)}});
+    fs->SetFailure("", "");
+    ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+    ASSERT_EQ(files_before, ListOptionsFiles(env_, dbname_));
+    // The DB still uses the previous OPTIONS file and lists no OPTIONS file
+    // that is missing on disk.
+    std::vector<std::string> live_files;
+    uint64_t manifest_size = 0;
+    ASSERT_OK(db_->GetLiveFiles(live_files, &manifest_size,
+                                /*flush_memtable=*/false));
+    for (const std::string& live_file : live_files) {
+      uint64_t number = 0;
+      FileType type;
+      if (ParseFileName(live_file.substr(1), &number, &type) &&
+          type == kOptionsFile) {
+        ASSERT_EQ("/" + files_before.back(), live_file);
+      }
+    }
+    ASSERT_NE(std::find(live_files.begin(), live_files.end(),
+                        "/" + files_before.back()),
+              live_files.end());
+
+    write_buffer_size += 1024;
+    ASSERT_OK(db_->SetOptions(
+        {{"write_buffer_size", std::to_string(write_buffer_size)}}));
+    ASSERT_NE(files_before, ListOptionsFiles(env_, dbname_));
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

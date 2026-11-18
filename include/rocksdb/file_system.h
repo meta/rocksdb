@@ -97,14 +97,15 @@ enum FSSupportedOps {
   kFSPrefetch,                // Supports prefetch operations
   // Set by a file system where a written file appears all at once at
   // Close(), for example some remote file systems. When this bit is set,
-  // RocksDB writes CURRENT and IDENTITY directly under their final names,
-  // without a temp file or a rename, which saves metadata calls on each write.
+  // RocksDB writes CURRENT, IDENTITY and OPTIONS-<number> directly under their
+  // final names, without a temp file or a rename, which saves metadata calls
+  // on each write.
   //
-  // RocksDB writes these files as `<db_path>/CURRENT` and
-  // `<db_path>/IDENTITY`, and does not tell the file system which file it
-  // opens. So the file system must recognize them by base name. The DB path
-  // can be any directory, so the rule must work under any path. Each such
-  // file, created with NewWritableFile() and then closed, must have these
+  // RocksDB writes these files as `<db_path>/CURRENT`, `<db_path>/IDENTITY`
+  // and `<db_path>/OPTIONS-<number>`, and does not tell the file system which
+  // file it opens. So the file system must recognize them by base name. The
+  // DB path can be any directory, so the rule must work under any path. Each
+  // such file, created with NewWritableFile() and then closed, must have these
   // properties:
   // 1. The content is not visible under the file name before Close() returns
   //    OK. Sync() and Fsync() must not make it visible.
@@ -117,6 +118,7 @@ enum FSSupportedOps {
   // 5. The FSWritableFile destructor must not publish the file when Close()
   //    has not returned OK. RocksDB destroys the file without calling Close()
   //    after a failed Append() or Sync().
+  // For OPTIONS-<number>, the name is always new, so property 2 never applies.
   // All other files keep the normal FileSystem semantics. RocksDB still calls
   // Sync() on these files and still syncs the directory after Close(). That
   // directory sync must keep its normal meaning, because it also makes the

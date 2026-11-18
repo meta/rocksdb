@@ -167,9 +167,9 @@ inline bool CheckFSFeatureSupport(FileSystem* fs, FSSupportedOps feat) {
 // file keeps its old content.
 //
 // Direct write. A file system that sets FSSupportedOps::kAtomicReplaceOnClose
-// promises that CURRENT and IDENTITY appear atomically and durably at Close()
-// (include/rocksdb/file_system.h has the full contract). For CURRENT and
-// IDENTITY on such a file system, the temp file and the rename protect
+// promises that CURRENT, IDENTITY and OPTIONS files appear atomically and
+// durably at Close() (include/rocksdb/file_system.h has the full contract).
+// For these files on such a file system, the temp file and the rename protect
 // nothing, so the writer skips them:
 // 1. Open the final file, append the new content, sync it and close it.
 // 2. Sync the directory, as in step 4 above.

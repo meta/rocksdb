@@ -939,6 +939,18 @@ IOStatus AtomicReplaceOnCloseFS::NewWritableFile(
   return IOStatus::OK();
 }
 
+IOStatus AtomicReplaceOnCloseFS::NewSequentialFile(
+    const std::string& fname, const FileOptions& file_opts,
+    std::unique_ptr<FSSequentialFile>* result, IODebugContext* dbg) {
+  if (IsAtomicWriteFile(BaseFileName(fname))) {
+    IOStatus s = MaybeFail(fname, "read");
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  return target()->NewSequentialFile(fname, file_opts, result, dbg);
+}
+
 IOStatus AtomicReplaceOnCloseFS::RenameFile(const std::string& src,
                                             const std::string& dst,
                                             const IOOptions& options,

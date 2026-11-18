@@ -7752,31 +7752,53 @@ Status DBImpl::PersistOptionsFile(
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteOptionsFile:PersistOptions",
                            const_cast<DBOptions*>(&db_options));
 
-  const std::string file_name =
-      TempOptionsFileName(GetName(), versions_->NewFileNumber());
+  // Without kAtomicReplaceOnClose, the file is written under a temp name and
+  // renamed, so it takes two new file numbers. For example,
+  // OPTIONS-000012.dbtmp is renamed to OPTIONS-000013. With the bit, the file
+  // is written directly under its final name, for example OPTIONS-000012, so
+  // it takes one file number.
+  const bool write_directly = versions_->fs_replaces_atomically();
+  std::string temp_file_name;
+  if (!write_directly) {
+    temp_file_name = TempOptionsFileName(GetName(), versions_->NewFileNumber());
+  }
   *options_file_number = versions_->NewFileNumber();
+  const std::string final_file_name =
+      OptionsFileName(GetName(), *options_file_number);
+  // The file that Write() creates: the temp file, or the final file of a
+  // direct write. The verify reads it, and the cleanup deletes it after a
+  // failure.
+  const std::string& written_file_name =
+      write_directly ? final_file_name : temp_file_name;
 
   const ConfigOptions config_options = OptionsFileConfigOptions(db_options);
   std::string contents;
   Status s = SerializeRocksDBOptions(config_options, db_options, cf_names,
                                      cf_opts, &contents);
+  // Reads the written file back and checks that it parses to the same
+  // options.
+  auto verify = [&]() {
+    return RocksDBOptionsParser::VerifyRocksDBOptionsFromFile(
+        config_options, db_options, cf_names, cf_opts, written_file_name,
+        fs_.get());
+  };
   if (s.ok()) {
-    // Write the temp file, read it back and verify it, then rename it to the
-    // final name. The rename and the delete go through Env, as the OPTIONS
-    // rename always did, so that Env overrides still apply. For example, the
-    // test Envs SpecialEnv and FaultInjectionTestEnv override
-    // Env::RenameFile() and Env::DeleteFile().
     AtomicFileWriteOptions atomic_opts;
+    atomic_opts.fs_replaces_atomically = write_directly;
     atomic_opts.use_fsync = true;
-    atomic_opts.temp_name = file_name;
-    atomic_opts.env = GetEnv();
-    atomic_opts.check_before_rename = [&]() {
-      return status_to_io_status(
-          RocksDBOptionsParser::VerifyRocksDBOptionsFromFile(
-              config_options, db_options, cf_names, cf_opts, file_name,
-              fs_.get()));
-    };
     atomic_opts.dir_path_to_open = GetName();
+    if (!write_directly) {
+      // Write the temp file, read it back and verify it, then rename it to the
+      // final name. The rename and the delete go through Env, as the OPTIONS
+      // rename always did, so that Env overrides still apply. For example, the
+      // test Envs SpecialEnv and FaultInjectionTestEnv override
+      // Env::RenameFile() and Env::DeleteFile().
+      atomic_opts.temp_name = temp_file_name;
+      atomic_opts.env = GetEnv();
+      atomic_opts.check_before_rename = [&]() {
+        return status_to_io_status(verify());
+      };
+    }
     IOOptions opts;
     s = PrepareIOFromWriteOptions(write_options, opts);
     opts.type = IOType::kMetadata;
@@ -7787,29 +7809,44 @@ Status DBImpl::PersistOptionsFile(
       // Tests turn the file system off at this point and on again at
       // "PersistRocksDBOptions:written". Both names are kept from
       // PersistRocksDBOptions() so that those tests still work. Here this
-      // point runs before the temp file is opened.
+      // point runs before Write() opens the temp file or, for a direct write,
+      // the final file.
       TEST_SYNC_POINT("PersistRocksDBOptions:create");
       s = NewAtomicFileWriter(fs_.get(), atomic_opts)
-              ->Write(OptionsFileName(GetName(), *options_file_number),
-                      contents, opts, file_opts);
+              ->Write(final_file_name, contents, opts, file_opts);
       // Unlike in PersistRocksDBOptions(), this point runs after Write()
-      // returns, which is after the verify and the rename. It also runs when
-      // the write failed.
+      // returns. For a temp-file write that is after the verify and the
+      // rename. For a direct write the verify runs later, below. It also runs
+      // when the write failed.
       TEST_SYNC_POINT("PersistRocksDBOptions:written");
+    }
+    if (s.ok() && write_directly) {
+      // A direct write has no step between Close() and the moment the file
+      // becomes visible, so the verify runs after the write. Between Close()
+      // and the end of the verify, other readers can see an unverified
+      // OPTIONS file. If the process crashes in this window, the file stays,
+      // and LoadLatestOptions() may pick it because it is the newest. A bad
+      // file comes from a serialization bug or a storage error, and the verify
+      // catches both. If the verify fails, the file is deleted below. Deleting
+      // it is safe: OPTIONS file names are unique, and the file is not yet
+      // recorded as the latest OPTIONS file.
+      s = verify();
     }
   }
   if (s.ok()) {
     *options_file_size = contents.size();
   }
 
-  // If the writer ran and failed, it already tried to delete the temp file.
-  // Delete it again here in case that delete failed. After an earlier failure
-  // no temp file exists, and this check finds nothing.
-  if (!s.ok() && GetEnv()->FileExists(file_name).ok()) {
-    if (!GetEnv()->DeleteFile(file_name).ok()) {
+  // After a failure, delete the file that Write() created: the temp file, or
+  // the final file of a direct write. If the writer wrote a temp file and
+  // failed, it already tried to delete it, and this tries once more in case
+  // that delete failed. After an earlier failure no such file exists, and
+  // this check finds nothing. The delete goes through Env, like the rename.
+  if (!s.ok() && GetEnv()->FileExists(written_file_name).ok()) {
+    if (!GetEnv()->DeleteFile(written_file_name).ok()) {
       ROCKS_LOG_WARN(immutable_db_options_.info_log,
-                     "Unable to delete temp options file %s",
-                     file_name.c_str());
+                     "Unable to delete options file %s",
+                     written_file_name.c_str());
     }
   }
   if (!s.ok()) {
