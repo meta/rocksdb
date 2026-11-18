@@ -3155,9 +3155,12 @@ class DBImpl : public DB
   Status RunLocalCompaction(std::function<void()> work, Env::Priority priority,
                             ColumnFamilyData* cfd,
                             const std::atomic<bool>& canceled, bool is_manual);
+  // Copies the input files of trivial copy compaction `c` to new files at its
+  // output temperature, appending their metadata to `out_files` without
+  // installing them. Must be called without the DB mutex held.
   IOStatus CopyTrivialCompactionFiles(Compaction* c, LogBuffer* log_buffer,
                                       std::vector<FileMetaData>* out_files,
-                                      int job_id, bool db_mutex_held);
+                                      int job_id);
   struct LocalCompactionTask {
     DBImpl* db;
     ColumnFamilyData* cfd;

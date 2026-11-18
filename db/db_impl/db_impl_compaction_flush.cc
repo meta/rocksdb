@@ -4026,7 +4026,7 @@ Status DBImpl::RunLocalCompaction(std::function<void()> work,
 
 IOStatus DBImpl::CopyTrivialCompactionFiles(
     Compaction* c, LogBuffer* log_buffer, std::vector<FileMetaData>* out_files,
-    int job_id, bool db_mutex_held) {
+    int job_id) {
   IOStatus io_s;
   ColumnFamilyData* const cfd = c->column_family_data();
   // Output whose creation was announced to listeners but has not finished.
@@ -4041,12 +4041,7 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
 
     // The output is a byte-for-byte copy of the input, so its table
     // properties are exactly the input's, including the SST unique ID.
-    // Loading them can read the input file, and listeners are called without
-    // the DB mutex.
     std::shared_ptr<const TableProperties> out_table_properties;
-    if (db_mutex_held) {
-      mutex_.Unlock();
-    }
     const TablePropertiesCollection& input_table_properties =
         c->GetOrInitInputTableProperties();
     auto input_table_properties_it = input_table_properties.find(in_fname);
@@ -4056,9 +4051,6 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
     EventHelpers::NotifyTableFileCreationStarted(
         cfd->ioptions().listeners, dbname_, cfd->GetName(), out_fname, job_id,
         TableFileCreationReason::kCompaction);
-    if (db_mutex_held) {
-      mutex_.Lock();
-    }
     unfinished_out_fname = out_fname;
 
     int64_t tmp_current_time = 0;
@@ -4126,6 +4118,7 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
     copy_files_compaction_io_options.type = IOType::kData;
     copy_files_compaction_io_options.io_activity = Env::IOActivity::kCompaction;
 
+    TEST_SYNC_POINT("DBImpl::CopyTrivialCompactionFiles:BeforeCopyFile");
     IOStatus copy_file_io_status = CopyFile(
         immutable_db_options_.fs.get() /* fileSystem */, in_fname /* source */,
         in_file->temperature /* src_temp_hint */, dest_writer /* dest_writer */,
@@ -4211,9 +4204,6 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
     if (out_table_properties) {
       c->SetOutputTableProperties(out_fname, out_table_properties);
     }
-    if (db_mutex_held) {
-      mutex_.Unlock();
-    }
     EventHelpers::LogAndNotifyTableFileCreationFinished(
         &event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(),
         out_fname, job_id, out_file_metadata.fd,
@@ -4222,9 +4212,6 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
         TableFileCreationReason::kCompaction, io_s,
         out_file_metadata.file_checksum,
         out_file_metadata.file_checksum_func_name);
-    if (db_mutex_held) {
-      mutex_.Lock();
-    }
     unfinished_out_fname.clear();
 
     out_files->push_back(std::move(out_file_metadata));
@@ -4232,17 +4219,11 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
 
   if (!unfinished_out_fname.empty()) {
     assert(!io_s.ok());
-    if (db_mutex_held) {
-      mutex_.Unlock();
-    }
     EventHelpers::LogAndNotifyTableFileCreationFinished(
         &event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(),
         unfinished_out_fname, job_id, FileDescriptor(), kInvalidBlobFileNumber,
         TableProperties(), TableFileCreationReason::kCompaction, io_s,
         kUnknownFileChecksum, kUnknownFileChecksumFuncName);
-    if (db_mutex_held) {
-      mutex_.Lock();
-    }
   }
   return io_s;
 }
@@ -5669,13 +5650,16 @@ Status DBImpl::BackgroundCompaction(
                             compaction_job_stats, job_context->job_id);
 
     std::vector<FileMetaData> out_files;
+    // As for other compactions, the copy runs without the DB mutex. The inputs
+    // are protected by being compacted and referenced by the input version, and
+    // the new file numbers by pending_outputs_.
+    mutex_.Unlock();
     if (separate_remote_pool) {
-      mutex_.Unlock();
       try {
         status = RunLocalCompaction(
             [&] {
               io_s = CopyTrivialCompactionFiles(c.get(), log_buffer, &out_files,
-                                                job_context->job_id, false);
+                                                job_context->job_id);
             },
             thread_pri, c->column_family_data(),
             is_manual ? manual_compaction->canceled
@@ -5684,11 +5668,11 @@ Status DBImpl::BackgroundCompaction(
       } catch (...) {
         status = Status::Aborted();
       }
-      mutex_.Lock();
     } else {
       io_s = CopyTrivialCompactionFiles(c.get(), log_buffer, &out_files,
-                                        job_context->job_id, true);
+                                        job_context->job_id);
     }
+    mutex_.Lock();
 
     // Update version set
     if (status.ok() && io_s.ok()) {
