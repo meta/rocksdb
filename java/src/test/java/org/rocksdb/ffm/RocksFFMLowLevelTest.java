@@ -14,7 +14,7 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.rocksdb.RocksDBException;
 
-public class RocksFFMBasicTest {
+public class RocksFFMLowLevelTest {
   @Rule public TemporaryFolder dbFolder = new TemporaryFolder();
 
   static String dbPath;

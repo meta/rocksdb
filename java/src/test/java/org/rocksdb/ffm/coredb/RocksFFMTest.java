@@ -26,7 +26,7 @@ public class RocksFFMTest {
   @Before
   public void setup() throws IOException {
     dbPath = dbFolder.newFolder().getAbsolutePath();
-}
+  }
 
   @Test
   public void openNonExistent() {
