@@ -30,6 +30,7 @@ class Transaction;
 class TransactionDB;
 class OptimisticTransactionDB;
 class DbStressFSWrapper;
+class DbStressListener;
 class Iterator;
 struct TransactionDBOptions;
 using experimental::SstQueryFilterConfigsManager;
@@ -657,6 +658,10 @@ class StressTest {
 
   // Currently only used in MultiOpsTxnsStressTest
   std::atomic<DB*> db_aptr_;
+
+  // The DbStressListener in options_.listeners for the current open; null
+  // when the open path does not install one.
+  std::shared_ptr<DbStressListener> db_stress_listener_;
 
   Options options_;
   SystemClock* clock_;

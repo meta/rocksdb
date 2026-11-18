@@ -1432,8 +1432,9 @@ void StressTest::InitializeListenersForOpen(
     SharedState* shared,
     const std::vector<ColumnFamilyDescriptor>& cf_descriptors) {
   options_.listeners.clear();
-  options_.listeners.emplace_back(new DbStressListener(
-      GetDbPath(), options_.db_paths, cf_descriptors, shared));
+  db_stress_listener_ = std::make_shared<DbStressListener>(
+      GetDbPath(), options_.db_paths, cf_descriptors, shared);
+  options_.listeners.emplace_back(db_stress_listener_);
   RegisterAdditionalListeners();
 
   if (!FLAGS_listener_uri.empty()) {
@@ -6290,6 +6291,10 @@ void StressTest::Open(SharedState* shared, bool reopen) {
   if (!s.ok()) {
     fprintf(stderr, "open error: %s\n", s.ToString().c_str());
     port::ImmediateExit(1);
+  }
+
+  if (db_stress_listener_) {
+    db_stress_listener_->SetPrimaryDb(db_->GetRootDB());
   }
 
   if (db_->GetLatestSequenceNumber() < shared->GetPersistedSeqno()) {
