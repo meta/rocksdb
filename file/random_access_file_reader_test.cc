@@ -6,11 +6,14 @@
 #include "file/random_access_file_reader.h"
 
 #include <algorithm>
+#include <chrono>
+#include <stdexcept>
 
 #include "file/file_util.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/listener.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -218,6 +221,54 @@ TEST_F(RandomAccessFileReaderTest, SubmitReadAsyncDirectIOAligned) {
   ASSERT_OK(req.status);
   ASSERT_EQ(req.result.data(), req.scratch);
   ASSERT_EQ(req.result, Slice(content.data(), req.len));
+}
+
+class ThrowingFileReadListener final : public EventListener {
+ public:
+  bool ShouldBeNotifiedOnFileIO() override { return true; }
+
+  [[noreturn]] void OnFileReadFinish(
+      const FileOperationInfo& /*info*/) override {
+    throw std::runtime_error("listener failed");
+  }
+};
+
+TEST_F(RandomAccessFileReaderTest, SubmitReadAsyncCallsBackWhenReadThrows) {
+  fs_->SetReadIOExecutorThreads(1);
+  if (fs_->GetReadExecutor() == nullptr) {
+    ROCKSDB_GTEST_SKIP("FileSystem has no read executor");
+    return;
+  }
+
+  const std::string fname = "submit-read-async-throws";
+  const std::string content = "submit read async throws";
+  Write(fname, content);
+  const std::string fpath = Path(fname);
+  std::unique_ptr<FSRandomAccessFile> file;
+  ASSERT_OK(fs_->NewRandomAccessFile(fpath, FileOptions(), &file, nullptr));
+  RandomAccessFileReader reader(
+      std::move(file), fpath, env_->GetSystemClock().get(),
+      /*io_tracer=*/nullptr, /*stats=*/nullptr, Histograms::HISTOGRAM_ENUM_MAX,
+      /*file_read_hist=*/nullptr, /*rate_limiter=*/nullptr,
+      {std::make_shared<ThrowingFileReadListener>()}, Temperature::kUnknown,
+      /*is_last_level=*/false, fs_.get());
+
+  std::string scratch(content.size(), '\0');
+  FSReadRequest req;
+  req.offset = 0;
+  req.len = content.size();
+  req.scratch = scratch.data();
+  folly::Baton<> completion;
+  ASSERT_TRUE(reader.SubmitReadAsync(
+      req, IOOptions(),
+      [&](FSReadRequest& /*completed*/) { completion.post(); },
+      /*dbg=*/nullptr));
+
+  ASSERT_TRUE(completion.try_wait_for(std::chrono::seconds(30)));
+  EXPECT_TRUE(req.status.IsIOError()) << req.status.ToString();
+  EXPECT_NE(std::string::npos,
+            req.status.ToString().find("coroutine read threw"));
+  EXPECT_NE(std::string::npos, req.status.ToString().find("listener failed"));
 }
 
 #endif  // USE_COROUTINES

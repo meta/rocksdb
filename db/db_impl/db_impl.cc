@@ -131,9 +131,10 @@
 #include "utilities/trace/replayer_impl.h"
 
 #if USE_COROUTINES
+#include "folly/ExceptionWrapper.h"
 #include "folly/Executor.h"
-#include "folly/coro/Nothrow.h"
 #include "folly/coro/Task.h"
+#include "folly/coro/ViaIfAsync.h"
 #include "folly/executors/IOExecutor.h"
 #include "folly/io/async/EventBase.h"
 #include "rocksdb/coro_db.h"
@@ -9852,6 +9853,19 @@ class AsyncReadStatsScope {
   AsyncReadStatsScope& operator=(AsyncReadStatsScope&&) = delete;
 };
 
+#if USE_COROUTINES
+// The async read callers wait for OnComplete(), so a coroutine read that throws
+// must still complete with an error. Not Aborted: MultiGet uses Aborted for
+// keys past the value size soft limit. Not exception_wrapper::what(): its
+// fbstring needs jemalloc's nallocx, which the open-source build does not link.
+Status CoroutineReadThrew(const folly::exception_wrapper& error) {
+  const std::exception* exception = error.get_exception();
+  return Status::IOError(
+      "coroutine read threw",
+      exception != nullptr ? exception->what() : "non-standard exception");
+}
+#endif  // USE_COROUTINES
+
 }  // namespace
 
 void DB::GetAsync(const ReadOptions& options, ColumnFamilyHandle* column_family,
@@ -9875,9 +9889,11 @@ void DB::GetAsync(const ReadOptions& options, ColumnFamilyHandle* column_family,
         {
           CoroutineStatsContextScope stats_scope(std::move(task_stats_config),
                                                  task_env);
-          task_status = co_await folly::coro::co_nothrow(
+          auto read = co_await folly::coro::co_awaitTry(
               task_db->GetCoroutine(task_options, task_column_family, task_key,
                                     task_value, task_timestamp));
+          task_status = read.hasValue() ? std::move(read).value()
+                                        : CoroutineReadThrew(read.exception());
         }
 
         task_callback.OnComplete();
@@ -9922,9 +9938,15 @@ void DB::MultiGetAsync(const ReadOptions& options, const size_t num_keys,
         {
           CoroutineStatsContextScope stats_scope(std::move(task_stats_config),
                                                  task_env);
-          co_await folly::coro::co_nothrow(task_db->MultiGetCoroutine(
-              task_options, task_num_keys, task_column_families, task_keys,
-              task_values, task_timestamps, task_statuses, task_sorted_input));
+          auto read =
+              co_await folly::coro::co_awaitTry(task_db->MultiGetCoroutine(
+                  task_options, task_num_keys, task_column_families, task_keys,
+                  task_values, task_timestamps, task_statuses,
+                  task_sorted_input));
+          if (read.hasException()) {
+            std::fill_n(task_statuses, task_num_keys,
+                        CoroutineReadThrew(read.exception()));
+          }
         }
 
         task_callback.OnComplete();

@@ -23,6 +23,8 @@
 #include "util/rate_limiter_impl.h"
 
 #if USE_COROUTINES
+#include "folly/ExceptionWrapper.h"
+#include "folly/coro/ViaIfAsync.h"
 #include "folly/io/async/EventBase.h"
 #endif
 
@@ -358,9 +360,18 @@ bool RandomAccessFileReader::SubmitReadAsync(
                      IOOptions task_opts,
                      std::function<void(FSReadRequest&)> task_cb,
                      IODebugContext* task_dbg) -> folly::coro::Task<void> {
-        co_await folly::coro::co_nothrow(reader->ReadCoroutine(
+        auto read = co_await folly::coro::co_awaitTry(reader->ReadCoroutine(
             task_opts, task_req,
             /*direct_io_buffer_context=*/nullptr, task_dbg));
+        if (read.hasException()) {
+          // Not exception_wrapper::what(): its fbstring needs jemalloc's
+          // nallocx, which the open-source build does not link.
+          const std::exception* exception = read.exception().get_exception();
+          task_req->status = IOStatus::IOError("coroutine read threw",
+                                               exception != nullptr
+                                                   ? exception->what()
+                                                   : "non-standard exception");
+        }
         task_cb(*task_req);
       }(this, &req, opts, std::move(cb), dbg);
       auto task_with_executor = folly::coro::co_withExecutor(

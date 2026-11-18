@@ -7,9 +7,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <future>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -19,6 +22,7 @@
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/thread_status_util.h"
 #include "port/port.h"
+#include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
@@ -459,6 +463,107 @@ TEST_F(PerfContextTest, CoroutineStatsContextRestoredOnForeignThread) {
 
   EXPECT_EQ(41, foreign_block_read_count);
   EXPECT_EQ(43, foreign_bytes_read);
+}
+
+TEST_F(PerfContextTest, CoroutineReadThatThrowsCompletesWithIOError) {
+  class ThrowingComparator final : public Comparator {
+   public:
+    const char* Name() const override { return "ThrowingComparator"; }
+
+    int Compare(const Slice& a, const Slice& b) const override {
+      if (throw_on_compare.load()) {
+        throw std::runtime_error("comparator failed");
+      }
+      return BytewiseComparator()->Compare(a, b);
+    }
+
+    void FindShortestSeparator(std::string* start,
+                               const Slice& limit) const override {
+      BytewiseComparator()->FindShortestSeparator(start, limit);
+    }
+
+    void FindShortSuccessor(std::string* key) const override {
+      BytewiseComparator()->FindShortSuccessor(key);
+    }
+
+    std::atomic<bool> throw_on_compare{false};
+  };
+
+  class CompletionCallback final : public DB::AsyncCallback {
+   public:
+    void OnComplete() override { done.set_value(); }
+
+    std::promise<void> done;
+  };
+
+  ThrowingComparator comparator;
+  Options options;
+  options.create_if_missing = true;
+  options.comparator = &comparator;
+  ASSERT_OK(DestroyDB(kDbName, options));
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, kDbName, &db));
+  if (db->GetCoroDB() == nullptr ||
+      db->GetFileSystem()->GetReadExecutor() == nullptr) {
+    ROCKSDB_GTEST_BYPASS("Needs coroutine reads and a read executor");
+    return;
+  }
+  ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  ASSERT_OK(db->Put(WriteOptions(), "key2", "value2"));
+  ASSERT_OK(db->Flush(FlushOptions()));
+
+  auto completed = [&comparator](CompletionCallback& callback) {
+    const bool done =
+        callback.done.get_future().wait_for(std::chrono::seconds(30)) ==
+        std::future_status::ready;
+    comparator.throw_on_compare = false;
+    return done;
+  };
+  auto expect_threw = [](const Status& status) {
+    EXPECT_TRUE(status.IsIOError()) << status.ToString();
+    EXPECT_NE(std::string::npos,
+              status.ToString().find("coroutine read threw"));
+    EXPECT_NE(std::string::npos, status.ToString().find("comparator failed"));
+  };
+
+  {
+    SCOPED_TRACE("GetAsync");
+    PinnableSlice value;
+    Status status;
+    CompletionCallback callback;
+    comparator.throw_on_compare = true;
+    db->GetAsync(ReadOptions(), db->DefaultColumnFamily(), "key", &value,
+                 status, callback);
+    ASSERT_TRUE(completed(callback));
+    expect_threw(status);
+  }
+
+  // Two keys throw while MultiGet sorts them. One key throws during the read,
+  // after MultiGet has referenced the SuperVersion.
+  for (const size_t num_keys : {size_t{2}, size_t{1}}) {
+    SCOPED_TRACE("MultiGetAsync with " + std::to_string(num_keys) + " keys");
+    ColumnFamilyHandle* column_families[] = {db->DefaultColumnFamily(),
+                                             db->DefaultColumnFamily()};
+    const Slice keys[] = {"key", "key2"};
+    PinnableSlice values[2];
+    Status statuses[2];
+    CompletionCallback callback;
+    comparator.throw_on_compare = true;
+    db->MultiGetAsync(ReadOptions(), num_keys, column_families, keys, values,
+                      statuses, /*sorted_input=*/false, callback);
+    ASSERT_TRUE(completed(callback));
+    for (size_t i = 0; i < num_keys; ++i) {
+      expect_threw(statuses[i]);
+    }
+  }
+
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "key", &value));
+  EXPECT_EQ("value", value);
+
+  // Closing the DB asserts in debug builds if MultiGet leaked a SuperVersion.
+  db.reset();
+  ASSERT_OK(DestroyDB(kDbName, options));
 }
 
 #endif

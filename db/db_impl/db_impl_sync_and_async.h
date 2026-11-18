@@ -833,6 +833,16 @@ DEFINE_SYNC_AND_ASYNC(void, DBImpl::MultiGetCommon)
     }
     CO_RETURN;
   }
+  Defer sv_cleanup([&] {
+    for (const auto& cf_sv_pair : cf_sv_pairs) {
+      if (sv_from_thread_local && !kExtraSvRef) {
+        ReturnAndCleanupSuperVersion(cf_sv_pair.cfd, cf_sv_pair.super_version);
+      } else {
+        TEST_SYNC_POINT("DBImpl::MultiCFSnapshot::BeforeLastTryUnRefSV");
+        CleanupSuperVersion(cf_sv_pair.super_version);
+      }
+    }
+  });
 
   GetWithTimestampReadCallback timestamp_read_callback(0);
   ReadCallback* read_callback = nullptr;
@@ -886,14 +896,6 @@ DEFINE_SYNC_AND_ASYNC(void, DBImpl::MultiGetCommon)
     }
   }
 
-  for (const auto& cf_sv_pair : cf_sv_pairs) {
-    if (sv_from_thread_local && !kExtraSvRef) {
-      ReturnAndCleanupSuperVersion(cf_sv_pair.cfd, cf_sv_pair.super_version);
-    } else {
-      TEST_SYNC_POINT("DBImpl::MultiCFSnapshot::BeforeLastTryUnRefSV");
-      CleanupSuperVersion(cf_sv_pair.super_version);
-    }
-  }
   CopyNewerVersionPresent(key_context, newer_version_present);
 }
 

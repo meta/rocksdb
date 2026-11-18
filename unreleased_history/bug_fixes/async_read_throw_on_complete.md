@@ -1,0 +1,1 @@
+Fixed `DB::GetAsync()` and `DB::MultiGetAsync()` never calling `AsyncCallback::OnComplete()` when the native coroutine read throws (for example, from a comparator, merge operator or event listener). The read now completes with `Status::IOError`, and a `MultiGet` that throws no longer leaks its SuperVersion references.
