@@ -454,9 +454,10 @@ class CompactionIterator {
   // generation number. The type follows the new generation number (see
   // BlobIndex::SetGenerationFileNumber()). The origin, the original offset and
   // the CRCs do not change, and blob values are never read. These do not
-  // flatten: remote compaction, coarse L0 output (see coarse_blob_output_),
-  // compactions with enable_blob_indirection off, and input Versions without
-  // the indirection format. Once no SST uses the old generation number, route
+  // flatten: a remote compaction that CompactionJob::AllowBlobIndexFlattening()
+  // does not allow, coarse L0 output (see coarse_blob_output_), compactions
+  // with enable_blob_indirection off, and input Versions without the
+  // indirection format. Once no SST uses the old generation number, route
   // retirement can delete its route. See the relocation overview in
   // db/blob/blob_relocation_manifest.h.
   //
@@ -710,7 +711,8 @@ class CompactionIterator {
   bool has_output_blob_index_ = false;
 
   // False for BuildTable() (flush, WAL recovery and RepairDB), for
-  // FlushJob::MemPurge(), and for a remote compaction (see
+  // FlushJob::MemPurge(), and for a remote compaction, unless it is a
+  // feature-aware job whose column family has enable_blob_indirection on (see
   // CompactionJob::AllowBlobIndexFlattening()).
   const bool allow_blob_index_flattening_;
 

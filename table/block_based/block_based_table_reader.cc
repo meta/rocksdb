@@ -2720,6 +2720,11 @@ std::shared_ptr<const TableProperties> BlockBasedTable::GetTableProperties()
 
 namespace {
 
+// Readahead for walks over every reference data block (verify). It starts at
+// 256 KB and grows to 1 MB (estimates).
+constexpr size_t kBlobReferenceWalkInitialReadahead = 256 * 1024;
+constexpr size_t kBlobReferenceWalkMaxReadahead = 1024 * 1024;
+
 // Reads one metadata block with checksum verification, without filling the
 // block cache and without the persistent cache. Data blocks may be
 // compressed; the index is not.
@@ -2730,6 +2735,7 @@ Status ReadBlobReferenceMetadataBlock(const BlockBasedTable::Rep& rep,
                                       const ReadOptions& caller_read_options,
                                       const BlockHandle& handle,
                                       bool maybe_compressed,
+                                      FilePrefetchBuffer* prefetch_buffer,
                                       BlockContents* contents) {
   // No persistent cache, also for a reader from the table cache, so census
   // reads and indirect blob GC reads never fill it (as fill_cache=false does
@@ -2739,8 +2745,8 @@ Status ReadBlobReferenceMetadataBlock(const BlockBasedTable::Rep& rep,
   read_options.fill_cache = false;
   read_options.verify_checksums = true;
   IOStatus io_status =
-      BlockFetcher(rep.file.get(), nullptr /* prefetch_buffer */, rep.footer,
-                   read_options, handle, contents, rep.ioptions,
+      BlockFetcher(rep.file.get(), prefetch_buffer, rep.footer, read_options,
+                   handle, contents, rep.ioptions,
                    maybe_compressed /* do_uncompress */, maybe_compressed,
                    BlockType::kUserDefinedIndex,
                    maybe_compressed ? rep.decompressor.get() : nullptr,
@@ -2775,7 +2781,7 @@ Status ReadBlobReferenceIndex(const BlockBasedTable::Rep& rep,
   BlockContents index_contents;
   status = ReadBlobReferenceMetadataBlock(
       rep, read_options, descriptor->index_handle,
-      /*maybe_compressed=*/false, &index_contents);
+      /*maybe_compressed=*/false, /*prefetch_buffer=*/nullptr, &index_contents);
   if (!status.ok()) {
     return status;
   }
@@ -2806,9 +2812,9 @@ Status ReadBlobReferenceDataBlocks(
     // instead of the batched MultiRead path below.
     for (size_t block : blocks) {
       BlockContents contents;
-      Status status =
-          ReadBlobReferenceMetadataBlock(rep, read_options, index.blocks[block],
-                                         /*maybe_compressed=*/true, &contents);
+      Status status = ReadBlobReferenceMetadataBlock(
+          rep, read_options, index.blocks[block], /*maybe_compressed=*/true,
+          /*prefetch_buffer=*/nullptr, &contents);
       if (!status.ok() && !status.IsCorruption()) {
         return status;
       }
@@ -2935,6 +2941,24 @@ struct BlobReferenceGroupReadState {
   // block visitor skips it.
   bool done = false;
 };
+
+// A block reader over the data blocks of `index`. `*holder` keeps the last
+// block alive until the next read.
+BlobReferenceBlockReader DataBlockReader(const BlockBasedTable::Rep& rep,
+                                         const ReadOptions& read_options,
+                                         const BlobReferenceIndex& index,
+                                         FilePrefetchBuffer* prefetch_buffer,
+                                         BlockContents* holder) {
+  return [&rep, &read_options, &index, prefetch_buffer, holder](
+             size_t block, Slice* contents) {
+    *holder = BlockContents();
+    Status status = ReadBlobReferenceMetadataBlock(
+        rep, read_options, index.blocks[block], /*maybe_compressed=*/true,
+        prefetch_buffer, holder);
+    *contents = holder->data;
+    return status;
+  };
+}
 
 }  // namespace
 
@@ -3248,6 +3272,36 @@ Status BlockBasedTable::ReadBlobReferences(
     }
   }
   return status;
+}
+
+Status BlockBasedTable::VerifyBlobReferenceMetadata(
+    const ReadOptions& read_options, const Slice& expected_descriptor) const {
+  if (rep_ == nullptr) {
+    return Status::Corruption("Missing block-based table reader state");
+  }
+  BlobReferenceMetadataDescriptor descriptor;
+  BlobReferenceIndex index;
+  Status status = ReadBlobReferenceIndex(
+      *rep_, read_options, expected_descriptor, &descriptor, &index);
+  if (!status.ok()) {
+    return status;
+  }
+  // Every block is read in file order, with readahead. The walk checks the key
+  // order across runs and blocks, and every group total. The index decoder
+  // already checked the descriptor totals.
+  ReadaheadParams readahead;
+  readahead.initial_readahead_size = kBlobReferenceWalkInitialReadahead;
+  readahead.max_readahead_size = kBlobReferenceWalkMaxReadahead;
+  std::unique_ptr<FilePrefetchBuffer> prefetch_buffer;
+  rep_->CreateFilePrefetchBuffer(readahead, &prefetch_buffer,
+                                 /*readaheadsize_cb=*/nullptr,
+                                 FilePrefetchBufferUsage::kUnknown);
+  BlockContents holder;
+  return ForEachBlobReference(
+      index,
+      DataBlockReader(*rep_, read_options, index, prefetch_buffer.get(),
+                      &holder),
+      [](const BlobReference& /*reference*/) { return Status::OK(); });
 }
 
 const SeqnoToTimeMapping& BlockBasedTable::GetSeqnoToTimeMapping() const {

@@ -532,7 +532,10 @@ Status CompactionOutputs::AddToOutput(
   }
 
   assert(builder_ != nullptr);
-  const Slice& value = c_iter.value();
+  Slice value = c_iter.value();
+  // Tests replace the value here to build malformed remote compaction output
+  // (see compaction_service_test.cc).
+  TEST_SYNC_POINT_CALLBACK("CompactionOutputs::AddToOutput:Value", &value);
   // Decode a kTypeBlobIndex value once, and share the decode with the table
   // builder, the blob garbage meter and the file metadata update below. If the
   // compaction iterator already decoded this value (when it checked whether to
@@ -541,7 +544,10 @@ Status CompactionOutputs::AddToOutput(
   BlobIndex decoded_blob_index;
   const BlobIndex* shared_blob_index = nullptr;
   if (c_iter.ikey().type == kTypeBlobIndex) {
-    if (c_iter.OutputBlobIndex() != nullptr) {
+    // The test hook above can replace the value; then decode the new value.
+    const bool same_value = value.data() == c_iter.value().data() &&
+                            value.size() == c_iter.value().size();
+    if (same_value && c_iter.OutputBlobIndex() != nullptr) {
       shared_blob_index = c_iter.OutputBlobIndex();
     } else if (decoded_blob_index.DecodeFrom(value).ok()) {
       shared_blob_index = &decoded_blob_index;

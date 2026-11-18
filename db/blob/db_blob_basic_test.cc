@@ -9926,9 +9926,9 @@ TEST_F(DBBlobBasicTest, BlobReferenceReadReportsDecodedIndexSize) {
 TEST_F(DBBlobBasicTest, BlobReferenceBlockChecksumMismatchIsCorruption) {
   // A flipped bit in a group's start block fails the block checksum.
   // ReadBlobReferences fails the request with Corruption.
-  // ReadBlobReferenceGroups (the census read, which reads only the index block)
-  // still succeeds. A flipped bit in the index block makes
-  // ReadBlobReferenceGroups fail too.
+  // VerifyBlobReferenceMetadata returns Corruption. ReadBlobReferenceGroups
+  // (the census read, which reads only the index block) still succeeds. A
+  // flipped bit in the index block makes ReadBlobReferenceGroups fail too.
   FlushManyBlobReferenceGroups();
   ColumnFamilyData* cfd =
       dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
@@ -9963,6 +9963,10 @@ TEST_F(DBBlobBasicTest, BlobReferenceBlockChecksumMismatchIsCorruption) {
                                  /*after_index_read=*/nullptr, &requests));
   ASSERT_TRUE(requests[0].status.IsCorruption());
   ASSERT_TRUE(references.empty());
+  ASSERT_TRUE(reader
+                  ->VerifyBlobReferenceMetadata(ReadOptions(),
+                                                file.blob_reference_descriptor)
+                  .IsCorruption());
 
   BlobReferenceMetadataDescriptor descriptor;
   ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(
@@ -12577,6 +12581,85 @@ TEST_F(DBBlobBasicTest, CompactionIteratorKeepsOutputBlobIndex) {
     // Nothing is flattened either.
     EXPECT_EQ(plain_outputs[i].value, entries[i].second);
   }
+}
+
+// CompactionOutputs::AddToOutput() uses the compaction iterator's
+// OutputBlobIndex() only when the value it adds is the iterator's own value
+// (same data pointer and size). The test hook
+// "CompactionOutputs::AddToOutput:Value" can replace the value; then
+// AddToOutput() must decode the new value. This test replaces one blob index
+// with a copy whose stored size is one byte smaller, and checks that the
+// exact reference metadata of the output SST counts the smaller size. If
+// AddToOutput() used the iterator's decode of the old value, the metadata
+// would count the old size.
+TEST_F(DBBlobBasicTest, AddToOutputDecodesReplacedBlobIndex) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+
+  // Two flushes with interleaved keys, so that the compaction to level 1
+  // rewrites all four values. 1000 bytes is an example value size.
+  constexpr size_t kValueSize = 1000;
+  ASSERT_OK(Put("k1", std::string(kValueSize, '1')));
+  ASSERT_OK(Put("k3", std::string(kValueSize, '3')));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("k2", std::string(kValueSize, '2')));
+  ASSERT_OK(Put("k4", std::string(kValueSize, '4')));
+  ASSERT_OK(Flush());
+
+  std::string replaced_index;
+  int replaced = 0;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "CompactionOutputs::AddToOutput:Value", [&](void* argument) {
+        auto* const value = static_cast<Slice*>(argument);
+        BlobIndex index;
+        if (replaced > 0 || !index.DecodeFrom(*value).ok() ||
+            !index.IsIndirect()) {
+          return;
+        }
+        ASSERT_EQ(index.size(), kValueSize);
+        BlobIndex::EncodeIndirectBlob(
+            &replaced_index, index.generation_file_number(),
+            {.origin_file_number = index.origin_file_number(),
+             .original_value_offset = index.original_value_offset(),
+             .stored_value_size = index.size() - 1,
+             .compression = index.compression(),
+             .stable_checksum = index.stable_checksum(),
+             .stored_checksum = index.stored_checksum()});
+        *value = Slice(replaced_index);
+        ++replaced;
+      });
+  sync_point->EnableProcessing();
+  const Defer cleanup([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  // One compaction moves the two L0 files to the last level. Its output has
+  // exact reference metadata. (BuildExactSstAtLevel1() would run a second
+  // compaction, which reads the replaced value back without a replacement.)
+  CompactRangeOptions compact_options;
+  compact_options.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kDisable;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_EQ(replaced, 1);
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  const auto& user_properties =
+      properties.begin()->second->user_collected_properties;
+  const auto descriptor_it =
+      user_properties.find(kBlobReferenceDescriptorPropertyName);
+  ASSERT_NE(descriptor_it, user_properties.end());
+  BlobReferenceMetadataDescriptor descriptor;
+  ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(descriptor_it->second,
+                                                        &descriptor));
+  EXPECT_EQ(descriptor.reference_count, 4U);
+  EXPECT_EQ(descriptor.stored_value_bytes, 4 * kValueSize - 1);
 }
 
 TEST_F(DBBlobBasicTest, BlobIndirectionRejectsUnsupportedOptionCombinations) {
