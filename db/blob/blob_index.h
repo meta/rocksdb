@@ -164,6 +164,8 @@ struct StableBlobFingerprint {
 //   logical CRC extended with the compression byte, so the decoder computes
 //   it.
 //
+// See the relocation overview in db/blob/blob_relocation_manifest.h.
+//
 // There isn't a kInlined (without TTL) type since we can store it as a plain
 // value (i.e. ValueType::kTypeValue).
 class BlobIndex {

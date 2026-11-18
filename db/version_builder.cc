@@ -43,6 +43,27 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+
+Status ApplyBlobRelocationCountDelta(size_t current, int64_t signed_delta,
+                                     size_t* result) {
+  assert(result != nullptr);
+  // A count is the number of routes to one relocation file. It is far below the
+  // size_t and int64_t limits, so the addition below cannot overflow.
+  if (signed_delta >= 0) {
+    *result = current + static_cast<size_t>(signed_delta);
+    return Status::OK();
+  }
+  const uint64_t magnitude = static_cast<uint64_t>(-signed_delta);
+  if (magnitude > current) {
+    return Status::Corruption("Invalid blob relocation route count");
+  }
+  *result = current - static_cast<size_t>(magnitude);
+  return Status::OK();
+}
+
+}  // namespace
+
 // Scalar/flag state that a VersionEdit can mutate while being applied. Factored
 // into a small struct so the single-edit undo (VersionBuilder::Rep::EditUndo)
 // can snapshot and restore all of it with a single copy/swap, and so the field
@@ -74,6 +95,12 @@ struct MutableScalars {
   // cached `valid_version_available_` must be recomputed on the next check
   // rather than reused.
   bool version_updated_since_last_check_ = false;
+
+  // The per-CF blob indirection format fence: 0 when it is not set, else
+  // kBlobIndirectionManifestFormatVersion (2). Records for indirect-origin blob
+  // files, relocation files and routes need it. Once set, it is never cleared,
+  // and every Version this builder saves inherits it.
+  uint32_t blob_indirection_format_version_ = 0;
 };
 
 class VersionBuilder::Rep : public MutableScalars {
@@ -322,8 +349,8 @@ class VersionBuilder::Rep : public MutableScalars {
   // SST references a blob file, the value is kInvalidBlobFileNumber and
   // SaveBlobFilesAndCheckTo() drops all blob files. The two steps are separate
   // public calls, and ProcessManifestWrites() releases the DB mutex between
-  // them. Both are const to match SaveTo(). So the value is kept in a mutable
-  // member instead of being passed through the caller.
+  // them. SaveTableFilesTo() is const, so it keeps the value in a mutable
+  // member.
   mutable uint64_t saved_min_oldest_blob_file_num_ = kInvalidBlobFileNumber;
 #ifndef NDEBUG
   // Debug check of the call order. SaveTableFilesTo() sets it, and the next
@@ -332,6 +359,43 @@ class VersionBuilder::Rep : public MutableScalars {
   // twice for one save.
   mutable bool table_files_saved_ = false;
 #endif  // NDEBUG
+
+  // The relocation file and route changes this builder made on top of the base
+  // Version. The base Version is immutable, so only the changes are kept here.
+  // A deletion of a base entry is a null pointer in the relocation file map and
+  // std::nullopt in the route map.
+  //
+  // How a relocation change reaches the new Version:
+  //   1. VersionBuilder::Apply() calls ApplyBlobRelocationState(), which
+  //      checks one VersionEdit in local staged maps. Only if every check
+  //      passes does it copy the staged changes into the change maps below
+  //      (the *_changes_ fields; they hold the changes of all VersionEdits this
+  //      builder applied).
+  //   2. SaveBlobFilesAndCheckTo() starts from the base Version's shared
+  //      relocation state. It syncs the blob file entries of the file table,
+  //      then replays the change maps through
+  //      VersionStorageInfo::AddBlobRelocationFile(),
+  //      DeleteBlobRelocationRoute(), DeleteBlobRelocationFile() and
+  //      AddBlobRelocationRoute(), in the order explained in
+  //      SaveBlobFilesAndCheckTo().
+  //   3. BlobRelocationState buffers these table changes in its pending map
+  //      (the first change copies the state; the base stays unchanged).
+  //   4. VersionStorageInfo::SealBlobRelocationState() calls
+  //      BlobRelocationState::Seal(), which turns the buffer into one
+  //      BlobFileTable::Apply() call. BlobFileTable::Apply() rebuilds only the
+  //      changed shards.
+  //
+  // Relocation files, keyed by file number. A null pointer marks a deletion.
+  // (A std::optional here would make the undo map below hold an optional of an
+  // optional of a shared_ptr, which gcc 13 wrongly reports as maybe
+  // uninitialized.)
+  std::map<uint64_t, std::shared_ptr<BlobRelocationFileMetaData>>
+      blob_relocation_file_changes_;
+  // Routes, keyed by the route's old file number.
+  std::map<uint64_t, std::optional<BlobRelocationRoute>>
+      blob_relocation_route_changes_;
+  // Per relocation file, the change in the number of routes to it.
+  std::map<uint64_t, int64_t> blob_relocation_target_count_deltas_;
 
   std::shared_ptr<CacheReservationManager> file_metadata_cache_res_mgr_;
 
@@ -364,6 +428,17 @@ class VersionBuilder::Rep : public MutableScalars {
   // Missing blob files, useful to check if only the missing L0 files'
   // associated blob files are missing.
   std::unordered_set<uint64_t> missing_blob_files_;
+  // Relocation files that recovery could not find or verify. Best-efforts
+  // recovery can accept a Version that misses only a suffix of L0 files and the
+  // blob files that only those L0 files use. A missing relocation file never
+  // qualifies: unlike a normal blob file, it has no linked-SST metadata to
+  // prove that only the missing L0 files use it.
+  UnorderedSet<uint64_t> missing_blob_relocation_files_;
+  // Indirect-origin blob files that a blob file retirement record removed from
+  // the Version. Their metadata stays in mutable_blob_file_metas_, but
+  // AddBlobFileIfNeeded() does not save them. A route may use a retired file's
+  // number as its old file number.
+  UnorderedSet<uint64_t> retired_blob_files_;
 
   // Note: additional scalar/flag state mutated while applying edits
   // (has_invalid_levels_, missing_blob_files_high_, valid_version_available_,
@@ -420,6 +495,17 @@ class VersionBuilder::Rep : public MutableScalars {
     // kept alive here rather than destroyed (which would spuriously mark the
     // blob obsolete).
     UnorderedMap<uint64_t, std::optional<MutableBlobFileMetaData>> blob_metas;
+    // The three maps below hold blob_relocation_file_changes_,
+    // blob_relocation_route_changes_ and blob_relocation_target_count_deltas_
+    // entries. The outer optional is empty when the edit map had no entry for
+    // the key on the non-live side. A deletion entry is a null pointer in the
+    // first map and an empty inner optional in the second.
+    std::map<uint64_t,
+             std::optional<std::shared_ptr<BlobRelocationFileMetaData>>>
+        blob_relocation_files;
+    std::map<uint64_t, std::optional<std::optional<BlobRelocationRoute>>>
+        blob_relocation_routes;
+    std::map<uint64_t, std::optional<int64_t>> blob_relocation_target_counts;
     // Membership on the non-live side for each tracking set, keyed by file
     // number (blob file number for `missing_blob_files`).
     UnorderedMap<uint64_t, bool> found_files;
@@ -427,6 +513,8 @@ class VersionBuilder::Rep : public MutableScalars {
     UnorderedMap<uint64_t, bool> non_l0_missing_files;
     UnorderedMap<uint64_t, bool> missing_blob_files;
     UnorderedMap<uint64_t, bool> dropped_blob_files;
+    UnorderedMap<uint64_t, bool> missing_blob_relocation_files;
+    UnorderedMap<uint64_t, bool> retired_blob_files;
 
     // `intermediate_files_` is append-only within an `Apply()`. Restore by
     // truncating to `intermediate_files_size` (rollback) / re-appending
@@ -466,6 +554,9 @@ class VersionBuilder::Rep : public MutableScalars {
         track_found_and_missing_files_(track_found_and_missing_files),
         allow_incomplete_valid_version_(allow_incomplete_valid_version) {
     assert(ioptions_);
+
+    blob_indirection_format_version_ =
+        base_vstorage_->GetBlobIndirectionFormatVersion();
 
     levels_ = new LevelState[num_levels_];
     if (track_found_and_missing_files_) {
@@ -623,7 +714,7 @@ class VersionBuilder::Rep : public MutableScalars {
   // Snapshots the pre-edit value of every piece of state that `edit` will
   // mutate, so the edit can later be rolled back / redone. Must be called
   // before the edit is applied and only in tracking mode.
-  void CaptureUndo(const VersionEdit* edit) {
+  void CaptureUndo(const VersionEdit& edit) {
     assert(track_found_and_missing_files_);
     assert(!undo_);
     undo_ = std::make_unique<EditUndo>();
@@ -654,17 +745,61 @@ class VersionBuilder::Rep : public MutableScalars {
                           blob_file_number);
     };
 
-    for (const auto& ba : edit->GetBlobFileAdditions()) {
+    for (const auto& ba : edit.GetBlobFileAdditions()) {
       touch_blob_file(ba.GetBlobFileNumber());
     }
-    for (const auto& bg : edit->GetBlobFileGarbages()) {
+    for (const auto& bg : edit.GetBlobFileGarbages()) {
       touch_blob_file(bg.GetBlobFileNumber());
     }
-    for (const uint64_t blob_file_number : edit->GetDroppedBlobFiles()) {
+    for (const uint64_t blob_file_number : edit.GetDroppedBlobFiles()) {
       RecordSetMembership(dropped_blob_files_, undo_->dropped_blob_files,
                           blob_file_number);
     }
-    for (const auto& deleted_file : edit->GetDeletedFiles()) {
+    for (uint64_t file_number : edit.GetBlobFileRetirements()) {
+      touch_blob_file(file_number);
+      RecordSetMembership(retired_blob_files_, undo_->retired_blob_files,
+                          file_number);
+    }
+    for (const BlobRelocationFileAddition& addition :
+         edit.GetBlobRelocationFileAdditions()) {
+      RecordMapEntry(blob_relocation_file_changes_,
+                     undo_->blob_relocation_files, addition.GetFileNumber());
+      RecordSetMembership(missing_blob_files_, undo_->missing_blob_files,
+                          addition.GetFileNumber());
+      RecordSetMembership(missing_blob_relocation_files_,
+                          undo_->missing_blob_relocation_files,
+                          addition.GetFileNumber());
+    }
+    for (uint64_t file_number : edit.GetBlobRelocationFileDeletions()) {
+      RecordMapEntry(blob_relocation_file_changes_,
+                     undo_->blob_relocation_files, file_number);
+      RecordSetMembership(missing_blob_relocation_files_,
+                          undo_->missing_blob_relocation_files, file_number);
+    }
+    const auto touch_route = [&](uint64_t old_file_number,
+                                 const BlobRelocationRoute* replacement) {
+      RecordMapEntry(blob_relocation_route_changes_,
+                     undo_->blob_relocation_routes, old_file_number);
+      const auto touch_count = [&](uint64_t target) {
+        RecordMapEntry(blob_relocation_target_count_deltas_,
+                       undo_->blob_relocation_target_counts, target);
+      };
+      const uint64_t current = GetBlobRelocationRouteTarget(old_file_number);
+      if (current != kInvalidBlobFileNumber) {
+        touch_count(current);
+      }
+      if (replacement != nullptr) {
+        touch_count(replacement->GetTargetFileNumber());
+      }
+    };
+    for (const BlobRelocationRoute& route : edit.GetBlobRelocationRoutes()) {
+      touch_route(route.GetOldFileNumber(), &route);
+    }
+    for (uint64_t old_file_number : edit.GetBlobRelocationRouteDeletions()) {
+      // A null replacement distinguishes deletion from route replacement.
+      touch_route(old_file_number, nullptr);
+    }
+    for (const auto& deleted_file : edit.GetDeletedFiles()) {
       const int level = deleted_file.first;
       const uint64_t fn = deleted_file.second;
       touch_table_file(level, fn);
@@ -674,13 +809,13 @@ class VersionBuilder::Rep : public MutableScalars {
         touch_blob_file(GetOldestBlobFileNumberForTableFile(level, fn));
       }
     }
-    for (const auto& new_file : edit->GetNewFiles()) {
+    for (const auto& new_file : edit.GetNewFiles()) {
       const int level = new_file.first;
       const FileMetaData& meta = new_file.second;
       touch_table_file(level, meta.fd.GetNumber());
       touch_blob_file(meta.oldest_blob_file_number);
     }
-    for (const auto& cursor : edit->GetCompactCursors()) {
+    for (const auto& cursor : edit.GetCompactCursors()) {
       const int level = cursor.first;
       if (level >= 0 && level < num_levels_) {
         RecordMapEntry(updated_compact_cursors_, undo_->compact_cursors, level);
@@ -727,11 +862,20 @@ class VersionBuilder::Rep : public MutableScalars {
     ToggleMapEntries(invalid_level_sizes_, undo_->invalid_level_sizes);
     ToggleMapEntries(updated_compact_cursors_, undo_->compact_cursors);
     ToggleMapEntries(mutable_blob_file_metas_, undo_->blob_metas);
+    ToggleMapEntries(blob_relocation_file_changes_,
+                     undo_->blob_relocation_files);
+    ToggleMapEntries(blob_relocation_route_changes_,
+                     undo_->blob_relocation_routes);
+    ToggleMapEntries(blob_relocation_target_count_deltas_,
+                     undo_->blob_relocation_target_counts);
     ToggleSetMembership(found_files_, undo_->found_files);
     ToggleSetMembership(l0_missing_files_, undo_->l0_missing_files);
     ToggleSetMembership(non_l0_missing_files_, undo_->non_l0_missing_files);
     ToggleSetMembership(missing_blob_files_, undo_->missing_blob_files);
     ToggleSetMembership(dropped_blob_files_, undo_->dropped_blob_files);
+    ToggleSetMembership(missing_blob_relocation_files_,
+                        undo_->missing_blob_relocation_files);
+    ToggleSetMembership(retired_blob_files_, undo_->retired_blob_files);
 
     if (!undo_->rolled_back) {
       // Forward -> pre-edit: peel off the entries appended by this edit.
@@ -1075,6 +1219,22 @@ class VersionBuilder::Rep : public MutableScalars {
   Status ApplyBlobFileAddition(const BlobFileAddition& blob_file_addition) {
     const uint64_t blob_file_number = blob_file_addition.GetBlobFileNumber();
 
+    if (blob_file_addition.IsIndirectOrigin() &&
+        blob_indirection_format_version_ !=
+            kBlobIndirectionManifestFormatVersion) {
+      return Status::Corruption(
+          "Indirect-origin blob file requires the format fence");
+    }
+
+    if (HasBlobRelocationFileNumber(blob_file_number)) {
+      return Status::Corruption(
+          "Normal blob file conflicts with a relocation file");
+    }
+    if (GetBlobRelocationRouteTarget(blob_file_number) !=
+        kInvalidBlobFileNumber) {
+      return Status::Corruption("Normal blob file conflicts with a route");
+    }
+
     if (IsBlobFileInVersion(blob_file_number)) {
       std::ostringstream oss;
       oss << "Blob file #" << blob_file_number << " already added";
@@ -1104,7 +1264,8 @@ class VersionBuilder::Rep : public MutableScalars {
         blob_file_number, blob_file_addition.GetTotalBlobCount(),
         blob_file_addition.GetTotalBlobBytes(),
         blob_file_addition.GetChecksumMethod(),
-        blob_file_addition.GetChecksumValue(), std::move(deleter));
+        blob_file_addition.GetChecksumValue(),
+        blob_file_addition.IsIndirectOrigin(), std::move(deleter));
 
     mutable_blob_file_metas_.emplace(
         blob_file_number, MutableBlobFileMetaData(std::move(shared_meta)));
@@ -1134,6 +1295,15 @@ class VersionBuilder::Rep : public MutableScalars {
         GetOrCreateMutableBlobFileMetaData(blob_file_number);
 
     if (!mutable_meta) {
+      // The file is not in the Version. If it has a route, an indirect blob GC
+      // install edit already moved its live values and wrote the blob file
+      // retirement record of the file. A compaction that started before that
+      // edit can still report garbage for the file. A garbage count has no use
+      // for a removed file, so ignore it.
+      if (GetBlobRelocationRouteTarget(blob_file_number) !=
+          kInvalidBlobFileNumber) {
+        return Status::OK();
+      }
       std::ostringstream oss;
       oss << "Blob file #" << blob_file_number << " not found";
 
@@ -1147,6 +1317,480 @@ class VersionBuilder::Rep : public MutableScalars {
       return Status::Corruption("VersionBuilder", oss.str());
     }
 
+    return Status::OK();
+  }
+
+  std::shared_ptr<BlobRelocationFileMetaData> GetBlobRelocationFile(
+      uint64_t file_number) const {
+    const auto edit = blob_relocation_file_changes_.find(file_number);
+    if (edit != blob_relocation_file_changes_.end()) {
+      return edit->second;
+    }
+    return base_vstorage_->GetBlobRelocationFileMetaData(file_number);
+  }
+
+  bool HasBlobRelocationFileNumber(uint64_t file_number) const {
+    return blob_relocation_file_changes_.find(file_number) !=
+               blob_relocation_file_changes_.end() ||
+           base_vstorage_->GetBlobRelocationFileMetaData(file_number) !=
+               nullptr;
+  }
+
+  // True if an earlier edit applied to this builder deleted relocation file
+  // `file_number`. It is not about blob file retirement.
+  bool IsBlobRelocationFileDeletedInBuilder(uint64_t file_number) const {
+    const auto edit = blob_relocation_file_changes_.find(file_number);
+    if (edit != blob_relocation_file_changes_.end()) {
+      return edit->second == nullptr;
+    }
+    // The base Version keeps no record of deleted files. This builder sees the
+    // deletions applied to it: the whole MANIFEST at replay, or one LogAndApply
+    // batch of version edits at runtime. At runtime, LogAndApply also checks
+    // the earlier batches of the current MANIFEST
+    // (VersionSet::RejectReaddedBlobRelocationState()).
+    return false;
+  }
+
+  // Returns the relocation file that the route of old file `old_file_number`
+  // points to, or kInvalidBlobFileNumber when `old_file_number` has no route.
+  uint64_t GetBlobRelocationRouteTarget(uint64_t old_file_number) const {
+    const auto edit = blob_relocation_route_changes_.find(old_file_number);
+    if (edit != blob_relocation_route_changes_.end()) {
+      return edit->second.has_value() ? edit->second->GetTargetFileNumber()
+                                      : kInvalidBlobFileNumber;
+    }
+    return base_vstorage_->GetBlobRelocationRouteTarget(old_file_number);
+  }
+
+  // True if an earlier edit applied to this builder deleted the route of old
+  // file `old_file_number` (a route deletion record).
+  bool IsBlobRelocationRouteDeletedInBuilder(uint64_t old_file_number) const {
+    const auto edit = blob_relocation_route_changes_.find(old_file_number);
+    if (edit != blob_relocation_route_changes_.end()) {
+      return !edit->second.has_value();
+    }
+    // The base Version keeps no record of deleted routes. This builder sees the
+    // deletions applied to it: the whole MANIFEST at replay, or one LogAndApply
+    // batch of version edits at runtime. At runtime, LogAndApply also checks
+    // the earlier batches of the current MANIFEST
+    // (VersionSet::RejectReaddedBlobRelocationState()).
+    return false;
+  }
+
+  Status GetBlobRelocationTargetCount(uint64_t physical_file_number,
+                                      int64_t additional_delta,
+                                      size_t* count) const {
+    assert(count != nullptr);
+    const size_t base_count =
+        base_vstorage_->GetBlobRelocationRouteTargetCount(physical_file_number);
+    const auto delta =
+        blob_relocation_target_count_deltas_.find(physical_file_number);
+    const int64_t existing_delta =
+        delta == blob_relocation_target_count_deltas_.end() ? 0 : delta->second;
+    size_t current = 0;
+    Status status =
+        ApplyBlobRelocationCountDelta(base_count, existing_delta, &current);
+    if (!status.ok()) {
+      return status;
+    }
+    return ApplyBlobRelocationCountDelta(current, additional_delta, count);
+  }
+
+  std::shared_ptr<BlobRelocationFileMetaData>
+  CreateVersionOwnedBlobRelocationFile(
+      BlobRelocationFileAddition addition) const {
+    auto deleter = [vs = version_set_, ioptions = ioptions_,
+                    bc = cfd_ ? cfd_->blob_file_cache()
+                              : nullptr](BlobRelocationFileMetaData* metadata) {
+      if (vs != nullptr) {
+        assert(ioptions != nullptr);
+        assert(!ioptions->cf_paths.empty());
+        assert(metadata != nullptr);
+        vs->AddObsoleteBlobFile(metadata->GetFileNumber(),
+                                ioptions->cf_paths.front().path);
+      }
+      // This runs under the DB mutex when the last Version that owns the file
+      // is destroyed. It runs without the DB mutex when a failed LogAndApply
+      // batch or ManifestTailer frees relocation state (see "Freeing
+      // relocation state" at VersionSet::FreeBlobRelocationState()). Because
+      // it can run under the DB mutex, it must not take the stripe mutex of
+      // the file, which a relocation file open can hold while it reads its
+      // location blocks. So it only drops a remembered failed open, and
+      // PurgeObsoleteFiles() evicts the cached reader later (see
+      // BlobFileCache::Evict()). While file deletions are disabled, no purge
+      // runs, so the reader of an obsolete relocation file stays cached until
+      // they are enabled again.
+      if (bc != nullptr) {
+        bc->ForgetFailedRelocationOpen(metadata->GetFileNumber());
+      }
+      delete metadata;
+    };
+    return BlobRelocationFileMetaData::Create(std::move(addition),
+                                              std::move(deleter));
+  }
+
+  Status ApplyBlobFileRetirement(uint64_t file_number) {
+    if (retired_blob_files_.count(file_number) != 0) {
+      // A retirement record holds only the file number. A second record for a
+      // file that an earlier edit of this builder already retired (for example,
+      // in a replay) changes nothing, so accept it.
+      return Status::OK();
+    }
+    MutableBlobFileMetaData* const meta =
+        GetOrCreateMutableBlobFileMetaData(file_number);
+    if (meta == nullptr || !meta->GetSharedMeta()->IsIndirectOrigin()) {
+      return Status::Corruption(
+          "Blob file retirement requires a live indirect-origin blob file");
+    }
+    retired_blob_files_.insert(file_number);
+    if (track_found_and_missing_files_ &&
+        missing_blob_files_.erase(file_number) != 0) {
+      // Recovery applies the file's addition first. The file can already be
+      // deleted from disk, so the addition put it in missing_blob_files_. The
+      // retirement shows that the file left on purpose, so remove it from the
+      // missing set and recompute missing_blob_files_high_. Otherwise the
+      // Version looks incomplete. CaptureUndo() saved the set membership and
+      // missing_blob_files_high_ for rollback.
+      missing_blob_files_high_ = kInvalidBlobFileNumber;
+      for (uint64_t missing_file_number : missing_blob_files_) {
+        missing_blob_files_high_ =
+            std::max(missing_blob_files_high_, missing_file_number);
+      }
+    }
+    return Status::OK();
+  }
+
+  // Checks and applies the format fence and the relocation records of one
+  // edit. Steps:
+  //   1. Reject accepted-loss records, and check the per-CF fence (records
+  //      need it; the compaction style must allow it).
+  //   2. Stage relocation file additions and deletions in local maps.
+  //   3. Stage route sets and deletions, and the change in the route count of
+  //      each target.
+  //   4. Check the final state: no route to a deleted or missing file, no route
+  //      from a live file, no chains, and at most 2^32 - 1 routes per target
+  //      (the file table keeps a 32-bit route count).
+  //   5. Only then commit the staged changes to the builder's change maps, so a
+  //      bad edit changes nothing.
+  Status ApplyBlobRelocationState(const VersionEdit& edit) {
+    // Step 1: loss records and the per-CF fence.
+    if (!edit.GetBlobPhysicalFileLosses().empty()) {
+      // VersionEdit decodes blob physical file loss records, but the builder
+      // does not apply them. Fail with NotSupported rather than skip one
+      // silently.
+      return Status::NotSupported(
+          "Accepted blob file loss records are not supported");
+    }
+    const bool has_records = !edit.GetBlobRelocationFileAdditions().empty() ||
+                             !edit.GetBlobRelocationFileDeletions().empty() ||
+                             !edit.GetBlobRelocationRoutes().empty() ||
+                             !edit.GetBlobRelocationRouteDeletions().empty();
+    if (!has_records && !edit.HasBlobIndirectionFormatVersion()) {
+      return Status::OK();
+    }
+    uint32_t final_format_version = blob_indirection_format_version_;
+    if (edit.HasBlobIndirectionFormatVersion()) {
+      const uint32_t requested = edit.GetBlobIndirectionFormatVersion();
+      if (requested != kBlobIndirectionManifestFormatVersion ||
+          (final_format_version != 0 && final_format_version != requested)) {
+        return Status::Corruption("Invalid blob indirection format fence");
+      }
+      final_format_version = requested;
+    }
+    if (has_records &&
+        final_format_version != kBlobIndirectionManifestFormatVersion) {
+      return Status::Corruption(
+          "Blob relocation records require the format fence");
+    }
+    if (ioptions_ != nullptr) {
+      const Status s = CheckBlobIndirectionCompactionStyle(
+          ioptions_->compaction_style, final_format_version != 0);
+      if (!s.ok()) {
+        return s;
+      }
+    }
+    if (!has_records) {
+      blob_indirection_format_version_ = final_format_version;
+      return Status::OK();
+    }
+
+    // Step 2: stage relocation file additions and deletions.
+    using StagedFile =
+        std::optional<std::shared_ptr<BlobRelocationFileMetaData>>;
+    using StagedRoute = std::optional<BlobRelocationRoute>;
+    std::map<uint64_t, StagedFile> staged_files;
+    std::map<uint64_t, StagedRoute> staged_routes;
+    std::map<uint64_t, int64_t> staged_target_count_deltas;
+    std::set<uint64_t> seen_file_additions;
+    std::set<uint64_t> seen_route_additions;
+    std::set<uint64_t> new_table_file_numbers;
+    std::set<uint64_t> new_blob_file_numbers;
+    for (const auto& new_file : edit.GetNewFiles()) {
+      new_table_file_numbers.insert(new_file.second.fd.GetNumber());
+    }
+    for (const BlobFileAddition& blob_addition : edit.GetBlobFileAdditions()) {
+      new_blob_file_numbers.insert(blob_addition.GetBlobFileNumber());
+    }
+
+    const auto get_final_file = [&](uint64_t file_number) {
+      const auto staged = staged_files.find(file_number);
+      if (staged != staged_files.end()) {
+        return staged->second.has_value() ? *staged->second : nullptr;
+      }
+      return GetBlobRelocationFile(file_number);
+    };
+    const auto get_final_route_target = [&](uint64_t old_file_number) {
+      const auto staged = staged_routes.find(old_file_number);
+      if (staged != staged_routes.end()) {
+        return staged->second.has_value()
+                   ? staged->second->GetTargetFileNumber()
+                   : kInvalidBlobFileNumber;
+      }
+      return GetBlobRelocationRouteTarget(old_file_number);
+    };
+
+    for (const BlobRelocationFileAddition& addition :
+         edit.GetBlobRelocationFileAdditions()) {
+      if (!seen_file_additions.insert(addition.GetFileNumber()).second ||
+          staged_files.find(addition.GetFileNumber()) != staged_files.end()) {
+        return Status::Corruption("Duplicate blob relocation file edit");
+      }
+      Status status = addition.Validate();
+      if (!status.ok()) {
+        return status;
+      }
+      if (IsBlobFileInVersion(addition.GetFileNumber())) {
+        return Status::Corruption(
+            "Blob relocation file conflicts with a normal blob file");
+      }
+      if (GetCurrentLevelForTableFile(addition.GetFileNumber()) !=
+          VersionStorageInfo::FileLocation::Invalid().GetLevel()) {
+        return Status::Corruption(
+            "Blob relocation file conflicts with a table file");
+      }
+      if (new_table_file_numbers.count(addition.GetFileNumber()) != 0) {
+        return Status::Corruption(
+            "Blob relocation file conflicts with a table file addition");
+      }
+      if (new_blob_file_numbers.count(addition.GetFileNumber()) != 0) {
+        return Status::Corruption(
+            "Blob relocation file conflicts with a normal blob addition");
+      }
+      if (IsBlobRelocationFileDeletedInBuilder(addition.GetFileNumber())) {
+        return Status::Corruption("Blob relocation file number was deleted");
+      }
+      const std::shared_ptr<BlobRelocationFileMetaData> current =
+          GetBlobRelocationFile(addition.GetFileNumber());
+      if (current != nullptr) {
+        // A repeated record (MANIFEST replay or catch-up) must equal the file
+        // the builder has. The record holds only small fields (numbers and the
+        // file checksum strings), so the compare is cheap enough to run here,
+        // under the DB mutex.
+        if (current->GetAddition() != addition) {
+          return Status::Corruption(
+              "Conflicting blob relocation file addition");
+        }
+        continue;
+      }
+      if (track_found_and_missing_files_) {
+        assert(version_edit_handler_ != nullptr);
+        status =
+            version_edit_handler_->VerifyBlobRelocationFile(cfd_, addition);
+        if (status.IsPathNotFound() || status.IsNotFound() ||
+            status.IsCorruption()) {
+          missing_blob_relocation_files_.insert(addition.GetFileNumber());
+        } else if (!status.ok()) {
+          return status;
+        }
+      }
+      // Stage metadata without a deleter. If a later check fails, dropping it
+      // must not mark the file obsolete. The commit step below creates the
+      // Version-owned metadata with the real deleter.
+      staged_files.emplace(addition.GetFileNumber(),
+                           BlobRelocationFileMetaData::Create(addition));
+    }
+
+    for (uint64_t file_number : edit.GetBlobRelocationFileDeletions()) {
+      if (file_number == kInvalidBlobFileNumber ||
+          seen_file_additions.count(file_number) != 0 ||
+          staged_files.find(file_number) != staged_files.end()) {
+        return Status::Corruption("Invalid blob relocation file deletion");
+      }
+      if (IsBlobRelocationFileDeletedInBuilder(file_number)) {
+        // A repeated deletion record (MANIFEST replay or catch-up) changes
+        // nothing, so accept it.
+        if (track_found_and_missing_files_) {
+          missing_blob_relocation_files_.erase(file_number);
+        }
+        continue;
+      }
+      // As for an SST deletion, the file must be live in this column family.
+      // A deletion of another column family's file is a bad record.
+      if (GetBlobRelocationFile(file_number) == nullptr) {
+        return Status::Corruption(
+            "Blob relocation file deletion names no live file");
+      }
+      staged_files.emplace(file_number, std::nullopt);
+      if (track_found_and_missing_files_) {
+        missing_blob_relocation_files_.erase(file_number);
+      }
+    }
+
+    // Step 3: stage route sets and deletions.
+    const auto stage_route = [&](uint64_t old_file_number,
+                                 StagedRoute replacement) -> Status {
+      if (staged_routes.find(old_file_number) != staged_routes.end()) {
+        return Status::Corruption("Duplicate blob relocation route edit");
+      }
+      const uint64_t current = GetBlobRelocationRouteTarget(old_file_number);
+      if (current != kInvalidBlobFileNumber) {
+        staged_target_count_deltas[current] -= 1;
+      }
+      if (replacement.has_value()) {
+        staged_target_count_deltas[replacement->GetTargetFileNumber()] += 1;
+      }
+      staged_routes.emplace(old_file_number, std::move(replacement));
+      return Status::OK();
+    };
+
+    for (const BlobRelocationRoute& route : edit.GetBlobRelocationRoutes()) {
+      const uint64_t old_file_number = route.GetOldFileNumber();
+      if (!seen_route_additions.insert(old_file_number).second) {
+        return Status::Corruption("Duplicate blob relocation route edit");
+      }
+      Status status = route.Validate();
+      if (!status.ok()) {
+        return status;
+      }
+      if (IsBlobRelocationRouteDeletedInBuilder(old_file_number)) {
+        return Status::Corruption("Blob relocation route was deleted");
+      }
+      if (GetBlobRelocationRouteTarget(old_file_number) ==
+          route.GetTargetFileNumber()) {
+        // The route already exists with this target (a repeated record), so
+        // there is nothing to stage.
+        continue;
+      }
+      status = stage_route(old_file_number, route);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+
+    for (uint64_t old_file_number : edit.GetBlobRelocationRouteDeletions()) {
+      if (old_file_number == kInvalidBlobFileNumber ||
+          seen_route_additions.count(old_file_number) != 0 ||
+          staged_routes.find(old_file_number) != staged_routes.end()) {
+        return Status::Corruption("Invalid blob relocation route deletion");
+      }
+      if (IsBlobRelocationRouteDeletedInBuilder(old_file_number)) {
+        // A repeated deletion record (MANIFEST replay or catch-up) changes
+        // nothing, so accept it.
+        continue;
+      }
+      Status status = stage_route(old_file_number, std::nullopt);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+
+    const auto get_final_target_count = [&](uint64_t physical_file_number,
+                                            size_t* count) {
+      const auto delta = staged_target_count_deltas.find(physical_file_number);
+      return GetBlobRelocationTargetCount(
+          physical_file_number,
+          delta == staged_target_count_deltas.end() ? 0 : delta->second, count);
+    };
+
+    // Step 4: check the final state after this edit: no route points to a
+    // deleted relocation file, and no added relocation file number is the old
+    // file number of a route.
+    for (const auto& file : staged_files) {
+      if (file.second.has_value()) {
+        if (get_final_route_target(file.first) != kInvalidBlobFileNumber) {
+          return Status::Corruption(
+              "Blob relocation file conflicts with a route");
+        }
+        continue;
+      }
+      size_t target_count = 0;
+      Status status = get_final_target_count(file.first, &target_count);
+      if (!status.ok()) {
+        return status;
+      }
+      if (target_count != 0) {
+        return Status::Corruption(
+            "Deleted blob relocation file is still a route target");
+      }
+    }
+
+    for (const auto& route_edit : staged_routes) {
+      if (!route_edit.second.has_value()) {
+        continue;
+      }
+      const BlobRelocationRoute& route = *route_edit.second;
+      // The target must be a live relocation file and must not have a route of
+      // its own: one hop, no chains.
+      if (get_final_file(route.GetTargetFileNumber()) == nullptr) {
+        return Status::Corruption("Invalid blob relocation route target");
+      }
+      if (get_final_route_target(route.GetTargetFileNumber()) !=
+          kInvalidBlobFileNumber) {
+        return Status::Corruption("Blob relocation route would form a chain");
+      }
+      size_t target_count = 0;
+      Status count_status =
+          get_final_target_count(route.GetTargetFileNumber(), &target_count);
+      if (!count_status.ok()) {
+        return count_status;
+      }
+      if (target_count > std::numeric_limits<uint32_t>::max()) {
+        return Status::Corruption("Too many routes to one relocation file");
+      }
+      // The old file number must not be a live file: not a live relocation
+      // file, not a blob file in the Version, and not a blob file this edit
+      // adds. A blob file removed by blob file retirement in this or an earlier
+      // edit is not live.
+      const uint64_t old_file_number = route.GetOldFileNumber();
+      if (get_final_file(old_file_number) != nullptr ||
+          (IsBlobFileInVersion(old_file_number) &&
+           retired_blob_files_.count(old_file_number) == 0) ||
+          new_blob_file_numbers.count(old_file_number) != 0) {
+        return Status::Corruption(
+            "Blob relocation route old file is a live file");
+      }
+      size_t incoming_count = 0;
+      Status status = get_final_target_count(old_file_number, &incoming_count);
+      if (!status.ok()) {
+        return status;
+      }
+      if (incoming_count != 0) {
+        return Status::Corruption("Blob relocation route would form a chain");
+      }
+    }
+
+    // Step 5: every record passed the checks against the final state. Commit
+    // them only now, so a bad record cannot leave part of the edit's file and
+    // route changes in the builder.
+    blob_indirection_format_version_ = final_format_version;
+    for (auto& file : staged_files) {
+      if (!file.second.has_value()) {
+        blob_relocation_file_changes_[file.first] = nullptr;
+        continue;
+      }
+      const std::shared_ptr<BlobRelocationFileMetaData>& staged = *file.second;
+      blob_relocation_file_changes_[file.first] =
+          CreateVersionOwnedBlobRelocationFile(staged->GetAddition());
+    }
+    for (auto& route : staged_routes) {
+      blob_relocation_route_changes_[route.first] = std::move(route.second);
+    }
+    for (const auto& delta : staged_target_count_deltas) {
+      blob_relocation_target_count_deltas_[delta.first] += delta.second;
+      if (blob_relocation_target_count_deltas_[delta.first] == 0) {
+        blob_relocation_target_count_deltas_.erase(delta.first);
+      }
+    }
     return Status::OK();
   }
 
@@ -1278,6 +1922,11 @@ class VersionBuilder::Rep : public MutableScalars {
 
     const uint64_t file_number = meta.fd.GetNumber();
 
+    if (HasBlobRelocationFileNumber(file_number)) {
+      return Status::Corruption(
+          "Table file conflicts with a blob relocation file");
+    }
+
     const int current_level = GetCurrentLevelForTableFile(file_number);
 
     if (current_level !=
@@ -1387,6 +2036,9 @@ class VersionBuilder::Rep : public MutableScalars {
 
   // Apply all of the edits in *edit to the current state.
   Status Apply(const VersionEdit* edit) {
+    if (edit == nullptr) {
+      return Status::InvalidArgument("VersionBuilder edit is null");
+    }
     bool version_updated = false;
     if (!base_checked_) {
       TEST_SYNC_POINT("VersionBuilder::Apply:CheckBaseConsistency");
@@ -1402,12 +2054,45 @@ class VersionBuilder::Rep : public MutableScalars {
     // (on a valid->invalid negative edge) via RollbackLastApply() instead of
     // copying the whole Rep on every edit.
     if (track_found_and_missing_files_) {
-      CaptureUndo(edit);
+      CaptureUndo(*edit);
     }
 
     // Note: we process the blob file related changes first because the
     // table file addition/deletion logic depends on the blob files
     // already being there.
+
+    // Apply blob file retirement records before the relocation records. For
+    // example, an indirect blob GC install edit writes the blob file
+    // retirement record of origin file 10 and adds a route from file 10 in the
+    // same edit. The route check requires that file 10 is no longer live.
+    {
+      const std::vector<uint64_t>& retirements = edit->GetBlobFileRetirements();
+      if (std::set<uint64_t>(retirements.begin(), retirements.end()).size() !=
+          retirements.size()) {
+        return Status::Corruption("Duplicate blob file retirement");
+      }
+    }
+    for (uint64_t file_number : edit->GetBlobFileRetirements()) {
+      const Status s = ApplyBlobFileRetirement(file_number);
+      if (!s.ok()) {
+        return s;
+      }
+      version_updated = true;
+    }
+
+    {
+      const Status s = ApplyBlobRelocationState(*edit);
+      if (!s.ok()) {
+        return s;
+      }
+      if (edit->HasBlobIndirectionFormatVersion() ||
+          !edit->GetBlobRelocationFileAdditions().empty() ||
+          !edit->GetBlobRelocationFileDeletions().empty() ||
+          !edit->GetBlobRelocationRoutes().empty() ||
+          !edit->GetBlobRelocationRouteDeletions().empty()) {
+        version_updated = true;
+      }
+    }
 
     // Add new blob files
     for (const auto& blob_file_addition : edit->GetBlobFileAdditions()) {
@@ -1634,6 +2319,9 @@ class VersionBuilder::Rep : public MutableScalars {
     assert(meta);
     assert(dropped_blob_files);
 
+    if (retired_blob_files_.count(blob_file_number) != 0) {
+      return;
+    }
     const auto& linked_ssts = meta->GetLinkedSsts();
     if (track_found_and_missing_files_) {
       if (missing_blob_files_.find(blob_file_number) !=
@@ -1809,6 +2497,7 @@ class VersionBuilder::Rep : public MutableScalars {
   bool ContainsCompleteVersion() const {
     assert(track_found_and_missing_files_);
     return l0_missing_files_.empty() && non_l0_missing_files_.empty() &&
+           missing_blob_relocation_files_.empty() &&
            (record_missing_blob_files_as_dropped_ ||
             missing_blob_files_high_ == kInvalidBlobFileNumber ||
             missing_blob_files_high_ < GetMinOldestBlobFileNumber());
@@ -1822,10 +2511,28 @@ class VersionBuilder::Rep : public MutableScalars {
     record_missing_blob_files_as_dropped_ = true;
   }
 
+  std::shared_ptr<void> ReleaseBlobRelocationChanges() {
+    if (blob_relocation_file_changes_.empty() &&
+        blob_relocation_route_changes_.empty()) {
+      return nullptr;
+    }
+    struct Edits {
+      decltype(blob_relocation_file_changes_) files;
+      decltype(blob_relocation_route_changes_) routes;
+      decltype(blob_relocation_target_count_deltas_) target_counts;
+    };
+    auto edits = std::make_shared<Edits>();
+    edits->files.swap(blob_relocation_file_changes_);
+    edits->routes.swap(blob_relocation_route_changes_);
+    edits->target_counts.swap(blob_relocation_target_count_deltas_);
+    return edits;
+  }
+
   bool HasMissingFiles() const {
     assert(track_found_and_missing_files_);
     return !l0_missing_files_.empty() || !non_l0_missing_files_.empty() ||
-           missing_blob_files_high_ != kInvalidBlobFileNumber;
+           missing_blob_files_high_ != kInvalidBlobFileNumber ||
+           !missing_blob_relocation_files_.empty();
   }
 
   std::vector<std::string> GetAndClearIntermediateFiles() {
@@ -1958,7 +2665,8 @@ class VersionBuilder::Rep : public MutableScalars {
   }
 
   bool OnlyMissingL0Suffix() const {
-    if (!non_l0_missing_files_.empty()) {
+    if (!non_l0_missing_files_.empty() ||
+        !missing_blob_relocation_files_.empty()) {
       return false;
     }
     assert(!(l0_missing_files_.empty() && missing_blob_files_.empty()));
@@ -2073,8 +2781,11 @@ class VersionBuilder::Rep : public MutableScalars {
     return Status::OK();
   }
 
-  Status SaveBlobFilesAndCheckTo(VersionStorageInfo* vstorage) const {
+  Status SaveBlobFilesAndCheckTo(VersionStorageInfo* vstorage) {
     assert(!track_found_and_missing_files_ || valid_version_available_);
+    if (vstorage == nullptr) {
+      return Status::InvalidArgument("VersionStorageInfo is null");
+    }
 
 #ifndef NDEBUG
     assert(table_files_saved_);
@@ -2085,12 +2796,113 @@ class VersionBuilder::Rep : public MutableScalars {
                     &dropped_blob_files);
     SaveDroppedBlobFilesTo(vstorage, saved_min_oldest_blob_file_num_,
                            std::move(dropped_blob_files));
+    vstorage->SetBlobIndirectionFormatVersion(blob_indirection_format_version_);
 
+    Status base_state_status = base_vstorage_->ValidateBlobRelocationState();
+    if (!base_state_status.ok()) {
+      return base_state_status;
+    }
+    // Start from the base Version's relocation state, which is immutable and
+    // shared. A Version keeps sharing all of it only when it changes no
+    // relocation file, no route and (with the fence set) no blob file. The
+    // first change copies the state, and the file table copies only the shards
+    // it changes (BlobFileTable is copy-on-write). At runtime (LogAndApply,
+    // ManifestTailer) this runs without the DB mutex.
+    vstorage->ShareBlobRelocationState(*base_vstorage_);
+    if (blob_indirection_format_version_ != 0) {
+      // The file table also lists the live blob files. The first fenced Version
+      // adds all of them. Otherwise, merge the sorted blob file vectors of the
+      // base and new Version, and update only the files that were added,
+      // removed or given new metadata.
+      const bool first_fenced = !base_vstorage_->HasBlobIndirectionFormat();
+      std::vector<uint64_t> changed_blob_files;
+      if (!first_fenced) {
+        const VersionStorageInfo::BlobFiles& before =
+            base_vstorage_->GetBlobFiles();
+        const VersionStorageInfo::BlobFiles& after = vstorage->GetBlobFiles();
+        size_t b = 0;
+        size_t a = 0;
+        while (b < before.size() || a < after.size()) {
+          if (a == after.size() ||
+              (b < before.size() && before[b]->GetBlobFileNumber() <
+                                        after[a]->GetBlobFileNumber())) {
+            changed_blob_files.push_back(before[b++]->GetBlobFileNumber());
+          } else if (b == before.size() || after[a]->GetBlobFileNumber() <
+                                               before[b]->GetBlobFileNumber()) {
+            changed_blob_files.push_back(after[a++]->GetBlobFileNumber());
+          } else {
+            if (before[b] != after[a]) {
+              changed_blob_files.push_back(after[a]->GetBlobFileNumber());
+            }
+            ++a;
+            ++b;
+          }
+        }
+      }
+      vstorage->SyncBlobFileTable(changed_blob_files, first_fenced,
+                                  file_metadata_cache_res_mgr_);
+    }
+    // Apply the changes in this order:
+    // 1. Add relocation files, so a new route's target is in the table.
+    // 2. Delete routes while their targets are still in the table, so the route
+    //    count of each target is updated.
+    // 3. Delete relocation files. DeleteBlobRelocationFile() finds the file
+    //    through its table entry, so it must run before step 4 replaces that
+    //    entry with a route of the same number.
+    // 4. Set routes. A deleted relocation file's number can become a route's
+    //    old file number in the same edit (indirect blob GC routes a
+    //    collected relocation file to its output).
+    using FileEdits = decltype(blob_relocation_file_changes_);
+    using RouteEdits = decltype(blob_relocation_route_changes_);
+    for (const FileEdits::value_type& file_edit :
+         blob_relocation_file_changes_) {
+      if (file_edit.second != nullptr) {
+        vstorage->AddBlobRelocationFile(file_edit.second);
+      }
+    }
+    for (const RouteEdits::value_type& route_edit :
+         blob_relocation_route_changes_) {
+      if (!route_edit.second.has_value()) {
+        vstorage->DeleteBlobRelocationRoute(route_edit.first);
+      }
+    }
+    for (const FileEdits::value_type& file_edit :
+         blob_relocation_file_changes_) {
+      if (file_edit.second == nullptr) {
+        vstorage->DeleteBlobRelocationFile(file_edit.first);
+      }
+    }
+    for (const RouteEdits::value_type& route_edit :
+         blob_relocation_route_changes_) {
+      if (route_edit.second.has_value()) {
+        vstorage->AddBlobRelocationRoute(*route_edit.second);
+      }
+    }
+    // Apply the buffered file table changes above in one step.
+    vstorage->SealBlobRelocationState();
+
+    // Apply() already checked, in all builds, every changed file and route
+    // against the final state. The base state was validated above, so the
+    // unchanged entries are valid too. Debug builds still run the full check as
+    // a test. Release builds mark the new state as validated, so
+    // ValidateBlobRelocationState() checks only the format fence and the
+    // byte-total overflow flag, and does not scan every entry of each new
+    // Version (for example, on each flush).
+    Status status;
+#ifndef NDEBUG
+    status = vstorage->ValidateBlobRelocationState();
+#else
+    vstorage->MarkBlobRelocationChangesValidated();
+    status = vstorage->ValidateBlobRelocationState();
+#endif
+    if (!status.ok()) {
+      return status;
+    }
     return CheckConsistency(vstorage);
   }
 
   // Save the current state in *vstorage.
-  Status SaveTo(VersionStorageInfo* vstorage) const {
+  Status SaveTo(VersionStorageInfo* vstorage) {
     Status s = SaveTableFilesTo(vstorage);
     if (!s.ok()) {
       return s;
@@ -2193,7 +3005,7 @@ Status VersionBuilder::Apply(const VersionEdit* edit) {
   return rep_->Apply(edit);
 }
 
-Status VersionBuilder::SaveTo(VersionStorageInfo* vstorage) const {
+Status VersionBuilder::SaveTo(VersionStorageInfo* vstorage) {
   return rep_->SaveTo(vstorage);
 }
 
@@ -2201,8 +3013,7 @@ Status VersionBuilder::SaveTableFilesTo(VersionStorageInfo* vstorage) const {
   return rep_->SaveTableFilesTo(vstorage);
 }
 
-Status VersionBuilder::SaveBlobFilesAndCheckTo(
-    VersionStorageInfo* vstorage) const {
+Status VersionBuilder::SaveBlobFilesAndCheckTo(VersionStorageInfo* vstorage) {
   return rep_->SaveBlobFilesAndCheckTo(vstorage);
 }
 
@@ -2231,6 +3042,10 @@ bool VersionBuilder::HasMissingFiles() const { return rep_->HasMissingFiles(); }
 
 void VersionBuilder::RecordMissingBlobFilesAsDropped() {
   rep_->RecordMissingBlobFilesAsDropped();
+}
+
+std::shared_ptr<void> VersionBuilder::ReleaseBlobRelocationChanges() {
+  return rep_->ReleaseBlobRelocationChanges();
 }
 
 std::vector<std::string> VersionBuilder::GetAndClearIntermediateFiles() {

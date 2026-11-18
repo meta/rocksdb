@@ -1951,6 +1951,13 @@ class DB {
     // "rocksdb.blob-cache-pinned-usage" - returns the memory size for the
     //      entries being pinned in blob cache.
     static const std::string kBlobCachePinnedUsage;
+
+    // "rocksdb.blob-indirection-format-version" - returns the blob indirection
+    // format version of the column family (the per-CF format fence). 0 means
+    // that the column family has no format fence yet (no SST built with
+    // enable_blob_indirection on was installed). A release that does not know
+    // the format cannot open a DB where it is not 0.
+    static const std::string kBlobIndirectionFormatVersion;
   };
 
   // DB implementations export properties about their state via this method.

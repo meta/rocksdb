@@ -3426,6 +3426,57 @@ TEST_F(BlobFileReaderTest, IncorrectColumnFamily) {
                   .IsCorruption());
 }
 
+TEST_F(BlobFileReaderTest, RelocationFileOfAnotherColumnFamilyIsRejected) {
+  // A relocation file records the ID of the column family that wrote it in its
+  // table properties. The reader compares it with the ID of the column family
+  // that opens the file, so a wrong MANIFEST record cannot make one column
+  // family read another column family's relocation file.
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "RelocationFileOfAnotherColumnFamily"),
+      0);
+  options.enable_blob_files = true;
+  BlockBasedTableOptions table_options;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  const ImmutableOptions immutable_options(options);
+  const MutableCFOptions mutable_cf_options(options);
+  constexpr uint32_t column_family_id = 1;
+  constexpr uint32_t other_column_family_id = 2;
+  constexpr uint64_t relocation_file_number = 400;
+  const std::string payload = "relocated-value";
+  BlobRelocationFileMetadata metadata;
+  uint64_t file_size = 0;
+  WriteRelocationFile(immutable_options, mutable_cf_options, table_options,
+                      column_family_id, relocation_file_number,
+                      {{/*origin_file_number=*/100,
+                        /*original_value_offset=*/10, payload, kNoCompression}},
+                      &metadata, &file_size);
+  const BlobPhysicalFile file =
+      RelocationPhysicalFile(relocation_file_number, file_size, metadata);
+
+  // The column family that wrote the file opens it.
+  {
+    std::unique_ptr<BlobFileReader> reader;
+    ASSERT_OK(OpenRelocationReader(
+        immutable_options, ReadOptions(), FileOptions(), column_family_id, file,
+        /*db_session_id=*/"reader", table_options,
+        mutable_cf_options.compression_manager.get(), &reader));
+  }
+  // Another column family gets Corruption.
+  std::unique_ptr<BlobFileReader> reader;
+  const Status status = OpenRelocationReader(
+      immutable_options, ReadOptions(), FileOptions(), other_column_family_id,
+      file, /*db_session_id=*/"reader", table_options,
+      mutable_cf_options.compression_manager.get(), &reader);
+  ASSERT_EQ(status.code(), Status::kCorruption) << status.ToString();
+  ASSERT_NE(status.ToString().find("Blob relocation column family mismatch"),
+            std::string::npos)
+      << status.ToString();
+  ASSERT_EQ(reader, nullptr);
+}
+
 TEST_F(BlobFileReaderTest, BlobCRCError) {
   Options options;
   options.env = mock_env_.get();

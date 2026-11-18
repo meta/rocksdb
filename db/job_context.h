@@ -16,6 +16,7 @@
 #include "db/column_family.h"
 #include "db/log_writer.h"
 #include "db/version_set.h"
+#include "test_util/sync_point.h"
 #include "util/autovector.h"
 #include "util/hash_containers.h"
 
@@ -127,7 +128,8 @@ struct JobContext {
       }
     }
     return memtables_to_free.size() > 0 || wals_to_free.size() > 0 ||
-           job_snapshot != nullptr || sv_have_sth;
+           !blob_relocation_states_to_free.empty() || job_snapshot != nullptr ||
+           sv_have_sth;
   }
 
   SequenceNumber GetJobSnapshotSequence() const {
@@ -197,6 +199,11 @@ struct JobContext {
 
   // the list of blob files that we need to delete
   std::vector<ObsoleteBlobFileInfo> blob_delete_files;
+
+  // File tables of destroyed Versions (see
+  // VersionSet::AddObsoleteBlobRelocationState()), freed by Clean() without the
+  // DB mutex.
+  std::vector<std::shared_ptr<void>> blob_relocation_states_to_free;
 
   // a list of log files that we need to delete
   std::vector<uint64_t> log_delete_files;
@@ -305,12 +312,17 @@ struct JobContext {
 
     memtables_to_free.clear();
     wals_to_free.clear();
+    if (!blob_relocation_states_to_free.empty()) {
+      TEST_SYNC_POINT("JobContext::Clean:FreeBlobRelocationStates");
+      blob_relocation_states_to_free.clear();
+    }
     job_snapshot.reset();
   }
 
   ~JobContext() {
     assert(memtables_to_free.size() == 0);
     assert(wals_to_free.size() == 0);
+    assert(blob_relocation_states_to_free.empty());
   }
 };
 

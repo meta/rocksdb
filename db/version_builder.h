@@ -51,7 +51,7 @@ class VersionBuilder {
   Status Apply(const VersionEdit* edit);
 
   // Save the current Version to the provided `vstorage`.
-  Status SaveTo(VersionStorageInfo* vstorage) const;
+  Status SaveTo(VersionStorageInfo* vstorage);
 
   // Saving a Version can also be done in two steps, so that step 2 (the blob
   // files and the consistency check) can run with the DB mutex released (see
@@ -83,7 +83,7 @@ class VersionBuilder {
   // atomic) and creates new BlobFileMetaData objects for the blob files that
   // the edits add or change. It does not touch FileMetaData reference
   // counts.
-  Status SaveBlobFilesAndCheckTo(VersionStorageInfo* vstorage) const;
+  Status SaveBlobFilesAndCheckTo(VersionStorageInfo* vstorage);
 
   // Load table handlers for newly added files in the builder. This does not
   // load any files in the base storage.
@@ -119,6 +119,13 @@ class VersionBuilder {
   // REQUIRES: track_found_and_missing_files and allow_incomplete_valid_version
   // are true, and no edit has been applied yet.
   void RecordMissingBlobFilesAsDropped();
+
+  // Moves out the staged relocation file and route changes, which can be large
+  // after a long replay, so that they can be freed without the DB mutex while
+  // the builder itself is destroyed under it (see
+  // VersionSet::FreeBlobRelocationState()). Returns null when there is nothing
+  // to move. The builder must not be used afterwards.
+  std::shared_ptr<void> ReleaseBlobRelocationChanges();
 
   // When applying a sequence of VersionEdits, intermediate files are the ones
   // that are added and then deleted. Returns the tracked files and clears them

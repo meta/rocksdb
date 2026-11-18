@@ -930,6 +930,8 @@ class InternalStats {
                                      Version* version);
   bool HandleBlobCacheCapacity(uint64_t* value, DBImpl* db, Version* version);
   bool HandleBlobCacheUsage(uint64_t* value, DBImpl* db, Version* version);
+  bool HandleBlobIndirectionFormatVersion(uint64_t* value, DBImpl* db,
+                                          Version* version);
   bool HandleBlobCachePinnedUsage(uint64_t* value, DBImpl* db,
                                   Version* version);
 

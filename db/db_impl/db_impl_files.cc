@@ -13,6 +13,7 @@
 
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blob/blob_relocation_file.h"
 #include "db/db_impl/db_impl.h"
 #include "db/event_helpers.h"
 #include "db/memtable_list.h"
@@ -97,6 +98,24 @@ bool ShouldKeepFooterlessBlobFile(FileSystem* fs,
   io_s = fs->NewRandomAccessFile(blob_file_path, read_file_options, &file, dbg);
   if (!io_s.ok()) {
     return !io_s.IsPathNotFound();
+  }
+
+  // A blob relocation file starts with kBlobRelocationFilePrefix ("RDBRLC01")
+  // and has no blob log footer, so the footer rule below would keep it
+  // forever. A relocation file reaches this check only after no Version owns
+  // it, so the purge deletes it.
+  std::array<char, kBlobRelocationFilePrefixSize> prefix_scratch{};
+  Slice prefix_slice;
+  io_s = file->Read(0, kBlobRelocationFilePrefixSize, io_options, &prefix_slice,
+                    prefix_scratch.data(), dbg);
+  // Lets a test fail the prefix read.
+  TEST_SYNC_POINT_CALLBACK("ShouldKeepFooterlessBlobFile:PrefixRead", &io_s);
+  if (!io_s.ok()) {
+    return !io_s.IsPathNotFound();
+  }
+  if (prefix_slice ==
+      Slice(kBlobRelocationFilePrefix, kBlobRelocationFilePrefixSize)) {
+    return false;
   }
 
   std::array<char, BlobLogFooter::kSize> scratch{};
@@ -227,6 +246,12 @@ bool DBImpl::IsFileDeletionsEnabled() const {
 void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
                                bool no_full_scan) {
   mutex_.AssertHeld();
+
+  // Move the relocation state of destroyed Versions to the JobContext;
+  // job_context->Clean() frees it without the DB mutex. This runs before the
+  // check below, so the state is freed also while file deletion is disabled.
+  versions_->TakeObsoleteBlobRelocationStates(
+      &job_context->blob_relocation_states_to_free);
 
   // if deletion is disabled, do nothing
   if (disable_delete_obsolete_files_ > 0) {
@@ -604,6 +629,14 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
   }
 
   for (const auto& blob_file : state.blob_delete_files) {
+    // The file is obsolete, so evict its cached reader now, before the keep
+    // decision below. The decision can keep the file (for example after an I/O
+    // error while it reads the file), but the file has then left the obsolete
+    // list, so a reader left here would stay cached with its file descriptor
+    // and its pinned location blocks until a full-scan purge. An eviction is
+    // always safe: a later read opens the file again. It takes no DB mutex and
+    // no stripe mutex (TableCache::Evict() of the shared cache).
+    TableCache::Evict(table_cache_.get(), blob_file.GetBlobFileNumber());
     candidate_files.emplace_back(BlobFileName(blob_file.GetBlobFileNumber()),
                                  blob_file.GetPath());
   }

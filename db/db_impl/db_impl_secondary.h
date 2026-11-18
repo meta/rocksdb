@@ -346,6 +346,13 @@ class DBImplSecondary : public DBImpl {
                           JobContext* job_context);
 
   std::unique_ptr<log::FragmentBufferedReader> manifest_reader_;
+  // Serializes catch-ups. ReactiveVersionSet::ReadAndApply() releases mutex_
+  // while it decodes MANIFEST records, checks files and builds Versions. No
+  // other catch-up may run meanwhile. Lock order: this mutex first, then
+  // mutex_. TryCatchUpWithPrimary() and the follower's TryCatchUpWithLeader()
+  // both hold it, so a second caller waits for the first one and then does its
+  // own catch-up, instead of returning TryAgain.
+  std::mutex catch_up_mutex_;
   std::unique_ptr<log::Reader::Reporter> manifest_reporter_;
   std::unique_ptr<Status> manifest_reader_status_;
 

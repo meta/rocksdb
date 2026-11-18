@@ -702,6 +702,11 @@ enum Tickers : uint32_t {
   // open, without opening the file again (see BlobFileCache).
   BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS,
 
+  // Used only by DBs that use or have used enable_blob_indirection. Number of
+  // blob cache misses that found the value through a route (the reference names
+  // an old file whose live values moved to a relocation file).
+  BLOB_DB_INDIRECT_READ_ROUTED,
+
   TICKER_ENUM_MAX
 };
 
