@@ -257,6 +257,7 @@ technique would be for our code generator to simply create the equivalent stubs 
 That's not hard to do.
 14. Generator loose ends. There are no constructors for `RocksdbFlushwaloptions` and many others; we have not yet
 worked out how to hook these classes up. It will not be difficult, it is just something that is left to do.
+15. Generating Javadoc from the C/C++ documentation. Is it preserved ? Can we preserve it ? Can we forward it ?
 
 ### Blended Prototype
 
