@@ -1468,6 +1468,32 @@ Status DecodeBlobReferenceIndex(
   return Status::OK();
 }
 
+Status CopyIndirectBlobReferenceGroups(
+    const BlobReferenceIndex& index,
+    const std::function<Status(size_t buffer_bytes)>& before_allocation,
+    std::vector<BlobReferenceGroup>* groups) {
+  assert(groups != nullptr);
+  size_t count = 0;
+  for (const BlobReferenceIndexEntry& entry : index.groups) {
+    count += entry.group.encoding_class != BlobReferenceEncodingClass::kDirect;
+  }
+  if (before_allocation) {
+    Status status = before_allocation(count * sizeof(BlobReferenceGroup));
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  std::vector<BlobReferenceGroup> result;
+  result.reserve(count);
+  for (const BlobReferenceIndexEntry& entry : index.groups) {
+    if (entry.group.encoding_class != BlobReferenceEncodingClass::kDirect) {
+      result.push_back(entry.group);
+    }
+  }
+  *groups = std::move(result);
+  return Status::OK();
+}
+
 size_t FindBlobReferenceGroup(const BlobReferenceIndex& index,
                               const BlobReferenceGroupKey& key) {
   const auto found =

@@ -102,6 +102,7 @@ class Version;
 class VersionEdit;
 class VersionSet;
 class WriteCallback;
+struct BlobReferenceCensusBuildContext;
 struct JobContext;
 struct ExternalSstFileInfo;
 struct MemTableInfo;
@@ -1209,6 +1210,19 @@ class DBImpl : public DB
   // Un-reference the super version and clean it up if it is the last reference.
   void CleanupSuperVersion(SuperVersion* sv);
 
+  // Releases a column family reference that the blob reference census took
+  // with cfd->Ref(). The census takes one in two places:
+  // - ScheduleBlobReferenceCensus() takes one for each column family that it
+  //   queues. The column family keeps it while it waits in the run queue or
+  //   the retry list. The census job releases it when the column family leaves
+  //   both, and the cleanup of both lists at close releases the rest.
+  // - Each census build takes one when it starts, for its starting Version
+  //   (see BuildBlobReferenceCensus()). The deleter of that Version releases
+  //   it when the build context is freed.
+  // This function takes the DB mutex, so the caller must not hold it. The
+  // column family is deleted when its last reference is released.
+  void ReleaseColumnFamilyDataRef(ColumnFamilyData* cfd);
+
   // Un-reference the super version and return it to thread local cache if
   // needed. If it is the last reference of the super version. Clean it up
   // after un-referencing it.
@@ -1473,6 +1487,7 @@ class DBImpl : public DB
 
   // Wait for any background purge
   Status TEST_WaitForPurge();
+  void TEST_WaitForBlobReferenceCensus();
 
   // Get the background error status
   Status TEST_GetBGError();
@@ -2268,6 +2283,64 @@ class DBImpl : public DB
   // shutdown begins.
   void WaitForAsyncFileOpen();
 
+  // Schedules the background job that builds and updates the blob reference
+  // census of each fenced CF (see db/blob/blob_reference_census.h). Only
+  // indirect blob GC uses the census; reads never wait for it. The overload
+  // without a CF queues every CF that needs a run.
+  void ScheduleBlobReferenceCensus();
+  void ScheduleBlobReferenceCensus(ColumnFamilyData* requested_cfd);
+  static void BGWorkBlobReferenceCensus(void* arg);
+  static void UnscheduleBlobReferenceCensus(void* arg);
+
+  // `*incomplete` is true when this run did not make the census ready: the scan
+  // has more slices, catch-up must wait while an indirect blob GC job copies
+  // its snapshot, or an install is being prepared. The job runs again later
+  // (see "Scheduling" in db/blob/blob_reference_census.h). `*overflowed`
+  // reports a change-log overflow. The first overflow restarts the build at
+  // once with the restart limit. A second overflow before a publish fails the
+  // build, which then backs off.
+  Status BuildBlobReferenceCensus(ColumnFamilyData* cfd, bool* incomplete,
+                                  bool* overflowed);
+
+  // Selects the indirect blob GC candidates of the census worker of `cfd` and
+  // publishes the census for the current Version if the worker has applied
+  // every install. Sets `*incomplete` if the publish must wait (an install is
+  // pending or not yet applied). Returns Aborted if the build is stale,
+  // ShutdownInProgress during shutdown or after a drop. Takes the DB mutex.
+  // REQUIRES: the caller holds the census's worker_run_mutex() and not the DB
+  // mutex.
+  Status PublishBlobReferenceCensusWorker(
+      ColumnFamilyData* cfd, BlobReferenceCensusBuildContext* context,
+      bool* incomplete);
+
+  // Called at the end of each background flush and compaction
+  // (BackgroundCallFlush() and BackgroundCallCompaction()), with the DB mutex
+  // held. `cfds` are the column families with a census that this job flushed or
+  // compacted (also when the job failed; a dropped column family is left out),
+  // each with a reference (`census_cfds`): BackgroundFlush() keeps the flush
+  // job's reference, and BackgroundCompaction() takes a new one. It releases
+  // the DB mutex and applies the queued census deltas of each of them (see
+  // "Apply after an install" in db/blob/blob_reference_census.h). It takes the
+  // DB mutex again, drops the references and returns. It never fails the
+  // caller's job. A column family that is dropped while this function has the
+  // DB mutex released gets its last Unref here, after the job's
+  // FindObsoleteFiles(). Its files are then deleted by the next obsolete-file
+  // pass or at close, so they do not leak.
+  void ApplyBlobReferenceCensusAfterInstall(
+      const autovector<ColumnFamilyData*>& cfds);
+
+  // Applies the queued deltas of one column family. If it applied at least one,
+  // it then tries to publish the census. Does nothing if another thread runs
+  // the worker, if the build has not started or has not finished its scan of
+  // the SSTs, or if the build has a stored failure
+  // (BlobReferenceCensusBuildContext::failure). REQUIRES: DB mutex not held.
+  void ApplyBlobReferenceCensusDeltas(ColumnFamilyData* cfd);
+
+  // Debug builds: rebuilds the expected per-generation-number records of the
+  // published Version from its SSTs and compares them with the census. Each
+  // call runs the check with a random 1 in 16 chance, unless a test forces it.
+  void CheckBlobReferenceCensus(ColumnFamilyData* cfd);
+  void RetryBlobReferenceCensus();
   void InvokeWalFilterIfNeededOnColumnFamilyToWalNumberMap();
 
   // Return true to proceed with current WAL record whose content is stored in
@@ -3269,11 +3342,13 @@ class DBImpl : public DB
                               Env::Priority thread_pri,
                               bool separate_remote_pool,
                               int* deferred_compactions,
-                              uint64_t min_output_file_number);
+                              uint64_t min_output_file_number,
+                              autovector<ColumnFamilyData*>* census_cfds);
   Status BackgroundFlush(bool* madeProgress, JobContext* job_context,
                          LogBuffer* log_buffer, FlushReason* reason,
                          bool* flush_rescheduled_to_retain_udt,
-                         Env::Priority thread_pri);
+                         Env::Priority thread_pri,
+                         autovector<ColumnFamilyData*>* census_cfds);
 
   Compaction* CreateIntendedCompactionForwardedToBottomPriorityPool(
       Compaction* c);
@@ -4161,6 +4236,36 @@ class DBImpl : public DB
   // Tracks whether background async file opening has been scheduled/completed.
   AsyncFileOpenState bg_async_file_open_state_ =
       AsyncFileOpenState::kNotScheduled;
+
+  enum class BlobReferenceCensusJobState : uint8_t {
+    kNotScheduled = 0,
+    kScheduled,
+    kComplete,
+  };
+  BlobReferenceCensusJobState bg_blob_reference_census_state_ =
+      BlobReferenceCensusJobState::kNotScheduled;
+  // Two intrusive lists of CFs, linked through
+  // ColumnFamilyData::next_blob_reference_census_: the run queue
+  // (queue_head/tail) and the retry list (retry_head/tail). Adding a CF is O(1)
+  // and allocates nothing, so option changes and SuperVersion installs can
+  // enqueue a CF under the DB mutex without scanning all CFs.
+  ColumnFamilyData* blob_reference_census_queue_head_ = nullptr;
+  ColumnFamilyData* blob_reference_census_queue_tail_ = nullptr;
+  ColumnFamilyData* blob_reference_census_retry_head_ = nullptr;
+  ColumnFamilyData* blob_reference_census_retry_tail_ = nullptr;
+  size_t blob_reference_census_retry_count_ = 0;
+  std::atomic<bool> blob_reference_census_retry_registered_{false};
+  // The census job registers its retry task in periodic_task_scheduler_, so
+  // it may start only after DB::Open() has started that scheduler. Until then,
+  // ScheduleBlobReferenceCensus() only queues column families. Protected by
+  // mutex_.
+  bool blob_reference_census_job_allowed_ = false;
+  // The number of census applies that flush and compaction jobs owe: each job
+  // adds one per column family when it installs, and
+  // ApplyBlobReferenceCensusAfterInstall() removes them. Such an apply never
+  // waits, so TEST_WaitForBlobReferenceCensus() can wait for it. Protected by
+  // mutex_.
+  size_t blob_reference_census_pending_applies_ = 0;
 
   // State machine for the single async WAL precreation slot protected by
   // mutex_. Background precreation failure returns to kNotScheduled; foreground

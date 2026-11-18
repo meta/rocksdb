@@ -127,6 +127,12 @@ class VersionBuilder {
   // to move. The builder must not be used afterwards.
   std::shared_ptr<void> ReleaseBlobRelocationChanges();
 
+  // True if a relocation file that the current replay state still uses is
+  // missing on disk or fails verification. A file that an old edit added and a
+  // later edit deleted does not count. Requires tracking of found and missing
+  // files.
+  bool HasMissingBlobRelocationFiles() const;
+
   // When applying a sequence of VersionEdits, intermediate files are the ones
   // that are added and then deleted. Returns the tracked files and clears them
   // so that subsequent VersionEdits start with a clean state.

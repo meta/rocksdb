@@ -187,7 +187,10 @@ TEST_F(RepairTest, NeverActivatedRepairWithPolicyEnabledKeepsLegacyOutput) {
                                                  ->storage_info();
   size_t files = 0;
   for (int level = 0; level < vstorage->num_levels(); ++level) {
-    files += vstorage->LevelFiles(level).size();
+    for (const FileMetaData* file : vstorage->LevelFiles(level)) {
+      EXPECT_TRUE(file->blob_reference_descriptor.empty());
+      ++files;
+    }
   }
   EXPECT_EQ(files, 2U);
 }

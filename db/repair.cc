@@ -310,8 +310,10 @@ class Repairer {
     // records. This check runs before RepairDB changes any file, and returns
     // NotSupported if it finds feature evidence:
     //   - in any MANIFEST: a format fence; a relocation file, route,
-    //     accepted-loss or blob file retirement record; or a blob file addition
-    //     marked as an indirect origin.
+    //     accepted-loss or blob file retirement record; a blob file addition
+    //     marked as an indirect origin; or a new SST record whose exact
+    //     reference metadata descriptor decodes, or that has a coarse frontier
+    //     (the oldest indirect-origin file number a coarse SST may reference).
     //   - in any SST: an exact reference metadata descriptor that decodes.
     // The search is best effort: it skips a file or record that it cannot read.
     // So when it finds nothing, that does not prove that the DB never used the
@@ -352,6 +354,18 @@ class Repairer {
                        !edit.GetBlobFileRetirements().empty();
         for (const BlobFileAddition& addition : edit.GetBlobFileAdditions()) {
           feature |= addition.IsIndirectOrigin();
+        }
+        for (const std::pair<int, FileMetaData>& addition :
+             edit.GetNewFiles()) {
+          if (!addition.second.blob_reference_descriptor.empty()) {
+            BlobReferenceMetadataDescriptor descriptor;
+            status = BlobReferenceMetadataDescriptor::DecodeFrom(
+                addition.second.blob_reference_descriptor, &descriptor);
+            feature |= status.ok();
+          }
+          feature |=
+              addition.second.oldest_coarse_indirect_origin_file_number !=
+              kInvalidBlobFileNumber;
         }
         if (feature) {
           return UnsupportedBlobIndirectionRepair();

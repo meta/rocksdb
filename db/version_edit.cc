@@ -10,6 +10,7 @@
 #include "db/version_edit.h"
 
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/version_set.h"
 #include "db/wide/wide_column_serialization.h"
 #include "logging/event_logger.h"
@@ -25,6 +26,34 @@ static_assert(kMaxBlobRelocationFileNumber == kFileNumberMask,
               "Relocation file numbers use the file number limit");
 
 namespace {
+// For DebugString() / DebugJSON(): the blob reference metadata kind of an SST
+// written with blob indirection (see db/blob/blob_reference_metadata.h), or an
+// empty string for an SST without it. Examples: "exact (3 references, 300
+// stored value bytes)", "coarse (frontier 12)", "legacy". The frontier is the
+// oldest indirect-origin file number a coarse SST may reference (see
+// "Coarse SST" in db/blob/blob_reference_metadata.h).
+std::string BlobReferenceMetadataToString(const FileMetaData& f) {
+  if (!f.blob_reference_descriptor.empty()) {
+    BlobReferenceMetadataDescriptor descriptor;
+    const Status s = BlobReferenceMetadataDescriptor::DecodeFrom(
+        f.blob_reference_descriptor, &descriptor);
+    if (!s.ok()) {
+      return "exact (cannot decode the descriptor: " + s.ToString() + ")";
+    }
+    return "exact (" + std::to_string(descriptor.reference_count) +
+           " references, " + std::to_string(descriptor.stored_value_bytes) +
+           " stored value bytes)";
+  }
+  if (f.oldest_coarse_indirect_origin_file_number != kInvalidBlobFileNumber) {
+    return "coarse (frontier " +
+           std::to_string(f.oldest_coarse_indirect_origin_file_number) + ")";
+  }
+  if (f.blob_reference_legacy_metadata) {
+    return "legacy";
+  }
+  return std::string();
+}
+
 // For DebugString() / DebugJSON(), e.g. "ingestion+moved+raw:0x1103" (the raw
 // value shows reserved bits that aren't decoded).
 std::string DataFileProvenanceToString(uint32_t encoded) {
@@ -211,6 +240,15 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
   return Status::OK();
 }
 
+size_t FileMetaData::BlobReferenceSummaryMemoryUsage() const {
+  // Only new files in a VersionEdit hold a summary; Version files drop it. The
+  // summary can be shared by several owners, so this may count it more than
+  // once.
+  return blob_reference_summary != nullptr
+             ? blob_reference_summary->MemoryUsage()
+             : 0;
+}
+
 void VersionEdit::Clear() { *this = VersionEdit(); }
 
 void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
@@ -227,6 +265,10 @@ void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
   FileMetaData& added = new_files_.back().second;
   added.db_ownership_start_time = f.db_ownership_start_time;
   added.data_file_provenance = f.data_file_provenance | provenance_flags_to_set;
+  added.blob_reference_descriptor = f.blob_reference_descriptor;
+  added.blob_reference_legacy_metadata = f.blob_reference_legacy_metadata;
+  added.oldest_coarse_indirect_origin_file_number =
+      f.oldest_coarse_indirect_origin_file_number;
 }
 
 bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
@@ -578,6 +620,20 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     PutVarint32(&varint_data_file_provenance, f.data_file_provenance);
     PutLengthPrefixedSlice(dst, Slice(varint_data_file_provenance));
   }
+  if (!f.blob_reference_descriptor.empty()) {
+    PutVarint32(dst, NewFileCustomTag::kBlobReferenceDescriptor);
+    PutLengthPrefixedSlice(dst, Slice(f.blob_reference_descriptor));
+  }
+  if (f.blob_reference_legacy_metadata) {
+    PutVarint32(dst, NewFileCustomTag::kBlobReferenceLegacyMetadata);
+    PutLengthPrefixedSlice(dst, Slice());
+  }
+  if (f.oldest_coarse_indirect_origin_file_number != kInvalidBlobFileNumber) {
+    PutVarint32(dst, kOldestCoarseIndirectOriginFileNumber);
+    std::string encoded;
+    PutVarint64(&encoded, f.oldest_coarse_indirect_origin_file_number);
+    PutLengthPrefixedSlice(dst, encoded);
+  }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
 
@@ -734,6 +790,45 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
         case kDataFileProvenance:
           if (!GetVarint32(&field, &f.data_file_provenance)) {
             return "invalid data file provenance";
+          }
+          break;
+        case kBlobReferenceDescriptor: {
+          if (!f.blob_reference_descriptor.empty() ||
+              f.blob_reference_legacy_metadata ||
+              f.oldest_coarse_indirect_origin_file_number !=
+                  kInvalidBlobFileNumber) {
+            return "duplicate blob reference metadata";
+          }
+          BlobReferenceMetadataDescriptor descriptor;
+          Status status =
+              BlobReferenceMetadataDescriptor::DecodeFrom(field, &descriptor);
+          if (!status.ok()) {
+            return "invalid blob reference descriptor";
+          }
+          f.blob_reference_descriptor = field.ToString();
+          break;
+        }
+        case kBlobReferenceLegacyMetadata:
+          if (!field.empty() || !f.blob_reference_descriptor.empty() ||
+              f.blob_reference_legacy_metadata ||
+              f.oldest_coarse_indirect_origin_file_number !=
+                  kInvalidBlobFileNumber) {
+            return "invalid legacy blob reference metadata";
+          }
+          f.blob_reference_legacy_metadata = true;
+          break;
+        case kOldestCoarseIndirectOriginFileNumber:
+          if (f.blob_reference_legacy_metadata ||
+              !f.blob_reference_descriptor.empty() ||
+              f.oldest_coarse_indirect_origin_file_number !=
+                  kInvalidBlobFileNumber ||
+              !GetVarint64(&field,
+                           &f.oldest_coarse_indirect_origin_file_number) ||
+              !field.empty() ||
+              f.oldest_coarse_indirect_origin_file_number ==
+                  kInvalidBlobFileNumber ||
+              f.oldest_coarse_indirect_origin_file_number > kFileNumberMask) {
+            return "invalid coarse blob reference metadata";
           }
           break;
         default:
@@ -1395,6 +1490,11 @@ std::string VersionEdit::DebugString(bool hex_key) const {
       r.append(" file_open_metadata_size: ");
       AppendNumberTo(&r, f.file_open_metadata.size());
     }
+    const std::string blob_references = BlobReferenceMetadataToString(f);
+    if (!blob_references.empty()) {
+      r.append(" blob_references: ");
+      r.append(blob_references);
+    }
   }
 
   for (const auto& blob_file_addition : blob_file_additions_) {
@@ -1572,6 +1672,10 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
          << f.user_defined_timestamps_persisted;
       if (!f.file_open_metadata.empty()) {
         jw << "FileOpenMetadataSize" << f.file_open_metadata.size();
+      }
+      const std::string blob_references = BlobReferenceMetadataToString(f);
+      if (!blob_references.empty()) {
+        jw << "BlobReferences" << blob_references;
       }
       jw.EndArrayedObject();
     }

@@ -2555,6 +2555,68 @@ std::shared_ptr<const TableProperties> BlockBasedTable::GetTableProperties()
   return rep_->table_properties;
 }
 
+Status BlockBasedTable::ReadBlobReferenceGroups(
+    const ReadOptions& caller_read_options, const Slice& expected_descriptor,
+    const std::function<Status(size_t buffer_bytes)>& before_allocation,
+    std::vector<BlobReferenceGroup>* groups) const {
+  if (groups == nullptr) {
+    return Status::InvalidArgument("Null blob reference group output");
+  }
+
+  const auto properties = GetTableProperties();
+  if (properties == nullptr) {
+    return Status::Corruption("Missing table properties");
+  }
+  const auto property = properties->user_collected_properties.find(
+      kBlobReferenceDescriptorPropertyName);
+  if (property == properties->user_collected_properties.end()) {
+    return Status::Corruption("Missing required blob reference descriptor");
+  }
+  if (Slice(property->second) != expected_descriptor) {
+    return Status::Corruption("Blob reference descriptor mismatch");
+  }
+
+  BlobReferenceMetadataDescriptor descriptor;
+  Status status = BlobReferenceMetadataDescriptor::DecodeFrom(
+      expected_descriptor, &descriptor);
+  if (!status.ok()) {
+    return status;
+  }
+
+  // Keep the caller's I/O activity, rate limiter priority and deadlines.
+  ReadOptions read_options = caller_read_options;
+  read_options.fill_cache = false;
+  read_options.verify_checksums = true;
+  // No persistent cache, also for a reader from the table cache, so census and
+  // indirect blob GC reads never fill it (as fill_cache=false does for the
+  // block cache).
+  const auto read_block = [&](const BlockHandle& handle,
+                              BlockContents* contents) -> Status {
+    IOStatus io_status =
+        BlockFetcher(rep_->file.get(), nullptr /* prefetch_buffer */,
+                     rep_->footer, read_options, handle, contents,
+                     rep_->ioptions, false /* do_uncompress */,
+                     false /* maybe_compressed */, BlockType::kUserDefinedIndex,
+                     nullptr /* decompressor */, PersistentCacheOptions())
+            .ReadBlockContents();
+    return io_status;
+  };
+
+  BlockContents index_contents;
+  status = read_block(descriptor.index_handle, &index_contents);
+  if (!status.ok()) {
+    return status;
+  }
+  // The index holds every group total, so no data block is read. The
+  // decoder checks that the totals add up to the descriptor.
+  BlobReferenceIndex index;
+  status = DecodeBlobReferenceIndex(index_contents.data, descriptor, &index);
+  if (!status.ok()) {
+    return status;
+  }
+  return CopyIndirectBlobReferenceGroups(index, before_allocation, groups);
+}
+
 const SeqnoToTimeMapping& BlockBasedTable::GetSeqnoToTimeMapping() const {
   return rep_->seqno_to_time_mapping;
 }
