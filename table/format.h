@@ -48,6 +48,11 @@ extern const uint64_t kPlainTableMagicNumber;
 
 extern const uint64_t kCuckooTableMagicNumber;
 
+// Reads the trailing SST format signature without decoding the footer.
+Status ReadTableMagicNumber(const IOOptions& io_options,
+                            FSRandomAccessFile& file, uint64_t file_size,
+                            uint64_t* magic_number);
+
 // BlockHandle is a pointer to the extent of a file that stores a data
 // block or a meta block.
 class BlockHandle {

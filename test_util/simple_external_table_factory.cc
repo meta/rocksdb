@@ -17,6 +17,7 @@
 #include "file/file_util.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/status.h"
+#include "table/format.h"
 #include "test_util/sync_point.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
@@ -503,6 +504,21 @@ const char* SimpleExternalTableFactoryBase<Mode>::Name() const {
     return "SimpleFullExternalTableFactory";
   }
   return "SimpleExternalTableFactory";
+}
+
+template <ExternalTableMode Mode>
+Status SimpleExternalTableFactoryBase<Mode>::FileIsValidTable(
+    const IOOptions& io_options, FSRandomAccessFile& file, uint64_t file_size,
+    bool* matches) const {
+  *matches = false;
+  if (file_size < kSimpleExternalTableFooterSize) {
+    return Status::OK();
+  }
+  uint64_t magic_number;
+  Status status = ReadTableMagicNumber(
+      io_options, file, file_size - sizeof(uint32_t), &magic_number);
+  *matches = status.ok() && magic_number == kSimpleExternalTableMagic;
+  return status;
 }
 
 template <ExternalTableMode Mode>

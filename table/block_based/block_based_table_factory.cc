@@ -781,6 +781,17 @@ Status CheckCacheOptionCompatibility(const BlockBasedTableOptions& bbto) {
 
 }  // namespace
 
+Status BlockBasedTableFactory::FileIsValidTable(const IOOptions& io_options,
+                                                FSRandomAccessFile& file,
+                                                uint64_t file_size,
+                                                bool* matches) const {
+  uint64_t magic_number;
+  Status status =
+      ReadTableMagicNumber(io_options, file, file_size, &magic_number);
+  *matches = status.ok() && magic_number == kBlockBasedTableMagicNumber;
+  return status;
+}
+
 Status BlockBasedTableFactory::NewTableReader(
     const ReadOptions& ro, const TableReaderOptions& table_reader_options,
     std::unique_ptr<RandomAccessFileReader>&& file, uint64_t file_size,
