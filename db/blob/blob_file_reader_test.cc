@@ -1130,6 +1130,143 @@ TEST_F(BlobFileReaderTest, RelocationLocationEntryNeedsValueTypeAndSequence0) {
   }
 }
 
+TEST(BlobLogHeaderTest, Version2HoldsRepairFields) {
+  // Version 2 always has the repair fields: the file number in the first
+  // expiration-range field and 0 in the second. Version 1 is the base format.
+  BlobLogHeader header(/*_column_family_id=*/7, kNoCompression,
+                       /*_has_ttl=*/false, ExpirationRange());
+  header.version = kVersion2;
+  header.is_indirect_origin = true;
+  header.repair_file_number = 42;
+  std::string encoded;
+  header.EncodeTo(&encoded);
+  BlobLogHeader decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  EXPECT_EQ(decoded.version, kVersion2);
+  EXPECT_TRUE(decoded.HasRepairMetadata());
+  EXPECT_TRUE(decoded.is_indirect_origin);
+  EXPECT_EQ(decoded.repair_file_number, 42U);
+  EXPECT_EQ(decoded.expiration_range, ExpirationRange());
+  EXPECT_EQ(
+      decoded.GetRepairMetadataFooterValue(),
+      uint64_t{crc32c::Mask(crc32c::Value(encoded.data(), encoded.size()))});
+
+  // Byte offsets in the 30-byte header: version at 4, flags at 12, the two
+  // expiration-range fields at 14 and 22.
+  const auto changed = [&encoded](size_t offset, const std::string& bytes) {
+    std::string copy = encoded;
+    copy.replace(offset, bytes.size(), bytes);
+    return copy;
+  };
+  std::string fixed32;
+  std::string fixed64;
+  PutFixed32(&fixed32, 3);
+  PutFixed64(&fixed64, 0);
+  std::string one;
+  PutFixed64(&one, 1);
+  const std::vector<std::pair<const char*, std::string>> bad{
+      {"unknown version 3", changed(4, fixed32)},
+      {"version 2 with has_ttl", changed(12, std::string(1, '\x05'))},
+      {"flag bit 1", changed(12, std::string(1, '\x06'))},
+      {"file number 0", changed(14, fixed64)},
+      {"nonzero second field", changed(22, one)},
+  };
+  for (const auto& entry : bad) {
+    SCOPED_TRACE(entry.first);
+    BlobLogHeader rejected;
+    EXPECT_TRUE(rejected.DecodeFrom(entry.second).IsCorruption());
+  }
+  // Version 1 does not allow is_indirect_origin.
+  BlobLogHeader v1(7, kNoCompression, /*_has_ttl=*/false, ExpirationRange());
+  v1.EncodeTo(&encoded);
+  BlobLogHeader rejected;
+  EXPECT_TRUE(
+      rejected.DecodeFrom(changed(12, std::string(1, '\x04'))).IsCorruption());
+  ASSERT_OK(rejected.DecodeFrom(encoded));
+  EXPECT_FALSE(rejected.HasRepairMetadata());
+}
+
+TEST_F(BlobFileReaderTest, OpensRepairMetadataFileWithFooterValueZero) {
+  // A version 2 header has repair metadata, and the footer stores
+  // BlobLogHeader::GetRepairMetadataFooterValue(), the masked CRC32C of the
+  // header. A masked CRC32C can be 0, so 0 must not be read as "no repair
+  // metadata". This test writes a file whose footer value is 0 and checks that
+  // BlobFileReader::Create accepts the footer and that the blob reads back.
+  //
+  // The column family ID below was found once, offline, by solving the
+  // CRC32C equation: CRC32C is linear in the input bits, so 32 free header
+  // bits can produce any CRC. With file number 1, no compression and no flags,
+  // this column family ID makes the masked header CRC32C equal to 0. The test
+  // checks this first, so a header format change fails here and not later.
+  constexpr uint32_t column_family_id = 1956959934;
+  constexpr uint64_t blob_file_number = 1;
+
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlobFileReaderTest_RepairFooterValueZero"),
+      0);
+  options.enable_blob_files = true;
+  ImmutableOptions immutable_options(options);
+
+  BlobLogHeader header(column_family_id, kNoCompression, /*_has_ttl=*/false,
+                       ExpirationRange());
+  header.version = kVersion2;
+  header.repair_file_number = blob_file_number;
+  ASSERT_TRUE(header.HasRepairMetadata());
+  ASSERT_EQ(header.GetRepairMetadataFooterValue(), 0U);
+
+  const std::string key = "key";
+  const std::string blob = "blob";
+  uint64_t blob_offset = 0;
+  {
+    const std::string blob_file_path =
+        BlobFileName(immutable_options.cf_paths.front().path, blob_file_number);
+    std::unique_ptr<FSWritableFile> file;
+    ASSERT_OK(NewWritableFile(immutable_options.fs.get(), blob_file_path, &file,
+                              FileOptions()));
+    std::unique_ptr<WritableFileWriter> file_writer(
+        new WritableFileWriter(std::move(file), blob_file_path, FileOptions(),
+                               immutable_options.clock));
+    BlobLogWriter blob_log_writer(std::move(file_writer),
+                                  immutable_options.clock,
+                                  /*statistics=*/nullptr, blob_file_number,
+                                  /*use_fsync=*/false, /*do_flush=*/false);
+    ASSERT_OK(blob_log_writer.WriteHeader(WriteOptions(), header));
+    uint64_t key_offset = 0;
+    ASSERT_OK(blob_log_writer.AddRecord(WriteOptions(), key, blob, &key_offset,
+                                        &blob_offset));
+
+    // A version 2 footer holds the bytes between the header and the footer,
+    // then the repair metadata footer value (0 here).
+    BlobLogFooter footer;
+    footer.blob_count = 1;
+    footer.expiration_range =
+        ExpirationRange{BlobLogRecord::kHeaderSize + key.size() + blob.size(),
+                        header.GetRepairMetadataFooterValue()};
+    std::string checksum_method;
+    std::string checksum_value;
+    ASSERT_OK(blob_log_writer.AppendFooter(WriteOptions(), footer,
+                                           &checksum_method, &checksum_value));
+  }
+
+  std::unique_ptr<BlobFileReader> reader;
+  ASSERT_OK(BlobFileReader::Create(
+      immutable_options, ReadOptions(), FileOptions(), column_family_id,
+      /*blob_file_read_hist=*/nullptr, blob_file_number,
+      /*io_tracer=*/nullptr, &reader));
+  ASSERT_NE(reader, nullptr);
+
+  std::unique_ptr<BlobContents> value;
+  uint64_t bytes_read = 0;
+  ASSERT_OK(reader->GetBlob(ReadOptions(), key, blob_offset, blob.size(),
+                            kNoCompression, /*prefetch_buffer=*/nullptr,
+                            /*allocator=*/nullptr, &value, &bytes_read));
+  ASSERT_NE(value, nullptr);
+  ASSERT_EQ(value->data(), blob);
+}
+
 TEST_F(BlobFileReaderTest, CompressedRelocationLocationBlocksReadBack) {
   // Location blocks use the column family's compression. Round 0 reads some
   // values one at a time, and round 1 reads all values in one MultiGetBlob

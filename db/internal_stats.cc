@@ -1113,6 +1113,15 @@ bool InternalStats::HandleIndirectBlobGcStats(
       std::to_string(census != nullptr ? census->StayingMemoryBytes() : 0);
   (*values)["route-count"] =
       std::to_string(vstorage->GetBlobRelocationRouteCount());
+  // How long the oldest route that route retirement deferred has waited (a
+  // duration, 0 when none waits).
+  const uint64_t retirement_since =
+      census != nullptr ? census->RetirementPendingSinceMicros() : 0;
+  const uint64_t retirement_now = clock_->NowMicros();
+  (*values)["retirement-pending-micros"] =
+      std::to_string(retirement_since == 0 || retirement_now < retirement_since
+                         ? 0
+                         : retirement_now - retirement_since);
   (*values)["relocation-file-count"] =
       std::to_string(vstorage->GetBlobRelocationFiles().size());
   (*values)["relocation-file-bytes"] =

@@ -149,8 +149,9 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckOneFile) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
-      &blob_file_paths, &blob_file_additions,
+      BlobFileCreationReason::kFlush, /*write_repair_metadata=*/false,
+      immutable_options.cf_paths.front().path, &blob_file_paths,
+      &blob_file_additions,
       /*blob_source=*/nullptr);
 
   std::vector<std::pair<std::string, std::string>> expected_key_value_pairs(
@@ -222,8 +223,9 @@ TEST_F(BlobFileBuilderTest, StableIdentityIndex) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       /*job_id=*/1, /*column_family_id=*/123, "foobar", Env::WLTH_MEDIUM,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
-      &blob_file_paths, &blob_file_additions,
+      BlobFileCreationReason::kFlush, /*write_repair_metadata=*/true,
+      immutable_options.cf_paths.front().path, &blob_file_paths,
+      &blob_file_additions,
       /*blob_source=*/nullptr);
 
   const std::string value = "logical uncompressed value";
@@ -243,6 +245,27 @@ TEST_F(BlobFileBuilderTest, StableIdentityIndex) {
             crc32c::Value(value.data(), value.size()));
   EXPECT_EQ(blob_index.stored_checksum(),
             BlobIndex::ComputeStoredChecksum(value, kNoCompression));
+
+  // The file has a version 2 header (with the repair fields): the
+  // is_indirect_origin flag and the file number. The footer value covers the
+  // header.
+  ASSERT_EQ(blob_file_paths.size(), 1U);
+  std::string contents;
+  ASSERT_OK(
+      ReadFileToString(mock_env_.get(), blob_file_paths.front(), &contents));
+  ASSERT_GE(contents.size(), BlobLogHeader::kSize + BlobLogFooter::kSize);
+  BlobLogHeader header;
+  ASSERT_OK(header.DecodeFrom(Slice(contents.data(), BlobLogHeader::kSize)));
+  EXPECT_EQ(header.version, kVersion2);
+  EXPECT_TRUE(header.HasRepairMetadata());
+  EXPECT_TRUE(header.is_indirect_origin);
+  EXPECT_EQ(header.repair_file_number, 2U);
+  BlobLogFooter footer;
+  ASSERT_OK(footer.DecodeFrom(
+      Slice(contents.data() + contents.size() - BlobLogFooter::kSize,
+            BlobLogFooter::kSize)));
+  EXPECT_EQ(footer.expiration_range.second,
+            header.GetRepairMetadataFooterValue());
 }
 
 TEST_F(BlobFileBuilderTest, StableChecksumsComputedOnceMatchDirectValues) {
@@ -275,8 +298,9 @@ TEST_F(BlobFileBuilderTest, StableChecksumsComputedOnceMatchDirectValues) {
         &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
         /*job_id=*/1, /*column_family_id=*/123, "foobar", Env::WLTH_MEDIUM,
         nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-        BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
-        &blob_file_paths, &blob_file_additions,
+        BlobFileCreationReason::kFlush, /*write_repair_metadata=*/true,
+        immutable_options.cf_paths.front().path, &blob_file_paths,
+        &blob_file_additions,
         /*blob_source=*/nullptr);
     const std::vector<std::pair<std::string, std::string>> key_values{
         {"k1", std::string(100, 'x')},
@@ -354,8 +378,9 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckMultipleFiles) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
-      &blob_file_paths, &blob_file_additions,
+      BlobFileCreationReason::kFlush, /*write_repair_metadata=*/false,
+      immutable_options.cf_paths.front().path, &blob_file_paths,
+      &blob_file_additions,
       /*blob_source=*/nullptr);
 
   std::vector<std::pair<std::string, std::string>> expected_key_value_pairs(
@@ -443,8 +468,9 @@ TEST_F(BlobFileBuilderTest, InlinedValues) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
-      &blob_file_paths, &blob_file_additions,
+      BlobFileCreationReason::kFlush, /*write_repair_metadata=*/false,
+      immutable_options.cf_paths.front().path, &blob_file_paths,
+      &blob_file_additions,
       /*blob_source=*/nullptr);
 
   for (size_t i = 0; i < number_of_blobs; ++i) {
@@ -499,8 +525,9 @@ TEST_F(BlobFileBuilderTest, Compression) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
-      &blob_file_paths, &blob_file_additions,
+      BlobFileCreationReason::kFlush, /*write_repair_metadata=*/false,
+      immutable_options.cf_paths.front().path, &blob_file_paths,
+      &blob_file_additions,
       /*blob_source=*/nullptr);
 
   const std::string key("1");
@@ -580,8 +607,9 @@ TEST_F(BlobFileBuilderTest, CompressionError) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
-      &blob_file_paths, &blob_file_additions,
+      BlobFileCreationReason::kFlush, /*write_repair_metadata=*/false,
+      immutable_options.cf_paths.front().path, &blob_file_paths,
+      &blob_file_additions,
       /*blob_source=*/nullptr);
 
   SyncPoint::GetInstance()->SetCallBack(
@@ -662,8 +690,9 @@ TEST_F(BlobFileBuilderTest, Checksum) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
-      &blob_file_paths, &blob_file_additions,
+      BlobFileCreationReason::kFlush, /*write_repair_metadata=*/false,
+      immutable_options.cf_paths.front().path, &blob_file_paths,
+      &blob_file_additions,
       /*blob_source=*/nullptr);
 
   const std::string key("1");
@@ -763,8 +792,9 @@ TEST_P(BlobFileBuilderIOErrorTest, IOError) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
-      &blob_file_paths, &blob_file_additions,
+      BlobFileCreationReason::kFlush, /*write_repair_metadata=*/false,
+      immutable_options.cf_paths.front().path, &blob_file_paths,
+      &blob_file_additions,
       /*blob_source=*/nullptr);
 
   SyncPoint::GetInstance()->SetCallBack(sync_point_, [this](void* arg) {

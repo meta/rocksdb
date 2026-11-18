@@ -535,12 +535,17 @@ Status CompactionOutputs::AddToOutput(
   const Slice& value = c_iter.value();
   // Decode a kTypeBlobIndex value once, and share the decode with the table
   // builder, the blob garbage meter and the file metadata update below. If the
-  // decode fails, each of them decodes again and reports the error as usual.
+  // compaction iterator already decoded this value (when it checked whether to
+  // flatten it), use that decode. If the decode fails, each of them decodes
+  // again and reports the error as usual.
   BlobIndex decoded_blob_index;
   const BlobIndex* shared_blob_index = nullptr;
-  if (c_iter.ikey().type == kTypeBlobIndex &&
-      decoded_blob_index.DecodeFrom(value).ok()) {
-    shared_blob_index = &decoded_blob_index;
+  if (c_iter.ikey().type == kTypeBlobIndex) {
+    if (c_iter.OutputBlobIndex() != nullptr) {
+      shared_blob_index = c_iter.OutputBlobIndex();
+    } else if (decoded_blob_index.DecodeFrom(value).ok()) {
+      shared_blob_index = &decoded_blob_index;
+    }
   }
   bool retried_after_new_table = false;
   while (true) {
@@ -657,8 +662,16 @@ Status CompactionOutputs::AddToOutput(
     smallest_preferred_seqno_ =
         std::min(smallest_preferred_seqno_, preferred_seqno);
   }
-  s = current_output().meta.UpdateBoundaries(key, value, ikey.sequence,
-                                             ikey.type, shared_blob_index);
+  const Version* const input_version = compaction_->input_version();
+  if (input_version != nullptr &&
+      input_version->storage_info()->HasBlobIndirectionFormat()) {
+    s = current_output().meta.UpdateBoundaries(
+        key, value, ikey.sequence, ikey.type, *input_version->storage_info(),
+        shared_blob_index);
+  } else {
+    s = current_output().meta.UpdateBoundaries(key, value, ikey.sequence,
+                                               ikey.type, shared_blob_index);
+  }
 
   return s;
 }

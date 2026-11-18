@@ -133,7 +133,10 @@
 //    finds file 20 in the file table directly. Flatten is a side effect of
 //    compaction: no job rewrites an SST only to flatten it.
 // 7. Route deletion. When no SST uses old file number 12 any more, a later
-//    MANIFEST edit removes its route (12 -> 20, or 12 -> 30 after step 4b).
+//    run of the census job (the background step that updates the blob
+//    reference counts after each install) writes a route deletion record,
+//    which removes its route (12 -> 20, or 12 -> 30 after step 4b). It is not
+//    a separate job (see DBImpl::RetireBlobRelocationRoutes()).
 //
 // MANIFEST records (codecs in this file and in VersionEdit)
 // ---------------------------------------------------------

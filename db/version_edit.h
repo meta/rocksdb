@@ -156,6 +156,7 @@ enum NewFileCustomTag : uint32_t {
 };
 
 class VersionSet;
+class VersionStorageInfo;
 
 constexpr uint64_t kFileNumberMask = 0x3FFFFFFFFFFFFFFF;
 constexpr uint64_t kUnknownOldestAncestorTime = 0;
@@ -495,6 +496,25 @@ struct FileMetaData {
   // of a kTypeBlobIndex `value`. It saves a second decode.
   Status UpdateBoundaries(const Slice& key, const Slice& value,
                           SequenceNumber seqno, ValueType value_type,
+                          const BlobIndex* decoded_blob_index);
+
+  // Like UpdateBoundaries() above, for compaction output when the input
+  // Version has the indirection format. `blob_relocation_storage` is the
+  // storage info of the compaction's pinned input Version. A flattened
+  // reference (generation number != origin), or a reference whose generation
+  // number has a route in `blob_relocation_storage`, does not set
+  // oldest_blob_file_number. Its value is in a relocation file, so it does not
+  // keep a normal blob file alive. Flush, RepairDB and compaction without the
+  // indirection format use the overload above.
+  Status UpdateBoundaries(const Slice& key, const Slice& value,
+                          SequenceNumber seqno, ValueType value_type,
+                          const VersionStorageInfo& blob_relocation_storage);
+
+  // Same as above, with the caller's decode of a kTypeBlobIndex `value` (or
+  // nullptr).
+  Status UpdateBoundaries(const Slice& key, const Slice& value,
+                          SequenceNumber seqno, ValueType value_type,
+                          const VersionStorageInfo& blob_relocation_storage,
                           const BlobIndex* decoded_blob_index);
 
   // Unlike UpdateBoundaries, ranges do not need to be presented in any

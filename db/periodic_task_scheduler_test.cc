@@ -339,8 +339,11 @@ TEST_F(PeriodicTaskSchedulerTest, CensusPendingInstallReturnsLowWorker) {
   // The install is paused while it holds its census install reservation. The
   // census worker must return and give its LOW pool thread back, and the census
   // stays not ready. If the worker kept retrying here, this wait would hang.
+  // The install reserved while the first worker ran, so that worker queues the
+  // CF once more when it ends (see blob_reference_census_rerun_ in
+  // column_family.h). The second worker also returns at once.
   dbfull()->TEST_WaitForBlobReferenceCensus();
-  ASSERT_EQ(started_workers.load(), 1U);
+  ASSERT_EQ(started_workers.load(), 2U);
   ASSERT_FALSE(census->IsReady(cfd->current()->GetVersionNumber()));
   {
     std::lock_guard<std::mutex> lock(gate_mutex);
@@ -354,7 +357,7 @@ TEST_F(PeriodicTaskSchedulerTest, CensusPendingInstallReturnsLowWorker) {
   // mutex. That cleanup must schedule the waiting CF again by itself, without a
   // timer, another write or a sleep.
   dbfull()->TEST_WaitForBlobReferenceCensus();
-  ASSERT_EQ(started_workers.load(), 2U);
+  ASSERT_EQ(started_workers.load(), 3U);
   ASSERT_TRUE(census->IsReady(cfd->current()->GetVersionNumber()));
   ASSERT_EQ(Get("key"), std::string(4096, 'v'));
 }

@@ -1971,8 +1971,9 @@ class DB {
     // the census tracks for GC, including files below the garbage threshold),
     // garbage-bytes-collectable, garbage-bytes-suppressed, coarse-pinned-files,
     // coarse-pinned-bytes, coarse-pinned-garbage-bytes, coarse-sst-count,
-    // lowest-coarse-frontier, idle-micros-with-candidates. Every *-micros key
-    // is a duration, never a timestamp.
+    // lowest-coarse-frontier, idle-micros-with-candidates,
+    // retirement-pending-micros. Every *-micros key is a duration, never a
+    // timestamp.
     static const std::string kIndirectBlobGcStats;
 
     // "rocksdb.blob-reference-census-unready-micros" - returns how long the

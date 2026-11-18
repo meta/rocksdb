@@ -110,19 +110,22 @@ Status BlobFileReader::Create(
   Statistics* const statistics = immutable_options.stats;
 
   CompressionType compression_type = kNoCompression;
+  // The footer value of a header with repair metadata, or nullopt. Any
+  // uint64_t is a valid footer value (it is a masked CRC32C, which can be 0).
+  std::optional<uint64_t> repair_metadata_footer_value;
 
   {
-    const Status s =
-        ReadHeader(file_reader.get(), read_options, column_family_id,
-                   statistics, &compression_type);
+    const Status s = ReadHeader(
+        file_reader.get(), read_options, column_family_id, blob_file_number,
+        statistics, &compression_type, &repair_metadata_footer_value);
     if (!s.ok()) {
       return s;
     }
   }
 
   if (!skip_footer_validation) {
-    const Status s =
-        ReadFooter(file_reader.get(), read_options, file_size, statistics);
+    const Status s = ReadFooter(file_reader.get(), read_options, file_size,
+                                statistics, repair_metadata_footer_value);
     if (!s.ok()) {
       return s;
     }
@@ -219,13 +222,14 @@ Status BlobFileReader::OpenFile(
   return Status::OK();
 }
 
-Status BlobFileReader::ReadHeader(const RandomAccessFileReader* file_reader,
-                                  const ReadOptions& read_options,
-                                  uint32_t column_family_id,
-                                  Statistics* statistics,
-                                  CompressionType* compression_type) {
+Status BlobFileReader::ReadHeader(
+    const RandomAccessFileReader* file_reader, const ReadOptions& read_options,
+    uint32_t column_family_id, uint64_t blob_file_number,
+    Statistics* statistics, CompressionType* compression_type,
+    std::optional<uint64_t>* repair_metadata_footer_value) {
   assert(file_reader);
   assert(compression_type);
+  assert(repair_metadata_footer_value);
 
   Slice header_slice;
   Buffer buf;
@@ -266,15 +270,25 @@ Status BlobFileReader::ReadHeader(const RandomAccessFileReader* file_reader,
   if (header.column_family_id != column_family_id) {
     return Status::Corruption("Column family ID mismatch");
   }
+  if (header.HasRepairMetadata() &&
+      header.repair_file_number != blob_file_number) {
+    return Status::Corruption("Blob repair file number mismatch");
+  }
 
   *compression_type = header.compression;
+  if (header.HasRepairMetadata()) {
+    *repair_metadata_footer_value = header.GetRepairMetadataFooterValue();
+  } else {
+    repair_metadata_footer_value->reset();
+  }
 
   return Status::OK();
 }
 
-Status BlobFileReader::ReadFooter(const RandomAccessFileReader* file_reader,
-                                  const ReadOptions& read_options,
-                                  uint64_t file_size, Statistics* statistics) {
+Status BlobFileReader::ReadFooter(
+    const RandomAccessFileReader* file_reader, const ReadOptions& read_options,
+    uint64_t file_size, Statistics* statistics,
+    std::optional<uint64_t> repair_metadata_footer_value) {
   assert(file_size >= BlobLogHeader::kSize + BlobLogFooter::kSize);
   assert(file_reader);
 
@@ -308,10 +322,14 @@ Status BlobFileReader::ReadFooter(const RandomAccessFileReader* file_reader,
     }
   }
 
-  constexpr ExpirationRange no_expiration_range;
-
-  if (footer.expiration_range != no_expiration_range) {
-    return Status::Corruption("Unexpected TTL blob file");
+  const ExpirationRange expected_range =
+      repair_metadata_footer_value.has_value()
+          ? ExpirationRange{file_size - BlobLogHeader::kSize -
+                                BlobLogFooter::kSize,
+                            *repair_metadata_footer_value}
+          : ExpirationRange{};
+  if (footer.expiration_range != expected_range) {
+    return Status::Corruption("Blob footer metadata does not match header");
   }
 
   return Status::OK();

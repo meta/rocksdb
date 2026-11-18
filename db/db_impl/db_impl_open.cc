@@ -3322,7 +3322,19 @@ void DBImpl::ScheduleBlobReferenceCensus(ColumnFamilyData* requested_cfd) {
   };
 
   const auto enqueue = [this, &needs_census](ColumnFamilyData* cfd) {
-    if (!needs_census(cfd) || cfd->queued_for_blob_reference_census_) {
+    const bool needed = needs_census(cfd);
+    if (cfd != nullptr && cfd->queued_for_blob_reference_census_) {
+      // A running census job may end after an apply after an install
+      // published the census, so the job queues the CF again at its end (see
+      // blob_reference_census_rerun_).
+      cfd->blob_reference_census_rerun_ |=
+          needed && cfd->blob_reference_census_running_;
+      return;
+    }
+    const bool rerun = cfd != nullptr &&
+                       std::exchange(cfd->blob_reference_census_rerun_, false);
+    if (!needed && !(rerun && !cfd->IsDropped() &&
+                     cfd->blob_reference_census() != nullptr)) {
       return;
     }
     cfd->blob_reference_census()->SetBuildWakeup(
@@ -3705,7 +3717,42 @@ Status DBImpl::BuildBlobReferenceCensus(ColumnFamilyData* cfd, bool* incomplete,
   if (!status.ok()) {
     return status;
   }
-  return PublishBlobReferenceCensusWorker(cfd, context.get(), incomplete);
+  const BlobReferenceCensus::RetirementSelection retirement_sources =
+      census.SelectWorkerRetirementSources(context->token);
+  status = PublishBlobReferenceCensusWorker(cfd, context.get(), incomplete);
+  if (!status.ok() || *incomplete) {
+    return status;
+  }
+  // The census is published. Route retirement runs only here, in the census
+  // job. It writes the MANIFEST, which can be slow and can fail. So the apply
+  // step that a flush or compaction thread runs after its install (see "Apply
+  // after an install" in db/blob/blob_reference_census.h) does not run it, and
+  // that thread is never delayed or failed by it.
+  bool retired = false;
+  status = RetireBlobRelocationRoutes(cfd, retirement_sources, &retired);
+  // Route retirement is optional cleanup, so its failure does not drop the
+  // census: a dropped census is rebuilt by reading every SST index again, and
+  // route retirement could then fail again in a loop. Two examples: TryAgain
+  // means that the state changed before the MANIFEST write. For example, an
+  // indirect blob GC job took a target as input, a running compaction holds a
+  // selected number, or another MANIFEST write installed a new Version.
+  // MemoryLimit means that the block cache refused the census snapshot charge.
+  // A MANIFEST write error already sets a background error. Only a shutdown, a
+  // dropped column family and Corruption stop the census here.
+  if (!status.ok() && !status.IsShutdownInProgress() &&
+      !status.IsColumnFamilyDropped() && !status.IsCorruption()) {
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "[%s] Blob route retirement skipped: %s",
+                   cfd->GetName().c_str(), status.ToString().c_str());
+    status = Status::OK();
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  // A route deletion installs a new Version. Mark the run incomplete, so the
+  // census worker runs again and catches up with that Version.
+  *incomplete |= retired;
+  return Status::OK();
 }
 
 Status DBImpl::PublishBlobReferenceCensusWorker(
@@ -4025,6 +4072,7 @@ void DBImpl::BGWorkBlobReferenceCensus(void* arg) {
     cfd->next_blob_reference_census_ = nullptr;
     // Keep queued=true while running: concurrent installs must not start a
     // second worker or duplicate this CF's intrusive queue entry.
+    cfd->blob_reference_census_running_ = true;
     should_build = !db->shutting_down_.load(std::memory_order_acquire) &&
                    !cfd->IsDropped();
   }
@@ -4101,6 +4149,7 @@ void DBImpl::BGWorkBlobReferenceCensus(void* arg) {
   bool retained_for_retry = false;
   {
     InstrumentedMutexLock lock(&db->mutex_);
+    cfd->blob_reference_census_running_ = false;
     cfd->queued_for_blob_reference_census_ = false;
     if (!status.ok()) {
       const std::shared_ptr<BlobReferenceCensusBuildContext> context =

@@ -12,6 +12,8 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -20,6 +22,7 @@
 
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_completion_callback.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/column_family.h"
 #include "db/compaction/compaction_iterator.h"
 #include "db/compaction/compaction_outputs.h"
@@ -359,6 +362,115 @@ class CompactionJob {
   void AggregateSubcompactionOutputAndJobStats();
   Status VerifyCompactionRecordCounts(bool stats_built_from_input_table_prop,
                                       uint64_t num_input_range_del);
+
+  // Compaction safety protocol for blob relocation
+  //
+  // Background: the exact reference metadata of an SST stores its references
+  // in reference groups. A reference group is the references of one SST that
+  // share an encoding class, a generation number and an origin
+  // (BlobReferenceGroup). For each indirect reference group of its exact
+  // inputs, a compaction output writes one of:
+  //   - the group's own generation number (a kept number),
+  //   - the route target of that number in the job's input Version (a
+  //     flattened number; a route target is always a live relocation file),
+  //   - neither, when compaction-time blob GC rewrites the value.
+  // While the compaction runs, indirect blob GC and route retirement can
+  // change routes and remove files. This section explains why every number
+  // that the output writes can still be read when the output is installed.
+  // No compaction waits for, or is retried because of, GC or route retirement.
+  //
+  // Why a kept number stays readable: the job's input SSTs hold the number,
+  // and they stay in the current Version until the job installs, because SSTs
+  // that are being compacted cannot be removed. So the census counts the
+  // number as held, and route retirement deletes only routes that no SST
+  // holds. GC never removes a route into an input that gets an output (see
+  // "Install protocol" in DBImpl::IndirectBlobGCJob::Install()).
+  //
+  // Why a flattened number stays readable: an example with file numbers, all
+  // of them example values.
+  //   1. The job's input Version has route 12 -> 20. The output says 20.
+  //   2. GC moves relocation file 20 into file 30. Its edit adds route
+  //      20 -> 30, because GC keeps a route for every number of a relocation
+  //      input that gets an output. A read of 20 now goes to 30.
+  //   3. No installed SST holds 20 yet, so route retirement could see route
+  //      20 -> 30 as unused. It does not delete it, because of the rule
+  //      below: 20 is a live file in the input Version of a running
+  //      compaction.
+  // The rule (DBImpl::RetireBlobRelocationRoutes()): route retirement skips
+  // route G -> X while G is a live blob file or relocation file in the input
+  // Version of any compaction in CompactionPicker::compactions_in_progress_.
+  // It checks this under the DB mutex when it filters the selected routes
+  // (step 3 of DBImpl::RetireBlobRelocationRoutes()), and again in the
+  // precondition of its MANIFEST write. A compaction that is picked later
+  // has an input Version where G is already a route, and file numbers are
+  // never reused, so it cannot write G.
+  //
+  // The safety depends on these invariants:
+  //   - A compaction stays in compactions_in_progress_ until its output Version
+  //     is installed: VersionSet::LogAndApply() runs the compaction's MANIFEST
+  //     write callback, which calls Compaction::ReleaseCompactionFiles().
+  //     VersionSet::ProcessManifestWrites() runs that callback at its end (the
+  //     finish_batch step), after it installs the new Versions.
+  //   - A failed MANIFEST write leaves nothing that a later check misses, so no
+  //     compaction needs to wait for it or retry after it. The failed edit may
+  //     or may not be on disk. After the failure,
+  //     VersionSet::ProcessManifestWrites() drops the candidate Versions of the
+  //     batch and resets the MANIFEST log. So the next write starts a new
+  //     MANIFEST file with the in-memory state (WriteCurrentStateToManifest()),
+  //     which does not hold the failed edit. The new files of the failed batch
+  //     are quarantined (ErrorHandler::AddFilesToQuarantine()), so no purge
+  //     deletes a file that the failed edit may have added.
+  //   - Only GC adds routes, and at most one GC job runs per column family.
+  //     A route target is always a live relocation file (one hop).
+  //   - Route retirement skips the inputs of the running GC job
+  //     (BlobReferenceCensus::IsGcInputFile()).
+  //   - Ingestion and import are assumed to add no indirect references (diff 12
+  //     rejects them). A flush references only the new blob files of its own
+  //     edit. A coarse SST holds no routed or flattened numbers.
+  //   - Flattening uses only the job's input Version.
+  //
+  // Checks at install:
+  //   1. Before the run, ValidateBlobRelocationInputGenerations() checks each
+  //      number in the job's own input Version. A number that cannot be read
+  //      there (a lost or dropped file) fails the job with Corruption.
+  //   2. After the run, PrepareBlobRelocationOutputDependencies() records the
+  //      physical file that each output number resolves to in the input
+  //      Version (the output dependencies).
+  //   3. At install, ValidateBlobRelocationOutputDependencies() runs in the
+  //      LogAndApply() precondition against the new current Version. It checks
+  //      only dependencies whose file metadata object changed. If a number
+  //      cannot be read, the install fails with Corruption. This should never
+  //      happen: the check guards the invariants above, so that a future bug
+  //      fails loudly instead of losing data.
+  //
+  // Coarse L0 inputs have no reference list. Until the install, a coarse
+  // input is still in the current Version, and its coarse frontier (the oldest
+  // indirect-origin file number a coarse SST may reference) pins every
+  // generation number at or above it: route retirement keeps those routes, and
+  // GC does not select those indirect-origin blob files. Coarse output does not
+  // flatten.
+  //
+  // Cost: for each selected number, the rule does one BlobFileTable lookup per
+  // running compaction whose input Version is not the Version that route
+  // retirement pinned. Route retirement selects at most
+  // kBlobRouteRetirementBatchSize (64) numbers. It runs the rule up to 3 times
+  // per retirement commit, all under the DB mutex: once in the step 3 filter,
+  // then twice in the LogAndApply() precondition, which runs before and after
+  // the unlocked apply. The compaction itself pays only for checks 1-3. These
+  // numbers are estimates, not measurements.
+  //
+  // Memory: ReserveBlobRelocationDependencyMemory() charges the output
+  // dependencies of check 2 to the block cache
+  // (CacheEntryRole::kBlobReferenceMetadataBuildingBuffer).
+  Status ValidateBlobRelocationInputGenerations();
+  // Calls `visit` for each indirect reference group of the job's exact inputs,
+  // in input order. It reads the reference summary of an input that has none
+  // in input_blob_reference_summaries_. Stops at the first non-OK status.
+  Status ForEachIndirectInputReferenceGroup(
+      const std::function<Status(const BlobReferenceGroup&)>& visit);
+  Status PrepareBlobRelocationOutputDependencies();
+  Status ReserveBlobRelocationDependencyMemory(size_t additional_bytes);
+  Status ValidateBlobRelocationOutputDependencies(const Version& current) const;
   void FinalizeCompactionRun(const Status& status,
                              bool stats_built_from_input_table_prop,
                              uint64_t num_input_range_del);
@@ -567,6 +679,27 @@ class CompactionJob {
   // write times.
   SequenceNumber preserve_seqno_after_ = kMaxSequenceNumber;
 
+  // One output dependency: a physical file (a normal blob file or a relocation
+  // file) that the output SSTs depend on. The map key below is the file number.
+  // `normal` is set for a normal blob file and `relocation` for a relocation
+  // file. Each holds the metadata object of the input Version. At install, the
+  // same object in the current Version means that the file did not change, so
+  // its numbers need no second check.
+  struct BlobOutputDependency {
+    std::shared_ptr<SharedBlobFileMetaData> normal;
+    std::shared_ptr<BlobRelocationFileMetaData> relocation;
+    // The generation numbers of the output references that resolve to this
+    // file (the map key) in the input Version.
+    std::vector<uint64_t> sources;
+  };
+
+  std::map<uint64_t, BlobOutputDependency> blob_output_dependencies_;
+
+  // Charges blob_output_dependencies_ to the block cache (see
+  // ReserveBlobRelocationDependencyMemory()).
+  std::shared_ptr<CacheReservationManager> blob_dependency_reservation_manager_;
+  size_t blob_dependency_reserved_bytes_ = 0;
+
   // Minimal sequence number to preclude the data from the last level. If the
   // key has bigger (newer) sequence number than this, it will be precluded from
   // the last level (output to proximal level).
@@ -622,6 +755,17 @@ class CompactionJob {
       CompactionFilter::MergeOrder /*merge_order*/) {
     return Status::OK();
   }
+
+  // True if the compaction iterator may flatten generation numbers. A remote
+  // compaction (the CompactionService worker side) does not flatten.
+  virtual bool AllowBlobIndexFlattening() const {
+    return !IsRemoteCompaction();
+  }
+
+  // False makes the job SST-only: a value that needs blob-file output ends the
+  // job with TryAgain (see CompactionIterator::SetSstOnlyBlobOutputPolicy()).
+  virtual bool AllowBlobFileCreation() const { return true; }
+
   // The rate limiter priority (io_priority) is determined dynamically here.
   // The Compaction Read and Write priorities are the same for different
   // scenarios, such as write stalled.

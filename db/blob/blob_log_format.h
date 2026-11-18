@@ -10,6 +10,7 @@
 #include <memory>
 #include <utility>
 
+#include "db/blob/blob_constants.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
@@ -18,7 +19,13 @@
 namespace ROCKSDB_NAMESPACE {
 
 constexpr uint32_t kMagicNumber = 2395959;  // 0x00248f37
+// Version 1: the base blob file format.
 constexpr uint32_t kVersion1 = 1;
+// Version 2: like version 1, plus repair fields, and the file has no TTL. The
+// header stores the file's own number. The footer stores the byte count between
+// the header and the footer, and a CRC of the header (see the header and footer
+// formats below).
+constexpr uint32_t kVersion2 = 2;
 
 using ExpirationRange = std::pair<uint64_t, uint64_t>;
 
@@ -33,10 +40,21 @@ using ExpirationRange = std::pair<uint64_t, uint64_t>;
 //    +--------------+---------+---------+-------+-------------+-------------------+
 //
 // List of flags:
-//   has_ttl: Whether the file contain TTL data.
+//   has_ttl (bit 0): the file contains TTL data. Version 1 only.
+//   is_indirect_origin (bit 2): the BlobIndexes for this file's values are
+//     kIndirectBlob (see blob_index.h). Version 2 only.
+//   Bit 1 is not used. DecodeFrom() returns Corruption for any flag bit that
+//   the version does not allow, so bit 1 is always rejected.
 //
-// Expiration range in the header is a rough range based on
+// Version 1: the expiration range in the header is a rough range based on
 // blob_db_options.ttl_range_secs.
+// Version 2: the file always has the repair fields. The first
+// expiration-range field holds the file's own number (not 0), and the second
+// one holds 0. The file has no TTL.
+//
+// DecodeFrom() returns Corruption for an unknown version, for a flag that the
+// version does not allow, and, in version 2, for file number 0 or a nonzero
+// second field.
 
 // clang-format on
 
@@ -55,9 +73,20 @@ struct BlobLogHeader {
   uint32_t column_family_id = 0;
   CompressionType compression = kNoCompression;
   bool has_ttl = false;
+  bool is_indirect_origin = false;
+  // Version 2 only.
+  uint64_t repair_file_number = kInvalidBlobFileNumber;
   ExpirationRange expiration_range;
 
-  void EncodeTo(std::string* dst);
+  // True for a version 2 header, which has the repair fields.
+  bool HasRepairMetadata() const { return version == kVersion2; }
+
+  void EncodeTo(std::string* dst) const;
+
+  // Returns the value that the footer of a version 2 file stores: the masked
+  // CRC32C of the encoded header. The header has no checksum of its own, so
+  // this protects its column family, file number, compression and flags.
+  uint64_t GetRepairMetadataFooterValue() const;
 
   Status DecodeFrom(Slice slice);
 };
@@ -75,7 +104,12 @@ struct BlobLogHeader {
 // The footer will be presented only when the blob file is properly closed.
 //
 // Unlike the same field in file header, expiration range in the footer is the
-// range of smallest and largest expiration of the data in this file.
+// range of smallest and largest expiration of the data in this file. A version
+// 2 file has no TTL, so it uses these two fields for other data. The first
+// field holds the bytes between the header and the footer: the file size minus
+// BlobLogHeader::kSize and BlobLogFooter::kSize. The second field holds
+// BlobLogHeader::GetRepairMetadataFooterValue(): the masked CRC32C of the
+// header.
 
 // clang-format on
 

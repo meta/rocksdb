@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <exception>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -26,7 +27,6 @@
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_builder.h"
 #include "db/blob/blob_reference_census.h"
-#include "db/blob/blob_reference_metadata.h"
 #include "db/blob/missing_blob_repair_iterator.h"
 #include "db/builder.h"
 #include "db/compaction/clipping_iterator.h"
@@ -1270,6 +1270,247 @@ Status CompactionJob::VerifyCompactionRecordCounts(
   return status;
 }
 
+Status CompactionJob::ForEachIndirectInputReferenceGroup(
+    const std::function<Status(const BlobReferenceGroup&)>& visit) {
+  Compaction* const compaction = compact_->compaction;
+  ColumnFamilyData* const cfd = compaction->column_family_data();
+  ReadOptions read_options(Env::IOActivity::kCompaction);
+  read_options.fill_cache = false;
+  read_options.rate_limiter_priority = GetRateLimiterPriority();
+  // The inputs' summaries were read at the start of Run() for the census.
+  // An input without one (its read failed, or the read stopped at an earlier
+  // input) is read here and dropped after its groups are visited.
+  std::map<uint64_t, const BlobReferenceSstSummary*> read_summaries;
+  for (const std::shared_ptr<const BlobReferenceSstSummary>& summary :
+       input_blob_reference_summaries_) {
+    read_summaries.emplace(summary->file_number, summary.get());
+  }
+  for (const CompactionInputFiles& level : *compaction->inputs()) {
+    for (const FileMetaData* file : level.files) {
+      if (file->blob_reference_descriptor.empty()) {
+        continue;
+      }
+      std::shared_ptr<const BlobReferenceSstSummary> read_summary;
+      const BlobReferenceSstSummary* summary = nullptr;
+      const auto found = read_summaries.find(file->fd.GetNumber());
+      if (found != read_summaries.end()) {
+        summary = found->second;
+      } else {
+        Status status = cfd->table_cache()->ReadBlobReferenceSstSummary(
+            read_options, file_options_, cfd->internal_comparator(), *file,
+            compaction->mutable_cf_options(), &read_summary,
+            /*reservation_manager=*/nullptr);
+        if (!status.ok()) {
+          return status;
+        }
+        summary = read_summary.get();
+      }
+      for (const BlobReferenceGroup& group : summary->groups) {
+        if (group.encoding_class == BlobReferenceEncodingClass::kDirect) {
+          continue;
+        }
+        Status status = visit(group);
+        if (!status.ok()) {
+          return status;
+        }
+      }
+    }
+  }
+  return Status::OK();
+}
+
+Status CompactionJob::ValidateBlobRelocationInputGenerations() {
+  Version* const input = compact_->compaction->input_version();
+  if (input == nullptr || !input->storage_info()->HasBlobIndirectionFormat()) {
+    return Status::OK();
+  }
+  // Check 1 of "Compaction safety protocol for blob relocation" in
+  // compaction_job.h. For each indirect reference group of the exact inputs,
+  // the output writes the generation number (kept), its route target
+  // (flattened), or neither. ValidateBlobReferenceGeneration() follows the
+  // route of the generation number, so one check per group covers both.
+  // A number that the input Version cannot read (for example, its blob file
+  // was lost) fails the job: a later run on the same input files cannot do
+  // better.
+  return ForEachIndirectInputReferenceGroup(
+      [input](const BlobReferenceGroup& group) {
+        const uint64_t generation = group.generation_file_number;
+        Status status = input->ValidateBlobReferenceGeneration(generation);
+        TEST_SYNC_POINT_CALLBACK(
+            "CompactionJob::ValidateBlobRelocationInputGenerations:Status",
+            &status);
+        if (status.ok()) {
+          return status;
+        }
+        return Status::Corruption(
+            "Blob compaction input references an unreadable generation "
+            "number (generation " +
+                std::to_string(generation) + ")",
+            status.ToString());
+      });
+}
+
+Status CompactionJob::ReserveBlobRelocationDependencyMemory(
+    size_t additional_bytes) {
+  if (additional_bytes >
+      std::numeric_limits<size_t>::max() - blob_dependency_reserved_bytes_) {
+    return Status::MemoryLimit("Blob output dependency size overflow");
+  }
+  if (blob_dependency_reservation_manager_ == nullptr &&
+      blob_dependency_reserved_bytes_ == 0) {
+    const BlockBasedTableOptions* options = GetBlockBasedTableWriterOptions(
+        compact_->compaction->mutable_cf_options().table_factory.get());
+    if (options != nullptr && options->block_cache != nullptr &&
+        options->cache_usage_options.options_overrides
+                .at(CacheEntryRole::kBlobReferenceMetadataBuildingBuffer)
+                .charged != CacheEntryRoleOptions::Decision::kDisabled) {
+      blob_dependency_reservation_manager_ =
+          std::make_shared<CacheReservationManagerImpl<
+              CacheEntryRole::kBlobReferenceMetadataBuildingBuffer>>(
+              options->block_cache);
+    }
+  }
+  const size_t bytes = blob_dependency_reserved_bytes_ + additional_bytes;
+  if (blob_dependency_reservation_manager_ != nullptr) {
+    Status status =
+        blob_dependency_reservation_manager_->UpdateCacheReservation(bytes);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  blob_dependency_reserved_bytes_ = bytes;
+  return Status::OK();
+}
+
+Status CompactionJob::PrepareBlobRelocationOutputDependencies() {
+  const VersionStorageInfo* const storage =
+      compact_->compaction->input_version()->storage_info();
+  // Groups of many outputs can name the same generation number. Each one is
+  // resolved once: the set holds the generation numbers already added to a
+  // dependency. It has at most one entry per entry of the dependency sources,
+  // and it lives only during this call.
+  UnorderedSet<uint64_t> resolved_generations;
+  for (const SubcompactionState& subcompaction : compact_->sub_compact_states) {
+    for (const CompactionOutputs::Output& output : subcompaction.GetOutputs()) {
+      const auto& summary = output.meta.blob_reference_summary;
+      if (summary == nullptr) {
+        continue;
+      }
+      for (const BlobReferenceGroup& group : summary->groups) {
+        if (group.encoding_class == BlobReferenceEncodingClass::kDirect) {
+          continue;
+        }
+        const uint64_t generation = group.generation_file_number;
+        if (resolved_generations.count(generation) != 0) {
+          continue;
+        }
+        const uint64_t route_target =
+            storage->GetBlobRelocationRouteTarget(generation);
+        const uint64_t target =
+            route_target != kInvalidBlobFileNumber ? route_target : generation;
+        const auto normal = storage->GetBlobFileMetaData(target);
+        const auto relocation = storage->GetBlobRelocationFileMetaData(target);
+        if (normal == nullptr && relocation == nullptr) {
+          // A freshly written indirect origin belongs to this edit rather than
+          // the input Version. VersionBuilder validates its addition normally.
+          bool fresh_indirect_origin = false;
+          for (const auto& file :
+               subcompaction.Current().GetBlobFileAdditions()) {
+            fresh_indirect_origin |=
+                file.GetBlobFileNumber() == target && file.IsIndirectOrigin();
+          }
+          if (!fresh_indirect_origin) {
+            return Status::Corruption(
+                "Compaction emitted an unowned blob dependency");
+          }
+          continue;
+        }
+        auto iterator = blob_output_dependencies_.find(target);
+        if (iterator == blob_output_dependencies_.end()) {
+          // A std::map node adds about 4 pointers to its value (an
+          // estimate).
+          Status status = ReserveBlobRelocationDependencyMemory(
+              sizeof(decltype(blob_output_dependencies_)::value_type) +
+              4 * sizeof(void*));
+          if (!status.ok()) {
+            return status;
+          }
+          iterator = blob_output_dependencies_.try_emplace(target).first;
+        }
+        BlobOutputDependency& dependency = iterator->second;
+        dependency.normal =
+            normal != nullptr ? normal->GetSharedMeta() : nullptr;
+        dependency.relocation = relocation;
+        if (dependency.sources.size() == dependency.sources.capacity()) {
+          const size_t old_capacity = dependency.sources.capacity();
+          if (old_capacity > dependency.sources.max_size() / 2) {
+            return Status::MemoryLimit("Blob output dependency count overflow");
+          }
+          const size_t capacity = std::max(size_t{1}, old_capacity * 2);
+          if (capacity >
+              std::numeric_limits<size_t>::max() / sizeof(uint64_t)) {
+            return Status::MemoryLimit("Blob output dependency bytes overflow");
+          }
+          Status status = ReserveBlobRelocationDependencyMemory(
+              (capacity - old_capacity) * sizeof(uint64_t));
+          if (!status.ok()) {
+            return status;
+          }
+          dependency.sources.reserve(capacity);
+        }
+        dependency.sources.push_back(generation);
+        resolved_generations.insert(generation);
+      }
+    }
+  }
+  for (auto& entry : blob_output_dependencies_) {
+    std::sort(entry.second.sources.begin(), entry.second.sources.end());
+    entry.second.sources.erase(
+        std::unique(entry.second.sources.begin(), entry.second.sources.end()),
+        entry.second.sources.end());
+  }
+  return Status::OK();
+}
+
+Status CompactionJob::ValidateBlobRelocationOutputDependencies(
+    const Version& current) const {
+  const VersionStorageInfo* const storage = current.storage_info();
+  for (const auto& entry : blob_output_dependencies_) {
+    const BlobOutputDependency& dependency = entry.second;
+    const auto normal = storage->GetBlobFileMetaData(entry.first);
+    // If the target file is the same metadata object as in the input Version,
+    // the file still exists. A generation number could then become unreadable
+    // only if its route were deleted. That cannot happen: route retirement
+    // skips the numbers of running compactions, and the coarse frontier (the
+    // oldest indirect-origin file number a coarse SST may reference) keeps the
+    // routes of coarse L0 inputs (see "Compaction safety protocol for blob
+    // relocation" in compaction_job.h). So only a changed file needs a check of
+    // each generation number.
+    if ((dependency.normal != nullptr && normal != nullptr &&
+         normal->GetSharedMeta() == dependency.normal) ||
+        (dependency.relocation != nullptr &&
+         storage->GetBlobRelocationFileMetaData(entry.first) ==
+             dependency.relocation)) {
+      continue;
+    }
+    // The target file changed, so check each generation number again.
+    for (uint64_t generation : dependency.sources) {
+      const Status status = current.ValidateBlobReferenceGeneration(generation);
+      if (status.ok()) {
+        continue;
+      }
+      // An invariant of the safety protocol failed. Fail the install, so that
+      // no output names a number that cannot be read.
+      return Status::Corruption(
+          "Compaction output references an unreadable generation number "
+          "(generation " +
+              std::to_string(generation) + ")",
+          status.ToString());
+    }
+  }
+  return Status::OK();
+}
+
 void CompactionJob::FinalizeCompactionRun(
     const Status& input_status, bool stats_built_from_input_table_prop,
     uint64_t num_input_range_del) {
@@ -1340,6 +1581,12 @@ void CompactionJob::ReadInputBlobReferenceSummaries() {
 Status CompactionJob::Run() {
   InitializeCompactionRun();
   ReadInputBlobReferenceSummaries();
+  Status input_check_status = ValidateBlobRelocationInputGenerations();
+  if (!input_check_status.ok()) {
+    compact_->status = input_check_status;
+    ReleaseSubcompactionResources();
+    return input_check_status;
+  }
 
   const uint64_t start_micros = db_options_.clock->NowMicros();
 
@@ -1384,6 +1631,10 @@ Status CompactionJob::Run() {
   if (status.ok()) {
     status = VerifyCompactionRecordCounts(stats_built_from_input_table_prop,
                                           num_input_range_del);
+  }
+
+  if (status.ok()) {
+    status = PrepareBlobRelocationOutputDependencies();
   }
 
   FinalizeCompactionRun(status, stats_built_from_input_table_prop,
@@ -1567,7 +1818,16 @@ Status CompactionJob::Install(bool* compaction_released) {
     compact_->status = status;
   }
 
-  CleanupCompaction();
+  if (!blob_output_dependencies_.empty() ||
+      blob_dependency_reservation_manager_ != nullptr) {
+    db_mutex_->Unlock();
+    blob_output_dependencies_.clear();
+    blob_dependency_reservation_manager_.reset();
+    CleanupCompaction();
+    db_mutex_->Lock();
+  } else {
+    CleanupCompaction();
+  }
   return status;
 }
 
@@ -1637,6 +1897,64 @@ bool CompactionJob::ShouldUseLocalCompaction(SubcompactionState* sub_compact) {
     return true;
   }
   if (db_options_.compaction_service) {
+    if (sub_compact == nullptr || sub_compact->compaction == nullptr ||
+        compact_ == nullptr) {
+      return true;
+    }
+    Version* const input_version = sub_compact->compaction->input_version();
+    if (input_version == nullptr) {
+      return true;
+    }
+    const VersionStorageInfo* input_vstorage = input_version->storage_info();
+    const bool input_has_blob_indirection_format =
+        input_vstorage->HasBlobIndirectionFormat();
+    // A feature-aware compaction may read or write indirect values: its input
+    // Version has the indirection format, or enable_blob_indirection is on.
+    const bool feature_aware_compaction =
+        input_has_blob_indirection_format ||
+        sub_compact->compaction->mutable_cf_options().enable_blob_indirection;
+    if (input_has_blob_indirection_format &&
+        !sub_compact->compaction->mutable_cf_options()
+             .enable_blob_indirection &&
+        sub_compact->compaction->enable_blob_garbage_collection()) {
+      // With enable_blob_indirection off and compaction-time blob GC on, the
+      // compaction rewrites indirect values into legacy blob files or inline
+      // values. It reads them through its input Version, which keeps their
+      // files alive until the job ends. The job runs locally only as a
+      // conservative choice: remote workers have not been validated for this
+      // rewrite.
+      sub_compact->compaction_job_stats.is_remote_compaction = false;
+      return true;
+    }
+    const bool has_blob_gc_override =
+        sub_compact->compaction->enable_blob_garbage_collection() !=
+            sub_compact->compaction->mutable_cf_options()
+                .enable_blob_garbage_collection ||
+        sub_compact->compaction->blob_garbage_collection_age_cutoff() !=
+            sub_compact->compaction->mutable_cf_options()
+                .blob_garbage_collection_age_cutoff;
+    if (feature_aware_compaction && has_blob_gc_override) {
+      // The current CompactionService protocol rebuilds the blob GC options
+      // (enable_blob_garbage_collection and
+      // blob_garbage_collection_age_cutoff) from the persisted options file.
+      // So a job with a manual override of these options runs locally.
+      sub_compact->compaction_job_stats.is_remote_compaction = false;
+      return true;
+    }
+    if (feature_aware_compaction && (!input_has_blob_indirection_format ||
+                                     compact_->sub_compact_states.size() > 1)) {
+      // Feature-aware output (output of a compaction that may write indirect
+      // values) must be accepted or rejected as a whole. CompactionService
+      // runs each remote subcompaction as a separate job, so their outputs
+      // cannot be accepted or rejected together. The current CompactionService
+      // protocol also needs an input Version that already has the indirection
+      // format. The first activation compaction (the first compaction after
+      // enable_blob_indirection is turned on) has an input Version without
+      // this format. So jobs with several subcompactions and the first
+      // activation compaction run fully locally.
+      sub_compact->compaction_job_stats.is_remote_compaction = false;
+      return true;
+    }
     const ImmutableCFOptions& options =
         sub_compact->compaction->column_family_data()->ioptions();
     const CompactionFilterFactory* factory = nullptr;
@@ -1880,7 +2198,7 @@ void CompactionJob::CreateBlobFileBuilder(
 
   // TODO: BlobDB to support output_to_proximal_level compaction, which needs
   //  2 builders, so may need to move to `CompactionOutputs`
-  if (mutable_cf_options.enable_blob_files &&
+  if (AllowBlobFileCreation() && mutable_cf_options.enable_blob_files &&
       sub_compact->compaction->output_level() >=
           mutable_cf_options.blob_file_starting_level) {
     blob_file_builder = std::make_unique<BlobFileBuilder>(
@@ -1888,8 +2206,15 @@ void CompactionJob::CreateBlobFileBuilder(
         &sub_compact->compaction->immutable_options(), &mutable_cf_options,
         &file_options_, &write_options, db_id_, db_session_id_, job_id_,
         cfd->GetID(), cfd->GetName(), write_hint_, io_tracer_, blob_callback_,
-        BlobFileCreationReason::kCompaction, GetBlobOutputPath(),
-        sub_compact->Current().GetOutputFilePathsPtr(),
+        BlobFileCreationReason::kCompaction,
+        mutable_cf_options.enable_blob_indirection ||
+            (sub_compact->compaction->input_version() != nullptr &&
+             sub_compact->compaction->input_version()->storage_info() !=
+                 nullptr &&
+             sub_compact->compaction->input_version()
+                 ->storage_info()
+                 ->HasBlobIndirectionFormat()),
+        GetBlobOutputPath(), sub_compact->Current().GetOutputFilePathsPtr(),
         sub_compact->Current().GetBlobFileAdditionsPtr(),
         // Compaction output never prepopulates the blob cache (flush only).
         /*blob_source=*/nullptr);
@@ -1903,27 +2228,42 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
     InternalIterator* input, const CompactionFilter* compaction_filter,
     MergeHelper& merge, std::unique_ptr<BlobFileBuilder>& blob_file_builder,
     const WriteOptions& write_options) {
+  if (sub_compact == nullptr || sub_compact->compaction == nullptr) {
+    return nullptr;
+  }
+  const Compaction* const compaction = sub_compact->compaction;
   CreateBlobFileBuilder(sub_compact, cfd, blob_file_builder, write_options);
 
   const std::string* const full_history_ts_low =
       full_history_ts_low_.empty() ? nullptr : &full_history_ts_low_;
   assert(job_context_);
+  const bool allow_blob_index_flattening = AllowBlobIndexFlattening();
 
-  return std::make_unique<CompactionIterator>(
-      input, cfd->user_comparator(), &merge, versions_->LastSequence(),
-      &(job_context_->snapshot_seqs), earliest_snapshot_,
-      job_context_->earliest_write_conflict_snapshot,
-      job_context_->GetJobSnapshotSequence(), job_context_->snapshot_checker,
-      env_, ShouldReportDetailedTime(env_, stats_), sub_compact->RangeDelAgg(),
-      blob_file_builder.get(), db_options_.allow_data_in_errors,
-      db_options_.enforce_single_del_contracts, manual_compaction_canceled_,
-      sub_compact->compaction->DoesInputReferenceBlobFiles() ||
-          sub_compact->compaction
-              ->RepairsMissingBlobReferences() /* must_count_input_entries */,
-      sub_compact->compaction, compaction_filter, shutting_down_,
-      db_options_.info_log, full_history_ts_low, preserve_seqno_after_,
-      nullptr /* input_version */, Env::IOActivity::kCompaction,
-      GetBlobGarbageCollectionCutoffFileNumber());
+  std::unique_ptr<CompactionIterator> compaction_iterator =
+      std::make_unique<CompactionIterator>(
+          input, cfd->user_comparator(), &merge, versions_->LastSequence(),
+          &(job_context_->snapshot_seqs), earliest_snapshot_,
+          job_context_->earliest_write_conflict_snapshot,
+          job_context_->GetJobSnapshotSequence(),
+          job_context_->snapshot_checker, env_,
+          ShouldReportDetailedTime(env_, stats_), sub_compact->RangeDelAgg(),
+          blob_file_builder.get(), db_options_.allow_data_in_errors,
+          db_options_.enforce_single_del_contracts, manual_compaction_canceled_,
+          /*must_count_input_entries=*/
+          compaction->DoesInputReferenceBlobFiles() ||
+              compaction->RepairsMissingBlobReferences(),
+          allow_blob_index_flattening, compaction, compaction_filter,
+          shutting_down_, db_options_.info_log, full_history_ts_low,
+          preserve_seqno_after_, nullptr /* input_version */,
+          Env::IOActivity::kCompaction,
+          GetBlobGarbageCollectionCutoffFileNumber());
+  const MutableCFOptions& mutable_options = compaction->mutable_cf_options();
+  if (!AllowBlobFileCreation() && mutable_options.enable_blob_files &&
+      compaction->output_level() >= mutable_options.blob_file_starting_level) {
+    compaction_iterator->SetSstOnlyBlobOutputPolicy(
+        mutable_options.min_blob_size);
+  }
+  return compaction_iterator;
 }
 
 std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc>
@@ -2331,6 +2671,8 @@ void CompactionJob::ProcessLocalKeyValueCompaction(
                            prev_cpu_micros);
 
   status = FinalizeProcessKeyValueStatus(cfd, input_iter, c_iter.get(), status);
+
+  sub_compact->has_flattened_blob_index |= c_iter->HasFlattenedBlobIndex();
 
   FinalizeSubcompaction(sub_compact, status, open_file_func, close_file_func,
                         blob_file_builder.get(), c_iter.get(), input_iter,
@@ -2901,7 +3243,9 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
   compaction->AddInputDeletions(edit);
   edit->SetBlobReferenceSummariesOfDeletedFiles(
       std::move(input_blob_reference_summaries_));
-  for (const auto& sub_compact : compact_->sub_compact_states) {
+  bool has_flattened_blob_index = false;
+  for (auto& sub_compact : compact_->sub_compact_states) {
+    has_flattened_blob_index |= sub_compact.has_flattened_blob_index;
     sub_compact.AddOutputsEdit(edit);
 
     for (const auto& blob : sub_compact.Current().GetBlobFileAdditions()) {
@@ -2938,6 +3282,62 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
     *compaction_released = true;
   };
 
+  std::function<Status()> relocation_state_precondition;
+  if (has_flattened_blob_index || !blob_output_dependencies_.empty()) {
+    ColumnFamilyData* const cfd = compaction->column_family_data();
+    Version* const input_version = compaction->input_version();
+    if (cfd == nullptr || input_version == nullptr) {
+      return Status::Corruption(
+          "Missing compaction state for blob relocation update");
+    }
+    ColumnFamilyData& cfd_ref = *cfd;
+    // Check 3 of "Compaction safety protocol for blob relocation" in
+    // compaction_job.h: the output dependencies are checked against the
+    // current Version in the LogAndApply() precondition. The precondition can
+    // run more than once, so the check runs for each new current Version.
+    Version* validated_current = nullptr;
+    relocation_state_precondition = [this, &cfd_ref,
+                                     validated_current]() mutable {
+      // This precondition runs under the DB mutex while this compaction's
+      // writer is at the head of the MANIFEST writer queue. It pins the
+      // current Version, releases the DB mutex only for the check, and takes
+      // the mutex again. The check is linear in the number of output
+      // dependencies, plus a lookup per generation number only for target
+      // files that changed. Only a LogAndApply() call installs a Version, and
+      // every other writer waits behind this one, so the current Version
+      // cannot change during the check. A change would break that invariant:
+      // debug builds assert, and release builds fail the install with
+      // Corruption. The compaction never retries.
+      Version* const current = cfd_ref.current();
+      if (cfd_ref.IsDropped() || current == nullptr) {
+        return Status::ColumnFamilyDropped(
+            "Column family dropped before blob relocation update");
+      }
+      if (current == validated_current) {
+        return Status::OK();
+      }
+      current->Ref();
+      db_mutex_->Unlock();
+      Status status = ValidateBlobRelocationOutputDependencies(*current);
+      TEST_SYNC_POINT_CALLBACK(
+          "CompactionJob::ValidateBlobRelocationOutputDependencies", &status);
+      db_mutex_->Lock();
+      const bool unchanged = cfd_ref.current() == current;
+      current->UnrefAndFreeBlobRelocationState(db_mutex_);
+      if (!status.ok()) {
+        return status;
+      }
+      assert(unchanged);
+      if (!unchanged) {
+        return Status::Corruption(
+            "Current Version changed while the compaction held the MANIFEST "
+            "queue head");
+      }
+      validated_current = current;
+      return status;
+    };
+  }
+
   Status s;
   TEST_SYNC_POINT_CALLBACK(
       "CompactionJob::InstallCompactionResults:BeforeLogAndApply", &s);
@@ -2945,7 +3345,8 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
     s = versions_->LogAndApply(compaction->column_family_data(), read_options,
                                write_options, edit, db_mutex_, db_directory_,
                                /*new_descriptor_log=*/false,
-                               /*column_family_options=*/nullptr, manifest_wcb);
+                               /*column_family_options=*/nullptr, manifest_wcb,
+                               relocation_state_precondition);
   }
   return s;
 }
@@ -2976,6 +3377,10 @@ void CompactionJob::RecordCompactionIOStats() {
 Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
                                                CompactionOutputs& outputs) {
   assert(sub_compact != nullptr);
+  const Compaction* const compaction = sub_compact->compaction;
+  if (compaction == nullptr) {
+    return Status::InvalidArgument("Missing compaction state");
+  }
 
   // no need to lock because VersionSet::next_file_number_ is atomic
   uint64_t file_number = versions_->NewFileNumber();
@@ -3137,7 +3542,6 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
       sub_compact->compaction->max_output_file_size(), file_number,
       proximal_after_seqno_ /*last_level_inclusive_max_seqno_threshold*/,
       dbname_ /*db_name*/, IsRemoteCompaction() /*is_remote_compaction*/);
-  const Compaction* compaction = sub_compact->compaction;
   const Version* input_version = compaction->input_version();
   tboptions.track_blob_reference_classification = UsesBlobIndirection(
       compaction->mutable_cf_options(),

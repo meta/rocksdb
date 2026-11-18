@@ -166,17 +166,14 @@ uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id) {
   return number | (path_id * (kFileNumberMask + 1));
 }
 
-Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
-                                      SequenceNumber seqno,
-                                      ValueType value_type) {
-  return UpdateBoundaries(key, value, seqno, value_type,
-                          /*decoded_blob_index=*/nullptr);
-}
+namespace {
 
-Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
-                                      SequenceNumber seqno,
-                                      ValueType value_type,
-                                      const BlobIndex* decoded_blob_index) {
+Status UpdateFileMetaDataBoundaries(
+    FileMetaData* meta, const Slice& key, const Slice& value,
+    SequenceNumber seqno, ValueType value_type,
+    const VersionStorageInfo* blob_relocation_storage,
+    const BlobIndex* decoded_blob_index) {
+  assert(meta != nullptr);
   // Helper: update oldest_blob_file_number from a single BlobIndex.
   auto update_oldest_blob = [&](const BlobIndex& blob_index) -> Status {
     if (!blob_index.IsInlined() && !blob_index.HasTTL()) {
@@ -201,9 +198,33 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
         return Status::Corruption("Invalid blob file number");
       }
 
-      if (oldest_blob_file_number == kInvalidBlobFileNumber ||
-          oldest_blob_file_number > blob_index.file_number()) {
-        oldest_blob_file_number = blob_index.file_number();
+      uint64_t normal_blob_file_number = blob_index.file_number();
+      if (blob_index.IsIndirect() && blob_relocation_storage != nullptr) {
+        // A flattened reference points to a relocation file. A routed
+        // generation number names a file that indirect blob GC collected, and
+        // the route target, a relocation file, holds its value. Neither keeps a
+        // normal blob file alive.
+        // This runs once per output reference, so skip the route lookup when
+        // the Version has no routes.
+        const uint64_t generation = blob_index.generation_file_number();
+        // A generation number at or above the current oldest cannot lower it,
+        // so the route lookup below is not needed.
+        if (meta->oldest_blob_file_number != kInvalidBlobFileNumber &&
+            generation >= meta->oldest_blob_file_number) {
+          return Status::OK();
+        }
+        if (generation != blob_index.origin_file_number() ||
+            (blob_relocation_storage->GetBlobRelocationRouteCount() != 0 &&
+             blob_relocation_storage->GetBlobRelocationRouteTarget(
+                 generation) != kInvalidBlobFileNumber)) {
+          return Status::OK();
+        }
+        normal_blob_file_number = generation;
+      }
+
+      if (meta->oldest_blob_file_number == kInvalidBlobFileNumber ||
+          meta->oldest_blob_file_number > normal_blob_file_number) {
+        meta->oldest_blob_file_number = normal_blob_file_number;
       }
     }
     return Status::OK();
@@ -230,14 +251,47 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
     }
   }
 
-  if (smallest.size() == 0) {
-    smallest.DecodeFrom(key);
+  if (meta->smallest.size() == 0) {
+    meta->smallest.DecodeFrom(key);
   }
-  largest.DecodeFrom(key);
-  fd.smallest_seqno = std::min(fd.smallest_seqno, seqno);
-  fd.largest_seqno = std::max(fd.largest_seqno, seqno);
+  meta->largest.DecodeFrom(key);
+  meta->fd.smallest_seqno = std::min(meta->fd.smallest_seqno, seqno);
+  meta->fd.largest_seqno = std::max(meta->fd.largest_seqno, seqno);
 
   return Status::OK();
+}
+
+}  // namespace
+
+Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
+                                      SequenceNumber seqno,
+                                      ValueType value_type) {
+  return UpdateFileMetaDataBoundaries(this, key, value, seqno, value_type,
+                                      nullptr, nullptr);
+}
+
+Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
+                                      SequenceNumber seqno,
+                                      ValueType value_type,
+                                      const BlobIndex* decoded_blob_index) {
+  return UpdateFileMetaDataBoundaries(this, key, value, seqno, value_type,
+                                      nullptr, decoded_blob_index);
+}
+
+Status FileMetaData::UpdateBoundaries(
+    const Slice& key, const Slice& value, SequenceNumber seqno,
+    ValueType value_type, const VersionStorageInfo& blob_relocation_storage) {
+  return UpdateFileMetaDataBoundaries(this, key, value, seqno, value_type,
+                                      &blob_relocation_storage, nullptr);
+}
+
+Status FileMetaData::UpdateBoundaries(
+    const Slice& key, const Slice& value, SequenceNumber seqno,
+    ValueType value_type, const VersionStorageInfo& blob_relocation_storage,
+    const BlobIndex* decoded_blob_index) {
+  return UpdateFileMetaDataBoundaries(this, key, value, seqno, value_type,
+                                      &blob_relocation_storage,
+                                      decoded_blob_index);
 }
 
 size_t FileMetaData::BlobReferenceSummaryMemoryUsage() const {

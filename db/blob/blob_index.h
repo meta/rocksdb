@@ -289,6 +289,22 @@ class BlobIndex {
     return offset_;
   }
 
+  // Rewrites the generation number (flatten). The type follows the new
+  // generation number: kIndirectBlob when it equals the origin,
+  // kIndirectFlattenedBlob when it is above it. It returns InvalidArgument if
+  // the index is not indirect or the new generation number is below the
+  // origin.
+  Status SetGenerationFileNumber(uint64_t generation_file_number) {
+    if (!IsIndirect() || generation_file_number < origin_file_number_) {
+      return Status::InvalidArgument("Invalid indirect blob generation");
+    }
+    file_number_ = generation_file_number;
+    type_ = generation_file_number == origin_file_number_
+                ? Type::kIndirectBlob
+                : Type::kIndirectFlattenedBlob;
+    return Status::OK();
+  }
+
   uint32_t stable_checksum() const {
     assert(IsIndirect());
     return stable_checksum_;

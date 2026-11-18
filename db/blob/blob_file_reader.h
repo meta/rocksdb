@@ -238,14 +238,18 @@ class BlobFileReader {
                          std::unique_ptr<RandomAccessFileReader>* file_reader,
                          bool skip_footer_size_check, bool is_relocation_file);
 
-  static Status ReadHeader(const RandomAccessFileReader* file_reader,
-                           const ReadOptions& read_options,
-                           uint32_t column_family_id, Statistics* statistics,
-                           CompressionType* compression_type);
+  static Status ReadHeader(
+      const RandomAccessFileReader* file_reader,
+      const ReadOptions& read_options, uint32_t column_family_id,
+      uint64_t blob_file_number, Statistics* statistics,
+      CompressionType* compression_type,
+      std::optional<uint64_t>* repair_metadata_footer_value);
 
-  static Status ReadFooter(const RandomAccessFileReader* file_reader,
-                           const ReadOptions& read_options, uint64_t file_size,
-                           Statistics* statistics);
+  static Status ReadFooter(
+      const RandomAccessFileReader* file_reader,
+      const ReadOptions& read_options, uint64_t file_size,
+      Statistics* statistics,
+      std::optional<uint64_t> repair_metadata_footer_value);
 
   using Buffer = std::unique_ptr<char[]>;
 

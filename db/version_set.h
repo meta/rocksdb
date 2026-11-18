@@ -1645,6 +1645,15 @@ class Version {
 
   const MutableCFOptions& GetMutableCFOptions() { return mutable_cf_options_; }
 
+  // Checks that a reference with generation number `generation` can still be
+  // read in this Version, with the same file table rules as an indirect read,
+  // without opening a file: `generation` is a live indirect-origin blob file, a
+  // live relocation file, or a route to a live relocation file. Returns
+  // NotFound for a relocation file marked lost and Corruption otherwise.
+  // Compaction uses it to check the generation numbers that its output SSTs
+  // write.
+  Status ValidateBlobReferenceGeneration(uint64_t generation) const;
+
   InternalIterator* TEST_GetLevelIterator(
       const ReadOptions& read_options, MergeIteratorBuilder* merge_iter_builder,
       int level, bool allow_unprepared_value);
@@ -1958,20 +1967,20 @@ class VersionSet {
   // when every column family is dropped, or when pre_cb fails. They must not
   // call user code or do I/O.
   //
-  // pre_cb: when pre_cb is set, the call gets no group commit with other
-  // calls. An earlier leader does not take the writers of this call into its
-  // batch, and the batch of this call does not take the writers of a later
-  // call. When the call reaches the queue head, pre_cb runs under the DB mutex.
-  // If the batch writes a MANIFEST record, each edit of the call's first
-  // column family that changes a Version is then applied without the DB mutex
+  // pre_cb: an optional check that the caller's edit is still valid. For
+  // example, indirect blob GC checks that its input is still installable. When
+  // pre_cb is set, the call gets no group commit with other calls. An earlier
+  // leader does not take the writers of this call into its batch, and the batch
+  // of this call does not take the writers of a later call. When the call
+  // reaches the queue head, pre_cb runs under the DB mutex. If the batch writes
+  // a MANIFEST record, each edit of the call's first column family that changes
+  // a Version is then applied without the DB mutex
   // (VersionSet::LogAndApplyHelper()), and pre_cb runs again after each such
   // edit, because the caller's state can change meanwhile. So a call with one
-  // such edit runs pre_cb twice, and pre_cb must be safe to run more than
-  // once. The edits of the other column families of the call are applied
-  // under the DB mutex. Dummy edits (SetOptions()) write no MANIFEST record
-  // and are applied under the DB mutex, so their pre_cb runs once.
-  // Intended user: indirect blob GC, which checks that its input is still
-  // installable.
+  // such edit runs pre_cb twice, and pre_cb must be safe to run more than once.
+  // The edits of the other column families of the call are applied under the DB
+  // mutex. Dummy edits (SetOptions()) write no MANIFEST record and are applied
+  // under the DB mutex, so their pre_cb runs once.
   virtual Status LogAndApply(
       const autovector<ColumnFamilyData*>& cfds,
       const ReadOptions& read_options, const WriteOptions& write_options,

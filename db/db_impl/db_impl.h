@@ -3360,6 +3360,78 @@ class DBImpl : public DB
                                const std::vector<CompactionInputFiles>& inputs,
                                bool* sfm_bookkeeping, LogBuffer* log_buffer);
 
+  // Route retirement deletes the routes that no SST uses any more. It sets
+  // `*made_progress` when it wrote a route deletion edit.
+  //
+  // Background: the census job (BuildBlobReferenceCensus() in
+  // db_impl_open.cc) calls this without the DB mutex, right after it publishes
+  // a ready census. `selected` holds up to kBlobRouteRetirementBatchSize (64)
+  // routed generation numbers with no holder (see
+  // BlobReferenceCensus::SelectWorkerRetirementSources()). Two places delete
+  // routes: this function, and the indirect blob GC install edit. The GC edit
+  // deletes the routes into a relocation input only when that input gets no
+  // output. When the input gets an output, the edit re-points all routes into
+  // it to the output, held or not, and this function deletes the unheld ones
+  // later (see "Install protocol" in IndirectBlobGCJob::Install()).
+  // Compaction never decides from its own inputs that a generation number is
+  // unused.
+  //
+  // Running compactions: a compaction may write a generation number that no
+  // installed SST holds yet. It writes the route target of a number in its
+  // input Version (a flattened number). So this function never deletes route
+  // G -> X while G is a live file in the input Version of a running
+  // compaction. "Compaction safety protocol for blob relocation" in
+  // db/compaction/compaction_job.h gives an example and the invariants. With
+  // this rule, no compaction waits for or is retried because of route
+  // retirement.
+  //
+  // Steps:
+  // 1. Pin the current Version.
+  // 2. Without the DB mutex, read a census snapshot of the selected generation
+  //    numbers.
+  // 3. Under the DB mutex, keep a generation number G only if all of these
+  //    are true:
+  //    - no SST holds it (the census snapshot has no holder for it);
+  //    - it is below the lowest coarse frontier of the Version, or there is no
+  //      coarse frontier (the coarse frontier of an SST is the oldest
+  //      indirect-origin file number a coarse SST may reference);
+  //    - it still has a route;
+  //    - its route target is not an input of the running GC job;
+  //    - G is not a live blob file or relocation file in the input Version of
+  //      any compaction in CompactionPicker::compactions_in_progress_.
+  //      Compactions with no input Version write no SST data and are skipped.
+  //      This costs at most one BlobFileTable lookup per selected number and
+  //      per running compaction whose input Version is not the pinned
+  //      Version.
+  // 4. Batch: write nothing unless this call can delete 64 routes (a full
+  //    selection), or routes have been pending for
+  //    kBlobRouteRetirementMaxPendingMicros (10 minutes). The census stores
+  //    only the time when routes were first left pending. A deferred call
+  //    still reads the census snapshot in step 2, because the number of routes
+  //    to delete is known only after steps 2 and 3. The 10-minute wait is
+  //    checked only here, when the census job runs after an install. So in an
+  //    idle column family, waiting routes stay until the next install. They
+  //    cost only Version memory: when no SST uses a relocation file, indirect
+  //    blob GC removes it as an empty input, and that edit deletes the routes
+  //    into it.
+  // 5. Write the route deletion records as a metadata commit: the
+  //    LogAndApply() precondition calls BeginMetadataCommit(). The
+  //    precondition returns TryAgain if the current Version is not the pinned
+  //    Version, if the census changed, or if a route target became a GC
+  //    input. It also runs the running-compaction check of step 3 again. A
+  //    compaction picked after step 3 has the pinned Version as its input
+  //    Version, where G is already a route, so the check matters only for
+  //    compactions registered before step 3, and it costs little.
+  // 6. If the MANIFEST write fails with an I/O error, the result is unknown.
+  //    Set a background error, so MANIFEST recovery decides the result. Until
+  //    then, GC jobs and route retirement wait (BeginGcJob() returns Busy).
+  //    Compactions do not wait: both possible results keep every number that
+  //    a running compaction may write.
+  Status RetireBlobRelocationRoutes(
+      ColumnFamilyData* cfd,
+      const BlobReferenceCensus::RetirementSelection& selected,
+      bool* made_progress);
+
   // Runs one indirect blob GC job. The job collects 1 to 8 input files (normal
   // blob files or relocation files) of `cfd`, whose file numbers are
   // `candidate_physical_file_numbers`, into new relocation files, and installs
