@@ -3219,6 +3219,142 @@ TEST_P(DBAtomicFlushTest, FlushMultipleCFsDropSomeBeforeRequestFlush) {
   Destroy(options);
 }
 
+TEST_P(DBAtomicFlushTest, AllColumnFamiliesDroppedWhileInstallWaits) {
+  // An atomic flush of column family 1 writes its SST and queues its MANIFEST
+  // writer. A drop of that column family is queued ahead of it, so when the
+  // writer reaches the head of the queue every column family of the group is
+  // dropped. LogAndApply() then returns ColumnFamilyDropped without calling
+  // any writer callback, so InstallMemtableAtomicFlushResults() updates the
+  // memtable list itself, once, with that error (the test counts the sync
+  // point
+  // MemTableList::InstallMemtableAtomicFlushResults:PublishWithoutCallback).
+  // The DB stays usable and reopens. (A second drop cannot be queued at the
+  // same time: DropColumnFamily() holds the DB options mutex while it waits.)
+  //
+  // Order of events:
+  // 1. An empty edit W0 blocks inside its MANIFEST write.
+  // 2. The flush switches the memtable (DropColumnFamily() would hold the
+  //    write thread it needs), and its background job waits at its start.
+  // 3. The drop queues behind W0.
+  // 4. The flush job writes its SST and queues its install behind the drop.
+  // 5. W0 finishes, the drop is applied, then the install finds the column
+  //    family dropped.
+  if (!GetParam()) {
+    return;
+  }
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.atomic_flush = true;
+  CreateAndReopenWithCF({"pikachu", "eevee"}, options);
+  WriteOptions write_options;
+  write_options.disableWAL = true;
+  for (int cf = 0; cf < 3; ++cf) {
+    ASSERT_OK(Put(cf, "key", "value", write_options));
+  }
+
+  std::mutex state_mutex;
+  std::condition_variable state_changed;
+  int queued_callers = 0;
+  bool first_write_blocked = false;
+  bool release_first_write = false;
+  bool flush_job_waiting = false;
+  bool release_flush_job = false;
+  std::atomic<bool> first_write_seen{false};
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:BeforeWriterWaiting", [&](void*) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        ++queued_callers;
+        state_changed.notify_all();
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WriteManifestStart", [&](void*) {
+        if (first_write_seen.exchange(true)) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(state_mutex);
+        first_write_blocked = true;
+        state_changed.notify_all();
+        state_changed.wait(lock, [&] { return release_first_write; });
+      });
+  int publishes_without_callback = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "MemTableList::InstallMemtableAtomicFlushResults:PublishWithoutCallback",
+      [&](void* arg) {
+        EXPECT_TRUE(static_cast<Status*>(arg)->IsColumnFamilyDropped());
+        ++publishes_without_callback;
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCallFlush:start", [&](void*) {
+        std::unique_lock<std::mutex> lock(state_mutex);
+        flush_job_waiting = true;
+        state_changed.notify_all();
+        state_changed.wait(lock, [&] { return release_flush_job; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const auto wait_for = [&](const std::function<bool()>& done) {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    state_changed.wait(lock, done);
+  };
+
+  ColumnFamilyData* const default_cfd =
+      static_cast<ColumnFamilyHandleImpl*>(handles_[0])->cfd();
+  Status first_status;
+  port::Thread first_writer([&] {
+    VersionEdit edit;
+    edit.SetColumnFamily(default_cfd->GetID());
+    dbfull()->TEST_LockMutex();
+    first_status = dbfull()->GetVersionSet()->LogAndApply(
+        default_cfd, ReadOptions(), WriteOptions(), &edit,
+        dbfull()->TEST_Mutex(), /*dir_contains_current_file=*/nullptr);
+    dbfull()->TEST_UnlockMutex();
+  });
+  wait_for([&] { return first_write_blocked; });
+  Status flush_status;
+  port::Thread flusher([&] {
+    FlushOptions flush_options;
+    flush_options.wait = true;
+    flush_status = dbfull()->Flush(flush_options, handles_[1]);
+  });
+  wait_for([&] { return flush_job_waiting; });
+  Status drop_status;
+  port::Thread dropper(
+      [&] { drop_status = dbfull()->DropColumnFamily(handles_[1]); });
+  wait_for([&] { return queued_callers >= 2; });
+  {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    release_flush_job = true;
+    state_changed.notify_all();
+  }
+  wait_for([&] { return queued_callers >= 3; });
+  {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    release_first_write = true;
+    state_changed.notify_all();
+  }
+  first_writer.join();
+  dropper.join();
+  flusher.join();
+  // Flush() returns ColumnFamilyDropped as soon as the drop is applied. The
+  // flush job can still be inside its install at that time. Wait for it, so
+  // that its sync point callbacks run before they are cleared.
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(first_status);
+  ASSERT_OK(drop_status);
+  ASSERT_TRUE(flush_status.IsColumnFamilyDropped()) << flush_status.ToString();
+  EXPECT_EQ(publishes_without_callback, 1);
+  ASSERT_EQ(Get(0, "key"), "value");
+  ASSERT_EQ(Get(2, "key"), "value");
+  ASSERT_OK(dbfull()->DestroyColumnFamilyHandle(handles_[1]));
+  handles_.erase(handles_.begin() + 1);
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "eevee"}, options);
+  ASSERT_EQ(Get(0, "key"), "value");
+}
+
 TEST_P(DBAtomicFlushTest,
        FlushMultipleCFsDropSomeAfterScheduleFlushBeforeFlushJobRun) {
   bool atomic_flush = GetParam();

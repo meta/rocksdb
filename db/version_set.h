@@ -643,6 +643,11 @@ class VersionStorageInfo {
     files_marked_for_periodic_compaction_.emplace_back(level, f);
   }
 
+  const PeriodicCompactionPhaseParams& TEST_GetPeriodicCompactionPhaseParams()
+      const {
+    return periodic_compaction_phase_params_;
+  }
+
   // REQUIRES: PrepareForVersionAppend has been called
   const autovector<std::pair<int, FileMetaData*>>& BottommostFiles() const {
     assert(finalized_);
@@ -1390,12 +1395,19 @@ class Version {
   uint64_t version_number_;
   std::shared_ptr<IOTracer> io_tracer_;
 
+  // `periodic_compaction_phase_params` are the phasing parameters of this
+  // Version. std::nullopt (the default) means the current parameters of the
+  // VersionSet. For a SetOptions() call that moves the phasing anchor,
+  // LogAndApply() passes the parameters for the new anchor, which is not
+  // published yet (see VersionSet::PrepareCompactionPhaseReanchor()).
   Version(ColumnFamilyData* cfd, VersionSet* vset, const FileOptions& file_opt,
           const MutableCFOptions& mutable_cf_options,
           const std::shared_ptr<IOTracer>& io_tracer,
           uint64_t version_number = 0,
           EpochNumberRequirement epoch_number_requirement =
-              EpochNumberRequirement::kMustPresent);
+              EpochNumberRequirement::kMustPresent,
+          std::optional<PeriodicCompactionPhaseParams>
+              periodic_compaction_phase_params = std::nullopt);
 
   ~Version();
 
@@ -1424,6 +1436,42 @@ class AtomicGroupReadBuffer {
  private:
   uint64_t read_edits_in_atomic_group_ = 0;
   std::vector<VersionEdit> replay_buffer_;
+};
+
+// The new options that SetOptions publishes together with the new Versions
+// (see VersionSet::LogAndApply()). SetOptions owns it.
+//
+// How the options of one SetOptions() call are published:
+//   1. DBImpl::SetOptions() fills one entry per column family with a copy of
+//      the latest options.
+//   2. LogAndApply() gives each ManifestWriter a pointer to its entry. A batch
+//      that holds a SetOptions() call holds only the writers of that call.
+//      SetOptions() edits are dummy edits, and a batch of dummy edits ends at
+//      the caller's last writer. On the test-only MANIFEST path (a test clears
+//      the dummy flag through the sync point DBImpl::SetOptions:dummy_edit),
+//      the grouping rule for prepared options in
+//      VersionSet::ProcessManifestWrites() keeps the call alone in its batch.
+//   3. When the call reaches the head of the MANIFEST writer queue, pre_cb
+//      applies the input maps to the entries under the DB mutex
+//      (ColumnFamilyData::PrepareMutableCFOptions()).
+//   4. VersionSet::ProcessManifestWrites() builds each new Version with its
+//      entry, and with the phasing parameters of the new anchor if one is set.
+//   5. In the same mutex hold as AppendVersion(), it commits the anchor and
+//      calls ColumnFamilyData::PublishMutableCFOptions() with the options of
+//      each new Version.
+struct MutableCFOptionsPublication {
+  // The new options of each column family, one entry per element of the
+  // `cfds` argument of LogAndApply(), stored by value. Each column family
+  // appears once. The pre_cb of SetOptions() writes the entries through
+  // SetOptions' own non-const reference, under the DB mutex, before any
+  // Version is built. LogAndApply() only reads them. The vector is not resized
+  // after LogAndApply() starts, because each ManifestWriter keeps the address
+  // of its entry.
+  autovector<MutableCFOptions> new_mutable_cf_options;
+  // If set, the new periodic compaction phasing anchor (see
+  // VersionSet::PrepareCompactionPhaseReanchor()). The new Versions are built
+  // with it, and it is published with them.
+  std::optional<uint64_t> compaction_phase_anchor_time;
 };
 
 // VersionSet is the collection of versions of all the column families of the
@@ -1526,9 +1574,26 @@ class VersionSet {
                        column_family_options, {manifest_wcb}, pre_cb);
   }
 
-  // The across-multi-cf batch version. If edit_lists contain more than
-  // 1 version edits, caller must ensure that no edit in the []list is column
-  // family manipulation.
+  // The batch version for several column families. If edit_lists hold more than
+  // one edit, no edit may add or drop a column family. Also, either every edit
+  // or no edit is a dummy edit that writes nothing to the MANIFEST (only
+  // SetOptions makes these). `options_publication` is set only by
+  // SetOptions(). It holds the new options (one entry per element of `cfds`)
+  // and an optional new phasing anchor. LogAndApply() publishes both with the
+  // new Versions. When it is set, each column family may appear only once in
+  // `cfds`, because all writers of one column family share one Version.
+  //
+  // LogAndApply() can release the DB mutex while it waits in the MANIFEST
+  // writer queue, and also during the batch, both when it writes a MANIFEST
+  // record and when it gets dummy edits and writes nothing (see
+  // VersionSet::ProcessManifestWrites()). The callbacks in `manifest_wcbs` run
+  // once per batch, under the DB mutex, at the end of the batch: on success
+  // after the new Versions are installed, and on a failure inside the batch
+  // with the error. The DB mutex is not released between the callbacks and the
+  // point where the writers of the batch are marked done. They do not run if
+  // LogAndApply() returns before the batch starts: when there are no edits,
+  // when every column family is dropped, or when pre_cb fails. They must not
+  // call user code or do I/O.
   virtual Status LogAndApply(
       const autovector<ColumnFamilyData*>& cfds,
       const ReadOptions& read_options, const WriteOptions& write_options,
@@ -1538,7 +1603,8 @@ class VersionSet {
       const ColumnFamilyOptions* new_cf_options = nullptr,
       const std::vector<std::function<void(const Status&)>>& manifest_wcbs = {},
       const std::function<Status()>& pre_cb = {},
-      int max_file_opening_threads = 1);
+      int max_file_opening_threads = 1,
+      const MutableCFOptionsPublication* options_publication = nullptr);
 
   void WakeUpWaitingManifestWriters();
 
@@ -1969,12 +2035,45 @@ class VersionSet {
   PeriodicCompactionPhaseParams GetPeriodicCompactionPhaseParams(
       uint32_t cf_id) const;
 
-  // (Re)anchor periodic-compaction phasing to now and refresh the cached phase
-  // params on every column family's current Version. Called when a CF's
-  // periodic_compaction_seconds changes via SetOptions, so a turn-down's newly
-  // past-due cohort is spread (over the phase grid within ~N/4 of now) instead
-  // of firing all at once. Caller must hold the DB mutex.
-  void ReanchorCompactionPhase();
+  // Periodic compaction phasing anchor (used only when
+  // DBOptions::periodic_compaction_phase_recovery_percent > 0). The anchor is
+  // the time from which PeriodicCompactionPhaser::TriggerTime() spreads
+  // catch-up compactions. A catch-up compaction is a periodic compaction of a
+  // file that is already due. A lower periodic_compaction_seconds can make many
+  // files due at the same time. So when an options map of any column family
+  // sets periodic_compaction_seconds and the call succeeds,
+  // DBImpl::SetOptions() moves the anchor to the current time. This also
+  // happens when the value does not change, unless the call returns early
+  // because no option changes. It does not move when there is no clock or the
+  // clock fails. TriggerTime() then spreads these compactions out after the
+  // anchor instead of running them all at once. The anchor is DB-wide, so it
+  // also applies to the column families that keep their period. The move has
+  // two steps, so that the new Versions can be built with the new anchor before
+  // it is published:
+  // 1. PrepareCompactionPhaseReanchor() reads the clock.
+  // 2. CommitCompactionPhaseReanchor() publishes the anchor, inside
+  //    LogAndApply(), together with the new options and Versions.
+  // Until step 2, the live phaser and the current Versions keep the old
+  // anchor.
+
+  // Step 1: returns a new phasing anchor (the current time) for SetOptions(),
+  // without changing the live phasing state. If there is no clock or the clock
+  // fails, it returns no anchor, and SetOptions() keeps the current one.
+  std::optional<uint64_t> PrepareCompactionPhaseReanchor() const;
+
+  // Returns the phasing parameters that column family `cf_id` would get with
+  // the anchor `anchor_time`, without changing the live phasing state.
+  // LogAndApply() uses it to build a new Version for SetOptions() before the
+  // anchor is published.
+  PeriodicCompactionPhaseParams GetPeriodicCompactionPhaseParamsAtAnchor(
+      uint32_t cf_id, uint64_t anchor_time) const;
+
+  // Step 2: publishes a phasing anchor, and refreshes the cached phasing
+  // parameters in the current Version of every column family that is not
+  // dropped. The new Versions that SetOptions() prepared already have these
+  // parameters.
+  // REQUIRES: DB mutex held.
+  void CommitCompactionPhaseReanchor(uint64_t anchor_time);
 
   const ImmutableDBOptions* db_options() const { return db_options_; }
 
@@ -2118,6 +2217,8 @@ class VersionSet {
       uint64_t initial_file_size = 0) const;
 
   void AppendVersion(ColumnFamilyData* column_family_data, Version* v);
+
+  void RefreshCurrentVersionCompactionPhaseParams();
 
   ColumnFamilyData* CreateColumnFamily(const ColumnFamilyOptions& cf_options,
                                        const ReadOptions& read_options,
@@ -2279,7 +2380,8 @@ class VersionSet {
       bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
       bool new_cf_options_are_sanitized,
       const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
-      const std::function<Status()>& pre_cb, int max_file_opening_threads);
+      const std::function<Status()>& pre_cb, int max_file_opening_threads,
+      const MutableCFOptionsPublication* options_publication);
 
   void LogAndApplyCFHelper(VersionEdit* edit,
                            SequenceNumber* max_last_sequence);
@@ -2389,7 +2491,8 @@ class ReactiveVersionSet : public VersionSet {
       bool /*new_descriptor_log*/, const ColumnFamilyOptions* /*new_cf_option*/,
       const std::vector<std::function<void(const Status&)>>& /*manifest_wcbs*/,
       const std::function<Status()>& /*pre_cb*/,
-      int /*max_file_opening_threads*/) override {
+      int /*max_file_opening_threads*/,
+      const MutableCFOptionsPublication* /*options_publication*/) override {
     return Status::NotSupported("not supported in reactive mode");
   }
 

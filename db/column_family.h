@@ -377,6 +377,28 @@ class ColumnFamilyData {
   // Validate CF options against DB options
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
+
+  // DBImpl::SetOptions() must change the options of all its column families or
+  // none, so it changes them in two steps: prepare every column family, then
+  // publish them all together. This is the prepare step. It applies
+  // `options_map` on top of `*mutable_cf_options`, validates the result, and
+  // stores the result back in `*mutable_cf_options`. It does not change the
+  // options of this column family. REQUIRES: DB mutex held. The caller starts
+  // `*mutable_cf_options` from a copy of the latest options of this column
+  // family. It must make sure that no one changes those options before the
+  // publish step. DBImpl::SetOptions() holds options_mutex_ for this.
+  Status PrepareMutableCFOptions(
+      const DBOptions& db_options,
+      const std::unordered_map<std::string, std::string>& options_map,
+      MutableCFOptions* mutable_cf_options) const;
+
+  // The publish step: makes options from PrepareMutableCFOptions() the latest
+  // options of this column family. LogAndApply() calls it for
+  // DBImpl::SetOptions(). Readers see the new options only after
+  // DBImpl::SetOptions() installs a new SuperVersion. Then
+  // DBImpl::SetOptions() calls MarkOptionsInstalled().
+  // REQUIRES: DB mutex held.
+  void PublishMutableCFOptions(const MutableCFOptions& mutable_cf_options);
   // REQUIRES: DB mutex held
   Status SetOptions(
       const DBOptions& db_options,
@@ -716,9 +738,10 @@ class ColumnFamilyData {
   const bool is_delete_range_supported_;
   const bool is_table_builder_supported_;
 
-  // True from a successful SetOptions() until MarkOptionsInstalled(). A
-  // DB::SetOptions() call that fails on a later column family leaves it set
-  // for the column families it already changed.
+  // True from PublishMutableCFOptions() until MarkOptionsInstalled().
+  // DBImpl::SetOptions() installs the options of all the column families it
+  // changes together, inside LogAndApply, after every one of them is prepared.
+  // So it sets this flag for every column family it changes, or for none.
   bool options_install_pending_ = false;
 
   std::unique_ptr<TableCache> table_cache_;
