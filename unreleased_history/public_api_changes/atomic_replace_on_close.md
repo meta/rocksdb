@@ -1,0 +1,1 @@
+Added `FSSupportedOps::kAtomicReplaceOnClose`. A `FileSystem` that makes CURRENT and IDENTITY appear atomically and durably at `Close()` can set it in `SupportedOps()`; RocksDB then writes these files directly under their final names, without a temp file or a rename.

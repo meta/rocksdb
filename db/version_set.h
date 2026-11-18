@@ -1666,6 +1666,10 @@ class VersionSet {
 
   bool unchanging() const { return unchanging_; }
 
+  // Whether the file system sets FSSupportedOps::kAtomicReplaceOnClose. It is
+  // checked once, when the VersionSet is created.
+  bool fs_replaces_atomically() const { return fs_replaces_atomically_; }
+
   // Allocate and return a new file number
   uint64_t NewFileNumber() { return next_file_number_.fetch_add(1); }
 
@@ -2288,6 +2292,7 @@ class VersionSet {
                            InstrumentedMutex* mu);
 
   const bool unchanging_;
+  const bool fs_replaces_atomically_;
   bool closed_;
 };
 

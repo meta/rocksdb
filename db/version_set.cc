@@ -5752,6 +5752,8 @@ VersionSet::VersionSet(
       offpeak_time_option_(OffpeakTimeOption(daily_offpeak_time_utc)),
       error_handler_(error_handler),
       unchanging_(unchanging),
+      fs_replaces_atomically_(CheckFSFeatureSupport(
+          fs_.get(), FSSupportedOps::kAtomicReplaceOnClose)),
       closed_(false) {
   UpdatedMutableDbOptions(mutable_db_options, /*mu=*/nullptr);
 }
@@ -6564,9 +6566,10 @@ Status VersionSet::ProcessManifestWrites(
       assert(manifest_io_status.ok());
     }
     if (s.ok() && new_descriptor_log) {
-      io_s = SetCurrentFile(
-          write_options, fs_.get(), dbname_, pending_manifest_file_number_,
-          file_options_.temperature, dir_contains_current_file);
+      io_s = SetCurrentFile(write_options, fs_.get(), dbname_,
+                            pending_manifest_file_number_,
+                            file_options_.temperature,
+                            dir_contains_current_file, fs_replaces_atomically_);
       TEST_SYNC_POINT_CALLBACK(
           "VersionSet::ProcessManifestWrites:AfterSetCurrentFile", &io_s);
       if (!io_s.ok()) {
