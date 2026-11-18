@@ -1,0 +1,1 @@
+Fixed a bug with user-defined timestamps where flush or compaction could drop merge operands, or the base value under them, that a range deletion at a newer timestamp covers, when `full_history_ts_low` was unset or not past them. Reads at older timestamps could then miss the key or return a wrong merged value.

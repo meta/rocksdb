@@ -408,6 +408,15 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
       if (range_del_agg &&
           range_del_agg->ShouldDelete(
               ikey, RangeDelPositioningMode::kForwardTraversal)) {
+        if (ts_sz > 0 && cmp_with_full_history_ts_low >= 0) {
+          // With user-defined timestamps, a base value not eligible for GC can
+          // be neither dropped nor merged in. The tombstone may hide it from
+          // every read (same timestamp, newer sequence number) or only from
+          // reads at newer timestamps, and ShouldDelete() cannot tell which.
+          // Output only the operands and leave iter at the base value, as for
+          // kMustMerge below, so that CompactionIterator writes it separately.
+          return Status::MergeInProgress();
+        }
         s = TimedFullMerge(user_merge_operator_, ikey.user_key, kNoBaseValue,
                            merge_context_.GetOperands(), logger_, stats_,
                            clock_, /* update_num_ops_stats */ false,
@@ -537,8 +546,15 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
               ? CompactionFilter::Decision::kKeep
               : FilterMerge(orig_ikey.user_key, value_slice);
       // FIXME: should also check for kRemove here
+      // With user-defined timestamps, drop an operand covered by a range
+      // tombstone only if it is below full_history_ts_low (eligible for GC), as
+      // CompactionIterator does for point keys: a read at a timestamp after the
+      // operand's and before the tombstone's must still see the operand. If
+      // full_history_ts_low is unset, cmp_with_full_history_ts_low stays 0, so
+      // no operand is dropped here.
       if (filter != CompactionFilter::Decision::kRemoveAndSkipUntil &&
           range_del_agg != nullptr &&
+          (ts_sz == 0 || cmp_with_full_history_ts_low < 0) &&
           range_del_agg->ShouldDelete(
               iter->key(), RangeDelPositioningMode::kForwardTraversal)) {
         filter = CompactionFilter::Decision::kRemove;
