@@ -431,6 +431,14 @@ architectures.
     unit tests. This should be done every time unit test is updated.
 * Don't use sleep to wait for certain events to happen. This will cause test to
     be flaky. Instead, use sync point to synchronize thread progress.
+* When a test waits for an expected event (a condition variable, sync point or
+    background job) with a timeout, so that it fails instead of hanging, make
+    the timeout several minutes, even if the event normally takes
+    milliseconds. CI machines can stall, and RocksDB CI does not retry failed
+    tests, so tests must be stable. A passing test returns as soon as the event
+    happens, so only a regression waits out the timeout. It is much better to
+    penalize a regressor with a slow result than to disrupt the workflow of the
+    innocent.
 * Cap unit test execution with 60 seconds timeout.
 * To build and run unit tests locally, prefer these helper scripts:
     * `build_tools/rocksptest.sh <test_binary> [more_binaries...] [args...]`

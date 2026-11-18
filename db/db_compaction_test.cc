@@ -10,8 +10,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -11654,6 +11657,251 @@ TEST_F(DBCompactionTest, FIFOChangeTemperature) {
 
       Destroy(options);
     }
+  }
+}
+
+namespace {
+Options FIFOTemperatureCopyOptions(Options options) {
+  options.compaction_style = kCompactionStyleFIFO;
+  options.num_levels = 1;
+  // Needed for the newest key times that make files old enough
+  options.max_open_files = -1;
+  options.compaction_options_fifo.file_temperature_age_thresholds = {
+      {Temperature::kCold, 1000}};
+  options.compaction_options_fifo.max_table_files_size = 100000000;
+  options.compaction_options_fifo.allow_trivial_copy_when_change_temperature =
+      true;
+  return options;
+}
+
+// Bound on waits for expected events in the FIFO trivial copy tests, which
+// normally take milliseconds. Long enough to ride out CI stalls, so that only
+// a regression waits it out.
+constexpr std::chrono::minutes kTrivialCopyTestTimeout{5};
+
+// Pauses FIFO temperature-change trivial copies just before copying the file,
+// until Resume() or destruction
+class TrivialCopyPause {
+ public:
+  TrivialCopyPause() {
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::CopyTrivialCompactionFiles:BeforeCopyFile", [this](void*) {
+          std::unique_lock<std::mutex> lock(mu_);
+          paused_ = true;
+          cv_.notify_all();
+          // Bounded so that a failure elsewhere cannot hang the test
+          cv_.wait_for(lock, kTrivialCopyTestTimeout,
+                       [this]() { return resumed_; });
+          pause_ended_ = true;
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+
+  ~TrivialCopyPause() {
+    Resume();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+
+  // Waits for a copy to pause, runs `fn` on another thread, and resumes the
+  // copy. Returns whether `fn` completed while the copy was paused, or false
+  // without running `fn` if no copy pauses.
+  bool CompletesWhilePaused(const std::function<void()>& fn) {
+    {
+      std::unique_lock<std::mutex> lock(mu_);
+      // Bounded so that a copy that is never picked fails the test
+      if (!cv_.wait_for(lock, kTrivialCopyTestTimeout,
+                        [this]() { return paused_; })) {
+        return false;
+      }
+    }
+    bool done = false;
+    // A pause that ended before `fn` finished does not count, such as when the
+    // test thread itself was blocked by the copy until the pause timed out
+    bool done_while_paused = false;
+    port::Thread thread([&]() {
+      fn();
+      std::lock_guard<std::mutex> lock(mu_);
+      done = true;
+      done_while_paused = !pause_ended_;
+      cv_.notify_all();
+    });
+    {
+      std::unique_lock<std::mutex> lock(mu_);
+      // Does not wait out the timeout unless `fn` is blocked by the copy
+      cv_.wait_for(lock, kTrivialCopyTestTimeout, [&]() { return done; });
+    }
+    Resume();
+    thread.join();
+    return done_while_paused;
+  }
+
+  void Resume() {
+    std::lock_guard<std::mutex> lock(mu_);
+    resumed_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool paused_ = false;
+  bool resumed_ = false;
+  bool pause_ended_ = false;
+};
+}  // namespace
+
+TEST_F(DBCompactionTest, FIFOChangeTemperatureCopyWithoutDBMutex) {
+  Options options = FIFOTemperatureCopyOptions(CurrentOptions());
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+
+  TrivialCopyPause pause;
+  ASSERT_OK(Put("a", "value"));
+  ASSERT_OK(Flush());
+  // The first file becomes old enough to be copied cold
+  env_->MockSleepForSeconds(1200);
+  ASSERT_OK(Put("b", "value"));
+  ASSERT_OK(Flush());
+
+  ASSERT_TRUE(pause.CompletesWhilePaused([&]() {
+    dbfull()->TEST_LockMutex();
+    dbfull()->TEST_UnlockMutex();
+  }));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.file_count, 2U);
+  ASSERT_EQ(metadata.levels[0].files[0].temperature, Temperature::kUnknown);
+  ASSERT_EQ(metadata.levels[0].files[1].temperature, Temperature::kCold);
+  ASSERT_EQ(Get("a"), "value");
+  ASSERT_EQ(Get("b"), "value");
+}
+
+TEST_F(DBCompactionTest, FIFOChangeTemperatureCopyDuringDropColumnFamily) {
+  Options options = FIFOTemperatureCopyOptions(CurrentOptions());
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  {
+    int copies_finished = 0;
+    TrivialCopyPause pause;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::BackgroundCompaction:TriviaCopyAfterCompaction",
+        [&](void*) { ++copies_finished; });
+    ASSERT_OK(Put(1, "a", "value"));
+    ASSERT_OK(Flush(1));
+    // The first file becomes old enough to be copied cold
+    env_->MockSleepForSeconds(1200);
+    ASSERT_OK(Put(1, "b", "value"));
+    ASSERT_OK(Flush(1));
+
+    ASSERT_TRUE(pause.CompletesWhilePaused(
+        [&]() { ASSERT_OK(db_->DropColumnFamily(handles_[1])); }));
+    // The copy is not installed in the dropped column family, which is not an
+    // error
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    ASSERT_EQ(copies_finished, 1);
+  }
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(handles_[1]));
+  handles_.pop_back();
+  ASSERT_OK(Put("c", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get("c"), "value");
+
+  // Reopening leaves only the live table file
+  Reopen(options);
+  std::vector<std::string> children;
+  ASSERT_OK(env_->GetChildren(dbname_, &children));
+  int table_files = 0;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kTableFile) {
+      ++table_files;
+    }
+  }
+  ASSERT_EQ(table_files, 1);
+  ASSERT_EQ(Get("c"), "value");
+}
+
+TEST_F(DBCompactionTest, FIFOChangeTemperatureCopyDuringIntraL0Compaction) {
+  class IntraL0Listener : public EventListener {
+   public:
+    void OnCompactionCompleted(DB* /*db*/,
+                               const CompactionJobInfo& info) override {
+      if (info.compaction_reason == CompactionReason::kFIFOReduceNumFiles) {
+        std::lock_guard<std::mutex> lock(mu);
+        ++completed;
+        num_input_files = info.input_files.size();
+        cv.notify_all();
+      }
+    }
+    std::mutex mu;
+    std::condition_variable cv;
+    int completed = 0;
+    size_t num_input_files = 0;
+  };
+  auto listener = std::make_shared<IntraL0Listener>();
+  Options options = FIFOTemperatureCopyOptions(CurrentOptions());
+  // Unlike the other FIFO compactions, intra-L0 compaction can be picked while
+  // another L0 compaction is running, on files newer than the ones it compacts
+  options.compaction_options_fifo.allow_compaction = true;
+  // Intra-L0 compaction needs a third file, so the copy is picked first
+  options.level0_file_num_compaction_trigger = 3;
+  // Allows two compactions at once
+  options.max_background_jobs = 4;
+  options.listeners.push_back(listener);
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+  // Without compaction pressure (such as from write stalls), only one
+  // compaction runs at a time regardless of max_background_jobs
+  std::unique_ptr<WriteControllerToken> pressure_token =
+      dbfull()->TEST_write_controler().GetCompactionPressureToken();
+
+  TrivialCopyPause pause;
+  ASSERT_OK(Put("a", "value"));
+  ASSERT_OK(Flush());
+  // The first file becomes old enough to be copied cold
+  env_->MockSleepForSeconds(1200);
+  ASSERT_OK(Put("b", "value"));
+  ASSERT_OK(Flush());
+
+  bool intra_l0_completed = false;
+  ASSERT_TRUE(pause.CompletesWhilePaused([&]() {
+    ASSERT_OK(Put("c", "value"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("d", "value"));
+    ASSERT_OK(Flush());
+    std::unique_lock<std::mutex> lock(listener->mu);
+    intra_l0_completed =
+        listener->cv.wait_for(lock, kTrivialCopyTestTimeout,
+                              [&]() { return listener->completed > 0; });
+  }));
+  ASSERT_TRUE(intra_l0_completed);
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  {
+    std::lock_guard<std::mutex> lock(listener->mu);
+    ASSERT_EQ(listener->completed, 1);
+    // All files except the one being copied
+    ASSERT_EQ(listener->num_input_files, 3U);
+  }
+
+  // Both are installed, and the intra-L0 output is still ordered as newer
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.file_count, 2U);
+  ASSERT_EQ(metadata.levels[0].files[0].temperature, Temperature::kUnknown);
+  ASSERT_EQ(metadata.levels[0].files[0].smallestkey, "b");
+  ASSERT_EQ(metadata.levels[0].files[0].largestkey, "d");
+  ASSERT_EQ(metadata.levels[0].files[1].temperature, Temperature::kCold);
+  ASSERT_EQ(metadata.levels[0].files[1].smallestkey, "a");
+  for (const char* key : {"a", "b", "c", "d"}) {
+    ASSERT_EQ(Get(key), "value");
   }
 }
 
