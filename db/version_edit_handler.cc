@@ -1139,6 +1139,23 @@ Status ManifestTailer::Initialize() {
 
 Status ManifestTailer::ApplyVersionEdit(VersionEdit& edit,
                                         ColumnFamilyData** cfd) {
+  // RocksDB writes the DB ID in the first record of each MANIFEST while
+  // write_dbid_to_manifest is true. Catch-up switches to a new MANIFEST when
+  // CURRENT names another file, and it decides this from the file name alone.
+  // So the new MANIFEST can belong to another DB, for example one that was
+  // destroyed and created again at the same path, and its records do not
+  // continue the Versions that this instance built. Recovery at open sets the
+  // DB ID that this check compares with, so the check runs only in catch-up
+  // mode, and only when the MANIFEST that the instance opened had a DB ID.
+  if (Mode::kCatchUp == mode_ && edit.HasDbId() &&
+      version_edit_params_.HasDbId() &&
+      edit.GetDbId() != version_edit_params_.GetDbId()) {
+    return Status::Corruption(
+        "MANIFEST record has DB ID " + edit.GetDbId() +
+        ", but this instance opened DB ID " + version_edit_params_.GetDbId() +
+        ". The DB at this path was possibly created again. Reopen this "
+        "instance.");
+  }
   Status s = VersionEditHandler::ApplyVersionEdit(edit, cfd);
   if (s.ok()) {
     assert(cfd);

@@ -181,7 +181,7 @@ Status DBImplFollower::TryCatchUpWithLeader() {
   }
   purge_files_job_context.Clean();
 
-  TEST_SYNC_POINT("DBImplFollower::TryCatchupWithLeader:End");
+  TEST_SYNC_POINT_CALLBACK("DBImplFollower::TryCatchupWithLeader:End", &s);
 
   return s;
 }
@@ -216,7 +216,8 @@ void DBImplFollower::PeriodicRefresh() {
           &cv_, std::chrono::microseconds(wait_until));
     }
     if (!s.ok()) {
-      ROCKS_LOG_INFO(immutable_db_options_.info_log, "Catch up unsuccessful");
+      ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                     "Catch up unsuccessful: %s", s.ToString().c_str());
     }
   }
 }

@@ -2387,13 +2387,13 @@ class ReactiveVersionSet : public VersionSet {
   // VersionEditHandlerPointInTime::trust_manifest_recovery_). Set only for the
   // DB::OpenAndCompact remote-compaction path.
   bool trust_manifest_recovery_ = false;
-  // Resume after a failed MANIFEST read. A log reader never reads again after
-  // a failed read, so:
-  // 1. A catch-up that started without a tailer error and stopped at a failed
-  //    read sets this flag and returns IOError. The tailer has applied every
-  //    record and every complete atomic group before
-  //    ManifestTailer::GetLastValidRecordEnd(), and none of an atomic group
-  //    that the failed read cut.
+  // Resume after a failed MANIFEST read. Any other tailer error is final, and
+  // ReadAndApply() returns it without reading more records. A log reader never
+  // reads again after a failed read, so:
+  // 1. A catch-up that stopped at a failed read sets this flag and returns
+  //    IOError. The tailer has applied every record and every complete atomic
+  //    group before ManifestTailer::GetLastValidRecordEnd(), and none of an
+  //    atomic group that the failed read cut.
   // 2. The next catch-up uses the reader from MaybeSwitchManifest() if CURRENT
   //    names another MANIFEST. Otherwise ReopenManifestAfterReadError() makes
   //    a new reader that starts at that offset. If that fails, the call returns

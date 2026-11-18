@@ -9160,6 +9160,13 @@ Status ReactiveVersionSet::ReadAndApply(
   assert(cfds_changed != nullptr);
   mu->AssertHeld();
 
+  // An error from applying a MANIFEST record is final. The tailer can have
+  // applied that record in part, and the records after it can belong to
+  // another DB, so return the error without reading more records. A failed
+  // read is not final: the next call resumes after it.
+  if (!resume_after_manifest_read_error_ && !manifest_tailer_->status().ok()) {
+    return manifest_tailer_->status();
+  }
   Status s;
   log::Reader* reader = manifest_reader->get();
   assert(reader);
@@ -9184,12 +9191,10 @@ Status ReactiveVersionSet::ReadAndApply(
     manifest_tailer_->PrepareToResumeAfterReadError();
     resume_after_manifest_read_error_ = false;
   }
-  const bool tailer_had_error_before_call = !manifest_tailer_->status().ok();
+  assert(manifest_tailer_->status().ok());
   manifest_tailer_->Iterate(*(manifest_reader->get()), manifest_read_status);
   s = manifest_tailer_->status();
-  // An error that the tailer had before this call is kept: it can come from a
-  // record that was applied only in part.
-  if (!tailer_had_error_before_call && manifest_reader->get()->hasReadError()) {
+  if (manifest_reader->get()->hasReadError()) {
     resume_after_manifest_read_error_ = true;
     if (s.ok()) {
       // The reader can set its read error flag without a report. This happens
