@@ -197,6 +197,17 @@ class DBCrashTestTest(unittest.TestCase):
                 params[name] = 0 if name == "enable_compaction_filter" else 1
                 finalized = db_crashtest.finalize_and_sanitize(params)
                 self.assertEqual(0, finalized["merge_before_compaction_filter"])
+        # cf_lifecycle_params pins use_merge=0, so merge-before-filter must not
+        # turn merges back on.
+        params = db_crashtest.gen_cmd_params(
+            self.build_mode_args("blackbox", cf_lifecycle=True)
+        )
+        params.update(
+            {"enable_compaction_filter": 1, "merge_before_compaction_filter": 1}
+        )
+        for _ in range(20):
+            finalized = db_crashtest.finalize_and_sanitize(self.build_params(params))
+            self.assertEqual(0, finalized["use_merge"])
 
     def test_user_timestamp_disables_merge(self):
         db_crashtest = self.load_db_crashtest()
