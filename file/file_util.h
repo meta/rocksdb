@@ -147,4 +147,98 @@ inline bool CheckFSFeatureSupport(FileSystem* fs, FSSupportedOps feat) {
   return false;
 }
 
+// Atomic small-file writes
+//
+// Background: RocksDB keeps a few small files, such as CURRENT and IDENTITY,
+// that a reader must never see half written. For example, a partial CURRENT
+// file after a crash makes the DB impossible to open. So RocksDB does not
+// write these files in place. AtomicFileWriter writes such a file in these
+// steps:
+// 1. Write the new content to a temp file, sync it and close it.
+// 2. Rename the temp file over the final file. The rename is atomic, so a
+//    reader sees the old content or the new content.
+// 3. Sync the directory, which makes the new name durable.
+// If step 1 or 2 fails, the writer deletes the temp file, and the final file
+// keeps its old content. AtomicFileWriteOptions describes the settings of
+// each step.
+//
+// Callers get the writer from NewAtomicFileWriter(), so that the way a file
+// is written can depend on the file system. NewAtomicFileWriter() always
+// returns the temp-file writer described above.
+
+// Settings of one writer, given to NewAtomicFileWriter(). The writer uses them
+// for every Write() call. They name the temp file, the object that renames
+// and deletes the temp file, how to sync the directory after the rename, and
+// the names of the test sync points.
+struct AtomicFileWriteOptions {
+  // Name of the temp file that holds the new content until the rename. It
+  // must be in the same directory as the final file, because a rename is
+  // atomic only inside one file system, and the directory sync covers only
+  // one directory. Must not be empty.
+  std::string temp_name;
+
+  // When not null, the rename and the delete of the temp file go through this
+  // Env instead of the FileSystem, so that overrides of Env::RenameFile() and
+  // Env::DeleteFile() apply. Env::RenameFile() takes no IOOptions, so that
+  // rename carries no IOOptions::type.
+  Env* env = nullptr;
+
+  // Directory sync after a successful rename. Set at most one of the two:
+  // - `dir`: an open directory handle. The writer syncs it and does not
+  //   close it.
+  // - `dir_path_to_open`: the writer opens this directory after the rename,
+  //   syncs it and closes it. The writer ignores a NotSupported status from
+  //   the close, because the default FSDirectory::Close() returns it.
+  // When both are empty, the writer does not sync the directory.
+  FSDirectory* dir = nullptr;
+  std::string dir_path_to_open;
+
+  // Which failures delete the temp file. When false, the writer deletes it
+  // only when the write or the rename fails. When true, it also deletes it
+  // when the directory sync fails. After a successful rename the temp file no
+  // longer exists, so that delete finds nothing. The writer ignores the status
+  // of the delete in all cases. Both settings leave the same files on disk.
+  // SetIdentityFile() sets it to keep the exact call sequence that IDENTITY
+  // writes have always made.
+  bool delete_temp_after_any_failure = false;
+
+  // Prefix of the test sync points and kill points, for example
+  // "SetCurrentFile". When not empty, the writer runs:
+  // - TEST_SYNC_POINT_CALLBACK("<prefix>:BeforeRename") after the temp file
+  //   is written and before the rename, and
+  //   TEST_SYNC_POINT_CALLBACK("<prefix>:AfterRename") after the rename. Both
+  //   pass a pointer to the IOStatus, so a callback can change the result.
+  //   The BeforeRename point runs even when the write failed.
+  // - TEST_KILL_RANDOM_WITH_WEIGHT("<prefix>:0") just before the rename and
+  //   "<prefix>:1" just after it, with weight REDUCE_ODDS2, the same weight as
+  //   the kill points that SetCurrentFile() always had.
+  // When empty, the writer has no sync points and no kill points.
+  std::string sync_point_prefix;
+};
+
+// Writes a small file so that a reader of the file sees the old content or
+// the new content, never a part of it.
+class AtomicFileWriter {
+ public:
+  virtual ~AtomicFileWriter() = default;
+
+  // Replaces the content of `final_name` with `contents`. `opts` applies to
+  // each IO of the write, and `file_opts` to opening the new file. If Write()
+  // returns an error, the caller must not assume that `final_name` still has
+  // the old content: an error after the replace, for example from the
+  // directory sync, leaves the new content in `final_name`. When Write() fails
+  // before the replace, `final_name` keeps its old content, or stays absent if
+  // it did not exist.
+  virtual IOStatus Write(const std::string& final_name, const Slice& contents,
+                         const IOOptions& opts,
+                         const FileOptions& file_opts) = 0;
+};
+
+// Returns the writer for one or more atomic writes through `fs`, with the
+// settings in `options`. The writer runs the steps in the overview above.
+// `fs` and the pointers in `options` must stay valid while the writer is
+// used.
+std::unique_ptr<AtomicFileWriter> NewAtomicFileWriter(
+    FileSystem* fs, const AtomicFileWriteOptions& options);
+
 }  // namespace ROCKSDB_NAMESPACE
