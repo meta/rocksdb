@@ -423,16 +423,18 @@ struct FileMetaData {
   // VersionBuilder drops it, so Version files do not keep it; later readers
   // read the SST's reference index.
   std::shared_ptr<const BlobReferenceSstSummary> blob_reference_summary;
-  // Marks an SST that has no descriptor and no coarse frontier, in a CF with
-  // the format fence, so that recovery accepts the SST. Such an SST was created
-  // before the format was activated. VersionBuilder sets it in memory for such
-  // an SST. A MANIFEST snapshot sets it for every SST of a fenced CF that has
-  // no descriptor and no coarse frontier, and writes it as an unignorable
-  // NewFile field. Edits that copy the file metadata (AddExistingFile()) carry
-  // it. Why the snapshot writes it: in a snapshot the format fence comes before
-  // (or in the same edit as) the SSTs of the CF, so replay checks every SST as
-  // one added after the fence. The marker lets replay accept an SST that has no
-  // descriptor and no coarse frontier.
+  // Marks an SST in a CF with the format fence that has no descriptor and no
+  // coarse frontier, so that recovery accepts the SST. There are two cases: an
+  // SST created before the format was activated, and a coarse SST with frontier
+  // 0 (it has no indirect references; see
+  // ExtractBlobReferenceClassificationFromTableProperties()). VersionBuilder
+  // sets it in memory for such an SST. A MANIFEST snapshot sets it for every
+  // SST of a fenced CF that has no descriptor and no coarse frontier, and
+  // writes it as an unignorable NewFile field. Edits that copy the file
+  // metadata (AddExistingFile()) carry it. Why the snapshot writes it: in a
+  // snapshot the format fence comes before (or in the same edit as) the SSTs of
+  // the CF, so replay checks every SST as one added after the fence. The marker
+  // lets replay accept an SST that has no descriptor and no coarse frontier.
   bool blob_reference_legacy_metadata = false;
   // Coarse frontier of a coarse SST: an SST that may hold kIndirectBlob
   // references but has no exact reference metadata, so it does not list them.

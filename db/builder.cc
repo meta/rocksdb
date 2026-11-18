@@ -85,6 +85,34 @@ void ExtractBlobReferenceDescriptorFromTableProperties(
   }
 }
 
+Status ExtractBlobReferenceClassificationFromTableProperties(
+    const TableProperties& tp, FileMetaData* meta) {
+  meta->oldest_coarse_indirect_origin_file_number = kInvalidBlobFileNumber;
+  const auto property = tp.user_collected_properties.find(
+      kBlobReferenceClassificationPropertyName);
+  if (property == tp.user_collected_properties.end()) {
+    return Status::OK();
+  }
+  if (!meta->blob_reference_descriptor.empty()) {
+    return Status::Corruption(
+        "SST has both exact blob reference metadata and a coarse "
+        "classification");
+  }
+  Status status = DecodeBlobReferenceClassification(
+      property->second, &meta->oldest_coarse_indirect_origin_file_number);
+  if (status.ok()) {
+    // A classification with frontier 0 means that the SST has no indirect
+    // references (see "Coarse SST" in db/blob/blob_reference_metadata.h). It
+    // needs no pin, so we store it like a legacy SST
+    // (blob_reference_legacy_metadata = true). Recovery then accepts it without
+    // exact metadata.
+    meta->blob_reference_legacy_metadata =
+        meta->oldest_coarse_indirect_origin_file_number ==
+        kInvalidBlobFileNumber;
+  }
+  return status;
+}
+
 Status BuildTable(
     const std::string& dbname, VersionSet* versions,
     const ImmutableDBOptions& db_options, const TableBuilderOptions& tboptions,
@@ -215,7 +243,8 @@ Status BuildTable(
             event_logger, ioptions.listeners, dbname,
             tboptions.column_family_name, fname, job_id, meta->fd,
             kInvalidBlobFileNumber, tp, tboptions.reason, s, file_checksum,
-            file_checksum_func_name);
+            file_checksum_func_name,
+            /*blob_references=*/nullptr);
         return s;
       }
 
@@ -448,6 +477,7 @@ Status BuildTable(
                ->GetTableProperties();  // refresh now that builder is finished
       ExtractTimestampFromTableProperties(tp, meta);
       ExtractBlobReferenceDescriptorFromTableProperties(tp, meta);
+      s = ExtractBlobReferenceClassificationFromTableProperties(tp, meta);
       meta->blob_reference_summary = builder->GetBlobReferenceSstSummary();
       TEST_SYNC_POINT_CALLBACK("BuildTable:BlobReferenceSummary", meta);
       if (meta->blob_reference_summary != nullptr &&
@@ -633,7 +663,8 @@ Status BuildTable(
       event_logger, ioptions.listeners, dbname, tboptions.column_family_name,
       fname, job_id, meta->fd, meta->oldest_blob_file_number, tp,
       tboptions.reason, status_for_listener, file_checksum,
-      file_checksum_func_name);
+      file_checksum_func_name,
+      /*blob_references=*/nullptr);
 
   return s;
 }

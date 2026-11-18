@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "db/blob/blob_reference_metadata.h"
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
@@ -193,6 +194,79 @@ TEST_F(RepairTest, NeverActivatedRepairWithPolicyEnabledKeepsLegacyOutput) {
     }
   }
   EXPECT_EQ(files, 2U);
+}
+
+TEST_F(RepairTest, PrefixRepairRejectsLegacyClassification) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  // A legacy L1 SST (written before blob indirection is on) with the same keys
+  // makes the L0 to L0 compaction below not bottommost. A bottommost compaction
+  // writes exact output.
+  for (const char* key : {"a", "b"}) {
+    ASSERT_OK(Put(key, "low"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  for (const char* key : {"a", "b"}) {
+    ASSERT_OK(Put(key, "value"));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  // The values are inline (min_blob_size is 1 MB). An L0 compaction output with
+  // no exact input that is not bottommost gets only the classification
+  // property, with frontier 0 (no indirect references; see "Coarse SST" in
+  // db/blob/blob_reference_metadata.h), and no exact metadata descriptor.
+  ColumnFamilyMetaData cf_meta;
+  db_->GetColumnFamilyMetaData(&cf_meta);
+  std::vector<std::string> inputs;
+  for (const SstFileMetaData& file : cf_meta.levels[0].files) {
+    inputs.push_back(file.name);
+  }
+  ASSERT_EQ(inputs.size(), 2U);
+  ASSERT_EQ(cf_meta.levels[1].files.size(), 1U);
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, 0));
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 2U);
+  // Only the L0 output has the classification; the legacy L1 SST has no
+  // blob reference properties.
+  std::string sst_path;
+  for (const auto& entry : properties) {
+    const UserCollectedProperties& collected =
+        entry.second->user_collected_properties;
+    ASSERT_EQ(collected.count(kBlobReferenceDescriptorPropertyName), 0U);
+    if (collected.count(kBlobReferenceClassificationPropertyName) == 1U) {
+      ASSERT_TRUE(sst_path.empty());
+      sst_path = entry.first;
+    }
+  }
+  ASSERT_FALSE(sst_path.empty());
+  const std::string manifest_path =
+      DescriptorFileName(dbname_, dbfull()->TEST_Current_Manifest_FileNo());
+  Close();
+  // Delete the MANIFEST, so the SST's classification is the only sign that the
+  // DB used enable_blob_indirection.
+  ASSERT_OK(env_->DeleteFile(manifest_path));
+
+  // An earlier test in this binary can leave a lost/ directory, so check that
+  // the failed repair moved nothing into it.
+  const auto lost_files = [&](std::vector<std::string>* files) {
+    const Status status = env_->GetChildren(dbname_ + "/lost", files);
+    return status.IsNotFound() ? Status::OK() : status;
+  };
+  std::vector<std::string> lost_before;
+  ASSERT_OK(lost_files(&lost_before));
+  ASSERT_TRUE(RepairDB(dbname_, options).IsNotSupported());
+  ASSERT_OK(env_->FileExists(sst_path));
+  std::vector<std::string> lost_after;
+  ASSERT_OK(lost_files(&lost_after));
+  ASSERT_EQ(lost_after, lost_before);
 }
 
 TEST_F(RepairTest, SortRepairedDBL0ByEpochNumber) {

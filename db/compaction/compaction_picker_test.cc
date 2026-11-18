@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <limits>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -296,6 +297,374 @@ class CompactionPickerTest : public CompactionPickerTestBase {
     SyncPoint::GetInstance()->DisableProcessing();
   }
 };
+
+TEST_F(CompactionPickerTest, ExactL0ClosureUsesEpochNotFileNumber) {
+  NewVersionStorage(3, kCompactionStyleLevel);
+  Add(0, 1, "a", "b");
+  Add(0, 100, "c", "d");
+  Add(0, 2, "e", "f");
+  files_[0]->epoch_number = 20;
+  files_[1]->epoch_number = 10;
+  files_[2]->epoch_number = 10;
+  // The test checks which files ExpandExactL0Inputs adds, not descriptor
+  // decoding, so any non-empty descriptor marks a file as exact.
+  files_[2]->blob_reference_descriptor = "exact";
+  vstorage_->SetBlobIndirectionFormatVersion(1);
+  std::vector<FileMetaData*> selected{files_[2].get()};
+  ASSERT_TRUE(vstorage_->ExpandExactL0Inputs(&selected));
+  ASSERT_EQ(selected.size(), 2U);
+  ASSERT_EQ(selected[0]->fd.GetNumber(), 100U);
+  ASSERT_EQ(selected[1]->fd.GetNumber(), 2U);
+  files_[1]->being_compacted = true;
+  selected = {files_[2].get()};
+  ASSERT_FALSE(vstorage_->ExpandExactL0Inputs(&selected));
+  ASSERT_EQ(selected.size(), 1U);
+  files_[1]->being_compacted = false;
+  vstorage_->SetBlobIndirectionFormatVersion(0);
+  ASSERT_TRUE(vstorage_->ExpandExactL0Inputs(&selected));
+  ASSERT_EQ(selected.size(), 1U);
+}
+
+TEST_F(CompactionPickerTest, ExactL0ClosureSortsOutOfOrderInputs) {
+  // Files 100 and 2 share epoch 10, and file 2 is exact, so the two files form
+  // an exact epoch run that must stay together. The inputs are given oldest
+  // first, out of the Version's epoch order. ExpandExactL0Inputs keeps every
+  // input, adds file 100, and returns the files newest epoch first.
+  NewVersionStorage(3, kCompactionStyleLevel);
+  Add(0, 1, "a", "b");
+  Add(0, 100, "c", "d");
+  Add(0, 2, "e", "f");
+  files_[0]->epoch_number = 20;
+  files_[1]->epoch_number = 10;
+  files_[2]->epoch_number = 10;
+  files_[2]->blob_reference_descriptor = "exact";
+  vstorage_->SetBlobIndirectionFormatVersion(1);
+  std::vector<FileMetaData*> selected{files_[2].get(), files_[0].get()};
+  ASSERT_TRUE(vstorage_->ExpandExactL0Inputs(&selected));
+  ASSERT_EQ(selected.size(), 3U);
+  EXPECT_EQ(selected[0]->fd.GetNumber(), 1U);
+  EXPECT_EQ(selected[1]->fd.GetNumber(), 100U);
+  EXPECT_EQ(selected[2]->fd.GetNumber(), 2U);
+}
+
+TEST_F(CompactionPickerTest, ExactL0CompactRangeExpandedOutOfEpochOrder) {
+  NewVersionStorage(6, kCompactionStyleLevel);
+  // Both L0 files are exact, and the range is [100, 200]. The older file 1
+  // (100-550) overlaps the range and widens it to 550. The newer file 2
+  // (500-600) starts after 200, the end of the requested range, so the first
+  // overlap search misses it. The search after the widening adds it second, out
+  // of epoch order. The pick still lists the inputs newest first.
+  Add(0, 2U, "500", "600");
+  Add(0, 1U, "100", "550");
+  files_[0]->epoch_number = 20;
+  files_[1]->epoch_number = 10;
+  for (size_t i = 0; i < 2; ++i) {
+    files_[i]->blob_reference_descriptor = "exact";
+  }
+  vstorage_->SetBlobIndirectionFormatVersion(1);
+  UpdateVersionStorageInfo();
+
+  const InternalKey begin("100", kMaxSequenceNumber, kValueTypeForSeek);
+  const InternalKey end("200", 0, kValueTypeForSeek);
+  bool manual_conflict = false;
+  InternalKey manual_end;
+  InternalKey* manual_end_ptr = &manual_end;
+  std::unique_ptr<Compaction> compaction(
+      level_compaction_picker.PickCompactionForCompactRange(
+          cf_name_, mutable_cf_options_, mutable_db_options_, vstorage_.get(),
+          /*input_level=*/0, /*output_level=*/1,
+          /*compact_range_options*/ {}, &begin, &end, &manual_end_ptr,
+          &manual_conflict,
+          /*max_file_num_to_ignore=*/std::numeric_limits<uint64_t>::max(),
+          /*trim_ts=*/"", /*full_history_ts_low=*/""));
+  ASSERT_NE(compaction, nullptr);
+  ASSERT_FALSE(manual_conflict);
+  ASSERT_EQ(compaction->num_input_files(0), 2U);
+  EXPECT_EQ(compaction->input(0, 0)->fd.GetNumber(), 2U);
+  EXPECT_EQ(compaction->input(0, 1)->fd.GetNumber(), 1U);
+}
+
+TEST_F(CompactionPickerTest, ExactL0SiblingWidensRangeToOlderFile) {
+  // S1[100-130] and S2[400-460] form an exact run (epoch 10). O[450-470] is
+  // older (epoch 5). CompactRange(100, 110) picks S1, the run adds S2, and the
+  // wider range must also take O; otherwise O would stay in L0 under the newer
+  // values that move to L1.
+  NewVersionStorage(6, kCompactionStyleLevel);
+  Add(0, 1U, "100", "130");
+  Add(0, 2U, "400", "460");
+  Add(0, 3U, "450", "470");
+  files_[0]->epoch_number = 10;
+  files_[1]->epoch_number = 10;
+  files_[2]->epoch_number = 5;
+  files_[0]->blob_reference_descriptor = "exact";
+  files_[1]->blob_reference_descriptor = "exact";
+  vstorage_->SetBlobIndirectionFormatVersion(1);
+  UpdateVersionStorageInfo();
+
+  const InternalKey begin("100", kMaxSequenceNumber, kValueTypeForSeek);
+  const InternalKey end("110", 0, kValueTypeForSeek);
+  bool manual_conflict = false;
+  InternalKey manual_end;
+  InternalKey* manual_end_ptr = &manual_end;
+  std::unique_ptr<Compaction> compaction(
+      level_compaction_picker.PickCompactionForCompactRange(
+          cf_name_, mutable_cf_options_, mutable_db_options_, vstorage_.get(),
+          /*input_level=*/0, /*output_level=*/1,
+          /*compact_range_options*/ {}, &begin, &end, &manual_end_ptr,
+          &manual_conflict,
+          /*max_file_num_to_ignore=*/std::numeric_limits<uint64_t>::max(),
+          /*trim_ts=*/"", /*full_history_ts_low=*/""));
+  ASSERT_NE(compaction, nullptr);
+  ASSERT_FALSE(manual_conflict);
+  std::set<uint64_t> picked;
+  for (size_t i = 0; i < compaction->num_input_files(0); ++i) {
+    picked.insert(compaction->input(0, i)->fd.GetNumber());
+  }
+  EXPECT_EQ(picked, (std::set<uint64_t>{1, 2, 3}));
+  // The inputs are in epoch order, newest first, so O is last.
+  EXPECT_EQ(
+      compaction->input(0, compaction->num_input_files(0) - 1)->fd.GetNumber(),
+      3U);
+}
+
+TEST_F(CompactionPickerTest, ExactL0SiblingWidensRangeInAutomaticPick) {
+  // Automatic L0 -> L1: the picker starts from the oldest L0 file X[300-310]
+  // and widens L0 inputs to the range of its L1 parent Y[100-320]. That adds
+  // S1[100-130]; its run sibling S2[400-460] widens the range again, so the
+  // older O[450-470] must be added too.
+  mutable_cf_options_.level0_file_num_compaction_trigger = 2;
+  mutable_cf_options_.max_bytes_for_level_base = 10000000u;
+  mutable_cf_options_.max_compaction_bytes = 10000000u;
+  ioptions_.level_compaction_dynamic_level_bytes = false;
+  NewVersionStorage(6, kCompactionStyleLevel);
+  Add(0, 1U, "100", "130");
+  Add(0, 2U, "400", "460");
+  Add(0, 3U, "450", "470");
+  Add(0, 4U, "300", "310");
+  Add(1, 10U, "100", "320");
+  files_[0]->epoch_number = 10;
+  files_[1]->epoch_number = 10;
+  files_[2]->epoch_number = 5;
+  files_[3]->epoch_number = 1;
+  files_[0]->blob_reference_descriptor = "exact";
+  files_[1]->blob_reference_descriptor = "exact";
+  vstorage_->SetBlobIndirectionFormatVersion(1);
+  UpdateVersionStorageInfo();
+
+  std::unique_ptr<Compaction> compaction(level_compaction_picker.PickCompaction(
+      cf_name_, mutable_cf_options_, mutable_db_options_,
+      /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr, vstorage_.get(),
+      &log_buffer_, /*full_history_ts_low=*/""));
+  ASSERT_NE(compaction, nullptr);
+  ASSERT_EQ(compaction->start_level(), 0);
+  std::set<uint64_t> picked;
+  for (size_t i = 0; i < compaction->num_input_files(0); ++i) {
+    picked.insert(compaction->input(0, i)->fd.GetNumber());
+  }
+  // The pick must widen (S1 overlaps the parent), and then it has the whole run
+  // and the older overlapping file.
+  EXPECT_EQ(picked, (std::set<uint64_t>{1, 2, 3, 4}));
+}
+
+TEST_F(CompactionPickerTest, ExactL0TrivialMoveOfSequentialRuns) {
+  mutable_cf_options_.max_bytes_for_level_base = 10000000u;
+  mutable_cf_options_.level0_file_num_compaction_trigger = 4;
+  mutable_cf_options_.max_compaction_bytes = 10000000u;
+  ioptions_.level_compaction_dynamic_level_bytes = false;
+  NewVersionStorage(6, kCompactionStyleLevel);
+  // Sequential inserts: newer L0 files hold larger keys, so key order is the
+  // reverse of the Version's newest-first L0 order.
+  Add(0, 4U, "451", "500");
+  Add(0, 3U, "351", "400");
+  Add(0, 2U, "251", "300");
+  Add(0, 1U, "151", "200");
+  Add(1, 10U, "100", "150");
+  for (size_t i = 0; i < 4; ++i) {
+    files_[i]->epoch_number = 40 - 10 * i;
+    files_[i]->blob_reference_descriptor = "exact";
+  }
+  vstorage_->SetBlobIndirectionFormatVersion(1);
+  UpdateVersionStorageInfo();
+
+  std::unique_ptr<Compaction> compaction(level_compaction_picker.PickCompaction(
+      cf_name_, mutable_cf_options_, mutable_db_options_,
+      /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr, vstorage_.get(),
+      &log_buffer_, /*full_history_ts_low=*/""));
+  ASSERT_NE(compaction, nullptr);
+  ASSERT_TRUE(compaction->IsTrivialMove());
+  ASSERT_EQ(compaction->num_input_files(0), 4U);
+  for (size_t i = 0; i < 4; ++i) {
+    ASSERT_EQ(compaction->input(0, i)->fd.GetNumber(), i + 1);
+  }
+}
+
+TEST_F(CompactionPickerTest, ExactL0TrivialMoveKeepsEpochRunWhole) {
+  mutable_cf_options_.max_bytes_for_level_base = 10000000u;
+  // L0 has 3 sorted runs: the epoch run of files 3 and 2 counts once (see
+  // VersionStorageInfo::NumL0SortedRuns()).
+  mutable_cf_options_.level0_file_num_compaction_trigger = 3;
+  mutable_cf_options_.max_compaction_bytes = 10000000u;
+  ioptions_.level_compaction_dynamic_level_bytes = false;
+  NewVersionStorage(6, kCompactionStyleLevel);
+  Add(0, 4U, "700", "800");
+  // Files 3 and 2 share epoch 20: one exact epoch run. File 3 overlaps L1 file
+  // 10, so it cannot be trivially moved, and file 2 must stay in L0 with it.
+  // Only file 1 is moved.
+  Add(0, 3U, "550", "560");
+  Add(0, 2U, "300", "400");
+  Add(0, 1U, "100", "200");
+  Add(1, 10U, "500", "600");
+  const uint64_t epochs[] = {30, 20, 20, 10};
+  for (size_t i = 0; i < 4; ++i) {
+    files_[i]->epoch_number = epochs[i];
+    files_[i]->blob_reference_descriptor = "exact";
+  }
+  vstorage_->SetBlobIndirectionFormatVersion(1);
+  UpdateVersionStorageInfo();
+
+  std::unique_ptr<Compaction> compaction(level_compaction_picker.PickCompaction(
+      cf_name_, mutable_cf_options_, mutable_db_options_,
+      /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr, vstorage_.get(),
+      &log_buffer_, /*full_history_ts_low=*/""));
+  ASSERT_NE(compaction, nullptr);
+  ASSERT_TRUE(compaction->IsTrivialMove());
+  ASSERT_EQ(compaction->num_input_files(0), 1U);
+  ASSERT_EQ(compaction->input(0, 0)->fd.GetNumber(), 1U);
+}
+
+TEST_F(CompactionPickerTest, CostBasedIntraL0NeverPicksOneExactRunAlone) {
+  // The cost-based intra-L0 pick (PickIntraL0Compaction) runs when L0 -> L1 is
+  // blocked. It takes the newest L0 files while the work per removed file
+  // does not grow and the total stays within max_compaction_bytes, and it needs
+  // at least 4 inputs (kMinFilesForIntraL0Compaction). It must count sorted
+  // runs, not files: if its inputs were one exact epoch run, the compaction
+  // would rewrite the run into itself and remove no sorted run.
+  //
+  // Setup: L0 holds 8 files of 200000 bytes each. The 5 newest (files 1..5,
+  // epoch 50) form one exact epoch run. Files 6, 7 and 8 are older single
+  // files. With max_compaction_bytes = 1000000, the pick stops after the 5
+  // run files. L0 has 4 sorted runs, which passes the trigger + 2 check with a
+  // trigger of 2. The L1 file covers all L0 keys and is being compacted, so
+  // L0 -> L1 is blocked.
+  //
+  // With blob indirection, the 5 files are one sorted run, so the cost-based
+  // pick must not take them alone. Without blob indirection, the same 5 files
+  // are 5 sorted runs, and the pick takes them. That case shows that the
+  // layout reaches the cost-based pick.
+  for (const bool indirection : {false, true}) {
+    SCOPED_TRACE(indirection);
+    mutable_cf_options_.level0_file_num_compaction_trigger = 2;
+    mutable_cf_options_.max_compaction_bytes = 1000000u;
+    NewVersionStorage(6, kCompactionStyleLevel);
+    Add(0, 1U, "100", "150", 200000U, 0, 180, 181);
+    Add(0, 2U, "151", "200", 200000U, 0, 170, 171);
+    Add(0, 3U, "201", "250", 200000U, 0, 160, 161);
+    Add(0, 4U, "251", "300", 200000U, 0, 150, 151);
+    Add(0, 5U, "301", "350", 200000U, 0, 140, 141);
+    Add(0, 6U, "100", "350", 200000U, 0, 130, 131);
+    Add(0, 7U, "100", "350", 200000U, 0, 120, 121);
+    Add(0, 8U, "100", "350", 200000U, 0, 110, 111);
+    Add(1, 9U, "100", "350", 200000U, 0, 100, 101);
+    const uint64_t epochs[] = {50, 50, 50, 50, 50, 40, 30, 20};
+    for (size_t i = 0; i < 8; ++i) {
+      files_[i]->epoch_number = epochs[i];
+      if (indirection) {
+        files_[i]->blob_reference_descriptor = "exact";
+      }
+    }
+    if (indirection) {
+      vstorage_->SetBlobIndirectionFormatVersion(1);
+    }
+    vstorage_->LevelFiles(1)[0]->being_compacted = true;
+    UpdateVersionStorageInfo();
+    ASSERT_EQ(vstorage_->NumL0SortedRuns(), indirection ? 4 : 8);
+
+    std::unique_ptr<Compaction> compaction(
+        level_compaction_picker.PickCompaction(
+            cf_name_, mutable_cf_options_, mutable_db_options_,
+            /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr,
+            vstorage_.get(), &log_buffer_, /*full_history_ts_low=*/""));
+    if (!indirection) {
+      ASSERT_NE(compaction, nullptr);
+      ASSERT_EQ(compaction->output_level(), 0);
+      ASSERT_EQ(compaction->num_input_files(0), 5U);
+      continue;
+    }
+    // No compaction, or an intra-L0 compaction with at least 4 sorted runs.
+    if (compaction != nullptr) {
+      ASSERT_EQ(compaction->start_level(), 0);
+      std::vector<FileMetaData*> inputs = *compaction->inputs(0);
+      EXPECT_GE(vstorage_->CountL0SortedRuns(inputs), 4U);
+    }
+  }
+}
+
+TEST_F(CompactionPickerTest, CoarseL0FilesAreNotTriviallyMoved) {
+  // Coarse L0 files must be rewritten with exact metadata when they leave L0.
+  // The L0 trivial move stops at them, so the normal pick runs and sets
+  // grandparents for output cutting.
+  mutable_cf_options_.max_bytes_for_level_base = 10000000u;
+  mutable_cf_options_.level0_file_num_compaction_trigger = 2;
+  mutable_cf_options_.max_compaction_bytes = 10000000u;
+  ioptions_.level_compaction_dynamic_level_bytes = false;
+  NewVersionStorage(6, kCompactionStyleLevel);
+  Add(0, 2U, "300", "400");
+  Add(0, 1U, "100", "200");
+  Add(1, 10U, "500", "600");
+  Add(2, 20U, "100", "450");
+  files_[0]->epoch_number = 20;
+  files_[1]->epoch_number = 10;
+  files_[0]->oldest_coarse_indirect_origin_file_number = 50;
+  files_[1]->oldest_coarse_indirect_origin_file_number = 50;
+  vstorage_->SetBlobIndirectionFormatVersion(1);
+  UpdateVersionStorageInfo();
+
+  std::unique_ptr<Compaction> compaction(level_compaction_picker.PickCompaction(
+      cf_name_, mutable_cf_options_, mutable_db_options_,
+      /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr, vstorage_.get(),
+      &log_buffer_, /*full_history_ts_low=*/""));
+  ASSERT_NE(compaction, nullptr);
+  EXPECT_EQ(compaction->start_level(), 0);
+  EXPECT_FALSE(compaction->IsTrivialMove());
+  EXPECT_FALSE(compaction->grandparents().empty());
+}
+
+TEST_F(CompactionPickerTest, CoarseL0FileStopsTrivialMoveAfterExactFile) {
+  // File 1, the oldest L0 file, has no coarse pin. File 2, the next one, is
+  // coarse with frontier 50 (an example file number; see "Coarse SST" in
+  // db/blob/blob_reference_metadata.h). A trivial move may take only the files
+  // older than the coarse file.
+  mutable_cf_options_.max_bytes_for_level_base = 10000000u;
+  mutable_cf_options_.level0_file_num_compaction_trigger = 2;
+  mutable_cf_options_.max_compaction_bytes = 10000000u;
+  ioptions_.level_compaction_dynamic_level_bytes = false;
+  NewVersionStorage(6, kCompactionStyleLevel);
+  Add(0, 2U, "300", "400");
+  Add(0, 1U, "100", "200");
+  Add(2, 20U, "500", "600");
+  files_[0]->epoch_number = 20;
+  files_[1]->epoch_number = 10;
+  files_[0]->oldest_coarse_indirect_origin_file_number = 50;
+  vstorage_->SetBlobIndirectionFormatVersion(1);
+  UpdateVersionStorageInfo();
+
+  std::unique_ptr<Compaction> compaction(level_compaction_picker.PickCompaction(
+      cf_name_, mutable_cf_options_, mutable_db_options_,
+      /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr, vstorage_.get(),
+      &log_buffer_, /*full_history_ts_low=*/""));
+  ASSERT_NE(compaction, nullptr);
+  EXPECT_EQ(compaction->start_level(), 0);
+  if (compaction->IsTrivialMove()) {
+    for (const FileMetaData* file : *compaction->inputs(0)) {
+      EXPECT_EQ(file->oldest_coarse_indirect_origin_file_number, 0U);
+    }
+  }
+  bool has_coarse_input = false;
+  for (const FileMetaData* file : *compaction->inputs(0)) {
+    has_coarse_input |= file->oldest_coarse_indirect_origin_file_number != 0;
+  }
+  EXPECT_TRUE(!has_coarse_input || !compaction->IsTrivialMove());
+}
 
 class CompactionPickerU64TsTest : public CompactionPickerTestBase {
  public:

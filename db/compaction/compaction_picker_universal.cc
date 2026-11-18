@@ -9,6 +9,7 @@
 
 #include "db/compaction/compaction_picker_universal.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <queue>
@@ -93,8 +94,12 @@ class UniversalCompactionBuilder {
 
     int level;
     // `file` Will be null for level > 0. For level = 0, the sorted run is
-    // for this file.
+    // for this file, or it is the newest file of an exact epoch run (see
+    // VersionStorageInfo::NumL0SortedRuns()). The run is the
+    // `l0_file_count` L0 files from L0 position `l0_position`.
     FileMetaData* file;
+    size_t l0_position = 0;
+    size_t l0_file_count = 0;
     // For level > 0, `size` and `compensated_file_size` are sum of sizes all
     // files in the level. `being_compacted` should be the same for all files
     // in a non-zero level. Use the value here.
@@ -329,6 +334,19 @@ class UniversalCompactionBuilder {
 
   Compaction* PickCompactionWithSortedRunRange(
       size_t start_index, size_t end_index, CompactionReason compaction_reason);
+
+  // Checks that the L0 sorted runs in [start_index, end_index] of sorted_runs_
+  // can be compacted: VersionStorageInfo::ExpandExactL0Inputs() accepts their
+  // files and adds none, because each L0 sorted run holds a whole exact epoch
+  // run. Returns false, with a WARN in the LOG, when a needed file is being
+  // compacted, has kUnknownEpochNumber, or the expansion would add a file.
+  // Returns true when the range starts at a non-L0 sorted run.
+  bool CheckExactL0RunRange(size_t start_index, size_t end_index) const;
+
+  // Appends the L0 files of sorted run `sr` (one file, or every file of an
+  // exact epoch run) to `files`, in L0 order.
+  void AppendL0RunFiles(const SortedRun& sr,
+                        std::vector<FileMetaData*>* files) const;
 
   // Try to pick periodic compaction. The caller should only call it
   // if there is at least one file marked for periodic compaction.
@@ -664,12 +682,17 @@ void UniversalCompactionBuilder::SortedRun::DumpSizeInfo(
     char* out_buf, size_t out_buf_size, size_t sorted_run_count) const {
   if (level == 0) {
     assert(file != nullptr);
-    snprintf(out_buf, out_buf_size,
-             "file %" PRIu64 "[%" ROCKSDB_PRIszt
-             "] "
-             "with size %" PRIu64 " (compensated size %" PRIu64 ")",
-             file->fd.GetNumber(), sorted_run_count, file->fd.GetFileSize(),
-             file->compensated_file_size);
+    const int written = snprintf(
+        out_buf, out_buf_size,
+        "file %" PRIu64 "[%" ROCKSDB_PRIszt
+        "] "
+        "with size %" PRIu64 " (compensated size %" PRIu64 ")",
+        file->fd.GetNumber(), sorted_run_count, size, compensated_file_size);
+    if (l0_file_count > 1 && written > 0 &&
+        static_cast<size_t>(written) < out_buf_size) {
+      snprintf(out_buf + written, out_buf_size - written,
+               " (epoch run of %" ROCKSDB_PRIszt " files)", l0_file_count);
+    }
   } else {
     snprintf(out_buf, out_buf_size,
              "level %d[%" ROCKSDB_PRIszt
@@ -686,15 +709,35 @@ UniversalCompactionBuilder::CalculateSortedRuns(
   assert(max_run_size);
   *max_run_size = 0;
   std::vector<UniversalCompactionBuilder::SortedRun> ret;
-  for (FileMetaData* f : vstorage.LevelFiles(0)) {
-    if (earliest_snapshot_.has_value() && f->marked_for_compaction) {
-      file_marked_for_compaction_to_sorted_run_index_.emplace(f->fd.GetNumber(),
-                                                              ret.size());
+  // Each L0 file is a sorted run, except that an exact epoch run is one sorted
+  // run (see VersionStorageInfo::NumL0SortedRuns()). Its size is the sum of
+  // its files, and picking it picks all its files.
+  const std::vector<FileMetaData*>& l0_files = vstorage.LevelFiles(0);
+  for (size_t first = 0; first < l0_files.size();) {
+    const size_t end = vstorage.L0SortedRunEnd(first);
+    uint64_t size = 0;
+    uint64_t compensated_size = 0;
+    bool being_compacted = false;
+    bool has_marked_standalone_rangedel = false;
+    for (size_t i = first; i < end; ++i) {
+      FileMetaData* const f = l0_files[i];
+      if (earliest_snapshot_.has_value() && f->marked_for_compaction) {
+        file_marked_for_compaction_to_sorted_run_index_.emplace(
+            f->fd.GetNumber(), ret.size());
+      }
+      size += f->fd.GetFileSize();
+      compensated_size += f->compensated_file_size;
+      being_compacted = being_compacted || f->being_compacted;
+      has_marked_standalone_rangedel =
+          has_marked_standalone_rangedel ||
+          (f->marked_for_compaction && f->FileIsStandAloneRangeTombstone());
     }
-    ret.emplace_back(
-        0, f, f->fd.GetFileSize(), f->compensated_file_size, f->being_compacted,
-        f->marked_for_compaction && f->FileIsStandAloneRangeTombstone());
-    *max_run_size = std::max(*max_run_size, f->fd.GetFileSize());
+    ret.emplace_back(0, l0_files[first], size, compensated_size,
+                     being_compacted, has_marked_standalone_rangedel);
+    ret.back().l0_position = first;
+    ret.back().l0_file_count = end - first;
+    *max_run_size = std::max(*max_run_size, size);
+    first = end;
   }
   for (int level = 1; level <= last_level; level++) {
     uint64_t total_compensated_size = 0U;
@@ -1031,7 +1074,11 @@ Compaction* UniversalCompactionBuilder::PickCompactionToReduceSortedRuns(
   if (!done || candidate_count <= 1) {
     return nullptr;
   }
-  size_t first_index_after = start_index + candidate_count;
+  size_t end_index = start_index + candidate_count - 1;
+  if (!CheckExactL0RunRange(start_index, end_index)) {
+    return nullptr;
+  }
+  size_t first_index_after = end_index + 1;
   // Compression is enabled if files compacted earlier already reached
   // size ratio of compression.
   bool enable_compression = true;
@@ -1082,8 +1129,7 @@ Compaction* UniversalCompactionBuilder::PickCompactionToReduceSortedRuns(
   for (size_t i = start_index; i < first_index_after; i++) {
     auto& picking_sr = sorted_runs_[i];
     if (picking_sr.level == 0) {
-      FileMetaData* picking_file = picking_sr.file;
-      inputs[0].files.push_back(picking_file);
+      AppendL0RunFiles(picking_sr, &inputs[0].files);
     } else {
       auto& files = inputs[picking_sr.level - start_level].files;
       for (auto* f : vstorage_->LevelFiles(picking_sr.level)) {
@@ -1509,9 +1555,16 @@ Compaction* UniversalCompactionBuilder::PickDeleteTriggeredCompaction() {
       if (sr->being_compacted) {
         continue;
       }
-      FileMetaData* f = vstorage_->LevelFiles(0)[loop];
-      if (f->marked_for_compaction && !ShouldSkipMarkedFile(f)) {
-        start_level_inputs.files.push_back(f);
+      // A sorted run is one L0 file or one exact epoch run. Pick the whole
+      // run when one of its files is marked.
+      std::vector<FileMetaData*> run_files;
+      AppendL0RunFiles(*sr, &run_files);
+      if (std::any_of(run_files.begin(), run_files.end(),
+                      [this](const FileMetaData* f) {
+                        return f->marked_for_compaction &&
+                               !ShouldSkipMarkedFile(f);
+                      })) {
+        start_level_inputs.files = std::move(run_files);
         start_index =
             static_cast<int>(loop);  // Consider this as the first candidate.
         break;
@@ -1528,8 +1581,14 @@ Compaction* UniversalCompactionBuilder::PickDeleteTriggeredCompaction() {
         break;
       }
 
-      FileMetaData* f = vstorage_->LevelFiles(0)[loop];
-      start_level_inputs.files.push_back(f);
+      AppendL0RunFiles(*sr, &start_level_inputs.files);
+    }
+    // Each sorted run holds a whole exact epoch run (see
+    // VersionStorageInfo::NumL0SortedRuns()), so ExpandExactL0Inputs() adds
+    // no file here. It still fails the pick when a run file has
+    // kUnknownEpochNumber.
+    if (!vstorage_->ExpandExactL0Inputs(&start_level_inputs.files)) {
+      return nullptr;
     }
   } else {
     int start_level;
@@ -1558,9 +1617,51 @@ Compaction* UniversalCompactionBuilder::PickCompactionToOldest(
                                           compaction_reason);
 }
 
+bool UniversalCompactionBuilder::CheckExactL0RunRange(size_t start_index,
+                                                      size_t end_index) const {
+  std::vector<FileMetaData*> inputs;
+  for (size_t index = start_index;
+       index <= end_index && sorted_runs_[index].level == 0; ++index) {
+    AppendL0RunFiles(sorted_runs_[index], &inputs);
+  }
+  const size_t picked_count = inputs.size();
+  if (!vstorage_->ExpandExactL0Inputs(&inputs)) {
+    ROCKS_LOG_WARN(ioptions_.logger,
+                   "[%s] Universal: skipped a pick of %" ROCKSDB_PRIszt
+                   " L0 files: an exact epoch run has a file that is being "
+                   "compacted or has no epoch number",
+                   cf_name_.c_str(), picked_count);
+    return false;
+  }
+  if (inputs.size() != picked_count) {
+    // A sorted run that holds only part of an exact epoch run. The pick would
+    // write an output that overlaps the files it leaves out, so it stops.
+    ROCKS_LOG_WARN(ioptions_.logger,
+                   "[%s] Universal: skipped a pick of %" ROCKSDB_PRIszt
+                   " L0 files that holds part of an exact epoch run (the run "
+                   "has %" ROCKSDB_PRIszt " files in the pick range)",
+                   cf_name_.c_str(), picked_count, inputs.size());
+    return false;
+  }
+  return true;
+}
+
+void UniversalCompactionBuilder::AppendL0RunFiles(
+    const SortedRun& sr, std::vector<FileMetaData*>* files) const {
+  assert(sr.level == 0);
+  const std::vector<FileMetaData*>& l0_files = vstorage_->LevelFiles(0);
+  assert(sr.l0_position + sr.l0_file_count <= l0_files.size());
+  assert(l0_files[sr.l0_position] == sr.file);
+  files->insert(files->end(), l0_files.begin() + sr.l0_position,
+                l0_files.begin() + sr.l0_position + sr.l0_file_count);
+}
+
 Compaction* UniversalCompactionBuilder::PickCompactionWithSortedRunRange(
     size_t start_index, size_t end_index, CompactionReason compaction_reason) {
   assert(start_index < sorted_runs_.size());
+  if (!CheckExactL0RunRange(start_index, end_index)) {
+    return nullptr;
+  }
 
   // Estimate total file size
   uint64_t estimated_total_size = 0;
@@ -1578,8 +1679,7 @@ Compaction* UniversalCompactionBuilder::PickCompactionWithSortedRunRange(
   for (size_t loop = start_index; loop <= end_index; loop++) {
     auto& picking_sr = sorted_runs_[loop];
     if (picking_sr.level == 0) {
-      FileMetaData* f = picking_sr.file;
-      inputs[0].files.push_back(f);
+      AppendL0RunFiles(picking_sr, &inputs[0].files);
     } else {
       auto& files = inputs[picking_sr.level - start_level].files;
       for (auto* f : vstorage_->LevelFiles(picking_sr.level)) {
@@ -1681,7 +1781,10 @@ Compaction* UniversalCompactionBuilder::PickPeriodicCompaction() {
   if (start_index == sorted_runs_.size() - 1) {
     bool included_file_marked = false;
     int start_level = sorted_runs_[start_index].level;
-    FileMetaData* start_file = sorted_runs_[start_index].file;
+    std::vector<FileMetaData*> start_run_files;
+    if (start_level == 0) {
+      AppendL0RunFiles(sorted_runs_[start_index], &start_run_files);
+    }
     for (const std::pair<int, FileMetaData*>& level_file_pair :
          vstorage_->FilesMarkedForPeriodicCompaction()) {
       if (start_level != 0) {
@@ -1691,8 +1794,9 @@ Compaction* UniversalCompactionBuilder::PickPeriodicCompaction() {
           break;
         }
       } else {
-        // Last sorted run is a L0 file.
-        if (start_file == level_file_pair.second) {
+        // Last sorted run is a L0 file or an exact epoch run.
+        if (std::find(start_run_files.begin(), start_run_files.end(),
+                      level_file_pair.second) != start_run_files.end()) {
           included_file_marked = true;
           break;
         }

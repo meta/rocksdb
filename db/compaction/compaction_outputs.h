@@ -41,6 +41,11 @@ class CompactionOutputs {
     OutputValidator validator;
     bool finished;
     bool is_proximal_level;
+    // True when the output was closed because it already held
+    // blob_indirection_max_references_per_sst blob references when the next
+    // user key arrived (see CompactionOutputs::AddToOutput()). Used by the
+    // event log.
+    bool closed_by_blob_reference_limit = false;
     std::shared_ptr<const TableProperties> table_properties;
   };
 
@@ -128,10 +133,10 @@ class CompactionOutputs {
 
   // Update output table properties from already populated TableProperties.
   // Used for remote compaction
-  void UpdateTableProperties(const TableProperties& table_properties);
+  Status UpdateTableProperties(const TableProperties& table_properties);
 
   // Update output table properties from table builder
-  void UpdateTableProperties();
+  Status UpdateTableProperties();
 
   IOStatus WriterSyncClose(const Status& intput_status, SystemClock* clock,
                            Statistics* statistics, bool use_fsync);
@@ -180,6 +185,10 @@ class CompactionOutputs {
   }
 
   FileMetaData* GetMetaData() { return &current_output().meta; }
+
+  bool CurrentOutputClosedByBlobReferenceLimit() const {
+    return outputs_.back().closed_by_blob_reference_limit;
+  }
 
   bool HasOutput() const { return !outputs_.empty(); }
 
@@ -290,6 +299,10 @@ class CompactionOutputs {
   // used for calculating the first key's overlap.
   uint64_t GetCurrentKeyGrandparentOverlappedBytes(
       const Slice& internal_key) const;
+
+  // Counts and logs a cut of the current output by the blob reference limit
+  // before `next_key`, and marks the output for the event log.
+  void NoteBlobReferenceLimitCut(const Slice& next_key);
 
   // Add current key from compaction_iterator to the output file. If needed
   // close and open new compaction output with the functions provided.

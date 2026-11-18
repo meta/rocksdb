@@ -405,6 +405,20 @@ class Repairer {
           return UnsupportedBlobIndirectionRepair();
         }
       }
+      const UserCollectedProperties::const_iterator classification =
+          collected.find(kBlobReferenceClassificationPropertyName);
+      if (classification != collected.end()) {
+        uint64_t frontier = 0;
+        status = DecodeBlobReferenceClassification(classification->second,
+                                                   &frontier);
+        // Any valid classification, also frontier 0, shows that the DB used
+        // enable_blob_indirection. RepairDB cannot rebuild that state, so it
+        // refuses the DB instead of writing a MANIFEST without the blob
+        // indirection format marker.
+        if (status.ok()) {
+          return UnsupportedBlobIndirectionRepair();
+        }
+      }
     }
     return Status::OK();
   }

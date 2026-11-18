@@ -3684,6 +3684,106 @@ void VersionStorageInfo::GenerateLevelFilesBrief() {
   }
 }
 
+bool VersionStorageInfo::ExpandExactL0Inputs(
+    std::vector<FileMetaData*>* inputs) const {
+  if (inputs->empty() || !HasBlobIndirectionFormat()) {
+    return true;
+  }
+  // Inputs can be out of Version's epoch order (newest first): the L0 overlap
+  // search with range expansion adds files in discovery order, so a newer file
+  // found after the range grows comes after an older one. Expand a copy sorted
+  // by epoch, newest first, so no input file is lost.
+  const auto newer = [](const FileMetaData* lhs, const FileMetaData* rhs) {
+    return lhs->epoch_number > rhs->epoch_number;
+  };
+  std::vector<FileMetaData*> sorted;
+  const std::vector<FileMetaData*>* ordered = inputs;
+  if (!std::is_sorted(inputs->begin(), inputs->end(), newer)) {
+    sorted = *inputs;
+    std::stable_sort(sorted.begin(), sorted.end(), newer);
+    ordered = &sorted;
+  }
+  const std::vector<FileMetaData*>& l0 = files_[0];
+  std::vector<FileMetaData*> expanded;
+  size_t input = 0;
+  while (input < ordered->size()) {
+    const uint64_t epoch = (*ordered)[input]->epoch_number;
+    const size_t first_input = input++;
+    while (input < ordered->size() &&
+           (*ordered)[input]->epoch_number == epoch) {
+      ++input;
+    }
+    const std::vector<FileMetaData*>::const_iterator first =
+        std::lower_bound(l0.begin(), l0.end(), epoch,
+                         [](const FileMetaData* file, uint64_t value) {
+                           return file->epoch_number > value;
+                         });
+    std::vector<FileMetaData*>::const_iterator last = first;
+    bool exact = false;
+    while (last != l0.end() && (*last)->epoch_number == epoch) {
+      exact |= !(*last)->blob_reference_descriptor.empty();
+      ++last;
+    }
+    if (exact) {
+      if (epoch == kUnknownEpochNumber) {
+        return false;
+      }
+      for (std::vector<FileMetaData*>::const_iterator file = first;
+           file != last; ++file) {
+        if ((*file)->being_compacted) {
+          return false;
+        }
+        expanded.push_back(*file);
+      }
+    } else {
+      expanded.insert(expanded.end(), ordered->begin() + first_input,
+                      ordered->begin() + input);
+    }
+  }
+  inputs->swap(expanded);
+  return true;
+}
+
+size_t VersionStorageInfo::L0SortedRunEnd(size_t first) const {
+  const std::vector<FileMetaData*>& l0 = files_[0];
+  assert(first < l0.size());
+  const uint64_t epoch = l0[first]->epoch_number;
+  if (!HasBlobIndirectionFormat() || epoch == kUnknownEpochNumber) {
+    return first + 1;
+  }
+  bool exact = !l0[first]->blob_reference_descriptor.empty();
+  size_t end = first + 1;
+  while (end < l0.size() && l0[end]->epoch_number == epoch) {
+    exact |= !l0[end]->blob_reference_descriptor.empty();
+    ++end;
+  }
+  return exact ? end : first + 1;
+}
+
+size_t VersionStorageInfo::CountL0SortedRuns(
+    const std::vector<FileMetaData*>& files) const {
+  if (!HasBlobIndirectionFormat()) {
+    return files.size();
+  }
+  size_t runs = 0;
+  size_t first = 0;
+  while (first < files.size()) {
+    const uint64_t epoch = files[first]->epoch_number;
+    bool exact = !files[first]->blob_reference_descriptor.empty();
+    size_t end = first + 1;
+    if (epoch != kUnknownEpochNumber) {
+      while (end < files.size() && files[end]->epoch_number == epoch) {
+        exact |= !files[end]->blob_reference_descriptor.empty();
+        ++end;
+      }
+    }
+    // Files of one epoch without an exact file are not a run: each one counts.
+    runs += exact ? 1 : end - first;
+    first = end;
+  }
+  return runs;
+}
+
 void VersionStorageInfo::PrepareForVersionAppend(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options) {
@@ -3906,9 +4006,10 @@ void VersionStorageInfo::EstimateCompactionBytesNeeded(
   for (auto* f : files_[0]) {
     level_size += f->fd.GetFileSize();
   }
-  // Level 0
+  // Level 0. An exact epoch run counts as one sorted run (see
+  // NumL0SortedRuns()), as in the L0 compaction score.
   bool level0_compact_triggered = false;
-  if (static_cast<int>(files_[0].size()) >=
+  if (static_cast<int>(CountL0SortedRuns(files_[0])) >=
           mutable_cf_options.level0_file_num_compaction_trigger ||
       level_size >= mutable_cf_options.max_bytes_for_level_base) {
     level0_compact_triggered = true;
@@ -4074,12 +4175,23 @@ void VersionStorageInfo::ComputeCompactionScore(
       // overwrites/deletions).
       int num_sorted_runs = 0;
       uint64_t total_size = 0;
-      for (auto* f : files_[level]) {
-        total_downcompact_bytes += static_cast<double>(f->fd.GetFileSize());
-        if (!f->being_compacted) {
-          total_size += f->compensated_file_size;
+      // An exact epoch run counts as one sorted run (see NumL0SortedRuns()).
+      // Its files are compacted together, so all or none of them are being
+      // compacted.
+      const std::vector<FileMetaData*>& l0_files = files_[level];
+      for (size_t first = 0; first < l0_files.size();) {
+        const size_t end = L0SortedRunEnd(first);
+        if (!l0_files[first]->being_compacted) {
           num_sorted_runs++;
         }
+        for (size_t i = first; i < end; ++i) {
+          FileMetaData* const f = l0_files[i];
+          total_downcompact_bytes += static_cast<double>(f->fd.GetFileSize());
+          if (!f->being_compacted) {
+            total_size += f->compensated_file_size;
+          }
+        }
+        first = end;
       }
       if (compaction_style_ == kCompactionStyleUniversal) {
         // For universal compaction, we use level0 score to indicate
@@ -5017,6 +5129,7 @@ void VersionStorageInfo::GenerateFileLocationIndex() {
   // SST walk already runs outside the DB mutex, so the census reads the result
   // without scanning the SSTs under the mutex.
   oldest_coarse_indirect_origin_file_number_ = kInvalidBlobFileNumber;
+  coarse_sst_count_ = 0;
 
   for (int level = 0; level < num_levels_; ++level) {
     num_files += files_[level].size();
@@ -5031,11 +5144,13 @@ void VersionStorageInfo::GenerateFileLocationIndex() {
 
       const uint64_t file_number = meta->fd.GetNumber();
       const uint64_t frontier = meta->oldest_coarse_indirect_origin_file_number;
-      if (frontier != kInvalidBlobFileNumber &&
-          (oldest_coarse_indirect_origin_file_number_ ==
-               kInvalidBlobFileNumber ||
-           frontier < oldest_coarse_indirect_origin_file_number_)) {
-        oldest_coarse_indirect_origin_file_number_ = frontier;
+      if (frontier != kInvalidBlobFileNumber) {
+        ++coarse_sst_count_;
+        if (oldest_coarse_indirect_origin_file_number_ ==
+                kInvalidBlobFileNumber ||
+            frontier < oldest_coarse_indirect_origin_file_number_) {
+          oldest_coarse_indirect_origin_file_number_ = frontier;
+        }
       }
 
       assert(file_locations_.find(file_number) == file_locations_.end());
@@ -5600,7 +5715,9 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
                                             const MutableCFOptions& options) {
   // Special logic to set number of sorted runs.
   // It is to match the previous behavior when all files are in L0.
-  int num_l0_count = static_cast<int>(files_[0].size());
+  // An exact epoch run counts as one sorted run (see NumL0SortedRuns()).
+  num_l0_sorted_runs_ = static_cast<int>(CountL0SortedRuns(files_[0]));
+  int num_l0_count = num_l0_sorted_runs_;
   if (compaction_style_ == kCompactionStyleUniversal) {
     // For universal compaction, we use level0 score to indicate
     // compaction score for the whole DB. Adding other levels as if

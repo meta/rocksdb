@@ -1093,10 +1093,12 @@ struct AdvancedColumnFamilyOptions {
   // Purpose: let indirect blob GC move the live values out of a blob file that
   // is mostly garbage without rewriting the SSTs that point to them. When this
   // option is on, each new blob value gets a kIndirectBlob BlobIndex, which
-  // keeps the value's identity (origin file and offset) when GC moves it, and
-  // each SST built by flush or compaction saves the exact list of blob
-  // references it keeps. See db/blob/blob_reference_metadata.h for how it
-  // works.
+  // keeps the value's identity (origin file and offset) when GC moves it.
+  // Compaction outputs at L1 or deeper, outputs of a bottommost compaction,
+  // and L0 compaction outputs with an exact input save the exact list of blob
+  // references they keep. Flush outputs save only a coarse classification,
+  // and a later compaction rewrites them with the exact list. See
+  // db/blob/blob_reference_metadata.h for how it works.
   //
   // Requirements and limits (option validation checks these after the
   // NotSupported check above):
@@ -1148,6 +1150,44 @@ struct AdvancedColumnFamilyOptions {
   // option when it opens, so a change applies to the relocation files that are
   // opened after it.
   bool pin_blob_relocation_location_blocks = false;
+
+  // Experimental. Applies to compaction outputs with exact blob reference
+  // metadata (the per-SST list of blob references that indirect blob GC reads).
+  // With enable_blob_indirection on, or after the DB has used it, these are
+  // outputs at L1 or deeper, outputs of a bottommost compaction, and L0
+  // outputs that have an exact L0 input. When such an output SST holds this
+  // many blob references, compaction starts a new output at the next user key.
+  //
+  // Build memory: while an SST is built, its blob references are kept in memory
+  // until the SST is finished, charged to the block cache. Each reference uses
+  // about the size of its encoded entry plus a small chunk overhead: about 8
+  // to 14 bytes (an estimate). A compressed value is at the high end, because
+  // its entry also stores the CRC of its stored bytes (see
+  // BlobReferenceMetadataCollector in db/blob/blob_reference_metadata.h). Many
+  // small groups in one SST cost more. This cap bounds that memory for each
+  // output being built. The default (1M references) uses about 8 to 14 MB. A
+  // lower value makes more, smaller output files.
+  //
+  // Output size: when every value is in a blob file, each SST row holds only
+  // the key and the BlobIndex, and the reference metadata adds a few bytes per
+  // reference. With small keys, an output at the default cap is well below the
+  // default target_file_size_base (64 MB). Larger keys or no compression make
+  // each row larger. With a larger target_file_size_base, raise this cap so
+  // that it does not cut outputs first. The build memory above then grows by
+  // about 8 to 14 bytes per extra reference.
+  //
+  // Soft limit: compaction starts a new output only before a new user key, once
+  // the output already holds the cap. The history of one user key (all of its
+  // versions that compaction keeps) is never split, so an output may pass the
+  // cap by one key's history.
+  //
+  // Scope: flush output carries no exact blob reference metadata, so this
+  // option applies to compaction outputs only.
+  //
+  // Valid range: [4096, 268435456] Default: 1048576
+  //
+  // Dynamically changeable through the SetOptions() API
+  uint64_t blob_indirection_max_references_per_sst = 1 << 20;
 
   // The size of the smallest value to be stored separately in a blob file.
   // Values which have an uncompressed size smaller than this threshold are

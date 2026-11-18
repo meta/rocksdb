@@ -81,6 +81,8 @@ class BlockBasedTableBuilder : public TableBuilder {
   TableBuilderAddResult TryAdd(const Slice& key, const Slice& value,
                                TableBuilderAddContext* context) override;
 
+  bool BlobReferenceLimitReached() const override;
+
   // Relocation file building. Indirect blob GC writes the live values it copies
   // into a relocation file, which is a block-based table (see
   // db/blob/blob_relocation_file.h). Create the builder with

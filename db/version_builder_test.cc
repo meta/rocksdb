@@ -1080,6 +1080,68 @@ TEST_F(VersionBuilderTest, IndirectOriginBlobFileRequiresFormatFence) {
   UnrefFilesInVersion(&output);
 }
 
+TEST_F(VersionBuilderTest, PhysicalFileLossRejectsNormalBlobFile) {
+  // A loss record names only a relocation file. A normal or indirect-origin
+  // blob file that is missing uses the base dropped-file record instead
+  // (best_efforts_blob_db_repair), so a loss record that names one is
+  // Corruption: in the edit that adds the file, and in a later edit. A later
+  // loss record that names a relocation file (file 200 in this test) is
+  // accepted.
+  UpdateVersionStorageInfo();
+  EnvOptions env_options;
+  const auto make_edit = [&](bool is_indirect_origin) {
+    VersionEdit edit;
+    edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+    edit.AddBlobFile(/*blob_file_number=*/100, /*total_blob_count=*/1,
+                     /*total_blob_bytes=*/10, /*checksum_method=*/{},
+                     /*checksum_value=*/{}, is_indirect_origin);
+    AddDummyFileToEdit(
+        &edit, /*table_file_number=*/101,
+        /*blob_file_number=*/is_indirect_origin ? kInvalidBlobFileNumber : 100,
+        /*epoch_number=*/1);
+    if (is_indirect_origin) {
+      AddBlobReferenceDescriptorToLastFile(&edit);
+    } else {
+      edit.GetMutableNewFiles().back().second.blob_reference_legacy_metadata =
+          true;
+    }
+    return edit;
+  };
+  for (const bool is_indirect_origin : {true, false}) {
+    SCOPED_TRACE("is_indirect_origin=" + std::to_string(is_indirect_origin));
+    VersionEdit lost = make_edit(is_indirect_origin);
+    lost.MarkBlobPhysicalFileLost(100);
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    const Status status = builder.Apply(&lost);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    ASSERT_NE(status.ToString().find("names no live target"),
+              std::string::npos);
+  }
+
+  VersionEdit added = make_edit(/*is_indirect_origin=*/true);
+  BlobRelocationFileAddition relocation;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/200,
+                                   /*origin_file_numbers=*/{90}, &relocation));
+  added.AddBlobRelocationFile(relocation);
+  const auto make_later = [](uint64_t lost_file_number) {
+    VersionEdit later;
+    later.SetBlobIndirectionFormatVersion(
+        kBlobIndirectionManifestFormatVersion);
+    later.MarkBlobPhysicalFileLost(lost_file_number);
+    return later;
+  };
+  VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                         &vstorage_, /*version_set=*/nullptr);
+  ASSERT_OK(builder.Apply(&added));
+  VersionEdit later_origin = make_later(100);
+  const Status status = builder.Apply(&later_origin);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(status.ToString().find("names no live target"), std::string::npos);
+  VersionEdit later_relocation = make_later(200);
+  ASSERT_OK(builder.Apply(&later_relocation));
+}
+
 TEST_F(VersionBuilderTest, ImplicitNormalBlobPruningReportsPhysicalDeletion) {
   constexpr uint64_t kBlob = 100;
   constexpr uint64_t kSst = 101;

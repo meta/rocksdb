@@ -409,6 +409,67 @@ class VersionStorageInfo {
     return files_[level];
   }
 
+  // An exact compaction to L0 can write several files with one epoch number,
+  // because the reference cap (blob_indirection_max_references_per_sst) can
+  // cut its output. These files are an epoch run. Later picks must take all
+  // files of such a run, or none of them.
+  //
+  // Why: a compaction output gets the smallest epoch number of its inputs. In
+  // this example, the file numbers, epochs and keys are only examples:
+  //
+  //   L0, newest first:
+  //     file 25  epoch 12  keys [j..n]
+  //     file 21  epoch 9   keys [m..z]   <- one epoch run, cut by the
+  //     file 20  epoch 9   keys [a..k]   <- reference cap
+  //
+  // Suppose a compaction to L0 takes files 25 and 21, but not file 20. Its
+  // output gets epoch 9 and keys [j..z]. The output holds the newer versions
+  // of the keys in [j..k] (from file 25), and file 20 holds older versions of
+  // the same keys, with the same epoch. L0 orders overlapping files by epoch,
+  // so the two files have no order. The Version consistency check (on by
+  // default; see force_consistency_checks) rejects them ("L0 files of same
+  // epoch number but overlapping range"), so the compaction cannot install.
+  // Taking the whole run avoids this.
+  //
+  // Only runs that hold an exact file are expanded, because only an exact
+  // output can be cut by the reference cap. Files of the other epochs are
+  // kept as given. Only the epochs of the inputs are inspected, not the whole
+  // Version. `inputs` may be in any order; the result is in Version's epoch
+  // order (newest first). When the DB has no blob indirection format,
+  // `inputs` is returned unchanged. Returns false, leaving `inputs`
+  // unchanged, when an exact run has a file being compacted or has
+  // kUnknownEpochNumber (0). A file with epoch 0 has no known epoch, so its
+  // run cannot be found.
+  bool ExpandExactL0Inputs(std::vector<FileMetaData*>* inputs) const;
+
+  // L0 sorted runs. In a column family with the blob indirection format, the
+  // files of one exact epoch run (adjacent L0 files with one known epoch
+  // number, at least one of them exact; see ExpandExactL0Inputs()) count as
+  // one sorted run. This is correct because the files share one epoch and
+  // their key ranges do not overlap, so each key is in at most one of them,
+  // the same as in a single file. Every other L0 file is its own sorted run, as
+  // in base RocksDB. See "Reference cap and epoch runs" in
+  // db/blob/blob_reference_metadata.h for why runs exist. Counting each file of
+  // a run would keep the L0 count at about references / cap:
+  // compactions would rewrite the same run again and again, and writes would
+  // slow down or stop.
+  //
+  // L0SortedRunEnd() returns the L0 position one past the last file of the
+  // sorted run that starts at L0 position `first`.
+  size_t L0SortedRunEnd(size_t first) const;
+
+  // The number of L0 sorted runs among `files`: L0 files of this Version in
+  // its order (newest first), where each run is whole. Without the blob
+  // indirection format, it is files.size(). O(files.size()).
+  size_t CountL0SortedRuns(const std::vector<FileMetaData*>& files) const;
+
+  // The number of L0 sorted runs in this Version, set by CalculateBaseBytes()
+  // (called from PrepareForVersionAppend()). Without the blob indirection
+  // format, it is the L0 file count. The L0 compaction score, the write stall
+  // count (l0_delay_trigger_count()) and the leveled intra-L0 triggers use
+  // it. rocksdb.num-files-at-level0 and NumLevelFiles(0) stay file counts.
+  int NumL0SortedRuns() const { return num_l0_sorted_runs_; }
+
   bool HasMissingEpochNumber() const;
   uint64_t GetMaxEpochNumberOfFiles() const;
   EpochNumberRequirement GetEpochNumberRequirement() const {
@@ -486,6 +547,9 @@ class VersionStorageInfo {
   uint64_t OldestCoarseIndirectOriginFileNumber() const {
     return oldest_coarse_indirect_origin_file_number_;
   }
+  // The number of coarse SSTs (SSTs with a nonzero coarse frontier, the oldest
+  // indirect-origin file number a coarse SST may reference).
+  size_t CoarseSstCount() const { return coarse_sst_count_; }
   bool IsCoarseIndirectOriginBlobPinned(uint64_t file_number) const {
     return oldest_coarse_indirect_origin_file_number_ !=
                kInvalidBlobFileNumber &&
@@ -1068,6 +1132,7 @@ class VersionStorageInfo {
   // Vector of blob files in version sorted by blob file number.
   BlobFiles blob_files_;
   uint64_t oldest_coarse_indirect_origin_file_number_ = kInvalidBlobFileNumber;
+  size_t coarse_sst_count_ = 0;
   // Blob files of the base Version that are gone from this Version.
   // VersionBuilder::SaveBlobFilesAndCheckTo() records them outside the DB mutex
   // for the census delta. This is not the set of retired files, and it is never
@@ -1194,6 +1259,7 @@ class VersionStorageInfo {
   std::vector<double> compaction_score_;
   std::vector<int> compaction_level_;
   int l0_delay_trigger_count_ = 0;  // Count used to trigger slow down and stop
+  int num_l0_sorted_runs_ = 0;      // See NumL0SortedRuns()
                                     // for number of L0 files.
 
   // Compact cursors for round-robin compactions in each level
@@ -1240,6 +1306,19 @@ class VersionStorageInfo {
   friend class Version;
   friend class VersionSet;
 };
+
+// True if the column family uses blob indirection now (the option
+// enable_blob_indirection) or has used it (the format fence of `storage`, see
+// VersionStorageInfo::HasBlobIndirectionFormat()). In such a column family,
+// flush, WAL recovery flush and compaction record blob reference metadata:
+// exact metadata, or the coarse classification (see
+// TableBuilderOptions::track_blob_reference_classification). `storage` may be
+// nullptr; then only the option counts.
+inline bool UsesBlobIndirection(const MutableCFOptions& mutable_cf_options,
+                                const VersionStorageInfo* storage) {
+  return mutable_cf_options.enable_blob_indirection ||
+         (storage != nullptr && storage->HasBlobIndirectionFormat());
+}
 
 struct ObsoleteFileInfo {
   FileMetaData* metadata;

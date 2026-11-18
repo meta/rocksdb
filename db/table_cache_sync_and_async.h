@@ -54,12 +54,19 @@ DEFINE_SYNC_AND_ASYNC(Status, TableCache::Get)
     if (s.ok() && ((max_covering_tombstone_seq != nullptr &&
                     !options.ignore_range_deletions) ||
                    track_newer_versions)) {
+      // Runs only for an L0 file with range tombstones (see
+      // RangeTombstonesMayCoverUserKey()).
+      const auto may_cover = [&]() {
+        return level != 0 || RangeTombstonesMayCoverUserKey(
+                                 internal_comparator.user_comparator(),
+                                 file_meta, ExtractUserKey(k));
+      };
       if (track_newer_versions) {
         std::unique_ptr<FragmentedRangeTombstoneIterator> latest_range_del_iter(
             t->NewRangeTombstoneIterator(GetInternalKeySeqno(k),
                                          options.timestamp));
         const SequenceNumber covering_seq =
-            latest_range_del_iter != nullptr
+            latest_range_del_iter != nullptr && may_cover()
                 ? latest_range_del_iter->MaxCoveringTombstoneSeqnum(
                       ExtractUserKey(k), get_context->read_callback())
                 : 0;
@@ -72,7 +79,7 @@ DEFINE_SYNC_AND_ASYNC(Status, TableCache::Get)
           !options.ignore_range_deletions) {
         std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
             t->NewRangeTombstoneIterator(options));
-        if (range_del_iter != nullptr) {
+        if (range_del_iter != nullptr && may_cover()) {
           SequenceNumber seq =
               range_del_iter->MaxCoveringTombstoneSeqnum(ExtractUserKey(k));
           if (seq > *max_covering_tombstone_seq) {
@@ -201,7 +208,9 @@ DEFINE_SYNC_AND_ASYNC(Status, TableCache::MultiGet)
     }
     if (s.ok() && !skip_range_deletions &&
         (!options.ignore_range_deletions || track_newer_versions)) {
-      UpdateRangeTombstoneSeqnums(options, t, table_range);
+      UpdateRangeTombstoneSeqnums(
+          options, t, internal_comparator.user_comparator(),
+          level == 0 ? &file_meta : nullptr, table_range);
     }
     if (s.ok()) {
       CO_AWAIT(t->MultiGet, options, &table_range,

@@ -603,13 +603,14 @@ std::string BuildTableForTest(
   const CompressionOptions compression_options;
   // Column family 0 and file number 12 are example values; the exact
   // metadata needs a known column family and a file number.
-  const TableBuilderOptions tbo(
+  TableBuilderOptions tbo(
       ioptions, moptions, read_options, write_options, icmp, &factories,
       kNoCompression, compression_options, /*_column_family_id=*/0,
       kDefaultColumnFamilyName, /*_level=*/1, kUnknownNewestKeyTime,
       /*_is_bottommost=*/false, TableFileCreationReason::kCompaction,
       /*_oldest_key_time=*/0, /*_db_id=*/"db", /*_db_session_id=*/"session",
       /*_target_file_size=*/0, /*_cur_file_num=*/12);
+  tbo.collect_blob_reference_metadata = true;
 
   auto sink = std::make_unique<test::StringSink>();
   test::StringSink* const sink_ptr = sink.get();
@@ -730,6 +731,9 @@ TEST(BlobReferenceMetadataTest, EmptyRoundTrip) {
   ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(encoded_descriptor,
                                                         &decoded_descriptor));
   EXPECT_TRUE(decoded_descriptor.IsEmpty());
+  EXPECT_TRUE(decoded_descriptor.HasRepairMetadata());
+  EXPECT_EQ(decoded_descriptor.column_family_id, 0U);
+  EXPECT_EQ(decoded_descriptor.sst_file_number, 1U);
 
   BlobReferenceIndex index;
   std::vector<BlobReference> references;
@@ -2360,6 +2364,71 @@ TEST(BlobReferenceMetadataTest, SingleBlockSst) {
   EXPECT_EQ(index.groups[0].group.reference_count, 2U);
   EXPECT_EQ(index.groups[0].group.stored_value_bytes, 1600U);
   EXPECT_EQ(references.size(), 2U);
+}
+
+TEST(BlobReferenceMetadataTest, EstimateCoversOneLargeGroup) {
+  // EstimatedEncodedSize() is an upper bound of the metadata size. The table
+  // builder adds it to the SST size estimate that decides when to cut an output
+  // file. For one large group, the bound must not count one data block per
+  // reference: that would cut SST outputs far below their target size. The
+  // bound must still cover every block that Finish() writes.
+  constexpr uint64_t kReferenceCount = 20000;
+  constexpr size_t kBlockTrailerBytes = 5;
+  BlobReferenceMetadataCollector collector(
+      nullptr, BlobReferenceSstIdentity{.column_family_id = kTestColumnFamilyId,
+                                        .sst_file_number = kTestSstFileNumber});
+  for (uint64_t i = 0; i < kReferenceCount; ++i) {
+    ASSERT_OK(collector.Add(UnflattenedForTest(42, 1000 + i * 200, 80)));
+  }
+  const uint64_t estimated = collector.EstimatedEncodedSize();
+  EXPECT_LT(estimated, 224U * kReferenceCount / 2);
+  MetadataForTest metadata;
+  ASSERT_OK(FinishForTest(&collector, &metadata));
+  ASSERT_GT(metadata.blocks.size(), 1U);
+  uint64_t written = metadata.index.size() + kBlockTrailerBytes;
+  for (const std::string& block : metadata.blocks) {
+    written += block.size() + kBlockTrailerBytes;
+  }
+  EXPECT_GE(estimated, written);
+}
+
+TEST(BlobReferenceMetadataTest, EstimateCoversDistinctWideEncodedGroups) {
+  constexpr size_t kBlockTrailerBytes = 5;
+  const std::shared_ptr<Cache> cache = NewLRUCache(16 * 1024 * 1024);
+  const std::shared_ptr<CacheReservationManager> reservation =
+      std::make_shared<CacheReservationManagerImpl<
+          CacheEntryRole::kBlobReferenceMetadataBuildingBuffer>>(cache);
+  auto collector = std::make_unique<BlobReferenceMetadataCollector>(
+      reservation,
+      BlobReferenceSstIdentity{.column_family_id = kTestColumnFamilyId,
+                               .sst_file_number = kTestSstFileNumber});
+  constexpr uint64_t kReferences = 200;
+  for (uint64_t i = 0; i < kReferences; ++i) {
+    std::string encoded;
+    BlobIndex::EncodeIndirectBlob(&encoded, (1ULL << 60) + 1,
+                                  {.origin_file_number = (1ULL << 59) + i,
+                                   .original_value_offset = (1ULL << 63) + i,
+                                   .stored_value_size = 1ULL << 40,
+                                   .compression = kZSTD,
+                                   .stable_checksum = 123,
+                                   .stored_checksum = 456});
+    ASSERT_OK(collector->Add(DecodeBlobIndexForTest(encoded)));
+  }
+  const uint64_t estimated = collector->EstimatedEncodedSize();
+  EXPECT_GT(cache->GetPinnedUsage(), 0U);
+  uint64_t written = 0;
+  BlobReferenceMetadataDescriptor descriptor;
+  ASSERT_OK(collector->Finish(
+      [&written](const Slice& block, bool /*is_index_block*/,
+                 BlockHandle* handle) -> Status {
+        *handle = BlockHandle((1ULL << 60) + written, block.size());
+        written += block.size() + kBlockTrailerBytes;
+        return Status::OK();
+      },
+      &descriptor, /*summary=*/nullptr));
+  EXPECT_GE(estimated, written);
+  collector.reset();
+  EXPECT_EQ(cache->GetPinnedUsage(), 0U);
 }
 
 TEST(BlobReferenceMetadataTest, RepeatedReferenceFailsClosed) {
@@ -4093,6 +4162,12 @@ TEST_F(DBBlobIndexTest, FlushRecordsExactReferenceMetadata) {
   const std::string value(100, 'v');
   ASSERT_OK(Put(1, key, value));
   ASSERT_OK(Flush(1));
+  // Flush writes only the classification. The compaction output (level 1 or
+  // higher) has the exact descriptor and reference blocks.
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, handles_[1], nullptr, nullptr));
 
   TablePropertiesCollection properties;
   ASSERT_OK(db_->GetPropertiesOfAllTables(handles_[1], &properties));
@@ -4160,6 +4235,12 @@ TEST_F(DBBlobIndexTest, ReferenceDataBlocksUseTableCompression) {
       ASSERT_OK(Put(Key(i), std::string(100, 'v')));
     }
     ASSERT_OK(Flush());
+    // Flush writes only the classification. The compaction output (level 1 or
+    // higher) is exact.
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
 
     TablePropertiesCollection properties;
     ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));

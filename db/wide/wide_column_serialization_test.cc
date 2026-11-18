@@ -8,6 +8,7 @@
 #include <chrono>
 #include <forward_list>
 #include <limits>
+#include <set>
 
 #include "db/blob/blob_index.h"
 #include "db/wide/wide_columns_helper.h"
@@ -929,6 +930,74 @@ TEST_F(WideColumnSerializationTest, ResolveEntityForMergeNullBlobFetcher) {
       Slice(serialized), "user_key", nullptr /* blob_fetcher */,
       nullptr /* prefetch_buffers */, resolved_entity, effective_entity);
   ASSERT_TRUE(s.IsCorruption());
+}
+
+TEST_F(WideColumnSerializationTest, RemoveBlobColumns) {
+  const std::vector<std::pair<std::string, std::string>> columns{
+      {"", "inline"}, {"a", ""}, {"b", ""}, {"c", "x"}};
+  const std::vector<std::pair<size_t, BlobIndex>> blob_columns{
+      {1, MakeBlobIndex(10, 100, 5)}, {2, MakeBlobIndex(20, 200, 6)}};
+  std::string entity;
+  ASSERT_OK(
+      WideColumnSerialization::SerializeV2(columns, blob_columns, entity));
+  const auto remove_files = [](std::set<uint64_t> files) {
+    return [files](const BlobIndex& index) {
+      return files.count(index.file_number()) != 0;
+    };
+  };
+
+  // Nothing to remove: the output is not changed.
+  std::string output = "unchanged";
+  using Removal = WideColumnSerialization::BlobColumnRemoval;
+  Removal removal = Removal::kAll;
+  ASSERT_OK(WideColumnSerialization::RemoveBlobColumns(
+      entity, remove_files({30}), &output, removal));
+  ASSERT_EQ(removal, Removal::kNone);
+  ASSERT_EQ(output, "unchanged");
+
+  // One blob column: the other blob column moves to position 1.
+  ASSERT_OK(WideColumnSerialization::RemoveBlobColumns(
+      entity, remove_files({10}), &output, removal));
+  ASSERT_EQ(removal, Removal::kSome);
+  WideColumns result;
+  std::vector<std::pair<size_t, BlobIndex>> result_blobs;
+  ASSERT_OK(
+      WideColumnSerialization::Deserialize(output, result, &result_blobs));
+  ASSERT_EQ(result.size(), 3U);
+  ASSERT_EQ(result[0].name(), kDefaultWideColumnName);
+  ASSERT_EQ(result[0].value(), "inline");
+  ASSERT_EQ(result[1].name(), "b");
+  ASSERT_EQ(result[2].name(), "c");
+  ASSERT_EQ(result[2].value(), "x");
+  ASSERT_EQ(result_blobs.size(), 1U);
+  ASSERT_EQ(result_blobs[0].first, 1U);
+  ASSERT_EQ(result_blobs[0].second.file_number(), 20U);
+
+  // Every blob column: a plain entity remains.
+  ASSERT_OK(WideColumnSerialization::RemoveBlobColumns(
+      entity, remove_files({10, 20}), &output, removal));
+  ASSERT_EQ(removal, Removal::kSome);
+  result.clear();
+  result_blobs.clear();
+  ASSERT_OK(
+      WideColumnSerialization::Deserialize(output, result, &result_blobs));
+  ASSERT_EQ(result,
+            WideColumns({{kDefaultWideColumnName, "inline"}, {"c", "x"}}));
+  ASSERT_TRUE(result_blobs.empty());
+
+  // Every column: the caller turns the entity into a deletion.
+  std::string blob_only;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      std::vector<std::pair<std::string, std::string>>{{"a", ""}},
+      {{0, MakeBlobIndex(10, 100, 5)}}, blob_only));
+  ASSERT_OK(WideColumnSerialization::RemoveBlobColumns(
+      blob_only, remove_files({10}), &output, removal));
+  ASSERT_EQ(removal, Removal::kAll);
+
+  // Malformed input fails.
+  ASSERT_TRUE(WideColumnSerialization::RemoveBlobColumns(
+                  "\xff", remove_files({10}), &output, removal)
+                  .IsCorruption());
 }
 
 TEST_F(WideColumnSerializationTest, DeserializeRejectsTrailingData) {
