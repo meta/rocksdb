@@ -6,6 +6,7 @@
 #include "file/random_access_file_reader.h"
 
 #include <algorithm>
+#include <stdexcept>
 
 #include "file/file_util.h"
 #include "port/port.h"
@@ -218,6 +219,86 @@ TEST_F(RandomAccessFileReaderTest, SubmitReadAsyncDirectIOAligned) {
   ASSERT_OK(req.status);
   ASSERT_EQ(req.result.data(), req.scratch);
   ASSERT_EQ(req.result, Slice(content.data(), req.len));
+}
+
+namespace {
+// Accepts the first SubmitReadAsync and holds its callback, then throws on the
+// second, like a file system whose client throws while issuing a read.
+class ThrowOnSecondSubmitFile : public FSRandomAccessFileOwnerWrapper {
+ public:
+  explicit ThrowOnSecondSubmitFile(std::unique_ptr<FSRandomAccessFile>&& target)
+      : FSRandomAccessFileOwnerWrapper(std::move(target)) {}
+
+  bool SubmitReadAsync(FSReadRequest& req, const IOOptions& /*opts*/,
+                       std::function<void(FSReadRequest&)> cb,
+                       IODebugContext* /*dbg*/) override {
+    if (!held_cb_) {
+      held_req_ = &req;
+      held_cb_ = std::move(cb);
+      return true;
+    }
+    second_submit_threw_.post();
+    throw std::runtime_error("submit failed");
+  }
+
+  void WaitForSecondSubmitToThrow() { second_submit_threw_.wait(); }
+
+  void CompleteHeldRead() {
+    held_req_->status = IOStatus::OK();
+    held_req_->result = Slice();
+    held_cb_(*held_req_);
+  }
+
+ private:
+  FSReadRequest* held_req_ = nullptr;
+  std::function<void(FSReadRequest&)> held_cb_;
+  folly::Baton<> second_submit_threw_;
+};
+}  // namespace
+
+TEST_F(RandomAccessFileReaderTest,
+       MultiReadCoroutineWaitsForAcceptedReadsWhenASubmitThrows) {
+  const std::string fname = "submit-throws";
+  Write(fname, "0123456789");
+  const std::string fpath = Path(fname);
+  std::unique_ptr<FSRandomAccessFile> target;
+  ASSERT_OK(fs_->NewRandomAccessFile(fpath, FileOptions(), &target, nullptr));
+  auto file = std::make_unique<ThrowOnSecondSubmitFile>(std::move(target));
+  ThrowOnSecondSubmitFile* throwing_file = file.get();
+  RandomAccessFileReader reader(std::move(file), fpath,
+                                env_->GetSystemClock().get());
+
+  std::string scratch(4, '\0');
+  std::vector<FSReadRequest> reqs(2);
+  reqs[0].offset = 0;
+  reqs[0].len = 2;
+  reqs[0].scratch = scratch.data();
+  reqs[1].offset = 5;
+  reqs[1].len = 2;
+  reqs[1].scratch = scratch.data() + 2;
+
+  const IOOptions io_options;
+  folly::IOThreadPoolExecutor executor(1);
+  folly::EventBase* event_base = executor.getEventBase();
+  ASSERT_NE(event_base, nullptr);
+  auto multi_read =
+      folly::coro::co_withExecutor(
+          folly::Executor::getKeepAliveToken(event_base),
+          reader.MultiReadCoroutine(io_options, reqs.data(), reqs.size(),
+                                    nullptr, nullptr))
+          .start();
+
+  // The read must still be waiting for the accepted first request.
+  throwing_file->WaitForSecondSubmitToThrow();
+  event_base->runInEventBaseThreadAndWait([] {});
+  const bool ended_with_read_in_flight = multi_read.isReady();
+  EXPECT_FALSE(ended_with_read_in_flight);
+
+  // Once that request completes, the read ends with the submit's exception.
+  if (!ended_with_read_in_flight) {
+    throwing_file->CompleteHeldRead();
+  }
+  EXPECT_THROW(std::move(multi_read).get(), std::runtime_error);
 }
 
 #endif  // USE_COROUTINES

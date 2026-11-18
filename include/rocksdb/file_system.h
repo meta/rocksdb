@@ -1163,6 +1163,10 @@ class FSRandomAccessFile {
   // All arguments and any memory they reference remain valid until cb is
   // invoked.
   //
+  // An implementation that throws must not have started the read: it must not
+  // invoke cb for this request, then or later. RocksDB waits for the requests
+  // it already submitted and rethrows the exception to its caller.
+  //
   // Default implementation reads the data synchronously and invokes the
   // callback before returning. It uses MultiRead() when scratch is nullptr so
   // implementations supporting kFSBuffer can provide an allocated buffer.

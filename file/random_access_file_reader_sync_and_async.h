@@ -11,6 +11,7 @@
 
 #if defined(USE_COROUTINES)
 #include <atomic>
+#include <exception>
 #include <memory>
 
 #include "folly/coro/Baton.h"
@@ -38,25 +39,46 @@ inline folly::coro::Task<void> SubmitMultiReadAsync(
   Defer assert_no_pending_reads(
       [&] { assert(pending.load(std::memory_order_acquire) == 0); });
 #endif  // NDEBUG
+  const auto on_read_done = [&baton, &pending](FSReadRequest& /*req*/) {
+    if (pending.fetch_sub(1) == 1) {
+      // If ViaIfAsync is already waiting, post from null so its executor
+      // callback does not also capture the read's stats as the outer context
+      // restored after continuation completes.
+      folly::RequestContextScopeGuard null_context{
+          std::shared_ptr<folly::RequestContext>{}};
+      baton.post();
+    }
+  };
+  std::exception_ptr submit_error;
+  bool reads_in_flight = true;
   for (size_t i = 0; i < num_fs_reqs; ++i) {
-    if (!file->SubmitReadAsync(
-            fs_reqs[i], opts,
-            [&baton, &pending](FSReadRequest& /*req*/) {
-              if (pending.fetch_sub(1) == 1) {
-                // If ViaIfAsync is already waiting, post from null so its
-                // executor callback does not also capture the read's stats as
-                // the outer context restored after continuation completes.
-                folly::RequestContextScopeGuard null_context{
-                    std::shared_ptr<folly::RequestContext>{}};
-                baton.post();
-              }
-            },
-            dbg)) {
+    bool submitted_async = false;
+    try {
+      submitted_async =
+          file->SubmitReadAsync(fs_reqs[i], opts, on_read_done, dbg);
+    } catch (...) {
+      // Requests i and later never call back. Earlier ones still will, and
+      // their callbacks use this frame, so wait for them before rethrowing.
+      submit_error = std::current_exception();
+      const size_t not_submitted = num_fs_reqs - i;
+      reads_in_flight = pending.fetch_sub(not_submitted) != not_submitted;
+      break;
+    }
+    if (!submitted_async) {
       RecordTick(stats, FILE_SUBMIT_ASYNC_READ_FALLBACK, 1);
     }
   }
 
-  co_await baton;
+  if (reads_in_flight) {
+    co_await baton;
+  }
+  if (submit_error) {
+    // The exception abandons every request's result, so no caller checks them.
+    for (size_t i = 0; i < num_fs_reqs; ++i) {
+      fs_reqs[i].status.PermitUncheckedError();
+    }
+    std::rethrow_exception(submit_error);
+  }
 }
 #endif  // WITH_COROUTINES
 
