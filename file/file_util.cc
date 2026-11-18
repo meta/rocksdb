@@ -14,6 +14,7 @@
 #include "file/writable_file_writer.h"
 #include "rocksdb/env.h"
 #include "rocksdb/statistics.h"
+#include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -343,6 +344,130 @@ Status DestroyDir(Env* env, const std::string& dir) {
     }
   }
   return s;
+}
+
+namespace {
+// The temp-file implementation of AtomicFileWriter. The overview in
+// file/file_util.h lists the steps, and AtomicFileWriteOptions describes the
+// settings of each step.
+class TempFileAtomicWriter : public AtomicFileWriter {
+ public:
+  TempFileAtomicWriter(FileSystem* fs, const AtomicFileWriteOptions& options)
+      : fs_(fs), options_(options) {
+    assert(!options_.temp_name.empty());
+    assert(options_.dir == nullptr || options_.dir_path_to_open.empty());
+  }
+
+  IOStatus Write(const std::string& final_name, const Slice& contents,
+                 const IOOptions& opts, const FileOptions& file_opts) override;
+
+ private:
+  IOStatus RenameTempFile(const std::string& final_name,
+                          const IOOptions& opts) const;
+  IOStatus SyncDirectory(const std::string& final_name,
+                         const IOOptions& opts) const;
+  void DeleteTempFile(const IOOptions& opts) const;
+
+  FileSystem* const fs_;
+  const AtomicFileWriteOptions options_;
+};
+
+IOStatus TempFileAtomicWriter::Write(const std::string& final_name,
+                                     const Slice& contents,
+                                     const IOOptions& opts,
+                                     const FileOptions& file_opts) {
+  const bool has_test_points = !options_.sync_point_prefix.empty();
+#ifndef NDEBUG
+  // The test point macros are empty in release builds, so build the names
+  // only in debug builds.
+  const std::string& prefix = options_.sync_point_prefix;
+  const std::string before_rename_point = prefix + ":BeforeRename";
+  const std::string after_rename_point = prefix + ":AfterRename";
+  const std::string kill_before_rename = prefix + ":0";
+  const std::string kill_after_rename = prefix + ":1";
+#endif  // !NDEBUG
+
+  // WriteStringToFile() opens, appends, syncs and closes the temp file, and
+  // deletes it after a failed append, sync or close. Write() deletes it again
+  // below after any failure before the rename.
+  IOStatus s = WriteStringToFile(fs_, contents, options_.temp_name,
+                                 /*should_sync=*/true, opts, file_opts);
+  if (has_test_points) {
+    TEST_SYNC_POINT_CALLBACK(before_rename_point, &s);
+  }
+  if (s.ok()) {
+    if (has_test_points) {
+      TEST_KILL_RANDOM_WITH_WEIGHT(kill_before_rename, REDUCE_ODDS2);
+    }
+    s = RenameTempFile(final_name, opts);
+    if (has_test_points) {
+      TEST_KILL_RANDOM_WITH_WEIGHT(kill_after_rename, REDUCE_ODDS2);
+      TEST_SYNC_POINT_CALLBACK(after_rename_point, &s);
+    }
+  }
+  if (!s.ok()) {
+    DeleteTempFile(opts);
+    return s;
+  }
+  s = SyncDirectory(final_name, opts);
+  if (!s.ok() && options_.delete_temp_after_any_failure) {
+    DeleteTempFile(opts);
+  }
+  return s;
+}
+
+IOStatus TempFileAtomicWriter::RenameTempFile(const std::string& final_name,
+                                              const IOOptions& opts) const {
+  if (options_.env != nullptr) {
+    return status_to_io_status(
+        options_.env->RenameFile(options_.temp_name, final_name));
+  }
+  return fs_->RenameFile(options_.temp_name, final_name, opts, nullptr);
+}
+
+IOStatus TempFileAtomicWriter::SyncDirectory(const std::string& final_name,
+                                             const IOOptions& opts) const {
+  if (options_.dir != nullptr) {
+    return options_.dir->FsyncWithDirOptions(opts, nullptr,
+                                             DirFsyncOptions(final_name));
+  }
+  if (options_.dir_path_to_open.empty()) {
+    return IOStatus::OK();
+  }
+  std::unique_ptr<FSDirectory> dir;
+  IOStatus s =
+      fs_->NewDirectory(options_.dir_path_to_open, opts, &dir, nullptr);
+  if (s.ok()) {
+    s = dir->FsyncWithDirOptions(opts, nullptr, DirFsyncOptions(final_name));
+  }
+  if (s.ok()) {
+    // The default FSDirectory::Close() returns NotSupported, which must not
+    // fail the write. Directories::Close() in db/db_impl/db_impl.h explains
+    // this.
+    IOStatus close_s = dir->Close(opts, nullptr);
+    if (close_s.IsNotSupported()) {
+      close_s.PermitUncheckedError();
+    } else {
+      s = close_s;
+    }
+  }
+  return s;
+}
+
+void TempFileAtomicWriter::DeleteTempFile(const IOOptions& opts) const {
+  // The write already failed, so the delete is a best-effort cleanup and its
+  // status is ignored.
+  if (options_.env != nullptr) {
+    options_.env->DeleteFile(options_.temp_name).PermitUncheckedError();
+  } else {
+    fs_->DeleteFile(options_.temp_name, opts, nullptr).PermitUncheckedError();
+  }
+}
+}  // namespace
+
+std::unique_ptr<AtomicFileWriter> NewAtomicFileWriter(
+    FileSystem* fs, const AtomicFileWriteOptions& options) {
+  return std::make_unique<TempFileAtomicWriter>(fs, options);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
