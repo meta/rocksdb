@@ -72,8 +72,9 @@ class FlushJobTestBase : public testing::Test {
 
  protected:
   void NewDB() {
-    ASSERT_OK(
-        SetIdentityFile(WriteOptions(), env_, dbname_, Temperature::kUnknown));
+    ASSERT_OK(SetIdentityFile(WriteOptions(), env_, dbname_,
+                              Temperature::kUnknown,
+                              /*fs_replaces_atomically=*/false));
     VersionEdit new_db;
 
     new_db.SetLogNumber(0);
@@ -120,7 +121,8 @@ class FlushJobTestBase : public testing::Test {
     ASSERT_OK(s);
     // Make "CURRENT" file that points to the new manifest file.
     s = SetCurrentFile(WriteOptions(), fs_.get(), dbname_, 1,
-                       Temperature::kUnknown, nullptr);
+                       Temperature::kUnknown, nullptr,
+                       /*fs_replaces_atomically=*/false);
     ASSERT_OK(s);
   }
 

@@ -1579,6 +1579,118 @@ TEST_F(DBOwnershipTest, Repair) {
   EXPECT_EQ(Decode(from_wal), expected);
 }
 
+// Returns the events of `fs` for writing CURRENT and IDENTITY: renames to
+// them, temp files other than OPTIONS temp files, and the publish and the
+// directory sync of CURRENT and IDENTITY.
+std::vector<std::string> TakeCurrentAndIdentityEvents(
+    test::AtomicReplaceOnCloseFS* fs) {
+  std::vector<std::string> events;
+  for (const std::string& event : fs->TakeEvents()) {
+    const Slice e(event);
+    if (e.ends_with(" CURRENT") || e.ends_with(" IDENTITY") ||
+        (e.starts_with("create ") && !e.starts_with("create OPTIONS-"))) {
+      events.push_back(event);
+    }
+  }
+  return events;
+}
+
+// With kAtomicReplaceOnClose, creating a DB, rolling the MANIFEST and
+// rewriting a missing IDENTITY at open write CURRENT and IDENTITY directly,
+// with no temp file and no rename, and each write is followed by the
+// directory sync (which also makes the directory entry of a new MANIFEST
+// durable). Without the bit, the same steps use temp files and renames.
+TEST_F(DBEtc3Test, AtomicReplaceOnCloseWritesCurrentAndIdentityDirectly) {
+  for (bool set_bit : {true, false}) {
+    SCOPED_TRACE("set_bit=" + std::to_string(set_bit));
+    auto fs =
+        std::make_shared<test::AtomicReplaceOnCloseFS>(env_->GetFileSystem());
+    fs->SetBitInSupportedOps(set_bit);
+    std::unique_ptr<Env> env = NewCompositeEnv(fs);
+    // Close the DB before env is destroyed, also when an assertion fails.
+    Defer close_db([this]() { Close(); });
+    Options options = CurrentOptions();
+    options.env = env.get();
+    // Write a new MANIFEST, and so a new CURRENT, on each MANIFEST write.
+    options.max_manifest_file_size = 0;
+    options.max_manifest_space_amp_pct = 0;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key", "value"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(env_->DeleteFile(IdentityFileName(dbname_)));
+    Reopen(options);
+    ASSERT_EQ("value", Get("key"));
+    ASSERT_OK(env_->FileExists(IdentityFileName(dbname_)));
+
+    const std::vector<std::string> events =
+        TakeCurrentAndIdentityEvents(fs.get());
+    if (!set_bit) {
+      size_t renames = 0;
+      for (const std::string& event : events) {
+        renames += Slice(event).starts_with("rename ") ? 1 : 0;
+      }
+      ASSERT_GT(renames, 0);
+      continue;
+    }
+    // Only direct writes, each followed by its directory sync.
+    size_t current_writes = 0;
+    for (size_t i = 0; i < events.size(); i += 2) {
+      SCOPED_TRACE(events[i]);
+      ASSERT_TRUE(events[i] == "publish CURRENT" ||
+                  events[i] == "publish IDENTITY");
+      const std::string name = events[i].substr(events[i].find(' ') + 1);
+      ASSERT_LT(i + 1, events.size());
+      ASSERT_EQ("dirsync " + name, events[i + 1]);
+      current_writes += name == "CURRENT" ? 1 : 0;
+    }
+    // NewDB, the flush and the reopen each write CURRENT.
+    ASSERT_GE(current_writes, size_t{3});
+  }
+}
+
+// With kAtomicReplaceOnClose, a failure while writing CURRENT for a new
+// MANIFEST fails the flush. A failure before CURRENT is published keeps the
+// old CURRENT. A Close() that publishes CURRENT and then fails leaves CURRENT
+// naming the new MANIFEST, which RocksDB keeps. Either way the DB reopens
+// with all its data.
+TEST_F(DBEtc3Test, AtomicReplaceOnCloseCurrentWriteFailure) {
+  for (const char* step :
+       {"open", "append", "sync", "close", "close after publish"}) {
+    SCOPED_TRACE(step);
+    const bool published = std::string(step) == "close after publish";
+    auto fs =
+        std::make_shared<test::AtomicReplaceOnCloseFS>(env_->GetFileSystem());
+    std::unique_ptr<Env> env = NewCompositeEnv(fs);
+    // Close the DB before env is destroyed, also when an assertion fails.
+    Defer close_db([this]() { Close(); });
+    Options options = CurrentOptions();
+    options.env = env.get();
+    options.max_manifest_file_size = 0;
+    options.max_manifest_space_amp_pct = 0;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key1", "value1"));
+    ASSERT_OK(Flush());
+    std::string current_before;
+    ASSERT_OK(
+        ReadFileToString(env_, CurrentFileName(dbname_), &current_before));
+
+    ASSERT_OK(Put("key2", "value2"));
+    fs->SetFailure("CURRENT", step);
+    ASSERT_NOK(Flush());
+    fs->SetFailure("", "");
+    std::string current_after;
+    ASSERT_OK(ReadFileToString(env_, CurrentFileName(dbname_), &current_after));
+    ASSERT_EQ(published, current_before != current_after);
+    // CURRENT names a MANIFEST that exists.
+    ASSERT_TRUE(Slice(current_after).ends_with("\n"));
+    ASSERT_OK(env_->FileExists(
+        dbname_ + "/" + current_after.substr(0, current_after.size() - 1)));
+
+    Reopen(options);
+    ASSERT_EQ("value1", Get("key1"));
+    ASSERT_EQ("value2", Get("key2"));
+  }
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

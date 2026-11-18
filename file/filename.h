@@ -179,17 +179,24 @@ bool ParseFileName(const std::string& filename, uint64_t* number,
                    FileType* type, WalFileType* log_type = nullptr);
 
 // Make the CURRENT file point to the descriptor file with the
-// specified number. On its success and when dir_contains_current_file is not
-// nullptr, the function will fsync the directory containing the CURRENT file
-// when
+// specified number. `fs_replaces_atomically` tells whether `fs` sets
+// FSSupportedOps::kAtomicReplaceOnClose. When true, CURRENT is written
+// directly (see AtomicFileWriter in file/file_util.h). Otherwise it is written
+// through a temp file and a rename. In both cases, on success the function
+// syncs dir_contains_current_file when it is not nullptr.
 IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
                         const std::string& dbname, uint64_t descriptor_number,
                         Temperature temp,
-                        FSDirectory* dir_contains_current_file);
+                        FSDirectory* dir_contains_current_file,
+                        bool fs_replaces_atomically);
 
-// Make the IDENTITY file for the db
+// Make the IDENTITY file for the db. `fs_replaces_atomically` tells whether
+// the DB's file system, which is the file system of `env`, sets
+// FSSupportedOps::kAtomicReplaceOnClose. When true, IDENTITY is written
+// directly.
 Status SetIdentityFile(const WriteOptions& write_options, Env* env,
                        const std::string& dbname, Temperature temp,
+                       bool fs_replaces_atomically,
                        const std::string& db_id = {});
 
 // Sync manifest file `file`.

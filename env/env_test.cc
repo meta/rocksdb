@@ -5272,12 +5272,23 @@ class AtomicWriteRecordingEnv : public CompositeEnvWrapper {
 
 class AtomicFileWriterTest : public testing::Test {
  protected:
+  // `fs_` records the calls on an in-memory file system, so the temp-file
+  // tests see the files that are left. `direct_fs_` records the calls on a
+  // file system that keeps the kAtomicReplaceOnClose contract, so a direct
+  // write that fails before Close() leaves the old final file.
   AtomicFileWriterTest()
       : fs_(std::make_shared<AtomicWriteRecordingFS>(
             std::make_shared<MockFileSystem>(SystemClock::Default()))),
+        direct_fs_(std::make_shared<AtomicWriteRecordingFS>(
+            std::make_shared<test::AtomicReplaceOnCloseFS>(
+                std::make_shared<MockFileSystem>(SystemClock::Default())))),
         env_(fs_) {
-    EXPECT_OK(fs_->CreateDirIfMissing(kDir, IOOptions(), nullptr));
+    for (AtomicWriteRecordingFS* fs : {fs_.get(), direct_fs_.get()}) {
+      EXPECT_OK(fs->CreateDirIfMissing(kDir, IOOptions(), nullptr));
+    }
     EXPECT_OK(fs_->NewDirectory(kDir, IOOptions(), &dir_, nullptr));
+    EXPECT_OK(
+        direct_fs_->NewDirectory(kDir, IOOptions(), &direct_dir_, nullptr));
   }
 
   ~AtomicFileWriterTest() override {
@@ -5318,6 +5329,15 @@ class AtomicFileWriterTest : public testing::Test {
     return options;
   }
 
+  // The CURRENT settings with a direct write, on `direct_fs_`. The direct
+  // write ignores the temp-file fields and keeps the directory sync.
+  AtomicFileWriteOptions DirectCurrentFileOptions() const {
+    AtomicFileWriteOptions options = CurrentFileOptions();
+    options.fs_replaces_atomically = true;
+    options.dir = direct_dir_.get();
+    return options;
+  }
+
   // Base options with a check before the rename. The check is recorded as
   // "check" and fails when "check" is the fail op.
   AtomicFileWriteOptions CheckOptions() {
@@ -5344,23 +5364,24 @@ class AtomicFileWriterTest : public testing::Test {
   // fails when `fail_op` is empty). Checks the exact list of calls of the
   // replace, that kFinal has `expected_content` and that no temp file is
   // left. Returns the status of the replace.
-  IOStatus CheckWrite(const AtomicFileWriteOptions& options,
+  IOStatus CheckWrite(AtomicWriteRecordingFS* fs,
+                      const AtomicFileWriteOptions& options,
                       const std::string& fail_op, Status::Code fail_code,
                       const std::vector<std::string>& expected_ops,
                       const std::string& expected_content) {
-    EXPECT_OK(WriteStringToFile(fs_.get(), kOldContent, kFinal,
+    EXPECT_OK(WriteStringToFile(fs, kOldContent, kFinal,
                                 /*should_sync=*/true));
-    fs_->TakeOps();
-    fs_->SetFailOp(fail_op, fail_code);
-    IOStatus s = NewAtomicFileWriter(fs_.get(), options)
+    fs->TakeOps();
+    fs->SetFailOp(fail_op, fail_code);
+    IOStatus s = NewAtomicFileWriter(fs, options)
                      ->Write(kFinal, kNewContent, IOOptions(), FileOptions());
-    fs_->SetFailOp("", Status::Code::kIOError);
-    EXPECT_EQ(expected_ops, fs_->TakeOps());
+    fs->SetFailOp("", Status::Code::kIOError);
+    EXPECT_EQ(expected_ops, fs->TakeOps());
     std::string data;
-    EXPECT_OK(ReadFileToString(fs_.get(), kFinal, &data));
+    EXPECT_OK(ReadFileToString(fs, kFinal, &data));
     EXPECT_EQ(expected_content, data);
     EXPECT_EQ(Status::Code::kNotFound,
-              fs_->FileExists(kTemp, IOOptions(), nullptr).code());
+              fs->FileExists(kTemp, IOOptions(), nullptr).code());
     return s;
   }
 
@@ -5372,15 +5393,21 @@ class AtomicFileWriterTest : public testing::Test {
 
   // The calls that write and rename the temp file, in order.
   static const std::vector<std::string> kWriteAndRenameOps;
+  // The calls of a direct write of the final file, in order.
+  static const std::vector<std::string> kDirectOps;
 
   std::shared_ptr<AtomicWriteRecordingFS> fs_;
+  std::shared_ptr<AtomicWriteRecordingFS> direct_fs_;
   AtomicWriteRecordingEnv env_;
   std::unique_ptr<FSDirectory> dir_;
+  std::unique_ptr<FSDirectory> direct_dir_;
 };
 
 const std::vector<std::string> AtomicFileWriterTest::kWriteAndRenameOps = {
     "open 000005.dbtmp", "append 000005.dbtmp", "sync 000005.dbtmp",
     "close 000005.dbtmp", "rename 000005.dbtmp CURRENT"};
+const std::vector<std::string> AtomicFileWriterTest::kDirectOps = {
+    "open CURRENT", "append CURRENT", "sync CURRENT", "close CURRENT"};
 
 // Each case runs one write with one setting and at most one failed call, and
 // checks the result, the exact calls and the final content.
@@ -5481,8 +5508,8 @@ TEST_F(AtomicFileWriterTest, CallsAndResultForEachSetting) {
   };
   for (const Case& c : cases) {
     SCOPED_TRACE(c.name);
-    IOStatus s = CheckWrite(c.options, c.fail_op, c.fail_code, c.expected_ops,
-                            c.expected_content);
+    IOStatus s = CheckWrite(fs_.get(), c.options, c.fail_op, c.fail_code,
+                            c.expected_ops, c.expected_content);
     ASSERT_EQ(c.expected_code, s.code()) << s.ToString();
   }
 }
@@ -5490,12 +5517,90 @@ TEST_F(AtomicFileWriterTest, CallsAndResultForEachSetting) {
 // A failed Env rename keeps its code and subcode.
 TEST_F(AtomicFileWriterTest, EnvRenameErrorKeepsSubcode) {
   const std::string kEnvRename = "env rename 000005.dbtmp CURRENT";
-  IOStatus s =
-      CheckWrite(IdentityFileOptions(), kEnvRename, Status::Code::kIOError,
-                 Ops(4, {kEnvRename, "env delete 000005.dbtmp"}), kOldContent);
+  IOStatus s = CheckWrite(
+      fs_.get(), IdentityFileOptions(), kEnvRename, Status::Code::kIOError,
+      Ops(4, {kEnvRename, "env delete 000005.dbtmp"}), kOldContent);
   ASSERT_EQ(Status::Code::kIOError, s.code());
   ASSERT_EQ(Status::SubCode::kNoSpace, s.subcode());
 }
+
+// A direct write makes no temp file, no rename and no Env call, and keeps the
+// directory sync. A failure before Close() returns OK publishes nothing, and
+// the writer neither closes nor deletes the final file. A directory sync
+// failure comes after the file is replaced, so the final file has the new
+// content.
+TEST_F(AtomicFileWriterTest, DirectWriteCallsAndResult) {
+  const std::string kDirSync = "dirsync CURRENT";
+  const std::string kNewDir = "newdir atomic_dir";
+  const std::string kDirClose = "dirclose";
+  const Status::Code kOK = Status::Code::kOk;
+  const Status::Code kIOError = Status::Code::kIOError;
+  // Returns the first `count` calls of kDirectOps followed by `tail`.
+  auto direct_ops = [](size_t count, const std::vector<std::string>& tail) {
+    std::vector<std::string> ops(kDirectOps.begin(),
+                                 kDirectOps.begin() + count);
+    ops.insert(ops.end(), tail.begin(), tail.end());
+    return ops;
+  };
+  const AtomicFileWriteOptions kCurrent = DirectCurrentFileOptions();
+  AtomicFileWriteOptions identity = IdentityFileOptions();
+  identity.fs_replaces_atomically = true;
+  AtomicFileWriteOptions fsync_options = kCurrent;
+  fsync_options.use_fsync = true;
+  // kDirectOps with Fsync() in place of Sync().
+  const std::vector<std::string> kFsyncOps = {
+      kDirectOps[0], kDirectOps[1], "fsync CURRENT", kDirectOps[3], kDirSync};
+  struct Case {
+    const char* name;
+    AtomicFileWriteOptions options;
+    std::string fail_op;
+    Status::Code fail_code;
+    Status::Code expected_code;
+    std::vector<std::string> expected_ops;
+    const char* expected_content;
+  };
+  const std::vector<Case> cases = {
+      {"current", kCurrent, "", kIOError, kOK, direct_ops(4, {kDirSync}),
+       kNewContent},
+      {"identity", identity, "", kIOError, kOK,
+       direct_ops(4, {kNewDir, kDirSync, kDirClose}), kNewContent},
+      {"identity, close NotSupported", identity, kDirClose,
+       Status::Code::kNotSupported, kOK,
+       direct_ops(4, {kNewDir, kDirSync, kDirClose}), kNewContent},
+      {"use_fsync", fsync_options, "", kIOError, kOK, kFsyncOps, kNewContent},
+      {"open fails", kCurrent, kDirectOps[0], kIOError, kIOError,
+       direct_ops(1, {}), kOldContent},
+      {"append fails", kCurrent, kDirectOps[1], kIOError, kIOError,
+       direct_ops(2, {}), kOldContent},
+      {"sync fails", kCurrent, kDirectOps[2], kIOError, kIOError,
+       direct_ops(3, {}), kOldContent},
+      {"close fails", kCurrent, kDirectOps[3], kIOError, kIOError,
+       direct_ops(4, {}), kOldContent},
+      {"directory sync fails", kCurrent, kDirSync, kIOError, kIOError,
+       direct_ops(4, {kDirSync}), kNewContent},
+      {"identity, directory open fails", identity, kNewDir, kIOError, kIOError,
+       direct_ops(4, {kNewDir}), kNewContent},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    IOStatus s = CheckWrite(direct_fs_.get(), c.options, c.fail_op, c.fail_code,
+                            c.expected_ops, c.expected_content);
+    ASSERT_EQ(c.expected_code, s.code()) << s.ToString();
+  }
+}
+
+#ifdef NDEBUG
+// The direct write does not support check_before_rename. Debug builds fail an
+// assert instead, so this runs only in release builds.
+TEST_F(AtomicFileWriterTest, DirectWriteRejectsCheck) {
+  AtomicFileWriteOptions options = CheckOptions();
+  options.fs_replaces_atomically = true;
+  ASSERT_EQ(Status::Code::kInvalidArgument,
+            CheckWrite(direct_fs_.get(), options, "", Status::Code::kIOError,
+                       {}, kOldContent)
+                .code());
+}
+#endif  // NDEBUG
 
 // With a sync point prefix, the BeforeRename and AfterRename callbacks run and
 // can change the result. BeforeRename runs also when the write of the temp
@@ -5517,24 +5622,25 @@ TEST_F(AtomicFileWriterTest, SyncPoints) {
   const std::string kDelete = "delete 000005.dbtmp";
 
   // No prefix: no callback runs.
-  ASSERT_OK(CheckWrite(BaseOptions(), "", Status::Code::kIOError, Ops(5, {}),
-                       kNewContent));
+  ASSERT_OK(CheckWrite(fs_.get(), BaseOptions(), "", Status::Code::kIOError,
+                       Ops(5, {}), kNewContent));
   ASSERT_EQ(0, before_count);
   ASSERT_EQ(0, after_count);
 
   // Prefix: both callbacks run once.
   AtomicFileWriteOptions options = BaseOptions();
   options.sync_point_prefix = "SetCurrentFile";
-  ASSERT_OK(
-      CheckWrite(options, "", Status::Code::kIOError, Ops(5, {}), kNewContent));
+  ASSERT_OK(CheckWrite(fs_.get(), options, "", Status::Code::kIOError,
+                       Ops(5, {}), kNewContent));
   ASSERT_EQ(1, before_count);
   ASSERT_EQ(1, after_count);
 
   // A failed append: BeforeRename runs, and the rename and AfterRename do
   // not.
   ASSERT_EQ(Status::Code::kIOError,
-            CheckWrite(options, kWriteAndRenameOps[1], Status::Code::kIOError,
-                       Ops(2, {kDelete, kDelete}), kOldContent)
+            CheckWrite(fs_.get(), options, kWriteAndRenameOps[1],
+                       Status::Code::kIOError, Ops(2, {kDelete, kDelete}),
+                       kOldContent)
                 .code());
   ASSERT_EQ(2, before_count);
   ASSERT_EQ(1, after_count);
@@ -5543,8 +5649,8 @@ TEST_F(AtomicFileWriterTest, SyncPoints) {
   // rename. The old file stays and the temp file is deleted.
   fail_before_rename = true;
   ASSERT_EQ(Status::Code::kIOError,
-            CheckWrite(options, "", Status::Code::kIOError, Ops(4, {kDelete}),
-                       kOldContent)
+            CheckWrite(fs_.get(), options, "", Status::Code::kIOError,
+                       Ops(4, {kDelete}), kOldContent)
                 .code());
   ASSERT_EQ(3, before_count);
   ASSERT_EQ(1, after_count);

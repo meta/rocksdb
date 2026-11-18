@@ -458,7 +458,8 @@ bool ParseFileName(const std::string& fname, uint64_t* number,
 IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
                         const std::string& dbname, uint64_t descriptor_number,
                         Temperature temp,
-                        FSDirectory* dir_contains_current_file) {
+                        FSDirectory* dir_contains_current_file,
+                        bool fs_replaces_atomically) {
   // Remove leading "dbname/" and add newline to manifest file name
   std::string manifest = DescriptorFileName(dbname, descriptor_number);
   Slice contents = manifest;
@@ -472,6 +473,7 @@ IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
   file_opts.io_options.type = IOType::kMetadata;
   if (s.ok()) {
     AtomicFileWriteOptions atomic_opts;
+    atomic_opts.fs_replaces_atomically = fs_replaces_atomically;
     atomic_opts.temp_name = TempFileName(dbname, descriptor_number);
     atomic_opts.dir = dir_contains_current_file;
     atomic_opts.sync_point_prefix = "SetCurrentFile";
@@ -484,7 +486,7 @@ IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
 
 Status SetIdentityFile(const WriteOptions& write_options, Env* env,
                        const std::string& dbname, Temperature temp,
-                       const std::string& db_id) {
+                       bool fs_replaces_atomically, const std::string& db_id) {
   std::string id;
   if (db_id.empty()) {
     id = env->GenerateUniqueId();
@@ -500,6 +502,7 @@ Status SetIdentityFile(const WriteOptions& write_options, Env* env,
   file_opts.io_options.type = IOType::kMetadata;
   if (s.ok()) {
     AtomicFileWriteOptions atomic_opts;
+    atomic_opts.fs_replaces_atomically = fs_replaces_atomically;
     // IDENTITY uses temp file number 0 (000000.dbtmp). File numbers of a DB
     // start at 1, so no other file uses this name.
     atomic_opts.temp_name = TempFileName(dbname, 0);
