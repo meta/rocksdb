@@ -8677,8 +8677,10 @@ class Benchmark {
             ++found;
           } else if (FLAGS_multiread_for_update &&
                      (stat_list[i].IsTimedOut() || stat_list[i].IsBusy())) {
-            // A lock or validation failure aborts the whole batch. Rollback
-            // above releases any locks acquired before the failure.
+            // Lock contention is expected here, not an I/O error, so count
+            // it rather than aborting via HandleBenchmarkIOError. The failure
+            // is copied to every key, so count once per batch. Rollback above
+            // releases any locks already acquired.
             if (i == 0) {
               ++aborted_batches;
             }
