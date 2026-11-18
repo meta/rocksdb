@@ -271,14 +271,19 @@ void WriteCommittedTxn::MultiGetForUpdate(const ReadOptions& read_options,
     return;
   }
 
-  ReadOptions read_opts_copy = read_options;
-  char ts_buf[sizeof(kMaxTxnTimestamp)];
-  EncodeFixed64(ts_buf, read_timestamp_);
-  Slice ts(ts_buf, sizeof(ts_buf));
-  read_opts_copy.timestamp = &ts;
-  TransactionBaseImpl::MultiGetForUpdate(read_opts_copy, column_family,
-                                         num_keys, keys, values, statuses,
-                                         sorted_input);
+  if (!read_options.timestamp) {
+    ReadOptions read_opts_copy = read_options;
+    char ts_buf[sizeof(kMaxTxnTimestamp)];
+    EncodeFixed64(ts_buf, read_timestamp_);
+    Slice ts(ts_buf, sizeof(ts_buf));
+    read_opts_copy.timestamp = &ts;
+    TransactionBaseImpl::MultiGetForUpdate(read_opts_copy, column_family,
+                                           num_keys, keys, values, statuses,
+                                           sorted_input);
+    return;
+  }
+  TransactionBaseImpl::MultiGetForUpdate(read_options, column_family, num_keys,
+                                         keys, values, statuses, sorted_input);
 }
 
 Status WriteCommittedTxn::GetEntityForUpdate(const ReadOptions& read_options,
