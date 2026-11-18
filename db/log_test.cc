@@ -915,6 +915,27 @@ class RetriableLogTest : public ::testing::TestWithParam<int> {
       return false;
     }
   }
+
+  uint64_t LastRecordEnd() { return log_reader_->LastRecordEnd(); }
+
+  size_t dropped_bytes() const { return report_.dropped_bytes_; }
+
+  // Returns a new reader of the log file that starts at `offset`, which must be
+  // the end of a record.
+  std::unique_ptr<FragmentBufferedReader> NewReaderAtRecordEnd(
+      uint64_t offset) {
+    std::unique_ptr<FSSequentialFile> seq_file;
+    EXPECT_OK(env_->GetFileSystem()->NewSequentialFile(log_file_, FileOptions(),
+                                                       &seq_file, nullptr));
+    std::unique_ptr<SequentialFileReader> file_reader(
+        new SequentialFileReader(std::move(seq_file), log_file_));
+    EXPECT_OK(file_reader->Skip(offset));
+    std::unique_ptr<FragmentBufferedReader> reader(
+        new FragmentBufferedReader(nullptr, std::move(file_reader), &report_,
+                                   true /* checksum */, 123 /* log_number */));
+    reader->StartAtRecordEnd(offset);
+    return reader;
+  }
 };
 
 TEST_P(RetriableLogTest, TailLogPartialHeader) {
@@ -1026,6 +1047,52 @@ TEST_P(RetriableLogTest, NonBlockingReadFullRecord) {
   Write(Slice(part2));
   ASSERT_TRUE(TryRead(&record));
   ASSERT_EQ("foo-bar", record);
+}
+
+// A reader that starts at the end of a record reads the same records after it
+// as a reader that read the file from its start. The record ends are in the
+// trailer at the end of a block, at a block boundary, in the middle of a
+// block, after a record that spans blocks, and at the end of the file.
+TEST_P(RetriableLogTest, StartAtRecordEnd) {
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(SetupTestEnv());
+  const size_t header_size = GetParam() ? kRecyclableHeaderSize : kHeaderSize;
+  const std::vector<std::string> records = {
+      std::string(kBlockSize - header_size - 3, 'a'),
+      std::string(kBlockSize - header_size, 'b'), std::string(100, 'c'),
+      std::string(2 * kBlockSize, 'd'), std::string(10, 'e')};
+  for (const std::string& record : records) {
+    Encode(record);
+  }
+  Write(Slice(contents()));
+
+  std::vector<uint64_t> record_ends = {0};
+  std::string read;
+  for (const std::string& record : records) {
+    ASSERT_TRUE(TryRead(&read));
+    ASSERT_EQ(record, read);
+    record_ends.push_back(LastRecordEnd());
+  }
+  // The first record leaves 3 bytes of trailer in the first block, and the
+  // second record fills the second block.
+  ASSERT_EQ(uint64_t{kBlockSize} - 3, record_ends[1]);
+  ASSERT_EQ(uint64_t{2} * kBlockSize, record_ends[2]);
+
+  for (size_t start = 0; start < record_ends.size(); ++start) {
+    std::unique_ptr<FragmentBufferedReader> reader =
+        NewReaderAtRecordEnd(record_ends[start]);
+    ASSERT_EQ(record_ends[start], reader->LastRecordEnd());
+    Slice record;
+    std::string scratch;
+    for (size_t i = start; i < records.size(); ++i) {
+      ASSERT_TRUE(reader->ReadRecord(&record, &scratch));
+      ASSERT_EQ(records[i], record.ToString());
+      ASSERT_EQ(record_ends[i + 1], reader->LastRecordEnd());
+    }
+    ASSERT_FALSE(reader->ReadRecord(&record, &scratch));
+  }
+  ASSERT_EQ(0U, dropped_bytes());
 }
 
 INSTANTIATE_TEST_CASE_P(bool, RetriableLogTest, ::testing::Values(0, 2));

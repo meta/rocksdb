@@ -58,6 +58,7 @@
 #include "options/options_helper.h"
 #include "options/options_parser.h"
 #include "rocksdb/env.h"
+#include "rocksdb/experimental.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/compaction_merging_iterator.h"
@@ -9166,8 +9167,39 @@ Status ReactiveVersionSet::ReadAndApply(
   if (!s.ok()) {
     return s;
   }
+  // See resume_after_manifest_read_error_ for the steps of a resume. Every
+  // MANIFEST reader reports into *manifest_read_status, which can still hold
+  // the error of the failed read. If MaybeSwitchManifest() opened another
+  // MANIFEST, its new reader starts at the beginning of that MANIFEST, so only
+  // that old error needs to be cleared.
+  if (resume_after_manifest_read_error_) {
+    if (manifest_reader->get() == reader) {
+      s = ReopenManifestAfterReadError(manifest_reader, manifest_read_status);
+      if (!s.ok()) {
+        return s;
+      }
+    } else {
+      *manifest_read_status = Status::OK();
+    }
+    manifest_tailer_->PrepareToResumeAfterReadError();
+    resume_after_manifest_read_error_ = false;
+  }
+  const bool tailer_had_error_before_call = !manifest_tailer_->status().ok();
   manifest_tailer_->Iterate(*(manifest_reader->get()), manifest_read_status);
   s = manifest_tailer_->status();
+  // An error that the tailer had before this call is kept: it can come from a
+  // record that was applied only in part.
+  if (!tailer_had_error_before_call && manifest_reader->get()->hasReadError()) {
+    resume_after_manifest_read_error_ = true;
+    if (s.ok()) {
+      // The reader can set its read error flag without a report. This happens
+      // in Reader::UnmarkEOFInternal(): the last call stopped at EOF in the
+      // middle of a log block, and this call reads the rest of that block. If
+      // that read fails and returns no data, nothing is reported.
+      s = Status::IOError("Failed to read MANIFEST",
+                          manifest_reader->get()->file()->file_name());
+    }
+  }
   if (s.ok()) {
     *cfds_changed = std::move(manifest_tailer_->GetUpdatedColumnFamilies());
   }
@@ -9176,6 +9208,88 @@ Status ReactiveVersionSet::ReadAndApply(
   }
 
   return s;
+}
+
+Status ReactiveVersionSet::NewManifestReader(
+    const std::string& manifest_path, log::Reader::Reporter* reporter,
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader) {
+  std::unique_ptr<FSSequentialFile> manifest_file;
+  Status s = fs_->NewSequentialFile(
+      manifest_path, GetFileOptionsForManifestRead(), &manifest_file, nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  std::unique_ptr<SequentialFileReader> manifest_file_reader(
+      new SequentialFileReader(std::move(manifest_file), manifest_path,
+                               db_options_->log_readahead_size, io_tracer_,
+                               db_options_->listeners));
+  manifest_file_reader->SetIOType(IOType::kManifest);
+  manifest_reader->reset(new log::FragmentBufferedReader(
+      nullptr, std::move(manifest_file_reader), reporter, true /* checksum */,
+      0 /* log_number */));
+  return Status::OK();
+}
+
+Status ReactiveVersionSet::ReopenManifestAfterReadError(
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+    Status* manifest_read_status) {
+  assert(manifest_reader != nullptr && manifest_reader->get() != nullptr);
+  log::FragmentBufferedReader* const old_reader = manifest_reader->get();
+  const std::string manifest_path = old_reader->file()->file_name();
+  const uint64_t resume_offset = manifest_tailer_->GetLastValidRecordEnd();
+
+  // The name of the MANIFEST can now name a file of another DB, for example
+  // after the DB was destroyed and created again at the same path. RocksDB
+  // writes the DB ID in the first record of each MANIFEST while
+  // write_dbid_to_manifest is true, so a check reads one record. There is no
+  // check when either MANIFEST has no DB ID.
+  const VersionEditParams& params = manifest_tailer_->GetVersionEditParams();
+  if (params.HasDbId()) {
+    std::string db_id;
+    Status id_status = experimental::GetDbIdentityFromManifest(
+        fs_.get(), manifest_path, &db_id);
+    if (id_status.ok() && db_id != params.GetDbId()) {
+      return Status::Corruption("MANIFEST " + manifest_path + " has DB ID " +
+                                db_id + ", but this instance opened DB ID " +
+                                params.GetDbId());
+    }
+    if (!id_status.ok() && !id_status.IsNotFound()) {
+      return id_status;
+    }
+  }
+
+  // The old reader read the file up to `resume_offset`. A shorter file can be
+  // a short-lived view of a remote file system, so return a retryable error.
+  uint64_t file_size = 0;
+  Status s = fs_->GetFileSize(manifest_path, IOOptions(), &file_size, nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  if (file_size < resume_offset) {
+    return Status::IOError("MANIFEST " + manifest_path + " has " +
+                           std::to_string(file_size) +
+                           " bytes, but this instance applied records up to "
+                           "offset " +
+                           std::to_string(resume_offset));
+  }
+
+  std::unique_ptr<log::FragmentBufferedReader> new_reader;
+  s = NewManifestReader(manifest_path, old_reader->GetReporter(), &new_reader);
+  if (!s.ok()) {
+    return s;
+  }
+  s = new_reader->file()->Skip(resume_offset);
+  if (!s.ok()) {
+    return s;
+  }
+  new_reader->StartAtRecordEnd(resume_offset);
+  *manifest_read_status = Status::OK();
+  *manifest_reader = std::move(new_reader);
+  ROCKS_LOG_INFO(db_options_->info_log,
+                 "Reopened MANIFEST %s at offset %" PRIu64
+                 " after a failed read\n",
+                 manifest_path.c_str(), resume_offset);
+  return Status::OK();
 }
 
 uint64_t ReactiveVersionSet::GetInstalledVersionLogNumber(
@@ -9195,7 +9309,6 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
   if (!s.ok()) {
     return s;
   }
-  std::unique_ptr<FSSequentialFile> manifest_file;
   if (manifest_reader->get() != nullptr &&
       manifest_reader->get()->file()->file_name() == manifest_path) {
     // CURRENT points to the same MANIFEST as before, no need to switch
@@ -9223,17 +9336,8 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
   // The primary can also delete the MANIFEST while the secondary is reading
   // it. This is OK on POSIX. For other file systems, maybe create a hard link
   // to MANIFEST. The hard link should be cleaned up later by the secondary.
-  s = fs_->NewSequentialFile(manifest_path, GetFileOptionsForManifestRead(),
-                             &manifest_file, nullptr);
-  std::unique_ptr<SequentialFileReader> manifest_file_reader;
+  s = NewManifestReader(manifest_path, reporter, manifest_reader);
   if (s.ok()) {
-    manifest_file_reader.reset(new SequentialFileReader(
-        std::move(manifest_file), manifest_path,
-        db_options_->log_readahead_size, io_tracer_, db_options_->listeners));
-    manifest_file_reader->SetIOType(IOType::kManifest);
-    manifest_reader->reset(new log::FragmentBufferedReader(
-        nullptr, std::move(manifest_file_reader), reporter, true /* checksum */,
-        0 /* log_number */));
     ROCKS_LOG_INFO(db_options_->info_log, "Switched to new manifest: %s\n",
                    manifest_path.c_str());
     if (manifest_tailer_) {

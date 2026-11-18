@@ -2958,6 +2958,13 @@ class DB {
   // is reclaimed only once those files become readable or this instance is
   // reopened; `rocksdb.num-immutable-mem-table` reports how many memtables are
   // being held.
+  // If a read of the MANIFEST fails, this call returns the error. The next
+  // call opens the MANIFEST again and continues after the last record that
+  // this instance applied. If that fails, the call returns the error, and the
+  // call after it tries again. If the MANIFEST now belongs to another DB
+  // (another DB ID), the call returns Corruption. Other errors persist until
+  // this instance is reopened, for example a corrupted MANIFEST record, or an
+  // I/O error while applying a record, such as from opening a table file.
   virtual Status TryCatchUpWithPrimary() {
     return Status::NotSupported("Supported only by secondary instance");
   }
