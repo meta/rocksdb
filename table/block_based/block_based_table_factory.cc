@@ -1031,6 +1031,7 @@ Status BlockBasedTableFactory::ValidateOptions(
         CacheEntryRole::kCompressionDictionaryBuildingBuffer,
         CacheEntryRole::kBlobReferenceMetadataBuildingBuffer,
         CacheEntryRole::kBlobReferenceCensus,
+        CacheEntryRole::kIndirectBlobGcWorkingMemory,
         CacheEntryRole::kFilterConstruction,
         CacheEntryRole::kBlockBasedTableReader,
         CacheEntryRole::kFileMetadata,

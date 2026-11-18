@@ -148,7 +148,8 @@ DEFINE_SYNC_AND_ASYNC(BlocklikeStatus<TBlocklike>,
         BlockFetcher block_fetcher(
             rep_->file.get(), prefetch_buffer, rep_->footer, ro, handle,
             &tmp_contents, rep_->ioptions, do_uncompress, maybe_compressed,
-            TBlocklike::kBlockType, decomp, rep_->persistent_cache_options,
+            TBlocklike::kBlockType, decomp,
+            rep_->PersistentCacheFor(TBlocklike::kBlockType),
             GetMemoryAllocator(rep_->table_options),
             /*allocator=*/nullptr);
 
@@ -287,7 +288,7 @@ DEFINE_SYNC_AND_ASYNC(BlocklikeStatus<TBlocklike>,
     s = CO_AWAIT(ReadAndParseBlockFromFile, rep_->file.get(), prefetch_buffer,
                  rep_->footer, ro, handle, &block, rep_->ioptions,
                  rep_->create_context, maybe_compressed, decomp,
-                 rep_->persistent_cache_options,
+                 rep_->PersistentCacheFor(TBlocklike::kBlockType),
                  GetMemoryAllocator(rep_->table_options), for_compaction,
                  async_read, block_buffer_provider);
 

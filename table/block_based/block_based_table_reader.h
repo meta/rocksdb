@@ -18,6 +18,7 @@
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
 #include "cache/cache_reservation_manager.h"
+#include "db/blob/blob_gen2_format.h"
 #include "db/blob/same_file_blob_reader.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/seqno_to_time_mapping.h"
@@ -154,8 +155,8 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   //    this table charge their memory to it.
   // @param force_direct_prefetch if true, always prefetching to RocksDB
   //    buffer, rather than calling RandomAccessFile::Prefetch().
-  // @param avoid_shared_metadata_cache if true, open-time index/filter/
-  //    dictionary reads must not insert into the shared block cache.
+  // @param avoid_shared_metadata_cache if true, metadata reads avoid shared
+  //    block and persistent caches.
   static Status Open(
       const ReadOptions& ro, const ImmutableOptions& ioptions,
       const EnvOptions& env_options,
@@ -359,6 +360,25 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
         &on_entry);
   }
 
+  // Like MultiGetSameFileBlob(), but used only by indirect blob GC: it returns
+  // the exact stored bytes. It checks the stored CRC and, unless the file uses
+  // kNoChecksum, the record checksum. It reads whole records with
+  // ReadCoalescedRanges() (gap `coalesce_bytes`, one read at most
+  // `max_stored_bytes`). Payloads point into `buffers`. Requests past
+  // `max_stored_bytes` of total stored bytes get MemoryLimit. A request past
+  // the buffer limit (see ReadCoalescedRanges()) is not read and gets
+  // Status::Incomplete. The caller retries it later.
+  void MultiGetStoredSameFileBlob(const ReadOptions& read_options,
+                                  uint64_t coalesce_bytes, size_t num_reads,
+                                  StoredSameFileBlobReadRequest* reqs,
+                                  uint64_t max_stored_bytes,
+                                  CoalescedReadBuffers* buffers,
+                                  uint64_t* bytes_read) const;
+  Status StreamStoredSameFileBlob(const ReadOptions& read_options,
+                                  const BlobIndex& blob_index,
+                                  uint32_t stored_checksum,
+                                  const BlobChunkConsumer& consumer) const;
+
   // Every data block of a table, read once and held in memory, with the last
   // user key of each block. The relocation file reader keeps one when
   // pin_blob_relocation_location_blocks is on, so its lookups need no index
@@ -518,6 +538,10 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
       const ReadOptions& read_options, const Slice& expected_descriptor,
       const std::function<Status(size_t buffer_bytes)>& before_allocation,
       std::vector<BlobReferenceGroup>* groups) const override;
+  Status ReadBlobReferences(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      const std::function<Status(size_t index_bytes)>& after_index_read,
+      std::vector<BlobReferenceGroupRead>* requests) const override;
 
   const SeqnoToTimeMapping& GetSeqnoToTimeMapping() const;
 
@@ -711,7 +735,6 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
                                     size_t compaction_readahead_size,
                                     bool allow_unprepared_value,
                                     const Slice* seek_target);
-
   void UpdateCacheHitMetrics(BlockType block_type, GetContext* get_context,
                              size_t usage) const;
   void UpdateCacheMissMetrics(BlockType block_type,
@@ -998,6 +1021,18 @@ struct BlockBasedTable::Rep {
   std::unique_ptr<RandomAccessFileReader> file;
   OffsetableCacheKey base_cache_key;
   PersistentCacheOptions persistent_cache_options;
+
+  // Persistent cache options for metadata blocks (index, filter, metaindex and
+  // the other non-data blocks). They are empty when the table was opened with
+  // avoid_shared_metadata_cache, so such a reader never adds metadata blocks to
+  // the persistent cache. Data blocks always use persistent_cache_options.
+  PersistentCacheOptions metadata_persistent_cache_options;
+
+  // Returns the persistent cache options for a block of type `type`.
+  const PersistentCacheOptions& PersistentCacheFor(BlockType type) const {
+    return type == BlockType::kData ? persistent_cache_options
+                                    : metadata_persistent_cache_options;
+  }
 
   // Footer contains the fixed table information
   Footer footer;

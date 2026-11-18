@@ -115,8 +115,7 @@ struct TableReaderOptions {
   // Whether the key in the table contains user-defined timestamps.
   bool user_defined_timestamps_persisted;
 
-  // Open-time metadata reads should not insert index/filter/dictionary blocks
-  // into the shared block cache.
+  // Metadata reads should avoid shared block and persistent caches.
   bool avoid_shared_metadata_cache;
 
   // Column family that owns this table. Empty outside DB-owned table opens.

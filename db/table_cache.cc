@@ -961,6 +961,21 @@ Status TableCache::ReadBlobReferenceSstSummary(
   return Status::OK();
 }
 
+Status TableCache::ReadBlobReferences(
+    const ReadOptions& read_options, const FileOptions& file_options,
+    const InternalKeyComparator& internal_comparator,
+    const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+    std::vector<BlobReferenceGroupRead>* requests) {
+  BlobReferenceReader reader;
+  Status status =
+      GetBlobReferenceReader(read_options, file_options, internal_comparator,
+                             file_meta, mutable_cf_options, &reader);
+  return status.ok() ? reader->ReadBlobReferences(
+                           read_options, file_meta.blob_reference_descriptor,
+                           /*after_index_read=*/nullptr, requests)
+                     : status;
+}
+
 Status TableCache::ApproximateKeyAnchors(
     const ReadOptions& ro, const InternalKeyComparator& internal_comparator,
     const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,

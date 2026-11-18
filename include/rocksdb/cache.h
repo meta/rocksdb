@@ -91,6 +91,10 @@ enum class CacheEntryRole {
   // reference them, its build state, its queued changes, and the SST summaries
   // that a compaction reads for the census
   kBlobReferenceCensus,
+  // Working memory of indirect blob GC. Indirect blob GC is a background
+  // job that copies the live values out of a mostly-garbage blob file. Its
+  // working memory holds the exact list of live references to the file
+  kIndirectBlobGcWorkingMemory,
   // Default bucket, for miscellaneous cache entries. Do not use for
   // entries that could potentially add up to large usage.
   kMisc,

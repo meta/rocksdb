@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <functional>
 #include <future>
 #include <limits>
@@ -21,6 +22,7 @@
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_writer.h"
 #include "db/blob/blob_relocation_file.h"
+#include "db/blob/blob_relocation_gc.h"
 #include "db/blob/blob_source.h"
 #include "db/blob/same_file_blob_reader.h"
 #include "db/dbformat.h"
@@ -544,6 +546,160 @@ TEST(BlobRelocationDirectoryTest, ValidatesOrderingAndChecksums) {
   EXPECT_EQ(original_value_offset, 99U);
 }
 
+TEST(BlobRelocationLiveSetTest, DeduplicatesAndRejectsConflicts) {
+  const auto make_reference = [](uint64_t offset, uint64_t stored_value_size,
+                                 uint64_t record_bytes,
+                                 uint32_t stable_checksum) {
+    BlobReference reference;
+    reference.encoding_class = BlobReferenceEncodingClass::kIndirectUnflattened;
+    reference.generation_file_number = 10;
+    reference.origin_file_number = 10;
+    reference.original_value_offset = offset;
+    reference.stored_value_size = stored_value_size;
+    reference.record_bytes = record_bytes;
+    reference.compression = kNoCompression;
+    reference.stable_checksum = stable_checksum;
+    reference.stored_checksum = BlobIndex::ExtendChecksumWithCompression(
+        stable_checksum, kNoCompression);
+    return reference;
+  };
+
+  const BlobReference first = make_reference(/*offset=*/100,
+                                             /*stored_value_size=*/20,
+                                             /*record_bytes=*/40,
+                                             /*stable_checksum=*/1);
+  const BlobReference second = make_reference(/*offset=*/200,
+                                              /*stored_value_size=*/30,
+                                              /*record_bytes=*/50,
+                                              /*stable_checksum=*/2);
+  BlobRelocationLiveSet live_set{std::shared_ptr<CacheReservationManager>(),
+                                 /*generation_numbers=*/{10}};
+  ASSERT_OK(live_set.Add({second, first}));
+  ASSERT_OK(live_set.Add({first}));
+  ASSERT_OK(live_set.Finalize());
+  ASSERT_EQ(live_set.references().size(), 2U);
+  EXPECT_EQ(live_set.references()[0].original_value_offset, 100U);
+  EXPECT_EQ(live_set.references()[1].original_value_offset, 200U);
+  EXPECT_EQ(live_set.live_stored_value_bytes(), 50U);
+  EXPECT_EQ(live_set.live_record_bytes(), 90U);
+  ASSERT_EQ(live_set.origin_runs().size(), 1U);
+  EXPECT_EQ(live_set.origin_runs()[0].origin_file_number, 10U);
+
+  BlobReference conflict = first;
+  ++conflict.stable_checksum;
+  BlobRelocationLiveSet conflicting_set{
+      std::shared_ptr<CacheReservationManager>(), /*generation_numbers=*/{10}};
+  ASSERT_OK(conflicting_set.Add({first, conflict}));
+  ASSERT_TRUE(conflicting_set.Finalize().IsCorruption());
+
+  // Copies that differ only in the stored CRC also conflict.
+  BlobReference stored_conflict = first;
+  ++stored_conflict.stored_checksum;
+  BlobRelocationLiveSet stored_conflict_set{
+      std::shared_ptr<CacheReservationManager>(), /*generation_numbers=*/{10}};
+  ASSERT_OK(stored_conflict_set.Add({stored_conflict, first}));
+  ASSERT_TRUE(stored_conflict_set.Finalize().IsCorruption());
+
+  // The set's generation numbers are the ones it was read for. Each reference
+  // also has an encoding class: unflattened when generation == origin,
+  // flattened otherwise. Add() rejects a reference under another generation
+  // number, or one whose class does not match its generation number.
+  BlobRelocationLiveSet checked_set{std::shared_ptr<CacheReservationManager>(),
+                                    /*generation_numbers=*/{10}};
+  BlobReference other_name = first;
+  other_name.origin_file_number = other_name.generation_file_number = 11;
+  ASSERT_TRUE(checked_set.Add({other_name}).IsCorruption());
+
+  BlobReference wrong_class = first;
+  wrong_class.encoding_class = BlobReferenceEncodingClass::kIndirectFlattened;
+  ASSERT_TRUE(checked_set.Add({wrong_class}).IsCorruption());
+
+  // A relocation input 20 has two generation numbers: 20 itself (flattened
+  // references of origins 5 and 10) and old file 10, which is routed to it
+  // (unflattened references). A value referenced under both generation numbers
+  // is kept once. The set is sorted by (origin, original offset) and has one
+  // run per origin.
+  BlobRelocationLiveSet input_set{std::shared_ptr<CacheReservationManager>(),
+                                  /*generation_numbers=*/{10, 20}};
+  BlobReference flattened = first;
+  flattened.encoding_class = BlobReferenceEncodingClass::kIndirectFlattened;
+  flattened.generation_file_number = 20;
+  flattened.record_bytes = flattened.stored_value_size + 8;
+  BlobReference other_origin = flattened;
+  other_origin.origin_file_number = 5;
+  other_origin.original_value_offset = 300;
+  ASSERT_OK(input_set.Add({flattened, second, other_origin, first}));
+  ASSERT_OK(input_set.Finalize());
+  ASSERT_EQ(input_set.references().size(), 3U);
+  EXPECT_EQ(input_set.references()[0].origin_file_number, 5U);
+  EXPECT_EQ(input_set.references()[1].original_value_offset, 100U);
+  EXPECT_EQ(input_set.references()[2].original_value_offset, 200U);
+  ASSERT_EQ(input_set.origin_runs().size(), 2U);
+  EXPECT_EQ(input_set.origin_runs()[0].origin_file_number, 5U);
+  EXPECT_EQ(input_set.origin_runs()[0].end, 1U);
+  EXPECT_EQ(input_set.origin_runs()[1].origin_file_number, 10U);
+  EXPECT_EQ(input_set.origin_runs()[1].begin, 1U);
+  EXPECT_EQ(input_set.origin_runs()[1].end, 3U);
+  EXPECT_LE(sizeof(BlobRelocationLiveValue), 40U);
+}
+
+TEST(BlobRelocationLiveSetTest, ReservesExactCapacity) {
+  BlobRelocationLiveSet live_set{std::shared_ptr<CacheReservationManager>(),
+                                 /*generation_numbers=*/{10}};
+  ASSERT_OK(live_set.Reserve(1000));
+  EXPECT_EQ(live_set.TEST_ReservedMemory(),
+            1000 * sizeof(BlobRelocationLiveValue));
+}
+
+TEST(BlobRelocationPackingTest, FirstFitDecreasingIsDeterministicAndWhole) {
+  const std::vector<BlobRelocationPackingItem> items{
+      {/*input_file_number=*/300, /*estimated_bytes=*/40, {30}},
+      {/*input_file_number=*/100, /*estimated_bytes=*/60, {10}},
+      {/*input_file_number=*/200, /*estimated_bytes=*/40, {20}},
+      {/*input_file_number=*/400, /*estimated_bytes=*/30, {40, 41}}};
+  std::vector<BlobRelocationPackingBin> bins;
+  ASSERT_OK(PlanBlobRelocationPacking(items, /*target_output_bytes=*/100,
+                                      /*max_outputs=*/3, &bins));
+  ASSERT_EQ(bins.size(), 2U);
+  EXPECT_EQ(bins[0].item_indexes, (std::vector<size_t>{1, 2}));
+  EXPECT_EQ(bins[0].estimated_bytes, 100U);
+  EXPECT_EQ(bins[1].item_indexes, (std::vector<size_t>{0, 3}));
+  EXPECT_EQ(bins[1].estimated_bytes, 70U);
+
+  // Two inputs that hold the same origin (this can happen after RepairDB) never
+  // share an output, because an output holds one entry per (origin, original
+  // offset).
+  const std::vector<BlobRelocationPackingItem> shared_origin{
+      {/*input_file_number=*/100, /*estimated_bytes=*/30, {10, 11}},
+      {/*input_file_number=*/200, /*estimated_bytes=*/20, {11, 12}},
+      {/*input_file_number=*/300, /*estimated_bytes=*/10, {13}}};
+  ASSERT_OK(PlanBlobRelocationPacking(shared_origin,
+                                      /*target_output_bytes=*/100,
+                                      /*max_outputs=*/3, &bins));
+  ASSERT_EQ(bins.size(), 2U);
+  EXPECT_EQ(bins[0].item_indexes, (std::vector<size_t>{0, 2}));
+  EXPECT_EQ(bins[1].item_indexes, (std::vector<size_t>{1}));
+
+  // An input larger than the target gets an output of its own.
+  const std::vector<BlobRelocationPackingItem> oversized{
+      {/*input_file_number=*/100, /*estimated_bytes=*/250, {10}},
+      {/*input_file_number=*/200, /*estimated_bytes=*/20, {20}}};
+  ASSERT_OK(PlanBlobRelocationPacking(oversized, /*target_output_bytes=*/100,
+                                      /*max_outputs=*/3, &bins));
+  ASSERT_EQ(bins.size(), 2U);
+  EXPECT_EQ(bins[0].item_indexes, (std::vector<size_t>{0}));
+  EXPECT_EQ(bins[0].estimated_bytes, 250U);
+
+  // Inputs that need more than max_outputs outputs get MemoryLimit. A zero
+  // target output size is InvalidArgument.
+  ASSERT_TRUE(PlanBlobRelocationPacking(items, /*target_output_bytes=*/50,
+                                        /*max_outputs=*/2, &bins)
+                  .IsMemoryLimit());
+  ASSERT_TRUE(PlanBlobRelocationPacking(items, /*target_output_bytes=*/0,
+                                        /*max_outputs=*/2, &bins)
+                  .IsInvalidArgument());
+}
+
 class BlobFileReaderTest : public testing::Test {
  protected:
   BlobFileReaderTest() { mock_env_.reset(MockEnv::Create(Env::Default())); }
@@ -971,6 +1127,121 @@ TEST_F(BlobFileReaderTest, RelocationLocationEntryNeedsValueTypeAndSequence0) {
     EXPECT_NE(status.ToString().find("Invalid blob relocation entry key"),
               std::string::npos)
         << status.ToString();
+  }
+}
+
+TEST_F(BlobFileReaderTest, CompressedRelocationLocationBlocksReadBack) {
+  // Location blocks use the column family's compression. Round 0 reads some
+  // values one at a time, and round 1 reads all values in one MultiGetBlob
+  // batch. Each round uses a new block cache, so the first read of each block
+  // in a round misses the cache and reads the compressed block from the file.
+  CompressionType compression = kNoCompression;
+  for (CompressionType candidate :
+       {kLZ4Compression, kZSTD, kSnappyCompression}) {
+    if (CompressionTypeSupported(candidate)) {
+      compression = candidate;
+      break;
+    }
+  }
+  if (compression == kNoCompression) {
+    ROCKSDB_GTEST_SKIP("No supported compression type");
+    return;
+  }
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(), "CompressedRelocationBlocks"), 0);
+  options.enable_blob_files = true;
+  options.compression = compression;
+  BlockBasedTableOptions table_options;
+  table_options.format_version = 7;
+  table_options.block_cache = NewLRUCache(8 << 20);
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  const ImmutableOptions immutable_options(options);
+  const MutableCFOptions mutable_cf_options(options);
+  constexpr uint64_t kOrigin = 100;
+  constexpr int kRecords = 5000;
+  std::vector<std::string> payloads;
+  for (int i = 0; i < kRecords; ++i) {
+    payloads.push_back("value-" + std::to_string(i));
+  }
+  std::vector<RelocationTestRecord> records;
+  for (int i = 0; i < kRecords; ++i) {
+    records.push_back({kOrigin, static_cast<uint64_t>(10 + i * 100),
+                       payloads[i], kNoCompression});
+  }
+  BlobRelocationFileMetadata metadata;
+  uint64_t file_size = 0;
+  WriteRelocationFile(immutable_options, mutable_cf_options, table_options,
+                      /*column_family_id=*/1, /*blob_file_number=*/400, records,
+                      &metadata, &file_size);
+  std::unique_ptr<RandomAccessFileReader> file_reader;
+  ASSERT_OK(RandomAccessFileReader::Create(
+      immutable_options.fs,
+      BlobFileName(immutable_options.cf_paths.front().path, 400), FileOptions(),
+      &file_reader, /*dbg=*/nullptr));
+  std::unique_ptr<TableProperties> properties;
+  ASSERT_OK(ReadTableProperties(file_reader.get(), file_size,
+                                kBlockBasedTableMagicNumber, immutable_options,
+                                ReadOptions(), &properties));
+  // format_version 7 writes the compression name as
+  // "<compression manager>;<hex compression types used>;".
+  char expected_name[32];
+  snprintf(expected_name, sizeof(expected_name), "BuiltinV2;%02X;",
+           static_cast<unsigned>(compression));
+  EXPECT_EQ(properties->compression_name, expected_name);
+
+  for (int round = 0; round < 2; ++round) {
+    SCOPED_TRACE(round);
+    // A new block cache each round, so the first read of each block misses the
+    // cache.
+    BlockBasedTableOptions reader_options = table_options;
+    reader_options.block_cache = NewLRUCache(8 << 20);
+    std::unique_ptr<BlobFileReader> reader;
+    ASSERT_OK(OpenRelocationReader(
+        immutable_options, ReadOptions(), FileOptions(), /*column_family_id=*/1,
+        RelocationPhysicalFile(400, file_size, metadata),
+        /*db_session_id=*/"reader", reader_options,
+        mutable_cf_options.compression_manager.get(), &reader));
+    std::vector<BlobIndex> indexes(kRecords);
+    for (int i = 0; i < kRecords; ++i) {
+      std::string encoded;
+      BlobIndex::EncodeIndirectBlob(
+          &encoded, kOrigin,
+          {.origin_file_number = kOrigin,
+           .original_value_offset = records[i].original_value_offset,
+           .stored_value_size = payloads[i].size(),
+           .compression = kNoCompression,
+           .stable_checksum =
+               crc32c::Value(payloads[i].data(), payloads[i].size()),
+           .stored_checksum =
+               BlobIndex::ComputeStoredChecksum(payloads[i], kNoCompression)});
+      ASSERT_OK(indexes[i].DecodeFrom(encoded));
+    }
+    if (round == 0) {
+      for (int i = 0; i < kRecords; i += 97) {
+        std::unique_ptr<BlobContents> value;
+        ASSERT_OK(GetFromRelocationFile(*reader, ReadOptions(), indexes[i], 0,
+                                        kWholeBlobLength, nullptr, &value,
+                                        nullptr))
+            << i;
+        EXPECT_EQ(value->data(), payloads[i]);
+      }
+    } else {
+      std::vector<SameFileBlobStandaloneRead> outputs(kRecords);
+      std::vector<Status> statuses(kRecords);
+      std::vector<RelocationBlobReadRequest> requests;
+      for (int i = 0; i < kRecords; ++i) {
+        requests.push_back(MakeRelocationRequest(
+            &indexes[i], 0, kWholeBlobLength, &statuses[i], &outputs[i]));
+      }
+      reader->relocation()->MultiGetBlob(
+          ReadOptions(), nullptr, requests.size(), requests.data(), nullptr);
+      for (int i = 0; i < kRecords; ++i) {
+        ASSERT_OK(statuses[i]) << i;
+        EXPECT_EQ(outputs[i].contents->data(), payloads[i]);
+      }
+    }
   }
 }
 
@@ -1459,6 +1730,9 @@ TEST_P(RelocationRawLookupTest, ReadsCorrectValues) {
   ASSERT_OK(env->CreateDirIfMissing(path));
   options.cf_paths.emplace_back(path, 0);
   options.enable_blob_files = true;
+  // Uncompressed location blocks: an mmap read then uses the mapping and never
+  // fills the block cache, which the batched-read counts below expect.
+  options.compression = kNoCompression;
   options.allow_mmap_reads = mode == RawLookupMode::kMmap;
   options.use_direct_reads = mode == RawLookupMode::kDirect;
   BlockBasedTableOptions table_options;
@@ -2277,6 +2551,66 @@ TEST_F(BlobFileReaderTest, RelocationFileMultiOriginCompressedRoundTrip) {
         << status.ToString();
   }
 
+  std::array<Slice, 3> stored_payloads;
+  std::array<Status, 3> stored_statuses;
+  const auto stored_request =
+      [](uint64_t origin, uint64_t original_offset, const Slice& stored_value,
+         CompressionType compression, const Slice& logical_value,
+         Slice* payload, Status* status) {
+        return StoredRelocationFileReadRequest{
+            origin,
+            original_offset,
+            stored_value.size(),
+            compression,
+            crc32c::Value(logical_value.data(), logical_value.size()),
+            payload,
+            status,
+            BlobIndex::ComputeStoredChecksum(stored_value, compression)};
+      };
+  std::array<StoredRelocationFileReadRequest, 3> stored_requests{
+      stored_request(first_origin, 10, first_value, kNoCompression, first_value,
+                     &stored_payloads[0], &stored_statuses[0]),
+      stored_request(first_origin, second_offset, compressed_second, kZSTD,
+                     second_value, &stored_payloads[1], &stored_statuses[1]),
+      stored_request(second_origin, 7, third_value, kNoCompression, third_value,
+                     &stored_payloads[2], &stored_statuses[2])};
+  // A wrong stored checksum fails only that request.
+  stored_requests[2].stored_checksum ^= 1;
+  uint64_t stored_bytes_read = 0;
+  CoalescedReadBuffers stored_buffers;
+  reader->relocation()->MultiGetStoredBlobs(
+      read_options, /*coalesce_bytes=*/4096, stored_requests.size(),
+      stored_requests.data(), /*max_stored_value_size=*/1 << 20,
+      &stored_buffers, &stored_bytes_read);
+  ASSERT_OK(stored_statuses[0]);
+  ASSERT_OK(stored_statuses[1]);
+  ASSERT_TRUE(stored_statuses[2].IsCorruption());
+  EXPECT_EQ(stored_payloads[0], first_value);
+  EXPECT_EQ(stored_payloads[1], Slice(compressed_second));
+  EXPECT_TRUE(stored_payloads[2].empty());
+  EXPECT_EQ(stored_bytes_read, first_value.size() + compressed_second.size() +
+                                   2 * kSimpleGen2BlobTrailerSize);
+
+  stored_requests[2].stored_checksum ^= 1;
+  for (Slice& payload : stored_payloads) {
+    payload.clear();
+  }
+  stored_requests[1].stored_payload = nullptr;
+  stored_bytes_read = 0;
+  CoalescedReadBuffers validate_buffers;
+  reader->relocation()->MultiGetStoredBlobs(
+      read_options, /*coalesce_bytes=*/4096, stored_requests.size(),
+      stored_requests.data(), /*max_stored_value_size=*/1 << 20,
+      &validate_buffers, &stored_bytes_read);
+  ASSERT_OK(stored_statuses[0]);
+  ASSERT_OK(stored_statuses[1]);
+  ASSERT_OK(stored_statuses[2]);
+  EXPECT_EQ(stored_payloads[0], first_value);
+  EXPECT_TRUE(stored_payloads[1].empty());
+  EXPECT_EQ(stored_payloads[2], third_value);
+  EXPECT_EQ(stored_bytes_read, directory.total_record_bytes());
+  stored_requests[1].stored_payload = &stored_payloads[1];
+
   std::unique_ptr<BlobContents> value;
   uint64_t bytes_read = 0;
   ASSERT_OK(GetFromRelocationFile(*reader, read_options, first_index,
@@ -2805,6 +3139,22 @@ TEST_F(BlobFileReaderTest, CreateReaderAndGetBlob) {
       total_size += blob_sizes[i];
     }
     ASSERT_EQ(bytes_read, total_size);
+
+    bytes_read = 0;
+    Status stored_status;
+    StoredNormalBlobReadRequest stored_request{
+        blob_offsets[0],
+        blob_sizes[0],
+        kNoCompression,
+        /*stored_payload=*/nullptr,
+        &stored_status,
+        BlobIndex::ComputeStoredChecksum(blob_strs[0], kNoCompression)};
+    CoalescedReadBuffers buffers;
+    reader->MultiGetStoredBlobsForRelocation(
+        read_options, /*coalesce_bytes=*/0, 1, &stored_request,
+        /*max_stored_value_size=*/1 << 20, &buffers, &bytes_read);
+    ASSERT_OK(stored_status);
+    EXPECT_EQ(bytes_read, blob_sizes[0]);
   }
 
   read_options.verify_checksums = true;
@@ -3013,6 +3363,414 @@ TEST_F(BlobFileReaderTest, CreateReaderAndGetBlob) {
       }
     }
   }
+}
+
+TEST_F(BlobFileReaderTest,
+       MultiGetStoredBlobsForRelocationPreservesCompressedBytes) {
+  if (!CompressionTypeSupported(kZSTD)) {
+    ROCKSDB_GTEST_SKIP("ZSTD is required for this test");
+    return;
+  }
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(
+          mock_env_.get(),
+          "BlobFileReaderTest_MultiGetStoredBlobsForRelocation"),
+      0);
+  options.enable_blob_files = true;
+  const ImmutableOptions immutable_options(options);
+
+  constexpr uint32_t column_family_id = 1;
+  constexpr uint64_t blob_file_number = 1;
+  constexpr ExpirationRange expiration_range;
+  const std::array<std::string, 3> key_strings{{"key1", "key2", "key3"}};
+  const std::array<std::string, 3> blob_strings{
+      {std::string(4096, 'a'), std::string(4096, 'b'), std::string(4096, 'c')}};
+  const std::vector<Slice> keys{key_strings[0], key_strings[1], key_strings[2]};
+  const std::vector<Slice> blobs{blob_strings[0], blob_strings[1],
+                                 blob_strings[2]};
+  std::vector<uint64_t> blob_offsets(keys.size());
+  std::vector<uint64_t> blob_sizes(keys.size());
+  WriteBlobFile(immutable_options, column_family_id,
+                /*has_ttl=*/false, expiration_range, expiration_range,
+                blob_file_number, keys, blobs, kZSTD, blob_offsets, blob_sizes);
+
+  std::unique_ptr<BlobFileReader> reader;
+  const ReadOptions read_options;
+  ASSERT_OK(BlobFileReader::Create(
+      immutable_options, read_options, FileOptions(), column_family_id,
+      /*blob_file_read_hist=*/nullptr, blob_file_number, nullptr /*IOTracer*/,
+      &reader));
+
+  // Read the raw file to get the stored (compressed) bytes of each value. The
+  // stored CRC covers these exact bytes.
+  std::string file_contents;
+  ASSERT_OK(ReadFileToString(
+      mock_env_.get(),
+      BlobFileName(immutable_options.cf_paths.front().path, blob_file_number),
+      &file_contents));
+
+  std::array<Slice, 3> stored_payloads;
+  std::array<Status, 3> statuses;
+  std::array<StoredNormalBlobReadRequest, 3> requests;
+  for (size_t i = 0; i < requests.size(); ++i) {
+    const Slice stored(file_contents.data() + blob_offsets[i], blob_sizes[i]);
+    requests[i] = StoredNormalBlobReadRequest{
+        blob_offsets[i], blob_sizes[i],
+        kZSTD,           &stored_payloads[i],
+        &statuses[i],    BlobIndex::ComputeStoredChecksum(stored, kZSTD)};
+  }
+  ++requests.back().stored_checksum;
+
+  uint64_t bytes_read = 0;
+  CoalescedReadBuffers buffers;
+  reader->MultiGetStoredBlobsForRelocation(
+      read_options, /*coalesce_bytes=*/0, requests.size(), requests.data(),
+      /*max_stored_value_size=*/1 << 20, &buffers, &bytes_read);
+  ASSERT_OK(statuses[0]);
+  ASSERT_OK(statuses[1]);
+  ASSERT_TRUE(statuses[2].IsCorruption());
+  EXPECT_EQ(stored_payloads[0].size(), blob_sizes[0]);
+  EXPECT_EQ(stored_payloads[1].size(), blob_sizes[1]);
+  EXPECT_TRUE(stored_payloads[2].empty());
+  EXPECT_NE(stored_payloads[0], blob_strings[0]);
+  EXPECT_EQ(stored_payloads[0],
+            file_contents.substr(blob_offsets[0], blob_sizes[0]));
+  EXPECT_EQ(bytes_read, blob_sizes[0] + blob_sizes[1]);
+  --requests.back().stored_checksum;
+
+  // The gap between two values is the next record's header and key. When
+  // coalesce_bytes is at least the gap, the three values come back from one
+  // read. With a smaller coalesce_bytes, or 0, each value takes its own read.
+  // The returned bytes are the same in each case.
+  SetPerfLevel(PerfLevel::kEnableCount);
+  for (const auto& [coalesce_bytes, expected_reads] :
+       std::vector<std::pair<uint64_t, uint64_t>>{{0, 3}, {1, 3}, {4096, 1}}) {
+    SCOPED_TRACE(coalesce_bytes);
+    get_perf_context()->Reset();
+    CoalescedReadBuffers coalesced_buffers;
+    reader->MultiGetStoredBlobsForRelocation(
+        read_options, coalesce_bytes, requests.size(), requests.data(),
+        /*max_stored_value_size=*/1 << 20, &coalesced_buffers, &bytes_read);
+    EXPECT_EQ(get_perf_context()->blob_read_count, expected_reads);
+    for (size_t i = 0; i < requests.size(); ++i) {
+      ASSERT_OK(statuses[i]);
+      EXPECT_EQ(stored_payloads[i],
+                file_contents.substr(blob_offsets[i], blob_sizes[i]));
+    }
+  }
+  // One read is at most max_stored_value_size bytes. Here that is the size of
+  // the first two values without their gap, so each value takes its own read.
+  get_perf_context()->Reset();
+  CoalescedReadBuffers bounded_buffers;
+  reader->MultiGetStoredBlobsForRelocation(
+      read_options, /*coalesce_bytes=*/4096, requests.size(), requests.data(),
+      /*max_stored_value_size=*/blob_sizes[0] + blob_sizes[1], &bounded_buffers,
+      &bytes_read);
+  EXPECT_EQ(get_perf_context()->blob_read_count, 3U);
+  SetPerfLevel(PerfLevel::kDisable);
+
+  for (Slice& payload : stored_payloads) {
+    payload.clear();
+  }
+  requests[1].stored_payload = nullptr;
+  bytes_read = 0;
+  CoalescedReadBuffers validate_buffers;
+  reader->MultiGetStoredBlobsForRelocation(
+      read_options, /*coalesce_bytes=*/0, requests.size(), requests.data(),
+      /*max_stored_value_size=*/1 << 20, &validate_buffers, &bytes_read);
+  for (const Status& status : statuses) {
+    ASSERT_OK(status);
+  }
+  EXPECT_FALSE(stored_payloads[0].empty());
+  EXPECT_TRUE(stored_payloads[1].empty());
+  EXPECT_FALSE(stored_payloads[2].empty());
+  EXPECT_EQ(bytes_read, blob_sizes[0] + blob_sizes[1] + blob_sizes[2]);
+
+  requests[1].stored_payload = &stored_payloads[1];
+  for (Slice& payload : stored_payloads) {
+    payload.clear();
+  }
+  bytes_read = 0;
+  CoalescedReadBuffers limited_buffers;
+  reader->MultiGetStoredBlobsForRelocation(
+      read_options, /*coalesce_bytes=*/0, requests.size(), requests.data(),
+      /*max_stored_value_size=*/1, &limited_buffers, &bytes_read);
+  for (size_t i = 0; i < requests.size(); ++i) {
+    EXPECT_TRUE(statuses[i].IsMemoryLimit());
+    EXPECT_TRUE(stored_payloads[i].empty());
+  }
+  EXPECT_EQ(bytes_read, 0U);
+}
+
+TEST_F(BlobFileReaderTest, StoredRelocationReadDoesNotDecompress) {
+  if (!CompressionTypeSupported(kZSTD)) {
+    ROCKSDB_GTEST_SKIP("ZSTD is required for this test");
+    return;
+  }
+  Options options;
+  options.env = mock_env_.get();
+  options.enable_blob_files = true;
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(), "StoredRelocationRead"), 0);
+  const ImmutableOptions immutable_options(options);
+  const std::string key = "key";
+  const std::string logical(4096, 'x');
+  GrowableBuffer compressed;
+  std::unique_ptr<Compressor> compressor =
+      GetBuiltinV2CompressionManager()->GetCompressor({}, kZSTD);
+  ASSERT_OK(LegacyForceBuiltinCompression(*compressor, nullptr, logical,
+                                          &compressed));
+  uint64_t offset = 0;
+  uint64_t size = 0;
+  const ExpirationRange expiration_range;
+  WriteBlobFile(immutable_options, 0, false, expiration_range, expiration_range,
+                1, key, logical, kZSTD, &offset, &size);
+  std::unique_ptr<BlobFileReader> reader;
+  ASSERT_OK(BlobFileReader::Create(immutable_options, ReadOptions(),
+                                   FileOptions(), 0, nullptr, 1, nullptr,
+                                   &reader));
+  const uint32_t logical_crc = crc32c::Value(logical.data(), logical.size());
+  const uint32_t stored_crc =
+      BlobIndex::ComputeStoredChecksum(compressed.AsSlice(), kZSTD);
+  size_t decompressions = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "UncompressBlobContentsIfNeeded:TamperWithResult",
+      [&](void*) { ++decompressions; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  Slice stored;
+  CoalescedReadBuffers stored_buffers;
+  const auto read_stored = [&](uint32_t expected_stored_crc) {
+    Status status;
+    StoredNormalBlobReadRequest request{offset,  size,    kZSTD,
+                                        &stored, &status, expected_stored_crc};
+    stored_buffers = CoalescedReadBuffers();
+    reader->MultiGetStoredBlobsForRelocation(
+        ReadOptions(), /*coalesce_bytes=*/0, 1, &request,
+        /*max_stored_value_size=*/size, &stored_buffers,
+        /*bytes_read=*/nullptr);
+    return status;
+  };
+  ASSERT_OK(read_stored(stored_crc));
+  ASSERT_EQ(Slice(stored), Slice(compressed));
+  ASSERT_EQ(decompressions, 0U);
+  std::string encoded;
+  BlobIndex::EncodeUnflattenedIndirectBlob(&encoded,
+                                           {.origin_file_number = 1,
+                                            .original_value_offset = offset,
+                                            .stored_value_size = size,
+                                            .compression = kZSTD,
+                                            .stable_checksum = logical_crc,
+                                            .stored_checksum = stored_crc});
+  BlobIndex index;
+  ASSERT_OK(index.DecodeFrom(encoded));
+  std::string streamed;
+  ASSERT_OK(reader->StreamStoredBlobForRelocation(
+      ReadOptions(), index, [&](const Slice& chunk) {
+        EXPECT_LE(chunk.size(), kBlobRelocationStreamChunkSize);
+        streamed.append(chunk.data(), chunk.size());
+        return Status::OK();
+      }));
+  ASSERT_EQ(streamed, stored);
+  ASSERT_EQ(decompressions, 0U);
+  ASSERT_TRUE(read_stored(stored_crc ^ 1).IsCorruption());
+  ASSERT_EQ(decompressions, 0U);
+}
+
+TEST(BlobStoredStreamTest, ChecksLengthAndPreservesSourceFailures) {
+  const std::string payload = "stored payload";
+  const uint32_t checksum =
+      BlobIndex::ComputeStoredChecksum(payload, kNoCompression);
+  for (int mode = 0; mode < 4; ++mode) {
+    SCOPED_TRACE(mode);
+    std::unique_ptr<test::StringSink> sink =
+        std::make_unique<test::StringSink>();
+    test::StringSink* const sink_ptr = sink.get();
+    WritableFileWriter writer(std::move(sink), "stream", FileOptions());
+    const Status result = WriteSimpleGen2BlobRecordStream(
+        &writer, WriteOptions(), kCRC32c, /*base_context_checksum=*/123,
+        /*record_offset=*/0, payload.size(), kNoCompression, checksum,
+        [&](const BlobChunkConsumer& consume) {
+          if (mode == 0) {
+            return consume(payload);
+          }
+          if (mode == 1) {
+            return consume(Slice(payload.data(), payload.size() - 1));
+          }
+          if (mode == 2) {
+            Status status = consume(payload + "extra");
+            EXPECT_TRUE(status.IsCorruption());
+            // A buggy source cannot swallow a failed consumer and publish.
+            return Status::OK();
+          }
+          Status status = consume(payload);
+          return status.ok() ? Status::IOError("injected source I/O") : status;
+        });
+    if (mode == 0) {
+      ASSERT_OK(result);
+    } else if (mode == 3) {
+      ASSERT_TRUE(result.IsIOError());
+    } else {
+      ASSERT_TRUE(result.IsCorruption());
+    }
+    ASSERT_OK(writer.Flush(IOOptions()));
+    ASSERT_EQ(sink_ptr->contents().size(),
+              mode == 0 ? payload.size() + kSimpleGen2BlobTrailerSize
+                        : (mode == 1 ? payload.size() - 1
+                                     : (mode == 2 ? 0 : payload.size())));
+    if (mode == 0) {
+      const Slice trailer(sink_ptr->contents().data() + payload.size(),
+                          kSimpleGen2BlobTrailerSize);
+      ASSERT_EQ(DecodeFixed32(trailer.data() + 1),
+                crc32c::Mask(checksum) + ChecksumModifierForContext(123, 0));
+    }
+    ASSERT_OK(writer.Close(IOOptions(), nullptr));
+  }
+}
+
+TEST_F(BlobFileReaderTest, CoalescedStoredReadsAreMonotoneAndDeferPastLimit) {
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlobFileReaderTest_CoalescedStoredReads"),
+      0);
+  options.enable_blob_files = true;
+  const ImmutableOptions immutable_options(options);
+  constexpr uint32_t column_family_id = 1;
+  constexpr uint64_t blob_file_number = 1;
+  constexpr ExpirationRange expiration_range;
+  const uint32_t seed = static_cast<uint32_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+  constexpr size_t kValues = 64;
+  std::vector<std::string> key_strings(kValues);
+  std::vector<std::string> blob_strings(kValues);
+  std::vector<Slice> keys(kValues);
+  std::vector<Slice> blobs(kValues);
+  for (size_t i = 0; i < kValues; ++i) {
+    key_strings[i] = "key" + std::to_string(1000 + i);
+    blob_strings[i] = rnd.RandomString(50 + rnd.Uniform(3000));
+    keys[i] = key_strings[i];
+    blobs[i] = blob_strings[i];
+  }
+  std::vector<uint64_t> blob_offsets(kValues);
+  std::vector<uint64_t> blob_sizes(kValues);
+  WriteBlobFile(immutable_options, column_family_id, /*has_ttl=*/false,
+                expiration_range, expiration_range, blob_file_number, keys,
+                blobs, kNoCompression, blob_offsets, blob_sizes);
+  std::unique_ptr<BlobFileReader> reader;
+  ASSERT_OK(BlobFileReader::Create(
+      immutable_options, ReadOptions(), FileOptions(), column_family_id,
+      /*blob_file_read_hist=*/nullptr, blob_file_number, nullptr /*IOTracer*/,
+      &reader));
+
+  // Reads the values in `live` with these limits and stores the read count in
+  // `reads`. Returns how many values came back before the first deferred one,
+  // and checks the bytes of each of them.
+  const auto read_live = [&](const std::vector<size_t>& live,
+                             uint64_t coalesce_bytes, uint64_t max_read_bytes,
+                             uint64_t* reads) {
+    std::vector<Slice> payloads(live.size());
+    std::vector<Status> statuses(live.size());
+    std::vector<StoredNormalBlobReadRequest> requests(live.size());
+    for (size_t i = 0; i < live.size(); ++i) {
+      const size_t value = live[i];
+      requests[i] = StoredNormalBlobReadRequest{
+          blob_offsets[value],
+          blob_sizes[value],
+          kNoCompression,
+          &payloads[i],
+          &statuses[i],
+          BlobIndex::ComputeStoredChecksum(blobs[value], kNoCompression)};
+    }
+    SetPerfLevel(PerfLevel::kEnableCount);
+    get_perf_context()->Reset();
+    CoalescedReadBuffers buffers;
+    reader->MultiGetStoredBlobsForRelocation(
+        ReadOptions(), coalesce_bytes, requests.size(), requests.data(),
+        max_read_bytes, &buffers, /*bytes_read=*/nullptr);
+    *reads = get_perf_context()->blob_read_count;
+    SetPerfLevel(PerfLevel::kDisable);
+    size_t done = 0;
+    while (done < live.size() && statuses[done].ok()) {
+      EXPECT_EQ(payloads[done], blobs[live[done]]);
+      ++done;
+    }
+    for (size_t i = done; i < live.size(); ++i) {
+      EXPECT_TRUE(statuses[i].IsIncomplete()) << statuses[i].ToString();
+    }
+    return done;
+  };
+
+  // Reads the whole live set as indirect blob GC does: call again from the
+  // first deferred value until every value is back. Returns the reads made in
+  // total.
+  const auto read_all = [&](std::vector<size_t> live, uint64_t coalesce_bytes,
+                            uint64_t max_read_bytes) {
+    uint64_t total_reads = 0;
+    while (!live.empty()) {
+      uint64_t reads = 0;
+      const size_t done =
+          read_live(live, coalesce_bytes, max_read_bytes, &reads);
+      EXPECT_GT(done, 0U);
+      if (done == 0) {
+        break;
+      }
+      total_reads += reads;
+      live.erase(live.begin(), live.begin() + done);
+    }
+    return total_reads;
+  };
+
+  // For the same live set, a larger coalesce_bytes never needs more reads, also
+  // when the buffer limit defers reads.
+  for (int round = 0; round < 20; ++round) {
+    std::vector<size_t> live;
+    for (size_t i = 0; i < kValues; ++i) {
+      if (rnd.OneIn(2)) {
+        live.push_back(i);
+      }
+    }
+    if (live.empty()) {
+      live.push_back(0);
+    }
+    for (uint64_t max_read_bytes : {uint64_t{1} << 20, uint64_t{6000}}) {
+      uint64_t previous_reads = std::numeric_limits<uint64_t>::max();
+      for (uint64_t coalesce_bytes : {0, 1, 64, 512, 4096, 65536}) {
+        SCOPED_TRACE(std::to_string(max_read_bytes) + "/" +
+                     std::to_string(coalesce_bytes));
+        const uint64_t reads = read_all(live, coalesce_bytes, max_read_bytes);
+        EXPECT_LE(reads, previous_reads);
+        previous_reads = reads;
+      }
+    }
+  }
+
+  // Every other value is dead, so each coalesced read also reads a dead gap.
+  // The buffer holds the requested bytes plus at most max_read_bytes of gaps.
+  // Reads past that are deferred, and reading the rest again in later calls
+  // returns every value.
+  std::vector<size_t> remaining;
+  for (size_t i = 0; i < kValues; i += 2) {
+    remaining.push_back(i);
+  }
+  size_t calls = 0;
+  while (!remaining.empty()) {
+    uint64_t reads = 0;
+    const size_t done = read_live(remaining, /*coalesce_bytes=*/4096,
+                                  /*max_read_bytes=*/8000, &reads);
+    ASSERT_GT(done, 0U);
+    remaining.erase(remaining.begin(), remaining.begin() + done);
+    ++calls;
+  }
+  EXPECT_GT(calls, 1U);
 }
 
 // Verifies Create() prefers the file size reported by the opened handle over a

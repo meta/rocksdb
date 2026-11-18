@@ -31,6 +31,7 @@ namespace ROCKSDB_NAMESPACE {
 
 struct BlobReferenceGroup;
 struct BlobReferenceSstSummary;
+struct BlobReference;
 class CacheReservationManager;
 
 class Env;
@@ -328,6 +329,17 @@ class TableCache {
       std::shared_ptr<const BlobReferenceSstSummary>* summary,
       const std::shared_ptr<CacheReservationManager>& reservation_manager);
 
+  // Reads, from one SST, the exact references of the sorted groups in
+  // `requests` (see TableReader::ReadBlobReferences()), through a reader from
+  // GetBlobReferenceReader(). Returns InvalidArgument for an SST without exact
+  // blob reference metadata. Only tests call it.
+  Status ReadBlobReferences(const ReadOptions& read_options,
+                            const FileOptions& file_options,
+                            const InternalKeyComparator& internal_comparator,
+                            const FileMetaData& file_meta,
+                            const MutableCFOptions& mutable_cf_options,
+                            std::vector<BlobReferenceGroupRead>* requests);
+
   Status ApproximateKeyAnchors(const ReadOptions& ro,
                                const InternalKeyComparator& internal_comparator,
                                const FileMetaData& file_meta,
@@ -394,10 +406,10 @@ class TableCache {
   // not inserted into the table cache, so this call never evicts the reader of
   // another SST. Both kinds read the metadata blocks with fill_cache=false,
   // checksum checks and no persistent cache (see
-  // BlockBasedTable::ReadBlobReferenceGroups()). The caller must keep
-  // `file_meta` alive (for example, hold a Version that contains it) while it
-  // uses the reader. Returns InvalidArgument for an SST without exact blob
-  // reference metadata.
+  // ReadBlobReferenceMetadataBlock() in block_based_table_reader.cc). The
+  // caller must keep `file_meta` alive (for example, hold a Version that
+  // contains it) while it uses the reader. Returns InvalidArgument for an SST
+  // without exact blob reference metadata.
   Status GetBlobReferenceReader(
       const ReadOptions& read_options, const FileOptions& file_options,
       const InternalKeyComparator& internal_comparator,
