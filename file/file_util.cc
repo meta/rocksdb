@@ -362,6 +362,8 @@ class TempFileAtomicWriter : public AtomicFileWriter {
                  const IOOptions& opts, const FileOptions& file_opts) override;
 
  private:
+  IOStatus WriteTempFile(const Slice& contents, const IOOptions& opts,
+                         const FileOptions& file_opts) const;
   IOStatus RenameTempFile(const std::string& final_name,
                           const IOOptions& opts) const;
   IOStatus SyncDirectory(const std::string& final_name,
@@ -387,11 +389,10 @@ IOStatus TempFileAtomicWriter::Write(const std::string& final_name,
   const std::string kill_after_rename = prefix + ":1";
 #endif  // !NDEBUG
 
-  // WriteStringToFile() opens, appends, syncs and closes the temp file, and
-  // deletes it after a failed append, sync or close. Write() deletes it again
-  // below after any failure before the rename.
-  IOStatus s = WriteStringToFile(fs_, contents, options_.temp_name,
-                                 /*should_sync=*/true, opts, file_opts);
+  IOStatus s = WriteTempFile(contents, opts, file_opts);
+  if (s.ok() && options_.check_before_rename) {
+    s = options_.check_before_rename();
+  }
   if (has_test_points) {
     TEST_SYNC_POINT_CALLBACK(before_rename_point, &s);
   }
@@ -412,6 +413,38 @@ IOStatus TempFileAtomicWriter::Write(const std::string& final_name,
   s = SyncDirectory(final_name, opts);
   if (!s.ok() && options_.delete_temp_after_any_failure) {
     DeleteTempFile(opts);
+  }
+  return s;
+}
+
+// This is a copy of WriteStringToFile(), with a choice between Sync() and
+// Fsync(). WriteStringToFile() can only call Sync(), and the OPTIONS file needs
+// Fsync(). Like WriteStringToFile(), it deletes the temp file after a failure,
+// so the call sequence of a write with Sync() stays the same. Write() then
+// deletes the temp file a second time.
+IOStatus TempFileAtomicWriter::WriteTempFile(
+    const Slice& contents, const IOOptions& opts,
+    const FileOptions& file_opts) const {
+  std::unique_ptr<FSWritableFile> file;
+  IOStatus s =
+      fs_->NewWritableFile(options_.temp_name, file_opts, &file, nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  s = file->Append(contents, opts, nullptr);
+  if (s.ok()) {
+    s = options_.use_fsync ? file->Fsync(opts, nullptr)
+                           : file->Sync(opts, nullptr);
+  }
+  // Close explicitly so that a close error is returned. The destructor would
+  // drop it.
+  if (s.ok()) {
+    s = file->Close(opts, nullptr);
+  }
+  if (!s.ok()) {
+    // Best-effort cleanup after an error. The original error is returned, so
+    // the status of the delete is ignored.
+    fs_->DeleteFile(options_.temp_name, opts, nullptr).PermitUncheckedError();
   }
   return s;
 }
