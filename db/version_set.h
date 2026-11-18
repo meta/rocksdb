@@ -1878,6 +1878,21 @@ class VersionSet {
   // LogAndApply() returns before the batch starts: when there are no edits,
   // when every column family is dropped, or when pre_cb fails. They must not
   // call user code or do I/O.
+  //
+  // pre_cb: when pre_cb is set, the call gets no group commit with other
+  // calls. An earlier leader does not take the writers of this call into its
+  // batch, and the batch of this call does not take the writers of a later
+  // call. When the call reaches the queue head, pre_cb runs under the DB mutex.
+  // If the batch writes a MANIFEST record, each edit of the call's first
+  // column family that changes a Version is then applied without the DB mutex
+  // (VersionSet::LogAndApplyHelper()), and pre_cb runs again after each such
+  // edit, because the caller's state can change meanwhile. So a call with one
+  // such edit runs pre_cb twice, and pre_cb must be safe to run more than
+  // once. The edits of the other column families of the call are applied
+  // under the DB mutex. Dummy edits (SetOptions()) write no MANIFEST record
+  // and are applied under the DB mutex, so their pre_cb runs once.
+  // Intended user: indirect blob GC, which checks that its input is still
+  // installable.
   virtual Status LogAndApply(
       const autovector<ColumnFamilyData*>& cfds,
       const ReadOptions& read_options, const WriteOptions& write_options,
@@ -2806,14 +2821,12 @@ class VersionSet {
       std::shared_ptr<BlobReferenceCensusDelta>* delta) const;
 
   // REQUIRES db mutex at beginning. may release and re-acquire db mutex
-  Status ProcessManifestWrites(std::deque<ManifestWriter>& writers,
-                               InstrumentedMutex* mu,
-                               FSDirectory* dir_contains_current_file,
-                               bool new_descriptor_log,
-                               const ColumnFamilyOptions* new_cf_options,
-                               bool new_cf_options_are_sanitized,
-                               const ReadOptions& read_options,
-                               const WriteOptions& write_options);
+  Status ProcessManifestWrites(
+      std::deque<ManifestWriter>& writers, InstrumentedMutex* mu,
+      FSDirectory* dir_contains_current_file, bool new_descriptor_log,
+      const ColumnFamilyOptions* new_cf_options,
+      bool new_cf_options_are_sanitized, const ReadOptions& read_options,
+      const WriteOptions& write_options, const std::function<Status()>& pre_cb);
 
   Status LogAndApplyImpl(
       const autovector<ColumnFamilyData*>& column_family_datas,
@@ -2830,7 +2843,8 @@ class VersionSet {
                            SequenceNumber* max_last_sequence);
   Status LogAndApplyHelper(ColumnFamilyData* cfd, VersionBuilder* b,
                            VersionEdit* edit, SequenceNumber* max_last_sequence,
-                           InstrumentedMutex* mu);
+                           InstrumentedMutex* mu, bool apply_unlocked,
+                           const std::function<Status()>& pre_cb);
   // The "no re-add" rule. File numbers are never reused. So an edit that adds
   // back a relocation file, a route, or a blob file that an earlier edit of the
   // same MANIFEST deleted (or removed by blob file retirement) is a writer bug.

@@ -5990,12 +5990,29 @@ struct VersionSet::ManifestWriter {
   // publishes them at install time.
   const MutableCFOptions* new_mutable_cf_options;
   std::optional<uint64_t> compaction_phase_anchor_time;
+  // True for the first writer of a LogAndApply() call that passed a
+  // precondition callback (pre_cb). Such a writer is called a precondition
+  // writer. pre_cb checks that the caller's edit is still valid, and it runs
+  // only when this writer is at the queue head. Only the first writer of the
+  // call gets the flag, because the writers of one call are queued together
+  // and only the first one waits for the queue head. ProcessManifestWrites()
+  // uses the flag in three ways:
+  // - An earlier leader stops its batch before this writer, so this writer
+  //   reaches the queue head and its pre_cb runs.
+  // - When this writer leads, its batch takes no writer of a later call.
+  // - When this writer leads a batch that writes a MANIFEST record, its edits
+  //   that change a Version are applied without the DB mutex (see
+  //   LogAndApplyHelper()).
+  // Intended user: indirect blob GC, which checks that its input is still
+  // installable.
+  bool requires_precondition;
   int max_file_opening_threads;
 
   explicit ManifestWriter(
       InstrumentedMutex* mu, ColumnFamilyData* _cfd,
       const autovector<VersionEdit*>& e,
       const std::function<void(const Status&)>& manifest_wcb,
+      bool _requires_precondition,
       const MutableCFOptions* _new_mutable_cf_options,
       std::optional<uint64_t> _compaction_phase_anchor_time,
       int _max_file_opening_threads = 1)
@@ -6006,6 +6023,7 @@ struct VersionSet::ManifestWriter {
         manifest_write_callback(manifest_wcb),
         new_mutable_cf_options(_new_mutable_cf_options),
         compaction_phase_anchor_time(_compaction_phase_anchor_time),
+        requires_precondition(_requires_precondition),
         max_file_opening_threads(_max_file_opening_threads) {}
   // No copying allowed
   ManifestWriter(const ManifestWriter&) = delete;
@@ -6776,7 +6794,7 @@ Status VersionSet::ProcessManifestWrites(
     FSDirectory* dir_contains_current_file, bool new_descriptor_log,
     const ColumnFamilyOptions* new_cf_options,
     bool new_cf_options_are_sanitized, const ReadOptions& read_options,
-    const WriteOptions& write_options) {
+    const WriteOptions& write_options, const std::function<Status()>& pre_cb) {
   mu->AssertHeld();
   assert(!writers.empty());
   ManifestWriter& first_writer = writers.front();
@@ -6894,14 +6912,21 @@ Status VersionSet::ProcessManifestWrites(
     batch_edits.push_back(first_writer.edit_list.front());
     batch_edits_ts_sz.push_back(std::nullopt);
   } else {
-    auto it = manifest_writers_.cbegin();
+    // Walk the queue by index, not by iterator. LogAndApplyHelper() can
+    // release the DB mutex, and other callers can then add writers to
+    // manifest_writers_. std::deque::push_back invalidates iterators. Indexes
+    // stay valid, because no writer is removed from the queue during the
+    // batch.
+    size_t writer_index = 0;
     // True once the batch holds every writer of the leader's caller.
     bool past_leader_caller = false;
     size_t group_start = std::numeric_limits<size_t>::max();
     Status batch_apply_status;
     for (;;) {
-      assert(!(*it)->edit_list.front()->IsColumnFamilyManipulation());
-      last_writer = *it;
+      assert(!manifest_writers_[writer_index]
+                  ->edit_list.front()
+                  ->IsColumnFamilyManipulation());
+      last_writer = manifest_writers_[writer_index];
       batch_max_file_opening_threads =
           std::max(batch_max_file_opening_threads,
                    last_writer->max_file_opening_threads);
@@ -7014,9 +7039,16 @@ Status VersionSet::ProcessManifestWrites(
               e->SetsBlobIndirectionState()) {
             batch_apply_status = RejectReaddedBlobRelocationState(*e);
           }
+          // Only the leader can be a precondition writer in this batch,
+          // because the loop stops before any other precondition writer (see
+          // the stop rules below). So pre_cb is this writer's own callback. A
+          // batch that writes no MANIFEST record (skip_manifest_write) applies
+          // its edits under the DB mutex, so its pre_cb runs only once.
           if (batch_apply_status.ok()) {
-            batch_apply_status = LogAndApplyHelper(writer_cfd, builder, e,
-                                                   &max_last_sequence, mu);
+            batch_apply_status = LogAndApplyHelper(
+                writer_cfd, builder, e, &max_last_sequence, mu,
+                last_writer->requires_precondition && !skip_manifest_write,
+                pre_cb);
           }
           if (!batch_apply_status.ok()) {
             break;  // inner for-`e` loop
@@ -7032,9 +7064,21 @@ Status VersionSet::ProcessManifestWrites(
           }
         }
       }
-      // Loop increment/conditions
-      ++it;
-      if (it == manifest_writers_.cend()) {
+      // Loop increment/conditions. The batch ends at the first of these stop
+      // rules, in this order:
+      // 1. The queue has no more writers.
+      // 2. A batch that writes no MANIFEST record reaches its caller's last
+      //    writer.
+      // 3. The batch holds all writers of the leader's caller, and the leader
+      //    or the next writer has prepared options.
+      // 4. The batch holds all writers of the leader's caller, and the leader
+      //    is a precondition writer.
+      // 5. The next writer is a precondition writer.
+      // 6. The next writer adds or drops a column family, or is a dummy edit
+      //    that writes no MANIFEST record.
+      // A batch that writes no MANIFEST record checks only rules 1 and 2.
+      ++writer_index;
+      if (writer_index == manifest_writers_.size()) {
         break;
       }
       if (skip_manifest_write) {
@@ -7060,10 +7104,29 @@ Status VersionSet::ProcessManifestWrites(
       }
       if (past_leader_caller &&
           (first_writer.new_mutable_cf_options != nullptr ||
-           (*it)->new_mutable_cf_options != nullptr)) {
+           manifest_writers_[writer_index]->new_mutable_cf_options !=
+               nullptr)) {
         break;
       }
-      const auto* next = (*it)->edit_list.front();
+      if (past_leader_caller && first_writer.requires_precondition) {
+        // A leader that is a precondition writer is a batch barrier: the
+        // batch ends after the writers of the leader's caller. Absorbing a
+        // later caller could invalidate the state that the precondition
+        // checked. Also, if the precondition fails after the unlocked apply
+        // (see LogAndApplyHelper()), its error must fail only its own caller,
+        // not the writers queued after it (also ones that joined while the DB
+        // mutex was released). We estimate that the lost grouping costs
+        // little, because precondition writers (for example indirect blob GC
+        // installs) are rare.
+        break;
+      }
+      if (manifest_writers_[writer_index]->requires_precondition) {
+        // Stop the group here. This writer becomes the queue head later, and
+        // its caller checks the precondition against all Versions committed
+        // before it.
+        break;
+      }
+      const auto* next = manifest_writers_[writer_index]->edit_list.front();
       if (next->IsColumnFamilyManipulation() ||
           next->IsNoManifestWriteDummy()) {
         // no group commits for column family add or drop
@@ -7881,6 +7944,7 @@ Status VersionSet::LogAndApplyImpl(
         manifest_wcbs.empty() ? [](const Status&) {} : manifest_wcbs[i];
     writers.emplace_back(
         mu, column_family_datas[i], edit_lists[i], wcb,
+        /*requires_precondition=*/i == 0 && !!pre_cb,
         options_publication == nullptr
             ? nullptr
             : &options_publication->new_mutable_cf_options[i],
@@ -7943,7 +8007,7 @@ Status VersionSet::LogAndApplyImpl(
     return ProcessManifestWrites(writers, mu, dir_contains_current_file,
                                  new_descriptor_log, new_cf_options,
                                  new_cf_options_are_sanitized, read_options,
-                                 write_options);
+                                 write_options, pre_cb);
   }
 }
 
@@ -8011,7 +8075,14 @@ void VersionSet::RecordBlobRelocationDeletions(
 Status VersionSet::LogAndApplyHelper(ColumnFamilyData* cfd,
                                      VersionBuilder* builder, VersionEdit* edit,
                                      SequenceNumber* max_last_sequence,
-                                     InstrumentedMutex* mu) {
+                                     InstrumentedMutex* mu, bool apply_unlocked,
+                                     const std::function<Status()>& pre_cb) {
+  // mu is used on every path (AssertHeld() below), and the unlocked apply must
+  // release it and take it again. A null mu is a caller bug, so return an
+  // error instead of crashing.
+  if (mu == nullptr) {
+    return Status::InvalidArgument("Null DB mutex in LogAndApply");
+  }
 #ifdef NDEBUG
   (void)cfd;
 #endif
@@ -8038,7 +8109,36 @@ Status VersionSet::LogAndApplyHelper(ColumnFamilyData* cfd,
   // LSM Version, so they do not need a VersionBuilder.
   assert(builder || edit->IsWalManipulation() ||
          edit->IsOptionsFileManipulation());
-  return builder ? builder->Apply(edit) : Status::OK();
+  if (builder == nullptr) {
+    return Status::OK();
+  }
+  if (!apply_unlocked) {
+    return builder->Apply(edit);
+  }
+
+  // Unlocked apply: a precondition writer (see
+  // ManifestWriter::requires_precondition) applies the edit without the DB
+  // mutex, because the edit can be large (one change per route). This is safe
+  // for these reasons:
+  // - The edit and the builder belong to this writer. The builder holds a
+  //   reference to its base Version, so that Version stays alive.
+  // - The writer stays at the queue head, so no other Version is installed
+  //   and no other MANIFEST edit is applied meanwhile.
+  // - The caller, ProcessManifestWrites(), already ran the re-add check
+  //   (RejectReaddedBlobRelocationState()) of a batch with the format fence
+  //   under the DB mutex, against that same state.
+  // State outside the Versions that pre_cb depends on can change, so pre_cb
+  // runs again below.
+  mu->Unlock();
+  TEST_SYNC_POINT("VersionSet::LogAndApplyHelper:ApplyUnlocked");
+  Status status = builder->Apply(edit);
+  mu->Lock();
+  // The caller's state may change while Apply() runs without the DB mutex.
+  // Revalidate before this candidate Version can be written or installed.
+  if (status.ok() && pre_cb) {
+    status = pre_cb();
+  }
+  return status;
 }
 
 FileOptions VersionSet::GetFileOptionsForManifestWrite() const {
