@@ -69,7 +69,21 @@ class DbStressListener : public EventListener {
 
   ~DbStressListener() override { assert(num_pending_file_creations_ == 0); }
 
-  void OnDBShutdownBegin(DB* /*db*/) override { shutting_down_.Store(true); }
+  void OnDBShutdownBegin(DB* db) override {
+    // Remote compaction workers (DB::OpenAndCompact) share this listener and
+    // close their own DB instance after every job, which says nothing about
+    // the primary DB's compaction tracking. Until the primary DB is
+    // registered (for example, a DB closed during a failed open), treat any
+    // shutdown as the primary's.
+    DB* primary_db = primary_db_.Load();
+    if (primary_db == nullptr || db == primary_db) {
+      shutting_down_.Store(true);
+    }
+  }
+
+  // Registers the primary DB's root DB (the DB* passed to OnDBShutdownBegin)
+  // once it is open.
+  void SetPrimaryDb(DB* root_db) { primary_db_.Store(root_db); }
 
   void OnFlushCompleted(DB* /*db*/, const FlushJobInfo& info) override {
     assert(IsValidColumnFamilyName(info.cf_name));
@@ -567,9 +581,11 @@ class DbStressListener : public EventListener {
   // callback. Protected by compacting_files_mu_.
   std::mutex compacting_files_mu_;
   std::unordered_set<uint64_t> compacting_files_;
-  // Set when DBImpl begins shutdown to suppress false positives from stale
-  // tracking when compaction callbacks are skipped during shutdown.
+  // Set when the primary DB begins shutdown to suppress false positives from
+  // stale tracking when compaction callbacks are skipped during shutdown.
   Atomic<bool> shutting_down_{false};
+  // Root DB of the primary DB instance; null until SetPrimaryDb().
+  Atomic<DB*> primary_db_{nullptr};
   // Jobs that have passed OnCompactionPreCommit but not yet
   // OnCompactionCompleted. Maps job_id -> input file numbers.
   // Used to verify Begin -> PreCommit -> Completed ordering per job.
