@@ -139,7 +139,15 @@ struct BlobLogRecord {
 
   uint64_t record_size() const { return kHeaderSize + key_size + value_size; }
 
+  // The base signature: EncodeHeaderTo(dst, /*value_crc32c=*/nullptr).
   void EncodeHeaderTo(std::string* dst);
+
+  // Encodes the record header into `dst`. The header ends with the record CRC
+  // (blob_crc), which covers the key and the value. `value_crc32c` is optional:
+  // when it is not null, it must be the CRC32C of `value`, already computed by
+  // the caller. The record CRC then combines it with the key CRC and does not
+  // read the value again.
+  void EncodeHeaderTo(std::string* dst, const uint32_t* value_crc32c);
 
   Status DecodeHeaderFrom(Slice src);
 

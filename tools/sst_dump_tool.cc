@@ -11,6 +11,7 @@
 #include <iostream>
 #include <regex>
 
+#include "db/blob/blob_reference_metadata.h"
 #include "db_stress_tool/db_stress_compression_manager.h"
 #include "options/options_helper.h"
 #include "port/port.h"
@@ -229,6 +230,39 @@ void PrintTableProperties(const char* label,
           "------------------------------\n"
           "  %s",
           label, tp->ToString("\n  ", ": ").c_str());
+}
+
+// Prints the blob reference table properties of an SST written with blob
+// indirection as readable text. The format is described in
+// db/blob/blob_reference_metadata.h. The raw bytes are also in the "Raw user
+// collected properties" list. Prints nothing for an SST without them.
+void PrintBlobReferenceProperties(const TableProperties& tp) {
+  const UserCollectedProperties& properties = tp.user_collected_properties;
+  const auto descriptor = properties.find(kBlobReferenceDescriptorPropertyName);
+  if (descriptor == properties.end()) {
+    return;
+  }
+  fprintf(stdout,
+          "Blob reference metadata\n"
+          "------------------------------\n");
+  BlobReferenceMetadataDescriptor decoded;
+  const Status s =
+      BlobReferenceMetadataDescriptor::DecodeFrom(descriptor->second, &decoded);
+  if (!s.ok()) {
+    fprintf(stdout, "  exact metadata: cannot decode the descriptor: %s\n",
+            s.ToString().c_str());
+    return;
+  }
+  fprintf(stdout,
+          "  exact metadata: %" PRIu64 " references, %" PRIu64
+          " stored value bytes\n",
+          decoded.reference_count, decoded.stored_value_bytes);
+  fprintf(stdout, "  column family ID: %" PRIu32 "\n",
+          decoded.column_family_id);
+  fprintf(stdout, "  SST file number when built: %" PRIu64 "\n",
+          decoded.sst_file_number);
+  fprintf(stdout, "  index block: offset %" PRIu64 ", size %" PRIu64 "\n",
+          decoded.index_handle.offset(), decoded.index_handle.size());
 }
 
 // Appends a JSON string literal (with surrounding quotes) for `s` to `out`.
@@ -1305,6 +1339,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
             fprintf(stdout, "  # %s: 0x%s\n", prop_name.c_str(),
                     prop_val.c_str());
           }
+          PrintBlobReferenceProperties(*table_properties);
         }
       } else {
         fprintf(stderr, "Reader unexpectedly returned null properties\n");

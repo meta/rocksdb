@@ -137,6 +137,14 @@ uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id) {
 Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
                                       SequenceNumber seqno,
                                       ValueType value_type) {
+  return UpdateBoundaries(key, value, seqno, value_type,
+                          /*decoded_blob_index=*/nullptr);
+}
+
+Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
+                                      SequenceNumber seqno,
+                                      ValueType value_type,
+                                      const BlobIndex* decoded_blob_index) {
   // Helper: update oldest_blob_file_number from a single BlobIndex.
   auto update_oldest_blob = [&](const BlobIndex& blob_index) -> Status {
     if (!blob_index.IsInlined() && !blob_index.HasTTL()) {
@@ -170,16 +178,20 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
   };
 
   if (value_type == kTypeBlobIndex) {
-    BlobIndex blob_index;
-    if (Status s = blob_index.DecodeFrom(value); !s.ok()) {
-      return s;
+    BlobIndex own_blob_index;
+    const BlobIndex* value_blob_index = decoded_blob_index;
+    if (value_blob_index == nullptr) {
+      if (Status s = own_blob_index.DecodeFrom(value); !s.ok()) {
+        return s;
+      }
+      value_blob_index = &own_blob_index;
     }
 
-    if (Status s = update_oldest_blob(blob_index); !s.ok()) {
+    if (Status s = update_oldest_blob(*value_blob_index); !s.ok()) {
       return s;
     }
   } else if (value_type == kTypeWideColumnEntity) {
-    if (Status s = WideColumnSerialization::ForEachBlobFileNumber(
+    if (Status s = WideColumnSerialization::ForEachBlobIndex(
             value, update_oldest_blob);
         !s.ok()) {
       return s;

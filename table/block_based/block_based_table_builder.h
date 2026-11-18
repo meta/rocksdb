@@ -42,9 +42,14 @@ class BlockBasedTableBuilder : public TableBuilder {
   // Create a builder that will store the contents of the table it is
   // building in *file.  Does not close the file.  It is up to the
   // caller to close the file after calling Finish().
-  BlockBasedTableBuilder(const BlockBasedTableOptions& table_options,
-                         const TableBuilderOptions& table_builder_options,
-                         WritableFileWriter* file);
+  // `blob_reference_cache_res_mgr` charges the block cache for the memory of
+  // the exact blob reference metadata collector. The table factory shares one
+  // manager between all its builders. Null means the memory is not charged.
+  BlockBasedTableBuilder(
+      const BlockBasedTableOptions& table_options,
+      const TableBuilderOptions& table_builder_options,
+      WritableFileWriter* file,
+      std::shared_ptr<CacheReservationManager> blob_reference_cache_res_mgr);
 
   // No copying allowed
   BlockBasedTableBuilder(const BlockBasedTableBuilder&) = delete;
@@ -141,6 +146,11 @@ class BlockBasedTableBuilder : public TableBuilder {
  private:
   bool ok() const;
 
+  // Add() with the caller's decode of a kTypeBlobIndex `value`, or nullptr
+  // (see TableBuilderAddContext::decoded_blob_index).
+  void AddImpl(const Slice& key, const Slice& value,
+               const BlobIndex* decoded_blob_index);
+
   // Transition state from buffered to unbuffered if the conditions are met. See
   // `Rep::State` API comment for details of the states.
   // REQUIRES: `rep_->state == kBuffered`
@@ -163,6 +173,8 @@ class BlockBasedTableBuilder : public TableBuilder {
   void WriteBlock(const Slice& block_contents, BlockHandle* handle,
                   BlockType block_type, bool* skip_delta_encoding = nullptr);
   // Directly write data to the file.
+  // The base signatures. They pass warm_cache = true (base behavior: the
+  // block may be added to the block cache when the options ask for it).
   void WriteMaybeCompressedBlock(
       const Slice& block_contents, CompressionType, BlockHandle* handle,
       BlockType block_type, const Slice* uncompressed_block_data = nullptr,
@@ -173,6 +185,20 @@ class BlockBasedTableBuilder : public TableBuilder {
       BlockType block_type, const Slice* uncompressed_block_data = nullptr,
       bool* skip_delta_encoding = nullptr,
       const uint32_t* precomputed_block_contents_crc32c = nullptr);
+
+  // `warm_cache` false keeps the block out of the block cache even when the
+  // options ask to warm it (prepopulate_block_cache). Used for blocks that no
+  // reader looks up in the block cache.
+  void WriteMaybeCompressedBlock(
+      const Slice& block_contents, CompressionType, BlockHandle* handle,
+      BlockType block_type, const Slice* uncompressed_block_data,
+      bool* skip_delta_encoding,
+      const uint32_t* precomputed_block_contents_crc32c, bool warm_cache);
+  IOStatus WriteMaybeCompressedBlockImpl(
+      const Slice& block_contents, CompressionType, BlockHandle* handle,
+      BlockType block_type, const Slice* uncompressed_block_data,
+      bool* skip_delta_encoding,
+      const uint32_t* precomputed_block_contents_crc32c, bool warm_cache);
 
   void SetupCacheKeyPrefix(const TableBuilderOptions& tbo);
 
@@ -194,6 +220,7 @@ class BlockBasedTableBuilder : public TableBuilder {
   void WritePropertiesBlock(MetaIndexBuilder* meta_index_builder);
   void WriteCompressionDictBlock(MetaIndexBuilder* meta_index_builder);
   void WriteRangeDelBlock(MetaIndexBuilder* meta_index_builder);
+  void WriteBlobReferenceMetadata(MetaIndexBuilder* meta_index_builder);
   void WriteFooter(BlockHandle& metaindex_block_handle,
                    BlockHandle& index_block_handle);
 

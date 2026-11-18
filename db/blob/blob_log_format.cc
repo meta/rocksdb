@@ -94,6 +94,11 @@ Status BlobLogFooter::DecodeFrom(Slice src) {
 }
 
 void BlobLogRecord::EncodeHeaderTo(std::string* dst) {
+  EncodeHeaderTo(dst, /*value_crc32c=*/nullptr);
+}
+
+void BlobLogRecord::EncodeHeaderTo(std::string* dst,
+                                   const uint32_t* value_crc32c) {
   assert(dst != nullptr);
   dst->clear();
   dst->reserve(BlobLogRecord::kHeaderSize + key.size() + value.size());
@@ -103,8 +108,13 @@ void BlobLogRecord::EncodeHeaderTo(std::string* dst) {
   header_crc = crc32c::Value(dst->c_str(), dst->size());
   header_crc = crc32c::Mask(header_crc);
   PutFixed32(dst, header_crc);
-  blob_crc = crc32c::Value(key.data(), key.size());
-  blob_crc = crc32c::Extend(blob_crc, value.data(), value.size());
+  if (value_crc32c != nullptr) {
+    blob_crc = crc32c::Crc32cCombine(crc32c::Value(key.data(), key.size()),
+                                     *value_crc32c, value.size());
+  } else {
+    blob_crc = crc32c::Value(key.data(), key.size());
+    blob_crc = crc32c::Extend(blob_crc, value.data(), value.size());
+  }
   blob_crc = crc32c::Mask(blob_crc);
   PutFixed32(dst, blob_crc);
 }

@@ -472,6 +472,15 @@ Status DBImpl::Recover(
   bool& is_new_db = recovery_ctx ? recovery_ctx->is_new_db_ : tmp_is_new_db;
   assert(db_lock_ == nullptr);
   std::vector<std::string> files_in_dbname;
+  if (read_only) {
+    // Read-only opens (DBImplReadOnly and CompactedDBImpl) do not call
+    // ValidateOptions(), so the blob indirection FIFO check runs here, once per
+    // CF. Secondary opens run it in OpenAsSecondaryImpl().
+    Status s = CheckBlobIndirectionCompactionStyle(column_families);
+    if (!s.ok()) {
+      return s;
+    }
+  }
   if (!read_only) {
     Status s = directories_.SetDirectories(fs_.get(), dbname_,
                                            immutable_db_options_.wal_dir,

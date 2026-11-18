@@ -212,9 +212,10 @@ TEST_F(WideColumnSerializationTest, FutureVersionRejectedConsistently) {
   ASSERT_TRUE(WideColumnSerialization::HasBlobColumns(input, has_blob_columns)
                   .IsCorruption());
 
-  ASSERT_TRUE(WideColumnSerialization::ForEachBlobFileNumber(
-                  input, [](const BlobIndex&) { return Status::OK(); })
-                  .IsCorruption());
+  ASSERT_TRUE(
+      WideColumnSerialization::ForEachBlobIndex(input, [](const BlobIndex&) {
+        return Status::OK();
+      }).IsCorruption());
 }
 
 TEST_F(WideColumnSerializationTest, DeserializeNumberOfColumnsError) {
@@ -404,7 +405,7 @@ TEST_F(WideColumnSerializationTest, DeserializeV2RejectsRecursiveType) {
 }
 
 TEST_F(WideColumnSerializationTest, FastPathsRejectUnsupportedColumnType) {
-  // GetValueOfDefaultColumn() and ForEachBlobFileNumber() read the COLUMN TYPES
+  // GetValueOfDefaultColumn() and ForEachBlobIndex() read the COLUMN TYPES
   // section on a fast path. An unrecognized/unsupported type byte (here
   // kTypeWideColumnEntity) must be rejected as Corruption -- consistent with
   // Deserialize()/HasBlobColumns() -- rather than silently treated as an inline
@@ -439,7 +440,7 @@ TEST_F(WideColumnSerializationTest, FastPathsRejectUnsupportedColumnType) {
   }
 
   {
-    const Status s = WideColumnSerialization::ForEachBlobFileNumber(
+    const Status s = WideColumnSerialization::ForEachBlobIndex(
         Slice(buf), [](const BlobIndex&) { return Status::OK(); });
     ASSERT_TRUE(s.IsCorruption());
     ASSERT_TRUE(std::strstr(s.getState(), "Unsupported wide column ValueType"));
@@ -1167,6 +1168,129 @@ TEST(PinnableWideColumnsTest, MultiBufferMovePreservesPointers) {
             Slice("a-fairly-long-resolved-blob-payload"));
   EXPECT_EQ(move_assigned.columns()[0].value().data(), inline_data);
   EXPECT_EQ(move_assigned.columns()[1].value().data(), resolved_data);
+}
+
+TEST_F(WideColumnSerializationTest, ForEachBlobIndexValidatesBeforeCallbacks) {
+  const std::vector<std::pair<std::string, std::string>> columns{
+      {"", "inline"}, {"a", "value-a"}, {"b", "value-b"}};
+  const BlobIndex first = MakeBlobIndex(/*file_number=*/11, /*offset=*/101,
+                                        /*size=*/1001);
+  const BlobIndex second = MakeBlobIndex(/*file_number=*/12, /*offset=*/102,
+                                         /*size=*/1002);
+  std::string serialized;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      columns, {{1, first}, {2, second}}, serialized));
+
+  std::vector<uint64_t> file_numbers;
+  ASSERT_OK(WideColumnSerialization::ForEachBlobIndex(
+      serialized, [&](const BlobIndex& blob_index) {
+        file_numbers.push_back(blob_index.file_number());
+        return Status::OK();
+      }));
+  EXPECT_EQ(file_numbers, std::vector<uint64_t>({11, 12}));
+
+  // With blob and inline columns mixed, the callback sees only the blob
+  // columns, in column order.
+  std::string mixed;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      columns, {{0, second}, {2, first}}, mixed));
+  file_numbers.clear();
+  ASSERT_OK(WideColumnSerialization::ForEachBlobIndex(
+      mixed, [&](const BlobIndex& blob_index) {
+        file_numbers.push_back(blob_index.file_number());
+        return Status::OK();
+      }));
+  EXPECT_EQ(file_numbers, std::vector<uint64_t>({12, 11}));
+
+  serialized.push_back('x');
+  size_t callback_count = 0;
+  Status status = WideColumnSerialization::ForEachBlobIndex(
+      serialized, [&](const BlobIndex&) {
+        ++callback_count;
+        return Status::OK();
+      });
+  EXPECT_TRUE(status.IsCorruption()) << status.ToString();
+  EXPECT_EQ(callback_count, 0);
+
+  std::string invalid_encoded;
+  BlobIndex::EncodeBlob(&invalid_encoded, kCurrentFileBlobIndexFileNumber,
+                        /*offset=*/103,
+                        /*size=*/1003, static_cast<CompressionType>(0xff));
+  BlobIndex invalid_same_file;
+  ASSERT_OK(invalid_same_file.DecodeFrom(invalid_encoded));
+  serialized.clear();
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      columns, {{1, first}, {2, invalid_same_file}}, serialized));
+  status = WideColumnSerialization::ForEachBlobIndex(serialized,
+                                                     [&](const BlobIndex&) {
+                                                       ++callback_count;
+                                                       return Status::OK();
+                                                     });
+  EXPECT_TRUE(status.IsCorruption()) << status.ToString();
+  EXPECT_EQ(callback_count, 0);
+}
+
+TEST_F(WideColumnSerializationTest,
+       ForEachBlobIndexSkipsFramingWithoutBlobColumns) {
+  // Without blob columns, only the header, the skip info and the column types
+  // are read, so damage in later sections (here a trailing byte) is not
+  // reported.
+  const std::vector<std::pair<std::string, std::string>> columns{
+      {"", "inline"}, {"a", "value-a"}};
+  std::string serialized;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(columns, {}, serialized));
+  serialized.push_back('x');
+
+  size_t callback_count = 0;
+  ASSERT_OK(WideColumnSerialization::ForEachBlobIndex(serialized,
+                                                      [&](const BlobIndex&) {
+                                                        ++callback_count;
+                                                        return Status::OK();
+                                                      }));
+  EXPECT_EQ(callback_count, 0);
+
+  // Entities with a version below 2 (here 1, then 0) cannot hold blob columns,
+  // so a trailing byte is not reported for them either.
+  const WideColumns v1_columns{{"", "inline"}, {"a", "value-a"}};
+  serialized.clear();
+  ASSERT_OK(WideColumnSerialization::Serialize(v1_columns, serialized));
+  serialized.push_back('x');
+  ASSERT_OK(WideColumnSerialization::ForEachBlobIndex(serialized,
+                                                      [&](const BlobIndex&) {
+                                                        ++callback_count;
+                                                        return Status::OK();
+                                                      }));
+  serialized[0] = 0;
+  ASSERT_OK(WideColumnSerialization::ForEachBlobIndex(serialized,
+                                                      [&](const BlobIndex&) {
+                                                        ++callback_count;
+                                                        return Status::OK();
+                                                      }));
+  EXPECT_EQ(callback_count, 0);
+}
+
+TEST_F(WideColumnSerializationTest,
+       ForEachBlobIndexRejectsUnorderedNamesWithBlobColumns) {
+  const std::vector<std::pair<std::string, std::string>> columns{
+      {"x1", "value-1"}, {"x2", "value-2"}};
+  const BlobIndex blob_index = MakeBlobIndex(/*file_number=*/11,
+                                             /*offset=*/101, /*size=*/1001);
+  std::string serialized;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(columns, {{1, blob_index}},
+                                                 serialized));
+  const size_t names_pos = serialized.find("x1x2");
+  ASSERT_NE(names_pos, std::string::npos);
+  serialized.replace(names_pos, 4, "x2x1");
+
+  size_t callback_count = 0;
+  const Status status = WideColumnSerialization::ForEachBlobIndex(
+      serialized, [&](const BlobIndex&) {
+        ++callback_count;
+        return Status::OK();
+      });
+  EXPECT_TRUE(status.IsCorruption()) << status.ToString();
+  EXPECT_TRUE(std::strstr(status.getState(), "Wide columns out of order"));
+  EXPECT_EQ(callback_count, 0);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
