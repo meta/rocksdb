@@ -695,7 +695,7 @@ class Constructor {
   virtual bool AnywayDeleteIterator() const { return false; }
 
  protected:
-  const InternalKeyComparator* last_internal_comparator_;
+  const InternalKeyComparator* last_internal_comparator_ = nullptr;
 
  private:
   stl_wrappers::KVMap data_;
@@ -947,7 +947,7 @@ class TableConstructor : public Constructor {
   }
 
   const ReadOptions read_options_;
-  uint64_t file_num_;
+  uint64_t file_num_ = 0;
   std::unique_ptr<WritableFileWriter> file_writer_;
   std::unique_ptr<RandomAccessFileReader> file_reader_;
   std::unique_ptr<TableReader> table_reader_;
@@ -1141,7 +1141,7 @@ static std::vector<TestArgs> GenerateArgList() {
           test_type == PLAIN_TABLE_FULL_STR_PREFIX ||
           test_type == PLAIN_TABLE_TOTAL_ORDER) {
         // Plain table doesn't use restart index or compression.
-        TestArgs one_arg;
+        TestArgs one_arg{};
         one_arg.type = test_type;
         one_arg.reverse_compare = reverse_compare;
         one_arg.restart_interval = restart_intervals[0];
@@ -1163,7 +1163,7 @@ static std::vector<TestArgs> GenerateArgList() {
             for (uint32_t fv :
                  {kMinSupportedBbtFormatVersionForRead, 7U,
                   BlockBasedTableOptions::kLatestSupportedFormatVersion}) {
-              TestArgs one_arg;
+              TestArgs one_arg{};
               one_arg.type = test_type;
               one_arg.reverse_compare = reverse_compare;
               one_arg.restart_interval = restart_interval;
@@ -1636,7 +1636,7 @@ class BlockBasedTableTest : public BlockBasedTableTestBase,
                                     &trace_reader);
       EXPECT_OK(s);
       BlockCacheTraceReader reader(std::move(trace_reader));
-      BlockCacheTraceHeader header;
+      BlockCacheTraceHeader header{};
       EXPECT_OK(reader.ReadHeader(&header));
       uint32_t index = 0;
       while (s.ok()) {
@@ -1942,7 +1942,7 @@ TestIds GetUniqueId(TableProperties* tp, std::unordered_set<uint64_t>* seen,
   tp->db_id = db_id;
   tp->db_session_id = db_session_id;
   tp->orig_file_number = file_number;
-  TestIds t;
+  TestIds t{};
   {
     std::string euid;
     EXPECT_OK(GetExtendedUniqueIdFromTableProperties(*tp, &euid));
@@ -3121,7 +3121,7 @@ std::string ChecksumAsString(const std::string& data,
                      checksum_type, data.data(), data.size() - 1, data.back()));
   }
   // Little endian as in file
-  std::array<char, 4> raw_bytes;
+  std::array<char, 4> raw_bytes{};
   EncodeFixed32(raw_bytes.data(), v);
   return Slice(raw_bytes.data(), raw_bytes.size()).ToString(/*hex*/ true);
 }
@@ -3621,18 +3621,19 @@ TEST_F(GeneralTableTest, IndexBlockCommonPrefixEquivalence) {
   };
   const std::vector<Config> configs = {
       {"leaf_binary", BlockBasedTableOptions::kBinarySearch, false, false,
-       false},
-      {"leaf_binary_reverse", BlockBasedTableOptions::kBinarySearch, false,
-       true, false},
-      {"leaf_first_key", BlockBasedTableOptions::kBinarySearchWithFirstKey,
-       false, false, false},
-      {"leaf_hash", BlockBasedTableOptions::kHashSearch, false, false, true},
-      {"partitioned", BlockBasedTableOptions::kTwoLevelIndexSearch, false,
        false, false},
-      {"partitioned_reverse", BlockBasedTableOptions::kTwoLevelIndexSearch,
-       false, true, false},
-      {"partitioned_filters", BlockBasedTableOptions::kTwoLevelIndexSearch,
+      {"leaf_binary_reverse", BlockBasedTableOptions::kBinarySearch, false,
        true, false, false},
+      {"leaf_first_key", BlockBasedTableOptions::kBinarySearchWithFirstKey,
+       false, false, false, false},
+      {"leaf_hash", BlockBasedTableOptions::kHashSearch, false, false, true,
+       false},
+      {"partitioned", BlockBasedTableOptions::kTwoLevelIndexSearch, false,
+       false, false, false},
+      {"partitioned_reverse", BlockBasedTableOptions::kTwoLevelIndexSearch,
+       false, true, false, false},
+      {"partitioned_filters", BlockBasedTableOptions::kTwoLevelIndexSearch,
+       true, false, false, false},
       // Non-(reverse-)bytewise comparator with kEnabled: exercises the reader's
       // reconstruction path for stripped index blocks (leaf + partitioned).
       {"leaf_binary_custom_cmp", BlockBasedTableOptions::kBinarySearch, false,
@@ -6238,8 +6239,7 @@ TEST(TableTest, LegacyFormatRejectionTests) {
   // Test legacy block-based magic number from LevelDB should be rejected
   {
     // Construct a fake footer with legacy block-based magic number
-    std::array<char, Footer::kVersion0EncodedLength> fake_footer;
-    std::fill(fake_footer.begin(), fake_footer.end(), 0);
+    std::array<char, Footer::kVersion0EncodedLength> fake_footer{};
     // Put legacy magic number at the end
     EncodeFixed64(fake_footer.data() + fake_footer.size() - 8,
                   0xdb4775248b80fb57ull /*legacy magic number*/);
@@ -6257,8 +6257,7 @@ TEST(TableTest, LegacyFormatRejectionTests) {
 
   // Test format_version=1 with new magic number should be rejected
   {
-    std::array<char, Footer::kNewVersionsEncodedLength> fake_footer;
-    std::fill(fake_footer.begin(), fake_footer.end(), 0);
+    std::array<char, Footer::kNewVersionsEncodedLength> fake_footer{};
     // Part 1: checksum type
     fake_footer[0] = kCRC32c;
     // Part 3: format_version=1 and new magic number
@@ -6277,8 +6276,7 @@ TEST(TableTest, LegacyFormatRejectionTests) {
 
   // Test format_version=0 with new magic number should be rejected
   {
-    std::array<char, Footer::kNewVersionsEncodedLength> fake_footer;
-    std::fill(fake_footer.begin(), fake_footer.end(), 0);
+    std::array<char, Footer::kNewVersionsEncodedLength> fake_footer{};
     // Part 1: checksum type
     fake_footer[0] = kCRC32c;
     // Part 3: format_version=0 and new magic number
@@ -10320,7 +10318,8 @@ TEST_F(ExternalTableTest, IngestionTest) {
                                 {},
                                 {},
                                 Temperature::kUnknown,
-                                {{nullptr, nullptr}}}});
+                                {{nullptr, nullptr}},
+                                {}}});
   ASSERT_OK(s);
 
   iter.reset(db->NewIterator({}, cfh));
@@ -10348,7 +10347,7 @@ TEST_F(ExternalTableTest, IngestionTest) {
   writer.reset();
 
   s = db->IngestExternalFiles(
-      {{cfh, {ingest_file}, ifo, {}, {}, Temperature::kUnknown, {}}});
+      {{cfh, {ingest_file}, ifo, {}, {}, Temperature::kUnknown, {}, {}}});
   ASSERT_OK(s);
 
   std::string value;
@@ -11032,8 +11031,8 @@ class UserDefinedIndexTestBase : public BlockBasedTableTestBase {
     EXPECT_OK(iter->status());
   }
   Options options_;
-  const Comparator* comparator_;
-  bool is_reverse_comparator_;
+  const Comparator* comparator_ = nullptr;
+  bool is_reverse_comparator_ = false;
   Random rnd{301};
 };
 

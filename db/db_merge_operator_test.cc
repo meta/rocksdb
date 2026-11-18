@@ -907,7 +907,7 @@ class PerConfigMergeOperatorPinningTest
     std::tie(disable_block_cache_, option_config_) = GetParam();
   }
 
-  bool disable_block_cache_;
+  bool disable_block_cache_ = false;
 };
 
 INSTANTIATE_TEST_CASE_P(

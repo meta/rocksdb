@@ -521,19 +521,19 @@ class BlockIter : public InternalIteratorBase<TValue> {
 
  protected:
   InternalKeyComparator icmp_;
-  const char* data_;       // underlying block contents
-  uint32_t num_restarts_;  // Number of uint32_t entries in restart array
+  const char* data_ = nullptr;  // underlying block contents
+  uint32_t num_restarts_ = 0;   // Number of uint32_t entries in restart array
 
-  const char* values_section_;
+  const char* values_section_ = nullptr;
   // Slice of current entry in the data section. Does not contain value if
   // values_section_ exists
   Slice entry_;
 
   // Index of restart block in which current_ or current_-1 falls
-  uint32_t restart_index_;
-  uint32_t restarts_;  // Offset of restart array (list of fixed32)
+  uint32_t restart_index_ = 0;
+  uint32_t restarts_ = 0;  // Offset of restart array (list of fixed32)
   // current_ is offset in data_ of current entry.  >= restarts_ if !Valid
-  uint32_t current_;
+  uint32_t current_ = 0;
   // Cached result of GetKeysEndOffset(). Computed once in InitializeBase()
   // since values_section_, data_, and restarts_ do not change afterward.
   uint32_t keys_end_offset_{0};
@@ -545,7 +545,7 @@ class BlockIter : public InternalIteratorBase<TValue> {
   Status status_;
   // Key to be exposed to users.
   Slice key_;
-  SequenceNumber global_seqno_;
+  SequenceNumber global_seqno_ = 0;
   // Size of the user-defined timestamp.
   size_t ts_sz_ = 0;
   // If user-defined timestamp is enabled but not persisted. A min timestamp
@@ -558,25 +558,25 @@ class BlockIter : public InternalIteratorBase<TValue> {
   // data blocks, index block for partitioned filter blocks, index block for
   // partitioned index blocks. In summary, this only applies to block whose key
   // are real user keys or internal keys created from user keys.
-  bool pad_min_timestamp_;
+  bool pad_min_timestamp_ = false;
 
   // Per key-value checksum related states
-  const char* kv_checksum_;
+  const char* kv_checksum_ = nullptr;
   // Index of the next entry to be parsed (used for checksum verification
   // and to determine if we're at a restart point for separated KV storage)
-  int32_t cur_entry_idx_;
-  uint32_t block_restart_interval_;
+  int32_t cur_entry_idx_ = 0;
+  uint32_t block_restart_interval_ = 0;
   // Byte length of the block's common user-key prefix (stored once at offset
   // 0), 0 if unused. See has_common_prefix()/common_prefix(). Only set for
   // DataBlockIter.
   uint32_t common_prefix_size_ = 0;
-  uint8_t protection_bytes_per_key_;
+  uint8_t protection_bytes_per_key_ = 0;
 
-  bool key_pinned_;
+  bool key_pinned_ = false;
   // Whether the block data is guaranteed to outlive this iterator, and
   // as long as the cleanup functions are transferred to another class,
   // e.g. PinnableSlice, the pointer to the bytes will still be valid.
-  bool block_contents_pinned_;
+  bool block_contents_pinned_ = false;
   // Whether and how seeks use the prefix-optimized search, which strips the
   // block's common prefix from the target once (see StripSeekTargetPrefix())
   // and then compares the remaining bytes, rather than comparing full keys.
@@ -793,7 +793,7 @@ class BlockIter : public InternalIteratorBase<TValue> {
   // function callback, which is hard to retrieve. When multiple value
   // PinnableSlices reference the block, they need the cache handle in order
   // to bump up the ref count
-  Cache::Handle* cache_handle_;
+  Cache::Handle* cache_handle_ = nullptr;
 
  public:
   // Return the offset in data_ just past the end of the current entry.
@@ -995,7 +995,7 @@ class DataBlockIter final : public BlockIter<Slice> {
   std::vector<CachedPrevEntry> prev_entries_;
   int32_t prev_entries_idx_ = -1;
 
-  DataBlockHashIndex* data_block_hash_index_;
+  DataBlockHashIndex* data_block_hash_index_ = nullptr;
 
   bool SeekForGetImpl(const Slice& target);
 };
@@ -1139,11 +1139,11 @@ class IndexBlockIter final : public BlockIter<IndexValue> {
   void SeekToLastImpl() override;
 
  private:
-  bool value_delta_encoded_;
+  bool value_delta_encoded_ = false;
   // format_version >= 8 value-delta codec (reserves an in-value escape). Only
   // consulted when value_delta_encoded_ and the entry is a non-restart entry.
-  bool value_delta_escape_;
-  bool have_first_key_;  // value includes first_internal_key
+  bool value_delta_escape_ = false;
+  bool have_first_key_ = false;  // value includes first_internal_key
   BlockPrefixIndex* prefix_index_;
   // Whether the value is delta encoded. In that case the value is assumed to be
   // BlockHandle. The first value in each restart interval is the full encoded

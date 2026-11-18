@@ -31,7 +31,7 @@ struct PointLockRequest {
 // Request for locking a range of keys.
 struct RangeLockRequest {
   // The id of the key's column family.
-  ColumnFamilyId column_family_id;
+  ColumnFamilyId column_family_id = 0;
 
   // The range to be locked
   Endpoint start_endp;

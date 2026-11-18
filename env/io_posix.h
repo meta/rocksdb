@@ -182,7 +182,7 @@ struct Posix_IOHandle {
         is_being_aborted(false),
         req_count(0) {}
 
-  struct iovec iov;
+  struct iovec iov{};
   struct io_uring* iu;
   std::function<void(FSReadRequest&, void*)> cb;
   void* cb_arg;

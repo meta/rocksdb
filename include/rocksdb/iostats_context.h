@@ -86,36 +86,36 @@ struct IOStatsContext {
   std::string ToString(bool exclude_zero_counters = false) const;
 
   // the thread pool id
-  uint64_t thread_pool_id;
+  uint64_t thread_pool_id = 0;
 
   // number of bytes that has been written.
-  uint64_t bytes_written;
+  uint64_t bytes_written = 0;
   // number of bytes that has been read.
-  uint64_t bytes_read;
+  uint64_t bytes_read = 0;
 
   // time spent in open() and fopen().
-  uint64_t open_nanos;
+  uint64_t open_nanos = 0;
   // time spent in fallocate().
-  uint64_t allocate_nanos;
+  uint64_t allocate_nanos = 0;
   // time spent in write() and pwrite().
-  uint64_t write_nanos;
+  uint64_t write_nanos = 0;
   // time spent in read() and pread()
-  uint64_t read_nanos;
+  uint64_t read_nanos = 0;
   // time spent in sync_file_range().
-  uint64_t range_sync_nanos;
+  uint64_t range_sync_nanos = 0;
   // time spent in fsync
-  uint64_t fsync_nanos;
+  uint64_t fsync_nanos = 0;
   // time spent in preparing write (fallocate etc).
-  uint64_t prepare_write_nanos;
+  uint64_t prepare_write_nanos = 0;
   // time spent in Logger::Logv().
-  uint64_t logger_nanos;
+  uint64_t logger_nanos = 0;
   // CPU time spent in write() and pwrite()
-  uint64_t cpu_write_nanos;
+  uint64_t cpu_write_nanos = 0;
   // CPU time spent in read() and pread(). Not supported for async read
   // requests.
-  uint64_t cpu_read_nanos;
+  uint64_t cpu_read_nanos = 0;
 
-  FileIOByTemperature file_io_stats_by_temperature;
+  FileIOByTemperature file_io_stats_by_temperature{};
 
   // It is not consistent that whether iostats follows PerfLevel.Timer counters
   // follows it but BackupEngine relies on counter metrics to always be there.

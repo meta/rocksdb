@@ -1142,7 +1142,7 @@ Status ReadRecordFromWriteBatch(Slice* input, char* tag,
 struct RangeTombstone {
   Slice start_key_;
   Slice end_key_;
-  SequenceNumber seq_;
+  SequenceNumber seq_ = 0;
   // TODO: we should optimize the storage here when user-defined timestamp
   //  is NOT enabled: they currently take up (16 + 32 + 32) bytes per tombstone.
   Slice ts_;

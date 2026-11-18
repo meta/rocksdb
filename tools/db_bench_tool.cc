@@ -2862,17 +2862,17 @@ class Stats {
   };
 
   SystemClock* clock_;
-  int id_;
+  int id_ = -1;
   uint64_t start_ = 0;
-  uint64_t sine_interval_;
-  uint64_t finish_;
-  double seconds_;
-  uint64_t done_;
-  uint64_t last_report_done_;
-  uint64_t next_report_;
-  uint64_t bytes_;
-  uint64_t last_op_finish_;
-  uint64_t last_report_finish_;
+  uint64_t sine_interval_ = 0;
+  uint64_t finish_ = 0;
+  double seconds_ = 0;
+  uint64_t done_ = 0;
+  uint64_t last_report_done_ = 0;
+  uint64_t next_report_ = 0;
+  uint64_t bytes_ = 0;
+  uint64_t last_op_finish_ = 0;
+  uint64_t last_report_finish_ = 0;
   OperationHistograms hist_;
   std::shared_ptr<IntervalStatsState> interval_stats_;
   std::string message_;
@@ -3639,7 +3639,7 @@ inline void ArmFatalShutdownWatchdog() {
 struct SharedState {
   port::Mutex mu;
   port::CondVar cv;
-  int total;
+  int total = 0;
   int perf_level;
   std::shared_ptr<RateLimiter> write_rate_limiter;
   std::shared_ptr<RateLimiter> read_rate_limiter;
@@ -3650,9 +3650,9 @@ struct SharedState {
   //    (3) running
   //    (4) done
 
-  long num_initialized;
-  long num_done;
-  bool start;
+  long num_initialized = 0;
+  long num_done = 0;
+  bool start = false;
 
   // Cooperative fatal-error handling for worker threads. When a worker hits a
   // fatal error mid-operation it records the error here and unwinds (returns
@@ -3788,7 +3788,7 @@ struct ThreadState {
   int tid;        // 0..n-1 when running in n threads
   Random64 rand;  // Has different seeds for different threads
   Stats stats;
-  SharedState* shared;
+  SharedState* shared = nullptr;
 
   explicit ThreadState(int index, int my_seed)
       : tid(index), rand(*seed_base + my_seed) {}
@@ -3848,10 +3848,10 @@ class Benchmark {
   int total_thread_count_;
   int64_t keys_per_prefix_;
   int64_t entries_per_batch_;
-  int64_t writes_before_delete_range_;
-  int64_t writes_per_range_tombstone_;
-  int64_t range_tombstone_width_;
-  int64_t max_num_range_tombstones_;
+  int64_t writes_before_delete_range_ = 0;
+  int64_t writes_per_range_tombstone_ = 0;
+  int64_t range_tombstone_width_ = 0;
+  int64_t max_num_range_tombstones_ = 0;
   ReadOptions read_options_;
   WriteOptions write_options_;
   std::shared_ptr<ROCKSDB_NAMESPACE::IndexFactory> udi_factory_;
@@ -3859,7 +3859,7 @@ class Benchmark {
   TraceOptions trace_options_;
   TraceOptions block_cache_trace_options_;
   int64_t reads_;
-  int64_t deletes_;
+  int64_t deletes_ = 0;
   double read_random_exp_range_;
   int64_t writes_;
   int64_t readwrites_;
@@ -9389,7 +9389,7 @@ class Benchmark {
    public:
     std::vector<int> type_;
     std::vector<double> ratio_;
-    int range_;
+    int range_ = 0;
 
     QueryDecider() = default;
     ~QueryDecider() = default;
@@ -9489,7 +9489,7 @@ class Benchmark {
 
         // Step 3. For each key-range, we calculate its position in the
         // [0, amplify] range, including the start, the size (keyrange_access)
-        KeyrangeUnit p_unit;
+        KeyrangeUnit p_unit{};
         p_unit.keyrange_start = keyrange_start;
         if (0.0 >= keyrange_p) {
           p_unit.keyrange_access = 0;

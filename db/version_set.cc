@@ -463,8 +463,8 @@ class FilePicker {
   bool search_ended_;
   bool is_hit_file_last_in_level_;
   LevelFilesBrief* curr_file_level_;
-  unsigned int curr_index_in_curr_level_;
-  unsigned int start_index_in_curr_level_;
+  unsigned int curr_index_in_curr_level_ = 0;
+  unsigned int start_index_in_curr_level_ = 0;
   Slice user_key_;
   Slice ikey_;
   FileIndexer* file_indexer_;
@@ -774,7 +774,7 @@ class FilePickerMultiGet {
   MultiGetRange::Iterator batch_iter_prev_;
   MultiGetRange::Iterator upper_key_;
   autovector<LevelFilesBrief>* level_files_brief_;
-  bool search_ended_;
+  bool search_ended_ = false;
   bool is_hit_file_last_in_level_;
   LevelFilesBrief* curr_file_level_;
   FileIndexer* file_indexer_;

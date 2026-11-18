@@ -1168,7 +1168,7 @@ class VersionSetTestBase {
   const static std::string kColumnFamilyName2;
   const static std::string kColumnFamilyName3;
   const static int kNumColumnFamilies = 4;
-  int num_initial_edits_;
+  int num_initial_edits_ = 0;
 
   explicit VersionSetTestBase(const std::string& name)
       : env_(nullptr),
@@ -1484,7 +1484,7 @@ class VersionSetTestBase {
     return cfd;
   }
 
-  Env* mem_env_;
+  Env* mem_env_ = nullptr;
   Env* env_;
   std::shared_ptr<Env> env_guard_;
   std::shared_ptr<FileSystem> fs_;
@@ -3243,7 +3243,7 @@ class VersionSetAtomicGroupTest : public VersionSetTestBase,
 
  protected:
   std::vector<ColumnFamilyDescriptor> column_families_;
-  SequenceNumber last_seqno_;
+  SequenceNumber last_seqno_ = 0;
   std::vector<VersionEdit> edits_;
   bool first_in_atomic_group_ = false;
   bool last_in_atomic_group_ = false;
@@ -4595,7 +4595,7 @@ class VersionSetTestMissingFiles : public VersionSetTestBase,
 
   std::shared_ptr<InternalKeyComparator> internal_comparator_;
   std::vector<ColumnFamilyDescriptor> column_families_;
-  SequenceNumber last_seqno_;
+  SequenceNumber last_seqno_ = 0;
   std::unique_ptr<log::Writer> log_writer_;
 };
 

@@ -2365,7 +2365,7 @@ class DBImpl : public DB
     explicit WalFileNumberSize(uint64_t _number) : number(_number) {}
     WalFileNumberSize() {}
     void AddSize(uint64_t new_size) { size += new_size; }
-    uint64_t number;
+    uint64_t number = 0;
     uint64_t size = 0;
     bool getting_flushed = false;
   };

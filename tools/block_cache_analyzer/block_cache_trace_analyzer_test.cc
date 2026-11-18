@@ -659,7 +659,7 @@ TEST_F(BlockCacheTracerTest, MixedBlocks) {
     ASSERT_OK(NewFileTraceReader(env_, env_options_, trace_file_path_,
                                  &trace_reader));
     BlockCacheTraceReader reader(std::move(trace_reader));
-    BlockCacheTraceHeader header;
+    BlockCacheTraceHeader header{};
     ASSERT_OK(reader.ReadHeader(&header));
     ASSERT_EQ(static_cast<uint32_t>(kMajorVersion),
               header.rocksdb_major_version);
@@ -766,7 +766,7 @@ TEST_F(BlockCacheTracerTest, MultiGetWithNullReferenceKey) {
     ASSERT_OK(NewFileTraceReader(env_, env_options_, trace_file_path_,
                                  &trace_reader));
     BlockCacheTraceReader reader(std::move(trace_reader));
-    BlockCacheTraceHeader header;
+    BlockCacheTraceHeader header{};
     ASSERT_OK(reader.ReadHeader(&header));
     ASSERT_EQ(static_cast<uint32_t>(kMajorVersion),
               header.rocksdb_major_version);

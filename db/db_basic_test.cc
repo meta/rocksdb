@@ -6988,9 +6988,9 @@ class DeadlineFS : public FileSystemWrapper {
 
  private:
   // The number of IOs to trigger the delay after
-  int delay_trigger_;
+  int delay_trigger_ = 0;
   // Current IO count
-  int io_count_;
+  int io_count_ = 0;
   // ReadOptions deadline for the Get/MultiGet/Iterator
   std::chrono::microseconds deadline_;
   // ReadOptions io_timeout for the Get/MultiGet/Iterator

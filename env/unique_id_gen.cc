@@ -127,7 +127,7 @@ struct Entropy {
 
 void GenerateRawUniqueIdImpl(uint64_t* a, uint64_t* b,
                              const GenerateRawUniqueIdOpts& opts) {
-  Entropy e;
+  Entropy e{};
   std::memset(&e, 0, sizeof(e));
   e.Populate(opts);
   Hash2x64(reinterpret_cast<const char*>(&e), sizeof(e), a, b);

@@ -54,7 +54,7 @@ struct FileCreationBriefInfo {
 
 struct TableFileCreationBriefInfo : public FileCreationBriefInfo {
   // reason of creating the table.
-  TableFileCreationReason reason;
+  TableFileCreationReason reason = TableFileCreationReason::kFlush;
 };
 
 struct TableFileCreationInfo : public TableFileCreationBriefInfo {
@@ -62,7 +62,7 @@ struct TableFileCreationInfo : public TableFileCreationBriefInfo {
   explicit TableFileCreationInfo(TableProperties&& prop)
       : table_properties(prop) {}
   // the size of the file.
-  uint64_t file_size;
+  uint64_t file_size = 0;
   // Detailed properties of the created file.
   TableProperties table_properties;
   // The status indicating whether the creation was successful or not.
@@ -213,8 +213,8 @@ struct WriteStallInfo {
   std::string cf_name;
   // state of the write controller
   struct {
-    WriteStallCondition cur;
-    WriteStallCondition prev;
+    WriteStallCondition cur = WriteStallCondition::kDelayed;
+    WriteStallCondition prev = WriteStallCondition::kDelayed;
   } condition;
 };
 
@@ -275,8 +275,8 @@ struct FileOperationInfo {
   // Rocksdb try to provide file temperature information, but it's not
   // guaranteed.
   Temperature temperature;
-  uint64_t offset;
-  size_t length;
+  uint64_t offset = 0;
+  size_t length = 0;
   const Duration duration;
   const SystemTimePoint& start_ts;
   Status status;
@@ -437,27 +437,27 @@ struct SubcompactionJobInfo {
 struct CompactionJobInfo {
   ~CompactionJobInfo() { status.PermitUncheckedError(); }
   // the id of the column family where the compaction happened.
-  uint32_t cf_id;
+  uint32_t cf_id = 0;
   // the name of the column family where the compaction happened.
   std::string cf_name;
   // the status indicating whether the compaction was successful or not.
   Status status;
   // the id of the thread that completed this compaction job.
-  uint64_t thread_id;
+  uint64_t thread_id = 0;
   // the job id, which is unique in the same thread.
-  int job_id;
+  int job_id = 0;
 
   // The execution pool selected for this job, independent of later DB option
   // updates.
   bool separate_remote_compaction_pool_selected = false;
 
   // the number of L0 files in the CF right before and after the compaction
-  int num_l0_files;
+  int num_l0_files = 0;
 
   // the smallest input level of the compaction.
-  int base_input_level;
+  int base_input_level = 0;
   // the output level of the compaction.
-  int output_level;
+  int output_level = 0;
 
   // The following variables contain information about compaction inputs
   // and outputs. A file may appear in both the input and output lists
@@ -482,16 +482,16 @@ struct CompactionJobInfo {
   TablePropertiesCollection table_properties;
 
   // Reason to run the compaction
-  CompactionReason compaction_reason;
+  CompactionReason compaction_reason = CompactionReason::kUnknown;
 
   // Compression algorithm used for output files
-  CompressionType compression;
+  CompressionType compression = kNoCompression;
 
   // Statistics and other additional details on the compaction
   CompactionJobStats stats;
 
   // Compression algorithm used for blob output files.
-  CompressionType blob_compression_type;
+  CompressionType blob_compression_type = kNoCompression;
 
   // Information about blob files created during compaction in Integrated
   // BlobDB.

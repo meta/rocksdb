@@ -711,7 +711,7 @@ class ReadaheadRandomAccessFileTest
   size_t GetReadaheadSize() const { return readahead_size_; }
 
  private:
-  size_t readahead_size_;
+  size_t readahead_size_ = 0;
   Slice control_contents_;
   std::unique_ptr<FSRandomAccessFile> test_read_holder_;
   std::unique_ptr<char[]> scratch_;
@@ -807,7 +807,7 @@ class ReadaheadSequentialFileTest : public testing::Test,
   size_t GetReadaheadSize() const { return readahead_size_; }
 
  private:
-  size_t readahead_size_;
+  size_t readahead_size_ = 0;
   std::unique_ptr<SequentialFileReader> test_read_holder_;
   std::unique_ptr<char[]> scratch_;
   std::atomic<int> seq_read_count_;

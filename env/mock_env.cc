@@ -541,8 +541,7 @@ class TestMemLogger : public Logger {
       port::TimeVal now_tv;
       port::GetTimeOfDay(&now_tv, nullptr);
       const time_t seconds = now_tv.tv_sec;
-      struct tm t;
-      memset(&t, 0, sizeof(t));
+      struct tm t{};
       struct tm* ret __attribute__((__unused__));
       ret = port::LocalTimeR(&seconds, &t);
       assert(ret);

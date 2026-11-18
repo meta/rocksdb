@@ -25,27 +25,27 @@ namespace ROCKSDB_NAMESPACE {
 
 class Stats {
  private:
-  uint64_t start_;
-  uint64_t finish_;
-  double seconds_;
-  long done_;
-  long gets_;
-  long prefixes_;
-  long writes_;
-  long deletes_;
-  size_t single_deletes_;
-  long iterator_size_sums_;
-  long founds_;
-  long iterations_;
-  long range_deletions_;
-  long covered_by_range_deletions_;
-  long errors_;
-  long verified_errors_;
-  long num_compact_files_succeed_;
-  long num_compact_files_failed_;
-  int next_report_;
-  size_t bytes_;
-  uint64_t last_op_finish_;
+  uint64_t start_ = 0;
+  uint64_t finish_ = 0;
+  double seconds_ = 0;
+  long done_ = 0;
+  long gets_ = 0;
+  long prefixes_ = 0;
+  long writes_ = 0;
+  long deletes_ = 0;
+  size_t single_deletes_ = 0;
+  long iterator_size_sums_ = 0;
+  long founds_ = 0;
+  long iterations_ = 0;
+  long range_deletions_ = 0;
+  long covered_by_range_deletions_ = 0;
+  long errors_ = 0;
+  long verified_errors_ = 0;
+  long num_compact_files_succeed_ = 0;
+  long num_compact_files_failed_ = 0;
+  int next_report_ = 0;
+  size_t bytes_ = 0;
+  uint64_t last_op_finish_ = 0;
   HistogramImpl hist_;
 
  public:

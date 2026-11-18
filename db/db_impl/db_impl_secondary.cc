@@ -1092,7 +1092,7 @@ Status DBImplSecondary::TryCatchUpWithPrimary() {
                         cfd->GetName().c_str());
         continue;
       }
-      VersionStorageInfo::LevelSummaryStorage tmp;
+      VersionStorageInfo::LevelSummaryStorage tmp{};
       ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
                       "[%s] Level summary: %s\n", cfd->GetName().c_str(),
                       cfd->current()->storage_info()->LevelSummary(&tmp));

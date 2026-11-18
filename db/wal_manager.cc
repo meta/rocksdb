@@ -497,12 +497,12 @@ Status WalManager::ReadFirstLine(const std::string& fname,
                                  const uint64_t number,
                                  SequenceNumber* sequence) {
   struct LogReporter : public log::Reader::Reporter {
-    Env* env;
-    Logger* info_log;
-    const char* fname;
+    Env* env = nullptr;
+    Logger* info_log = nullptr;
+    const char* fname = nullptr;
 
-    Status* status;
-    bool ignore_error;  // true if db_options_.paranoid_checks==false
+    Status* status = nullptr;
+    bool ignore_error = false;  // true if db_options_.paranoid_checks==false
     void Corruption(size_t bytes, const Status& s,
                     uint64_t /*log_number*/ = kMaxSequenceNumber) override {
       ROCKS_LOG_WARN(info_log, "[WalManager] %s%s: dropping %d bytes; %s",

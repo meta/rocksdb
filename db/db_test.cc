@@ -3117,7 +3117,7 @@ static const int kTestSeconds = 10;
 static const int kNumKeys = 1000;
 
 struct MTState {
-  DBTest* test;
+  DBTest* test = nullptr;
   std::atomic<int> counter[kNumThreads];
 };
 
@@ -3260,7 +3260,7 @@ class MultiThreadedDBTest
     return optionConfigs;
   }
 
-  bool multiget_batched_;
+  bool multiget_batched_ = false;
 };
 
 TEST_P(MultiThreadedDBTest, MultiThreaded) {
@@ -3311,8 +3311,8 @@ static const int kGCNumThreads = 4;
 static const int kGCNumKeys = 1000;
 
 struct GCThread {
-  DB* db;
-  int id;
+  DB* db = nullptr;
+  int id = 0;
   std::atomic<bool> done;
 };
 
@@ -3639,7 +3639,7 @@ class ModelDB : public DB {
   Status Write(const WriteOptions& /*options*/, WriteBatch* batch) override {
     class Handler : public WriteBatch::Handler {
      public:
-      KVMap* map_;
+      KVMap* map_ = nullptr;
       void Put(const Slice& key, const Slice& value) override {
         (*map_)[key.ToString()] = value.ToString();
       }

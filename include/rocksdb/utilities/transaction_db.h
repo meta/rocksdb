@@ -61,13 +61,13 @@ class LockManagerHandle {
 // Same as class Endpoint, but use std::string to manage the buffer allocation
 struct EndpointWithString {
   std::string slice;
-  bool inf_suffix;
+  bool inf_suffix = false;
 };
 
 struct RangeDeadlockInfo {
-  TransactionID m_txn_id;
-  uint32_t m_cf_id;
-  bool m_exclusive;
+  TransactionID m_txn_id = 0;
+  uint32_t m_cf_id = 0;
+  bool m_exclusive = false;
 
   EndpointWithString m_start;
   EndpointWithString m_end;
@@ -482,9 +482,9 @@ struct RangeLockInfo {
 };
 
 struct DeadlockInfo {
-  TransactionID m_txn_id;
-  uint32_t m_cf_id;
-  bool m_exclusive;
+  TransactionID m_txn_id = 0;
+  uint32_t m_cf_id = 0;
+  bool m_exclusive = false;
   std::string m_waiting_key;
 };
 

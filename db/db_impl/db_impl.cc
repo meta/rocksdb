@@ -4713,8 +4713,8 @@ void DBImpl::MultiGetWithCallbackImpl(
     ReadCallback* callback,
     autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* sorted_keys) {
   assert(sorted_keys != nullptr);
-  std::array<ColumnFamilySuperVersionPair, 1> cf_sv_pairs;
-  cf_sv_pairs[0] = ColumnFamilySuperVersionPair(column_family, nullptr);
+  std::array<ColumnFamilySuperVersionPair, 1> cf_sv_pairs{
+      ColumnFamilySuperVersionPair(column_family, nullptr)};
   size_t num_keys = sorted_keys->size();
   if (num_keys == 0) {
     return;

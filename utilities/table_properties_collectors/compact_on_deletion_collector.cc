@@ -19,7 +19,8 @@ namespace ROCKSDB_NAMESPACE {
 CompactOnDeletionCollector::CompactOnDeletionCollector(
     size_t sliding_window_size, size_t deletion_trigger, double deletion_ratio,
     uint64_t min_file_size)
-    : bucket_size_((sliding_window_size + kNumBuckets - 1) / kNumBuckets),
+    : num_deletions_in_buckets_(),
+      bucket_size_((sliding_window_size + kNumBuckets - 1) / kNumBuckets),
       current_bucket_(0),
       num_keys_in_current_bucket_(0),
       num_deletions_in_observation_window_(0),
@@ -29,9 +30,7 @@ CompactOnDeletionCollector::CompactOnDeletionCollector(
       cur_file_size_(0),
       max_deletion_in_window_(0),
       deletion_ratio_enabled_(deletion_ratio > 0 && deletion_ratio <= 1),
-      need_compaction_(false) {
-  memset(num_deletions_in_buckets_, 0, sizeof(size_t) * kNumBuckets);
-}
+      need_compaction_(false) {}
 
 // AddUserKey() will be called when a new key/value pair is inserted into the
 // table.

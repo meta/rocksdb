@@ -803,7 +803,7 @@ class TestFlushListener : public EventListener {
   std::vector<DB*> flushed_dbs_;
   int slowdown_count;
   int stop_count;
-  bool db_closing;
+  bool db_closing = false;
   std::atomic_bool db_closed;
   TableFileCreationInfo prev_fc_info_;
 

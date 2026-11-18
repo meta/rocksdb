@@ -44,7 +44,7 @@ class ColumnFamilyHandleImplDummy : public ColumnFamilyHandleImpl {
 struct Entry {
   std::string key;
   std::string value;
-  WriteType type;
+  WriteType type = kPutRecord;
 };
 
 struct TestHandler : public WriteBatch::Handler {

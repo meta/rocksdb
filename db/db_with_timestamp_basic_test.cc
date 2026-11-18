@@ -2340,9 +2340,9 @@ class DataVisibilityTest : public DBBasicTestWithTimestampBase {
   struct TestData {
     std::string key;
     std::string value;
-    int ts;
+    int ts = 0;
     std::string timestamp;
-    SequenceNumber seq_num;
+    SequenceNumber seq_num = 0;
   };
 
   constexpr static int kTestDataSize = 3;

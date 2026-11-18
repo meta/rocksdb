@@ -186,7 +186,8 @@ std::string TempFileName(const std::string& dbname, uint64_t number) {
 }
 
 InfoLogPrefix::InfoLogPrefix(bool has_log_dir,
-                             const std::string& db_absolute_path) {
+                             const std::string& db_absolute_path)
+    : buf{} {
   if (!has_log_dir) {
     const char kInfoLogPrefix[] = "LOG";
     // "\0" is automatically added to the end

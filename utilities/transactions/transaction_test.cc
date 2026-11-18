@@ -5904,7 +5904,7 @@ TEST_P(TransactionStressTest, ExpiredTransactionDataRace1) {
   // In this test, txn1 should succeed committing,
   // as the callback is called after txn1 starts committing.
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency(
-      {{"TransactionTest::ExpirableTransactionDataRace:1"}});
+      {{"TransactionTest::ExpirableTransactionDataRace:1", ""}});
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "TransactionTest::ExpirableTransactionDataRace:1", [&](void* /*arg*/) {
         WriteOptions write_options;

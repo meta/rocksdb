@@ -35,8 +35,8 @@ class DBTestUniversalCompactionBase
     num_levels_ = std::get<0>(GetParam());
     exclusive_manual_compaction_ = std::get<1>(GetParam());
   }
-  int num_levels_;
-  bool exclusive_manual_compaction_;
+  int num_levels_ = 0;
+  bool exclusive_manual_compaction_ = false;
 };
 
 class DBTestUniversalCompaction : public DBTestUniversalCompactionBase {

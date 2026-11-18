@@ -423,7 +423,7 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
   std::unique_ptr<SnapshotChecker> snapshot_checker_;
   std::atomic<bool> shutting_down_{false};
   const std::atomic<bool> kManualCompactionCanceledFalse_{false};
-  FakeCompaction* compaction_proxy_;
+  FakeCompaction* compaction_proxy_ = nullptr;
   bool repair_enabled_ = false;
   bool repair_only_dropped_blob_files_ = false;
 };

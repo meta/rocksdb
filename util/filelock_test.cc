@@ -73,8 +73,7 @@ class LockTest : public testing::Test {
         exit(exit_val);  // NOLINT(concurrency-mt-unsafe)
       }
 
-      struct flock f;
-      memset(&f, 0, sizeof(f));
+      struct flock f{};
       f.l_type = (F_WRLCK);
       f.l_whence = SEEK_SET;
       f.l_start = 0;

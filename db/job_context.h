@@ -30,7 +30,7 @@ struct SuperVersion;
 struct SuperVersionContext {
   struct WriteStallNotification {
     WriteStallInfo write_stall_info;
-    const ImmutableOptions* immutable_options;
+    const ImmutableOptions* immutable_options = nullptr;
   };
 
   autovector<SuperVersion*> superversions_to_free;
@@ -245,7 +245,7 @@ struct JobContext {
 
   // Used for remote compaction. To prevent OPTIONS files from getting
   // purged by PurgeObsoleteFiles() of the primary host
-  uint64_t min_options_file_number;
+  uint64_t min_options_file_number = 0;
   // Exact OPTIONS file committed by the current MANIFEST. Unlike
   // min_options_file_number, this protects one authoritative file even when
   // higher-numbered uncommitted OPTIONS files exist.

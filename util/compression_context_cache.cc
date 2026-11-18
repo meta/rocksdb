@@ -32,7 +32,7 @@ struct ZSTDCachedData {
   char
       padding[(CACHE_LINE_SIZE -
                (sizeof(ZSTDUncompressCachedData) + sizeof(std::atomic<void*>)) %
-                   CACHE_LINE_SIZE)];  // unused padding field
+                   CACHE_LINE_SIZE)]{};  // unused padding field
 
   ZSTDCachedData() : zstd_uncomp_sentinel_(&uncomp_cached_data_) {}
   ~ZSTDCachedData() = default;

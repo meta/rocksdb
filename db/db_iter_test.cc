@@ -2693,7 +2693,7 @@ class DBIterWithMergeIterTest : public testing::Test {
   TestIterator* internal_iter1_;
   TestIterator* internal_iter2_;
   InternalKeyComparator icomp_;
-  Iterator* merge_iter_;
+  Iterator* merge_iter_ = nullptr;
   std::unique_ptr<Iterator> db_iter_;
 };
 

@@ -2065,7 +2065,7 @@ class VersionSet {
                            const Slice& end, TableReaderCaller caller);
 
   struct MutableCFState {
-    uint64_t log_number;
+    uint64_t log_number = 0;
     std::string full_history_ts_low;
 
     explicit MutableCFState() = default;
@@ -2225,16 +2225,16 @@ class VersionSet {
   uint64_t last_compacted_manifest_file_size_;
 
   // Auto-tuned max allowed size for the current manifest file
-  uint64_t tuned_max_manifest_file_size_;
+  uint64_t tuned_max_manifest_file_size_ = 0;
 
   // Saved copy of max_manifest_file_size in (Mutable)DBOptions
-  uint64_t min_max_manifest_file_size_;
+  uint64_t min_max_manifest_file_size_ = 0;
   // Saved, sanitized copy from (Mutable)DBOptions
-  unsigned max_manifest_space_amp_pct_;
+  unsigned max_manifest_space_amp_pct_ = 0;
   // Saved copy from (Mutable)DBOptions
-  size_t manifest_preallocation_size_;
+  size_t manifest_preallocation_size_ = 0;
   // Saved copy from (Mutable)DBOptions
-  bool verify_manifest_content_on_close_;
+  bool verify_manifest_content_on_close_ = false;
 
   // Obsolete files, or during DB shutdown any files not referenced by what's
   // left of the in-memory LSM state.

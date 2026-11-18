@@ -156,7 +156,7 @@ struct ThreadStatus {
   // A list of properties that describe some details about the current
   // operation.  Same field in op_properties[] might have different
   // meanings for different operations.
-  uint64_t op_properties[kNumOperationProperties];
+  uint64_t op_properties[kNumOperationProperties] = {};
 
   // The state (lower-level action) that the current thread is involved.
   const StateType state_type;

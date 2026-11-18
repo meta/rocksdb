@@ -217,7 +217,7 @@ class BlockBasedTableReaderBaseTest : public testing::Test {
   std::string Path(const std::string& fname) { return test_dir_ + "/" + fname; }
 
   std::string test_dir_;
-  Env* env_;
+  Env* env_ = nullptr;
   std::shared_ptr<FileSystem> fs_;
   Options options_;
   uint64_t table_num_{0};
@@ -481,13 +481,13 @@ class BlockBasedTableReaderTest
         std::shared_ptr<const SliceTransform>(NewFixedPrefixTransform(3));
   }
 
-  CompressionType compression_type_;
-  bool use_direct_reads_;
-  bool udt_enabled_;
-  bool persist_udt_;
-  uint32_t compression_parallel_threads_;
-  uint32_t compression_dict_bytes_;
-  bool same_key_diff_ts_;
+  CompressionType compression_type_ = kNoCompression;
+  bool use_direct_reads_ = false;
+  bool udt_enabled_ = false;
+  bool persist_udt_ = false;
+  uint32_t compression_parallel_threads_ = 0;
+  uint32_t compression_dict_bytes_ = 0;
+  bool same_key_diff_ts_ = false;
   const Comparator* comparator_{};
 };
 
@@ -803,13 +803,14 @@ class ChargeTableReaderTest
     options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
   }
 
-  CacheEntryRoleOptions::Decision charge_table_reader_;
+  CacheEntryRoleOptions::Decision charge_table_reader_ =
+      CacheEntryRoleOptions::Decision::kFallback;
   std::shared_ptr<
       TargetCacheChargeTrackingCache<CacheEntryRole::kBlockBasedTableReader>>
       table_reader_charge_tracking_cache_;
-  std::size_t approx_table_reader_mem_;
+  std::size_t approx_table_reader_mem_ = 0;
   std::vector<std::pair<std::string, std::string>> kv_;
-  CompressionType compression_type_;
+  CompressionType compression_type_ = kNoCompression;
 
  private:
   std::size_t ApproximateTableReaderMem() {

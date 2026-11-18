@@ -223,7 +223,7 @@ PerfContext::~PerfContext() {
 #endif
 }
 
-PerfContext::PerfContext(const PerfContext& other) {
+PerfContext::PerfContext(const PerfContext& other) : PerfContextBase() {
 #ifdef NPERF_CONTEXT
   (void)other;
 #else

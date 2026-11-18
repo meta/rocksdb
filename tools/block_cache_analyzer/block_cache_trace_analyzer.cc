@@ -1478,6 +1478,7 @@ BlockCacheTraceAnalyzer::BlockCacheTraceAnalyzer(
       compute_reuse_distance_(compute_reuse_distance),
       mrc_only_(mrc_only),
       is_human_readable_trace_file_(is_human_readable_trace_file),
+      header_{},
       cache_simulator_(std::move(cache_simulator)) {}
 
 void BlockCacheTraceAnalyzer::ComputeReuseDistance(

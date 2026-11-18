@@ -48,6 +48,7 @@ PessimisticTransaction::PessimisticTransaction(
       waiting_cf_id_(0),
       waiting_key_(nullptr),
       lock_timeout_(0),
+      deadlock_timeout_us_(0),
       deadlock_detect_(false),
       deadlock_detect_depth_(0),
       skip_concurrency_control_(false) {

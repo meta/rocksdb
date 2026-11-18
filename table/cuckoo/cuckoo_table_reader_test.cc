@@ -201,9 +201,9 @@ class CuckooReaderTest : public testing::Test {
   std::vector<std::string> keys;
   std::vector<std::string> user_keys;
   std::vector<std::string> values;
-  uint64_t num_items;
+  uint64_t num_items = 0;
   std::string fname;
-  uint64_t file_size;
+  uint64_t file_size = 0;
   Options options;
   Env* env;
   FileOptions file_options;

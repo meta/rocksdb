@@ -1269,8 +1269,7 @@ TYPED_TEST(RibbonTypeParamTest, OptimizeHomogAtScale) {
     SimpleSoln soln;
     soln.BackSubstFrom(banding);
 
-    std::array<uint32_t, 8U * sizeof(ResultRow)> fp_counts_by_cols;
-    fp_counts_by_cols.fill(0U);
+    std::array<uint32_t, 8U * sizeof(ResultRow)> fp_counts_by_cols{};
     for (uint32_t i = 0; i < FLAGS_optimize_homog_check; ++i) {
       ResultRow r = soln.PhsfQuery(*cur, banding);
       ++cur;

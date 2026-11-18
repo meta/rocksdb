@@ -121,7 +121,7 @@ static uint32_t NextNum(uint32_t num) {
 }
 
 TEST_F(DynamicBloomTest, VaryingLengths) {
-  KeyMaker km;
+  KeyMaker km{};
 
   // Count number of filters that significantly exceed the false positive rate
   int mediocre_filters = 0;
@@ -178,7 +178,7 @@ TEST_F(DynamicBloomTest, VaryingLengths) {
 }
 
 TEST_F(DynamicBloomTest, perf) {
-  KeyMaker km;
+  KeyMaker km{};
   StopWatchNano timer(SystemClock::Default().get());
   uint32_t num_probes = static_cast<uint32_t>(FLAGS_num_probes);
 
@@ -238,7 +238,7 @@ TEST_F(DynamicBloomTest, ConcurrentWithPerf) {
     std::atomic<uint64_t> elapsed(0);
 
     std::function<void(size_t)> adder([&](size_t t) {
-      KeyMaker km;
+      KeyMaker km{};
       StopWatchNano timer(SystemClock::Default().get());
       timer.Start();
       for (uint64_t i = 1 + t; i <= num_keys; i += num_threads) {
@@ -261,7 +261,7 @@ TEST_F(DynamicBloomTest, ConcurrentWithPerf) {
 
     elapsed = 0;
     std::function<void(size_t)> hitter([&](size_t t) {
-      KeyMaker km;
+      KeyMaker km{};
       StopWatchNano timer(SystemClock::Default().get());
       timer.Start();
       for (uint64_t i = 1 + t; i <= num_keys; i += num_threads) {
@@ -286,7 +286,7 @@ TEST_F(DynamicBloomTest, ConcurrentWithPerf) {
     elapsed = 0;
     std::atomic<uint32_t> false_positives(0);
     std::function<void(size_t)> misser([&](size_t t) {
-      KeyMaker km;
+      KeyMaker km{};
       StopWatchNano timer(SystemClock::Default().get());
       timer.Start();
       for (uint64_t i = num_keys + 1 + t; i <= 2 * num_keys; i += num_threads) {

@@ -1053,7 +1053,7 @@ class BackupEngineTest : public testing::Test {
   std::unique_ptr<FileManager> db_file_manager_;
 
   // all the dbs!
-  DummyDB* dummy_db_;  // owned as db_ when present
+  DummyDB* dummy_db_ = nullptr;  // owned as db_ when present
   std::unique_ptr<DB> db_;
   DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_.get()); }
   std::unique_ptr<BackupEngine> backup_engine_;

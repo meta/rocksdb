@@ -2300,7 +2300,7 @@ class CostAwareTestFlushBlockPolicy : public FlushBlockPolicy {
   int window_;
   int num_keys_;
   const BlockBuilder& data_block_builder_;
-  IOCPUCostPredictor* predictor_;
+  IOCPUCostPredictor* predictor_ = nullptr;
 };
 class CostAwareTestFlushBlockPolicyFactory : public FlushBlockPolicyFactory {
  public:

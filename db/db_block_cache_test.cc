@@ -134,7 +134,7 @@ class DBBlockCacheTest : public DBTestBase {
 
   const std::array<size_t, kNumCacheEntryRoles> GetCacheEntryRoleCountsBg() {
     // Verify in cache entry role stats
-    std::array<size_t, kNumCacheEntryRoles> cache_entry_role_counts;
+    std::array<size_t, kNumCacheEntryRoles> cache_entry_role_counts{};
     std::map<std::string, std::string> values;
     EXPECT_TRUE(db_->GetMapProperty(DB::Properties::kFastBlockCacheEntryStats,
                                     &values));
@@ -1633,8 +1633,8 @@ class DBBlockCacheKeyTest
     exclude_file_numbers_ = std::get<1>(GetParam());
   }
 
-  bool use_compressed_cache_;
-  bool exclude_file_numbers_;
+  bool use_compressed_cache_ = false;
+  bool exclude_file_numbers_ = false;
 };
 
 // Disable LinkFile so that we can physically copy a DB using Checkpoint.
@@ -2047,7 +2047,7 @@ TEST_F(CacheKeyTest, Encodings) {
   // result
   Random64 r{std::random_device{}()};
 
-  CacheKeyDecoder decoder;
+  CacheKeyDecoder decoder{};
   db_id_ = r.Next();
   base_session_upper_ = r.Next();
   base_session_lower_ = r.Next();
@@ -2105,10 +2105,10 @@ class DBBlockCachePinningTest
     unpartitioned_pinning_ = std::get<3>(GetParam());
   }
 
-  bool partition_index_and_filters_;
-  PinningTier top_level_index_pinning_;
-  PinningTier partition_pinning_;
-  PinningTier unpartitioned_pinning_;
+  bool partition_index_and_filters_ = false;
+  PinningTier top_level_index_pinning_ = PinningTier::kFallback;
+  PinningTier partition_pinning_ = PinningTier::kFallback;
+  PinningTier unpartitioned_pinning_ = PinningTier::kFallback;
 };
 
 #ifdef LZ4

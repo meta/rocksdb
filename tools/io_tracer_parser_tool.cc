@@ -106,7 +106,7 @@ int IOTraceRecordParser::ReadIOTraceRecords() {
   io_trace_reader.reset(new IOTraceReader(std::move(trace_reader)));
 
   // Read the header and dump it in a file.
-  IOTraceHeader header;
+  IOTraceHeader header{};
   status = io_trace_reader->ReadHeader(&header);
   if (!status.ok()) {
     fprintf(stderr, "%s: %s\n", input_file_.c_str(), status.ToString().c_str());

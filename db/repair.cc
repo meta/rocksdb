@@ -255,7 +255,7 @@ class Repairer {
  private:
   struct TableInfo {
     FileMetaData meta;
-    uint32_t column_family_id;
+    uint32_t column_family_id = 0;
     std::string column_family_name;
   };
 
@@ -362,9 +362,9 @@ class Repairer {
 
   Status ConvertLogToTable(const std::string& wal_dir, uint64_t log) {
     struct LogReporter : public log::Reader::Reporter {
-      Env* env;
+      Env* env = nullptr;
       std::shared_ptr<Logger> info_log;
-      uint64_t lognum;
+      uint64_t lognum = 0;
       void Corruption(size_t bytes, const Status& s,
                       uint64_t log_number = kMaxSequenceNumber) override {
         // We print error messages for corruption, but continue repairing.

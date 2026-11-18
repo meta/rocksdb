@@ -352,7 +352,7 @@ class HashSkipListRepFactory : public MemTableRepFactory {
   const char* NickName() const override { return kNickName(); }
 
  private:
-  HashSkipListRepOptions options_;
+  HashSkipListRepOptions options_{};
 };
 
 }  // namespace

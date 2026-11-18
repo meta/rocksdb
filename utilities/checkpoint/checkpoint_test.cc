@@ -56,7 +56,7 @@ class CheckpointTest : public testing::Test {
   enum OptionConfig {
     kDefault = 0,
   };
-  int option_config_;
+  int option_config_ = kDefault;
 
  public:
   std::string dbname_;

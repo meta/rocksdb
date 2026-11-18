@@ -15,7 +15,7 @@ namespace ROCKSDB_NAMESPACE {
 // trailing newline. Uses SequentialFileReader internally.
 class LineFileReader {
  private:
-  std::array<char, 8192> buf_;
+  std::array<char, 8192> buf_{};
   SequentialFileReader sfr_;
   IOStatus io_status_;
   const char* buf_begin_ = buf_.data();

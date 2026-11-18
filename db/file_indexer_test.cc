@@ -87,7 +87,7 @@ class FileIndexerTest : public testing::Test {
   int32_t right = 100;
   const uint32_t kNumLevels;
   IntComparator ucmp;
-  FileIndexer* indexer;
+  FileIndexer* indexer = nullptr;
 
   std::vector<FileMetaData*>* files;
 };

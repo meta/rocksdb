@@ -18,6 +18,7 @@ BlobLogSequentialReader::BlobLogSequentialReader(
     : file_(std::move(file_reader)),
       clock_(clock),
       statistics_(statistics),
+      header_buf_(),
       next_byte_(0) {}
 
 BlobLogSequentialReader::~BlobLogSequentialReader() = default;

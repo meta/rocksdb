@@ -742,6 +742,7 @@ VersionEditHandlerPointInTime::VersionEditHandlerPointInTime(
                          read_options, /*skip_load_table_files=*/false,
                          allow_incomplete_valid_version,
                          epoch_number_requirement),
+      atomic_update_versions_missing_(0),
       trust_manifest_recovery_(trust_manifest_recovery),
       defer_sst_file_opening_(defer_sst_file_opening) {
   assert(!record_missing_blob_files_as_dropped ||

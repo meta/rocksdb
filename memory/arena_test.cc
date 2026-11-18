@@ -207,7 +207,7 @@ TEST_F(ArenaTest, Simple) {
 size_t PopMinorPageFaultCount() {
 #ifdef RUSAGE_SELF
   static long prev = 0;
-  struct rusage usage;
+  struct rusage usage{};
   EXPECT_EQ(getrusage(RUSAGE_SELF, &usage), 0);
   size_t rv = usage.ru_minflt - prev;
   prev = usage.ru_minflt;
