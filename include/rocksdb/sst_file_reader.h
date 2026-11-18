@@ -53,6 +53,15 @@ class SstFileReader {
 
   // Returns a new iterator over the table contents as a raw table iterator,
   // a.k.a a `TableIterator`that iterates all point data entries in the table
+  // including logically invisible entries like delete entries lying in a range inclusive of from_key and
+  // exclusive of to_key.
+  // This API is intended to provide a programmatic way to observe SST files
+  // created by a DB, to be used by third party tools. DB optimization
+  // capabilities like filling cache, read ahead are disabled.
+  std::unique_ptr<Iterator> NewTableIterator(const Slice* from_key, const Slice* to_key);
+
+  // Returns a new iterator over the table contents as a raw table iterator,
+  // a.k.a a `TableIterator`that iterates all point data entries in the table
   // including logically invisible entries like delete entries.
   // This API is intended to provide a programmatic way to observe SST files
   // created by a DB, to be used by third party tools. DB optimization

@@ -144,19 +144,23 @@ Iterator* SstFileReader::NewIterator(const ReadOptions& roptions) {
   return res;
 }
 
-std::unique_ptr<Iterator> SstFileReader::NewTableIterator() {
+std::unique_ptr<Iterator> SstFileReader::NewTableIterator(const Slice* from_key, const Slice* to_key) {
   auto r = rep_.get();
   InternalIterator* internal_iter = r->table_reader->NewIterator(
-      r->roptions_for_table_iter, r->moptions.prefix_extractor.get(),
-      /*arena*/ nullptr, false /* skip_filters */,
-      TableReaderCaller::kSSTFileReader);
+          r->roptions_for_table_iter,
+          r->moptions.prefix_extractor.get(),/*arena*/ nullptr, false /* skip_filters */,
+          TableReaderCaller::kSSTFileReader);
   assert(internal_iter);
   if (internal_iter == nullptr) {
     // Do not attempt to create a TableIterator if we cannot get a valid
     // InternalIterator.
     return nullptr;
   }
-  return std::make_unique<TableIterator>(internal_iter);
+  return std::make_unique<TableIterator>(internal_iter, from_key, to_key, &r->ioptions.internal_comparator);
+}
+
+std::unique_ptr<Iterator> SstFileReader::NewTableIterator() {
+  return NewTableIterator(nullptr, nullptr);
 }
 
 Status SstFileReader::ParseTableIteratorKey(const Slice& raw_table_key,

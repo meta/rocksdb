@@ -63,6 +63,11 @@ Status GetInternalKeyForSeekForPrev(const Slice& user_key,
 
 Status ParseEntry(const Slice& internal_key, const Comparator* comparator,
                   ParsedEntryInfo* parsed_entry) {
+  return ParseEntry(internal_key, comparator, parsed_entry, false);
+}
+
+Status ParseEntry(const Slice& internal_key, const Comparator* comparator,
+                  ParsedEntryInfo* parsed_entry, bool copied_user_key) {
   if (internal_key.size() < kNumInternalBytes) {
     return Status::InvalidArgument("Internal key size invalid.");
   }
@@ -80,6 +85,10 @@ Status ParseEntry(const Slice& internal_key, const Comparator* comparator,
   if (pikey.user_key.size() < ts_sz) {
     return Status::InvalidArgument("User key(with timestamp) size invalid.");
   }
+  if (parsed_entry->copied_user_key) {
+    delete parsed_entry->user_key.data();
+  }
+
   if (ts_sz == 0) {
     parsed_entry->user_key = pikey.user_key;
   } else {
@@ -89,6 +98,7 @@ Status ParseEntry(const Slice& internal_key, const Comparator* comparator,
   }
   parsed_entry->sequence = pikey.sequence;
   parsed_entry->type = ROCKSDB_NAMESPACE::GetEntryType(pikey.type);
+  parsed_entry->copied_user_key = copied_user_key;
   return Status::OK();
 }
 
