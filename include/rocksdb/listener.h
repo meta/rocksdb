@@ -630,6 +630,14 @@ struct BackgroundJobPressure {
 // [Exceptions] Exceptions MUST NOT propagate out of overridden functions into
 // RocksDB, because RocksDB is not exception-safe. This could cause undefined
 // behavior including data loss, unreported corruption, deadlocks, and more.
+//
+// [File lifetime] RocksDB actively avoids deleting a file before a callback
+// that reports it returns, so that a callback can usually open, copy, or link
+// a file it is told about. This is best effort, not a guarantee. Exceptions
+// include OnTableFileDeleted() and OnBlobFileDeleted(), files that
+// OnCompactionCompleted() lists as inputs (including trivially moved files,
+// which are also listed as outputs), and files reported to
+// OnExternalFileIngested().
 class EventListener : public Customizable {
  public:
   static const char* Type() { return "EventListener"; }

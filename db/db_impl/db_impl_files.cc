@@ -279,9 +279,13 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
   // Get obsolete files.  This function will also update the list of
   // pending files in VersionSet().
   assert(versions_);
+  const uint64_t min_listener_pending_output =
+      listener_pending_outputs_.empty() ? std::numeric_limits<uint64_t>::max()
+                                        : *listener_pending_outputs_.begin();
   versions_->GetObsoleteFiles(
       &job_context->sst_delete_files, &job_context->blob_delete_files,
-      &job_context->manifest_delete_files, job_context->min_pending_output);
+      &job_context->manifest_delete_files, job_context->min_pending_output,
+      min_listener_pending_output);
 
   // Mark the elements in job_context->sst_delete_files and
   // job_context->blob_delete_files as "grabbed for purge" so that other threads
@@ -575,6 +579,11 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
       candidate_files.size() + state.sst_delete_files.size() +
       state.blob_delete_files.size() + state.log_delete_files.size() +
       state.manifest_delete_files.size());
+  // SSTs that VersionSet reported as obsolete. Unlike files found only by a
+  // directory scan, these are known to be finished, so min_pending_output does
+  // not hold them back.
+  std::unordered_set<uint64_t> known_obsolete_sst_set;
+  known_obsolete_sst_set.reserve(state.sst_delete_files.size());
   // We may ignore the dbname when generating the file names.
   for (auto& file : state.sst_delete_files) {
     auto* handle = file.metadata->fd.pinned_reader.GetCacheHandle();
@@ -586,6 +595,7 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
     } else {
       // File is being deleted (actually obsolete)
       auto number = file.metadata->fd.GetNumber();
+      known_obsolete_sst_set.insert(number);
       candidate_files.emplace_back(MakeTableFileName(number), file.path);
       TableCache::ReleaseObsolete(table_cache_.get(), number, handle,
                                   file.uncache_aggressiveness);
@@ -702,11 +712,13 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
         keep = (number >= state.manifest_file_number);
         break;
       case kTableFile:
-        // If the second condition is not there, this makes
-        // DontDeletePendingOutputs fail
-        // FIXME: but should NOT keep if it came from sst_delete_files?
+        // A file found only by the directory scan and numbered at or above
+        // min_pending_output may be an unfinished output of a running job
+        // (see DontDeletePendingOutputs).
         keep = (sst_live_set.find(number) != sst_live_set.end()) ||
-               number >= state.min_pending_output;
+               (number >= state.min_pending_output &&
+                known_obsolete_sst_set.find(number) ==
+                    known_obsolete_sst_set.end());
         if (!keep) {
           // NOTE: sometimes redundant (if came from sst_delete_files)
           // We don't know which column family is applicable here so we don't

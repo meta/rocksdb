@@ -2063,7 +2063,8 @@ TEST_F(VersionSetTest, ObsoleteBlobFile) {
     constexpr uint64_t min_pending_output = blob_file_number;
 
     versions_->GetObsoleteFiles(&table_files, &blob_files, &manifest_files,
-                                min_pending_output);
+                                min_pending_output,
+                                std::numeric_limits<uint64_t>::max());
 
     ASSERT_TRUE(blob_files.empty());
   }
@@ -2077,7 +2078,8 @@ TEST_F(VersionSetTest, ObsoleteBlobFile) {
     constexpr uint64_t min_pending_output = blob_file_number + 1;
 
     versions_->GetObsoleteFiles(&table_files, &blob_files, &manifest_files,
-                                min_pending_output);
+                                min_pending_output,
+                                std::numeric_limits<uint64_t>::max());
 
     ASSERT_EQ(blob_files.size(), 1);
     ASSERT_EQ(blob_files[0].GetBlobFileNumber(), blob_file_number);
@@ -2091,7 +2093,8 @@ TEST_F(VersionSetTest, ObsoleteBlobFile) {
     constexpr uint64_t min_pending_output = blob_file_number + 1;
 
     versions_->GetObsoleteFiles(&table_files, &blob_files, &manifest_files,
-                                min_pending_output);
+                                min_pending_output,
+                                std::numeric_limits<uint64_t>::max());
 
     ASSERT_TRUE(blob_files.empty());
   }

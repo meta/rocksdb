@@ -10,6 +10,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "db_stress_tool/db_stress_compaction_service.h"
 #include "db_stress_tool/db_stress_shared_state.h"
@@ -73,12 +74,16 @@ class DbStressListener : public EventListener {
   void OnFlushCompleted(DB* /*db*/, const FlushJobInfo& info) override {
     assert(IsValidColumnFamilyName(info.cf_name));
     VerifyFilePath(info.file_path);
+    const std::vector<uint64_t> reported_files{info.file_number};
+    AddReportedFiles(reported_files);
     // pretending doing some work here
     RandomSleep();
+    MaybeLongSleep();
     if (db_fault_injection_fs_) {
       db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
     }
     shared_->SetPersistedSeqno(info.largest_seqno);
+    RemoveReportedFiles(reported_files);
   }
 
   void OnFlushBegin(DB* /*db*/,
@@ -136,6 +141,21 @@ class DbStressListener : public EventListener {
                 "OnTableFileDeleted for file tracked as being compacted "
                 "(between Begin and PreCommit): file_number=%" PRIu64 "\n",
                 file_number);
+        fflush(stderr);
+        std::abort();
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(reported_files_mu_);
+      uint64_t file_number = FileNumberFromPath(info.file_path);
+      if (file_number != 0 &&
+          reported_files_.find(file_number) != reported_files_.end()) {
+        fprintf(
+            stderr,
+            "OnTableFileDeleted for file still being reported to "
+            "OnFlushCompleted or OnCompactionCompleted: file_number=%" PRIu64
+            "\n",
+            file_number);
         fflush(stderr);
         std::abort();
       }
@@ -208,6 +228,22 @@ class DbStressListener : public EventListener {
     for (const auto& file_path : ci.output_files) {
       VerifyFilePath(file_path);
     }
+    // RocksDB does not keep trivially moved files (outputs that are also
+    // inputs) for the callback, and outputs of a failed compaction were never
+    // installed.
+    std::vector<uint64_t> reported_files;
+    if (ci.status.ok() && !ci.aborted) {
+      std::unordered_set<uint64_t> input_files;
+      for (const auto& info : ci.input_file_infos) {
+        input_files.insert(info.file_number);
+      }
+      for (const auto& info : ci.output_file_infos) {
+        if (input_files.find(info.file_number) == input_files.end()) {
+          reported_files.push_back(info.file_number);
+        }
+      }
+    }
+    AddReportedFiles(reported_files);
 
     // Verify that OnCompactionPreCommit fired before OnCompactionCompleted
     // for the same job, with matching input files.
@@ -242,6 +278,10 @@ class DbStressListener : public EventListener {
 
     // pretending doing some work here
     RandomSleep();
+    if (!reported_files.empty()) {
+      MaybeLongSleep();
+    }
+    RemoveReportedFiles(reported_files);
   }
 
   void OnSubcompactionBegin(const SubcompactionJobInfo& /* si */) override {
@@ -481,6 +521,36 @@ class DbStressListener : public EventListener {
         std::chrono::microseconds(Random::GetTLSInstance()->Uniform(5000)));
   }
 
+  // RocksDB does not delete an SST file reported to OnFlushCompleted() or
+  // OnCompactionCompleted() before that callback returns, even if another
+  // compaction makes it obsolete meanwhile (see
+  // DBImpl::listener_pending_outputs_). These track the reported files for
+  // OnTableFileDeleted() to check.
+  void AddReportedFiles(const std::vector<uint64_t>& file_numbers) {
+    std::lock_guard<std::mutex> lock(reported_files_mu_);
+    reported_files_.insert(file_numbers.begin(), file_numbers.end());
+  }
+
+  // Occasionally holds a completion callback open for longer, so that other
+  // compactions have time to make a reported file obsolete and purge it.
+  // Otherwise the callbacks rarely last long enough for such a deletion to
+  // happen.
+  void MaybeLongSleep() {
+    if (Random::GetTLSInstance()->OneIn(10)) {
+      std::this_thread::sleep_for(
+          std::chrono::microseconds(Random::GetTLSInstance()->Uniform(100000)));
+    }
+  }
+
+  void RemoveReportedFiles(const std::vector<uint64_t>& file_numbers) {
+    std::lock_guard<std::mutex> lock(reported_files_mu_);
+    for (uint64_t file_number : file_numbers) {
+      auto it = reported_files_.find(file_number);
+      assert(it != reported_files_.end());
+      reported_files_.erase(it);
+    }
+  }
+
  private:
   std::string db_name_;
   std::vector<DbPath> db_paths_;
@@ -505,6 +575,11 @@ class DbStressListener : public EventListener {
   // Used to verify Begin -> PreCommit -> Completed ordering per job.
   // Protected by compacting_files_mu_.
   std::unordered_map<int, std::unordered_set<uint64_t>> precommitted_jobs_;
+  // SST files (by file_number) reported to OnFlushCompleted() or
+  // OnCompactionCompleted() whose callback has not returned yet. A multiset
+  // because concurrent callbacks can report the same file.
+  std::mutex reported_files_mu_;
+  std::unordered_multiset<uint64_t> reported_files_;
 
   // Extract file number from a file path like "/path/to/000123.sst".
   // Returns 0 if the path cannot be parsed.

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -2143,6 +2144,141 @@ TEST_F(EventListenerTest, BackgroundJobPressure) {
   ASSERT_EQ(latest3.compaction_scheduled, 0);
   ASSERT_FALSE(latest3.compaction_speedup_active);
   ASSERT_LT(latest3.write_stall_proximity_pct, 100);
+}
+
+// Blocks inside the Nth OnFlushCompleted (or OnCompactionCompleted) callback
+// until released, after reporting the files that callback was given.
+class BlockingCompletedListener : public EventListener {
+ public:
+  BlockingCompletedListener(bool block_flush, int block_at)
+      : block_flush_(block_flush),
+        block_at_(block_at),
+        reported_files_future_(reported_files_.get_future()),
+        release_future_(release_.get_future().share()) {}
+
+  void OnFlushCompleted(DB* /*db*/, const FlushJobInfo& info) override {
+    if (block_flush_) {
+      MaybeBlock({info.file_path});
+    }
+  }
+
+  void OnCompactionCompleted(DB* /*db*/, const CompactionJobInfo& ci) override {
+    if (!block_flush_) {
+      MaybeBlock(ci.output_files);
+    }
+  }
+
+  std::vector<std::string> WaitUntilBlocked() {
+    return reported_files_future_.get();
+  }
+
+  void Release() {
+    if (!released_.exchange(true)) {
+      release_.set_value();
+    }
+  }
+
+ private:
+  void MaybeBlock(const std::vector<std::string>& files) {
+    if (++calls_ == block_at_) {
+      reported_files_.set_value(files);
+      release_future_.wait();
+    }
+  }
+
+  const bool block_flush_;
+  const int block_at_;
+  std::atomic<int> calls_{0};
+  std::atomic<bool> released_{false};
+  std::promise<std::vector<std::string>> reported_files_;
+  std::future<std::vector<std::string>> reported_files_future_;
+  std::promise<void> release_;
+  std::shared_future<void> release_future_;
+};
+
+TEST_F(EventListenerTest, FlushedFileNotDeletedDuringOnFlushCompleted) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  auto* listener = new BlockingCompletedListener(/*block_flush=*/true,
+                                                 /*block_at=*/2);
+  options.listeners.emplace_back(listener);
+  DestroyAndReopen(options);
+  Defer release_on_exit([listener]() { listener->Release(); });
+
+  ASSERT_OK(Put("key", "v0"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key", "v1"));
+  // A waiting Flush() would not return until OnFlushCompleted does.
+  FlushOptions no_wait;
+  no_wait.wait = false;
+  ASSERT_OK(db_->Flush(no_wait));
+  const std::vector<std::string> reported = listener->WaitUntilBlocked();
+  ASSERT_EQ(reported.size(), 1U);
+
+  // While the second flush's OnFlushCompleted is still running, compact both
+  // flushed files away. CompactFiles() purges obsolete files before returning.
+  std::vector<LiveFileMetaData> live_files;
+  db_->GetLiveFilesMetaData(&live_files);
+  ASSERT_EQ(live_files.size(), 2U);
+  std::vector<std::string> input_files;
+  for (const auto& file : live_files) {
+    input_files.push_back(file.name);
+  }
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), input_files,
+                              options.num_levels - 1));
+  ASSERT_OK(env_->FileExists(reported[0]));
+
+  listener->Release();
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  ASSERT_TRUE(env_->FileExists(reported[0]).IsNotFound());
+  ASSERT_EQ("v1", Get("key"));
+}
+
+TEST_F(EventListenerTest,
+       CompactionOutputNotDeletedDuringOnCompactionCompleted) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  auto* listener = new BlockingCompletedListener(/*block_flush=*/false,
+                                                 /*block_at=*/1);
+  options.listeners.emplace_back(listener);
+  DestroyAndReopen(options);
+
+  // Two keys per file so that the files overlap and the manual compaction
+  // below writes a new output instead of trivially moving its inputs.
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_OK(Put("a", "v" + std::to_string(i)));
+    ASSERT_OK(Put("b", "v" + std::to_string(i)));
+    ASSERT_OK(Flush());
+  }
+  CompactRangeOptions cro;
+  cro.exclusive_manual_compaction = false;
+  port::Thread compact_range_thread(
+      [&]() { ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr)); });
+  bool joined = false;
+  auto release_and_join = [&]() {
+    if (!joined) {
+      joined = true;
+      listener->Release();
+      compact_range_thread.join();
+    }
+  };
+  Defer release_on_exit(release_and_join);
+  const std::vector<std::string> reported = listener->WaitUntilBlocked();
+  ASSERT_EQ(reported.size(), 1U);
+
+  // While OnCompactionCompleted is still running, compact its output away.
+  // CompactFiles() purges obsolete files before returning.
+  ASSERT_OK(
+      db_->CompactFiles(CompactionOptions(), reported, options.num_levels - 1));
+  ASSERT_OK(env_->FileExists(reported[0]));
+
+  release_and_join();
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  ASSERT_TRUE(env_->FileExists(reported[0]).IsNotFound());
+  ASSERT_EQ("v1", Get("a"));
+  ASSERT_EQ("v1", Get("b"));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

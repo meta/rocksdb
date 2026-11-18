@@ -491,6 +491,18 @@ architectures.
 
 ### Stress test
 * When adding a new feature, make sure stress test covers the new option.
+* The crash test finds bugs through breadth: many randomized configurations
+    and operations, run continuously. A check for one feature or possible
+    regression should be cheap and leave the general workload largely
+    unchanged. Catching a specific regression only occasionally per run is
+    fine, because the crash test runs constantly. Do not add machinery that
+    frequently forces one scenario (for example, calling DB APIs from listener
+    callbacks, or extra compactions or long sleeps to provoke one race). It
+    takes time and operations away from finding other failures. Cover a
+    specific scenario deterministically in unit tests instead.
+* When adding such a check, confirm that it can fire against a deliberately
+    broken build, even if only occasionally, and that it does not fire against
+    correct code.
 
 ### Component docs
 * For component-level design notes and implementation walkthroughs, start with
