@@ -2662,6 +2662,14 @@ class DBImpl : public DB
   void ReleaseFileNumberFromPendingOutputs(
       std::unique_ptr<std::list<uint64_t>::iterator>& v);
 
+  // Adds `file_number` to listener_pending_outputs_ until the returned entry
+  // is passed to ReleaseListenerPendingOutput(). Returns no entry, and does
+  // nothing, if no listeners are configured.
+  std::optional<std::multiset<uint64_t>::iterator> CaptureListenerPendingOutput(
+      uint64_t file_number);
+  void ReleaseListenerPendingOutput(
+      std::optional<std::multiset<uint64_t>::iterator>& entry);
+
   // Rolls back one prepared file ingestion (delete its staged files, release
   // the reserved file numbers)
   void RollbackPreparedFileIngestion(FileIngestionHandleImpl* const h);
@@ -3250,12 +3258,15 @@ class DBImpl : public DB
   // Recursively removes all children of the DB session temporary directory.
   // Best effort: errors are logged, not returned. REQUIRES: mutex_ not held.
   void CleanupSessionTmpDir();
+  // `min_output_file_number` is the job's pending_outputs_ number, a lower
+  // bound on the numbers of the output files it creates.
   Status BackgroundCompaction(bool* madeProgress, JobContext* job_context,
                               LogBuffer* log_buffer,
                               PrepickedCompaction* prepicked_compaction,
                               Env::Priority thread_pri,
                               bool separate_remote_pool,
-                              int* deferred_compactions);
+                              int* deferred_compactions,
+                              uint64_t min_output_file_number);
   Status BackgroundFlush(bool* madeProgress, JobContext* job_context,
                          LogBuffer* log_buffer, FlushReason* reason,
                          bool* flush_rescheduled_to_retain_udt,
@@ -4000,14 +4011,40 @@ class DBImpl : public DB
 
   // For each background job, pending_outputs_ keeps the current file number at
   // the time that background job started.
-  // FindObsoleteFiles()/PurgeObsoleteFiles() never deletes any file that has
-  // number bigger than any of the file number in pending_outputs_. Since file
-  // numbers grow monotonically, this also means that pending_outputs_ is always
-  // sorted. After a background job is done executing, its file number is
-  // deleted from pending_outputs_, which allows PurgeObsoleteFiles() to clean
-  // it up.
+  // FindObsoleteFiles()/PurgeObsoleteFiles() never deletes an unrecognized
+  // file found by a directory scan whose number is bigger than any of the file
+  // numbers in pending_outputs_, because it may be an unfinished output of a
+  // running job. pending_outputs_ does not hold back obsolete SST files
+  // reported by VersionSet, because they were part of an installed Version and
+  // so are not unfinished (but see listener_pending_outputs_).
+  // Since file numbers grow monotonically, pending_outputs_ is always sorted.
+  // After a background job is done executing, its file number is deleted from
+  // pending_outputs_, which allows PurgeObsoleteFiles() to clean it up.
   // State is protected with db mutex.
   std::list<uint64_t> pending_outputs_;
+
+  // While a flush or compaction might still report its output files to
+  // listeners (OnFlushCompleted(), OnCompactionCompleted()), its
+  // pending_outputs_ number is also kept here. The purge does not delete
+  // obsolete SST files reported by VersionSet that are numbered at or above the
+  // smallest entry, so it does not delete a reported file before the callbacks
+  // return. EventListener documents this as best effort ("File lifetime" in
+  // listener.h). A compaction registers just before installing its outputs,
+  // because it can run for a long time (e.g. a remote compaction waiting in
+  // CompactionService::Wait()). A flush registers when it starts, because
+  // flushes are short and a flush can install its outputs over several
+  // MANIFEST writes. Nothing is registered when no listeners are configured.
+  //
+  // This is a deliberate compromise with diminishing returns in mind: the
+  // number is only a lower bound, so this also keeps unrelated obsolete SST
+  // files created after the job started, for as long as the flush or the
+  // completion callbacks run. Tracking exact output file numbers would avoid
+  // that, but needs them passed out of MemTableList and CompactionJob at each
+  // install site, only to delete some files a little sooner.
+  //
+  // A multiset because compactions register out of number order.
+  // State is protected with db mutex.
+  std::multiset<uint64_t> listener_pending_outputs_;
 
   // First file number -> reserved file count for external file ingestions.
   // Full-scan purge snapshots protect these SSTs until commit or cleanup.

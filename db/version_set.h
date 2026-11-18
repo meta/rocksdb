@@ -1924,10 +1924,14 @@ class VersionSet {
     obsolete_blob_files_.emplace_back(blob_file_number, std::move(path));
   }
 
+  // Obsolete blob files numbered at or above `min_pending_output`, and
+  // obsolete SST files numbered at or above `min_listener_pending_output`, are
+  // left for a later call.
   void GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
                         std::vector<ObsoleteBlobFileInfo>* blob_files,
                         std::vector<std::string>* manifest_filenames,
-                        uint64_t min_pending_output);
+                        uint64_t min_pending_output,
+                        uint64_t min_listener_pending_output);
 
   // REQUIRES: DB mutex held
   uint64_t GetObsoleteSstFilesSize() const;

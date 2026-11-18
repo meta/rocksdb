@@ -8919,7 +8919,8 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
 void VersionSet::GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
                                   std::vector<ObsoleteBlobFileInfo>* blob_files,
                                   std::vector<std::string>* manifest_filenames,
-                                  uint64_t min_pending_output) {
+                                  uint64_t min_pending_output,
+                                  uint64_t min_listener_pending_output) {
   assert(files);
   assert(blob_files);
   assert(manifest_filenames);
@@ -8927,9 +8928,14 @@ void VersionSet::GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
   assert(blob_files->empty());
   assert(manifest_filenames->empty());
 
+  // Every SST in obsolete_files_ was part of an installed Version (see
+  // ~Version()), so none is an unfinished output of a running job and none
+  // needs min_pending_output protection. Those at or above
+  // min_listener_pending_output might still be reported to event listeners,
+  // so they stay for a later call (see DBImpl::listener_pending_outputs_).
   std::vector<ObsoleteFileInfo> pending_files;
   for (auto& f : obsolete_files_) {
-    if (f.metadata->fd.GetNumber() < min_pending_output) {
+    if (f.metadata->fd.GetNumber() < min_listener_pending_output) {
       files->emplace_back(std::move(f));
     } else {
       pending_files.emplace_back(std::move(f));
@@ -8937,6 +8943,9 @@ void VersionSet::GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
   }
   obsolete_files_.swap(pending_files);
 
+  // min_pending_output still holds back blob files: VersionBuilder can report
+  // one obsolete without it having been part of an installed Version, so the
+  // reasoning above does not apply to them.
   std::vector<ObsoleteBlobFileInfo> pending_blob_files;
   for (auto& blob_file : obsolete_blob_files_) {
     if (blob_file.GetBlobFileNumber() < min_pending_output) {

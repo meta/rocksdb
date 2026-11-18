@@ -5049,6 +5049,10 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
     std::unique_ptr<std::list<uint64_t>::iterator>
         pending_outputs_inserted_elem(new std::list<uint64_t>::iterator(
             CaptureCurrentFileNumberInPendingOutputs()));
+    // Flushes are short, so this registers for OnFlushCompleted() from the
+    // start of the job (see listener_pending_outputs_).
+    std::optional<std::multiset<uint64_t>::iterator> listener_pending_output =
+        CaptureListenerPendingOutput(**pending_outputs_inserted_elem);
     FlushReason reason;
     bool flush_rescheduled_to_retain_udt = false;
     Status s =
@@ -5084,6 +5088,7 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
 
     TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:FlushFinish:0");
     ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
+    ReleaseListenerPendingOutput(listener_pending_output);
     // There is no need to find obsolete files if the flush job is rescheduled
     // to retain user-defined timestamps because the job doesn't get to the
     // stage of actually flushing the MemTables.
@@ -5167,9 +5172,10 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                 : (bg_thread_pri == Env::Priority::BOTTOM
                                        ? bg_bottom_compaction_scheduled_ > 0
                                        : bg_compaction_scheduled_ > 0));
-    Status s = BackgroundCompaction(
-        &made_progress, &job_context, &log_buffer, prepicked_compaction,
-        bg_thread_pri, separate_remote_pool, &deferred_compactions);
+    Status s = BackgroundCompaction(&made_progress, &job_context, &log_buffer,
+                                    prepicked_compaction, bg_thread_pri,
+                                    separate_remote_pool, &deferred_compactions,
+                                    **pending_outputs_inserted_elem);
     TEST_SYNC_POINT("BackgroundCallCompaction:1");
     if (s.IsBusy()) {
       bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
@@ -5292,7 +5298,8 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
 Status DBImpl::BackgroundCompaction(
     bool* made_progress, JobContext* job_context, LogBuffer* log_buffer,
     PrepickedCompaction* prepicked_compaction, Env::Priority thread_pri,
-    bool separate_remote_pool, int* deferred_compactions) {
+    bool separate_remote_pool, int* deferred_compactions,
+    uint64_t min_output_file_number) {
   ManualCompactionState* manual_compaction =
       prepicked_compaction == nullptr
           ? nullptr
@@ -5345,6 +5352,11 @@ Status DBImpl::BackgroundCompaction(
     in_flight_cfd = c->column_family_data();
     BeginInFlightCompaction(in_flight_cfd);
   }
+  // Set just before new output files are installed, and released on return,
+  // after NotifyOnCompactionCompleted() (see listener_pending_outputs_).
+  std::optional<std::multiset<uint64_t>::iterator> listener_pending_output;
+  Defer release_listener_pending_output(
+      [&]() { ReleaseListenerPendingOutput(listener_pending_output); });
   bool is_prepicked = is_manual || c;
   ColumnFamilyData* prepicked_cfd = nullptr;
   if (c) {
@@ -5710,6 +5722,8 @@ Status DBImpl::BackgroundCompaction(
 
       NotifyOnCompactionPreCommit(c->column_family_data(), c.get(), status,
                                   compaction_job_stats, job_context->job_id);
+      listener_pending_output =
+          CaptureListenerPendingOutput(min_output_file_number);
       status = versions_->LogAndApply(
           c->column_family_data(), read_options, write_options, c->edit(),
           &mutex_, directories_.GetDbDir(),
@@ -5915,6 +5929,8 @@ Status DBImpl::BackgroundCompaction(
     // ReleaseCompactionFiles in its manifest write callback.
     NotifyOnCompactionPreCommit(c->column_family_data(), c.get(), status,
                                 compaction_job_stats, job_context->job_id);
+    listener_pending_output =
+        CaptureListenerPendingOutput(min_output_file_number);
     status = compaction_job.Install(&compaction_released);
     io_s = compaction_job.io_status();
     if (status.ok()) {

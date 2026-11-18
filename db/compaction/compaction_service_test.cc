@@ -9,6 +9,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1331,6 +1333,107 @@ TEST_F(CompactionServiceTest, MergeBeforeFilterLocalSubcompactions) {
     SyncPoint::GetInstance()->DisableProcessing();
     SyncPoint::GetInstance()->ClearAllCallBacks();
     Close();
+  }
+}
+
+TEST_F(CompactionServiceTest, PendingRemoteCompactionDoesNotPinObsoleteSsts) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.max_background_jobs = 8;
+  ReopenWithCompactionService(&options);
+
+  // Hold the first remote compaction inside Wait(), as a stuck remote worker
+  // would. Its pending_outputs_ entry stays registered until it is released.
+  std::promise<void> stuck_started;
+  std::promise<void> release_stuck;
+  std::shared_future<void> release = release_stuck.get_future().share();
+  std::atomic<bool> first_wait{true};
+  std::promise<void> purged;
+  std::atomic<bool> purged_once{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "MyTestCompactionService::Wait:BeforeOpenAndCompact", [&](void*) {
+        if (first_wait.exchange(false)) {
+          stuck_started.set_value();
+          release.wait();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCallCompaction:PurgedObsoleteFiles", [&](void*) {
+        if (!purged_once.exchange(true)) {
+          purged.set_value();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  auto write_two_overlapping_files = [&](int cf) {
+    for (int file = 0; file < 2; file++) {
+      for (int i = 0; i < 100; i++) {
+        ASSERT_OK(Put(cf, Key(i), "v" + std::to_string(file)));
+      }
+      ASSERT_OK(Flush(cf));
+    }
+  };
+
+  CompactRangeOptions cro;
+  cro.exclusive_manual_compaction = false;
+
+  write_two_overlapping_files(1);
+  port::Thread stuck_thread([&]() {
+    ASSERT_OK(db_->CompactRange(cro, handles_[1], nullptr, nullptr));
+  });
+  // Unblock and join on every exit path, so that a failed assertion below
+  // reports a failure instead of hanging or terminating the test.
+  bool stuck_released = false;
+  auto release_and_join = [&]() {
+    if (!stuck_released) {
+      stuck_released = true;
+      release_stuck.set_value();
+      stuck_thread.join();
+    }
+  };
+  Defer release_on_exit(release_and_join);
+  stuck_started.get_future().wait();
+
+  // These files are created after the stuck job registered its
+  // pending_outputs_ entry, so their numbers are above it.
+  write_two_overlapping_files(2);
+  std::vector<LiveFileMetaData> live_files;
+  db_->GetLiveFilesMetaData(&live_files);
+  std::vector<std::string> cf2_inputs;
+  uint64_t min_cf2_input_number = std::numeric_limits<uint64_t>::max();
+  for (const auto& file : live_files) {
+    if (file.column_family_name == "cf_2") {
+      cf2_inputs.push_back(file.directory + "/" + file.relative_filename);
+      min_cf2_input_number = std::min(min_cf2_input_number, file.file_number);
+    }
+  }
+  ASSERT_EQ(cf2_inputs.size(), 2U);
+  uint64_t min_to_keep = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kMinObsoleteSstNumberToKeep,
+                                  &min_to_keep));
+  ASSERT_LT(min_to_keep, min_cf2_input_number);
+
+  // Compacting cf_2 makes its two input files obsolete while the cf_1 job is
+  // still waiting.
+  ASSERT_OK(db_->CompactRange(cro, handles_[2], nullptr, nullptr));
+  uint64_t obsolete_sst_size = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kObsoleteSstFilesSize,
+                                  &obsolete_sst_size));
+  ASSERT_EQ(obsolete_sst_size, 0U);
+  purged.get_future().wait();
+  for (const auto& path : cf2_inputs) {
+    ASSERT_TRUE(env_->FileExists(path).IsNotFound()) << path;
+  }
+
+  release_and_join();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  for (int cf : {1, 2}) {
+    for (int i = 0; i < 100; i++) {
+      ASSERT_EQ("v1", Get(cf, Key(i)));
+    }
   }
 }
 

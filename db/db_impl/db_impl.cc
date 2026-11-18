@@ -7016,6 +7016,24 @@ void DBImpl::ReleaseFileNumberFromPendingOutputs(
   }
 }
 
+std::optional<std::multiset<uint64_t>::iterator>
+DBImpl::CaptureListenerPendingOutput(uint64_t file_number) {
+  mutex_.AssertHeld();
+  if (immutable_db_options_.listeners.empty()) {
+    return std::nullopt;
+  }
+  return listener_pending_outputs_.insert(file_number);
+}
+
+void DBImpl::ReleaseListenerPendingOutput(
+    std::optional<std::multiset<uint64_t>::iterator>& entry) {
+  if (entry.has_value()) {
+    mutex_.AssertHeld();
+    listener_pending_outputs_.erase(*entry);
+    entry.reset();
+  }
+}
+
 std::list<uint64_t>::iterator DBImpl::CaptureOptionsFileNumber() {
   // We need to remember the iterator of our insert, because after the
   // compaction is done, we need to remove that element from
