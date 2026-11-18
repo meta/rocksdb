@@ -36,11 +36,7 @@ static const std::string option_file_header =
     "#\n"
     "\n";
 
-Status PersistRocksDBOptions(const WriteOptions& write_options,
-                             const DBOptions& db_opt,
-                             const std::vector<std::string>& cf_names,
-                             const std::vector<ColumnFamilyOptions>& cf_opts,
-                             const std::string& file_name, FileSystem* fs) {
+ConfigOptions OptionsFileConfigOptions(const DBOptions& db_opt) {
   ConfigOptions
       config_options;  // Use default for escaped(true) and check (exact)
   config_options.delimiter = "\n  ";
@@ -50,8 +46,74 @@ Status PersistRocksDBOptions(const WriteOptions& write_options,
   if (db_opt.log_readahead_size > 0) {
     config_options.file_readahead_size = db_opt.log_readahead_size;
   }
-  return PersistRocksDBOptions(write_options, config_options, db_opt, cf_names,
-                               cf_opts, file_name, fs);
+  return config_options;
+}
+
+Status PersistRocksDBOptions(const WriteOptions& write_options,
+                             const DBOptions& db_opt,
+                             const std::vector<std::string>& cf_names,
+                             const std::vector<ColumnFamilyOptions>& cf_opts,
+                             const std::string& file_name, FileSystem* fs) {
+  return PersistRocksDBOptions(write_options, OptionsFileConfigOptions(db_opt),
+                               db_opt, cf_names, cf_opts, file_name, fs);
+}
+
+Status SerializeRocksDBOptions(const ConfigOptions& config_options_in,
+                               const DBOptions& db_opt,
+                               const std::vector<std::string>& cf_names,
+                               const std::vector<ColumnFamilyOptions>& cf_opts,
+                               std::string* contents) {
+  ConfigOptions config_options = config_options_in;
+  config_options.delimiter = "\n  ";  // Override the default to nl
+
+  TEST_SYNC_POINT("PersistRocksDBOptions:start");
+  contents->clear();
+  if (cf_names.size() != cf_opts.size()) {
+    return Status::InvalidArgument(
+        "cf_names.size() and cf_opts.size() must be the same");
+  }
+  std::string options_file_content;
+  contents->append(
+      option_file_header + "[" + opt_section_titles[kOptionSectionVersion] +
+      "]\n"
+      "  rocksdb_version=" +
+      std::to_string(ROCKSDB_MAJOR) + "." + std::to_string(ROCKSDB_MINOR) +
+      "." + std::to_string(ROCKSDB_PATCH) + "\n");
+  contents->append(
+      "  options_file_version=" + std::to_string(ROCKSDB_OPTION_FILE_MAJOR) +
+      "." + std::to_string(ROCKSDB_OPTION_FILE_MINOR) + "\n");
+  contents->append("\n[" + opt_section_titles[kOptionSectionDBOptions] +
+                   "]\n  ");
+
+  Status s =
+      GetStringFromDBOptions(config_options, db_opt, &options_file_content);
+  if (s.ok()) {
+    contents->append(options_file_content + "\n");
+  }
+
+  for (size_t i = 0; s.ok() && i < cf_opts.size(); ++i) {
+    // CFOptions section
+    contents->append("\n[" + opt_section_titles[kOptionSectionCFOptions] +
+                     " \"" + EscapeOptionString(cf_names[i]) + "\"]\n  ");
+    s = GetStringFromColumnFamilyOptions(config_options, cf_opts[i],
+                                         &options_file_content);
+    if (s.ok()) {
+      contents->append(options_file_content + "\n");
+    }
+    // TableOptions section
+    auto* tf = cf_opts[i].table_factory.get();
+    if (s.ok() && tf != nullptr) {
+      contents->append("[" + opt_section_titles[kOptionSectionTableOptions] +
+                       tf->Name() + " \"" + EscapeOptionString(cf_names[i]) +
+                       "\"]\n  ");
+      options_file_content.clear();
+      s = tf->GetOptionString(config_options, &options_file_content);
+      if (s.ok()) {
+        contents->append(options_file_content + "\n");
+      }
+    }
+  }
+  return s;
 }
 
 Status PersistRocksDBOptions(const WriteOptions& write_options,
@@ -63,17 +125,18 @@ Status PersistRocksDBOptions(const WriteOptions& write_options,
   ConfigOptions config_options = config_options_in;
   config_options.delimiter = "\n  ";  // Override the default to nl
 
-  TEST_SYNC_POINT("PersistRocksDBOptions:start");
-  if (cf_names.size() != cf_opts.size()) {
-    return Status::InvalidArgument(
-        "cf_names.size() and cf_opts.size() must be the same");
+  std::string contents;
+  Status s = SerializeRocksDBOptions(config_options, db_opt, cf_names, cf_opts,
+                                     &contents);
+  if (!s.ok()) {
+    return s;
   }
   std::unique_ptr<FSWritableFile> wf;
 
   FileOptions file_options;
   file_options.temperature = db_opt.metadata_write_temperature;
   file_options.io_options.type = IOType::kMetadata;
-  Status s = fs->NewWritableFile(file_name, file_options, &wf, nullptr);
+  s = fs->NewWritableFile(file_name, file_options, &wf, nullptr);
   if (!s.ok()) {
     return s;
   }
@@ -87,68 +150,10 @@ Status PersistRocksDBOptions(const WriteOptions& write_options,
       std::move(wf), file_name, writer_options, nullptr /* statistics */));
   TEST_SYNC_POINT("PersistRocksDBOptions:create");
 
-  std::string options_file_content;
-
   IOOptions opts;
   s = WritableFileWriter::PrepareIOOptions(write_options, opts);
   if (s.ok()) {
-    s = writable->Append(option_file_header + "[" +
-                             opt_section_titles[kOptionSectionVersion] +
-                             "]\n"
-                             "  rocksdb_version=" +
-                             std::to_string(ROCKSDB_MAJOR) + "." +
-                             std::to_string(ROCKSDB_MINOR) + "." +
-                             std::to_string(ROCKSDB_PATCH) + "\n",
-                         opts);
-  }
-  if (s.ok()) {
-    s = writable->Append(
-        "  options_file_version=" + std::to_string(ROCKSDB_OPTION_FILE_MAJOR) +
-            "." + std::to_string(ROCKSDB_OPTION_FILE_MINOR) + "\n",
-        opts);
-  }
-  if (s.ok()) {
-    s = writable->Append(
-        "\n[" + opt_section_titles[kOptionSectionDBOptions] + "]\n  ", opts);
-  }
-
-  if (s.ok()) {
-    s = GetStringFromDBOptions(config_options, db_opt, &options_file_content);
-  }
-  if (s.ok()) {
-    s = writable->Append(options_file_content + "\n", opts);
-  }
-
-  for (size_t i = 0; s.ok() && i < cf_opts.size(); ++i) {
-    // CFOptions section
-    s = writable->Append("\n[" + opt_section_titles[kOptionSectionCFOptions] +
-                             " \"" + EscapeOptionString(cf_names[i]) +
-                             "\"]\n  ",
-                         opts);
-    if (s.ok()) {
-      s = GetStringFromColumnFamilyOptions(config_options, cf_opts[i],
-                                           &options_file_content);
-    }
-    if (s.ok()) {
-      s = writable->Append(options_file_content + "\n", opts);
-    }
-    // TableOptions section
-    auto* tf = cf_opts[i].table_factory.get();
-    if (tf != nullptr) {
-      if (s.ok()) {
-        s = writable->Append(
-            "[" + opt_section_titles[kOptionSectionTableOptions] + tf->Name() +
-                " \"" + EscapeOptionString(cf_names[i]) + "\"]\n  ",
-            opts);
-      }
-      if (s.ok()) {
-        options_file_content.clear();
-        s = tf->GetOptionString(config_options, &options_file_content);
-      }
-      if (s.ok()) {
-        s = writable->Append(options_file_content + "\n", opts);
-      }
-    }
+    s = writable->Append(contents, opts);
   }
   if (s.ok()) {
     s = writable->Fsync(opts);

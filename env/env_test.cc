@@ -5199,6 +5199,10 @@ class AtomicWriteRecordingFS : public FileSystemWrapper {
       IOStatus s = fs_->RecordAndMaybeFail("sync " + name_);
       return s.ok() ? target()->Sync(options, dbg) : s;
     }
+    IOStatus Fsync(const IOOptions& options, IODebugContext* dbg) override {
+      IOStatus s = fs_->RecordAndMaybeFail("fsync " + name_);
+      return s.ok() ? target()->Fsync(options, dbg) : s;
+    }
     IOStatus Close(const IOOptions& options, IODebugContext* dbg) override {
       IOStatus s = fs_->RecordAndMaybeFail("close " + name_);
       return s.ok() ? target()->Close(options, dbg) : s;
@@ -5314,6 +5318,16 @@ class AtomicFileWriterTest : public testing::Test {
     return options;
   }
 
+  // Base options with a check before the rename. The check is recorded as
+  // "check" and fails when "check" is the fail op.
+  AtomicFileWriteOptions CheckOptions() {
+    AtomicFileWriteOptions options = BaseOptions();
+    options.check_before_rename = [this]() {
+      return fs_->RecordAndMaybeFail("check");
+    };
+    return options;
+  }
+
   // Returns the first `count` calls of kWriteAndRenameOps followed by `tail`.
   // For example, Ops(4, {...}) has the calls up to and including the close of
   // the temp file.
@@ -5370,10 +5384,13 @@ const std::vector<std::string> AtomicFileWriterTest::kWriteAndRenameOps = {
 
 // Each case runs one write with one setting and at most one failed call, and
 // checks the result, the exact calls and the final content.
-// - A failure before or at the rename keeps the old final file and deletes
-//   the temp file. After a failed append, sync or close the temp file is
-//   deleted twice: once by WriteStringToFile(), and once more by the writer,
-//   as after any other failure before the rename.
+// - use_fsync calls Fsync() instead of Sync() on the temp file.
+// - The check runs after the temp file is closed and before the rename. It
+//   does not run when the write of the temp file failed.
+// - A failure before or at the rename, including a failed check, keeps the
+//   old final file and deletes the temp file. After a failed append, sync or
+//   close the writer deletes the temp file twice: once right after the
+//   failure, and once more like after any other failure before the rename.
 // - A directory sync failure comes after the rename, so the final file has
 //   the new content. The writer deletes the temp file (which no longer
 //   exists) only when delete_temp_after_any_failure is set.
@@ -5402,6 +5419,15 @@ TEST_F(AtomicFileWriterTest, CallsAndResultForEachSetting) {
   const AtomicFileWriteOptions kCurrent = CurrentFileOptions();
   const AtomicFileWriteOptions kDirPath = DirPathOptions();
   const AtomicFileWriteOptions kIdentity = IdentityFileOptions();
+  const AtomicFileWriteOptions kCheck = CheckOptions();
+  AtomicFileWriteOptions fsync_options = BaseOptions();
+  fsync_options.use_fsync = true;
+  const std::string kCheckOp = "check";
+  const std::string kRename = kWriteAndRenameOps[4];
+  // kWriteAndRenameOps with Fsync() in place of Sync().
+  const std::vector<std::string> kFsyncOps = {
+      kWriteAndRenameOps[0], kWriteAndRenameOps[1], "fsync 000005.dbtmp",
+      kWriteAndRenameOps[3], kRename};
   const std::vector<Case> cases = {
       // No failure.
       {"no directory", kBase, "", kIOError, kOK, Ops(5, {}), kNewContent},
@@ -5413,6 +5439,14 @@ TEST_F(AtomicFileWriterTest, CallsAndResultForEachSetting) {
        kOK, Ops(5, {kNewDir, kDirSync, kDirClose}), kNewContent},
       {"identity", kIdentity, "", kIOError, kOK,
        Ops(4, {kEnvRename, kNewDir, kDirSync, kDirClose}), kNewContent},
+      {"use_fsync", fsync_options, "", kIOError, kOK, kFsyncOps, kNewContent},
+      {"check passes", kCheck, "", kIOError, kOK, Ops(4, {kCheckOp, kRename}),
+       kNewContent},
+      // Check failure, and no check after a failed write.
+      {"check fails", kCheck, kCheckOp, kIOError, kIOError,
+       Ops(4, {kCheckOp, kDelete}), kOldContent},
+      {"check, close fails", kCheck, kWriteAndRenameOps[3], kIOError, kIOError,
+       Ops(4, {kDelete, kDelete}), kOldContent},
       // Write or rename failure.
       {"open fails", kBase, kWriteAndRenameOps[0], kIOError, kIOError,
        Ops(1, {kDelete}), kOldContent},
