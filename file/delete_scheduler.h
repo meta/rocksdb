@@ -163,7 +163,7 @@ class DeleteScheduler {
   std::atomic<int64_t> rate_bytes_per_sec_;
   // Mutex to protect queue_, pending_files_, pending_files_in_directories_,
   // failed_accounted_trash_deletions_, next_trash_bucket_,
-  // pending_files_in_buckets_, bg_errors_, closing_, stats_
+  // pending_files_in_buckets_, bg_errors_, closing_, stats_, bg_thread_
   InstrumentedMutex mu_;
 
   struct FileAndDir {

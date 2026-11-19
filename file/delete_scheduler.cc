@@ -638,6 +638,7 @@ void DeleteScheduler::WaitForEmptyTrashBucket(int32_t bucket) {
 }
 
 void DeleteScheduler::MaybeCreateBackgroundThread() {
+  InstrumentedMutexLock l(&mu_);
   if (bg_thread_ == nullptr && rate_bytes_per_sec_.load() > 0) {
     bg_thread_.reset(
         new port::Thread(&DeleteScheduler::BackgroundEmptyTrash, this));
