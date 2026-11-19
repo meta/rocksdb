@@ -2,8 +2,8 @@ package org.rocksdb.ffm.coredb;
 
 import static org.assertj.core.api.Java6Assertions.assertThat;
 import static org.assertj.core.api.Java6Assertions.assertThatThrownBy;
-import static org.rocksdb.ffm.RocksFFM.segmentOf;
-import static org.rocksdb.ffm.RocksFFM.stringOf;
+import static org.rocksdb.ffm.util.FFMSegment.segmentOf;
+import static org.rocksdb.ffm.util.FFMSegment.stringOf;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -16,7 +16,6 @@ import org.junit.rules.TemporaryFolder;
 import org.rocksdb.ffm.RocksFFM;
 import org.rocksdb.ffm.RocksFFMException;
 import org.rocksdb.ffm.RocksdbOptions;
-import org.rocksdb.ffm.RocksdbTableProperties;
 
 public class RocksFFMTest {
   @Rule public TemporaryFolder dbFolder = new TemporaryFolder();

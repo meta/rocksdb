@@ -31,7 +31,8 @@ public class AnalysedClass {
     sb.append(String.format("package %s;\n\n", targetPackage));
 
     // Java JDK imports that the receiver(s) use
-    Set<String> imports = new TreeSet<>(Collections.singleton("java.lang.foreign.MemorySegment"));
+    Set<String> imports = new TreeSet<>(
+      List.of("org.rocksdb.RocksDB", "java.lang.foreign.MemorySegment"));
 
     // jextract-generated method imports that are called out to by the wrappers we generate
     Set<String> staticImports = new TreeSet<>();
@@ -64,6 +65,12 @@ public class AnalysedClass {
       // memory segment
       sb.append(String.format("private MemorySegment %s;\n\n", receiverName.get()));
     }
+
+    // Every class needs to ensure the native library is loaded
+    sb.append("static {\n");
+    sb.append("RocksDB.loadLibrary();\n");
+    sb.append("}\n\n");
+
     // memory segment accessor method
     sb.append(String.format("public MemorySegment nativeSegment() {\nreturn %s;\n}\n\n", receiverName.get()));
     if (createConstructor) {

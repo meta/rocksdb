@@ -2,7 +2,7 @@ package org.rocksdb.ffm;
 
 import static org.assertj.core.api.Java6Assertions.assertThat;
 import static org.assertj.core.api.Java6Assertions.assertThatThrownBy;
-import static org.rocksdb.ffm.RocksFFM.stringOf;
+import static org.rocksdb.ffm.util.FFMSegment.stringOf;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;

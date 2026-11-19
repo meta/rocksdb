@@ -2,12 +2,13 @@ package org.rocksdb.ffm;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.SegmentAllocator;
 
-abstract class WithDB extends ArenaHolder {
+abstract class WithDB extends WithAllocator {
   protected final MemorySegment db;
 
-  protected WithDB(Arena arena, MemorySegment db) {
-    super(arena);
+  protected WithDB(SegmentAllocator allocator, MemorySegment db) {
+    super(allocator);
     this.db = db;
   }
 }

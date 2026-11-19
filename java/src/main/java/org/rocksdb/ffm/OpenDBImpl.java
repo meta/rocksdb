@@ -1,27 +1,56 @@
 package org.rocksdb.ffm;
 
+import org.rocksdb.ffm.util.FFMSegment;
+
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.SegmentAllocator;
 
-final class OpenDBImpl extends WithDB implements RocksFFM.OpenDB {
-  OpenDBImpl(Arena arena, MemorySegment db) {
-    super(arena, db);
+final class OpenDBImpl extends WithDB implements OpenDB {
+  OpenDBImpl(SegmentAllocator allocator, MemorySegment db) {
+    super(allocator, db);
   }
 
-  public RocksFFM.Getter get(MemorySegment key) {
-    return new GetterImpl(arena, db, key);
+  public Getter get(MemorySegment key) {
+    return new GetterImpl(allocator, db, key);
   }
 
-  public RocksFFM.Getter get(String key) {
-    return new GetterImpl(arena, db, RocksFFM.segmentOf(arena, key));
+  public Getter get(String key) {
+    return new GetterImpl(allocator, db, FFMSegment.segmentOf(allocator, key));
   }
 
-  public RocksFFM.Putter put(MemorySegment key, MemorySegment value) {
-    return new PutterImpl(arena, db, key, value);
+  public Putter put(MemorySegment key, MemorySegment value) {
+    return new PutterImpl(allocator, db, key, value);
   }
 
-  public RocksFFM.Putter put(String key, MemorySegment value) {
-    return new PutterImpl(arena, db, RocksFFM.segmentOf(arena, key), value);
+  @Override
+  public MultiGetter multiGet() {
+    return new MultiGetter(allocator, db);
+  }
+
+  /**
+   * A multi-getter, but override the DB's allocator for allocations when performing the {@code }multiGet()}
+   *
+   * @param allocator to be used by the multi-getter, in place of the DB's allocator
+   * @return
+   */
+  @Override
+  public MultiGetter multiGet(SegmentAllocator allocator) {
+    return new MultiGetter(allocator, db);
+  }
+
+  @Override
+  public ColumnFamily columnFamily() {
+    return new ColumnFamilyImpl(allocator, db);
+  }
+
+  @Override
+  public ColumnFamily columnFamily(SegmentAllocator allocator) {
+    return new ColumnFamilyImpl(allocator, db);
+  }
+
+  public Putter put(String key, MemorySegment value) {
+    return new PutterImpl(allocator, db, FFMSegment.segmentOf(allocator, key), value);
   }
 
   @Override

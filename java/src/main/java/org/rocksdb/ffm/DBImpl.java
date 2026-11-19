@@ -1,19 +1,17 @@
 package org.rocksdb.ffm;
 
-import org.rocksdb.ffm.RocksFFM.OpenDB;
-
-import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.SegmentAllocator;
 import java.lang.foreign.ValueLayout;
 
 import static java.lang.foreign.MemorySegment.NULL;
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.rocksdb.ffm.RocksFFM.throwOnError;
+import static org.rocksdb.ffm.RocksFFMException.throwOnError;
 
-final class DBImpl extends ArenaHolder implements RocksFFM.DB {
+final class DBImpl extends WithAllocator implements DB {
 
-  DBImpl(Arena arena) {
-    super(arena);
+  DBImpl(SegmentAllocator allocator) {
+    super(allocator);
   }
 
   @Override
@@ -26,11 +24,11 @@ final class DBImpl extends ArenaHolder implements RocksFFM.DB {
   @Override
   public OpenDB open(RocksdbOptions dbOptions, String path) throws RocksFFMException {
     // See RocksDB rules on options structs
-    MemorySegment pathName = arena.allocateFrom(path, UTF_8);
-    MemorySegment errptr = arena.allocateFrom(ValueLayout.ADDRESS, NULL);
+    MemorySegment pathName = allocator.allocateFrom(path, UTF_8);
+    MemorySegment errptr = allocator.allocateFrom(ValueLayout.ADDRESS, NULL);
     MemorySegment db = rocksdb_c_api_2.rocksdb_open(dbOptions.nativeSegment(), pathName, errptr);
     throwOnError(errptr, message -> String.format("rocksdb_get() %s", message));
 
-    return new OpenDBImpl(arena, db);
+    return new OpenDBImpl(allocator, db);
   }
 }

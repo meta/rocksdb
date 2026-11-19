@@ -20,7 +20,7 @@ public class RocksFFMHelperJNI {
     try (final Options options = new Options().setCreateIfMissing(true);
         final RocksDB db = RocksDB.open(options, db_path)) {
       // create column family
-      try (final ColumnFamilyHandle columnFamilyHandle = db.createColumnFamily(
+      try (final org.rocksdb.ColumnFamilyHandle columnFamilyHandle = db.createColumnFamily(
                new ColumnFamilyDescriptor(cf_name.getBytes(), new ColumnFamilyOptions()))) {
         assert (columnFamilyHandle != null);
       }
