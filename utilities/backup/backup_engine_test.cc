@@ -338,6 +338,28 @@ class TestFs : public FileSystemWrapper {
     check_iooptions_sequential_file_ = check_iooptions_sequential_file;
   }
 
+  static bool IsInSharedDir(const std::string& path) {
+    return path.find("/shared/") != std::string::npos ||
+           path.find("/shared_checksum/") != std::string::npos;
+  }
+
+  IOStatus FileExists(const std::string& f, const IOOptions& options,
+                      IODebugContext* dbg) override {
+    if (IsInSharedDir(f)) {
+      ++num_shared_file_exists_;
+    }
+    return FileSystemWrapper::FileExists(f, options, dbg);
+  }
+
+  int num_shared_file_exists() { return num_shared_file_exists_; }
+  void ClearSharedFileExistsCounter() { num_shared_file_exists_ = 0; }
+
+  size_t NumWrittenSharedFiles() {
+    MutexLock l(&mutex_);
+    return std::count_if(written_files_.begin(), written_files_.end(),
+                         IsInSharedDir);
+  }
+
   void SetGetChildrenFailure(bool fail) { get_children_failure_ = fail; }
   IOStatus GetChildren(const std::string& dir, const IOOptions& io_opts,
                        std::vector<std::string>* r,
@@ -450,6 +472,7 @@ class TestFs : public FileSystemWrapper {
   std::atomic<int> num_seq_readers_{};
   std::atomic<int> num_direct_seq_readers_{};
   std::atomic<int> num_writers_{};
+  std::atomic<int> num_shared_file_exists_{};
 };  // TestFs
 
 class FileManager : public EnvWrapper {
@@ -2112,6 +2135,67 @@ TEST_F(BackupEngineTest, FlushCompactDuringBackupCheckpoint) {
     }
     */
     AssertBackupConsistency(0, 0, keys_iteration);
+  }
+}
+
+TEST_F(BackupEngineTest, FirstBackupToEmptySharedDirSkipsFileExistsChecks) {
+  const int keys_iteration = 1000;
+  for (const auto sopt : {kShareNoChecksum, kShareWithChecksum}) {
+    OpenDBAndBackupEngine(true /* destroy_old_data */, false /* dummy */, sopt);
+    CloseBackupEngine();
+    OpenBackupEngine();
+
+    FillDB(db_.get(), 0, keys_iteration);
+    test_backup_fs_->ClearSharedFileExistsCounter();
+    ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), true));
+    ASSERT_EQ(test_backup_fs_->num_shared_file_exists(), 0);
+
+    FillDB(db_.get(), keys_iteration, keys_iteration * 2);
+    test_backup_fs_->ClearSharedFileExistsCounter();
+    ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), true));
+    ASSERT_GT(test_backup_fs_->num_shared_file_exists(), 0);
+
+    CloseDBAndBackupEngine();
+    AssertBackupConsistency(0, 0, keys_iteration * 2, keys_iteration * 3);
+    DestroyDBWithoutCheck(dbname_, options_);
+  }
+}
+
+TEST_F(BackupEngineTest, NonEmptySharedDirChecksFileExistsAndReusesFiles) {
+  const int keys_iteration = 1000;
+  for (const auto sopt : {kShareNoChecksum, kShareWithChecksum}) {
+    OpenDBAndBackupEngine(true /* destroy_old_data */, false /* dummy */, sopt);
+    FillDB(db_.get(), 0, keys_iteration);
+    ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), true));
+    CloseBackupEngine();
+    OpenBackupEngine();
+
+    FillDB(db_.get(), keys_iteration, keys_iteration * 2);
+    test_backup_fs_->ClearSharedFileExistsCounter();
+    test_backup_fs_->ClearWrittenFiles();
+    ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), true));
+    ASSERT_GT(test_backup_fs_->num_shared_file_exists(), 0);
+
+    std::vector<BackupInfo> infos;
+    backup_engine_->GetBackupInfo(&infos, /*include_file_details=*/true);
+    ASSERT_EQ(infos.size(), 2U);
+    std::set<std::string> first_backup_files;
+    for (const auto& file : infos[0].file_details) {
+      first_backup_files.insert(file.relative_filename);
+    }
+    size_t new_shared_files = 0;
+    for (const auto& file : infos[1].file_details) {
+      if (TestFs::IsInSharedDir("/" + file.relative_filename) &&
+          first_backup_files.count(file.relative_filename) == 0) {
+        ++new_shared_files;
+      }
+    }
+    ASSERT_GT(new_shared_files, 0U);
+    ASSERT_EQ(test_backup_fs_->NumWrittenSharedFiles(), new_shared_files);
+
+    CloseDBAndBackupEngine();
+    AssertBackupConsistency(0, 0, keys_iteration * 2, keys_iteration * 3);
+    DestroyDBWithoutCheck(dbname_, options_);
   }
 }
 

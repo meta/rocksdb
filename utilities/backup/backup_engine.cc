@@ -687,6 +687,13 @@ class BackupEngineImpl {
   // session and have not failed to delete backup files since then (false).
   bool might_need_garbage_collect_ = true;
 
+  // True from Open until the first CreateNewBackup starts if the shared
+  // directories held no files at Open. No shared file can exist yet then, so
+  // that backup skips the per-file existence check on the backup FileSystem.
+  bool shared_dirs_empty_at_open_ = false;
+  // Whether the backup in progress skips that check.
+  bool skip_shared_file_exists_check_ = false;
+
   // Adds a file to the backup work queue to be copied or created if it doesn't
   // already exist.
   //
@@ -1057,6 +1064,7 @@ IOStatus BackupEngineImpl::Initialize() {
         return io_s;
       }
     }
+    shared_dirs_empty_at_open_ = !read_only_ && abs_path_to_size.empty();
     // load the backups if any, until valid_backups_to_open of the latest
     // non-corrupted backups have been successfully opened.
     int valid_backups_to_open = options_.max_valid_backups_to_open;
@@ -1166,6 +1174,14 @@ IOStatus BackupEngineImpl::CreateNewBackupWithMetadata(
   if (options.decrease_background_thread_cpu_priority) {
     copy_engine_->MaybeDecreaseCpuPriority(
         options.background_thread_cpu_priority);
+  }
+
+  skip_shared_file_exists_check_ =
+      std::exchange(shared_dirs_empty_at_open_, false);
+  if (skip_shared_file_exists_check_) {
+    ROCKS_LOG_INFO(options_.info_log,
+                   "Shared directories were empty at Open; skipping the "
+                   "per-file existence check for shared files");
   }
 
   BackupID new_backup_id = latest_backup_id_ + 1;
@@ -2212,7 +2228,7 @@ IOStatus BackupEngineImpl::AddBackupFileWorkItem(
       live_dst_paths.find(final_dest_path) != live_dst_paths.end();
 
   bool file_exists = false;
-  if (shared && !same_path) {
+  if (shared && !same_path && !skip_shared_file_exists_check_) {
     // Should be in shared directory but not a live path, check existence in
     // shared directory
     IOStatus exist =
