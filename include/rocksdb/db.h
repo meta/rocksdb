@@ -1477,9 +1477,11 @@ class DB {
   // a native coroutine capability or read executor, the default implementation
   // delegates to the synchronous Get/MultiGet path and invokes the callback
   // inline before returning. The callback is invoked after the requested
-  // statuses and output buffers have been populated. Applications can set
-  // `DBOptions::read_io_executor_threads` before opening the DB to configure
-  // executor parallelism for their workload.
+  // statuses and output buffers have been populated. The default FileSystem
+  // creates its read executor only for a positive
+  // `DBOptions::read_io_executor_threads` (default 0), so set it before
+  // opening the DB to use async file IO and to size the executor for the
+  // workload.
   //
   // Only selected data-block file reads can be issued asynchronously. Other
   // work in the read path, including waiting for DB or cache locks, opening

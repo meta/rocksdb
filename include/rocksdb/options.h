@@ -815,11 +815,17 @@ struct DBOptions {
   // Default: 16
   int max_file_opening_threads = 16;
 
-  // Requested maximum number of threads in the shared read I/O executor.
-  // Opening a DB or SstFileReader can increase the executor to this size but
-  // cannot reduce it. Used exclusively for asynchronous read requests (e.g.
-  // GetAsync, MultiGetAsync).
-  int read_io_executor_threads = 1;
+  // Requested maximum number of threads in the shared read I/O executor, used
+  // only by asynchronous reads (e.g. GetAsync, MultiGetAsync, CoroDB::CoGet,
+  // CoroDB::CoMultiGet). Opening a DB or SstFileReader with a positive value
+  // creates the executor or grows it to this size, but never shrinks it. 0
+  // leaves the executor unchanged: until a DB or SstFileReader in the process
+  // opens with a positive value, the default FileSystem has no executor,
+  // starts no read threads or event loops, and the asynchronous read APIs fall
+  // back to synchronous reads. Negative values are rejected.
+  //
+  // Default: 0
+  int read_io_executor_threads = 0;
 
   // If true, SST files are opened and validated asynchronously in the
   // background after DB::Open or DB::OpenAsSecondary returns. This reduces DB

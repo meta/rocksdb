@@ -70,6 +70,7 @@ class SstFileReaderTest : public testing::Test {
     EXPECT_NE(nullptr, base_env);
     env_ = base_env;
     options_.env = env_;
+    options_.read_io_executor_threads = 1;
   }
 
   ~SstFileReaderTest() override {

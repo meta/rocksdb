@@ -65,6 +65,7 @@ std::unique_ptr<DB> OpenDb(bool read_only = false) {
   Options options;
   options.create_if_missing = true;
   options.max_open_files = -1;
+  options.read_io_executor_threads = 1;
   options.write_buffer_size = FLAGS_write_buffer_size;
   options.max_write_buffer_number = FLAGS_max_write_buffer_number;
   options.min_write_buffer_number_to_merge =

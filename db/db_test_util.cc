@@ -353,6 +353,9 @@ Options DBTestBase::GetDefaultOptions() const {
   // Unit tests for this option sets level_compaction_dynamic_level_bytes=true
   // explicitly.
   options.level_compaction_dynamic_level_bytes = false;
+  // Lets tests that request coroutine reads take the native path rather than
+  // the synchronous fallback.
+  options.read_io_executor_threads = 1;
   options.env = env_;
   if (!env_->skip_fsync_) {
     options.track_and_verify_wals_in_manifest = true;
