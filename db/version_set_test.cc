@@ -3029,8 +3029,13 @@ TEST_F(VersionStorageInfoTest, AddRangeDeletionCompensatedFileSize) {
 // it here. When that happens:
 // 1. Add a row field for the new tag in db/manifest_rows.h, or list the tag
 //    as not stored in the comment at the top of that file and skip to step 5.
-// 2. Set the field in VersionSet::GetManifestRows() (DB fields) or in
-//    SetManifestCfRows() (column family fields) in db/manifest_rows.cc.
+// 2. Set the field in db/manifest_rows.cc: for a DB field in
+//    VersionSet::SetManifestDbRowAndWals() and BuildManifestRowChanges(),
+//    for a column family field in MakeManifestCfRow() and in the column family
+//    add case of BuildManifestRowChanges(). A column family field that a
+//    MANIFEST write merges with the old row (like log_number and
+//    full_history_ts_low) also needs the loop over `versions` of
+//    BuildManifestRowChanges().
 // 3. Write the field in ManifestRowsToRecords().
 // 4. For a column family field, compare it in SameCfRow(), which
 //    ManifestRowsEqual() uses.
@@ -3357,6 +3362,179 @@ TEST_F(VersionSetTest, ManifestRowsRoundTrip) {
   changed.db.prev_log_number = 0;
   ASSERT_FALSE(ManifestRowsEqual(rows_before, changed, &diff));
   ASSERT_EQ("DB row", diff);
+}
+
+// Runs MANIFEST writes of each kind that the structured MANIFEST row changes
+// (BuildManifestRowChanges()) handle. In debug builds, ProcessManifestWrites()
+// checks after each write that the row changes give the rows of the new
+// Versions, and stops the test if they do not. The test also checks that the
+// debug check ran for every write.
+TEST_F(VersionSetTest, ManifestRowChangesMatchVersions) {
+  NewDB();
+  int num_checks = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::DebugCheckRowsAfterInstall:Done",
+      [&](void*) { ++num_checks; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  int num_writes = 0;
+  ColumnFamilySet* cf_set = versions_->GetColumnFamilySet();
+  ColumnFamilyData* default_cfd = cf_set->GetDefault();
+  ColumnFamilyData* alice_cfd = cf_set->GetColumnFamily(kColumnFamilyName1);
+  ASSERT_NE(nullptr, alice_cfd);
+  versions_->FetchAddFileNumber(100);
+  auto apply = [&](ColumnFamilyData* cfd, VersionEdit* edit) {
+    edit->SetColumnFamily(cfd->GetID());
+    ++num_writes;
+    mutex_.Lock();
+    Status s = versions_->LogAndApply(cfd, read_options_, write_options_, edit,
+                                      &mutex_, /*db_directory=*/nullptr);
+    mutex_.Unlock();
+    return s;
+  };
+
+  // The file numbers below are examples.
+  std::vector<FileMetaData> files;
+  CreateDummyTableFiles(
+      {SstInfo(10, kDefaultColumnFamilyName, "a", 0,
+               /*_epoch_number=*/1, /*_file_missing=*/false,
+               /*_oldest_blob_file_number=*/20),
+       SstInfo(11, kDefaultColumnFamilyName, "c", 0, 2),
+       SstInfo(12, kDefaultColumnFamilyName, "e", 0, 3, false, 20),
+       SstInfo(13, kColumnFamilyName1, "g", 0, 1)},
+      &files);
+
+  // New files and blob files.
+  VersionEdit add_files;
+  add_files.AddFile(0, files[0]);
+  add_files.AddFile(0, files[1]);
+  add_files.AddBlobFile(20, /*total_blob_count=*/10, /*total_blob_bytes=*/1000,
+                        "", "");
+  add_files.AddBlobFile(21, /*total_blob_count=*/4, /*total_blob_bytes=*/400,
+                        "", "");
+  ASSERT_OK(apply(default_cfd, &add_files));
+
+  // A trivial move: file 11 leaves level 0 and comes back on level 1 in the
+  // same edit.
+  VersionEdit move;
+  move.DeleteFile(0, 11);
+  move.AddFile(1, files[1]);
+  ASSERT_OK(apply(default_cfd, &move));
+
+  // A compaction: file 10 is replaced by file 12, which also refers to blob
+  // file 20, and blob file 20 gets some garbage.
+  VersionEdit compaction;
+  compaction.DeleteFile(0, 10);
+  compaction.AddFile(1, files[2]);
+  compaction.AddBlobFileGarbage(20, /*count=*/3, /*bytes=*/300);
+  ASSERT_OK(apply(default_cfd, &compaction));
+
+  // Blob file 21 has no SST file that refers to it, so it leaves the Version
+  // once all of it is garbage. No edit says that it is gone.
+  VersionEdit blob_garbage;
+  blob_garbage.AddBlobFileGarbage(21, /*count=*/4, /*bytes=*/400);
+  ASSERT_OK(apply(default_cfd, &blob_garbage));
+
+  // One atomic group across two column families, in one MANIFEST write. The
+  // default column family gets two log numbers and two minimum log numbers to
+  // keep; the larger one counts each time.
+  {
+    VersionEdit default_first;
+    VersionEdit default_second;
+    VersionEdit alice_edit;
+    default_first.SetColumnFamily(default_cfd->GetID());
+    default_first.SetLogNumber(30);
+    default_first.SetMinLogNumberToKeep(20);
+    default_first.MarkAtomicGroup(2);
+    default_second.SetColumnFamily(default_cfd->GetID());
+    default_second.SetLogNumber(25);
+    default_second.SetMinLogNumberToKeep(15);
+    default_second.MarkAtomicGroup(1);
+    alice_edit.SetColumnFamily(alice_cfd->GetID());
+    alice_edit.AddFile(0, files[3]);
+    alice_edit.SetLogNumber(31);
+    alice_edit.MarkAtomicGroup(0);
+    ++num_writes;
+    mutex_.Lock();
+    Status s = versions_->LogAndApply(
+        {default_cfd, alice_cfd}, read_options_, write_options_,
+        {{&default_first, &default_second}, {&alice_edit}}, &mutex_,
+        /*dir_contains_current_file=*/nullptr);
+    mutex_.Unlock();
+    ASSERT_OK(s);
+    ASSERT_EQ(30, default_cfd->GetLogNumber());
+    ASSERT_EQ(20, versions_->min_log_number_to_keep());
+  }
+
+  // WAL rows: two WALs are added, then the first one is deleted.
+  VersionEdit add_wals;
+  add_wals.AddWal(40, WalMetadata(/*synced_size_bytes=*/100));
+  add_wals.AddWal(41);
+  ++num_writes;
+  ASSERT_OK(LogAndApplyToDefaultCF(add_wals));
+  VersionEdit delete_wals;
+  delete_wals.DeleteWalsBefore(41);
+  ++num_writes;
+  ASSERT_OK(LogAndApplyToDefaultCF(delete_wals));
+  // The WAL set rejects a second add of WAL 41. The MANIFEST write succeeds,
+  // installing it fails, and no check runs. The next write checks the rows
+  // again.
+  VersionEdit add_wal_again;
+  add_wal_again.AddWal(41);
+  ASSERT_EQ(Status::Code::kCorruption,
+            LogAndApplyToDefaultCF(add_wal_again).code());
+  VersionEdit after_wal_error;
+  after_wal_error.AddWal(42);
+  ++num_writes;
+  ASSERT_OK(LogAndApplyToDefaultCF(after_wal_error));
+
+  // A committed OPTIONS file number.
+  VersionEdit options_edit;
+  options_edit.SetCommittedOptionsFileNumber(77);
+  options_edit.MarkOptionsFileManipulation();
+  ++num_writes;
+  ASSERT_OK(LogAndApplyToDefaultCF(options_edit));
+  // Without track_options_file_number_in_manifest, a new OPTIONS file
+  // changes the number in memory only. The MANIFEST, and so the rows, keep
+  // the committed number.
+  mutex_.Lock();
+  versions_->ApplyLegacyOptionsFileNumber(78);
+  mutex_.Unlock();
+
+  // DB::CreateColumnFamily() takes the new column family id before its add
+  // edit is written, while other MANIFEST writes can still run.
+  mutex_.Lock();
+  cf_set->GetNextColumnFamilyID();
+  mutex_.Unlock();
+  VersionEdit between;
+  between.SetLogNumber(32);
+  ASSERT_OK(apply(default_cfd, &between));
+
+  // A column family add, and a drop of a column family that has a file. Its
+  // file row stays behind in the rows.
+  ++num_writes;
+  ASSERT_NE(nullptr, CreateColumnFamily("new_cf", cf_options_));
+  VersionEdit drop;
+  drop.DropColumnFamily();
+  ASSERT_OK(apply(alice_cfd, &drop));
+
+  // A write after the drop.
+  VersionEdit after_drop;
+  after_drop.SetLogNumber(50);
+  ASSERT_OK(apply(default_cfd, &after_drop));
+
+  // A dummy write that does not write the MANIFEST makes no row changes and
+  // runs no check.
+  VersionEdit dummy;
+  dummy.MarkNoManifestWriteDummy();
+  mutex_.Lock();
+  ASSERT_OK(versions_->LogAndApply(default_cfd, read_options_, write_options_,
+                                   &dummy, &mutex_,
+                                   /*dir_contains_current_file=*/nullptr));
+  mutex_.Unlock();
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(num_writes, num_checks);
 }
 
 class VersionSetWithTimestampTest : public VersionSetTest {

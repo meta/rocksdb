@@ -2141,7 +2141,10 @@ class VersionSet {
   // holding DB mutex if outside of DB startup.
   void TuneMaxManifestFileSize();
 
-  // Protected by DB mutex.
+  // Protected by DB mutex. In a VersionSet that writes the MANIFEST, only the
+  // thread that runs ProcessManifestWrites() changes it after recovery, so
+  // debug builds also read it in that thread without the mutex
+  // (DebugCheckRowsBeforeInstall()).
   WalSet wals_;
 
   std::unique_ptr<ColumnFamilySet> column_family_set_;
@@ -2244,6 +2247,44 @@ class VersionSet {
   // Saved copy from (Mutable)DBOptions
   bool verify_manifest_content_on_close_;
 
+#ifndef NDEBUG
+  // The structured MANIFEST rows (db/manifest_rows.h) of the installed state,
+  // kept only in debug builds to check BuildManifestRowChanges().
+  //
+  // Lifecycle: ProcessManifestWrites() fills it from the installed state with
+  // the DB mutex held, on its first call and on the first call after a WAL
+  // edit was rejected. This copies the metadata of every live file. In a DB
+  // the first call is normally the MANIFEST write of DB::Open(), before other
+  // threads use the DB. Only one thread at a time runs
+  // ProcessManifestWrites(), and only that thread uses it.
+  //
+  // Each MANIFEST write that is installed runs the check in two phases:
+  //
+  //   Phase   When                     What it checks
+  //   ------  -----------------------  --------------------------------------
+  //   1       no DB mutex, before the  builds and applies the row changes;
+  //           new Versions are         for each new Version: the number and
+  //           installed                level of all files, the file count,
+  //                                    all fields of added files, the blob
+  //                                    file rows, and the column family row
+  //                                    with the log number,
+  //                                    full_history_ts_low and dropped flag
+  //                                    taken from the rows
+  //   2       DB mutex held, after     the DB row and the WAL rows; for each
+  //           install                  column family named in the edits: log
+  //                                    number bounds, full_history_ts_low and
+  //                                    the dropped flag; the whole row of an
+  //                                    added column family
+  //
+  // Phase 1 is DebugCheckRowsBeforeInstall(). Phase 2 is
+  // DebugCheckRowsAfterInstall().
+  //
+  // Phase 1 reads only file fields that no other thread changes (see
+  // AssertCfRowsMatchVersion() in db/manifest_rows.cc). Phase 2 allows for
+  // the in-memory differences listed at BuildManifestRowChanges().
+  std::unique_ptr<ManifestRows> debug_manifest_rows_;
+#endif
+
   // Obsolete files, or during DB shutdown any files not referenced by what's
   // left of the in-memory LSM state.
   std::vector<ObsoleteFileInfo> obsolete_files_;
@@ -2278,6 +2319,30 @@ class VersionSet {
                                bool new_cf_options_are_sanitized,
                                const ReadOptions& read_options,
                                const WriteOptions& write_options);
+
+  // Sets the DB row and the WAL rows of `rows` from the current state. See
+  // GetManifestRows().
+  void SetManifestDbRowAndWals(ManifestRows* rows) const;
+
+#ifndef NDEBUG
+  // Phase 1 of the debug check, see debug_manifest_rows_.
+  // ProcessManifestWrites() calls this function after a successful MANIFEST
+  // write, before it takes the DB mutex again. When the WAL set rejects a WAL
+  // edit of the write, it resets debug_manifest_rows_ instead; installing the
+  // write then fails too.
+  void DebugCheckRowsBeforeInstall(
+      const autovector<VersionEdit*>& batch_edits,
+      const autovector<Version*>& versions,
+      const std::vector<std::unique_ptr<BaseReferencedVersionBuilder>>&
+          builder_guards,
+      ColumnFamilyData* first_cfd, const ColumnFamilyOptions* new_cf_options);
+
+  // Phase 2 of the debug check, see debug_manifest_rows_.
+  // ProcessManifestWrites() calls this after it installs the write, with the
+  // DB mutex held. The cost is a few lookups for each edit, O(live WALs), and
+  // O(levels) for an added column family.
+  void DebugCheckRowsAfterInstall(const autovector<VersionEdit*>& batch_edits);
+#endif
 
   Status LogAndApplyImpl(
       const autovector<ColumnFamilyData*>& column_family_datas,

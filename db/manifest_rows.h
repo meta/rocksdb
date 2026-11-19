@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "db/blob/blob_file_addition.h"
@@ -17,6 +19,10 @@
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+class ColumnFamilyData;
+class VersionStorageInfo;
+struct ColumnFamilyOptions;
 
 // Background
 //
@@ -28,8 +34,14 @@ namespace ROCKSDB_NAMESPACE {
 // WAL), not the changes that led to them. A reader gets the whole state by
 // reading all rows, with no history.
 //
-// This file defines the in-memory form of the rows and two conversions:
+// This file defines the in-memory form of the rows and these conversions. A
+// batch is the VersionEdits of one MANIFEST write.
 // - VersionSet::GetManifestRows() reads the current state into rows.
+// - BuildManifestRowChanges() turns one batch into the rows to write and the
+//   rows to delete, and ApplyManifestRowChanges() applies them to rows. Today
+//   only a debug check in VersionSet::ProcessManifestWrites() uses them. It
+//   compares the result with the new Versions (see
+//   VersionSet::debug_manifest_rows_).
 // - ManifestRowsToRecords() turns rows into encoded "full-state" VersionEdit
 //   records, like the ones that VersionSet::WriteCurrentStateToManifest()
 //   writes at the start of a new MANIFEST file. The existing recovery code
@@ -53,7 +65,10 @@ namespace ROCKSDB_NAMESPACE {
 struct ManifestDbRow {
   // The DB id, also kept in the IDENTITY file.
   std::string db_id;
-  // The smallest file number that is not used yet.
+  // The next file number. VersionSet::GetManifestRows() takes the in-memory
+  // value, which is the smallest file number that is not used yet. Rows that
+  // follow MANIFEST writes (BuildManifestRowChanges()) hold the value that the
+  // last write recorded, and other threads can already use that number.
   uint64_t next_file_number = 0;
   // The last sequence number written to the MANIFEST
   // (VersionSet::descriptor_last_sequence_).
@@ -92,7 +107,8 @@ struct ManifestCfRow {
   // (DBImpl::FailIfReadCollapsedHistory()). Empty means it is not set.
   std::string full_history_ts_low;
   // The round-robin compaction cursor of each level, indexed by level. An
-  // unset (empty) key means the level has no cursor.
+  // unset (empty) key means the level has no cursor. Trailing levels with no
+  // cursor are left out.
   std::vector<InternalKey> compact_cursors;
   // Blob files that best-efforts BlobDB repair left out of the column family
   // (VersionStorageInfo::GetDroppedBlobFiles()). Sorted, with no duplicates.
@@ -143,6 +159,111 @@ struct ManifestRows {
   // (DBOptions::track_and_verify_wals_in_manifest), keyed by WAL number.
   std::map<WalNumber, WalMetadata> wals;
 };
+
+// Returns the column family row of `cfd`, with the compaction cursors and the
+// dropped blob files of `vstorage`, which must be a Version of `cfd`.
+// `log_number` and `full_history_ts_low` are passed in because a MANIFEST
+// write records the values of its edits, which can differ from the values in
+// `cfd` at the time of the call.
+// REQUIRES: DB mutex held, or `vstorage` is a Version that is not installed
+// yet, or the current Version of a column family that the calling
+// VersionSet::ProcessManifestWrites() is dropping.
+ManifestCfRow MakeManifestCfRow(const ColumnFamilyData& cfd,
+                                const VersionStorageInfo& vstorage,
+                                uint64_t log_number,
+                                const std::string& full_history_ts_low);
+
+// The changes that one MANIFEST write makes to the rows: the rows to write,
+// with their whole new values, and the keys of the rows to delete. An upsert
+// writes a row: it adds the row, or replaces the row with the same key. File
+// and blob file rows are keyed by (column family id, file number).
+struct ManifestRowChanges {
+  // The DB row after the write. Every write sets it, because each edit carries
+  // the next file number and the last sequence.
+  ManifestDbRow db;
+  std::map<uint32_t, ManifestCfRow> cf_upserts;
+  std::map<std::pair<uint32_t, uint64_t>, ManifestFileRow> file_upserts;
+  std::set<std::pair<uint32_t, uint64_t>> file_deletes;
+  std::map<std::pair<uint32_t, uint64_t>, ManifestBlobFileRow>
+      blob_file_upserts;
+  std::set<std::pair<uint32_t, uint64_t>> blob_file_deletes;
+  std::map<WalNumber, WalMetadata> wal_upserts;
+  std::set<WalNumber> wal_deletes;
+};
+
+// One entry of the `versions` list of a MANIFEST write. Normally the write
+// installs a new Version for the column family. For a column family drop, no
+// new Version is installed, so `base` and `updated` are both its current
+// Version.
+struct ManifestBatchVersion {
+  const ColumnFamilyData* cfd = nullptr;
+  // The Version that the edits of the write were applied to.
+  const VersionStorageInfo* base = nullptr;
+  // The new Version that the write installs.
+  const VersionStorageInfo* updated = nullptr;
+};
+
+// Builds the row changes of one batch, as VersionSet::ProcessManifestWrites()
+// groups it, before the write is installed.
+//
+// Parameters:
+// - `edits` are the edits of the batch, in order. Edits of dropped column
+//   families are already left out.
+// - `versions` has one entry for each column family that gets a new Version.
+//   For a column family drop, it has the dropped column family with its
+//   current Version as both `base` and `updated`.
+// - `new_cf_options` holds the options of the new column family for a column
+//   family add, and is null otherwise.
+// - `old_rows` holds the rows before the write. Only its DB row and column
+//   family rows are used, not its file rows. `wals` is the WAL set before the
+//   write.
+//
+// Rules: the rows follow the edits that the MANIFEST write appends, as
+// recovery replays them:
+// - Within one edit, deleted files are applied before new files, so a file that
+//   moves to another level becomes one upsert.
+// - The log number of a column family is the largest of its row and the edits.
+//   full_history_ts_low only increases.
+// - A blob file row is written when the blob file is new or its garbage
+//   changed, and deleted when the new Version no longer has the blob file,
+//   because no VersionEdit says that a blob file is gone.
+//
+// In-memory differences: some values change in memory without a MANIFEST
+// write, and the rows keep the values from the edits:
+// - the log number of an empty column family (DBImpl::SwitchMemtable());
+// - files marked for compaction (DB::SuggestCompactRange());
+// - the committed OPTIONS file number, which a new OPTIONS file drops without
+//   track_options_file_number_in_manifest;
+// - the max column family, which DB::CreateColumnFamily() raises
+//   (ColumnFamilySet::GetNextColumnFamilyID()) before its add edit is
+//   written;
+// - the next file number: each edit records it when the batch is built, and
+//   other threads allocate more file numbers later.
+// A new MANIFEST file starts with a snapshot of the in-memory state, so it can
+// hold the newer in-memory values. Both describe a state that recovery
+// accepts.
+//
+// The DB id is not an in-memory difference. An edit can set it, and the row
+// takes the value from the edit. DBImpl sets the id in memory before it
+// writes the edit, so the row and memory differ only when a caller writes the
+// edit alone, as tests do.
+//
+// Cost: the work is linear in the number of edits and the files in them. It
+// also scans the edits once for each column family with a new Version, and
+// reads the blob files of those column families and all live WALs.
+//
+// Errors: returns the error of a WAL edit that the WAL set rejects.
+Status BuildManifestRowChanges(
+    const autovector<VersionEdit*>& edits,
+    const std::vector<ManifestBatchVersion>& versions,
+    const ColumnFamilyOptions* new_cf_options, const ManifestRows& old_rows,
+    const WalSet& wals, ManifestRowChanges* changes);
+
+// Applies `changes` to `rows`. File and blob file rows of a dropped column
+// family stay in `rows`. The column family row comes from `changes`, where
+// BuildManifestRowChanges() set its dropped flag.
+void ApplyManifestRowChanges(const ManifestRowChanges& changes,
+                             ManifestRows* rows);
 
 // Converts `rows` into encoded full-state VersionEdit records and appends them
 // to `records`. Writing the records to a new MANIFEST file and recovering from
