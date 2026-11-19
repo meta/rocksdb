@@ -838,6 +838,8 @@ INSTANTIATE_TEST_CASE_P(
 
 #if USE_COROUTINES
 TEST_P(WritePreparedTransactionTest, CoroutineReadsDoNotExposeUncommittedData) {
+  options.read_io_executor_threads = 1;
+  ASSERT_OK(ReOpen());
   ASSERT_OK(db->Put(WriteOptions(), "key", "committed"));
   std::unique_ptr<Transaction> transaction(
       db->BeginTransaction(WriteOptions()));

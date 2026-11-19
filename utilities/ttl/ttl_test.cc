@@ -420,6 +420,7 @@ class TtlTest : public testing::Test {
 #if USE_COROUTINES
 TEST_F(TtlTest, GetCoroutine) {
   options_.env = Env::Default();
+  options_.read_io_executor_threads = 1;
   OpenTtl();
   ASSERT_OK(db_ttl_->Put(WriteOptions(), "key", "value"));
 
@@ -443,6 +444,7 @@ TEST_F(TtlTest, GetCoroutine) {
 
 TEST_F(TtlTest, MultiGetCoroutine) {
   options_.env = Env::Default();
+  options_.read_io_executor_threads = 1;
   OpenTtl();
   ASSERT_OK(db_ttl_->Put(WriteOptions(), "key", "value"));
 

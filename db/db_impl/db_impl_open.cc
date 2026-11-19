@@ -255,9 +255,9 @@ Status DBImpl::ValidateOptions(
 }
 
 Status DBImpl::ValidateOptions(const DBOptions& db_options) {
-  if (db_options.read_io_executor_threads <= 0) {
+  if (db_options.read_io_executor_threads < 0) {
     return Status::InvalidArgument(
-        "read_io_executor_threads must be greater than zero");
+        "read_io_executor_threads must not be negative");
   }
 
   if (db_options.db_paths.size() > 4) {

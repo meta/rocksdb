@@ -260,8 +260,10 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
                      &error_handler_, &event_logger_,
                      immutable_db_options_.listeners, dbname_) {
 #if USE_COROUTINES
-  immutable_db_options_.fs->SetReadIOExecutorThreads(
-      immutable_db_options_.read_io_executor_threads);
+  if (immutable_db_options_.read_io_executor_threads > 0) {
+    immutable_db_options_.fs->SetReadIOExecutorThreads(
+        immutable_db_options_.read_io_executor_threads);
+  }
 #endif  // USE_COROUTINES
 
   // !batch_per_trx_ implies seq_per_batch_ because it is only unset for
