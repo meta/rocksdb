@@ -453,6 +453,10 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
     initialized_ = false;
     ResetReadState();
     cfs_awaiting_from_previous_manifest_ = cfs_awaiting_file_list_;
+    cfs_not_yet_in_manifest_.clear();
+    for (const auto& builder : builders_) {
+      cfs_not_yet_in_manifest_.insert(builder.first);
+    }
   }
 
   // ReactiveVersionSet::ReadAndApply() calls this before it reads with a new
@@ -465,6 +469,14 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
     status_ = Status::OK();
     GetReadBuffer().Clear();
   }
+
+  // Returns whether catch-up cannot build a Version of the newest state of a
+  // column family that this instance opened, because a file of that state was
+  // not found or failed verification. A column family that the current
+  // MANIFEST left out does not count: the primary dropped it before this
+  // instance read the drop record, and its builder keeps the state from the
+  // previous MANIFEST.
+  bool NewestStateHasMissingFiles();
 
   std::unordered_set<ColumnFamilyData*>& GetUpdatedColumnFamilies() {
     return cfds_changed_;
@@ -503,6 +515,12 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
   // Column families that were awaiting their file list when the tailer
   // switched to the current MANIFEST, and that it has not added again.
   std::unordered_set<uint32_t> cfs_awaiting_from_previous_manifest_;
+  // Column families with a builder that the current MANIFEST has not added
+  // again since the tailer switched to it.
+  std::unordered_set<uint32_t> cfs_not_yet_in_manifest_;
+  // Column families that the snapshot opening a MANIFEST left out, because the
+  // primary dropped them. Their builders are never reset again.
+  std::unordered_set<uint32_t> cfs_left_out_of_manifest_;
 };
 
 class DumpManifestHandler : public VersionEditHandler {

@@ -245,6 +245,14 @@ class DBSecondaryTestBase : public DBBasicTestWithTimestampBase {
     return records;
   }
 
+  // Returns the value of `rocksdb.secondary-has-missing-files` for `db`.
+  static uint64_t GetSecondaryHasMissingFiles(DB* db) {
+    uint64_t value = 0;
+    EXPECT_TRUE(
+        db->GetIntProperty(DB::Properties::kSecondaryHasMissingFiles, &value));
+    return value;
+  }
+
   // Moves `path` aside so that opening it fails, and returns where it went.
   // Every DB holding the file open must be closed first, because not every
   // platform allows renaming an open file. The caller must move it back before
@@ -1963,6 +1971,128 @@ TEST_F(DBSecondaryTest, KeepsMemtableWhenFlushedFileIsMissing) {
   // reopen. What must not happen is the key disappearing.
   VerifySecondaryValue("foo", "v1");
 }
+
+// TryCatchUpWithPrimary() returns OK while a file that the newest MANIFEST
+// state lists is missing, so the property is how a caller can tell that the
+// secondary still serves an older Version.
+TEST_F(DBSecondaryTest, SecondaryHasMissingFilesProperty) {
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(0U, GetSecondaryHasMissingFiles(db_.get()));
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  ASSERT_EQ(0U, GetSecondaryHasMissingFiles(db_secondary_.get()));
+
+  // The file of the next flush goes away before the secondary reads the
+  // MANIFEST record that adds it.
+  ASSERT_OK(Put("foo", "v2"));
+  ASSERT_OK(Flush());
+  const std::string table_file =
+      GetNewestTableFilePath(kDefaultColumnFamilyName);
+  Close();
+  const std::string aside_file = MoveFileAside(table_file);
+  bool restored = false;
+  Defer restore_file([&] {
+    if (!restored) {
+      EXPECT_OK(env_->RenameFile(aside_file, table_file));
+    }
+  });
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_EQ(1U, GetSecondaryHasMissingFiles(db_secondary_.get()));
+  VerifySecondaryValue("foo", "v1");
+
+  // The primary compacts the file into a new one, so the newest state no
+  // longer lists it.
+  ASSERT_OK(env_->RenameFile(aside_file, table_file));
+  restored = true;
+  Reopen(options);
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_EQ(0U, GetSecondaryHasMissingFiles(db_secondary_.get()));
+  VerifySecondaryValue("foo", "v2");
+}
+
+// The parameter is whether the primary drops the column family whose file is
+// missing. Either way, the primary then starts a new MANIFEST before the
+// secondary catches up again. The new MANIFEST leaves out a dropped column
+// family, so the property returns to 0. A column family that the new MANIFEST
+// lists again is checked again, and its missing file keeps the value at 1.
+class DBSecondaryMissingFileAcrossManifestSwitchTest
+    : public DBSecondaryTestBase,
+      public testing::WithParamInterface<bool> {
+ public:
+  DBSecondaryMissingFileAcrossManifestSwitchTest()
+      : DBSecondaryTestBase(
+            "db_secondary_missing_file_across_manifest_switch_test") {}
+};
+
+TEST_P(DBSecondaryMissingFileAcrossManifestSwitchTest,
+       PropertyFollowsNewManifest) {
+  const bool drop_column_family = GetParam();
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+  ASSERT_OK(Put(1, "foo", "v1"));
+  ASSERT_OK(Flush(1));
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondaryWithColumnFamilies({"pikachu"}, secondary_options);
+  ASSERT_EQ(0U, GetSecondaryHasMissingFiles(db_secondary_.get()));
+
+  // The file of the next flush of "pikachu" is away while the secondary reads
+  // the MANIFEST record that adds it.
+  ASSERT_OK(Put(1, "foo", "v2"));
+  ASSERT_OK(Flush(1));
+  const std::string table_file = GetNewestTableFilePath("pikachu");
+  Close();
+  std::string aside_file = MoveFileAside(table_file);
+  bool file_is_aside = true;
+  Defer restore_file([&] {
+    if (file_is_aside) {
+      EXPECT_OK(env_->RenameFile(aside_file, table_file));
+    }
+  });
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_EQ(1U, GetSecondaryHasMissingFiles(db_secondary_.get()));
+
+  // The primary needs the file to open. Each open starts a new MANIFEST, so the
+  // MANIFEST of the second open leaves out a column family that was dropped
+  // after the first open.
+  ASSERT_OK(env_->RenameFile(aside_file, table_file));
+  file_is_aside = false;
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "pikachu"}, options);
+  if (drop_column_family) {
+    ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+    Reopen(options);
+  } else {
+    ReopenWithColumnFamilies({kDefaultColumnFamilyName, "pikachu"}, options);
+  }
+  ASSERT_OK(Put("bar", "b1"));
+  ASSERT_OK(Flush());
+  Close();
+  if (!drop_column_family) {
+    aside_file = MoveFileAside(table_file);
+    file_is_aside = true;
+  }
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  VerifySecondaryValue("bar", "b1");
+  ASSERT_EQ(drop_column_family ? 0U : 1U,
+            GetSecondaryHasMissingFiles(db_secondary_.get()));
+}
+
+INSTANTIATE_TEST_CASE_P(DBSecondaryMissingFileAcrossManifestSwitchTest,
+                        DBSecondaryMissingFileAcrossManifestSwitchTest,
+                        ::testing::Bool());
 
 // Same hazard reached without any missing file of the column family's own: an
 // atomic flush whose group is incomplete parks the new Version of every column

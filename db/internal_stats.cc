@@ -324,6 +324,8 @@ static const std::string num_running_flushes = "num-running-flushes";
 static const std::string actual_delayed_write_rate =
     "actual-delayed-write-rate";
 static const std::string is_write_stopped = "is-write-stopped";
+static const std::string secondary_has_missing_files =
+    "secondary-has-missing-files";
 static const std::string estimate_oldest_key_time = "estimate-oldest-key-time";
 static const std::string block_cache_capacity = "block-cache-capacity";
 static const std::string block_cache_usage = "block-cache-usage";
@@ -439,6 +441,8 @@ const std::string DB::Properties::kActualDelayedWriteRate =
     rocksdb_prefix + actual_delayed_write_rate;
 const std::string DB::Properties::kIsWriteStopped =
     rocksdb_prefix + is_write_stopped;
+const std::string DB::Properties::kSecondaryHasMissingFiles =
+    rocksdb_prefix + secondary_has_missing_files;
 const std::string DB::Properties::kEstimateOldestKeyTime =
     rocksdb_prefix + estimate_oldest_key_time;
 const std::string DB::Properties::kBlockCacheCapacity =
@@ -635,6 +639,9 @@ const UnorderedMap<std::string, DBPropertyInfo>
         {DB::Properties::kIsWriteStopped,
          {false, nullptr, &InternalStats::HandleIsWriteStopped, nullptr,
           nullptr}},
+        {DB::Properties::kSecondaryHasMissingFiles,
+         {false, nullptr, &InternalStats::HandleSecondaryHasMissingFiles,
+          nullptr, nullptr}},
         {DB::Properties::kEstimateOldestKeyTime,
          {false, nullptr, &InternalStats::HandleEstimateOldestKeyTime, nullptr,
           nullptr}},
@@ -1562,6 +1569,12 @@ bool InternalStats::HandleActualDelayedWriteRate(uint64_t* value, DBImpl* db,
 bool InternalStats::HandleIsWriteStopped(uint64_t* value, DBImpl* db,
                                          Version* /*version*/) {
   *value = db->write_controller().IsStopped() ? 1 : 0;
+  return true;
+}
+
+bool InternalStats::HandleSecondaryHasMissingFiles(uint64_t* value, DBImpl* db,
+                                                   Version* /*version*/) {
+  *value = db->SecondaryHasMissingFiles() ? 1 : 0;
   return true;
 }
 

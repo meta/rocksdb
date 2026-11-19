@@ -1903,6 +1903,22 @@ class DB {
     //  "rocksdb.is-write-stopped" - Return 1 if write has been stopped.
     static const std::string kIsWriteStopped;
 
+    //  "rocksdb.secondary-has-missing-files" - for a secondary or follower
+    //      instance, returns 1 while catch-up cannot build a Version of the
+    //      newest MANIFEST state of a column family that the instance opened,
+    //      because a table or blob file of that state is missing or failed
+    //      verification. TryCatchUpWithPrimary() returns OK in that case, and
+    //      the column family keeps serving an older Version. Otherwise, and
+    //      for other instances, returns 0.
+    //      A value of 0 does not prove that the instance is caught up. These
+    //      files do not count: files of column families that the instance did
+    //      not open, files listed at open with `open_files_async`, and, with
+    //      `verify_sst_unique_id_in_manifest` = false, a table file of the
+    //      right size that fails to open.
+    //      After a missing blob file is deleted, the value can stay 1 while a
+    //      table file still references a blob file with a lower number.
+    static const std::string kSecondaryHasMissingFiles;
+
     //  "rocksdb.estimate-oldest-key-time" - returns an estimation of
     //      oldest key timestamp in the DB. Currently only available for
     //      FIFO compaction with
@@ -2962,6 +2978,9 @@ class DB {
   // is reclaimed only once those files become readable or this instance is
   // reopened; `rocksdb.num-immutable-mem-table` reports how many memtables are
   // being held.
+  // When a table or blob file of the newest MANIFEST state is missing or fails
+  // verification, this call returns OK, and the column family keeps serving an
+  // older Version. `rocksdb.secondary-has-missing-files` reports this state.
   // If a read of the MANIFEST fails, this call returns the error. The next
   // call opens the MANIFEST again and continues after the last record that
   // this instance applied. If that fails, the call returns the error, and the

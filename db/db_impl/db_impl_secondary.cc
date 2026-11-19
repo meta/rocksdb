@@ -1197,6 +1197,12 @@ Status DBImplSecondary::TryCatchUpWithPrimary() {
   return s;
 }
 
+bool DBImplSecondary::SecondaryHasMissingFiles() {
+  mutex_.AssertHeld();
+  return static_cast_with_check<ReactiveVersionSet>(versions_.get())
+      ->NewestStateHasMissingFiles();
+}
+
 Status DB::OpenAsSecondary(const Options& options, const std::string& dbname,
                            const std::string& secondary_path,
                            std::unique_ptr<DB>* dbptr) {

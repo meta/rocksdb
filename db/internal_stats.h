@@ -906,6 +906,8 @@ class InternalStats {
   bool HandleActualDelayedWriteRate(uint64_t* value, DBImpl* db,
                                     Version* version);
   bool HandleIsWriteStopped(uint64_t* value, DBImpl* db, Version* version);
+  bool HandleSecondaryHasMissingFiles(uint64_t* value, DBImpl* db,
+                                      Version* version);
   bool HandleEstimateOldestKeyTime(uint64_t* value, DBImpl* db,
                                    Version* version);
   bool HandleBlockCacheCapacity(uint64_t* value, DBImpl* db, Version* version);

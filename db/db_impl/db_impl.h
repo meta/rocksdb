@@ -636,6 +636,14 @@ class DBImpl : public DB
 
   virtual bool IsFileDeletionsEnabled() const;
 
+  // Returns whether the newest MANIFEST state that this instance has read
+  // lists a file that the instance could not find or verify. Only secondary
+  // and follower instances keep replaying the MANIFEST after open, so other
+  // instances return false.
+  //
+  // REQUIRES: mutex_ held
+  virtual bool SecondaryHasMissingFiles() { return false; }
+
   Status GetStatsHistory(
       uint64_t start_time, uint64_t end_time,
       std::unique_ptr<StatsHistoryIterator>* stats_iterator) override;
