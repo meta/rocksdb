@@ -120,6 +120,10 @@ class RangeTreeLockManager : public RangeLockManagerBase,
   // (uses the same approach as TransactionLockMgr::lock_maps_cache_)
   std::unique_ptr<ThreadLocalPtr> ltree_lookup_cache_;
 
+  // Incremented by RemoveColumnFamily(). A thread discards its
+  // ltree_lookup_cache_ entry when it was filled under an older version.
+  std::atomic<uint64_t> ltree_map_version_{0};
+
   RangeDeadlockInfoBuffer dlock_buffer_;
 
   std::shared_ptr<toku::locktree> MakeLockTreePtr(toku::locktree* lt);
