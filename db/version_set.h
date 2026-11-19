@@ -83,6 +83,7 @@ class ColumnFamilySet;
 class MergeIteratorBuilder;
 class SystemClock;
 class ManifestTailer;
+struct ManifestRows;
 class FilePickerMultiGet;
 class MultiScanArgs;
 
@@ -1989,6 +1990,13 @@ class VersionSet {
 
   // The returned WalSet needs to be accessed with DB mutex held.
   const WalSet& GetWalSet() const { return wals_; }
+
+  // Sets `rows` to the structured MANIFEST rows of the current state (see
+  // db/manifest_rows.h). Rows of dropped column families are not included. It
+  // copies the metadata of every live file while the DB mutex is held, so it
+  // is meant for tests, debug checks and tools, not for the write path.
+  // REQUIRES: DB mutex held.
+  void GetManifestRows(ManifestRows* rows) const;
 
   void TEST_CreateAndAppendVersion(ColumnFamilyData* cfd) {
     assert(cfd);

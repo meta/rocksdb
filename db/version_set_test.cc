@@ -24,6 +24,7 @@
 #include "db/db_test_util.h"
 #include "db/log_writer.h"
 #include "db/manifest_ops.h"
+#include "db/manifest_rows.h"
 #include "db/version_edit.h"
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/convenience.h"
@@ -3020,6 +3021,342 @@ TEST_F(VersionStorageInfoTest, AddRangeDeletionCompensatedFileSize) {
 
   auto meta = vstorage_.GetFileMetaDataByNumber(100U);
   ASSERT_EQ(meta->compensated_file_size, 100U + 1000U);
+}
+
+// Tells where the structured MANIFEST rows (db/manifest_rows.h) keep the
+// content of each VersionEdit tag. The switch has no default case, so the
+// build fails (-Wswitch with -Werror) when someone adds a tag without listing
+// it here. When that happens:
+// 1. Add a row field for the new tag in db/manifest_rows.h, or list the tag
+//    as not stored in the comment at the top of that file and skip to step 5.
+// 2. Set the field in VersionSet::GetManifestRows() (DB fields) or in
+//    SetManifestCfRows() (column family fields) in db/manifest_rows.cc.
+// 3. Write the field in ManifestRowsToRecords().
+// 4. For a column family field, compare it in SameCfRow(), which
+//    ManifestRowsEqual() uses.
+// 5. Add the case here.
+const char* ManifestRowFieldOfTag(Tag tag) {
+  switch (tag) {
+    case kComparator:
+      return "ManifestCfRow::comparator_name";
+    case kLogNumber:
+      return "ManifestCfRow::log_number";
+    case kNextFileNumber:
+      return "ManifestDbRow::next_file_number";
+    case kLastSequence:
+      return "ManifestDbRow::last_sequence";
+    case kCompactCursor:
+      return "ManifestCfRow::compact_cursors";
+    case kDeletedFile:
+      return "removes a ManifestFileRow";
+    case kNewFile:
+    case kNewFile2:
+    case kNewFile3:
+    case kBlobFileAddition_DEPRECATED:
+    case kBlobFileGarbage_DEPRECATED:
+      return "not stored: deprecated, read only from old MANIFEST files";
+    case kNewFile4:
+      return "ManifestFileRow";
+    case kPrevLogNumber:
+      return "ManifestDbRow::prev_log_number";
+    case kMinLogNumberToKeep:
+      return "ManifestDbRow::min_log_number_to_keep";
+    case kColumnFamily:
+      return "the column family id of the rows";
+    case kColumnFamilyAdd:
+      return "ManifestCfRow::name";
+    case kColumnFamilyDrop:
+      return "ManifestCfRow::dropped";
+    case kMaxColumnFamily:
+      return "ManifestDbRow::max_column_family";
+    case kInAtomicGroup:
+      return "not stored: an atomic group is written in one MANIFEST write";
+    case kBlobFileAddition:
+      return "ManifestBlobFileRow::addition";
+    case kBlobFileGarbage:
+      return "ManifestBlobFileRow::garbage_blob_count and garbage_blob_bytes";
+    case kTagSafeIgnoreMask:
+      return "not a tag";
+    case kDbId:
+      return "ManifestDbRow::db_id";
+    case kWalAddition:
+    case kWalAddition2:
+      return "ManifestRows::wals";
+    case kWalDeletion:
+    case kWalDeletion2:
+      return "removes entries of ManifestRows::wals";
+    case kFullHistoryTsLow:
+      return "ManifestCfRow::full_history_ts_low";
+    case kPersistUserDefinedTimestamps:
+      return "ManifestCfRow::persist_user_defined_timestamps";
+    case kSubcompactionProgress:
+      return "not stored: never written to the DB MANIFEST";
+    case kLastCompactedManifestFileSize:
+      return "not stored: only controls MANIFEST file rewrites";
+    case kCommittedOptionsFileNumber:
+      return "ManifestDbRow::committed_options_file_number";
+    case kDroppedBlobFile:
+      return "ManifestCfRow::dropped_blob_files";
+  }
+  return nullptr;
+}
+
+// Same as ManifestRowFieldOfTag() for the fields of a new file record. Every
+// field is kept in ManifestFileRow::meta, except the hack below.
+const char* ManifestRowFieldOfNewFileTag(NewFileCustomTag tag) {
+  switch (tag) {
+    case kTerminate:
+    case kCustomTagNonSafeIgnoreMask:
+      return "not a field";
+    case kMinLogNumberToKeepHack:
+      return "ManifestDbRow::min_log_number_to_keep";
+    case kNeedCompaction:
+    case kOldestBlobFileNumber:
+    case kOldestAncestorTime:
+    case kFileCreationTime:
+    case kFileChecksum:
+    case kFileChecksumFuncName:
+    case kTemperature:
+    case kMinTimestamp:
+    case kMaxTimestamp:
+    case kUniqueId:
+    case kEpochNumber:
+    case kCompensatedRangeDeletionSize:
+    case kTailSize:
+    case kUserDefinedTimestampsPersisted:
+    case kFileOpenMetadata:
+    case kDbOwnershipStartTime:
+    case kDataFileProvenance:
+    case kPathId:
+      return "ManifestFileRow::meta";
+  }
+  return nullptr;
+}
+
+TEST(ManifestRowsTagTest, EveryTagHasARowField) {
+  // The real check is at build time, in the switch statements above.
+  ASSERT_STREQ("ManifestCfRow::dropped_blob_files",
+               ManifestRowFieldOfTag(kDroppedBlobFile));
+  ASSERT_STREQ("ManifestFileRow::meta",
+               ManifestRowFieldOfNewFileTag(kDataFileProvenance));
+}
+
+// Builds a state that sets every row field to a value that is not its default,
+// reads it into rows, writes the rows as a new MANIFEST file, recovers a new
+// VersionSet from that file and checks that it gives the same rows.
+TEST_F(VersionSetTest, ManifestRowsRoundTrip) {
+  // A second DB path, so that a file can have path id 1. Both paths are the
+  // DB directory, so the dummy files below are found under either id.
+  imm_db_options_.db_paths.emplace_back(dbname_,
+                                        std::numeric_limits<uint64_t>::max());
+  NewDB();
+  // An OPTIONS file number that is not committed in the MANIFEST (the default
+  // with track_options_file_number_in_manifest false) is not a row field.
+  {
+    mutex_.Lock();
+    versions_->ApplyLegacyOptionsFileNumber(5);
+    ManifestRows legacy_rows;
+    versions_->GetManifestRows(&legacy_rows);
+    mutex_.Unlock();
+    ASSERT_FALSE(legacy_rows.db.committed_options_file_number.has_value());
+  }
+  // A column family with user-defined timestamps that are not persisted, so
+  // that the file boundaries go through the timestamp removal on write.
+  Options udt_options;
+  udt_options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  udt_options.persist_user_defined_timestamps = false;
+  udt_options.table_factory = table_factory_;
+  ColumnFamilyData* udt_cfd = CreateColumnFamily("udt", udt_options);
+  column_families_.emplace_back("udt", udt_options);
+  // The column family kColumnFamilyName1 ("alice"), which NewDB() creates.
+  ColumnFamilyData* alice_cfd =
+      versions_->GetColumnFamilySet()->GetColumnFamily(kColumnFamilyName1);
+  ASSERT_NE(nullptr, alice_cfd);
+  versions_->FetchAddFileNumber(100);
+
+  // LogAndApply() opens each new SST file, so the files must exist. Only their
+  // sizes are taken from the dummy files.
+  std::vector<FileMetaData> dummy_files;
+  CreateDummyTableFiles(
+      {SstInfo(10, kDefaultColumnFamilyName, "a"),
+       SstInfo(11, kDefaultColumnFamilyName, "c"),
+       SstInfo(12, kColumnFamilyName1, "e"), SstInfo(13, "udt", "g")},
+      &dummy_files);
+  std::map<uint64_t, uint64_t> file_sizes;
+  for (const FileMetaData& f : dummy_files) {
+    file_sizes[f.fd.GetNumber()] = f.fd.GetFileSize();
+  }
+  // The file numbers and values below are examples. Every field is set to a
+  // value that is not its default. The column families get lower sequence
+  // numbers in id order, which recovery accepts only if every record carries
+  // the DB last sequence.
+  auto make_file = [&](uint64_t number, uint32_t path_id,
+                       const std::string& smallest_key,
+                       const std::string& largest_key, SequenceNumber seq,
+                       uint64_t oldest_blob, bool udt) {
+    const std::string ts = udt ? test::EncodeInt(0) : "";
+    FileMetaData f(
+        number, path_id, file_sizes.at(number),
+        InternalKey(smallest_key + ts, seq, kTypeValue),
+        InternalKey(largest_key + ts, seq + 10, kTypeValue), seq, seq + 10,
+        /*marked_for_compact=*/true, Temperature::kWarm, oldest_blob,
+        /*_oldest_ancestor_time=*/111, /*_file_creation_time=*/222,
+        /*_epoch_number=*/number, "checksum", "checksum_func",
+        UniqueId64x2{number, 7}, /*_compensated_range_deletion_size=*/333,
+        /*_tail_size=*/444, /*_user_defined_timestamps_persisted=*/!udt,
+        udt ? test::EncodeInt(5) : "", udt ? test::EncodeInt(9) : "");
+    f.file_open_metadata = "open_metadata";
+    f.db_ownership_start_time = 555;
+    f.data_file_provenance =
+        DataFileProvenanceForOrigin(DataFileProvenance::Origin::kCompaction) |
+        kProvenanceMovedBetweenLevels;
+    return f;
+  };
+  auto apply = [&](ColumnFamilyData* cfd, VersionEdit* edit) {
+    // LogAndApply() applies the log number and the full_history_ts_low to the
+    // column family named in the edit.
+    edit->SetColumnFamily(cfd->GetID());
+    mutex_.Lock();
+    Status s = versions_->LogAndApply(cfd, read_options_, write_options_, edit,
+                                      &mutex_, /*db_directory=*/nullptr);
+    mutex_.Unlock();
+    return s;
+  };
+
+  VersionEdit default_edit;
+  default_edit.AddFile(0, make_file(10, /*path_id=*/1, "a", "b", 100,
+                                    /*oldest_blob=*/20, false));
+  default_edit.AddFile(2, make_file(11, /*path_id=*/0, "c", "d", 90,
+                                    kInvalidBlobFileNumber, false));
+  default_edit.AddBlobFile(20, /*total_blob_count=*/10,
+                           /*total_blob_bytes=*/1000, "checksum_method",
+                           "checksum_value");
+  default_edit.AddBlobFileGarbage(20, /*count=*/3, /*bytes=*/300);
+  default_edit.AddBlobFile(21, /*total_blob_count=*/5, /*total_blob_bytes=*/500,
+                           "", "");
+  default_edit.AddDroppedBlobFile(30);
+  default_edit.AddCompactCursor(2, InternalKey("c", 15, kTypeValue));
+  default_edit.SetLogNumber(45);
+  default_edit.SetMinLogNumberToKeep(40);
+  ASSERT_OK(
+      apply(versions_->GetColumnFamilySet()->GetDefault(), &default_edit));
+
+  VersionEdit alice_edit;
+  alice_edit.AddFile(1, make_file(12, /*path_id=*/0, "e", "f", 50,
+                                  kInvalidBlobFileNumber, false));
+  alice_edit.SetLogNumber(46);
+  ASSERT_OK(apply(alice_cfd, &alice_edit));
+
+  VersionEdit udt_edit;
+  udt_edit.AddFile(1, make_file(13, /*path_id=*/0, "g", "h", 10,
+                                kInvalidBlobFileNumber, true));
+  udt_edit.SetFullHistoryTsLow(test::EncodeInt(3));
+  ASSERT_OK(apply(udt_cfd, &udt_edit));
+
+  // A dropped column family has no rows, but it still counts for the max
+  // column family.
+  ColumnFamilyData* dropped_cfd = CreateColumnFamily("dropped", cf_options_);
+  const uint32_t dropped_cf_id = dropped_cfd->GetID();
+  VersionEdit drop_edit;
+  drop_edit.DropColumnFamily();
+  ASSERT_OK(apply(dropped_cfd, &drop_edit));
+
+  VersionEdit wal_edit;
+  wal_edit.AddWal(50, WalMetadata(/*synced_size_bytes=*/123));
+  wal_edit.AddWal(51);
+  ASSERT_OK(LogAndApplyToDefaultCF(wal_edit));
+
+  VersionEdit options_edit;
+  options_edit.SetCommittedOptionsFileNumber(77);
+  options_edit.MarkOptionsFileManipulation();
+  // Each MANIFEST write sets the prev log number from its first edit, and a
+  // column family add or drop sets it to 0, so set it on the last write.
+  options_edit.SetPrevLogNumber(7);
+  ASSERT_OK(LogAndApplyToDefaultCF(options_edit));
+
+  ManifestRows rows_before;
+  mutex_.Lock();
+  versions_->GetManifestRows(&rows_before);
+  mutex_.Unlock();
+  // CloseDB() below deletes the ColumnFamilyData objects, so keep the ids.
+  const uint32_t udt_cf_id = udt_cfd->GetID();
+  const uint32_t alice_cf_id = alice_cfd->GetID();
+  ASSERT_FALSE(rows_before.db.db_id.empty());
+  // 110 is the largest sequence number of the files above: file 10 has
+  // sequence numbers up to 100 + 10.
+  ASSERT_EQ(110, rows_before.db.last_sequence);
+  ASSERT_EQ(7, rows_before.db.prev_log_number);
+  ASSERT_EQ(40, rows_before.db.min_log_number_to_keep);
+  ASSERT_EQ(dropped_cf_id, rows_before.db.max_column_family);
+  ASSERT_EQ(std::optional<uint64_t>(77),
+            rows_before.db.committed_options_file_number);
+  ASSERT_EQ(5, rows_before.cfs.size());
+  ASSERT_EQ(0, rows_before.cfs.count(dropped_cf_id));
+  ASSERT_EQ(2, rows_before.cfs[0].files.size());
+  ASSERT_EQ(1, rows_before.cfs[0].files[10].meta.fd.GetPathId());
+  ASSERT_EQ(555, rows_before.cfs[0].files[10].meta.db_ownership_start_time);
+  ASSERT_EQ(3, rows_before.cfs[0].blob_files[20].garbage_blob_count);
+  ASSERT_EQ(std::vector<uint64_t>{30},
+            rows_before.cfs[0].cf.dropped_blob_files);
+  ASSERT_EQ(46, rows_before.cfs[alice_cf_id].cf.log_number);
+  ASSERT_EQ(8, rows_before.cfs[udt_cf_id].cf.timestamp_size);
+  ASSERT_EQ(test::EncodeInt(3),
+            rows_before.cfs[udt_cf_id].cf.full_history_ts_low);
+  ASSERT_EQ(2, rows_before.wals.size());
+  CloseDB();
+
+  // Write the rows as a new MANIFEST file and make CURRENT point to it.
+  std::vector<std::string> records;
+  ASSERT_OK(ManifestRowsToRecords(rows_before, &records));
+
+  // GetManifestRows() never gives a dropped column family row, so check here
+  // that ManifestRowsToRecords() skips one: the column family record and the
+  // file record of the column family are left out.
+  {
+    ManifestRows with_dropped = rows_before;
+    with_dropped.cfs[alice_cf_id].cf.dropped = true;
+    std::vector<std::string> fewer_records;
+    ASSERT_OK(ManifestRowsToRecords(with_dropped, &fewer_records));
+    ASSERT_EQ(records.size() - 2, fewer_records.size());
+  }
+  // An example MANIFEST number that no other file uses.
+  constexpr uint64_t kManifestNumber = 95;
+  std::unique_ptr<WritableFileWriter> file_writer;
+  ASSERT_OK(WritableFileWriter::Create(
+      fs_, DescriptorFileName(dbname_, kManifestNumber),
+      fs_->OptimizeForManifestWrite(env_options_), &file_writer, nullptr));
+  log::Writer writer(std::move(file_writer), /*log_number=*/0,
+                     /*recycle_log_files=*/false);
+  for (const std::string& record : records) {
+    ASSERT_OK(writer.AddRecord(write_options_, record));
+  }
+  ASSERT_OK(writer.Close(write_options_));
+  ASSERT_OK(SetCurrentFile(write_options_, fs_.get(), dbname_, kManifestNumber,
+                           Temperature::kUnknown,
+                           /*dir_contains_current_file=*/nullptr));
+
+  ReopenDB();
+  ManifestRows rows_after;
+  mutex_.Lock();
+  versions_->GetManifestRows(&rows_after);
+  mutex_.Unlock();
+  // Recovery sets the next file number to the recorded value plus one
+  // (VersionEditHandler::CheckIterationResult()), as after every reopen.
+  ASSERT_EQ(rows_before.db.next_file_number + 1,
+            rows_after.db.next_file_number);
+  rows_after.db.next_file_number = rows_before.db.next_file_number;
+  std::string diff;
+  ASSERT_TRUE(ManifestRowsEqual(rows_before, rows_after, &diff)) << diff;
+
+  // ManifestRowsEqual() reports a changed field.
+  ManifestRows changed = rows_after;
+  changed.cfs[0].files[10].meta.epoch_number++;
+  ASSERT_FALSE(ManifestRowsEqual(rows_before, changed, &diff));
+  ASSERT_EQ("column family 0 file rows", diff);
+  changed = rows_after;
+  changed.db.prev_log_number = 0;
+  ASSERT_FALSE(ManifestRowsEqual(rows_before, changed, &diff));
+  ASSERT_EQ("DB row", diff);
 }
 
 class VersionSetWithTimestampTest : public VersionSetTest {
