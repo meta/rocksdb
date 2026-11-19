@@ -5519,7 +5519,17 @@ void StressTest::TestCompactRange(ThreadState* thread, int64_t rand_key,
 
   const Snapshot* pre_snapshot = nullptr;
   uint32_t pre_hash = 0;
-  if (thread->rand.OneIn(2)) {
+  // With ingest_external_file_atomic_replace_one_in, a concurrent atomic range
+  // replacement ingestion runs with snapshot_consistency=false. Like
+  // DeleteFilesInRange, it can drop files that an existing snapshot still
+  // reads. So the data that pre_snapshot sees in this key range can change
+  // while CompactRange runs, and the hash check would fail even when
+  // CompactRange is correct. Skip the check in this mode, for the same reason
+  // that db_stress rejects acquire_snapshot_one_in with it. The random number
+  // is drawn in both modes, so the random sequence of the test does not change.
+  const bool check_hash = thread->rand.OneIn(2) &&
+                          FLAGS_ingest_external_file_atomic_replace_one_in == 0;
+  if (check_hash) {
     // Temporarily disable error injection to for validation
     if (db_fault_injection_fs_) {
       db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
