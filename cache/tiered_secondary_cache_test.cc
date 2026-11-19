@@ -229,7 +229,7 @@ class DBTieredSecondaryCacheTest : public DBTestBase {
  private:
   std::shared_ptr<Cache> cache_;
   std::shared_ptr<TestSecondaryCache> nvm_sec_cache_;
-  double compressed_secondary_ratio_;
+  double compressed_secondary_ratio_ = 0.0;
 };
 
 // In this test, the block size is set to 4096. Each value is 1007 bytes, so

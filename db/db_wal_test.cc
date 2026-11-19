@@ -189,7 +189,7 @@ class DBWALTestBase : public DBTestBase {
 #endif  // ROCKSDB_FALLOCATE_PRESENT
 
   uint64_t GetAllocatedFileSize(const std::string& file_name) {
-    struct stat sbuf;
+    struct stat sbuf{};
     int err = stat(file_name.c_str(), &sbuf);
     assert(err == 0);
     return sbuf.st_blocks * 512;
@@ -199,7 +199,7 @@ class DBWALTestBase : public DBTestBase {
   bool ShouldSkipAllocationCheck(const std::string& file_name) {
     (void)file_name;
 #if defined(OS_LINUX)
-    struct statfs fs_stat;
+    struct statfs fs_stat{};
     if (statfs(file_name.c_str(), &fs_stat) == 0) {
       if (fs_stat.f_type ==
           static_cast<decltype(fs_stat.f_type)>(BTRFS_SUPER_MAGIC)) {

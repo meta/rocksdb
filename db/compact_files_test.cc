@@ -352,7 +352,7 @@ TEST_F(CompactFilesTest, CompactionFilterWithGetSv) {
     const char* Name() const override { return "FilterWithGet"; }
 
    private:
-    DB* db_;
+    DB* db_ = nullptr;
   };
 
   std::shared_ptr<FilterWithGet> cf(new FilterWithGet());

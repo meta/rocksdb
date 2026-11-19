@@ -101,7 +101,7 @@ class PlainTableDBTest : public testing::Test,
   Env* env_;
   std::unique_ptr<DB> db_;
 
-  bool mmap_mode_;
+  bool mmap_mode_ = false;
   Options last_options_;
 
  public:

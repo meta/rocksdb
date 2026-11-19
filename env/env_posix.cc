@@ -144,7 +144,7 @@ class PosixClock : public SystemClock {
   uint64_t NowNanos() override {
 #if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) || \
     defined(OS_AIX)
-    struct timespec ts;
+    struct timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
 #elif defined(__MACH__)
@@ -164,7 +164,7 @@ class PosixClock : public SystemClock {
   uint64_t CPUMicros() override {
 #if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) || \
     defined(OS_AIX) || (defined(__MACH__) && defined(__MAC_10_12))
-    struct timespec ts;
+    struct timespec ts{};
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     return (static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec) / 1000;
 #else
@@ -175,7 +175,7 @@ class PosixClock : public SystemClock {
   uint64_t CPUNanos() override {
 #if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) || \
     defined(OS_AIX) || (defined(__MACH__) && defined(__MAC_10_12))
-    struct timespec ts;
+    struct timespec ts{};
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
 #else
@@ -196,7 +196,7 @@ class PosixClock : public SystemClock {
 
   std::string TimeToString(uint64_t secondsSince1970) override {
     const time_t seconds = (time_t)secondsSince1970;
-    struct tm t;
+    struct tm t{};
     int maxsize = 64;
     std::string dummy;
     dummy.reserve(maxsize);
@@ -403,7 +403,7 @@ class PosixEnv : public CompositeEnv {
   // Non-default instances simply maintain references to the backing
   // members in te default instance
   std::vector<ThreadPoolImpl> thread_pools_storage_;
-  pthread_mutex_t mu_storage_;
+  pthread_mutex_t mu_storage_{};
   std::vector<pthread_t> threads_to_join_storage_;
   bool allow_non_owner_access_storage_;
 

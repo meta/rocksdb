@@ -212,7 +212,7 @@ class StalledEnv : public EnvWrapper {
 // Represents a single read operation recorded by the tracking file system
 struct ReadOp {
   enum Type { kMultiRead, kReadAsync };
-  Type type;
+  Type type = kMultiRead;
   // For MultiRead: contains all (offset, len) pairs in the request
   // For ReadAsync: contains a single (offset, len) pair
   std::vector<std::pair<uint64_t, size_t>> requests;

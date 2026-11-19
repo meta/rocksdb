@@ -816,7 +816,7 @@ TEST_F(InlineSkipTest, ConcurrentInsertWithoutThreads) {
 class TestState {
  public:
   ConcurrentTest t_;
-  bool use_hint_;
+  bool use_hint_ = false;
   int seed_;
   std::atomic<bool> quit_flag_;
   std::atomic<uint32_t> next_writer_;

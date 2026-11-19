@@ -280,17 +280,17 @@ class CompactionFilter : public Customizable {
   struct Context {
     // Whether this table file is created as part of a compaction including all
     // table files.
-    bool is_full_compaction;
+    bool is_full_compaction = false;
     // Whether this table file is created as part of a compaction requested by
     // the client.
-    bool is_manual_compaction;
+    bool is_manual_compaction = false;
     // The lowest level among all the input files (if any) used in table
     // creation
     int input_start_level = kUnknownStartLevel;
     // The column family that will contain the created table file.
-    uint32_t column_family_id;
+    uint32_t column_family_id = 0;
     // Reason this table file is being created.
-    TableFileCreationReason reason;
+    TableFileCreationReason reason = TableFileCreationReason::kFlush;
     // Map from all the input files (if any) used in table creation to their
     // table properties. When there are such input files but RocksDB fail to
     // load their table properties, `input_table_properties` will be an empty

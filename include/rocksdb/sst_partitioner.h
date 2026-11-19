@@ -87,12 +87,12 @@ class SstPartitioner {
   // Context information of a compaction run
   struct Context {
     // Does this compaction run include all data files
-    bool is_full_compaction;
+    bool is_full_compaction = false;
     // Is this compaction requested by the client (true),
     // or is it occurring as an automatic compaction process
-    bool is_manual_compaction;
+    bool is_manual_compaction = false;
     // Output level for this compaction
-    int output_level;
+    int output_level = 0;
     // Smallest key for compaction
     Slice smallest_user_key;
     // Largest key for compaction

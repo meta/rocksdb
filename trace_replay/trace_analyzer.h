@@ -172,7 +172,7 @@ struct TraceStats {
   uint32_t cf_id;
   std::string cf_name;
   uint64_t a_count;
-  uint64_t a_succ_count;
+  uint64_t a_succ_count = 0;
   uint64_t a_key_id;
   uint64_t a_key_size_sqsum;
   uint64_t a_key_size_sum;
@@ -230,11 +230,11 @@ struct TraceStats {
 
 struct TypeUnit {
   std::string type_name;
-  bool enabled;
-  uint64_t total_keys;
-  uint64_t total_access;
-  uint64_t total_succ_access;
-  uint32_t sample_count;
+  bool enabled = false;
+  uint64_t total_keys = 0;
+  uint64_t total_access = 0;
+  uint64_t total_succ_access = 0;
+  uint32_t sample_count = 0;
   std::map<uint32_t, TraceStats> stats;
   TypeUnit() = default;
   ~TypeUnit() = default;
@@ -377,7 +377,7 @@ class TraceAnalyzer : private TraceRecord::Handler,
   EnvOptions env_options_;
   std::unique_ptr<TraceReader> trace_reader_;
   size_t offset_;
-  char buffer_[1024];
+  char buffer_[1024] = {};
   // Timestamp of a WriteBatch, used in its iteration.
   uint64_t write_batch_ts_;
   std::string trace_name_;
@@ -433,7 +433,7 @@ class TraceAnalyzer : private TraceRecord::Handler,
   Status MakeStatisticKeyStatsOrPrefix(TraceStats& stats);
   Status MakeStatisticCorrelation(TraceStats& stats, StatsUnit& unit);
   Status MakeStatisticQPS();
-  int db_version_;
+  int db_version_ = 0;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

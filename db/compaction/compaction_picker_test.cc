@@ -28,7 +28,7 @@ class CountingLogger : public Logger {
  public:
   using Logger::Logv;
   void Logv(const char* /*format*/, va_list /*ap*/) override { log_count++; }
-  size_t log_count;
+  size_t log_count = 0;
 };
 
 class CompactionPickerTestBase : public testing::Test {
@@ -51,7 +51,7 @@ class CompactionPickerTestBase : public testing::Test {
   std::unordered_map<uint32_t, std::pair<FileMetaData*, int>> file_map_;
   // input files to compaction process.
   std::vector<CompactionInputFiles> input_files_;
-  int compaction_level_start_;
+  int compaction_level_start_ = 0;
 
   explicit CompactionPickerTestBase(const Comparator* _ucmp)
       : ucmp_(_ucmp),

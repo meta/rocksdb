@@ -25,7 +25,7 @@ class DBWriteBufferManagerTest : public DBTestBase,
  public:
   DBWriteBufferManagerTest()
       : DBTestBase("db_write_buffer_manager_test", /*env_do_fsync=*/false) {}
-  bool cost_cache_;
+  bool cost_cache_ = false;
 };
 
 TEST_P(DBWriteBufferManagerTest, SharedBufferAcrossCFs1) {

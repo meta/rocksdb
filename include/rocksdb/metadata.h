@@ -336,7 +336,7 @@ struct ColumnFamilyMetaData {
   // the file size of its "levels".
   uint64_t size;
   // The number of files in this column family.
-  size_t file_count;
+  size_t file_count = 0;
   // The name of the column family.
   std::string name;
   // The metadata of all levels in this column family.

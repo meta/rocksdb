@@ -325,7 +325,7 @@ struct PerfContextBase {
 struct PerfContext : public PerfContextBase {
   ~PerfContext();
 
-  PerfContext() { Reset(); }
+  PerfContext() : PerfContextBase() {}
 
   PerfContext(const PerfContext&);
   PerfContext& operator=(const PerfContext&);

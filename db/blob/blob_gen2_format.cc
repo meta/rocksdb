@@ -410,7 +410,7 @@ IOStatus WriteSimpleGen2BlobRecord(WritableFileWriter* file,
   // uncompressed payloads are currently written.
   assert(compression == kNoCompression);
 
-  std::array<char, kSimpleGen2BlobTrailerSize> trailer;
+  std::array<char, kSimpleGen2BlobTrailerSize> trailer{};
   trailer[0] = lossless_cast<char>(compression);
   uint32_t checksum = ComputeBuiltinChecksumWithLastByte(
       checksum_type, payload.data(), payload.size(), /*last_byte=*/trailer[0]);

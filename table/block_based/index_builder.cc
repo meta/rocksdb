@@ -171,6 +171,7 @@ PartitionedIndexBuilder::PartitionedIndexBuilder(
           persist_user_defined_timestamps, true /* is_user_key */,
           /*use_separated_kv_storage=*/false, /*statistics=*/nullptr,
           /*uniform_cv_threshold=*/-1.0, use_common_prefix_top),
+      sub_index_builder_(nullptr),
       table_opt_(table_opt),
       // We start by false. After each partition we revise the value based on
       // what the sub_index_builder has decided. If the feature is disabled

@@ -209,15 +209,15 @@ class ColumnFamilyHandleInternal : public ColumnFamilyHandleImpl {
 struct SuperVersion {
   // Accessing members of this class is not thread-safe and requires external
   // synchronization (ie db mutex held or on write thread).
-  ColumnFamilyData* cfd;
-  ReadOnlyMemTable* mem;
-  MemTableListVersion* imm;
-  Version* current;
+  ColumnFamilyData* cfd = nullptr;
+  ReadOnlyMemTable* mem = nullptr;
+  MemTableListVersion* imm = nullptr;
+  Version* current = nullptr;
   // TODO: do we really need this in addition to what's in current Version?
   MutableCFOptions mutable_cf_options;
   // Version number of the current SuperVersion
-  uint64_t version_number;
-  WriteStallCondition write_stall_condition;
+  uint64_t version_number = 0;
+  WriteStallCondition write_stall_condition = WriteStallCondition::kNormal;
   // Each time `full_history_ts_low` collapses history, a new SuperVersion is
   // installed. This field tracks the effective `full_history_ts_low` for that
   // SuperVersion, to be used by read APIs for sanity checks. This field is

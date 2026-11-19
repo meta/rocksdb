@@ -1359,7 +1359,7 @@ Status CompactionJob::Install(bool* compaction_released) {
     io_status_ = versions_->io_status();
   }
 
-  VersionStorageInfo::LevelSummaryStorage tmp;
+  VersionStorageInfo::LevelSummaryStorage tmp{};
   auto vstorage = cfd->current()->storage_info();
   const auto& stats = internal_stats_.output_level_stats;
 
@@ -2697,7 +2697,7 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
   assert(compaction);
 
   {
-    Compaction::InputLevelSummaryBuffer inputs_summary;
+    Compaction::InputLevelSummaryBuffer inputs_summary{};
     if (internal_stats_.has_proximal_level_output) {
       ROCKS_LOG_BUFFER(
           log_buffer_,
@@ -3277,7 +3277,7 @@ void CompactionJob::LogCompaction() {
   // Let's check if anything will get logged. Don't prepare all the info if
   // we're not logging
   if (db_options_.info_log_level <= InfoLogLevel::INFO_LEVEL) {
-    Compaction::InputLevelSummaryBuffer inputs_summary;
+    Compaction::InputLevelSummaryBuffer inputs_summary{};
     ROCKS_LOG_INFO(
         db_options_.info_log, "[%s] [JOB %d] Compacting %s, score %.2f",
         cfd->GetName().c_str(), job_id_,

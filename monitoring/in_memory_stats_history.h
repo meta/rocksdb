@@ -62,7 +62,7 @@ class InMemoryStatsHistoryIterator final : public StatsHistoryIterator {
   // between [start_time, end_time)
   void AdvanceIteratorByTime(uint64_t start_time, uint64_t end_time);
 
-  uint64_t time_;
+  uint64_t time_ = 0;
   uint64_t start_time_;
   uint64_t end_time_;
   std::map<std::string, uint64_t> stats_map_;

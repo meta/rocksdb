@@ -70,15 +70,14 @@ class AlignedBuffer {
                                          ExternalAllocation* out)>;
 
  private:
-  size_t alignment_;
+  size_t alignment_ = 0;
   FSAllocationPtr buf_;
-  size_t capacity_;
-  size_t cursize_;
-  char* bufstart_;
+  size_t capacity_ = 0;
+  size_t cursize_ = 0;
+  char* bufstart_ = nullptr;
 
  public:
-  AlignedBuffer()
-      : alignment_(), capacity_(0), cursize_(0), bufstart_(nullptr) {}
+  AlignedBuffer() = default;
 
   AlignedBuffer(AlignedBuffer&& o) noexcept { *this = std::move(o); }
 

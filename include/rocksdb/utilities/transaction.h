@@ -779,7 +779,7 @@ class Transaction {
 
   // the log in which the prepared section for this txn resides
   // (for two phase commit)
-  uint64_t log_number_;
+  uint64_t log_number_ = 0;
   TransactionName name_;
 
   // Execution status of the transaction.

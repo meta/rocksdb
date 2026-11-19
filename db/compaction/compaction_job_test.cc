@@ -793,7 +793,7 @@ class CompactionJobTestBase : public testing::Test {
   std::atomic<bool> shutting_down_;
   std::shared_ptr<mock::MockTableFactory> mock_table_factory_;
   CompactionJobStats compaction_job_stats_;
-  ColumnFamilyData* cfd_;
+  ColumnFamilyData* cfd_ = nullptr;
   std::unique_ptr<CompactionFilter> compaction_filter_;
   std::shared_ptr<MergeOperator> merge_op_;
   ErrorHandler error_handler_;

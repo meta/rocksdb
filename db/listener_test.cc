@@ -491,7 +491,7 @@ class TestFlushListener : public EventListener {
   std::vector<DB*> flushed_dbs_;
   int slowdown_count;
   int stop_count;
-  bool db_closing;
+  bool db_closing = false;
   std::atomic_bool db_closed;
   TableFileCreationInfo prev_fc_info_;
 
@@ -956,12 +956,6 @@ class TableFileCreationListener : public EventListener {
     IOStatus status_;
   };
 
-  TableFileCreationListener() {
-    for (int i = 0; i < 2; i++) {
-      started_[i] = finished_[i] = failure_[i] = 0;
-    }
-  }
-
   int Index(TableFileCreationReason reason) {
     int idx;
     switch (reason) {
@@ -1033,9 +1027,9 @@ class TableFileCreationListener : public EventListener {
     }
   }
 
-  int started_[2];
-  int finished_[2];
-  int failure_[2];
+  int started_[2]{};
+  int finished_[2]{};
+  int failure_[2]{};
   Status last_failure_;
 };
 
@@ -1298,7 +1292,7 @@ TEST_F(EventListenerTest, TableFileCreationByFIFOTemperatureChangeCopy) {
 
 class MemTableSealedListener : public EventListener {
  private:
-  SequenceNumber latest_seq_number_;
+  SequenceNumber latest_seq_number_ = 0;
 
  public:
   MemTableSealedListener() = default;

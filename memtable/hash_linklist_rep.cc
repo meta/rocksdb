@@ -865,7 +865,7 @@ class HashLinkListRepFactory : public MemTableRepFactory {
   const char* NickName() const override { return kNickName(); }
 
  private:
-  HashLinkListRepOptions options_;
+  HashLinkListRepOptions options_{};
 };
 
 }  // namespace

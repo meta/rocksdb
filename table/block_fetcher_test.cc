@@ -274,7 +274,7 @@ class BlockFetcherTest : public testing::Test {
 
  private:
   std::string test_dir_;
-  Env* env_;
+  Env* env_ = nullptr;
   std::shared_ptr<FileSystem> fs_;
   BlockBasedTableFactory table_factory_;
   Options options_;
@@ -434,7 +434,7 @@ TEST_F(BlockFetcherTest, FetchIndexBlock) {
     CreateTable(table_name, compression);
 
     CountedMemoryAllocator allocator;
-    MemcpyStats memcpy_stats;
+    MemcpyStats memcpy_stats{};
     BlockContents indexes[NumModes];
     std::string index_datas[NumModes];
     for (int i = 0; i < NumModes; ++i) {

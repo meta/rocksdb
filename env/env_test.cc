@@ -427,7 +427,7 @@ TEST_F(EnvPosixTest, DISABLED_FilePermission) {
     std::unique_ptr<RandomRWFile> rwfile;
     ASSERT_OK(env_->NewRandomRWFile(fileNames[1], &rwfile, soptions));
 
-    struct stat sb;
+    struct stat sb{};
     for (const auto& filename : fileNames) {
       if (::stat(filename.c_str(), &sb) == 0) {
         ASSERT_EQ(sb.st_mode & 0777, 0644);
@@ -693,8 +693,8 @@ TEST_P(EnvPosixTestWithParam, RunMany) {
 
 struct State {
   port::Mutex mu;
-  int val;
-  int num_running;
+  int val = 0;
+  int num_running = 0;
 };
 
 static void ThreadBody(void* arg) {
@@ -1298,7 +1298,7 @@ class IoctlFriendlyTmpdir {
     // check if it's running test within a docker container, in which case, the
     // file system inside `overlayfs` may not support FS_IOC_GETVERSION
     // skip the tests
-    struct stat buffer;
+    struct stat buffer{};
     if (stat("/.dockerenv", &buffer) == 0) {
       is_supported_ = false;
       return;
@@ -1458,7 +1458,7 @@ TEST_P(EnvPosixTestWithParam, AllocateTest) {
     ASSERT_OK(wfile->Append(data));
     ASSERT_OK(wfile->Flush());
 
-    struct stat f_stat;
+    struct stat f_stat{};
     ASSERT_EQ(stat(fname.c_str(), &f_stat), 0);
     ASSERT_EQ((unsigned int)kDataSize, f_stat.st_size);
     // btrfs (and other CoW filesystems) accept fallocate but use
@@ -1469,7 +1469,7 @@ TEST_P(EnvPosixTestWithParam, AllocateTest) {
     // blocks in st_blocks reliably.
     bool skip_block_checks = false;
 #ifdef OS_LINUX
-    struct statfs fs_stat;
+    struct statfs fs_stat{};
     if (statfs(fname.c_str(), &fs_stat) == 0) {
       if (fs_stat.f_type ==
           static_cast<decltype(fs_stat.f_type)>(BTRFS_SUPER_MAGIC)) {
@@ -2252,9 +2252,9 @@ class TestLogger : public Logger {
       }
     }
   }
-  int log_count;
-  int char_x_count;
-  int char_0_count;
+  int log_count = 0;
+  int char_x_count = 0;
+  int char_0_count = 0;
 };
 
 TEST_P(EnvPosixTestWithParam, LogBufferTest) {
@@ -2726,7 +2726,7 @@ class RandomRWFileWithMirrorString {
     }
   }
 
-  char buf_[10000];
+  char buf_[10000]{};
   RandomRWFile* file_;
   std::string file_mirror_;
 };
@@ -3877,8 +3877,8 @@ class ReadAsyncFS;
 
 struct MockIOHandle {
   std::function<void(FSReadRequest&, void*)> cb;
-  void* cb_arg;
-  bool create_io_error;
+  void* cb_arg = nullptr;
+  bool create_io_error = false;
 };
 
 // ReadAsyncFS and ReadAsyncRandomAccessFile mocks the FS doing asynchronous

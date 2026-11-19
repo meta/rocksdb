@@ -20,7 +20,8 @@ namespace ROCKSDB_NAMESPACE {
 ExpectedState::ExpectedState(size_t max_key, size_t num_column_families)
     : max_key_(max_key),
       num_column_families_(num_column_families),
-      values_(nullptr) {}
+      values_(nullptr),
+      persisted_seqno_(nullptr) {}
 
 void ExpectedState::ClearColumnFamily(int cf) {
   const uint32_t del_mask = ExpectedValue::GetDelMask();

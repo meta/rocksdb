@@ -252,7 +252,7 @@ namespace {
 // Used only for benchmarking, so degrading to -1 (reported as N/A) is fine.
 int64_t ProcessCpuMicros() {
 #if !defined(OS_WIN) && defined(CLOCK_PROCESS_CPUTIME_ID)
-  struct timespec ts;
+  struct timespec ts{};
   if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) == 0) {
     return static_cast<int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
   }

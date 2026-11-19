@@ -4024,7 +4024,7 @@ class FilePrefetchBufferTest : public testing::Test {
   Statistics* stats() { return stats_.get(); }
 
  private:
-  Env* env_;
+  Env* env_ = nullptr;
   std::shared_ptr<FileSystem> fs_;
   std::string test_dir_;
   std::shared_ptr<Statistics> stats_;
@@ -4567,7 +4567,7 @@ class FSBufferPrefetchTest
   SystemClock* clock() { return env_->GetSystemClock().get(); }
 
  private:
-  Env* env_;
+  Env* env_ = nullptr;
   std::shared_ptr<FileSystem> fs_;
   std::string test_dir_;
   std::shared_ptr<Statistics> stats_;

@@ -160,7 +160,7 @@ TEST_F(IOTracerTest, MultipleRecordsWithDifferentIOOpOptions) {
     ASSERT_OK(NewFileTraceReader(env_, env_options_, trace_file_path_,
                                  &trace_reader));
     IOTraceReader reader(std::move(trace_reader));
-    IOTraceHeader header;
+    IOTraceHeader header{};
     ASSERT_OK(reader.ReadHeader(&header));
     ASSERT_EQ(kMajorVersion, static_cast<int>(header.rocksdb_major_version));
     ASSERT_EQ(kMinorVersion, static_cast<int>(header.rocksdb_minor_version));
@@ -233,7 +233,7 @@ TEST_F(IOTracerTest, AtomicWrite) {
     ASSERT_OK(NewFileTraceReader(env_, env_options_, trace_file_path_,
                                  &trace_reader));
     IOTraceReader reader(std::move(trace_reader));
-    IOTraceHeader header;
+    IOTraceHeader header{};
     ASSERT_OK(reader.ReadHeader(&header));
     ASSERT_EQ(kMajorVersion, static_cast<int>(header.rocksdb_major_version));
     ASSERT_EQ(kMinorVersion, static_cast<int>(header.rocksdb_minor_version));
@@ -268,7 +268,7 @@ TEST_F(IOTracerTest, AtomicWriteBeforeStartTrace) {
     ASSERT_OK(NewFileTraceReader(env_, env_options_, trace_file_path_,
                                  &trace_reader));
     IOTraceReader reader(std::move(trace_reader));
-    IOTraceHeader header;
+    IOTraceHeader header{};
     ASSERT_NOK(reader.ReadHeader(&header));
   }
 }
@@ -300,7 +300,7 @@ TEST_F(IOTracerTest, AtomicNoWriteAfterEndTrace) {
     ASSERT_OK(NewFileTraceReader(env_, env_options_, trace_file_path_,
                                  &trace_reader));
     IOTraceReader reader(std::move(trace_reader));
-    IOTraceHeader header;
+    IOTraceHeader header{};
     ASSERT_OK(reader.ReadHeader(&header));
     ASSERT_EQ(kMajorVersion, static_cast<int>(header.rocksdb_major_version));
     ASSERT_EQ(kMinorVersion, static_cast<int>(header.rocksdb_minor_version));
@@ -334,7 +334,7 @@ TEST_F(IOTracerTest, AtomicMultipleWrites) {
     ASSERT_OK(NewFileTraceReader(env_, env_options_, trace_file_path_,
                                  &trace_reader));
     IOTraceReader reader(std::move(trace_reader));
-    IOTraceHeader header;
+    IOTraceHeader header{};
     ASSERT_OK(reader.ReadHeader(&header));
     ASSERT_EQ(kMajorVersion, static_cast<int>(header.rocksdb_major_version));
     ASSERT_EQ(kMinorVersion, static_cast<int>(header.rocksdb_minor_version));

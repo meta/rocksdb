@@ -9,6 +9,7 @@
 
 #pragma once
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -122,8 +123,6 @@ class DBIter final : public Iterator {
   // The purpose of this approach is to avoid perf regression happening
   // when multiple threads bump the atomic counters from a DBIter::Next().
   struct LocalStatistics {
-    explicit LocalStatistics() { ResetCounters(); }
-
     void ResetCounters() {
       next_count_ = 0;
       next_found_count_ = 0;
@@ -145,17 +144,17 @@ class DBIter final : public Iterator {
     }
 
     // Map to Tickers::NUMBER_DB_NEXT
-    uint64_t next_count_;
+    uint64_t next_count_ = 0;
     // Map to Tickers::NUMBER_DB_NEXT_FOUND
-    uint64_t next_found_count_;
+    uint64_t next_found_count_ = 0;
     // Map to Tickers::NUMBER_DB_PREV
-    uint64_t prev_count_;
+    uint64_t prev_count_ = 0;
     // Map to Tickers::NUMBER_DB_PREV_FOUND
-    uint64_t prev_found_count_;
+    uint64_t prev_found_count_ = 0;
     // Map to Tickers::ITER_BYTES_READ
-    uint64_t bytes_read_;
+    uint64_t bytes_read_ = 0;
     // Map to Tickers::NUMBER_ITER_SKIP
-    uint64_t skip_count_;
+    uint64_t skip_count_ = 0;
   };
 
   // No copying allowed
@@ -704,7 +703,7 @@ class DBIter final : public Iterator {
   // sequence number if the seqno to time mapping is available. For a
   // kTypeValuePreferredSeqno entry, this is the write time specified by the
   // user.
-  uint64_t saved_write_unix_time_;
+  uint64_t saved_write_unix_time_ = std::numeric_limits<uint64_t>::max();
   DirtyTracked<ValueColumnsState> value_columns_state_;
   Slice pinned_value_;
   Statistics* statistics_;

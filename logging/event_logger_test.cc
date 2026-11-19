@@ -23,7 +23,7 @@ class StringLogger : public Logger {
   char* buffer() { return buffer_; }
 
  private:
-  char buffer_[1000];
+  char buffer_[1000] = {};
 };
 
 TEST_F(EventLoggerTest, SimpleTest) {

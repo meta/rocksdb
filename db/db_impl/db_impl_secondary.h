@@ -61,10 +61,11 @@ class LogReaderContainer {
 
  private:
   struct LogReporter : public log::Reader::Reporter {
-    Env* env;
-    Logger* info_log;
+    Env* env = nullptr;
+    Logger* info_log = nullptr;
     std::string fname;
-    Status* status;  // nullptr if immutable_db_options_.paranoid_checks==false
+    // nullptr if immutable_db_options_.paranoid_checks==false
+    Status* status = nullptr;
     void Corruption(size_t bytes, const Status& s,
                     uint64_t /*log_number*/ = kMaxSequenceNumber) override {
       ROCKS_LOG_WARN(info_log, "%s%s: dropping %d bytes; %s",

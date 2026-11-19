@@ -65,7 +65,7 @@ class RandomAccessFileReaderTest : public testing::Test {
   }
 
  protected:
-  Env* env_;
+  Env* env_ = nullptr;
   std::shared_ptr<FileSystem> fs_;
   std::string test_dir_;
 

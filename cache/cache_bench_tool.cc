@@ -448,7 +448,7 @@ class CacheBench {
 
   void PopulateCache() {
     Random64 rnd(FLAGS_seed);
-    KeyGen keygen;
+    KeyGen keygen{};
     size_t max_occ = 0;
     size_t inserts_since_max_occ_increase = 0;
     size_t keys_since_last_not_found = 0;
@@ -711,7 +711,7 @@ class CacheBench {
     // For this thread. Some round up, some round down, as appropriate
     size_t pin_count = (total_pin_count + thread->tid) / FLAGS_threads;
 
-    KeyGen gen;
+    KeyGen gen{};
     const auto clock = SystemClock::Default().get();
     uint64_t start_time = clock->NowMicros();
     StopWatchNano timer(clock);

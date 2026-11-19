@@ -108,8 +108,8 @@ class DeleteSchedulerTest : public testing::Test {
 
   Env* env_;
   std::vector<std::string> dummy_files_dirs_;
-  int64_t rate_bytes_per_sec_;
-  DeleteScheduler* delete_scheduler_;
+  int64_t rate_bytes_per_sec_ = 0;
+  DeleteScheduler* delete_scheduler_ = nullptr;
   std::unique_ptr<SstFileManagerImpl> sst_file_mgr_;
   std::shared_ptr<Statistics> stats_;
 };

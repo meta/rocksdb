@@ -118,13 +118,13 @@ class WriteCallbackPTest
   }
 
  protected:
-  bool unordered_write_;
-  bool seq_per_batch_;
-  bool two_queues_;
-  bool allow_parallel_;
-  bool allow_batching_;
-  bool enable_WAL_;
-  bool enable_pipelined_write_;
+  bool unordered_write_ = false;
+  bool seq_per_batch_ = false;
+  bool two_queues_ = false;
+  bool allow_parallel_ = false;
+  bool allow_batching_ = false;
+  bool enable_WAL_ = false;
+  bool enable_pipelined_write_ = false;
 };
 
 TEST_P(WriteCallbackPTest, WriteWithCallbackTest) {

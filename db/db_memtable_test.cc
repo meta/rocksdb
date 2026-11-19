@@ -73,8 +73,8 @@ class MockMemTableRep : public MemTableRep {
 
  private:
   std::unique_ptr<MemTableRep> rep_;
-  void* last_hint_in_;
-  void* last_hint_out_;
+  void* last_hint_in_ = nullptr;
+  void* last_hint_out_ = nullptr;
   int num_insert_with_hint_;
 };
 
@@ -109,7 +109,7 @@ class MockMemTableRepFactory : public MemTableRepFactory {
   uint32_t GetLastColumnFamilyId() { return last_column_family_id_; }
 
  private:
-  MockMemTableRep* mock_rep_;
+  MockMemTableRep* mock_rep_ = nullptr;
   // workaround since there's no std::numeric_limits<uint32_t>::max() yet.
   uint32_t last_column_family_id_ = static_cast<uint32_t>(-1);
 };

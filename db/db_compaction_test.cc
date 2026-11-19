@@ -523,7 +523,7 @@ class DBCompactionWaitForCompactTest
   bool abort_on_pause_;
   bool flush_;
   bool close_db_;
-  std::chrono::microseconds timeout_;
+  std::chrono::microseconds timeout_{};
   Options options_;
   WaitForCompactOptions wait_for_compact_options_;
 

@@ -186,7 +186,7 @@ struct DecompressorDict {
   std::unique_ptr<Decompressor> decompressor_;
 
   // Approximate owned memory usage
-  size_t memory_usage_;
+  size_t memory_usage_ = 0;
 
   DecompressorDict(std::string&& dict, Decompressor& from_decompressor)
       : dict_str_(std::move(dict)) {
@@ -722,7 +722,6 @@ class ZSTDStreamingCompress final : public StreamingCompress {
     // Each compressed frame will have a checksum
     ZSTD_CCtx_setParameter(cctx_, ZSTD_c_checksumFlag, 1);
     assert(cctx_ != nullptr);
-    input_buffer_ = {/*src=*/nullptr, /*size=*/0, /*pos=*/0};
 #endif
   }
   ~ZSTDStreamingCompress() override {
@@ -740,7 +739,7 @@ class ZSTDStreamingCompress final : public StreamingCompress {
   void Reset() override;
 #ifdef ZSTD
   ZSTD_CCtx* cctx_;
-  ZSTD_inBuffer input_buffer_;
+  ZSTD_inBuffer input_buffer_ = {/*src=*/nullptr, /*size=*/0, /*pos=*/0};
 #endif
 };
 
@@ -752,7 +751,6 @@ class ZSTDStreamingUncompress final : public StreamingUncompress {
 #ifdef ZSTD
     dctx_ = ZSTD_createDCtx();
     assert(dctx_ != nullptr);
-    input_buffer_ = {/*src=*/nullptr, /*size=*/0, /*pos=*/0};
 #endif
   }
   ~ZSTDStreamingUncompress() override {
@@ -772,7 +770,7 @@ class ZSTDStreamingUncompress final : public StreamingUncompress {
  private:
 #ifdef ZSTD
   ZSTD_DCtx* dctx_;
-  ZSTD_inBuffer input_buffer_;
+  ZSTD_inBuffer input_buffer_ = {/*src=*/nullptr, /*size=*/0, /*pos=*/0};
 #endif
 };
 

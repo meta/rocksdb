@@ -902,16 +902,16 @@ struct rocksdb_compactionfilterfactory_t : public CompactionFilterFactory {
 };
 
 struct rocksdb_comparator_t : public Comparator {
-  void* state_;
-  void (*destructor_)(void*);
+  void* state_ = nullptr;
+  void (*destructor_)(void*) = nullptr;
   int (*compare_)(void*, const char* a, size_t alen, const char* b,
-                  size_t blen);
-  const char* (*name_)(void*);
+                  size_t blen) = nullptr;
+  const char* (*name_)(void*) = nullptr;
   int (*compare_ts_)(void*, const char* a_ts, size_t a_tslen, const char* b_ts,
-                     size_t b_tslen);
+                     size_t b_tslen) = nullptr;
   int (*compare_without_ts_)(void*, const char* a, size_t alen,
                              unsigned char a_has_ts, const char* b, size_t blen,
-                             unsigned char b_has_ts);
+                             unsigned char b_has_ts) = nullptr;
 
   rocksdb_comparator_t() : Comparator() {}
 
@@ -4077,10 +4077,11 @@ void rocksdb_writebatch_delete_rangev_cf(
 
 class H : public WriteBatch::Handler {
  public:
-  void* state_;
-  void (*put_)(void*, const char* k, size_t klen, const char* v, size_t vlen);
-  void (*deleted_)(void*, const char* k, size_t klen);
-  void (*log_data_)(void*, const char* blob, size_t blob_len);
+  void* state_ = nullptr;
+  void (*put_)(void*, const char* k, size_t klen, const char* v,
+               size_t vlen) = nullptr;
+  void (*deleted_)(void*, const char* k, size_t klen) = nullptr;
+  void (*log_data_)(void*, const char* blob, size_t blob_len) = nullptr;
 
   void Put(const Slice& key, const Slice& value) override {
     (*put_)(state_, key.data(), key.size(), value.data(), value.size());
@@ -4098,13 +4099,14 @@ class H : public WriteBatch::Handler {
 
 class HCF : public WriteBatch::Handler {
  public:
-  void* state_;
+  void* state_ = nullptr;
   void (*put_cf_)(void*, uint32_t cfid, const char* k, size_t klen,
-                  const char* v, size_t vlen);
-  void (*deleted_cf_)(void*, uint32_t cfid, const char* k, size_t klen);
+                  const char* v, size_t vlen) = nullptr;
+  void (*deleted_cf_)(void*, uint32_t cfid, const char* k,
+                      size_t klen) = nullptr;
   void (*merge_cf_)(void*, uint32_t cfid, const char* k, size_t klen,
-                    const char* v, size_t vlen);
-  void (*log_data_)(void*, const char* blob, size_t blob_len);
+                    const char* v, size_t vlen) = nullptr;
+  void (*log_data_)(void*, const char* blob, size_t blob_len) = nullptr;
 
   Status PutCF(uint32_t column_family_id, const Slice& key,
                const Slice& value) override {

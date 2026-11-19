@@ -218,7 +218,7 @@ class PrefixFullBloomWithReverseComparator
   PrefixFullBloomWithReverseComparator()
       : DBTestBase("prefix_bloom_reverse", /*env_do_fsync=*/true) {}
   void SetUp() override { if_cache_filter_ = GetParam(); }
-  bool if_cache_filter_;
+  bool if_cache_filter_ = false;
 };
 
 TEST_P(PrefixFullBloomWithReverseComparator,
@@ -363,8 +363,8 @@ class DBTestSharedWriteBufferAcrossCFs
     use_old_interface_ = std::get<0>(GetParam());
     cost_cache_ = std::get<1>(GetParam());
   }
-  bool use_old_interface_;
-  bool cost_cache_;
+  bool use_old_interface_ = false;
+  bool cost_cache_ = false;
 };
 
 TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
@@ -2062,8 +2062,8 @@ class PinL0IndexAndFilterBlocksTest
     table_options.block_cache->EraseUnRefEntries();
   }
 
-  bool infinite_max_files_;
-  bool disallow_preload_;
+  bool infinite_max_files_ = false;
+  bool disallow_preload_ = false;
 };
 
 TEST_P(PinL0IndexAndFilterBlocksTest,
@@ -3389,8 +3389,8 @@ class CancelCompactionListener : public EventListener {
 
   std::atomic<size_t> num_compaction_started_;
   std::atomic<size_t> num_compaction_ended_;
-  Status::Code code_;
-  Status::SubCode subcode_;
+  Status::Code code_ = Status::kOk;
+  Status::SubCode subcode_ = Status::kNone;
 };
 
 TEST_F(DBTest2, CancelManualCompactionWithListener) {
@@ -7476,11 +7476,11 @@ TEST_F(DBTest2, VariousFileTemperatures) {
       }
     }
 
-    Temperature optimize_manifest_temperature;
-    Temperature optimize_wal_temperature;
-    Temperature expected_manifest_temperature;
-    Temperature expected_other_metadata_temperature;
-    Temperature expected_wal_temperature;
+    Temperature optimize_manifest_temperature = Temperature::kUnknown;
+    Temperature optimize_wal_temperature = Temperature::kUnknown;
+    Temperature expected_manifest_temperature = Temperature::kUnknown;
+    Temperature expected_other_metadata_temperature = Temperature::kUnknown;
+    Temperature expected_wal_temperature = Temperature::kUnknown;
     std::array<RelaxedAtomic<int>, kNumberFileTypes> counts;
   };
 

@@ -1670,7 +1670,7 @@ class BlobSourceCacheReservationTest : public DBTestBase {
   std::vector<Slice> blobs_;
   std::vector<std::string> key_strs_;
   std::vector<std::string> blob_strs_;
-  uint64_t blob_file_size_;
+  uint64_t blob_file_size_ = 0;
 
   Options options_;
   std::string db_id_;

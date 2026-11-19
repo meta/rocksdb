@@ -517,7 +517,7 @@ Status Footer::DecodeFrom(Slice input, uint64_t input_offset,
     }
     // This is the most convenient place to compute the checksum
     if (checksum_type_ != kNoChecksum && format_version_ >= 6) {
-      std::array<char, kNewVersionsEncodedLength> copy_without_checksum;
+      std::array<char, kNewVersionsEncodedLength> copy_without_checksum{};
       std::copy_n(input.data(), kNewVersionsEncodedLength,
                   copy_without_checksum.data());
       EncodeFixed32(&copy_without_checksum[5], 0);  // Clear embedded checksum
@@ -660,7 +660,7 @@ static Status ReadFooterFromFileInternal(
                               file->file_name());
   }
 
-  std::array<char, Footer::kMaxEncodedLength + 1> footer_buf;
+  std::array<char, Footer::kMaxEncodedLength + 1> footer_buf{};
   AlignedBuffer direct_io_buffer;
   Slice footer_input;
   uint64_t read_offset = (expected_file_size > Footer::kMaxEncodedLength)

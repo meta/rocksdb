@@ -592,9 +592,9 @@ class BackupEngineImpl {
 
   struct BackupAfterCopyOrCreateWorkItem {
     std::future<WorkItemResult> result;
-    bool shared;
-    bool needed_to_copy;
-    Env* backup_env;
+    bool shared = false;
+    bool needed_to_copy = false;
+    Env* backup_env = nullptr;
     std::string dst_path_tmp;
     std::string dst_path;
     std::string dst_relative;
@@ -638,7 +638,7 @@ class BackupEngineImpl {
   struct ComputeChecksumWorkItem {
     std::future<WorkItemResult> result;
     std::string file_path;
-    uint64_t file_number;
+    uint64_t file_number = 0;
 
     ComputeChecksumWorkItem(std::future<WorkItemResult>&& _result,
                             const std::string& _file_path,

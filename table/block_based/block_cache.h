@@ -106,8 +106,8 @@ struct BlockCreateContext : public Cache::CreateContext {
   Decompressor* decompressor = nullptr;
   const Comparator* raw_ucmp = nullptr;
   uint8_t protection_bytes_per_key = 0;
-  bool index_value_is_full;
-  bool index_has_first_key;
+  bool index_value_is_full = false;
+  bool index_has_first_key = false;
   // format_version >= 8 index value-delta escape codec (see IndexValue).
   bool index_value_delta_escape = false;
   // Whether index keys are internal keys (vs. user keys). Only used to rule

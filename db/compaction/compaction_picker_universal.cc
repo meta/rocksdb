@@ -453,9 +453,9 @@ class UniversalCompactionBuilder {
 
   const ImmutableOptions& ioptions_;
   const InternalKeyComparator* icmp_;
-  double score_;
+  double score_ = 0;
   std::vector<SortedRun> sorted_runs_;
-  uint64_t max_run_size_;
+  uint64_t max_run_size_ = 0;
   const std::string& cf_name_;
   const MutableCFOptions& mutable_cf_options_;
   const MutableDBOptions& mutable_db_options_;
@@ -795,7 +795,7 @@ Compaction* UniversalCompactionBuilder::PickCompaction() {
     return nullptr;
   }
 
-  VersionStorageInfo::LevelSummaryStorage tmp;
+  VersionStorageInfo::LevelSummaryStorage tmp{};
   ROCKS_LOG_BUFFER_MAX_SZ(
       log_buffer_, 3072,
       "[%s] Universal: sorted runs: %" ROCKSDB_PRIszt " files: %s\n",

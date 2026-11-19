@@ -60,7 +60,7 @@ class FaultInjectionTest
   // When need to make sure data is persistent, call DB::CompactRange()
   bool sync_use_compact_;
 
-  bool sequential_order_;
+  bool sequential_order_ = false;
 
  public:
   enum ExpectedVerifResult { kValExpectFound, kValExpectNoError };
@@ -356,7 +356,7 @@ class FaultInjectionTest
   }
 
  private:
-  Env* system_env_;
+  Env* system_env_ = nullptr;
   std::shared_ptr<Env> env_guard_;
 };
 

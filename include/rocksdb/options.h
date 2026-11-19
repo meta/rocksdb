@@ -472,28 +472,28 @@ struct CompactionServiceJobInfo {
   std::string db_session_id;
 
   // the id of the column family where the compaction happened.
-  uint32_t cf_id;
+  uint32_t cf_id = 0;
   // the name of the column family where the compaction happened.
   std::string cf_name;
 
-  uint64_t job_id;  // job_id is only unique within the current DB and session,
-                    // restart DB will reset the job_id. `db_id` and
-                    // `db_session_id` could help you build unique id across
-                    // different DBs and sessions.
+  uint64_t job_id = 0;  // job_id is only unique within the current DB and
+                        // session, restart DB will reset the job_id. `db_id`
+                        // and `db_session_id` could help you build unique id
+                        // across different DBs and sessions.
 
-  Env::Priority priority;
+  Env::Priority priority = Env::LOW;
 
   // Additional Compaction Details that can be useful in the CompactionService
-  CompactionReason compaction_reason;
-  bool is_full_compaction;
-  bool is_manual_compaction;
-  bool bottommost_level;
+  CompactionReason compaction_reason = CompactionReason::kUnknown;
+  bool is_full_compaction = false;
+  bool is_manual_compaction = false;
+  bool bottommost_level = false;
 
   // the smallest input level of the compaction.
   // (same as Compaction::start_level and CompactionJobInfo::base_input_level)
-  int base_input_level;
+  int base_input_level = 0;
   // the output level of the compaction.
-  int output_level;
+  int output_level = 0;
 
   // The execution pool selected for this job, independent of later DB option
   // updates.

@@ -1579,7 +1579,7 @@ TEST_F(DBBlobBasicTest, GenerateIOTracing) {
         NewFileTraceReader(env_, EnvOptions(), trace_file, &trace_reader));
     IOTraceReader reader(std::move(trace_reader));
 
-    IOTraceHeader header;
+    IOTraceHeader header{};
     ASSERT_OK(reader.ReadHeader(&header));
     ASSERT_EQ(kMajorVersion, static_cast<int>(header.rocksdb_major_version));
     ASSERT_EQ(kMinorVersion, static_cast<int>(header.rocksdb_minor_version));

@@ -214,7 +214,7 @@ IOStatus CacheDumperImpl::WriteBlock(CacheDumpUnitType type, const Slice& key,
   // Second, create the metadata, which contains a sequence number, the dump
   // unit string checksum and the string size. The sequence number monotonically
   // increases from 0.
-  DumpUnitMeta unit_meta;
+  DumpUnitMeta unit_meta{};
   unit_meta.sequence_num = sequence_num_;
   sequence_num_++;
   unit_meta.dump_unit_checksum =
@@ -351,7 +351,7 @@ IOStatus CacheDumpedLoaderImpl::ReadDumpUnit(size_t len, std::string* data,
 // Read the header
 IOStatus CacheDumpedLoaderImpl::ReadHeader(std::string* data,
                                            DumpUnit* dump_unit) {
-  DumpUnitMeta header_meta;
+  DumpUnitMeta header_meta{};
   header_meta.reset();
   std::string meta_string;
   IOStatus io_s = ReadDumpUnitMeta(&meta_string, &header_meta);
@@ -374,7 +374,7 @@ IOStatus CacheDumpedLoaderImpl::ReadHeader(std::string* data,
 IOStatus CacheDumpedLoaderImpl::ReadCacheBlock(std::string* data,
                                                DumpUnit* dump_unit) {
   // According to the write process, we read the dump_unit_metadata first
-  DumpUnitMeta unit_meta;
+  DumpUnitMeta unit_meta{};
   unit_meta.reset();
   std::string unit_string;
   IOStatus io_s = ReadDumpUnitMeta(&unit_string, &unit_meta);

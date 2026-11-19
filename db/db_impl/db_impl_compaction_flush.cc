@@ -434,7 +434,7 @@ Status DBImpl::FlushMemTableToOutputFile(
     const VersionStorageInfo* const storage_info = current->storage_info();
     assert(storage_info);
 
-    VersionStorageInfo::LevelSummaryStorage tmp;
+    VersionStorageInfo::LevelSummaryStorage tmp{};
     ROCKS_LOG_BUFFER(log_buffer, "[%s] Level summary: %s\n",
                      column_family_name.c_str(),
                      storage_info->LevelSummary(&tmp));
@@ -1026,7 +1026,7 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
       const VersionStorageInfo* const storage_info = current->storage_info();
       assert(storage_info);
 
-      VersionStorageInfo::LevelSummaryStorage tmp;
+      VersionStorageInfo::LevelSummaryStorage tmp{};
       ROCKS_LOG_BUFFER(log_buffer, "[%s] Level summary: %s\n",
                        column_family_name.c_str(),
                        storage_info->LevelSummary(&tmp));
@@ -4288,7 +4288,7 @@ DBImpl::BGJobLimits DBImpl::GetBGJobLimits(int max_background_flushes,
                                            int max_background_compactions,
                                            int max_background_jobs,
                                            bool parallelize_compactions) {
-  BGJobLimits res;
+  BGJobLimits res{};
   if (max_background_flushes == -1 && max_background_compactions == -1) {
     // for our first stab implementing max_background_jobs, simply allocate a
     // quarter of the threads to flushes.
@@ -5789,7 +5789,7 @@ Status DBImpl::BackgroundCompaction(
         c->column_family_data(), job_context->superversion_contexts.data(),
         /*defer_snapshot_refresh=*/false);
 
-    VersionStorageInfo::LevelSummaryStorage tmp;
+    VersionStorageInfo::LevelSummaryStorage tmp{};
     c->column_family_data()->internal_stats()->IncBytesMoved(c->output_level(),
                                                              moved_bytes);
     {

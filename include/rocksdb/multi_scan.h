@@ -263,7 +263,7 @@ class MultiScan {
  private:
   ReadOptions read_options_;
   const MultiScanArgs scan_opts_;
-  DB* db_;
+  DB* db_{};
   ColumnFamilyHandle* cfh_{};
   Slice lower_bound_;
   Slice upper_bound_;

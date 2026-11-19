@@ -153,7 +153,7 @@ class WriteThread {
     Writer* link_older;  // read/write only before linking, or as leader
     Writer* link_newer;  // lazy, read/write only before linking, or as leader
 
-    bool ingest_wbwi;
+    bool ingest_wbwi = false;
 
     Writer()
         : batch(nullptr),

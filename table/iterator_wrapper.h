@@ -215,7 +215,7 @@ class IteratorWrapperBase {
 
   InternalIteratorBase<TValue>* iter_;
   IterateResult result_;
-  bool valid_;
+  bool valid_ = false;
 
 #ifdef ROCKSDB_ASSERT_STATUS_CHECKED
   mutable bool status_checked_after_invalid_ = true;

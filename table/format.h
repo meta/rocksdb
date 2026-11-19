@@ -458,7 +458,7 @@ class FooterBuilder {
 
  private:
   Slice slice_;
-  std::array<char, Footer::kMaxEncodedLength> data_;
+  std::array<char, Footer::kMaxEncodedLength> data_{};
 };
 
 // Set to true to allow unit testing of writing unsupported block-based table

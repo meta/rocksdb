@@ -104,8 +104,8 @@ class DBBloomFilterTestWithFormatParams
           std::tuple<std::string, FilterPartitioning, uint32_t>> {
  protected:
   std::string bfp_impl_;
-  double bits_per_key_;
-  uint32_t format_version_;
+  double bits_per_key_ = 0;
+  uint32_t format_version_ = 0;
 
  public:
   ~DBBloomFilterTestWithFormatParams() override = default;
@@ -2501,8 +2501,8 @@ class DBBloomFilterTestVaryPrefixAndFormatVer
     : public DBTestBase,
       public testing::WithParamInterface<std::tuple<bool, uint32_t>> {
  protected:
-  bool use_prefix_;
-  uint32_t format_version_;
+  bool use_prefix_ = false;
+  uint32_t format_version_ = 0;
 
  public:
   DBBloomFilterTestVaryPrefixAndFormatVer()
@@ -2556,7 +2556,7 @@ TEST_P(DBBloomFilterTestVaryPrefixAndFormatVer, PartitionedMultiGet) {
   // MultiGet In
   std::array<std::string, Q> keys;
   std::array<Slice, Q> key_slices;
-  std::array<ColumnFamilyHandle*, Q> column_families;
+  std::array<ColumnFamilyHandle*, Q> column_families{};
   // MultiGet Out
   std::array<Status, Q> statuses;
   std::array<PinnableSlice, Q> values;

@@ -164,7 +164,14 @@ Status PersistRocksDBOptions(const WriteOptions& write_options,
   return s;
 }
 
-RocksDBOptionsParser::RocksDBOptionsParser() { Reset(); }
+RocksDBOptionsParser::RocksDBOptionsParser()
+    : has_version_section_(false),
+      has_db_options_(false),
+      has_default_cf_options_(false),
+      db_version{},
+      opt_file_version{} {
+  Reset();
+}
 
 void RocksDBOptionsParser::Reset() {
   db_opt_ = DBOptions();
