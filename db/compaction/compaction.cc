@@ -1091,7 +1091,8 @@ int Compaction::EvaluateProximalLevel(
   }
 
   bool supports_per_key_placement =
-      mutable_cf_options.preclude_last_level_data_seconds > 0;
+      mutable_cf_options.preclude_last_level_data_seconds > 0 &&
+      !mutable_cf_options.enable_blob_files && vstorage->GetBlobFiles().empty();
 
   // it could be overridden by unittest
   TEST_SYNC_POINT_CALLBACK("Compaction::SupportsPerKeyPlacement:Enabled",
