@@ -37,6 +37,19 @@ T& AssertNotNull(T* ptr) {
   return *ptr;
 }
 
+// Ends a write stop and wakes the writers that wait for it. A stalled writer
+// checks WriteController::IsStopped() and then waits on the background
+// condition variable, both with the DB mutex held. So the token is released
+// and the signal is sent with the DB mutex held too. Otherwise both can happen
+// between the writer's check and its wait, the signal is lost, and the writer
+// waits forever.
+void EndWriteStop(DBImpl& db_impl,
+                  std::unique_ptr<WriteControllerToken>* stop_token) {
+  InstrumentedMutexLock lock(db_impl.mutex());
+  stop_token->reset();
+  db_impl.TEST_SignalAllBgCv();
+}
+
 }  // namespace
 
 class WritePreparedTransactionSeqnoTest : public ::testing::Test {
@@ -279,8 +292,7 @@ TEST_F(WritePreparedTransactionSeqnoTest,
   sync_point.SetCallBack("WriteThread::EnterUnbatchedNonBlocking:BeforeLock",
                          [&](void*) {
                            if (non_blocking_joins.fetch_add(1) == 1) {
-                             stop_token.reset();
-                             db_impl.TEST_SignalAllBgCv();
+                             EndWriteStop(db_impl, &stop_token);
                              sync_point.Process(test_prefix + ":writer_paused");
                            }
                          });
@@ -374,8 +386,7 @@ TEST_F(WritePreparedTransactionSeqnoTest,
   const bool synced =
       versions.LastSequence() == versions.LastAllocatedSequence();
 
-  stop_token.reset();
-  db_impl.TEST_SignalAllBgCv();
+  EndWriteStop(db_impl, &stop_token);
   committer.join();
   sync_point.DisableProcessing();
   sync_point.LoadDependency({});
