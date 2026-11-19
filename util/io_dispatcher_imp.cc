@@ -244,6 +244,7 @@ struct AsyncIOState {
   AlignedBuffer direct_io_buffer;
   void* io_handle = nullptr;
   IOHandleDeleter del_fn;
+  std::shared_ptr<IODebugContext> debug_context;
   uint64_t offset;
   // Captures ReadScopedIOConfig::read_buffer_requires_cleanup until async I/O
   // completion processing can attach the read buffer cleanup to BlockContents.
@@ -985,8 +986,9 @@ std::vector<size_t> IODispatcherImpl::Impl::ExecuteAsyncIO(
   // Get file and IO options
   auto* rep = job->table->get_rep();
   IOOptions io_opts;
+  IODebugContext dbg;
   Status s =
-      rep->file->PrepareIOOptions(job->job_options.read_options, io_opts);
+      rep->file->PrepareIOOptions(job->job_options.read_options, io_opts, &dbg);
   if (!s.ok()) {
     *out_status = s;
     return fallback_block_indices;
@@ -1000,6 +1002,9 @@ std::vector<size_t> IODispatcherImpl::Impl::ExecuteAsyncIO(
   // Submit async read requests and store them in the ReadSet
   for (size_t i = 0; i < read_reqs.size(); ++i) {
     auto async_state = std::make_shared<AsyncIOState>();
+    if (dbg.read_source_state != nullptr) {
+      async_state->debug_context = std::make_shared<IODebugContext>(dbg);
+    }
 
     async_state->offset = read_reqs[i].offset;
     async_state->read_buffer_requires_cleanup =
@@ -1071,7 +1076,7 @@ std::vector<size_t> IODispatcherImpl::Impl::ExecuteAsyncIO(
         read_scoped_io.use_read_scoped_direct_io
             ? nullptr
             : (direct_io ? &async_state->aligned_buf : nullptr),
-        /*dbg=*/nullptr, direct_io_context_arg);
+        async_state->debug_context.get(), direct_io_context_arg);
 
     if (s.IsNotSupported()) {
       // Async IO may be compiled in but unavailable at runtime. Fall back to
@@ -1124,8 +1129,9 @@ Status IODispatcherImpl::Impl::ExecuteSyncIO(
   // Get file and IO options
   auto* rep = job->table->get_rep();
   IOOptions io_opts;
-  if (Status s =
-          rep->file->PrepareIOOptions(job->job_options.read_options, io_opts);
+  IODebugContext dbg;
+  if (Status s = rep->file->PrepareIOOptions(job->job_options.read_options,
+                                             io_opts, &dbg);
       !s.ok()) {
 #ifdef ROCKSDB_ASSERT_STATUS_CHECKED
     permit_unchecked_read_req_statuses();
@@ -1196,7 +1202,7 @@ Status IODispatcherImpl::Impl::ExecuteSyncIO(
   // Execute MultiRead
   if (Status s =
           rep->file->MultiRead(io_opts, read_reqs.data(), read_reqs.size(),
-                               &direct_io_context, /*dbg=*/nullptr);
+                               &direct_io_context, &dbg);
       !s.ok()) {
 #ifdef ROCKSDB_ASSERT_STATUS_CHECKED
     permit_unchecked_read_req_statuses();

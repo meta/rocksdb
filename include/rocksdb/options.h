@@ -65,6 +65,7 @@ class IODispatcher;
 
 struct Options;
 struct DbPath;
+struct IODebugContext;
 
 using FileTypeSet = SmallEnumSet<FileType, FileType::kBlobFile>;
 using CompactionStyleSet =
@@ -2882,6 +2883,14 @@ struct ReadOptions {
   // request_id may not be unique to each RocksDB api call - it could refer to
   // an application level request that results in multiple RocksDB api calls
   const std::string* request_id = nullptr;
+
+  // Optional borrowed application IO diagnostic context. The caller must keep
+  // the context and its source-state binding alive and stable through the read,
+  // async completion callback, or iterator lifetime, including IO cleanup.
+  // Copies of ReadOptions do not extend the context's lifetime. Per-IO debug
+  // context copies independently retain shared diagnostic state after
+  // submission.
+  IODebugContext* io_debug_context = nullptr;
 
   // *** END per-request settings for internal team use only ***
 

@@ -6,7 +6,11 @@
 #include "file/random_access_file_reader.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <memory>
 
+#include "file/file_prefetch_buffer.h"
 #include "file/file_util.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
@@ -111,7 +115,256 @@ class ScratchObservingRandomAccessFile : public FSRandomAccessFileOwnerWrapper {
   bool* saw_null_scratch_;
 };
 
+class ReadSourceObservingFile : public FSRandomAccessFile {
+ public:
+  struct PendingRead {
+    ReadSourceObservingFile* file = nullptr;
+    bool completed = false;
+  };
+
+  IOStatus Read(uint64_t, size_t n, const IOOptions&, Slice* result,
+                char* scratch, IODebugContext* dbg) const override {
+    if (dbg != nullptr && dbg->read_source_state != nullptr) {
+      dbg->read_source_state->fetch_or(
+          static_cast<uint8_t>(ReadSource::kRemoteStorage),
+          std::memory_order_relaxed);
+    }
+    std::memset(scratch, 'x', n);
+    *result = Slice(scratch, n);
+    return IOStatus::OK();
+  }
+
+  IOStatus ReadAsync(FSReadRequest& req, const IOOptions&,
+                     std::function<void(FSReadRequest&, void*)> cb,
+                     void* cb_arg, void** io_handle, IOHandleDeleter* del_fn,
+                     IODebugContext* dbg) override {
+    pending_.offset = req.offset;
+    pending_.len = req.len;
+    pending_.scratch = req.scratch;
+    callback_ = std::move(cb);
+    callback_arg_ = cb_arg;
+    debug_context_ = dbg;
+    read_handle_ = new PendingRead{this};
+    *io_handle = read_handle_;
+    *del_fn = [](void* handle) {
+      PendingRead* pending = static_cast<PendingRead*>(handle);
+      EXPECT_TRUE(pending->completed);
+      pending->file->read_handle_ = nullptr;
+      delete pending;
+    };
+    return IOStatus::OK();
+  }
+
+  IODebugContext* debug_context() const { return debug_context_; }
+
+  void Complete() {
+    ASSERT_TRUE(callback_);
+    ASSERT_NE(nullptr, read_handle_);
+    read_handle_->completed = true;
+    if (debug_context_ != nullptr &&
+        debug_context_->read_source_state != nullptr) {
+      debug_context_->read_source_state->fetch_or(
+          static_cast<uint8_t>(ReadSource::kRemoteStorage),
+          std::memory_order_relaxed);
+    }
+    if (debug_context_ != nullptr) {
+      debug_context_->cost_info = uint64_t{11};
+      debug_context_->counters["completed_reads"] = 1;
+      debug_context_->msg = "filesystem completion diagnostics";
+    }
+    std::memset(pending_.scratch, 'x', pending_.len);
+    pending_.result = Slice(pending_.scratch, pending_.len);
+    pending_.status = IOStatus::OK();
+    std::function<void(FSReadRequest&, void*)> callback = std::move(callback_);
+    callback(pending_, callback_arg_);
+    // Filesystem completion may still inspect the debug context after callback.
+    if (debug_context_ != nullptr &&
+        debug_context_->read_source_state != nullptr) {
+      EXPECT_EQ(ReadSource::kRemoteStorage,
+                static_cast<ReadSource>(debug_context_->read_source_state->load(
+                    std::memory_order_relaxed)));
+    }
+    debug_context_ = nullptr;
+  }
+
+  void Abort() {
+    ASSERT_TRUE(callback_);
+    ASSERT_NE(nullptr, read_handle_);
+    read_handle_->completed = true;
+    pending_.status = IOStatus::Aborted();
+    std::function<void(FSReadRequest&, void*)> callback = std::move(callback_);
+    callback(pending_, callback_arg_);
+    debug_context_ = nullptr;
+  }
+
+ private:
+  PendingRead* read_handle_ = nullptr;
+  FSReadRequest pending_;
+  std::function<void(FSReadRequest&, void*)> callback_;
+  void* callback_arg_ = nullptr;
+  IODebugContext* debug_context_ = nullptr;
+};
+
+class ReadSourceObservingFS : public FileSystemWrapper {
+ public:
+  ReadSourceObservingFS() : FileSystemWrapper(FileSystem::Default()) {}
+
+  const char* Name() const override { return "ReadSourceObservingFS"; }
+
+  IOStatus Poll(std::vector<void*>& handles, size_t) override {
+    ++poll_count;
+    for (void* handle : handles) {
+      ReadSourceObservingFile::PendingRead* pending =
+          static_cast<ReadSourceObservingFile::PendingRead*>(handle);
+      if (!pending->completed) {
+        pending->file->Complete();
+      }
+    }
+    return IOStatus::OK();
+  }
+
+  IOStatus AbortIO(std::vector<void*>& handles) override {
+    for (void* handle : handles) {
+      ReadSourceObservingFile::PendingRead* pending =
+          static_cast<ReadSourceObservingFile::PendingRead*>(handle);
+      if (!pending->completed) {
+        pending->file->Abort();
+      }
+    }
+    return IOStatus::OK();
+  }
+
+  size_t poll_count = 0;
+};
+
 }  // namespace
+
+TEST(ReadSourceDebugContextTest, PrefetchForwardsDebugContext) {
+  std::unique_ptr<ReadSourceObservingFile> file(new ReadSourceObservingFile());
+  RandomAccessFileReader reader(std::move(file), "source-prefetch", nullptr);
+  IODebugContext source_dbg;
+  ReadOptions read_options;
+  read_options.io_debug_context = &source_dbg;
+  read_options.io_debug_context->read_source_state =
+      std::make_shared<std::atomic<uint8_t>>(
+          static_cast<uint8_t>(ReadSource::kUnknown));
+  IOOptions opts;
+  IODebugContext dbg;
+  ASSERT_OK(PrepareIOFromReadOptions(read_options, nullptr, opts, &dbg));
+  FilePrefetchBuffer buffer;
+  ASSERT_OK(buffer.Prefetch(opts, &reader, 0, 4096, &dbg));
+  EXPECT_EQ(ReadSource::kRemoteStorage,
+            static_cast<ReadSource>(
+                read_options.io_debug_context->read_source_state->load(
+                    std::memory_order_relaxed)));
+}
+
+TEST(ReadSourceDebugContextTest, AsyncPrefetchRetainsAttributionContext) {
+  std::unique_ptr<ReadSourceObservingFile> file(new ReadSourceObservingFile());
+  ReadSourceObservingFile* observed_file = file.get();
+  RandomAccessFileReader reader(std::move(file), "source-async", nullptr);
+  ReadSourceObservingFS fs;
+  std::unique_ptr<FilePrefetchBuffer> buffer(
+      new FilePrefetchBuffer(ReadaheadParams(), true, false, &fs));
+  std::weak_ptr<std::atomic<uint8_t>> weak_state;
+  {
+    IODebugContext source_dbg;
+    ReadOptions read_options;
+    read_options.io_debug_context = &source_dbg;
+    read_options.io_debug_context->read_source_state =
+        std::make_shared<std::atomic<uint8_t>>(
+            static_cast<uint8_t>(ReadSource::kUnknown));
+    weak_state = read_options.io_debug_context->read_source_state;
+    IOOptions opts;
+    IODebugContext dbg;
+    const std::string request_id = "source-request";
+    dbg.SetRequestId(&request_id);
+    dbg.cost_info = uint64_t{7};
+    ASSERT_OK(PrepareIOFromReadOptions(read_options, nullptr, opts, &dbg));
+    Slice result;
+    ASSERT_TRUE(buffer->PrefetchAsync(opts, &reader, 0, 4096, &result, &dbg)
+                    .IsTryAgain());
+    ASSERT_NE(nullptr, observed_file->debug_context());
+    EXPECT_NE(&dbg, observed_file->debug_context());
+    EXPECT_EQ(read_options.io_debug_context->read_source_state,
+              observed_file->debug_context()->read_source_state);
+    EXPECT_EQ(uint64_t{7}, std::any_cast<uint64_t>(
+                               observed_file->debug_context()->cost_info));
+  }
+  ASSERT_FALSE(weak_state.expired());
+  ASSERT_NE(nullptr, observed_file->debug_context()->request_id);
+  EXPECT_EQ("source-request", *observed_file->debug_context()->request_id);
+  std::shared_ptr<std::atomic<uint8_t>> retained_state = weak_state.lock();
+  IODebugContext* retained_debug = observed_file->debug_context();
+  observed_file->Complete();
+  EXPECT_EQ(
+      ReadSource::kRemoteStorage,
+      static_cast<ReadSource>(retained_state->load(std::memory_order_relaxed)));
+  EXPECT_EQ(uint64_t{11}, std::any_cast<uint64_t>(retained_debug->cost_info));
+  EXPECT_EQ(uint64_t{1}, retained_debug->counters.at("completed_reads"));
+  EXPECT_EQ("filesystem completion diagnostics", retained_debug->msg);
+  Slice prefetched;
+  Status status;
+  ASSERT_TRUE(buffer->TryReadFromCache(IOOptions(), &reader, 0, 4096,
+                                       &prefetched, &status));
+  ASSERT_OK(status);
+  EXPECT_EQ(4096, prefetched.size());
+  EXPECT_EQ(size_t{1}, fs.poll_count);
+  retained_state.reset();
+  buffer.reset();
+  EXPECT_TRUE(weak_state.expired());
+}
+
+TEST(ReadSourceDebugContextTest, InactiveAsyncContextRemainsBorrowed) {
+  std::unique_ptr<ReadSourceObservingFile> file(new ReadSourceObservingFile());
+  ReadSourceObservingFile* observed_file = file.get();
+  RandomAccessFileReader reader(std::move(file), "source-inactive", nullptr);
+  IODebugContext dbg;
+  FSReadRequest req;
+  std::string scratch(4096, '\0');
+  req.len = scratch.size();
+  req.scratch = scratch.data();
+  void* io_handle = nullptr;
+  IOHandleDeleter deleter;
+  bool completed = false;
+  ASSERT_OK(reader.ReadAsync(
+      req, IOOptions(), [&](FSReadRequest&, void*) { completed = true; },
+      nullptr, &io_handle, &deleter, nullptr, &dbg));
+  EXPECT_EQ(&dbg, observed_file->debug_context());
+  observed_file->Complete();
+  deleter(io_handle);
+  EXPECT_TRUE(completed);
+  EXPECT_OK(req.status);
+}
+
+TEST(ReadSourceDebugContextTest, CallerOutputsCoexistWithSourceAttribution) {
+  std::unique_ptr<ReadSourceObservingFile> file(new ReadSourceObservingFile());
+  ReadSourceObservingFile* observed_file = file.get();
+  RandomAccessFileReader reader(std::move(file), "source-output", nullptr);
+  IODebugContext dbg;
+  dbg.read_source_state = std::make_shared<std::atomic<uint8_t>>(
+      static_cast<uint8_t>(ReadSource::kUnknown));
+  dbg.cost_info = uint64_t{7};
+  FSReadRequest req;
+  std::string scratch(4096, '\0');
+  req.len = scratch.size();
+  req.scratch = scratch.data();
+  void* io_handle = nullptr;
+  IOHandleDeleter deleter;
+  ASSERT_OK(reader.ReadAsync(
+      req, IOOptions(), [](FSReadRequest&, void*) {}, nullptr, &io_handle,
+      &deleter, nullptr, &dbg));
+  EXPECT_EQ(&dbg, observed_file->debug_context());
+  observed_file->Complete();
+  EXPECT_EQ(ReadSource::kRemoteStorage,
+            static_cast<ReadSource>(
+                dbg.read_source_state->load(std::memory_order_relaxed)));
+  EXPECT_EQ(uint64_t{11}, std::any_cast<uint64_t>(dbg.cost_info));
+  EXPECT_EQ(uint64_t{1}, dbg.counters.at("completed_reads"));
+  EXPECT_EQ("filesystem completion diagnostics", dbg.msg);
+  deleter(io_handle);
+  EXPECT_OK(req.status);
+}
 
 #if defined(USE_COROUTINES)
 TEST_F(RandomAccessFileReaderTest, CountsCoroutineReadSyncFallback) {

@@ -114,7 +114,7 @@ inline bool BlockFetcher::TryGetFromPrefetchBuffer() {
     if (io_s.ok()) {
       bool read_from_prefetch_buffer = prefetch_buffer_->TryReadFromCache(
           opts, file_, handle_.offset(), block_size_with_trailer_, &slice_,
-          &io_s, for_compaction_);
+          &io_s, for_compaction_, &dbg);
       if (read_from_prefetch_buffer) {
         ProcessTrailerIfPresent();
         if (io_status_.ok()) {
@@ -332,7 +332,8 @@ IOStatus BlockFetcher::ReadAsyncBlockContents() {
         return io_s;
       }
       io_s = status_to_io_status(prefetch_buffer_->PrefetchAsync(
-          opts, file_, handle_.offset(), block_size_with_trailer_, &slice_));
+          opts, file_, handle_.offset(), block_size_with_trailer_, &slice_,
+          &dbg));
       if (io_s.IsTryAgain()) {
         return io_s;
       }

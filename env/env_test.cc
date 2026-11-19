@@ -22,6 +22,8 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <type_traits>
 #include <unordered_set>
 
 #ifdef OS_LINUX
@@ -65,6 +67,7 @@
 #endif
 #include "env/mock_env.h"
 #include "env/unique_id_gen.h"
+#include "file/file_util.h"
 #include "logging/log_buffer.h"
 #include "logging/logging.h"
 #include "options/options_helper.h"
@@ -75,6 +78,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/env_encryption.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/read_source.h"
 #include "rocksdb/system_clock.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "test_util/mock_time_env.h"
@@ -94,6 +98,152 @@
 namespace ROCKSDB_NAMESPACE {
 
 using port::kPageSize;
+
+static_assert(!std::is_copy_constructible_v<std::atomic<uint8_t>>);
+static_assert(!std::is_copy_assignable_v<std::atomic<uint8_t>>);
+static_assert(!std::is_move_constructible_v<std::atomic<uint8_t>>);
+static_assert(!std::is_move_assignable_v<std::atomic<uint8_t>>);
+
+TEST(ReadSourceStateTest, PrepareIOOptionsSharesStateWithDebugContext) {
+  IODebugContext source_dbg;
+  ReadOptions read_options;
+  read_options.io_debug_context = &source_dbg;
+  read_options.io_debug_context->read_source_state =
+      std::make_shared<std::atomic<uint8_t>>(
+          static_cast<uint8_t>(ReadSource::kUnknown));
+  IOOptions io_options;
+  IODebugContext dbg;
+  ASSERT_OK(PrepareIOFromReadOptions(read_options, nullptr, io_options, &dbg));
+  EXPECT_EQ(read_options.io_debug_context->read_source_state,
+            dbg.read_source_state);
+  dbg.read_source_state->fetch_or(static_cast<uint8_t>(ReadSource::kCache),
+                                  std::memory_order_relaxed);
+  EXPECT_EQ(ReadSource::kCache,
+            static_cast<ReadSource>(
+                read_options.io_debug_context->read_source_state->load(
+                    std::memory_order_relaxed)));
+}
+
+TEST(ReadSourceStateTest, NullDebugContextLeavesSourceUnobserved) {
+  IODebugContext source_dbg;
+  ReadOptions read_options;
+  read_options.io_debug_context = &source_dbg;
+  read_options.io_debug_context->read_source_state =
+      std::make_shared<std::atomic<uint8_t>>(
+          static_cast<uint8_t>(ReadSource::kUnknown));
+  IOOptions io_options;
+  ASSERT_OK(PrepareIOFromReadOptions(read_options, nullptr, io_options));
+  EXPECT_EQ(ReadSource::kUnknown,
+            static_cast<ReadSource>(
+                read_options.io_debug_context->read_source_state->load(
+                    std::memory_order_relaxed)));
+}
+
+TEST(ReadSourceStateTest, PrepareIOOptionsReplacesAndClearsPreviousState) {
+  ReadOptions read_options;
+  IOOptions io_options;
+  IODebugContext dbg;
+  dbg.read_source_state = std::make_shared<std::atomic<uint8_t>>(
+      static_cast<uint8_t>(ReadSource::kUnknown));
+  IODebugContext source_dbg;
+  read_options.io_debug_context = &source_dbg;
+  read_options.io_debug_context->read_source_state =
+      std::make_shared<std::atomic<uint8_t>>(
+          static_cast<uint8_t>(ReadSource::kUnknown));
+  ASSERT_OK(PrepareIOFromReadOptions(read_options, nullptr, io_options, &dbg));
+  EXPECT_EQ(read_options.io_debug_context->read_source_state,
+            dbg.read_source_state);
+
+  IODebugContext empty_dbg;
+  read_options.io_debug_context = &empty_dbg;
+  ASSERT_OK(PrepareIOFromReadOptions(read_options, nullptr, io_options, &dbg));
+  EXPECT_EQ(nullptr, dbg.read_source_state);
+  dbg.read_source_state = std::make_shared<std::atomic<uint8_t>>(
+      static_cast<uint8_t>(ReadSource::kCache));
+  read_options.io_debug_context = nullptr;
+  ASSERT_OK(PrepareIOFromReadOptions(read_options, nullptr, io_options, &dbg));
+  EXPECT_EQ(nullptr, dbg.read_source_state);
+}
+
+TEST(ReadSourceStateTest, DebugContextCopiesShareState) {
+  IODebugContext original;
+  original.read_source_state = std::make_shared<std::atomic<uint8_t>>(
+      static_cast<uint8_t>(ReadSource::kUnknown));
+  IODebugContext copied(original);
+  IODebugContext assigned;
+  assigned = original;
+  EXPECT_EQ(original.read_source_state, copied.read_source_state);
+  EXPECT_EQ(original.read_source_state, assigned.read_source_state);
+  copied.read_source_state->fetch_or(static_cast<uint8_t>(ReadSource::kCache),
+                                     std::memory_order_relaxed);
+  assigned.read_source_state->fetch_or(
+      static_cast<uint8_t>(ReadSource::kRemoteStorage),
+      std::memory_order_relaxed);
+  EXPECT_EQ(ReadSource::kMixed,
+            static_cast<ReadSource>(
+                original.read_source_state->load(std::memory_order_relaxed)));
+
+  IODebugContext empty;
+  assigned = empty;
+  EXPECT_EQ(nullptr, assigned.read_source_state);
+}
+
+TEST(ReadSourceStateTest, ConcurrentCopiesRetainAndCombineState) {
+  std::unique_ptr<IODebugContext> source_dbg(new IODebugContext());
+  ReadOptions read_options;
+  read_options.io_debug_context = source_dbg.get();
+  read_options.io_debug_context->read_source_state =
+      std::make_shared<std::atomic<uint8_t>>(
+          static_cast<uint8_t>(ReadSource::kUnknown));
+  ReadOptions copied_read_options(read_options);
+  ReadOptions assigned_read_options;
+  assigned_read_options = copied_read_options;
+  EXPECT_EQ(read_options.io_debug_context,
+            assigned_read_options.io_debug_context);
+  EXPECT_EQ(read_options.io_debug_context,
+            copied_read_options.io_debug_context);
+  IOOptions io_options;
+  IODebugContext dbg;
+  ASSERT_OK(PrepareIOFromReadOptions(assigned_read_options, nullptr, io_options,
+                                     &dbg));
+  std::weak_ptr<std::atomic<uint8_t>> weak_state =
+      read_options.io_debug_context->read_source_state;
+  std::atomic<bool> start{false};
+  std::thread cache_worker([dbg, &start] {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    for (int i = 0; i < 1000; ++i) {
+      dbg.read_source_state->fetch_or(static_cast<uint8_t>(ReadSource::kCache),
+                                      std::memory_order_relaxed);
+    }
+  });
+  std::thread remote_worker([dbg, &start] {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    for (int i = 0; i < 1000; ++i) {
+      dbg.read_source_state->fetch_or(
+          static_cast<uint8_t>(ReadSource::kRemoteStorage),
+          std::memory_order_relaxed);
+    }
+  });
+  read_options.io_debug_context = nullptr;
+  copied_read_options.io_debug_context = nullptr;
+  assigned_read_options.io_debug_context = nullptr;
+  source_dbg.reset();
+  dbg.read_source_state.reset();
+  std::shared_ptr<std::atomic<uint8_t>> retained_state = weak_state.lock();
+  start.store(true, std::memory_order_release);
+  cache_worker.join();
+  remote_worker.join();
+  ASSERT_NE(nullptr, retained_state);
+  EXPECT_EQ(
+      ReadSource::kMixed,
+      static_cast<ReadSource>(retained_state->load(std::memory_order_relaxed)));
+  retained_state.reset();
+  EXPECT_TRUE(weak_state.expired());
+}
 
 static const int kDelayMicros = 100000;
 

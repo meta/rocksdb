@@ -377,7 +377,8 @@ Status BlobFileReader::GetBlob(
     }
     prefetched = prefetch_buffer->TryReadFromCache(
         io_options, file_reader_.get(), record_offset,
-        static_cast<size_t>(record_size), &record_slice, &s, for_compaction);
+        static_cast<size_t>(record_size), &record_slice, &s, for_compaction,
+        &dbg);
     if (!s.ok()) {
       return s;
     }

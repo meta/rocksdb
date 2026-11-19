@@ -98,6 +98,10 @@ IOStatus GenerateOneFileChecksum(
 inline IOStatus PrepareIOFromReadOptions(const ReadOptions& ro,
                                          SystemClock* clock, IOOptions& opts,
                                          IODebugContext* dbg = nullptr) {
+  if (dbg != nullptr) {
+    dbg->read_source_state =
+        ro.io_debug_context ? ro.io_debug_context->read_source_state : nullptr;
+  }
   if (ro.request_id != nullptr) {
     if (dbg != nullptr && dbg->request_id == nullptr) {
       dbg->SetRequestId(ro.request_id);

@@ -68,6 +68,7 @@ struct BufferInfo {
     buffer_.Clear();
     initial_end_offset_ = 0;
     async_req_len_ = 0;
+    async_debug_context_.reset();
   }
 
   AlignedBuffer buffer_;
@@ -87,6 +88,10 @@ struct BufferInfo {
   void* io_handle_ = nullptr;
 
   IOHandleDeleter del_fn_ = nullptr;
+
+  // Source-enabled prefetches retain filesystem diagnostics until IO is
+  // drained.
+  std::shared_ptr<IODebugContext> async_debug_context_;
 
   // initial_end_offset is used to keep track of the end offset of the buffer
   // that was originally called. It's helpful in case of autotuning of readahead
@@ -334,7 +339,7 @@ class FilePrefetchBuffer {
   // BlobFileCache::GetBlobFileReader, after we have already allocated a new
   // FilePrefetchBuffer.
   Status Prefetch(const IOOptions& opts, RandomAccessFileReader* reader,
-                  uint64_t offset, size_t n);
+                  uint64_t offset, size_t n, IODebugContext* dbg = nullptr);
 
   // Request for reading the data from a file asynchronously.
   // If data already exists in the buffer, result will be updated.
@@ -347,7 +352,8 @@ class FilePrefetchBuffer {
   // If data already exist in the buffer, it will return Status::OK, otherwise
   // it will send asynchronous request and return Status::TryAgain.
   Status PrefetchAsync(const IOOptions& opts, RandomAccessFileReader* reader,
-                       uint64_t offset, size_t n, Slice* result);
+                       uint64_t offset, size_t n, Slice* result,
+                       IODebugContext* dbg = nullptr);
 
   // Tries returning the data for a file read from this buffer if that data is
   // in the buffer.
@@ -364,7 +370,8 @@ class FilePrefetchBuffer {
   // for_compaction        : true if cache read is done for compaction read.
   bool TryReadFromCache(const IOOptions& opts, RandomAccessFileReader* reader,
                         uint64_t offset, size_t n, Slice* result, Status* s,
-                        bool for_compaction = false);
+                        bool for_compaction = false,
+                        IODebugContext* dbg = nullptr);
 
   // The minimum `offset` ever passed to TryReadFromCache(). This will nly be
   // tracked if track_min_offset = true.
@@ -461,16 +468,16 @@ class FilePrefetchBuffer {
 
   Status PrefetchInternal(const IOOptions& opts, RandomAccessFileReader* reader,
                           uint64_t offset, size_t length, size_t readahead_size,
-                          bool& copy_to_third_buffer);
+                          bool& copy_to_third_buffer, IODebugContext* dbg);
 
   Status Read(BufferInfo* buf, const IOOptions& opts,
               RandomAccessFileReader* reader, uint64_t read_len,
               uint64_t aligned_useful_len, uint64_t start_offset,
-              bool use_fs_buffer);
+              bool use_fs_buffer, IODebugContext* dbg);
 
   Status ReadAsync(BufferInfo* buf, const IOOptions& opts,
                    RandomAccessFileReader* reader, uint64_t read_len,
-                   uint64_t start_offset);
+                   uint64_t start_offset, IODebugContext* dbg);
 
   // Copy the data from src to overlap_buf_.
   void CopyDataToOverlapBuffer(BufferInfo* src, uint64_t& offset,
@@ -548,14 +555,14 @@ class FilePrefetchBuffer {
   // Reuses the file system allocated buffer to avoid an extra copy
   IOStatus FSBufferDirectRead(RandomAccessFileReader* reader, BufferInfo* buf,
                               const IOOptions& opts, uint64_t offset, size_t n,
-                              Slice& result) {
+                              Slice& result, IODebugContext* dbg) {
     FSReadRequest read_req;
     read_req.offset = offset;
     read_req.len = n;
     read_req.scratch = nullptr;
     AlignedBuffer direct_io_buffer;
     AlignedBufferAllocationContext direct_io_context{&direct_io_buffer};
-    IOStatus s = reader->MultiRead(opts, &read_req, 1, &direct_io_context);
+    IOStatus s = reader->MultiRead(opts, &read_req, 1, &direct_io_context, dbg);
     if (!s.ok()) {
       return s;
     }
@@ -578,23 +585,23 @@ class FilePrefetchBuffer {
       buf->del_fn_ = nullptr;
     }
     buf->async_read_in_progress_ = false;
+    buf->async_debug_context_.reset();
   }
 
   void HandleOverlappingSyncData(uint64_t offset, size_t length,
                                  uint64_t& tmp_offset, size_t& tmp_length,
                                  bool& use_overlap_buffer);
 
-  Status HandleOverlappingAsyncData(const IOOptions& opts,
-                                    RandomAccessFileReader* reader,
-                                    uint64_t offset, size_t length,
-                                    size_t readahead_size,
-                                    bool& copy_to_third_buffer,
-                                    uint64_t& tmp_offset, size_t& tmp_length);
+  Status HandleOverlappingAsyncData(
+      const IOOptions& opts, RandomAccessFileReader* reader, uint64_t offset,
+      size_t length, size_t readahead_size, bool& copy_to_third_buffer,
+      uint64_t& tmp_offset, size_t& tmp_length, IODebugContext* dbg);
 
   bool TryReadFromCacheUntracked(const IOOptions& opts,
                                  RandomAccessFileReader* reader,
                                  uint64_t offset, size_t n, Slice* result,
-                                 Status* s, bool for_compaction = false);
+                                 Status* s, bool for_compaction,
+                                 IODebugContext* dbg);
 
   void ReadAheadSizeTuning(BufferInfo* buf, bool read_curr_block,
                            bool refit_tail, bool use_fs_buffer,
@@ -625,7 +632,7 @@ class FilePrefetchBuffer {
   Status PrefetchRemBuffers(const IOOptions& opts,
                             RandomAccessFileReader* reader,
                             uint64_t end_offset1, size_t alignment,
-                            size_t readahead_size);
+                            size_t readahead_size, IODebugContext* dbg);
 
   // *** BEGIN APIs related to allocating and freeing buffers ***
   bool IsBufferQueueEmpty() { return bufs_.empty(); }
