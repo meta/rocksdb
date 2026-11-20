@@ -269,8 +269,10 @@ public class KeyMayExistTest {
     keyBuffer.flip();
     assertThat(keyMayExist.exists).isEqualTo(KeyMayExist.KeyMayExistEnum.kExistsWithValue);
     assertThat(keyMayExist.valueLength).isEqualTo(value.length);
-    assertThat(valueBuffer.position()).isEqualTo(12);
-    assertThat(valueBuffer.limit()).isEqualTo(12 + value.length);
+    assertThat(valueBuffer.position()).isEqualTo(19);
+    assertThat(valueBuffer.limit()).isEqualTo(24 + value.length);
+    valueBuffer.flip();
+    valueBuffer.position(12);
     byte[] valueGet = new byte[value.length];
     valueBuffer.get(valueGet);
     assertThat(valueGet).isEqualTo(value);
@@ -280,8 +282,10 @@ public class KeyMayExistTest {
     keyMayExist = db.keyMayExist(keyBuffer, valueBuffer);
     assertThat(keyMayExist.exists).isEqualTo(KeyMayExist.KeyMayExistEnum.kExistsWithValue);
     assertThat(keyMayExist.valueLength).isEqualTo(value.length);
-    assertThat(valueBuffer.position()).isEqualTo(25);
+    assertThat(valueBuffer.position()).isEqualTo(24 + value.length);
     assertThat(valueBuffer.limit()).isEqualTo(24 + value.length);
+
+    valueBuffer.position(25);
     valueGet = new byte[value.length - 1];
     valueBuffer.get(valueGet);
     assertThat(valueGet).isEqualTo(Arrays.copyOfRange(value, 0, value.length - 1));
@@ -312,8 +316,10 @@ public class KeyMayExistTest {
       keyBuffer.flip();
       assertThat(keyMayExist.exists).isEqualTo(KeyMayExist.KeyMayExistEnum.kExistsWithValue);
       assertThat(keyMayExist.valueLength).isEqualTo(value.length);
-      assertThat(valueBuffer.position()).isEqualTo(12);
-      assertThat(valueBuffer.limit()).isEqualTo(12 + value.length);
+
+      assertThat(valueBuffer.position()).isEqualTo(12 + value.length);
+      valueBuffer.flip();
+      valueBuffer.position(12);
       byte[] valueGet = new byte[value.length];
       valueBuffer.get(valueGet);
       assertThat(valueGet).isEqualTo(value);
@@ -324,9 +330,11 @@ public class KeyMayExistTest {
       keyBuffer.flip();
       assertThat(keyMayExist.exists).isEqualTo(KeyMayExist.KeyMayExistEnum.kExistsWithValue);
       assertThat(keyMayExist.valueLength).isEqualTo(value.length);
-      assertThat(valueBuffer.position()).isEqualTo(25);
+      assertThat(valueBuffer.position()).isEqualTo(24 + value.length);
       assertThat(valueBuffer.limit()).isEqualTo(24 + value.length);
       valueGet = new byte[value.length - 1];
+      valueBuffer.flip();
+      valueBuffer.position(25);
       valueBuffer.get(valueGet);
       assertThat(valueGet).isEqualTo(Arrays.copyOfRange(value, 0, value.length - 1));
 
@@ -452,8 +460,10 @@ public class KeyMayExistTest {
     keyBuffer.flip();
     assertThat(keyMayExist.exists).isEqualTo(KeyMayExist.KeyMayExistEnum.kExistsWithValue);
     assertThat(keyMayExist.valueLength).isEqualTo(value.length);
-    assertThat(valueBuffer.position()).isEqualTo(12);
-    assertThat(valueBuffer.limit()).isEqualTo(12 + value.length);
+
+    assertThat(valueBuffer.position()).isEqualTo(12 + value.length);
+    valueBuffer.flip();
+    valueBuffer.position(12);
     byte[] valueGet = new byte[value.length];
     valueBuffer.get(valueGet);
     assertThat(valueGet).isEqualTo(value);
@@ -463,8 +473,11 @@ public class KeyMayExistTest {
     keyMayExist = db.keyMayExist(columnFamilyHandleList.get(1), keyBuffer, valueBuffer);
     assertThat(keyMayExist.exists).isEqualTo(KeyMayExist.KeyMayExistEnum.kExistsWithValue);
     assertThat(keyMayExist.valueLength).isEqualTo(value.length);
-    assertThat(valueBuffer.position()).isEqualTo(25);
-    assertThat(valueBuffer.limit()).isEqualTo(24 + value.length);
+
+    assertThat(valueBuffer.position()).isEqualTo(24 + value.length);
+    valueBuffer.flip();
+    valueBuffer.position(25);
+
     valueGet = new byte[value.length - 1];
     valueBuffer.get(valueGet);
     assertThat(valueGet).isEqualTo(Arrays.copyOfRange(value, 0, value.length - 1));
@@ -496,8 +509,11 @@ public class KeyMayExistTest {
       keyBuffer.flip();
       assertThat(keyMayExist.exists).isEqualTo(KeyMayExist.KeyMayExistEnum.kExistsWithValue);
       assertThat(keyMayExist.valueLength).isEqualTo(value.length);
-      assertThat(valueBuffer.position()).isEqualTo(12);
-      assertThat(valueBuffer.limit()).isEqualTo(12 + value.length);
+
+      assertThat(valueBuffer.position()).isEqualTo(12 + value.length);
+      valueBuffer.flip();
+      valueBuffer.position(12);
+
       byte[] valueGet = new byte[value.length];
       valueBuffer.get(valueGet);
       assertThat(valueGet).isEqualTo(value);
@@ -509,8 +525,10 @@ public class KeyMayExistTest {
       keyBuffer.flip();
       assertThat(keyMayExist.exists).isEqualTo(KeyMayExist.KeyMayExistEnum.kExistsWithValue);
       assertThat(keyMayExist.valueLength).isEqualTo(value.length);
-      assertThat(valueBuffer.position()).isEqualTo(25);
-      assertThat(valueBuffer.limit()).isEqualTo(24 + value.length);
+      assertThat(valueBuffer.position()).isEqualTo(24 + value.length);
+      valueBuffer.flip();
+      valueBuffer.position(25);
+
       valueGet = new byte[value.length - 1];
       valueBuffer.get(valueGet);
       assertThat(valueGet).isEqualTo(Arrays.copyOfRange(value, 0, value.length - 1));

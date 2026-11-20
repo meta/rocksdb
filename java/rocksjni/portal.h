@@ -2198,8 +2198,8 @@ class JniUtil {
       std::function<ROCKSDB_NAMESPACE::Status(ROCKSDB_NAMESPACE::Slice,
                                               ROCKSDB_NAMESPACE::Slice)>
           op,
-      JNIEnv* env, jbyteArray jkey, jint jkey_len, jbyteArray jvalue,
-      jint jvalue_len) {
+      JNIEnv* env, jbyteArray jkey, jint jkey_offset, jint jkey_len,
+      jbyteArray jvalue, jint jvalue_offset, jint jvalue_len) {
     jbyte* key = env->GetByteArrayElements(jkey, nullptr);
     if (env->ExceptionCheck()) {
       // exception thrown: OutOfMemoryError
@@ -2215,9 +2215,12 @@ class JniUtil {
       return nullptr;
     }
 
-    ROCKSDB_NAMESPACE::Slice key_slice(reinterpret_cast<char*>(key), jkey_len);
-    ROCKSDB_NAMESPACE::Slice value_slice(reinterpret_cast<char*>(value),
-                                         jvalue_len);
+    ROCKSDB_NAMESPACE::Slice key_slice(
+        reinterpret_cast<char*>(key) + static_cast<size_t>(jkey_offset),
+        jkey_len);
+    ROCKSDB_NAMESPACE::Slice value_slice(
+        reinterpret_cast<char*>(value) + static_cast<size_t>(jvalue_offset),
+        jvalue_len);
 
     auto status = op(key_slice, value_slice);
 
@@ -2230,6 +2233,21 @@ class JniUtil {
 
     return std::unique_ptr<ROCKSDB_NAMESPACE::Status>(
         new ROCKSDB_NAMESPACE::Status(status));
+  }
+
+  /*
+   * Helper for operations on a key and value
+   * for example WriteBatch->Put
+   *
+   * TODO(AR) could be used for RocksDB->Put etc.
+   */
+  static std::unique_ptr<ROCKSDB_NAMESPACE::Status> kv_op(
+      std::function<ROCKSDB_NAMESPACE::Status(ROCKSDB_NAMESPACE::Slice,
+                                              ROCKSDB_NAMESPACE::Slice)>
+          op,
+      JNIEnv* env, jbyteArray jkey, jint jkey_len, jbyteArray jvalue,
+      jint jvalue_len) {
+    return kv_op(op, env, jkey, 0, jkey_len, jvalue, 0, jvalue_len);
   }
 
   /*

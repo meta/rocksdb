@@ -85,11 +85,12 @@ jint Java_org_rocksdb_WriteBatchWithIndex_count0Jni(JNIEnv* /*env*/,
 /*
  * Class:     org_rocksdb_WriteBatchWithIndex
  * Method:    put
- * Signature: (J[BI[BI)V
+ * Signature: (J[BII[BII)V
  */
-void Java_org_rocksdb_WriteBatchWithIndex_putJni__J_3BI_3BI(
-    JNIEnv* env, jclass, jlong jwbwi_handle, jbyteArray jkey, jint jkey_len,
-    jbyteArray jentry_value, jint jentry_value_len) {
+void Java_org_rocksdb_WriteBatchWithIndex_putJni__J_3BII_3BII(
+    JNIEnv* env, jclass, jlong jwbwi_handle, jbyteArray jkey, jint jkey_offset,
+    jint jkey_len, jbyteArray jentry_value, jint jvalue_offset,
+    jint jentry_value_len) {
   auto* wbwi =
       reinterpret_cast<ROCKSDB_NAMESPACE::WriteBatchWithIndex*>(jwbwi_handle);
   assert(wbwi != nullptr);
@@ -98,7 +99,8 @@ void Java_org_rocksdb_WriteBatchWithIndex_putJni__J_3BI_3BI(
     return wbwi->Put(key, value);
   };
   std::unique_ptr<ROCKSDB_NAMESPACE::Status> status =
-      ROCKSDB_NAMESPACE::JniUtil::kv_op(put, env, jkey, jkey_len, jentry_value,
+      ROCKSDB_NAMESPACE::JniUtil::kv_op(put, env, jkey, jkey_offset, jkey_len,
+                                        jentry_value, jvalue_offset,
                                         jentry_value_len);
   if (status != nullptr && !status->ok()) {
     ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, status);
@@ -108,11 +110,12 @@ void Java_org_rocksdb_WriteBatchWithIndex_putJni__J_3BI_3BI(
 /*
  * Class:     org_rocksdb_WriteBatchWithIndex
  * Method:    put
- * Signature: (J[BI[BIJ)V
+ * Signature: (J[BII[BIIJ)V
  */
-void Java_org_rocksdb_WriteBatchWithIndex_putJni__J_3BI_3BIJ(
-    JNIEnv* env, jclass, jlong jwbwi_handle, jbyteArray jkey, jint jkey_len,
-    jbyteArray jentry_value, jint jentry_value_len, jlong jcf_handle) {
+void Java_org_rocksdb_WriteBatchWithIndex_putJni__J_3BII_3BIIJ(
+    JNIEnv* env, jclass, jlong jwbwi_handle, jbyteArray jkey, jint jkey_offset,
+    jint jkey_len, jbyteArray jentry_value, jint jentry_value_offset,
+    jint jentry_value_len, jlong jcf_handle) {
   auto* wbwi =
       reinterpret_cast<ROCKSDB_NAMESPACE::WriteBatchWithIndex*>(jwbwi_handle);
   assert(wbwi != nullptr);
@@ -124,7 +127,8 @@ void Java_org_rocksdb_WriteBatchWithIndex_putJni__J_3BI_3BIJ(
     return wbwi->Put(cf_handle, key, value);
   };
   std::unique_ptr<ROCKSDB_NAMESPACE::Status> status =
-      ROCKSDB_NAMESPACE::JniUtil::kv_op(put, env, jkey, jkey_len, jentry_value,
+      ROCKSDB_NAMESPACE::JniUtil::kv_op(put, env, jkey, jkey_offset, jkey_len,
+                                        jentry_value, jentry_value_offset,
                                         jentry_value_len);
   if (status != nullptr && !status->ok()) {
     ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, status);
