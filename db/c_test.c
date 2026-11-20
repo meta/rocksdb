@@ -1691,8 +1691,9 @@ int main(int argc, char** argv) {
         rocksdb_checkpoint_object_create(db, &err);
     CheckNoError(err);
 
-    rocksdb_checkpoint_create(checkpoint, dbcheckpointname, 0, &err);
+    uint64_t checkpoint_sequence_number = rocksdb_checkpoint_create(checkpoint, dbcheckpointname, 0, &err);
     CheckNoError(err);
+    CheckCondition(checkpoint_sequence_number > 0);
 
     rocksdb_checkpoint_object_destroy(checkpoint);
     checkpoint = NULL;

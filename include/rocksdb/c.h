@@ -521,7 +521,7 @@ extern ROCKSDB_LIBRARY_API void rocksdb_backup_engine_options_destroy(
 extern ROCKSDB_LIBRARY_API rocksdb_checkpoint_t*
 rocksdb_checkpoint_object_create(rocksdb_t* db, char** errptr);
 
-extern ROCKSDB_LIBRARY_API void rocksdb_checkpoint_create(
+extern ROCKSDB_LIBRARY_API uint64_t rocksdb_checkpoint_create(
     rocksdb_checkpoint_t* checkpoint, const char* checkpoint_dir,
     uint64_t log_size_for_flush, char** errptr);
 

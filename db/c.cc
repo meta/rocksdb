@@ -2110,11 +2110,15 @@ rocksdb_checkpoint_t* rocksdb_checkpoint_object_create(rocksdb_t* db,
   return result;
 }
 
-void rocksdb_checkpoint_create(rocksdb_checkpoint_t* checkpoint,
+uint64_t rocksdb_checkpoint_create(rocksdb_checkpoint_t* checkpoint,
                                const char* checkpoint_dir,
                                uint64_t log_size_for_flush, char** errptr) {
+  uint64_t* sequence_number_ptr = nullptr;
+
   SaveError(errptr, checkpoint->rep->CreateCheckpoint(
-                        std::string(checkpoint_dir), log_size_for_flush));
+                        std::string(checkpoint_dir), log_size_for_flush, sequence_number_ptr));
+
+  return sequence_number_ptr ? *sequence_number_ptr : 0;
 }
 
 rocksdb_export_import_files_metadata_t* rocksdb_checkpoint_export_column_family(
