@@ -1939,6 +1939,83 @@ TEST_F(BlobDBTest, MaintainBlobFileToSstMapping) {
   }
 }
 
+// Inspect the base DB before the BlobDB wrapper receives its DB pointer.
+// No SST files are needed: this verifies the unsafe window without relying on
+// a background thread winning the race and dereferencing a null pointer.
+TEST_F(BlobDBTest, DisableAutoCompactionsUntilBaseDBIsInitialized) {
+  for (bool enable_gc : {false, true}) {
+    for (bool disable_auto : {false, true}) {
+      SCOPED_TRACE("enable_gc=" + std::to_string(enable_gc) +
+                   " disable_auto=" + std::to_string(disable_auto));
+      BlobDBOptions blob_options;
+      blob_options.enable_garbage_collection = enable_gc;
+      blob_options.disable_background_tasks = true;
+      Options options;
+      options.disable_auto_compactions = disable_auto;
+      bool base_db_opened = false;
+      SyncPoint::GetInstance()->SetCallBack(
+          "BlobDBImpl::Open:BaseDBOpened", [&](void* arg) {
+            auto* base_db = static_cast<DB*>(arg);
+            EXPECT_TRUE(base_db->GetOptions().disable_auto_compactions);
+            base_db_opened = true;
+          });
+      SyncPoint::GetInstance()->EnableProcessing();
+      Status s = TryOpen(blob_options, options);
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      ASSERT_OK(s);
+      ASSERT_TRUE(base_db_opened);
+      ASSERT_EQ(disable_auto, blob_db_->GetOptions().disable_auto_compactions);
+      Destroy();
+    }
+  }
+}
+
+TEST_F(BlobDBTest, ResumeAutoCompactionsAfterOpen) {
+  constexpr int kCompactionTrigger = 4;
+  for (bool enable_gc : {false, true}) {
+    for (bool disable_auto : {false, true}) {
+      SCOPED_TRACE("enable_gc=" + std::to_string(enable_gc) +
+                   " disable_auto=" + std::to_string(disable_auto));
+      BlobDBOptions blob_options;
+      blob_options.enable_garbage_collection = enable_gc;
+      blob_options.disable_background_tasks = true;
+      Options options;
+      options.disable_auto_compactions = true;
+      options.level0_file_num_compaction_trigger = kCompactionTrigger;
+      Open(blob_options, options);
+      FlushOptions flush_options;
+      flush_options.wait = true;
+      for (int i = 0; i < kCompactionTrigger; ++i) {
+        ASSERT_OK(Put("key", "value" + std::to_string(i)));
+        ASSERT_OK(blob_db_->Flush(flush_options));
+      }
+      ColumnFamilyMetaData metadata;
+      blob_db_->GetColumnFamilyMetaData(blob_db_->DefaultColumnFamily(),
+                                        &metadata);
+      ASSERT_EQ(kCompactionTrigger, metadata.levels[0].files.size());
+      Close();
+
+      options.disable_auto_compactions = disable_auto;
+      ASSERT_OK(TryOpen(blob_options, options));
+      ASSERT_EQ(disable_auto, blob_db_->GetOptions().disable_auto_compactions);
+      WaitForCompactOptions wait_options;
+      ASSERT_OK(blob_db_->WaitForCompact(wait_options));
+      blob_db_->GetColumnFamilyMetaData(blob_db_->DefaultColumnFamily(),
+                                        &metadata);
+      if (disable_auto) {
+        ASSERT_EQ(kCompactionTrigger, metadata.levels[0].files.size());
+      } else {
+        ASSERT_LT(metadata.levels[0].files.size(), kCompactionTrigger);
+      }
+      std::string value;
+      ASSERT_OK(blob_db_->Get(ReadOptions(), "key", &value));
+      ASSERT_EQ("value" + std::to_string(kCompactionTrigger - 1), value);
+      Destroy();
+    }
+  }
+}
+
 TEST_F(BlobDBTest, ShutdownWait) {
   BlobDBOptions bdb_options;
   bdb_options.ttl_range_secs = 100;
