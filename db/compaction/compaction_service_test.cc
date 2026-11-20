@@ -4808,6 +4808,64 @@ TEST_F(CompactionServiceTest, CancelCompactionOnPrimarySide) {
   ASSERT_GE(my_cs->GetCompactionNum(), comp_num);
 }
 
+// An automatic remote compaction can end with
+// Status::Incomplete(kManualCompactionPaused): when the DB closes, it calls
+// CompactionService::CancelAwaitingJobs(), and this test service passes its
+// canceled flag to DB::OpenAndCompact() as OpenAndCompactOptions::canceled. The
+// worker then stops and returns the paused status, and the primary takes it as
+// the compaction result. The primary must accept this status for a compaction
+// that it picked by itself, not only for a manual compaction.
+TEST_F(CompactionServiceTest, CancelAutoCompactionOnPrimarySide) {
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = 2;
+  ReopenWithCompactionService(&options);
+  auto my_cs = GetCompactionService();
+
+  // Close calls CancelAllBackgroundWork() first. Call it while the worker runs
+  // the automatic compaction, so the worker sees the canceled flag. The test
+  // calls Close() only after this callback, so the compaction has started
+  // before the close.
+  std::atomic_bool cancel_issued{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():Inprogress", [&](void* /*arg*/) {
+        if (!cancel_issued.exchange(true)) {
+          CancelAllBackgroundWork(db_.get(), false /*wait*/);
+        }
+      });
+  // The remote compaction starts only after both Flush() calls return, so the
+  // cancel cannot make a Flush() call fail with ShutdownInProgress.
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"CompactionServiceTest::CancelAutoCompactionOnPrimarySide:"
+        "FlushesDone",
+        "MyTestCompactionService::Wait:BeforeOpenAndCompact"},
+       {"CompactionJob::Run():Inprogress",
+        "CompactionServiceTest::CancelAutoCompactionOnPrimarySide:"
+        "BeforeClose"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Two L0 files reach level0_file_num_compaction_trigger, so the DB schedules
+  // an automatic compaction, which runs remotely. Both files hold the same
+  // keys, so the compaction cannot be a trivial move.
+  for (int file = 0; file < 2; file++) {
+    for (int i = 0; i < 10; i++) {
+      ASSERT_OK(Put(Key(i), "value" + std::to_string(file)));
+    }
+    ASSERT_OK(Flush());
+  }
+  TEST_SYNC_POINT(
+      "CompactionServiceTest::CancelAutoCompactionOnPrimarySide:FlushesDone");
+
+  // Close waits for the canceled compaction to finish.
+  TEST_SYNC_POINT(
+      "CompactionServiceTest::CancelAutoCompactionOnPrimarySide:BeforeClose");
+  Close();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_TRUE(cancel_issued);
+  ASSERT_TRUE(my_cs->GetCanceled());
+}
+
 TEST_F(CompactionServiceTest, FailedToStart) {
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;

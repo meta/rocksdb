@@ -5188,11 +5188,26 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
       immutable_db_options_.clock->SleepForMicroseconds(1000000);
       mutex_.Lock();
     } else if (s.IsManualCompactionPaused()) {
-      assert(prepicked_compaction);
-      ManualCompactionState* m = prepicked_compaction->manual_compaction_state;
-      assert(m);
-      ROCKS_LOG_BUFFER(&log_buffer, "[%s] [JOB %d] Manual compaction paused",
-                       m->cfd->GetName().c_str(), job_context.job_id);
+      // A manual compaction ends with this status when the user pauses or
+      // cancels it. An automatic compaction can also end with it: a remote
+      // compaction returns it when the CompactionService cancels the job, for
+      // example through OpenAndCompactOptions::canceled after the DB calls
+      // CompactionService::CancelAwaitingJobs() during close. An automatic
+      // compaction has no ManualCompactionState: its prepicked_compaction is
+      // null, or has a null manual_compaction_state when the compaction was
+      // forwarded to the bottom-priority pool.
+      const ManualCompactionState* m =
+          prepicked_compaction != nullptr
+              ? prepicked_compaction->manual_compaction_state
+              : nullptr;
+      if (m != nullptr) {
+        ROCKS_LOG_BUFFER(&log_buffer, "[%s] [JOB %d] Manual compaction paused",
+                         m->cfd->GetName().c_str(), job_context.job_id);
+      } else {
+        ROCKS_LOG_BUFFER(&log_buffer,
+                         "[JOB %d] Automatic compaction canceled: %s",
+                         job_context.job_id, s.ToString().c_str());
+      }
     }
 
     ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
