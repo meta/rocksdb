@@ -1108,8 +1108,7 @@ set(SOURCES
         utilities/transactions/write_prepared_txn_db.cc
         utilities/transactions/write_unprepared_txn.cc
         utilities/transactions/write_unprepared_txn_db.cc
-        utilities/trie_index/bitvector.cc
-        utilities/trie_index/louds_trie.cc
+        utilities/trie_index/trie.cc
         utilities/trie_index/trie_index_factory.cc
         utilities/types_util.cc
         utilities/ttl/db_ttl_impl.cc

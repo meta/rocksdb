@@ -3797,6 +3797,65 @@ TEST_P(TrieIndexDBTest, ReopenWithoutTrieUDI) {
   ASSERT_EQ(keys[1], "key_b");
 }
 
+TEST_P(TrieIndexDBTest, EmptyUserKey) {
+  ASSERT_OK(OpenDB(/*block_size=*/256));
+  // The empty key's value fills a data block, so that block's separator is
+  // the empty key.
+  ASSERT_OK(db_->Put(WriteOptions(), "", std::string(1000, 'E')));
+  std::vector<std::string> expected_keys = {""};
+  for (char c = 'b'; c <= 'f'; c++) {
+    expected_keys.emplace_back(1, c);
+    ASSERT_OK(
+        db_->Put(WriteOptions(), expected_keys.back(), std::string(300, c)));
+  }
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes("", std::string(1000, 'E')));
+  ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes("d", std::string(300, 'd')));
+  ASSERT_NO_FATAL_FAILURE(VerifyScanBothIndexes(expected_keys));
+}
+
+TEST_P(TrieIndexDBTest, OnlyEmptyUserKey) {
+  ASSERT_OK(OpenDB());
+  ASSERT_OK(db_->Put(WriteOptions(), "", "v"));
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes("", "v"));
+  ASSERT_NO_FATAL_FAILURE(VerifyScanBothIndexes({""}));
+}
+
+TEST_P(TrieIndexDBTest, OpenRejectsNonBytewiseComparator) {
+  options_.comparator = ReverseBytewiseComparator();
+  ASSERT_EQ(OpenDB().code(), Status::Code::kNotSupported);
+}
+
+TEST_P(TrieIndexDBTest, CreateColumnFamilyRejectsNonBytewiseComparator) {
+  ASSERT_OK(OpenDB());
+  ColumnFamilyOptions cf_options(options_);
+  cf_options.comparator = ReverseBytewiseComparator();
+  ColumnFamilyHandle* handle = nullptr;
+  ASSERT_EQ(db_->CreateColumnFamily(cf_options, "reverse", &handle).code(),
+            Status::Code::kNotSupported);
+  ASSERT_EQ(handle, nullptr);
+}
+
+// kStandardOnly ignores the factory, so the trie's comparator requirement must
+// not stop a DB from opening and working.
+TEST_F(TrieIndexDBTest, StandardOnlyIgnoresTrieComparatorRequirement) {
+  options_.comparator = ReverseBytewiseComparator();
+  ASSERT_OK(OpenDBImpl(/*block_size=*/0,
+                       BlockBasedTableOptions::IndexMode::kStandardOnly));
+  ASSERT_OK(db_->Put(WriteOptions(), "a", "1"));
+  ASSERT_OK(db_->Put(WriteOptions(), "b", "2"));
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  std::string value;
+  ASSERT_OK(db_->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ(value, "1");
+  std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+  it->SeekToFirst();
+  ASSERT_TRUE(it->Valid());
+  ASSERT_EQ(it->key(), "b");
+  ASSERT_OK(it->status());
+}
+
 // Mixed SSTs: some written with UDI, some without. Both should be readable
 // through both index paths.
 TEST_P(TrieIndexDBTest, MixedSSTsWithAndWithoutUDI) {
@@ -4711,6 +4770,256 @@ TEST_F(TrieIndexDBTest, CustomOnlySSTsSurviveLoweredIndexMode) {
   iter->SeekToFirst();
   ASSERT_FALSE(iter->Valid());
   ASSERT_TRUE(iter->status().IsInvalidArgument());
+}
+
+// An iterator that leaves a MultiScan, here with SeekToLast(), reads like a
+// normal iterator, so the scan's limit no longer bounds the trie's Next().
+// (DBIter rejects SeekForPrev() on a forward MultiScan, and a Seek() there
+// needs iterate_upper_bound set to the limit, which would bound this scan
+// anyway.)
+TEST_P(TrieIndexDBTest, IteratorAfterMultiScanIgnoresScanRanges) {
+  ASSERT_OK(OpenDB(/*block_size=*/128));
+  const std::vector<std::string> keys = PutNumberedKeys(200, "value");
+  ASSERT_OK(db_->Flush(FlushOptions()));
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(TrieIndexReadOptions()));
+  // The scan keys outlive the iterator, so a kept limit would still apply.
+  MultiScanArgs scans(BytewiseComparator());
+  scans.insert(Slice(keys[10]), Slice(keys[20]));
+  iter->Prepare(scans);
+  iter->SeekToLast();
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key().ToString(), keys.back());
+
+  std::vector<std::string> all;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    all.push_back(iter->key().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(all, keys);
+}
+
+// The trie reads its block in place. With mmap reads, a block read from the
+// file points into the table file's mapping, which lives as long as the table
+// reader, and never goes into the block cache. The block cache holds a trie
+// block only when a flush put it there (prepopulate_block_cache), and then it
+// is a heap copy. The cases cover a trie block the table reader reads itself,
+// one looked up in the block cache but never inserted, and one warmed into the
+// cache by flush. 16 SSTs share a 10-reader table cache, so table readers are
+// evicted and reopened.
+TEST_P(TrieIndexDBTest, MmapReads) {
+  struct Case {
+    bool cache_index;
+    bool warm_on_flush;
+  };
+  for (const Case c :
+       {Case{false, false}, Case{true, false}, Case{true, true}}) {
+    SCOPED_TRACE(std::to_string(c.cache_index) +
+                 std::to_string(c.warm_on_flush));
+    options_.allow_mmap_reads = true;
+    options_.statistics = CreateDBStatistics();
+    // The smallest table cache, 10 readers, for 16 SSTs.
+    options_.max_open_files = 20;
+    options_.disable_auto_compactions = true;
+    options_.create_if_missing = true;
+    BlockBasedTableOptions table_options;
+    table_options.user_defined_index_factory = trie_factory_;
+    table_options.index_mode = GetIndexMode();
+    table_options.block_size = 256;
+    table_options.cache_index_and_filter_blocks = c.cache_index;
+    if (c.warm_on_flush) {
+      table_options.prepopulate_block_cache =
+          BlockBasedTableOptions::PrepopulateBlockCache::kFlushOnly;
+    }
+    options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    last_options_ = options_;
+    ASSERT_OK(DB::Open(options_, dbname_, &db_));
+
+    constexpr int kNumSsts = 16;
+    std::vector<std::string> keys;
+    for (int sst = 0; sst < kNumSsts; sst++) {
+      for (int i = sst; i < 800; i += kNumSsts) {
+        char key[16];
+        snprintf(key, sizeof(key), "key_%04d", i);
+        ASSERT_OK(db_->Put(WriteOptions(), key,
+                           std::string(40, static_cast<char>('a' + sst))));
+      }
+      ASSERT_OK(db_->Flush(FlushOptions()));
+    }
+    if (c.warm_on_flush) {
+      // Each flush warms its standard index (a stub in kCustomOnly) and its
+      // trie block.
+      ASSERT_EQ(options_.statistics->getTickerCount(BLOCK_CACHE_INDEX_ADD),
+                2 * kNumSsts);
+    }
+    for (int i = 0; i < 800; i++) {
+      char key[16];
+      snprintf(key, sizeof(key), "key_%04d", i);
+      keys.emplace_back(key);
+    }
+    for (int round = 0; round < 3; round++) {
+      SCOPED_TRACE(round);
+      if (round == 1) {
+        ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+      } else if (round == 2) {
+        ASSERT_OK(db_->Close());
+        db_.reset();
+        ASSERT_OK(DB::Open(options_, dbname_, &db_));
+      }
+      std::string value;
+      for (size_t i = 0; i < keys.size(); i++) {
+        ASSERT_OK(db_->Get(TrieIndexReadOptions(), keys[i], &value));
+        ASSERT_EQ(value,
+                  std::string(40, static_cast<char>('a' + i % kNumSsts)));
+      }
+      VerifyScanBothIndexes(keys);
+      if (round == 0 && c.warm_on_flush) {
+        // Every table reader open looks up both index blocks, and each found
+        // the copy its flush warmed.
+        ASSERT_GT(options_.statistics->getTickerCount(BLOCK_CACHE_INDEX_HIT),
+                  0);
+        ASSERT_EQ(options_.statistics->getTickerCount(BLOCK_CACHE_INDEX_MISS),
+                  0);
+      }
+    }
+    ASSERT_OK(db_->Close());
+    db_.reset();
+    ASSERT_OK(DestroyDB(dbname_, options_));
+  }
+}
+
+// A trie block of another format version, such as one written by an earlier
+// release, cannot be read. kStandardDefault falls back to the standard index;
+// modes that need the trie fail with NotSupported. An SST written in
+// kCustomOnly has only a stub standard index, so no mode can open it.
+TEST_F(TrieIndexDBTest, OtherTrieVersionFallsBackOrFails) {
+  // Writes the trie's blocks with version 1 in the header.
+  class OldVersionFactory : public TrieIndexFactory {
+   public:
+    using TrieIndexFactory::NewBuilder;
+    using TrieIndexFactory::NewReader;
+    Status NewBuilder(
+        const IndexFactoryOptions& options,
+        std::unique_ptr<IndexFactoryBuilder>& builder) const override {
+      std::unique_ptr<IndexFactoryBuilder> trie;
+      Status s = TrieIndexFactory::NewBuilder(options, trie);
+      if (s.ok()) {
+        builder = std::make_unique<Builder>(std::move(trie));
+      }
+      return s;
+    }
+
+    // Reads its own blocks, as the earlier release did, so that a flush in
+    // kCustomOnly can open its output.
+    Status NewReader(
+        const IndexFactoryOptions& options, Slice& index_block,
+        std::unique_ptr<IndexFactoryReader>& reader) const override {
+      auto own = std::make_unique<Reader>(index_block);
+      Status s = TrieIndexFactory::NewReader(options, own->contents, own->trie);
+      if (s.ok()) {
+        reader = std::move(own);
+      }
+      return s;
+    }
+
+   private:
+    // A trie reader over a copy of the block with the current version.
+    struct Reader : public IndexFactoryReader {
+      explicit Reader(const Slice& block)
+          : data(block.ToString()), contents(data) {
+        EncodeFixed32(&data[4], 2);
+      }
+      std::unique_ptr<IndexFactoryIterator> NewIterator(
+          const ReadOptions& read_options) override {
+        return trie->NewIterator(read_options);
+      }
+      size_t ApproximateMemoryUsage() const override {
+        return sizeof(*this) + data.size();
+      }
+      std::string data;
+      Slice contents;
+      std::unique_ptr<IndexFactoryReader> trie;
+    };
+
+    class Builder : public IndexFactoryBuilder {
+     public:
+      explicit Builder(std::unique_ptr<IndexFactoryBuilder> trie)
+          : trie_(std::move(trie)) {}
+      Slice AddIndexEntry(const Slice& last_key_in_current_block,
+                          const Slice* first_key_in_next_block,
+                          const BlockHandle& block_handle,
+                          std::string* separator_scratch,
+                          const IndexEntryContext& context) override {
+        return trie_->AddIndexEntry(last_key_in_current_block,
+                                    first_key_in_next_block, block_handle,
+                                    separator_scratch, context);
+      }
+      void OnKeyAdded(const Slice& key, ValueType type,
+                      const Slice& value) override {
+        trie_->OnKeyAdded(key, type, value);
+      }
+      Status Finish(Slice* index_contents) override {
+        Status s = trie_->Finish(index_contents);
+        if (s.ok()) {
+          data_ = index_contents->ToString();
+          EncodeFixed32(&data_[4], 1);
+          *index_contents = data_;
+        }
+        return s;
+      }
+      uint64_t EstimatedSize() const override { return trie_->EstimatedSize(); }
+
+     private:
+      std::unique_ptr<IndexFactoryBuilder> trie_;
+      std::string data_;
+    };
+  };
+
+  using IndexMode = BlockBasedTableOptions::IndexMode;
+  trie_factory_ = std::make_shared<OldVersionFactory>();
+  ASSERT_OK(OpenDBImpl(/*block_size=*/128, IndexMode::kStandardDefault));
+  WriteSequentialKeys(0, 30);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_OK(db_->Close());
+  db_.reset();
+
+  trie_factory_ = std::make_shared<TrieIndexFactory>();
+  options_.statistics = CreateDBStatistics();
+  ASSERT_OK(OpenDBImpl(/*block_size=*/128, IndexMode::kStandardDefault));
+  std::string value;
+  ASSERT_OK(db_->Get(ReadOptions(), "key_0015", &value));
+  ASSERT_EQ(value, "val_0015");
+  ASSERT_EQ(options_.statistics->getTickerCount(
+                SST_USER_DEFINED_INDEX_LOAD_FAIL_COUNT),
+            1u);
+  ASSERT_OK(db_->Close());
+  db_.reset();
+
+  for (IndexMode mode :
+       {IndexMode::kStandardRequired, IndexMode::kCustomDefault}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    ASSERT_EQ(OpenDBImpl(/*block_size=*/128, mode).code(),
+              Status::Code::kNotSupported);
+  }
+
+  ASSERT_OK(DestroyDB(dbname_, options_));
+  trie_factory_ = std::make_shared<OldVersionFactory>();
+  ASSERT_OK(OpenDBImpl(/*block_size=*/128, IndexMode::kCustomOnly));
+  WriteSequentialKeys(0, 30);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_OK(db_->Close());
+  db_.reset();
+
+  trie_factory_ = std::make_shared<TrieIndexFactory>();
+  for (IndexMode mode : {IndexMode::kStandardDefault, IndexMode::kCustomOnly}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    ASSERT_EQ(OpenDBImpl(/*block_size=*/128, mode).code(),
+              Status::Code::kNotSupported);
+  }
+  // kStandardOnly does not load the trie, so it rejects the stub.
+  ASSERT_EQ(OpenDBImpl(/*block_size=*/128, IndexMode::kStandardOnly).code(),
+            Status::Code::kInvalidArgument);
 }
 
 TEST_P(TrieIndexDBTest, RollbackFromPrimaryWithoutCompactSucceeds) {
