@@ -5,6 +5,8 @@
 
 #include "cache/lru_cache.h"
 
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -45,13 +47,16 @@ class LRUCacheTest : public testing::Test {
 
   void NewCache(size_t capacity, double high_pri_pool_ratio = 0.0,
                 double low_pri_pool_ratio = 1.0,
-                bool use_adaptive_mutex = kDefaultToAdaptiveMutex) {
+                bool use_adaptive_mutex = kDefaultToAdaptiveMutex,
+                CacheMetadataChargePolicy metadata_charge_policy =
+                    kDontChargeCacheMetadata,
+                bool strict_capacity_limit = false) {
     DeleteCache();
     cache_ = static_cast<LRUCacheShard*>(
         port::cacheline_aligned_alloc(sizeof(LRUCacheShard)));
-    new (cache_) LRUCacheShard(capacity, /*strict_capacity_limit=*/false,
+    new (cache_) LRUCacheShard(capacity, strict_capacity_limit,
                                high_pri_pool_ratio, low_pri_pool_ratio,
-                               use_adaptive_mutex, kDontChargeCacheMetadata,
+                               use_adaptive_mutex, metadata_charge_policy,
                                /*max_upper_hash_bits=*/24,
                                /*allocator*/ nullptr, &eviction_callback_);
   }
@@ -151,6 +156,180 @@ class LRUCacheTest : public testing::Test {
  private:
   Cache::EvictionCallback eviction_callback_;
 };
+
+// Recomputes the high/low pri pool usage from the LRU list itself and checks
+// it against the counters MaintainPoolSize() loops on, plus marker ordering
+// and per-region flags. A mismatch here is what makes MaintainPoolSize walk
+// off the end of its region and spin forever (issue #15128).
+class LRUCacheStateValidator {
+ public:
+  static void Validate(LRUCacheShard* cache, size_t* walked) {
+    size_t entries = 0;
+    LRUHandle* lru;
+    LRUHandle* lru_low_pri;
+    LRUHandle* lru_bottom_pri;
+    cache->TEST_GetLRUList(&lru, &lru_low_pri, &lru_bottom_pri);
+    size_t reported_high = 0, reported_low = 0;
+    cache->TEST_GetPoolUsage(&reported_high, &reported_low);
+
+    // 0 = bottom-pri region, 1 = low-pri region, 2 = high-pri region.
+    int region = 0;
+    if (lru_bottom_pri == lru) {
+      region = (lru_low_pri == lru) ? 2 : 1;
+    }
+    size_t actual_high = 0, actual_low = 0;
+    bool saw_bottom_marker = (lru_bottom_pri == lru);
+    bool saw_low_marker = (lru_low_pri == lru);
+    for (LRUHandle* p = lru->next; p != lru; p = p->next) {
+      entries++;
+      if (region == 0) {
+        ASSERT_FALSE(p->InHighPriPool()) << "key=" << p->key().ToString();
+        ASSERT_FALSE(p->InLowPriPool()) << "key=" << p->key().ToString();
+      } else if (region == 1) {
+        ASSERT_TRUE(p->InLowPriPool()) << "key=" << p->key().ToString();
+        ASSERT_FALSE(p->InHighPriPool()) << "key=" << p->key().ToString();
+        actual_low += p->total_charge;
+      } else {
+        ASSERT_TRUE(p->InHighPriPool()) << "key=" << p->key().ToString();
+        ASSERT_FALSE(p->InLowPriPool()) << "key=" << p->key().ToString();
+        actual_high += p->total_charge;
+      }
+      if (p == lru_bottom_pri) {
+        ASSERT_EQ(0, region) << "bottom marker out of order";
+        saw_bottom_marker = true;
+        if (p == lru_low_pri) {
+          saw_low_marker = true;
+          region = 2;
+        } else {
+          region = 1;
+        }
+      } else if (p == lru_low_pri) {
+        ASSERT_EQ(1, region) << "MARKERS OUT OF ORDER (low before bottom)";
+        saw_low_marker = true;
+        region = 2;
+      }
+    }
+    ASSERT_TRUE(saw_bottom_marker) << "lru_bottom_pri_ dangling";
+    ASSERT_TRUE(saw_low_marker) << "lru_low_pri_ dangling";
+    ASSERT_EQ(2, region) << "markers not both reached";
+    ASSERT_EQ(actual_high, reported_high) << "high_pri_pool_usage_ drift";
+    ASSERT_EQ(actual_low, reported_low) << "low_pri_pool_usage_ drift";
+    if (walked != nullptr) {
+      *walked += entries;
+    }
+  }
+};
+
+// A shard whose low-pri counter no longer describes its list used to spin in
+// MaintainPoolSize() forever, holding mutex_ and wedging every user of the
+// cache. It must now abort instead, leaving a core dump to diagnose from.
+TEST_F(LRUCacheTest, CorruptPoolUsageAborts) {
+  NewCache(10, /*high_pri_pool_ratio=*/0.5, /*low_pri_pool_ratio=*/0.0);
+  for (char ch = 'a'; ch <= 'e'; ch++) {
+    Insert(ch, Cache::Priority::HIGH);
+  }
+  ASSERT_DEATH(cache_->TEST_SimulateCorruptLowPriPoolUsage(SIZE_MAX),
+               "corrupt low-pri pool accounting");
+}
+
+// Randomized stress over the shard's full public API, validating the pool
+// bookkeeping after every single operation.
+TEST_F(LRUCacheTest, PoolBookkeepingStress) {
+  const double kRatios[] = {0.0, 0.25, 0.5, 1.0};
+  const int kSeeds =
+      getenv("LRU_STRESS_SEEDS") ? atoi(getenv("LRU_STRESS_SEEDS")) : 2000;
+  const int kSteps = 400;
+  const int kKeys = 30;
+  size_t validated_entries = 0;
+  for (int seed = 0; seed < kSeeds; seed++) {
+    Random rnd(seed);
+    double hi = kRatios[rnd.Uniform(4)];
+    double lo = kRatios[rnd.Uniform(4)];
+    if (hi + lo > 1.0) {
+      lo = 1.0 - hi;
+    }
+    // Capacity well above the working set so the LRU list actually stays
+    // populated; the pool-region logic is only exercised by long lists.
+    size_t cap = 60 + rnd.Uniform(140);
+    CacheMetadataChargePolicy policy =
+        rnd.OneIn(2) ? kFullChargeCacheMetadata : kDontChargeCacheMetadata;
+    if (policy == kFullChargeCacheMetadata) {
+      cap *= 128;  // metadata alone is ~100 bytes/entry
+    }
+    NewCache(cap, hi, lo, kDefaultToAdaptiveMutex, policy, rnd.OneIn(8));
+    SCOPED_TRACE("seed=" + std::to_string(seed));
+    std::vector<LRUHandle*> pinned;
+    for (int step = 0; step < kSteps; step++) {
+      SCOPED_TRACE("step=" + std::to_string(step));
+      std::string key(1, static_cast<char>('a' + rnd.Uniform(kKeys)));
+      uint32_t roll = rnd.Uniform(100);
+      if (roll < 30) {  // Insert, no handle -> straight onto the LRU list.
+        Cache::Priority pri = static_cast<Cache::Priority>(rnd.Uniform(3));
+        cache_
+            ->Insert(key, 0, nullptr, &kNoopCacheItemHelper, 1 + rnd.Uniform(6),
+                     nullptr, pri)
+            .PermitUncheckedError();
+      } else if (roll < 40) {  // Insert pinned -> enters the list via Release.
+        LRUHandle* h = nullptr;
+        Cache::Priority pri = static_cast<Cache::Priority>(rnd.Uniform(3));
+        cache_
+            ->Insert(key, 0, nullptr, &kNoopCacheItemHelper, 1 + rnd.Uniform(6),
+                     &h, pri)
+            .PermitUncheckedError();
+        if (h != nullptr) {
+          pinned.push_back(h);
+        }
+      } else if (roll < 62) {  // Lookup -> pulls the entry out of the list.
+        LRUHandle* h = cache_->Lookup(key, 0, &kNoopCacheItemHelper, nullptr,
+                                      Cache::Priority::LOW, nullptr);
+        if (h != nullptr) {
+          pinned.push_back(h);
+        }
+      } else if (roll < 84) {  // Release -> re-inserts into the list.
+        if (!pinned.empty()) {
+          size_t i = rnd.Uniform(static_cast<int>(pinned.size()));
+          cache_->Release(pinned[i], true, rnd.OneIn(8));
+          pinned.erase(pinned.begin() + static_cast<long>(i));
+        }
+      } else if (roll < 88) {
+        cache_->Erase(key, 0);
+      } else if (roll < 92) {
+        cache_->SetCapacity(60 + rnd.Uniform(140));
+      } else if (roll < 97) {
+        if (rnd.OneIn(2)) {
+          cache_->SetHighPriorityPoolRatio(kRatios[rnd.Uniform(4)]);
+        } else {
+          cache_->SetLowPriorityPoolRatio(kRatios[rnd.Uniform(4)]);
+        }
+      } else if (roll < 99) {  // Standalone: shares usage_, never in the list.
+        LRUHandle* h =
+            cache_->CreateStandalone(key, 0, nullptr, &kNoopCacheItemHelper,
+                                     1 + rnd.Uniform(6), rnd.OneIn(2));
+        if (h != nullptr) {
+          cache_->Release(h, true, false);
+        }
+      } else if (rnd.OneIn(10)) {
+        cache_->EraseUnRefEntries();
+      }
+      LRUCacheStateValidator::Validate(cache_, &validated_entries);
+      if (HasFatalFailure()) {
+        return;
+      }
+    }
+    for (LRUHandle* h : pinned) {
+      cache_->Release(h, true, false);
+    }
+    LRUCacheStateValidator::Validate(cache_, &validated_entries);
+    if (HasFatalFailure()) {
+      return;
+    }
+  }
+  size_t validations = static_cast<size_t>(kSeeds) * (kSteps + 1);
+  fprintf(stderr, "avg LRU list length during validation: %.1f entries\n",
+          static_cast<double>(validated_entries) / validations);
+  // Guard against a vacuous run: near-empty lists never exercise the pools.
+  ASSERT_GT(validated_entries, validations * 5);
+}
 
 TEST_F(LRUCacheTest, BasicLRU) {
   NewCache(5);
