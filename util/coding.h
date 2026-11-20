@@ -138,6 +138,8 @@ inline void PutFixed32(std::string* dst, uint32_t value) {
   }
 }
 
+// PutFixed64: Appends a 64-bit unsigned integer to the given string in fixed-size little-endian format.
+// If the system is little-endian, it appends directly. Otherwise, it encodes the integer into a buffer first.
 inline void PutFixed64(std::string* dst, uint64_t value) {
   if (port::kLittleEndian) {
     dst->append(const_cast<const char*>(reinterpret_cast<char*>(&value)),
