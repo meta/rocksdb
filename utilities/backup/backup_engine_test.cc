@@ -14,14 +14,18 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "db/db_impl/db_impl.h"
@@ -294,6 +298,19 @@ class TestFs : public FileSystemWrapper {
       return IOStatus::IOError();
     }
     return FileSystemWrapper::DeleteDir(d, options, dbg);
+  }
+
+  std::function<IOStatus(const std::string&)> before_rename;
+
+  IOStatus RenameFile(const std::string& src, const std::string& dst,
+                      const IOOptions& options, IODebugContext* dbg) override {
+    if (before_rename) {
+      IOStatus status = before_rename(src);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    return FileSystemWrapper::RenameFile(src, dst, options, dbg);
   }
 
   void AssertWrittenFiles(std::vector<std::string>& should_have_written) {
@@ -1118,6 +1135,52 @@ class BackupEngineTestWithParam : public BackupEngineTest,
     OpenBackupEngine(destroy_old_data);
   }
 };
+
+TEST_P(BackupEngineTestWithParam, SharedFileRenamesOverlap) {
+  options_.disable_auto_compactions = true;
+  engine_options_->max_background_operations = 2;
+  OpenDBAndBackupEngine(true);
+  FillDB(db_.get(), 0, 100, kFlushAll);
+  FillDB(db_.get(), 100, 200, kFlushAll);
+
+  std::promise<void> second_rename;
+  std::future<void> ready = second_rename.get_future();
+  std::atomic<int> started{0};
+  test_backup_fs_->before_rename = [&](const std::string& src) {
+    if (EndsWith(src, ".sst.tmp")) {
+      const int call = started.fetch_add(1);
+      if (call == 0 && ready.wait_for(std::chrono::seconds(10)) !=
+                           std::future_status::ready) {
+        return IOStatus::IOError("Shared-file renames did not overlap");
+      }
+      if (call == 1) {
+        second_rename.set_value();
+      }
+    }
+    return IOStatus::OK();
+  };
+  Status backup_status = backup_engine_->CreateNewBackup(db_.get());
+  test_backup_fs_->before_rename = {};
+
+  ASSERT_OK(backup_status);
+  ASSERT_EQ(2, started.load());
+}
+
+TEST_P(BackupEngineTestWithParam, SharedFileRenameFailureDoesNotPublishBackup) {
+  OpenDBAndBackupEngine(true);
+  FillDB(db_.get(), 0, 100, kFlushAll);
+  test_backup_fs_->before_rename = [](const std::string& src) {
+    return EndsWith(src, ".sst.tmp")
+               ? IOStatus::IOError("Injected rename failure")
+               : IOStatus::OK();
+  };
+  Status status = backup_engine_->CreateNewBackup(db_.get());
+  test_backup_fs_->before_rename = {};
+  ASSERT_EQ(Status::kIOError, status.code());
+  std::vector<BackupInfo> backups;
+  backup_engine_->GetBackupInfo(&backups);
+  ASSERT_TRUE(backups.empty());
+}
 
 TEST_F(BackupEngineTest, IncrementalRestore) {
   // Required for excluding files.
@@ -1995,6 +2058,10 @@ TEST_F(BackupEngineTest, TableFileWithoutDbChecksumCorruptedDuringBackup) {
 
   FillDB(db_.get(), 0, keys_iteration);
   std::atomic<bool> corrupted{false};
+  test_backup_fs_->before_rename = [&](const std::string& src) {
+    EXPECT_FALSE(corrupted && EndsWith(src, ".sst.tmp"));
+    return IOStatus::OK();
+  };
   // corrupt files when copying to the backup directory
   SyncPoint::GetInstance()->SetCallBack(
       "BackupEngineImpl::CopyOrCreateFile:CorruptionDuringBackup",
@@ -2009,6 +2076,7 @@ TEST_F(BackupEngineTest, TableFileWithoutDbChecksumCorruptedDuringBackup) {
       });
   SyncPoint::GetInstance()->EnableProcessing();
   Status s = backup_engine_->CreateNewBackup(db_.get());
+  test_backup_fs_->before_rename = {};
   if (corrupted) {
     ASSERT_NOK(s);
   } else {

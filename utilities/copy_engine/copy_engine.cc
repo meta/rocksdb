@@ -120,6 +120,10 @@ void CopyEngine::ThreadBody() {
                          checksum_function_info.c_str());
         }
       }
+      if (result.io_status.ok() && !work_item.final_dst_path.empty()) {
+        result.io_status = work_item.dst_env->GetFileSystem()->RenameFile(
+            work_item.dst_path, work_item.final_dst_path, IOOptions(), nullptr);
+      }
     } else if (work_item.type == ComputeChecksum) {
       result.io_status = ReadFileAndComputeChecksum(
           work_item.src_path, work_item.src_env->GetFileSystem(),

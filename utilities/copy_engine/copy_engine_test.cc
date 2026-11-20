@@ -5,16 +5,49 @@
 
 #include "utilities/copy_engine/copy_engine.h"
 
+#include <chrono>
 #include <future>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "file/file_util.h"
 #include "port/stack_trace.h"
 #include "rocksdb/env.h"
+#include "rocksdb/file_system.h"
 #include "test_util/testharness.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+class BlockingRenameFileSystem : public FileSystemWrapper {
+ public:
+  explicit BlockingRenameFileSystem(const std::shared_ptr<FileSystem>& fs)
+      : FileSystemWrapper(fs) {}
+
+  const char* Name() const override { return "BlockingRenameFileSystem"; }
+
+  std::future<void> GetRenameStartedFuture() {
+    return rename_started_.get_future();
+  }
+  void ReleaseRename() { release_rename_.set_value(); }
+
+  IOStatus RenameFile(const std::string& src, const std::string& dst,
+                      const IOOptions& options, IODebugContext* dbg) override {
+    rename_started_.set_value();
+    release_rename_future_.wait();
+    return FileSystemWrapper::RenameFile(src, dst, options, dbg);
+  }
+
+ private:
+  std::promise<void> rename_started_;
+  std::promise<void> release_rename_;
+  std::future<void> release_rename_future_ = release_rename_.get_future();
+};
+
+}  // namespace
 
 class CopyEngineTest : public testing::Test {
  protected:
@@ -159,6 +192,32 @@ TEST_F(CopyEngineTest, SerialCopyMatchesSingleThread) {
     ASSERT_OK(r.io_status);
     VerifyDstMatches(i, contents[i]);
   }
+}
+
+TEST_F(CopyEngineTest, ResultWaitsForRename) {
+  const std::string content = ContentFor(0);
+  CreateSrc(0, content);
+  auto fs = std::make_shared<BlockingRenameFileSystem>(env_->GetFileSystem());
+  std::unique_ptr<Env> dst_env = NewCompositeEnv(fs);
+  std::future<void> rename_started = fs->GetRenameStartedFuture();
+  CopyEngine engine{CopyEngineOptions{}};
+  WorkItem item = MakeCopyItem(0);
+  item.dst_env = dst_env.get();
+  item.final_dst_path = DstPath(1);
+  std::future<WorkItemResult> result = item.result.get_future();
+  engine.Submit(std::move(item));
+
+  const std::future_status rename_status =
+      rename_started.wait_for(std::chrono::minutes(1));
+  const std::future_status result_status =
+      result.wait_for(std::chrono::seconds(0));
+  fs->ReleaseRename();
+
+  ASSERT_EQ(std::future_status::ready, rename_status);
+  EXPECT_EQ(std::future_status::timeout, result_status);
+  WorkItemResult copied = result.get();
+  ASSERT_OK(copied.io_status);
+  VerifyDstMatches(1, content);
 }
 
 TEST_F(CopyEngineTest, MissingSourceReportsErrorPerItem) {
