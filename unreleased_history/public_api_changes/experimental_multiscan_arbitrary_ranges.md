@@ -1,0 +1,1 @@
+Added experimental `MultiScanArgs::allow_unsorted_or_overlapping_ranges`. It preserves caller range order and evaluates overlapping ranges independently; legacy sorted, non-overlapping validation remains the default. External table factories must explicitly opt in through `SupportsMultiScan()`.

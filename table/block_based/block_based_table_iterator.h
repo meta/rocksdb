@@ -196,7 +196,8 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
     // or index_iter_'s current *value*.
     return pinned_iters_mgr_ && pinned_iters_mgr_->PinningEnabled() &&
            ((is_at_first_key_from_index_ && index_iter_->IsValuePinned()) ||
-            (block_iter_points_to_real_block_ && block_iter_.IsKeyPinned()));
+            (block_iter_points_to_real_block_ && !data_block_is_borrowed_ &&
+             block_iter_.IsKeyPinned()));
   }
   bool IsValuePinned() const override {
     assert(!is_at_first_key_from_index_);
@@ -204,7 +205,7 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
 
     // BlockIter::IsValuePinned() is always true. No need to check
     return pinned_iters_mgr_ && pinned_iters_mgr_->PinningEnabled() &&
-           block_iter_points_to_real_block_;
+           block_iter_points_to_real_block_ && !data_block_is_borrowed_;
   }
 
   // Pinning this iterator keeps alive the reader (through a table cache
@@ -232,6 +233,7 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
       block_iter_.Invalidate(Status::OK());
       block_iter_points_to_real_block_ = false;
     }
+    data_block_is_borrowed_ = false;
     block_upper_bound_check_ = BlockUpperBound::kUnknown;
   }
 
@@ -431,6 +433,9 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   // True if block_iter_ is initialized and points to the same block
   // as index iterator.
   bool block_iter_points_to_real_block_;
+  // A borrowed block is owned by multi_scan_read_set_, not by block_iter_.
+  // Pinning APIs must not advertise lifetime beyond that ReadSet.
+  bool data_block_is_borrowed_ = false;
   // See InternalIteratorBase::IsOutOfBound().
   bool is_out_of_bound_ = false;
 
@@ -458,6 +463,7 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
 
   // Reset MultiScan state and restore the original index iterator.
   void ResetMultiScan() {
+    assert(!data_block_is_borrowed_);
     multi_scan_read_set_.reset();
     multi_scan_index_iter_ = nullptr;
     prefetch_max_idx_ = 0;
@@ -593,6 +599,17 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
       std::vector<BlockHandle>* scan_block_handles,
       std::vector<std::tuple<size_t, size_t>>* block_index_ranges_per_scan,
       std::vector<std::string>* data_block_boundary_keys);
+
+  // Produces unique handles in first logical-use order, one handle-index list
+  // per local range, parallel separator/end-of-file metadata, and each unique
+  // block's earliest caller-range index for admission priority.
+  Status CollectNonCanonicalBlockHandles(
+      const MultiScanArgs& multiscan_opts,
+      std::vector<BlockHandle>* unique_block_handles,
+      std::vector<std::vector<size_t>>* block_indices_per_scan,
+      std::vector<std::string>* data_block_boundary_keys,
+      std::vector<bool>* range_reaches_file_end,
+      std::vector<size_t>* logical_block_priorities);
 
   // *** END APIs relevant to multiscan ***
 };

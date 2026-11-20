@@ -7,9 +7,11 @@
 
 #include <algorithm>
 
+#include "db/multi_scan_internal.h"
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics_impl.h"
 #include "rocksdb/options.h"
+#include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -35,8 +37,45 @@ MultiScanIndexIterator::MultiScanIndexIterator(
       user_comparator_(icomp.user_comparator()),
       statistics_(statistics) {}
 
+MultiScanIndexIterator::MultiScanIndexIterator(
+    std::vector<BlockHandle>&& block_handles,
+    std::vector<std::string>&& data_block_separators,
+    std::vector<std::vector<size_t>>&& block_indices_per_scan,
+    std::vector<bool>&& range_reaches_file_end, const MultiScanArgs* scan_opts,
+    std::shared_ptr<ReadSet> read_set, size_t prefetch_start_idx,
+    size_t prefetch_max_idx, const InternalKeyComparator& icomp,
+    Statistics* statistics)
+    : block_handles_(std::move(block_handles)),
+      data_block_separators_(std::move(data_block_separators)),
+      block_indices_per_scan_(std::move(block_indices_per_scan)),
+      range_reaches_file_end_(std::move(range_reaches_file_end)),
+      scan_opts_(scan_opts),
+      read_set_(std::move(read_set)),
+      prefetch_start_idx_(prefetch_start_idx),
+      prefetch_max_idx_(prefetch_max_idx),
+      first_unreleased_prefetch_idx_(prefetch_start_idx),
+      one_past_last_unreleased_prefetch_idx_(prefetch_max_idx),
+      released_prefetch_blocks_(prefetch_max_idx - prefetch_start_idx, false),
+      unreleased_prefetch_blocks_(prefetch_max_idx - prefetch_start_idx),
+      remaining_range_uses_(block_handles_.size(), 0),
+      used_prefetch_blocks_(prefetch_max_idx - prefetch_start_idx, false),
+      icomp_(icomp),
+      user_comparator_(icomp.user_comparator()),
+      statistics_(statistics),
+      noncanonical_ranges_(true) {
+  for (const std::vector<size_t>& block_indices : block_indices_per_scan_) {
+    for (const size_t block_index : block_indices) {
+      ++remaining_range_uses_[block_index];
+    }
+  }
+}
+
 MultiScanIndexIterator::~MultiScanIndexIterator() {
-  CountUnreleasedPrefetchedBlocksAsWasted();
+  if (noncanonical_ranges_) {
+    ReleaseNonCanonicalBlocks();
+  } else {
+    CountUnreleasedPrefetchedBlocksAsWasted();
+  }
   if (statistics_ && wasted_blocks_count_ > 0) {
     RecordTick(statistics_, MULTISCAN_PREFETCH_BLOCKS_WASTED,
                wasted_blocks_count_);
@@ -95,15 +134,80 @@ void MultiScanIndexIterator::CountUnreleasedPrefetchedBlocksAsWasted() {
   }
 }
 
+void MultiScanIndexIterator::ReleaseNonCanonicalBlocks() {
+  for (size_t block_index = prefetch_start_idx_;
+       block_index < prefetch_max_idx_; ++block_index) {
+    const size_t prefetch_index = block_index - prefetch_start_idx_;
+    if (released_prefetch_blocks_[prefetch_index]) {
+      continue;
+    }
+    if (!used_prefetch_blocks_[prefetch_index]) {
+      ++wasted_blocks_count_;
+    }
+    ReleasePrefetchedBlock(block_index);
+  }
+}
+
+void MultiScanIndexIterator::RetireNonCanonicalRange() {
+  if (active_scan_idx_ >= block_indices_per_scan_.size() ||
+      active_range_retired_) {
+    return;
+  }
+  for (const size_t block_index : block_indices_per_scan_[active_scan_idx_]) {
+    assert(remaining_range_uses_[block_index] > 0);
+    --remaining_range_uses_[block_index];
+    if (remaining_range_uses_[block_index] != 0 ||
+        !IsPrefetchedBlock(block_index)) {
+      continue;
+    }
+    const size_t prefetch_index = block_index - prefetch_start_idx_;
+    if (!used_prefetch_blocks_[prefetch_index]) {
+      ++wasted_blocks_count_;
+    }
+    ReleasePrefetchedBlock(block_index);
+  }
+  active_range_retired_ = true;
+}
+
+void MultiScanIndexIterator::FinishNonCanonicalRange() {
+  RetireNonCanonicalRange();
+  active_scan_idx_ = std::numeric_limits<size_t>::max();
+}
+
+size_t MultiScanIndexIterator::FindLocalRange(
+    size_t logical_range_index) const {
+  for (size_t i = 0; i < block_indices_per_scan_.size(); ++i) {
+    if (MultiScanArgsHelper::GetLogicalRangeIndex(*scan_opts_, i) ==
+        logical_range_index) {
+      return i;
+    }
+  }
+  return std::numeric_limits<size_t>::max();
+}
+
 bool MultiScanIndexIterator::IsPrefetchedBlock(size_t block_idx) const {
   return block_idx >= prefetch_start_idx_ && block_idx < prefetch_max_idx_;
 }
 
-size_t MultiScanIndexIterator::current_read_set_index() const {
+size_t MultiScanIndexIterator::current_read_set_index() {
   if (!IsPrefetchedBlock(cur_idx_)) {
     return prefetch_max_idx_ - prefetch_start_idx_;
   }
+  if (noncanonical_ranges_) {
+    used_prefetch_blocks_[cur_idx_ - prefetch_start_idx_] = true;
+  }
   return cur_idx_ - prefetch_start_idx_;
+}
+
+bool MultiScanIndexIterator::CurrentRangeEndsInThisFile() const {
+  if (scan_opts_->reverse) {
+    return false;
+  }
+  if (noncanonical_ranges_) {
+    return active_scan_idx_ < range_reaches_file_end_.size() &&
+           !range_reaches_file_end_[active_scan_idx_];
+  }
+  return next_scan_idx_ < block_index_ranges_per_scan_.size();
 }
 
 void MultiScanIndexIterator::ReleaseBlock(size_t block_idx) {
@@ -126,6 +230,12 @@ bool MultiScanIndexIterator::ReleasePrefetchedBlock(size_t block_idx) {
   --unreleased_prefetch_blocks_;
   ShrinkUnreleasedPrefetchBounds();
   return true;
+}
+
+void MultiScanIndexIterator::MarkCurrentBlockUnretained() {
+  assert(noncanonical_ranges_);
+  TEST_SYNC_POINT("MultiScanIndexIterator::MarkCurrentBlockUnretained");
+  ReleasePrefetchedBlock(cur_idx_);
 }
 
 void MultiScanIndexIterator::ShrinkUnreleasedPrefetchBounds() {
@@ -165,6 +275,10 @@ void MultiScanIndexIterator::Seek(const Slice& target) {
     status_ = Status::InvalidArgument("Seek called on reverse MultiScan");
     RecordTick(statistics_, MULTISCAN_SEEK_ERRORS);
     valid_ = false;
+    return;
+  }
+  if (noncanonical_ranges_) {
+    SeekNonCanonical(target);
     return;
   }
 
@@ -266,6 +380,92 @@ void MultiScanIndexIterator::Seek(const Slice& target) {
     }
     SeekToBlockIdx(block_idx);
   }
+}
+
+void MultiScanIndexIterator::SeekNonCanonical(const Slice& target) {
+  scan_range_exhausted_ = false;
+  const std::shared_ptr<MultiScanSeekState> seek_state =
+      MultiScanArgsHelper::GetSeekState(*scan_opts_);
+  // A new DBIter range transition retires the old range and activates the
+  // caller-selected logical range, even when its keys move backward.
+  if (seek_state && seek_state->generation != observed_seek_generation_) {
+    FinishNonCanonicalRange();
+    observed_seek_generation_ = seek_state->generation;
+    const size_t local_range = FindLocalRange(seek_state->logical_range_index);
+    if (local_range == std::numeric_limits<size_t>::max()) {
+      valid_ = false;
+      return;
+    }
+    ActivateNonCanonicalRange(local_range, target);
+    return;
+  }
+
+  const Slice user_seek_target = ExtractUserKey(target);
+  // A table iterator can also be prepared and driven directly. Without the
+  // shared state, an exact range-start seek advances through caller order.
+  if (!seek_state && next_scan_idx_ < block_indices_per_scan_.size() &&
+      user_comparator_.CompareWithoutTimestamp(
+          user_seek_target, /*a_has_ts=*/true,
+          *scan_opts_->GetScanRanges()[next_scan_idx_].range.start,
+          /*b_has_ts=*/false) == 0) {
+    FinishNonCanonicalRange();
+    ActivateNonCanonicalRange(next_scan_idx_, target);
+    ++next_scan_idx_;
+    return;
+  }
+
+  if (active_scan_idx_ >= block_indices_per_scan_.size()) {
+    valid_ = false;
+    return;
+  }
+  // Tombstone and skip reseeks keep the same generation and reposition only
+  // within the active logical range.
+  PositionInNonCanonicalRange(target);
+}
+
+void MultiScanIndexIterator::ActivateNonCanonicalRange(size_t scan_idx,
+                                                       const Slice& target) {
+  assert(scan_idx < block_indices_per_scan_.size());
+  active_scan_idx_ = scan_idx;
+  active_scan_block_pos_ = 0;
+  active_range_retired_ = false;
+  PositionInNonCanonicalRange(target);
+}
+
+void MultiScanIndexIterator::PositionInNonCanonicalRange(const Slice& target) {
+  assert(active_scan_idx_ < block_indices_per_scan_.size());
+  const std::vector<size_t>& block_indices =
+      block_indices_per_scan_[active_scan_idx_];
+  const Slice user_seek_target = ExtractUserKey(target);
+  size_t block_position = 0;
+  while (block_position < block_indices.size() &&
+         user_comparator_.CompareWithoutTimestamp(
+             user_seek_target, /*a_has_ts=*/true,
+             data_block_separators_[block_indices[block_position]],
+             /*b_has_ts=*/false) > 0) {
+    ++block_position;
+  }
+  if (block_position == block_indices.size()) {
+    SetNonCanonicalRangeExhausted();
+    return;
+  }
+
+  active_scan_block_pos_ = block_position;
+  cur_idx_ = block_indices[block_position];
+  if (!IsPrefetchedBlock(cur_idx_)) {
+    valid_ = false;
+    if (scan_opts_->max_prefetch_size > 0) {
+      status_ = Status::PrefetchLimitReached();
+    }
+    return;
+  }
+  valid_ = true;
+}
+
+void MultiScanIndexIterator::SetNonCanonicalRangeExhausted() {
+  scan_range_exhausted_ = true;
+  valid_ = false;
+  RetireNonCanonicalRange();
 }
 
 void MultiScanIndexIterator::SeekToBlock(const Slice* user_seek_target) {
@@ -371,6 +571,10 @@ void MultiScanIndexIterator::SetExhausted() {
 
 void MultiScanIndexIterator::Next() {
   assert(valid_);
+  if (noncanonical_ranges_) {
+    NextNonCanonical();
+    return;
+  }
 
   // Release current block
   ReleaseBlock(cur_idx_);
@@ -397,6 +601,26 @@ void MultiScanIndexIterator::Next() {
   }
 
   // Still within current range, valid
+  valid_ = true;
+}
+
+void MultiScanIndexIterator::NextNonCanonical() {
+  assert(active_scan_idx_ < block_indices_per_scan_.size());
+  const std::vector<size_t>& block_indices =
+      block_indices_per_scan_[active_scan_idx_];
+  ++active_scan_block_pos_;
+  if (active_scan_block_pos_ >= block_indices.size()) {
+    SetNonCanonicalRangeExhausted();
+    return;
+  }
+  cur_idx_ = block_indices[active_scan_block_pos_];
+  if (!IsPrefetchedBlock(cur_idx_)) {
+    valid_ = false;
+    if (scan_opts_->max_prefetch_size > 0) {
+      status_ = Status::PrefetchLimitReached();
+    }
+    return;
+  }
   valid_ = true;
 }
 

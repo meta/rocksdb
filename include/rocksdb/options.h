@@ -2278,6 +2278,7 @@ class MultiScanArgs {
   MultiScanArgs(const MultiScanArgs& other) {
     comp_ = other.comp_;
     original_ranges_ = other.original_ranges_;
+    logical_range_indices_ = other.logical_range_indices_;
     io_coalesce_threshold = other.io_coalesce_threshold;
     max_prefetch_size = other.max_prefetch_size;
     rolling_prefetch = other.rolling_prefetch;
@@ -2286,7 +2287,10 @@ class MultiScanArgs {
     use_parallel_async_io_block_decompression =
         other.use_parallel_async_io_block_decompression;
     reverse = other.reverse;
+    allow_unsorted_or_overlapping_ranges =
+        other.allow_unsorted_or_overlapping_ranges;
     io_dispatcher = other.io_dispatcher;
+    seek_state_ = other.seek_state_;
   }
   MultiScanArgs(MultiScanArgs&& other) noexcept
       : io_coalesce_threshold(other.io_coalesce_threshold),
@@ -2296,14 +2300,19 @@ class MultiScanArgs {
         use_async_io(other.use_async_io),
         use_parallel_async_io_block_decompression(
             other.use_parallel_async_io_block_decompression),
+        allow_unsorted_or_overlapping_ranges(
+            other.allow_unsorted_or_overlapping_ranges),
         reverse(other.reverse),
         io_dispatcher(std::move(other.io_dispatcher)),
+        seek_state_(std::move(other.seek_state_)),
         comp_(other.comp_),
-        original_ranges_(std::move(other.original_ranges_)) {}
+        original_ranges_(std::move(other.original_ranges_)),
+        logical_range_indices_(std::move(other.logical_range_indices_)) {}
 
   MultiScanArgs& operator=(const MultiScanArgs& other) {
     comp_ = other.comp_;
     original_ranges_ = other.original_ranges_;
+    logical_range_indices_ = other.logical_range_indices_;
     io_coalesce_threshold = other.io_coalesce_threshold;
     max_prefetch_size = other.max_prefetch_size;
     rolling_prefetch = other.rolling_prefetch;
@@ -2312,7 +2321,10 @@ class MultiScanArgs {
     use_parallel_async_io_block_decompression =
         other.use_parallel_async_io_block_decompression;
     reverse = other.reverse;
+    allow_unsorted_or_overlapping_ranges =
+        other.allow_unsorted_or_overlapping_ranges;
     io_dispatcher = other.io_dispatcher;
+    seek_state_ = other.seek_state_;
     return *this;
   }
 
@@ -2320,6 +2332,7 @@ class MultiScanArgs {
     if (this != &other) {
       comp_ = other.comp_;
       original_ranges_ = std::move(other.original_ranges_);
+      logical_range_indices_ = std::move(other.logical_range_indices_);
       io_coalesce_threshold = other.io_coalesce_threshold;
       max_prefetch_size = other.max_prefetch_size;
       rolling_prefetch = other.rolling_prefetch;
@@ -2328,7 +2341,10 @@ class MultiScanArgs {
       use_parallel_async_io_block_decompression =
           other.use_parallel_async_io_block_decompression;
       reverse = other.reverse;
+      allow_unsorted_or_overlapping_ranges =
+          other.allow_unsorted_or_overlapping_ranges;
       io_dispatcher = std::move(other.io_dispatcher);
+      seek_state_ = std::move(other.seek_state_);
     }
     return *this;
   }
@@ -2398,7 +2414,10 @@ class MultiScanArgs {
     use_parallel_async_io_block_decompression =
         other.use_parallel_async_io_block_decompression;
     reverse = other.reverse;
+    allow_unsorted_or_overlapping_ranges =
+        other.allow_unsorted_or_overlapping_ranges;
     io_dispatcher = other.io_dispatcher;
+    seek_state_ = other.seek_state_;
   }
 
   uint64_t io_coalesce_threshold = 16 << 10;  // 16KB by default
@@ -2412,7 +2431,9 @@ class MultiScanArgs {
   // Note that prefetching happens only once in Prepare(), which is different
   // from ReadOptions::readahead_size, which applies any time the iterator does
   // I/O.
-  // Note that this limit is per file and applies to compressed block size.
+  // This limit is per file and applies to compressed block size. For
+  // overlapping arbitrary ranges, each unique physical block is counted once
+  // at its first logical use.
   uint64_t max_prefetch_size = 0;
 
   // Use max_prefetch_size as the maximum adaptive rolling batch size. The
@@ -2441,6 +2462,20 @@ class MultiScanArgs {
   // materialized on pool threads are not attributed to the calling thread.
   bool use_parallel_async_io_block_decompression = false;
 
+  // Allow MultiScan ranges to be unsorted or overlapping. Such an opted-in
+  // request is non-canonical; an opted-in request that is already sorted and
+  // non-overlapping remains canonical and uses the legacy path. By default,
+  // ranges must be sorted by start key and must not overlap. Results follow
+  // caller-provided range order, and overlapping ranges return matching keys
+  // independently.
+  //
+  // Iterator::Prepare() prefetches unique physical blocks for forward bounded
+  // requests in first logical-use order. Reverse, unbounded, and mixed-bound
+  // DB::NewMultiScan() requests use ordinary iterator reads. Direct Prepare()
+  // accepts uniformly bounded or uniformly unbounded ranges, but not a mix of
+  // the two. Rolling prefetch is not applied to non-canonical requests.
+  bool allow_unsorted_or_overlapping_ranges = false;
+
   // Scan ranges in reverse order. Ranges are still specified in comparator
   // order as [start, limit), and reverse scans require bounded ranges.
   bool reverse = false;
@@ -2452,9 +2487,15 @@ class MultiScanArgs {
   std::shared_ptr<IODispatcher> io_dispatcher = nullptr;
 
  private:
+  friend class MultiScanArgsHelper;
+
+  std::shared_ptr<void> seek_state_;
   // The comparator used for ordering ranges
   const Comparator* comp_;
   std::vector<ScanOptions> original_ranges_;
+  // Empty means local indexes are logical indexes. Per-file pruning populates
+  // this vector to preserve the caller's original range indexes.
+  std::vector<size_t> logical_range_indices_;
 };
 
 // Options that control read operations
