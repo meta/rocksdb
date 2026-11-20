@@ -104,6 +104,12 @@ static void Free(char** ptr) {
   }
 }
 
+static void CheckErrorContains(char** err, const char* expected) {
+  CheckCondition(*err != NULL);
+  CheckCondition(strstr(*err, expected) != NULL);
+  Free(err);
+}
+
 static long GetLocalFileSize(const char* path) {
   FILE* file = fopen(path, "rb");
   long size;
@@ -514,6 +520,48 @@ static int CmpCompare(void* arg, const char* a, size_t alen, const char* b,
     }
   }
   return r;
+}
+
+static int TimestampCmpCompare(void* arg, const char* a, size_t alen,
+                               const char* b, size_t blen) {
+  const size_t timestamp_size = 8;
+  if (alen < timestamp_size || blen < timestamp_size) {
+    return CmpCompare(arg, a, alen, b, blen);
+  }
+  int result =
+      CmpCompare(arg, a, alen - timestamp_size, b, blen - timestamp_size);
+  if (result != 0) {
+    return result;
+  }
+  return CmpCompare(arg, b + blen - timestamp_size, timestamp_size,
+                    a + alen - timestamp_size, timestamp_size);
+}
+
+static int TimestampCmpCompareTimestamp(void* arg, const char* a, size_t alen,
+                                        const char* b, size_t blen) {
+  return CmpCompare(arg, b, blen, a, alen);
+}
+
+static int TimestampCmpCompareWithoutTimestamp(void* arg, const char* a,
+                                               size_t alen,
+                                               unsigned char a_has_ts,
+                                               const char* b, size_t blen,
+                                               unsigned char b_has_ts) {
+  const size_t timestamp_size = 8;
+  if (a_has_ts) {
+    CheckCondition(alen >= timestamp_size);
+    alen -= timestamp_size;
+  }
+  if (b_has_ts) {
+    CheckCondition(blen >= timestamp_size);
+    blen -= timestamp_size;
+  }
+  return CmpCompare(arg, a, alen, b, blen);
+}
+
+static const char* TimestampCmpName(void* arg) {
+  (void)arg;
+  return "c_test.TimestampComparator";
 }
 
 static const char* CmpName(void* arg) {
@@ -2839,6 +2887,193 @@ int main(int argc, char** argv) {
     rocksdb_merge(db, woptions, "bar", 3, "barvalue", 8, &err);
     CheckNoError(err);
     CheckGet(db, roptions, "bar", "fake");
+  }
+
+  StartPhase("writebatch_slice_parts");
+  {
+    rocksdb_column_family_handle_t* slices_cf = rocksdb_create_column_family(
+        db, options, "writebatch_slice_parts", &err);
+    CheckNoError(err);
+
+    rocksdb_put(db, woptions, "slices-merge", 12, "base", 4, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "slices-delete", 13, "old", 3, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "slices-range-a", 14, "a", 1, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "slices-range-b", 14, "b", 1, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "slices-range-c", 14, "c", 1, &err);
+    CheckNoError(err);
+
+    rocksdb_writebatch_t* wb = rocksdb_writebatch_create();
+    const rocksdb_slice_t put_key[] = {{"slices-", 7}, {"", 0}, {"put", 3}};
+    const rocksdb_slice_t put_value[] = {{"v", 1}, {"", 0}, {"alue", 4}};
+    const rocksdb_slice_t merge_key[] = {{"slices-", 7}, {"merge", 5}};
+    const rocksdb_slice_t merge_value[] = {{"oper", 4}, {"and", 3}};
+    const rocksdb_slice_t delete_key[] = {{"slices-", 7}, {"delete", 6}};
+    const rocksdb_slice_t range_begin[] = {{"slices-", 7}, {"range-a", 7}};
+    const rocksdb_slice_t range_end[] = {
+        {"slices", 6}, {"-range-", 7}, {"c", 1}};
+    const rocksdb_slice_t null_empty_key[] = {{NULL, 0}, {"null-key", 8}};
+
+    rocksdb_writebatch_put_slice_parts(wb, 3, put_key, 3, put_value, &err);
+    CheckNoError(err);
+    rocksdb_writebatch_put_slice_parts(wb, 0, NULL, 0, NULL, &err);
+    CheckNoError(err);
+    rocksdb_writebatch_put_slice_parts(wb, 2, null_empty_key, 3, put_value,
+                                       &err);
+    CheckNoError(err);
+    rocksdb_writebatch_merge_slice_parts(wb, 2, merge_key, 2, merge_value,
+                                         &err);
+    CheckNoError(err);
+    rocksdb_writebatch_delete_slice_parts(wb, 2, delete_key, &err);
+    CheckNoError(err);
+    rocksdb_writebatch_delete_range_slice_parts(wb, 2, range_begin, 3,
+                                                range_end, &err);
+    CheckNoError(err);
+    CheckCondition(rocksdb_writebatch_count(wb) == 6);
+
+    rocksdb_write(db, woptions, wb, &err);
+    CheckNoError(err);
+    CheckGet(db, roptions, "slices-put", "value");
+    CheckGet(db, roptions, "", "");
+    CheckGet(db, roptions, "null-key", "value");
+    CheckGet(db, roptions, "slices-merge", "fake");
+    CheckGet(db, roptions, "slices-delete", NULL);
+    CheckGet(db, roptions, "slices-range-a", NULL);
+    CheckGet(db, roptions, "slices-range-b", NULL);
+    CheckGet(db, roptions, "slices-range-c", "c");
+
+    int count = rocksdb_writebatch_count(wb);
+    rocksdb_writebatch_put_slice_parts(wb, -1, NULL, 0, NULL, &err);
+    CheckErrorContains(&err, "key part count must be non-negative: -1");
+    CheckCondition(rocksdb_writebatch_count(wb) == count);
+    rocksdb_writebatch_delete_range_slice_parts(wb, 0, NULL, -1, NULL, &err);
+    CheckErrorContains(&err, "end key part count must be non-negative: -1");
+    CheckCondition(rocksdb_writebatch_count(wb) == count);
+    rocksdb_writebatch_delete_slice_parts(wb, 1, NULL, &err);
+    CheckErrorContains(
+        &err, "key parts must not be null when part count is positive: 1");
+    CheckCondition(rocksdb_writebatch_count(wb) == count);
+
+    const rocksdb_slice_t null_data[] = {{NULL, 1}};
+    rocksdb_writebatch_delete_slice_parts(wb, 1, null_data, &err);
+    CheckErrorContains(&err, "key part 0 has null data with non-zero size: 1");
+    CheckCondition(rocksdb_writebatch_count(wb) == count);
+
+    const rocksdb_slice_t oversized_key[] = {{"x", (size_t)UINT32_MAX}};
+    rocksdb_writebatch_delete_slice_parts(wb, 1, oversized_key, &err);
+    CheckErrorContains(&err, "key is too large");
+    CheckCondition(rocksdb_writebatch_count(wb) == count);
+    const rocksdb_slice_t small_key[] = {{"k", 1}};
+    const rocksdb_slice_t overflowing_value[] = {{"v", SIZE_MAX}, {"x", 1}};
+    rocksdb_writebatch_put_slice_parts(wb, 1, small_key, 2, overflowing_value,
+                                       &err);
+    CheckErrorContains(&err, "value is too large");
+    CheckCondition(rocksdb_writebatch_count(wb) == count);
+    rocksdb_writebatch_delete_range_slice_parts(wb, 1, small_key, 1,
+                                                oversized_key, &err);
+    CheckErrorContains(&err, "end key is too large");
+    CheckCondition(rocksdb_writebatch_count(wb) == count);
+
+    if (sizeof(size_t) > sizeof(uint32_t)) {
+      const rocksdb_slice_t oversized_value[] = {
+          {"v", (size_t)UINT32_MAX + (size_t)1}};
+      rocksdb_writebatch_put_slice_parts(wb, 1, small_key, 1, oversized_value,
+                                         &err);
+      CheckErrorContains(&err, "value is too large");
+      CheckCondition(rocksdb_writebatch_count(wb) == count);
+    }
+    rocksdb_writebatch_destroy(wb);
+
+    rocksdb_put_cf(db, woptions, slices_cf, "cf-merge", 8, "base", 4, &err);
+    CheckNoError(err);
+    rocksdb_put_cf(db, woptions, slices_cf, "cf-delete", 9, "old", 3, &err);
+    CheckNoError(err);
+    rocksdb_put_cf(db, woptions, slices_cf, "cf-range-a", 10, "a", 1, &err);
+    CheckNoError(err);
+    rocksdb_put_cf(db, woptions, slices_cf, "cf-range-b", 10, "b", 1, &err);
+    CheckNoError(err);
+    rocksdb_put_cf(db, woptions, slices_cf, "cf-range-c", 10, "c", 1, &err);
+    CheckNoError(err);
+
+    wb = rocksdb_writebatch_create();
+    const rocksdb_slice_t cf_put_key[] = {{"cf-", 3}, {"put", 3}};
+    const rocksdb_slice_t cf_put_value[] = {{"v", 1}, {"", 0}, {"alue", 4}};
+    const rocksdb_slice_t cf_merge_key[] = {{"cf-", 3}, {"merge", 5}};
+    const rocksdb_slice_t cf_delete_key[] = {{"cf-", 3}, {"delete", 6}};
+    const rocksdb_slice_t cf_range_begin[] = {
+        {"cf-", 3}, {"range-", 6}, {"a", 1}};
+    const rocksdb_slice_t cf_range_end[] = {{"cf-range-", 9}, {"c", 1}};
+
+    rocksdb_writebatch_put_slice_parts_cf(wb, slices_cf, 2, cf_put_key, 3,
+                                          cf_put_value, &err);
+    CheckNoError(err);
+    rocksdb_writebatch_merge_slice_parts_cf(wb, slices_cf, 2, cf_merge_key, 2,
+                                            merge_value, &err);
+    CheckNoError(err);
+    rocksdb_writebatch_delete_slice_parts_cf(wb, slices_cf, 2, cf_delete_key,
+                                             &err);
+    CheckNoError(err);
+    rocksdb_writebatch_delete_range_slice_parts_cf(
+        wb, slices_cf, 3, cf_range_begin, 2, cf_range_end, &err);
+    CheckNoError(err);
+    CheckCondition(rocksdb_writebatch_count(wb) == 4);
+
+    rocksdb_write(db, woptions, wb, &err);
+    CheckNoError(err);
+    CheckGetCF(db, roptions, slices_cf, "cf-put", "value");
+    CheckGetCF(db, roptions, slices_cf, "cf-merge", "fake");
+    CheckGetCF(db, roptions, slices_cf, "cf-delete", NULL);
+    CheckGetCF(db, roptions, slices_cf, "cf-range-a", NULL);
+    CheckGetCF(db, roptions, slices_cf, "cf-range-b", NULL);
+    CheckGetCF(db, roptions, slices_cf, "cf-range-c", "c");
+
+    rocksdb_writebatch_destroy(wb);
+    rocksdb_drop_column_family(db, slices_cf, &err);
+    CheckNoError(err);
+    rocksdb_column_family_handle_destroy(slices_cf);
+  }
+
+  StartPhase("writebatch_slice_parts_timestamp_cf");
+  {
+    rocksdb_comparator_t* timestamp_cmp = rocksdb_comparator_with_ts_create(
+        NULL, CmpDestroy, TimestampCmpCompare, TimestampCmpCompareTimestamp,
+        TimestampCmpCompareWithoutTimestamp, TimestampCmpName, 8);
+    rocksdb_options_t* timestamp_options = rocksdb_options_create();
+    rocksdb_options_set_comparator(timestamp_options, timestamp_cmp);
+    rocksdb_column_family_handle_t* timestamp_cf = rocksdb_create_column_family(
+        db, timestamp_options, "writebatch_slice_parts_timestamp", &err);
+    CheckNoError(err);
+
+    rocksdb_writebatch_t* wb = rocksdb_writebatch_create();
+    const rocksdb_slice_t key[] = {{"k", 1}, {"ey", 2}};
+    const rocksdb_slice_t value[] = {{"v", 1}, {"alue", 4}};
+    int count = rocksdb_writebatch_count(wb);
+
+    rocksdb_writebatch_put_slice_parts_cf(wb, timestamp_cf, 2, key, 2, value,
+                                          &err);
+    CheckErrorContains(&err, "column family enabling timestamp");
+    CheckCondition(rocksdb_writebatch_count(wb) == count);
+    rocksdb_writebatch_merge_slice_parts_cf(wb, timestamp_cf, 2, key, 2, value,
+                                            &err);
+    CheckErrorContains(&err, "column family enabling timestamp");
+    CheckCondition(rocksdb_writebatch_count(wb) == count);
+    rocksdb_writebatch_delete_slice_parts_cf(wb, timestamp_cf, 2, key, &err);
+    CheckErrorContains(&err, "column family enabling timestamp");
+    CheckCondition(rocksdb_writebatch_count(wb) == count);
+    rocksdb_writebatch_delete_range_slice_parts_cf(wb, timestamp_cf, 1, key, 2,
+                                                   value, &err);
+    CheckErrorContains(&err, "column family enabling timestamp");
+    CheckCondition(rocksdb_writebatch_count(wb) == count);
+
+    rocksdb_writebatch_destroy(wb);
+    rocksdb_drop_column_family(db, timestamp_cf, &err);
+    CheckNoError(err);
+    rocksdb_column_family_handle_destroy(timestamp_cf);
+    rocksdb_options_destroy(timestamp_options);
+    rocksdb_comparator_destroy(timestamp_cmp);
   }
 
   StartPhase("columnfamilies");
