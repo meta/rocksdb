@@ -549,6 +549,8 @@ class DBImpl : public DB
 
   Status EnableAutoCompaction(
       const std::vector<ColumnFamilyHandle*>& column_family_handles) override;
+  Status EnableIntraL0Compaction(
+      const std::vector<ColumnFamilyHandle*>& column_family_handles) override;
 
   void EnableManualCompaction() override;
   void DisableManualCompaction() override;

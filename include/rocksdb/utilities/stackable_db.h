@@ -465,6 +465,11 @@ class StackableDB : public DB {
     return db_->EnableAutoCompaction(column_family_handles);
   }
 
+  Status EnableIntraL0Compaction(
+      const std::vector<ColumnFamilyHandle*>& column_family_handles) override {
+    return db_->EnableIntraL0Compaction(column_family_handles);
+  }
+
   void EnableManualCompaction() override {
     return db_->EnableManualCompaction();
   }
