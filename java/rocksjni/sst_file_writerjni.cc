@@ -283,6 +283,25 @@ void Java_org_rocksdb_SstFileWriter_delete__JJ(JNIEnv* env, jclass /*jcls*/,
 
 /*
  * Class:     org_rocksdb_SstFileWriter
+ * Method:    deleteDirect
+ * Signature: (JLjava/nio/ByteBuffer;IIL)V
+ */
+void Java_org_rocksdb_SstFileWriter_deleteDirect(JNIEnv *env, jclass /*jcls*/,
+                                              jlong jdb_handle, jobject jkey,
+                                              jint jkey_off, jint jkey_len) {
+  auto *writer = reinterpret_cast<ROCKSDB_NAMESPACE::SstFileWriter *>(jdb_handle);
+  auto Delete = [&env, &writer](ROCKSDB_NAMESPACE::Slice &key) {
+      ROCKSDB_NAMESPACE::Status s = writer->Delete(key);
+      if (s.ok()) {
+        return;
+      }
+      ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
+  };
+  ROCKSDB_NAMESPACE::JniUtil::k_op_direct(Delete, env, jkey, jkey_off, jkey_len);
+}
+
+/*
+ * Class:     org_rocksdb_SstFileWriter
  * Method:    finish
  * Signature: (J)V
  */
