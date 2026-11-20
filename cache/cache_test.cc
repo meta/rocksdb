@@ -173,6 +173,34 @@ std::string CacheTest::type_;
 
 class LRUCacheTest : public CacheTest {};
 
+TEST_P(CacheTest, InvalidKeySize) {
+  if (!IsHyperClock()) {
+    return;
+  }
+
+  const std::string valid_key = EncodeKey16Bytes(1);
+  ASSERT_OK(cache_->Insert(valid_key, EncodeValue(1), &kHelper, /*charge=*/1));
+
+  for (const std::string& invalid_key :
+       {std::string("short"), valid_key + "x"}) {
+    SCOPED_TRACE("key_size=" + std::to_string(invalid_key.size()));
+    EXPECT_TRUE(cache_
+                    ->Insert(invalid_key, EncodeValue(2), &kHelper,
+                             /*charge=*/1)
+                    .IsNotSupported());
+    EXPECT_EQ(nullptr, cache_->Lookup(invalid_key));
+    EXPECT_EQ(nullptr, cache_->CreateStandalone(invalid_key, EncodeValue(2),
+                                                &kHelper, /*charge=*/1,
+                                                /*allow_uncharged=*/true));
+    cache_->Erase(invalid_key);
+  }
+
+  Cache::Handle* handle = cache_->Lookup(valid_key);
+  ASSERT_NE(nullptr, handle);
+  EXPECT_EQ(1, DecodeValue(cache_->Value(handle)));
+  cache_->Release(handle);
+}
+
 TEST_P(CacheTest, UsageTest) {
   // cache is std::shared_ptr and will be automatically cleaned up.
   const size_t kCapacity = 100000;

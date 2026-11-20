@@ -1190,11 +1190,31 @@ class ALIGN_AS(CACHE_LINE_SIZE) ClockCacheShard final : public CacheShardBase {
 template <class Table>
 class BaseHyperClockCache : public ShardedCache<ClockCacheShard<Table>> {
  public:
+  using Base = ShardedCache<ClockCacheShard<Table>>;
   using Shard = ClockCacheShard<Table>;
   using Handle = Cache::Handle;
   using CacheItemHelper = Cache::CacheItemHelper;
 
   explicit BaseHyperClockCache(const HyperClockCacheOptions& opts);
+
+  // Check the public key before ShardedCache computes its fixed-width hash.
+  Status Insert(
+      const Slice& key, Cache::ObjectPtr obj, const CacheItemHelper* helper,
+      size_t charge, Handle** handle = nullptr,
+      Cache::Priority priority = Cache::Priority::LOW,
+      const Slice& compressed_value = Slice(),
+      CompressionType type = CompressionType::kNoCompression) override;
+
+  Handle* CreateStandalone(const Slice& key, Cache::ObjectPtr obj,
+                           const CacheItemHelper* helper, size_t charge,
+                           bool allow_uncharged) override;
+
+  Handle* Lookup(const Slice& key, const CacheItemHelper* helper = nullptr,
+                 Cache::CreateContext* create_context = nullptr,
+                 Cache::Priority priority = Cache::Priority::LOW,
+                 Statistics* stats = nullptr) override;
+
+  void Erase(const Slice& key) override;
 
   Cache::ObjectPtr Value(Handle* handle) override;
 
