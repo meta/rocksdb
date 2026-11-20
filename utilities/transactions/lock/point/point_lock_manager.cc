@@ -819,18 +819,19 @@ void PointLockManager::UnLockKey(PessimisticTransaction* txn,
     if (txn_it != txns.end()) {
       if (txns.size() == 1) {
         stripe->keys.erase(stripe_iter);
+        if (max_num_locks_ > 0) {
+          // Maintain lock count if there is a limit on the number of locks.
+          // Multiple shared locks on the same key are counted as one lock, so
+          // the count only changes when the last holder unlocks the key.
+          assert(lock_map->locked_key_cnt.LoadRelaxed() > 0);
+          lock_map->locked_key_cnt.FetchSubRelaxed(1);
+        }
       } else {
         auto last_it = txns.end() - 1;
         if (txn_it != last_it) {
           *txn_it = *last_it;
         }
         txns.pop_back();
-      }
-
-      if (max_num_locks_ > 0) {
-        // Maintain lock count if there is a limit on the number of locks.
-        assert(lock_map->locked_key_cnt.LoadRelaxed() > 0);
-        lock_map->locked_key_cnt.FetchSubRelaxed(1);
       }
     }
   } else {
