@@ -132,9 +132,14 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       // can hide newer UDT versions unless the read is at max timestamp with no
       // lower timestamp bound. Legacy prefix iterators without
       // prefix_same_as_start do not guarantee complete scans, so conversion
-      // must stay disabled for the iterator lifetime.
+      // must stay disabled for the iterator lifetime. With unordered_write, a
+      // write publishes its sequence number before it inserts into the
+      // memtable, so the scan can miss a key that its snapshot includes. The
+      // converted range tombstone has a larger sequence number than that key
+      // and would delete it for every reader after the insert finishes.
       min_tombstones_for_range_conversion_(
-          active_mem != nullptr && !HasTableFilter(read_options) &&
+          active_mem != nullptr && !ioptions.unordered_write &&
+                  !HasTableFilter(read_options) &&
                   read_options.read_tier == kReadAllTier &&
                   (expect_total_order_inner_iter_ || prefix_same_as_start_) &&
                   HasFullTimestampVisibility(read_options)

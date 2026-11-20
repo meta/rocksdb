@@ -4386,7 +4386,8 @@ TEST_P(WritePreparedTransactionTest, RangeTombstoneInsertionWithWritePrepared) {
 
     // Pre-commit: one-write-queue mode publishes the prepare seq to readers,
     // so insertion must be discarded. Two-write-queues mode can still expose
-    // an older published seq to readers, so insertion remains safe.
+    // an older published seq to readers, so insertion remains safe. DBs opened
+    // with unordered_write never insert range tombstones on the read path.
     {
       ReadOptions read_opts;
       std::unique_ptr<Iterator> iter(db->NewIterator(read_opts));
@@ -4399,12 +4400,14 @@ TEST_P(WritePreparedTransactionTest, RangeTombstoneInsertionWithWritePrepared) {
       }
       EXPECT_OK(iter->status());
     }
-    const size_t expected_insertions = options.two_write_queues ? 1u : 0u;
+    const bool expect_insertion =
+        options.two_write_queues && !options.unordered_write;
+    const size_t expected_insertions = expect_insertion ? 1u : 0u;
     EXPECT_EQ(
         options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
         expected_insertions);
-    EXPECT_EQ(inserted_ranges.size(), expected_insertions);
-    if (options.two_write_queues) {
+    ASSERT_EQ(inserted_ranges.size(), expected_insertions);
+    if (expect_insertion) {
       EXPECT_EQ(inserted_ranges[0].first, "c");
       EXPECT_EQ(inserted_ranges[0].second, "h");
     }

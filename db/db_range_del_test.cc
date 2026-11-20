@@ -3,6 +3,7 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <future>
 #include <memory>
 
 #include "db/db_test_util.h"
@@ -10,6 +11,7 @@
 #include "port/stack_trace.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
 #include "test_util/testutil.h"
+#include "util/defer.h"
 #include "util/random.h"
 #include "utilities/merge_operators.h"
 
@@ -3328,6 +3330,86 @@ TEST_F(DBRangeDelTest, PrefixSameAsStartUnboundedScanNoRangeConversion) {
     ASSERT_FALSE(iter->Valid());
   }
   ASSERT_EQ(1, options.statistics->getTickerCount(
+                   READ_PATH_RANGE_TOMBSTONES_INSERTED));
+}
+
+TEST_F(DBRangeDelTest, UnorderedWriteRangeConversionKeepsPendingWrite) {
+  // With unordered_write, a write publishes its sequence number before it
+  // inserts into the memtable. A scan that runs in that window cannot see the
+  // write's key. The scan must not convert the point deletes around that key
+  // into a range tombstone, because the tombstone has a larger sequence number
+  // than the pending write and would delete it for every later reader.
+  //
+  // Example used below: "b1", "b2", "b4" and "b5" are deleted, and a writer is
+  // paused between publishing "b3" and inserting it into the memtable.
+  Options options = CurrentOptions();
+  options.unordered_write = true;
+  // 2, so the two deletes on each side of "b3" are enough for a conversion.
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("c", "vc"));
+  for (const char* k : {"b1", "b2", "b4", "b5"}) {
+    ASSERT_OK(Delete(k));
+  }
+
+  // Only the "b3" writer stops in the callback. The test thread's own write
+  // below takes the same code path and must not stop.
+  std::atomic<std::thread::id> paused_writer{};
+  std::promise<void> published;
+  std::promise<void> scan_done;
+  std::shared_future<void> scan_done_future = scan_done.get_future().share();
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteImpl:BeforeUnorderedWriteMemtable", [&](void*) {
+        if (std::this_thread::get_id() == paused_writer.load()) {
+          published.set_value();
+          scan_done_future.wait();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  {
+    port::Thread writer([&] {
+      paused_writer.store(std::this_thread::get_id());
+      ASSERT_OK(Put("b3", "v3"));
+    });
+    // This Defer releases and joins the writer, even when an assertion below
+    // fails.
+    Defer release_writer([&] {
+      scan_done.set_value();
+      writer.join();
+    });
+    // A bounded wait: the test fails instead of hanging if the writer never
+    // reaches the callback.
+    ASSERT_EQ(std::future_status::ready,
+              published.get_future().wait_for(std::chrono::seconds(10)));
+    // Advance the published sequence number past the pending "b3" write, so
+    // the scan below reads at a snapshot newer than "b3".
+    ASSERT_OK(Put("d", "vd"));
+
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    std::vector<std::string> keys;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      keys.push_back(iter->key().ToString());
+    }
+    ASSERT_OK(iter->status());
+    // "b3" is not in the memtable yet, so the scan cannot see it.
+    ASSERT_EQ((std::vector<std::string>{"a", "c", "d"}), keys);
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // "b3" finished its write, so every new read must see it.
+  ASSERT_EQ("v3", Get("b3"));
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->Seek("b");
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ("b3", iter->key());
+  }
+  ASSERT_EQ(0, options.statistics->getTickerCount(
                    READ_PATH_RANGE_TOMBSTONES_INSERTED));
 }
 
