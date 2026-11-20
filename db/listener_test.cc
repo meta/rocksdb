@@ -1506,7 +1506,8 @@ class TestFileOperationListener : public EventListener {
     if (EndsWith(info.path, ".blob")) {
       ++blob_file_flushes_;
     }
-    ReportDuration(info);
+    // WritableFile::Flush() is a no-op on POSIX and Windows, so its duration
+    // can be zero. See #15139.
   }
 
   void OnFileCloseFinish(const FileOperationInfo& info) override {
