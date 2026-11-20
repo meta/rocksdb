@@ -43,7 +43,7 @@ void rocksdb_readoptions_set_read_tier(rocksdb_readoptions_t* opt, int v) {
 }
 
 int rocksdb_readoptions_get_read_tier(rocksdb_readoptions_t* opt) {
-  return static_cast<int>(opt->rep.read_tier);
+  return ROCKSDB_NAMESPACE::lossless_cast<int>(opt->rep.read_tier);
 }
 
 void rocksdb_readoptions_set_rate_limiter_priority(rocksdb_readoptions_t* opt,
@@ -53,7 +53,7 @@ void rocksdb_readoptions_set_rate_limiter_priority(rocksdb_readoptions_t* opt,
 }
 
 int rocksdb_readoptions_get_rate_limiter_priority(rocksdb_readoptions_t* opt) {
-  return static_cast<int>(opt->rep.rate_limiter_priority);
+  return ROCKSDB_NAMESPACE::lossless_cast<int>(opt->rep.rate_limiter_priority);
 }
 
 void rocksdb_readoptions_set_value_size_soft_limit(rocksdb_readoptions_t* opt,
@@ -236,5 +236,5 @@ void rocksdb_readoptions_set_io_activity(rocksdb_readoptions_t* opt, int v) {
 }
 
 int rocksdb_readoptions_get_io_activity(rocksdb_readoptions_t* opt) {
-  return static_cast<int>(opt->rep.io_activity);
+  return ROCKSDB_NAMESPACE::lossless_cast<int>(opt->rep.io_activity);
 }

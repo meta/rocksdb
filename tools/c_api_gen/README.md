@@ -58,48 +58,35 @@ Backward compatibility with the existing hand-written C API is one input, but
 it is not the primary reason this layer exists. Even for brand-new wrappers, we
 still need an explicit policy layer for non-trivial C bindings.
 
-## What this prototype focuses on
+## What is generated
 
-The generator currently targets representative examples from the easiest and
-most repetitive wrapper families:
+Three generators share the work. Each owns the declaration in `c.h` and the
+definition in `c.cc` of every function it generates.
 
-1. **Simple scalar field setters/getters**
-   - `rocksdb_options_set_create_if_missing`
-   - `rocksdb_options_get_create_if_missing`
-   - `rocksdb_readoptions_set_fill_cache`
-   - `rocksdb_writeoptions_set_sync`
-   - `rocksdb_block_based_options_set_block_size`
-   - `rocksdb_cuckoo_options_set_hash_ratio`
+1. **Public struct fields** (`auto_simple_bindings.py`): setters and getters for
+   the scalar, enum, string and chrono fields of the managed option and
+   metadata structs, discovered from the C++ headers. A new field gets its
+   bindings at the next regeneration.
+   - `rocksdb_options_set_create_if_missing`, `rocksdb_readoptions_set_fill_cache`
+   - `rocksdb_flushjobinfo_cf_name`, `rocksdb_flushjobinfo_largest_seqno`
 
-2. **Simple forwarding wrappers with no `Status`**
-   - `rocksdb_writebatch_clear`
-   - `rocksdb_writebatch_put`
-   - `rocksdb_writebatch_put_cf`
-   - `rocksdb_writebatch_delete`
-   - `rocksdb_writebatch_put_log_data`
-   - `rocksdb_writebatch_set_save_point`
-   - `rocksdb_transaction_set_savepoint`
+2. **Handle methods and lifecycle** (`handle_bindings.py` + `handles.json`):
+   C functions that forward to one C++ member function of the object a handle
+   wraps, plus trivial `create` (`return new H;`) and `destroy` (`delete h;`)
+   functions and the definition of each handle struct that holds only `rep`.
+   The C signature comes from the C++ declaration; `handles.json` records only
+   what the declaration cannot decide (which overload, bound arguments,
+   borrowed or copied string results, ABI pins).
+   - `rocksdb_writebatch_put`, `rocksdb_iter_seek`, `rocksdb_iter_key`
+   - `rocksdb_put_cf`, `rocksdb_transaction_commit`, `rocksdb_flush_wal`
 
-3. **Simple forwarding wrappers with `Status` -> `char** errptr`**
-   - `rocksdb_put`, `rocksdb_put_cf`
-   - `rocksdb_delete`, `rocksdb_delete_cf`
-   - `rocksdb_merge`, `rocksdb_merge_cf`
-   - `rocksdb_write`
-   - `rocksdb_writebatch_rollback_to_save_point`
-   - `rocksdb_writebatch_pop_save_point`
-   - `rocksdb_transaction_put`, `rocksdb_transaction_put_cf`
-   - `rocksdb_transaction_merge`, `rocksdb_transaction_merge_cf`
-   - `rocksdb_transaction_delete`, `rocksdb_transaction_delete_cf`
-   - `rocksdb_transaction_commit`
-   - `rocksdb_transaction_rollback`
-   - `rocksdb_transaction_rollback_to_savepoint`
+3. **Explicit spec** (`generate_c_api.py` + `spec.json`): wrappers whose call
+   expression is written out by hand, such as `rocksdb_destroy_db` and the
+   nested `compression_opts` accessors.
 
-4. **Simple metadata accessors**
-   - `rocksdb_flushjobinfo_cf_name`
-   - `rocksdb_flushjobinfo_largest_seqno`
-
-This is intentionally a constrained subset. The point is to demonstrate a
-maintainable pattern and a spec format that can be extended gradually.
+Everything else in `c_base.h` / `c_base.cc` is hand-written: functions with
+more than one statement of logic, NULL-tolerant arguments, ownership transfer,
+callbacks, vectors, or a C shape that intentionally differs from the C++ one.
 
 ## What should remain manual
 
@@ -127,10 +114,13 @@ looks like today's hand-written wrappers:
 
 ### 2. Let auto-discovery handle the simple direct cases
 
-For a small set of mechanically mappable public structs, the generator can
-discover missing bindings directly from the C++ headers and emit the missing C
-wrappers automatically. Existing handwritten wrappers still win when they
-already exist.
+For a set of mechanically mappable public structs, the generator discovers
+the public fields directly from the C++ headers and owns their C bindings, both
+the declaration in `c.h` and the definition in `c.cc`. A hand-written binding
+for such a field in `c_base.h` / `c_base.cc` fails regeneration, so the
+generated and hand-written layers never overlap. When an already-shipped
+binding has a C type that differs from the natural mapping, pin it in
+`abi_type_overrides.json` instead of hand-writing it.
 
 Today this strict auto-discovery path is used for:
 
@@ -143,15 +133,24 @@ For those managed families, unsupported or intentionally deferred fields must
 be explicitly recorded in `auto_simple_bindings_blocklist.json` rather than
 being skipped silently. Anything outside those families remains hand-written.
 
-### 3. Keep explicit spec for non-trivial wrappers
+### 3. Derive method wrappers from the C++ declaration
 
-The spec-driven generator remains the right tool for method-style wrappers and
-other APIs whose C surface requires an explicit design decision. In practice:
+A C function that forwards to one C++ member function is listed in
+`handles.json` under the handle it takes first. `handle_bindings.py` looks the
+method up with clang (following C++ name lookup, so a derived declaration hides
+base overloads unless re-exported with `using`) and maps each parameter and the
+result with the conventions documented at the top of that file. Generated
+calls pass every argument by reference or as a `Slice`; string results are
+returned borrowed (`result: borrow` / `slice`, no copy) unless the shipped
+signature hands the caller a `malloc()`ed buffer (`result: copy`).
+
+In practice:
 
 - auto-discovery owns simple direct field coverage for selected struct families
-- `spec.json` owns wrappers that are still manual in design but repetitive in
-  implementation
-- fully irregular ownership-heavy or callback-heavy APIs remain hand-written
+- `handles.json` owns single-call method forwards and trivial lifecycle
+  functions
+- `spec.json` owns other wrappers whose call expression is spelled out
+- functions with logic of their own remain hand-written
 
 ### 4. Let C++ headers guide validation, not policy
 
@@ -185,8 +184,14 @@ Generators and inputs:
 - `abi_type_overrides.json`
   - per-function C type pins so already-shipped wrappers keep their historical
     C signature even when the C++ field type maps to a different C type
+- `handle_bindings.py`
+  - generates handle struct definitions, lifecycle functions and method
+    forwards from `handles.json`
+- `handles.json`
+  - one entry per C handle type: the C++ type of `rep`, its create/destroy
+    functions and its method bindings
 - `regen_all.py`
-  - orchestrates both generators and inlines the fragments into `c.h` / `c.cc`
+  - orchestrates the generators and inlines the fragments into `c.h` / `c.cc`
 
 Verification (run by `make check-c-api-gen` and in CI):
 
@@ -198,6 +203,13 @@ Verification (run by `make check-c-api-gen` and in CI):
     the authoritative ABI/API-stability check
 - `verify_generated_up_to_date.py`
   - regenerates in a temp dir and confirms the checked-in output is current
+- `check_method_coverage.py` + `method_coverage.json`
+  - fails when a public method of a covered C++ class is neither called from
+    `db/c.cc` nor excluded with a reason, or when an exclusion is stale
+- `c_api_gen_test.py`
+  - unit tests for the generator rules (coverage policy, blocklist schema,
+    ABI pins, access specifiers, handle method lookup and C mapping), the
+    equivalence normalizations and the method coverage rules
 - `validate_generated_equivalence.py` + `equivalence_allowlist.json`
   - best-effort migration aid: compares generated wrapper *bodies* against a
     PRE-migration hand-written revision. Body comparison is heuristic; for
@@ -224,8 +236,8 @@ python3 tools/c_api_gen/regen_all.py --clang-format clang-format-21
 make check-c-api-gen CLANG_FORMAT_BINARY=clang-format-21
 ```
 
-If `clang++` is not installed, `make check` skips the C API staleness check
-with a message instead of failing, so it still works without the codegen
+If `clang++` is not installed, `make check` skips the C API staleness and
+method coverage checks with a message instead of failing, so it still works without the codegen
 toolchain. CI is the authoritative gate.
 
 The dedicated `build-linux-clang-21-no_test_run` CI job runs this target with
@@ -250,6 +262,7 @@ This regenerates:
 
 - the spec-driven fragments from `spec.json`
 - the auto-discovered fragments produced by `auto_simple_bindings.py`
+- the handle fragments produced by `handle_bindings.py` from `handles.json`
 - the round-trip tests produced by `gen_roundtrip_tests.py`
 
 To preview only the spec-driven output for one section without touching the
@@ -297,6 +310,11 @@ The blocklist is intentionally strict:
 - each entry must have a non-empty reason
 - policy must be either `manual` or `deferred`
 - stale entries fail regeneration if the field disappears or is renamed
+- an entry may list `functions` to leave only those C functions of the field
+  to another layer (for example a legacy setter with extra behavior); the
+  generator still owns the field's other bindings, and each listed function
+  must exist in `c_base.h` / `c_base.cc` or `handles.json`
+- non-public members are never discovered, so they need no entry
 
 Example deferred entry:
 
@@ -320,6 +338,63 @@ owns non-trivial method-style wrappers. It is also unrelated to
 `equivalence_allowlist.json`, which only suppresses intentional diff mismatches
 in the equivalence checker.
 
+## Adding a handle method binding
+
+To expose a C++ member function as `rocksdb_<object>_<verb>`, add an entry to
+the handle's `methods` list in `handles.json` and regenerate:
+
+```json
+{"name": "rocksdb_writebatch_put", "method": "Put", "overload": ["const Slice &", "const Slice &"], "result": "discard"}
+```
+
+Only `name` and `method` are required (or `field` or `count`, described below).
+The optional keys are:
+
+- `overload`: the C++ parameter types, when the method is overloaded
+- `arity`: call with only the first N arguments and let the rest default
+- `bind`: fixed C++ arguments, e.g. `{"pri": "Env::BOTTOM"}`
+- `result`: `discard` to drop a result, `borrow` / `slice` / `copy` for a
+  `Slice` or string result (`c_str` for a `std::string` returned through
+  `c_str()`, without a length), `handle` to return a pointer or smart pointer
+  result in a new handle
+- `result_handle`: the handle to return, when several wrap the result's type
+- `out_handle`: a `T*` out-parameter to fill straight into a new handle, which
+  the C function returns instead of taking the parameter
+- `consumes`: `T*` parameters the C++ call takes ownership of; their C handles
+  are freed after the call (needs `result: handle`)
+- `param_order`: the order of the C parameters, when it differs from the C++
+  one (the handle still comes first, and `errptr` or `len` last)
+- `nullable`: parameters that accept a NULL C pointer. A `const Slice *` takes
+  `const char* x, size_t x_len` and passes `nullptr` when `x` is NULL; a
+  `const T &` whose handle holds a `T` passes a default-constructed `T` when
+  the handle is NULL
+- `receiver_const`: override the `const` of the handle parameter, which
+  otherwise follows the C++ method
+- `c_types`: pin a parameter's (or `return`'s) C type for ABI compatibility;
+  a handle parameter can only drop `const`, and for a new handle, `return` can
+  only add `const`
+- `param_handles`: the handle to use for a parameter when several wrap its
+  C++ type
+- `param_names`: a C name for a parameter the C++ declaration leaves unnamed,
+  keyed by its zero-based position
+- `doc`: comment lines emitted above the declaration in `c.h`
+
+Keys naming a parameter use its C++ name (or position, when unnamed).
+
+A handle whose `rep` is a `std::vector<T>` can also read the vector. An entry
+with `"count": true` returns `rep.size()`, and an entry with `"field": "x"`
+returns `rep[index].x`, where `index` is a C parameter of the type the handle
+names in `index_type` (`int` or `size_t`). Such entries take only `result`,
+`c_types` and `doc`:
+
+```json
+{"name": "rocksdb_livefiles_name", "field": "name", "result": "c_str"}
+```
+
+A function listed here must not also be hand-written; regeneration fails if it
+is. If the C function needs more than the one call, write it by hand in
+`c_base.h` / `c_base.cc` instead.
+
 To refresh the full checked-in generated set and confirm nothing changes:
 
 ```bash
@@ -337,6 +412,29 @@ This checks the generated fragments currently included by
 `include/rocksdb/c.h` and `db/c.cc` against `HEAD:include/rocksdb/c.h` and
 `HEAD:db/c.cc`. Known historical inconsistencies can be documented in
 `equivalence_allowlist.json` with a reason instead of being silently ignored.
+
+## Method coverage
+
+`check_method_coverage.py` keeps the list of what the C API leaves out. For
+each class in `method_coverage.json` it takes every public method from the C++
+headers and every call in `db/c.cc` from clang's AST, and fails if a method is
+neither called nor listed in that class's `excluded` map. A call counts for the
+static type of the object it is made on: `db->rep->Put(...)` covers `DB::Put`,
+and a call through a `TransactionDB*` covers `TransactionDB`, not `DB`. Methods
+a class inherits from another covered class (or from a subclass of one) are
+checked on that class only, and the bases in `excluded_bases` are not checked
+at all. Deprecated, deleted and `TEST_` methods are ignored. Coverage is per
+name, so a new overload of a method that is already called does not trip it.
+
+When it fails on a new method, bind the method (in `handles.json`, or by hand)
+or add it to `excluded` with one of the keys in `reasons`. An exclusion also
+fails once its method is removed or `db/c.cc` starts calling it, so the list
+only ever holds methods that really have no binding. `--report` prints how
+many methods of each class are bound and excluded:
+
+```bash
+python3 tools/c_api_gen/check_method_coverage.py --clang clang++ --report
+```
 
 ## Suggested migration path
 
