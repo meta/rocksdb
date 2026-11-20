@@ -12,6 +12,7 @@ NATIVE_JAVA_CLASSES = \
 	org.rocksdb.BackupEngineOptions\
 	org.rocksdb.BlockBasedTableConfig\
 	org.rocksdb.BloomFilter\
+	org.rocksdb.RibbonFilter\
 	org.rocksdb.Checkpoint\
 	org.rocksdb.ClockCache\
 	org.rocksdb.Cache\
