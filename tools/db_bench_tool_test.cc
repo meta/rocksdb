@@ -15,6 +15,7 @@
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/random.h"
+#include "util/string_util.h"
 
 #ifdef GFLAGS
 #include "util/gflags_compat.h"
@@ -222,6 +223,41 @@ TEST_F(DBBenchTest, IngestExternalFileWithoutFillCache) {
   RunIngestBench(/*batch_size=*/3, /*num_batches=*/2,
                  /*file_opening_threads=*/1,
                  /*use_file_info=*/false, /*fill_cache=*/false);
+}
+
+TEST_F(DBBenchTest, ReportFileKeepsAllBenchmarkRuns) {
+  // Each run lasts 2s, so secs_elapsed reaches 3 only if both runs share
+  // the report.
+  GFLAGS_NAMESPACE::FlagSaver flag_saver;
+  const std::string report_file = test_path_ + "/report.csv";
+  ResetArgs();
+  AppendArgs({"./db_bench", "--benchmarks=fillrandom,readrandom",
+              "--use_existing_db=0", "--num=100000000", "--value_size=10",
+              "--duration=2", "--report_interval_seconds=1",
+              "--report_file=" + report_file, "--compression_type=none",
+              "--db=" + db_path_, "--wal_dir=" + wal_path_});
+  ASSERT_EQ(0, db_bench_tool(argc(), argv()));
+
+  std::string contents;
+  ASSERT_OK(ReadFileToString(Env::Default(), report_file, &contents));
+  SCOPED_TRACE("report:\n" + contents);
+  std::vector<std::string> lines = StringSplit(contents, '\n');
+  ASSERT_GE(lines.size(), 2U);
+  ASSERT_EQ("secs_elapsed,interval_qps", lines[0]);
+  std::vector<uint64_t> secs_elapsed;
+  for (size_t i = 1; i < lines.size(); ++i) {
+    std::vector<std::string> fields = StringSplit(lines[i], ',');
+    ASSERT_EQ(2U, fields.size());
+    // Also rejects a repeated header
+    ASSERT_FALSE(fields[0].empty());
+    ASSERT_EQ(std::string::npos, fields[0].find_first_not_of("0123456789"));
+    secs_elapsed.push_back(ParseUint64(fields[0]));
+  }
+  ASSERT_EQ(1U, secs_elapsed.front());
+  for (size_t i = 1; i < secs_elapsed.size(); ++i) {
+    ASSERT_LT(secs_elapsed[i - 1], secs_elapsed[i]);
+  }
+  ASSERT_GE(secs_elapsed.back(), 3U);
 }
 
 TEST_F(DBBenchTest, OptionsFileUniversal) {
