@@ -783,6 +783,8 @@ Status CompactionOutputs::AddRangeDels(
     // range_del_agg_, and range_del_agg_ internally drops tombstones above
     // trim_ts_.
     bool consider_drop =
+        !compaction_->immutable_options().cf_allow_ingest_behind &&
+        !compaction_->immutable_options().allow_ingest_behind &&
         tombstone.seq_ <= earliest_snapshot &&
         (ts_sz == 0 ||
          (!full_history_ts_low.empty() &&
