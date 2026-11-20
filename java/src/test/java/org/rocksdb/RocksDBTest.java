@@ -179,6 +179,17 @@ public class RocksDBTest {
   }
 
   @Test
+  public void closeReleasesDefaultReadOptions() throws RocksDBException {
+    try (final Options options = new Options().setCreateIfMissing(true)) {
+      final RocksDB db = RocksDB.open(options, dbFolder.getRoot().getAbsolutePath());
+      final ReadOptions defaultReadOptions = db.getDefaultReadOptions();
+      assertThat(defaultReadOptions.isOwningHandle()).isTrue();
+      db.close();
+      assertThat(defaultReadOptions.isOwningHandle()).isFalse();
+    }
+  }
+
+  @Test
   public void put() throws RocksDBException {
     try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
          final WriteOptions opt = new WriteOptions(); final ReadOptions optr = new ReadOptions()) {
