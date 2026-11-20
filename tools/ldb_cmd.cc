@@ -3847,6 +3847,9 @@ void BatchPutCommand::OverrideBaseOptions() {
 
 // ----------------------------------------------------------------------------
 
+const std::string ScanCommand::ARG_SEEK_FOR_PREV = "seek_for_prev";
+const std::string ScanCommand::ARG_REVERSE = "reverse";
+
 ScanCommand::ScanCommand(const std::vector<std::string>& /*params*/,
                          const std::map<std::string, std::string>& options,
                          const std::vector<std::string>& flags)
@@ -3855,7 +3858,8 @@ ScanCommand::ScanCommand(const std::vector<std::string>& /*params*/,
           BuildCmdLineOptions({ARG_TTL, ARG_NO_VALUE, ARG_HEX, ARG_KEY_HEX,
                                ARG_TO, ARG_VALUE_HEX, ARG_FROM, ARG_TIMESTAMP,
                                ARG_MAX_KEYS, ARG_TTL_START, ARG_TTL_END,
-                               ARG_READ_TIMESTAMP, ARG_GET_WRITE_UNIX_TIME})),
+                               ARG_READ_TIMESTAMP, ARG_GET_WRITE_UNIX_TIME,
+                               ARG_SEEK_FOR_PREV, ARG_REVERSE})),
       start_key_specified_(false),
       end_key_specified_(false),
       max_keys_scanned_(-1),
@@ -3900,6 +3904,16 @@ ScanCommand::ScanCommand(const std::vector<std::string>& /*params*/,
     }
   }
   get_write_unix_time_ = IsFlagPresent(flags_, ARG_GET_WRITE_UNIX_TIME);
+  seek_for_prev_ = IsFlagPresent(flags_, ARG_SEEK_FOR_PREV);
+  reverse_ = IsFlagPresent(flags_, ARG_REVERSE);
+  if (seek_for_prev_ && !start_key_specified_) {
+    exec_state_ = LDBCommandExecuteResult::Failed("--" + ARG_SEEK_FOR_PREV +
+                                                  " requires --" + ARG_FROM);
+  }
+  if (reverse_ && end_key_specified_) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "--" + ARG_TO + " cannot be combined with --" + ARG_REVERSE);
+  }
 }
 
 void ScanCommand::Help(std::string& ret) {
@@ -3914,7 +3928,15 @@ void ScanCommand::Help(std::string& ret) {
   ret.append(" [--" + ARG_NO_VALUE + "]");
   ret.append(" [--" + ARG_READ_TIMESTAMP + "=<uint64_ts>] ");
   ret.append(" [--" + ARG_GET_WRITE_UNIX_TIME + "]");
+  ret.append(" [--" + ARG_SEEK_FOR_PREV + "]");
+  ret.append(" [--" + ARG_REVERSE + "]");
   ret.append("\n");
+  ret.append("    --" + ARG_SEEK_FOR_PREV + " : position at --" + ARG_FROM +
+             " with SeekForPrev() instead of Seek()\n");
+  ret.append("    --" + ARG_REVERSE +
+             " : step with Prev() instead of Next(); ");
+  ret.append("without --" + ARG_FROM + ", start at the last key. ");
+  ret.append("Cannot be combined with --" + ARG_TO + "\n");
 }
 
 void ScanCommand::DoCommand() {
@@ -3938,8 +3960,12 @@ void ScanCommand::DoCommand() {
   }
   scan_read_opts.total_order_seek = true;
   Iterator* it = db_->NewIterator(scan_read_opts, cfh);
-  if (start_key_specified_) {
+  if (start_key_specified_ && seek_for_prev_) {
+    it->SeekForPrev(start_key_);
+  } else if (start_key_specified_) {
     it->Seek(start_key_);
+  } else if (reverse_) {
+    it->SeekToLast();
   } else {
     it->SeekToFirst();
   }
@@ -3963,7 +3989,7 @@ void ScanCommand::DoCommand() {
   }
   for (;
        it->Valid() && (!end_key_specified_ || it->key().ToString() < end_key_);
-       it->Next()) {
+       reverse_ ? it->Prev() : it->Next()) {
     if (is_db_ttl_) {
       TtlIterator* it_ttl = static_cast_with_check<TtlIterator>(it);
       int rawtime = it_ttl->ttl_timestamp();
@@ -3975,26 +4001,26 @@ void ScanCommand::DoCommand() {
       }
     }
 
+    std::string str;
     if (no_value_) {
-      std::string key_str = it->key().ToString();
+      str = it->key().ToString();
       if (is_key_hex_) {
-        key_str = StringToHex(key_str);
+        str = StringToHex(str);
       } else if (ldb_options_.key_formatter) {
-        key_str = ldb_options_.key_formatter->Format(key_str);
+        str = ldb_options_.key_formatter->Format(str);
       }
-      fprintf(stdout, "%s\n", key_str.c_str());
     } else {
-      std::string str =
-          is_db_ttl_
-              ? PrintKeyValue(it->key().ToString(),
-                              ts_sz == 0 ? "" : it->timestamp().ToString(),
-                              it->value().ToString(), is_key_hex_,
-                              is_value_hex_, ucmp)
-              : PrintKeyValueOrWideColumns(
-                    it->key(), ts_sz == 0 ? "" : it->timestamp(), it->value(),
-                    it->columns(), is_key_hex_, is_value_hex_, ucmp);
-      fprintf(stdout, "%s\n", str.c_str());
+      str = is_db_ttl_
+                ? PrintKeyValue(it->key().ToString(),
+                                ts_sz == 0 ? "" : it->timestamp().ToString(),
+                                it->value().ToString(), is_key_hex_,
+                                is_value_hex_, ucmp)
+                : PrintKeyValueOrWideColumns(
+                      it->key(), ts_sz == 0 ? "" : it->timestamp(), it->value(),
+                      it->columns(), is_key_hex_, is_value_hex_, ucmp);
     }
+    TEST_SYNC_POINT_CALLBACK("ScanCommand::DoCommand:BeforePrint", &str);
+    fprintf(stdout, "%s\n", str.c_str());
 
     if (get_write_unix_time_) {
       std::string write_unix_time;
