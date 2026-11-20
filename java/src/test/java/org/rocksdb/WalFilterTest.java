@@ -47,64 +47,60 @@ public class WalFilterTest {
 
     };
 
-    final List<ColumnFamilyDescriptor> cfDescriptors = Arrays.asList(
-        new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY),
-        new ColumnFamilyDescriptor(bytes("pikachu"))
-    );
     final List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
 
     // Test with all WAL processing options
     for (final WalProcessingOption option : WalProcessingOption.values()) {
-      try (final Options options = optionsForLogIterTest();
-           final DBOptions dbOptions = new DBOptions(options)
-               .setCreateMissingColumnFamilies(true);
-           final RocksDB db = RocksDB.open(dbOptions,
-               dbFolder.getRoot().getAbsolutePath(),
-                cfDescriptors, cfHandles)) {
-        try (final WriteOptions writeOptions = new WriteOptions()) {
-          // Write given keys in given batches
-          for (final byte[][] batchKey : batchKeys) {
-            final WriteBatch batch = new WriteBatch();
-            for (final byte[] bytes : batchKey) {
-              batch.put(cfHandles.get(0), bytes, dummyString(1024));
-            }
-            db.write(writeOptions, batch);
-          }
-        } finally {
-          for (final ColumnFamilyHandle cfHandle : cfHandles) {
-            cfHandle.close();
-          }
-          cfHandles.clear();
-        }
-      }
-
-      // Create a test filter that would apply wal_processing_option at the first
-      // record
-      final int applyOptionForRecordIndex = 1;
-      try (final TestableWalFilter walFilter =
-               new TestableWalFilter(option, applyOptionForRecordIndex)) {
+      try (final ColumnFamilyDescriptor defaultCF =
+               new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY);
+          final ColumnFamilyDescriptor pikachuCF = new ColumnFamilyDescriptor(bytes("pikachu"))) {
+        List<ColumnFamilyDescriptor> cfDescriptors = Arrays.asList(defaultCF, pikachuCF);
 
         try (final Options options = optionsForLogIterTest();
-             final DBOptions dbOptions = new DBOptions(options)
-                .setWalFilter(walFilter)) {
+            final DBOptions dbOptions = new DBOptions(options).setCreateMissingColumnFamilies(true);
 
-          try (final RocksDB db = RocksDB.open(dbOptions,
-              dbFolder.getRoot().getAbsolutePath(),
-              cfDescriptors, cfHandles)) {
-
-            try {
-              assertThat(walFilter.logNumbers).isNotEmpty();
-              assertThat(walFilter.logFileNames).isNotEmpty();
-            } finally {
-              for (final ColumnFamilyHandle cfHandle : cfHandles) {
-                cfHandle.close();
+            final RocksDB db = RocksDB.open(
+                dbOptions, dbFolder.getRoot().getAbsolutePath(), cfDescriptors, cfHandles)) {
+          try (final WriteOptions writeOptions = new WriteOptions()) {
+            // Write given keys in given batches
+            for (final byte[][] batchKey : batchKeys) {
+              final WriteBatch batch = new WriteBatch();
+              for (final byte[] bytes : batchKey) {
+                batch.put(cfHandles.get(0), bytes, dummyString(1024));
               }
-              cfHandles.clear();
+              db.write(writeOptions, batch);
             }
-          } catch (final RocksDBException e) {
-            if (option != WalProcessingOption.CORRUPTED_RECORD) {
-              // exception is expected when CORRUPTED_RECORD!
-              throw e;
+          } finally {
+            for (final ColumnFamilyHandle cfHandle : cfHandles) {
+              cfHandle.close();
+            }
+            cfHandles.clear();
+          }
+        }
+
+        // Create a test filter that would apply wal_processing_option at the first
+        // record
+        final int applyOptionForRecordIndex = 1;
+        try (final TestableWalFilter walFilter =
+                 new TestableWalFilter(option, applyOptionForRecordIndex)) {
+          try (final Options options = optionsForLogIterTest();
+              final DBOptions dbOptions = new DBOptions(options).setWalFilter(walFilter)) {
+            try (final RocksDB db = RocksDB.open(
+                     dbOptions, dbFolder.getRoot().getAbsolutePath(), cfDescriptors, cfHandles)) {
+              try {
+                assertThat(walFilter.logNumbers).isNotEmpty();
+                assertThat(walFilter.logFileNames).isNotEmpty();
+              } finally {
+                for (final ColumnFamilyHandle cfHandle : cfHandles) {
+                  cfHandle.close();
+                }
+                cfHandles.clear();
+              }
+            } catch (final RocksDBException e) {
+              if (option != WalProcessingOption.CORRUPTED_RECORD) {
+                // exception is expected when CORRUPTED_RECORD!
+                throw e;
+              }
             }
           }
         }

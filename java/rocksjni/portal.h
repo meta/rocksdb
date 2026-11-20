@@ -7034,14 +7034,14 @@ class ColumnFamilyDescriptorJni : public JavaClass {
     }
 
     jmethodID mid = env->GetMethodID(jclazz, "<init>",
-                                     "([BLorg/rocksdb/ColumnFamilyOptions;)V");
+                                     "([BLorg/rocksdb/ColumnFamilyOptions;Z)V");
     if (mid == nullptr) {
       // exception thrown: NoSuchMethodException or OutOfMemoryError
       env->DeleteLocalRef(jcf_name);
       return nullptr;
     }
 
-    jobject jcfd = env->NewObject(jclazz, mid, jcf_name, cfopts);
+    jobject jcfd = env->NewObject(jclazz, mid, jcf_name, cfopts, JNI_TRUE);
     if (env->ExceptionCheck()) {
       env->DeleteLocalRef(jcf_name);
       return nullptr;
@@ -7089,6 +7089,35 @@ class ColumnFamilyDescriptorJni : public JavaClass {
         jclazz, "columnFamilyOptions", "()Lorg/rocksdb/ColumnFamilyOptions;");
     assert(mid != nullptr);
     return mid;
+  }
+
+  /**
+   * @brief Converts a Java long array to a vector of ColumnFamilyDescriptor.
+   *
+   * @param env The JNI environment pointer.
+   * @param jcf_descriptors The JNI long array containing column family
+   * descriptors.
+   * @return A `std::vector` of `ROCKSDB_NAMESPACE::ColumnFamilyDescriptor`.
+   *         Returns an empty vector if an exception occurs.
+   */
+  static std::vector<ROCKSDB_NAMESPACE::ColumnFamilyDescriptor>
+  jcf_descriptorsToVec(JNIEnv* env, jlongArray jcf_descriptors) {
+    const jsize len_cols = env->GetArrayLength(jcf_descriptors);
+
+    auto cf_descriptors = std::make_unique<jlong[]>(len_cols);
+    env->GetLongArrayRegion(jcf_descriptors, 0, len_cols, cf_descriptors.get());
+    if (env->ExceptionCheck()) {
+      return std::vector<ROCKSDB_NAMESPACE::ColumnFamilyDescriptor>();
+    }
+
+    std::vector<ROCKSDB_NAMESPACE::ColumnFamilyDescriptor> column_families;
+    column_families.reserve(len_cols);
+    for (int i = 0; i < len_cols; i++) {
+      column_families.push_back(
+          *reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyDescriptor*>(
+              cf_descriptors[i]));
+    }
+    return column_families;
   }
 };
 

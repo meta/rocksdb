@@ -7,24 +7,15 @@
 package org.rocksdb;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.Assert.fail;
 
-import java.io.File;
-import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.rocksdb.util.BytewiseComparator;
 
 public class ImportColumnFamilyTest {
-  private static final String SST_FILE_NAME = "test.sst";
-  private static final String DB_DIRECTORY_NAME = "test_db";
-
   @ClassRule
   public static final RocksNativeLibraryResource ROCKS_NATIVE_LIBRARY_RESOURCE =
       new RocksNativeLibraryResource();
@@ -41,13 +32,14 @@ public class ImportColumnFamilyTest {
         db.put("key1".getBytes(), "value1".getBytes());
 
         try (final Checkpoint checkpoint = Checkpoint.create(db);
-             final ImportColumnFamilyOptions importColumnFamilyOptions =
-                 new ImportColumnFamilyOptions()) {
+            final ImportColumnFamilyOptions importColumnFamilyOptions =
+                new ImportColumnFamilyOptions();
+            ColumnFamilyDescriptor columnFamilyDescriptor =
+                new ColumnFamilyDescriptor("new_cf".getBytes());) {
           ExportImportFilesMetaData default_cf_metadata =
               checkpoint.exportColumnFamily(db.getDefaultColumnFamily(),
                   checkpointFolder.getRoot().getAbsolutePath() + "/default_cf_metadata");
-          ColumnFamilyDescriptor columnFamilyDescriptor =
-              new ColumnFamilyDescriptor("new_cf".getBytes());
+
           final ColumnFamilyHandle importCfHandle = db.createColumnFamilyWithImport(
               columnFamilyDescriptor, importColumnFamilyOptions, default_cf_metadata);
           assertThat(db.get(importCfHandle, "key".getBytes())).isEqualTo("value".getBytes());
@@ -61,8 +53,9 @@ public class ImportColumnFamilyTest {
   public void ImportMultiColumnFamilyTest() throws RocksDBException {
     try (final Options options = new Options().setCreateIfMissing(true)) {
       try (final RocksDB db1 = RocksDB.open(options, dbFolder.getRoot().getAbsolutePath() + "db1");
-           final RocksDB db2 =
-               RocksDB.open(options, dbFolder.getRoot().getAbsolutePath() + "db2");) {
+          final RocksDB db2 = RocksDB.open(options, dbFolder.getRoot().getAbsolutePath() + "db2");
+          final ColumnFamilyDescriptor columnFamilyDescriptor =
+              new ColumnFamilyDescriptor("new_cf".getBytes())) {
         db1.put("key".getBytes(), "value".getBytes());
         db1.put("key1".getBytes(), "value1".getBytes());
         db2.put("key2".getBytes(), "value2".getBytes());
@@ -78,10 +71,7 @@ public class ImportColumnFamilyTest {
               checkpoint2.exportColumnFamily(db2.getDefaultColumnFamily(),
                   checkpointFolder.getRoot().getAbsolutePath() + "/default_cf_metadata2");
 
-          ColumnFamilyDescriptor columnFamilyDescriptor =
-              new ColumnFamilyDescriptor("new_cf".getBytes());
-
-          List<ExportImportFilesMetaData> importMetaDatas = new ArrayList();
+          List<ExportImportFilesMetaData> importMetaDatas = new ArrayList<>();
           importMetaDatas.add(default_cf_metadata1);
           importMetaDatas.add(default_cf_metadata2);
 
