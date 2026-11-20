@@ -4422,7 +4422,7 @@ sub no_of_cpus_netbsd {
     # Returns:
     #   Number of physical CPUs on NetBSD
     #   undef if not NetBSD
-    my $no_of_cpus = `sysctl -n hw.ncpu 2>/dev/null`;
+    my $no_of_cpus = `sysctl -n hw.ncpuonline 2>/dev/null`;
     chomp $no_of_cpus;
     return $no_of_cpus;
 }
@@ -4431,7 +4431,7 @@ sub no_of_cores_netbsd {
     # Returns:
     #   Number of CPU cores on NetBSD
     #   undef if not NetBSD
-    my $no_of_cores = `sysctl -n hw.ncpu 2>/dev/null`;
+    my $no_of_cores = `sysctl -n hw.ncpuonline 2>/dev/null`;
     chomp $no_of_cores;
     return $no_of_cores;
 }
@@ -4440,7 +4440,7 @@ sub no_of_cpus_openbsd {
     # Returns:
     #   Number of physical CPUs on OpenBSD
     #   undef if not OpenBSD
-    my $no_of_cpus = `sysctl -n hw.ncpu 2>/dev/null`;
+    my $no_of_cpus = `sysctl -n hw.ncpuonline 2>/dev/null`;
     chomp $no_of_cpus;
     return $no_of_cpus;
 }
@@ -4449,7 +4449,7 @@ sub no_of_cores_openbsd {
     # Returns:
     #   Number of CPU cores on OpenBSD
     #   undef if not OpenBSD
-    my $no_of_cores = `sysctl -n hw.ncpu 2>/dev/null`;
+    my $no_of_cores = `sysctl -n hw.ncpuonline 2>/dev/null`;
     chomp $no_of_cores;
     return $no_of_cores;
 }
