@@ -1,9 +1,8 @@
 package org.rocksdb.ffm;
 
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.SegmentAllocator;
-
 public interface ColumnFamily {
 
-  public ColumnFamilyHandle defaultFamilyHandle();
+  ColumnFamilyHandle defaultFamilyHandle();
+
+  ColumnFamilyHandle createColumnFamily(String columnFamilyName, RocksdbOptions columnFamilyOptions) throws RocksFFMException;
 }
