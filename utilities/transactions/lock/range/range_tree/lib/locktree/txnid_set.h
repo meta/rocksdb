@@ -87,6 +87,6 @@ class txnid_set {
 
   friend class txnid_set_unit_test;
 };
-ENSURE_POD(txnid_set);
+static_assert(std::is_trivially_default_constructible_v<txnid_set>);
 
 } /* namespace toku */
