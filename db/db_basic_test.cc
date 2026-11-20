@@ -2841,6 +2841,42 @@ TEST_F(DBBasicTest, MultiGetSimple) {
   } while (ChangeCompactOptions());
 }
 
+TEST_F(DBBasicTest, MultiGetRangeTombstoneStopsLowerLevelSearch) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("key1", "value1"));
+  ASSERT_OK(Put("key2", "value2"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "key0",
+                             "key3"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ("1,0,1", FilesPerLevel());
+
+  int table_lookup_count = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::MultiGet::BeforeFindTable",
+      [&](void* /*arg*/) { ++table_lookup_count; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::vector<Slice> keys({"key1", "key2"});
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+  db_->MultiGet(ReadOptions(), db_->DefaultColumnFamily(), keys.size(),
+                keys.data(), values.data(), statuses.data(),
+                /*sorted_input=*/false);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_TRUE(statuses[0].IsNotFound());
+  ASSERT_TRUE(statuses[1].IsNotFound());
+  ASSERT_EQ(1, table_lookup_count);
+}
+
 TEST_F(DBBasicTest, MultiGetNewerVersionPresent) {
   // A mixed MultiGet batch reports newer writes independently for each key in
   // input order.
