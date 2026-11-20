@@ -1402,6 +1402,10 @@ IOStatus BackupEngineImpl::CreateNewBackupWithMetadata(
   }
   auto backup_time = backup_env_->NowMicros() - start_backup;
 
+  if (io_s.ok() && options_.sync && shared_directory_ != nullptr) {
+    io_s = shared_directory_->FsyncWithDirOptions(io_options_, nullptr,
+                                                  DirFsyncOptions());
+  }
   if (io_s.ok()) {
     // persist the backup metadata on the disk
     io_s = new_backup->StoreToFile(options_.sync, options_.schema_version,
@@ -1424,10 +1428,6 @@ IOStatus BackupEngineImpl::CreateNewBackupWithMetadata(
     if (io_s.ok() && meta_directory_ != nullptr) {
       io_s = meta_directory_->FsyncWithDirOptions(io_options_, nullptr,
                                                   DirFsyncOptions());
-    }
-    if (io_s.ok() && shared_directory_ != nullptr) {
-      io_s = shared_directory_->FsyncWithDirOptions(io_options_, nullptr,
-                                                    DirFsyncOptions());
     }
     if (io_s.ok() && backup_directory_ != nullptr) {
       io_s = backup_directory_->FsyncWithDirOptions(io_options_, nullptr,

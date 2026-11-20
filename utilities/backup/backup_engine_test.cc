@@ -442,6 +442,9 @@ class TestFs : public FileSystemWrapper {
     return FileSystemWrapper::CreateDirIfMissing(d, options, dbg);
   }
 
+  using DirectorySyncCallback = std::function<IOStatus(const std::string&)>;
+  DirectorySyncCallback before_directory_sync;
+
   void SetNewDirectoryFailure(bool fail) { new_directory_failure_ = fail; }
   IOStatus NewDirectory(const std::string& name, const IOOptions& io_opts,
                         std::unique_ptr<FSDirectory>* result,
@@ -449,7 +452,13 @@ class TestFs : public FileSystemWrapper {
     if (new_directory_failure_) {
       return IOStatus::IOError("SimulatedFailure");
     }
-    return FileSystemWrapper::NewDirectory(name, io_opts, result, dbg);
+    IOStatus status =
+        FileSystemWrapper::NewDirectory(name, io_opts, result, dbg);
+    if (status.ok() && *result != nullptr && before_directory_sync) {
+      *result = std::make_unique<TestDirectory>(std::move(*result), name,
+                                                before_directory_sync);
+    }
+    return status;
   }
 
   void ClearFileOpenCounters() {
@@ -468,6 +477,28 @@ class TestFs : public FileSystemWrapper {
   int num_writers() { return num_writers_; }
 
  private:
+  class TestDirectory : public FSDirectoryWrapper {
+   public:
+    TestDirectory(std::unique_ptr<FSDirectory> directory, std::string name,
+                  DirectorySyncCallback callback)
+        : FSDirectoryWrapper(std::move(directory)),
+          name_(std::move(name)),
+          callback_(std::move(callback)) {}
+
+    IOStatus FsyncWithDirOptions(const IOOptions& options, IODebugContext* dbg,
+                                 const DirFsyncOptions& dir_options) override {
+      IOStatus status = callback_(name_);
+      if (!status.ok()) {
+        return status;
+      }
+      return FSDirectoryWrapper::FsyncWithDirOptions(options, dbg, dir_options);
+    }
+
+   private:
+    std::string name_;
+    DirectorySyncCallback callback_;
+  };
+
   port::Mutex mutex_;
   bool dummy_sequential_file_ = false;
   bool dummy_sequential_file_fail_reads_ = false;
@@ -1180,6 +1211,61 @@ TEST_P(BackupEngineTestWithParam, SharedFileRenameFailureDoesNotPublishBackup) {
   std::vector<BackupInfo> backups;
   backup_engine_->GetBackupInfo(&backups);
   ASSERT_TRUE(backups.empty());
+}
+
+// Publishing metadata before the shared directory is durable can leave a
+// backup record pointing to missing files after a crash. Watch the metadata
+// rename itself because cleanup can remove a record that was already published.
+TEST_P(BackupEngineTestWithParam, SyncSharedDirectoryBeforePublishingMetadata) {
+  engine_options_->sync = true;
+  const std::string shared_dir =
+      backupdir_ + (GetParam() ? "/shared_checksum" : "/shared");
+  const std::string meta_dir = backupdir_ + "/meta";
+  std::vector<std::string> events;
+  bool fail_shared_sync = true;
+  test_backup_fs_->before_directory_sync = [&](const std::string& name) {
+    if (name == shared_dir || name == shared_dir + "/") {
+      std::vector<std::string> files;
+      EXPECT_OK(backup_chroot_env_->GetChildren(name, &files));
+      EXPECT_TRUE(std::any_of(
+          files.begin(), files.end(),
+          [](const std::string& file) { return EndsWith(file, ".sst"); }));
+      events.emplace_back("fsync shared");
+      if (fail_shared_sync) {
+        return IOStatus::IOError("Injected shared directory fsync failure");
+      }
+    } else if (name == meta_dir) {
+      events.emplace_back("fsync metadata");
+    }
+    return IOStatus::OK();
+  };
+  OpenDBAndBackupEngine(true);
+  FillDB(db_.get(), 0, 100, kFlushAll);
+  test_backup_fs_->before_rename = [&](const std::string& src) {
+    if (StartsWith(src, meta_dir + "/")) {
+      events.emplace_back("rename metadata");
+    }
+    return IOStatus::OK();
+  };
+
+  Status failed_backup = backup_engine_->CreateNewBackup(db_.get());
+  std::vector<std::string> failure_events = std::exchange(events, {});
+  std::vector<BackupInfo> backups_after_failure;
+  backup_engine_->GetBackupInfo(&backups_after_failure);
+
+  fail_shared_sync = false;
+  Status successful_backup = backup_engine_->CreateNewBackup(db_.get());
+  test_backup_fs_->before_rename = {};
+  test_backup_fs_->before_directory_sync = {};
+
+  const std::vector<std::string> expected_failure{"fsync shared"};
+  const std::vector<std::string> expected_success{
+      "fsync shared", "rename metadata", "fsync metadata"};
+  EXPECT_EQ(Status::kIOError, failed_backup.code());
+  EXPECT_EQ(expected_failure, failure_events);
+  EXPECT_TRUE(backups_after_failure.empty());
+  ASSERT_OK(successful_backup);
+  EXPECT_EQ(expected_success, events);
 }
 
 TEST_F(BackupEngineTest, IncrementalRestore) {
