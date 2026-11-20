@@ -143,9 +143,16 @@ char* Arena::AllocateAligned(size_t bytes, size_t huge_page_size,
 }
 
 char* Arena::AllocateNewBlock(size_t block_bytes) {
+#if _POSIX_C_SOURCE >= 200112L
+  char* block = NULL;
+  if (posix_memalign((void**)&block, 128, block_bytes) != 0) {
+    exit(1);
+  }
+#else
+  char* block = new char[block_bytes];
+#endif
   // NOTE: std::make_unique zero-initializes the block so is not appropriate
   // here
-  char* block = new char[block_bytes];
   blocks_.push_back(std::unique_ptr<char[]>(block));
 
   size_t allocated_size;
