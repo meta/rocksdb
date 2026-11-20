@@ -122,7 +122,8 @@ void AutoRollLogger::GetExistingFiles() {
   std::string parent_dir;
   std::vector<std::string> info_log_files;
   Status s =
-      GetInfoLogFiles(fs_, db_log_dir_, dbname_, &parent_dir, &info_log_files);
+      GetInfoLogFiles(fs_, db_log_dir_, dbname_, db_absolute_path_,
+                     &parent_dir, &info_log_files);
   if (status_.ok()) {
     status_ = s;
   }
