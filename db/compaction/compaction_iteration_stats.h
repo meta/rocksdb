@@ -44,6 +44,14 @@ struct CompactionIterationStats {
   uint64_t total_blob_bytes_read = 0;
   uint64_t num_blobs_relocated = 0;
   uint64_t total_blob_bytes_relocated = 0;
+  // The total size of the values (or wide-column entities) whose large parts
+  // were extracted into blob files, measured before and after the extraction.
+  // Only the post-extraction form, which holds blob references in place of the
+  // extracted parts, is written to the table file. The difference between the
+  // two is therefore the amount by which the raw value size of the table file
+  // understates the amount of input it stands for.
+  uint64_t total_value_bytes_before_blob_extraction = 0;
+  uint64_t total_value_bytes_after_blob_extraction = 0;
 
   // TimedPut diagnostics
   // Total number of kTypeValuePreferredSeqno records encountered.

@@ -438,8 +438,14 @@ Status BuildTable(
         uint64_t total_payload_bytes = ci_stats.total_input_raw_key_bytes +
                                        ci_stats.total_input_raw_value_bytes +
                                        total_tombstone_payload_bytes;
+        // A value that was extracted into a blob file is represented in the
+        // table file by a blob reference only, so trade the size of those
+        // references back for the size of the values they stand for. Without
+        // this, every extracted byte would be reported as garbage.
         uint64_t total_payload_bytes_written =
-            (tp.raw_key_size + tp.raw_value_size);
+            (tp.raw_key_size + tp.raw_value_size) +
+            ci_stats.total_value_bytes_before_blob_extraction -
+            ci_stats.total_value_bytes_after_blob_extraction;
         // Prevent underflow, which may still happen at this point
         // since we only support inserts, deletes, and deleteRanges.
         if (total_payload_bytes_written <= total_payload_bytes) {
