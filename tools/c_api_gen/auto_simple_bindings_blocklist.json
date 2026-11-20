@@ -143,16 +143,6 @@
           "field": "calculate_sst_write_lifetime_hint_set",
           "policy": "manual",
           "reason": "Stores external objects, callback collections, or nested aggregates that need explicit C ownership and lifetime policy."
-        },
-        {
-          "field": "max_manifest_file_size",
-          "policy": "manual",
-          "reason": "ABI type mismatch: legacy C API uses size_t but C++ field is uint64_t. Hand-written binding preserved for ABI compatibility."
-        },
-        {
-          "field": "writable_file_max_buffer_size",
-          "policy": "manual",
-          "reason": "ABI type mismatch: legacy C API uses uint64_t but C++ field is size_t. Hand-written binding preserved for ABI compatibility."
         }
       ]
     },
@@ -213,16 +203,6 @@
           "field": "blob_direct_write_partition_strategy",
           "policy": "manual",
           "reason": "std::shared_ptr<BlobFilePartitionStrategy> \u2014 factory/ownership-transfer type; needs explicit C bridging."
-        },
-        {
-          "field": "soft_pending_compaction_bytes_limit",
-          "policy": "manual",
-          "reason": "ABI type mismatch: legacy C API uses size_t but C++ field is uint64_t. Hand-written binding preserved for ABI compatibility."
-        },
-        {
-          "field": "hard_pending_compaction_bytes_limit",
-          "policy": "manual",
-          "reason": "ABI type mismatch: legacy C API uses size_t but C++ field is uint64_t. Hand-written binding preserved for ABI compatibility."
         }
       ]
     },
@@ -333,6 +313,14 @@
           "field": "canceled",
           "policy": "manual",
           "reason": "Uses caller-owned cancellation state that should not be exposed as a blind auto-generated field wrapper."
+        },
+        {
+          "field": "allow_resumption",
+          "policy": "manual",
+          "functions": [
+            "rocksdb_open_and_compact_options_set_allow_resumption"
+          ],
+          "reason": "Legacy setter is a no-op for a NULL options pointer; the generated getter is unaffected."
         }
       ]
     },
@@ -483,21 +471,6 @@
           "field": "secondary_indices",
           "policy": "manual",
           "reason": "Uses factories, handles, callbacks, or internal collections that need hand-designed C bridging."
-        },
-        {
-          "field": "wp_snapshot_cache_bits",
-          "policy": "manual",
-          "reason": "Uses factories, handles, callbacks, or internal collections that need hand-designed C bridging."
-        },
-        {
-          "field": "wp_commit_cache_bits",
-          "policy": "manual",
-          "reason": "Uses factories, handles, callbacks, or internal collections that need hand-designed C bridging."
-        },
-        {
-          "field": "autogenerate_name",
-          "policy": "manual",
-          "reason": "Uses factories, handles, callbacks, or internal collections that need hand-designed C bridging."
         }
       ]
     },
@@ -618,6 +591,46 @@
           "field": "referenced_blob_bytes",
           "policy": "manual",
           "reason": "std::optional uses separate value and presence accessors; nullopt maps to has=false and value=0."
+        }
+      ]
+    },
+    {
+      "name": "LRUCacheOptions",
+      "entries": [
+        {
+          "field": "memory_allocator",
+          "policy": "manual",
+          "reason": "Takes a rocksdb_memory_allocator_t handle and shares its std::shared_ptr; set with the hand-written rocksdb_*_set_memory_allocator."
+        },
+        {
+          "field": "secondary_cache",
+          "policy": "manual",
+          "reason": "std::shared_ptr<SecondaryCache> needs a C ownership design; the C API has no secondary cache handle."
+        }
+      ]
+    },
+    {
+      "name": "HyperClockCacheOptions",
+      "entries": [
+        {
+          "field": "memory_allocator",
+          "policy": "manual",
+          "reason": "Takes a rocksdb_memory_allocator_t handle and shares its std::shared_ptr; set with the hand-written rocksdb_*_set_memory_allocator."
+        },
+        {
+          "field": "secondary_cache",
+          "policy": "manual",
+          "reason": "std::shared_ptr<SecondaryCache> needs a C ownership design; the C API has no secondary cache handle."
+        }
+      ]
+    },
+    {
+      "name": "CompactionFilter::Context",
+      "entries": [
+        {
+          "field": "input_table_properties",
+          "policy": "manual",
+          "reason": "Map of std::shared_ptr<const TableProperties>; needs a C iteration and lifetime design."
         }
       ]
     }

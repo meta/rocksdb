@@ -1,0 +1,345 @@
+{
+  "reasons": {
+    "not-yet": "No C binding yet, and nothing needs designing first. Add one when it is needed.",
+    "wide-columns": "Wide columns and attribute groups have no C representation yet.",
+    "multiget": "Part of the batched MultiGet API, which needs a C design for pinned, zero-copy results.",
+    "collections": "Takes or returns a C++ container (vector, map, set) that has no C collection type.",
+    "no-handle": "Uses a C++ type that has no C handle.",
+    "borrowed-object": "Returns an object the caller does not own, and the C API has no non-owning handle for that type.",
+    "timestamped-snapshots": "Timestamped snapshots are shared_ptr<const Snapshot>, and the C snapshot handle has no shared ownership.",
+    "ingestion-handles": "File ingestion handles carry ownership from the prepare step to the commit step, which needs a C lifetime design.",
+    "lifetime": "Shares or transfers ownership in a way the C API has no convention for.",
+    "callbacks": "Takes a C++ callback object or std::function.",
+    "async": "Asynchronous or coroutine API with no C equivalent.",
+    "cache-entries": "Low-level cache entry API (Handle, CacheItemHelper, ObjectPtr) that C has no design for.",
+    "customizable": "Customizable and Configurable plumbing. The C API configures these objects through dedicated setters and option strings.",
+    "cleanable": "Cleanup hooks that RocksDB registers internally.",
+    "internal": "Called by RocksDB itself rather than by applications."
+  },
+  "excluded_bases": {
+    "Customizable": "customizable",
+    "Configurable": "customizable",
+    "Cleanable": "cleanable"
+  },
+  "classes": {
+    "DB": {
+      "header": "rocksdb/db.h",
+      "excluded": {
+        "AbortCompactions": "not-yet",
+        "ClipColumnFamily": "not-yet",
+        "Close": "not-yet",
+        "CommitFileIngestionHandle": "ingestion-handles",
+        "CommitFileIngestionHandles": "ingestion-handles",
+        "DestroyColumnFamilyHandle": "not-yet",
+        "DropColumnFamilies": "collections",
+        "EnableAutoCompaction": "collections",
+        "GetAggregatedIntProperty": "not-yet",
+        "GetAllColumnFamilyMetaData": "collections",
+        "GetApproximateMemTableStats": "not-yet",
+        "GetAsync": "async",
+        "GetCoroDB": "async",
+        "GetCreationTimeOfOldestFile": "not-yet",
+        "GetDBOptions": "no-handle",
+        "GetDbSessionId": "not-yet",
+        "GetEntity": "wide-columns",
+        "GetEntityLazy": "wide-columns",
+        "GetEntityWithMetadata": "wide-columns",
+        "GetFileSystem": "no-handle",
+        "GetLiveFiles": "collections",
+        "GetLiveFilesChecksumInfo": "no-handle",
+        "GetMapProperty": "collections",
+        "GetMergeOperands": "collections",
+        "GetName": "not-yet",
+        "GetNewestUserDefinedTimestamp": "not-yet",
+        "GetOptions": "not-yet",
+        "GetPreparedFileInfoForExternalSstIngestion": "ingestion-handles",
+        "GetPropertiesOfAllTables": "collections",
+        "GetPropertiesOfTablesByLevel": "collections",
+        "GetPropertiesOfTablesInRange": "collections",
+        "GetRootDB": "borrowed-object",
+        "GetStatsHistory": "no-handle",
+        "IngestExternalFiles": "collections",
+        "IngestWriteBatchWithIndex": "lifetime",
+        "Level0StopWriteTrigger": "not-yet",
+        "LockWAL": "not-yet",
+        "MultiGetAsync": "async",
+        "MultiGetEntity": "wide-columns",
+        "MultiGetEntityLazy": "wide-columns",
+        "MultiGetEntityWithMetadata": "wide-columns",
+        "NewAttributeGroupIterator": "wide-columns",
+        "NewCoalescingIterator": "wide-columns",
+        "NewMultiScan": "no-handle",
+        "NumberLevels": "not-yet",
+        "OpenAsFollower": "not-yet",
+        "PrepareFileIngestion": "ingestion-handles",
+        "PromoteL0": "not-yet",
+        "PutEntity": "wide-columns",
+        "ResetStats": "not-yet",
+        "Resume": "not-yet",
+        "ResumeCompactions": "not-yet",
+        "SyncWAL": "not-yet",
+        "UnlockWAL": "not-yet",
+        "WriteWithCallback": "callbacks"
+      }
+    },
+    "ColumnFamilyHandle": {
+      "header": "rocksdb/db.h",
+      "excluded": {
+        "GetComparator": "borrowed-object",
+        "GetDescriptor": "no-handle"
+      }
+    },
+    "Snapshot": {
+      "header": "rocksdb/snapshot.h",
+      "excluded": {
+        "GetTimestamp": "not-yet",
+        "GetUnixTime": "not-yet"
+      }
+    },
+    "Iterator": {
+      "header": "rocksdb/iterator.h",
+      "excluded": {
+        "columns": "wide-columns",
+        "GetProperty": "not-yet",
+        "Prepare": "no-handle",
+        "PrepareValue": "not-yet"
+      }
+    },
+    "WriteBatch": {
+      "header": "rocksdb/write_batch.h",
+      "excluded": {
+        "GetColumnFamilyToTimestampSize": "collections",
+        "GetProtectionBytesPerKey": "not-yet",
+        "GetWalTerminationPoint": "no-handle",
+        "GetWriteBatch": "borrowed-object",
+        "HasBeginPrepare": "not-yet",
+        "HasCommit": "not-yet",
+        "HasDelete": "not-yet",
+        "HasDeleteRange": "not-yet",
+        "HasEndPrepare": "not-yet",
+        "HasMerge": "not-yet",
+        "HasPut": "not-yet",
+        "HasPutEntity": "not-yet",
+        "HasRollback": "not-yet",
+        "HasSingleDelete": "not-yet",
+        "HasTimedPut": "not-yet",
+        "MarkWalTerminationPoint": "not-yet",
+        "MaybeTrackTimestampSize": "not-yet",
+        "PutEntity": "wide-columns",
+        "Release": "not-yet",
+        "SetMaxBytes": "not-yet",
+        "SetTrackTimestampSize": "not-yet",
+        "TimedPut": "not-yet"
+      }
+    },
+    "WriteBatchWithIndex": {
+      "header": "rocksdb/utilities/write_batch_with_index.h",
+      "excluded": {
+        "GetCFStats": "collections",
+        "GetDataSize": "not-yet",
+        "GetEntityFromBatch": "wide-columns",
+        "GetEntityFromBatchAndDB": "wide-columns",
+        "GetOverwriteKey": "not-yet",
+        "GetWBWIOpCount": "not-yet",
+        "MultiGetEntityFromBatchAndDB": "wide-columns",
+        "MultiGetFromBatchAndDB": "multiget",
+        "NewIterator": "no-handle",
+        "PopSavePoint": "not-yet",
+        "PutEntity": "wide-columns",
+        "SetMaxBytes": "not-yet",
+        "TimedPut": "not-yet"
+      }
+    },
+    "Transaction": {
+      "header": "rocksdb/utilities/transaction.h",
+      "excluded": {
+        "ClearSnapshot": "not-yet",
+        "CollapseKey": "not-yet",
+        "CommitAndTryCreateSnapshot": "timestamped-snapshots",
+        "DeleteUntracked": "not-yet",
+        "DisableIndexing": "not-yet",
+        "EnableIndexing": "not-yet",
+        "GetAttributeGroupIterator": "wide-columns",
+        "GetCoalescingIterator": "wide-columns",
+        "GetCommitTimestamp": "not-yet",
+        "GetCommitTimeWriteBatch": "borrowed-object",
+        "GetElapsedTime": "not-yet",
+        "GetEntity": "wide-columns",
+        "GetEntityForUpdate": "wide-columns",
+        "GetID": "not-yet",
+        "GetId": "not-yet",
+        "GetLogNumber": "not-yet",
+        "GetNumDeletes": "not-yet",
+        "GetNumKeys": "not-yet",
+        "GetNumMerges": "not-yet",
+        "GetNumPutEntities": "not-yet",
+        "GetNumPuts": "not-yet",
+        "GetRangeLock": "no-handle",
+        "GetState": "not-yet",
+        "GetTimestampedSnapshot": "timestamped-snapshots",
+        "GetWaitingTxns": "collections",
+        "GetWriteOptions": "borrowed-object",
+        "IsDeadlockDetect": "not-yet",
+        "MergeUntracked": "not-yet",
+        "MultiGetEntity": "wide-columns",
+        "PopSavePoint": "not-yet",
+        "PutEntity": "wide-columns",
+        "PutEntityUntracked": "wide-columns",
+        "PutUntracked": "not-yet",
+        "SetDeadlockTimeout": "not-yet",
+        "SetLockTimeout": "not-yet",
+        "SetLogNumber": "not-yet",
+        "SetSnapshot": "not-yet",
+        "SetSnapshotOnNextOperation": "callbacks",
+        "SetState": "internal",
+        "SetWriteOptions": "not-yet",
+        "SingleDelete": "not-yet",
+        "SingleDeleteUntracked": "not-yet",
+        "UndoGetForUpdate": "not-yet"
+      }
+    },
+    "TransactionDB": {
+      "header": "rocksdb/utilities/transaction_db.h",
+      "excluded": {
+        "CreateTimestampedSnapshot": "timestamped-snapshots",
+        "DeleteRange": "not-yet",
+        "GetAllTimestampedSnapshots": "timestamped-snapshots",
+        "GetDeadlockInfoBuffer": "collections",
+        "GetLatestTimestampedSnapshot": "timestamped-snapshots",
+        "GetLockStatusData": "collections",
+        "GetTimestampedSnapshot": "timestamped-snapshots",
+        "GetTimestampedSnapshots": "timestamped-snapshots",
+        "GetTransactionByName": "borrowed-object",
+        "PrepareWrap": "no-handle",
+        "ReleaseTimestampedSnapshotsOlderThan": "timestamped-snapshots",
+        "SetDeadlockInfoBufferSize": "not-yet",
+        "WrapDB": "no-handle",
+        "WrapStackableDB": "no-handle"
+      }
+    },
+    "OptimisticTransactionDB": {
+      "header": "rocksdb/utilities/optimistic_transaction_db.h",
+      "excluded": {}
+    },
+    "BackupEngine": {
+      "header": "rocksdb/utilities/backup_engine.h",
+      "excluded": {
+        "AsBackupEngine": "borrowed-object",
+        "DeleteBackup": "not-yet",
+        "GarbageCollect": "not-yet",
+        "GetCorruptedBackups": "collections",
+        "GetLatestBackupInfo": "no-handle"
+      }
+    },
+    "Checkpoint": {
+      "header": "rocksdb/utilities/checkpoint.h",
+      "excluded": {}
+    },
+    "SstFileWriter": {
+      "header": "rocksdb/sst_file_writer.h",
+      "excluded": {
+        "CreatedBySstFileWriter": "not-yet",
+        "OpenWithEmbeddedBlobs": "no-handle",
+        "PutEntity": "wide-columns"
+      }
+    },
+    "Cache": {
+      "header": "rocksdb/advanced_cache.h",
+      "excluded": {
+        "ApplyToAllEntries": "callbacks",
+        "ApplyToHandle": "callbacks",
+        "BasicLookup": "cache-entries",
+        "CreateFromString": "not-yet",
+        "CreateStandalone": "cache-entries",
+        "Erase": "cache-entries",
+        "EraseUnRefEntries": "not-yet",
+        "GetCacheItemHelper": "cache-entries",
+        "GetCharge": "cache-entries",
+        "GetHashSeed": "not-yet",
+        "GetPrintableOptions": "customizable",
+        "GetSecondaryCacheCapacity": "not-yet",
+        "GetSecondaryCachePinnedUsage": "not-yet",
+        "HasStrictCapacityLimit": "not-yet",
+        "Insert": "cache-entries",
+        "Lookup": "cache-entries",
+        "memory_allocator": "borrowed-object",
+        "Name": "customizable",
+        "NewId": "cache-entries",
+        "Ref": "cache-entries",
+        "Release": "cache-entries",
+        "ReportProblems": "not-yet",
+        "SetEvictionCallback": "callbacks",
+        "StartAsyncLookup": "cache-entries",
+        "Type": "customizable",
+        "Value": "cache-entries",
+        "Wait": "cache-entries",
+        "WaitAll": "cache-entries"
+      }
+    },
+    "Statistics": {
+      "header": "rocksdb/statistics.h",
+      "excluded": {
+        "CreateFromString": "not-yet",
+        "getAndResetTickerCount": "not-yet",
+        "getHistogramString": "not-yet",
+        "getTickerMap": "collections",
+        "HistEnabledForType": "not-yet",
+        "measureTime": "internal",
+        "Name": "customizable",
+        "recordInHistogram": "internal",
+        "recordTick": "internal",
+        "reportTimeToHistogram": "internal",
+        "Reset": "not-yet",
+        "setTickerCount": "internal",
+        "Type": "customizable"
+      }
+    },
+    "SstFileManager": {
+      "header": "rocksdb/sst_file_manager.h",
+      "excluded": {
+        "GetTrackedFiles": "collections",
+        "SetStatisticsPtr": "internal"
+      }
+    },
+    "WriteBufferManager": {
+      "header": "rocksdb/write_buffer_manager.h",
+      "excluded": {
+        "BeginWriteStall": "internal",
+        "DeregisterFlushInitiator": "internal",
+        "FenceFlushInitiator": "internal",
+        "FreeMem": "internal",
+        "GetFlushInitiatorReportBytes": "not-yet",
+        "GetLocalFlushRetryMicros": "not-yet",
+        "IsStallActive": "not-yet",
+        "IsStallThresholdExceeded": "not-yet",
+        "MaybeEndWriteStall": "internal",
+        "NotifyFlushInitiatorChanged": "internal",
+        "NotifyFlushInitiatorFlushCancelled": "internal",
+        "NotifyFlushInitiatorFlushCompleted": "internal",
+        "RegisterFlushInitiator": "internal",
+        "RemoveDBFromQueue": "internal",
+        "ReserveMem": "internal",
+        "ScheduleFreeMem": "internal",
+        "ShouldFlush": "internal",
+        "ShouldStall": "internal",
+        "ShouldTrackFlushInitiator": "internal",
+        "TryAcquireLocalFlush": "internal"
+      }
+    },
+    "RateLimiter": {
+      "header": "rocksdb/rate_limiter.h",
+      "excluded": {
+        "GetBytesPerSecond": "not-yet",
+        "GetSingleBurstBytes": "not-yet",
+        "GetTotalBytesThrough": "not-yet",
+        "GetTotalPendingRequests": "not-yet",
+        "GetTotalRequests": "not-yet",
+        "IsRateLimited": "not-yet",
+        "Request": "internal",
+        "RequestToken": "internal",
+        "SetBytesPerSecond": "not-yet",
+        "SetSingleBurstBytes": "not-yet"
+      }
+    }
+  }
+}
