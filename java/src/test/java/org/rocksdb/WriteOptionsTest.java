@@ -54,6 +54,13 @@ public class WriteOptionsTest {
       assertThat(writeOptions.memtableInsertHintPerBatch()).isTrue();
       writeOptions.setMemtableInsertHintPerBatch(false);
       assertThat(writeOptions.memtableInsertHintPerBatch()).isFalse();
+
+      // Test protectionBytesPerKey - supported values: 0, 8
+      assertThat(writeOptions.protectionBytesPerKey()).isEqualTo(0);
+      writeOptions.setProtectionBytesPerKey(8);
+      assertThat(writeOptions.protectionBytesPerKey()).isEqualTo(8);
+      writeOptions.setProtectionBytesPerKey(0);
+      assertThat(writeOptions.protectionBytesPerKey()).isEqualTo(0);
     }
   }
 

@@ -1705,6 +1705,32 @@ public class RocksDBTest {
   }
 
   @Test
+  public void verifyFileChecksums() throws RocksDBException {
+    // NOTE: verifyFileChecksums requires file_checksum_gen_factory to be set
+    // For now, we test that the method is callable and returns appropriate error
+    try (final Options options = new Options().setCreateIfMissing(true);
+        final ReadOptions readOptions = new ReadOptions()) {
+      final String dbPath = dbFolder.getRoot().getAbsolutePath();
+      try (final RocksDB db = RocksDB.open(options, dbPath)) {
+        // Put some data to create SST files
+        db.put("key1".getBytes(UTF_8), "value1".getBytes(UTF_8));
+        db.put("key2".getBytes(UTF_8), "value2".getBytes(UTF_8));
+        db.flush(new FlushOptions());
+
+        // Verify file checksums - will throw InvalidArgument if file_checksum_gen_factory not set
+        // This is expected behavior, we're just testing the JNI binding works
+        try {
+          db.verifyFileChecksums(readOptions);
+          // If no exception, the call succeeded (factory was set, unlikely in this test)
+        } catch (RocksDBException e) {
+          // Expected: "Cannot verify file checksum if options.file_checksum_gen_factory is null"
+          assertThat(e.getMessage()).contains("file_checksum_gen_factory");
+        }
+      }
+    }
+  }
+
+  @Test
   public void getPropertiesOfAllTables() throws RocksDBException {
     try (final DBOptions options = new DBOptions()
         .setCreateIfMissing(true)) {

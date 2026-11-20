@@ -716,4 +716,19 @@ public class ColumnFamilyOptionsTest {
       assertThat(options.minTombstonesForRangeConversion()).isEqualTo(val);
     }
   }
+
+  @Test
+  public void memtableProtectionBytesPerKey() {
+    try (final ColumnFamilyOptions options = new ColumnFamilyOptions()) {
+      // Default should be 0 (disabled)
+      assertThat(options.memtableProtectionBytesPerKey()).isEqualTo(0);
+
+      // Test each supported value: 0, 1, 2, 4, 8
+      final int[] supportedValues = {0, 1, 2, 4, 8};
+      for (int val : supportedValues) {
+        assertThat(options.setMemtableProtectionBytesPerKey(val)).isEqualTo(options);
+        assertThat(options.memtableProtectionBytesPerKey()).isEqualTo(val);
+      }
+    }
+  }
 }
