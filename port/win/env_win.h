@@ -215,7 +215,7 @@ class WinFileSystem : public FileSystem {
                            std::string* output_path,
                            IODebugContext* dbg) override;
   IOStatus IsDirectory(const std::string& /*path*/, const IOOptions& options,
-                       bool* is_dir, IODebugContext* /*dgb*/) override;
+                       bool* is_dir, IODebugContext* /*dbg*/) override;
   // This seems to clash with a macro on Windows, so #undef it here
 #undef GetFreeSpace
   IOStatus GetFreeSpace(const std::string& /*path*/,
