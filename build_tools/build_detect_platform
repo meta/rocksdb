@@ -784,7 +784,7 @@ EOF
 fi
 
 # check for F_FULLFSYNC
-$CXX $PLATFORM_CXXFALGS -x c++ - -o test.o 2>/dev/null  <<EOF
+$CXX $PLATFORM_CXXFLAGS -x c++ - -o test.o 2>/dev/null  <<EOF
   #include <fcntl.h>
   int main() {
     fcntl(0, F_FULLFSYNC);
@@ -792,7 +792,10 @@ $CXX $PLATFORM_CXXFALGS -x c++ - -o test.o 2>/dev/null  <<EOF
   }
 EOF
 if [ "$?" = 0 ]; then
-  COMMON_FLAGS="$COMMON_FLAGS -DHAVE_FULLFSYNC"
+  if [ ! "$MACOS_IGNORE_FULLFSYNC" ] || [ ! "$PLATFORM" = OS_MACOSX ]; then
+    echo "Full fsync"
+    COMMON_FLAGS="$COMMON_FLAGS -DHAVE_FULLFSYNC"
+  fi
 fi
 
 rm -f test.o test_dl.o
