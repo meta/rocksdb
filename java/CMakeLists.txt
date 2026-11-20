@@ -42,6 +42,7 @@ set(JNI_NATIVE_SOURCES
         rocksjni/event_listener_jnicallback.cc
         rocksjni/export_import_files_metadatajni.cc
         rocksjni/filter.cc
+        rocksjni/flush_wal_options.cc
         rocksjni/hyper_clock_cache.cc
         rocksjni/import_column_family_options.cc
         rocksjni/ingest_external_file_options.cc
@@ -173,6 +174,7 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/FlushJobInfo.java
   src/main/java/org/rocksdb/FlushOptions.java
   src/main/java/org/rocksdb/FlushReason.java
+  src/main/java/org/rocksdb/FlushWALOptions.java
   src/main/java/org/rocksdb/GetStatus.java
   src/main/java/org/rocksdb/GetWithMetadataResult.java
   src/main/java/org/rocksdb/HashLinkedListMemTableConfig.java
@@ -349,6 +351,7 @@ set(JAVA_TEST_CLASSES
   src/test/java/org/rocksdb/FilterTest.java
   src/test/java/org/rocksdb/FlushOptionsTest.java
   src/test/java/org/rocksdb/FlushTest.java
+  src/test/java/org/rocksdb/FlushWALOptionsTest.java
   src/test/java/org/rocksdb/HyperClockCacheTest.java
   src/test/java/org/rocksdb/ImportColumnFamilyTest.java
   src/test/java/org/rocksdb/InfoLogLevelTest.java

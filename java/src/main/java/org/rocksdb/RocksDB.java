@@ -4369,6 +4369,17 @@ public class RocksDB extends RocksObject {
   }
 
   /**
+   * Flush the WAL buffer to disk with advanced control.
+   * Use this for fine-grained control over sync behavior and I/O rate limiting.
+   *
+   * @param flushWALOptions controls sync and rate limiter priority
+   * @throws RocksDBException if flush fails
+   */
+  public void flushWal(final FlushWALOptions flushWALOptions) throws RocksDBException {
+    flushWal(nativeHandle_, flushWALOptions.nativeHandle_);
+  }
+
+  /**
    * Sync the WAL.
    * <p>
    * Note that {@link #write(WriteOptions, WriteBatch)} followed by
@@ -5163,6 +5174,8 @@ public class RocksDB extends RocksObject {
   private static native void flush(final long handle, final long flushOptHandle,
       /* @Nullable */ final long[] cfHandles) throws RocksDBException;
   private static native void flushWal(final long handle, final boolean sync)
+      throws RocksDBException;
+  private static native void flushWal(final long handle, final long flushWALOptionsHandle)
       throws RocksDBException;
   private static native void syncWal(final long handle) throws RocksDBException;
   private static native long getLatestSequenceNumber(final long handle);
