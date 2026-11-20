@@ -161,7 +161,7 @@ class CondVar {
   Mutex* mu_;
 };
 
-using Thread = std::thread;
+using Thread = std::jthread;
 
 static inline void AsmVolatilePause() {
 #if defined(__i386__) || defined(__x86_64__)

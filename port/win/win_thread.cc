@@ -10,7 +10,7 @@
 #if defined(OS_WIN)
 // Most Mingw builds support std::thread only when using posix threads.
 // In that case, some of these functions will be unavailable.
-// Note that we're using either WindowsThread or std::thread, depending on
+// Note that we're using either WindowsThread or std::jthread, depending on
 // which one is available.
 #ifndef _POSIX_THREADS
 
@@ -65,16 +65,12 @@ void WindowsThread::Init(std::function<void()>&& func) {
 WindowsThread::WindowsThread() : data_(nullptr), th_id_(0) {}
 
 WindowsThread::~WindowsThread() {
-  // Must be joined or detached
-  // before destruction.
-  // This is the same as std::thread
-  if (data_) {
-    if (joinable()) {
-      assert(false);
-      std::terminate();
-    }
-    data_.reset();
+  // Is joined and detached on destruction.
+  // This is the same as std::jthread.
+  if (joinable()) {
+    join();
   }
+  data_.reset();
 }
 
 WindowsThread::WindowsThread(WindowsThread&& o) noexcept : WindowsThread() {
@@ -102,7 +98,7 @@ WindowsThread::native_handle_type WindowsThread::native_handle() const {
 }
 
 unsigned WindowsThread::hardware_concurrency() {
-  return std::thread::hardware_concurrency();
+  return std::jthread::hardware_concurrency();
 }
 
 void WindowsThread::join() {
