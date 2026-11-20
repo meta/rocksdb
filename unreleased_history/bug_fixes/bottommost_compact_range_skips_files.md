@@ -1,0 +1,1 @@
+Fixed `CompactRange()` with `bottommost_level_compaction` set to `kForceOptimized` or `kIfHaveCompactionFilter` (the default) sometimes not compacting old bottommost files that are to the right of a file written by the same `CompactRange()`. Those files kept data that the compaction filter should drop, kept tombstones, and did not get new options applied.
