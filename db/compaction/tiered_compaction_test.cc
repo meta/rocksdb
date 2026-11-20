@@ -2097,8 +2097,139 @@ TEST_P(PrecludeLastLevelTest, CheckInternalKeyRange) {
   Close();
 }
 
+TEST_P(PrecludeLastLevelTest, ExistingBlobFilesDisablePerKeyPlacement) {
+  for (const bool blob_gc : {false, true}) {
+    SCOPED_TRACE("blob_gc=" + std::to_string(blob_gc));
+    Options options = CurrentOptions();
+    options.env = mock_env_.get();
+    options.num_levels = 7;
+    options.level_compaction_dynamic_level_bytes = true;
+    options.disable_auto_compactions = true;
+    options.enable_blob_files = true;
+    options.min_blob_size = 0;
+    options.preserve_internal_time_seconds = 10000;
+    DestroyAndReopen(options);
+
+    dbfull()->TEST_WaitForPeriodicTaskRun(
+        [&] { mock_clock_->MockSleepForSeconds(10); });
+    ASSERT_OK(Put("z", "cold_value"));
+    for (int i = 0; i < 200; i++) {
+      dbfull()->TEST_WaitForPeriodicTaskRun(
+          [&] { mock_clock_->MockSleepForSeconds(100); });
+    }
+    ASSERT_OK(Put("b", "hot_value_b"));
+    ASSERT_OK(Put("d", "hot_value_d"));
+    ASSERT_OK(Flush());
+    for (const char* key : {"a", "c", "e"}) {
+      ASSERT_OK(Put(key, std::string("hot_value_") + key));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_EQ(GetBlobFileNumbers().size(), 2);
+
+    ApplyConfigChange(
+        &options,
+        {{"enable_blob_files", "false"},
+         {"preclude_last_level_data_seconds", "10000"},
+         {"enable_blob_garbage_collection", blob_gc ? "true" : "false"},
+         {"blob_garbage_collection_age_cutoff", "0.5"}});
+    ASSERT_OK(TimedPut("f", "hot_value_f", mock_clock_->NowSeconds()));
+
+    CompactRangeOptions cro;
+    cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+
+    Reopen(options);
+    ASSERT_EQ("cold_value", Get("z"));
+    for (const char* key : {"a", "b", "c", "d", "e", "f"}) {
+      ASSERT_EQ(std::string("hot_value_") + key, Get(key));
+    }
+    ASSERT_EQ("0,0,0,0,0,0,1", FilesPerLevel());
+    Close();
+  }
+}
+
+TEST_P(PrecludeLastLevelTest, EnableBlobFilesDisablesPerKeyPlacement) {
+  Options options = CurrentOptions();
+  options.env = mock_env_.get();
+  options.num_levels = 7;
+  options.level_compaction_dynamic_level_bytes = true;
+  options.disable_auto_compactions = true;
+  options.preserve_internal_time_seconds = 10000;
+  DestroyAndReopen(options);
+
+  for (const char* key : {"a", "b", "c"}) {
+    ASSERT_OK(Put(key, std::string("hot_value_") + key));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_TRUE(GetBlobFileNumbers().empty());
+
+  ApplyConfigChange(&options, {{"enable_blob_files", "true"},
+                               {"min_blob_size", "0"},
+                               {"preclude_last_level_data_seconds", "10000"}});
+
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+
+  Reopen(options);
+  for (const char* key : {"a", "b", "c"}) {
+    ASSERT_EQ(std::string("hot_value_") + key, Get(key));
+  }
+  ASSERT_EQ(NumTableFilesAtLevel(5), 0);
+  ASSERT_GT(NumTableFilesAtLevel(6), 0);
+  Close();
+}
+
 INSTANTIATE_TEST_CASE_P(PrecludeLastLevelTest, PrecludeLastLevelTest,
                         ::testing::Bool());
+
+class PrecludeLastLevelBlobIssueTest
+    : public PrecludeLastLevelTestBase,
+      public testing::WithParamInterface<std::tuple<bool, bool>> {};
+
+TEST_P(PrecludeLastLevelBlobIssueTest, CompactRangeKeepsValuesReadable) {
+  const bool timed_put = std::get<0>(GetParam());
+  const bool tiering = std::get<1>(GetParam());
+  Options options = CurrentOptions();
+  options.env = mock_env_.get();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.min_blob_size = 64;
+  options.preclude_last_level_data_seconds = tiering ? 1000 : 0;
+  options.num_levels = 7;
+  options.compaction_style = kCompactionStyleLevel;
+  options.level_compaction_dynamic_level_bytes = true;
+  if (!timed_put) {
+    options.enable_blob_garbage_collection = true;
+    options.blob_garbage_collection_age_cutoff = 0.5;
+  }
+  DestroyAndReopen(options);
+
+  const std::string value_a(100, 'A');
+  const std::string value_b(100, 'B');
+  if (timed_put) {
+    ASSERT_OK(TimedPut("a", value_a, mock_clock_->NowSeconds()));
+  } else {
+    ASSERT_OK(Put("a", value_a));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(Put("b", value_b));
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(value_a, Get("a"));
+  ASSERT_EQ(value_b, Get("b"));
+  ASSERT_EQ(NumTableFilesAtLevel(5), 0);
+  ASSERT_GT(NumTableFilesAtLevel(6), 0);
+
+  Reopen(options);
+  ASSERT_EQ(value_a, Get("a"));
+  ASSERT_EQ(value_b, Get("b"));
+  Close();
+}
+
+INSTANTIATE_TEST_CASE_P(PrecludeLastLevelBlobIssueTest,
+                        PrecludeLastLevelBlobIssueTest,
+                        ::testing::Combine(::testing::Bool(),
+                                           ::testing::Bool()));
 
 class PrecludeWithCompactStyleTest : public PrecludeLastLevelTestBase,
                                      public testing::WithParamInterface<bool> {
