@@ -61,11 +61,18 @@ DEFINE_SYNC_AND_ASYNC(void, Version::Get)
                 &storage_info_.file_indexer_, user_comparator(),
                 internal_comparator());
   FdWithKeyRange* f = fp.GetNextFile();
+  // True when f is the next file of the same level (L1+) as the file read
+  // before it. The file picker only returns such a file when the lookup key
+  // equals the previous file's largest user key, i.e. when the versions of the
+  // key may span the file boundary.
+  bool key_spans_from_prev_file = false;
 
   while (f != nullptr) {
-    if (*max_covering_tombstone_seq > 0) {
-      // The remaining files we look at will only contain covered keys, so we
-      // stop here.
+    if (*max_covering_tombstone_seq > 0 && !key_spans_from_prev_file) {
+      // The remaining files in lower levels will only contain covered keys, so
+      // we stop here. The next file of the same level is the exception: it
+      // holds older versions of the same key, which can still be newer than
+      // the tombstone we found in the previous file.
       break;
     }
     if (get_context.sample()) {
@@ -183,7 +190,10 @@ DEFINE_SYNC_AND_ASYNC(void, Version::Get)
         *status = Status::Corruption(Status::SubCode::kMergeOperatorFailed);
         CO_RETURN;
     }
+    const unsigned int prev_file_level = fp.GetHitFileLevel();
     f = fp.GetNextFile();
+    key_spans_from_prev_file = f != nullptr && prev_file_level > 0 &&
+                               fp.GetHitFileLevel() == prev_file_level;
   }
   if (db_statistics_ != nullptr) {
     get_context.ReportCounters();
