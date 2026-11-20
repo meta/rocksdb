@@ -3919,6 +3919,18 @@ public class RocksDB extends RocksObject {
   }
 
   /**
+   * Wait for all pending flush and compaction jobs to complete.
+   * Warning: May block indefinitely if writes continue. Use timeout to prevent this.
+   *
+   * @param waitForCompactOptions controls timeout, flush inclusion, and abort behavior
+   * @throws RocksDBException if wait fails or DB is shutting down
+   */
+  public void waitForCompact(final WaitForCompactOptions waitForCompactOptions)
+      throws RocksDBException {
+    waitForCompact(nativeHandle_, waitForCompactOptions.nativeHandle_);
+  }
+
+  /**
    * ClipColumnFamily() will clip the entries in the CF according to the range
    * [begin_key, end_key). Returns OK on success, and a non-OK status on error.
    * Any entries outside this range will be completely deleted (including
@@ -5165,6 +5177,15 @@ public class RocksDB extends RocksObject {
   private static native void flushWal(final long handle, final boolean sync)
       throws RocksDBException;
   private static native void syncWal(final long handle) throws RocksDBException;
+  private static native void waitForCompact(
+      final long handle, final long waitForCompactOptionsHandle) throws RocksDBException;
+  private static native String getDbSessionId(final long handle) throws RocksDBException;
+  private static native void lockWAL(final long handle) throws RocksDBException;
+  private static native void unlockWAL(final long handle) throws RocksDBException;
+  private static native void increaseFullHistoryTsLow(
+      final long handle, final long columnFamilyHandle, final byte[] tsLow) throws RocksDBException;
+  private static native byte[] getFullHistoryTsLow(final long handle, final long columnFamilyHandle)
+      throws RocksDBException;
   private static native long getLatestSequenceNumber(final long handle);
   private static native void disableFileDeletions(long handle) throws RocksDBException;
   private static native void enableFileDeletions(long handle) throws RocksDBException;
