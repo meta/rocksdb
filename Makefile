@@ -2821,6 +2821,10 @@ rocksdbjavastaticdockers390xmusl:
 	mkdir -p java/target
 	docker run --rm --name rocksdb_linux_s390x-musl-be --platform linux/s390x --attach stdin --attach stdout --attach stderr --volume $(HOME)/.m2:/root/.m2:ro --volume `pwd`:/rocksdb-host:ro --volume /rocksdb-local-build --volume `pwd`/java/target:/rocksdb-java-target --env DEBUG_LEVEL=$(DEBUG_LEVEL) --env J=$(J) evolvedbinary/rocksjava:alpine3_s390x-be /rocksdb-host/java/crossbuild/docker-build-linux.sh
 
+rocksdbjavastaticdockerriscv64musl:
+	mkdir -p java/target
+	docker run --rm --name rocksdb_linux_riscv64-musl-be --platform linux/riscv64 --attach stdin --attach stdout --attach stderr --volume $(HOME)/.m2:/root/.m2:ro --volume `pwd`:/rocksdb-host:ro --volume /rocksdb-local-build --volume `pwd`/java/target:/rocksdb-java-target --env DEBUG_LEVEL=$(DEBUG_LEVEL) --env J=$(J) evolvedbinary/rocksjava:alpine3_riscv64-be /rocksdb-host/java/crossbuild/docker-build-linux.sh
+
 rocksdbjavastaticpublish: rocksdbjavastaticrelease rocksdbjavastaticpublishcentral
 
 rocksdbjavastaticpublishdocker: rocksdbjavastaticreleasedocker rocksdbjavastaticpublishcentral
