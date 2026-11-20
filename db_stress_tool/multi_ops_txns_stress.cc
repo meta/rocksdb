@@ -964,7 +964,17 @@ Status MultiOpsTxnsStressTest::UpdatePrimaryIndexValueTxn(ThreadState* thread,
   ropts.rate_limiter_priority =
       FLAGS_rate_limit_user_ops ? Env::IO_USER : Env::IO_TOTAL;
   std::string value;
-  s = txn->GetForUpdate(ropts, pk_str, &value);
+  if (thread->rand.OneIn(2)) {
+    const Slice key(pk_str);
+    PinnableSlice pinned_value(&value);
+    txn->MultiGetForUpdate(ropts, db_->DefaultColumnFamily(), 1, &key,
+                           &pinned_value, &s, thread->rand.OneIn(2));
+    if (s.ok() && pinned_value.IsPinned()) {
+      value.assign(pinned_value.data(), pinned_value.size());
+    }
+  } else {
+    s = txn->GetForUpdate(ropts, pk_str, &value);
+  }
   if (!s.ok()) {
     return s;
   }

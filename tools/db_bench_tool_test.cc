@@ -12,6 +12,7 @@
 #include "db/db_impl/db_impl.h"
 #include "options/options_parser.h"
 #include "rocksdb/utilities/options_util.h"
+#include "rocksdb/utilities/transaction_db.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/random.h"
@@ -154,6 +155,117 @@ class DBBenchTest : public testing::Test {
 };
 
 namespace {}  // namespace
+
+TEST_F(DBBenchTest, MultiReadForUpdateLockFailures) {
+  GFLAGS_NAMESPACE::FlagSaver flag_saver;
+  db_path_ += "_lock_failures";
+  wal_path_ += "_lock_failures";
+  Options options;
+  options.create_if_missing = true;
+  options.wal_dir = wal_path_;
+  ASSERT_OK(DestroyDB(db_path_, options));
+  const std::string key = "locked";
+  {
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(options, db_path_, &db));
+    ASSERT_OK(db->Put(WriteOptions(), key, "value"));
+  }
+
+  class LockHoldingHooks : public DefaultHooks {
+   public:
+    using DefaultHooks::OpenTransactionDB;
+    Status OpenTransactionDB(const Options& options,
+                             const TransactionDBOptions& txn_options,
+                             const std::string& name,
+                             TransactionDB** dbptr) override {
+      Status s =
+          DefaultHooks::OpenTransactionDB(options, txn_options, name, dbptr);
+      if (!s.ok()) {
+        return s;
+      }
+      std::unique_ptr<Transaction> blocker(
+          (*dbptr)->BeginTransaction(WriteOptions()));
+      std::string value;
+      s = blocker->GetForUpdate(ReadOptions(), "locked", &value);
+      if (!s.ok()) {
+        return s;
+      }
+      s = blocker->SetName("db_bench_lock_holder");
+      if (!s.ok()) {
+        return s;
+      }
+      // TransactionDB deletes registered named transactions during teardown,
+      // keeping this lock held throughout the benchmark.
+      blocker.release();
+      ++opens;
+      return Status::OK();
+    }
+    unsigned opens = 0;
+  } hooks;
+
+  ResetArgs();
+  AppendArgs({"./db_bench", "--benchmarks=multireadrandom",
+              "--use_existing_db=1", "--use_existing_keys=true", "--num=1",
+              "--reads=20", "--threads=2", "--num_multi_db=1", "--batch_size=2",
+              "--transaction_db=true", "--optimistic_transaction_db=false",
+              "--multiread_batched=true", "--multiread_for_update=true",
+              "--transaction_lock_timeout=0", "--compression_type=none",
+              "--db=" + db_path_, "--wal_dir=" + wal_path_});
+  testing::internal::CaptureStdout();
+  const int result = db_bench_tool(argc(), argv(), hooks);
+  const std::string output = testing::internal::GetCapturedStdout();
+  ASSERT_EQ(result, 0);
+  ASSERT_EQ(hooks.opens, 1U);
+  ASSERT_NE(output.find("(0 of 20 found)"), std::string::npos) << output;
+  ASSERT_NE(output.find("(aborted batches: 10)"), std::string::npos) << output;
+}
+
+TEST_F(DBBenchTest, MultiReadForUpdateReadOnly) {
+  GFLAGS_NAMESPACE::FlagSaver flag_saver;
+  {
+    Options options;
+    options.create_if_missing = true;
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(options, db_path_, &db));
+  }
+
+  ResetArgs();
+  AppendArgs({"./db_bench", "--benchmarks=multireadrandom", "--num=2",
+              "--reads=2", "--threads=1", "--batch_size=2", "--readonly=true",
+              "--transaction_db=false", "--optimistic_transaction_db=true",
+              "--num_multi_db=1", "--multiread_batched=true",
+              "--multiread_for_update=true", "--compression_type=none",
+              "--db=" + db_path_});
+  ASSERT_EXIT(db_bench_tool(argc(), argv()), testing::ExitedWithCode(1),
+              "Cannot use readonly flag with multiread_for_update");
+}
+
+TEST_F(DBBenchTest, MultiReadForUpdateOptimistic) {
+  GFLAGS_NAMESPACE::FlagSaver flag_saver;
+  // Opening a DB gives optimistic_transaction_db precedence when both flags
+  // are enabled. Exercise that case with multiple DBs to check DB selection.
+  for (bool pessimistic : {false, true}) {
+    SCOPED_TRACE(pessimistic ? "both flags, multiple DBs" : "optimistic only");
+    ResetArgs();
+    AppendArgs(
+        {"./db_bench", "--benchmarks=fillseq,multireadrandom",
+         "--use_existing_db=0", "--num=16", "--reads=20", "--threads=2",
+         "--batch_size=4", "--optimistic_transaction_db=true",
+         std::string("--transaction_db=") + (pessimistic ? "true" : "false"),
+         std::string("--num_multi_db=") + (pessimistic ? "2" : "1"),
+         "--multiread_batched=true", "--multiread_for_update=true",
+         std::string("--multiread_sorted_input=") +
+             (pessimistic ? "true" : "false"),
+         "--compression_type=none", "--db=" + db_path_,
+         "--wal_dir=" + wal_path_});
+    testing::internal::CaptureStdout();
+    const int result = db_bench_tool(argc(), argv());
+    const std::string output = testing::internal::GetCapturedStdout();
+    ASSERT_EQ(result, 0);
+    ASSERT_NE(output.find("(20 of 20 found)"), std::string::npos) << output;
+    ASSERT_NE(output.find("(aborted batches: 0)"), std::string::npos) << output;
+  }
+}
 
 TEST_F(DBBenchTest, OptionsFile) {
   const std::string kOptionsFileName = test_path_ + "/OPTIONS_test";

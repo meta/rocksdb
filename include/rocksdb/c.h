@@ -4489,6 +4489,20 @@ extern ROCKSDB_LIBRARY_API void rocksdb_transaction_multi_get_for_update_cf(
     const size_t* keys_list_sizes, char** values_list,
     size_t* values_list_sizes, char** errs);
 
+extern ROCKSDB_LIBRARY_API void
+rocksdb_transaction_batched_multi_get_for_update_cf(
+    rocksdb_transaction_t* txn, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const char* const* keys_list, const size_t* keys_list_sizes,
+    rocksdb_pinnableslice_t** values, char** errs, const bool sorted_input);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_transaction_batched_multi_get_for_update_cf_slice(
+    rocksdb_transaction_t* txn, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const rocksdb_slice_t* keys_list, rocksdb_pinnableslice_t** values,
+    char** errs, const bool sorted_input);
+
 extern ROCKSDB_LIBRARY_API char* rocksdb_transactiondb_get(
     rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
     const char* key, size_t klen, size_t* vlen, char** errptr);

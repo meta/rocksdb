@@ -2134,6 +2134,13 @@ DEFINE_bool(avoid_flush_during_shutdown,
 DEFINE_int64(multiread_stride, 0,
              "Stride length for the keys in a MultiGet batch");
 DEFINE_bool(multiread_batched, false, "Use the new MultiGet API");
+DEFINE_bool(multiread_for_update, false,
+            "Use batched Transaction::MultiGetForUpdate for multireadrandom; "
+            "requires transaction_db or optimistic_transaction_db, and "
+            "multiread_batched. Each batch is rolled back; optimistic "
+            "commit-time conflict validation is not measured");
+DEFINE_bool(multiread_sorted_input, false,
+            "Sort multireadrandom keys before batched MultiGetForUpdate");
 DEFINE_int32(coro_jobs_per_thread, 1,
              "For readrandomcoroutine and multireadrandomcoroutine: number of "
              "concurrent coroutine jobs per executor thread. Each job does the "
@@ -6550,6 +6557,10 @@ class Benchmark {
     options.read_triggered_compaction_threshold =
         FLAGS_read_triggered_compaction_threshold;
 
+    if (FLAGS_readonly && FLAGS_multiread_for_update) {
+      fprintf(stderr, "Cannot use readonly flag with multiread_for_update\n");
+      db_bench_exit(1);
+    }
     if (FLAGS_readonly && FLAGS_transaction_db) {
       fprintf(stderr, "Cannot use readonly flag with transaction_db\n");
       db_bench_exit(1);
@@ -8401,6 +8412,17 @@ class Benchmark {
   // Calls MultiGet over a list of keys from a random distribution.
   // Returns the total number of keys found.
   void MultiReadRandom(ThreadState* thread) {
+    if (FLAGS_multiread_for_update &&
+        ((!FLAGS_transaction_db && !FLAGS_optimistic_transaction_db) ||
+         !FLAGS_multiread_batched || multiread_entity_ ||
+         multiread_entity_lazy_ || FLAGS_read_with_metadata ||
+         user_timestamp_size_ > 0)) {
+      fprintf(stderr,
+              "multiread_for_update requires transaction_db or "
+              "optimistic_transaction_db, and "
+              "multiread_batched, without entities, metadata, or timestamps\n");
+      db_bench_exit(1);
+    }
     if (multiread_entity_ && user_timestamp_size_ > 0) {
       fprintf(stderr, "multireadentity does not support user timestamps\n");
       db_bench_exit(1);
@@ -8433,6 +8455,7 @@ class Benchmark {
     int64_t bytes = 0;
     int64_t num_multireads = 0;
     int64_t found = 0;
+    uint64_t aborted_batches = 0;
     ReadOptions options = read_options_;
     std::vector<Slice> keys;
     std::vector<std::unique_ptr<const char[]>> key_guards;
@@ -8462,7 +8485,8 @@ class Benchmark {
 
     auto duration = thread->shared->MakeDuration(FLAGS_duration, reads_);
     while (!duration.Done(entries_per_batch_)) {
-      DB* db = SelectDB(thread);
+      DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(thread);
+      DB* db = db_with_cfh->db;
       if (FLAGS_multiread_stride) {
         int64_t key = GetRandomKey(&thread->rand);
         if ((key + (entries_per_batch_ - 1) * FLAGS_multiread_stride) >=
@@ -8602,7 +8626,35 @@ class Benchmark {
           }
         }
       } else {
-        if (FLAGS_read_with_metadata) {
+        if (FLAGS_multiread_for_update) {
+          if (FLAGS_multiread_sorted_input) {
+            const Comparator* comparator =
+                db->DefaultColumnFamily()->GetComparator();
+            std::sort(keys.begin(), keys.end(),
+                      [comparator](const Slice& a, const Slice& b) {
+                        return comparator->Compare(a, b) < 0;
+                      });
+          }
+          std::unique_ptr<Transaction> txn;
+          if (FLAGS_optimistic_transaction_db) {
+            txn.reset(
+                db_with_cfh->opt_txn_db->BeginTransaction(write_options_));
+          } else {
+            auto* txn_db = static_cast_with_check<TransactionDB>(db);
+            TransactionOptions txn_options;
+            txn_options.lock_timeout = FLAGS_transaction_lock_timeout;
+            txn.reset(txn_db->BeginTransaction(write_options_, txn_options));
+          }
+          txn->MultiGetForUpdate(
+              options, db->DefaultColumnFamily(), keys.size(), keys.data(),
+              pin_values, stat_list.data(), FLAGS_multiread_sorted_input);
+          const Status s = txn->Rollback();
+          if (!s.ok()) {
+            fprintf(stderr, "Transaction rollback failed: %s\n",
+                    s.ToString().c_str());
+            db_bench_exit(1);
+          }
+        } else if (FLAGS_read_with_metadata) {
           MultiGetOutputMetadata output_metadata;
           output_metadata.WantNewerVersionPresent();
           if (user_timestamp_size_ > 0) {
@@ -8623,6 +8675,15 @@ class Benchmark {
             bytes +=
                 keys[i].size() + pin_values[i].size() + user_timestamp_size_;
             ++found;
+          } else if (FLAGS_multiread_for_update &&
+                     (stat_list[i].IsTimedOut() || stat_list[i].IsBusy())) {
+            // Lock contention is expected here, not an I/O error, so count
+            // it rather than aborting via HandleBenchmarkIOError. The failure
+            // is copied to every key, so count once per batch. Rollback above
+            // releases any locks already acquired.
+            if (i == 0) {
+              ++aborted_batches;
+            }
           } else if (!stat_list[i].IsNotFound()) {
             // Tolerated IO error: skip this key and continue.
             HandleBenchmarkIOError(stat_list[i], "MultiGet returned an error");
@@ -8645,6 +8706,10 @@ class Benchmark {
              read);
     thread->stats.AddBytes(bytes);
     thread->stats.AddMessage(msg);
+    if (FLAGS_multiread_for_update) {
+      thread->stats.AddMessage(
+          "(aborted batches: " + std::to_string(aborted_batches) + ")");
+    }
   }
 
 #if USE_COROUTINES

@@ -127,6 +127,11 @@ class TransactionBaseImpl : public Transaction {
                       Status* statuses, bool sorted_input = false) override;
 
   using Transaction::MultiGetForUpdate;
+  void MultiGetForUpdate(const ReadOptions& options,
+                         ColumnFamilyHandle* column_family, size_t num_keys,
+                         const Slice* keys, PinnableSlice* values,
+                         Status* statuses, bool sorted_input) override;
+
   std::vector<Status> MultiGetForUpdate(
       const ReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_family,
