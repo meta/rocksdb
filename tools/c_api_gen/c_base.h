@@ -141,6 +141,8 @@ typedef struct rocksdb_column_family_metadata_options_t
 typedef struct rocksdb_envoptions_t rocksdb_envoptions_t;
 typedef struct rocksdb_ingestexternalfileoptions_t
     rocksdb_ingestexternalfileoptions_t;
+typedef struct rocksdb_ingestexternalfilearg_t rocksdb_ingestexternalfilearg_t;
+typedef struct rocksdb_fileingestionhandle_t rocksdb_fileingestionhandle_t;
 typedef struct rocksdb_trace_options_t rocksdb_trace_options_t;
 typedef struct rocksdb_trace_reader_t rocksdb_trace_reader_t;
 typedef struct rocksdb_replay_options_t rocksdb_replay_options_t;
@@ -152,6 +154,7 @@ typedef struct rocksdb_livefiles_storage_info_options_t
 typedef struct rocksdb_livefiles_storage_info_t
     rocksdb_livefiles_storage_info_t;
 typedef struct rocksdb_sstfilewriter_t rocksdb_sstfilewriter_t;
+typedef struct rocksdb_sstfilereader_t rocksdb_sstfilereader_t;
 typedef struct rocksdb_ratelimiter_t rocksdb_ratelimiter_t;
 typedef struct rocksdb_perfcontext_t rocksdb_perfcontext_t;
 typedef struct rocksdb_pinnableslice_t rocksdb_pinnableslice_t;
@@ -2838,6 +2841,23 @@ extern ROCKSDB_LIBRARY_API void rocksdb_sstfilewriter_file_size(
     rocksdb_sstfilewriter_t* writer, uint64_t* file_size);
 extern ROCKSDB_LIBRARY_API void rocksdb_sstfilewriter_destroy(
     rocksdb_sstfilewriter_t* writer);
+
+/* SstFileReader. Iterators returned by rocksdb_sstfilereader_new_iterator()
+   are regular rocksdb_iterator_t objects and must be destroyed with
+   rocksdb_iter_destroy() before the reader is destroyed. */
+extern ROCKSDB_LIBRARY_API rocksdb_sstfilereader_t*
+rocksdb_sstfilereader_create(const rocksdb_options_t* io_options);
+extern ROCKSDB_LIBRARY_API void rocksdb_sstfilereader_open(
+    rocksdb_sstfilereader_t* reader, const char* name, char** errptr);
+extern ROCKSDB_LIBRARY_API rocksdb_iterator_t*
+rocksdb_sstfilereader_new_iterator(rocksdb_sstfilereader_t* reader,
+                                   const rocksdb_readoptions_t* options);
+extern ROCKSDB_LIBRARY_API void rocksdb_sstfilereader_verify_checksum(
+    rocksdb_sstfilereader_t* reader, const rocksdb_readoptions_t* options,
+    char** errptr);
+extern ROCKSDB_LIBRARY_API void rocksdb_sstfilereader_destroy(
+    rocksdb_sstfilereader_t* reader);
+
 extern ROCKSDB_LIBRARY_API rocksdb_ingestexternalfileoptions_t*
 rocksdb_ingestexternalfileoptions_create(void);
 extern ROCKSDB_LIBRARY_API void
@@ -2872,6 +2892,69 @@ extern ROCKSDB_LIBRARY_API void rocksdb_ingest_external_file_cf(
     rocksdb_t* db, rocksdb_column_family_handle_t* handle,
     const char* const* file_list, const size_t list_len,
     const rocksdb_ingestexternalfileoptions_t* opt, char** errptr);
+
+/* IngestExternalFileArg: the per-column-family argument to
+   rocksdb_ingest_external_files(). The setters copy their inputs, so the
+   caller keeps ownership of everything passed in. */
+extern ROCKSDB_LIBRARY_API rocksdb_ingestexternalfilearg_t*
+rocksdb_ingestexternalfilearg_create(void);
+extern ROCKSDB_LIBRARY_API void rocksdb_ingestexternalfilearg_destroy(
+    rocksdb_ingestexternalfilearg_t* arg);
+extern ROCKSDB_LIBRARY_API void rocksdb_ingestexternalfilearg_set_column_family(
+    rocksdb_ingestexternalfilearg_t* arg,
+    rocksdb_column_family_handle_t* column_family);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfilearg_set_external_files(
+    rocksdb_ingestexternalfilearg_t* arg, const char* const* file_list,
+    size_t list_len);
+extern ROCKSDB_LIBRARY_API void rocksdb_ingestexternalfilearg_set_options(
+    rocksdb_ingestexternalfilearg_t* arg,
+    const rocksdb_ingestexternalfileoptions_t* opt);
+/* Checksums are raw bytes (e.g. the 4-byte big-endian CRC32C produced by
+   rocksdb_file_checksum_gen_crc32c_factory_create()), so each one is passed
+   with its length. Entry i applies to the i-th external file. */
+extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfilearg_set_files_checksums(
+    rocksdb_ingestexternalfilearg_t* arg, const char* const* checksums,
+    const size_t* checksums_lens, size_t num_checksums);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfilearg_set_files_checksum_func_names(
+    rocksdb_ingestexternalfilearg_t* arg, const char* const* func_names,
+    size_t num_func_names);
+
+/* Ingests files into multiple column families and records the result
+   atomically in the MANIFEST. Each arg must refer to a different column
+   family. */
+extern ROCKSDB_LIBRARY_API void rocksdb_ingest_external_files(
+    rocksdb_t* db, const rocksdb_ingestexternalfilearg_t* const* args,
+    size_t num_args, char** errptr);
+
+/* Two-phase external file ingestion. rocksdb_prepare_file_ingestion() does
+   the work that does not need the DB mutex (validating the args, reading file
+   metadata, and linking/copying/syncing the files into the DB) and returns a
+   handle, or NULL with *errptr set on failure. Nothing is visible until the
+   handle is committed with rocksdb_commit_file_ingestion_handles(). `args` has
+   the same requirements as for rocksdb_ingest_external_files().
+
+   Every handle must be either committed or destroyed before the DB is closed.
+   Destroying a handle that was never committed rolls back its ingestion. */
+extern ROCKSDB_LIBRARY_API rocksdb_fileingestionhandle_t*
+rocksdb_prepare_file_ingestion(
+    rocksdb_t* db, const rocksdb_ingestexternalfilearg_t* const* args,
+    size_t num_args, char** errptr);
+/* Commits the prepared ingestions atomically: all of their files become
+   visible together, or none do. Handles that target the same column family
+   are committed in array order (a later handle wins for overlapping keys) and
+   must have been prepared with the same ingest options.
+
+   This call takes ownership of every handle, whether it succeeds or fails; on
+   failure all of them are rolled back. Each entry of `handles` is set to NULL,
+   and the caller must not destroy the handles afterwards. */
+extern ROCKSDB_LIBRARY_API void rocksdb_commit_file_ingestion_handles(
+    rocksdb_t* db, rocksdb_fileingestionhandle_t** handles, size_t num_handles,
+    char** errptr);
+extern ROCKSDB_LIBRARY_API void rocksdb_fileingestionhandle_destroy(
+    rocksdb_fileingestionhandle_t* handle);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_try_catch_up_with_primary(
     rocksdb_t* db, char** errptr);
