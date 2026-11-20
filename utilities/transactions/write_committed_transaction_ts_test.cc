@@ -1409,6 +1409,81 @@ TEST_P(WriteCommittedTxnWithTsTest, GetEntityForUpdate) {
   }
 }
 
+// MultiGetForUpdate() reads with batched per-column-family lookups; the read
+// timestamp must still be validated against each key's column family.
+TEST_P(WriteCommittedTxnWithTsTest, MultiGetForUpdateTimestampValidation) {
+  ASSERT_OK(ReOpenNoDelete());
+
+  ColumnFamilyOptions cf_options;
+  cf_options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+
+  ColumnFamilyHandle* cfh = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(cf_options, "test_cf", &cfh));
+  std::unique_ptr<ColumnFamilyHandle> cfh_guard(cfh);
+  ColumnFamilyHandle* const default_cfh = db->DefaultColumnFamily();
+
+  {
+    std::unique_ptr<Transaction> txn(
+        NewTxn(WriteOptions(), TransactionOptions()));
+    ASSERT_OK(txn->Put(cfh, "foo", "foo_val"));
+    ASSERT_OK(txn->Put(cfh, "bar", "bar_val"));
+    ASSERT_OK(txn->Put(default_cfh, "baz", "baz_val"));
+    ASSERT_OK(txn->SetCommitTimestamp(24));
+    ASSERT_OK(txn->Commit());
+  }
+
+  std::vector<std::string> values;
+
+  // Correct timestamp for the timestamped column family => success. A key in
+  // the column family without timestamps rejects the timestamp, without
+  // affecting keys in the other column family.
+  {
+    std::unique_ptr<Transaction> txn(
+        NewTxn(WriteOptions(), TransactionOptions()));
+    ReadOptions read_options;
+    Slice max_ts = MaxU64Ts();
+    read_options.timestamp = &max_ts;
+    std::vector<Status> statuses = txn->MultiGetForUpdate(
+        read_options, {cfh, default_cfh, cfh}, {"foo", "baz", "bar"}, &values);
+    ASSERT_EQ(statuses.size(), 3);
+    ASSERT_OK(statuses[0]);
+    ASSERT_EQ(values[0], "foo_val");
+    ASSERT_TRUE(statuses[1].IsInvalidArgument());
+    ASSERT_OK(statuses[2]);
+    ASSERT_EQ(values[2], "bar_val");
+    ASSERT_OK(txn->Rollback());
+  }
+
+  // Timestamp size does not match the column family => invalid
+  {
+    std::unique_ptr<Transaction> txn(
+        NewTxn(WriteOptions(), TransactionOptions()));
+    ReadOptions read_options;
+    Slice short_ts("ts");
+    read_options.timestamp = &short_ts;
+    std::vector<Status> statuses = txn->MultiGetForUpdate(
+        read_options, {cfh, cfh}, {"foo", "bar"}, &values);
+    ASSERT_EQ(statuses.size(), 2);
+    ASSERT_TRUE(statuses[0].IsInvalidArgument());
+    ASSERT_TRUE(statuses[1].IsInvalidArgument());
+    ASSERT_OK(txn->Rollback());
+  }
+
+  // ReadOptions.timestamp is not set for the timestamped column family =>
+  // invalid
+  {
+    std::unique_ptr<Transaction> txn(
+        NewTxn(WriteOptions(), TransactionOptions()));
+    std::vector<Status> statuses = txn->MultiGetForUpdate(
+        ReadOptions(), {cfh, default_cfh}, {"foo", "baz"}, &values);
+    ASSERT_EQ(statuses.size(), 2);
+    ASSERT_TRUE(statuses[0].IsInvalidArgument());
+    ASSERT_OK(statuses[1]);
+    ASSERT_EQ(values[1], "baz_val");
+    ASSERT_OK(txn->Rollback());
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
