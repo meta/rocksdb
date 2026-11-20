@@ -1,0 +1,1 @@
+Added `rocksdb_livefiles_file_checksum` and `rocksdb_livefiles_file_checksum_func_name` to the C API to expose SST file checksum fields from `SstFileMetaData`. Also added `rocksdb_livefile_set_file_checksum` and `rocksdb_livefile_set_file_checksum_func_name` for symmetry with the existing `rocksdb_livefile_set_*` builder functions.

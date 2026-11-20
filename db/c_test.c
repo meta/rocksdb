@@ -7292,6 +7292,57 @@ int main(int argc, char** argv) {
     free(cf_err);
   }
 
+  StartPhase("livefiles_checksum");
+  {
+    // Open a separate DB with file checksum generation enabled
+    rocksdb_options_t* ck_options = rocksdb_options_create();
+    rocksdb_options_set_create_if_missing(ck_options, 1);
+    rocksdb_file_checksum_gen_factory_t* ck_factory =
+        rocksdb_file_checksum_gen_crc32c_factory_create();
+    rocksdb_options_set_file_checksum_gen_factory(ck_options, ck_factory);
+
+    char ck_dbname[200];
+    snprintf(ck_dbname, sizeof(ck_dbname),
+             "%s/rocksdb_c_test-%d-livefiles-checksum", GetTempDir(),
+             ((int)geteuid()));
+
+    rocksdb_t* ck_db = rocksdb_open(ck_options, ck_dbname, &err);
+    CheckNoError(err);
+
+    // Write some data and flush to create SST files
+    rocksdb_writeoptions_t* ck_woptions = rocksdb_writeoptions_create();
+    rocksdb_put(ck_db, ck_woptions, "key1", 4, "val1", 4, &err);
+    CheckNoError(err);
+    rocksdb_put(ck_db, ck_woptions, "key2", 4, "val2", 4, &err);
+    CheckNoError(err);
+
+    rocksdb_flushoptions_t* ck_flush = rocksdb_flushoptions_create();
+    rocksdb_flushoptions_set_wait(ck_flush, 1);
+    rocksdb_flush(ck_db, ck_flush, &err);
+    CheckNoError(err);
+
+    // Verify getters return populated checksum fields from live files
+    const rocksdb_livefiles_t* lf = rocksdb_livefiles(ck_db);
+    CheckCondition(rocksdb_livefiles_count(lf) > 0);
+
+    for (int i = 0; i < rocksdb_livefiles_count(lf); i++) {
+      const char* checksum = rocksdb_livefiles_file_checksum(lf, i);
+      const char* func_name =
+          rocksdb_livefiles_file_checksum_func_name(lf, i);
+      CheckCondition(checksum != NULL && strlen(checksum) > 0);
+      CheckCondition(strcmp(func_name, "FileChecksumCrc32c") == 0);
+    }
+
+    rocksdb_livefiles_destroy(lf);
+    rocksdb_flushoptions_destroy(ck_flush);
+    rocksdb_writeoptions_destroy(ck_woptions);
+    rocksdb_close(ck_db);
+    rocksdb_destroy_db(ck_options, ck_dbname, &err);
+    CheckNoError(err);
+    rocksdb_file_checksum_gen_factory_destroy(ck_factory);
+    rocksdb_options_destroy(ck_options);
+  }
+
   StartPhase("cancel_all_background_work");
   rocksdb_cancel_all_background_work(db, 1);
 
