@@ -81,6 +81,38 @@ class WriteThread {
     STATE_PARALLEL_MEMTABLE_CALLER = 64,
   };
 
+  // Writer state transitions are centralized in SetState(), which verifies
+  // the transition with IsValidStateTransition() before publishing it.
+  //
+  // Normal transitions:
+  //   STATE_INIT ->
+  //     STATE_GROUP_LEADER
+  //     STATE_MEMTABLE_WRITER_LEADER
+  //     STATE_PARALLEL_MEMTABLE_CALLER
+  //     STATE_PARALLEL_MEMTABLE_WRITER
+  //     STATE_COMPLETED
+  //
+  //   STATE_GROUP_LEADER ->
+  //     STATE_MEMTABLE_WRITER_LEADER
+  //     STATE_PARALLEL_MEMTABLE_WRITER
+  //     STATE_COMPLETED
+  //
+  //   STATE_MEMTABLE_WRITER_LEADER ->
+  //     STATE_PARALLEL_MEMTABLE_CALLER
+  //     STATE_PARALLEL_MEMTABLE_WRITER
+  //     STATE_COMPLETED
+  //
+  //   STATE_PARALLEL_MEMTABLE_CALLER ->
+  //     STATE_PARALLEL_MEMTABLE_WRITER
+  //     STATE_COMPLETED
+  //
+  //   STATE_PARALLEL_MEMTABLE_WRITER ->
+  //     STATE_COMPLETED
+  //
+  // STATE_LOCKED_WAITING is a wait marker installed by BlockingAwaitState().
+  // It temporarily hides the writer's prior state from the waker, so SetState()
+  // accepts any normal wake-up state from it.
+
   struct Writer;
 
   struct WriteGroup {
@@ -494,6 +526,11 @@ class WriteThread {
 
   // Set writer state and wake the writer up if it is waiting.
   void SetState(Writer* w, uint8_t new_state);
+
+  // Returns true when SetState() may publish `new_state` for a writer currently
+  // observed in `old_state`. This documents the state machine in executable
+  // form without changing the lock-free handoff protocol.
+  static bool IsValidStateTransition(uint8_t old_state, uint8_t new_state);
 
   // Links w into the newest_writer list. Return true if w was linked directly
   // into the leader position.  Safe to call from multiple threads without
