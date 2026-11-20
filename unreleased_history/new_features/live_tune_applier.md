@@ -1,1 +1,0 @@
-Live tuning: a `LiveTuneApplier` in `LiveTuneOptions` applies and reverts a cycle's changes (built in: `SetOptions()` / `SetDBOptions()` on the DB), so an application can apply them its own way, e.g. to every DB of a group.

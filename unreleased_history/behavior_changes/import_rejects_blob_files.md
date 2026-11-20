@@ -1,1 +1,0 @@
-`Checkpoint::ExportColumnFamily()` and `DB::CreateColumnFamilyWithImport()` now return `NotSupported` for SST files that reference blob files, instead of producing a column family with dangling blob references.

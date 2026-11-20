@@ -1,1 +1,0 @@
-Fixed a bug where the data covered by range tombstones that start at the empty key could be counted more than once in the compensated file size of a new SST file, so compaction prioritized the file more than intended.

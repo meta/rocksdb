@@ -1,1 +1,0 @@
-`sst_dump --command=recompress` has a new option `--recompress_max_kv_bytes` to limit the input's keys and values held in memory, by benchmarking only the data blocks from the start of the file that fit within it.
