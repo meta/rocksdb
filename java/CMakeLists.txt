@@ -50,6 +50,7 @@ set(JNI_NATIVE_SOURCES
         rocksjni/jni_perf_context.cc
         rocksjni/jnicallback.cc
         rocksjni/loggerjnicallback.cc
+        rocksjni/logger_from_options.cc
         rocksjni/lru_cache.cc
         rocksjni/memory_util.cc
         rocksjni/memtablejni.cc
@@ -303,6 +304,7 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/util/BytewiseComparator.java
   src/main/java/org/rocksdb/util/Environment.java
   src/main/java/org/rocksdb/util/IntComparator.java
+  src/main/java/org/rocksdb/util/LoggerFromOptions.java
   src/main/java/org/rocksdb/util/ReverseBytewiseComparator.java
   src/main/java/org/rocksdb/util/SizeUnit.java
   src/main/java/org/rocksdb/util/StdErrLogger.java
