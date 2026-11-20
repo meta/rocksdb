@@ -39,6 +39,7 @@
 #include "port/port.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
+#include "rocksdb/memtablerep.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
@@ -658,22 +659,17 @@ Status FlushJob::MemPurge() {
         TEST_SYNC_POINT("FlushJob::MemPurge:BeforeReacquireMutex");
         TEST_SYNC_POINT("FlushJob::MemPurge:AfterWaitForTest");
         db_mutex_->Lock();
-        // Take the newest id, so that memtables in MemtableList don't have
-        // out-of-order memtable ids. While the db mutex was released during
-        // MemPurge, new memtables may have been switched to the immutable
-        // list with higher IDs, so we must use the maximum of the original
-        // flush batch ID and the current latest immutable memtable ID.
-        uint64_t new_mem_id = std::max(
-            mems_.back()->GetID(),
-            cfd_->imm()->GetLatestMemTableID(false /*for_atomic_flush*/));
-
-        new_mem->SetID(new_mem_id);
+        // The output replaces this flush batch, so keep its newest input's ID
+        // and position. Newer memtables might have been added while the mutex
+        // was released and must remain ahead of this output for reads.
+        new_mem->SetID(mems_.back()->GetID());
         // Take the latest memtable's next log number.
         new_mem->SetNextLogNumber(mems_.back()->GetNextLogNumber());
 
         // This addition will not trigger another flush, because
         // we do not call EnqueuePendingFlush().
-        cfd_->imm()->Add(new_mem, &job_context_->memtables_to_free);
+        cfd_->imm()->AddBefore(new_mem, mems_.back(),
+                               &job_context_->memtables_to_free);
         new_mem->Ref();
         // Piggyback FlushJobInfo on the first flushed memtable.
         db_mutex_->AssertHeld();
@@ -720,6 +716,12 @@ Status FlushJob::MemPurge() {
 bool FlushJob::MemPurgeDecider(double threshold) {
   // Never trigger mempurge if threshold is not a strictly positive value.
   if (!(threshold > 0.0)) {
+    return false;
+  }
+  // UniqueRandomSample() is currently implemented only by SkipListRep.
+  // Other representations must use a normal flush.
+  if (!cfd_->ioptions().memtable_factory->IsInstanceOf(
+          SkipListFactory::kClassName())) {
     return false;
   }
   if (threshold > (1.0 * mems_.size())) {

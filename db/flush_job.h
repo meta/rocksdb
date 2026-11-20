@@ -154,7 +154,8 @@ class FlushJob {
   // the case, ALL automatic flush operations (kWRiteBufferManagerFull) will
   // first go through the MemPurge process. Therefore, we strongly
   // recommend all users not to set this flag as true given that the MemPurge
-  // process has not matured yet.
+  // process has not matured yet. MemPurge currently requires the default
+  // SkipList memtable representation; other representations use normal flush.
   Status MemPurge();
   bool MemPurgeDecider(double threshold);
   // The rate limiter priority (io_priority) is determined dynamically here.
