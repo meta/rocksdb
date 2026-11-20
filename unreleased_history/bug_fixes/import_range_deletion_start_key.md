@@ -1,0 +1,1 @@
+Fixed `CreateColumnFamilyWithImport()` of `SstFileWriter` files losing the coverage of a range deletion over the older versions of its start key, which happened when the range deletion was the first entry of its file. Deleted keys could come back after compaction.
