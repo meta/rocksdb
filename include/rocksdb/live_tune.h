@@ -103,7 +103,8 @@ struct LiveTuneObjective {
 // A limit a change must not break, checked on every validation window:
 // absolute (max, min) and relative to the baseline in percent
 // (max_increase_pct, max_decrease_pct). A metric whose baseline is zero breaks
-// max_increase_pct on any increase.
+// max_increase_pct on any increase. A watch window that doesn't measure the
+// metric breaks the constraint.
 struct LiveTuneConstraint {
   std::string metric;
   std::optional<double> max;

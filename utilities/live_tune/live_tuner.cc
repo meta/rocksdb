@@ -833,7 +833,9 @@ std::string LiveTuner::BrokenConstraint(
   for (const LiveTuneConstraint& c : constraints) {
     LiveTuneMetrics::const_iterator it = window.find(c.metric);
     if (it == window.end()) {
-      continue;
+      // The baseline measured it, so a window without it can't show the
+      // constraint holds.
+      return c.metric + " not measured";
     }
     const double now = it->second;
     LiveTuneMetrics::const_iterator b = baseline.find(c.metric);

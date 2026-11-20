@@ -664,6 +664,27 @@ TEST_F(LiveTunerTest, RevertedWhenConstraintBreaks) {
   EXPECT_TRUE(verdict->Watches().empty());
 }
 
+TEST_F(LiveTunerTest, RevertedWhenAConstraintMetricIsNotMeasured) {
+  // The baseline measures errors; the changed DB no longer does.
+  auto verdict =
+      std::make_shared<TestVerdict>(true, [](DB* db, LiveTuneMetrics* m) {
+        LatencyBetterAt4(db, m);
+        if (MaxWriteBufferNumber(db) != 4) {
+          (*m)["errors"] = 0;
+        }
+      });
+  LiveTuneOptions o = TuneOptions(To4(), verdict);
+  LiveTuneConstraint no_errors;
+  no_errors.metric = "errors";
+  no_errors.max = 0;
+  o.intent.constraints.push_back(no_errors);
+  ASSERT_OK(StartLiveTuneCycle(db_.get(), o));
+  ASSERT_TRUE(
+      verdict->WaitFor("\"outcome\": \"constraint: errors not measured\""));
+
+  EXPECT_EQ(MaxWriteBufferNumber(db_.get()), 2);
+}
+
 TEST_F(LiveTunerTest, SetOptionValuesLeavesNothingHalfApplied) {
   // An unknown DB option fails the check before anything is set.
   Status s = live_tune::SetOptionValues(
