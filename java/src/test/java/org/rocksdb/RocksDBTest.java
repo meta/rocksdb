@@ -44,6 +44,53 @@ public class RocksDBTest {
     }
   }
 
+  @Test(timeout = 60000)
+  public void closeEClosesOwnedColumnFamilies() throws Exception {
+    for (final String type : Arrays.asList("plain", "transaction", "optimistic", "ttl")) {
+      for (final boolean closeOneFamilyFirst : new boolean[] {false, true}) {
+        try (final DBOptions options =
+                 new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
+             final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions();
+             final TransactionDBOptions transactionOptions = new TransactionDBOptions()) {
+          final List<ColumnFamilyDescriptor> descriptors = Arrays.asList(
+              new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY, cfOptions),
+              new ColumnFamilyDescriptor("cf".getBytes(UTF_8), cfOptions));
+          final List<ColumnFamilyHandle> handles = new ArrayList<>();
+          final String path = dbFolder.newFolder().getAbsolutePath();
+          final RocksDB openedDb;
+          switch (type) {
+            case "transaction":
+              openedDb = TransactionDB.open(options, transactionOptions, path, descriptors, handles);
+              break;
+            case "optimistic":
+              openedDb = OptimisticTransactionDB.open(options, path, descriptors, handles);
+              break;
+            case "ttl":
+              openedDb = TtlDB.open(options, path, descriptors, handles, Arrays.asList(0, 0), false);
+              break;
+            default:
+              openedDb = RocksDB.open(options, path, descriptors, handles);
+          }
+          try (final RocksDB db = openedDb) {
+            db.put(handles.get(1), "key".getBytes(UTF_8), "value".getBytes(UTF_8));
+            if (closeOneFamilyFirst) {
+              handles.get(1).close();
+            }
+            db.closeE();
+            assertThat(db.isOwningHandle()).as(type).isFalse();
+            for (final ColumnFamilyHandle handle : handles) {
+              assertThat(handle.isOwningHandle()).as(type).isFalse();
+            }
+            assertThat(db.ownedColumnFamilyHandles).as(type).isEmpty();
+            // Both close variants must remain safe after an explicit closeE().
+            db.closeE();
+            db.close();
+          }
+        }
+      }
+    }
+  }
+
   @Test
   public void openWhenOpen() throws RocksDBException {
     final String dbPath = dbFolder.getRoot().getAbsolutePath();
