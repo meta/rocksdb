@@ -304,6 +304,16 @@ Status GetDBOptionsFromMap(
     const std::unordered_map<std::string, std::string>& opts_map,
     DBOptions* new_options);
 
+// Take a ConfigOptions `config_options` and a Options "base_options" as the
+// default option in addition to a map "opts_map" of option name to option value
+// to construct the new Options "new_options".
+//
+// Options are a superset of DBOptions and ColumnFamilyOptions.
+Status GetOptionsFromMap(
+    const ConfigOptions& config_options, const Options& base_options,
+    const std::unordered_map<std::string, std::string>& opts_map,
+    Options* new_options);
+
 // Take a ConfigOptions `config_options` and a BlockBasedTableOptions
 // "table_options" as the default option in addition to a map "opts_map" of
 // option name to option value to construct the new BlockBasedTableOptions
