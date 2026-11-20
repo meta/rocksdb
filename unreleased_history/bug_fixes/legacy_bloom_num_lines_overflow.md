@@ -1,0 +1,1 @@
+Fixed a 32-bit overflow in reading a legacy Bloom filter block from an SST file. A corrupt or crafted filter whose stored `num_lines` makes `num_lines * CACHE_LINE_SIZE` wrap to the filter length was accepted as valid, so `MayMatch` could read far out of bounds. The product is now computed in 64 bits and such filters are rejected (treated as always-match).
