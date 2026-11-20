@@ -8,6 +8,7 @@
 #include <atomic>
 
 #include "rocksdb/listener.h"
+#include "test_util/sync_point.h"
 #include "util/mutexlock.h"
 #include "utilities/blob_db/blob_db_impl.h"
 
@@ -51,17 +52,23 @@ class BlobDBListenerGC : public BlobDBListener {
   const char* Name() const override { return kClassName(); }
   static const char* kClassName() { return "BlobDBListenerGC"; }
   void OnFlushCompleted(DB* db, const FlushJobInfo& info) override {
-    BlobDBListener::OnFlushCompleted(db, info);
-
     assert(blob_db_impl_);
+    TEST_SYNC_POINT_CALLBACK("BlobDBListenerGC::OnFlushCompleted:BeforeProcess",
+                             const_cast<FlushJobInfo*>(&info));
+    // Keep GC bookkeeping ahead of any DB property queries in the base
+    // listener; later compactions can rely on these mappings.
     blob_db_impl_->ProcessFlushJobInfo(info);
+
+    BlobDBListener::OnFlushCompleted(db, info);
   }
 
   void OnCompactionCompleted(DB* db, const CompactionJobInfo& info) override {
-    BlobDBListener::OnCompactionCompleted(db, info);
-
     assert(blob_db_impl_);
+    // Keep GC bookkeeping ahead of any DB property queries in the base
+    // listener; later compactions can rely on these mappings.
     blob_db_impl_->ProcessCompactionJobInfo(info);
+
+    BlobDBListener::OnCompactionCompleted(db, info);
   }
 };
 
