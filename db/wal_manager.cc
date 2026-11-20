@@ -137,6 +137,11 @@ Status WalManager::GetUpdatesSince(SequenceNumber seq,
     return s;
   }
 
+  std::sort(std::begin(*wal_files), std::end(*wal_files),
+            [](auto& lhs, auto& rhs) {
+              return lhs->StartSequence() > rhs->StartSequence();
+            });
+
   s = RetainProbableWalFiles(*wal_files, seq);
   if (!s.ok()) {
     return s;
