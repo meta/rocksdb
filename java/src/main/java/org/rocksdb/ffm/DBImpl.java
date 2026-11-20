@@ -14,8 +14,8 @@ final class DBImpl extends WithDB implements DB {
     return new GetterImpl(allocator, db);
   }
 
-  public Putter put(MemorySegment key, MemorySegment value) {
-    return new PutterImpl(allocator, db, key, value);
+  public Putter put() {
+    return new PutterImpl(allocator, db);
   }
 
   @Override
@@ -42,10 +42,6 @@ final class DBImpl extends WithDB implements DB {
   @Override
   public ColumnFamily columnFamily(SegmentAllocator allocator) {
     return new ColumnFamilyImpl(allocator, db);
-  }
-
-  public Putter put(String key, MemorySegment value) {
-    return new PutterImpl(allocator, db, FFMSegment.segmentOf(allocator, key), value);
   }
 
   @Override

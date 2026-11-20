@@ -6,7 +6,7 @@ import java.lang.foreign.SegmentAllocator;
 public interface DB extends AutoCloseable {
   Getter get();
 
-  Putter put(MemorySegment key, MemorySegment value);
+  Putter put();
 
   MultiGetter multiGet();
 

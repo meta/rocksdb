@@ -13,10 +13,7 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.rocksdb.ffm.RocksFFM;
-import org.rocksdb.ffm.RocksFFMException;
-import org.rocksdb.ffm.RocksdbOptions;
-import org.rocksdb.ffm.RocksdbReadoptions;
+import org.rocksdb.ffm.*;
 
 public class RocksFFMTest {
   @Rule public TemporaryFolder dbFolder = new TemporaryFolder();
@@ -68,14 +65,19 @@ public class RocksFFMTest {
             var getter = db.get();
             MemorySegment value2 = getter.get(readOptions, segmentOf(arena, "key2"));
             assertThat(value2).isNull();
+          }
 
-            var key4 = segmentOf(arena, "key4");
-            var put4 = db.put(key4, segmentOf(arena, "wroteValue4"));
-            put4.invoke();
+          try (var writeOptions = new RocksdbWriteoptions()) {
+            // write value
+            var putter = db.put();
+            putter.put(writeOptions, segmentOf(arena, "key4"), segmentOf(arena, "value4"));
+          }
 
-            // value now exists exist
+          try (var readOptions = new RocksdbReadoptions()) {
+            // value now exists
+            var getter = db.get();
             MemorySegment value4 = getter.get(readOptions, segmentOf(arena, "key4"));
-            assertThat(stringOf(value4)).isEqualTo("wroteValue4");
+            assertThat(stringOf(value4)).isEqualTo("value4");
           }
         }
       }

@@ -1,5 +1,7 @@
 package org.rocksdb.ffm;
 
+import java.lang.foreign.MemorySegment;
+
 public interface Putter {
-  void invoke() throws RocksFFMException;
+  void put(RocksdbWriteoptions writeoptions, MemorySegment key, MemorySegment value) throws RocksFFMException;
 }

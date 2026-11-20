@@ -34,8 +34,11 @@ public class RocksFFMMultiGetTest {
         rocksdbOptions.setCreateIfMissing((byte) 1);
         try (var db = RocksFFM.db(arena).open(rocksdbOptions, dbPath)) {
 
-          db.put(segmentOf(arena, "key2"), segmentOf(arena, "value2")).invoke();
-          db.put(segmentOf(arena, "key4"), segmentOf(arena, "value4")).invoke();
+          try (RocksdbWriteoptions writeoptions = new RocksdbWriteoptions()) {
+            var putter = db.put();
+            putter.put(writeoptions, segmentOf(arena, "key2"), segmentOf(arena, "value2"));
+            putter.put(writeoptions, segmentOf(arena, "key4"), segmentOf(arena, "value4"));
+          }
 
           ColumnFamilyHandle defaultColumnFamilyHandle = db.columnFamily().defaultFamilyHandle();
 
