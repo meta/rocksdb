@@ -754,6 +754,7 @@ JNI_NATIVE_SOURCES =                                          \
   java/rocksjni/jni_perf_context.cc                           \
   java/rocksjni/jni_multiget_helpers.cc                       \
   java/rocksjni/jnicallback.cc                                \
+  java/rocksjni/jni_merge_operator_v2.cc                      \
   java/rocksjni/loggerjnicallback.cc                          \
   java/rocksjni/lru_cache.cc                                  \
   java/rocksjni/memtablejni.cc                                \
