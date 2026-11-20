@@ -5,11 +5,13 @@
 
 #pragma once
 
-#include "rocksdb/db.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+class ColumnFamilyHandle;
+class DB;
 
 // EXPERIMENTAL
 //
