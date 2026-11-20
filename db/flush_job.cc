@@ -1099,12 +1099,8 @@ Status FlushJob::WriteLevel0Table() {
         }
       }
 
-      // Only verify on table with format collects table properties
       if (s.ok() &&
-          (mutable_cf_options_.table_factory->IsInstanceOf(
-               TableFactory::kBlockBasedTableName()) ||
-           mutable_cf_options_.table_factory->IsInstanceOf(
-               TableFactory::kPlainTableName())) &&
+          mutable_cf_options_.table_factory->IsRecordCountSupported() &&
           flush_stats.num_output_records != table_properties_.num_entries) {
         std::string msg =
             "Number of keys in flush output SST files does not match "
