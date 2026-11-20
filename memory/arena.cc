@@ -42,7 +42,7 @@ Arena::Arena(size_t block_size, AllocTracker* tracker, size_t huge_page_size)
   blocks_memory_ += alloc_bytes_remaining_;
   aligned_alloc_ptr_ = inline_block_;
   unaligned_alloc_ptr_ = inline_block_ + alloc_bytes_remaining_;
-  if (MemMapping::kHugePageSupported) {
+  if constexpr (MemMapping::kHugePageSupported) {
     hugetlb_size_ = huge_page_size;
     if (hugetlb_size_ && kBlockSize > hugetlb_size_) {
       hugetlb_size_ = ((kBlockSize - 1U) / hugetlb_size_ + 1U) * hugetlb_size_;
