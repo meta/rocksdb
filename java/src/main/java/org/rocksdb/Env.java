@@ -157,7 +157,7 @@ public abstract class Env extends RocksObject {
     return Arrays.asList(getThreadList(nativeHandle_));
   }
 
-  Env(final long nativeHandle) {
+  protected Env(final long nativeHandle) {
     super(nativeHandle);
   }
 

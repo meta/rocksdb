@@ -38,7 +38,7 @@ public enum InfoLogLevel {
    *     value is provided.
    */
   public static InfoLogLevel getInfoLogLevel(final byte value) {
-    for (final InfoLogLevel infoLogLevel : InfoLogLevel.values()) {
+    for (final InfoLogLevel infoLogLevel : values()) {
       if (infoLogLevel.getValue() == value) {
         return infoLogLevel;
       }

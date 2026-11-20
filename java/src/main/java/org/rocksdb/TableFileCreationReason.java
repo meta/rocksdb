@@ -35,7 +35,7 @@ public enum TableFileCreationReason {
    * @throws IllegalArgumentException if the value is unknown.
    */
   static TableFileCreationReason fromValue(final byte value) {
-    for (final TableFileCreationReason tableFileCreationReason : TableFileCreationReason.values()) {
+    for (final TableFileCreationReason tableFileCreationReason : values()) {
       if (tableFileCreationReason.value == value) {
         return tableFileCreationReason;
       }

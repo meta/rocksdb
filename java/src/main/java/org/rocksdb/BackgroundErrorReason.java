@@ -34,7 +34,7 @@ public enum BackgroundErrorReason {
    * @throws IllegalArgumentException if the value is unknown.
    */
   static BackgroundErrorReason fromValue(final byte value) {
-    for (final BackgroundErrorReason backgroundErrorReason : BackgroundErrorReason.values()) {
+    for (final BackgroundErrorReason backgroundErrorReason : values()) {
       if (backgroundErrorReason.value == value) {
         return backgroundErrorReason;
       }

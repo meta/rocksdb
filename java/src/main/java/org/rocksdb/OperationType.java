@@ -44,7 +44,7 @@ public enum OperationType {
    */
   static OperationType fromValue(final byte value)
       throws IllegalArgumentException {
-    for (final OperationType threadType : OperationType.values()) {
+    for (final OperationType threadType : values()) {
       if (threadType.value == value) {
         return threadType;
       }

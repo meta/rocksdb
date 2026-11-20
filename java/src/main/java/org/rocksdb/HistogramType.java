@@ -319,7 +319,7 @@ public enum HistogramType {
    *     value is provided.
    */
   public static HistogramType getHistogramType(final byte value) {
-    for (final HistogramType histogramType : HistogramType.values()) {
+    for (final HistogramType histogramType : values()) {
       if (histogramType.getValue() == value) {
         return histogramType;
       }

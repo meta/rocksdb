@@ -102,7 +102,7 @@ public class ColumnFamilyHandle extends RocksObject {
       return false;
     }
 
-    @SuppressWarnings("PMD.CloseResource") final ColumnFamilyHandle that = (ColumnFamilyHandle) o;
+    final ColumnFamilyHandle that = (ColumnFamilyHandle) o;
     try {
       return rocksDB_.nativeHandle_ == that.rocksDB_.nativeHandle_ &&
           getID() == that.getID() &&

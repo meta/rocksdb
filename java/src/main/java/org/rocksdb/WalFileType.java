@@ -43,7 +43,7 @@ public enum WalFileType {
    * @throws IllegalArgumentException if the value is unknown.
    */
   static WalFileType fromValue(final byte value) {
-    for (final WalFileType walFileType : WalFileType.values()) {
+    for (final WalFileType walFileType : values()) {
       if(walFileType.value == value) {
         return walFileType;
       }

@@ -1109,11 +1109,11 @@ public enum TickerType {
      *     value is provided.
      */
     public static TickerType getTickerType(final byte value) {
-        for (final TickerType tickerType : TickerType.values()) {
-            if (tickerType.getValue() == value) {
-                return tickerType;
-            }
+      for (final TickerType tickerType : values()) {
+        if (tickerType.getValue() == value) {
+          return tickerType;
         }
+      }
         throw new IllegalArgumentException(
             "Illegal value provided for TickerType.");
     }
