@@ -467,7 +467,7 @@ Status CheckpointImpl::CreateCheckpointImpl(
   std::string manifest_relative_filename;
   uint64_t manifest_size = 0;
   if (s.ok()) {
-    // enable file deletions
+    // Disable file deletions
     s = db_->DisableFileDeletions();
     const bool disabled_file_deletions = s.ok();
 
