@@ -52,7 +52,7 @@ class SstFileReader {
              PinnableSlice* value);
 
   // Returns a new iterator over the table contents as a raw table iterator,
-  // a.k.a a `TableIterator`that iterates all point data entries in the table
+  // a.k.a a `TableIterator` that iterates all point data entries in the table
   // including logically invisible entries like delete entries.
   // This API is intended to provide a programmatic way to observe SST files
   // created by a DB, to be used by third party tools. DB optimization
