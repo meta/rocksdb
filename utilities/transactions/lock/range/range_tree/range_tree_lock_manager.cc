@@ -271,12 +271,14 @@ int RangeTreeLockManager::CompareDbtEndpoints(void* arg, const DBT* a_key,
 }
 
 namespace {
+struct LockTreeMapCache {
+  uint64_t version = 0;
+  std::unordered_map<ColumnFamilyId, std::shared_ptr<toku::locktree>> ltree_map;
+};
+
 void UnrefLockTreeMapsCache(void* ptr) {
   // Called when a thread exits or a ThreadLocalPtr gets destroyed.
-  auto lock_tree_map_cache = static_cast<
-      std::unordered_map<ColumnFamilyId, std::shared_ptr<toku::locktree>>*>(
-      ptr);
-  delete lock_tree_map_cache;
+  delete static_cast<LockTreeMapCache*>(ptr);
 }
 }  // anonymous namespace
 
@@ -352,7 +354,7 @@ RangeTreeLockManager::~RangeTreeLockManager() {
   autovector<void*> local_caches;
   ltree_lookup_cache_->Scrape(&local_caches, nullptr);
   for (auto cache : local_caches) {
-    delete static_cast<LockTreeMap*>(cache);
+    delete static_cast<LockTreeMapCache*>(cache);
   }
   ltree_map_.clear();  // this will call release_lt() for all locktrees
   ltm_.destroy();
@@ -434,26 +436,25 @@ void RangeTreeLockManager::RemoveColumnFamily(const ColumnFamilyHandle* cfh) {
     auto lock_maps_iter = ltree_map_.find(column_family_id);
     assert(lock_maps_iter != ltree_map_.end());
     ltree_map_.erase(lock_maps_iter);
+    ltree_map_version_.fetch_add(1);
   }  // lock_map_mutex_
-
-  autovector<void*> local_caches;
-  ltree_lookup_cache_->Scrape(&local_caches, nullptr);
-  for (auto cache : local_caches) {
-    delete static_cast<LockTreeMap*>(cache);
-  }
 }
 
 std::shared_ptr<toku::locktree> RangeTreeLockManager::GetLockTreeForCF(
     ColumnFamilyId column_family_id) {
   // First check thread-local cache
-  if (ltree_lookup_cache_->Get() == nullptr) {
-    ltree_lookup_cache_->Reset(new LockTreeMap());
+  const uint64_t version = ltree_map_version_.load();
+  auto ltree_map_cache =
+      static_cast<LockTreeMapCache*>(ltree_lookup_cache_->Get());
+  if (ltree_map_cache == nullptr || ltree_map_cache->version != version) {
+    auto new_cache = new LockTreeMapCache{version, {}};
+    ltree_lookup_cache_->Reset(new_cache);
+    delete ltree_map_cache;
+    ltree_map_cache = new_cache;
   }
 
-  auto ltree_map_cache = static_cast<LockTreeMap*>(ltree_lookup_cache_->Get());
-
-  auto it = ltree_map_cache->find(column_family_id);
-  if (it != ltree_map_cache->end()) {
+  auto it = ltree_map_cache->ltree_map.find(column_family_id);
+  if (it != ltree_map_cache->ltree_map.end()) {
     // Found lock map for this column family.
     return it->second;
   }
@@ -466,7 +467,7 @@ std::shared_ptr<toku::locktree> RangeTreeLockManager::GetLockTreeForCF(
     return nullptr;
   } else {
     // Found lock map.  Store in thread-local cache and return.
-    ltree_map_cache->insert({column_family_id, it->second});
+    ltree_map_cache->ltree_map.insert({column_family_id, it->second});
     return it->second;
   }
 }
