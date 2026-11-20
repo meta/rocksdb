@@ -200,12 +200,13 @@ class Cache : public Customizable {
   static const char* Type() { return "Cache"; }
 
   // Creates a new Cache based on the input value string and returns the result.
-  // Currently, this method can be used to create LRUCaches only
+  // Currently, this method can be used to create LRUCaches and FIFOCaches
   // @param config_options
   // @param value  The value might be:
   //   - an old-style cache ("1M") -- equivalent to NewLRUCache(1024*102(
   //   - Name-value option pairs -- "capacity=1M; num_shard_bits=4;
   //     For the LRUCache, the values are defined in LRUCacheOptions.
+  //   - "fifo_cache://" followed by name-value pairs of FIFOCacheOptions
   // @param result The new Cache object
   // @return OK if the cache was successfully created
   // @return NotFound if an invalid name was specified in the value
