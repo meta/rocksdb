@@ -50,7 +50,7 @@ class WriteBufferManager final {
  public:
   // Parameters:
   // _buffer_size: _buffer_size = 0 indicates no limit. Memory won't be capped.
-  // memory_usage() won't be valid and ShouldFlush() will always return true.
+  // memory_usage() won't be valid and ShouldFlush() will always return false.
   //
   // cache_: if `cache` is provided, we'll put dummy entries in the cache and
   // cost the memory allocated to the cache. It can be used even if _buffer_size
