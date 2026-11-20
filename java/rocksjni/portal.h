@@ -1980,7 +1980,7 @@ class JniUtil {
     if (jbyte_string == nullptr) {
       // exception thrown: OutOfMemoryError
       *has_exception = JNI_TRUE;
-      return nullptr;  // signal error
+      return T();  // caller must check has_exception
     }
 
     T result =
