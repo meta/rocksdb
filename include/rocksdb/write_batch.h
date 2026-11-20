@@ -75,10 +75,6 @@ class WriteBatch : public WriteBatchBase {
 
   using WriteBatchBase::Put;
   // Store the mapping "key->value" in the database.
-  // The following Put(..., const Slice& key, ...) API can also be used when
-  // user-defined timestamp is enabled as long as `key` points to a contiguous
-  // buffer with timestamp appended after user key. The caller is responsible
-  // for setting up the memory buffer pointed to by `key`.
   Status Put(ColumnFamilyHandle* column_family, const Slice& key,
              const Slice& value) override;
   Status Put(const Slice& key, const Slice& value) override {
@@ -90,15 +86,13 @@ class WriteBatch : public WriteBatchBase {
   // Variant of Put() that gathers output like writev(2).  The key and value
   // that will be written to the database are concatenations of arrays of
   // slices.
-  // The following Put(..., const SliceParts& key, ...) API can be used when
-  // user-defined timestamp is enabled as long as the timestamp is the last
-  // Slice in `key`, a SliceParts (array of Slices). The caller is responsible
-  // for setting up the `key` SliceParts object.
   Status Put(ColumnFamilyHandle* column_family, const SliceParts& key,
              const SliceParts& value) override;
   Status Put(const SliceParts& key, const SliceParts& value) override {
     return Put(nullptr, key, value);
   }
+  Status Put(ColumnFamilyHandle* column_family, const SliceParts& key,
+             const Slice& ts, const SliceParts& value) override;
 
   using WriteBatchBase::TimedPut;
   // EXPERIMENTAL
@@ -139,6 +133,8 @@ class WriteBatch : public WriteBatchBase {
   Status Delete(ColumnFamilyHandle* column_family,
                 const SliceParts& key) override;
   Status Delete(const SliceParts& key) override { return Delete(nullptr, key); }
+  Status Delete(ColumnFamilyHandle* column_family, const SliceParts& key,
+                const Slice& ts) override;
 
   using WriteBatchBase::SingleDelete;
   // WriteBatch implementation of DB::SingleDelete().  See db.h.
@@ -156,6 +152,8 @@ class WriteBatch : public WriteBatchBase {
   Status SingleDelete(const SliceParts& key) override {
     return SingleDelete(nullptr, key);
   }
+  Status SingleDelete(ColumnFamilyHandle* column_family, const SliceParts& key,
+                      const Slice& ts) override;
 
   using WriteBatchBase::DeleteRange;
   // WriteBatch implementation of DB::DeleteRange().  See db.h.
@@ -176,6 +174,9 @@ class WriteBatch : public WriteBatchBase {
                      const SliceParts& end_key) override {
     return DeleteRange(nullptr, begin_key, end_key);
   }
+  Status DeleteRange(ColumnFamilyHandle* column_family,
+                     const SliceParts& begin_key, const SliceParts& end_key,
+                     const Slice& ts) override;
 
   using WriteBatchBase::Merge;
   // Merge "value" with the existing value of "key" in the database.
@@ -194,6 +195,8 @@ class WriteBatch : public WriteBatchBase {
   Status Merge(const SliceParts& key, const SliceParts& value) override {
     return Merge(nullptr, key, value);
   }
+  Status Merge(ColumnFamilyHandle* column_family, const SliceParts& key,
+               const Slice& ts, const SliceParts& value) override;
 
   using WriteBatchBase::PutLogData;
   // Append a blob of arbitrary size to the records in this batch. The blob will

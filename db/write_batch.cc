@@ -1085,14 +1085,44 @@ Status WriteBatch::Put(ColumnFamilyHandle* column_family, const SliceParts& key,
 
   if (ts_sz == 0) {
     s = WriteBatchInternal::Put(this, cf_id, key, value);
-    if (s.ok()) {
-      MaybeTrackTimestampSize(cf_id, ts_sz);
-    }
+  } else {
+    needs_in_place_update_ts_ = true;
+    has_key_with_ts_ = true;
+    std::string dummy_ts(ts_sz, '\0');
+    const int key_with_ts_num_parts = key.num_parts + 1;
+    std::vector<Slice> key_with_ts(key_with_ts_num_parts);
+    std::copy(key.parts, key.parts + key.num_parts, key_with_ts.begin());
+    key_with_ts[key.num_parts] = Slice(dummy_ts);
+    s = WriteBatchInternal::Put(
+        this, cf_id, SliceParts(key_with_ts.data(), key_with_ts_num_parts),
+        value);
+  }
+  if (s.ok()) {
+    MaybeTrackTimestampSize(cf_id, ts_sz);
+  }
+  return s;
+}
+
+Status WriteBatch::Put(ColumnFamilyHandle* column_family, const SliceParts& key,
+                       const Slice& ts, const SliceParts& value) {
+  Status s = CheckColumnFamilyTimestampSize(column_family, ts);
+  if (!s.ok()) {
     return s;
   }
-
-  return Status::InvalidArgument(
-      "Cannot call this method on column family enabling timestamp");
+  has_key_with_ts_ = true;
+  assert(column_family);
+  uint32_t cf_id = column_family->GetID();
+  const int key_with_ts_num_parts = key.num_parts + 1;
+  std::vector<Slice> key_with_ts(key_with_ts_num_parts);
+  std::copy(key.parts, key.parts + key.num_parts, key_with_ts.begin());
+  key_with_ts[key.num_parts] = ts;
+  s = WriteBatchInternal::Put(
+      this, cf_id, SliceParts(key_with_ts.data(), key_with_ts_num_parts),
+      value);
+  if (s.ok()) {
+    MaybeTrackTimestampSize(cf_id, ts.size());
+  }
+  return s;
 }
 
 Status WriteBatchInternal::PutEntity(WriteBatch* b, uint32_t column_family_id,
@@ -1418,14 +1448,42 @@ Status WriteBatch::Delete(ColumnFamilyHandle* column_family,
 
   if (0 == ts_sz) {
     s = WriteBatchInternal::Delete(this, cf_id, key);
-    if (s.ok()) {
-      MaybeTrackTimestampSize(cf_id, ts_sz);
-    }
+  } else {
+    needs_in_place_update_ts_ = true;
+    has_key_with_ts_ = true;
+    std::string dummy_ts(ts_sz, '\0');
+    const int key_with_ts_num_parts = key.num_parts + 1;
+    std::vector<Slice> key_with_ts(key_with_ts_num_parts);
+    std::copy(key.parts, key.parts + key.num_parts, key_with_ts.begin());
+    key_with_ts[key.num_parts] = Slice(dummy_ts);
+    s = WriteBatchInternal::Delete(
+        this, cf_id, SliceParts(key_with_ts.data(), key_with_ts_num_parts));
+  }
+  if (s.ok()) {
+    MaybeTrackTimestampSize(cf_id, ts_sz);
+  }
+  return s;
+}
+
+Status WriteBatch::Delete(ColumnFamilyHandle* column_family,
+                          const SliceParts& key, const Slice& ts) {
+  Status s = CheckColumnFamilyTimestampSize(column_family, ts);
+  if (!s.ok()) {
     return s;
   }
-
-  return Status::InvalidArgument(
-      "Cannot call this method on column family enabling timestamp");
+  assert(column_family);
+  has_key_with_ts_ = true;
+  uint32_t cf_id = column_family->GetID();
+  const int key_with_ts_num_parts = key.num_parts + 1;
+  std::vector<Slice> key_with_ts(key_with_ts_num_parts);
+  std::copy(key.parts, key.parts + key.num_parts, key_with_ts.begin());
+  key_with_ts[key.num_parts] = ts;
+  s = WriteBatchInternal::Delete(
+      this, cf_id, SliceParts(key_with_ts.data(), key_with_ts_num_parts));
+  if (s.ok()) {
+    MaybeTrackTimestampSize(cf_id, ts.size());
+  }
+  return s;
 }
 
 Status WriteBatchInternal::SingleDelete(WriteBatch* b,
@@ -1554,14 +1612,42 @@ Status WriteBatch::SingleDelete(ColumnFamilyHandle* column_family,
 
   if (0 == ts_sz) {
     s = WriteBatchInternal::SingleDelete(this, cf_id, key);
-    if (s.ok()) {
-      MaybeTrackTimestampSize(cf_id, ts_sz);
-    }
+  } else {
+    needs_in_place_update_ts_ = true;
+    has_key_with_ts_ = true;
+    std::string dummy_ts(ts_sz, '\0');
+    const int key_with_ts_num_parts = key.num_parts + 1;
+    std::vector<Slice> key_with_ts(key_with_ts_num_parts);
+    std::copy(key.parts, key.parts + key.num_parts, key_with_ts.begin());
+    key_with_ts[key.num_parts] = Slice(dummy_ts);
+    s = WriteBatchInternal::SingleDelete(
+        this, cf_id, SliceParts(key_with_ts.data(), key_with_ts_num_parts));
+  }
+  if (s.ok()) {
+    MaybeTrackTimestampSize(cf_id, ts_sz);
+  }
+  return s;
+}
+
+Status WriteBatch::SingleDelete(ColumnFamilyHandle* column_family,
+                                const SliceParts& key, const Slice& ts) {
+  Status s = CheckColumnFamilyTimestampSize(column_family, ts);
+  if (!s.ok()) {
     return s;
   }
-
-  return Status::InvalidArgument(
-      "Cannot call this method on column family enabling timestamp");
+  has_key_with_ts_ = true;
+  assert(column_family);
+  uint32_t cf_id = column_family->GetID();
+  const int key_with_ts_num_parts = key.num_parts + 1;
+  std::vector<Slice> key_with_ts(key_with_ts_num_parts);
+  std::copy(key.parts, key.parts + key.num_parts, key_with_ts.begin());
+  key_with_ts[key.num_parts] = ts;
+  s = WriteBatchInternal::SingleDelete(
+      this, cf_id, SliceParts(key_with_ts.data(), key_with_ts_num_parts));
+  if (s.ok()) {
+    MaybeTrackTimestampSize(cf_id, ts.size());
+  }
+  return s;
 }
 
 Status WriteBatchInternal::DeleteRange(WriteBatch* b, uint32_t column_family_id,
@@ -1700,14 +1786,59 @@ Status WriteBatch::DeleteRange(ColumnFamilyHandle* column_family,
 
   if (0 == ts_sz) {
     s = WriteBatchInternal::DeleteRange(this, cf_id, begin_key, end_key);
-    if (s.ok()) {
-      MaybeTrackTimestampSize(cf_id, ts_sz);
-    }
+  } else {
+    needs_in_place_update_ts_ = true;
+    has_key_with_ts_ = true;
+    std::string dummy_ts(ts_sz, '\0');
+    const int begin_key_with_ts_num_parts = begin_key.num_parts + 1;
+    std::vector<Slice> begin_key_with_ts(begin_key_with_ts_num_parts);
+    std::copy(begin_key.parts, begin_key.parts + begin_key.num_parts,
+              begin_key_with_ts.begin());
+    begin_key_with_ts[begin_key.num_parts] = Slice(dummy_ts);
+    const int end_key_with_ts_num_parts = end_key.num_parts + 1;
+    std::vector<Slice> end_key_with_ts(end_key_with_ts_num_parts);
+    std::copy(end_key.parts, end_key.parts + end_key.num_parts,
+              end_key_with_ts.begin());
+    end_key_with_ts[end_key.num_parts] = Slice(dummy_ts);
+    s = WriteBatchInternal::DeleteRange(
+        this, cf_id,
+        SliceParts(begin_key_with_ts.data(), begin_key_with_ts_num_parts),
+        SliceParts(end_key_with_ts.data(), end_key_with_ts_num_parts));
+  }
+  if (s.ok()) {
+    MaybeTrackTimestampSize(cf_id, ts_sz);
+  }
+  return s;
+}
+
+Status WriteBatch::DeleteRange(ColumnFamilyHandle* column_family,
+                               const SliceParts& begin_key,
+                               const SliceParts& end_key, const Slice& ts) {
+  Status s = CheckColumnFamilyTimestampSize(column_family, ts);
+  if (!s.ok()) {
     return s;
   }
-
-  return Status::InvalidArgument(
-      "Cannot call this method on column family enabling timestamp");
+  assert(column_family);
+  has_key_with_ts_ = true;
+  uint32_t cf_id = column_family->GetID();
+  const int begin_key_with_ts_num_parts = begin_key.num_parts + 1;
+  std::vector<Slice> begin_key_with_ts(begin_key_with_ts_num_parts);
+  std::copy(begin_key.parts, begin_key.parts + begin_key.num_parts,
+            begin_key_with_ts.begin());
+  begin_key_with_ts[begin_key.num_parts] = ts;
+  const int end_key_with_ts_num_parts = end_key.num_parts + 1;
+  std::vector<Slice> end_key_with_ts(end_key_with_ts_num_parts);
+  std::copy(end_key.parts, end_key.parts + end_key.num_parts,
+            end_key_with_ts.begin());
+  end_key_with_ts[end_key.num_parts] = ts;
+  s = WriteBatchInternal::DeleteRange(
+      this, cf_id,
+      SliceParts(begin_key_with_ts.data(), begin_key_with_ts_num_parts),
+      SliceParts(end_key_with_ts.data(), end_key_with_ts_num_parts));
+  if (s.ok()) {
+    MaybeTrackTimestampSize(cf_id, ts.size());
+  }
+  return s;
 }
 
 Status WriteBatchInternal::Merge(WriteBatch* b, uint32_t column_family_id,
@@ -1838,14 +1969,45 @@ Status WriteBatch::Merge(ColumnFamilyHandle* column_family,
 
   if (0 == ts_sz) {
     s = WriteBatchInternal::Merge(this, cf_id, key, value);
-    if (s.ok()) {
-      MaybeTrackTimestampSize(cf_id, ts_sz);
-    }
+  } else {
+    needs_in_place_update_ts_ = true;
+    has_key_with_ts_ = true;
+    std::string dummy_ts(ts_sz, '\0');
+    const int key_with_ts_num_parts = key.num_parts + 1;
+    std::vector<Slice> key_with_ts(key_with_ts_num_parts);
+    std::copy(key.parts, key.parts + key.num_parts, key_with_ts.begin());
+    key_with_ts[key.num_parts] = Slice(dummy_ts);
+    s = WriteBatchInternal::Merge(
+        this, cf_id, SliceParts(key_with_ts.data(), key_with_ts_num_parts),
+        value);
+  }
+  if (s.ok()) {
+    MaybeTrackTimestampSize(cf_id, ts_sz);
+  }
+  return s;
+}
+
+Status WriteBatch::Merge(ColumnFamilyHandle* column_family,
+                         const SliceParts& key, const Slice& ts,
+                         const SliceParts& value) {
+  Status s = CheckColumnFamilyTimestampSize(column_family, ts);
+  if (!s.ok()) {
     return s;
   }
-
-  return Status::InvalidArgument(
-      "Cannot call this method on column family enabling timestamp");
+  has_key_with_ts_ = true;
+  assert(column_family);
+  uint32_t cf_id = column_family->GetID();
+  const int key_with_ts_num_parts = key.num_parts + 1;
+  std::vector<Slice> key_with_ts(key_with_ts_num_parts);
+  std::copy(key.parts, key.parts + key.num_parts, key_with_ts.begin());
+  key_with_ts[key.num_parts] = ts;
+  s = WriteBatchInternal::Merge(
+      this, cf_id, SliceParts(key_with_ts.data(), key_with_ts_num_parts),
+      value);
+  if (s.ok()) {
+    MaybeTrackTimestampSize(cf_id, ts.size());
+  }
+  return s;
 }
 
 Status WriteBatchInternal::PutBlobIndex(WriteBatch* b,
