@@ -3862,6 +3862,9 @@ extern ROCKSDB_LIBRARY_API void
 rocksdb_ingestexternalfileoptions_set_move_files(
     rocksdb_ingestexternalfileoptions_t* opt, unsigned char move_files);
 extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfileoptions_set_link_files(
+    rocksdb_ingestexternalfileoptions_t* opt, unsigned char link_files);
+extern ROCKSDB_LIBRARY_API void
 rocksdb_ingestexternalfileoptions_set_snapshot_consistency(
     rocksdb_ingestexternalfileoptions_t* opt,
     unsigned char snapshot_consistency);
