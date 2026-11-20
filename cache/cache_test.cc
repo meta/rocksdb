@@ -525,6 +525,14 @@ TEST_P(CacheTest, EvictEmptyCache) {
   ASSERT_OK(cache->Insert(EncodeKey(1000), nullptr, &kDumbHelper, 10));
 }
 
+TEST_P(CacheTest, ReportProblemsWithoutLogger) {
+  // A null logger is accepted, as by the logging functions in env.h.
+  for (int i = 0; i < 2 * kCacheSize; i++) {
+    ASSERT_OK(cache_->Insert(EncodeKey(i), nullptr, &kDumbHelper, 1));
+  }
+  cache_->ReportProblems(nullptr);
+}
+
 TEST_P(CacheTest, EraseFromDeleter) {
   // Have deleter which will erase item from cache, which will re-enter
   // the cache at that point.
