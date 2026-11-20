@@ -1,0 +1,1 @@
+The first `BackupEngine::CreateNewBackup()` after `BackupEngine::Open()` no longer checks the backup FileSystem for each shared table and blob file when the shared directories held no files at Open. This saves one metadata call per file on remote backup storage.
