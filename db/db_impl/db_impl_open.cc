@@ -1191,7 +1191,8 @@ bool DBImpl::InvokeWalFilterIfNeededOnWalRecord(uint64_t wal_number,
           wal_filter.Name());
       MaybeIgnoreError(&status);
       if (!status.ok()) {
-        // Ignore the error with current record processing.
+        // Skip current record and stop replay. The error fails the recovery.
+        process_current_record = false;
         stop_replay = true;
       }
       break;
@@ -1415,18 +1416,17 @@ Status DBImpl::ProcessLogFile(
       wal_number, is_retry, fname, *stop_replay_for_corruption, min_wal_number,
       predecessor_wal_info, &old_log_record, &status, &reporter, reader);
 
-  // FIXME(hx235): Consolidate `!init_status.ok()` and `reader == nullptr` cases
   if (!init_status.ok()) {
+    assert(reader == nullptr);
+    // `reader` was not created so nothing could have updated `status`
     assert(status.ok());
     status.PermitUncheckedError();
+    // With `paranoid_checks == false`, a WAL that cannot be opened is skipped
+    // and recovery continues with the next WAL
+    MaybeIgnoreError(&init_status);
     return init_status;
-  } else if (reader == nullptr) {
-    // TODO(hx235): remove this case since it's confusing
-    assert(status.ok());
-    // Fail initializing log reader for one log file with an ok status.
-    // Try next one.
-    return status;
   }
+  assert(reader != nullptr);
 
   TEST_SYNC_POINT_CALLBACK("DBImpl::RecoverLogFiles:BeforeReadWal",
                            /*cb_arg=*/nullptr);
@@ -1516,7 +1516,6 @@ Status DBImpl::InitializeLogReader(
     status = fs_->NewSequentialFile(
         fname, fs_->OptimizeForLogRead(file_options_), &file, nullptr);
     if (!status.ok()) {
-      MaybeIgnoreError(&status);
       return status;
     }
     file_reader.reset(new SequentialFileReader(
@@ -1612,11 +1611,8 @@ Status DBImpl::ProcessLogRecord(
                                           *batch_to_use)) {
     assert(process_status.ok());
     return process_status;
-  } else {
-    // FIXME(hx235): Handle the potential non-okay `status` when
-    // `InvokeWalFilterIfNeededOnWalRecord()` returns true
-    status->PermitUncheckedError();
   }
+  assert(status->ok());
 
   assert(process_status.ok());
   process_status = InsertLogRecordToMemtable(
@@ -1625,8 +1621,6 @@ Status DBImpl::ProcessLogRecord(
   // We are treating this as a failure while reading since we read valid
   // blocks that do not form coherent data
   if (!process_status.ok()) {
-    // FIXME(hx235): `reporter->Corruption()` will override the non-ok status
-    // set in `InvokeWalFilterIfNeededOnWalRecord` through passing `*status`
     reporter->Corruption(record.size(), process_status);
     process_status = Status::OK();
     return process_status;
