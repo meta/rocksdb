@@ -99,6 +99,7 @@ class BlobFileBuilderTest : public testing::Test {
       ASSERT_OK(blob_index.DecodeFrom(blob_indexes[i]));
       ASSERT_FALSE(blob_index.IsInlined());
       ASSERT_FALSE(blob_index.HasTTL());
+      ASSERT_EQ(blob_index.compression(), blob_compression_type);
       ASSERT_EQ(blob_index.file_number(), blob_file_number);
       ASSERT_EQ(blob_index.offset(), blob_offset);
       ASSERT_EQ(blob_index.size(), value.size());
@@ -424,6 +425,43 @@ TEST_F(BlobFileBuilderTest, Compression) {
 
   VerifyBlobFile(blob_file_number, blob_file_path, column_family_id,
                  kSnappyCompression, expected_key_value_pairs, blob_indexes);
+}
+
+TEST_F(BlobFileBuilderTest, DisabledCompressionRecordsUncompressedBlob) {
+  Options options;
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlobFileBuilderTest_DisabledCompression"),
+      0);
+  options.enable_blob_files = true;
+  options.blob_compression_type = kSnappyCompression;
+  options.blob_compression_opts.SetMinRatio(4096.0);
+  options.env = mock_env_.get();
+
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_cf_options(options);
+  constexpr uint32_t column_family_id = 123;
+  std::vector<std::string> blob_file_paths;
+  std::vector<BlobFileAddition> blob_file_additions;
+
+  BlobFileBuilder builder(
+      TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
+      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
+      /*job_id=*/1, column_family_id, "foobar", Env::WLTH_MEDIUM,
+      nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
+      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      &blob_file_paths, &blob_file_additions);
+
+  const std::string key = "key";
+  const std::string value(128, 'x');
+  std::string blob_index;
+  ASSERT_OK(builder.Add(key, value, &blob_index));
+  ASSERT_OK(builder.Finish());
+
+  ASSERT_EQ(blob_file_paths.size(), 1);
+  constexpr uint64_t blob_file_number = 2;
+  VerifyBlobFile(blob_file_number, blob_file_paths.front(), column_family_id,
+                 kNoCompression, {{key, value}}, {blob_index});
 }
 
 TEST_F(BlobFileBuilderTest, CompressionError) {
