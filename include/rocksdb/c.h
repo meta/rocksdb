@@ -997,6 +997,11 @@ rocksdb_iter_timestamp_slice(const rocksdb_iterator_t* iter);
 extern ROCKSDB_LIBRARY_API void rocksdb_iter_refresh(
     const rocksdb_iterator_t* iter, char** errptr);
 
+extern ROCKSDB_LIBRARY_API unsigned char rocksdb_iter_is_key_pinned(
+    const rocksdb_iterator_t*);
+extern ROCKSDB_LIBRARY_API unsigned char rocksdb_iter_is_value_pinned(
+    const rocksdb_iterator_t*);
+
 extern ROCKSDB_LIBRARY_API void rocksdb_wal_iter_next(
     rocksdb_wal_iterator_t* iter);
 extern ROCKSDB_LIBRARY_API unsigned char rocksdb_wal_iter_valid(

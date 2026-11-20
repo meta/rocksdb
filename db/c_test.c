@@ -2325,6 +2325,37 @@ int main(int argc, char** argv) {
     rocksdb_iter_destroy(iter);
   }
 
+  StartPhase("iter_pinned");
+  {
+    rocksdb_readoptions_t* pin_roptions = rocksdb_readoptions_create();
+    rocksdb_readoptions_set_pin_data(pin_roptions, 1);
+    rocksdb_iterator_t* iter = rocksdb_create_iterator(db, pin_roptions);
+    rocksdb_iter_seek_to_first(iter);
+    CheckCondition(rocksdb_iter_valid(iter));
+
+    // With pin_data=true, key and value should be pinned
+    CheckCondition(rocksdb_iter_is_key_pinned(iter));
+    CheckCondition(rocksdb_iter_is_value_pinned(iter));
+
+    rocksdb_iter_get_error(iter, &err);
+    CheckNoError(err);
+    rocksdb_iter_destroy(iter);
+    rocksdb_readoptions_destroy(pin_roptions);
+
+    // Without pin_data, test that the functions work (may return 0)
+    iter = rocksdb_create_iterator(db, roptions);
+    rocksdb_iter_seek_to_first(iter);
+    CheckCondition(rocksdb_iter_valid(iter));
+
+    // Just call them to ensure they don't crash; pinned status may vary
+    rocksdb_iter_is_key_pinned(iter);
+    rocksdb_iter_is_value_pinned(iter);
+
+    rocksdb_iter_get_error(iter, &err);
+    CheckNoError(err);
+    rocksdb_iter_destroy(iter);
+  }
+
   StartPhase("wbwi_iter");
   {
     rocksdb_iterator_t* base_iter = rocksdb_create_iterator(db, roptions);
