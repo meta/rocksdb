@@ -219,6 +219,42 @@ public interface WriteBatchInterface {
         throws RocksDBException;
 
     /**
+     * Removes the database entries in the range ["beginKey", "endKey"), i.e.,
+     * including "beginKey" and excluding "endKey". a non-OK status on error. It
+     * is not an error if no keys exist in the range ["beginKey", "endKey").
+     * <p>
+     * Delete the database entry (if any) for "key". Returns OK on success, and a
+     * non-OK status on error. It is not an error if "key" did not exist in the
+     * database.
+     *
+     * @param beginKey
+     *          First key to delete within database (included)
+     * @param endKey
+     *          Last key to delete within database (excluded)
+     * @throws RocksDBException thrown if error happens in underlying native library.
+     */
+    void deleteRange(ByteBuffer beginKey, ByteBuffer endKey) throws RocksDBException;
+
+    /**
+     * Removes the database entries in the range ["beginKey", "endKey"), i.e.,
+     * including "beginKey" and excluding "endKey". a non-OK status on error. It
+     * is not an error if no keys exist in the range ["beginKey", "endKey").
+     * <p>
+     * Delete the database entry (if any) for "key". Returns OK on success, and a
+     * non-OK status on error. It is not an error if "key" did not exist in the
+     * database.
+     *
+     * @param columnFamilyHandle {@link ColumnFamilyHandle} instance
+     * @param beginKey
+     *          First key to delete within database (included)
+     * @param endKey
+     *          Last key to delete within database (excluded)
+     * @throws RocksDBException thrown if error happens in underlying native library.
+     */
+    void deleteRange(ColumnFamilyHandle columnFamilyHandle, ByteBuffer beginKey, ByteBuffer endKey)
+        throws RocksDBException;
+
+    /**
      * Append a blob of arbitrary size to the records in this batch. The blob will
      * be stored in the transaction log but not in any other file. In particular,
      * it will not be persisted to the SST files. When iterating over this

@@ -1580,6 +1580,59 @@ public class RocksDB extends RocksObject {
         columnFamilyHandle.nativeHandle_);
   }
 
+  /**
+   * Removes the database entries in the range ["beginKey", "endKey"), i.e.,
+   * including "beginKey" and excluding "endKey". a non-OK status on error. It
+   * is not an error if no keys exist in the range ["beginKey", "endKey").
+   * <p>
+   * Delete the database entry (if any) for "key". Returns OK on success, and a
+   * non-OK status on error. It is not an error if "key" did not exist in the
+   * database.
+   *
+   * @param beginKey First key to delete within database (inclusive)
+   * @param endKey Last key to delete within database (exclusive)
+   *
+   * @throws RocksDBException thrown if error happens in underlying native
+   *     library.
+   */
+  public void deleteRange(final WriteOptions writeOpt,
+      final ByteBuffer beginKey, final ByteBuffer endKey) throws RocksDBException {
+    assert beginKey.isDirect() && endKey.isDirect();
+    if (beginKey.isDirect() && endKey.isDirect()) {
+      deleteRangeDirect(nativeHandle_, writeOpt.nativeHandle_, beginKey, beginKey.position(), beginKey.remaining(), endKey,
+          endKey.position(), endKey.remaining(), 0);
+    }
+    beginKey.position(beginKey.limit());
+    endKey.position(endKey.limit());
+  }
+
+  /**
+   * Removes the database entries in the range ["beginKey", "endKey"), i.e.,
+   * including "beginKey" and excluding "endKey". a non-OK status on error. It
+   * is not an error if no keys exist in the range ["beginKey", "endKey").
+   * <p>
+   * Delete the database entry (if any) for "key". Returns OK on success, and a
+   * non-OK status on error. It is not an error if "key" did not exist in the
+   * database.
+   *
+   * @param columnFamilyHandle {@link org.rocksdb.ColumnFamilyHandle} instance
+   * @param beginKey First key to delete within database (inclusive)
+   * @param endKey Last key to delete within database (exclusive)
+   *
+   * @throws RocksDBException thrown if error happens in underlying native
+   *     library.
+   */
+  public void deleteRange(final ColumnFamilyHandle columnFamilyHandle, final WriteOptions writeOpt,
+      final ByteBuffer beginKey, final ByteBuffer endKey) throws RocksDBException {
+    assert beginKey.isDirect() && endKey.isDirect();
+    if (beginKey.isDirect() && endKey.isDirect()) {
+      deleteRangeDirect(nativeHandle_, writeOpt.nativeHandle_, beginKey, beginKey.position(), beginKey.remaining(), endKey,
+          endKey.position(), endKey.remaining(), columnFamilyHandle.nativeHandle_);
+    }
+    beginKey.position(beginKey.limit());
+    endKey.position(endKey.limit());
+  }
+
 
   /**
    * Add merge operand for key/value pair.
@@ -5021,6 +5074,9 @@ public class RocksDB extends RocksObject {
       final byte[] beginKey, final int beginKeyOffset, final int beginKeyLength,
       final byte[] endKey, final int endKeyOffset, final int endKeyLength, final long cfHandle)
       throws RocksDBException;
+  private static native void deleteRangeDirect(long handle, long writeOptHandle, ByteBuffer key,
+      int keyOffset, int keyLength, ByteBuffer value, int valueOffset, int valueLength,
+      long cfHandle) throws RocksDBException;
   private static native void clipColumnFamily(final long handle, final long cfHandle,
       final byte[] beginKey, final int beginKeyOffset, final int beginKeyLength,
       final byte[] endKey, final int endKeyOffset, final int endKeyLength) throws RocksDBException;

@@ -409,6 +409,17 @@ public class WriteBatchWithIndex extends AbstractWriteBatch {
     deleteRangeJni(handle, beginKey, beginKeyLen, endKey, endKeyLen, cfHandle);
   }
 
+  @Override
+  final void deleteRangeDirect(final long handle, final ByteBuffer beginKey, final int beginKeyOffset,
+      final int beginKeyLength, final ByteBuffer endKey, final int endKeyOffset, final int endKeyLength,
+      final long cfHandle) {
+    deleteRangeDirectJni(handle, beginKey, beginKeyOffset, beginKeyLength, endKey, endKeyOffset, endKeyLength, cfHandle);
+  }
+
+  private static native void deleteRangeDirectJni(final long handle, final ByteBuffer beginKey,
+      final int beginKeyOffset, final int beginKeyLength, final ByteBuffer endKey, final int endKeyOffset,
+      final int endKeyLength, final long cfHandle);
+
   private static native void deleteRangeJni(final long handle, final byte[] beginKey,
       final int beginKeyLen, final byte[] endKey, final int endKeyLen, final long cfHandle);
 

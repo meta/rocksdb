@@ -333,6 +333,17 @@ public class WriteBatch extends AbstractWriteBatch {
       final int beginKeyLen, final byte[] endKey, final int endKeyLen, final long cfHandle);
 
   @Override
+  final void deleteRangeDirect(final long handle, final ByteBuffer beginKey, final int beginKeyOffset,
+      final int beginKeyLength, final ByteBuffer endKey, final int endKeyOffset, final int endKeyValue,
+      final long cfHandle) {
+    deleteRangeDirectJni(handle, beginKey, beginKeyOffset, beginKeyLength, endKey, endKeyOffset, endKeyValue, cfHandle);
+  }
+
+  private static native void deleteRangeDirectJni(final long handle, final ByteBuffer key,
+      final int keyOffset, final int keyLength, final ByteBuffer value, final int valueOffset,
+      final int valueLength, final long cfHandle);
+
+  @Override
   final void putLogData(final long handle, final byte[] blob, final int blobLen)
       throws RocksDBException {
     putLogDataJni(handle, blob, blobLen);

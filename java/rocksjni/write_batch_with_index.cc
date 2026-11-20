@@ -372,6 +372,31 @@ void Java_org_rocksdb_WriteBatchWithIndex_deleteRangeJni__J_3BI_3BIJ(
 
 /*
  * Class:     org_rocksdb_WriteBatchWithIndex
+ * Method:    deleteRangeDirect
+ * Signature: (JLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIJ)V
+ */
+void Java_org_rocksdb_WriteBatchWithIndex_deleteRangeDirectJni(
+        JNIEnv* env, jclass /*jobj*/, jlong jwb_handle, jobject jbegin_key,
+        jint jbegin_key_offset, jint jbegin_key_len, jobject jend_key, jint jend_key_offset,
+        jint jend_key_len, jlong jcf_handle) {
+  auto* wb = reinterpret_cast<ROCKSDB_NAMESPACE::WriteBatch*>(jwb_handle);
+  assert(wb != nullptr);
+  auto* cf_handle =
+          reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>(jcf_handle);
+  auto put = [&wb, &cf_handle](ROCKSDB_NAMESPACE::Slice& begin_key,
+                               ROCKSDB_NAMESPACE::Slice& end_key) {
+      if (cf_handle == nullptr) {
+        wb->DeleteRange(begin_key, end_key);
+      } else {
+        wb->DeleteRange(cf_handle, begin_key, end_key);
+      }
+  };
+  ROCKSDB_NAMESPACE::JniUtil::kv_op_direct(
+          put, env, jbegin_key, jbegin_key_offset, jbegin_key_len, jend_key, jend_key_offset, jend_key_len);
+}
+
+/*
+ * Class:     org_rocksdb_WriteBatchWithIndex
  * Method:    putLogData
  * Signature: (J[BI)V
  */
