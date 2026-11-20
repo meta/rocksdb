@@ -974,6 +974,17 @@ public class OptionsTest {
   }
 
   @Test
+  public void walCompression() {
+    try (final Options opt = new Options()) {
+      assertThat(opt.walCompression()).isEqualTo(CompressionType.NO_COMPRESSION);
+      for (CompressionType compressionType : CompressionType.values()) {
+        opt.setWalCompression(compressionType);
+        assertThat(opt.walCompression()).isEqualTo(compressionType);
+      }
+    }
+  }
+
+  @Test
   public void atomicFlush() {
     try (final Options opt = new Options()) {
       assertThat(opt.atomicFlush()).isFalse();

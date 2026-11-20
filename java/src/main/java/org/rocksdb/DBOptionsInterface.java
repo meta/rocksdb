@@ -1464,6 +1464,26 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
   boolean manualWalFlush();
 
   /**
+   * If enabled WAL records will be compressed before they are written. Only
+   * ZSTD (= kZSTD) is supported (until streaming support is adapted for other
+   * compression types). Compressed WAL records will be read in supported
+   * versions ({@code >=} RocksDB 7.4.0 for ZSTD) regardless of this setting when
+   *  the WAL is read.
+   *
+   * @param compressionType type of compression to use on WAL
+   *
+   * @return the reference to the current options.
+   */
+  T setWalCompression(final CompressionType compressionType);
+
+  /**
+   * Returns the compression type enabled for WAL compression.
+   *
+   * @return the type of compression currently enabled for WAL compression
+   */
+  CompressionType walCompression();
+
+  /**
    * If true, RocksDB supports flushing multiple column families and committing
    * their results atomically to MANIFEST. Note that it is not
    * necessary to set atomic_flush to true if WAL is always enabled since WAL
